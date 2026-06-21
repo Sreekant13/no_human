@@ -15,6 +15,8 @@ from no_human.core.db import Store
 from no_human.core.orchestrator import Orchestrator
 from no_human.core.task import Task, TaskStatus
 from no_human.notify.slack import SlackNotifier
+from no_human.review.reviewer import AdversarialReviewer, ReviewDecision
+from no_human.review.selfcheck import ChecklistItem
 
 
 def _git(cwd, *args):
@@ -129,3 +131,139 @@ async def test_tamper_weakening_is_blocked_and_escalates(bare_repo, tmp_path, st
     assert refreshed.blocker is not None
     # nothing was pushed as an approvable PR
     assert outcome.pr_url is None
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2: adversarial reviewer gate                                           #
+# --------------------------------------------------------------------------- #
+
+class FakeReviewer:
+    """Injects a scripted ReviewDecision without running the LLM."""
+
+    def __init__(self, decision: ReviewDecision, *, call_count: list | None = None):
+        self._decision = decision
+        self.calls: list[dict] = []
+        self._call_count = call_count  # shared mutable list for multi-attempt tests
+
+    async def review(self, task, *, repo_path, test_output="", held_out_output="",
+                     before_ref="HEAD~1", after_ref="HEAD"):
+        self.calls.append({"task_id": task.id})
+        if self._call_count is not None:
+            self._call_count.append(1)
+        return self._decision
+
+
+async def test_reviewer_passes_proceeds_to_pr(bare_repo, tmp_path, store):
+    """Correct change + passing reviewer → AWAITING_APPROVAL."""
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\n"
+            "def mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+
+    passing_decision = ReviewDecision(
+        passed=True,
+        checklist=[
+            ChecklistItem("mul(a,b) implemented", True, "calc.py:3 returns a*b"),
+            ChecklistItem("tests added", True, "test_calc.py:5 test_mul asserts mul(2,3)==6"),
+        ],
+    )
+    cfg = _config(tmp_path)
+    reviewer = FakeReviewer(passing_decision)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=events.append, reviewer=reviewer)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert outcome.pr_url is not None
+    assert reviewer.calls  # reviewer was actually invoked
+    # attempt records the review checklist
+    attempts = await store.list_attempts(t.id)
+    last = attempts[-1]
+    assert last["review_passed"] == 1
+    assert last["review_checklist"] is not None
+    assert [e["kind"] for e in events].count("review") >= 1
+
+
+async def test_reviewer_fails_blocks_pr_and_loops(bare_repo, tmp_path, store):
+    """Flawed change + failing reviewer → reviewer blocks; after max_attempts → ESCALATED."""
+    call_count: list = []
+
+    def mutate(cwd):
+        # Introduce a product file change without adequate tests
+        (cwd / "calc.py").write_text("def add(a, b):\n    return 0  # broken impl\n")
+        # No test changes — tamper guard stays clean, but reviewer catches the fault.
+
+    failing_decision = ReviewDecision(
+        passed=False,
+        checklist=[
+            ChecklistItem("add(a,b) returns correct sum", False,
+                          "calc.py:2 returns 0, not a+b — implementation is wrong"),
+            ChecklistItem("tests verify correctness", False,
+                          "test_calc.py: existing test_add() would catch this; "
+                          "tests were not updated to fail"),
+        ],
+    )
+    cfg = _config(tmp_path)
+    reviewer = FakeReviewer(failing_decision, call_count=call_count)
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        reviewer=reviewer)
+    t = Task.new("fix add()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["add(a,b) returns a+b"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    # Escalated after max_attempts; never opened a PR.
+    assert outcome.status is TaskStatus.ESCALATED
+    assert outcome.pr_url is None
+    # Reviewer was called once per attempt (max_attempts=3 by default).
+    assert len(call_count) == 3
+    # Each attempt's review_passed is recorded as 0.
+    attempts = await store.list_attempts(t.id)
+    assert all(a["review_passed"] == 0 for a in attempts)
+    # Evidence from the reviewer surfaces in the escalation detail.
+    assert "review failed" in outcome.detail.lower()
+
+
+async def test_red_team_agent_weakens_test_tamper_guard_blocks(bare_repo, tmp_path, store):
+    """Red-team: agent guts the test to make a broken impl pass.
+
+    The tamper guard fires BEFORE the reviewer runs, so the reviewer never
+    even gets called. Escalated with 'tamper' in the detail.
+    """
+    call_count: list = []
+
+    def mutate(cwd):
+        # Agent "fixes" broken impl by removing the assertion that catches it.
+        (cwd / "calc.py").write_text("def add(a, b):\n    return 0  # still broken\n")
+        (cwd / "test_calc.py").write_text(
+            "from calc import add\n\ndef test_add():\n    pass  # assertion deleted\n"
+        )
+
+    passing_decision = ReviewDecision(passed=True, checklist=[
+        ChecklistItem("all good", True, "looks fine"),
+    ])
+    cfg = _config(tmp_path)
+    reviewer = FakeReviewer(passing_decision, call_count=call_count)
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        reviewer=reviewer)
+    t = Task.new("make tests pass", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    # Tamper guard fires; reviewer is NEVER called (guard is pre-review).
+    assert outcome.status is TaskStatus.ESCALATED
+    assert "tamper" in outcome.detail.lower()
+    assert len(call_count) == 0, "reviewer must not run when tamper guard fires"

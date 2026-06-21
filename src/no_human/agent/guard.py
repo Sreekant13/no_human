@@ -78,8 +78,13 @@ def evaluate(
     *,
     forbidden_paths: list[str],
     never_push_to: list[str],
+    readonly: bool = False,
 ) -> GuardDecision:
     """Return allow/deny for a single proposed tool call."""
+    # 0. Reviewer / read-only mode: block ALL writes unconditionally.
+    if readonly and tool_name in WRITE_TOOLS:
+        return GuardDecision(False, f"read-only session: {tool_name} blocked")
+
     # 1. Writes to forbidden paths.
     if tool_name in WRITE_TOOLS:
         path = (

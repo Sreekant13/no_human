@@ -96,6 +96,30 @@ def _git_files(repo_path: Path, ref: str) -> list[str]:
     return [f for f in proc.stdout.splitlines() if f] if proc.returncode == 0 else []
 
 
+def run_held_out_tests(repo_path: Path, *, timeout: int = 120) -> TestRunResult | None:
+    """Run held-out tests if tests/held_out/ exists. Returns None if absent.
+
+    The held-out directory is intentionally not mentioned to the implementing
+    agent, so it cannot be gamed. These results are passed to the reviewer as
+    additional evidence the implementer never saw.
+    """
+    held_path = Path(repo_path) / "tests" / "held_out"
+    if not held_path.exists():
+        return None
+    cmd = f"pytest -q {held_path}"
+    try:
+        proc = subprocess.run(
+            cmd, cwd=repo_path, shell=True, capture_output=True, text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return TestRunResult(True, False, 0, 0, 1, cmd, f"timed out after {timeout}s")
+    output = (proc.stdout or "") + (proc.stderr or "")
+    passed, failed, errors = _parse_pytest(output)
+    ok = proc.returncode == 0
+    return TestRunResult(True, ok, passed, failed, errors, cmd, output[-4000:])
+
+
 def tamper_check_between(
     repo_path: Path, before_ref: str = "HEAD~1", after_ref: str = "HEAD"
 ) -> tamper_guard.TamperReport:

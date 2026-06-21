@@ -46,3 +46,24 @@ def test_blocks_force_push():
 
 def test_blocks_hard_reset_to_ref():
     assert not _ev("Bash", {"command": "git reset --hard HEAD~3"}).allow
+
+
+def test_readonly_blocks_all_write_tools():
+    def _ro(tool, inp):
+        return guard.evaluate(tool, inp, forbidden_paths=FORBIDDEN, never_push_to=PROTECTED,
+                              readonly=True)
+    # All write tools blocked in readonly mode, regardless of path.
+    for tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        d = _ro(tool, {"file_path": "src/totally_fine.py"})
+        assert not d.allow, f"{tool} should be blocked in readonly mode"
+    # Bash / Read are still allowed (read-only operations).
+    assert _ro("Bash", {"command": "pytest -q"}).allow
+    assert _ro("Read", {"file_path": "README.md"}).allow
+
+
+def test_readonly_still_blocks_destructive_bash():
+    def _ro(tool, inp):
+        return guard.evaluate(tool, inp, forbidden_paths=FORBIDDEN, never_push_to=PROTECTED,
+                              readonly=True)
+    assert not _ro("Bash", {"command": "rm -rf ."}).allow
+    assert not _ro("Bash", {"command": "git merge origin/main"}).allow

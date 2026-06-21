@@ -56,7 +56,7 @@ class AgentResult:
 
 
 def _make_guard_hook(
-    forbidden_paths: list[str], never_push_to: list[str]
+    forbidden_paths: list[str], never_push_to: list[str], *, readonly: bool = False,
 ) -> Callable[..., Awaitable[dict]]:
     """Build a PreToolUse hook callback that applies the pure guard policy."""
 
@@ -66,6 +66,7 @@ def _make_guard_hook(
             input_data.get("tool_input", {}) or {},
             forbidden_paths=forbidden_paths,
             never_push_to=never_push_to,
+            readonly=readonly,
         )
         if decision.allow:
             return {}
@@ -90,6 +91,7 @@ class ClaudeBackend:
         forbidden_paths: list[str] | None = None,
         never_push_to: list[str] | None = None,
         permission_mode: str = "bypassPermissions",
+        readonly: bool = False,
     ):
         self.model = model
         self.forbidden_paths = forbidden_paths or [".env", "secrets/", "*.key", "*.pem"]
@@ -97,6 +99,7 @@ class ClaudeBackend:
         # bypassPermissions: unattended autonomy. The PreToolUse guard is the
         # real safety boundary and fires even in this mode (Part 10).
         self.permission_mode = permission_mode
+        self.readonly = readonly
 
     def _options(
         self, cwd: Path, max_turns: int, *, effort: str | None = None,
@@ -114,7 +117,11 @@ class ClaudeBackend:
                     HookMatcher(
                         matcher=None,
                         hooks=[
-                            _make_guard_hook(self.forbidden_paths, self.never_push_to)
+                            _make_guard_hook(
+                                self.forbidden_paths,
+                                self.never_push_to,
+                                readonly=self.readonly,
+                            )
                         ],
                     )
                 ]

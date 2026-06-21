@@ -90,8 +90,10 @@ class WatchApp(App):
                 never_push_to=self.config["git"]["never_push_to"],
             )
             notifier = SlackNotifier(self.config["notifications"].get("slack_webhook_url"))
+            from ..context import ContextGatherer, build_default_sources
+            gatherer = ContextGatherer(build_default_sources(store, self.config.data))
             orch = Orchestrator(store, self.config.data, backend, notifier,
-                                event_sink=self._sink)
+                                event_sink=self._sink, context_gatherer=gatherer)
             outcome = await orch.run_task(t)
             log.write(f"[bold]── {outcome.status.value} ──[/]")
             if outcome.pr_url:

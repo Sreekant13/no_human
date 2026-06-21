@@ -23,6 +23,7 @@ from typing import Any, Callable
 from ..agent.claude_backend import AgentEvent, ClaudeBackend
 from ..notify.slack import SlackNotifier
 from ..review import selfcheck
+from ..review.reviewer import AdversarialReviewer, ReviewDecision
 from ..testing import runner
 from ..vcs import GitRepo, ProtectedBranch, open_pr
 from .bounds import Bounds, QuotaExhausted, StuckDetector
@@ -63,6 +64,8 @@ class Orchestrator:
         notifier: SlackNotifier,
         *,
         event_sink: EventSink | None = None,
+        context_gatherer: Any | None = None,
+        reviewer: AdversarialReviewer | None = None,
     ):
         self.store = store
         self.config = config
@@ -70,6 +73,8 @@ class Orchestrator:
         self.notifier = notifier
         self.bounds = Bounds.from_config(config.get("bounds"))
         self._sink = event_sink or (lambda e: None)
+        self.context_gatherer = context_gatherer
+        self.reviewer = reviewer
 
     # ----------------------------- events ---------------------------------- #
 
@@ -105,14 +110,19 @@ class Orchestrator:
         if task.status == TaskStatus.PENDING:
             await self.store.set_status(task, TaskStatus.CONTEXT)
             self.emit("state", "context", status="context")
+            await self._gather_context(task)
             await self.store.set_status(task, TaskStatus.PLANNING)
             self.emit("state", "planning", status="planning")
+
+        # Capture base branch once — never re-derive from current branch, which
+        # may point at a previous attempt's feature branch after a failed attempt.
+        base_branch = repo.current_branch()
 
         outcome = TaskOutcome(task, status=task.status, detail="")
         for attempt_n in range(1, self.bounds.max_attempts + 1):
             self.emit("attempt_start", f"attempt {attempt_n}/{self.bounds.max_attempts}")
             try:
-                outcome = await self._run_attempt(task, repo, attempt_n)
+                outcome = await self._run_attempt(task, repo, attempt_n, base_branch)
             except QuotaExhausted as exc:
                 return await self._park_quota(task, exc)
             if outcome.status == TaskStatus.AWAITING_APPROVAL:
@@ -129,13 +139,18 @@ class Orchestrator:
             f"passing, untampered change. Last: {outcome.detail}"
         )
 
-    async def _run_attempt(self, task: Task, repo: GitRepo, attempt_n: int) -> TaskOutcome:
+    async def _run_attempt(
+        self, task: Task, repo: GitRepo, attempt_n: int, base: str | None = None
+    ) -> TaskOutcome:
         attempt_id = await self.store.create_attempt(task.id, attempt_n)
         stuck = StuckDetector()
 
         # --- branch (deterministic git; agent never touches git) ---
         branch = f"{self.config['git']['branch_prefix']}{task.id[:8]}"
-        base = repo.current_branch()
+        # base is passed from run_task (captured once before the attempt loop) so
+        # we always branch off the original base, not a prior attempt's branch.
+        if base is None:
+            base = repo.current_branch()
         try:
             repo.create_branch(branch, base=base)
         except ProtectedBranch as exc:
@@ -176,13 +191,13 @@ class Orchestrator:
         if over:
             return await self._escalate(task, over)
 
-        # --- review (advisory self-check in Phase 0; real reviewer = Phase 2) ---
+        # --- review: tamper guard first (cheap, deterministic pre-filter),
+        #     then adversarial reviewer (the real gate, §3.3) ---
         await self.store.set_status(task, TaskStatus.REVIEWING)
-        self.emit("state", "reviewing (advisory self-check)", status="reviewing")
+        self.emit("state", "reviewing", status="reviewing")
 
-        # --- test + tamper guard (trust only verifiable signals) ---
-        await self.store.set_status(task, TaskStatus.TESTING)
-        self.emit("state", "testing", status="testing")
+        # Tamper guard fires before spending reviewer tokens. A net reduction in
+        # tests/assertions is reward hacking; escalate immediately.
         tamper = runner.tamper_check_between(repo.path)
         self.emit("tamper", tamper.summary, tampered=tamper.tampered)
         if tamper.tampered:
@@ -196,6 +211,29 @@ class Orchestrator:
                 + "; ".join(tamper.reasons),
             )
 
+        decision = await self._run_review(task, repo, attempt_id)
+        if not decision.passed:
+            failed = decision.failed_items
+            detail = "review failed: " + "; ".join(
+                f"{i.label}: {i.evidence}" for i in failed[:3]
+            )
+            await self.store.update_attempt(
+                attempt_id,
+                review_checklist=decision.as_dict(),
+                review_passed=0,
+                status="failed",
+                failure_reason=detail,
+            )
+            return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+        await self.store.update_attempt(
+            attempt_id,
+            review_checklist=decision.as_dict(),
+            review_passed=1,
+        )
+
+        # --- test: run local suite, record results ---
+        await self.store.set_status(task, TaskStatus.TESTING)
+        self.emit("state", "testing", status="testing")
         test_cmd = self.config.get("tests", {}).get("command")
         test_result = runner.run_tests(repo.path, test_cmd)
         self.emit("tests", test_result.summary, ok=test_result.ok)
@@ -273,6 +311,74 @@ class Orchestrator:
 
     # --------------------------- helpers ----------------------------------- #
 
+    async def _run_review(
+        self, task: Task, repo: GitRepo, attempt_id: str
+    ) -> ReviewDecision:
+        """Run the adversarial reviewer; fall back to advisory pass if none configured."""
+        if self.reviewer is None:
+            from ..review.selfcheck import ChecklistItem
+            return ReviewDecision(
+                passed=True,
+                checklist=[ChecklistItem(
+                    "advisory (no reviewer configured)", True,
+                    "reviewer not wired — advisory pass-through",
+                )],
+            )
+
+        # Collect test output to give the reviewer evidence to work with.
+        test_cmd = self.config.get("tests", {}).get("command")
+        test_result = runner.run_tests(repo.path, test_cmd)
+        held_result = runner.run_held_out_tests(repo.path)
+
+        self.emit("review_start", "running independent adversarial reviewer")
+        try:
+            decision = await self.reviewer.review(
+                task,
+                repo_path=repo.path,
+                test_output=test_result.output if test_result.ran else "",
+                held_out_output=held_result.output if held_result else "",
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Reviewer crash → fail closed (never pass-through on error).
+            from ..review.selfcheck import ChecklistItem
+            self.emit("review_error", str(exc))
+            return ReviewDecision(
+                passed=False,
+                checklist=[ChecklistItem("reviewer run", False, f"reviewer crashed: {exc}")],
+            )
+
+        verdict = "PASS" if decision.passed else "FAIL"
+        self.emit("review", verdict, passed=decision.passed,
+                  failed_count=len(decision.failed_items))
+        return decision
+
+    async def _gather_context(self, task: Task) -> None:
+        if not self.context_gatherer:
+            return
+        self.emit("context_gather", "gathering context")
+        try:
+            ctx = await self.context_gatherer.gather(task)
+        except Exception as exc:  # noqa: BLE001 — context is best-effort
+            self.emit("context_gather", f"context gathering failed: {exc}")
+            return
+        task.context = {**(task.context or {}), "gathered": ctx.to_dict()}
+        await self.store.update_task(task)
+        comp = ctx.completeness
+        detail = f"{len(ctx.chunks)} chunks from {len({c.source for c in ctx.chunks})} sources"
+        if comp and comp.missing:
+            detail += f"; missing: {', '.join(comp.missing)}"
+        self.emit("context", detail, complete=bool(comp and comp.ok))
+
+    def _context_digest(self, task: Task, limit: int = 8) -> str:
+        gathered = (task.context or {}).get("gathered") or {}
+        chunks = gathered.get("chunks") or []
+        if not chunks:
+            return ""
+        lines = ["Gathered context (read-only, for reference):"]
+        for c in chunks[:limit]:
+            lines.append(f"  [{c['source']}] {c['title']}")
+        return "\n".join(lines)
+
     def _open_repo(self, task: Task) -> GitRepo | None:
         try:
             return GitRepo(
@@ -312,11 +418,13 @@ class Orchestrator:
             "  - Do NOT run any git command — branching, committing, pushing and\n"
             "    opening the PR are handled for you. Just edit files and run tests.\n"
         )
+        digest = self._context_digest(task)
         return (
             f"You are implementing a software task on the repo at {task.repo_path}.\n\n"
             f"Task: {task.title}\n"
             f"{('Description: ' + task.description) if task.description else ''}\n\n"
             f"Acceptance criteria:\n{criteria}\n\n"
+            f"{(digest + chr(10) + chr(10)) if digest else ''}"
             f"{rules}\n"
             + selfcheck.build_prompt(task.title, task.acceptance_criteria)
         )
