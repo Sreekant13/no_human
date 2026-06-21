@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets & local state — never commit
+.env
+*.key
+*.pem
+.no_human/
+secrets/
+*.db
+*.db-wal
+*.db-shm
+
+# Test scratch
+/tmp_e2e/
