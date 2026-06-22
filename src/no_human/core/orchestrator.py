@@ -78,6 +78,7 @@ class Orchestrator:
         context_gatherer: Any | None = None,
         reviewer: AdversarialReviewer | None = None,
         ci_runner: Any | None = None,
+        learning_queue: Any | None = None,
     ):
         self.store = store
         self.config = config
@@ -88,6 +89,7 @@ class Orchestrator:
         self.context_gatherer = context_gatherer
         self.reviewer = reviewer
         self.ci_runner = ci_runner
+        self.learning_queue = learning_queue
 
     # ----------------------------- events ---------------------------------- #
 
@@ -342,6 +344,10 @@ class Orchestrator:
             "needs_approval",
             f"{task.title} — PR ready ({pr.kind}): {pr.url}. `nh approve {task.id[:8]}`",
         )
+        await self._propose_learning(
+            task, TaskStatus.AWAITING_APPROVAL,
+            summary=(result.final_text or "").strip()[:500],
+        )
         return TaskOutcome(task, pr_url=pr.url, status=TaskStatus.AWAITING_APPROVAL,
                            detail="PR opened; awaiting human approval")
 
@@ -441,10 +447,31 @@ class Orchestrator:
                 "stuck",
                 notification_line(blocker, task_title=task.title, task_id=task.id),
             )
+        # 6. Learning: propose an anti-pattern for escalations (not for parked
+        #    tasks that may still resolve themselves; 22.8).
+        if route.target_status == TaskStatus.ESCALATED:
+            await self._propose_learning(
+                task, TaskStatus.ESCALATED, blocker=blocker.to_dict())
         return TaskOutcome(
             task, status=route.target_status,
             detail=blocker.root_cause_hypothesis or blocker.question or "",
         )
+
+    async def _propose_learning(
+        self, task: Task, status: TaskStatus, *, blocker: dict | None = None,
+        summary: str = "",
+    ) -> None:
+        """Queue a human-confirmed learning proposal (4.5). Best-effort: a
+        learning failure must never affect the task outcome."""
+        if self.learning_queue is None:
+            return
+        try:
+            mem_id = await self.learning_queue.propose_from_outcome(
+                task, status=status, blocker=blocker, summary=summary)
+            if mem_id:
+                self.emit("learning_proposed", f"queued proposal {mem_id[:8]}")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("learning proposal failed: %s", exc)
 
     def _checkpoint_wip(self, repo: GitRepo, task: Task) -> str:
         """Commit uncommitted work as [WIP-BLOCKED]; return the resume commit sha."""

@@ -171,3 +171,77 @@ class Store:
         )
         row = await cur.fetchone()
         return int(row["n"]) if row else 0
+
+    # --------------------------- memories ---------------------------------- #
+    # The human-confirmed learning queue (PLAN.md 4.5): proposals land here
+    # with confirmed=0 and never enter the active rule set until a human
+    # confirms them (avoids leniency-biased lessons accumulating silently).
+
+    async def add_memory(
+        self, *, mem_type: str, title: str, content: str,
+        tags: list[str] | None = None, project: str | None = None,
+        source: str = "proposed", confirmed: bool = False,
+        dedupe_key: str | None = None,
+    ) -> str | None:
+        """Insert a memory. If ``dedupe_key`` matches an existing memory's
+        signature (stored in file_path), skip and return None."""
+        if dedupe_key is not None:
+            cur = await self.db.execute(
+                "SELECT id FROM memories WHERE file_path = ? LIMIT 1", (dedupe_key,)
+            )
+            if await cur.fetchone():
+                return None
+        mem_id = uuid.uuid4().hex
+        await self.db.execute(
+            """INSERT INTO memories
+                 (id, type, title, content, file_path, tags, project, source, confirmed)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (mem_id, mem_type, title, content, dedupe_key,
+             json.dumps(tags or []), project, source, 1 if confirmed else 0),
+        )
+        await self.db.commit()
+        return mem_id
+
+    async def list_memories(
+        self, *, confirmed: bool | None = None, source: str | None = None,
+        mem_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses, params = [], []
+        if confirmed is not None:
+            clauses.append("confirmed = ?")
+            params.append(1 if confirmed else 0)
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        if mem_type is not None:
+            clauses.append("type = ?")
+            params.append(mem_type)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        cur = await self.db.execute(
+            f"SELECT * FROM memories{where} ORDER BY created_at DESC", params
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def find_memory(self, prefix: str) -> dict[str, Any] | None:
+        cur = await self.db.execute(
+            "SELECT * FROM memories WHERE id = ? OR id LIKE ? LIMIT 2",
+            (prefix, prefix + "%"),
+        )
+        rows = await cur.fetchall()
+        return dict(rows[0]) if len(rows) == 1 else None
+
+    async def confirm_memory(self, mem_id: str) -> bool:
+        """Promote a proposed memory into the active set (one-click confirm)."""
+        cur = await self.db.execute(
+            "UPDATE memories SET confirmed = 1, source = 'confirmed', "
+            "updated_at = ? WHERE id = ?",
+            (_now(), mem_id),
+        )
+        await self.db.commit()
+        return cur.rowcount > 0
+
+    async def delete_memory(self, mem_id: str) -> bool:
+        cur = await self.db.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
+        await self.db.commit()
+        return cur.rowcount > 0
