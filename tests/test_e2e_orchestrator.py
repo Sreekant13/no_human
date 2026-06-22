@@ -394,3 +394,76 @@ async def test_low_confidence_dependency_wait_escalates(bare_repo, tmp_path, sto
     outcome = await orch.run_task(t)
 
     assert outcome.status is TaskStatus.ESCALATED
+
+
+class PromptCapturingBackend:
+    """First run emits an AMBIGUITY blocker; second run (after the human reply)
+    records the prompt it received and applies a real fix."""
+
+    def __init__(self, blocker_json, fix):
+        self._json = blocker_json
+        self._fix = fix
+        self.calls = 0
+        self.prompts: list[str] = []
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None, on_event=None):
+        self.calls += 1
+        self.prompts.append(prompt)
+        if self.calls == 1:
+            text = "Need a decision.\nBLOCKER_JSON_START\n" + self._json + "\nBLOCKER_JSON_END\n"
+            return AgentResult(final_text=text, num_turns=1, is_error=False,
+                               tokens_used=30, session_id="s", stop_reason="end_turn")
+        self._fix(cwd)
+        return AgentResult(final_text="applied the agreed behavior", num_turns=2,
+                           is_error=False, tokens_used=80, session_id="s",
+                           stop_reason="end_turn")
+
+
+async def test_reply_resumes_from_checkpoint_with_human_answer(bare_repo, tmp_path, store):
+    """DoD: a parked task resumes from its checkpoint when a human replies, and
+    the resumed (fresh) session is seeded with the human's answer."""
+    bjson = (
+        '{"category": "AMBIGUITY", "confidence": 0.9, '
+        '"root_cause_hypothesis": "empty-input behavior unspecified", '
+        '"question": "What should mul() do on empty input?", '
+        '"options": ["raise", "return 0"], "goal": "implement mul", '
+        '"evidence": "spec silent on empty input"}'
+    )
+
+    def fix(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n")
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n\ndef test_add():\n    assert add(1, 2) == 3\n\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+    backend = PromptCapturingBackend(bjson, fix)
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    await store.create_task(t)
+
+    # 1. First run parks in awaiting_input with the question.
+    outcome = await orch.run_task(t)
+    assert outcome.status is TaskStatus.AWAITING_INPUT
+
+    # 2. Simulate `nh reply <id> "return 0"`: store the answer, resume.
+    refreshed = await store.get_task(t.id)
+    ctx = refreshed.context or {}
+    ctx["human_replies"] = [{"at": "2026-06-22", "question": "empty input?",
+                             "answer": "return 0 on empty input"}]
+    refreshed.context = ctx
+    refreshed.wake_check_at = None
+    await store.update_task(refreshed)
+    await store.set_status(refreshed, TaskStatus.IMPLEMENTING, validate=False)
+
+    # 3. Re-run: resumes from the checkpoint and completes to a PR.
+    outcome2 = await orch.run_task(refreshed)
+    assert outcome2.status is TaskStatus.AWAITING_APPROVAL
+    assert outcome2.pr_url is not None
+
+    # The resumed (fresh) session prompt carried the human's answer (22.5).
+    resume_prompt = backend.prompts[-1]
+    assert "return 0 on empty input" in resume_prompt
+    assert "do NOT re-ask" in resume_prompt
