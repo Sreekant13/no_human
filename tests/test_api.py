@@ -214,3 +214,18 @@ async def test_send_back_missing_message_422(client, store):
     t = await _seed_task(store)
     r = await client.post(f"/api/tasks/{t.id}/send-back", json={})
     assert r.status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# Static SPA path resolution                                                   #
+# --------------------------------------------------------------------------- #
+
+def test_web_dist_path_points_at_repo_web_dir():
+    """_WEB_DIST must resolve to <repo>/web/dist — not above the repo. A wrong
+    parents[] index silently breaks SPA serving (the API just 404s on /)."""
+    from pathlib import Path
+
+    from no_human.api.app import _WEB_DIST
+
+    repo_root = Path(__file__).resolve().parents[1]  # tests/ -> repo root
+    assert _WEB_DIST == repo_root / "web" / "dist"

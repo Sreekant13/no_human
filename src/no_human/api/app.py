@@ -31,7 +31,7 @@ from ..core.db import Store
 from ..core.task import Task, TaskStatus
 from .models import AttemptOut, BoardPayload, SendBackRequest, TaskOut, TaskSummaryOut
 
-_WEB_DIST = Path(__file__).resolve().parents[4] / "web" / "dist"
+_WEB_DIST = Path(__file__).resolve().parents[3] / "web" / "dist"
 
 
 @asynccontextmanager

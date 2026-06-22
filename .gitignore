@@ -21,3 +21,6 @@ secrets/
 
 # Test scratch
 /tmp_e2e/
+
+# web build
+web/node_modules/
