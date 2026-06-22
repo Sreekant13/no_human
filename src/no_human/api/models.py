@@ -124,5 +124,9 @@ class SendBackRequest(BaseModel):
     message: str
 
 
+class ReplyRequest(BaseModel):
+    answer: str
+
+
 class BoardPayload(BaseModel):
     tasks: list[TaskSummaryOut]

@@ -192,8 +192,8 @@ def test_review_shows_checklist(tmp_path, monkeypatch):
     checklist = {
         "passed": True,
         "items": [
-            {"criterion": "Tests pass", "passed": True, "evidence": "208 passed"},
-            {"criterion": "No regressions", "passed": True, "evidence": "tamper guard clean"},
+            {"label": "Tests pass", "passed": True, "evidence": "208 passed"},
+            {"label": "No regressions", "passed": True, "evidence": "tamper guard clean"},
         ],
     }
     _seed_attempt(db, task_id, review_checklist=checklist, review_passed=1)

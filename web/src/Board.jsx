@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import SlideOver from "./SlideOver.jsx";
 
 // "Awaiting You" and "Escalated" are pinned first and rendered loud.
@@ -15,15 +15,30 @@ const LANES = [
 
 export default function Board({ tasks }) {
   const [selectedId, setSelectedId] = useState(null);
+  const [refreshKey, setRefreshKey] = useState(0);
   const triggerRef = useRef(null);
+  const prevUpdatedAtRef = useRef(null);
+
+  // Re-fetch the SlideOver whenever the selected task's updated_at changes via WS
+  useEffect(() => {
+    if (!selectedId) return;
+    const selected = tasks.find((t) => t.id === selectedId);
+    const stamp = selected?.updated_at ?? null;
+    if (stamp && stamp !== prevUpdatedAtRef.current) {
+      prevUpdatedAtRef.current = stamp;
+      setRefreshKey((k) => k + 1);
+    }
+  }, [tasks, selectedId]);
 
   function openTask(id, domNode) {
     triggerRef.current = domNode;
+    prevUpdatedAtRef.current = null; // reset so first open always fetches
     setSelectedId(id);
   }
 
   function closeTask() {
     setSelectedId(null);
+    prevUpdatedAtRef.current = null;
     // Restore focus to the card that triggered the panel
     triggerRef.current?.focus();
     triggerRef.current = null;
@@ -45,6 +60,7 @@ export default function Board({ tasks }) {
         <SlideOver
           taskId={selectedId}
           onClose={closeTask}
+          refreshKey={refreshKey}
         />
       )}
     </>
@@ -97,7 +113,19 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
         {showSubStatus && (
           <span className={`card-substatus substatus-${task.status}`}>{task.status}</span>
         )}
-        {task.pr_url && <span className="card-pr-badge">PR</span>}
+        {task.pr_url && (
+          task.pr_url.startsWith("http") ? (
+            <a
+              className="card-pr-badge"
+              href={task.pr_url}
+              target="_blank"
+              rel="noreferrer"
+              onClick={(e) => e.stopPropagation()}
+            >PR</a>
+          ) : (
+            <span className="card-pr-badge">PR</span>
+          )
+        )}
         <span className="card-age">{age}</span>
       </div>
     </div>

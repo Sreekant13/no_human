@@ -217,6 +217,58 @@ async def test_send_back_missing_message_422(client, store):
 
 
 # --------------------------------------------------------------------------- #
+# POST /api/tasks/{id}/reply                                                   #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_reply_stores_answer_and_resets(client, store):
+    t = await _seed_task(store, status=TaskStatus.BLOCKED)
+    t.blocker = {"question": "Which DB?", "category": "need_clarification"}
+    await store.update_task(t)
+
+    r = await client.post(f"/api/tasks/{t.id}/reply", json={"answer": "SQLite only"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+
+    refreshed = await store.find_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING
+    replies = refreshed.context.get("human_replies", [])
+    assert len(replies) == 1
+    assert replies[0]["answer"] == "SQLite only"
+    assert replies[0]["question"] == "Which DB?"
+
+
+@pytest.mark.asyncio
+async def test_reply_all_parked_statuses_accepted(client, store):
+    for status in (TaskStatus.BLOCKED, TaskStatus.AWAITING_INPUT,
+                   TaskStatus.PAUSED_QUOTA, TaskStatus.ESCALATED):
+        t = await _seed_task(store, status=status, title=f"parked-{status.value}")
+        r = await client.post(f"/api/tasks/{t.id}/reply", json={"answer": "go ahead"})
+        assert r.status_code == 200, f"expected 200 for {status.value}, got {r.status_code}"
+
+
+@pytest.mark.asyncio
+async def test_reply_wrong_status_409(client, store):
+    t = await _seed_task(store, status=TaskStatus.IMPLEMENTING)
+    r = await client.post(f"/api/tasks/{t.id}/reply", json={"answer": "irrelevant"})
+    assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_reply_404(client):
+    r = await client.post("/api/tasks/ghost/reply", json={"answer": "x"})
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_reply_missing_answer_422(client, store):
+    t = await _seed_task(store, status=TaskStatus.BLOCKED)
+    r = await client.post(f"/api/tasks/{t.id}/reply", json={})
+    assert r.status_code == 422
+
+
+# --------------------------------------------------------------------------- #
 # Static SPA path resolution                                                   #
 # --------------------------------------------------------------------------- #
 

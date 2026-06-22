@@ -47,6 +47,7 @@ class ReviewDecision:
             "passed": self.passed,
             "items": [{"label": i.label, "passed": i.passed, "evidence": i.evidence}
                       for i in self.checklist],
+            "raw_output": self.raw_output or None,
         }
 
 

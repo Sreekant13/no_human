@@ -24,6 +24,16 @@ export async function approveTask(id) {
   return r.json();
 }
 
+export async function replyTask(id, answer) {
+  const r = await fetch(`${BASE}/api/tasks/${id}/reply`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ answer }),
+  });
+  if (!r.ok) throw new Error(`POST reply → ${r.status}`);
+  return r.json();
+}
+
 export async function sendBack(id, message) {
   const r = await fetch(`${BASE}/api/tasks/${id}/send-back`, {
     method: "POST",

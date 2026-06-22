@@ -29,7 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from ..config import load_config
 from ..core.db import Store
 from ..core.task import Task, TaskStatus
-from .models import AttemptOut, BoardPayload, SendBackRequest, TaskOut, TaskSummaryOut
+from .models import AttemptOut, BoardPayload, ReplyRequest, SendBackRequest, TaskOut, TaskSummaryOut
 
 _WEB_DIST = Path(__file__).resolve().parents[3] / "web" / "dist"
 
@@ -213,6 +213,52 @@ async def send_back(
     return {
         "ok": True,
         "message": "Feedback stored. Run `nh watch <id>` to retry.",
+    }
+
+
+_PARKED_STATUSES = {
+    TaskStatus.BLOCKED, TaskStatus.AWAITING_INPUT,
+    TaskStatus.PAUSED_QUOTA, TaskStatus.ESCALATED,
+}
+
+
+@app.post("/api/tasks/{task_id}/reply")
+async def reply_task(
+    task_id: str, body: ReplyRequest, request: Request
+) -> dict[str, Any]:
+    """Store a human answer to a parked task's question; reset to IMPLEMENTING.
+
+    Does NOT auto-run the orchestrator — the human runs `nh watch <id>` to resume.
+    Parity with `nh reply --no-run`.
+    """
+    store = _store(request)
+    task = await _require_task(store, task_id)
+    if task.status not in _PARKED_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"task is {task.status.value!r}, not a parked state — no question to answer",
+        )
+    ctx = task.context or {}
+    replies = ctx.get("human_replies") or []
+    blocker = task.blocker or {}
+    question = blocker.get("question") if isinstance(blocker, dict) else None
+    replies.append({"at": _now(), "question": question, "answer": body.answer})
+    ctx["human_replies"] = replies
+    ctx.pop("wake_check_at", None)
+    task.context = ctx
+    task.wake_check_at = None
+    await store.update_task(task)
+    await store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
+    tasks = await _board_tasks(store)
+    await _mgr.broadcast({
+        "type": "task_updated",
+        "task_id": task.id,
+        "status": TaskStatus.IMPLEMENTING.value,
+        "tasks": [t.model_dump() for t in tasks],
+    })
+    return {
+        "ok": True,
+        "message": f"Reply stored. Run `nh watch {task_id[:8]}` to resume.",
     }
 
 

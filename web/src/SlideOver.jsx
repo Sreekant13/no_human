@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { approveTask, fetchDiff, fetchTask, sendBack } from "./api.js";
+import { approveTask, fetchDiff, fetchTask, replyTask, sendBack } from "./api.js";
 
 const STATUS_PILL = {
   pending:            "pill-pending",
@@ -14,21 +14,24 @@ const STATUS_PILL = {
   failed:             "pill-failed",
 };
 
-export default function SlideOver({ taskId, onClose }) {
+export default function SlideOver({ taskId, onClose, refreshKey = 0 }) {
   const [task, setTask] = useState(null);
   const [diff, setDiff] = useState("");
   const [tab, setTab] = useState("details");
   const [busy, setBusy] = useState(false);
   const [sbOpen, setSbOpen] = useState(false);
   const [sbMsg, setSbMsg] = useState("");
+  const [replyOpen, setReplyOpen] = useState(false);
+  const [replyMsg, setReplyMsg] = useState("");
   const [flash, setFlash] = useState(null);
   const dialogRef = useRef(null);
   const closeRef = useRef(null);
 
+  // Re-fetch whenever taskId changes OR when Board signals a WS update
   useEffect(() => {
     fetchTask(taskId).then(setTask).catch(() => {});
     fetchDiff(taskId).then(setDiff).catch(() => {});
-  }, [taskId]);
+  }, [taskId, refreshKey]);
 
   // Escape-to-close + focus trap
   useEffect(() => {
@@ -57,6 +60,7 @@ export default function SlideOver({ taskId, onClose }) {
   }, [onClose]);
 
   const isAwaiting = task?.status === "awaiting_approval";
+  const isParked = task?.status === "awaiting_input" || task?.status === "blocked";
   const pillClass = STATUS_PILL[task?.status] || "pill-pending";
 
   async function handleApprove() {
@@ -82,6 +86,23 @@ export default function SlideOver({ taskId, onClose }) {
       setSbOpen(false);
       setSbMsg("");
       setFlash("Feedback stored. Task returned to queue.");
+      const updated = await fetchTask(taskId);
+      setTask(updated);
+    } catch (e) {
+      setFlash(`Error: ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleReply() {
+    if (!replyMsg.trim() || busy) return;
+    setBusy(true);
+    try {
+      const res = await replyTask(taskId, replyMsg.trim());
+      setReplyOpen(false);
+      setReplyMsg("");
+      setFlash(res.message || "Reply stored. Run `nh watch` to resume.");
       const updated = await fetchTask(taskId);
       setTask(updated);
     } catch (e) {
@@ -154,6 +175,15 @@ export default function SlideOver({ taskId, onClose }) {
             >
               Send back
             </button>
+            {isParked && (
+              <button
+                className="btn btn-reply"
+                onClick={() => setReplyOpen(true)}
+                disabled={busy}
+              >
+                Reply
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -180,6 +210,34 @@ export default function SlideOver({ taskId, onClose }) {
                 disabled={!sbMsg.trim() || busy}
               >
                 {busy ? "…" : "Send"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* reply modal */}
+      {replyOpen && (
+        <div className="sendback-overlay" onClick={() => setReplyOpen(false)}>
+          <div className="sendback-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="sendback-label">Reply to blocker question</div>
+            <textarea
+              className="sendback-textarea"
+              placeholder="Your answer…"
+              value={replyMsg}
+              onChange={(e) => setReplyMsg(e.target.value)}
+              autoFocus
+            />
+            <div className="sendback-actions">
+              <button className="btn btn-sendback" onClick={() => setReplyOpen(false)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-approve"
+                onClick={handleReply}
+                disabled={!replyMsg.trim() || busy}
+              >
+                {busy ? "…" : "Send reply"}
               </button>
             </div>
           </div>
@@ -310,6 +368,7 @@ function BlockerSection({ blocker: b }) {
 }
 
 function ReviewTab({ task }) {
+  const [rawOpen, setRawOpen] = useState(false);
   if (!task) return <div className="so-diff-empty">Loading…</div>;
 
   const lastAttempt = task.attempts?.[task.attempts.length - 1];
@@ -326,22 +385,43 @@ function ReviewTab({ task }) {
   }
 
   const allPassed = checklist.passed;
+  const testResults = lastAttempt?.test_results;
+  const tamperFlag = testResults?.tamper_flag;
+  const ciUrl = lastAttempt?.ci_pipeline_url;
+  const rawOutput = checklist.raw_output;
 
   return (
     <>
+      {tamperFlag && (
+        <div className="tamper-banner">
+          TAMPER DETECTED — test count reduced between attempts
+        </div>
+      )}
       <section>
-        <div className="so-section-label">
-          Reviewer verdict — {allPassed
-            ? <span style={{ color: "var(--green)" }}>PASSED</span>
-            : <span style={{ color: "var(--red)" }}>FAILED</span>
-          }
+        <div className="so-section-label" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span>Reviewer verdict —{" "}
+            {allPassed
+              ? <span style={{ color: "var(--green)" }}>PASSED</span>
+              : <span style={{ color: "var(--red)" }}>FAILED</span>
+            }
+          </span>
+          {ciUrl && (
+            <a
+              href={ciUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="ci-link"
+            >
+              CI pipeline →
+            </a>
+          )}
         </div>
         <div className="so-checklist">
           {checklist.items.map((item, i) => (
             <div key={i} className={`checklist-item ${item.passed ? "pass" : "fail"}`}>
               <div className="checklist-icon">{item.passed ? "✓" : "✗"}</div>
               <div>
-                <div className="checklist-text">{item.criterion}</div>
+                <div className="checklist-text">{item.label}</div>
                 {item.evidence && (
                   <div className="checklist-evidence">{item.evidence}</div>
                 )}
@@ -350,10 +430,28 @@ function ReviewTab({ task }) {
           ))}
         </div>
       </section>
-      {lastAttempt?.test_results && (
+      {testResults && (
         <section>
-          <div className="so-section-label">Test results</div>
-          <TestResultCard result={lastAttempt.test_results} />
+          <div className="so-section-label" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span>Test results</span>
+            {!tamperFlag && (
+              <span style={{ fontSize: 10, color: "var(--green)" }}>clean</span>
+            )}
+          </div>
+          <TestResultCard result={testResults} />
+        </section>
+      )}
+      {rawOutput && (
+        <section>
+          <button
+            className="raw-toggle"
+            onClick={() => setRawOpen((o) => !o)}
+          >
+            {rawOpen ? "▼" : "▶"} Reviewer reasoning
+          </button>
+          {rawOpen && (
+            <pre className="raw-output">{rawOutput}</pre>
+          )}
         </section>
       )}
     </>
