@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import Editor from "@monaco-editor/react";
 import { approveTask, fetchDiff, fetchTask, sendBack } from "./api.js";
 
 const STATUS_PILL = {
@@ -314,28 +313,32 @@ function TestResultCard({ result }) {
   );
 }
 
+// Self-contained, offline diff renderer. A read-only unified diff doesn't need
+// a 5MB CDN-loaded editor — colorized monospace lines are lighter, work without
+// network, and match the operator-terminal aesthetic.
+function diffLineClass(line) {
+  if (line.startsWith("+++") || line.startsWith("---")) return "diff-file";
+  if (line.startsWith("@@")) return "diff-hunk";
+  if (line.startsWith("diff ") || line.startsWith("index ")) return "diff-meta";
+  if (line.startsWith("+")) return "diff-add";
+  if (line.startsWith("-")) return "diff-del";
+  return "diff-ctx";
+}
+
 function DiffTab({ diff }) {
   if (!diff) {
     return <div className="so-diff-empty">No diff available yet.</div>;
   }
+  const lines = diff.split("\n");
   return (
-    <div className="so-diff-wrap">
-      <Editor
-        defaultLanguage="diff"
-        value={diff}
-        theme="vs-dark"
-        options={{
-          readOnly: true,
-          minimap: { enabled: false },
-          scrollBeyondLastLine: false,
-          fontSize: 12,
-          fontFamily: '"JetBrains Mono", "Fira Code", monospace',
-          wordWrap: "on",
-          lineNumbers: "off",
-          folding: false,
-          renderLineHighlight: "none",
-        }}
-      />
+    <div className="so-diff-wrap" data-testid="diff-view">
+      <pre className="diff-pre">
+        {lines.map((line, i) => (
+          <div key={i} className={`diff-line ${diffLineClass(line)}`}>
+            {line || " "}
+          </div>
+        ))}
+      </pre>
     </div>
   );
 }

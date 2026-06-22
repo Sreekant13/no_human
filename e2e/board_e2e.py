@@ -73,8 +73,14 @@ def run() -> int:
         check("attempts show branch", "no-human/aabbccdd" in page.locator(".so-body").inner_text())
 
         page.locator(".so-tab", has_text="diff").click()
-        page.wait_for_timeout(300)
-        check("diff tab renders (no crash)", page.locator(".so-body").count() == 1)
+        page.wait_for_timeout(400)
+        # Native diff renderer (no Monaco/CDN): real diff shows colorized lines.
+        check("diff view present", page.locator("[data-testid=diff-view]").count() == 1)
+        check("diff renders added lines (mul)", page.locator(".diff-line.diff-add").count() >= 1)
+        check("diff shows the mul() addition",
+              "def mul" in page.locator("[data-testid=diff-view]").inner_text())
+        check("no monaco/CDN editor in DOM", page.locator(".monaco-editor").count() == 0)
+        page.screenshot(path=f"{SHOTS}/nh_e2e_5_diff.png", full_page=True)
 
         page.locator(".btn-approve").click()
         page.wait_for_timeout(800)

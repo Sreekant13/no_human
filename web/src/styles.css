@@ -473,6 +473,30 @@ html, body, #root {
   text-align: center;
 }
 
+/* diff tab — native colorized unified diff (no Monaco/CDN) */
+.diff-pre {
+  margin: 0;
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow: auto;
+  background: var(--bg);
+  height: 100%;
+}
+
+.diff-line {
+  white-space: pre;
+  padding: 0 10px;
+  color: var(--text);
+}
+
+.diff-line.diff-add  { background: rgba(34, 197, 94, 0.10); color: #86efac; }
+.diff-line.diff-del  { background: rgba(239, 68, 68, 0.10); color: #fca5a5; }
+.diff-line.diff-hunk { color: var(--cyan); }
+.diff-line.diff-file { color: var(--text-hi); font-weight: 700; }
+.diff-line.diff-meta { color: var(--text-dim); }
+.diff-line.diff-ctx  { color: var(--text-dim); }
+
 /* attempts tab */
 .attempt-row {
   padding: 10px 12px;

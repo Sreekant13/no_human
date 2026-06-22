@@ -7,6 +7,7 @@ api.app module so the real lifespan opens a temp database instead.
 """
 import asyncio
 import os
+import subprocess
 import sys
 
 import uvicorn
@@ -24,11 +25,39 @@ TEMP_DB = os.environ.get("NH_DEMO_DB", "/tmp/nh_demo_board.db")
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8488
 
 
+def build_demo_repo() -> tuple[str, str]:
+    """Create a real 2-commit git repo so the diff tab renders an actual diff.
+    Returns (repo_path, head_sha)."""
+    repo = "/tmp/nh_demo_repo"
+    subprocess.run(["rm", "-rf", repo], check=True)
+    os.makedirs(repo)
+
+    def git(*a):
+        subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True, text=True)
+
+    git("init", "-b", "main")
+    git("config", "user.email", "demo@e.com")
+    git("config", "user.name", "demo")
+    with open(f"{repo}/calc.py", "w") as f:
+        f.write("def add(a, b):\n    return a + b\n")
+    git("add", "-A")
+    git("commit", "-m", "base")
+    with open(f"{repo}/calc.py", "w") as f:
+        f.write("def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n")
+    git("add", "-A")
+    git("commit", "-m", "add mul")
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                         capture_output=True, text=True).stdout.strip()
+    return repo, sha
+
+
 async def seed() -> int:
     store = await Store(TEMP_DB).connect()
+    demo_repo, demo_sha = build_demo_repo()
 
-    async def mk(title, status, *, blocker=None, attempt=None, criteria=None):
-        t = Task.new(title, repo_path="/tmp/demo-repo", description=f"Demo task: {title}")
+    async def mk(title, status, *, blocker=None, attempt=None, criteria=None,
+                 repo="/tmp/demo-repo"):
+        t = Task.new(title, repo_path=repo, description=f"Demo task: {title}")
         t.acceptance_criteria = criteria or [f"{title} works", "tests cover it"]
         await store.create_task(t)
         if status != TaskStatus.PENDING:
@@ -70,8 +99,9 @@ async def seed() -> int:
     })
     await mk("Add mul() to calc — ready for you", TaskStatus.AWAITING_APPROVAL,
              criteria=["mul(a,b) returns a*b", "a test covers mul()"],
+             repo=demo_repo,
              attempt={
-                 "branch_name": "no-human/aabbccdd", "commit_sha": "aabbccdd1122",
+                 "branch_name": "no-human/aabbccdd", "commit_sha": demo_sha,
                  "pr_url": "local-pr://remote.git/no-human/aabbccdd", "status": "succeeded",
                  "review_passed": 1, "turns_used": 7,
                  "review_checklist": {"passed": True, "items": [
