@@ -20,13 +20,14 @@ function tasksReducer(state, action) {
 export default function App() {
   const [tasks, dispatch] = useReducer(tasksReducer, []);
   const [wsLive, setWsLive] = useState(false);
+  const [fetchError, setFetchError] = useState(null);
   const wsRef = useRef(null);
 
   // initial load
   useEffect(() => {
     fetchTasks()
-      .then((ts) => dispatch({ type: "set", tasks: ts }))
-      .catch(() => {});
+      .then((ts) => { setFetchError(null); dispatch({ type: "set", tasks: ts }); })
+      .catch((err) => setFetchError(err?.message || "Cannot reach the no_human API."));
   }, []);
 
   // WebSocket
@@ -45,6 +46,28 @@ export default function App() {
     connect();
     return () => wsRef.current?.close();
   }, []);
+
+  if (fetchError) {
+    return (
+      <div className="nh-shell">
+        <header className="nh-header">
+          <div className="nh-logo">no_human<span> // operator terminal</span></div>
+        </header>
+        <div className="nh-center">
+          <div className="nh-error">
+            <div>API unavailable: {fetchError}</div>
+            <button
+              className="btn btn-sendback"
+              style={{ marginTop: 12 }}
+              onClick={() => window.location.reload()}
+            >
+              Retry
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="nh-shell">

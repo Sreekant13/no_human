@@ -39,9 +39,13 @@ def run() -> int:
 
         lane_titles = page.locator(".lane-title").all_inner_texts()
         print("    lanes:", lane_titles)
-        for expected in ["INTAKE", "CONTEXT", "BUILDING", "REVIEW", "TESTING",
-                         "PARKED", "AWAITING YOU", "DONE", "ESCALATED"]:
+        # Transient stages (context/planning/implementing/reviewing/testing) are
+        # collapsed into "IN PROGRESS" — check the new lane set.
+        for expected in ["INTAKE", "IN PROGRESS", "PARKED", "AWAITING YOU", "DONE", "ESCALATED"]:
             check(f"lane '{expected}' present", expected in lane_titles)
+        # Loud lanes must appear first and second
+        check("awaiting-you lane is first", lane_titles[0] == "AWAITING YOU")
+        check("escalated lane is second", lane_titles[1] == "ESCALATED")
 
         check("all 11 demo tasks rendered", page.locator(".task-card").count() == 11)
 
@@ -107,6 +111,48 @@ def run() -> int:
         page.wait_for_timeout(800)
         check("send-back submitted (modal closed)",
               page.locator(".sendback-modal").count() == 0)
+
+        # ── a11y / keyboard checks ────────────────────────────────────────── #
+
+        # Close the still-open SlideOver from the send-back test
+        if page.locator(".slideover").is_visible():
+            page.locator(".so-close").click()
+            page.wait_for_timeout(300)
+
+        # Escape closes the SlideOver
+        page.locator(".card-title", has_text="ready for you").first.click()
+        page.wait_for_selector(".slideover", timeout=5000)
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+        check("Escape closes SlideOver", page.locator(".slideover").count() == 0)
+
+        # Space key opens a card (keyboard-only interaction)
+        card = page.locator(".task-card").first
+        card.focus()
+        page.keyboard.press("Space")
+        page.wait_for_timeout(500)
+        check("Space key opens SlideOver", page.locator(".slideover").is_visible())
+
+        # focus-visible outline is defined (CSS-level check via computed style)
+        # SlideOver has aria-labelledby pointing to a non-empty element
+        so_title_id = page.locator("#so-dialog-title").count()
+        dialog_label = page.locator("[role=dialog][aria-labelledby=so-dialog-title]").count()
+        check("dialog aria-labelledby wired up", so_title_id >= 1 and dialog_label >= 1)
+
+        # Focus trap: close button gets focus on open (first focusable element)
+        focused_label = page.evaluate("document.activeElement?.ariaLabel")
+        check("close button focused on open", focused_label == "Close")
+
+        # Escape again to close
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+
+        # Sub-status pill visible in In Progress lane
+        ip_lane = page.locator(".lane", has=page.locator(".lane-title", has_text="IN PROGRESS"))
+        substatus_count = ip_lane.locator(".card-substatus").count()
+        check("sub-status pill visible in In Progress lane", substatus_count > 0)
+
+        page.screenshot(path=f"{SHOTS}/nh_e2e_5_a11y.png", full_page=True)
 
         browser.close()
 

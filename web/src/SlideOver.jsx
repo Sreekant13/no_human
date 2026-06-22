@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { approveTask, fetchDiff, fetchTask, sendBack } from "./api.js";
 
 const STATUS_PILL = {
@@ -22,11 +22,39 @@ export default function SlideOver({ taskId, onClose }) {
   const [sbOpen, setSbOpen] = useState(false);
   const [sbMsg, setSbMsg] = useState("");
   const [flash, setFlash] = useState(null);
+  const dialogRef = useRef(null);
+  const closeRef = useRef(null);
 
   useEffect(() => {
     fetchTask(taskId).then(setTask).catch(() => {});
     fetchDiff(taskId).then(setDiff).catch(() => {});
   }, [taskId]);
+
+  // Escape-to-close + focus trap
+  useEffect(() => {
+    closeRef.current?.focus();
+
+    function onKeyDown(e) {
+      if (e.key === "Escape") { onClose(); return; }
+      if (e.key !== "Tab") return;
+      const el = dialogRef.current;
+      if (!el) return;
+      const focusable = Array.from(
+        el.querySelectorAll('button:not([disabled]), [href], input, textarea, [tabindex]:not([tabindex="-1"])')
+      );
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey) {
+        if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+      } else {
+        if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
+    }
+
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
 
   const isAwaiting = task?.status === "awaiting_approval";
   const pillClass = STATUS_PILL[task?.status] || "pill-pending";
@@ -66,19 +94,25 @@ export default function SlideOver({ taskId, onClose }) {
   return (
     <>
       <div className="slideover-backdrop" onClick={onClose} />
-      <div className="slideover" role="dialog" aria-modal="true">
+      <div
+        className="slideover"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="so-dialog-title"
+        ref={dialogRef}
+      >
         {/* header */}
         <div className="so-header">
           <div className="so-header-text">
             <div className="so-id">{task?.id ?? taskId}</div>
-            <div className="so-title">{task?.title ?? "Loading…"}</div>
+            <div className="so-title" id="so-dialog-title">{task?.title ?? "Loading…"}</div>
           </div>
           {task && (
             <span className={`so-status-pill ${pillClass}`}>
               {task.status}
             </span>
           )}
-          <button className="so-close" onClick={onClose}>✕</button>
+          <button className="so-close" onClick={onClose} ref={closeRef} aria-label="Close">✕</button>
         </div>
 
         {/* tabs */}
@@ -207,14 +241,7 @@ function DetailsTab({ task }) {
           </ul>
         </section>
       )}
-      {task.blocker && (
-        <section>
-          <div className="so-section-label" style={{ color: "var(--red)" }}>Blocker</div>
-          <div className="so-description" style={{ color: "var(--red)" }}>
-            {JSON.stringify(task.blocker, null, 2)}
-          </div>
-        </section>
-      )}
+      {task.blocker && <BlockerSection blocker={task.blocker} />}
       {task.repo_path && (
         <section>
           <div className="so-section-label">Repo</div>
@@ -222,6 +249,63 @@ function DetailsTab({ task }) {
         </section>
       )}
     </>
+  );
+}
+
+function BlockerSection({ blocker: b }) {
+  const cat = b.category ? String(b.category).replace(/_/g, " ") : null;
+  const pct = b.confidence != null ? `${Math.round(b.confidence * 100)}%` : null;
+  return (
+    <section>
+      <div className="so-section-label blocker-label">Blocker</div>
+      {cat && (
+        <div className="blocker-meta">
+          <span className="blocker-cat">{cat}</span>
+          {pct && <span className="blocker-confidence">{pct} confidence</span>}
+          {b.transient && <span className="blocker-transient">transient</span>}
+        </div>
+      )}
+      {b.goal && (
+        <div className="blocker-field">
+          <div className="blocker-field-label">Goal</div>
+          <div className="blocker-field-body">{b.goal}</div>
+        </div>
+      )}
+      {b.evidence && (
+        <div className="blocker-field">
+          <div className="blocker-field-label">What happened</div>
+          <div className="blocker-field-body">{b.evidence}</div>
+        </div>
+      )}
+      {b.root_cause_hypothesis && (
+        <div className="blocker-field">
+          <div className="blocker-field-label">Why blocked</div>
+          <div className="blocker-field-body">{b.root_cause_hypothesis}</div>
+        </div>
+      )}
+      {b.question && (
+        <div className="blocker-field blocker-question">
+          <div className="blocker-field-label">Question for you</div>
+          <div className="blocker-field-body">{b.question}</div>
+          {b.options?.length > 0 && (
+            <ul className="blocker-options">
+              {b.options.map((opt, i) => (
+                <li key={i}>[{i + 1}] {opt}</li>
+              ))}
+            </ul>
+          )}
+          <div className="blocker-reply-hint">
+            Reply: <code>nh reply {"{id}"} "&lt;answer&gt;"</code>
+          </div>
+        </div>
+      )}
+      {b.wake_condition && (
+        <div className="blocker-field">
+          <div className="blocker-field-label">Wake when</div>
+          <div className="blocker-field-body blocker-wake">{b.wake_condition}</div>
+        </div>
+      )}
+    </section>
   );
 }
 

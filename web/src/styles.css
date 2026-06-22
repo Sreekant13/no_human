@@ -249,6 +249,42 @@ html, body, #root {
   letter-spacing: 0.04em;
 }
 
+/* Sub-status pill (In Progress lane) */
+.card-substatus {
+  font-size: 9px;
+  color: var(--text-dim);
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  letter-spacing: 0.04em;
+  text-transform: none;
+}
+
+/* :focus-visible — keyboard navigation outlines */
+.task-card:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 1px;
+}
+.so-close:focus-visible,
+.so-tab:focus-visible,
+.btn:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+/* Loud lanes — "Awaiting You" and "Escalated" */
+.lane-loud .lane-header {
+  border-bottom-width: 2px;
+}
+.lane-loud .lane-title {
+  color: var(--text);
+  font-size: 11px;
+}
+.lane-loud .lane-count {
+  color: var(--amber);
+  font-weight: 700;
+}
+
 /* ── SLIDE-OVER ───────────────────────────────────────────────────────────── */
 
 .slideover-backdrop {
@@ -490,6 +526,82 @@ html, body, #root {
 .diff-line.diff-file { color: var(--text-hi); font-weight: 700; }
 .diff-line.diff-meta { color: var(--text-dim); }
 .diff-line.diff-ctx  { color: var(--text-dim); }
+
+/* ── BLOCKER SECTION ─────────────────────────────────────────────────────── */
+
+.blocker-label { color: var(--red) !important; }
+
+.blocker-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.blocker-cat {
+  font-size: 10px;
+  color: var(--red);
+  border: 1px solid var(--red);
+  padding: 1px 6px;
+  border-radius: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.blocker-confidence, .blocker-transient {
+  font-size: 10px;
+  color: var(--text-dim);
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+}
+
+.blocker-field {
+  margin-bottom: 10px;
+}
+
+.blocker-field-label {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+.blocker-field-body {
+  font-size: 11px;
+  color: var(--text);
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.blocker-question .blocker-field-label { color: var(--amber); }
+.blocker-question .blocker-field-body  { color: var(--text-hi); font-weight: 500; }
+
+.blocker-options {
+  list-style: none;
+  padding: 0;
+  margin: 6px 0;
+}
+.blocker-options li {
+  font-size: 11px;
+  color: var(--text);
+  padding: 3px 0;
+}
+
+.blocker-reply-hint {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 8px;
+}
+.blocker-reply-hint code {
+  color: var(--amber);
+  font-family: inherit;
+}
+
+.blocker-wake { color: var(--text-dim); font-style: italic; }
 
 /* attempts tab */
 .attempt-row {
