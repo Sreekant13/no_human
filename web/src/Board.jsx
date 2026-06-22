@@ -7,7 +7,8 @@ const LANES = [
   { key: "building",           label: "Building",    accent: "var(--c-building)", statuses: ["implementing"] },
   { key: "review",             label: "Review",      accent: "var(--c-review)",   statuses: ["reviewing"] },
   { key: "testing",            label: "Testing",     accent: "var(--c-testing)",  statuses: ["testing"] },
-  { key: "awaiting_approval",  label: "Awaiting You",accent: "var(--c-awaiting)", statuses: ["awaiting_approval"] },
+  { key: "parked",             label: "Parked",      accent: "var(--c-context)",  statuses: ["blocked", "paused_quota"] },
+  { key: "awaiting_you",       label: "Awaiting You",accent: "var(--c-awaiting)", statuses: ["awaiting_approval", "awaiting_input"] },
   { key: "done",               label: "Done",        accent: "var(--c-done)",     statuses: ["done"] },
   { key: "escalated",          label: "Escalated",   accent: "var(--c-escalated)",statuses: ["escalated", "failed"] },
 ];
@@ -54,7 +55,7 @@ function Lane({ lane, tasks, onSelect }) {
               key={task.id}
               task={task}
               accent={lane.accent}
-              isAwaiting={lane.key === "awaiting_approval"}
+              isAwaiting={lane.key === "awaiting_you"}
               onClick={() => onSelect(task.id)}
             />
           ))

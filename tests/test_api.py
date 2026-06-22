@@ -229,3 +229,20 @@ def test_web_dist_path_points_at_repo_web_dir():
 
     repo_root = Path(__file__).resolve().parents[1]  # tests/ -> repo root
     assert _WEB_DIST == repo_root / "web" / "dist"
+
+
+def test_board_lanes_cover_every_task_status():
+    """Every TaskStatus must map to a board lane — otherwise a task in that state
+    silently vanishes from the UI (regression: parked states were dropped)."""
+    import re
+    from pathlib import Path
+
+    from no_human.core.task import TaskStatus
+
+    board = (Path(__file__).resolve().parents[1] / "web" / "src" / "Board.jsx").read_text()
+    # Collect every status string listed in a `statuses: [...]` array.
+    listed: set[str] = set()
+    for arr in re.findall(r"statuses:\s*\[([^\]]*)\]", board):
+        listed |= set(re.findall(r'"([a-z_]+)"', arr))
+    missing = {s.value for s in TaskStatus} - listed
+    assert not missing, f"task statuses with no board lane: {sorted(missing)}"
