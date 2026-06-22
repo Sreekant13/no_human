@@ -110,6 +110,11 @@ html, body, #root {
   display: flex;
   gap: 1px;
   flex: 1;
+  /* Fill the viewport up to a cap, then center — so lanes don't stretch to
+     absurd widths on an ultrawide monitor. */
+  width: 100%;
+  max-width: 2000px;
+  margin: 0 auto;
   overflow-x: auto;
   overflow-y: hidden;
   padding: 0;
