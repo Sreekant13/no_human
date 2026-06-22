@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+import httpx
+
 from ..core.task import Task
 from .base import ContextChunk, keywords
 
@@ -20,11 +22,29 @@ class CommsClient(Protocol):
 
 
 class GraphTeamsClient:
-    """Production client: Microsoft Graph search. Stub until a token is set."""
+    """Production comms client: read-only Microsoft Graph search.
 
-    def __init__(self, config: dict[str, Any] | None = None):
+    Comms-IN for no_human is Teams + Outlook over the Microsoft 365 Graph (the
+    notify-OUT channel is the separate Slack webhook). One client serves both
+    sources; its ``entity_types`` decide what it searches — a deployment can bind
+    one client to ``chatMessage`` (Teams) and another to ``message`` (Outlook),
+    or share one over both (the default). The token is read-only and lives in
+    config, never the repo.
+    """
+
+    GRAPH_SEARCH_URL = "https://graph.microsoft.com/v1.0/search/query"
+
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+        *,
+        entity_types: tuple[str, ...] = ("chatMessage", "message"),
+        transport: Any | None = None,
+    ):
         cfg = (config or {}).get("context", {}).get("m365", {})
         self.token = cfg.get("token")
+        self.entity_types = tuple(cfg.get("entity_types") or entity_types)
+        self._transport = transport  # httpx.MockTransport in tests
 
     def search(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
         if not self.token:
@@ -32,10 +52,47 @@ class GraphTeamsClient:
                 "M365 Graph token not configured (context.m365.token). Provide a "
                 "read-only token, or inject an MCP-backed client."
             )
-        # Graph /search/query wiring lands with the token; intentionally not
-        # guessed here. The interface (search -> list[{title,body,from,url}]) is
-        # what the gatherer relies on.
-        raise NotImplementedError
+        body = {
+            "requests": [{
+                "entityTypes": list(self.entity_types),
+                "query": {"queryString": query},
+                "from": 0,
+                "size": limit,
+            }]
+        }
+        headers = {"Authorization": f"Bearer {self.token}",
+                   "Content-Type": "application/json"}
+        with httpx.Client(transport=self._transport, timeout=20) as client:
+            resp = client.post(self.GRAPH_SEARCH_URL, json=body, headers=headers)
+        resp.raise_for_status()
+        return self._parse(resp.json())
+
+    @staticmethod
+    def _parse(data: dict[str, Any]) -> list[dict[str, Any]]:
+        """Flatten the Graph /search/query response into the gatherer's record
+        shape: ``{title, subject, body, from, url}``."""
+        out: list[dict[str, Any]] = []
+        for req in data.get("value", []) or []:
+            for container in req.get("hitsContainers", []) or []:
+                for hit in container.get("hits", []) or []:
+                    out.append(GraphTeamsClient._normalize(hit))
+        return out
+
+    @staticmethod
+    def _normalize(hit: dict[str, Any]) -> dict[str, Any]:
+        res = hit.get("resource", {}) or {}
+        frm = res.get("from", {}) or {}
+        sender = ((frm.get("user") or {}).get("displayName")
+                  or (frm.get("emailAddress") or {}).get("address") or "")
+        body = (res.get("body", {}) or {}).get("content") \
+            or res.get("bodyPreview") or hit.get("summary") or ""
+        return {
+            "title": (res.get("subject") or sender or hit.get("summary") or "message"),
+            "subject": res.get("subject", ""),
+            "body": body,
+            "from": sender,
+            "url": res.get("webUrl") or res.get("webLink") or "",
+        }
 
 
 class TeamsSource:
