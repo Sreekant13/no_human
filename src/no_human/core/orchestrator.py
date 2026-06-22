@@ -129,9 +129,17 @@ class Orchestrator:
             await self.store.set_status(task, TaskStatus.PLANNING)
             self.emit("state", "planning", status="planning")
 
-        # Capture base branch once — never re-derive from current branch, which
-        # may point at a previous attempt's feature branch after a failed attempt.
-        base_branch = repo.current_branch()
+        # Capture the base branch once and PERSIST it on the task. Re-deriving
+        # from current_branch() is wrong on two axes: (1) within a run, after a
+        # failed attempt the head points at a feature branch; (2) across runs, a
+        # resumed task (nh reply / wake) is checked out on the parked feature
+        # branch, so deriving base from it would open a PR with base == head.
+        ctx = task.context or {}
+        if not ctx.get("base_branch"):
+            ctx["base_branch"] = repo.current_branch()
+            task.context = ctx
+            await self.store.update_task(task)
+        base_branch = ctx["base_branch"]
 
         outcome = TaskOutcome(task, status=task.status, detail="")
         for attempt_n in range(1, self.bounds.max_attempts + 1):

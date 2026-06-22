@@ -447,6 +447,9 @@ async def test_reply_resumes_from_checkpoint_with_human_answer(bare_repo, tmp_pa
     # 1. First run parks in awaiting_input with the question.
     outcome = await orch.run_task(t)
     assert outcome.status is TaskStatus.AWAITING_INPUT
+    # base branch was captured as main and persisted (not the feature branch).
+    parked = await store.get_task(t.id)
+    assert parked.context["base_branch"] == "main"
 
     # 2. Simulate `nh reply <id> "return 0"`: store the answer, resume.
     refreshed = await store.get_task(t.id)
@@ -467,3 +470,64 @@ async def test_reply_resumes_from_checkpoint_with_human_answer(bare_repo, tmp_pa
     resume_prompt = backend.prompts[-1]
     assert "return 0 on empty input" in resume_prompt
     assert "do NOT re-ask" in resume_prompt
+    # Resume must re-base from main, not the parked feature branch.
+    final = await store.get_task(t.id)
+    assert final.context["base_branch"] == "main"
+
+
+async def test_resume_after_wip_checkpoint_rebases_from_main(bare_repo, tmp_path, store):
+    """A DEPENDENCY_WAIT parks with a [WIP-BLOCKED] commit on a feature branch.
+    On resume the base must still be main — not the feature branch (which would
+    make open_pr use base == head)."""
+    bjson = (
+        '{"category": "DEPENDENCY_WAIT", "confidence": 0.9, '
+        '"wake_condition": "pr_merged:org/repo#42", '
+        '"root_cause_hypothesis": "needs upstream PR", "goal": "use helper", '
+        '"evidence": "import fails"}'
+    )
+
+    def wip(cwd):
+        (cwd / "calc.py").write_text("def add(a, b):\n    return a + b  # partial WIP\n")
+
+    def fix(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n")
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n\ndef test_add():\n    assert add(1, 2) == 3\n\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+    backend = PromptCapturingBackend(bjson, fix)
+    # First call mutates WIP then parks; override call 1 to also write WIP.
+    backend._fix = fix  # used on call 2
+
+    class _WipFirst:
+        def __init__(self, inner, wip):
+            self.inner = inner
+            self.wip = wip
+        async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None, on_event=None):
+            if self.inner.calls == 0:
+                self.wip(cwd)
+            return await self.inner.run(prompt, cwd=cwd, max_turns=max_turns,
+                                        effort=effort, resume=resume, on_event=on_event)
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, _WipFirst(backend, wip), SlackNotifier(None))
+    t = Task.new("use helper", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul works"]
+    await store.create_task(t)
+
+    o1 = await orch.run_task(t)
+    assert o1.status is TaskStatus.BLOCKED
+    parked = await store.get_task(t.id)
+    assert parked.context["base_branch"] == "main"
+    # WIP was checkpointed.
+    log = subprocess.run(["git", "log", "--all", "--oneline"], cwd=bare_repo,
+                         capture_output=True, text=True).stdout
+    assert "WIP-BLOCKED" in log
+
+    # Resume (simulate nh unblock → implementing) and complete.
+    await store.set_status(parked, TaskStatus.IMPLEMENTING, validate=False)
+    o2 = await orch.run_task(parked)
+    assert o2.status is TaskStatus.AWAITING_APPROVAL
+    final = await store.get_task(t.id)
+    assert final.context["base_branch"] == "main"
