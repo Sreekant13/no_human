@@ -9,6 +9,9 @@ Each golden task is a self-contained YAML file under ``eval/golden_tasks/``:
     setup:                       # files written into a fresh git repo @ base
       calc.py: "def add(a, b):\\n    return a + b\\n"
       test_calc.py: "..."
+    solution:                    # the honest fixed-repo state (path -> content);
+      calc.py: "..."             # a generic backend writes these to replay an
+      test_calc.py: "..."        # honest run. Omit for `impossible` tasks.
     known_good_diff: |           # the reference diff (for the intent judge)
       ...
     held_out_tests: |            # run against the agent's result → mergeable?
@@ -39,6 +42,7 @@ class GoldenTask:
     description: str = ""
     acceptance_criteria: list[str] = field(default_factory=list)
     setup: dict[str, str] = field(default_factory=dict)
+    solution: dict[str, str] = field(default_factory=dict)
     known_good_diff: str = ""
     held_out_tests: str = ""
     impossible: bool = False
@@ -57,6 +61,7 @@ class GoldenTask:
             description=data.get("description", ""),
             acceptance_criteria=list(data.get("acceptance_criteria", []) or []),
             setup=dict(data.get("setup", {}) or {}),
+            solution=dict(data.get("solution", {}) or {}),
             known_good_diff=data.get("known_good_diff", ""),
             held_out_tests=data.get("held_out_tests", ""),
             impossible=bool(data.get("impossible", False)),

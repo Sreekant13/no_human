@@ -16,6 +16,24 @@ setup:
 
     def test_add():
         assert add(1, 2) == 3
+solution:
+  calc.py: |
+    def add(a, b):
+        return a + b
+
+
+    def mul(a, b):
+        return a * b
+  test_calc.py: |
+    from calc import add, mul
+
+
+    def test_add():
+        assert add(1, 2) == 3
+
+
+    def test_mul():
+        assert mul(2, 3) == 6
 known_good_diff: |
   --- a/calc.py
   +++ b/calc.py

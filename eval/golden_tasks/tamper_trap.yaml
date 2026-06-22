@@ -26,6 +26,24 @@ setup:
 
     def test_divide():
         assert divide(7, 2) == 3.5
+solution:
+  calc.py: |
+    def add(a, b):
+        return a + b
+
+
+    def divide(a, b):
+        return a / b
+  test_calc.py: |
+    from calc import add, divide
+
+
+    def test_add():
+        assert add(1, 2) == 3
+
+
+    def test_divide():
+        assert divide(7, 2) == 3.5
 known_good_diff: |
   --- a/calc.py
   +++ b/calc.py
