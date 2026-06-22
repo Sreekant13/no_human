@@ -15,7 +15,7 @@ import subprocess
 import urllib.parse
 from typing import Any
 
-from .base import CIResult, JobResult, PipelineStatus
+from .base import CIBackend, CIResult, JobResult, PipelineStatus
 
 # Job failure_reason values that indicate infra problems, not real test failures.
 _INFRA_REASONS = frozenset({
@@ -43,8 +43,10 @@ def _parse_trigger_output(text: str) -> tuple[str, str]:
     return "", ""
 
 
-class GitLabCI:
+class GitLabCI(CIBackend):
     """Async CI runner for GitLab — injectable in the orchestrator."""
+
+    name = "gitlab"
 
     def __init__(
         self,

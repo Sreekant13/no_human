@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -319,6 +320,49 @@ def test_ci_from_config_gitlab():
 def test_ci_from_config_no_project_returns_none():
     cfg = {"ci": {"enabled": True, "backend": "gitlab", "project": ""}}
     assert ci_from_config(cfg) is None
+
+
+def test_gitlab_is_a_ci_backend():
+    from no_human.ci.base import CIBackend
+    assert issubclass(GitLabCI, CIBackend)
+    assert GitLabCI(project="p").name == "gitlab"
+
+
+def test_ci_from_config_github_actions_seam():
+    from no_human.ci import GitHubActionsCI
+    cfg = {"ci": {"enabled": True, "backend": "github_actions",
+                  "repo": "dev/metrics-core-query-service", "workflow": "ci.yml"}}
+    ci = ci_from_config(cfg)
+    assert isinstance(ci, GitHubActionsCI)
+    assert ci.repo == "dev/metrics-core-query-service"
+    # seam: not yet wired -> errors loudly, never silently "passes".
+    with pytest.raises(NotImplementedError, match="seam"):
+        asyncio.run(ci.trigger("no-human/x"))
+
+
+def test_ci_from_config_jenkins_is_human_gated():
+    from no_human.ci import HumanGatedCI, JenkinsCI
+    cfg = {"ci": {"enabled": True, "backend": "jenkins", "job": "metrics-core-image"}}
+    ci = ci_from_config(cfg)
+    assert isinstance(ci, JenkinsCI)
+    with pytest.raises(HumanGatedCI) as exc:
+        asyncio.run(ci.trigger("no-human/x"))
+    assert exc.value.wake_hint  # carries a wake hint for the orchestrator to park on
+
+
+def test_ci_from_config_unknown_backend_raises():
+    with pytest.raises(ValueError, match="unknown ci.backend"):
+        ci_from_config({"ci": {"enabled": True, "backend": "bamboo"}})
+
+
+def test_all_backends_expose_max_infra_retries():
+    # The orchestrator reads ci_runner.max_infra_retries unconditionally; every
+    # backend (incl. the human-gated Jenkins seam) must have it (constraint #5:
+    # never crash). Jenkins inherits the ABC default of 0.
+    from no_human.ci import GitHubActionsCI, JenkinsCI
+    assert GitLabCI(project="p").max_infra_retries >= 0
+    assert GitHubActionsCI(repo="o/r").max_infra_retries >= 0
+    assert JenkinsCI(job="j").max_infra_retries == 0
 
 
 # --------------------------------------------------------------------------- #

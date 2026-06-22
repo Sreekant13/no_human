@@ -1,10 +1,27 @@
-"""CI data types shared across backends."""
+"""CI data types + the pluggable backend interface.
+
+The orchestrator depends only on ``CIBackend.trigger`` — never on ``glab`` or any
+provider CLI directly. ``ci_from_config`` selects the concrete backend from the
+project profile / config, so adding GitHub Actions or Jenkins is a new subclass,
+not a change to the engine.
+"""
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+
+class HumanGatedCI(Exception):
+    """Raised by a backend whose pipeline must be started by a human (e.g. a
+    Jenkins image build). The orchestrator parks the task with a wake condition
+    rather than faking or skipping the step."""
+
+    def __init__(self, message: str, wake_hint: str = ""):
+        super().__init__(message)
+        self.wake_hint = wake_hint
 
 
 class PipelineStatus(str, Enum):
@@ -77,3 +94,25 @@ class CIResult:
             "jobs": [{"name": j.name, "status": j.status,
                       "failure_reason": j.failure_reason} for j in self.jobs],
         }
+
+
+class CIBackend(ABC):
+    """Provider-agnostic CI contract the orchestrator drives.
+
+    Implementations: ``GitLabCI`` (complete), ``GitHubActionsCI`` and
+    ``JenkinsCI`` (seams). All must retry only on infra failures, never on real
+    test failures, and surface a parsed ``CIResult``.
+    """
+
+    name: str = "ci"
+    # Backends that don't auto-retry infra (seams, human-gated) inherit 0 so the
+    # orchestrator can read it unconditionally without crashing.
+    max_infra_retries: int = 0
+
+    @abstractmethod
+    async def trigger(
+        self, branch: str, extra_variables: dict[str, str] | None = None
+    ) -> CIResult:
+        """Trigger CI for ``branch``, wait for a terminal status, return the
+        parsed result. Raise ``HumanGatedCI`` if a human must start the run."""
+        raise NotImplementedError

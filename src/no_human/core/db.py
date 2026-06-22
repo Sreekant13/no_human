@@ -245,3 +245,35 @@ class Store:
         cur = await self.db.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
         await self.db.commit()
         return cur.rowcount > 0
+
+    # ----------------------- project profiles ----------------------------- #
+
+    async def upsert_profile(self, profile: "ProjectProfile") -> None:
+        d = profile.to_dict()
+        await self.db.execute(
+            """INSERT INTO project_profiles
+                 (repo_path, ecosystem, install_cmd, test_cmd, lint_cmd,
+                  confirmed, data, updated_at)
+               VALUES (:repo_path, :ecosystem, :install_cmd, :test_cmd, :lint_cmd,
+                       :confirmed, :data, :updated_at)
+               ON CONFLICT(repo_path) DO UPDATE SET
+                 ecosystem=excluded.ecosystem, install_cmd=excluded.install_cmd,
+                 test_cmd=excluded.test_cmd, lint_cmd=excluded.lint_cmd,
+                 confirmed=excluded.confirmed, data=excluded.data,
+                 updated_at=excluded.updated_at""",
+            {
+                "repo_path": d["repo_path"], "ecosystem": d["ecosystem"],
+                "install_cmd": d["install_cmd"], "test_cmd": d["test_cmd"],
+                "lint_cmd": d["lint_cmd"], "confirmed": 1 if d["confirmed"] else 0,
+                "data": json.dumps(d), "updated_at": _now(),
+            },
+        )
+        await self.db.commit()
+
+    async def get_profile(self, repo_path: str) -> "ProjectProfile | None":
+        from ..profile import ProjectProfile
+        cur = await self.db.execute(
+            "SELECT data FROM project_profiles WHERE repo_path = ?", (str(repo_path),)
+        )
+        row = await cur.fetchone()
+        return ProjectProfile.from_dict(json.loads(row["data"])) if row else None
