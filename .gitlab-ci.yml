@@ -1,0 +1,36 @@
+# Self-CI gate for no_human itself (PLAN.md 21.4).
+#
+# Every change to the orchestrator, prompts, rules, or skills runs the full test
+# suite — which includes the eval harness offline (golden replay, the
+# tamper-incident / faked-impossible release gates, the red-team suite). A
+# regression here blocks the change.
+#
+# The *live* `nh eval` (which spends subscription tokens via the Agent SDK) is
+# run locally / on demand, not in CI — CI has no subscription token and must
+# never fall back to the metered API.
+
+stages: [test]
+
+variables:
+  UV_CACHE_DIR: "$CI_PROJECT_DIR/.uv-cache"
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths: [.uv-cache/]
+
+eval-gate:
+  stage: test
+  image: python:3.12-slim
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends git
+    - curl -LsSf https://astral.sh/uv/install.sh | sh
+    - export PATH="$HOME/.local/bin:$PATH"
+    # Belt-and-braces: ensure no metered key leaks into CI.
+    - unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+    - uv sync --frozen
+  script:
+    # The offline eval harness + red-team suite run as part of the test suite.
+    - uv run pytest -q
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
