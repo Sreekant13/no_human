@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..agent.claude_backend import AgentEvent, ClaudeBackend
+from ..ci.base import CIResult
 from ..notify.slack import SlackNotifier
 from ..review import selfcheck
 from ..review.reviewer import AdversarialReviewer, ReviewDecision
@@ -66,6 +67,7 @@ class Orchestrator:
         event_sink: EventSink | None = None,
         context_gatherer: Any | None = None,
         reviewer: AdversarialReviewer | None = None,
+        ci_runner: Any | None = None,
     ):
         self.store = store
         self.config = config
@@ -75,6 +77,7 @@ class Orchestrator:
         self._sink = event_sink or (lambda e: None)
         self.context_gatherer = context_gatherer
         self.reviewer = reviewer
+        self.ci_runner = ci_runner
 
     # ----------------------------- events ---------------------------------- #
 
@@ -146,7 +149,13 @@ class Orchestrator:
         stuck = StuckDetector()
 
         # --- branch (deterministic git; agent never touches git) ---
-        branch = f"{self.config['git']['branch_prefix']}{task.id[:8]}"
+        # Include attempt_n so each attempt uses a distinct branch. This avoids
+        # non-fast-forward rejection when pushing attempt 2+ (the remote already
+        # holds attempt 1's commit) without needing force-push.
+        branch = (
+            f"{self.config['git']['branch_prefix']}{task.id[:8]}"
+            f"{f'-{attempt_n}' if attempt_n > 1 else ''}"
+        )
         # base is passed from run_task (captured once before the attempt loop) so
         # we always branch off the original base, not a prior attempt's branch.
         if base is None:
@@ -253,6 +262,29 @@ class Orchestrator:
             await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
 
+        # --- CI (if configured): push branch first, then trigger pipeline ---
+        if self.ci_runner is not None:
+            # Push now (review passed, local tests pass) so CI can access the branch.
+            # open_pr in _finalize will no-op push since branch is already up to date.
+            try:
+                repo.push(branch)
+            except ProtectedBranch as exc:
+                return await self._escalate(task, str(exc))
+            except Exception as exc:  # noqa: BLE001
+                return await self._escalate(task, f"push for CI failed: {exc}")
+
+            ci_result = await self._run_ci(task, branch, attempt_id, stuck)
+            if ci_result is not None and not ci_result.passed:
+                if ci_result.infra_failure:
+                    return await self._escalate(
+                        task,
+                        f"CI infra failure after {self.ci_runner.max_infra_retries} retries: "
+                        f"{ci_result.summary}",
+                    )
+                detail = f"CI failed: {ci_result.summary}"
+                await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
+                return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+
         # --- finalize: push + open PR (NEVER merge) + notify ---
         return await self._finalize(task, repo, branch, base, commit, attempt_id, result)
 
@@ -310,6 +342,36 @@ class Orchestrator:
         return TaskOutcome(task, status=TaskStatus.PAUSED_QUOTA, detail=str(exc))
 
     # --------------------------- helpers ----------------------------------- #
+
+    async def _run_ci(
+        self, task: Task, branch: str, attempt_id: str, stuck: StuckDetector
+    ) -> "CIResult | None":
+        """Trigger CI, wait, record results. Returns None if CI not configured."""
+        if self.ci_runner is None:
+            return None
+        self.emit("ci_start", f"triggering CI for branch {branch}")
+        try:
+            ci_result = await self.ci_runner.trigger(branch)
+        except Exception as exc:  # noqa: BLE001
+            self.emit("ci_error", str(exc))
+            from ..ci.base import CIResult as _CIResult, PipelineStatus
+            return _CIResult(
+                pipeline_id="", pipeline_url="",
+                status=PipelineStatus.FAILED,
+                infra_failure=True,
+                parsed_output=f"CI runner raised: {exc}",
+            )
+        await self.store.update_attempt(
+            attempt_id,
+            ci_pipeline_id=ci_result.pipeline_id,
+            ci_pipeline_url=ci_result.pipeline_url,
+            ci_status=ci_result.status.value,
+        )
+        self.emit("ci", ci_result.summary, passed=ci_result.passed,
+                  infra=ci_result.infra_failure, url=ci_result.pipeline_url)
+        if not ci_result.passed and not ci_result.infra_failure:
+            stuck.record(ci_result.parsed_output)
+        return ci_result
 
     async def _run_review(
         self, task: Task, repo: GitRepo, attempt_id: str

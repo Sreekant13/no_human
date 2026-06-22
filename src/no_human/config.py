@@ -178,6 +178,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "escalate_after": 3,
         "max_correction_rounds": 2,
     },
+    "ci": {
+        # Opt-in per project. Set enabled=true and provide project path.
+        "enabled": False,
+        "backend": "gitlab",
+        "project": "",
+        "hostname": "gitlab.acme.net",
+        "variables": {},          # extra KEY:VALUE pairs for glab ci run
+        "timeout_minutes": 60,
+        "max_infra_retries": 2,   # CLAUDE.md: retry after 2 min, max 2
+        "poll_interval": 30,
+        "result_parser": "pytest",  # or "surefire" for Maven projects
+    },
 }
 
 
