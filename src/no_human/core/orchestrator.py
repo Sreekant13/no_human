@@ -141,6 +141,27 @@ class Orchestrator:
             await self.store.update_task(task)
         base_branch = ctx["base_branch"]
 
+        # A human-confirmed, proven ProjectProfile (nh onboard) is the source of
+        # truth for how to test/build this repo and which CI to drive — it
+        # replaces the detect_command heuristic. Resolve it once per run: surface
+        # the proven test command and, when CI wasn't explicitly injected, build
+        # the profile's CI backend. An explicit injection always wins.
+        prof = await self._usable_profile(repo.path)
+        if prof:
+            self.emit("profile",
+                      f"using confirmed profile (test: {prof.test_cmd!r}"
+                      + (f", ci: {prof.ci.get('backend')}" if prof.ci else "") + ")")
+            if self.ci_runner is None and prof.ci:
+                from ..ci import ci_from_config
+                try:
+                    built = ci_from_config({"ci": prof.ci})
+                except Exception as exc:  # noqa: BLE001
+                    built = None
+                    log.warning("CI from profile failed: %s", exc)
+                if built is not None:
+                    self.ci_runner = built
+                    self.emit("ci_backend", f"CI from profile: {built.name}")
+
         outcome = TaskOutcome(task, status=task.status, detail="")
         for attempt_n in range(1, self.bounds.max_attempts + 1):
             self.emit("attempt_start", f"attempt {attempt_n}/{self.bounds.max_attempts}")
@@ -295,7 +316,7 @@ class Orchestrator:
         # --- test: run local suite, record results ---
         await self.store.set_status(task, TaskStatus.TESTING)
         self.emit("state", "testing", status="testing")
-        test_cmd = self.config.get("tests", {}).get("command")
+        test_cmd = await self._resolve_test_cmd(repo)
         test_result = runner.run_tests(repo.path, test_cmd)
         self.emit("tests", test_result.summary, ok=test_result.ok)
         await self.store.update_attempt(
@@ -586,7 +607,7 @@ class Orchestrator:
             )
 
         # Collect test output to give the reviewer evidence to work with.
-        test_cmd = self.config.get("tests", {}).get("command")
+        test_cmd = await self._resolve_test_cmd(repo)
         test_result = runner.run_tests(repo.path, test_cmd)
         held_result = runner.run_held_out_tests(repo.path)
 
@@ -638,6 +659,35 @@ class Orchestrator:
         for c in chunks[:limit]:
             lines.append(f"  [{c['source']}] {c['title']}")
         return "\n".join(lines)
+
+    async def _usable_profile(self, repo_path) -> Any | None:
+        """Return the repo's ProjectProfile only if a human confirmed it AND its
+        test command was proven to run (``is_usable``); else None. Prefer the
+        SQLite mirror; fall back to the repo's ``.no_human/project.yml``."""
+        from ..profile import ProjectProfile
+        prof = None
+        try:
+            prof = await self.store.get_profile(str(repo_path))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("profile lookup failed: %s", exc)
+        if prof is None:
+            try:
+                prof = ProjectProfile.load(repo_path)
+            except Exception:  # noqa: BLE001
+                prof = None
+        return prof if (prof and prof.is_usable) else None
+
+    async def _resolve_test_cmd(self, repo: GitRepo) -> str | None:
+        """Resolve the test command: an explicit config override wins; else a
+        usable profile's proven ``test_cmd``; else None so ``run_tests`` falls
+        back to ``detect_command`` (the heuristic of last resort)."""
+        explicit = self.config.get("tests", {}).get("command")
+        if explicit:
+            return explicit
+        prof = await self._usable_profile(repo.path)
+        if prof and prof.test_cmd:
+            return prof.test_cmd
+        return None
 
     def _open_repo(self, task: Task) -> GitRepo | None:
         try:

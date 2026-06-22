@@ -109,6 +109,43 @@ async def test_full_pipeline_opens_local_pr(bare_repo, tmp_path, store):
     assert "pr_open" in kinds and "commit" in kinds
 
 
+async def test_run_task_uses_confirmed_profile_test_command(bare_repo, tmp_path, store):
+    """A usable ProjectProfile's proven test_cmd drives the run, not detect_command."""
+    from no_human.profile import ProjectProfile
+
+    marker = bare_repo / ".profile_ran"
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+    # A profile whose test command writes a sentinel — distinct from `pytest -q`,
+    # so its presence proves the profile (not the heuristic) chose the command.
+    prof = ProjectProfile(
+        repo_path=str(bare_repo), ecosystem="custom",
+        test_cmd=f"sh -c 'echo ran > {marker}; exit 0'",
+        derived_from=["test"], proven={"test_cmd": True}, confirmed=True,
+    )
+    await store.upsert_profile(prof)
+
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert marker.exists(), "profile test_cmd did not run"
+    assert "profile" in [e["kind"] for e in events]
+
+
 async def test_tamper_weakening_is_blocked_and_escalates(bare_repo, tmp_path, store):
     def mutate(cwd):
         # "fix" by gutting the existing test — the documented reward hack
