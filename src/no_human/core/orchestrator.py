@@ -21,6 +21,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..agent.claude_backend import AgentEvent, ClaudeBackend
+from ..blockers import (
+    Blocker,
+    BlockerCategory,
+    blocker_prompt_suffix,
+    fallback_blocker,
+    notification_line,
+    parse_blocker,
+    render_report,
+    triage,
+)
 from ..ci.base import CIResult
 from ..notify.slack import SlackNotifier
 from ..review import selfcheck
@@ -128,19 +138,16 @@ class Orchestrator:
                 outcome = await self._run_attempt(task, repo, attempt_n, base_branch)
             except QuotaExhausted as exc:
                 return await self._park_quota(task, exc)
-            if outcome.status == TaskStatus.AWAITING_APPROVAL:
+            # Only a plain FAILED attempt is retried (bounded exploration, 22.3).
+            # Any off-ramp (escalated / awaiting_input / blocked / paused_quota)
+            # or a ready PR returns immediately — never retry blindly.
+            if outcome.status != TaskStatus.FAILED:
                 return outcome
-            if outcome.status in (TaskStatus.ESCALATED, TaskStatus.FAILED):
-                # Tamper / structural blocker — do not retry blindly.
-                if outcome.status == TaskStatus.ESCALATED:
-                    return outcome
             self.emit("attempt_failed", outcome.detail)
 
-        # Bounds exhausted -> escalate with a diagnosis (never fake done).
-        return await self._escalate(
-            task, f"max_attempts ({self.bounds.max_attempts}) reached without a "
-            f"passing, untampered change. Last: {outcome.detail}"
-        )
+        # Bounds exhausted -> escalate with a diagnosis built from the attempts
+        # (never fake done). 22.3: ≤2 distinct alternatives, then escalate.
+        return await self._escalate_exhausted(task, repo, base_branch)
 
     async def _run_attempt(
         self, task: Task, repo: GitRepo, attempt_n: int, base: str | None = None
@@ -182,8 +189,17 @@ class Orchestrator:
         )
         if result.is_error and _quota_signal(result.final_text or ""):
             raise QuotaExhausted()
-        if not repo.has_changes() and base == repo.current_branch():
-            pass  # changes may already be staged/committed by tooling; check below
+
+        # The agent may self-report a structural blocker (Part 22) instead of
+        # lowering the bar. Honour it: checkpoint WIP and route by taxonomy.
+        emitted = parse_blocker(result.final_text or "")
+        if emitted is not None:
+            emitted.goal = emitted.goal or task.title
+            await self.store.update_attempt(
+                attempt_id, status="failed",
+                failure_reason=f"agent blocker: {emitted.category.value}",
+            )
+            return await self._raise_blocker(task, emitted, repo=repo, branch=branch)
 
         # --- commit (deterministic) ---
         if not repo.has_changes():
@@ -198,7 +214,16 @@ class Orchestrator:
         # --- safety: change-size limits ---
         over = self._over_size_limits(commit)
         if over:
-            return await self._escalate(task, over)
+            # SCOPE_EXPLOSION (22.2): stop, escalate with a proposed smaller scope.
+            blocker = Blocker(
+                category=BlockerCategory.SCOPE_EXPLOSION,
+                transient=False, confidence=0.9, goal=task.title,
+                root_cause_hypothesis=over, evidence=over,
+                question="This change exceeds the safety size limits. Approve a "
+                         "larger scope, or split the task into smaller PRs?",
+                options=["split into smaller tasks", "raise the limit for this task"],
+            )
+            return await self._raise_blocker(task, blocker, repo=repo, branch=branch)
 
         # --- review: tamper guard first (cheap, deterministic pre-filter),
         #     then adversarial reviewer (the real gate, §3.3) ---
@@ -218,6 +243,7 @@ class Orchestrator:
                 task,
                 "test-tampering detected — net reduction in tests/assertions: "
                 + "; ".join(tamper.reasons),
+                repo=repo, branch=branch,
             )
 
         decision = await self._run_review(task, repo, attempt_id)
@@ -269,18 +295,26 @@ class Orchestrator:
             try:
                 repo.push(branch)
             except ProtectedBranch as exc:
-                return await self._escalate(task, str(exc))
+                return await self._escalate(task, str(exc), repo=repo, branch=branch)
             except Exception as exc:  # noqa: BLE001
-                return await self._escalate(task, f"push for CI failed: {exc}")
+                return await self._escalate(
+                    task, f"push for CI failed: {exc}", repo=repo, branch=branch)
 
             ci_result = await self._run_ci(task, branch, attempt_id, stuck)
             if ci_result is not None and not ci_result.passed:
                 if ci_result.infra_failure:
-                    return await self._escalate(
-                        task,
-                        f"CI infra failure after {self.ci_runner.max_infra_retries} retries: "
-                        f"{ci_result.summary}",
+                    # TRANSIENT_INFRA with retries exhausted → escalate (22.2).
+                    blocker = Blocker(
+                        category=BlockerCategory.TRANSIENT_INFRA,
+                        transient=True, confidence=0.8, goal=task.title,
+                        root_cause_hypothesis="CI infra failure persisted after "
+                        f"{self.ci_runner.max_infra_retries} retries",
+                        evidence=ci_result.summary,
+                        question="CI infrastructure is failing (not the change). "
+                                 "Retry later or investigate the runner?",
                     )
+                    return await self._raise_blocker(
+                        task, blocker, repo=repo, branch=branch, escalate_now=True)
                 detail = f"CI failed: {ci_result.summary}"
                 await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
                 return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
@@ -294,9 +328,10 @@ class Orchestrator:
         try:
             pr = open_pr(repo, branch, title, body, base=base)
         except ProtectedBranch as exc:
-            return await self._escalate(task, str(exc))
+            return await self._escalate(task, str(exc), repo=repo, branch=branch)
         except Exception as exc:  # noqa: BLE001
-            return await self._escalate(task, f"opening PR failed: {exc}")
+            return await self._escalate(
+                task, f"opening PR failed: {exc}", repo=repo, branch=branch)
         await self.store.update_attempt(
             attempt_id, pr_url=pr.url, status="succeeded", completed_at=_now(),
             review_passed=1,
@@ -318,20 +353,131 @@ class Orchestrator:
         self.notifier.notify("task_failed", f"{task.title}: {detail}")
         return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
 
-    async def _escalate(self, task: Task, detail: str) -> TaskOutcome:
-        # Phase 0 stub of the Part 22 structured blocker report.
-        task.blocker = {
-            "category": "NOVEL_UNKNOWN",
-            "transient": False,
-            "question": "Review the blocker and advise.",
-            "detail": detail,
-            "raised_at": _now(),
-        }
+    async def _escalate(
+        self, task: Task, detail: str, *, repo: GitRepo | None = None,
+        branch: str | None = None, goal: str = "",
+    ) -> TaskOutcome:
+        """Escalate a deterministic orchestrator-side failure with a structured
+        NOVEL_UNKNOWN report (never bare prose; 22.4)."""
+        blocker = fallback_blocker(detail, goal=goal or task.title)
+        return await self._raise_blocker(task, blocker, repo=repo, branch=branch)
+
+    async def _escalate_exhausted(
+        self, task: Task, repo: GitRepo, branch: str | None
+    ) -> TaskOutcome:
+        """Bounds exhausted: build a blocker whose `tried` reflects each attempt's
+        failure reason (22.3 verifiable-progress trail)."""
+        attempts = await self.store.list_attempts(task.id)
+        tried = [
+            f"attempt {a['attempt_number']}: {a.get('failure_reason') or a.get('status')}"
+            for a in attempts if a.get("failure_reason") or a.get("status") == "failed"
+        ]
+        blocker = Blocker(
+            category=BlockerCategory.NOVEL_UNKNOWN,
+            transient=False,
+            confidence=0.4,
+            goal=task.title,
+            root_cause_hypothesis=(
+                f"max_attempts ({self.bounds.max_attempts}) reached without a "
+                f"passing, untampered change. Last: {tried[-1] if tried else 'n/a'}"
+            ),
+            tried=tried,
+            evidence=tried[-1] if tried else "no successful attempt",
+            question="The agent could not complete this within bounds. Refine the "
+                     "task, split it, or advise an approach.",
+        )
+        return await self._raise_blocker(task, blocker, repo=repo, branch=branch)
+
+    async def _raise_blocker(
+        self, task: Task, blocker: Blocker, *, repo: GitRepo | None = None,
+        branch: str | None = None, escalate_now: bool = False,
+    ) -> TaskOutcome:
+        """Checkpoint WIP, route by taxonomy (22.2), persist, and notify by
+        severity (22.6). The single funnel for every off-ramp.
+
+        ``escalate_now`` forces ESCALATED regardless of taxonomy — used when a
+        normally-parkable category (e.g. TRANSIENT_INFRA) has already exhausted
+        its bounded auto-retries and must now reach a human.
+        """
+        # 1. Checkpoint: never lose work (22.5). Commit WIP as [WIP-BLOCKED].
+        if repo is not None:
+            sha = self._checkpoint_wip(repo, task)
+            if sha:
+                blocker.resume_commit = sha
+            if branch:
+                blocker.resume_branch = branch
+
+        # 2. Route (with the low-confidence override from config).
+        if escalate_now:
+            from ..blockers import Route
+            route = Route(TaskStatus.ESCALATED, notify_now=True, parked=False)
+        else:
+            route = triage(blocker, escalate_below_confidence=self._escalate_below_conf())
+
+        # 3. Parked routes get a wake_check_at so the watcher re-evaluates.
+        if route.parked:
+            task.wake_check_at = self._wake_check_at(blocker)
+        else:
+            task.wake_check_at = None
+
+        # 4. Persist the structured report and transition.
+        task.blocker = blocker.to_dict()
         await self.store.update_task(task)
-        await self.store.set_status(task, TaskStatus.ESCALATED)
-        self.emit("escalated", detail, status="escalated")
-        self.notifier.notify("stuck", f"{task.title} escalated: {detail}")
-        return TaskOutcome(task, status=TaskStatus.ESCALATED, detail=detail)
+        await self.store.set_status(task, route.target_status, validate=False)
+
+        kind = {
+            TaskStatus.ESCALATED: "escalated",
+            TaskStatus.AWAITING_INPUT: "awaiting_input",
+            TaskStatus.BLOCKED: "blocked",
+            TaskStatus.PAUSED_QUOTA: "paused_quota",
+        }.get(route.target_status, "escalated")
+        report = render_report(blocker, task_title=task.title, task_id=task.id)
+        self.emit(kind, report, status=route.target_status.value,
+                  blocker=blocker.to_dict())
+
+        # 5. Notify only when a human must act now (22.6). Parked = silent.
+        if route.notify_now:
+            self.notifier.notify(
+                "stuck",
+                notification_line(blocker, task_title=task.title, task_id=task.id),
+            )
+        return TaskOutcome(
+            task, status=route.target_status,
+            detail=blocker.root_cause_hypothesis or blocker.question or "",
+        )
+
+    def _checkpoint_wip(self, repo: GitRepo, task: Task) -> str:
+        """Commit uncommitted work as [WIP-BLOCKED]; return the resume commit sha."""
+        try:
+            if repo.has_changes():
+                commit = repo.commit_all(f"[WIP-BLOCKED] {self._commit_message(task)}")
+                self.emit("checkpoint", f"WIP-BLOCKED {commit.sha[:8]}")
+                return commit.sha
+            return repo.head_sha()
+        except Exception as exc:  # noqa: BLE001 — checkpoint must never crash routing
+            log.warning("WIP checkpoint failed: %s", exc)
+            return ""
+
+    def _escalate_below_conf(self) -> float:
+        return float(
+            self.config.get("blockers", {}).get("escalate_on_low_confidence_below", 0.6)
+        )
+
+    def _wake_check_at(self, blocker: Blocker) -> str:
+        """Compute the next watcher re-check stamp for a parked task. Time-based
+        conditions resolve against this; richer conditions just get re-polled."""
+        from ..blockers.wake import parse_duration
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        cond = (blocker.wake_condition or "").lower()
+        if cond.startswith("after:"):
+            dur = parse_duration(cond.split(":", 1)[1]) or timedelta(hours=1)
+            return (now + dur).isoformat()
+        poll = parse_duration(
+            str(self.config.get("blockers", {}).get("wake_poll_interval", "10m"))
+        ) or timedelta(minutes=10)
+        return (now + poll).isoformat()
 
     async def _park_quota(self, task: Task, exc: QuotaExhausted) -> TaskOutcome:
         task.wake_check_at = exc.resets_at
@@ -481,15 +627,48 @@ class Orchestrator:
             "    opening the PR are handled for you. Just edit files and run tests.\n"
         )
         digest = self._context_digest(task)
+        resume = self._resume_digest(task)
         return (
             f"You are implementing a software task on the repo at {task.repo_path}.\n\n"
             f"Task: {task.title}\n"
             f"{('Description: ' + task.description) if task.description else ''}\n\n"
             f"Acceptance criteria:\n{criteria}\n\n"
             f"{(digest + chr(10) + chr(10)) if digest else ''}"
+            f"{(resume + chr(10) + chr(10)) if resume else ''}"
             f"{rules}\n"
             + selfcheck.build_prompt(task.title, task.acceptance_criteria)
+            + blocker_prompt_suffix()
         )
+
+    def _resume_digest(self, task: Task) -> str:
+        """Seed a resumed task's fresh session with the prior blocker report and
+        any human reply (22.5) — not a stale, bloated context."""
+        parts: list[str] = []
+        if task.blocker:
+            b = Blocker.from_dict(task.blocker)
+            parts.append(
+                "You are resuming a previously-blocked task. Prior diagnosis:\n"
+                f"  category: {b.category.value}\n"
+                f"  why: {b.root_cause_hypothesis}\n"
+                f"  tried: {'; '.join(b.tried) if b.tried else '(none)'}"
+            )
+        ctx = task.context or {}
+        replies = ctx.get("human_replies") or []
+        if replies:
+            latest = replies[-1]
+            parts.append(
+                "A human answered your blocking question:\n"
+                f"  Q: {latest.get('question', '')}\n"
+                f"  A: {latest.get('answer', '')}\n"
+                "Use this answer; do NOT re-ask. Do not lower the bar."
+            )
+        feedback = ctx.get("send_back_feedback") or []
+        if feedback:
+            parts.append(
+                "Reviewer/human send-back feedback to address:\n"
+                + "\n".join(f"  - {f.get('message', '')}" for f in feedback[-3:])
+            )
+        return "\n\n".join(parts)
 
     def _pr_body(self, task: Task, commit, result) -> str:
         criteria = "\n".join(f"- {c}" for c in task.acceptance_criteria) or "- (none stated)"

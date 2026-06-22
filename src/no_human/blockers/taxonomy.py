@@ -1,0 +1,173 @@
+"""Blocker taxonomy and routing (PLAN.md Part 22).
+
+Core principle (22, stated up front): *a blocker is never resolved by lowering
+the bar.* When stuck, the agent makes verifiable progress, parks with a wake
+condition, or escalates with a precise diagnosis — it never weakens a test,
+expands scope, edits acceptance criteria, or fakes "done".
+
+This module is pure data + routing logic (no I/O), so it is trivially testable
+and the orchestrator stays the only place that touches the DB / git / SDK.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any
+
+from ..core.task import TaskStatus
+
+
+class BlockerCategory(str, Enum):
+    """The Part 22.2 taxonomy. Value is the stable string stored on the task."""
+
+    TRANSIENT_INFRA = "TRANSIENT_INFRA"
+    QUOTA = "QUOTA"
+    DEPENDENCY_WAIT = "DEPENDENCY_WAIT"
+    MISSING_ACCESS = "MISSING_ACCESS"
+    AMBIGUITY = "AMBIGUITY"
+    SCOPE_EXPLOSION = "SCOPE_EXPLOSION"
+    IMPOSSIBLE = "IMPOSSIBLE"
+    NOVEL_UNKNOWN = "NOVEL_UNKNOWN"
+
+    @classmethod
+    def coerce(cls, value: str | "BlockerCategory") -> "BlockerCategory":
+        """Map a raw string (e.g. from the agent) to a category, defaulting to
+        NOVEL_UNKNOWN so an unrecognized label escalates rather than crashes."""
+        if isinstance(value, cls):
+            return value
+        key = (value or "").strip().upper().replace("/", "_").replace(" ", "_")
+        # accept a few aliases the agent might emit
+        aliases = {
+            "SPEC_GAP": cls.AMBIGUITY,
+            "AMBIGUITY_SPEC_GAP": cls.AMBIGUITY,
+            "INVALID": cls.IMPOSSIBLE,
+            "IMPOSSIBLE_INVALID": cls.IMPOSSIBLE,
+            "INFRA": cls.TRANSIENT_INFRA,
+            "RATE_LIMIT": cls.TRANSIENT_INFRA,
+        }
+        if key in aliases:
+            return aliases[key]
+        try:
+            return cls(key)
+        except ValueError:
+            return cls.NOVEL_UNKNOWN
+
+
+@dataclass(frozen=True)
+class Route:
+    """How a category is handled: the target state, whether to notify now, and
+    whether the wake-watcher should poll it (parked) vs. a human must act."""
+
+    target_status: TaskStatus
+    notify_now: bool          # 22.6: "needs you now" vs "parked, silent"
+    parked: bool              # watcher polls a parked task; escalations wait on a human
+    auto_retry: bool = False  # bounded auto-retry before this routing applies
+
+
+# Part 22.2 taxonomy → routing, with 22.6 severity baked in.
+_ROUTING: dict[BlockerCategory, Route] = {
+    # Parked, no action needed — silent until resume or timeout-then-escalate.
+    BlockerCategory.TRANSIENT_INFRA: Route(
+        TaskStatus.BLOCKED, notify_now=False, parked=True, auto_retry=True),
+    BlockerCategory.QUOTA: Route(
+        TaskStatus.PAUSED_QUOTA, notify_now=False, parked=True),
+    BlockerCategory.DEPENDENCY_WAIT: Route(
+        TaskStatus.BLOCKED, notify_now=False, parked=True),
+    # Needs you now — only a human can move these forward.
+    BlockerCategory.MISSING_ACCESS: Route(
+        TaskStatus.ESCALATED, notify_now=True, parked=False),
+    BlockerCategory.AMBIGUITY: Route(
+        TaskStatus.AWAITING_INPUT, notify_now=True, parked=False),
+    BlockerCategory.SCOPE_EXPLOSION: Route(
+        TaskStatus.ESCALATED, notify_now=True, parked=False),
+    BlockerCategory.IMPOSSIBLE: Route(
+        TaskStatus.ESCALATED, notify_now=True, parked=False),
+    BlockerCategory.NOVEL_UNKNOWN: Route(
+        TaskStatus.ESCALATED, notify_now=True, parked=False),
+}
+
+
+def route_for(category: BlockerCategory) -> Route:
+    return _ROUTING[category]
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass
+class Blocker:
+    """Structured blocker report (PLAN.md 22.1). Never prose — a human acts on
+    this in under a minute (the escalation-precision promise, 22.4)."""
+
+    category: BlockerCategory
+    transient: bool = False
+    wake_condition: str | None = None      # machine-checkable, see watcher
+    root_cause_hypothesis: str = ""
+    confidence: float = 0.0                # 0-1; low confidence biases to escalate
+    tried: list[str] = field(default_factory=list)
+    question: str | None = None            # the ONE decision/info needed
+    options: list[str] = field(default_factory=list)
+    resume_branch: str = ""
+    resume_commit: str = ""
+    goal: str = ""                         # the step it was attempting (22.4 #1)
+    evidence: str = ""                      # exact command + output (22.4 #2)
+    raised_at: str = field(default_factory=_now)
+
+    @property
+    def route(self) -> Route:
+        return route_for(self.category)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "category": self.category.value,
+            "transient": self.transient,
+            "wake_condition": self.wake_condition,
+            "root_cause_hypothesis": self.root_cause_hypothesis,
+            "confidence": self.confidence,
+            "tried": list(self.tried),
+            "question": self.question,
+            "options": list(self.options),
+            "resume_branch": self.resume_branch,
+            "resume_commit": self.resume_commit,
+            "goal": self.goal,
+            "evidence": self.evidence,
+            "raised_at": self.raised_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Blocker":
+        return cls(
+            category=BlockerCategory.coerce(data.get("category", "NOVEL_UNKNOWN")),
+            transient=bool(data.get("transient", False)),
+            wake_condition=data.get("wake_condition"),
+            root_cause_hypothesis=data.get("root_cause_hypothesis", ""),
+            confidence=float(data.get("confidence", 0.0) or 0.0),
+            tried=list(data.get("tried", []) or []),
+            question=data.get("question"),
+            options=list(data.get("options", []) or []),
+            resume_branch=data.get("resume_branch", ""),
+            resume_commit=data.get("resume_commit", ""),
+            goal=data.get("goal", ""),
+            evidence=data.get("evidence", ""),
+            raised_at=data.get("raised_at", _now()),
+        )
+
+
+def triage(
+    blocker: Blocker, *, escalate_below_confidence: float = 0.6
+) -> Route:
+    """Decide routing for a blocker.
+
+    Honours the 22.2 taxonomy, but with one override from the config knob
+    ``escalate_on_low_confidence_below`` (22.8 / Part 22 config): if the agent
+    is *unsure what's wrong* (low confidence) on an otherwise-parkable blocker,
+    we escalate and ask rather than silently parking on a wrong hypothesis.
+    """
+    route = blocker.route
+    if route.parked and blocker.confidence < escalate_below_confidence:
+        # Unsure → don't thrash silently; ask a human.
+        return Route(TaskStatus.ESCALATED, notify_now=True, parked=False)
+    return route

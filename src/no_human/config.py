@@ -178,6 +178,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "escalate_after": 3,
         "max_correction_rounds": 2,
     },
+    "blockers": {
+        # Part 22 blocker handling.
+        "max_alternatives_before_escalate": 2,
+        "max_park_duration": "48h",
+        "wake_poll_interval": "10m",
+        "transient_infra_retries": 2,
+        "escalate_on_low_confidence_below": 0.6,
+    },
     "ci": {
         # Opt-in per project. Set enabled=true and provide project path.
         "enabled": False,

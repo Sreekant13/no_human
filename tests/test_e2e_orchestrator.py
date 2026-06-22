@@ -267,3 +267,130 @@ async def test_red_team_agent_weakens_test_tamper_guard_blocks(bare_repo, tmp_pa
     assert outcome.status is TaskStatus.ESCALATED
     assert "tamper" in outcome.detail.lower()
     assert len(call_count) == 0, "reviewer must not run when tamper guard fires"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5: agent-emitted structured blockers (Part 22)                        #
+# --------------------------------------------------------------------------- #
+
+class BlockerBackend:
+    """A backend that emits a structured BLOCKER_JSON block instead of finishing.
+
+    Models the agent hitting something it cannot solve without lowering the bar.
+    Optionally mutates files first (to test that WIP is checkpointed).
+    """
+
+    def __init__(self, blocker_json: str, *, mutate=None):
+        self._json = blocker_json
+        self._mutate = mutate
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None):
+        if self._mutate:
+            self._mutate(cwd)
+        text = (
+            "I cannot proceed without lowering the bar.\n"
+            "BLOCKER_JSON_START\n" + self._json + "\nBLOCKER_JSON_END\n"
+        )
+        return AgentResult(final_text=text, num_turns=1, is_error=False,
+                           tokens_used=50, session_id="s", stop_reason="end_turn")
+
+
+async def test_agent_ambiguity_blocker_routes_to_awaiting_input(bare_repo, tmp_path, store):
+    """An AMBIGUITY blocker parks the task in awaiting_input with its question —
+    never guesses, never fakes done (22.2)."""
+    bjson = (
+        '{"category": "AMBIGUITY", "confidence": 0.9, '
+        '"root_cause_hypothesis": "criterion 2 contradicts criterion 1", '
+        '"question": "Which behavior is correct for empty input?", '
+        '"options": ["raise", "return 0"], '
+        '"goal": "implement parse()", "evidence": "$ grep ...\\nno spec found"}'
+    )
+    cfg = _config(tmp_path)
+    notes = []
+    orch = Orchestrator(store, cfg.data, BlockerBackend(bjson), SlackNotifier(None),
+                        event_sink=notes.append)
+    t = Task.new("parse input", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_INPUT
+    assert outcome.pr_url is None
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status is TaskStatus.AWAITING_INPUT
+    assert refreshed.blocker["category"] == "AMBIGUITY"
+    assert refreshed.blocker["question"]
+    assert "awaiting_input" in [e["kind"] for e in notes]
+
+
+async def test_agent_impossible_blocker_escalates_not_faked(bare_repo, tmp_path, store):
+    """The DoD red-team case: a deliberately-impossible task is escalated with
+    evidence, never faked done."""
+    bjson = (
+        '{"category": "IMPOSSIBLE", "confidence": 0.95, '
+        '"root_cause_hypothesis": "requested API does not exist in this version", '
+        '"question": "This cannot be done as specified; drop or change it?", '
+        '"goal": "call nonexistent API", "evidence": "ImportError: no such symbol"}'
+    )
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, BlockerBackend(bjson), SlackNotifier(None))
+    t = Task.new("impossible task", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.ESCALATED
+    assert outcome.pr_url is None
+    refreshed = await store.get_task(t.id)
+    assert refreshed.blocker["category"] == "IMPOSSIBLE"
+
+
+async def test_agent_dependency_wait_parks_and_checkpoints_wip(bare_repo, tmp_path, store):
+    """A high-confidence DEPENDENCY_WAIT parks (blocked) with a wake condition and
+    the partial work is checkpointed as [WIP-BLOCKED]."""
+    def mutate(cwd):
+        (cwd / "calc.py").write_text("def add(a, b):\n    return a + b  # WIP\n")
+
+    bjson = (
+        '{"category": "DEPENDENCY_WAIT", "confidence": 0.9, '
+        '"wake_condition": "pr_merged:org/repo#42", '
+        '"root_cause_hypothesis": "needs upstream PR #42 merged first", '
+        '"goal": "use new upstream helper", "evidence": "import fails until #42 lands"}'
+    )
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, BlockerBackend(bjson, mutate=mutate),
+                        SlackNotifier(None))
+    t = Task.new("use upstream helper", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.BLOCKED
+    refreshed = await store.get_task(t.id)
+    assert refreshed.blocker["wake_condition"] == "pr_merged:org/repo#42"
+    assert refreshed.wake_check_at is not None  # watcher will re-evaluate
+    # WIP was committed as [WIP-BLOCKED] on the feature branch.
+    log = subprocess.run(["git", "log", "--all", "--oneline"], cwd=bare_repo,
+                         capture_output=True, text=True).stdout
+    assert "WIP-BLOCKED" in log or refreshed.blocker["resume_commit"]
+
+
+async def test_low_confidence_dependency_wait_escalates(bare_repo, tmp_path, store):
+    """Unsure-what's-wrong (confidence < threshold) escalates instead of parking
+    silently (Part 22 config: escalate_on_low_confidence_below)."""
+    bjson = (
+        '{"category": "DEPENDENCY_WAIT", "confidence": 0.3, '
+        '"wake_condition": "after:2h", '
+        '"root_cause_hypothesis": "maybe a dependency? not sure", '
+        '"question": "Unclear why this fails — advise?", '
+        '"goal": "build", "evidence": "intermittent failure"}'
+    )
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, BlockerBackend(bjson), SlackNotifier(None))
+    t = Task.new("flaky build", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.ESCALATED
