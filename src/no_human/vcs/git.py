@@ -75,6 +75,12 @@ class GitRepo:
     def head_sha(self) -> str:
         return self._run("rev-parse", "HEAD")
 
+    def checkout(self, branch: str) -> str:
+        """Switch to an existing branch (no reset). Used to resume a parked
+        task's feature branch."""
+        self._run("checkout", branch)
+        return branch
+
     def create_branch(self, name: str, *, base: str | None = None) -> str:
         if _branch_protected(name, self.never_push_to):
             raise ProtectedBranch(f"refusing to create protected branch: {name}")

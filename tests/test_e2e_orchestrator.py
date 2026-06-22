@@ -146,6 +146,91 @@ async def test_run_task_uses_confirmed_profile_test_command(bare_repo, tmp_path,
     assert "profile" in [e["kind"] for e in events]
 
 
+class _GatedCI:
+    """A CI backend that must be started by a human (like JenkinsCI)."""
+    name = "jenkins"
+    max_infra_retries = 0
+
+    async def trigger(self, branch, extra_variables=None):
+        from no_human.ci.base import HumanGatedCI
+        raise HumanGatedCI("build it first", wake_hint="Build image on Jenkins job X")
+
+
+class _RecordingNotifier(SlackNotifier):
+    def __init__(self):
+        super().__init__(None)
+        self.sent = []
+
+    def notify(self, kind, message):
+        self.sent.append((kind, message))
+
+
+def _feature_mutate(cwd):
+    (cwd / "calc.py").write_text(
+        "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+    (cwd / "test_calc.py").write_text(
+        "from calc import add, mul\n\n"
+        "def test_add():\n    assert add(1, 2) == 3\n\n"
+        "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+
+async def test_human_gated_ci_parks_with_wake_and_notifies(bare_repo, tmp_path, store):
+    cfg = _config(tmp_path)
+    notifier = _RecordingNotifier()
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(_feature_mutate), notifier,
+                        event_sink=events.append, ci_runner=_GatedCI())
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.BLOCKED          # parked, not failed/infra
+    t = await store.find_task(t.id)
+    assert t.blocker["category"] == "DEPENDENCY_WAIT"
+    assert t.blocker["wake_condition"].startswith("ci_green_on:no-human/")
+    assert t.context["human_gated_ci"]["branch"].startswith("no-human/")
+    # the human got a heads-up (parked-but-actionable), and the branch is pushed.
+    assert notifier.sent and "Jenkins" in notifier.sent[-1][1]
+    branches = subprocess.run(["git", "branch", "--list"], cwd=bare_repo,
+                              capture_output=True, text=True).stdout
+    assert "no-human/" in branches
+    # no PR opened yet — CI hasn't verified the change.
+    attempts = await store.list_attempts(t.id)
+    assert all(not a.get("pr_url") for a in attempts)
+
+
+async def test_human_gated_ci_resume_opens_pr_without_rerunning_agent(
+    bare_repo, tmp_path, store
+):
+    cfg = _config(tmp_path)
+    # First run: park on the gate.
+    orch = Orchestrator(store, cfg.data, FakeBackend(_feature_mutate),
+                        SlackNotifier(None), ci_runner=_GatedCI())
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+    assert (await orch.run_task(t)).status is TaskStatus.BLOCKED
+
+    # Human/watcher resumes (gate cleared). The agent must NOT run again, and the
+    # gated CI must NOT be re-triggered — we go straight to the PR.
+    class _Exploding:
+        async def run(self, *a, **k):
+            raise AssertionError("agent must not re-run on a human-gated resume")
+
+    await store.set_status(t, TaskStatus.IMPLEMENTING, validate=False)
+    t = await store.find_task(t.id)
+    orch2 = Orchestrator(store, cfg.data, _Exploding(), SlackNotifier(None),
+                         ci_runner=_GatedCI())
+
+    outcome = await orch2.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert outcome.pr_url and "no-human/" in outcome.pr_url
+    t = await store.find_task(t.id)
+    assert "human_gated_ci" not in (t.context or {})
+    assert t.blocker in (None, {})
+
+
 async def test_tamper_weakening_is_blocked_and_escalates(bare_repo, tmp_path, store):
     def mutate(cwd):
         # "fix" by gutting the existing test — the documented reward hack

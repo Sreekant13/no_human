@@ -31,7 +31,7 @@ from ..blockers import (
     render_report,
     triage,
 )
-from ..ci.base import CIResult
+from ..ci.base import CIResult, HumanGatedCI
 from ..notify.slack import SlackNotifier
 from ..review import selfcheck
 from ..review.reviewer import AdversarialReviewer, ReviewDecision
@@ -118,6 +118,15 @@ class Orchestrator:
         repo = self._open_repo(task)
         if repo is None:
             return await self._fail(task, f"not a git repo: {task.repo_path}")
+
+        # Resume fast-path: a task parked on a human-gated CI step that is now
+        # being resumed (status moved off PENDING by nh reply / wake) goes
+        # straight to the PR — the gate is cleared and the change was already
+        # verified before parking. Re-running the agent would only find nothing
+        # to change and fail the attempt.
+        hg = (task.context or {}).get("human_gated_ci")
+        if hg and task.status != TaskStatus.PENDING:
+            return await self._resume_human_gated(task, repo, hg)
 
         # Walk the pre-implementation spine. Context/planning are minimal in
         # Phase 0 (real gathering = Phase 1); the states are honoured so the
@@ -347,7 +356,14 @@ class Orchestrator:
                 return await self._escalate(
                     task, f"push for CI failed: {exc}", repo=repo, branch=branch)
 
-            ci_result = await self._run_ci(task, branch, attempt_id, stuck)
+            try:
+                ci_result = await self._run_ci(task, branch, attempt_id, stuck)
+            except HumanGatedCI as gated:
+                # CI is human-gated (e.g. a Jenkins image build): park with a
+                # wake condition and tell the human what to do — never mock/skip
+                # the step. Review/tamper/local tests already passed (CI is last),
+                # so on resume we go straight to the PR.
+                return await self._park_human_gated_ci(task, gated, repo, branch, base)
             if ci_result is not None and not ci_result.passed:
                 if ci_result.infra_failure:
                     # TRANSIENT_INFRA with retries exhausted → escalate (22.2).
@@ -443,6 +459,7 @@ class Orchestrator:
     async def _raise_blocker(
         self, task: Task, blocker: Blocker, *, repo: GitRepo | None = None,
         branch: str | None = None, escalate_now: bool = False,
+        notify_override: bool | None = None,
     ) -> TaskOutcome:
         """Checkpoint WIP, route by taxonomy (22.2), persist, and notify by
         severity (22.6). The single funnel for every off-ramp.
@@ -450,6 +467,11 @@ class Orchestrator:
         ``escalate_now`` forces ESCALATED regardless of taxonomy — used when a
         normally-parkable category (e.g. TRANSIENT_INFRA) has already exhausted
         its bounded auto-retries and must now reach a human.
+
+        ``notify_override`` forces the notification on/off regardless of the
+        route's default — used to give the human a heads-up on a *parked* task
+        they must still act on (e.g. a human-gated CI build), which otherwise
+        parks silently.
         """
         # 1. Checkpoint: never lose work (22.5). Commit WIP as [WIP-BLOCKED].
         if repo is not None:
@@ -487,8 +509,10 @@ class Orchestrator:
         self.emit(kind, report, status=route.target_status.value,
                   blocker=blocker.to_dict())
 
-        # 5. Notify only when a human must act now (22.6). Parked = silent.
-        if route.notify_now:
+        # 5. Notify only when a human must act now (22.6). Parked = silent,
+        #    unless a notify_override says this parked task still needs a person.
+        should_notify = route.notify_now if notify_override is None else notify_override
+        if should_notify:
             self.notifier.notify(
                 "stuck",
                 notification_line(blocker, task_title=task.title, task_id=task.id),
@@ -552,6 +576,67 @@ class Orchestrator:
         ) or timedelta(minutes=10)
         return (now + poll).isoformat()
 
+    async def _park_human_gated_ci(
+        self, task: Task, gated: HumanGatedCI, repo: GitRepo, branch: str, base: str | None
+    ) -> TaskOutcome:
+        """Park on a human-gated CI step (DEPENDENCY_WAIT) with a wake condition
+        and a heads-up notification. The branch is already pushed (push precedes
+        CI), review/tamper/local tests already passed, so resuming opens the PR.
+        """
+        ctx = task.context or {}
+        ctx["human_gated_ci"] = {"branch": branch, "base": base, "hint": gated.wake_hint}
+        task.context = ctx
+        blocker = Blocker(
+            category=BlockerCategory.DEPENDENCY_WAIT,
+            transient=True, confidence=0.9, goal=task.title,
+            wake_condition=f"ci_green_on:{branch}",
+            root_cause_hypothesis="CI for this backend is human-gated; a person "
+            "must start the build/pipeline before it can verify the change.",
+            evidence=str(gated),
+            question=(gated.wake_hint or
+                      "Start the gated CI pipeline; the task resumes when it is green."),
+        )
+        return await self._raise_blocker(
+            task, blocker, repo=repo, branch=branch, notify_override=True)
+
+    async def _resume_human_gated(self, task: Task, repo: GitRepo, hg: dict) -> TaskOutcome:
+        """Resume a task parked on a human-gated CI: the gate is cleared (wake
+        fired green, or a human resumed), the change was already reviewed/tested
+        before parking, so go straight to the PR — no agent re-run (it would have
+        nothing to change), no faked CI (a real human ran it)."""
+        from types import SimpleNamespace
+
+        branch = hg["branch"]
+        base = hg.get("base") or (task.context or {}).get("base_branch")
+        try:
+            repo.checkout(branch)
+        except Exception as exc:  # noqa: BLE001
+            return await self._escalate(
+                task, f"could not check out parked branch {branch}: {exc}", repo=repo)
+
+        ctx = task.context or {}
+        ctx.pop("human_gated_ci", None)
+        task.context = ctx
+        task.blocker = None
+        task.wake_check_at = None
+        await self.store.update_task(task)
+
+        self.emit("ci", "human-gated CI cleared on resume — opening PR", passed=True)
+        # The change was already reviewed + tested before parking; advance to the
+        # post-verification state so _finalize's transition to awaiting_approval
+        # is legal (verification is not re-run — nothing changed).
+        await self.store.set_status(task, TaskStatus.TESTING, validate=False)
+        attempt_n = len(await self.store.list_attempts(task.id)) + 1
+        attempt_id = await self.store.create_attempt(task.id, attempt_n)
+        await self.store.update_attempt(attempt_id, branch_name=branch,
+                                        commit_sha=repo.head_sha())
+        commit = SimpleNamespace(files_changed=0, insertions=0, deletions=0,
+                                 sha=repo.head_sha())
+        result = SimpleNamespace(
+            final_text="Resumed after the human-gated CI step was cleared.",
+            num_turns=0)
+        return await self._finalize(task, repo, branch, base, commit, attempt_id, result)
+
     async def _park_quota(self, task: Task, exc: QuotaExhausted) -> TaskOutcome:
         task.wake_check_at = exc.resets_at
         await self.store.update_task(task)
@@ -571,6 +656,10 @@ class Orchestrator:
         self.emit("ci_start", f"triggering CI for branch {branch}")
         try:
             ci_result = await self.ci_runner.trigger(branch)
+        except HumanGatedCI:
+            # A human must start this pipeline — not an infra failure. Let it
+            # propagate so _run_attempt parks the task with a wake condition.
+            raise
         except Exception as exc:  # noqa: BLE001
             self.emit("ci_error", str(exc))
             from ..ci.base import CIResult as _CIResult, PipelineStatus
