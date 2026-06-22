@@ -200,6 +200,22 @@ class Orchestrator:
         if result.is_error and _quota_signal(result.final_text or ""):
             raise QuotaExhausted()
 
+        # A terminal agent error that isn't a quota signal (hit max_turns, SDK /
+        # process error) is a FAILED attempt — never a crash, and never a silent
+        # commit of half-finished work. Record it and let the bounded loop retry,
+        # then escalate honestly once attempts are exhausted (constraint #5, 22.3).
+        if result.is_error:
+            reason = result.stop_reason or "error"
+            is_stuck = stuck.record(result.final_text or reason)
+            if is_stuck:
+                self.emit("stuck", "same agent-error signature repeated; resetting context")
+            detail = f"agent run did not complete ({reason})"
+            await self.store.update_attempt(
+                attempt_id, status="failed", failure_reason=detail,
+            )
+            self.emit("agent_error", detail)
+            return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+
         # The agent may self-report a structural blocker (Part 22) instead of
         # lowering the bar. Honour it: checkpoint WIP and route by taxonomy.
         emitted = parse_blocker(result.final_text or "")
@@ -336,7 +352,8 @@ class Orchestrator:
         title = self._commit_message(task)
         body = self._pr_body(task, commit, result)
         try:
-            pr = open_pr(repo, branch, title, body, base=base)
+            pr = open_pr(repo, branch, title, body, base=base,
+                         github_hosts=self.config.get("git", {}).get("github_hosts"))
         except ProtectedBranch as exc:
             return await self._escalate(task, str(exc), repo=repo, branch=branch)
         except Exception as exc:  # noqa: BLE001

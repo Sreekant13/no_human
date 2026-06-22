@@ -1,4 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from "react";
+// (clock removed — the operator board doesn't need a wall clock)
 import { connectWS, fetchTasks } from "./api.js";
 import Board from "./Board.jsx";
 
@@ -19,14 +20,7 @@ function tasksReducer(state, action) {
 export default function App() {
   const [tasks, dispatch] = useReducer(tasksReducer, []);
   const [wsLive, setWsLive] = useState(false);
-  const [clock, setClock] = useState(fmtTime());
   const wsRef = useRef(null);
-
-  // clock
-  useEffect(() => {
-    const id = setInterval(() => setClock(fmtTime()), 5000);
-    return () => clearInterval(id);
-  }, []);
 
   // initial load
   useEffect(() => {
@@ -60,14 +54,9 @@ export default function App() {
         </div>
         <div className="nh-header-right">
           <div className={`nh-ws-dot${wsLive ? " live" : ""}`} title={wsLive ? "live" : "reconnecting"} />
-          <div className="nh-clock">{clock}</div>
         </div>
       </header>
       <Board tasks={tasks} />
     </div>
   );
-}
-
-function fmtTime() {
-  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }

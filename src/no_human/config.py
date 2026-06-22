@@ -162,6 +162,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "branch_prefix": "no-human/",
         "commit_prefix": "",
         "never_push_to": ["main", "master", "release/*"],
+        # Extra GitHub Enterprise hosts treated as GitHub (github.com is always
+        # recognized). Add your GHE host (e.g. "code.example.com") to open real PRs.
+        "github_hosts": ["github.com"],
         "agent_identity_name": "no_human",
         "agent_identity_email": "no-human@acme.com",
         "auto_pr": True,

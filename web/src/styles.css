@@ -105,12 +105,6 @@ html, body, #root {
   50% { opacity: 0.4; }
 }
 
-.nh-clock {
-  font-size: 11px;
-  color: var(--text-dim);
-  letter-spacing: 0.05em;
-}
-
 /* board scroll area */
 .nh-board {
   display: flex;

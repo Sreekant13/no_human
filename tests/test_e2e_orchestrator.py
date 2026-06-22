@@ -531,3 +531,57 @@ async def test_resume_after_wip_checkpoint_rebases_from_main(bare_repo, tmp_path
     assert o2.status is TaskStatus.AWAITING_APPROVAL
     final = await store.get_task(t.id)
     assert final.context["base_branch"] == "main"
+
+
+# --------------------------------------------------------------------------- #
+# Regression: agent hitting max_turns must escalate via the bounded loop,      #
+# never crash the orchestrator (shadow-validation finding, 2026-06-22).        #
+# --------------------------------------------------------------------------- #
+
+class MaxTurnsBackend:
+    """Backend that always returns a terminal max_turns error (as the real
+    ClaudeBackend now does when the SDK raises 'maximum number of turns')."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None):
+        self.calls += 1
+        if on_event:
+            on_event(AgentEvent("result", text="Reached maximum number of turns (40)"))
+        return AgentResult(
+            final_text="Reached maximum number of turns (40)",
+            num_turns=max_turns, is_error=True, tokens_used=1234,
+            session_id="s", stop_reason="max_turns",
+        )
+
+
+async def test_agent_max_turns_escalates_not_crashes(bare_repo, tmp_path, store):
+    cfg = _config(tmp_path)
+    backend = MaxTurnsBackend()
+    events = []
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("do the hard thing", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    # Must NOT raise — the whole point of the fix.
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.ESCALATED
+    # The bounded loop ran every attempt, then escalated honestly.
+    assert backend.calls == cfg.data["bounds"]["max_attempts"]
+    attempts = await store.list_attempts(t.id)
+    assert len(attempts) == cfg.data["bounds"]["max_attempts"]
+    assert all(a["status"] == "failed" for a in attempts)
+    assert all("max_turns" in (a.get("failure_reason") or "") for a in attempts)
+    # No half-finished work was committed/pushed as an approvable PR. (A local
+    # attempt branch may exist — it's created before the agent runs — but the
+    # remote received no pushed branch.)
+    assert outcome.pr_url is None
+    remote_branches = subprocess.run(
+        ["git", "ls-remote", "--heads", "origin"], cwd=bare_repo,
+        capture_output=True, text=True).stdout
+    assert "no-human/" not in remote_branches
+    assert "agent_error" in [e["kind"] for e in events]

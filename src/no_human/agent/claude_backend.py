@@ -139,42 +139,74 @@ class ClaudeBackend:
     ) -> AsyncIterator[AgentEvent]:
         """Run the agent, yielding normalized events; the final event is ``result``."""
         options = self._options(cwd, max_turns, effort=effort, resume=resume)
-        async for message in query(prompt=prompt, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, ThinkingBlock):
-                        yield AgentEvent("thinking", text=block.thinking)
-                    elif isinstance(block, TextBlock):
-                        yield AgentEvent("text", text=block.text)
-                    elif isinstance(block, ToolUseBlock):
-                        yield AgentEvent(
-                            "tool_use",
-                            tool_name=block.name,
-                            tool_input=block.input,
-                        )
-                    elif isinstance(block, ToolResultBlock):
-                        content = block.content
-                        text = content if isinstance(content, str) else str(content)
-                        yield AgentEvent("tool_result", text=text[:2000])
-            elif isinstance(message, ResultMessage):
-                usage = message.usage or {}
-                tokens = int(usage.get("input_tokens", 0)) + int(
-                    usage.get("output_tokens", 0)
-                )
-                denials = [str(d) for d in (message.permission_denials or [])]
-                yield AgentEvent(
-                    "result",
-                    text=message.result or "",
-                    meta={
-                        "num_turns": message.num_turns,
-                        "is_error": message.is_error,
-                        "tokens_used": tokens,
-                        "session_id": message.session_id,
-                        "stop_reason": message.stop_reason,
-                        "denials": denials,
-                        "api_error_status": message.api_error_status,
-                    },
-                )
+        # The SDK signals terminal conditions (notably hitting max_turns) by
+        # *raising* a bare Exception from inside query(). It usually emits a
+        # ResultMessage first ("agent done: N turns") and THEN raises, so we
+        # cannot simply re-raise once a result was seen — that's exactly the
+        # max_turns crash. If the raise escaped it would crash the whole
+        # orchestrator and never reach the bounded-loop retry/escalate path
+        # (constraint #5). So we never let it escape: we emit a corrective
+        # is_error result event. run() keeps the LAST result event, so this
+        # supersedes any prior (non-error) ResultMessage and the orchestrator
+        # treats the attempt as failed rather than crashing or committing
+        # half-finished work.
+        last_turns = last_tokens = 0
+        last_session: str | None = None
+        try:
+            async for message in query(prompt=prompt, options=options):
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, ThinkingBlock):
+                            yield AgentEvent("thinking", text=block.thinking)
+                        elif isinstance(block, TextBlock):
+                            yield AgentEvent("text", text=block.text)
+                        elif isinstance(block, ToolUseBlock):
+                            yield AgentEvent(
+                                "tool_use",
+                                tool_name=block.name,
+                                tool_input=block.input,
+                            )
+                        elif isinstance(block, ToolResultBlock):
+                            content = block.content
+                            text = content if isinstance(content, str) else str(content)
+                            yield AgentEvent("tool_result", text=text[:2000])
+                elif isinstance(message, ResultMessage):
+                    usage = message.usage or {}
+                    tokens = int(usage.get("input_tokens", 0)) + int(
+                        usage.get("output_tokens", 0)
+                    )
+                    denials = [str(d) for d in (message.permission_denials or [])]
+                    last_turns, last_tokens = message.num_turns, tokens
+                    last_session = message.session_id
+                    yield AgentEvent(
+                        "result",
+                        text=message.result or "",
+                        meta={
+                            "num_turns": message.num_turns,
+                            "is_error": message.is_error,
+                            "tokens_used": tokens,
+                            "session_id": message.session_id,
+                            "stop_reason": message.stop_reason,
+                            "denials": denials,
+                            "api_error_status": message.api_error_status,
+                        },
+                    )
+        except Exception as exc:  # noqa: BLE001 — SDK raises bare Exception on terminal errors
+            msg = str(exc)
+            is_max_turns = "maximum number of turns" in msg.lower()
+            yield AgentEvent(
+                "result",
+                text=msg,
+                meta={
+                    "num_turns": last_turns or (max_turns if is_max_turns else 0),
+                    "is_error": True,
+                    "tokens_used": last_tokens,
+                    "session_id": last_session,
+                    "stop_reason": "max_turns" if is_max_turns else "error",
+                    "denials": [],
+                    "api_error_status": None,
+                },
+            )
 
     async def run(
         self,
