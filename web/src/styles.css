@@ -121,8 +121,10 @@ html, body, #root {
 .lane {
   display: flex;
   flex-direction: column;
-  flex-shrink: 0;
-  width: 220px;
+  /* Grow to share the full board width; min-width keeps lanes legible and lets
+     the board scroll horizontally only when the viewport is genuinely narrow. */
+  flex: 1 1 0;
+  min-width: 200px;
   background: var(--bg);
   overflow: hidden;
 }
@@ -272,7 +274,11 @@ html, body, #root {
   outline-offset: 2px;
 }
 
-/* Loud lanes — "Awaiting You" and "Escalated" */
+/* Loud lanes — "Awaiting You" and "Escalated": give the human-action lanes
+   more of the pixel budget than the transient pipeline lanes. */
+.lane-loud {
+  flex-grow: 1.6;
+}
 .lane-loud .lane-header {
   border-bottom-width: 2px;
 }
