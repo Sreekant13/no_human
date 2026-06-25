@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { approveTask, fetchDiff, fetchTask, replyTask, sendBack } from "./api.js";
+import {
+  approveTask, cancelTask, fetchDiff, fetchTask, fetchTaskEvents, pauseTask,
+  postReviewComments, replyTask, resumeTask, retryTask, sendBack,
+} from "./api.js";
 
 const STATUS_PILL = {
   pending:            "pill-pending",
@@ -17,7 +20,7 @@ const STATUS_PILL = {
 export default function SlideOver({ taskId, onClose, refreshKey = 0 }) {
   const [task, setTask] = useState(null);
   const [diff, setDiff] = useState("");
-  const [tab, setTab] = useState("details");
+  const [tab, setTab] = useState("activity");
   const [busy, setBusy] = useState(false);
   const [sbOpen, setSbOpen] = useState(false);
   const [sbMsg, setSbMsg] = useState("");
@@ -60,7 +63,10 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0 }) {
   }, [onClose]);
 
   const isAwaiting = task?.status === "awaiting_approval";
-  const isParked = task?.status === "awaiting_input" || task?.status === "blocked";
+  const isParked = task?.status === "awaiting_input" || task?.status === "blocked" || task?.status === "escalated";
+  const isActive = ["pending", "context", "planning", "implementing", "reviewing", "testing"].includes(task?.status);
+  const isFailed = task?.status === "failed";
+  const isTerminal = task?.status === "done" || task?.status === "failed";
   const pillClass = STATUS_PILL[task?.status] || "pill-pending";
 
   async function handleApprove() {
@@ -112,6 +118,25 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0 }) {
     }
   }
 
+  async function handleLifecycle(action) {
+    if (busy) return;
+    const actions = { pause: pauseTask, resume: resumeTask, cancel: cancelTask, retry: retryTask };
+    const fn = actions[action];
+    if (!fn) return;
+    if (action === "cancel" && !window.confirm("Cancel this task? It will be marked as failed.")) return;
+    setBusy(true);
+    try {
+      const res = await fn(taskId);
+      setFlash(res.message);
+      const updated = await fetchTask(taskId);
+      setTask(updated);
+    } catch (e) {
+      setFlash(`Error: ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <>
       <div className="slideover-backdrop" onClick={onClose} />
@@ -138,7 +163,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0 }) {
 
         {/* tabs */}
         <div className="so-tabs">
-          {["details", "review", "diff", "attempts"].map((t) => (
+          {["activity", "details", "review", "diff", "attempts"].map((t) => (
             <button
               key={t}
               className={`so-tab${tab === t ? " active" : ""}`}
@@ -152,36 +177,49 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0 }) {
         {/* body */}
         <div className="so-body">
           {flash && <FlashBanner msg={flash} onDismiss={() => setFlash(null)} />}
+          {tab === "activity" && <ActivityTab taskId={taskId} isActive={isActive} />}
           {tab === "details"  && <DetailsTab task={task} />}
-          {tab === "review"   && <ReviewTab task={task} />}
+          {tab === "review"   && <ReviewTab task={task} diff={diff} />}
           {tab === "diff"     && <DiffTab diff={diff} />}
           {tab === "attempts" && <AttemptsTab task={task} />}
         </div>
 
-        {/* action bar */}
+        {/* action bar — contextual based on task status */}
         {task && (
           <div className="so-actions">
-            <button
-              className="btn btn-approve"
-              onClick={handleApprove}
-              disabled={!isAwaiting || busy}
-            >
-              {busy ? "…" : "Approve"}
-            </button>
-            <button
-              className="btn btn-sendback"
-              onClick={() => setSbOpen(true)}
-              disabled={busy}
-            >
-              Send back
-            </button>
+            {isAwaiting && (
+              <button className="btn btn-approve" onClick={handleApprove} disabled={busy}>
+                {busy ? "…" : "Approve"}
+              </button>
+            )}
+            {isAwaiting && (
+              <button className="btn btn-sendback" onClick={() => setSbOpen(true)} disabled={busy}>
+                Send back
+              </button>
+            )}
             {isParked && (
-              <button
-                className="btn btn-reply"
-                onClick={() => setReplyOpen(true)}
-                disabled={busy}
-              >
+              <button className="btn btn-reply" onClick={() => setReplyOpen(true)} disabled={busy}>
                 Reply
+              </button>
+            )}
+            {isParked && (
+              <button className="btn btn-lifecycle btn-resume" onClick={() => handleLifecycle("resume")} disabled={busy}>
+                Resume
+              </button>
+            )}
+            {isActive && (
+              <button className="btn btn-lifecycle btn-pause" onClick={() => handleLifecycle("pause")} disabled={busy}>
+                Pause
+              </button>
+            )}
+            {isFailed && (
+              <button className="btn btn-lifecycle btn-retry" onClick={() => handleLifecycle("retry")} disabled={busy}>
+                Retry
+              </button>
+            )}
+            {!isTerminal && (
+              <button className="btn btn-lifecycle btn-cancel" onClick={() => handleLifecycle("cancel")} disabled={busy}>
+                Cancel
               </button>
             )}
           </div>
@@ -251,32 +289,133 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0 }) {
 
 function FlashBanner({ msg, onDismiss }) {
   return (
-    <div
-      style={{
-        padding: "8px 12px",
-        background: "rgba(245,158,11,0.1)",
-        border: "1px solid var(--amber-dim)",
-        borderRadius: 3,
-        fontSize: 11,
-        color: "var(--amber)",
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: "center",
-        gap: 8,
-      }}
-    >
+    <div className="flash-banner">
       <span>{msg}</span>
-      <button
-        onClick={onDismiss}
-        style={{
-          background: "none", border: "none", color: "var(--amber)",
-          cursor: "pointer", fontFamily: "inherit", fontSize: 11,
-        }}
-      >
-        ✕
-      </button>
+      <button className="flash-banner-dismiss" onClick={onDismiss}>✕</button>
     </div>
   );
+}
+
+// Which agent role an event belongs to. The orchestrator's event `kind` is
+// already role-specific (the supervisor hook emits `supervisor`, the reviewer
+// emits review_*), so we derive the role here for per-role styling without a
+// backend change. A `source` field on the event (when present) wins.
+const SOURCE_BY_KIND = {
+  supervisor: "supervisor",
+  review_start: "reviewer", review: "reviewer", review_error: "reviewer",
+  tamper: "reviewer",
+};
+function eventSource(e) {
+  return e.source || SOURCE_BY_KIND[e.kind] || "worker";
+}
+const ROLE_LABEL = { worker: "Worker", supervisor: "Supervisor", reviewer: "Reviewer" };
+
+function ActivityTab({ taskId, isActive }) {
+  const [events, setEvents] = useState([]);
+  const endRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function poll() {
+      while (!cancelled) {
+        try {
+          const evts = await fetchTaskEvents(taskId);
+          if (!cancelled) setEvents(evts);
+        } catch { /* ignore */ }
+        // Poll faster while active.
+        await new Promise((r) => setTimeout(r, isActive ? 2000 : 10000));
+      }
+    }
+    poll();
+    return () => { cancelled = true; };
+  }, [taskId, isActive]);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [events.length]);
+
+  if (events.length === 0) {
+    return <div className="so-diff-empty">{isActive ? "Waiting for events…" : "No events recorded."}</div>;
+  }
+
+  const lastEvent = events[events.length - 1];
+  const isWorking = isActive && lastEvent;
+  const lastRole = eventSource(lastEvent);
+
+  return (
+    <div className="activity-feed">
+      <div className="activity-legend">
+        <span className="al-role role-worker"><i />Worker — builds</span>
+        <span className="al-role role-supervisor"><i />Supervisor — steers</span>
+        <span className="al-role role-reviewer"><i />Reviewer — gates</span>
+      </div>
+      {isWorking && (
+        <div className={`activity-status-bar role-${lastRole}`}>
+          <span className="activity-pulse" />
+          <span className="activity-status-text">
+            {ROLE_LABEL[lastRole]} · {eventLabel(lastEvent.kind)}: {lastEvent.text}
+          </span>
+        </div>
+      )}
+      <div className="activity-log">
+        {events.map((e, i) => {
+          const elapsed = i > 0 ? e.ts - events[i - 1].ts : 0;
+          const role = eventSource(e);
+          return (
+            <div key={i} className={`activity-event role-${role} ak-${e.kind}`}>
+              <span className="activity-ts">{fmtTs(e.ts)}</span>
+              <span className="activity-role">{ROLE_LABEL[role]}</span>
+              <span className="activity-text">
+                <span className={`activity-kind ak-${e.kind}`}>{eventLabel(e.kind)}</span>
+                {" "}{e.text}
+              </span>
+              {elapsed > 2 && <span className="activity-elapsed">+{fmtDuration(elapsed)}</span>}
+            </div>
+          );
+        })}
+        <div ref={endRef} />
+      </div>
+    </div>
+  );
+}
+
+function fmtTs(epoch) {
+  if (!epoch) return "";
+  const d = new Date(epoch * 1000);
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+const EVENT_LABELS = {
+  kind: "Task type",
+  state: "Status",
+  context_gather: "Context",
+  context: "Context",
+  profile: "Profile",
+  ci_backend: "CI",
+  attempt_start: "Attempt",
+  attempt_failed: "Attempt failed",
+  supervisor: "Supervisor",
+  commit: "Commit",
+  lint: "Lint",
+  tests: "Tests",
+  tamper: "Tamper check",
+  review_start: "Review",
+  review: "Review result",
+  review_error: "Review error",
+  agent_error: "Agent error",
+  stuck: "Stuck",
+  failed: "Failed",
+  bounds: "Bounds",
+};
+
+function eventLabel(kind) {
+  return EVENT_LABELS[kind] || kind;
+}
+
+function fmtDuration(secs) {
+  if (secs < 60) return `${Math.round(secs)}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ${Math.round(secs % 60)}s`;
+  return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
 }
 
 function DetailsTab({ task }) {
@@ -303,7 +442,7 @@ function DetailsTab({ task }) {
       {task.repo_path && (
         <section>
           <div className="so-section-label">Repo</div>
-          <div style={{ fontSize: 11, color: "var(--text-dim)" }}>{task.repo_path}</div>
+          <div className="so-repo-path">{task.repo_path}</div>
         </section>
       )}
     </>
@@ -367,8 +506,62 @@ function BlockerSection({ blocker: b }) {
   );
 }
 
-function ReviewTab({ task }) {
+// Extract the unified-diff hunk covering `file:line` from the already-fetched
+// full diff, so each review comment can show its exact code context with no
+// extra backend round-trip. Returns the hunk's lines (incl. the @@ header) or
+// null. Falls back to the file's first hunk when the line isn't pinned.
+function extractHunk(diff, file, line) {
+  if (!diff || !file) return null;
+  const lines = diff.split("\n");
+  const want = String(file).replace(/^[ab]\//, "");
+  let secStart = -1;
+  for (let j = 0; j < lines.length; j++) {
+    const l = lines[j];
+    if ((l.startsWith("+++ ") || l.startsWith("diff --git")) && l.includes(want)) { secStart = j; break; }
+  }
+  if (secStart === -1) return null;
+  let secEnd = lines.length;
+  for (let j = secStart + 1; j < lines.length; j++) {
+    if (lines[j].startsWith("diff --git")) { secEnd = j; break; }
+  }
+  const hunkRe = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+  let best = null, bestDist = Infinity;
+  for (let j = secStart; j < secEnd; j++) {
+    const m = lines[j].match(hunkRe);
+    if (!m) continue;
+    const start = parseInt(m[1], 10);
+    const count = m[2] ? parseInt(m[2], 10) : 1;
+    const end = start + count - 1;
+    const body = [lines[j]];
+    let k = j + 1;
+    while (k < secEnd && !lines[k].startsWith("@@") && !lines[k].startsWith("diff --git")) {
+      body.push(lines[k]); k++;
+    }
+    if (!line || line <= 0) { if (!best) best = body; continue; }
+    if (line >= start - 2 && line <= end + 2) return body;  // direct hit
+    const dist = Math.min(Math.abs(line - start), Math.abs(line - end));
+    if (dist < bestDist) { bestDist = dist; best = body; }  // else keep nearest
+  }
+  return best;
+}
+
+function CommentHunk({ diff, file, line }) {
+  const hunk = extractHunk(diff, file, line);
+  if (!hunk) return null;
+  return (
+    <pre className="diff-pre comment-hunk">
+      {hunk.map((l, idx) => (
+        <div key={idx} className={`diff-line ${diffLineClass(l)}`}>{l || " "}</div>
+      ))}
+    </pre>
+  );
+}
+
+function ReviewTab({ task, diff }) {
   const [rawOpen, setRawOpen] = useState(false);
+  const [posted, setPosted] = useState({});  // index → "ok" | "error" | "busy"
+  const [postingAll, setPostingAll] = useState(false);
+
   if (!task) return <div className="so-diff-empty">Loading…</div>;
 
   const lastAttempt = task.attempts?.[task.attempts.length - 1];
@@ -389,6 +582,39 @@ function ReviewTab({ task }) {
   const tamperFlag = testResults?.tamper_flag;
   const ciUrl = lastAttempt?.ci_pipeline_url;
   const rawOutput = checklist.raw_output;
+  const hasPrUrl = !!(task.context?.pr_url);
+  const failedIndices = checklist.items
+    .map((it, i) => (!it.passed ? i : -1))
+    .filter((i) => i >= 0);
+
+  async function handlePostOne(index) {
+    setPosted((p) => ({ ...p, [index]: "busy" }));
+    try {
+      const res = await postReviewComments(task.id, [index]);
+      const r = res.results?.[0];
+      setPosted((p) => ({ ...p, [index]: r?.ok ? "ok" : "error" }));
+    } catch {
+      setPosted((p) => ({ ...p, [index]: "error" }));
+    }
+  }
+
+  async function handlePostAll() {
+    setPostingAll(true);
+    const toPost = failedIndices.filter((i) => posted[i] !== "ok");
+    toPost.forEach((i) => setPosted((p) => ({ ...p, [i]: "busy" })));
+    try {
+      const res = await postReviewComments(task.id, toPost);
+      for (const r of res.results || []) {
+        setPosted((p) => ({ ...p, [r.index]: r.ok ? "ok" : "error" }));
+      }
+    } catch {
+      toPost.forEach((i) => setPosted((p) => ({ ...p, [i]: "error" })));
+    }
+    setPostingAll(false);
+  }
+
+  const allFailedPosted = failedIndices.length > 0 &&
+    failedIndices.every((i) => posted[i] === "ok");
 
   return (
     <>
@@ -398,45 +624,80 @@ function ReviewTab({ task }) {
         </div>
       )}
       <section>
-        <div className="so-section-label" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <div className="so-section-label so-section-label-row">
           <span>Reviewer verdict —{" "}
             {allPassed
-              ? <span style={{ color: "var(--green)" }}>PASSED</span>
-              : <span style={{ color: "var(--red)" }}>FAILED</span>
+              ? <span className="verdict-pass">PASSED</span>
+              : <span className="verdict-fail">FAILED</span>
             }
           </span>
-          {ciUrl && (
-            <a
-              href={ciUrl}
-              target="_blank"
-              rel="noreferrer"
-              className="ci-link"
-            >
-              CI pipeline →
-            </a>
-          )}
+          <div className="review-header-actions">
+            {ciUrl && (
+              <a href={ciUrl} target="_blank" rel="noreferrer" className="ci-link">
+                CI pipeline →
+              </a>
+            )}
+            {hasPrUrl && failedIndices.length > 0 && !allFailedPosted && (
+              <button
+                className="btn btn-post-all"
+                onClick={handlePostAll}
+                disabled={postingAll}
+              >
+                {postingAll ? "Posting…" : `Post All Comments (${failedIndices.length})`}
+              </button>
+            )}
+            {allFailedPosted && (
+              <span className="review-posted-badge">All comments posted</span>
+            )}
+          </div>
         </div>
         <div className="so-checklist">
           {checklist.items.map((item, i) => (
             <div key={i} className={`checklist-item ${item.passed ? "pass" : "fail"}`}>
               <div className="checklist-icon">{item.passed ? "✓" : "✗"}</div>
-              <div>
+              <div className="checklist-content">
                 <div className="checklist-text">{item.label}</div>
-                {item.evidence && (
+                {item.file && (
+                  <div className="checklist-file">
+                    {item.file}{item.line > 0 ? `:${item.line}` : ""}
+                  </div>
+                )}
+                {item.file && <CommentHunk diff={diff} file={item.file} line={item.line} />}
+                {item.comment && (
+                  <div className="checklist-comment">{item.comment}</div>
+                )}
+                {item.evidence && item.evidence !== item.comment && (
                   <div className="checklist-evidence">{item.evidence}</div>
                 )}
               </div>
+              {hasPrUrl && !item.passed && (
+                <div className="checklist-post-action">
+                  {posted[i] === "ok" ? (
+                    <span className="post-badge post-ok">Posted</span>
+                  ) : posted[i] === "error" ? (
+                    <button className="btn btn-post-retry" onClick={() => handlePostOne(i)}>
+                      Retry
+                    </button>
+                  ) : (
+                    <button
+                      className="btn btn-post-one"
+                      onClick={() => handlePostOne(i)}
+                      disabled={posted[i] === "busy"}
+                    >
+                      {posted[i] === "busy" ? "…" : "Post to PR"}
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           ))}
         </div>
       </section>
       {testResults && (
         <section>
-          <div className="so-section-label" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div className="so-section-label so-section-label-row">
             <span>Test results</span>
-            {!tamperFlag && (
-              <span style={{ fontSize: 10, color: "var(--green)" }}>clean</span>
-            )}
+            {!tamperFlag && <span className="verdict-clean">clean</span>}
           </div>
           <TestResultCard result={testResults} />
         </section>
@@ -461,36 +722,13 @@ function ReviewTab({ task }) {
 function TestResultCard({ result }) {
   const { passed, failed, total, output } = result;
   return (
-    <div style={{
-      background: "var(--bg-panel)",
-      border: "1px solid var(--border)",
-      borderRadius: 3,
-      padding: "10px 12px",
-      fontSize: 11,
-      display: "flex",
-      flexDirection: "column",
-      gap: 6,
-    }}>
-      <div style={{ display: "flex", gap: 16 }}>
-        <span style={{ color: "var(--green)" }}>✓ {passed ?? 0} passed</span>
-        {(failed ?? 0) > 0 && (
-          <span style={{ color: "var(--red)" }}>✗ {failed} failed</span>
-        )}
-        <span style={{ color: "var(--text-dim)" }}>{total ?? 0} total</span>
+    <div className="test-result-card">
+      <div className="test-result-stats">
+        <span className="test-result-pass">✓ {passed ?? 0} passed</span>
+        {(failed ?? 0) > 0 && <span className="test-result-fail">✗ {failed} failed</span>}
+        <span className="test-result-dim">{total ?? 0} total</span>
       </div>
-      {output && (
-        <div style={{
-          marginTop: 4,
-          fontFamily: "inherit",
-          fontSize: 10,
-          color: "var(--text-dim)",
-          whiteSpace: "pre-wrap",
-          maxHeight: 120,
-          overflow: "auto",
-        }}>
-          {output.slice(0, 2000)}
-        </div>
-      )}
+      {output && <pre className="raw-output">{output.slice(0, 2000)}</pre>}
     </div>
   );
 }
@@ -555,9 +793,7 @@ function AttemptsTab({ task }) {
             )}
           </div>
           {a.failure_reason && (
-            <div style={{ fontSize: 10, color: "var(--red)", marginTop: 4 }}>
-              {a.failure_reason}
-            </div>
+            <div className="test-result-fail-msg">{a.failure_reason}</div>
           )}
         </div>
       ))}
