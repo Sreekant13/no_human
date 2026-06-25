@@ -1,94 +1,97 @@
-/* ── no_human board — "Warm Editorial" (dark-first) ─────────────────────── */
-/* Every token traces to docs/DESIGN_SYSTEM.md (deep-research wf_a0280dc0-958).
-   Warm ink base (not cold blue-black), terracotta accent, cream text,
-   Fraunces display + IBM Plex Sans/Mono. Inspired by Claude, Linear, Jira. */
+/* ── no_human board — Jira-style (light, Atlassian blue) ─────────────────── */
+/* Light board surface, white cards, Atlassian blue accent, status lozenges,
+   neutral sans (no serif display). Tokens map to Atlassian Design System
+   neutrals/blue. Every component reads these vars, so the palette retheme
+   cascades app-wide. (Supersedes the prior warm-editorial token set.) */
 
 :root {
-  /* ── Warm ink base + surfaces (8–14% L, slight red>blue bias) ── */
-  --base:       #14110F;
-  --surface-1:  #1C1815;
-  --surface-2:  #232019;
-  --surface-3:  #2C2722;
+  /* ── Light neutrals (Atlassian neutral ramp) ── */
+  --base:       #F4F5F7;   /* board canvas */
+  --surface-1:  #FFFFFF;
+  --surface-2:  #EBECF0;   /* columns / pills */
+  --surface-3:  #F1F2F4;   /* hover */
 
-  /* Legacy aliases (existing rules reference these names) → warm mapping */
-  --bg:        #14110F;   /* base */
-  --bg-raised: #1C1815;   /* surface-1 — rails / header / slide-over */
-  --bg-panel:  #232019;   /* surface-2 — panels / pills */
-  --bg-hover:  #2C2722;   /* surface-3 — hover lift */
-  --bg-card:   #1C1815;   /* surface-1 — cards */
-  --bg-surface:#2C2722;   /* surface-3 */
-  --border:    #3A332C;
-  --border-hi: #4A4138;
-  --border-glow: rgba(226, 114, 91, 0.12);
+  /* Legacy aliases (existing rules reference these names) → light mapping */
+  --bg:        #F4F5F7;   /* board canvas */
+  --bg-raised: #FFFFFF;   /* rails / header / slide-over */
+  --bg-panel:  #EBECF0;   /* columns / panels */
+  --bg-hover:  #F1F2F4;   /* hover lift */
+  --bg-card:   #FFFFFF;   /* cards */
+  --bg-surface:#EBECF0;
+  --border:    #DFE1E6;
+  --border-hi: #C1C7D0;
+  --border-glow: rgba(12, 102, 228, 0.20);
 
-  /* Text ramp (cream → faint). Contrast verified ≥AA vs --base. */
-  --text:      #DACFC0;   /* body         ~9:1  */
-  --text-hi:   #F2EADD;   /* cream / heads ~13:1 */
-  --text-muted:#A89B8A;   /* meta         ~7:1  */
-  --text-dim:  #8C8073;   /* faint meta   ~4.9:1 (AA floor for small text) */
+  /* Text ramp — Atlassian ink (dark navy) on light. Contrast ≥AA vs --base. */
+  --text:      #172B4D;   /* body / primary ink */
+  --text-hi:   #091E42;   /* headings (darkest) */
+  --text-muted:#44546F;   /* meta */
+  --text-dim:  #626F86;   /* faint meta */
+  --text-body: #172B4D;   /* alias used by onboarding/long-form copy */
 
-  /* ── Accent: terracotta / sun-baked clay. Fills carry --ink labels. ── */
-  --accent-100:#F4C9BD;
-  --accent-300:#ECA08D;   /* terracotta text-on-dark (≥4.5:1) */
-  --accent-500:#E2725B;   /* base accent */
-  --accent-600:#C85A44;   /* hover */
-  --accent-700:#B85138;   /* pressed / accent borders on dark (3.31:1 — verified) */
-  --ink:       #14110F;   /* label colour ON terracotta fills (6.79:1) */
+  /* ── Accent: Atlassian blue. Fills carry --ink (white) labels. ── */
+  --accent-100:#E9F2FF;
+  --accent-300:#579DFF;
+  --accent-500:#0C66E4;   /* primary blue */
+  --accent-600:#0055CC;   /* hover */
+  --accent-700:#09326C;   /* pressed / strong */
+  --ink:       #FFFFFF;   /* label colour ON blue fills */
 
-  /* Legacy accent aliases → terracotta */
-  --amber:     #E2725B;
-  --amber-dim: #A8472F;
-  --amber-glow: rgba(226, 114, 91, 0.12);
-  --accent:    #C9893F;   /* legacy "active/working" → worker amber */
+  /* Legacy accent aliases → blue */
+  --amber:     #0C66E4;
+  --amber-dim: #0055CC;
+  --amber-glow: rgba(12, 102, 228, 0.18);
+  --accent:    #0C66E4;   /* "active/working" → blue */
 
-  /* ── Agent role colours (warm spectrum, not RGB primaries) ── */
-  --agent-worker:     #C9893F;  /* warm amber/ochre — builds */
-  --agent-supervisor: #B8624A;  /* deep clay — steers in-flight */
-  --agent-reviewer:   #8C6A9E;  /* muted warm-plum — gates */
+  /* ── Agent role colours (distinct, Atlassian hues) ── */
+  --agent-worker:     #0C66E4;  /* blue — builds */
+  --agent-supervisor: #974F0C;  /* orange — steers in-flight */
+  --agent-reviewer:   #5E4DB2;  /* purple — gates */
 
-  /* ── Lifecycle state colours (harmonise with terracotta) ── */
-  --state-working: #C9893F;  /* amber                         (5.52:1) */
-  --state-waiting: #B79B6E;  /* sand / parchment-gold         (6.14:1) */
-  --state-blocked: #D2604E;  /* clay-red                      (4.27:1) */
-  --state-done:    #7E8C5A;  /* warm olive (NOT neon green)   (4.48:1) */
-  --state-failed:  #C45B40;  /* burnt sienna                  (3.81:1) */
+  /* ── Lifecycle state colours (Atlassian lozenge text hues) ── */
+  --state-working: #0C66E4;  /* blue (In Progress) */
+  --state-waiting: #974F0C;  /* orange (waiting) */
+  --state-blocked: #C9372C;  /* red */
+  --state-done:    #216E4E;  /* green (Done) */
+  --state-failed:  #AE2E24;  /* dark red */
 
-  /* Legacy semantic aliases → warm state hues (all contrast-verified) */
-  --green:     #7E8C5A;   /* pass / done → olive (5.18:1 as text) */
-  --green-dim: rgba(126, 140, 90, 0.12);
-  --red:       #D9685C;   /* error / fail / escalated → rosy clay-red (5.45:1) */
-  --red-dim:   rgba(217, 104, 92, 0.12);
-  --blue:      #C9893F;   /* legacy "context/link" → warm amber */
-  --blue-dim:  rgba(201, 137, 63, 0.10);
-  --cyan:      #ECA08D;   /* code / file / repo chips → soft terracotta */
-  --purple:    #8C6A9E;   /* building / traceability / memory → plum */
-  --purple-dim:rgba(140, 106, 158, 0.12);
+  /* Legacy semantic aliases → Atlassian hues */
+  --green:     #216E4E;   /* pass / done */
+  --green-dim: #DCFFF1;   /* lozenge green bg */
+  --red:       #C9372C;   /* error / fail / escalated */
+  --red-dim:   #FFECEB;   /* lozenge red bg */
+  --blue:      #0C66E4;   /* context / link */
+  --blue-dim:  #E9F2FF;   /* lozenge blue bg */
+  --cyan:      #1558BC;   /* code / file / repo chips */
+  --purple:    #5E4DB2;   /* building / traceability / memory */
+  --purple-dim:#F3F0FF;   /* lozenge purple bg */
 
-  /* Lane accent colours (warm-mapped) */
-  --c-intake:   #8C8073;  /* sand-grey */
-  --c-context:  #B79B6E;  /* parchment-gold */
-  --c-building: #C9893F;  /* worker amber */
-  --c-review:   #8C6A9E;  /* reviewer plum */
-  --c-testing:  #7E8C5A;  /* olive */
-  --c-awaiting: #E2725B;  /* terracotta — needs you */
-  --c-done:     #7E8C5A;  /* olive */
-  --c-escalated:#D9685C;  /* rosy clay-red */
+  /* Lane accent colours (Atlassian) */
+  --c-intake:   #626F86;  /* grey */
+  --c-context:  #1558BC;  /* blue */
+  --c-building: #0C66E4;  /* blue — in progress */
+  --c-review:   #5E4DB2;  /* purple */
+  --c-testing:  #216E4E;  /* green */
+  --c-awaiting: #0C66E4;  /* blue — needs you */
+  --c-done:     #216E4E;  /* green */
+  --c-escalated:#C9372C;  /* red */
 
-  /* ── Typography — Fraunces (display) + IBM Plex Sans (UI) + Plex Mono ── */
-  --font-display: "Fraunces", Georgia, "Times New Roman", serif;
-  --font-ui:   "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, "JetBrains Mono", monospace;
+  /* ── Typography — Inter (designed UI sans, Jira-clean) + IBM Plex Mono ── */
+  --font-display: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-ui:   "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "JetBrains Mono", "SFMono-Regular", monospace;
 
-  /* Radii */
-  --r-sm: 6px;
-  --r-md: 10px;
-  --r-lg: 16px;
-  --r-xl: 16px;
+  /* Radii — Jira uses tight corners */
+  --r-sm: 3px;
+  --r-md: 4px;
+  --r-lg: 8px;
+  --r-xl: 8px;
+  --r-pill: 999px;
 
-  /* Shadows — warm, low-alpha (pair with surface step-up for elevation) */
-  --shadow-card:  0 1px 2px rgba(10,7,4,0.40), 0 2px 8px rgba(10,7,4,0.22);
-  --shadow-hover: 0 4px 16px rgba(10,7,4,0.45), 0 8px 32px rgba(10,7,4,0.25);
-  --shadow-modal: 0 16px 48px rgba(10,7,4,0.55), 0 4px 16px rgba(10,7,4,0.40);
+  /* Shadows — Atlassian elevation (low-alpha navy on light) */
+  --shadow-card:  0 1px 1px rgba(9,30,66,0.25), 0 0 1px rgba(9,30,66,0.13);
+  --shadow-hover: 0 4px 8px rgba(9,30,66,0.16), 0 0 1px rgba(9,30,66,0.31);
+  --shadow-modal: 0 8px 16px rgba(9,30,66,0.25), 0 0 1px rgba(9,30,66,0.31);
 }
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -143,28 +146,52 @@ html, body, #root {
   background: linear-gradient(
     90deg,
     transparent 0%,
-    rgba(226, 114, 91, 0.2) 20%,
-    rgba(226, 114, 91, 0.4) 50%,
-    rgba(226, 114, 91, 0.2) 80%,
+    rgba(12, 102, 228, 0.2) 20%,
+    rgba(12, 102, 228, 0.4) 50%,
+    rgba(12, 102, 228, 0.2) 80%,
     transparent 100%
   );
 }
 
-.nh-logo {
-  font-family: var(--font-display);
-  font-size: 19px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
+/* ── Legion brand (header) ── */
+.legion-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.legion-logo {
+  border-radius: 8px;
+  flex-shrink: 0;
+  box-shadow: 0 1px 2px rgba(9,30,66,0.20);
+}
+.legion-wordmark {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.05;
+}
+.legion-name {
+  font-family: var(--font-ui);
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
   color: var(--text-hi);
 }
-
-.nh-logo span {
-  font-family: var(--font-mono);
-  color: var(--text-dim);
-  font-weight: 400;
-  font-size: 12px;
-  letter-spacing: 0.02em;
+.legion-tag {
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  color: var(--text-muted);
+  margin-top: 1px;
 }
+.legion-credit {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* the header needs more height now that the wordmark is larger */
+.nh-header { height: 64px; }
 
 .nh-header-right {
   margin-left: auto;
@@ -210,15 +237,8 @@ html, body, #root {
   overflow-x: auto;
   overflow-y: hidden;
   padding: 12px 12px 0;
-  /* paper-in-the-dark grain (algorithmic SVG feTurbulence, no raster asset)
-     + warm dot grid + contextual terracotta glow behind the board header. */
-  background:
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.035'/%3E%3C/svg%3E"),
-    radial-gradient(circle 1px at center, rgba(242,234,221,0.020) 1px, transparent 1px),
-    radial-gradient(ellipse 80% 50% at 50% 0%, rgba(226, 114, 91, 0.05) 0%, transparent 60%),
-    radial-gradient(ellipse 60% 40% at 80% 100%, rgba(201, 137, 63, 0.03) 0%, transparent 50%),
-    var(--bg);
-  background-size: 140px 140px, 24px 24px, 100% 100%, 100% 100%, 100% 100%;
+  /* Jira boards are a flat light canvas — no grain, dot-grid, or glow. */
+  background: var(--bg);
 }
 
 /* ── LANE ─────────────────────────────────────────────────────────────────── */
@@ -332,8 +352,8 @@ html, body, #root {
   background: var(--bg-hover);
 }
 
-.task-card.awaiting { --lane-accent: var(--amber); border-color: rgba(226, 114, 91, 0.2); }
-.task-card.awaiting:hover { border-color: rgba(226, 114, 91, 0.35); box-shadow: var(--shadow-hover), 0 0 20px rgba(226, 114, 91, 0.06); }
+.task-card.awaiting { --lane-accent: var(--amber); border-color: rgba(12, 102, 228, 0.2); }
+.task-card.awaiting:hover { border-color: rgba(12, 102, 228, 0.35); box-shadow: var(--shadow-hover), 0 0 20px rgba(12, 102, 228, 0.06); }
 
 .card-id {
   font-family: var(--font-mono);
@@ -481,7 +501,7 @@ html, body, #root {
 
 /* Active working card — pulsing indicator */
 .task-card.active-working {
-  border-color: rgba(201, 137, 63, 0.28);
+  border-color: rgba(12, 102, 228, 0.28);
 }
 .card-active-pulse {
   width: 6px;
@@ -494,9 +514,10 @@ html, body, #root {
   animation: pulse-dot 2.5s ease-in-out infinite;
 }
 @keyframes pulse-dot {
-  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(201, 137, 63, 0.45); }
-  50% { opacity: 0.4; box-shadow: 0 0 0 5px rgba(201, 137, 63, 0); }
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(12, 102, 228, 0.45); }
+  50% { opacity: 0.4; box-shadow: 0 0 0 5px rgba(12, 102, 228, 0); }
 }
+
 
 /* ── Activity feed — per-role live event stream (worker/supervisor/reviewer) ── */
 .activity-feed { display: flex; flex-direction: column; gap: 10px; }
@@ -683,23 +704,25 @@ html, body, #root {
 
 .slideover {
   position: fixed;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: min(720px, 100vw);
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: min(1280px, 94vw);
+  height: min(92vh, 1000px);
   background: var(--bg-raised);
-  border-left: 1px solid var(--border);
+  border: 1px solid var(--border);
+  border-radius: 10px;
   z-index: 101;
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  animation: slide-in 0.32s cubic-bezier(0.16, 1, 0.3, 1);
-  box-shadow: -16px 0 64px rgba(0, 0, 0, 0.5), -4px 0 20px rgba(0, 0, 0, 0.3);
+  animation: modal-in 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: var(--shadow-modal), 0 20px 60px rgba(9,30,66,0.18);
 }
 
-@keyframes slide-in {
-  from { transform: translateX(100%); }
-  to   { transform: translateX(0); }
+@keyframes modal-in {
+  from { opacity: 0; transform: translate(-50%, calc(-50% + 20px)) scale(0.97); }
+  to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
 }
 
 .so-header {
@@ -846,93 +869,111 @@ html, body, #root {
   color: var(--text-dim);
 }
 
-/* checklist */
+/* ── Review checklist — card layout ──────────────────────────────────────── */
 .so-checklist {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
 }
 
+/* Card container: overflow:hidden clips the diff to the card's rounded corners */
 .checklist-item {
-  display: flex;
-  gap: 12px;
-  align-items: flex-start;
-  padding: 10px 14px;
-  background: var(--bg-panel);
+  background: var(--bg-raised);
   border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  transition: border-color 0.15s;
+  border-radius: 6px;
+  overflow: hidden;
+  transition: box-shadow 0.15s;
+}
+.checklist-item:hover { box-shadow: var(--shadow-hover); }
+
+.checklist-item.pass { border-left: 3px solid #216E4E; }
+.checklist-item.fail { border-left: 3px solid #C9372C; }
+
+/* Header row: icon + title + file chip (all on one line) */
+.ci-header {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 11px 14px;
 }
 
-.checklist-item:hover { border-color: var(--border-hi); }
-
-.checklist-icon {
+.ci-icon {
   flex-shrink: 0;
   font-size: 14px;
-  margin-top: 1px;
+  font-weight: 700;
+  width: 18px;
+  text-align: center;
 }
+.checklist-item.pass .ci-icon { color: #216E4E; }
+.checklist-item.fail .ci-icon { color: #C9372C; }
 
-.checklist-item.pass .checklist-icon { color: var(--green); }
-.checklist-item.fail .checklist-icon { color: var(--red); }
-
-.checklist-text {
-  font-size: 12px;
-  color: var(--text);
-  line-height: 1.5;
-}
-
-.checklist-content {
+.ci-title {
   flex: 1;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-hi);
+  line-height: 1.4;
   min-width: 0;
 }
 
-.checklist-file {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--cyan);
-  margin-top: 4px;
-  padding: 2px 6px;
-  background: rgba(226, 114, 91, 0.06);
-  border: 1px solid rgba(226, 114, 91, 0.12);
-  border-radius: 3px;
-  display: inline-block;
-}
-
-.checklist-comment {
-  font-size: 12px;
-  color: var(--text);
-  margin-top: 6px;
-  padding: 8px 12px;
-  background: rgba(255, 255, 255, 0.02);
-  border-left: 2px solid rgba(226, 114, 91, 0.3);
-  border-radius: 0 var(--r-sm) var(--r-sm) 0;
-  line-height: 1.6;
-}
-
-/* Inline diff hunk shown with each review comment (the exact code it's about). */
-.comment-hunk {
-  margin: 8px 0 2px;
-  max-height: 220px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  background: var(--base);
-  font-size: 11.5px;
-  line-height: 1.55;
-}
-.comment-hunk .diff-line { padding: 0 12px; }
-
-.checklist-evidence {
-  font-size: 11px;
-  color: var(--text-dim);
-  margin-top: 4px;
-  font-style: italic;
-}
-
-.checklist-post-action {
+.ci-filechip {
   flex-shrink: 0;
-  margin-left: 8px;
-  align-self: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: #1558BC;
+  background: rgba(12,102,228,0.07);
+  border: 1px solid rgba(12,102,228,0.18);
+  border-radius: 3px;
+  padding: 2px 7px;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
+
+.ci-badge { flex-shrink: 0; }
+
+/* Diff hunk — full-width strip, no side margins (clipped by card overflow:hidden) */
+.ci-hunk {
+  border-top: 1px solid #30363d;
+  background: #0d1117;
+  max-height: 240px;
+  overflow: auto;
+}
+.ci-hunk .diff-pre { background: #0d1117; font-size: 12px; line-height: 1.55; }
+.ci-hunk .diff-line { padding: 1px 18px; }
+
+/* Comment block below the diff */
+.ci-comment {
+  font-size: 13px;
+  color: var(--text-hi);
+  padding: 11px 14px;
+  border-top: 1px solid var(--border);
+  line-height: 1.65;
+  background: #f8f9fa;
+  border-left: 3px solid #0C66E4;
+}
+
+.ci-evidence {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 4px 14px 10px;
+  font-style: italic;
+  line-height: 1.5;
+  background: #f8f9fa;
+}
+
+/* Post-to-PR footer row */
+.ci-post-row {
+  display: flex;
+  justify-content: flex-end;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+}
+
+/* legacy: keep checklist-post-action in case anything still references it */
+.checklist-post-action { display: none; }
 
 .btn-post-one, .btn-post-retry {
   font-size: 11px;
@@ -952,7 +993,7 @@ html, body, #root {
 .btn-post-one:hover {
   background: var(--amber);
   color: var(--bg);
-  box-shadow: 0 0 12px rgba(226, 114, 91, 0.2);
+  box-shadow: 0 0 12px rgba(12, 102, 228, 0.2);
 }
 
 .btn-post-retry {
@@ -1003,7 +1044,7 @@ html, body, #root {
   text-shadow: 0 1px 2px rgba(0,0,0,0.15);
 }
 
-.btn-post-all:hover { box-shadow: 0 2px 16px rgba(226, 114, 91, 0.3); }
+.btn-post-all:hover { box-shadow: 0 2px 16px rgba(12, 102, 228, 0.3); }
 .btn-post-all:active { transform: scale(0.97); }
 .btn-post-all:disabled { opacity: 0.5; cursor: wait; }
 
@@ -1018,13 +1059,14 @@ html, body, #root {
   letter-spacing: 0.02em;
 }
 
-/* diff tab */
+/* diff tab — always dark, code-editor style regardless of app light theme */
 .so-diff-wrap {
   flex: 1;
   min-height: 400px;
-  border: 1px solid var(--border);
+  border: 1px solid #30363d;
   border-radius: var(--r-md);
   overflow: hidden;
+  background: #0d1117;
 }
 
 .so-diff-empty {
@@ -1034,29 +1076,29 @@ html, body, #root {
   text-align: center;
 }
 
-/* diff tab — native colorized unified diff (no Monaco/CDN) */
 .diff-pre {
   margin: 0;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 12.5px;
   line-height: 1.6;
   overflow: auto;
-  background: var(--bg);
+  background: #0d1117;
   height: 100%;
 }
 
 .diff-line {
   white-space: pre;
-  padding: 1px 14px;
-  color: var(--text);
+  padding: 1px 16px;
+  color: #e6edf3;
 }
 
-.diff-line.diff-add  { background: rgba(126, 140, 90, 0.14); color: #B6C487; }
-.diff-line.diff-del  { background: rgba(168, 71, 47, 0.16);  color: #E8A98F; }
-.diff-line.diff-hunk { color: var(--accent-300); opacity: 0.85; }
-.diff-line.diff-file { color: var(--text-hi); font-weight: 600; }
-.diff-line.diff-meta { color: var(--text-dim); }
-.diff-line.diff-ctx  { color: var(--text-dim); opacity: 0.7; }
+/* GitHub dark diff palette — vivid, high contrast */
+.diff-line.diff-add  { background: #0d4429; color: #aff5b4; }
+.diff-line.diff-del  { background: #67060c; color: #ffdcd7; }
+.diff-line.diff-hunk { background: #161b22; color: #79c0ff; font-weight: 500; }
+.diff-line.diff-file { background: #161b22; color: #e6edf3; font-weight: 700; }
+.diff-line.diff-meta { color: #8b949e; }
+.diff-line.diff-ctx  { color: #c9d1d9; }
 
 /* ── BLOCKER SECTION ─────────────────────────────────────────────────────── */
 
@@ -1316,17 +1358,23 @@ html, body, #root {
   text-align: center;
 }
 
-/* status pill colours */
-.pill-pending    { color: var(--text-dim); border-color: var(--border-hi); background: transparent; }
-.pill-context    { color: var(--blue);     border-color: var(--blue);     background: var(--blue-dim); }
-.pill-planning   { color: var(--purple);   border-color: var(--purple);   background: var(--purple-dim); }
-.pill-implementing { color: var(--purple); border-color: var(--purple);   background: var(--purple-dim); }
-.pill-reviewing  { color: var(--c-review); border-color: var(--c-review); background: rgba(251,146,60,0.12); }
-.pill-testing    { color: var(--cyan);     border-color: var(--cyan);     background: rgba(34,211,238,0.1); }
-.pill-awaiting_approval { color: var(--amber); border-color: var(--amber); background: var(--amber-glow); }
-.pill-done       { color: var(--green);    border-color: var(--green);    background: var(--green-dim); }
-.pill-escalated  { color: var(--red);      border-color: var(--red);      background: var(--red-dim); }
-.pill-failed     { color: var(--red);      border-color: var(--red);      background: var(--red-dim); }
+/* status lozenges (Atlassian Jira): solid pale fill, strong uppercase text,
+   no border. Each modifier carries its own bg + colour pair. */
+.pill-pending,
+.pill-context, .pill-planning, .pill-implementing, .pill-reviewing,
+.pill-testing, .pill-awaiting_approval, .pill-done, .pill-escalated,
+.pill-failed { border-color: transparent !important; }
+
+.pill-pending          { color: #44546F; background: #DCDFE4; }
+.pill-context          { color: #0055CC; background: #E9F2FF; }
+.pill-planning         { color: #5E4DB2; background: #F3F0FF; }
+.pill-implementing     { color: #0055CC; background: #E9F2FF; }
+.pill-reviewing        { color: #5E4DB2; background: #F3F0FF; }
+.pill-testing          { color: #206A83; background: #E7F9FF; }
+.pill-awaiting_approval{ color: #974F0C; background: #FFF7D6; }
+.pill-done             { color: #216E4E; background: #DCFFF1; }
+.pill-escalated        { color: #AE2E24; background: #FFECEB; }
+.pill-failed           { color: #AE2E24; background: #FFECEB; }
 
 /* loading / error states */
 .nh-center {
@@ -1344,13 +1392,13 @@ html, body, #root {
 
 /* reply button */
 .btn-reply {
-  background: rgba(226, 114, 91, 0.08);
+  background: rgba(12, 102, 228, 0.08);
   border-color: var(--cyan);
   color: var(--cyan);
 }
 
 .btn-reply:hover {
-  background: rgba(226, 114, 91, 0.16);
+  background: rgba(12, 102, 228, 0.16);
 }
 
 .btn-reply:disabled {
@@ -1468,7 +1516,7 @@ html, body, #root {
   border-top: 2px solid var(--c-awaiting);
 }
 .lane-needs_you .lane-body {
-  background: rgba(226, 114, 91, 0.02);
+  background: rgba(12, 102, 228, 0.02);
 }
 
 .lane-failed .lane-header {
@@ -1562,7 +1610,7 @@ html, body, #root {
 }
 .btn-new-task:hover {
   background: linear-gradient(135deg, var(--accent-600) 0%, var(--accent-500) 100%);
-  box-shadow: 0 2px 12px rgba(226, 114, 91, 0.25);
+  box-shadow: 0 2px 12px rgba(12, 102, 228, 0.25);
 }
 .btn-new-task:active { transform: scale(0.97); }
 
@@ -1570,24 +1618,37 @@ html, body, #root {
   background: var(--bg-panel);
   border: 1px solid var(--border-hi);
   border-radius: var(--r-lg);
-  padding: 24px;
-  min-width: 440px;
-  max-width: 540px;
+  padding: 32px 36px;
+  width: min(720px, 94vw);
+  max-height: 90vh;
+  overflow-y: auto;
   box-shadow: var(--shadow-modal);
+}
+
+.new-task-modal .sendback-label {
+  font-size: 22px;
+  margin-bottom: 18px;
 }
 
 .new-task-input {
   width: 100%;
+  box-sizing: border-box;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   color: var(--text-hi);
   font-family: inherit;
-  font-size: 13px;
-  padding: 10px 14px;
-  margin-bottom: 10px;
+  font-size: 15px;
+  padding: 13px 16px;
+  margin-bottom: 14px;
   outline: none;
   transition: border-color 0.15s, box-shadow 0.15s;
+}
+/* The title is the primary field — make it read as such. */
+.new-task-modal form > .new-task-input:first-of-type {
+  font-size: 17px;
+  font-weight: 500;
+  padding: 15px 16px;
 }
 .new-task-input:focus {
   border-color: var(--amber);
@@ -1607,8 +1668,8 @@ html, body, #root {
   border-radius: var(--r-md);
   color: var(--text);
   font-family: inherit;
-  font-size: 12px;
-  padding: 8px 12px;
+  font-size: 14px;
+  padding: 11px 14px;
   outline: none;
   transition: border-color 0.15s;
 }
@@ -1849,8 +1910,8 @@ html, body, #root {
 .memory-tag {
   font-size: 10px;
   color: var(--cyan);
-  background: rgba(226, 114, 91, 0.08);
-  border: 1px solid rgba(226, 114, 91, 0.15);
+  background: rgba(12, 102, 228, 0.08);
+  border: 1px solid rgba(12, 102, 228, 0.15);
   border-radius: 10px;
   padding: 2px 10px;
 }
@@ -1919,8 +1980,8 @@ html, body, #root {
   padding: 56px 24px 80px;
   background:
     url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E"),
-    radial-gradient(ellipse 70% 50% at 50% -8%, rgba(226,114,91,0.10) 0%, transparent 60%),
-    radial-gradient(ellipse 50% 40% at 85% 110%, rgba(201,137,63,0.06) 0%, transparent 55%),
+    radial-gradient(ellipse 70% 50% at 50% -8%, rgba(12, 102, 228,0.10) 0%, transparent 60%),
+    radial-gradient(ellipse 50% 40% at 85% 110%, rgba(12, 102, 228,0.06) 0%, transparent 55%),
     var(--base);
   background-size: 140px 140px, 100% 100%, 100% 100%, 100% 100%;
 }
@@ -1946,13 +2007,63 @@ html, body, #root {
   min-height: 340px;
 }
 .ob-eyebrow { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.18em; text-transform: lowercase; color: var(--accent-500); margin-bottom: 18px; }
-.ob-h1 { font-family: var(--font-display); font-weight: 600; font-size: 38px; line-height: 1.08; letter-spacing: -0.015em; color: var(--text-hi); margin-bottom: 18px; }
-.ob-h2 { font-family: var(--font-display); font-weight: 600; font-size: 27px; line-height: 1.15; letter-spacing: -0.01em; color: var(--text-hi); margin-bottom: 8px; }
-.ob-lede { font-size: 16px; line-height: 1.7; color: var(--text-body); max-width: 52ch; }
-.ob-lede em { color: var(--accent-300); font-style: italic; }
+.ob-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 22px; }
+.ob-brand span { font-family: var(--font-ui); font-size: 30px; font-weight: 800; letter-spacing: -0.02em; color: var(--text-hi); }
+.ob-h1 { font-family: var(--font-ui); font-weight: 800; font-size: 40px; line-height: 1.05; letter-spacing: -0.03em; color: var(--text-hi); margin-bottom: 14px; }
+.ob-h2 { font-family: var(--font-ui); font-weight: 800; font-size: 27px; line-height: 1.15; letter-spacing: -0.02em; color: var(--text-hi); margin-bottom: 8px; }
+.ob-lede { font-family: var(--font-ui); font-size: 16px; line-height: 1.6; color: var(--text-body); max-width: 56ch; }
+.ob-lede em { color: var(--accent-500); font-style: normal; font-weight: 600; }
 .ob-sub { font-size: 13.5px; line-height: 1.6; color: var(--text-muted); margin-bottom: 22px; max-width: 54ch; }
 .ob-note { font-size: 12px; color: var(--text-muted); margin-top: 18px; line-height: 1.6; }
-.ob-note code, .ob-faint { font-family: var(--font-mono); color: var(--accent-300); font-size: 11px; }
+.ob-note code, .ob-faint { font-family: var(--font-mono); color: var(--accent-500); font-size: 11px; }
+.ob-note em { color: var(--accent-500); font-style: normal; font-weight: 600; }
+
+/* Welcome — the three agents as role-colored cards */
+.ob-agents { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 22px; }
+.ob-agent { background: var(--surface-1); border: 1px solid var(--border); border-top: 3px solid var(--a); border-radius: var(--r-lg); padding: 14px 14px 16px; }
+.ob-agent p { font-size: 12.5px; line-height: 1.5; color: var(--text-muted); margin-top: 6px; }
+.ob-agent-role { font-size: 13px; font-weight: 700; letter-spacing: -0.01em; color: var(--a); }
+.ob-agent-worker     { --a: var(--agent-worker); }
+.ob-agent-supervisor { --a: var(--agent-supervisor); }
+.ob-agent-reviewer   { --a: var(--agent-reviewer); }
+
+/* Welcome — the pipeline flow */
+.ob-flow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 22px; }
+.ob-flow span { font-family: var(--font-mono); font-size: 11px; font-weight: 500; color: var(--text-muted); background: var(--surface-2); padding: 5px 10px; border-radius: var(--r-pill); position: relative; }
+.ob-flow span:not(:last-child)::after { content: "→"; position: absolute; right: -13px; top: 50%; transform: translateY(-50%); color: var(--text-dim); }
+.ob-flow .ob-flow-pr { color: var(--ink); background: var(--accent-500); font-weight: 600; }
+.ob-flow .ob-flow-you { color: var(--state-done); background: var(--green-dim); font-weight: 600; }
+
+/* history scan — "building your validator agent" (T-800 head assembling) */
+.va-build { display: flex; align-items: center; gap: 18px; margin-top: 18px; padding: 16px 18px; background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r-lg); }
+.va-build-text { line-height: 1.5; }
+.va-build-title { font-weight: 700; font-size: 14px; color: var(--text-hi); }
+.va-build-sub { font-size: 13px; color: var(--text-muted); margin-top: 3px; }
+.va-build-sub strong { color: var(--text-hi); font-weight: 700; }
+
+.validator-avatar { width: 96px; height: 104px; flex-shrink: 0; }
+/* skull powers in once, then gently floats */
+.va-skull { transform-origin: 60px 60px; animation: va-in 0.55s cubic-bezier(.2,.8,.2,1) both, va-float 3.4s ease-in-out 0.6s infinite; }
+.va-eye-red { transform-origin: 74px 63px; opacity: 0;
+  animation: va-ignite 0.7s ease 0.7s forwards, va-breathe 1.6s ease-in-out 1.4s infinite; }
+.va-scan { fill: #BFE0FF; opacity: 0; mix-blend-mode: screen;
+  animation: va-scan 1.9s ease-in-out 0.6s infinite; }
+
+@keyframes va-in     { 0% { opacity: 0; transform: scale(.82) translateY(6px); } 100% { opacity: 1; transform: none; } }
+@keyframes va-float  { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-3px); } }
+@keyframes va-ignite { 0% { opacity: 0; filter: none; } 55% { opacity: 1; filter: drop-shadow(0 0 9px #ff4d4d); } 100% { opacity: 1; filter: drop-shadow(0 0 5px #ff3b3b); } }
+@keyframes va-breathe{ 0%,100% { filter: drop-shadow(0 0 4px #E5202A); } 50% { filter: drop-shadow(0 0 9px #ff5b5b); } }
+@keyframes va-scan   { 0% { transform: translateY(0); opacity: 0; } 12% { opacity: .9; } 80% { opacity: .9; } 100% { transform: translateY(92px); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .va-skull, .va-eye-red, .va-scan { animation: none; }
+  .va-eye-red { opacity: 1; }
+}
+
+/* importance label on proposed rules */
+.ob-rule-imp { font-family: var(--font-ui); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; padding: 2px 7px; border-radius: var(--r-pill); margin-left: 6px; }
+.imp-high { color: #AE2E24; background: #FFECEB; }
+.imp-med  { color: #974F0C; background: #FFF7D6; }
+.imp-low  { color: #44546F; background: #DCDFE4; }
 
 /* fields */
 .ob-field { display: flex; flex-direction: column; gap: 8px; }

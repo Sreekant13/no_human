@@ -3,9 +3,23 @@ import { connectWS, createTask, fetchTasks, fetchProfiles, fetchWorkerStatus, fe
 import Board from "./Board.jsx";
 import Settings from "./Settings.jsx";
 import Onboarding from "./Onboarding.jsx";
+import { LegionLogo } from "./Logo.jsx";
 
 const NEEDS_YOU_STATUSES = new Set(["awaiting_approval", "awaiting_input", "escalated"]);
 const PROGRESS_STATUSES  = new Set(["pending", "context", "planning", "implementing", "reviewing", "testing"]);
+
+// Header brand: logo + wordmark + tagline. Used in the main and error headers.
+function Brand() {
+  return (
+    <div className="legion-brand">
+      <LegionLogo size={32} />
+      <div className="legion-wordmark">
+        <span className="legion-name">no_human</span>
+        <span className="legion-tag">get the max out of Claude</span>
+      </div>
+    </div>
+  );
+}
 
 function fmtAge(seconds) {
   if (seconds < 60) return "<1m";
@@ -253,7 +267,8 @@ export default function App() {
     return (
       <div className="nh-shell">
         <header className="nh-header">
-          <div className="nh-logo">no_human<span> · operator terminal</span></div>
+          <Brand />
+          <span className="legion-credit">Developed by eyalgolan</span>
         </header>
         <div className="nh-center">
           <div className="nh-error">
@@ -273,14 +288,13 @@ export default function App() {
   return (
     <div className="nh-shell">
       <header className="nh-header">
-        <div className="nh-logo">
-          no_human<span> · operator terminal</span>
-        </div>
+        <Brand />
         <nav className="nh-nav">
           <button className={`nh-nav-btn${page === "board" ? " active" : ""}`} onClick={() => setPage("board")}>Board</button>
           <button className={`nh-nav-btn${page === "settings" ? " active" : ""}`} onClick={() => setPage("settings")}>Settings</button>
         </nav>
         <div className="nh-header-right">
+          <span className="legion-credit">Developed by eyalgolan</span>
           {page === "board" && (
             <button className="btn btn-new-task" onClick={() => setShowNewTask(true)}>+ New Task</button>
           )}

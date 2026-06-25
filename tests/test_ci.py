@@ -322,6 +322,40 @@ def test_ci_from_config_no_project_returns_none():
     assert ci_from_config(cfg) is None
 
 
+def test_gitlab_check_status_terminal():
+    """check_status returns terminal status with jobs when pipeline is done."""
+    fake = FakeRunner([
+        _make_pipeline_response("success"),
+        _make_jobs_response([{"name": "test", "status": "success",
+                               "failure_reason": None, "web_url": ""}]),
+    ])
+    ci = GitLabCI("g/p", hostname="gitlab.sn.net", poll_interval=0, _run_cmd=fake)
+    result = ci._check_pipeline("99")
+    assert result.status == PipelineStatus.SUCCESS
+    assert result.passed
+    assert len(result.jobs) == 1
+
+
+def test_gitlab_check_status_running():
+    """check_status returns non-terminal status when pipeline is still running."""
+    fake = FakeRunner([
+        _make_pipeline_response("running"),
+    ])
+    ci = GitLabCI("g/p", hostname="gitlab.sn.net", poll_interval=0, _run_cmd=fake)
+    result = ci._check_pipeline("99")
+    assert result.status == PipelineStatus.RUNNING
+    assert not result.status.is_terminal
+
+
+def test_gitlab_check_status_api_failure():
+    """check_status returns UNKNOWN when the API call fails."""
+    fake = FakeRunner([""])  # empty response → _glab_api returns None
+    ci = GitLabCI("g/p", hostname="gitlab.sn.net", poll_interval=0, _run_cmd=fake)
+    result = ci._check_pipeline("99")
+    assert result.status == PipelineStatus.UNKNOWN
+    assert result.infra_failure
+
+
 def test_gitlab_is_a_ci_backend():
     from no_human.ci.base import CIBackend
     assert issubclass(GitLabCI, CIBackend)
@@ -340,9 +374,22 @@ def test_ci_from_config_github_actions_seam():
         asyncio.run(ci.trigger("no-human/x"))
 
 
-def test_ci_from_config_jenkins_is_human_gated():
-    from no_human.ci import HumanGatedCI, JenkinsCI
+def test_ci_from_config_jenkins_defaults_to_watch():
+    # Phase 6: Jenkins is now a real backend. The default mode is read-only
+    # `watch` (poll the PR-triggered build); it is NOT human-gated by default.
+    from no_human.ci import JenkinsCI
     cfg = {"ci": {"enabled": True, "backend": "jenkins", "job": "metrics-core-image"}}
+    ci = ci_from_config(cfg)
+    assert isinstance(ci, JenkinsCI)
+    assert ci.mode == "watch"
+
+
+def test_ci_jenkins_human_gated_mode_still_parks():
+    # The image-build prerequisite is preserved as an OPT-IN mode that parks the
+    # task with a wake hint rather than faking the step (constraint §3.4).
+    from no_human.ci import HumanGatedCI, JenkinsCI
+    cfg = {"ci": {"enabled": True, "backend": "jenkins", "job": "metrics-core-image",
+                  "mode": "human_gated"}}
     ci = ci_from_config(cfg)
     assert isinstance(ci, JenkinsCI)
     with pytest.raises(HumanGatedCI) as exc:
@@ -357,12 +404,12 @@ def test_ci_from_config_unknown_backend_raises():
 
 def test_all_backends_expose_max_infra_retries():
     # The orchestrator reads ci_runner.max_infra_retries unconditionally; every
-    # backend (incl. the human-gated Jenkins seam) must have it (constraint #5:
-    # never crash). Jenkins inherits the ABC default of 0.
+    # backend must have it (constraint #5: never crash). Jenkins is now a real
+    # backend that retries infra failures like the others.
     from no_human.ci import GitHubActionsCI, JenkinsCI
     assert GitLabCI(project="p").max_infra_retries >= 0
     assert GitHubActionsCI(repo="o/r").max_infra_retries >= 0
-    assert JenkinsCI(job="j").max_infra_retries == 0
+    assert JenkinsCI(job="j").max_infra_retries >= 0
 
 
 # --------------------------------------------------------------------------- #
@@ -417,7 +464,8 @@ class FakeBackend:
     def __init__(self, mutate=None):
         self._mutate = mutate or (lambda cwd: None)
 
-    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None, on_event=None):
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None, on_event=None,
+                  supervisor_hook=None):
         self._mutate(cwd)
         return AgentResult(final_text="done", num_turns=2, is_error=False,
                            tokens_used=100, session_id="s", stop_reason="end_turn")
@@ -563,3 +611,116 @@ async def test_no_ci_runner_skips_ci(bare_repo, tmp_path, store):
     outcome = await orch.run_task(t)
 
     assert outcome.status is TaskStatus.AWAITING_APPROVAL
+
+
+async def test_ci_unrelated_failure_escalates_immediately(bare_repo, tmp_path, store):
+    """Phase 6.3: a red build whose failing tests are not in any changed file is a
+    pre-existing/monorepo failure → escalate from the first attempt with cited
+    evidence, NOT loop trying to fix code we didn't write."""
+    ci_result = CIResult(
+        "88", "https://x/88", PipelineStatus.FAILED, infra_failure=False,
+        jobs=[JobResult(name="com.acme.billing.InvoiceIT.testTotals",
+                        status="failed", failure_reason="pre-existing")],
+        parsed_output="1 failing test: com.acme.billing.InvoiceIT.testTotals",
+    )
+    cfg = load_config(tmp_path / "config.yaml")
+    fake_ci = FakeCI(ci_result)
+    orch = Orchestrator(
+        store, cfg.data, FakeBackend(_good_mutate), SlackNotifier(None),
+        reviewer=FakeReviewer(_passing_review()), ci_runner=fake_ci,
+    )
+    t = Task.new("add mul()", repo_path=str(bare_repo))  # touches calc.py/test_calc.py
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.ESCALATED
+    assert len(fake_ci.calls) == 1  # did NOT burn 3 attempts
+    t2 = await store.get_task(t.id)
+    assert "InvoiceIT" in (t2.blocker or {}).get("evidence", "")
+
+
+async def test_concurrency_worktree_mode_opens_pr_and_cleans_up(bare_repo, tmp_path, store):
+    """Phase 7.2: with concurrency.enabled the task runs in its own worktree,
+    still reaches AWAITING_APPROVAL with a PR, and the worktree is removed."""
+    from no_human.vcs import GitRepo
+    cfg = load_config(tmp_path / "config.yaml")
+    cfg.data["concurrency"] = {"enabled": True,
+                               "worktree_root": str(tmp_path / "wt")}
+    orch = Orchestrator(
+        store, cfg.data, FakeBackend(_good_mutate), SlackNotifier(None),
+        reviewer=FakeReviewer(_passing_review()), ci_runner=None,
+    )
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul works"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert outcome.pr_url is not None
+    # Worktree cleaned up: only the primary checkout remains.
+    main = GitRepo(bare_repo)
+    assert all("/wt/" not in w for w in main.list_worktrees())
+    assert not (tmp_path / "wt" / t.id).exists()
+    # The agent worked in the worktree, never the primary checkout.
+    assert "mul" not in (bare_repo / "calc.py").read_text()
+
+
+async def test_ci_access_failure_routes_to_missing_access(bare_repo, tmp_path, store):
+    """Phase 6 / (a): a credential/permission wall (not infra, not code) parks as
+    MISSING_ACCESS with an ask, and is NOT retried."""
+    ci_result = CIResult(
+        "", "https://x/jenkins/job", PipelineStatus.FAILED,
+        access_failure=True,
+        parsed_output="Jenkins denied access (401/403). Set JENKINS_API_TOKEN …",
+    )
+    cfg = load_config(tmp_path / "config.yaml")
+    fake_ci = FakeCI(ci_result)
+    orch = Orchestrator(
+        store, cfg.data, FakeBackend(_good_mutate), SlackNotifier(None),
+        reviewer=FakeReviewer(_passing_review()), ci_runner=fake_ci,
+    )
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.ESCALATED
+    assert len(fake_ci.calls) == 1  # access is not retried
+    t2 = await store.get_task(t.id)
+    assert (t2.blocker or {}).get("category") == "MISSING_ACCESS"
+    assert "access" in (t2.blocker or {}).get("question", "").lower()
+
+
+async def test_ci_related_failure_threads_into_next_prompt(bare_repo, tmp_path, store):
+    """Phase 6.2: a real failure in a file we changed feeds the next attempt's
+    prompt so the agent fixes the ACTUAL remote failure."""
+    ci_result = CIResult(
+        "91", "https://x/91", PipelineStatus.FAILED, infra_failure=False,
+        jobs=[JobResult(name="calc.test_mul", status="failed",
+                        failure_reason="AssertionError: mul(2,3)==6")],
+        parsed_output="1 failing test: calc.test_mul",
+    )
+    cfg = load_config(tmp_path / "config.yaml")
+    fake_ci = FakeCI(ci_result)
+    prompts: list[str] = []
+
+    class CapturingBackend(FakeBackend):
+        async def run(self, prompt, **kw):
+            prompts.append(prompt)
+            return await super().run(prompt, **kw)
+
+    orch = Orchestrator(
+        store, cfg.data, CapturingBackend(_good_mutate), SlackNotifier(None),
+        reviewer=FakeReviewer(_passing_review()), ci_runner=fake_ci,
+    )
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    # First attempt got no CI context; the second (after the red build) does.
+    assert len(prompts) >= 2
+    assert "remote ci build" in prompts[1].lower()
+    assert "calc.test_mul" in prompts[1]

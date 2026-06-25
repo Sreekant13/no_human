@@ -113,6 +113,39 @@ def fallback_blocker(detail: str, *, resume_branch: str = "",
     )
 
 
+def missing_access(
+    env_key: str,
+    *,
+    system: str = "",
+    goal: str = "",
+    evidence: str = "",
+    resume_branch: str = "",
+    resume_commit: str = "",
+) -> Blocker:
+    """Build a MISSING_ACCESS blocker that names the EXACT ``~/.no_human/.env``
+    key a human must set (WS-F). The point of the precision: a human resolves it
+    in under a minute — set one named key, then ``nh reply`` — without guessing
+    which credential is missing. Never include the value, only the key name."""
+    sys_label = f" for {system}" if system else ""
+    return Blocker(
+        category=BlockerCategory.MISSING_ACCESS,
+        transient=False,
+        confidence=0.95,
+        root_cause_hypothesis=(
+            f"Missing credential{sys_label}: {env_key} is not set. This is an "
+            "access wall, not a code failure — retrying cannot resolve it."
+        ),
+        goal=goal,
+        evidence=evidence or f"{env_key} not found in ~/.no_human/.env or the environment",
+        question=(
+            f"Set {env_key} in ~/.no_human/.env (chmod 600){sys_label}, then "
+            f"`nh reply` to resume. no_human never reads or logs the value."
+        ),
+        resume_branch=resume_branch,
+        resume_commit=resume_commit,
+    )
+
+
 def blocker_prompt_suffix() -> str:
     """Instruction appended to the agent prompt so it can self-report a blocker.
 

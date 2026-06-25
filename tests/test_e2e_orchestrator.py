@@ -52,7 +52,7 @@ class FakeBackend:
         self.mutate = mutate
 
     async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
-                  on_event=None):
+                  on_event=None, supervisor_hook=None):
         if on_event:
             on_event(AgentEvent("tool_use", tool_name="Edit",
                                 tool_input={"file_path": "calc.py"}))
@@ -268,7 +268,7 @@ class FakeReviewer:
         self._call_count = call_count  # shared mutable list for multi-attempt tests
 
     async def review(self, task, *, repo_path, test_output="", held_out_output="",
-                     before_ref="HEAD~1", after_ref="HEAD"):
+                     before_ref="HEAD~1", after_ref="HEAD", **kwargs):
         self.calls.append({"task_id": task.id})
         if self._call_count is not None:
             self._call_count.append(1)
@@ -358,6 +358,57 @@ async def test_reviewer_fails_blocks_pr_and_loops(bare_repo, tmp_path, store):
     assert "review failed" in outcome.detail.lower()
 
 
+async def test_implement_prompt_uses_worktree_dir_not_primary_checkout(bare_repo, tmp_path, store):
+    """Regression (validation found this): in concurrency mode the agent runs in a
+    per-task worktree, so the prompt must point at that working dir — NOT
+    task.repo_path (the primary checkout). Handing it the primary path made the
+    agent edit the wrong tree; the worktree then showed 'no file changes'."""
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    t = Task.new("add f()", repo_path="/primary/checkout")
+    t.acceptance_criteria = ["f exists"]
+
+    wt = "/tmp/worktrees/abc123"
+    prompt = orch._build_implement_prompt(t, wt)
+    assert wt in prompt
+    assert "make ALL edits here" in prompt
+    # The primary checkout must NOT be presented as the working directory.
+    assert "repo at /primary/checkout" not in prompt
+
+    # Backward-compat: with no work_dir it falls back to task.repo_path.
+    assert "/primary/checkout" in orch._build_implement_prompt(t)
+
+
+async def test_review_feedback_injected_into_next_attempt(bare_repo, tmp_path, store):
+    """EVOLUTION_PLAN §2.2: on reviewer FAIL the cited findings are persisted and
+    surface in the next attempt's implement prompt (no new loop — reuses the
+    bounded attempt machinery; tamper guard still gates each round)."""
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    t = Task.new("fix add()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["add(a,b) returns a+b"]
+    await store.create_task(t)
+
+    failed = [
+        ChecklistItem("add(a,b) returns correct sum", False,
+                      "calc.py:2 returns 0, not a+b", file="calc.py", line=2,
+                      comment="Return a + b, not a hardcoded 0."),
+    ]
+    await orch._record_review_feedback(t, failed)
+
+    refreshed = await store.get_task(t.id)
+    assert refreshed.context["review_feedback"][0]["file"] == "calc.py"
+
+    prompt = orch._build_implement_prompt(refreshed)
+    assert "independent staff reviewer FAILED" in prompt
+    assert "Return a + b, not a hardcoded 0." in prompt
+    assert "calc.py:2" in prompt
+    # The anti-tamper instruction must ride along with the feedback.
+    assert "do NOT weaken" in prompt.lower() or "do not weaken" in prompt.lower()
+
+
 async def test_red_team_agent_weakens_test_tamper_guard_blocks(bare_repo, tmp_path, store):
     """Red-team: agent guts the test to make a broken impl pass.
 
@@ -407,7 +458,7 @@ class BlockerBackend:
         self._mutate = mutate
 
     async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
-                  on_event=None):
+                  on_event=None, supervisor_hook=None):
         if self._mutate:
             self._mutate(cwd)
         text = (
@@ -528,7 +579,8 @@ class PromptCapturingBackend:
         self.calls = 0
         self.prompts: list[str] = []
 
-    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None, on_event=None):
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None, on_event=None,
+                  supervisor_hook=None):
         self.calls += 1
         self.prompts.append(prompt)
         if self.calls == 1:
@@ -626,11 +678,13 @@ async def test_resume_after_wip_checkpoint_rebases_from_main(bare_repo, tmp_path
         def __init__(self, inner, wip):
             self.inner = inner
             self.wip = wip
-        async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None, on_event=None):
+        async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None, on_event=None,
+                      supervisor_hook=None):
             if self.inner.calls == 0:
                 self.wip(cwd)
             return await self.inner.run(prompt, cwd=cwd, max_turns=max_turns,
-                                        effort=effort, resume=resume, on_event=on_event)
+                                        effort=effort, resume=resume, on_event=on_event,
+                                        supervisor_hook=supervisor_hook)
 
     cfg = _config(tmp_path)
     orch = Orchestrator(store, cfg.data, _WipFirst(backend, wip), SlackNotifier(None))
@@ -668,7 +722,7 @@ class MaxTurnsBackend:
         self.calls = 0
 
     async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
-                  on_event=None):
+                  on_event=None, supervisor_hook=None):
         self.calls += 1
         if on_event:
             on_event(AgentEvent("result", text="Reached maximum number of turns (40)"))

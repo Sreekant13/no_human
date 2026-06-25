@@ -29,6 +29,7 @@ from claude_agent_sdk import (
 )
 
 from . import guard
+from .supervisor import SupervisorHook
 
 
 @dataclass
@@ -92,6 +93,7 @@ class ClaudeBackend:
         never_push_to: list[str] | None = None,
         permission_mode: str = "bypassPermissions",
         readonly: bool = False,
+        supervisor_hook: SupervisorHook | None = None,
     ):
         self.model = model
         self.forbidden_paths = forbidden_paths or [".env", "secrets/", "*.key", "*.pem"]
@@ -100,11 +102,32 @@ class ClaudeBackend:
         # real safety boundary and fires even in this mode (Part 10).
         self.permission_mode = permission_mode
         self.readonly = readonly
+        self.supervisor_hook = supervisor_hook
 
     def _options(
         self, cwd: Path, max_turns: int, *, effort: str | None = None,
         resume: str | None = None,
+        supervisor_hook: SupervisorHook | None = None,
     ) -> ClaudeAgentOptions:
+        hooks: dict = {
+            "PreToolUse": [
+                HookMatcher(
+                    matcher=None,
+                    hooks=[
+                        _make_guard_hook(
+                            self.forbidden_paths,
+                            self.never_push_to,
+                            readonly=self.readonly,
+                        )
+                    ],
+                )
+            ]
+        }
+        sv = supervisor_hook or self.supervisor_hook
+        if sv is not None:
+            hooks["PostToolUse"] = [
+                HookMatcher(matcher=None, hooks=[sv.hook])
+            ]
         return ClaudeAgentOptions(
             model=self.model,
             cwd=str(cwd),
@@ -112,20 +135,7 @@ class ClaudeBackend:
             permission_mode=self.permission_mode,
             effort=effort,
             resume=resume,
-            hooks={
-                "PreToolUse": [
-                    HookMatcher(
-                        matcher=None,
-                        hooks=[
-                            _make_guard_hook(
-                                self.forbidden_paths,
-                                self.never_push_to,
-                                readonly=self.readonly,
-                            )
-                        ],
-                    )
-                ]
-            },
+            hooks=hooks,
         )
 
     async def stream(
@@ -136,9 +146,11 @@ class ClaudeBackend:
         max_turns: int,
         effort: str | None = None,
         resume: str | None = None,
+        supervisor_hook: SupervisorHook | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run the agent, yielding normalized events; the final event is ``result``."""
-        options = self._options(cwd, max_turns, effort=effort, resume=resume)
+        options = self._options(cwd, max_turns, effort=effort, resume=resume,
+                                supervisor_hook=supervisor_hook)
         # The SDK signals terminal conditions (notably hitting max_turns) by
         # *raising* a bare Exception from inside query(). It usually emits a
         # ResultMessage first ("agent done: N turns") and THEN raises, so we
@@ -217,6 +229,7 @@ class ClaudeBackend:
         effort: str | None = None,
         resume: str | None = None,
         on_event: Callable[[AgentEvent], None] | None = None,
+        supervisor_hook: SupervisorHook | None = None,
     ) -> AgentResult:
         """Run to completion, optionally forwarding each event, return the result."""
         final = AgentResult(
@@ -224,7 +237,8 @@ class ClaudeBackend:
             session_id=None, stop_reason=None,
         )
         async for event in self.stream(
-            prompt, cwd=cwd, max_turns=max_turns, effort=effort, resume=resume
+            prompt, cwd=cwd, max_turns=max_turns, effort=effort, resume=resume,
+            supervisor_hook=supervisor_hook,
         ):
             if on_event is not None:
                 on_event(event)

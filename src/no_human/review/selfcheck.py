@@ -16,6 +16,9 @@ class ChecklistItem:
     label: str
     passed: bool
     evidence: str = ""
+    file: str = ""       # file path (relative to repo root) for PR line comments
+    line: int = 0        # line number in the file for PR line comments
+    comment: str = ""    # formatted comment text for PR posting
 
 
 @dataclass
@@ -46,4 +49,7 @@ def build_prompt(task_title: str, acceptance_criteria: list[str]) -> str:
         "  [ ] No test weakened or deleted (show test-file diff)\n"
         "  [ ] Edge cases / error paths handled (cite lines)\n"
         "  [ ] Existing suite still passes (paste run)\n"
+        "  [ ] Devil's advocate: what is the most likely way this change breaks\n"
+        "      in a different environment or with different data? If you can\n"
+        "      verify it now (run a command, check a range), do so.\n"
     )

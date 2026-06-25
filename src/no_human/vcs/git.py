@@ -8,9 +8,25 @@ branch (never_push_to).
 from __future__ import annotations
 
 import fnmatch
+import re
 import subprocess
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
+
+
+# Patterns stripped from commit messages to prevent AI attribution leaking
+# into the repo history (the agent identity is set via git config, not trailers).
+_AI_ATTRIBUTION = re.compile(
+    r"\n*Co-authored-by:.*(?:Claude|anthropic|OpenAI|Copilot).*",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_commit_message(msg: str) -> str:
+    """Strip AI attribution trailers from a commit message."""
+    return _AI_ATTRIBUTION.sub("", msg).rstrip()
 
 
 class GitError(RuntimeError):
@@ -84,9 +100,14 @@ class GitRepo:
     def create_branch(self, name: str, *, base: str | None = None) -> str:
         if _branch_protected(name, self.never_push_to):
             raise ProtectedBranch(f"refusing to create protected branch: {name}")
+        # Single command: create/reset `name` at `base` and check it out. Using
+        # `base` only as a start-point (not `git checkout base` first) keeps this
+        # worktree-safe — checking out the base branch directly fails when it is
+        # already checked out in the primary worktree.
         if base:
-            self._run("checkout", base)
-        self._run("checkout", "-B", name)
+            self._run("checkout", "-B", name, base)
+        else:
+            self._run("checkout", "-B", name)
         return name
 
     # Build/cache artifacts we never commit even when a repo lacks a .gitignore.
@@ -96,6 +117,11 @@ class GitRepo:
         ":(exclude,glob)**/.pytest_cache/**",
         ":(exclude,glob)**/node_modules/**",
         ":(exclude,glob)**/.DS_Store",
+        ":(exclude,glob)**/.no_human/**",
+        ":(exclude,glob)**/.windsurf/**",
+        ":(exclude,glob)**/.devin/**",
+        ":(exclude,glob)**/.claude/**",
+        ":(exclude,glob)**/HANDOVER.md",
     )
 
     def stage_all(self) -> None:
@@ -111,7 +137,42 @@ class GitRepo:
                 f"refusing to commit on protected branch: {branch}"
             )
         self.stage_all()
-        self._run("commit", "-m", message)
+        self._run("commit", "-m", _sanitize_commit_message(message))
+        return CommitResult(branch=branch, sha=self.head_sha(), **self._diffstat())
+
+    def commit_paths(self, paths: list[str], message: str) -> CommitResult:
+        """Stage and commit only the listed *paths* — files the agent
+        intentionally wrote/edited.  Test side-effects (e.g. state files
+        mutated by running vitest) are left unstaged.
+
+        Falls back to :meth:`commit_all` if none of the paths carry changes
+        (the agent may have done all its work via Bash tool, which we can't
+        track file-by-file).
+        """
+        branch = self.current_branch()
+        if _branch_protected(branch, self.never_push_to):
+            raise ProtectedBranch(
+                f"refusing to commit on protected branch: {branch}"
+            )
+        # Resolve paths relative to the repo root.
+        from pathlib import Path
+        repo_root = Path(self.path).resolve()
+        rel_paths: list[str] = []
+        for p in paths:
+            abs_p = Path(p).resolve()
+            try:
+                rel = str(abs_p.relative_to(repo_root))
+            except ValueError:
+                continue  # outside the repo — skip
+            rel_paths.append(rel)
+        if rel_paths:
+            self._run("add", "--", *rel_paths)
+        # If no files were actually staged (e.g. agent only used Bash to
+        # create files), fall back to stage_all so the commit isn't empty.
+        staged = self._run("diff", "--cached", "--name-only", check=False).strip()
+        if not staged:
+            self.stage_all()
+        self._run("commit", "-m", _sanitize_commit_message(message))
         return CommitResult(branch=branch, sha=self.head_sha(), **self._diffstat())
 
     def _diffstat(self) -> dict[str, int]:
@@ -134,6 +195,26 @@ class GitRepo:
         out = self._run("diff", "--name-only", ref, "HEAD", check=False)
         return [f for f in out.splitlines() if f]
 
+    def fetch(self, remote: str = "origin", *, prune: bool = True,
+              timeout: int = 30) -> None:
+        """Fetch latest refs from ``remote``.
+
+        Called before deriving a base branch so we never branch off stale
+        state (e.g. remote moved because a PR was merged or another task
+        pushed).  Best-effort: a fetch failure is logged, never fatal —
+        offline work still functions on the last-known refs.
+        """
+        args = ["fetch", remote]
+        if prune:
+            args.append("--prune")
+        try:
+            subprocess.run(
+                ["git", *args],
+                cwd=self.path, capture_output=True, text=True, timeout=timeout,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            pass  # best-effort; offline work must still function
+
     def remote_url(self, remote: str = "origin") -> str | None:
         out = self._run("remote", "get-url", remote, check=False)
         return out or None
@@ -148,3 +229,72 @@ class GitRepo:
             args += ["-u"]
         args += [remote, branch]
         return self._run(*args)
+
+    # ----------------------------- worktrees ------------------------------- #
+    # Phase 7 foundation: per-task isolation. A linked git worktree gives a task
+    # its own working tree, index, and HEAD while sharing the repo's object store
+    # — so concurrent tasks (even in the SAME repo) never clobber each other's
+    # files or branch checkout. Cheaper than a full clone.
+
+    def add_worktree(
+        self, worktree_path: Path | str, *, base: str, branch: str | None = None,
+        create: bool = True, detach: bool = False,
+    ) -> "GitRepo":
+        """Create a linked worktree at ``worktree_path``. Modes:
+          - ``detach=True``: detached HEAD at ``base`` — the caller then creates
+            the attempt branch inside (the orchestrator's per-task worktree).
+          - ``create`` + ``branch``: new ``branch`` off ``base``.
+          - ``create=False`` + ``branch``: attach an existing branch (resume).
+        Returns a GitRepo rooted there with this repo's identity + protection
+        rules. Refuses a protected branch name."""
+        wt = Path(worktree_path).expanduser()
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        if detach:
+            self._run("worktree", "add", "--detach", str(wt), base)
+        else:
+            if not branch:
+                raise GitError("add_worktree requires branch unless detach=True")
+            if _branch_protected(branch, self.never_push_to):
+                raise ProtectedBranch(
+                    f"refusing to create worktree on protected branch: {branch}")
+            if create:
+                self._run("worktree", "add", "-b", branch, str(wt), base)
+            else:
+                self._run("worktree", "add", str(wt), branch)
+        return GitRepo(
+            wt,
+            identity_name=self.identity_name,
+            identity_email=self.identity_email,
+            never_push_to=list(self.never_push_to),
+        )
+
+    def remove_worktree(self, worktree_path: Path | str, *, force: bool = True) -> None:
+        """Remove a linked worktree (and prune its admin files). Best-effort:
+        a missing/already-removed worktree is not an error."""
+        wt = Path(worktree_path).expanduser()
+        args = ["worktree", "remove"]
+        if force:
+            args.append("--force")
+        args.append(str(wt))
+        self._run(*args, check=False)
+        self._run("worktree", "prune", check=False)
+
+    def list_worktrees(self) -> list[str]:
+        """Absolute paths of all worktrees (including the main one)."""
+        out = self._run("worktree", "list", "--porcelain", check=False)
+        return [ln.split(" ", 1)[1] for ln in out.splitlines()
+                if ln.startswith("worktree ")]
+
+    @contextmanager
+    def worktree(
+        self, worktree_path: Path | str, *, base: str, branch: str,
+        create: bool = True, cleanup: bool = True,
+    ) -> Iterator["GitRepo"]:
+        """Scoped worktree: yields the worktree GitRepo and removes it on exit
+        (set ``cleanup=False`` to preserve it across a park/resume boundary)."""
+        wt = self.add_worktree(worktree_path, base=base, branch=branch, create=create)
+        try:
+            yield wt
+        finally:
+            if cleanup:
+                self.remove_worktree(worktree_path)

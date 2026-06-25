@@ -85,6 +85,43 @@ class GitLabCI(CIBackend):
                 await asyncio.sleep(_INFRA_BACKOFF_SECONDS)
         return result  # still infra failure after retries
 
+    async def check_status(self, pipeline_id: str) -> CIResult:
+        """Non-blocking status check of an existing pipeline."""
+        return await asyncio.to_thread(self._check_pipeline, pipeline_id)
+
+    def _check_pipeline(self, pipeline_id: str) -> CIResult:
+        """Blocking single poll of a pipeline."""
+        encoded = urllib.parse.quote(self.project, safe="")
+        raw_status = self._get_pipeline_status(pipeline_id, encoded)
+        if raw_status is None:
+            return CIResult(
+                pipeline_id=pipeline_id,
+                pipeline_url="",
+                status=PipelineStatus.UNKNOWN,
+                infra_failure=True,
+                parsed_output="pipeline status API call failed",
+            )
+        try:
+            status = PipelineStatus(raw_status)
+        except ValueError:
+            status = PipelineStatus.UNKNOWN
+
+        if status.is_terminal:
+            jobs = self._get_jobs(pipeline_id, encoded)
+            infra = status == PipelineStatus.FAILED and _is_infra_failure(jobs)
+            return CIResult(
+                pipeline_id=pipeline_id,
+                pipeline_url=f"https://{self.hostname}/{self.project}/-/pipelines/{pipeline_id}",
+                status=status,
+                jobs=jobs,
+                infra_failure=infra,
+            )
+        return CIResult(
+            pipeline_id=pipeline_id,
+            pipeline_url=f"https://{self.hostname}/{self.project}/-/pipelines/{pipeline_id}",
+            status=status,
+        )
+
     def _trigger_and_wait(
         self, branch: str, variables: dict[str, str]
     ) -> CIResult:

@@ -55,7 +55,21 @@ class Store:
     async def _migrate(self) -> None:
         for sql_file in sorted(MIGRATIONS_DIR.glob("*.sql")):
             await self.db.executescript(sql_file.read_text())
+        await self._ensure_task_columns()
         await self.db.commit()
+
+    async def _ensure_task_columns(self) -> None:
+        """Add columns that SQLite cannot create idempotently in a .sql file
+        (no ADD COLUMN IF NOT EXISTS). Safe to run on every connect."""
+        cur = await self.db.execute("PRAGMA table_info(tasks)")
+        existing = {row["name"] for row in await cur.fetchall()}
+        wanted = {
+            "kind": "TEXT DEFAULT 'feature'",
+            "linked_repos": "TEXT",  # JSON list of additional repo paths
+        }
+        for col, decl in wanted.items():
+            if col not in existing:
+                await self.db.execute(f"ALTER TABLE tasks ADD COLUMN {col} {decl}")
 
     # ----------------------------- tasks ---------------------------------- #
 
@@ -122,6 +136,7 @@ class Store:
                  external_id=:external_id, source=:source, title=:title,
                  description=:description, requirements=:requirements,
                  acceptance_criteria=:acceptance_criteria, repo_path=:repo_path,
+                 kind=:kind,
                  status=:status, blocker=:blocker, wake_check_at=:wake_check_at,
                  priority=:priority, context=:context, plan=:plan, config=:config,
                  updated_at=:updated_at
@@ -277,3 +292,12 @@ class Store:
         )
         row = await cur.fetchone()
         return ProjectProfile.from_dict(json.loads(row["data"])) if row else None
+
+    async def list_profiles(self) -> list[dict[str, Any]]:
+        """Return all onboarded repo profiles as dicts."""
+        cur = await self.db.execute(
+            "SELECT repo_path, ecosystem, confirmed, data FROM project_profiles "
+            "ORDER BY repo_path"
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]

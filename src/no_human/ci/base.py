@@ -19,9 +19,16 @@ class HumanGatedCI(Exception):
     Jenkins image build). The orchestrator parks the task with a wake condition
     rather than faking or skipping the step."""
 
-    def __init__(self, message: str, wake_hint: str = ""):
+    def __init__(self, message: str, wake_hint: str = "",
+                 kind: str = "", name: str = ""):
         super().__init__(message)
         self.wake_hint = wake_hint
+        self.kind = kind
+        self.name = name
+
+    def to_dict(self) -> dict[str, str]:
+        return {"message": str(self), "wake_hint": self.wake_hint,
+                "kind": self.kind, "name": self.name}
 
 
 class PipelineStatus(str, Enum):
@@ -63,6 +70,13 @@ class CIResult:
     status: PipelineStatus
     jobs: list[JobResult] = field(default_factory=list)
     infra_failure: bool = False
+    # An access/permission wall (401/403, missing token, forbidden) — distinct
+    # from a transient infra failure: retrying won't help, only a human granting
+    # access will. The orchestrator routes this to a MISSING_ACCESS blocker.
+    access_failure: bool = False
+    # The exact ~/.no_human/.env key the human must set to clear an access wall
+    # (e.g. "JENKINS_API_TOKEN"), so the escalation names it precisely (WS-F).
+    access_env_key: str = ""
     parsed_output: str = ""
 
     @property
@@ -75,7 +89,9 @@ class CIResult:
 
     @property
     def summary(self) -> str:
-        if self.infra_failure:
+        if self.access_failure:
+            verdict = "ACCESS-DENIED"
+        elif self.infra_failure:
             verdict = "INFRA-FAIL"
         elif self.passed:
             verdict = "PASS"
@@ -90,6 +106,7 @@ class CIResult:
             "pipeline_url": self.pipeline_url,
             "status": self.status.value,
             "infra_failure": self.infra_failure,
+            "access_failure": self.access_failure,
             "passed": self.passed,
             "jobs": [{"name": j.name, "status": j.status,
                       "failure_reason": j.failure_reason} for j in self.jobs],
@@ -116,3 +133,13 @@ class CIBackend(ABC):
         """Trigger CI for ``branch``, wait for a terminal status, return the
         parsed result. Raise ``HumanGatedCI`` if a human must start the run."""
         raise NotImplementedError
+
+    async def check_status(self, pipeline_id: str) -> CIResult:
+        """Non-blocking poll of an existing pipeline. Returns immediately with
+        the current status. Subclasses should override; the default returns
+        UNKNOWN (safe fallback — WakeWatcher will re-check next tick)."""
+        return CIResult(
+            pipeline_id=pipeline_id,
+            pipeline_url="",
+            status=PipelineStatus.UNKNOWN,
+        )

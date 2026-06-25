@@ -50,8 +50,14 @@ class CodebaseSource:
     _EXCLUDE_DIRS = (
         ".git", "node_modules", "dist", "build", "target", ".venv", "venv",
         "vendor", "__pycache__", ".idea", ".gradle", "coverage", "out",
+        ".next", ".nuxt", ".cache", "public", "static",
     )
-    _EXCLUDE_GLOBS = ("*.min.js", "*.map", "*.lock", "*.snap", "*.bundle.js")
+    _EXCLUDE_GLOBS = (
+        "*.min.js", "*.map", "*.lock", "*.snap", "*.bundle.js",
+        "*.svg", "*.png", "*.jpg", "*.ico", "*.woff*", "*.ttf",
+        "*.pyc", "*.class", "*.jar",
+    )
+    _SEARCH_TIMEOUT = 20  # must be < ContextGatherer.per_source_timeout (30s)
 
     def _search(self, repo: Path, terms: list[str]) -> dict[Path, list[str]]:
         """Return {file: matched lines} ranked by hit count, using rg or grep."""
@@ -61,7 +67,7 @@ class CodebaseSource:
         hits: dict[Path, list[str]] = {}
         if shutil.which("rg"):
             cmd = ["rg", "-n", "--no-heading", "-i", "--max-columns", "200",
-                   "--max-count", "5", "-e", pattern]
+                   "--max-count", "5", "--max-filesize", "256K", "-e", pattern]
             for d in self._EXCLUDE_DIRS:
                 cmd += ["--glob", f"!**/{d}/**"]
             for g in self._EXCLUDE_GLOBS:
@@ -74,7 +80,13 @@ class CodebaseSource:
             for g in self._EXCLUDE_GLOBS:
                 cmd.append(f"--exclude={g}")
             cmd.append(str(repo))
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=self._SEARCH_TIMEOUT)
+        except subprocess.TimeoutExpired as exc:
+            # Return partial results from whatever stdout was captured.
+            proc_stdout = (exc.stdout or b"").decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            proc = type("R", (), {"stdout": proc_stdout, "returncode": -1})()
         for line in proc.stdout.splitlines():
             parts = line.split(":", 2)
             if len(parts) < 3:

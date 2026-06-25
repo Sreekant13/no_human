@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from ..core.db import Store
 from ..core.task import Task, TaskStatus
@@ -30,6 +30,10 @@ log = logging.getLogger("no_human.wake")
 # Async hooks the host wires in (live PR/CI lookups). Default: not satisfied.
 PrMergedChecker = Callable[[str], Awaitable[bool]]
 CiGreenChecker = Callable[[str], Awaitable[bool]]
+# Returns (is_terminal, is_success) for a pipeline ID.
+CiTerminalChecker = Callable[[str], Awaitable[tuple[bool, bool]]]
+# Returns list of new PrComment objects for a PR ref.
+PrCommentChecker = Callable[[str], Awaitable[list[Any]]]
 
 _DURATION = re.compile(r"(\d+)\s*([smhd])", re.IGNORECASE)
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -68,6 +72,8 @@ class WakeWatcher:
         *,
         pr_merged: PrMergedChecker | None = None,
         ci_green: CiGreenChecker | None = None,
+        ci_terminal: CiTerminalChecker | None = None,
+        pr_comment: PrCommentChecker | None = None,
         on_event: Callable[[str, str], None] | None = None,
     ):
         self.store = store
@@ -77,6 +83,8 @@ class WakeWatcher:
         ) or timedelta(hours=48)
         self._pr_merged = pr_merged
         self._ci_green = ci_green
+        self._ci_terminal = ci_terminal
+        self._pr_comment = pr_comment
         self._on_event = on_event or (lambda kind, text: None)
 
     # ----------------------------- condition ------------------------------- #
@@ -108,6 +116,28 @@ class WakeWatcher:
                 return await self._ci_green(branch)
             except Exception as exc:  # noqa: BLE001 — checker must never crash watcher
                 log.warning("ci_green checker failed: %s", exc)
+                return False
+
+        if low.startswith("pr_comment_on:"):
+            pr_ref = cond.split(":", 1)[1].strip()
+            if self._pr_comment is None:
+                return False
+            try:
+                comments = await self._pr_comment(pr_ref)
+                return len(comments) > 0
+            except Exception as exc:  # noqa: BLE001
+                log.warning("pr_comment checker failed: %s", exc)
+                return False
+
+        if low.startswith("ci_terminal_on:"):
+            pipeline_ref = cond.split(":", 1)[1].strip()
+            if self._ci_terminal is None:
+                return False
+            try:
+                is_terminal, _is_success = await self._ci_terminal(pipeline_ref)
+                return is_terminal
+            except Exception as exc:  # noqa: BLE001
+                log.warning("ci_terminal checker failed: %s", exc)
                 return False
 
         ref = None
@@ -158,6 +188,9 @@ class WakeWatcher:
                 condition, raised_at=raised_at, now=now, wake_check_at=wake_check_at,
             )
             if satisfied:
+                # If the condition is pr_comment_on, inject the comments as feedback.
+                if condition and condition.strip().lower().startswith("pr_comment_on:"):
+                    await self._inject_pr_feedback(task, condition)
                 return await self._resume(task)
 
         # Timeout → escalate (never silently abandon).
@@ -181,6 +214,53 @@ class WakeWatcher:
         await self.store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
         self._on_event("resumed", f"{task.id[:8]} wake condition satisfied")
         return "resumed"
+
+    async def _inject_pr_feedback(self, task: Task, condition: str) -> None:
+        """Fetch PR comments and thread them into send_back_feedback."""
+        if self._pr_comment is None:
+            return
+        pr_ref = condition.split(":", 1)[1].strip()
+        try:
+            comments = await self._pr_comment(pr_ref)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("failed to fetch PR comments for injection: %s", exc)
+            return
+        if not comments:
+            return
+        ctx = task.context or {}
+        feedback = ctx.get("send_back_feedback") or []
+        for c in comments:
+            # Support both PrComment objects and plain dicts.
+            if hasattr(c, "body"):
+                msg = c.body
+                author = c.author if hasattr(c, "author") else "reviewer"
+                path = getattr(c, "path", None)
+                line = getattr(c, "line", None)
+                diff_hunk = getattr(c, "diff_hunk", None)
+                created = getattr(c, "created_at", "") or now_iso()
+            else:
+                msg = str(c)
+                author = "reviewer"
+                path = line = diff_hunk = None
+                created = now_iso()
+            if path:
+                loc = f"{path}"
+                if line:
+                    loc += f":{line}"
+                msg = f"[{loc}] {msg}"
+            if diff_hunk:
+                msg += f"\n\nContext:\n```\n{str(diff_hunk)[:500]}\n```"
+            feedback.append({
+                "at": created,
+                "message": msg,
+                "author": author,
+                "source": "pr_comment",
+            })
+        ctx["send_back_feedback"] = feedback
+        ctx["pr_comment_ref"] = pr_ref
+        task.context = ctx
+        await self.store.update_task(task)
+        self._on_event("pr_feedback", f"{task.id[:8]} got {len(comments)} PR comment(s)")
 
     async def _escalate_timeout(self, task: Task, blocker: Blocker | None) -> None:
         data = task.blocker or {}

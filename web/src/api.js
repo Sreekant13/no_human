@@ -208,6 +208,12 @@ export const analyzeHistory    = (days = 30) => _post("/api/onboarding/history/a
 export const confirmRules      = (ids)     => _post("/api/onboarding/rules/confirm", { ids });
 export const completeOnboarding = (payload) => _post("/api/onboarding/complete", payload);
 
+export async function suggestPaths(path) {
+  const r = await fetch(`${BASE}/api/fs/suggest?path=${encodeURIComponent(path || "")}`);
+  if (!r.ok) return { suggestions: [] };
+  return r.json();
+}
+
 // ── WebSocket ───────────────────────────────────────────────────────────────
 
 export function connectWS(onMessage) {

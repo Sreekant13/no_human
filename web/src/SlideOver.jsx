@@ -310,6 +310,7 @@ function eventSource(e) {
 }
 const ROLE_LABEL = { worker: "Worker", supervisor: "Supervisor", reviewer: "Reviewer" };
 
+
 function ActivityTab({ taskId, isActive }) {
   const [events, setEvents] = useState([]);
   const endRef = useRef(null);
@@ -506,10 +507,27 @@ function BlockerSection({ blocker: b }) {
   );
 }
 
-// Extract the unified-diff hunk covering `file:line` from the already-fetched
-// full diff, so each review comment can show its exact code context with no
-// extra backend round-trip. Returns the hunk's lines (incl. the @@ header) or
-// null. Falls back to the file's first hunk when the line isn't pinned.
+// Extract the unified-diff hunk for `file:line` and trim to ±CTX lines around
+// the target so each review comment shows only the relevant snippet.
+const HUNK_CTX = 7;
+
+function trimToTarget(body, targetLine) {
+  if (body.length <= HUNK_CTX * 2 + 2) return body;
+  const m = body[0].match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/);
+  if (!m || !targetLine || targetLine <= 0) return body.slice(0, HUNK_CTX * 2 + 1);
+  let cur = parseInt(m[1], 10) - 1;
+  let idx = -1;
+  for (let i = 1; i < body.length; i++) {
+    if (!body[i].startsWith("-")) cur++;
+    if (cur === targetLine) { idx = i; break; }
+    if (cur > targetLine + 2) break;
+  }
+  if (idx < 0) return body.slice(0, HUNK_CTX * 2 + 1);
+  const from = Math.max(1, idx - HUNK_CTX);
+  const to   = Math.min(body.length - 1, idx + HUNK_CTX);
+  return [body[0], ...body.slice(from, to + 1)];
+}
+
 function extractHunk(diff, file, line) {
   if (!diff || !file) return null;
   const lines = diff.split("\n");
@@ -531,16 +549,16 @@ function extractHunk(diff, file, line) {
     if (!m) continue;
     const start = parseInt(m[1], 10);
     const count = m[2] ? parseInt(m[2], 10) : 1;
-    const end = start + count - 1;
-    const body = [lines[j]];
+    const end   = start + count - 1;
+    const body  = [lines[j]];
     let k = j + 1;
     while (k < secEnd && !lines[k].startsWith("@@") && !lines[k].startsWith("diff --git")) {
       body.push(lines[k]); k++;
     }
-    if (!line || line <= 0) { if (!best) best = body; continue; }
-    if (line >= start - 2 && line <= end + 2) return body;  // direct hit
+    if (!line || line <= 0) { if (!best) best = trimToTarget(body, -1); continue; }
+    if (line >= start - 2 && line <= end + 2) return trimToTarget(body, line);
     const dist = Math.min(Math.abs(line - start), Math.abs(line - end));
-    if (dist < bestDist) { bestDist = dist; best = body; }  // else keep nearest
+    if (dist < bestDist) { bestDist = dist; best = trimToTarget(body, line); }
   }
   return best;
 }
@@ -549,11 +567,13 @@ function CommentHunk({ diff, file, line }) {
   const hunk = extractHunk(diff, file, line);
   if (!hunk) return null;
   return (
-    <pre className="diff-pre comment-hunk">
-      {hunk.map((l, idx) => (
-        <div key={idx} className={`diff-line ${diffLineClass(l)}`}>{l || " "}</div>
-      ))}
-    </pre>
+    <div className="ci-hunk">
+      <pre className="diff-pre">
+        {hunk.map((l, idx) => (
+          <div key={idx} className={`diff-line ${diffLineClass(l)}`}>{l || " "}</div>
+        ))}
+      </pre>
+    </div>
   );
 }
 
@@ -654,29 +674,34 @@ function ReviewTab({ task, diff }) {
         <div className="so-checklist">
           {checklist.items.map((item, i) => (
             <div key={i} className={`checklist-item ${item.passed ? "pass" : "fail"}`}>
-              <div className="checklist-icon">{item.passed ? "✓" : "✗"}</div>
-              <div className="checklist-content">
-                <div className="checklist-text">{item.label}</div>
+              {/* header row: icon + title + file chip */}
+              <div className="ci-header">
+                <span className="ci-icon">{item.passed ? "✓" : "✗"}</span>
+                <span className="ci-title">{item.label}</span>
                 {item.file && (
-                  <div className="checklist-file">
-                    {item.file}{item.line > 0 ? `:${item.line}` : ""}
-                  </div>
+                  <span className="ci-filechip" title={item.file + (item.line > 0 ? `:${item.line}` : "")}>
+                    {item.file.split("/").slice(-2).join("/")}{item.line > 0 ? `:${item.line}` : ""}
+                  </span>
                 )}
-                {item.file && <CommentHunk diff={diff} file={item.file} line={item.line} />}
-                {item.comment && (
-                  <div className="checklist-comment">{item.comment}</div>
-                )}
-                {item.evidence && item.evidence !== item.comment && (
-                  <div className="checklist-evidence">{item.evidence}</div>
+                {hasPrUrl && !item.passed && posted[i] === "ok" && (
+                  <span className="post-badge post-ok ci-badge">Posted</span>
                 )}
               </div>
-              {hasPrUrl && !item.passed && (
-                <div className="checklist-post-action">
-                  {posted[i] === "ok" ? (
-                    <span className="post-badge post-ok">Posted</span>
-                  ) : posted[i] === "error" ? (
+              {/* failed items get code hunk + comment */}
+              {!item.passed && item.file && (
+                <CommentHunk diff={diff} file={item.file} line={item.line} />
+              )}
+              {!item.passed && item.comment && (
+                <div className="ci-comment">{item.comment}</div>
+              )}
+              {!item.passed && item.evidence && item.evidence !== item.comment && (
+                <div className="ci-evidence">{item.evidence}</div>
+              )}
+              {hasPrUrl && !item.passed && posted[i] !== "ok" && (
+                <div className="ci-post-row">
+                  {posted[i] === "error" ? (
                     <button className="btn btn-post-retry" onClick={() => handlePostOne(i)}>
-                      Retry
+                      Retry posting
                     </button>
                   ) : (
                     <button
@@ -684,7 +709,7 @@ function ReviewTab({ task, diff }) {
                       onClick={() => handlePostOne(i)}
                       disabled={posted[i] === "busy"}
                     >
-                      {posted[i] === "busy" ? "…" : "Post to PR"}
+                      {posted[i] === "busy" ? "Posting…" : "Post to PR"}
                     </button>
                   )}
                 </div>

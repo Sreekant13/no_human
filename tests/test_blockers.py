@@ -338,6 +338,77 @@ async def test_timeout_escalates(store):
 
 
 @pytest.mark.asyncio
+async def test_ci_terminal_checker_resumes_when_terminal(store):
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={"category": "DEPENDENCY_WAIT",
+                 "wake_condition": "ci_terminal_on:12345",
+                 "raised_at": now.isoformat(), "confidence": 0.9},
+    )
+
+    async def ci_terminal(pipeline_id):
+        return (True, True)  # terminal + success
+
+    watcher = WakeWatcher(store, _cfg(), ci_terminal=ci_terminal)
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") in actions
+
+
+@pytest.mark.asyncio
+async def test_ci_terminal_checker_not_terminal_yet(store):
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={"category": "DEPENDENCY_WAIT",
+                 "wake_condition": "ci_terminal_on:12345",
+                 "raised_at": now.isoformat(), "confidence": 0.9},
+    )
+
+    async def ci_terminal(pipeline_id):
+        return (False, False)  # still running
+
+    watcher = WakeWatcher(store, _cfg(), ci_terminal=ci_terminal)
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") not in actions
+
+
+@pytest.mark.asyncio
+async def test_ci_terminal_checker_failure_safe(store):
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={"category": "DEPENDENCY_WAIT",
+                 "wake_condition": "ci_terminal_on:12345",
+                 "raised_at": now.isoformat(), "confidence": 0.9},
+    )
+
+    async def ci_terminal(pipeline_id):
+        raise RuntimeError("API down")
+
+    watcher = WakeWatcher(store, _cfg(), ci_terminal=ci_terminal)
+    actions = await watcher.tick(now=now)
+    # Checker failure → not satisfied, but also not crashed.
+    assert (t.id, "resumed") not in actions
+
+
+@pytest.mark.asyncio
+async def test_ci_terminal_no_checker_not_satisfied(store):
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={"category": "DEPENDENCY_WAIT",
+                 "wake_condition": "ci_terminal_on:12345",
+                 "raised_at": now.isoformat(), "confidence": 0.9},
+    )
+
+    # No ci_terminal checker wired → never satisfied.
+    watcher = WakeWatcher(store, _cfg())
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") not in actions
+
+
+@pytest.mark.asyncio
 async def test_awaiting_input_does_not_auto_resume(store):
     now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
     t = await _park(

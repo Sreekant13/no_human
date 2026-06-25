@@ -63,6 +63,11 @@ def ci_from_config(config: dict[str, Any]) -> CIBackend | None:
         return JenkinsCI(
             job=job,
             base_url=ci_conf.get("base_url", "https://build.example.com"),
+            mode=ci_conf.get("mode", "watch"),
+            timeout_minutes=int(ci_conf.get("timeout_minutes", 60)),
+            max_infra_retries=int(ci_conf.get("max_infra_retries", 2)),
+            poll_interval=int(ci_conf.get("poll_interval", 30)),
+            result_parser=ci_conf.get("result_parser", "surefire"),
             wake_hint=ci_conf.get("wake_hint", ""),
         )
 

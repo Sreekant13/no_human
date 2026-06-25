@@ -1,0 +1,4 @@
+-- WS-A: task-type routing. `kind` tags a task with the pipeline it routes to:
+-- feature | bugfix | ci_fix | traceability | test_gap. The column is added
+-- defensively in Python (`Store._ensure_task_columns`) for already-created DBs,
+-- since SQLite has no ADD COLUMN IF NOT EXISTS; this file documents the column.

@@ -84,6 +84,14 @@ def _allowed_transitions() -> dict[TaskStatus, frozenset[TaskStatus]]:
     for state in _ACTIVE:
         table[state] |= _OFF_RAMPS
 
+    # PENDING can fail immediately (e.g. no repo_path set).
+    table[TaskStatus.PENDING].add(TaskStatus.FAILED)
+
+    # code_review tasks skip planning/implementing and go straight to reviewing.
+    table[TaskStatus.CONTEXT].add(TaskStatus.REVIEWING)
+    # code_review completes directly after review (no approval gate).
+    table[TaskStatus.REVIEWING].add(TaskStatus.DONE)
+
     # reviewing can loop back to implementing when the gate fails (within bounds)
     table[TaskStatus.REVIEWING].add(TaskStatus.IMPLEMENTING)
     table[TaskStatus.TESTING].add(TaskStatus.IMPLEMENTING)
@@ -138,6 +146,8 @@ class Task:
     requirements: list[str] = field(default_factory=list)
     acceptance_criteria: list[str] = field(default_factory=list)
     repo_path: str | None = None
+    kind: str = "feature"           # WS-A task type: feature|bugfix|ci_fix|traceability|test_gap
+    linked_repos: list[str] = field(default_factory=list)  # WS-E: additional repo paths
     blocker: dict[str, Any] | None = None
     wake_check_at: str | None = None
     priority: str = "medium"
@@ -149,7 +159,8 @@ class Task:
 
     @staticmethod
     def new(title: str, *, source: str = "freeform", repo_path: str | None = None,
-            description: str | None = None, external_id: str | None = None) -> "Task":
+            description: str | None = None, external_id: str | None = None,
+            kind: str = "feature") -> "Task":
         return Task(
             id=uuid.uuid4().hex,
             source=source,
@@ -157,6 +168,7 @@ class Task:
             description=description,
             repo_path=repo_path,
             external_id=external_id,
+            kind=kind,
         )
 
     def to_row(self) -> dict[str, Any]:
@@ -170,6 +182,8 @@ class Task:
             "requirements": json.dumps(self.requirements),
             "acceptance_criteria": json.dumps(self.acceptance_criteria),
             "repo_path": self.repo_path,
+            "kind": self.kind,
+            "linked_repos": json.dumps(self.linked_repos),
             "status": self.status.value,
             "blocker": json.dumps(self.blocker) if self.blocker else None,
             "wake_check_at": self.wake_check_at,
@@ -192,6 +206,8 @@ class Task:
             requirements=json.loads(row["requirements"] or "[]"),
             acceptance_criteria=json.loads(row["acceptance_criteria"] or "[]"),
             repo_path=row["repo_path"],
+            kind=row.get("kind") or "feature",
+            linked_repos=json.loads(row.get("linked_repos") or "[]"),
             status=TaskStatus(row["status"]),
             blocker=json.loads(row["blocker"]) if row["blocker"] else None,
             wake_check_at=row["wake_check_at"],

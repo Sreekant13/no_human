@@ -1,0 +1,231 @@
+"""Phase 7.3/7.4: the concurrent scheduler — pool cap, no double-dispatch,
+shared-quota gate, wake integration. Uses a controllable fake orchestrator so the
+scheduling logic is tested in isolation (the real run_task is covered elsewhere)."""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import pytest
+
+from no_human.core.db import Store
+from no_human.core.scheduler import Scheduler
+from no_human.core.task import Task, TaskStatus
+
+
+@pytest.fixture
+async def store(tmp_path):
+    s = await Store(tmp_path / "nh.db").connect()
+    yield s
+    await s.close()
+
+
+class FakeOrch:
+    """Records run_task calls; optionally blocks on a gate; sets a terminal DB
+    status so finished tasks aren't re-claimed."""
+
+    def __init__(self, store, *, hold=None, terminal=TaskStatus.AWAITING_APPROVAL,
+                 quota_first=False, quota_resets=None):
+        self.store = store
+        self.hold = hold
+        self.terminal = terminal
+        self.quota_first = quota_first
+        self.quota_resets = quota_resets
+        self.started: list[str] = []
+        self.max_concurrent = 0
+        self._active = 0
+
+    async def run_task(self, task):
+        self.started.append(task.id)
+        self._active += 1
+        self.max_concurrent = max(self.max_concurrent, self._active)
+        try:
+            if self.hold is not None:
+                await self.hold.wait()
+            if self.quota_first and len(self.started) == 1:
+                task.wake_check_at = self.quota_resets
+                await self.store.set_status(task, TaskStatus.PAUSED_QUOTA,
+                                            validate=False)
+                return SimpleNamespace(status=TaskStatus.PAUSED_QUOTA, task=task)
+            await self.store.set_status(task, self.terminal, validate=False)
+            return SimpleNamespace(status=self.terminal, task=task)
+        finally:
+            self._active -= 1
+
+
+async def _mk_tasks(store, n):
+    ids = []
+    for i in range(n):
+        t = Task.new(f"task {i}", repo_path="/tmp/x")
+        await store.create_task(t)
+        ids.append(t.id)
+    return ids
+
+
+async def test_pool_cap_and_no_double_dispatch(store):
+    hold = asyncio.Event()
+    fake = FakeOrch(store, hold=hold)
+    sched = Scheduler(store, lambda: fake, max_workers=2)
+    await _mk_tasks(store, 3)
+
+    started1 = await sched.tick()
+    assert len(started1) == 2                 # capped at max_workers
+    assert len(sched.inflight) == 2
+
+    started2 = await sched.tick()
+    assert started2 == []                      # pool full → nothing new
+    assert len(sched.inflight) == 2            # no double-dispatch
+
+    hold.set()
+    await asyncio.sleep(0.05)                   # let the 2 finish
+    assert len(sched.inflight) == 0
+
+    started3 = await sched.tick()
+    assert len(started3) == 1                   # the third task now runs
+    await asyncio.sleep(0.05)
+    assert fake.max_concurrent == 2             # never exceeded the cap
+
+
+async def test_inflight_task_not_reclaimed(store):
+    fake = FakeOrch(store, hold=asyncio.Event())  # never releases
+    sched = Scheduler(store, lambda: fake, max_workers=4)
+    ids = await _mk_tasks(store, 2)
+
+    await sched.tick()
+    assert len(sched.inflight) == 2
+    # A second tick must not re-dispatch the same still-running tasks.
+    again = await sched.tick()
+    assert again == []
+    assert sched.inflight == set(ids)
+
+
+async def test_quota_pause_gates_the_whole_pool(store):
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc)
+    resets = (now + timedelta(hours=1)).isoformat()
+    fake = FakeOrch(store, quota_first=True, quota_resets=resets)
+    sched = Scheduler(store, lambda: fake, max_workers=2)
+    await _mk_tasks(store, 1)
+
+    await sched.tick(now=now)
+    await asyncio.sleep(0.05)                    # first task parks PAUSED_QUOTA
+    assert sched._quota_cooldown_until is not None
+
+    # A new task arrives, but the pool is paused until the reset time.
+    await _mk_tasks(store, 1)
+    during = await sched.tick(now=now + timedelta(minutes=10))
+    assert during == []                           # gated pool-wide
+
+    after = await sched.tick(now=now + timedelta(hours=2))
+    assert len(after) == 1                         # resumes once quota is back
+
+
+def _git(cwd, *args):
+    import subprocess
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _make_work_repo(tmp_path, name):
+    import subprocess
+    bare = tmp_path / f"{name}.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare)], check=True,
+                   capture_output=True)
+    work = tmp_path / name
+    work.mkdir()
+    _git(work, "init", "-b", "main")
+    _git(work, "config", "user.email", "u@e.com")
+    _git(work, "config", "user.name", "u")
+    (work / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    (work / "test_calc.py").write_text(
+        "from calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "init")
+    _git(work, "remote", "add", "origin", str(bare))
+    _git(work, "push", "-u", "origin", "main")
+    return work
+
+
+async def test_two_repos_run_concurrently_in_worktrees(store, tmp_path):
+    """Phase 7 DoD: two tasks in DIFFERENT repos run through the pool, each in its
+    own worktree, both open a PR — with no git corruption."""
+    from no_human.agent.claude_backend import AgentResult
+    from no_human.config import load_config
+    from no_human.core.orchestrator import Orchestrator
+    from no_human.notify.slack import SlackNotifier
+    from no_human.review.reviewer import ReviewDecision
+    from no_human.review.selfcheck import ChecklistItem
+    from no_human.vcs import GitRepo
+
+    repo_a = _make_work_repo(tmp_path, "metrics-core")
+    repo_b = _make_work_repo(tmp_path, "analytics-export")
+
+    def mutate(cwd):
+        from pathlib import Path
+        (Path(cwd) / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+        (Path(cwd) / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+    class Backend:
+        async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                      on_event=None, supervisor_hook=None):
+            mutate(cwd)
+            return AgentResult(final_text="done", num_turns=1, is_error=False,
+                               tokens_used=10, session_id="s", stop_reason="end_turn")
+
+    class Reviewer:
+        async def review(self, task, *, repo_path, **kw):
+            return ReviewDecision(passed=True,
+                                  checklist=[ChecklistItem("ok", True, "calc.py:3")])
+
+    cfg = load_config(tmp_path / "config.yaml")
+    cfg.data["concurrency"] = {"enabled": True, "max_workers": 2,
+                               "worktree_root": str(tmp_path / "wt")}
+
+    def factory():
+        return Orchestrator(store, cfg.data, Backend(), SlackNotifier(None),
+                            reviewer=Reviewer())
+
+    ta = Task.new("metrics-core story", repo_path=str(repo_a))
+    tb = Task.new("analytics-export story", repo_path=str(repo_b))
+    await store.create_task(ta)
+    await store.create_task(tb)
+
+    sched = Scheduler(store, factory, max_workers=2)
+    started = await sched.tick()
+    assert len(started) == 2
+    await sched.drain()
+
+    a2 = await store.get_task(ta.id)
+    b2 = await store.get_task(tb.id)
+    assert a2.status == TaskStatus.AWAITING_APPROVAL
+    assert b2.status == TaskStatus.AWAITING_APPROVAL
+    # Worktrees cleaned up in both repos; primary checkouts untouched.
+    assert all("/wt/" not in w for w in GitRepo(repo_a).list_worktrees())
+    assert all("/wt/" not in w for w in GitRepo(repo_b).list_worktrees())
+    assert "mul" not in (repo_a / "calc.py").read_text()
+
+
+async def test_wake_watcher_ticked_and_implementing_is_claimable(store):
+    class FakeWake:
+        def __init__(self):
+            self.ticked = False
+
+        async def tick(self, *, now=None):
+            self.ticked = True
+
+    wake = FakeWake()
+    fake = FakeOrch(store, hold=asyncio.Event())
+    sched = Scheduler(store, lambda: fake, max_workers=2, wake_watcher=wake)
+
+    # A task already in IMPLEMENTING (e.g. just resumed) is claimable.
+    t = Task.new("resumed", repo_path="/tmp/x")
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.IMPLEMENTING, validate=False)
+
+    started = await sched.tick()
+    assert wake.ticked
+    assert t.id in started

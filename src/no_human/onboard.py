@@ -44,6 +44,58 @@ from .testing import runner
 # command's dependencies exist; test is the trust anchor; lint is best-effort.
 _KINDS = ("install", "test", "lint")
 
+# The coding backend always needs the subscription token (constraint §3.1).
+_ALWAYS_REQUIRED = ("CLAUDE_CODE_OAUTH_TOKEN",)
+
+
+def _strip_remote_credentials(url: str) -> str:
+    """Drop any ``user[:token]@`` embedded in an https remote so we never store
+    or echo a credential that was baked into the origin URL."""
+    return re.sub(r"(https?://)[^/@]+@", r"\1", url.strip())
+
+
+def _host_from_remote(url: str) -> str:
+    """Extract the host from an origin URL (https or scp-style git@host:path)."""
+    url = url.strip()
+    m = re.match(r"^[a-zA-Z][\w+.-]*://(?:[^/@]*@)?([^/:]+)", url)  # scheme://[user@]host
+    if m:
+        return m.group(1).lower()
+    m = re.match(r"^[^@]+@([^:]+):", url)  # git@host:owner/repo.git
+    if m:
+        return m.group(1).lower()
+    return ""
+
+
+def derive_required_credentials(ci: dict[str, Any], vcs_host: str,
+                                human_gated_steps: list[str] | None = None,
+                                github_hosts: list[str] | None = None) -> list[str]:
+    """The ~/.no_human/.env keys this repo needs, derived from its CI backend and
+    VCS host — never hardcoded per repo. Returned in a stable, de-duplicated
+    order. Values are never read here; only the key names a human must set.
+
+    ``github_hosts`` is the operator's configured list of GitHub-Enterprise hosts
+    (``git.github_hosts``); a VCS host on it that isn't public github.com needs an
+    enterprise token to open PRs.
+    """
+    keys: list[str] = list(_ALWAYS_REQUIRED)
+    backend = (ci or {}).get("backend", "")
+    steps_text = " ".join(human_gated_steps or []).lower()
+    ghe = {h.lower() for h in (github_hosts or [])}
+
+    if backend == "jenkins" or "jenkins" in steps_text:
+        keys += ["JENKINS_USER", "JENKINS_API_TOKEN"]
+    if backend == "gitlab" or (vcs_host and "gitlab" in vcs_host):
+        keys.append("GITLAB_TOKEN")
+    # PR opening: public github.com uses `gh auth login` (no env key); a GHE host
+    # (configured, or simply not github.com but github-flavored) needs a token.
+    if vcs_host and vcs_host != "github.com" and (
+        vcs_host in ghe or "github" in vcs_host or vcs_host == "code.example.com"
+    ):
+        keys.append("GH_ENTERPRISE_TOKEN")
+
+    seen: set[str] = set()
+    return [k for k in keys if not (k in seen or seen.add(k))]
+
 
 @dataclass
 class CommandCandidate:
@@ -297,15 +349,19 @@ class AgentDeriver:
 class OnboardEngine:
     """Derive candidates, prove each by running it, build a proposed profile."""
 
-    def __init__(self, deriver: Any | None = None, *, prove_timeout: int = 600):
+    def __init__(self, deriver: Any | None = None, *, prove_timeout: int = 600,
+                 github_hosts: list[str] | None = None):
         self.deriver = deriver or DeclarationDeriver()
         self.prove_timeout = prove_timeout
+        self.github_hosts = github_hosts or ["github.com"]
 
     async def onboard(self, repo_path: str | Path) -> OnboardResult:
         repo = Path(repo_path).expanduser().resolve()
         derived = self.deriver.derive(repo)
         if inspect.isawaitable(derived):
             derived = await derived
+
+        vcs_host, vcs_remote = await asyncio.to_thread(self._derive_vcs, repo)
 
         proofs: list[ProveOutcome] = []
         chosen: dict[str, CommandCandidate] = {}
@@ -322,6 +378,9 @@ class OnboardEngine:
                     proven[f"{kind}_cmd"] = True
                     break
 
+        required = derive_required_credentials(
+            derived.ci, vcs_host, derived.human_gated_steps, self.github_hosts)
+
         profile = ProjectProfile(
             repo_path=str(repo),
             ecosystem=derived.ecosystem,
@@ -330,12 +389,32 @@ class OnboardEngine:
             lint_cmd=chosen["lint"].command if "lint" in chosen else "",
             ci=derived.ci,
             human_gated_steps=derived.human_gated_steps,
+            vcs_host=vcs_host,
+            vcs_remote=vcs_remote,
+            required_credentials=required,
             derived_from=sorted(set(derived.sources)),
             proven=proven,
             confirmed=False,
             notes=self._notes(derived, proofs),
         )
         return OnboardResult(profile=profile, proofs=proofs)
+
+    @staticmethod
+    def _derive_vcs(repo: Path) -> tuple[str, str]:
+        """Read the repo's ``origin`` remote → (host, credential-stripped URL).
+        Returns ("", "") when there is no origin (a fresh/local-only repo)."""
+        import subprocess
+        try:
+            proc = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=repo, capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return "", ""
+        if proc.returncode != 0:
+            return "", ""
+        url = proc.stdout.strip()
+        return _host_from_remote(url), _strip_remote_credentials(url)
 
     async def _prove(self, repo: Path, cand: CommandCandidate) -> ProveOutcome:
         if cand.kind == "test":
