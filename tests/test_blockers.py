@@ -470,3 +470,102 @@ async def test_pr_comment_revision_cap_escalates(store):
     refreshed = await store.get_task(t.id)
     assert refreshed.status == TaskStatus.ESCALATED
     assert refreshed.context["revision_rounds"] == 3
+
+
+# --------------------------------------------------------------------------- #
+# B4: auto PR-comment loop on AWAITING_APPROVAL                                #
+# --------------------------------------------------------------------------- #
+
+from no_human.vcs.pr_watcher import PrComment, parse_pr_url  # noqa: E402
+
+
+async def _approval_task(store, *, since, ctx_extra=None):
+    t = Task.new("PR task", repo_path="/tmp/r")
+    await store.create_task(t)
+    t.context = {"pr_watch": "https://code.example.com/o/r/pull/3",
+                 "pr_comment_since": since, **(ctx_extra or {})}
+    await store.update_task(t)
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+    return t
+
+
+@pytest.mark.asyncio
+async def test_awaiting_approval_new_comment_triggers_revision(store):
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _approval_task(store, since="2026-06-22T11:00:00+00:00")
+
+    async def pr_comment(url):
+        assert url == "https://code.example.com/o/r/pull/3"
+        return [PrComment(author="human", body="please rename it",
+                          created_at="2026-06-22T11:30:00+00:00")]
+
+    watcher = WakeWatcher(store, _cfg(), pr_comment=pr_comment)
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") in actions
+    r = await store.get_task(t.id)
+    assert r.status == TaskStatus.IMPLEMENTING
+    assert any("rename" in f["message"] for f in r.context["send_back_feedback"])
+    assert r.context["pr_comment_since"] == "2026-06-22T11:30:00+00:00"
+    assert r.context["revision_rounds"] == 1
+
+
+@pytest.mark.asyncio
+async def test_awaiting_approval_old_comment_does_not_retrigger(store):
+    """A comment at/before the cursor must not cause a (duplicate) revision."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _approval_task(store, since="2026-06-22T11:30:00+00:00")
+
+    async def pr_comment(url):
+        return [PrComment(author="human", body="already handled",
+                          created_at="2026-06-22T11:30:00+00:00")]
+
+    watcher = WakeWatcher(store, _cfg(), pr_comment=pr_comment)
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") not in actions
+    r = await store.get_task(t.id)
+    assert r.status == TaskStatus.AWAITING_APPROVAL
+
+
+@pytest.mark.asyncio
+async def test_awaiting_approval_never_times_out(store):
+    """An open PR waiting on a human must not escalate on max-park timeout."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _approval_task(store, since="2026-06-20T00:00:00+00:00")
+    # Make it look very old.
+    t.updated_at = (now - timedelta(hours=200)).isoformat()
+    await store.update_task(t)
+
+    async def pr_comment(url):
+        return []  # no new comments
+
+    watcher = WakeWatcher(store, _cfg(), pr_comment=pr_comment)
+    actions = await watcher.tick(now=now)
+    assert actions == []
+    r = await store.get_task(t.id)
+    assert r.status == TaskStatus.AWAITING_APPROVAL
+
+
+@pytest.mark.asyncio
+async def test_awaiting_approval_revision_cap_escalates(store):
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _approval_task(store, since="2026-06-22T11:00:00+00:00",
+                             ctx_extra={"revision_rounds": 2})
+
+    async def pr_comment(url):
+        return [PrComment(author="human", body="one more nit",
+                          created_at="2026-06-22T11:45:00+00:00")]
+
+    watcher = WakeWatcher(store, _cfg(), pr_comment=pr_comment)
+    actions = await watcher.tick(now=now)
+    assert (t.id, "escalated_revisions") in actions
+    r = await store.get_task(t.id)
+    assert r.status == TaskStatus.ESCALATED
+
+
+def test_parse_pr_url():
+    assert parse_pr_url("https://code.example.com/dev/test_ai_repo/pull/7") == (
+        "github", "code.example.com", "dev/test_ai_repo", 7)
+    assert parse_pr_url("https://github.com/o/r/pull/12")[0:1] == ("github",)
+    gl = parse_pr_url("https://gitlab.com/grp/sub/repo/-/merge_requests/42")
+    assert gl[0] == "gitlab" and gl[3] == 42 and "%2F" in gl[2]
+    assert parse_pr_url("https://example.com/not-a-pr") is None

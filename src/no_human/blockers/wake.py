@@ -175,7 +175,7 @@ class WakeWatcher:
         now = now or datetime.now(timezone.utc)
         actions: list[tuple[str, str]] = []
         for status in (TaskStatus.BLOCKED, TaskStatus.PAUSED_QUOTA,
-                       TaskStatus.AWAITING_INPUT):
+                       TaskStatus.AWAITING_INPUT, TaskStatus.AWAITING_APPROVAL):
             for task in await self.store.list_tasks(status):
                 action = await self._evaluate(task, now=now)
                 if action:
@@ -183,6 +183,11 @@ class WakeWatcher:
         return actions
 
     async def _evaluate(self, task: Task, *, now: datetime) -> str | None:
+        # An open PR (B4): poll it for new human comments and revise on them.
+        # It NEVER times out — a PR may wait for human approval indefinitely.
+        if task.status == TaskStatus.AWAITING_APPROVAL:
+            return await self._check_approval_pr_comments(task)
+
         blocker = Blocker.from_dict(task.blocker) if task.blocker else None
         raised_at = _parse_iso(blocker.raised_at if blocker else None) \
             or _parse_iso(task.updated_at) or now
@@ -244,13 +249,25 @@ class WakeWatcher:
             return None
         if not comments:
             return None
+        rounds = self._append_comments_as_feedback(task, comments)
+        (task.context or {}).setdefault("pr_comment_ref", pr_ref)
+        await self.store.update_task(task)
+        self._on_event("pr_feedback", f"{task.id[:8]} got {len(comments)} PR comment(s)")
+        return rounds
+
+    @staticmethod
+    def _append_comments_as_feedback(task: Task, comments: list) -> int:
+        """Append PR comments to send_back_feedback; bump revision_rounds.
+
+        Mutates ``task.context`` (caller persists). Returns the new round count.
+        """
         ctx = task.context or {}
         feedback = ctx.get("send_back_feedback") or []
         for c in comments:
-            # Support both PrComment objects and plain dicts.
+            # Support both PrComment objects and plain dicts/strings.
             if hasattr(c, "body"):
                 msg = c.body
-                author = c.author if hasattr(c, "author") else "reviewer"
+                author = getattr(c, "author", "reviewer")
                 path = getattr(c, "path", None)
                 line = getattr(c, "line", None)
                 diff_hunk = getattr(c, "diff_hunk", None)
@@ -261,26 +278,58 @@ class WakeWatcher:
                 path = line = diff_hunk = None
                 created = now_iso()
             if path:
-                loc = f"{path}"
-                if line:
-                    loc += f":{line}"
+                loc = f"{path}" + (f":{line}" if line else "")
                 msg = f"[{loc}] {msg}"
             if diff_hunk:
                 msg += f"\n\nContext:\n```\n{str(diff_hunk)[:500]}\n```"
             feedback.append({
-                "at": created,
-                "message": msg,
-                "author": author,
+                "at": created, "message": msg, "author": author,
                 "source": "pr_comment",
             })
         ctx["send_back_feedback"] = feedback
-        ctx["pr_comment_ref"] = pr_ref
         rounds = int(ctx.get("revision_rounds", 0)) + 1
         ctx["revision_rounds"] = rounds
         task.context = ctx
-        await self.store.update_task(task)
-        self._on_event("pr_feedback", f"{task.id[:8]} got {len(comments)} PR comment(s)")
         return rounds
+
+    async def _check_approval_pr_comments(self, task: Task) -> str | None:
+        """Poll an awaiting-approval PR for NEW human comments (B4).
+
+        Uses a per-task ``pr_comment_since`` cursor so the same comment never
+        triggers a second revision. On new comments: inject them, advance the
+        cursor, and either resume the task to revise or — past the revision cap —
+        escalate to the human. Never times out.
+        """
+        ctx = task.context or {}
+        url = ctx.get("pr_watch")
+        if not url or self._pr_comment is None:
+            return None
+        try:
+            comments = await self._pr_comment(url)
+        except Exception as exc:  # noqa: BLE001 — a poll error must not crash the watcher
+            log.warning("failed to poll PR comments for %s: %s", task.id[:8], exc)
+            return None
+
+        since = ctx.get("pr_comment_since")
+        fresh = [c for c in comments
+                 if not since or (getattr(c, "created_at", "") or "") > since]
+        if not fresh:
+            return None
+
+        # Advance the cursor past everything we've now seen (newest wins).
+        newest = max((getattr(c, "created_at", "") or "") for c in comments)
+        rounds = self._append_comments_as_feedback(task, fresh)
+        ctx = task.context or {}
+        if newest:
+            ctx["pr_comment_since"] = newest
+        task.context = ctx
+        await self.store.update_task(task)
+        self._on_event("pr_feedback", f"{task.id[:8]} got {len(fresh)} new PR comment(s)")
+
+        if rounds > self.max_revision_rounds:
+            await self._escalate_revisions(task, rounds)
+            return "escalated_revisions"
+        return await self._resume(task)
 
     async def _escalate_revisions(self, task: Task, rounds: int) -> None:
         """Stop the comment→revise loop after the cap and hand back to a human."""

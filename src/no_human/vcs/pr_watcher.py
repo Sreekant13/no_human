@@ -84,21 +84,24 @@ async def _run_cli(cmd: list[str]) -> str | None:
 
 async def fetch_github_pr_comments(
     repo: str, pr_number: int, *, since: str | None = None,
-    agent_login: str = "no-human[bot]",
+    agent_login: str = "no-human[bot]", host: str | None = None,
 ) -> list[PrComment]:
     """Fetch PR review comments + issue comments from GitHub via ``gh`` CLI.
 
     ``since`` is an ISO timestamp; only comments after it are returned.
     Comments authored by ``agent_login`` are excluded (avoid self-loops).
+    ``host`` targets a GitHub Enterprise host (e.g. ``code.example.com``); when
+    None, ``gh`` uses its default (github.com).
     """
     if not shutil.which("gh"):
         return []
 
+    host_args = ["--hostname", host] if host else []
     comments: list[PrComment] = []
 
     # 1. Review comments (line-level)
     out = await _run_cli([
-        "gh", "api",
+        "gh", "api", *host_args,
         f"repos/{repo}/pulls/{pr_number}/comments",
         "--paginate",
     ])
@@ -120,7 +123,7 @@ async def fetch_github_pr_comments(
 
     # 2. Issue comments (general PR comments)
     out = await _run_cli([
-        "gh", "api",
+        "gh", "api", *host_args,
         f"repos/{repo}/issues/{pr_number}/comments",
         "--paginate",
     ])
@@ -187,6 +190,50 @@ async def fetch_gitlab_mr_comments(
 PrCommentChecker = Callable[[str], Awaitable[list[PrComment]]]
 
 
+def parse_pr_url(url: str) -> tuple[str, str, str, int] | None:
+    """Parse a PR/MR URL into ``(forge, host, slug, number)``.
+
+    Handles GitHub/GHE (``https://<host>/<owner>/<repo>/pull/<n>``) and GitLab
+    (``https://<host>/<group>/<repo>/-/merge_requests/<n>``). Returns None if it
+    can't be parsed. The ``host`` lets us target GitHub Enterprise (e.g.
+    ``code.example.com``) rather than defaulting to github.com.
+    """
+    import re
+    from urllib.parse import quote
+    gh = re.match(r"https?://([^/]+)/(.+?)/pull/(\d+)", url)
+    if gh:
+        return ("github", gh.group(1), gh.group(2), int(gh.group(3)))
+    gl = re.match(r"https?://([^/]+)/(.+?)(?:/-)?/merge_requests/(\d+)", url)
+    if gl:
+        return ("gitlab", gl.group(1), quote(gl.group(2), safe=""), int(gl.group(3)))
+    return None
+
+
+async def default_pr_merged(ref: str) -> bool:
+    """Resolve a ``pr_merged:`` wake condition via gh.
+
+    ``ref`` may be a full PR URL or ``owner/repo#num``. Unknown/unsupported →
+    False (never falsely report merged). Used by serve/wake/api watchers.
+    """
+    if not shutil.which("gh"):
+        return False
+    if ref.startswith("http"):
+        parsed = parse_pr_url(ref)
+        if not parsed or parsed[0] != "github":
+            return False
+        _, host, slug, num = parsed
+        repo_arg, num_str = f"{host}/{slug}", str(num)  # gh --repo takes [HOST/]OWNER/REPO
+    elif "#" in ref:
+        repo, _, num_str = ref.partition("#")
+        repo_arg = repo
+    else:
+        return False
+    out = await _run_cli(
+        ["gh", "pr", "view", num_str, "--repo", repo_arg, "--json", "state"]
+    )
+    return bool(out) and '"MERGED"' in out
+
+
 async def check_pr_comments(
     pr_ref: str,
     *,
@@ -194,12 +241,23 @@ async def check_pr_comments(
 ) -> list[PrComment]:
     """Check for new comments on a PR/MR.
 
-    ``pr_ref`` format:
-    - GitHub: ``owner/repo#123``
-    - GitLab: ``project_id!123`` (using ``!`` for MR)
+    ``pr_ref`` may be:
+    - a full PR/MR URL (preferred — carries the host for GitHub Enterprise)
+    - GitHub short ref ``owner/repo#123``
+    - GitLab short ref ``project_id!123`` (using ``!`` for MR)
 
     Returns new comments since ``since`` (ISO timestamp), or all if None.
     """
+    if pr_ref.startswith("http"):
+        parsed = parse_pr_url(pr_ref)
+        if not parsed:
+            log.warning("could not parse PR URL: %s", pr_ref)
+            return []
+        forge, host, slug, num = parsed
+        if forge == "github":
+            return await fetch_github_pr_comments(slug, num, since=since, host=host)
+        return await fetch_gitlab_mr_comments(slug, num, since=since)
+
     if "!" in pr_ref:
         # GitLab MR
         project_id, _, iid_str = pr_ref.partition("!")

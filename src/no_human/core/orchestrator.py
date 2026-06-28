@@ -644,6 +644,15 @@ class Orchestrator:
             attempt_id, pr_url=pr.url, status="succeeded", completed_at=_now(),
             review_passed=1,
         )
+        # B4: mark the PR for comment-watching so the wake watcher polls it for
+        # new human comments and auto-revises. The cursor starts at PR-open time
+        # so only comments posted afterwards trigger a revision.
+        ctx = task.context or {}
+        ctx["pr_watch"] = pr.url
+        ctx.setdefault("pr_comment_since", _now())
+        task.context = ctx
+        await self.store.update_task(task)
+
         await self.store.set_status(task, TaskStatus.AWAITING_APPROVAL)
         self.emit("pr_open", pr.url, pr_kind=pr.kind, status="awaiting_approval")
         self.notifier.notify(

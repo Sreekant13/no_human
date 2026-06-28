@@ -21,7 +21,12 @@ def is_github_remote(url: str, extra_hosts: tuple[str, ...] | list[str] = ()) ->
 def open_pr(
     repo_path: Path, branch: str, title: str, body: str, *, base: str = "main"
 ) -> str:
-    """Create a draft PR and return its URL. Requires `gh` auth."""
+    """Create a draft PR and return its URL. Requires `gh` auth.
+
+    Idempotent: if a PR already exists for ``branch`` (e.g. when revising after a
+    human PR comment, which pushes onto the same branch), return the existing PR's
+    URL instead of failing — the push has already updated it. Never merges.
+    """
     proc = subprocess.run(
         [
             "gh", "pr", "create",
@@ -33,6 +38,23 @@ def open_pr(
         ],
         cwd=repo_path, capture_output=True, text=True,
     )
-    if proc.returncode != 0:
-        raise RuntimeError(f"gh pr create failed: {proc.stderr.strip()}")
-    return proc.stdout.strip()
+    if proc.returncode == 0:
+        return proc.stdout.strip()
+
+    stderr = proc.stderr.strip()
+    if "already exists" in stderr.lower():
+        existing = _existing_pr_url(repo_path, branch)
+        if existing:
+            return existing
+    raise RuntimeError(f"gh pr create failed: {stderr}")
+
+
+def _existing_pr_url(repo_path: Path, branch: str) -> str | None:
+    """Return the URL of the open PR for ``branch``, or None."""
+    proc = subprocess.run(
+        ["gh", "pr", "list", "--head", branch, "--state", "open",
+         "--json", "url", "--jq", ".[0].url"],
+        cwd=repo_path, capture_output=True, text=True,
+    )
+    url = proc.stdout.strip()
+    return url or None
