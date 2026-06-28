@@ -1611,6 +1611,10 @@ class Orchestrator:
             "    Try a fundamentally different approach, not a minor tweak.\n"
             "  - Fix root causes, not symptoms. If a test fails, understand WHY before\n"
             "    changing code. Chasing the error message leads to cascading wrong fixes.\n"
+            "  - Do NOT create virtualenvs, install packages (pip install, npm install),\n"
+            "    or generate build artifacts in the repo. Use the existing environment.\n"
+            "    If dependencies are needed, add them to the project's dependency file\n"
+            "    (requirements.txt, pyproject.toml, package.json, pom.xml, etc.).\n"
         )
         # Append confirmed rules + skills from the learning queue (Phase G).
         extra = self._format_active_memories()

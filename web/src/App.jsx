@@ -240,7 +240,7 @@ function NewTaskModal({ onClose, onCreated }) {
               >
                 {profiles.map((p) => (
                   <option key={p.repo_path} value={p.repo_path}>
-                    {p.name}{p.confirmed ? '' : ' (unconfirmed)'}
+                    {p.name}
                   </option>
                 ))}
               </select>

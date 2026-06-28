@@ -122,6 +122,19 @@ class GitRepo:
         ":(exclude,glob)**/.devin/**",
         ":(exclude,glob)**/.claude/**",
         ":(exclude,glob)**/HANDOVER.md",
+        ":(exclude,glob)**/.venv/**",
+        ":(exclude,glob)**/.venv*/**",
+        ":(exclude,glob)**/venv/**",
+        ":(exclude,glob)**/.tox/**",
+        ":(exclude,glob)**/.mypy_cache/**",
+        ":(exclude,glob)**/.ruff_cache/**",
+        ":(exclude,glob)**/dist/**",
+        ":(exclude,glob)**/build/**",
+        ":(exclude,glob)**/*.egg-info/**",
+        ":(exclude,glob)**/.coverage",
+        ":(exclude,glob)**/.env",
+        ":(exclude,glob)**/.idea/**",
+        ":(exclude,glob)**/.vscode/**",
     )
 
     def stage_all(self) -> None:
