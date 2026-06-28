@@ -81,6 +81,14 @@ class WakeWatcher:
         self.max_park = parse_duration(
             str(blockers_cfg.get("max_park_duration", "48h"))
         ) or timedelta(hours=48)
+        # Cap on autonomous PR-comment → revise cycles. A reviewer (or bot) can
+        # post comments indefinitely; without this, each batch resets the full
+        # attempt budget, so the agent could revise forever. After this many
+        # rounds we escalate to the human instead of resuming (constraint §5,
+        # bounded autonomy). Defaults to the same value as bounds.max_correction_rounds.
+        self.max_revision_rounds = int(
+            (config or {}).get("bounds", {}).get("max_correction_rounds", 2)
+        )
         self._pr_merged = pr_merged
         self._ci_green = ci_green
         self._ci_terminal = ci_terminal
@@ -190,7 +198,12 @@ class WakeWatcher:
             if satisfied:
                 # If the condition is pr_comment_on, inject the comments as feedback.
                 if condition and condition.strip().lower().startswith("pr_comment_on:"):
-                    await self._inject_pr_feedback(task, condition)
+                    rounds = await self._inject_pr_feedback(task, condition)
+                    # Bound the comment→revise loop: after max_revision_rounds
+                    # autonomous rounds, escalate to the human rather than resume.
+                    if rounds is not None and rounds > self.max_revision_rounds:
+                        await self._escalate_revisions(task, rounds)
+                        return "escalated_revisions"
                 return await self._resume(task)
 
         # Timeout → escalate (never silently abandon).
@@ -215,18 +228,22 @@ class WakeWatcher:
         self._on_event("resumed", f"{task.id[:8]} wake condition satisfied")
         return "resumed"
 
-    async def _inject_pr_feedback(self, task: Task, condition: str) -> None:
-        """Fetch PR comments and thread them into send_back_feedback."""
+    async def _inject_pr_feedback(self, task: Task, condition: str) -> int | None:
+        """Fetch PR comments and thread them into send_back_feedback.
+
+        Returns the task's running revision-round count after this batch (so the
+        caller can enforce the cap), or None if there were no new comments.
+        """
         if self._pr_comment is None:
-            return
+            return None
         pr_ref = condition.split(":", 1)[1].strip()
         try:
             comments = await self._pr_comment(pr_ref)
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to fetch PR comments for injection: %s", exc)
-            return
+            return None
         if not comments:
-            return
+            return None
         ctx = task.context or {}
         feedback = ctx.get("send_back_feedback") or []
         for c in comments:
@@ -258,9 +275,30 @@ class WakeWatcher:
             })
         ctx["send_back_feedback"] = feedback
         ctx["pr_comment_ref"] = pr_ref
+        rounds = int(ctx.get("revision_rounds", 0)) + 1
+        ctx["revision_rounds"] = rounds
         task.context = ctx
         await self.store.update_task(task)
         self._on_event("pr_feedback", f"{task.id[:8]} got {len(comments)} PR comment(s)")
+        return rounds
+
+    async def _escalate_revisions(self, task: Task, rounds: int) -> None:
+        """Stop the comment→revise loop after the cap and hand back to a human."""
+        data = task.blocker or {}
+        data["category"] = "AMBIGUITY"
+        data["root_cause_hypothesis"] = (
+            f"PR feedback revised {rounds} time(s), exceeding "
+            f"max_revision_rounds={self.max_revision_rounds}; escalating so a "
+            "human can decide rather than revising indefinitely."
+        )
+        task.blocker = data
+        await self.store.update_task(task)
+        if task.status != TaskStatus.ESCALATED:
+            await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
+        self._on_event(
+            "escalated_revisions",
+            f"{task.id[:8]} exceeded {self.max_revision_rounds} PR-revision rounds",
+        )
 
     async def _escalate_timeout(self, task: Task, blocker: Blocker | None) -> None:
         data = task.blocker or {}

@@ -300,7 +300,11 @@ class Orchestrator:
                     self.emit("ci_backend", f"CI from profile: {built.name}")
 
         # Pre-fetch confirmed rules + skills for prompt injection (Phase G).
-        self._active_memories = await self.store.list_memories(confirmed=True)
+        # Scope to this task's repo plus globals, so a rule learned for one
+        # project never leaks into (or pollutes the context of) another.
+        self._active_memories = await self.store.list_memories(
+            confirmed=True, project=task.repo_path
+        )
 
         outcome = TaskOutcome(task, status=task.status, detail="")
         for attempt_n in range(1, self.bounds.max_attempts + 1):
@@ -363,6 +367,14 @@ class Orchestrator:
         # rides into the implement prompt so the agent closes it from turn one.
         prompt = await self._maybe_preflight(task, repo, supervisor, prompt)
 
+        # Per-edit lint feedback (B1): deterministic, runs alongside the
+        # supervisor. Config-gated (default off) until validated; only fires when
+        # a lint command is known for the repo.
+        lint_hook = await self._build_lint_hook(repo)
+        # Only pass lint_hook when active, so backends that predate the param
+        # (e.g. test doubles) are unaffected while it stays default-off.
+        extra = {"lint_hook": lint_hook} if lint_hook is not None else {}
+
         result = await self.backend.run(
             prompt,
             cwd=repo.path,
@@ -370,6 +382,7 @@ class Orchestrator:
             effort="high",
             on_event=self._agent_sink,
             supervisor_hook=supervisor,
+            **extra,
         )
         await self.store.update_attempt(
             attempt_id, turns_used=result.num_turns, tokens_used=result.tokens_used,
@@ -1068,7 +1081,9 @@ class Orchestrator:
         # Build profile + rules context for the staff-level reviewer.
         prof = await self._usable_profile(repo.path)
         self._active_profile = prof
-        self._active_memories = await self.store.list_memories(confirmed=True)
+        self._active_memories = await self.store.list_memories(
+            confirmed=True, project=task.repo_path
+        )
 
         profile_ctx = ""
         if prof:
@@ -1244,6 +1259,22 @@ class Orchestrator:
         if prof and getattr(prof, "lint_cmd", None):
             return prof.lint_cmd
         return None
+
+    async def _build_lint_hook(self, repo: GitRepo):
+        """Build the per-edit lint feedback hook (B1), or None if disabled.
+
+        Gated by ``hooks.per_edit_lint`` (default off) so it can be validated
+        before becoming the default. No-op when the repo has no lint command.
+        """
+        if not self.config.get("hooks", {}).get("per_edit_lint", False):
+            return None
+        lint_cmd = await self._resolve_lint_cmd(repo)
+        if not lint_cmd:
+            return None
+        from ..agent.lint_hook import LintFeedbackHook
+        return LintFeedbackHook(
+            repo_path=repo.path, lint_cmd=lint_cmd, on_event=self.emit,
+        )
 
     def _open_repo(self, task: Task) -> GitRepo | None:
         try:

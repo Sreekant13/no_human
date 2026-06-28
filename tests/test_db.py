@@ -55,3 +55,26 @@ async def test_list_by_status(store):
     await store.set_status(b, TaskStatus.CONTEXT)
     pend = await store.list_tasks(TaskStatus.PENDING)
     assert {t.id for t in pend} == {a.id}
+
+
+async def test_list_memories_project_scoped(store):
+    """A task on repo A sees A's rules + globals, never repo B's (B3)."""
+    await store.add_memory(mem_type="rule", title="ra", content="for A",
+                           project="/repo/a", confirmed=True)
+    await store.add_memory(mem_type="rule", title="rb", content="for B",
+                           project="/repo/b", confirmed=True)
+    await store.add_memory(mem_type="rule", title="rg", content="global",
+                           project=None, confirmed=True)
+
+    scoped = await store.list_memories(confirmed=True, project="/repo/a")
+    titles = {m["title"] for m in scoped}
+    assert titles == {"ra", "rg"}  # A's rule + global, not B's
+
+    scoped_only = await store.list_memories(
+        confirmed=True, project="/repo/a", include_global=False
+    )
+    assert {m["title"] for m in scoped_only} == {"ra"}
+
+    # No project filter → all rows (back-compat).
+    everything = await store.list_memories(confirmed=True)
+    assert {m["title"] for m in everything} == {"ra", "rb", "rg"}

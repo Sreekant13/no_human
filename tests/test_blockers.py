@@ -422,3 +422,51 @@ async def test_awaiting_input_does_not_auto_resume(store):
     assert (t.id, "resumed") not in actions
     refreshed = await store.get_task(t.id)
     assert refreshed.status == TaskStatus.AWAITING_INPUT
+
+
+@pytest.mark.asyncio
+async def test_pr_comment_resumes_and_injects_feedback(store):
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={"category": "DEPENDENCY_WAIT",
+                 "wake_condition": "pr_comment_on:org/repo#5",
+                 "raised_at": now.isoformat(), "confidence": 0.9},
+    )
+
+    async def pr_comment(ref):
+        return ["please rename the function"]
+
+    watcher = WakeWatcher(store, _cfg(), pr_comment=pr_comment)
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") in actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING
+    fb = refreshed.context["send_back_feedback"]
+    assert any("rename" in f["message"] for f in fb)
+    assert refreshed.context["revision_rounds"] == 1
+
+
+@pytest.mark.asyncio
+async def test_pr_comment_revision_cap_escalates(store):
+    """After max_revision_rounds autonomous comment→revise cycles, escalate (A2)."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={"category": "DEPENDENCY_WAIT",
+                 "wake_condition": "pr_comment_on:org/repo#5",
+                 "raised_at": now.isoformat(), "confidence": 0.9},
+    )
+    # Already revised twice (the default cap); the next batch must escalate.
+    t.context = {"revision_rounds": 2}
+    await store.update_task(t)
+
+    async def pr_comment(ref):
+        return ["one more change"]
+
+    watcher = WakeWatcher(store, _cfg(), pr_comment=pr_comment)
+    actions = await watcher.tick(now=now)
+    assert (t.id, "escalated_revisions") in actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.ESCALATED
+    assert refreshed.context["revision_rounds"] == 3

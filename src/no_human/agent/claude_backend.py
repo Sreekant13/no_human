@@ -94,6 +94,7 @@ class ClaudeBackend:
         permission_mode: str = "bypassPermissions",
         readonly: bool = False,
         supervisor_hook: SupervisorHook | None = None,
+        lint_hook: Any | None = None,
     ):
         self.model = model
         self.forbidden_paths = forbidden_paths or [".env", "secrets/", "*.key", "*.pem"]
@@ -103,11 +104,13 @@ class ClaudeBackend:
         self.permission_mode = permission_mode
         self.readonly = readonly
         self.supervisor_hook = supervisor_hook
+        self.lint_hook = lint_hook
 
     def _options(
         self, cwd: Path, max_turns: int, *, effort: str | None = None,
         resume: str | None = None,
         supervisor_hook: SupervisorHook | None = None,
+        lint_hook: Any | None = None,
     ) -> ClaudeAgentOptions:
         hooks: dict = {
             "PreToolUse": [
@@ -123,11 +126,17 @@ class ClaudeBackend:
                 )
             ]
         }
+        # PostToolUse may carry two callbacks: the deterministic per-edit lint
+        # hook (cheap, runs first) and the supervisor's every-N LLM check.
         sv = supervisor_hook or self.supervisor_hook
+        lh = lint_hook or self.lint_hook
+        post_hooks = []
+        if lh is not None:
+            post_hooks.append(lh.hook)
         if sv is not None:
-            hooks["PostToolUse"] = [
-                HookMatcher(matcher=None, hooks=[sv.hook])
-            ]
+            post_hooks.append(sv.hook)
+        if post_hooks:
+            hooks["PostToolUse"] = [HookMatcher(matcher=None, hooks=post_hooks)]
         return ClaudeAgentOptions(
             model=self.model,
             cwd=str(cwd),
@@ -147,10 +156,11 @@ class ClaudeBackend:
         effort: str | None = None,
         resume: str | None = None,
         supervisor_hook: SupervisorHook | None = None,
+        lint_hook: Any | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run the agent, yielding normalized events; the final event is ``result``."""
         options = self._options(cwd, max_turns, effort=effort, resume=resume,
-                                supervisor_hook=supervisor_hook)
+                                supervisor_hook=supervisor_hook, lint_hook=lint_hook)
         # The SDK signals terminal conditions (notably hitting max_turns) by
         # *raising* a bare Exception from inside query(). It usually emits a
         # ResultMessage first ("agent done: N turns") and THEN raises, so we
@@ -230,6 +240,7 @@ class ClaudeBackend:
         resume: str | None = None,
         on_event: Callable[[AgentEvent], None] | None = None,
         supervisor_hook: SupervisorHook | None = None,
+        lint_hook: Any | None = None,
     ) -> AgentResult:
         """Run to completion, optionally forwarding each event, return the result."""
         final = AgentResult(
@@ -238,7 +249,7 @@ class ClaudeBackend:
         )
         async for event in self.stream(
             prompt, cwd=cwd, max_turns=max_turns, effort=effort, resume=resume,
-            supervisor_hook=supervisor_hook,
+            supervisor_hook=supervisor_hook, lint_hook=lint_hook,
         ):
             if on_event is not None:
                 on_event(event)

@@ -219,8 +219,15 @@ class Store:
 
     async def list_memories(
         self, *, confirmed: bool | None = None, source: str | None = None,
-        mem_type: str | None = None,
+        mem_type: str | None = None, project: str | None = None,
+        include_global: bool = True,
     ) -> list[dict[str, Any]]:
+        """List memories, optionally scoped to a project.
+
+        When ``project`` is given, only rules/skills attached to that project are
+        returned, plus globals (``project IS NULL``) unless ``include_global`` is
+        False. When ``project`` is None, no project filter is applied (all rows).
+        """
         clauses, params = [], []
         if confirmed is not None:
             clauses.append("confirmed = ?")
@@ -231,6 +238,12 @@ class Store:
         if mem_type is not None:
             clauses.append("type = ?")
             params.append(mem_type)
+        if project is not None:
+            if include_global:
+                clauses.append("(project = ? OR project IS NULL)")
+            else:
+                clauses.append("project = ?")
+            params.append(project)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         cur = await self.db.execute(
             f"SELECT * FROM memories{where} ORDER BY created_at DESC", params
