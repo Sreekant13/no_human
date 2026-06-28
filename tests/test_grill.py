@@ -169,6 +169,42 @@ async def test_grill_step_prompt_includes_qa_history():
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.asyncio
+async def test_grill_step_timeout_returns_fallback_question():
+    """When the backend takes too long, the grill returns a timeout question."""
+    import asyncio
+    from no_human.intake.grill import grill_step
+
+    class SlowBackend:
+        async def run(self, prompt, *, cwd, max_turns, effort=None):
+            await asyncio.sleep(999)
+
+    # Use a very short timeout by monkey-patching; the real timeout is 120s.
+    import no_human.intake.grill as grill_mod
+    orig = grill_mod.asyncio.wait_for
+
+    async def fast_timeout(coro, *, timeout):
+        return await orig(coro, timeout=0.1)
+
+    grill_mod.asyncio.wait_for = fast_timeout
+    try:
+        result = await grill_step("Fix X", None, None, [], SlowBackend())
+        assert isinstance(result, GrillQuestion)
+        assert "too long" in result.question.lower()
+    finally:
+        grill_mod.asyncio.wait_for = orig
+
+
+def test_summarize_tool():
+    from no_human.api.app import _summarize_tool
+
+    assert _summarize_tool("Read", {"file_path": "/a/b/c/foo.py"}) == "Read c/foo.py"
+    assert _summarize_tool("Edit", {"file_path": "/a/b/bar.js"}) == "Edit b/bar.js"
+    assert 'Grep' in _summarize_tool("Grep", {"query": "hello", "path": "/x"})
+    assert _summarize_tool("Bash", {"command": "mvn test"}) == "Run `mvn test`"
+    assert _summarize_tool("UnknownTool", {"val": "x"}) == "UnknownTool x"
+
+
 def test_api_models_round_trip():
     from no_human.api.models import GrillQuestionOut, GrillResultOut, GrillStepRequest
 

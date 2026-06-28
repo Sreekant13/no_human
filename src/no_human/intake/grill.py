@@ -16,6 +16,7 @@ out and the autonomous pipeline takes over.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass, field
@@ -174,15 +175,13 @@ async def grill_step(
         force_clause=force_clause,
     )
 
-    import asyncio as _aio
-
     cwd = Path(repo_path) if repo_path else Path.home()
     try:
-        result = await _aio.wait_for(
+        result = await asyncio.wait_for(
             backend.run(prompt, cwd=cwd, max_turns=4, effort="low"),
             timeout=120,
         )
-    except _aio.TimeoutError:
+    except asyncio.TimeoutError:
         return GrillQuestion(
             question="The codebase exploration took too long. Can you describe the scope more narrowly?",
             suggestions=[

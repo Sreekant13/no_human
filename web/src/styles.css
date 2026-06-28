@@ -1679,6 +1679,31 @@ html, body, #root {
 }
 .new-task-select:focus { border-color: var(--amber); }
 
+/* Grill loading spinner */
+.grill-spinner {
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  border: 2.5px solid var(--border-hi);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: grill-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+.btn .grill-spinner {
+  width: 14px;
+  height: 14px;
+  border-width: 2px;
+  border-top-color: white;
+  border-color: rgba(255,255,255,0.3);
+  border-top-color: white;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+@keyframes grill-spin {
+  to { transform: rotate(360deg); }
+}
+
 .new-task-error {
   font-size: 12px;
   color: var(--red);
