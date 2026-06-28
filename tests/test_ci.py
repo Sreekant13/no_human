@@ -480,6 +480,8 @@ class FakeReviewer:
 
 
 class FakeCI:
+    name = "fake-ci"
+
     def __init__(self, result: CIResult):
         self._result = result
         self.calls: list[str] = []

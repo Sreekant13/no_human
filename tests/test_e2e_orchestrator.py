@@ -761,3 +761,75 @@ async def test_agent_max_turns_escalates_not_crashes(bare_repo, tmp_path, store)
         capture_output=True, text=True).stdout
     assert "no-human/" not in remote_branches
     assert "agent_error" in [e["kind"] for e in events]
+
+
+# --------------------------------------------------------------------------- #
+# B5 regression: revision must reuse the existing PR branch                     #
+# --------------------------------------------------------------------------- #
+
+async def test_revision_reuses_pr_branch_b5(bare_repo, tmp_path, store):
+    """B5: a revision (PR comment / nh reject) must push to the SAME branch the
+    PR was opened on.  Before the fix the attempt loop restarted at attempt_n=1,
+    computed a DIFFERENT branch name, and opened a duplicate PR."""
+    call_count = 0
+
+    def mutate(cwd):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            (cwd / "calc.py").write_text(
+                "def add(a, b):\n    return a + b\n\n"
+                "def mul(a, b):\n    return a * b\n"
+            )
+            (cwd / "test_calc.py").write_text(
+                "from calc import add, mul\n\n"
+                "def test_add():\n    assert add(1, 2) == 3\n\n"
+                "def test_mul():\n    assert mul(2, 3) == 6\n"
+            )
+        else:
+            (cwd / "calc.py").write_text(
+                "def add(a, b):\n    \"\"\"Add.\"\"\"\n    return a + b\n\n"
+                "def mul(a, b):\n    \"\"\"Multiply.\"\"\"\n    return a * b\n"
+            )
+            (cwd / "test_calc.py").write_text(
+                "from calc import add, mul\n\n"
+                "def test_add():\n    assert add(1, 2) == 3\n\n"
+                "def test_mul():\n    assert mul(2, 3) == 6\n"
+            )
+
+    cfg = _config(tmp_path)
+    events: list[dict] = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+    await store.create_task(t)
+
+    # --- Run 1: original work → PR opened ---
+    outcome1 = await orch.run_task(t)
+    assert outcome1.status is TaskStatus.AWAITING_APPROVAL
+    t = await store.get_task(t.id)
+    assert t.context.get("pr_branch"), "pr_branch must be stored on PR open"
+    original_branch = t.context["pr_branch"]
+
+    # --- Simulate PR comment → task resumed for revision ---
+    ctx = t.context
+    ctx["send_back_feedback"] = [{"at": "2026-06-28T12:00:00Z", "message": "add docstrings"}]
+    t.context = ctx
+    await store.update_task(t)
+    await store.set_status(t, TaskStatus.IMPLEMENTING, validate=False)
+
+    # --- Run 2: revision → must reuse the same branch ---
+    events.clear()
+    outcome2 = await orch.run_task(t)
+    assert outcome2.status is TaskStatus.AWAITING_APPROVAL
+
+    t = await store.get_task(t.id)
+    assert t.context["pr_branch"] == original_branch, (
+        f"revision changed pr_branch from {original_branch!r} to "
+        f"{t.context['pr_branch']!r} — B5 bug: duplicate PR"
+    )
+    # The attempt record must also show the original branch.
+    attempts = await store.list_attempts(t.id)
+    revision_attempt = attempts[-1]
+    assert revision_attempt["branch_name"] == original_branch

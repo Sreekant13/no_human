@@ -332,21 +332,33 @@ class Orchestrator:
         self._agent_edited_files: set[str] = set()  # reset per attempt
 
         # --- branch (deterministic git; agent never touches git) ---
-        # Include attempt_n so each attempt uses a distinct branch. This avoids
-        # non-fast-forward rejection when pushing attempt 2+ (the remote already
-        # holds attempt 1's commit) without needing force-push.
-        branch = (
-            f"{self.config['git']['branch_prefix']}{task.id[:8]}"
-            f"{f'-{attempt_n}' if attempt_n > 1 else ''}"
-        )
-        # base is passed from run_task (captured once before the attempt loop) so
-        # we always branch off the original base, not a prior attempt's branch.
-        if base is None:
-            base = repo.current_branch()
-        try:
-            repo.create_branch(branch, base=base)
-        except ProtectedBranch as exc:
-            return await self._escalate(task, str(exc))
+        # B5: if the task already has an open PR (revision after a PR comment or
+        # nh reject), reuse that PR's branch so the push updates the existing PR
+        # instead of opening a new one.
+        ctx = task.context or {}
+        revision_branch = ctx.get("pr_branch")
+        if revision_branch:
+            branch = revision_branch
+            repo.checkout(branch)
+            # Discard any uncommitted leftovers from a prior failed attempt
+            # so the agent starts from the last committed state.
+            repo._run("checkout", "--", ".", check=False)
+        else:
+            # Include attempt_n so each attempt uses a distinct branch. This avoids
+            # non-fast-forward rejection when pushing attempt 2+ (the remote already
+            # holds attempt 1's commit) without needing force-push.
+            branch = (
+                f"{self.config['git']['branch_prefix']}{task.id[:8]}"
+                f"{f'-{attempt_n}' if attempt_n > 1 else ''}"
+            )
+            # base is passed from run_task (captured once before the attempt loop) so
+            # we always branch off the original base, not a prior attempt's branch.
+            if base is None:
+                base = repo.current_branch()
+            try:
+                repo.create_branch(branch, base=base)
+            except ProtectedBranch as exc:
+                return await self._escalate(task, str(exc))
         await self.store.update_attempt(attempt_id, branch_name=branch)
 
         # --- implement (the SDK session) ---
@@ -649,6 +661,7 @@ class Orchestrator:
         # so only comments posted afterwards trigger a revision.
         ctx = task.context or {}
         ctx["pr_watch"] = pr.url
+        ctx["pr_branch"] = branch
         ctx.setdefault("pr_comment_since", _now())
         task.context = ctx
         await self.store.update_task(task)
@@ -1104,6 +1117,15 @@ class Orchestrator:
             profile_ctx = "\n".join(f"  {p}" for p in parts if p)
         confirmed_rules = self._format_active_memories() or ""
 
+        # Fetch existing PR comments so the reviewer can check they were addressed.
+        pr_comments_text = ""
+        try:
+            pr_comments_text = await self._fetch_pr_comments_text(pr_url)
+            if pr_comments_text:
+                self.emit("review_start", f"fetched PR comments for context")
+        except Exception as exc:  # noqa: BLE001
+            self.emit("review_error", f"could not fetch PR comments: {exc}")
+
         self.emit("review_start", f"running staff-level code review on {pr_url}")
         if self.reviewer is None:
             return await self._fail(task, "no reviewer configured for code_review tasks")
@@ -1117,29 +1139,18 @@ class Orchestrator:
                 diff_override=diff,
                 profile_context=profile_ctx,
                 confirmed_rules=confirmed_rules,
+                mode="code_review",
+                pr_comments=pr_comments_text,
             )
         except Exception as exc:  # noqa: BLE001
             self.emit("review_error", str(exc))
             return await self._fail(task, f"reviewer crashed: {exc}")
 
         # Store the review result.
-        import json as _json
-        checklist_data = {
-            "passed": decision.passed,
-            "items": [
-                {
-                    "label": it.label, "passed": it.passed,
-                    "evidence": it.evidence,
-                    "file": it.file, "line": it.line,
-                    "comment": it.comment,
-                }
-                for it in (decision.checklist or [])
-            ],
-        }
         await self.store.update_attempt(
             attempt_id,
             review_passed=1 if decision.passed else 0,
-            review_checklist=_json.dumps(checklist_data),
+            review_checklist=decision.as_dict(),
             status="succeeded",
         )
 
@@ -1164,6 +1175,69 @@ class Orchestrator:
             text,
         )
         return m.group(0) if m else None
+
+    @staticmethod
+    def _parse_pr_url_parts(pr_url: str) -> tuple[str, str, int] | None:
+        """Parse a PR/MR URL into (forge_type, repo_slug, number).
+
+        Returns None if the URL cannot be parsed.
+        Examples:
+          https://code.example.com/dev/metrics-core-query-service/pull/513
+            -> ('github', 'dev/metrics-core-query-service', 513)
+          https://gitlab.com/org/repo/-/merge_requests/42
+            -> ('gitlab', 'org%2Frepo', 42)
+        """
+        import re as _re
+        # GitHub / GHE: .../owner/repo/pull/123
+        gh = _re.search(r'https?://[^/]+/([^/]+/[^/]+)/pull/(\d+)', pr_url)
+        if gh:
+            return ('github', gh.group(1), int(gh.group(2)))
+        # GitLab: .../group/repo/-/merge_requests/123 or .../group/repo/merge_requests/123
+        gl = _re.search(r'https?://[^/]+/(.+?)(?:/-)?/merge_requests/(\d+)', pr_url)
+        if gl:
+            from urllib.parse import quote
+            project_id = quote(gl.group(1), safe='')
+            return ('gitlab', project_id, int(gl.group(2)))
+        return None
+
+    async def _fetch_pr_comments_text(self, pr_url: str) -> str:
+        """Fetch existing PR comments and format them as text for the reviewer."""
+        parts = self._parse_pr_url_parts(pr_url)
+        if not parts:
+            return ""
+
+        from ..vcs.pr_watcher import (
+            fetch_github_pr_comments,
+            fetch_gitlab_mr_comments,
+        )
+
+        forge_type, repo_slug, number = parts
+        if forge_type == 'github':
+            comments = await fetch_github_pr_comments(repo_slug, number)
+        elif forge_type == 'gitlab':
+            comments = await fetch_gitlab_mr_comments(repo_slug, number)
+        else:
+            return ""
+
+        if not comments:
+            return ""
+
+        # Format comments for the reviewer, capped to avoid prompt bloat.
+        _COMMENTS_CAP = 8000  # chars
+        lines: list[str] = []
+        for c in comments:
+            loc = ""
+            if c.path:
+                loc = f" [{c.path}"
+                if c.line:
+                    loc += f":{c.line}"
+                loc += "]"
+            lines.append(f"  @{c.author}{loc}: {c.body}")
+
+        text = "\n".join(lines)
+        if len(text) > _COMMENTS_CAP:
+            text = text[:_COMMENTS_CAP] + "\n  ... (comments truncated)"
+        return text
 
     def _fetch_pr_diff(self, repo: GitRepo, pr_url: str) -> str:
         """Fetch the PR diff via git fetch + diff. Supports GitHub and GitLab."""
@@ -1340,26 +1414,39 @@ class Orchestrator:
     # the task type the classifier tagged. The pipeline shape (gate, tamper guard,
     # never-merge) is unchanged; only the agent's framing differs.
     _KIND_DIRECTIVES: dict[str, str] = {
+        "feature": (
+            "This is a FEATURE task. Implement the feature, add tests covering "
+            "the new behaviour, and run the full unit test suite to confirm "
+            "everything passes (paste the output). If integration tests exist, "
+            "run them too or verify compatibility."
+        ),
         "bugfix": (
             "This is a BUGFIX. Reproduce the defect with a failing test first, "
-            "then fix the root cause (not the symptom), and confirm the test passes."
+            "then fix the root cause (not the symptom), and run the full test "
+            "suite to confirm the fix AND that no regressions were introduced. "
+            "Paste the test output as evidence."
         ),
         "ci_fix": (
             "This task is to make a failing remote CI build GREEN. Fix the actual "
             "cause of the failing tests/build — never weaken, skip, or delete a "
             "test to go green. If the failing tests are not in code this change "
-            "owns, say so rather than editing code you didn't break."
+            "owns, say so rather than editing code you didn't break. Run the unit "
+            "tests locally to confirm they still pass before finishing."
         ),
         "traceability": (
             "This is a TEST-AUTOMATION TRACEABILITY task. Author the missing "
-            "automated test for the linked work item. Do NOT fabricate an "
-            "execution result or test-automation count — the count is "
-            "execution-backed and only populates after the test really runs in CI."
+            "automated test for the linked work item. Run the test suite to "
+            "confirm the new test passes and existing tests are not broken. "
+            "Do NOT fabricate an execution result or test-automation count — the "
+            "count is execution-backed and only populates after the test really "
+            "runs in CI."
         ),
         "test_gap": (
             "This task is to ADD missing test coverage for existing behaviour. "
             "Do not change production behaviour except minimally to make the code "
-            "testable; the new tests must genuinely exercise the code."
+            "testable; the new tests must genuinely exercise the code. Run the "
+            "full test suite (unit and integration if available) and paste the "
+            "output to prove all tests pass."
         ),
         "investigation": (
             "This is an INVESTIGATION / ROOT-CAUSE ANALYSIS task. You have wider "
@@ -1368,7 +1455,8 @@ class Orchestrator:
             "commands, form hypotheses and verify them with evidence. Do NOT guess "
             "or speculate — prove each step. Document your findings as you go. "
             "If you identify the root cause, propose a fix with evidence that it "
-            "addresses the actual problem, not just the symptom."
+            "addresses the actual problem, not just the symptom. Run the relevant "
+            "tests to verify your fix."
         ),
     }
 
@@ -1478,13 +1566,39 @@ class Orchestrator:
     def _build_implement_prompt(self, task: Task, work_dir: str | None = None) -> str:
         criteria = "\n".join(f"  - {c}" for c in task.acceptance_criteria) or "  (none stated)"
         kind_directive = self._kind_directive(task)
+        # Resolve the profile early — the rules block and profile block both need it.
+        prof = getattr(self, "_active_profile", None)
+        # Build the concrete test command string for the rules block.
+        test_cmd_str = ""
+        if prof and prof.test_cmd:
+            test_cmd_str = prof.test_cmd
+        elif self.config.get("tests", {}).get("command"):
+            test_cmd_str = self.config["tests"]["command"]
+        integration_cmd_str = getattr(prof, "integration_test_cmd", "") if prof else ""
+
         rules = (
             "Rules:\n"
             "  - Verify with evidence: run commands, read their output; don't assert.\n"
             "    'I think it works' is NOT evidence. Run the command and show the output.\n"
             "  - Minimal, focused edits. No comments unless the WHY is non-obvious.\n"
             "  - Add or update tests for your change and run them.\n"
-            "  - NEVER weaken, skip, or delete a test to make things pass.\n"
+            + (f"  - Run unit tests with: {test_cmd_str}\n"
+               f"    You MUST run this command and confirm ALL tests pass before finishing.\n"
+               f"    Paste the full output as evidence.\n"
+               if test_cmd_str else
+               "  - Run the project's test suite and confirm all tests pass before finishing.\n")
+            + (f"  - Integration tests run on GitLab CI after your branch is pushed. Your\n"
+               f"    change must also pass integration tests. If you can run them locally\n"
+               f"    with: {integration_cmd_str}\n"
+               f"    do so and confirm they pass. Otherwise, ensure your changes are\n"
+               f"    compatible with the integration test expectations.\n"
+               if integration_cmd_str else "")
+            + (f"  - Remote CI ({self.ci_runner.name}) will run after local tests pass.\n"
+               f"    Your change must pass both local tests AND the remote CI pipeline.\n"
+               f"    If you know what the CI tests exercise, verify your changes are\n"
+               f"    compatible. Do NOT assume local-only tests are sufficient.\n"
+               if self.ci_runner is not None and not integration_cmd_str else "")
+            + "  - NEVER weaken, skip, or delete a test to make things pass.\n"
             "  - Do NOT run any git command — branching, committing, pushing and\n"
             "    opening the PR are handled for you. Just edit files and run tests.\n"
             "  - All imports MUST be at the top of the file. Never add imports in the\n"
@@ -1511,16 +1625,22 @@ class Orchestrator:
 
         # Profile context: tell the agent about the repo's ecosystem so it
         # doesn't waste turns discovering the tech stack.
-        prof = getattr(self, "_active_profile", None)
         profile_block = ""
         if prof:
             parts = [f"Ecosystem: {prof.ecosystem}" if prof.ecosystem else ""]
             if prof.test_cmd:
-                parts.append(f"Test command: {prof.test_cmd}")
+                parts.append(f"Unit test command: {prof.test_cmd}")
+            if getattr(prof, "integration_test_cmd", ""):
+                parts.append(f"Integration test command: {prof.integration_test_cmd}")
             if prof.install_cmd:
                 parts.append(f"Install command: {prof.install_cmd}")
             if prof.lint_cmd:
                 parts.append(f"Lint command: {prof.lint_cmd}")
+            ci_conf = getattr(prof, "ci", {}) or {}
+            if ci_conf.get("enabled"):
+                ci_backend = ci_conf.get("backend", "gitlab")
+                ci_project = ci_conf.get("project", "")
+                parts.append(f"Remote CI: {ci_backend}" + (f" ({ci_project})" if ci_project else ""))
             profile_block = "Project profile (confirmed):\n" + "\n".join(f"  {p}" for p in parts if p) + "\n\n"
 
         # CRITICAL: the agent must operate in its ACTUAL working directory, which

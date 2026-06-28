@@ -30,6 +30,9 @@ _REVIEW_JSON = re.compile(r"REVIEW_JSON_START\s*(.*?)\s*REVIEW_JSON_END", re.DOT
 
 _REVIEW_TURNS = 10
 _DIFF_CAP = 12000  # chars — keep prompt manageable while allowing meaningful diffs
+_CODE_REVIEW_DIFF_CAP = 120_000  # code_review tasks: ~30K tokens, fits in 200K context
+_CODE_REVIEW_TURNS = 15
+_CODE_REVIEW_TIMEOUT = 600  # seconds — larger diffs need more time
 _OUTPUT_CAP = 4000
 
 
@@ -52,6 +55,7 @@ class ReviewDecision:
                     "evidence": i.evidence,
                     "file": i.file, "line": i.line,
                     "comment": i.comment,
+                    "severity": i.severity,
                 }
                 for i in self.checklist
             ],
@@ -137,6 +141,110 @@ def _build_review_prompt(
     )
 
 
+def _build_code_review_prompt(
+    task: Task,
+    diff: str,
+    diff_total_len: int,
+    *,
+    pr_comments: str = "",
+    profile_context: str = "",
+    confirmed_rules: str = "",
+) -> str:
+    """Build the prompt for dedicated code-review tasks (not the gate prompt).
+
+    Key differences from the gate prompt:
+    - Constructive tone (not adversarial "refute done")
+    - Encourages reading full files via tools when diff is truncated
+    - Includes prior PR comments so the reviewer can verify they were addressed
+    - Requests severity classification per finding
+    - Uses task description as context when acceptance_criteria is empty
+    """
+    criteria = "\n".join(f"  - {c}" for c in task.acceptance_criteria)
+    if not criteria:
+        # Fall back to description as implicit acceptance criteria
+        desc = (task.description or "").strip()
+        if desc:
+            criteria = f"  (derived from description) {desc}"
+        else:
+            criteria = "  (none stated — review for general correctness and quality)"
+
+    truncation_notice = ""
+    if diff_total_len > len(diff):
+        truncation_notice = (
+            f"\n** NOTE: The diff was truncated from {diff_total_len:,} to "
+            f"{len(diff):,} characters. Use your tools to read full file contents "
+            f"for any file where the diff is cut off. Do NOT flag findings about "
+            f"'missing code' unless you have read the full file and confirmed it. **\n"
+        )
+
+    comments_section = ""
+    if pr_comments:
+        comments_section = (
+            f"\nExisting PR comments (check whether each was addressed in the diff):\n"
+            f"{pr_comments}\n"
+        )
+
+    profile_section = (
+        f"\nProject profile (use these conventions as a baseline):\n{profile_context}\n"
+        if profile_context else ""
+    )
+    rules_section = (
+        f"\nConfirmed rules from past experience (the team learned these the hard way):\n"
+        f"{confirmed_rules}\n"
+        if confirmed_rules else ""
+    )
+
+    return (
+        "You are a Staff Software Engineer performing a thorough code review of a PR.\n"
+        "Your job is to provide constructive, evidence-based feedback that helps the\n"
+        "author improve the code. Be rigorous but fair — acknowledge good patterns\n"
+        "while flagging real issues.\n\n"
+        f"Task: {task.title}\n"
+        f"Acceptance criteria:\n{criteria}\n\n"
+        f"Diff:\n```\n{diff}\n```\n"
+        f"{truncation_notice}"
+        f"{comments_section}"
+        f"{profile_section}"
+        f"{rules_section}\n"
+        "If the diff appears truncated for any file, use your read tools to open\n"
+        "the full file and understand the complete change before making judgments.\n"
+        "Never flag 'missing code' or 'orphaned constant' without first reading\n"
+        "the full file to confirm.\n\n"
+        "Review the diff in THREE explicit passes:\n\n"
+        "PASS 1: CORRECTNESS — does the code actually meet each acceptance\n"
+        "  criterion? Trace the changed code against every criterion. Does it\n"
+        "  return what it claims? Are the tests real (not asserting trivia)?\n"
+        "PASS 2: ARCHITECTURE — is this the right approach or a workaround? Does\n"
+        "  it follow the existing patterns/conventions shown in the profile? Any\n"
+        "  layering, coupling, or abstraction problems?\n"
+        "PASS 3: EDGE CASES — error handling, empty/null/boundary inputs,\n"
+        "  security (injection, auth, secrets), concurrency, performance.\n\n"
+        "For each finding, cite the specific file:line from the diff or file.\n\n"
+        "Rules:\n"
+        "  - You MAY use read/search tools to inspect full files for context.\n"
+        "  - Do NOT modify any files. This is a read-only review.\n"
+        "  - Pass/fail only. No numeric scores.\n"
+        "  - Classify each finding with a severity: critical, high, medium, low, nit.\n"
+        "  - 'passed: true' means ALL criteria are demonstrably met and no\n"
+        "    critical/high issues remain.\n\n"
+        "Output EXACTLY this format (and NOTHING after it):\n\n"
+        "REVIEW_JSON_START\n"
+        '{"passed": true_or_false, "items": [\n'
+        '  {"label": "short label", "passed": true_or_false,\n'
+        '   "severity": "critical|high|medium|low|nit",\n'
+        '   "evidence": "detailed explanation of the finding",\n'
+        '   "file": "path/to/file.py", "line": 42,\n'
+        '   "comment": "The review comment to post on the PR (concise, actionable)"}\n'
+        "]}\n"
+        "REVIEW_JSON_END\n\n"
+        "For each item:\n"
+        "  - 'file' must be the path exactly as shown in the diff header (e.g. 'src/foo.py')\n"
+        "  - 'line' must be a line number from the RIGHT side of the diff (new file)\n"
+        "  - 'comment' should be a concise, actionable PR comment suitable for posting\n"
+        "  - For general observations with no specific line, set file to '' and line to 0\n"
+    )
+
+
 def _parse_review_output(text: str) -> ReviewDecision:
     m = _REVIEW_JSON.search(text or "")
     if not m:
@@ -165,6 +273,7 @@ def _parse_review_output(text: str) -> ReviewDecision:
             file=str(i.get("file", "")),
             line=int(i.get("line", 0) or 0),
             comment=str(i.get("comment", "")),
+            severity=str(i.get("severity", "")),
         )
         for i in (data.get("items") or [])
     ]
@@ -202,7 +311,29 @@ class AdversarialReviewer:
         diff_override: str | None = None,
         profile_context: str = "",
         confirmed_rules: str = "",
+        mode: str = "gate",
+        pr_comments: str = "",
     ) -> ReviewDecision:
+        # Code review mode: higher diff cap, different prompt, multi-turn agent.
+        if mode == "code_review":
+            cap = _CODE_REVIEW_DIFF_CAP
+            raw = diff_override or ""
+            diff = raw[:cap]
+            prompt = _build_code_review_prompt(
+                task,
+                diff,
+                len(raw),
+                pr_comments=pr_comments,
+                profile_context=profile_context,
+                confirmed_rules=confirmed_rules,
+            )
+            return await self._agent_review(
+                prompt, repo_path,
+                max_turns=_CODE_REVIEW_TURNS,
+                timeout=_CODE_REVIEW_TIMEOUT,
+            )
+
+        # Gate mode (default): original adversarial review.
         diff = (diff_override[:_DIFF_CAP] if diff_override
                 else _git_diff(repo_path, before_ref, after_ref))
         prompt = _build_review_prompt(
@@ -243,7 +374,10 @@ class AdversarialReviewer:
             )
         return _parse_review_output(result.final_text or "")
 
-    async def _agent_review(self, prompt: str, repo_path: Path) -> ReviewDecision:
+    async def _agent_review(
+        self, prompt: str, repo_path: Path,
+        *, max_turns: int = _REVIEW_TURNS, timeout: int = 300,
+    ) -> ReviewDecision:
         """Multi-turn review — model can explore the repo with read-only tools."""
         all_text_parts: list[str] = []
         original_on_event = self._on_event
@@ -259,17 +393,17 @@ class AdversarialReviewer:
                 self._backend.run(
                     prompt,
                     cwd=repo_path,
-                    max_turns=_REVIEW_TURNS,
+                    max_turns=max_turns,
                     effort="medium",
                     on_event=_capture_event,
                 ),
-                timeout=300,
+                timeout=timeout,
             )
         except asyncio.TimeoutError:
             return ReviewDecision(
                 passed=False,
                 checklist=[ChecklistItem("timeout", False,
-                    "reviewer timed out after 300s — fail closed")],
+                    f"reviewer timed out after {timeout}s — fail closed")],
             )
         # Try final_text first, then all captured text.
         decision = _parse_review_output(result.final_text or "")
