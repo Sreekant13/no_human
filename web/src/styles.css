@@ -547,36 +547,29 @@ html, body, #root {
 .activity-log {
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: 2px;
   font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.6;
+  font-size: 13px;
+  line-height: 1.5;
+  background: #1e1e2e;
+  border-radius: var(--r-md);
+  padding: 8px 4px;
 }
 .activity-event {
   display: flex;
-  gap: 10px;
-  padding: 5px 8px 5px 16px;
+  flex-direction: column;
+  padding: 6px 12px 6px 14px;
   border-radius: var(--r-sm);
-  align-items: baseline;
   position: relative;
-  /* staggered entrance — one orchestrated reveal, CSS-only */
+  border-left: 3px solid var(--role-color, #555);
+  margin-left: 4px;
   animation: act-enter 0.32s cubic-bezier(0.16, 1, 0.3, 1) both;
-}
-.activity-event::before {
-  content: "";
-  position: absolute;
-  left: 3px;
-  top: 11px;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--role-color, var(--text-dim));
 }
 .activity-event.role-worker     { --role-color: var(--agent-worker); }
 .activity-event.role-supervisor { --role-color: var(--agent-supervisor); }
 .activity-event.role-reviewer   { --role-color: var(--agent-reviewer); }
 .activity-event.role-agent      { --role-color: var(--agent-agent); }
-.activity-event:hover { background: var(--bg-hover); }
+.activity-event:hover { background: rgba(255,255,255,0.03); }
 
 @keyframes act-enter {
   from { opacity: 0; transform: translateY(4px); }
@@ -584,20 +577,26 @@ html, body, #root {
 }
 .activity-event:nth-last-child(1) { animation-delay: 0s; }
 
+/* Top row: timestamp + role + kind badge */
+.activity-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 2px;
+}
 .activity-role {
   flex-shrink: 0;
-  min-width: 78px;
   font-family: var(--font-ui);
   font-size: 10px;
-  font-weight: 600;
+  font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--role-color, var(--text-dim));
+  color: var(--role-color, #999);
 }
 .activity-ts {
-  color: var(--text-dim);
+  color: #888;
   flex-shrink: 0;
-  min-width: 70px;
+  font-size: 11px;
 }
 .activity-kind {
   font-family: var(--font-ui);
@@ -605,30 +604,33 @@ html, body, #root {
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  color: var(--role-color, var(--text-dim));
-  opacity: 0.85;
-  margin-right: 2px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(255,255,255,0.07);
+  color: var(--role-color, #999);
 }
-.ak-state { color: var(--accent, #63b3ed); }
-.ak-kind { color: var(--amber, #e8a04f); }
-.ak-commit { color: var(--green, #68d391); }
-.ak-tests, .ak-lint { color: var(--green, #68d391); }
-.ak-review_start { color: var(--accent, #63b3ed); }
-.ak-review { color: var(--green, #68d391); }
-.ak-failed { color: var(--red, #fc8181); }
-.ak-attempt_start { color: var(--accent, #63b3ed); }
-.ak-attempt_failed { color: var(--red, #fc8181); }
-.ak-agent_error { color: var(--red, #fc8181); }
+.ak-state { color: #63b3ed; }
+.ak-kind { color: #e8a04f; }
+.ak-commit { color: #68d391; }
+.ak-tests, .ak-lint { color: #68d391; }
+.ak-review_start { color: #63b3ed; }
+.ak-review { color: #68d391; }
+.ak-failed { color: #fc8181; }
+.ak-attempt_start { color: #63b3ed; }
+.ak-attempt_failed { color: #fc8181; }
+.ak-agent_error { color: #fc8181; }
+/* Bottom row: the actual text content */
 .activity-text {
-  color: var(--text);
+  color: #d4d4d8;
   word-break: break-word;
-  flex: 1;
+  font-size: 13px;
+  line-height: 1.5;
 }
 .activity-elapsed {
-  color: var(--text-dim);
+  color: #666;
   font-size: 10px;
   flex-shrink: 0;
-  opacity: 0.6;
+  margin-left: auto;
 }
 .activity-status-bar {
   display: flex;

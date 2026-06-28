@@ -192,6 +192,25 @@ function NewTaskModal({ onClose, onCreated }) {
   }
 
   if (grillMode && grillQuestion) {
+    // While processing the answer, show a loading overlay that blocks all interaction.
+    if (busy) {
+      return (
+        <div className="sendback-overlay">
+          <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="sendback-label">Intake Grill (Q{grillQuestion.round})</div>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2rem 1rem', gap: '1rem' }}>
+              <Spinner />
+              <div style={{ color: 'var(--text)', fontSize: '0.9rem' }}>Processing your answer...</div>
+              <div style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>Refining the next question based on your input</div>
+            </div>
+            {error && <div className="new-task-error">{error}</div>}
+            <div className="sendback-actions">
+              <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="sendback-overlay" onClick={onClose}>
         <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
@@ -202,9 +221,7 @@ function NewTaskModal({ onClose, onCreated }) {
           {error && <div className="new-task-error">{error}</div>}
           <div className="sendback-actions">
             <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
-            <button className="btn btn-approve" disabled={!grillAnswer.trim() || busy} onClick={submitGrillAnswer}>
-              {busy ? <><Spinner /> Processing...</> : "Answer"}
-            </button>
+            <button className="btn btn-approve" disabled={!grillAnswer.trim()} onClick={submitGrillAnswer}>Answer</button>
           </div>
         </div>
       </div>

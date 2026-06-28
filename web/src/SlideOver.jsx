@@ -366,13 +366,13 @@ function ActivityTab({ taskId, isActive }) {
           const role = eventSource(e);
           return (
             <div key={i} className={`activity-event role-${role} ak-${e.kind}`}>
-              <span className="activity-ts">{fmtTs(e.ts)}</span>
-              <span className="activity-role">{ROLE_LABEL[role]}</span>
-              <span className="activity-text">
+              <div className="activity-meta">
+                <span className="activity-ts">{fmtTs(e.ts)}</span>
+                <span className="activity-role">{ROLE_LABEL[role]}</span>
                 <span className={`activity-kind ak-${e.kind}`}>{eventLabel(e.kind)}</span>
-                {" "}{e.text}
-              </span>
-              {elapsed > 2 && <span className="activity-elapsed">+{fmtDuration(elapsed)}</span>}
+                {elapsed > 2 && <span className="activity-elapsed">+{fmtDuration(elapsed)}</span>}
+              </div>
+              <span className="activity-text">{e.text}</span>
             </div>
           );
         })}
