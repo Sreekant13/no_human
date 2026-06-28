@@ -190,7 +190,7 @@ function NewTaskModal({ onClose, onCreated }) {
     <div className="sendback-overlay" onClick={onClose}>
       <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
         <div className="sendback-label">New Task</div>
-        <form onSubmit={handleSubmit}>
+        <form onSubmit={(e) => { e.preventDefault(); startGrill(); }}>
           <input
             className="new-task-input"
             placeholder="Task title (required)"
@@ -263,9 +263,8 @@ function NewTaskModal({ onClose, onCreated }) {
           {error && <div className="new-task-error">{error}</div>}
           <div className="sendback-actions">
             <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
-            <button type="button" className="btn btn-sendback" disabled={!title.trim() || !repoPath.trim() || busy} onClick={startGrill} style={{ fontSize: '0.75rem' }}>{busy ? "…" : "Refine with AI"}</button>
-            <button type="submit" className="btn btn-approve" disabled={!title.trim() || busy}>
-              {busy ? "…" : "Create"}
+            <button type="submit" className="btn btn-approve" disabled={!title.trim() || !repoPath.trim() || busy}>
+              {busy ? "…" : "Next \u2192"}
             </button>
           </div>
         </form>

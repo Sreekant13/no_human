@@ -304,11 +304,12 @@ const SOURCE_BY_KIND = {
   supervisor: "supervisor",
   review_start: "reviewer", review: "reviewer", review_error: "reviewer",
   tamper: "reviewer",
+  tool_use: "agent", agent_text: "agent",
 };
 function eventSource(e) {
   return e.source || SOURCE_BY_KIND[e.kind] || "worker";
 }
-const ROLE_LABEL = { worker: "Worker", supervisor: "Supervisor", reviewer: "Reviewer" };
+const ROLE_LABEL = { worker: "Worker", supervisor: "Supervisor", reviewer: "Reviewer", agent: "Agent" };
 
 
 function ActivityTab({ taskId, isActive }) {
@@ -346,7 +347,8 @@ function ActivityTab({ taskId, isActive }) {
   return (
     <div className="activity-feed">
       <div className="activity-legend">
-        <span className="al-role role-worker"><i />Worker — builds</span>
+        <span className="al-role role-worker"><i />Worker — orchestrates</span>
+        <span className="al-role role-agent"><i />Agent — reads &amp; edits code</span>
         <span className="al-role role-supervisor"><i />Supervisor — steers</span>
         <span className="al-role role-reviewer"><i />Reviewer — gates</span>
       </div>
@@ -407,6 +409,9 @@ const EVENT_LABELS = {
   stuck: "Stuck",
   failed: "Failed",
   bounds: "Bounds",
+  tool_use: "Tool",
+  agent_text: "Agent",
+  supervisor_decision: "Supervisor",
 };
 
 function eventLabel(kind) {

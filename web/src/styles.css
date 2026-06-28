@@ -47,6 +47,7 @@
   --agent-worker:     #0C66E4;  /* blue — builds */
   --agent-supervisor: #974F0C;  /* orange — steers in-flight */
   --agent-reviewer:   #5E4DB2;  /* purple — gates */
+  --agent-agent:       #1F845A;  /* green — reads & edits code */
 
   /* ── Lifecycle state colours (Atlassian lozenge text hues) ── */
   --state-working: #0C66E4;  /* blue (In Progress) */
@@ -541,6 +542,7 @@ html, body, #root {
 .al-role.role-worker     i { background: var(--agent-worker);     color: var(--agent-worker); }
 .al-role.role-supervisor i { background: var(--agent-supervisor); color: var(--agent-supervisor); }
 .al-role.role-reviewer   i { background: var(--agent-reviewer);   color: var(--agent-reviewer); }
+.al-role.role-agent      i { background: var(--agent-agent);      color: var(--agent-agent); }
 
 .activity-log {
   display: flex;
@@ -573,6 +575,7 @@ html, body, #root {
 .activity-event.role-worker     { --role-color: var(--agent-worker); }
 .activity-event.role-supervisor { --role-color: var(--agent-supervisor); }
 .activity-event.role-reviewer   { --role-color: var(--agent-reviewer); }
+.activity-event.role-agent      { --role-color: var(--agent-agent); }
 .activity-event:hover { background: var(--bg-hover); }
 
 @keyframes act-enter {
@@ -643,6 +646,7 @@ html, body, #root {
 .activity-status-bar.role-worker     { --role-color: var(--agent-worker); }
 .activity-status-bar.role-supervisor { --role-color: var(--agent-supervisor); }
 .activity-status-bar.role-reviewer   { --role-color: var(--agent-reviewer); }
+.activity-status-bar.role-agent      { --role-color: var(--agent-agent); }
 .activity-status-bar .activity-pulse { background: var(--role-color, var(--accent)); }
 .activity-pulse {
   width: 8px;
