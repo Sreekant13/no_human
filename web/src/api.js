@@ -57,6 +57,21 @@ export async function sendBack(id, message) {
   return r.json();
 }
 
+// ── Intake grill ────────────────────────────────────────────────────────────
+
+export async function grillStep({ title, description, repo_path, qa_history }) {
+  const r = await fetch(`${BASE}/api/grill`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title, description, repo_path, qa_history: qa_history || [] }),
+  });
+  if (!r.ok) {
+    const detail = await r.json().catch(() => ({}));
+    throw new Error(detail.detail || `POST /api/grill → ${r.status}`);
+  }
+  return r.json();
+}
+
 // ── Task lifecycle ──────────────────────────────────────────────────────────
 
 export async function pauseTask(id) {

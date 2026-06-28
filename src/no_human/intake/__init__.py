@@ -8,6 +8,7 @@ from ..core.task import Task
 from .base import SourceRef, parse_source
 from .tracker import TrackerAdapter
 from .classify import KindVerdict, TaskKind, classify, classify_kind
+from .grill import GrillQuestion, GrillResult, grill_step
 from .github_issues import GitHubAdapter
 from .gitlab_issues import GitLabAdapter
 from .jira import JiraAdapter
@@ -15,6 +16,7 @@ from .jira import JiraAdapter
 __all__ = [
     "SourceRef", "parse_source", "get_adapter", "ingest_from_url",
     "TaskKind", "KindVerdict", "classify", "classify_kind",
+    "GrillQuestion", "GrillResult", "grill_step",
 ]
 
 

@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { connectWS, createTask, fetchTasks, fetchProfiles, fetchWorkerStatus, fetchOnboardingStatus } from "./api.js";
+import { connectWS, createTask, fetchTasks, fetchProfiles, fetchWorkerStatus, fetchOnboardingStatus, grillStep } from "./api.js";
 import Board from "./Board.jsx";
 import Settings from "./Settings.jsx";
 import Onboarding from "./Onboarding.jsx";
@@ -87,6 +87,12 @@ function NewTaskModal({ onClose, onCreated }) {
   const [error, setError] = useState(null);
   const [profiles, setProfiles] = useState([]);
   const [customRepo, setCustomRepo] = useState(false);
+  // B2: grill state
+  const [grillMode, setGrillMode] = useState(false);
+  const [grillQA, setGrillQA] = useState([]);
+  const [grillQuestion, setGrillQuestion] = useState(null);
+  const [grillAnswer, setGrillAnswer] = useState("");
+  const [grillResult, setGrillResult] = useState(null);
 
   useEffect(() => {
     fetchProfiles().then((p) => {
@@ -96,18 +102,18 @@ function NewTaskModal({ onClose, onCreated }) {
   }, []);
 
   async function handleSubmit(e) {
-    e.preventDefault();
+    if (e) e.preventDefault();
     if (!title.trim() || busy) return;
     setBusy(true);
     setError(null);
     try {
       await createTask({
-        title: title.trim(),
-        description: description.trim() || null,
+        title: grillResult?.title || title.trim(),
+        description: grillResult?.description || description.trim() || null,
         repo_path: repoPath.trim() || null,
         kind,
         priority,
-        acceptance_criteria: [],
+        acceptance_criteria: grillResult?.acceptance_criteria || [],
       });
       onCreated();
       onClose();
@@ -116,6 +122,68 @@ function NewTaskModal({ onClose, onCreated }) {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function startGrill() {
+    if (!title.trim() || busy) return;
+    setBusy(true); setError(null); setGrillMode(true);
+    setGrillQA([]); setGrillQuestion(null); setGrillResult(null);
+    try {
+      const step = await grillStep({ title: title.trim(), description: description.trim() || null, repo_path: repoPath.trim() || null, qa_history: [] });
+      if (step.type === "done") { setGrillResult(step); } else { setGrillQuestion(step); }
+    } catch (err) { setError(err.message); setGrillMode(false); }
+    finally { setBusy(false); }
+  }
+
+  async function submitGrillAnswer() {
+    if (!grillAnswer.trim() || busy) return;
+    setBusy(true); setError(null);
+    const newQA = [...grillQA, { question: grillQuestion.question, answer: grillAnswer.trim() }];
+    setGrillQA(newQA); setGrillAnswer("");
+    try {
+      const step = await grillStep({ title: title.trim(), description: description.trim() || null, repo_path: repoPath.trim() || null, qa_history: newQA });
+      if (step.type === "done") { setGrillResult(step); setGrillQuestion(null); } else { setGrillQuestion(step); }
+    } catch (err) { setError(err.message); }
+    finally { setBusy(false); }
+  }
+
+  if (grillResult) {
+    return (
+      <div className="sendback-overlay" onClick={onClose}>
+        <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
+          <div className="sendback-label">Refined Spec</div>
+          <div style={{ padding: '0.5rem 0' }}>
+            <div style={{ fontWeight: 600, marginBottom: '0.3rem' }}>{grillResult.title}</div>
+            {grillResult.description && <div style={{ fontSize: '0.85rem', color: 'var(--fg-dim)', marginBottom: '0.5rem' }}>{grillResult.description}</div>}
+            <div style={{ fontSize: '0.8rem', fontWeight: 600, marginBottom: '0.2rem' }}>Acceptance Criteria:</div>
+            {grillResult.acceptance_criteria.map((ac, i) => <div key={i} style={{ fontSize: '0.8rem', color: 'var(--green)', paddingLeft: '0.5rem' }}>{i + 1}. {ac}</div>)}
+          </div>
+          {error && <div className="new-task-error">{error}</div>}
+          <div className="sendback-actions">
+            <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
+            <button className="btn btn-approve" disabled={busy} onClick={handleSubmit}>{busy ? "\u2026" : "Create Task"}</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (grillMode && grillQuestion) {
+    return (
+      <div className="sendback-overlay" onClick={onClose}>
+        <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
+          <div className="sendback-label">Intake Grill (Q{grillQuestion.round})</div>
+          <div style={{ fontWeight: 500, margin: '0.5rem 0' }}>{grillQuestion.question}</div>
+          {grillQuestion.suggestions.map((s, i) => <button key={i} type="button" className="btn btn-sendback" style={{ display: 'block', width: '100%', textAlign: 'left', marginBottom: '0.3rem', fontSize: '0.8rem' }} onClick={() => setGrillAnswer(s.replace(/^[A-D]:\s*/, ''))}>{s}</button>)}
+          <textarea className="sendback-textarea" placeholder="Your answer (or click a suggestion)" value={grillAnswer} onChange={(e) => setGrillAnswer(e.target.value)} rows={2} />
+          {error && <div className="new-task-error">{error}</div>}
+          <div className="sendback-actions">
+            <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
+            <button className="btn btn-approve" disabled={!grillAnswer.trim() || busy} onClick={submitGrillAnswer}>{busy ? "\u2026" : "Answer"}</button>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -195,6 +263,7 @@ function NewTaskModal({ onClose, onCreated }) {
           {error && <div className="new-task-error">{error}</div>}
           <div className="sendback-actions">
             <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
+            <button type="button" className="btn btn-sendback" disabled={!title.trim() || !repoPath.trim() || busy} onClick={startGrill} style={{ fontSize: '0.75rem' }}>{busy ? "…" : "Refine with AI"}</button>
             <button type="submit" className="btn btn-approve" disabled={!title.trim() || busy}>
               {busy ? "…" : "Create"}
             </button>

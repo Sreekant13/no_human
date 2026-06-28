@@ -179,3 +179,24 @@ class ReplyRequest(BaseModel):
 
 class BoardPayload(BaseModel):
     tasks: list[TaskSummaryOut]
+
+
+class GrillStepRequest(BaseModel):
+    title: str
+    description: str | None = None
+    repo_path: str | None = None
+    qa_history: list[dict] = []
+
+
+class GrillQuestionOut(BaseModel):
+    type: str = "question"
+    question: str
+    suggestions: list[str]
+    round: int
+
+
+class GrillResultOut(BaseModel):
+    type: str = "done"
+    title: str
+    description: str
+    acceptance_criteria: list[str]
