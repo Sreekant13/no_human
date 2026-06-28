@@ -190,7 +190,7 @@ function NewTaskModal({ onClose, onCreated }) {
     <div className="sendback-overlay" onClick={onClose}>
       <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
         <div className="sendback-label">New Task</div>
-        <form onSubmit={(e) => { e.preventDefault(); startGrill(); }}>
+        <form onSubmit={(e) => { e.preventDefault(); startGrill(); }} style={busy ? { opacity: 0.6, pointerEvents: 'none' } : {}}>
           <input
             className="new-task-input"
             placeholder="Task title (required)"
@@ -264,7 +264,7 @@ function NewTaskModal({ onClose, onCreated }) {
           <div className="sendback-actions">
             <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
             <button type="submit" className="btn btn-approve" disabled={!title.trim() || !repoPath.trim() || busy}>
-              {busy ? "…" : "Next \u2192"}
+              {busy ? "Exploring repo\u2026" : "Next \u2192"}
             </button>
           </div>
         </form>

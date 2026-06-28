@@ -174,13 +174,23 @@ async def grill_step(
         force_clause=force_clause,
     )
 
+    import asyncio as _aio
+
     cwd = Path(repo_path) if repo_path else Path.home()
-    result = await backend.run(
-        prompt,
-        cwd=cwd,
-        max_turns=10,
-        effort="low",
-    )
+    try:
+        result = await _aio.wait_for(
+            backend.run(prompt, cwd=cwd, max_turns=4, effort="low"),
+            timeout=120,
+        )
+    except _aio.TimeoutError:
+        return GrillQuestion(
+            question="The codebase exploration took too long. Can you describe the scope more narrowly?",
+            suggestions=[
+                "A: Let me provide a more specific description",
+                "B: Skip the grill and create the task as-is",
+            ],
+            round=round_n,
+        )
 
     parsed = parse_grill_response(result.final_text, round_n, qa_history)
 
