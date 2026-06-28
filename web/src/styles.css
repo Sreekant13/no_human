@@ -620,7 +620,7 @@ html, body, #root {
 .ak-attempt_failed { color: var(--red, #fc8181); }
 .ak-agent_error { color: var(--red, #fc8181); }
 .activity-text {
-  color: var(--text-primary, #e2e8f0);
+  color: var(--text);
   word-break: break-word;
   flex: 1;
 }
