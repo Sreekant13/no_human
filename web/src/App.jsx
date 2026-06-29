@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { connectWS, createTask, fetchTasks, fetchProfiles, fetchWorkerStatus, fetchOnboardingStatus, grillStep } from "./api.js";
+import { connectWS, createTask, fetchTasks, fetchProjects, fetchWorkerStatus, fetchOnboardingStatus, grillStep } from "./api.js";
 import Board from "./Board.jsx";
 import Settings from "./Settings.jsx";
 import Onboarding from "./Onboarding.jsx";
@@ -89,7 +89,8 @@ function NewTaskModal({ onClose, onCreated }) {
   const [priority, setPriority] = useState("medium");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
-  const [profiles, setProfiles] = useState([]);
+  const [projects, setProjects] = useState([]);
+  const [selectedProjectId, setSelectedProjectId] = useState("");
   const [customRepo, setCustomRepo] = useState(false);
   // B2: grill state
   const [grillMode, setGrillMode] = useState(false);
@@ -99,9 +100,9 @@ function NewTaskModal({ onClose, onCreated }) {
   const [grillResult, setGrillResult] = useState(null);
 
   useEffect(() => {
-    fetchProfiles().then((p) => {
-      setProfiles(p || []);
-      if (p && p.length > 0) setRepoPath(p[0].repo_path);
+    fetchProjects().then((p) => {
+      setProjects(p || []);
+      if (p && p.length > 0) setSelectedProjectId(p[0].id);
     });
   }, []);
 
@@ -114,7 +115,8 @@ function NewTaskModal({ onClose, onCreated }) {
       await createTask({
         title: grillResult?.title || title.trim(),
         description: grillResult?.description || description.trim() || null,
-        repo_path: repoPath.trim() || null,
+        repo_path: customRepo ? repoPath.trim() || null : null,
+        project_id: !customRepo && selectedProjectId ? selectedProjectId : null,
         kind,
         priority,
         acceptance_criteria: grillResult?.acceptance_criteria || [],
@@ -133,7 +135,7 @@ function NewTaskModal({ onClose, onCreated }) {
     setBusy(true); setError(null); setGrillMode(true);
     setGrillQA([]); setGrillQuestion(null); setGrillResult(null);
     try {
-      const step = await grillStep({ title: title.trim(), description: description.trim() || null, repo_path: repoPath.trim() || null, qa_history: [] });
+      const step = await grillStep({ title: title.trim(), description: description.trim() || null, repo_path: customRepo ? repoPath.trim() || null : null, project_id: !customRepo && selectedProjectId ? selectedProjectId : null, qa_history: [] });
       if (step.type === "done") { setGrillResult(step); } else { setGrillQuestion(step); }
     } catch (err) { setError(err.message); setGrillMode(false); }
     finally { setBusy(false); }
@@ -145,7 +147,7 @@ function NewTaskModal({ onClose, onCreated }) {
     const newQA = [...grillQA, { question: grillQuestion.question, answer: grillAnswer.trim() }];
     setGrillQA(newQA); setGrillAnswer("");
     try {
-      const step = await grillStep({ title: title.trim(), description: description.trim() || null, repo_path: repoPath.trim() || null, qa_history: newQA });
+      const step = await grillStep({ title: title.trim(), description: description.trim() || null, repo_path: customRepo ? repoPath.trim() || null : null, project_id: !customRepo && selectedProjectId ? selectedProjectId : null, qa_history: newQA });
       if (step.type === "done") { setGrillResult(step); setGrillQuestion(null); } else { setGrillQuestion(step); }
     } catch (err) { setError(err.message); }
     finally { setBusy(false); }
@@ -247,17 +249,17 @@ function NewTaskModal({ onClose, onCreated }) {
             onChange={(e) => setDescription(e.target.value)}
             rows={3}
           />
-          {profiles.length > 0 && !customRepo ? (
+          {projects.length > 0 && !customRepo ? (
             <div className="new-task-row">
               <select
                 className="new-task-select"
                 style={{ flex: 1 }}
-                value={repoPath}
-                onChange={(e) => setRepoPath(e.target.value)}
+                value={selectedProjectId}
+                onChange={(e) => setSelectedProjectId(e.target.value)}
               >
-                {profiles.map((p) => (
-                  <option key={p.repo_path} value={p.repo_path}>
-                    {p.name}
+                {projects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} ({p.repo_paths.length} repo{p.repo_paths.length !== 1 ? 's' : ''})
                   </option>
                 ))}
               </select>
@@ -277,12 +279,12 @@ function NewTaskModal({ onClose, onCreated }) {
                 value={repoPath}
                 onChange={(e) => setRepoPath(e.target.value)}
               />
-              {profiles.length > 0 && (
+              {projects.length > 0 && (
                 <button
                   type="button"
                   className="btn btn-sendback"
                   style={{ fontSize: '0.75rem', padding: '0.3rem 0.6rem' }}
-                  onClick={() => { setCustomRepo(false); setRepoPath(profiles[0]?.repo_path || ''); }}
+                  onClick={() => { setCustomRepo(false); setSelectedProjectId(projects[0]?.id || ''); }}
                 >list</button>
               )}
             </div>
@@ -305,7 +307,7 @@ function NewTaskModal({ onClose, onCreated }) {
           {error && <div className="new-task-error">{error}</div>}
           <div className="sendback-actions">
             <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
-            <button type="submit" className="btn btn-approve" disabled={!title.trim() || !repoPath.trim() || busy}>
+            <button type="submit" className="btn btn-approve" disabled={!title.trim() || (!selectedProjectId && !repoPath.trim()) || busy}>
               {busy ? "Exploring repo\u2026" : "Next \u2192"}
             </button>
           </div>

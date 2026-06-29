@@ -118,7 +118,17 @@ def _build_review_prompt(
         "  it follow the existing patterns/conventions shown in the profile? Any\n"
         "  layering, coupling, or abstraction problems?\n"
         "PASS 3: EDGE CASES — error handling, empty/null/boundary inputs,\n"
-        "  security (injection, auth, secrets), concurrency, performance.\n\n"
+        "  security (injection, auth, secrets), concurrency, performance.\n"
+        + (
+            "\nPASS 4: SCOPE — is this the SMALLEST change that solves the task?\n"
+            "  This is a large diff. Check for: unnecessary abstractions or indirection\n"
+            "  that aren't required by the acceptance criteria; 'while I'm here' changes\n"
+            "  unrelated to the task; premature generalization (e.g. building a framework\n"
+            "  when a simple function suffices). Fail if the change could be significantly\n"
+            "  smaller while still meeting every criterion.\n"
+            if diff.count("\n") > 150 else ""
+        )
+        + "\n"
         "For each finding, cite the specific file:line from the diff.\n\n"
         "Rules:\n"
         "  - Do NOT use tools, run commands, or read files.\n"

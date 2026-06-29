@@ -2126,6 +2126,17 @@ html, body, #root {
 .ob-repo-status { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
 .ob-repo-status.ok { color: var(--state-done); }
 
+/* project cards (onboarding) */
+.ob-project-card {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: var(--r-md); padding: 12px 14px; margin-bottom: 10px;
+}
+.ob-project-head {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+  font-family: var(--font-ui);
+}
+.ob-project-head strong { color: var(--text-hi); font-size: 14px; }
+
 /* rules review */
 .ob-rules { display: flex; flex-direction: column; gap: 8px; max-height: 360px; overflow: auto; }
 .ob-rule { display: flex; gap: 12px; padding: 12px 14px; background: var(--surface-1); border: 1px solid var(--border); border-left: 3px solid var(--agent-supervisor); border-radius: var(--r-md); cursor: pointer; }

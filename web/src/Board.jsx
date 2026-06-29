@@ -126,9 +126,10 @@ function actionHint(task) {
 }
 
 function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
-  const ageMs = Date.now() - new Date(task.updated_at || task.created_at).getTime();
+  const activityTs = task.last_activity || task.updated_at || task.created_at;
+  const ageMs = Date.now() - new Date(activityTs).getTime();
   const ageSec = ageMs / 1000;
-  const age = relativeTime(task.updated_at || task.created_at);
+  const age = relativeTime(activityTs);
   const isStale = STALE_STATUSES.has(task.status) && ageSec > STALE_THRESHOLD_S;
   const priority = task.priority ?? "medium";
 

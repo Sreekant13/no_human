@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from .base import CIBackend, CIResult, HumanGatedCI, JobResult, PipelineStatus
+from .ghe_checkruns import GHECheckRunsCI
 from .github_actions import GitHubActionsCI
 from .gitlab import GitLabCI
 from .jenkins import JenkinsCI
@@ -71,12 +72,23 @@ def ci_from_config(config: dict[str, Any]) -> CIBackend | None:
             wake_hint=ci_conf.get("wake_hint", ""),
         )
 
+    if backend == "ghe_checkruns":
+        repo = ci_conf.get("repo") or ci_conf.get("project", "")
+        if not repo:
+            return None
+        return GHECheckRunsCI(
+            repo=repo,
+            hostname=ci_conf.get("hostname", ""),
+            timeout_minutes=int(ci_conf.get("timeout_minutes", 60)),
+            poll_interval=int(ci_conf.get("poll_interval", 30)),
+        )
+
     raise ValueError(f"unknown ci.backend: {backend!r}")
 
 
 __all__ = [
     "CIBackend", "CIResult", "HumanGatedCI", "JobResult", "PipelineStatus",
-    "GitLabCI", "GitHubActionsCI", "JenkinsCI",
+    "GitLabCI", "GitHubActionsCI", "JenkinsCI", "GHECheckRunsCI",
     "ci_from_config",
     "parse_results",
 ]

@@ -314,3 +314,57 @@ class Store:
         )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+    # ----------------------------- projects --------------------------------- #
+
+    async def create_project(self, project: "Project") -> "Project":
+        from ..project_model import Project
+        row = project.to_row()
+        await self.db.execute(
+            "INSERT INTO projects (id, name, repo_paths, primary_repo) "
+            "VALUES (:id, :name, :repo_paths, :primary_repo)",
+            row,
+        )
+        await self.db.commit()
+        return project
+
+    async def get_project(self, project_id: str) -> "Project | None":
+        from ..project_model import Project
+        cur = await self.db.execute(
+            "SELECT * FROM projects WHERE id = ?", (project_id,)
+        )
+        row = await cur.fetchone()
+        return Project.from_row(row) if row else None
+
+    async def get_project_by_name(self, name: str) -> "Project | None":
+        from ..project_model import Project
+        cur = await self.db.execute(
+            "SELECT * FROM projects WHERE name = ?", (name,)
+        )
+        row = await cur.fetchone()
+        return Project.from_row(row) if row else None
+
+    async def list_projects(self) -> list["Project"]:
+        from ..project_model import Project
+        cur = await self.db.execute(
+            "SELECT * FROM projects ORDER BY name"
+        )
+        rows = await cur.fetchall()
+        return [Project.from_row(r) for r in rows]
+
+    async def update_project(self, project: "Project") -> None:
+        row = project.to_row()
+        await self.db.execute(
+            "UPDATE projects SET name = :name, repo_paths = :repo_paths, "
+            "primary_repo = :primary_repo, updated_at = :updated_at "
+            "WHERE id = :id",
+            {**row, "updated_at": _now()},
+        )
+        await self.db.commit()
+
+    async def delete_project(self, project_id: str) -> bool:
+        cur = await self.db.execute(
+            "DELETE FROM projects WHERE id = ?", (project_id,)
+        )
+        await self.db.commit()
+        return cur.rowcount > 0

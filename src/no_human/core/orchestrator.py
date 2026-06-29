@@ -415,6 +415,9 @@ class Orchestrator:
             await self.store.update_attempt(
                 attempt_id, status="failed", failure_reason=detail,
             )
+            # C2: persist a handoff digest so the next attempt can resume
+            # cleanly from where this one left off.
+            await self._persist_handoff(task, result, repo)
             self.emit("agent_error", detail)
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
 
@@ -1611,6 +1614,9 @@ class Orchestrator:
             "    Try a fundamentally different approach, not a minor tweak.\n"
             "  - Fix root causes, not symptoms. If a test fails, understand WHY before\n"
             "    changing code. Chasing the error message leads to cascading wrong fixes.\n"
+            "  - Make the SMALLEST change that solves the task. No speculative abstraction,\n"
+            "    no 'while I'm here' extras, no premature generalization. If a one-line fix\n"
+            "    works, ship it — don't build a framework.\n"
             "  - Do NOT create virtualenvs, install packages (pip install, npm install),\n"
             "    or generate build artifacts in the repo. Use the existing environment.\n"
             "    If dependencies are needed, add them to the project's dependency file\n"
@@ -1739,6 +1745,19 @@ class Orchestrator:
                 "skip, or delete any test to satisfy the reviewer:\n"
                 + "\n".join(lines)
             )
+        handoff = ctx.get("handoff")
+        if handoff:
+            summary = handoff.get("summary", "")
+            files = handoff.get("changed_files", [])
+            turns = handoff.get("turns_used", "?")
+            parts.append(
+                f"The previous attempt ran out of turns ({turns} used) and left "
+                f"partial work. Here is what it reported:\n"
+                f"  {summary[:600]}\n"
+                + (f"  Files touched: {', '.join(files[:15])}\n" if files else "")
+                + "Inspect the working tree to see what is already done — do NOT "
+                "redo work. Pick up where it left off."
+            )
         ci_fail = ctx.get("ci_failure")
         if ci_fail:
             tests = ci_fail.get("failing_tests") or []
@@ -1752,6 +1771,35 @@ class Orchestrator:
                             (ci_fail.get("detail", "")).splitlines()[:30])
             )
         return "\n\n".join(parts)
+
+    async def _persist_handoff(self, task: Task, result, repo) -> None:
+        """C2: persist a compact handoff record on turn-budget exhaustion or
+        error so the next attempt resumes with context of what was accomplished.
+
+        Stored in task.context["handoff"] — a dict with:
+          - summary: the agent's last output (capped to 800 chars)
+          - changed_files: files modified in the working tree
+          - commit: last-good commit SHA if any
+        """
+        ctx = task.context or {}
+        summary = (result.final_text or "").strip()[:800]
+        changed: list[str] = []
+        commit_sha = ""
+        try:
+            if repo.has_changes():
+                raw = repo._run("status", "--porcelain", check=False)
+                changed = [ln[3:].strip() for ln in raw.splitlines() if ln.strip()][:30]
+            commit_sha = repo.head_sha()
+        except Exception:  # noqa: BLE001
+            pass
+        ctx["handoff"] = {
+            "summary": summary,
+            "changed_files": changed,
+            "commit": commit_sha,
+            "turns_used": result.num_turns,
+        }
+        task.context = ctx
+        await self.store.update_task(task)
 
     def _pr_body(self, task: Task, commit, result) -> str:
         criteria = "\n".join(f"- {c}" for c in task.acceptance_criteria) or "- (none stated)"

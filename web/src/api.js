@@ -18,11 +18,11 @@ export async function fetchDiff(id) {
   return r.text();
 }
 
-export async function createTask({ title, description, repo_path, kind, priority, acceptance_criteria }) {
+export async function createTask({ title, description, repo_path, project_id, kind, priority, acceptance_criteria }) {
   const r = await fetch(`${BASE}/api/tasks`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title, description, repo_path, kind, priority, acceptance_criteria }),
+    body: JSON.stringify({ title, description, repo_path, project_id, kind, priority, acceptance_criteria }),
   });
   if (!r.ok) {
     const detail = await r.json().catch(() => ({}));
@@ -59,11 +59,11 @@ export async function sendBack(id, message) {
 
 // ── Intake grill ────────────────────────────────────────────────────────────
 
-export async function grillStep({ title, description, repo_path, qa_history }) {
+export async function grillStep({ title, description, repo_path, project_id, qa_history }) {
   const r = await fetch(`${BASE}/api/grill`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title, description, repo_path, qa_history: qa_history || [] }),
+    body: JSON.stringify({ title, description, repo_path, project_id, qa_history: qa_history || [] }),
   });
   if (!r.ok) {
     const detail = await r.json().catch(() => ({}));
@@ -171,6 +171,38 @@ export async function fetchConfig() {
 export async function fetchProfiles() {
   const r = await fetch(`${BASE}/api/profiles`);
   if (!r.ok) return [];
+  return r.json();
+}
+
+export async function fetchProjects() {
+  const r = await fetch(`${BASE}/api/projects`);
+  if (!r.ok) return [];
+  return r.json();
+}
+
+export async function createProject({ name, repo_paths, primary_repo }) {
+  const r = await fetch(`${BASE}/api/projects`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, repo_paths, primary_repo }),
+  });
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `POST projects → ${r.status}`); }
+  return r.json();
+}
+
+export async function updateProject(id, body) {
+  const r = await fetch(`${BASE}/api/projects/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `PUT projects → ${r.status}`); }
+  return r.json();
+}
+
+export async function deleteProject(id) {
+  const r = await fetch(`${BASE}/api/projects/${id}`, { method: "DELETE" });
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `DELETE projects → ${r.status}`); }
   return r.json();
 }
 

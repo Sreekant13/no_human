@@ -96,6 +96,16 @@ class TaskOut(BaseModel):
         )
 
 
+def _last_activity(task: "Task", attempts: list[dict] | None) -> str | None:
+    """Return the most recent timestamp across task.updated_at and attempt
+    timestamps.  Used for the board card's 'last activity' line."""
+    candidates = [task.updated_at or ""]
+    for a in (attempts or []):
+        candidates.append(a.get("completed_at") or "")
+        candidates.append(a.get("started_at") or "")
+    return max(candidates) or None
+
+
 class TaskSummaryOut(BaseModel):
     id: str
     external_id: str | None = None
@@ -115,6 +125,7 @@ class TaskSummaryOut(BaseModel):
     blocker_question: str | None = None
     blocker_category: str | None = None
     blocker_wake_condition: str | None = None
+    last_activity: str | None = None
 
     @classmethod
     def from_task(
@@ -157,6 +168,7 @@ class TaskSummaryOut(BaseModel):
             blocker_question=blocker_q,
             blocker_category=blocker_cat,
             blocker_wake_condition=blocker_wake,
+            last_activity=_last_activity(task, attempts),
         )
 
 
@@ -164,6 +176,7 @@ class CreateTaskRequest(BaseModel):
     title: str
     description: str | None = None
     repo_path: str | None = None
+    project_id: str | None = None
     kind: str = "feature"
     priority: str = "medium"
     acceptance_criteria: list[str] = []
@@ -185,6 +198,7 @@ class GrillStepRequest(BaseModel):
     title: str
     description: str | None = None
     repo_path: str | None = None
+    project_id: str | None = None
     qa_history: list[dict] = []
 
 
@@ -200,3 +214,32 @@ class GrillResultOut(BaseModel):
     title: str
     description: str
     acceptance_criteria: list[str]
+
+
+class ProjectOut(BaseModel):
+    id: str
+    name: str
+    repo_paths: list[str]
+    primary_repo: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+    @classmethod
+    def from_project(cls, p: Any) -> "ProjectOut":
+        return cls(
+            id=p.id, name=p.name, repo_paths=p.repo_paths,
+            primary_repo=p.primary_repo,
+            created_at=p.created_at, updated_at=p.updated_at,
+        )
+
+
+class CreateProjectRequest(BaseModel):
+    name: str
+    repo_paths: list[str] = []
+    primary_repo: str | None = None
+
+
+class UpdateProjectRequest(BaseModel):
+    name: str | None = None
+    repo_paths: list[str] | None = None
+    primary_repo: str | None = None
