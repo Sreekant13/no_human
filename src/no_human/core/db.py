@@ -380,6 +380,13 @@ class Store:
         rows = await cur.fetchall()
         return [Project.from_row(r) for r in rows]
 
+    async def find_project_by_repo(self, repo_path: str) -> "Project | None":
+        """Find the project whose ``repo_paths`` contains *repo_path*."""
+        for proj in await self.list_projects():
+            if repo_path in proj.repo_paths:
+                return proj
+        return None
+
     async def update_project(self, project: "Project") -> None:
         row = project.to_row()
         await self.db.execute(

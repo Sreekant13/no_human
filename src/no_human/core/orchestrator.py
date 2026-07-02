@@ -656,25 +656,80 @@ class Orchestrator:
         await self.store.set_status(task, TaskStatus.TESTING)
         self.emit("state", "testing", status="testing")
         test_cmd = await self._resolve_test_cmd(repo)
-        # Offload the (blocking) test subprocess to a thread so concurrent tasks'
-        # agent phases keep progressing on the event loop (Phase 7).
-        test_result = await asyncio.to_thread(runner.run_tests, repo.path, test_cmd)
-        self.emit("tests", test_result.summary, ok=test_result.ok)
-        await self.store.update_attempt(
-            attempt_id,
-            test_results={
-                "ran": test_result.ran, "ok": test_result.ok,
-                "passed": test_result.passed, "failed": test_result.failed,
-                "errors": test_result.errors, "tamper_flag": False,
-            },
-        )
-        if test_result.ran and not test_result.ok:
-            is_stuck = stuck.record(test_result.output)
-            detail = f"tests failed: {test_result.summary}"
-            if is_stuck:
-                self.emit("stuck", "same failure signature repeated; resetting context")
-            await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
-            return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+
+        # PR4: layered test execution — if the task's repo belongs to a project
+        # with a non-empty TestPlan, execute layers in dependency order.
+        # Otherwise fall back to the single-command run_tests.
+        test_plan = await self._resolve_test_plan(task)
+        if test_plan and test_plan.layers:
+            from ..testing.plan_runner import run_test_plan
+
+            def _on_layer_start(layer):
+                self.emit("test_layer_start", layer.name)
+
+            def _on_layer_done(layer, lr):
+                self.emit("test_layer_done", lr.summary, ok=lr.ok)
+
+            plan_result = await asyncio.to_thread(
+                run_test_plan, test_plan, repo.path,
+                on_layer_start=_on_layer_start,
+                on_layer_done=_on_layer_done,
+                fallback_cmd=test_cmd,
+            )
+            self.emit("tests", plan_result.summary, ok=plan_result.ok)
+            # Build aggregate test_results for the attempt record.
+            total_passed = sum(
+                (lr.result.passed if lr.result else 0) for lr in plan_result.layer_results
+            )
+            total_failed = sum(
+                (lr.result.failed if lr.result else 0) for lr in plan_result.layer_results
+            )
+            total_errors = sum(
+                (lr.result.errors if lr.result else 0) for lr in plan_result.layer_results
+            )
+            any_ran = any(lr.result and lr.result.ran for lr in plan_result.layer_results)
+            await self.store.update_attempt(
+                attempt_id,
+                test_results={
+                    "ran": any_ran, "ok": plan_result.ok,
+                    "passed": total_passed, "failed": total_failed,
+                    "errors": total_errors, "tamper_flag": False,
+                    "layers": [lr.summary for lr in plan_result.layer_results],
+                },
+            )
+            if any_ran and not plan_result.ok:
+                # Find the first failing blocking layer's output for stuck detection.
+                fail_output = ""
+                for lr in plan_result.layer_results:
+                    if lr.result and not lr.result.ok:
+                        fail_output = lr.result.output
+                        break
+                is_stuck = stuck.record(fail_output) if fail_output else False
+                detail = f"tests failed: {plan_result.summary}"
+                if is_stuck:
+                    self.emit("stuck", "same failure signature repeated; resetting context")
+                await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
+                return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+        else:
+            # Offload the (blocking) test subprocess to a thread so concurrent tasks'
+            # agent phases keep progressing on the event loop (Phase 7).
+            test_result = await asyncio.to_thread(runner.run_tests, repo.path, test_cmd)
+            self.emit("tests", test_result.summary, ok=test_result.ok)
+            await self.store.update_attempt(
+                attempt_id,
+                test_results={
+                    "ran": test_result.ran, "ok": test_result.ok,
+                    "passed": test_result.passed, "failed": test_result.failed,
+                    "errors": test_result.errors, "tamper_flag": False,
+                },
+            )
+            if test_result.ran and not test_result.ok:
+                is_stuck = stuck.record(test_result.output)
+                detail = f"tests failed: {test_result.summary}"
+                if is_stuck:
+                    self.emit("stuck", "same failure signature repeated; resetting context")
+                await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
+                return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
 
         # --- CI (if configured): push branch first, then trigger pipeline ---
         if self.ci_runner is not None:
@@ -1496,6 +1551,20 @@ class Orchestrator:
             except Exception:  # noqa: BLE001
                 prof = None
         return prof if (prof and prof.is_usable) else None
+
+    async def _resolve_test_plan(self, task: Task):
+        """Look up the project's TestPlan for layered test execution (PR4).
+
+        Returns a ``TestPlan`` with layers if the task's repo belongs to a
+        project that has configured test layers; else ``None``.
+        """
+        if not task.repo_path:
+            return None
+        proj = await self.store.find_project_by_repo(task.repo_path)
+        if proj is None:
+            return None
+        plan = proj.test_plan
+        return plan if plan and plan.layers else None
 
     async def _resolve_test_cmd(self, repo: GitRepo) -> str | None:
         """Resolve the test command: an explicit config override wins; else a
