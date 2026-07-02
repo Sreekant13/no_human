@@ -250,3 +250,14 @@ def test_logs_no_attempts(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert "no attempts" in result.output.lower()
+
+
+def test_test_cmd_help():
+    """nh test --help works without any bootstrap or auth."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["test", "--help"])
+    assert result.exit_code == 0
+    assert "fast" in result.output
+    assert "full" in result.output
+    assert "slow" in result.output
+    assert "zero llm tokens" in result.output.lower()
