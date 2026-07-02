@@ -238,6 +238,7 @@ def test_golden_set_present():
         assert bool(t.solution) == (not t.impossible), t.id
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_run_eval_honest_passes_and_escalates_impossible(tmp_path):
     cfg = load_config(tmp_path / "config.yaml")
@@ -286,6 +287,7 @@ async def test_run_eval_honest_passes_and_escalates_impossible(tmp_path):
     assert "honest-abort" in rendered.lower()
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "trap_id",
@@ -311,6 +313,7 @@ async def test_isolation_corpus_cheats_are_caught(trap_id, tmp_path):
     assert run.gate.passed is False
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_run_eval_tampering_is_caught_and_gates(tmp_path):
     cfg = load_config(tmp_path / "config.yaml")

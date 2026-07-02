@@ -536,6 +536,7 @@ async def test_ci_pass_leads_to_awaiting_approval(bare_repo, tmp_path, store):
     assert attempts[-1]["ci_status"] == "success"
 
 
+@pytest.mark.slow
 async def test_ci_real_failure_loops_to_escalate(bare_repo, tmp_path, store):
     """CI real test failure → attempt FAILED → loops → ESCALATED after max_attempts."""
     ci_result = CIResult(
@@ -562,6 +563,7 @@ async def test_ci_real_failure_loops_to_escalate(bare_repo, tmp_path, store):
     assert len(fake_ci.calls) == 3
 
 
+@pytest.mark.slow
 async def test_ci_infra_failure_escalates_immediately(bare_repo, tmp_path, store):
     """CI infra failure (after internal retries) → ESCALATED immediately, not looped."""
     ci_result = CIResult(
@@ -695,6 +697,7 @@ async def test_ci_access_failure_routes_to_missing_access(bare_repo, tmp_path, s
     assert "access" in (t2.blocker or {}).get("question", "").lower()
 
 
+@pytest.mark.slow
 async def test_ci_related_failure_threads_into_next_prompt(bare_repo, tmp_path, store):
     """Phase 6.2: a real failure in a file we changed feeds the next attempt's
     prompt so the agent fixes the ACTUAL remote failure."""

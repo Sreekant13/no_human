@@ -146,6 +146,7 @@ def _make_work_repo(tmp_path, name):
     return work
 
 
+@pytest.mark.slow
 async def test_two_repos_run_concurrently_in_worktrees(store, tmp_path):
     """Phase 7 DoD: two tasks in DIFFERENT repos run through the pool, each in its
     own worktree, both open a PR — with no git corruption."""
