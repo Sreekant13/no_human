@@ -349,6 +349,37 @@ class Orchestrator:
             confirmed=True, project=task.repo_path
         )
 
+        # PR3: Progressive skill disclosure — discover project-level skills
+        # from the task repo's .claude/skills/ and merge with DB-confirmed ones.
+        # This lets the supervisor's "I can't / skill-exists" detector work for
+        # skills that are on-disk but not yet in the DB.
+        self._discovered_skills: list[str] = []
+        if task.repo_path:
+            from ..history.skills import discover_skills
+            extra_roots = [Path(task.repo_path) / ".claude" / "skills"]
+            disk_skills = await asyncio.to_thread(
+                discover_skills, extra_roots=extra_roots,
+            )
+            # Confirmed skill titles from DB
+            db_skill_titles = {
+                m.get("title", "")
+                for m in (self._active_memories or [])
+                if m.get("type") == "skill"
+            }
+            # Merge: disk skills not already in DB
+            for s in disk_skills:
+                if s.name not in db_skill_titles:
+                    self._discovered_skills.append(s.name)
+            all_skill_names = sorted(
+                db_skill_titles | {s.name for s in disk_skills}
+            )
+            if all_skill_names:
+                self.emit(
+                    "skills_loaded",
+                    f"{len(all_skill_names)} skills: "
+                    + ", ".join(all_skill_names[:10]),
+                )
+
         outcome = TaskOutcome(task, status=task.status, detail="")
         for attempt_n in range(1, self.bounds.max_attempts + 1):
             self.emit("attempt_start", f"attempt {attempt_n}/{self.bounds.max_attempts}")
@@ -1661,13 +1692,16 @@ class Orchestrator:
             )
 
         # Skills the supervisor must check the agent uses (EVOLUTION_PLAN §1.2 #2,
-        # §1.3 row 1): confirmed skill-type memories. This is what lets the
-        # supervisor convert "I can't access X" into "use skill Y" when Y exists.
-        skills = [
+        # §1.3 row 1): confirmed skill-type memories + discovered on-disk skills
+        # (PR3 progressive disclosure). This is what lets the supervisor convert
+        # "I can't access X" into "use skill Y" when Y exists.
+        db_skills = [
             m.get("title", "")
             for m in (getattr(self, "_active_memories", None) or [])
             if m.get("type") == "skill" and m.get("title")
         ]
+        discovered = getattr(self, "_discovered_skills", None) or []
+        skills = list(dict.fromkeys(db_skills + discovered))  # dedup, preserve order
 
         return SupervisorHook(
             task_title=task.title,

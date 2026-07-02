@@ -150,3 +150,39 @@ def test_skills_list_empty(tmp_path, monkeypatch):
     result = runner.invoke(cli, ["skills", "list"], catch_exceptions=False)
     assert result.exit_code == 0
     assert "no confirmed skills" in result.output
+
+
+# --------------------------------------------------------------------------- #
+# PR3: Progressive skill disclosure — discover_skills unit tests               #
+# --------------------------------------------------------------------------- #
+
+def test_discover_skills_from_project_dir(tmp_path):
+    """Skills in a project .claude/skills/ dir are discovered."""
+    from no_human.history.skills import discover_skills
+
+    proj_skills = tmp_path / ".claude" / "skills" / "test-skill"
+    proj_skills.mkdir(parents=True)
+    (proj_skills / "SKILL.md").write_text(
+        "---\nname: test-skill\ndescription: A test skill\n---\nDetails here."
+    )
+
+    found = discover_skills(extra_roots=[tmp_path / ".claude" / "skills"])
+    names = [s.name for s in found]
+    assert "test-skill" in names
+
+
+def test_discover_skills_dedup_across_roots(tmp_path):
+    """Skill with the same name in two roots is deduplicated."""
+    from no_human.history.skills import discover_skills
+
+    r1 = tmp_path / "root1" / "my-skill"
+    r1.mkdir(parents=True)
+    (r1 / "SKILL.md").write_text("---\nname: shared\ndescription: first\n---\n")
+
+    r2 = tmp_path / "root2" / "my-skill"
+    r2.mkdir(parents=True)
+    (r2 / "SKILL.md").write_text("---\nname: shared\ndescription: second\n---\n")
+
+    found = discover_skills(extra_roots=[tmp_path / "root1", tmp_path / "root2"])
+    shared = [s for s in found if s.name == "shared"]
+    assert len(shared) == 1  # deduped
