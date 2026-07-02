@@ -50,6 +50,26 @@ log = logging.getLogger("no_human.orchestrator")
 EventSink = Callable[[dict], None]
 
 
+def _summarize_tool_sig(tool: str, inp: dict) -> str:
+    """Compact tool-call signature for doom-loop detection.
+
+    Produces a short deterministic summary of a tool invocation so
+    ``StuckDetector.record_tool_call`` can compare consecutive calls.
+    """
+    if tool in ("Read", "View"):
+        return inp.get("file_path") or inp.get("path") or ""
+    if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        return inp.get("file_path") or inp.get("path") or ""
+    if tool in ("Grep", "Search"):
+        q = inp.get("query") or inp.get("pattern") or ""
+        p = inp.get("path") or inp.get("search_path") or ""
+        return f"{q[:60]}|{p}"
+    if tool in ("Bash", "Terminal"):
+        return inp.get("command") or inp.get("cmd") or ""
+    first = next(iter(inp.values()), "") if inp else ""
+    return str(first)[:80]
+
+
 @dataclass
 class TaskOutcome:
     task: Task
@@ -166,6 +186,23 @@ class Orchestrator:
             sv.note_text(event.text)
         # Track files the agent intentionally modified so we only commit those
         # (not test side-effects like state files updated during test runs).
+        # Phase 7e: feed tool calls to the doom-loop detector.  If the
+        # agent repeats the exact same call 3× consecutively, emit a "stuck"
+        # event.  We do NOT interrupt mid-attempt (constraint #5); the event
+        # is telemetry and the attempt will end naturally at max_turns.
+        if event.kind == "tool_use":
+            detector = getattr(self, "_stuck", None)
+            if detector is not None:
+                sig = _summarize_tool_sig(
+                    event.tool_name or "", event.tool_input or {}
+                )
+                if detector.record_tool_call(event.tool_name or "", sig):
+                    self.emit(
+                        "stuck",
+                        "doom-loop: identical tool call repeated "
+                        f"{detector.doom_loop_threshold}×; "
+                        "will reset context on next attempt",
+                    )
         if event.kind == "tool_use" and event.tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
             inp = event.tool_input or {}
             path = inp.get("file_path") or inp.get("path") or inp.get("notebook_path") or ""
@@ -335,6 +372,7 @@ class Orchestrator:
     ) -> TaskOutcome:
         attempt_id = await self.store.create_attempt(task.id, attempt_n)
         stuck = StuckDetector()
+        self._stuck: StuckDetector | None = stuck  # visible to _agent_sink
         self._agent_edited_files: set[str] = set()  # reset per attempt
 
         # --- branch (deterministic git; agent never touches git) ---

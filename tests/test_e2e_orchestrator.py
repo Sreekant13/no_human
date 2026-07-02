@@ -1037,3 +1037,56 @@ async def test_full_pipeline_with_planning(bare_repo, tmp_path, store):
     assert "planning" in kinds
     # PLAN.md was written to worktree (but not committed)
     assert outcome.pr_url and "no-human/" in outcome.pr_url
+
+
+# --------------------------------------------------------------------------- #
+# Phase 7e: doom-loop detection wired through _agent_sink                      #
+# --------------------------------------------------------------------------- #
+
+class DoomLoopBackend:
+    """Backend that emits 3 identical Read tool_use events (a doom-loop)."""
+
+    def __init__(self, mutate):
+        self.mutate = mutate
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        if on_event:
+            for _ in range(3):
+                on_event(AgentEvent("tool_use", tool_name="Read",
+                                    tool_input={"file_path": "/src/foo.py"}))
+            on_event(AgentEvent("tool_use", tool_name="Edit",
+                                tool_input={"file_path": "calc.py"}))
+        self.mutate(cwd)
+        return AgentResult(final_text="done", num_turns=4, is_error=False,
+                           tokens_used=100, session_id="s", stop_reason="end_turn")
+
+
+async def test_doom_loop_emits_stuck_event(bare_repo, tmp_path, store):
+    """When the agent repeats the exact same tool call 3×, the orchestrator
+    emits a 'stuck' event but does NOT interrupt the attempt (constraint #5)."""
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef greet():\n    return 'hi'\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, greet\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_greet():\n    assert greet() == 'hi'\n"
+        )
+
+    cfg = _config(tmp_path)
+    events: list[dict] = []
+    orch = Orchestrator(store, cfg.data, DoomLoopBackend(mutate),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("trigger doom loop", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    # The attempt should still complete — no mid-attempt interruption.
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    # A "stuck" event with doom-loop text must have been emitted.
+    stuck_events = [e for e in events if e.get("kind") == "stuck"]
+    assert len(stuck_events) >= 1
+    assert "doom-loop" in stuck_events[0]["text"]

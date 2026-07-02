@@ -37,3 +37,41 @@ def test_bounds_from_config_override():
     b = Bounds.from_config({"max_attempts": 5, "max_turns_per_attempt": 10})
     assert b.max_attempts == 5
     assert b.max_turns_per_attempt == 10
+
+
+# --- Phase 7e: doom-loop detection via tool-call signatures --- #
+
+def test_doom_loop_after_three_identical():
+    """Three consecutive identical tool calls → doom-loop fires."""
+    d = StuckDetector(doom_loop_threshold=3)
+    assert d.record_tool_call("Read", "/src/foo.py") is False
+    assert d.record_tool_call("Read", "/src/foo.py") is False
+    assert d.record_tool_call("Read", "/src/foo.py") is True  # 3rd → stuck
+
+
+def test_doom_loop_not_triggered_by_interleaved():
+    """Different calls interleaved should NOT trigger doom-loop."""
+    d = StuckDetector(doom_loop_threshold=3)
+    assert d.record_tool_call("Read", "/src/foo.py") is False
+    assert d.record_tool_call("Edit", "/src/bar.py") is False
+    assert d.record_tool_call("Read", "/src/foo.py") is False  # reset streak
+    assert d.record_tool_call("Read", "/src/foo.py") is False  # only 2
+
+
+def test_doom_loop_health_reflects_state():
+    d = StuckDetector(doom_loop_threshold=3)
+    d.record_tool_call("Read", "/a.py")
+    d.record_tool_call("Read", "/a.py")
+    h = d.health
+    assert h["consecutive_repeats"] == 2
+    assert h["total_tool_calls"] == 2
+
+
+def test_doom_loop_resets_on_different_call():
+    d = StuckDetector(doom_loop_threshold=3)
+    d.record_tool_call("Read", "/a.py")
+    d.record_tool_call("Read", "/a.py")
+    d.record_tool_call("Grep", "pattern|/src")  # different → resets
+    assert d.health["consecutive_repeats"] == 1
+    assert d.record_tool_call("Grep", "pattern|/src") is False  # only 2
+    assert d.record_tool_call("Grep", "pattern|/src") is True   # 3rd → stuck
