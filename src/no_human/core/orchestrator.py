@@ -438,7 +438,7 @@ class Orchestrator:
 
         # PR-F Gate 2: create matching branches in linked repos so changes
         # there land on their own deterministic branch (never_push_to honoured).
-        linked_repos_git: list[tuple[str, GitRepo]] = []
+        linked_repos_git: list[tuple[str, GitRepo, str]] = []  # (path, repo, base_branch)
         for lr_path in (task.linked_repos or []):
             lr = Path(lr_path)
             if not (lr / ".git").is_dir():
@@ -449,7 +449,7 @@ class Orchestrator:
                 )
                 lr_base = lr_repo.current_branch()
                 lr_repo.create_branch(branch, base=lr_base)
-                linked_repos_git.append((lr_path, lr_repo))
+                linked_repos_git.append((lr_path, lr_repo, lr_base))
             except ProtectedBranch:
                 log.warning("linked repo %s: branch %s is protected, skipping", lr_path, branch)
             except Exception as exc:  # noqa: BLE001
@@ -594,12 +594,12 @@ class Orchestrator:
         self.emit("commit", f"{commit.sha[:8]} ({commit.files_changed} files)")
 
         # PR-F Gate 2: commit changes in linked repos (if any).
-        linked_commits: list[tuple[str, GitRepo]] = []
-        for lr_path, lr_repo in linked_repos_git:
+        linked_commits: list[tuple[str, GitRepo, str]] = []  # (path, repo, base_branch)
+        for lr_path, lr_repo, lr_base_branch in linked_repos_git:
             try:
                 if lr_repo.has_changes():
                     lr_commit = lr_repo.commit_all(commit_msg)
-                    linked_commits.append((lr_path, lr_repo))
+                    linked_commits.append((lr_path, lr_repo, lr_base_branch))
                     self.emit("commit",
                               f"[linked:{lr_path}] {lr_commit.sha[:8]} "
                               f"({lr_commit.files_changed} files)")
@@ -920,10 +920,8 @@ class Orchestrator:
         # PR-F Gate 3: open PRs for linked repos that had changes committed.
         linked_pr_urls: list[str] = []
         gh_hosts = self.config.get("git", {}).get("github_hosts")
-        for lr_path, lr_repo in (linked_commits or []):
+        for lr_path, lr_repo, lr_base in (linked_commits or []):
             try:
-                lr_base = lr_repo._run("rev-parse", "--abbrev-ref", "HEAD@{-1}",
-                                       check=False).strip() or "main"
                 lr_body = f"Linked PR for {task.title}\n\nPrimary PR: {pr.url}"
                 lr_pr = open_pr(lr_repo, branch, title, lr_body, base=lr_base,
                                 github_hosts=gh_hosts)
