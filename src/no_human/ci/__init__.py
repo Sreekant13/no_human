@@ -22,6 +22,18 @@ from .jenkins import JenkinsCI
 from .parser import parse_results
 
 
+def ci_from_layer(layer_ci: dict[str, Any]) -> CIBackend | None:
+    """Build a CI backend from a TestLayer's ``ci`` dict.
+
+    Reuses ``ci_from_config`` by wrapping the layer dict as
+    ``{"ci": {"enabled": True, ...}}``.  Returns ``None`` if *layer_ci*
+    is empty or missing ``backend``/``project``.
+    """
+    if not layer_ci or not (layer_ci.get("backend") or layer_ci.get("project")):
+        return None
+    return ci_from_config({"ci": {"enabled": True, **layer_ci}})
+
+
 def ci_from_config(config: dict[str, Any]) -> CIBackend | None:
     """Build a CI backend from the config dict, or None if CI is disabled."""
     ci_conf = config.get("ci") or {}
@@ -89,6 +101,6 @@ def ci_from_config(config: dict[str, Any]) -> CIBackend | None:
 __all__ = [
     "CIBackend", "CIResult", "HumanGatedCI", "JobResult", "PipelineStatus",
     "GitLabCI", "GitHubActionsCI", "JenkinsCI", "GHECheckRunsCI",
-    "ci_from_config",
+    "ci_from_config", "ci_from_layer",
     "parse_results",
 ]

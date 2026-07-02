@@ -258,6 +258,222 @@ def test_missing_cred_produces_missing_access(tmp_path, monkeypatch):
     assert lr.deferred
 
 
+# --------------------------------------------------------------------------- #
+# ci_from_layer factory tests                                                   #
+# --------------------------------------------------------------------------- #
+
+from no_human.ci import ci_from_layer, GitLabCI, JenkinsCI
+
+
+def test_ci_from_layer_gitlab():
+    """ci_from_layer builds a GitLabCI from a layer ci dict."""
+    ci = ci_from_layer({
+        "backend": "gitlab",
+        "project": "ci_gate-analytics-export-report-generator",
+        "hostname": "gitlab.acme.net",
+        "variables": {"METHOD": "create", "TEST": "true"},
+        "timeout_minutes": 45,
+    })
+    assert isinstance(ci, GitLabCI)
+    assert ci.project == "ci_gate-analytics-export-report-generator"
+    assert ci.hostname == "gitlab.acme.net"
+    assert ci.variables == {"METHOD": "create", "TEST": "true"}
+    assert ci.timeout_minutes == 45
+
+
+def test_ci_from_layer_jenkins():
+    """ci_from_layer builds a JenkinsCI from a layer ci dict."""
+    ci = ci_from_layer({
+        "backend": "jenkins",
+        "job": "job/metrics-core/job/metrics-core-query-service",
+        "mode": "human_gated",
+    })
+    assert isinstance(ci, JenkinsCI)
+    assert ci.mode == "human_gated"
+
+
+def test_ci_from_layer_empty():
+    """ci_from_layer returns None for empty or missing config."""
+    assert ci_from_layer({}) is None
+    assert ci_from_layer(None) is None
+
+
+def test_ci_from_layer_no_project():
+    """ci_from_layer returns None when backend is set but project is missing."""
+    assert ci_from_layer({"backend": "gitlab"}) is None
+
+
+# --------------------------------------------------------------------------- #
+# _run_ci_layer tests (mocked CI backend)                                       #
+# --------------------------------------------------------------------------- #
+
+from no_human.testing.plan_runner import _run_ci_layer
+from no_human.ci.base import CIResult, PipelineStatus, HumanGatedCI
+
+
+def test_run_ci_layer_no_config():
+    """CI layer without ci dict → deferred."""
+    layer = TestLayer(name="ci-test", command="", runner=Runner.CI, ci={})
+    lr = _run_ci_layer(layer)
+    assert lr.deferred
+    assert lr.ok  # deferred is not a failure
+
+
+def test_run_ci_layer_success(monkeypatch):
+    """CI layer with a successful pipeline → ok."""
+    fake_result = CIResult(
+        pipeline_id="123", pipeline_url="https://gitlab/p/123",
+        status=PipelineStatus.SUCCESS,
+    )
+    def fake_from_layer(ci_dict):
+        class FakeCI:
+            name = "gitlab"
+            async def trigger(self, branch, extra_vars=None):
+                return fake_result
+        return FakeCI()
+    monkeypatch.setattr("no_human.ci.ci_from_layer", fake_from_layer)
+
+    layer = TestLayer(name="ci_gate-e2e", command="", runner=Runner.CI, ci={
+        "backend": "gitlab", "project": "ci_gate-analytics-export",
+    })
+    lr = _run_ci_layer(layer)
+    assert lr.ok
+    assert not lr.deferred
+    assert lr.result is not None
+    assert lr.result.ok
+
+
+def test_run_ci_layer_failure(monkeypatch):
+    """CI layer with a failed pipeline → not ok."""
+    fake_result = CIResult(
+        pipeline_id="456", pipeline_url="https://gitlab/p/456",
+        status=PipelineStatus.FAILED,
+    )
+    def fake_from_layer(ci_dict):
+        class FakeCI:
+            name = "gitlab"
+            async def trigger(self, branch, extra_vars=None):
+                return fake_result
+        return FakeCI()
+    monkeypatch.setattr("no_human.ci.ci_from_layer", fake_from_layer)
+
+    layer = TestLayer(name="ci_gate-e2e", command="", runner=Runner.CI, ci={
+        "backend": "gitlab", "project": "ci_gate-analytics-export",
+    })
+    lr = _run_ci_layer(layer)
+    assert not lr.ok
+    assert lr.result is not None
+    assert not lr.result.ok
+
+
+def test_run_ci_layer_human_gated(monkeypatch):
+    """CI layer with human_gated Jenkins → deferred + HUMAN_GATED error."""
+    def fake_from_layer(ci_dict):
+        class FakeCI:
+            name = "jenkins"
+            async def trigger(self, branch, extra_vars=None):
+                raise HumanGatedCI("build image first", wake_hint="Jenkins build #42")
+        return FakeCI()
+    monkeypatch.setattr("no_human.ci.ci_from_layer", fake_from_layer)
+
+    layer = TestLayer(name="docker-build", command="", runner=Runner.CI, ci={
+        "backend": "jenkins", "job": "job/metrics-core", "mode": "human_gated",
+    })
+    lr = _run_ci_layer(layer)
+    assert lr.deferred
+    assert "HUMAN_GATED" in (lr.error or "")
+
+
+def test_run_ci_layer_uses_variables(monkeypatch):
+    """CI layer passes variables from layer.ci to the trigger."""
+    captured = {}
+    def fake_from_layer(ci_dict):
+        class FakeCI:
+            name = "gitlab"
+            async def trigger(self, branch, extra_vars=None):
+                captured["branch"] = branch
+                captured["vars"] = extra_vars
+                return CIResult(
+                    pipeline_id="789", pipeline_url="",
+                    status=PipelineStatus.SUCCESS,
+                )
+        return FakeCI()
+    monkeypatch.setattr("no_human.ci.ci_from_layer", fake_from_layer)
+
+    layer = TestLayer(name="ci_gate", command="", runner=Runner.CI, ci={
+        "backend": "gitlab", "project": "ci_gate-analytics-export",
+        "branch": "main",
+        "variables": {"METHOD": "create", "DESTROY": "true"},
+    })
+    lr = _run_ci_layer(layer)
+    assert lr.ok
+    assert captured["branch"] == "main"
+    assert captured["vars"] == {"METHOD": "create", "DESTROY": "true"}
+
+
+# --------------------------------------------------------------------------- #
+# Plan runner: CI layer integration in full plan                                #
+# --------------------------------------------------------------------------- #
+
+
+def test_plan_runner_ci_layer_triggers(tmp_path, monkeypatch):
+    """A plan with local + CI layers runs local first, then triggers CI."""
+    (tmp_path / "test.sh").write_text("#!/bin/sh\necho '3 passed'\nexit 0\n")
+
+    fake_result = CIResult(
+        pipeline_id="100", pipeline_url="https://gitlab/p/100",
+        status=PipelineStatus.SUCCESS,
+    )
+    def fake_from_layer(ci_dict):
+        class FakeCI:
+            name = "gitlab"
+            async def trigger(self, branch, extra_vars=None):
+                return fake_result
+        return FakeCI()
+    monkeypatch.setattr("no_human.ci.ci_from_layer", fake_from_layer)
+
+    plan = TestPlan(layers=[
+        TestLayer(name="unit", command="sh test.sh", gating=Gating.BLOCKING),
+        TestLayer(name="ci_gate", command="", runner=Runner.CI, gating=Gating.BLOCKING,
+                  depends_on=["unit"], ci={"backend": "gitlab", "project": "ci_gate"}),
+    ])
+    result = run_test_plan(plan, tmp_path)
+    assert result.ok
+    assert len(result.layer_results) == 2
+    assert result.layer_results[0].layer_name == "unit"
+    assert result.layer_results[0].ok
+    assert result.layer_results[1].layer_name == "ci_gate"
+    assert result.layer_results[1].ok
+
+
+def test_plan_runner_ci_fail_blocks(tmp_path, monkeypatch):
+    """A failing CI blocking layer stops the plan."""
+    (tmp_path / "test.sh").write_text("#!/bin/sh\necho '3 passed'\nexit 0\n")
+
+    fake_result = CIResult(
+        pipeline_id="101", pipeline_url="",
+        status=PipelineStatus.FAILED,
+    )
+    def fake_from_layer(ci_dict):
+        class FakeCI:
+            name = "gitlab"
+            async def trigger(self, branch, extra_vars=None):
+                return fake_result
+        return FakeCI()
+    monkeypatch.setattr("no_human.ci.ci_from_layer", fake_from_layer)
+
+    plan = TestPlan(layers=[
+        TestLayer(name="unit", command="sh test.sh", gating=Gating.BLOCKING),
+        TestLayer(name="ci_gate", command="", runner=Runner.CI, gating=Gating.BLOCKING,
+                  depends_on=["unit"], ci={"backend": "gitlab", "project": "ci_gate"}),
+        TestLayer(name="after", command="sh test.sh", gating=Gating.BLOCKING,
+                  depends_on=["ci_gate"]),
+    ])
+    result = run_test_plan(plan, tmp_path)
+    assert not result.ok
+    assert len(result.layer_results) == 2  # "after" was skipped
+
+
 @pytest.mark.asyncio
 async def test_find_project_by_repo(tmp_path):
     """Store.find_project_by_repo finds a project by its repo_paths."""

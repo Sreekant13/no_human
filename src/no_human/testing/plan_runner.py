@@ -115,14 +115,15 @@ def run_test_plan(
                 on_layer_done(layer, lr)
             continue
 
-        # CI layers are also deferred (the CIBackend handles them).
+        # CI layers: build a per-layer CI backend and trigger the pipeline.
+        # Falls back to deferred if no ci config is present on the layer.
         if layer.runner == Runner.CI:
-            lr = LayerResult(
-                layer_name=layer.name, gating=layer.gating, deferred=True,
-            )
+            lr = _run_ci_layer(layer)
             result.layer_results.append(lr)
             if on_layer_done:
                 on_layer_done(layer, lr)
+            if not lr.ok and layer.gating == Gating.BLOCKING:
+                break
             continue
 
         # Resolve the working directory.
@@ -182,6 +183,82 @@ def run_test_plan(
             break
 
     return result
+
+
+# --------------------------------------------------------------------------- #
+# CI layer execution: build per-layer backend, trigger, convert result         #
+# --------------------------------------------------------------------------- #
+
+
+def _run_ci_layer(layer: TestLayer) -> LayerResult:
+    """Trigger a CI pipeline for a layer and wait for the result.
+
+    Builds a CI backend from ``layer.ci`` (per-layer config). If the layer has
+    no ``ci`` dict or the backend cannot be constructed, the layer is deferred.
+
+    ``HumanGatedCI`` → deferred with a wake hint (the orchestrator parks).
+    """
+    import asyncio
+
+    from ..ci import HumanGatedCI, PipelineStatus, ci_from_layer
+
+    if not layer.ci:
+        log.info("layer %s: no ci config — deferring", layer.name)
+        return LayerResult(
+            layer_name=layer.name, gating=layer.gating, deferred=True,
+        )
+
+    try:
+        backend = ci_from_layer(layer.ci)
+    except Exception as exc:  # noqa: BLE001
+        return LayerResult(
+            layer_name=layer.name, gating=layer.gating,
+            error=f"ci_from_layer failed: {exc}",
+        )
+
+    if backend is None:
+        return LayerResult(
+            layer_name=layer.name, gating=layer.gating,
+            error="CI config incomplete — need backend + project/job",
+        )
+
+    ci_branch = layer.ci.get("branch") or layer.branch or "main"
+    ci_variables = layer.ci.get("variables") or {}
+
+    try:
+        # run_test_plan runs in asyncio.to_thread — no event loop in this
+        # thread, so asyncio.run() is safe.
+        ci_result = asyncio.run(backend.trigger(ci_branch, ci_variables))
+    except HumanGatedCI as exc:
+        return LayerResult(
+            layer_name=layer.name, gating=layer.gating, deferred=True,
+            error=f"HUMAN_GATED: {exc.wake_hint or str(exc)}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return LayerResult(
+            layer_name=layer.name, gating=layer.gating,
+            error=f"CI trigger error: {exc}",
+        )
+
+    # Convert CIResult → TestRunResult for uniform reporting.
+    ok = ci_result.status == PipelineStatus.SUCCESS
+    summary = ci_result.summary
+    if ci_result.pipeline_url:
+        summary += f"\n{ci_result.pipeline_url}"
+
+    test_result = TestRunResult(
+        ran=True, ok=ok,
+        passed=1 if ok else 0, failed=0 if ok else 1, errors=0,
+        command=f"ci:{backend.name}",
+        output=ci_result.parsed_output or summary,
+    )
+
+    lr = LayerResult(
+        layer_name=layer.name, gating=layer.gating, result=test_result,
+    )
+    if ci_result.infra_failure:
+        lr.error = f"INFRA: {ci_result.parsed_output or 'infrastructure failure'}"
+    return lr
 
 
 # --------------------------------------------------------------------------- #
