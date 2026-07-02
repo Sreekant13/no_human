@@ -330,6 +330,11 @@ export async function fetchTrackerSettings() {
   if (!r.ok) return { boards: [] };
   return r.json();
 }
+export async function fetchTrackerTransport() {
+  const r = await fetch(`${BASE}/api/settings/tracker/transport`);
+  if (!r.ok) return { transport: "unconfigured" };
+  return r.json();
+}
 export const updateTrackerBoards = (boards) => _put("/api/settings/tracker/boards", { boards });
 
 export async function suggestPaths(path) {
