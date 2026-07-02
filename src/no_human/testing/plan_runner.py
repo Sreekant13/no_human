@@ -13,6 +13,8 @@ task's working directory, tests run in that repo's path.
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -34,20 +36,20 @@ class LayerResult:
 
     @property
     def ok(self) -> bool:
+        if self.error:
+            return False  # exception or missing credentials
         if self.deferred:
             return True  # not a failure; will be checked later
-        if self.error:
-            return False  # exception during execution
         if self.result is None:
             return True  # skipped
         return self.result.ok
 
     @property
     def summary(self) -> str:
-        if self.deferred:
-            return f"{self.layer_name}: deferred (wake-gated)"
         if self.error:
             return f"{self.layer_name}: ERROR — {self.error}"
+        if self.deferred:
+            return f"{self.layer_name}: deferred (wake-gated)"
         if self.result is None:
             return f"{self.layer_name}: skipped"
         status = "PASS" if self.result.ok else "FAIL"
@@ -127,9 +129,33 @@ def run_test_plan(
         cwd = Path(layer.repo) if layer.repo else task_repo
         cmd = layer.command or fallback_cmd
 
+        # --- PR-C: credential resolution --------------------------------- #
+        resolved_env, missing = _resolve_credentials(layer)
+        if missing:
+            lr = LayerResult(
+                layer_name=layer.name, gating=layer.gating,
+                error=f"MISSING_ACCESS: required env vars not set: {', '.join(missing)}",
+            )
+            lr.deferred = True  # human must supply creds first
+            result.layer_results.append(lr)
+            if on_layer_done:
+                on_layer_done(layer, lr)
+            log.warning(
+                "layer %s skipped — missing credentials: %s (never log values)",
+                layer.name, ", ".join(missing),
+            )
+            if layer.gating == Gating.BLOCKING:
+                break
+            continue
+
+        # --- PR-C: branch freshness check -------------------------------- #
+        if layer.repo and layer.branch:
+            _check_branch_freshness(cwd, layer, task_repo)
+
         try:
             test_result = run_tests(
                 cwd, cmd, cwd=cwd, timeout=layer.timeout,
+                env=resolved_env or None,
             )
         except Exception as exc:  # noqa: BLE001
             lr = LayerResult(
@@ -156,3 +182,66 @@ def run_test_plan(
             break
 
     return result
+
+
+# --------------------------------------------------------------------------- #
+# PR-C helpers: credential resolution + branch freshness                       #
+# --------------------------------------------------------------------------- #
+
+
+def _resolve_credentials(
+    layer: TestLayer,
+) -> tuple[dict[str, str], list[str]]:
+    """Resolve ``env`` and ``secret_ref`` for a layer.
+
+    Returns (merged_env, missing_names). *merged_env* contains the layer's
+    ``env`` dict plus any ``secret_ref`` vars read from ``os.environ``.
+    *missing_names* lists ``secret_ref`` entries that are absent from the
+    environment — the caller must NOT run the layer when this is non-empty.
+
+    Values are never logged.
+    """
+    merged: dict[str, str] = dict(layer.env)  # static overrides
+    missing: list[str] = []
+    for name in layer.secret_ref:
+        val = os.environ.get(name)
+        if val is None:
+            missing.append(name)
+        else:
+            merged[name] = val
+    return merged, missing
+
+
+def _check_branch_freshness(
+    layer_cwd: Path, layer: TestLayer, task_repo: Path,
+) -> None:
+    """Warn if the integration-test repo's branch is behind the code repo.
+
+    Compares the HEAD SHA of *task_repo* with the merge-base of
+    *layer.branch* in *layer_cwd*. If the branch doesn't contain the code
+    repo's HEAD, the test results may be stale.
+
+    This is advisory only — it logs a warning but never blocks execution.
+    """
+    if not (layer_cwd / ".git").is_dir():
+        return
+    try:
+        code_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=task_repo, capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        if not code_head:
+            return
+        # Check if the code HEAD is an ancestor of the layer branch.
+        rc = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", code_head, layer.branch or "HEAD"],
+            cwd=layer_cwd, capture_output=True, timeout=10,
+        ).returncode
+        if rc != 0:
+            log.warning(
+                "layer %s: branch %r in %s may be stale — "
+                "code HEAD %s is not an ancestor; consider refreshing",
+                layer.name, layer.branch, layer_cwd, code_head[:8],
+            )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        log.debug("branch freshness check skipped for %s: %s", layer.name, exc)

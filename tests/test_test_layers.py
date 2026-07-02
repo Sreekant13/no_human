@@ -194,6 +194,70 @@ def test_layer_result_error_is_not_ok():
     assert "ERROR" in lr.summary
 
 
+# --- PR-C: credentials + freshness ---------------------------------------- #
+
+
+def test_layer_env_secret_ref_roundtrip():
+    """env and secret_ref survive to_dict/from_dict."""
+    layer = TestLayer(
+        name="it", command="pytest", env={"FOO": "bar"},
+        secret_ref=["SECRET_TOKEN"],
+    )
+    d = layer.to_dict()
+    assert d["env"] == {"FOO": "bar"}
+    assert d["secret_ref"] == ["SECRET_TOKEN"]
+    restored = TestLayer.from_dict(d)
+    assert restored.env == {"FOO": "bar"}
+    assert restored.secret_ref == ["SECRET_TOKEN"]
+
+
+def test_layer_env_secret_ref_defaults():
+    """Layers without env/secret_ref default to empty."""
+    layer = TestLayer.from_dict({"name": "unit", "command": "pytest"})
+    assert layer.env == {}
+    assert layer.secret_ref == []
+
+
+def test_resolve_credentials_all_present(monkeypatch):
+    """When all secret_ref vars are set, resolved_env has them and missing is empty."""
+    from no_human.testing.plan_runner import _resolve_credentials
+    monkeypatch.setenv("MY_TOKEN", "secret123")
+    layer = TestLayer(
+        name="it", command="pytest",
+        env={"FOO": "bar"}, secret_ref=["MY_TOKEN"],
+    )
+    merged, missing = _resolve_credentials(layer)
+    assert missing == []
+    assert merged["FOO"] == "bar"
+    assert merged["MY_TOKEN"] == "secret123"
+
+
+def test_resolve_credentials_missing(monkeypatch):
+    """When a secret_ref var is absent, it appears in missing list."""
+    from no_human.testing.plan_runner import _resolve_credentials
+    monkeypatch.delenv("ABSENT_VAR", raising=False)
+    layer = TestLayer(
+        name="it", command="pytest", secret_ref=["ABSENT_VAR"],
+    )
+    merged, missing = _resolve_credentials(layer)
+    assert missing == ["ABSENT_VAR"]
+
+
+def test_missing_cred_produces_missing_access(tmp_path, monkeypatch):
+    """A layer with a missing secret_ref is deferred with MISSING_ACCESS error."""
+    monkeypatch.delenv("REQUIRED_CRED", raising=False)
+    plan = TestPlan(layers=[
+        TestLayer(name="needs-cred", command="echo ok",
+                  secret_ref=["REQUIRED_CRED"]),
+    ])
+    pr = run_test_plan(plan, tmp_path)
+    assert len(pr.layer_results) == 1
+    lr = pr.layer_results[0]
+    assert not lr.ok  # deferred=True but has error → not ok checked via error
+    assert "MISSING_ACCESS" in (lr.error or "")
+    assert lr.deferred
+
+
 @pytest.mark.asyncio
 async def test_find_project_by_repo(tmp_path):
     """Store.find_project_by_repo finds a project by its repo_paths."""
