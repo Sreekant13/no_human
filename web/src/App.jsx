@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { connectWS, createTask, fetchTasks, fetchProjects, fetchWorkerStatus, fetchOnboardingStatus, grillStep, fetchTrackerBoards, fetchTrackerBoardItems } from "./api.js";
+import { connectWS, createTask, fetchTasks, fetchProjects, fetchWorkerStatus, fetchOnboardingStatus, grillStep, grillStepSSE, fetchTrackerBoards, fetchTrackerBoardItems } from "./api.js";
 import Board from "./Board.jsx";
 import Settings from "./Settings.jsx";
 import Onboarding from "./Onboarding.jsx";
@@ -98,6 +98,8 @@ function NewTaskModal({ onClose, onCreated }) {
   const [grillQuestion, setGrillQuestion] = useState(null);
   const [grillAnswer, setGrillAnswer] = useState("");
   const [grillResult, setGrillResult] = useState(null);
+  const [grillEvents, setGrillEvents] = useState([]);
+  const grillStreamRef = useRef(null);
   // Phase 3b: TRACKER import state
   const [trackerBoards, setTrackerBoards] = useState([]);
   const [trackerItems, setTrackerItems] = useState([]);
@@ -137,27 +139,51 @@ function NewTaskModal({ onClose, onCreated }) {
     }
   }
 
-  async function startGrill() {
+  function _grillParams(qaOverride) {
+    return {
+      title: title.trim(), description: description.trim() || null,
+      repo_path: customRepo ? repoPath.trim() || null : null,
+      project_id: !customRepo && selectedProjectId ? selectedProjectId : null,
+      qa_history: qaOverride ?? [],
+    };
+  }
+
+  function _startGrillSSE(params) {
+    if (grillStreamRef.current) grillStreamRef.current.close();
+    setGrillEvents([]);
+    grillStreamRef.current = grillStepSSE(
+      params,
+      (evt) => setGrillEvents((prev) => [...prev.slice(-30), evt]),
+      (result) => {
+        setBusy(false);
+        if (result.type === "done") { setGrillResult(result); setGrillQuestion(null); }
+        else { setGrillQuestion(result); }
+      },
+      (err) => {
+        // SSE failed — fall back to sync POST
+        grillStep(params)
+          .then((step) => {
+            if (step.type === "done") { setGrillResult(step); } else { setGrillQuestion(step); }
+          })
+          .catch((e) => { setError(e.message); setGrillMode(false); })
+          .finally(() => setBusy(false));
+      },
+    );
+  }
+
+  function startGrill() {
     if (!title.trim() || busy) return;
     setBusy(true); setError(null); setGrillMode(true);
     setGrillQA([]); setGrillQuestion(null); setGrillResult(null);
-    try {
-      const step = await grillStep({ title: title.trim(), description: description.trim() || null, repo_path: customRepo ? repoPath.trim() || null : null, project_id: !customRepo && selectedProjectId ? selectedProjectId : null, qa_history: [] });
-      if (step.type === "done") { setGrillResult(step); } else { setGrillQuestion(step); }
-    } catch (err) { setError(err.message); setGrillMode(false); }
-    finally { setBusy(false); }
+    _startGrillSSE(_grillParams([]));
   }
 
-  async function submitGrillAnswer() {
+  function submitGrillAnswer() {
     if (!grillAnswer.trim() || busy) return;
     setBusy(true); setError(null);
     const newQA = [...grillQA, { question: grillQuestion.question, answer: grillAnswer.trim() }];
     setGrillQA(newQA); setGrillAnswer("");
-    try {
-      const step = await grillStep({ title: title.trim(), description: description.trim() || null, repo_path: customRepo ? repoPath.trim() || null : null, project_id: !customRepo && selectedProjectId ? selectedProjectId : null, qa_history: newQA });
-      if (step.type === "done") { setGrillResult(step); setGrillQuestion(null); } else { setGrillQuestion(step); }
-    } catch (err) { setError(err.message); }
-    finally { setBusy(false); }
+    _startGrillSSE(_grillParams(newQA));
   }
 
   if (grillResult) {
@@ -189,8 +215,19 @@ function NewTaskModal({ onClose, onCreated }) {
           <div className="sendback-label">Intake Grill</div>
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2rem 1rem', gap: '1rem' }}>
             <Spinner />
-            <div style={{ color: 'var(--text)', fontSize: '0.9rem' }}>Exploring the codebase to ask the right questions...</div>
-            <div style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>This usually takes 15–30 seconds</div>
+            <div style={{ color: 'var(--text)', fontSize: '0.9rem' }}>Exploring the codebase...</div>
+            {grillEvents.length > 0 && (
+              <div style={{ width: '100%', maxHeight: 120, overflowY: 'auto', fontSize: '0.75rem', color: 'var(--fg-dim)', fontFamily: 'var(--font-mono)', borderTop: '1px solid var(--border)', paddingTop: '0.4rem' }}>
+                {grillEvents.map((ev, i) => (
+                  <div key={i} style={{ padding: '0.1rem 0', opacity: i === grillEvents.length - 1 ? 1 : 0.6 }}>
+                    {ev.kind === 'tool_use' ? `⚙ ${ev.text}` : ev.text}
+                  </div>
+                ))}
+              </div>
+            )}
+            {grillEvents.length === 0 && (
+              <div style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>This usually takes 15–30 seconds</div>
+            )}
           </div>
           <div className="sendback-actions">
             <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>

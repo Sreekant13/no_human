@@ -72,6 +72,55 @@ export async function grillStep({ title, description, repo_path, project_id, qa_
   return r.json();
 }
 
+// ── Grill SSE streaming ─────────────────────────────────────────────────────
+
+export function grillStepSSE({ title, description, repo_path, project_id, qa_history }, onEvent, onResult, onError) {
+  // POST-based SSE: we need to fetch as a stream since EventSource only does GET.
+  const ctrl = new AbortController();
+  (async () => {
+    try {
+      const r = await fetch(`${BASE}/api/grill/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, description, repo_path, project_id, qa_history: qa_history || [] }),
+        signal: ctrl.signal,
+      });
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        if (onError) onError(new Error(d.detail || `POST /api/grill/stream → ${r.status}`));
+        return;
+      }
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (data.kind === "done") { return; }
+            if (data.kind === "grill_result" || data.kind === "grill_question") {
+              if (onResult) onResult(data);
+            } else if (data.kind === "error") {
+              if (onError) onError(new Error(data.text || "grill error"));
+            } else {
+              if (onEvent) onEvent(data);
+            }
+          } catch { /* skip malformed */ }
+        }
+      }
+    } catch (err) {
+      if (err.name !== "AbortError" && onError) onError(err);
+    }
+  })();
+  return { close: () => ctrl.abort() };
+}
+
 // ── Task lifecycle ──────────────────────────────────────────────────────────
 
 export async function pauseTask(id) {

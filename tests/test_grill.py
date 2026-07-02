@@ -205,6 +205,43 @@ def test_summarize_tool():
     assert _summarize_tool("UnknownTool", {"val": "x"}) == "UnknownTool x"
 
 
+@pytest.mark.asyncio
+async def test_grill_step_on_event_passthrough():
+    """When on_event is provided, grill_step forwards it to backend.run."""
+    from no_human.intake.grill import grill_step
+
+    received_kwargs = {}
+
+    class EventCapturingBackend:
+        async def run(self, prompt, *, cwd, max_turns, effort=None, on_event=None):
+            received_kwargs["on_event"] = on_event
+            class _R:
+                final_text = '```json\n{"type": "done", "title": "T", "description": "D", "acceptance_criteria": ["AC"]}\n```'
+            return _R()
+
+    cb = lambda event: None
+    await grill_step("Fix X", None, None, [], EventCapturingBackend(), on_event=cb)
+    assert received_kwargs["on_event"] is cb
+
+
+@pytest.mark.asyncio
+async def test_grill_step_no_on_event_by_default():
+    """When on_event is not provided, backend.run is called without it."""
+    from no_human.intake.grill import grill_step
+
+    received_kwargs = {}
+
+    class KwargsCapturingBackend:
+        async def run(self, prompt, *, cwd, max_turns, effort=None, **kwargs):
+            received_kwargs.update(kwargs)
+            class _R:
+                final_text = '```json\n{"type": "done", "title": "T", "description": "D", "acceptance_criteria": ["AC"]}\n```'
+            return _R()
+
+    await grill_step("Fix X", None, None, [], KwargsCapturingBackend())
+    assert "on_event" not in received_kwargs
+
+
 def test_api_models_round_trip():
     from no_human.api.models import GrillQuestionOut, GrillResultOut, GrillStepRequest
 

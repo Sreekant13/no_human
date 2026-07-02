@@ -146,6 +146,7 @@ async def grill_step(
     backend: Any,
     *,
     max_rounds: int = MAX_ROUNDS_DEFAULT,
+    on_event: Any | None = None,
 ) -> GrillQuestion | GrillResult:
     """Run one step of the intake grill.
 
@@ -176,9 +177,12 @@ async def grill_step(
     )
 
     cwd = Path(repo_path) if repo_path else Path.home()
+    extra: dict[str, Any] = {}
+    if on_event is not None:
+        extra["on_event"] = on_event
     try:
         result = await asyncio.wait_for(
-            backend.run(prompt, cwd=cwd, max_turns=4, effort="low"),
+            backend.run(prompt, cwd=cwd, max_turns=4, effort="low", **extra),
             timeout=120,
         )
     except asyncio.TimeoutError:
