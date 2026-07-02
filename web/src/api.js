@@ -1,5 +1,12 @@
 const BASE = import.meta.env.DEV ? "" : "";
 
+/** Guard against the SPA catch-all returning index.html instead of JSON. */
+function _jsonSafe(r, fallback) {
+  const ct = (r.headers.get("content-type") || "");
+  if (!ct.includes("application/json")) return fallback;
+  return r.json();
+}
+
 export async function fetchTasks() {
   const r = await fetch(`${BASE}/api/tasks`);
   if (!r.ok) throw new Error(`GET /api/tasks → ${r.status}`);
@@ -318,22 +325,22 @@ export const completeOnboarding = (payload) => _post("/api/onboarding/complete",
 export async function fetchTrackerBoards() {
   const r = await fetch(`${BASE}/api/tracker/boards`);
   if (!r.ok) return { boards: [] };
-  return r.json();
+  return _jsonSafe(r, { boards: [] });
 }
 export async function fetchTrackerBoardItems(boardKey) {
   const r = await fetch(`${BASE}/api/tracker/boards/${encodeURIComponent(boardKey)}/items`);
   if (!r.ok) return { items: [], error: `HTTP ${r.status}` };
-  return r.json();
+  return _jsonSafe(r, { items: [], error: "unexpected response" });
 }
 export async function fetchTrackerSettings() {
   const r = await fetch(`${BASE}/api/settings/tracker/boards`);
   if (!r.ok) return { boards: [] };
-  return r.json();
+  return _jsonSafe(r, { boards: [] });
 }
 export async function fetchTrackerTransport() {
   const r = await fetch(`${BASE}/api/settings/tracker/transport`);
   if (!r.ok) return { transport: "unconfigured" };
-  return r.json();
+  return _jsonSafe(r, { transport: "unconfigured" });
 }
 export const updateTrackerBoards = (boards) => _put("/api/settings/tracker/boards", { boards });
 
