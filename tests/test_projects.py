@@ -242,3 +242,51 @@ async def test_api_create_task_project_not_found(client):
         "project_id": "nonexistent",
     })
     assert r.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# PR5: Test-plan API tests                                                     #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_api_project_out_includes_test_layers(client, store):
+    """ProjectOut includes test_layers (empty by default)."""
+    p = Project.new("layered")
+    await store.create_project(p)
+    r = await client.get(f"/api/projects/{p.id}")
+    assert r.status_code == 200
+    assert r.json()["test_layers"] == []
+
+
+@pytest.mark.asyncio
+async def test_api_update_project_test_layers(client, store):
+    """PUT /api/projects/{id} with test_layers saves and returns them."""
+    p = Project.new("layered2")
+    await store.create_project(p)
+
+    layers = [
+        {"name": "unit", "command": "pytest -q", "gating": "blocking"},
+        {"name": "e2e", "command": "make e2e", "gating": "advisory", "depends_on": ["unit"]},
+    ]
+    r = await client.put(f"/api/projects/{p.id}", json={"test_layers": layers})
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data["test_layers"]) == 2
+    assert data["test_layers"][0]["name"] == "unit"
+    assert data["test_layers"][1]["gating"] == "advisory"
+
+    # Verify on re-fetch.
+    r = await client.get(f"/api/projects/{p.id}")
+    assert len(r.json()["test_layers"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_api_update_project_test_layers_validation(client, store):
+    """Invalid test layers are rejected with 422."""
+    p = Project.new("badlayers")
+    await store.create_project(p)
+
+    r = await client.put(f"/api/projects/{p.id}", json={
+        "test_layers": [{"name": "bad", "gating": "invalid_gating"}],
+    })
+    assert r.status_code == 422

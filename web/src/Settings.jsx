@@ -473,6 +473,7 @@ function ProjectCard({ project, onDelete, onUpdated }) {
           ) : (
             <button className="btn btn-sendback btn-sm" style={{ marginTop: '0.5rem' }} onClick={() => setAddingRepo(true)}>+ Add repo</button>
           )}
+          <TestPlanEditor project={project} onUpdated={onUpdated} />
         </div>
       )}
     </div>
@@ -504,6 +505,108 @@ function PathInputSettings({ value, onChange, placeholder }) {
         ))}
       </datalist>
     </>
+  );
+}
+
+/* ── Test-plan editor (PR5) ─────────────────────────────────────────────── */
+
+const GATING_OPTIONS = ["blocking", "advisory", "wake_gated"];
+
+function TestPlanEditor({ project, onUpdated }) {
+  const layers = project.test_layers || [];
+  const [adding, setAdding] = useState(false);
+  const [newLayer, setNewLayer] = useState({ name: "", command: "", gating: "blocking", repo: "" });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+
+  async function handleRemoveLayer(idx) {
+    const updated = layers.filter((_, i) => i !== idx);
+    setSaving(true); setError(null);
+    try {
+      await updateProject(project.id, { test_layers: updated });
+      onUpdated();
+    } catch (e) { setError(e.message); }
+    finally { setSaving(false); }
+  }
+
+  async function handleAddLayer(e) {
+    if (e) e.preventDefault();
+    const { name, command, gating, repo } = newLayer;
+    if (!name.trim() || !command.trim()) return;
+    const layer = {
+      name: name.trim(),
+      command: command.trim(),
+      gating,
+      runner: "local",
+      timeout: 300,
+      depends_on: [],
+    };
+    if (repo.trim()) layer.repo = repo.trim();
+    const updated = [...layers, layer];
+    setSaving(true); setError(null);
+    try {
+      await updateProject(project.id, { test_layers: updated });
+      setNewLayer({ name: "", command: "", gating: "blocking", repo: "" });
+      setAdding(false);
+      onUpdated();
+    } catch (e) { setError(e.message); }
+    finally { setSaving(false); }
+  }
+
+  return (
+    <div style={{ marginTop: "0.75rem", borderTop: "1px solid var(--border)", paddingTop: "0.5rem" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.25rem" }}>
+        <span style={{ fontWeight: 600, fontSize: "0.85rem" }}>Test Plan</span>
+        {!adding && (
+          <button className="btn btn-sendback btn-sm" onClick={() => setAdding(true)}>+ Add layer</button>
+        )}
+      </div>
+      {error && <div className="new-task-error" style={{ margin: "0.25rem 0" }}>{error}</div>}
+      {layers.length === 0 && !adding && (
+        <div style={{ fontSize: "0.8rem", color: "var(--fg-dim)" }}>
+          No test layers configured. The orchestrator will use the profile's test command.
+        </div>
+      )}
+      {layers.map((l, idx) => (
+        <div key={idx} className="project-repo-row" style={{ fontSize: "0.82rem" }}>
+          <span style={{ fontWeight: 600 }}>{l.name}</span>
+          <code style={{ fontSize: "0.75rem", color: "var(--fg-dim)", flex: 1, marginLeft: "0.5rem", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {l.command}
+          </code>
+          <span className={`memory-tag ${l.gating === "blocking" ? "" : "advisory"}`} style={{ fontSize: "0.65rem" }}>
+            {l.gating}
+          </span>
+          {l.repo && (
+            <span style={{ fontSize: "0.7rem", color: "var(--fg-dim)" }} title={l.repo}>
+              ↗ {l.repo.split("/").pop()}
+            </span>
+          )}
+          <button className="project-repo-action danger" disabled={saving} onClick={() => handleRemoveLayer(idx)} title="Remove layer">✕</button>
+        </div>
+      ))}
+      {adding && (
+        <form onSubmit={handleAddLayer} style={{ display: "flex", flexDirection: "column", gap: "0.3rem", marginTop: "0.4rem", padding: "0.4rem", border: "1px solid var(--border)", borderRadius: "4px", background: "var(--surface-1)" }}>
+          <div style={{ display: "flex", gap: "0.3rem" }}>
+            <input className="new-task-input" style={{ flex: 1 }} placeholder="Layer name (e.g. unit, integration)" value={newLayer.name}
+              onChange={(e) => setNewLayer({ ...newLayer, name: e.target.value })} autoFocus />
+            <select className="new-task-input" style={{ width: 120 }} value={newLayer.gating}
+              onChange={(e) => setNewLayer({ ...newLayer, gating: e.target.value })}>
+              {GATING_OPTIONS.map(g => <option key={g} value={g}>{g}</option>)}
+            </select>
+          </div>
+          <input className="new-task-input" placeholder="Test command (e.g. uv run pytest -q)" value={newLayer.command}
+            onChange={(e) => setNewLayer({ ...newLayer, command: e.target.value })} />
+          <input className="new-task-input" placeholder="Cross-repo path (optional, e.g. ~/git/tests-repo)" value={newLayer.repo}
+            onChange={(e) => setNewLayer({ ...newLayer, repo: e.target.value })} />
+          <div style={{ display: "flex", gap: "0.3rem", justifyContent: "flex-end" }}>
+            <button type="button" className="btn btn-sendback btn-sm" onClick={() => setAdding(false)}>Cancel</button>
+            <button type="submit" className="btn btn-approve btn-sm" disabled={!newLayer.name.trim() || !newLayer.command.trim() || saving}>
+              {saving ? "…" : "Add Layer"}
+            </button>
+          </div>
+        </form>
+      )}
+    </div>
   );
 }
 

@@ -221,14 +221,23 @@ class ProjectOut(BaseModel):
     name: str
     repo_paths: list[str]
     primary_repo: str | None = None
+    test_layers: list[dict[str, Any]] = []
     created_at: str | None = None
     updated_at: str | None = None
 
     @classmethod
     def from_project(cls, p: Any) -> "ProjectOut":
+        import json
+        layers = []
+        raw = getattr(p, "test_layers", "[]")
+        if raw:
+            try:
+                layers = json.loads(raw) if isinstance(raw, str) else raw
+            except (json.JSONDecodeError, TypeError):
+                pass
         return cls(
             id=p.id, name=p.name, repo_paths=p.repo_paths,
-            primary_repo=p.primary_repo,
+            primary_repo=p.primary_repo, test_layers=layers,
             created_at=p.created_at, updated_at=p.updated_at,
         )
 
@@ -243,3 +252,4 @@ class UpdateProjectRequest(BaseModel):
     name: str | None = None
     repo_paths: list[str] | None = None
     primary_repo: str | None = None
+    test_layers: list[dict[str, Any]] | None = None
