@@ -227,7 +227,6 @@ class ProjectOut(BaseModel):
 
     @classmethod
     def from_project(cls, p: Any) -> "ProjectOut":
-        import json
         layers = []
         raw = getattr(p, "test_layers", "[]")
         if raw:

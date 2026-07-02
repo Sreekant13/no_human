@@ -187,6 +187,13 @@ def test_plan_runner_callbacks(tmp_path):
     assert len(dones) == 1
 
 
+def test_layer_result_error_is_not_ok():
+    """LayerResult with error set must be not-ok (regression: was treated as skipped)."""
+    lr = LayerResult(layer_name="broken", gating=Gating.BLOCKING, error="boom")
+    assert not lr.ok
+    assert "ERROR" in lr.summary
+
+
 @pytest.mark.asyncio
 async def test_find_project_by_repo(tmp_path):
     """Store.find_project_by_repo finds a project by its repo_paths."""

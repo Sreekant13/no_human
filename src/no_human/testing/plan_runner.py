@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 from .runner import TestRunResult, run_tests
 from .test_layers import Gating, Runner, TestLayer, TestPlan
@@ -36,6 +36,8 @@ class LayerResult:
     def ok(self) -> bool:
         if self.deferred:
             return True  # not a failure; will be checked later
+        if self.error:
+            return False  # exception during execution
         if self.result is None:
             return True  # skipped
         return self.result.ok
@@ -44,6 +46,8 @@ class LayerResult:
     def summary(self) -> str:
         if self.deferred:
             return f"{self.layer_name}: deferred (wake-gated)"
+        if self.error:
+            return f"{self.layer_name}: ERROR — {self.error}"
         if self.result is None:
             return f"{self.layer_name}: skipped"
         status = "PASS" if self.result.ok else "FAIL"
