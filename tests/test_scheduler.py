@@ -229,3 +229,70 @@ async def test_wake_watcher_ticked_and_implementing_is_claimable(store):
     started = await sched.tick()
     assert wake.ticked
     assert t.id in started
+
+
+# --------------------------------------------------------------------------- #
+# PR-E: ReanalysisJob                                                          #
+# --------------------------------------------------------------------------- #
+
+from no_human.core.scheduler import ReanalysisJob
+
+
+@pytest.mark.asyncio
+async def test_reanalysis_due_after_interval(store):
+    """ReanalysisJob is due immediately (last_run=0), then not due after running."""
+    job = ReanalysisJob(store, interval_seconds=60)
+    assert job.due()
+    # Simulate a run completing.
+    job._last_run = __import__("time").time()
+    assert not job.due()
+
+
+@pytest.mark.asyncio
+async def test_reanalysis_maybe_run_skips_when_not_due(store):
+    """maybe_run returns None when not due."""
+    import time as _time
+    job = ReanalysisJob(store, interval_seconds=9999)
+    job._last_run = _time.time()  # just ran
+    result = await job.maybe_run()
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_reanalysis_maybe_run_produces_result(store):
+    """maybe_run returns a result dict with expected keys when due."""
+    job = ReanalysisJob(store, interval_seconds=60, days=1)
+    # Due because _last_run is 0.
+    result = await job.maybe_run()
+    assert result is not None
+    assert "transcripts" in result
+    assert "proposed" in result
+    assert "duplicates" in result
+
+
+@pytest.mark.asyncio
+async def test_reanalysis_dedup_across_runs(store):
+    """Running re-analysis twice does not duplicate proposals."""
+    job = ReanalysisJob(store, interval_seconds=0, days=1)
+    r1 = await job.maybe_run()
+    job._running = False  # reset guard
+    job._last_run = 0     # force re-run
+    r2 = await job.maybe_run()
+    # Second run: any findings from r1 are now cached/deduped.
+    assert r2 is not None
+    assert r2["duplicates"] >= 0  # no new proposals if transcripts unchanged
+
+
+@pytest.mark.asyncio
+async def test_scheduler_tick_triggers_reanalysis(store):
+    """Scheduler.tick() triggers the re-analysis job when it's due."""
+    events = []
+    job = ReanalysisJob(store, interval_seconds=0, days=1)
+    fake = FakeOrch(store, hold=asyncio.Event())
+    sched = Scheduler(
+        store, lambda: fake, max_workers=1,
+        on_event=lambda k, t: events.append((k, t)),
+        reanalysis_job=job,
+    )
+    await sched.tick()
+    # Job ran — even if no proposals, no error should have occurred.

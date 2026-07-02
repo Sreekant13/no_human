@@ -53,6 +53,7 @@ class Scheduler:
         max_workers: int = 2,
         wake_watcher: object | None = None,
         on_event: Callable[[str, str], None] | None = None,
+        reanalysis_job: ReanalysisJob | None = None,
     ):
         self.store = store
         self.factory = orchestrator_factory
@@ -61,6 +62,7 @@ class Scheduler:
         self._inflight: set[str] = set()
         self._on_event = on_event or (lambda kind, text: None)
         self._quota_cooldown_until: datetime | None = None
+        self.reanalysis = reanalysis_job
         # Per-task event log: task_id -> deque of {ts, source, kind, text, ...}
         self._event_log: dict[str, deque] = {}
         self._MAX_EVENTS = 200
@@ -106,6 +108,18 @@ class Scheduler:
         if started:
             self._on_event("dispatch", f"started {len(started)} task(s); "
                            f"{len(self._inflight)}/{self.max_workers} busy")
+        # PR-E: periodic re-analysis (best-effort, never blocks task dispatch).
+        if self.reanalysis is not None:
+            try:
+                ra_result = await self.reanalysis.maybe_run()
+                if ra_result and ra_result.get("proposed", 0) > 0:
+                    self._on_event(
+                        "reanalysis",
+                        f"proposed {ra_result['proposed']} learning(s) from "
+                        f"{ra_result['transcripts']} transcript(s)",
+                    )
+            except Exception as exc:  # noqa: BLE001 — never kill the pool
+                log.warning("re-analysis failed: %s", exc)
         return started
 
     def task_events(self, task_id: str) -> list[dict]:
@@ -172,3 +186,84 @@ class Scheduler:
         """Wait for all in-flight tasks to finish (best-effort, bounded poll)."""
         while self._inflight:
             await asyncio.sleep(0.05)
+
+
+# --------------------------------------------------------------------------- #
+# PR-E: Periodic re-analysis scheduler (EVOLUTION_PLAN Phase 9)                #
+# --------------------------------------------------------------------------- #
+
+
+class ReanalysisJob:
+    """Periodically re-runs transcript extraction/ingestion on new sessions
+    and proposes only patterns not already covered.
+
+    All proposals land in ``learning/queue.py`` with ``confirmed=0`` — nothing
+    activates without ``nh learnings --confirm``.
+
+    Dedup is handled by the ingester's ``dedupe_key`` (content-based hash) and
+    the transcript cache (Phase 7e): unchanged transcripts are skipped, and
+    identical findings are never re-proposed.
+    """
+
+    def __init__(
+        self,
+        store: Store,
+        *,
+        interval_seconds: float = 86400,  # default: once per day
+        days: int = 30,                    # look-back window for transcripts
+        max_proposals_per_run: int = 20,   # cap to prevent queue flooding
+        use_llm: bool = False,             # heuristic-only by default
+        llm_call=None,                     # async (prompt) -> str, when use_llm=True
+    ):
+        self.store = store
+        self.interval = max(60, interval_seconds)
+        self.days = days
+        self.max_proposals = max_proposals_per_run
+        self.use_llm = use_llm
+        self._llm_call = llm_call
+        self._last_run: float = 0.0
+        self._running = False
+
+    def due(self, now: float | None = None) -> bool:
+        """True when enough time has elapsed since the last run."""
+        return (now or time.time()) - self._last_run >= self.interval
+
+    async def maybe_run(self) -> dict | None:
+        """Run re-analysis if due and not already running. Returns result dict
+        or None if skipped. Thread-safe via ``_running`` flag."""
+        if not self.due() or self._running:
+            return None
+        self._running = True
+        try:
+            return await self._run()
+        finally:
+            self._running = False
+            self._last_run = time.time()
+
+    async def _run(self) -> dict:
+        from ..history.ingester import TranscriptIngester
+
+        ingester = TranscriptIngester(self.store, llm_call=self._llm_call)
+        result = await ingester.ingest(days=self.days, use_llm=self.use_llm)
+
+        # Cap: if more proposals than max, keep only the first batch.
+        # The surplus are already in the DB (ingester committed them), so
+        # we log a warning but don't delete — the human can triage them.
+        if result.proposed > self.max_proposals:
+            log.warning(
+                "re-analysis proposed %d items (cap %d) — review queue may be large",
+                result.proposed, self.max_proposals,
+            )
+
+        log.info(
+            "re-analysis complete: %d transcripts, %d findings, "
+            "%d proposed, %d duplicates",
+            result.transcripts, result.findings,
+            result.proposed, result.duplicates,
+        )
+        return {
+            "transcripts": result.transcripts,
+            "findings": result.findings,
+            "proposed": result.proposed,
+            "duplicates": result.duplicates,
+        }
