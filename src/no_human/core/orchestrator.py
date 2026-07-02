@@ -503,6 +503,14 @@ class Orchestrator:
                     hook = staticmethod(_composite_hook)
                 extra["lint_hook"] = _CompositeHook()
 
+        # PR-D: True skills delivery — materialize confirmed DB skills to
+        # .claude/skills/<name>/SKILL.md so the SDK can load them. The VCS
+        # commit path already excludes .claude/** (_EPHEMERAL), so these
+        # never appear in PR diffs.
+        sdk_skills = self._materialize_skills(repo.path)
+        if sdk_skills:
+            extra["skills"] = sdk_skills
+
         result = await self.backend.run(
             prompt,
             cwd=repo.path,
@@ -1782,6 +1790,57 @@ class Orchestrator:
             check_every=check_every,
             on_decision=on_decision,
         )
+
+    def _materialize_skills(self, repo_path: Path) -> list[str]:
+        """Write confirmed skill memories to ``.claude/skills/<name>/SKILL.md``
+        in the working tree so the SDK can load them via ``skills=``.
+
+        Returns the list of skill names materialized. The VCS commit path
+        already excludes ``.claude/**`` (``_EPHEMERAL``), so these files
+        never appear in PR diffs.
+
+        On-disk skills that were discovered (not from DB) are left as-is —
+        they already exist on disk.
+        """
+        skills_dir = repo_path / ".claude" / "skills"
+        materialized: list[str] = []
+
+        # Confirmed DB skills: materialize if not already on disk.
+        for m in (getattr(self, "_active_memories", None) or []):
+            if m.get("type") != "skill":
+                continue
+            name = m.get("title", "").strip()
+            content = m.get("content", "").strip()
+            if not name:
+                continue
+            # Sanitize name for filesystem use.
+            safe_name = name.replace("/", "_").replace("\\", "_").replace(" ", "-")
+            skill_path = skills_dir / safe_name / "SKILL.md"
+            if skill_path.exists():
+                materialized.append(safe_name)
+                continue
+            try:
+                skill_path.parent.mkdir(parents=True, exist_ok=True)
+                skill_path.write_text(
+                    f"---\nname: {name}\ndescription: {name}\n---\n\n{content}\n",
+                    encoding="utf-8",
+                )
+                materialized.append(safe_name)
+            except OSError as exc:
+                log.warning("failed to materialize skill %r: %s", name, exc)
+
+        # On-disk skills (discovered) — already present, just collect names.
+        for s_name in (getattr(self, "_discovered_skills", None) or []):
+            if s_name not in materialized:
+                materialized.append(s_name)
+
+        if materialized:
+            self.emit(
+                "skills_materialized",
+                f"{len(materialized)} skills delivered to SDK: "
+                + ", ".join(materialized[:10]),
+            )
+        return materialized
 
     async def _generate_plan(self, task: Task, repo: GitRepo) -> str:
         """Generate a detailed implementation plan before the implement loop.

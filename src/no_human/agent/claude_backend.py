@@ -117,6 +117,7 @@ class ClaudeBackend:
         resume: str | None = None,
         supervisor_hook: SupervisorHook | None = None,
         lint_hook: Any | None = None,
+        skills: list[str] | None = None,
     ) -> ClaudeAgentOptions:
         hooks: dict = {
             "PreToolUse": [
@@ -151,6 +152,7 @@ class ClaudeBackend:
             effort=effort,
             resume=resume,
             hooks=hooks,
+            skills=skills or None,
         )
 
     async def stream(
@@ -163,10 +165,12 @@ class ClaudeBackend:
         resume: str | None = None,
         supervisor_hook: SupervisorHook | None = None,
         lint_hook: Any | None = None,
+        skills: list[str] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run the agent, yielding normalized events; the final event is ``result``."""
         options = self._options(cwd, max_turns, effort=effort, resume=resume,
-                                supervisor_hook=supervisor_hook, lint_hook=lint_hook)
+                                supervisor_hook=supervisor_hook, lint_hook=lint_hook,
+                                skills=skills)
         # The SDK signals terminal conditions (notably hitting max_turns) by
         # *raising* a bare Exception from inside query(). It usually emits a
         # ResultMessage first ("agent done: N turns") and THEN raises, so we
@@ -257,6 +261,7 @@ class ClaudeBackend:
         on_event: Callable[[AgentEvent], None] | None = None,
         supervisor_hook: SupervisorHook | None = None,
         lint_hook: Any | None = None,
+        skills: list[str] | None = None,
     ) -> AgentResult:
         """Run to completion, optionally forwarding each event, return the result."""
         final = AgentResult(
@@ -265,7 +270,7 @@ class ClaudeBackend:
         )
         async for event in self.stream(
             prompt, cwd=cwd, max_turns=max_turns, effort=effort, resume=resume,
-            supervisor_hook=supervisor_hook, lint_hook=lint_hook,
+            supervisor_hook=supervisor_hook, lint_hook=lint_hook, skills=skills,
         ):
             if on_event is not None:
                 on_event(event)

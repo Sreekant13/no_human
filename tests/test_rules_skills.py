@@ -186,3 +186,77 @@ def test_discover_skills_dedup_across_roots(tmp_path):
     found = discover_skills(extra_roots=[tmp_path / "root1", tmp_path / "root2"])
     shared = [s for s in found if s.name == "shared"]
     assert len(shared) == 1  # deduped
+
+
+# --- PR-D: skill materialization ------------------------------------------ #
+
+
+def test_materialize_skills_writes_skill_md(tmp_path):
+    """_materialize_skills writes SKILL.md for confirmed DB skills."""
+    from no_human.core.orchestrator import Orchestrator
+
+    # Fake orchestrator with _active_memories containing a skill.
+    class FakeOrch:
+        _active_memories = [
+            {"type": "skill", "title": "pr-review", "content": "Always check the diff."},
+            {"type": "rule", "title": "no-force-push", "content": "Never force push."},
+        ]
+        _discovered_skills = []
+
+        def emit(self, *a, **kw):
+            pass
+
+    orch = FakeOrch()
+    names = Orchestrator._materialize_skills(orch, tmp_path)
+    assert "pr-review" in names
+    skill_file = tmp_path / ".claude" / "skills" / "pr-review" / "SKILL.md"
+    assert skill_file.exists()
+    content = skill_file.read_text()
+    assert "Always check the diff." in content
+    assert "name: pr-review" in content
+    # Rules are not materialized as skills.
+    assert not (tmp_path / ".claude" / "skills" / "no-force-push").exists()
+
+
+def test_materialize_skills_skips_existing(tmp_path):
+    """Existing skill files on disk are not overwritten."""
+    from no_human.core.orchestrator import Orchestrator
+
+    # Pre-create a skill on disk.
+    skill_dir = tmp_path / ".claude" / "skills" / "existing" / "SKILL.md"
+    skill_dir.parent.mkdir(parents=True)
+    skill_dir.write_text("---\nname: existing\n---\nOriginal content.\n")
+
+    class FakeOrch:
+        _active_memories = [
+            {"type": "skill", "title": "existing", "content": "New content."},
+        ]
+        _discovered_skills = []
+
+        def emit(self, *a, **kw):
+            pass
+
+    orch = FakeOrch()
+    names = Orchestrator._materialize_skills(orch, tmp_path)
+    assert "existing" in names
+    # Content must NOT be overwritten.
+    assert "Original content." in skill_dir.read_text()
+
+
+def test_materialize_skills_sanitizes_names(tmp_path):
+    """Skill names with slashes/spaces are sanitized for filesystem."""
+    from no_human.core.orchestrator import Orchestrator
+
+    class FakeOrch:
+        _active_memories = [
+            {"type": "skill", "title": "my cool/skill", "content": "body"},
+        ]
+        _discovered_skills = []
+
+        def emit(self, *a, **kw):
+            pass
+
+    orch = FakeOrch()
+    names = Orchestrator._materialize_skills(orch, tmp_path)
+    assert "my-cool_skill" in names
+    assert (tmp_path / ".claude" / "skills" / "my-cool_skill" / "SKILL.md").exists()
