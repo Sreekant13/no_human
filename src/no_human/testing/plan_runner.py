@@ -105,18 +105,9 @@ def run_test_plan(
         if on_layer_start:
             on_layer_start(layer)
 
-        # Wake-gated layers are deferred — the orchestrator parks and wakes.
-        if layer.gating == Gating.WAKE_GATED:
-            lr = LayerResult(
-                layer_name=layer.name, gating=layer.gating, deferred=True,
-            )
-            result.layer_results.append(lr)
-            if on_layer_done:
-                on_layer_done(layer, lr)
-            continue
-
         # CI layers: build a per-layer CI backend and trigger the pipeline.
-        # Falls back to deferred if no ci config is present on the layer.
+        # Must be checked BEFORE wake_gated — a CI layer with wake_gated
+        # gating needs to trigger the pipeline before deferring.
         if layer.runner == Runner.CI:
             lr = _run_ci_layer(layer)
             result.layer_results.append(lr)
@@ -124,6 +115,17 @@ def run_test_plan(
                 on_layer_done(layer, lr)
             if not lr.ok and layer.gating == Gating.BLOCKING:
                 break
+            continue
+
+        # Wake-gated LOCAL layers are deferred — the orchestrator parks and wakes.
+        # (CI wake-gated layers are handled above — they trigger before deferring.)
+        if layer.gating == Gating.WAKE_GATED:
+            lr = LayerResult(
+                layer_name=layer.name, gating=layer.gating, deferred=True,
+            )
+            result.layer_results.append(lr)
+            if on_layer_done:
+                on_layer_done(layer, lr)
             continue
 
         # Resolve the working directory.
@@ -224,6 +226,37 @@ def _run_ci_layer(layer: TestLayer) -> LayerResult:
 
     ci_branch = layer.ci.get("branch") or layer.branch or "main"
     ci_variables = layer.ci.get("variables") or {}
+
+    # Wake-gated CI layers: trigger the pipeline but don't wait.
+    # Return immediately as deferred so the orchestrator parks the task.
+    # The WakeWatcher polls ``check_status`` until the pipeline finishes.
+    if layer.gating == Gating.WAKE_GATED:
+        try:
+            # Trigger only — the backend's internal _trigger returns (id, url).
+            # We access it through a short-timeout trigger or, for GitLab,
+            # via the sync _trigger helper.
+            if hasattr(backend, "_trigger"):
+                pid, purl = backend._trigger(ci_branch, {**getattr(backend, "variables", {}), **ci_variables})
+            else:
+                pid, purl = "", ""
+        except HumanGatedCI as exc:
+            return LayerResult(
+                layer_name=layer.name, gating=layer.gating, deferred=True,
+                error=f"HUMAN_GATED: {exc.wake_hint or str(exc)}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return LayerResult(
+                layer_name=layer.name, gating=layer.gating,
+                error=f"CI trigger error: {exc}",
+            )
+        wake_hint = f"CI pipeline #{pid}" if pid else "CI pipeline triggered"
+        if purl:
+            wake_hint += f" — {purl}"
+        log.info("layer %s: triggered pipeline %s (wake_gated, not waiting)", layer.name, pid or "?")
+        return LayerResult(
+            layer_name=layer.name, gating=layer.gating, deferred=True,
+            error=f"TRIGGERED: {wake_hint}",
+        )
 
     try:
         # run_test_plan runs in asyncio.to_thread — no event loop in this

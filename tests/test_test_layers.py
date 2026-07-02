@@ -384,6 +384,36 @@ def test_run_ci_layer_human_gated(monkeypatch):
     assert "HUMAN_GATED" in (lr.error or "")
 
 
+def test_run_ci_layer_wake_gated_triggers_but_defers(monkeypatch):
+    """CI layer with wake_gated triggers the pipeline but returns deferred immediately."""
+    triggered = {}
+    def fake_from_layer(ci_dict):
+        class FakeCI:
+            name = "gitlab"
+            variables = {}
+            def _trigger(self, branch, variables):
+                triggered["branch"] = branch
+                triggered["vars"] = variables
+                return ("999", "https://gitlab/p/999")
+            async def trigger(self, branch, extra_vars=None):
+                raise AssertionError("should not call full trigger for wake_gated")
+        return FakeCI()
+    monkeypatch.setattr("no_human.ci.ci_from_layer", fake_from_layer)
+
+    layer = TestLayer(name="ci_gate-e2e", command="", runner=Runner.CI,
+                      gating=Gating.WAKE_GATED, ci={
+        "backend": "gitlab", "project": "ci_gate-analytics-export",
+        "branch": "main",
+        "variables": {"METHOD": "create", "DESTROY": "true"},
+    })
+    lr = _run_ci_layer(layer)
+    assert lr.deferred
+    assert "TRIGGERED" in (lr.error or "")
+    assert "999" in (lr.error or "")
+    assert triggered["branch"] == "main"
+    assert triggered["vars"] == {"METHOD": "create", "DESTROY": "true"}
+
+
 def test_run_ci_layer_uses_variables(monkeypatch):
     """CI layer passes variables from layer.ci to the trigger."""
     captured = {}
