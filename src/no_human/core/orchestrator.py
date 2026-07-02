@@ -436,6 +436,25 @@ class Orchestrator:
                 return await self._escalate(task, str(exc))
         await self.store.update_attempt(attempt_id, branch_name=branch)
 
+        # PR-F Gate 2: create matching branches in linked repos so changes
+        # there land on their own deterministic branch (never_push_to honoured).
+        linked_repos_git: list[tuple[str, GitRepo]] = []
+        for lr_path in (task.linked_repos or []):
+            lr = Path(lr_path)
+            if not (lr / ".git").is_dir():
+                continue
+            try:
+                lr_repo = GitRepo(
+                    lr, never_push_to=self.config.get("git", {}).get("never_push_to", []),
+                )
+                lr_base = lr_repo.current_branch()
+                lr_repo.create_branch(branch, base=lr_base)
+                linked_repos_git.append((lr_path, lr_repo))
+            except ProtectedBranch:
+                log.warning("linked repo %s: branch %s is protected, skipping", lr_path, branch)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("linked repo %s: branch setup failed: %s", lr_path, exc)
+
         # Write PLAN.md into the worktree (Phase 1) so the worker can re-read
         # it if context gets truncated during a long session. The file is NOT
         # tracked in _agent_edited_files, so it won't be committed.
@@ -574,6 +593,21 @@ class Orchestrator:
         await self.store.update_attempt(attempt_id, commit_sha=commit.sha)
         self.emit("commit", f"{commit.sha[:8]} ({commit.files_changed} files)")
 
+        # PR-F Gate 2: commit changes in linked repos (if any).
+        linked_commits: list[tuple[str, GitRepo]] = []
+        for lr_path, lr_repo in linked_repos_git:
+            try:
+                if lr_repo.has_changes():
+                    lr_commit = lr_repo.commit_all(commit_msg)
+                    linked_commits.append((lr_path, lr_repo))
+                    self.emit("commit",
+                              f"[linked:{lr_path}] {lr_commit.sha[:8]} "
+                              f"({lr_commit.files_changed} files)")
+            except ProtectedBranch:
+                log.warning("linked repo %s: commit on protected branch, skipping", lr_path)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("linked repo %s: commit failed: %s", lr_path, exc)
+
         # --- lint gate (cheap, deterministic — catches mechanical issues like
         #     import placement before spending reviewer tokens) ---
         lint_cmd = await self._resolve_lint_cmd(repo)
@@ -633,6 +667,33 @@ class Orchestrator:
                 + "; ".join(tamper.reasons),
                 repo=repo, branch=branch,
             )
+
+        # PR-F Gate 1: extend tamper guard to every linked repo. Without this
+        # a worker could gut assertions in a linked repo to force a layer green.
+        for linked_path in (task.linked_repos or []):
+            linked = Path(linked_path)
+            if not (linked / ".git").is_dir():
+                continue
+            try:
+                lr_tamper = runner.tamper_check_between(linked)
+                self.emit("tamper", f"[linked:{linked_path}] {lr_tamper.summary}",
+                          tampered=lr_tamper.tampered)
+                if lr_tamper.tampered:
+                    await self.store.update_attempt(
+                        attempt_id, status="failed",
+                        test_results={
+                            "tamper_flag": True, "linked_repo": linked_path,
+                            "reasons": lr_tamper.reasons,
+                        },
+                    )
+                    return await self._escalate(
+                        task,
+                        f"test-tampering in linked repo {linked_path}: "
+                        + "; ".join(lr_tamper.reasons),
+                        repo=repo, branch=branch,
+                    )
+            except Exception as exc:  # noqa: BLE001 — guard must not crash the pipeline
+                log.warning("tamper check failed for linked repo %s: %s", linked_path, exc)
 
         decision = await self._run_review(task, repo, attempt_id)
         if not decision.passed:
@@ -832,9 +893,15 @@ class Orchestrator:
                 return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
 
         # --- finalize: push + open PR (NEVER merge) + notify ---
-        return await self._finalize(task, repo, branch, base, commit, attempt_id, result)
+        return await self._finalize(
+            task, repo, branch, base, commit, attempt_id, result,
+            linked_commits=linked_commits,
+        )
 
-    async def _finalize(self, task, repo, branch, base, commit, attempt_id, result) -> TaskOutcome:
+    async def _finalize(
+        self, task, repo, branch, base, commit, attempt_id, result,
+        *, linked_commits: list | None = None,
+    ) -> TaskOutcome:
         title = self._commit_message(task)
         body = self._pr_body(task, commit, result)
         try:
@@ -849,6 +916,23 @@ class Orchestrator:
             attempt_id, pr_url=pr.url, status="succeeded", completed_at=_now(),
             review_passed=1,
         )
+
+        # PR-F Gate 3: open PRs for linked repos that had changes committed.
+        linked_pr_urls: list[str] = []
+        gh_hosts = self.config.get("git", {}).get("github_hosts")
+        for lr_path, lr_repo in (linked_commits or []):
+            try:
+                lr_base = lr_repo._run("rev-parse", "--abbrev-ref", "HEAD@{-1}",
+                                       check=False).strip() or "main"
+                lr_body = f"Linked PR for {task.title}\n\nPrimary PR: {pr.url}"
+                lr_pr = open_pr(lr_repo, branch, title, lr_body, base=lr_base,
+                                github_hosts=gh_hosts)
+                linked_pr_urls.append(lr_pr.url)
+                self.emit("pr_open", f"[linked:{lr_path}] {lr_pr.url}",
+                          pr_kind=lr_pr.kind)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("linked repo %s: PR failed: %s", lr_path, exc)
+
         # B4: mark the PR for comment-watching so the wake watcher polls it for
         # new human comments and auto-revises. The cursor starts at PR-open time
         # so only comments posted afterwards trigger a revision.
@@ -856,6 +940,8 @@ class Orchestrator:
         ctx["pr_watch"] = pr.url
         ctx["pr_branch"] = branch
         ctx.setdefault("pr_comment_since", _now())
+        if linked_pr_urls:
+            ctx["linked_pr_urls"] = linked_pr_urls
         task.context = ctx
         await self.store.update_task(task)
 

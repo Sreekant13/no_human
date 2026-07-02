@@ -147,3 +147,69 @@ def test_legit_added_real_assertions_with_helpers_clean():
     after = {"test_x.py": "def test_a():\n    assert f() == 1\n    assert g() == 2\n"}
     report = tamper_guard.check(before, after)
     assert report.tampered is False
+
+
+# --- PR-F Gate 1: linked-repo tamper detection ----------------------------- #
+
+import subprocess
+from pathlib import Path
+
+
+def _init_repo(path: Path) -> None:
+    """Create a minimal git repo with one commit."""
+    subprocess.run(["git", "init", str(path)], capture_output=True, check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "t@t"],
+                   capture_output=True, check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "t"],
+                   capture_output=True, check=True)
+
+
+def test_tamper_check_between_detects_linked_repo_tampering(tmp_path):
+    """tamper_check_between detects test weakening in a linked repo."""
+    from no_human.testing.runner import tamper_check_between
+
+    repo = tmp_path / "linked"
+    repo.mkdir()
+    _init_repo(repo)
+
+    # First commit: a test file with two assertions.
+    test_file = repo / "test_foo.py"
+    test_file.write_text("def test_a():\n    assert f() == 1\n    assert g() == 2\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], capture_output=True, check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"],
+                   capture_output=True, check=True)
+
+    # Second commit: weaken the test (remove an assertion).
+    test_file.write_text("def test_a():\n    assert f() == 1\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], capture_output=True, check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "weaken"],
+                   capture_output=True, check=True)
+
+    report = tamper_check_between(repo)
+    assert report.tampered is True
+    assert any("assertions" in r for r in report.reasons)
+
+
+def test_tamper_check_between_clean_linked_repo(tmp_path):
+    """tamper_check_between passes when linked repo tests are not weakened."""
+    from no_human.testing.runner import tamper_check_between
+
+    repo = tmp_path / "linked_clean"
+    repo.mkdir()
+    _init_repo(repo)
+
+    # First commit: a test file.
+    test_file = repo / "test_bar.py"
+    test_file.write_text("def test_a():\n    assert x() == 1\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], capture_output=True, check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"],
+                   capture_output=True, check=True)
+
+    # Second commit: ADD more assertions (legit improvement).
+    test_file.write_text("def test_a():\n    assert x() == 1\n    assert y() == 2\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], capture_output=True, check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "improve"],
+                   capture_output=True, check=True)
+
+    report = tamper_check_between(repo)
+    assert report.tampered is False
