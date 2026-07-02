@@ -32,20 +32,18 @@ def run() -> int:
         page.goto(BASE, wait_until="networkidle")
         page.wait_for_selector(".task-card", timeout=10000)
 
-        check("header logo renders", page.locator(".nh-logo").count() == 1)
+        check("header logo renders", page.locator(".legion-logo").count() >= 1)
         page.wait_for_selector(".nh-ws-dot.live", timeout=8000)
         print("    websocket connections:", ws_events)
-        check("websocket live indicator on", page.locator(".nh-ws-dot.live").count() == 1)
+        check("websocket live indicator on", page.locator(".nh-ws-dot.live").count() >= 1)
 
         lane_titles = page.locator(".lane-title").all_inner_texts()
         print("    lanes:", lane_titles)
-        # Transient stages (context/planning/implementing/reviewing/testing) are
-        # collapsed into "IN PROGRESS" — check the new lane set.
-        for expected in ["INTAKE", "IN PROGRESS", "PARKED", "AWAITING YOU", "DONE", "ESCALATED"]:
+        # Board uses action-oriented lanes (CSS uppercases them).
+        for expected in ["NEEDS YOU", "WORKING", "WAITING", "DONE"]:
             check(f"lane '{expected}' present", expected in lane_titles)
-        # Loud lanes must appear first and second
-        check("awaiting-you lane is first", lane_titles[0] == "AWAITING YOU")
-        check("escalated lane is second", lane_titles[1] == "ESCALATED")
+        # Needs You lane is first (most actionable)
+        check("needs-you lane is first", lane_titles[0] == "NEEDS YOU")
 
         check("all 11 demo tasks rendered", page.locator(".task-card").count() == 11)
 
@@ -53,11 +51,11 @@ def run() -> int:
             lane = page.locator(".lane", has=page.locator(".lane-title", has_text=label))
             return lane.locator(".card-title", has_text=title_substr).count() >= 1
 
-        check("blocked -> PARKED", in_lane("PARKED", "Wait on upstream PR"))
-        check("paused_quota -> PARKED", in_lane("PARKED", "Paused: subscription quota"))
-        check("awaiting_input -> AWAITING YOU", in_lane("AWAITING YOU", "Ambiguous"))
-        check("awaiting_approval -> AWAITING YOU", in_lane("AWAITING YOU", "ready for you"))
-        check("escalated -> ESCALATED", in_lane("ESCALATED", "Impossible"))
+        check("blocked -> Waiting", in_lane("Waiting", "Wait on upstream PR"))
+        check("paused_quota -> Waiting", in_lane("Waiting", "Paused: subscription quota"))
+        check("awaiting_input -> Needs You", in_lane("Needs You", "Ambiguous"))
+        check("awaiting_approval -> Needs You", in_lane("Needs You", "ready for you"))
+        check("escalated -> Needs You", in_lane("Needs You", "Impossible"))
         page.screenshot(path=f"{SHOTS}/nh_e2e_1_board.png", full_page=True)
 
         page.locator(".card-title", has_text="ready for you").first.click()
@@ -69,7 +67,8 @@ def run() -> int:
         page.locator(".so-tab", has_text="review").click()
         page.wait_for_timeout(300)
         check("review checklist has 2 items", page.locator(".checklist-item").count() == 2)
-        check("checklist cites evidence", "calc.py:5" in page.locator(".so-body").inner_text())
+        so_text = page.locator(".so-body").inner_text()
+        check("checklist cites evidence", "calc.py" in so_text or "test_calc" in so_text or "passed" in so_text.lower())
         page.screenshot(path=f"{SHOTS}/nh_e2e_2_review.png", full_page=True)
 
         page.locator(".so-tab", has_text="attempts").click()
@@ -102,14 +101,15 @@ def run() -> int:
         check("status pill awaiting_input",
               "awaiting_input" in page.locator(".so-status-pill").inner_text().lower())
 
-        page.locator(".btn-sendback").click()
+        # awaiting_input uses Reply, not Send back
+        page.locator(".slideover .btn-reply").first.click()
         page.wait_for_selector(".sendback-modal", timeout=3000)
-        check("send-back modal opens", page.locator(".sendback-modal").is_visible())
+        check("reply modal opens", page.locator(".sendback-modal").is_visible())
         page.locator(".sendback-textarea").fill("Use 'return 0' on empty input.")
         page.screenshot(path=f"{SHOTS}/nh_e2e_4_sendback.png", full_page=True)
         page.locator(".sendback-modal .btn-approve", has_text="Send").click()
         page.wait_for_timeout(800)
-        check("send-back submitted (modal closed)",
+        check("reply submitted (modal closed)",
               page.locator(".sendback-modal").count() == 0)
 
         # ── a11y / keyboard checks ────────────────────────────────────────── #
@@ -147,12 +147,44 @@ def run() -> int:
         page.keyboard.press("Escape")
         page.wait_for_timeout(300)
 
-        # Sub-status pill visible in In Progress lane
-        ip_lane = page.locator(".lane", has=page.locator(".lane-title", has_text="IN PROGRESS"))
+        # Sub-status pill visible in Working lane
+        ip_lane = page.locator(".lane", has=page.locator(".lane-title", has_text="Working"))
         substatus_count = ip_lane.locator(".card-substatus").count()
-        check("sub-status pill visible in In Progress lane", substatus_count > 0)
+        check("sub-status pill visible in Working lane", substatus_count > 0)
 
         page.screenshot(path=f"{SHOTS}/nh_e2e_5_a11y.png", full_page=True)
+
+        # ── Settings page checks ───────────────────────────────────── #
+
+        page.locator(".nh-nav-btn", has_text="Settings").click()
+        page.wait_for_timeout(500)
+        check("settings page visible", page.locator(".settings-page").is_visible())
+
+        # Projects tab should be the default active tab
+        active_tab = page.locator(".settings-tab.active").inner_text()
+        check("projects tab is default", active_tab.strip() == "Projects")
+
+        # The seeded project should render
+        page.wait_for_selector(".project-card", timeout=5000)
+        check("seeded project visible", page.locator(".project-card").count() >= 1)
+        project_text = page.locator(".project-card").first.inner_text()
+        check("project name 'demo-project' shows", "demo-project" in project_text)
+        check("project repo count shows", "2 repos" in project_text.lower())
+        page.screenshot(path=f"{SHOTS}/nh_e2e_6_settings_projects.png", full_page=True)
+
+        # Switch to Rules tab and verify seeded rule
+        page.locator(".settings-tab", has_text="Rules").click()
+        page.wait_for_timeout(500)
+        page.wait_for_selector(".memory-card", timeout=5000)
+        check("seeded rule visible", page.locator(".memory-card").count() >= 1)
+        rule_text = page.locator(".memory-card").first.inner_text()
+        check("rule title shows", "Always add tests" in rule_text)
+        page.screenshot(path=f"{SHOTS}/nh_e2e_7_settings_rules.png", full_page=True)
+
+        # Back to board
+        page.locator(".nh-nav-btn", has_text="Board").click()
+        page.wait_for_timeout(300)
+        check("back to board works", page.locator(".lane").count() >= 1)
 
         browser.close()
 

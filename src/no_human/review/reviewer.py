@@ -29,7 +29,7 @@ from ..core.task import Task
 _REVIEW_JSON = re.compile(r"REVIEW_JSON_START\s*(.*?)\s*REVIEW_JSON_END", re.DOTALL)
 
 _REVIEW_TURNS = 10
-_DIFF_CAP = 12000  # chars — keep prompt manageable while allowing meaningful diffs
+_DIFF_CAP = 60_000  # chars — ~15K tokens, fits in 200K context alongside test output
 _CODE_REVIEW_DIFF_CAP = 120_000  # code_review tasks: ~30K tokens, fits in 200K context
 _CODE_REVIEW_TURNS = 15
 _CODE_REVIEW_TIMEOUT = 600  # seconds — larger diffs need more time
@@ -63,12 +63,14 @@ class ReviewDecision:
         }
 
 
-def _git_diff(repo_path: Path, before: str = "HEAD~1", after: str = "HEAD") -> str:
+def _git_diff(repo_path: Path, before: str = "HEAD~1", after: str = "HEAD") -> tuple[str, int]:
+    """Return (truncated_diff, total_length)."""
     proc = subprocess.run(
         ["git", "diff", f"{before}..{after}", "--stat", "--patch", "--no-color"],
         cwd=repo_path, capture_output=True, text=True,
     )
-    return (proc.stdout or "")[:_DIFF_CAP]
+    raw = proc.stdout or ""
+    return raw[:_DIFF_CAP], len(raw)
 
 
 def _build_review_prompt(
@@ -77,6 +79,7 @@ def _build_review_prompt(
     test_output: str,
     held_out_output: str,
     *,
+    diff_total_len: int = 0,
     profile_context: str = "",
     confirmed_rules: str = "",
 ) -> str:
@@ -94,20 +97,58 @@ def _build_review_prompt(
         f"{confirmed_rules}\n"
         if confirmed_rules else ""
     )
+    # Prompt ordering: STABLE protocol first → VOLATILE task/diff last (Phase 2a).
+    is_truncated = diff_total_len > len(diff)
+
+    if is_truncated:
+        tool_policy = (
+            "You MAY use read/search tools to inspect full file contents when the\n"
+            "diff below is truncated. Do NOT modify any files.\n\n"
+        )
+        tool_rule = (
+            "  - You MAY use read/search tools to inspect truncated files.\n"
+            "  - Do NOT modify any files.\n"
+        )
+        diff_section = (
+            f"Diff (TRUNCATED from {diff_total_len:,} to {len(diff):,} chars — use your"
+            f" read tools to inspect any file whose diff is cut off):\n```\n{diff}\n```\n\n"
+        )
+    else:
+        tool_policy = (
+            "CRITICAL: Do NOT use any tools. Do NOT run any commands. Do NOT read any files.\n"
+            "Everything you need is provided below. Respond with text ONLY.\n\n"
+        )
+        tool_rule = "  - Do NOT use tools, run commands, or read files.\n"
+        diff_section = f"Diff (complete and authoritative):\n```\n{diff}\n```\n\n"
+
+    next_pass = 4
+    rules_pass = ""
+    if confirmed_rules:
+        rules_pass = (
+            f"\nPASS {next_pass}: RULE ADHERENCE — for each confirmed rule listed above,\n"
+            "  check whether the diff violates it. Cite the rule text, the violating\n"
+            "  file:line, and a concrete explanation. Only flag rules that are actually\n"
+            "  relevant to the changed files — do not flag rules about unrelated areas.\n"
+        )
+        next_pass += 1
+
+    scope_pass = (
+        f"\nPASS {next_pass}: SCOPE — is this the SMALLEST change that solves the task?\n"
+        "  This is a large diff. Check for: unnecessary abstractions or indirection\n"
+        "  that aren't required by the acceptance criteria; 'while I'm here' changes\n"
+        "  unrelated to the task; premature generalization (e.g. building a framework\n"
+        "  when a simple function suffices). Fail if the change could be significantly\n"
+        "  smaller while still meeting every criterion.\n"
+        if diff.count("\n") > 150 else ""
+    )
+
     return (
+        # ── stable prefix (review protocol, rules, output format) ──
         "You are a Staff Software Engineer performing an independent code review.\n"
         "Your ONLY job is to find flaws. Do NOT trust the implementer's work.\n"
         "Try to REFUTE the claim that this task is 'done.' Be adversarial.\n\n"
-        "CRITICAL: Do NOT use any tools. Do NOT run any commands. Do NOT read any files.\n"
-        "Everything you need is provided below. Respond with text ONLY.\n\n"
-        f"Task: {task.title}\n"
-        f"Acceptance criteria:\n{criteria}\n\n"
-        f"Diff (complete and authoritative):\n```\n{diff}\n```\n\n"
-        f"Test results:\n```\n{test_output or '(no test output provided)'}\n```\n"
-        f"{held_section}"
-        f"{profile_section}"
-        f"{rules_section}\n"
-        "Review the diff in THREE explicit passes. Each pass produces checklist\n"
+        + tool_policy
+        + "Review the diff in THREE explicit passes. Each pass produces checklist\n"
         "items, and EVERY item must cite concrete evidence (a file:line from the\n"
         "diff, a line of command/test output, or a specific failing input).\n"
         "An item with no cited evidence is not a valid finding.\n\n"
@@ -118,21 +159,11 @@ def _build_review_prompt(
         "  it follow the existing patterns/conventions shown in the profile? Any\n"
         "  layering, coupling, or abstraction problems?\n"
         "PASS 3: EDGE CASES — error handling, empty/null/boundary inputs,\n"
-        "  security (injection, auth, secrets), concurrency, performance.\n"
-        + (
-            "\nPASS 4: SCOPE — is this the SMALLEST change that solves the task?\n"
-            "  This is a large diff. Check for: unnecessary abstractions or indirection\n"
-            "  that aren't required by the acceptance criteria; 'while I'm here' changes\n"
-            "  unrelated to the task; premature generalization (e.g. building a framework\n"
-            "  when a simple function suffices). Fail if the change could be significantly\n"
-            "  smaller while still meeting every criterion.\n"
-            if diff.count("\n") > 150 else ""
-        )
-        + "\n"
+        "  security (injection, auth, secrets), concurrency, performance.\n\n"
         "For each finding, cite the specific file:line from the diff.\n\n"
         "Rules:\n"
-        "  - Do NOT use tools, run commands, or read files.\n"
-        "  - Pass/fail only. No numeric scores.\n"
+        + tool_rule
+        + "  - Pass/fail only. No numeric scores.\n"
         "  - 'passed: true' means ALL criteria are demonstrably met.\n\n"
         "Output EXACTLY this format (and NOTHING after it):\n\n"
         "REVIEW_JSON_START\n"
@@ -147,7 +178,17 @@ def _build_review_prompt(
         "  - 'file' must be the path exactly as shown in the diff header (e.g. 'src/foo.py')\n"
         "  - 'line' must be a line number from the RIGHT side of the diff (new file)\n"
         "  - 'comment' should be a concise, actionable PR comment suitable for posting\n"
-        "  - For general observations with no specific line, set file to '' and line to 0\n"
+        "  - For general observations with no specific line, set file to '' and line to 0\n\n"
+        f"{profile_section}"
+        f"{rules_section}\n"
+        # ── volatile task-specific content ──
+        f"Task: {task.title}\n"
+        f"Acceptance criteria:\n{criteria}\n\n"
+        + diff_section
+        + f"Test results:\n```\n{test_output or '(no test output provided)'}\n```\n"
+        f"{held_section}"
+        + rules_pass
+        + scope_pass
     )
 
 
@@ -204,18 +245,13 @@ def _build_code_review_prompt(
         if confirmed_rules else ""
     )
 
+    # Prompt ordering: STABLE protocol first → VOLATILE task/diff last (Phase 2a).
     return (
+        # ── stable prefix (protocol, rules, output format) ──
         "You are a Staff Software Engineer performing a thorough code review of a PR.\n"
         "Your job is to provide constructive, evidence-based feedback that helps the\n"
         "author improve the code. Be rigorous but fair — acknowledge good patterns\n"
         "while flagging real issues.\n\n"
-        f"Task: {task.title}\n"
-        f"Acceptance criteria:\n{criteria}\n\n"
-        f"Diff:\n```\n{diff}\n```\n"
-        f"{truncation_notice}"
-        f"{comments_section}"
-        f"{profile_section}"
-        f"{rules_section}\n"
         "If the diff appears truncated for any file, use your read tools to open\n"
         "the full file and understand the complete change before making judgments.\n"
         "Never flag 'missing code' or 'orphaned constant' without first reading\n"
@@ -251,7 +287,15 @@ def _build_code_review_prompt(
         "  - 'file' must be the path exactly as shown in the diff header (e.g. 'src/foo.py')\n"
         "  - 'line' must be a line number from the RIGHT side of the diff (new file)\n"
         "  - 'comment' should be a concise, actionable PR comment suitable for posting\n"
-        "  - For general observations with no specific line, set file to '' and line to 0\n"
+        "  - For general observations with no specific line, set file to '' and line to 0\n\n"
+        f"{profile_section}"
+        f"{rules_section}\n"
+        # ── volatile task-specific content ──
+        f"Task: {task.title}\n"
+        f"Acceptance criteria:\n{criteria}\n\n"
+        f"Diff:\n```\n{diff}\n```\n"
+        f"{truncation_notice}"
+        f"{comments_section}"
     )
 
 
@@ -344,13 +388,17 @@ class AdversarialReviewer:
             )
 
         # Gate mode (default): original adversarial review.
-        diff = (diff_override[:_DIFF_CAP] if diff_override
-                else _git_diff(repo_path, before_ref, after_ref))
+        if diff_override:
+            diff = diff_override[:_DIFF_CAP]
+            diff_total_len = len(diff_override)
+        else:
+            diff, diff_total_len = _git_diff(repo_path, before_ref, after_ref)
         prompt = _build_review_prompt(
             task,
             diff,
             test_output[:_OUTPUT_CAP],
             held_out_output[:_OUTPUT_CAP],
+            diff_total_len=diff_total_len,
             profile_context=profile_context,
             confirmed_rules=confirmed_rules,
         )

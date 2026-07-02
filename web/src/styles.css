@@ -1831,6 +1831,61 @@ html, body, #root {
   padding: 10px 0;
 }
 
+/* settings loading indicator */
+.settings-loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 48px 0;
+  justify-content: center;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+/* project cards (settings) */
+.project-card { border-left: 3px solid var(--accent-500); }
+.project-repos { display: flex; flex-direction: column; gap: 4px; }
+.project-repo-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  font-size: 12px;
+}
+.project-repo-name { font-weight: 600; color: var(--text-hi); }
+.project-repo-path { font-family: var(--font-mono); font-size: 10px; color: var(--text-dim); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-repo-primary {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--green);
+  background: var(--green-dim);
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+}
+.project-repo-action {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 6px;
+  border-radius: var(--r-sm);
+  transition: color 0.15s, background 0.15s;
+}
+.project-repo-action:hover { color: var(--amber); background: var(--amber-glow); }
+.project-repo-action.danger:hover { color: var(--red); background: var(--red-dim); }
+.project-add-repo {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+}
+
 /* ── MEMORY (RULES/SKILLS) ──────────────────────────────────────────────── */
 
 .memory-panel {

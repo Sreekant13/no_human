@@ -30,7 +30,7 @@ def test_not_stuck_on_progress():
 def test_bounds_from_config_defaults():
     b = Bounds.from_config(None)
     assert b.max_attempts == 3
-    assert b.max_turns_per_attempt == 40
+    assert b.max_turns_per_attempt == 60
 
 
 def test_bounds_from_config_override():

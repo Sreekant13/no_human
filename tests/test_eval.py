@@ -35,7 +35,7 @@ class MutateBackend:
         self.mutate = mutate
 
     async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None, on_event=None,
-                  supervisor_hook=None):
+                  supervisor_hook=None, **kwargs):
         self.mutate(Path(cwd))
         return AgentResult(final_text="done", num_turns=2, is_error=False,
                            tokens_used=120, session_id="s", stop_reason="end_turn")
@@ -52,7 +52,7 @@ class SolutionBackend:
         self.solution = solution
 
     async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None, on_event=None,
-                  supervisor_hook=None):
+                  supervisor_hook=None, **kwargs):
         for rel, content in self.solution.items():
             p = Path(cwd) / rel
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -67,7 +67,7 @@ class BlockerBackend:
         self.category = category
 
     async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None, on_event=None,
-                  supervisor_hook=None):
+                  supervisor_hook=None, **kwargs):
         text = (
             "Cannot do this.\nBLOCKER_JSON_START\n"
             f'{{"category": "{self.category}", "confidence": 0.95, '

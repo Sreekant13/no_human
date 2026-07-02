@@ -31,6 +31,10 @@ from claude_agent_sdk import (
 from . import guard
 from .supervisor import SupervisorHook
 
+# Phase 7c: explicit cap for tool-result display. Silent truncation makes the
+# model treat a partial as complete; the marker + retrieval hint prevent that.
+_TOOL_RESULT_CAP = 2000
+
 
 @dataclass
 class AgentEvent:
@@ -54,6 +58,8 @@ class AgentResult:
     session_id: str | None
     stop_reason: str | None
     denials: list[str] = field(default_factory=list)
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
 
 
 def _make_guard_hook(
@@ -191,12 +197,20 @@ class ClaudeBackend:
                         elif isinstance(block, ToolResultBlock):
                             content = block.content
                             text = content if isinstance(content, str) else str(content)
-                            yield AgentEvent("tool_result", text=text[:2000])
+                            if len(text) > _TOOL_RESULT_CAP:
+                                text = (
+                                    text[:_TOOL_RESULT_CAP]
+                                    + f"\n[TRUNCATED: showing {_TOOL_RESULT_CAP} of "
+                                    f"{len(text)} chars — use Grep or offset to see more]"
+                                )
+                            yield AgentEvent("tool_result", text=text)
                 elif isinstance(message, ResultMessage):
                     usage = message.usage or {}
                     tokens = int(usage.get("input_tokens", 0)) + int(
                         usage.get("output_tokens", 0)
                     )
+                    cache_read = int(usage.get("cache_read_input_tokens", 0))
+                    cache_creation = int(usage.get("cache_creation_input_tokens", 0))
                     denials = [str(d) for d in (message.permission_denials or [])]
                     last_turns, last_tokens = message.num_turns, tokens
                     last_session = message.session_id
@@ -211,6 +225,8 @@ class ClaudeBackend:
                             "stop_reason": message.stop_reason,
                             "denials": denials,
                             "api_error_status": message.api_error_status,
+                            "cache_read_tokens": cache_read,
+                            "cache_creation_tokens": cache_creation,
                         },
                     )
         except Exception as exc:  # noqa: BLE001 — SDK raises bare Exception on terminal errors
@@ -263,5 +279,7 @@ class ClaudeBackend:
                     session_id=m.get("session_id"),
                     stop_reason=m.get("stop_reason"),
                     denials=m.get("denials", []),
+                    cache_read_tokens=int(m.get("cache_read_tokens", 0)),
+                    cache_creation_tokens=int(m.get("cache_creation_tokens", 0)),
                 )
         return final

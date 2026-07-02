@@ -264,6 +264,12 @@ class Orchestrator:
             await self._gather_context(task)
             await self.store.set_status(task, TaskStatus.PLANNING)
             self.emit("state", "planning", status="planning")
+            plan_text = await self._generate_plan(task, repo)
+            if plan_text:
+                ctx = task.context or {}
+                ctx["plan"] = plan_text
+                task.context = ctx
+                await self.store.update_task(task)
 
         # Capture the base branch once and PERSIST it on the task. Re-deriving
         # from current_branch() is wrong on two axes: (1) within a run, after a
@@ -361,6 +367,15 @@ class Orchestrator:
                 return await self._escalate(task, str(exc))
         await self.store.update_attempt(attempt_id, branch_name=branch)
 
+        # Write PLAN.md into the worktree (Phase 1) so the worker can re-read
+        # it if context gets truncated during a long session. The file is NOT
+        # tracked in _agent_edited_files, so it won't be committed.
+        ctx = task.context or {}
+        plan = ctx.get("plan", "")
+        if plan:
+            plan_file = repo.path / "PLAN.md"
+            plan_file.write_text(plan, encoding="utf-8")
+
         # --- implement (the SDK session) ---
         await self.store.set_status(task, TaskStatus.IMPLEMENTING)
         self.emit("state", "implementing", status="implementing")
@@ -374,18 +389,50 @@ class Orchestrator:
             self.emit("supervisor", "supervisor active")
 
         # Pre-flight plan check (EVOLUTION_PLAN §1.2 #1): one cheap evaluation of
-        # the agent's plan BEFORE it edits. Config-gated (default off) since it
-        # spends an extra short planning turn; when a gap is found, the correction
+        # the agent's plan BEFORE it edits. When a gap is found, the correction
         # rides into the implement prompt so the agent closes it from turn one.
-        prompt = await self._maybe_preflight(task, repo, supervisor, prompt)
+        # Skipped for trivial tasks (planner emitted SKIP_PLAN → no plan).
+        if plan:
+            prompt = await self._maybe_preflight(task, repo, supervisor, prompt)
 
         # Per-edit lint feedback (B1): deterministic, runs alongside the
         # supervisor. Config-gated (default off) until validated; only fires when
         # a lint command is known for the repo.
         lint_hook = await self._build_lint_hook(repo)
-        # Only pass lint_hook when active, so backends that predate the param
-        # (e.g. test doubles) are unaffected while it stays default-off.
-        extra = {"lint_hook": lint_hook} if lint_hook is not None else {}
+
+        # Scope guard (Phase 5e): deterministic PostToolUse that warns when an
+        # edit targets a file not declared in the plan's FILES TO CHANGE/CREATE.
+        # Warn-not-block: legit refactors can touch unplanned files.
+        scope_hook = None
+        if plan:
+            from ..agent.scope_guard import ScopeGuardHook
+            scope_hook = ScopeGuardHook(
+                plan, repo.path, on_event=self.emit,
+            )
+
+        # Only pass hooks when active, so backends that predate the params
+        # (e.g. test doubles) are unaffected while they stay default-off.
+        extra: dict = {}
+        if lint_hook is not None or scope_hook is not None:
+            from ..agent.lint_hook import LintFeedbackHook as _LFH  # noqa: F811
+            # Combine lint + scope into a single composite PostToolUse hook
+            # since ClaudeBackend only accepts one lint_hook.
+            hooks = [h for h in (lint_hook, scope_hook) if h is not None]
+            if len(hooks) == 1:
+                extra["lint_hook"] = hooks[0]
+            elif hooks:
+                # Wrap multiple hooks into a composite
+                async def _composite_hook(
+                    input_data, tool_use_id, context, _hooks=hooks
+                ):
+                    for h in _hooks:
+                        result = await h.hook(input_data, tool_use_id, context)
+                        if result:
+                            return result
+                    return {}
+                class _CompositeHook:
+                    hook = staticmethod(_composite_hook)
+                extra["lint_hook"] = _CompositeHook()
 
         result = await self.backend.run(
             prompt,
@@ -398,6 +445,8 @@ class Orchestrator:
         )
         await self.store.update_attempt(
             attempt_id, turns_used=result.num_turns, tokens_used=result.tokens_used,
+            cache_read_tokens=result.cache_read_tokens,
+            cache_creation_tokens=result.cache_creation_tokens,
         )
         if result.is_error and _quota_signal(result.final_text or ""):
             raise QuotaExhausted()
@@ -463,6 +512,15 @@ class Orchestrator:
                     attempt_id, status="failed", failure_reason=detail,
                 )
                 return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+
+        # --- deterministic commit-time guards (Phase 5e) ---
+        try:
+            from ..agent.scope_guard import commit_time_checks
+            changed_paths = [repo.path / f for f in repo.changed_files()]
+            for w in commit_time_checks(repo.path, changed_paths):
+                self.emit("guard_warning", w)
+        except Exception:  # noqa: BLE001 — best-effort, never block
+            pass
 
         # --- safety: change-size limits ---
         over = self._over_size_limits(commit)
@@ -1276,6 +1334,10 @@ class Orchestrator:
 
         raise ValueError(f"cannot parse PR number from URL: {pr_url}")
 
+    # Phase 7a: chunks longer than this are distilled through a readonly backend
+    # so raw file bytes never bloat the worker's implement prompt.
+    _CHUNK_DISTILL_THRESHOLD = 2000  # chars
+
     async def _gather_context(self, task: Task) -> None:
         if not self.context_gatherer:
             return
@@ -1285,6 +1347,12 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001 — context is best-effort
             self.emit("context_gather", f"context gathering failed: {exc}")
             return
+
+        # Phase 7a: distill large chunks through a readonly session so the
+        # worker gets concise summaries, not raw file bytes (research: sub-agent
+        # isolation > context editing for staying in the high-signal zone).
+        await self._distill_large_chunks(ctx.chunks, task)
+
         task.context = {**(task.context or {}), "gathered": ctx.to_dict()}
         await self.store.update_task(task)
         comp = ctx.completeness
@@ -1292,6 +1360,46 @@ class Orchestrator:
         if comp and comp.missing:
             detail += f"; missing: {', '.join(comp.missing)}"
         self.emit("context", detail, complete=bool(comp and comp.ok))
+
+    async def _distill_large_chunks(
+        self, chunks: list, task: "Task",
+    ) -> None:
+        """Replace large context chunks with LLM-distilled summaries.
+
+        Uses a readonly backend (same pattern as _generate_plan) to compress
+        raw file/grep bytes into task-relevant summaries. Best-effort: any
+        failure preserves the original (truncated) chunk.
+        """
+        large = [
+            (i, c) for i, c in enumerate(chunks)
+            if len(c.content) > self._CHUNK_DISTILL_THRESHOLD
+        ]
+        if not large:
+            return
+        distill_model = self.config.get("llm", {}).get(
+            "review_model", "claude-sonnet-4-6",
+        )
+        for idx, chunk in large:
+            try:
+                backend = ClaudeBackend(model=distill_model, readonly=True)
+                prompt = (
+                    f"Summarize this context for a developer working on: {task.title}\n"
+                    f"Source: {chunk.source} — {chunk.title}\n\n"
+                    f"Content:\n{chunk.content[:8000]}\n\n"
+                    "Produce a concise summary (max 500 chars) focusing on what's "
+                    "relevant to the task. Keep specific file paths, function names, "
+                    "and key details."
+                )
+                result = await backend.run(
+                    prompt, cwd=Path(task.repo_path or "."),
+                    max_turns=1, effort="low",
+                )
+                summary = (result.final_text or "").strip()
+                if summary and len(summary) < len(chunk.content):
+                    chunk.content = f"[distilled] {summary}"
+                    self.emit("context_distill", f"distilled {chunk.source}/{chunk.title}")
+            except Exception:  # noqa: BLE001 — distillation is best-effort
+                pass
 
     def _context_digest(self, task: Task, limit: int = 8) -> str:
         gathered = (task.context or {}).get("gathered") or {}
@@ -1494,9 +1602,14 @@ class Orchestrator:
             )
 
         # The supervisor LLM call: a simple prompt-in, text-out function.
-        # Uses the same backend model but with low effort to keep costs down.
+        # Phase 2b: uses review_model (Sonnet) — supervisor is a sparse
+        # every-5-calls course-corrector at effort="low"; Sonnet suffices and
+        # preserves the Opus budget for implementation.
+        sv_model = self.config.get("llm", {}).get(
+            "review_model", "claude-sonnet-4-6",
+        )
         async def sv_llm_call(prompt: str) -> str:
-            sv_backend = ClaudeBackend(model=self.backend.model, readonly=True)
+            sv_backend = ClaudeBackend(model=sv_model, readonly=True)
             result = await sv_backend.run(
                 prompt, cwd=Path(work_dir or task.repo_path or "."),
                 max_turns=1, effort="low",
@@ -1528,6 +1641,100 @@ class Orchestrator:
             check_every=check_every,
             on_decision=on_decision,
         )
+
+    async def _generate_plan(self, task: Task, repo: GitRepo) -> str:
+        """Generate a detailed implementation plan before the implement loop.
+
+        Uses a read-only Sonnet (planner_model) session that explores the codebase
+        and produces a structured plan the Opus worker follows. Best-effort: any
+        failure returns "" and the task proceeds without a plan (no regression).
+
+        Gated by:
+          - config ``planning.enabled`` (default True)
+          - task kind: code_review skips (no implementation)
+          - complexity: the planner may emit SKIP_PLAN for trivial one-line diffs
+        """
+        plan_cfg = self.config.get("planning", {})
+        if not plan_cfg.get("enabled", True):
+            self.emit("planning", "skipped (disabled in config)")
+            return ""
+        if task.kind == "code_review":
+            self.emit("planning", "skipped (code_review kind)")
+            return ""
+
+        planner_model = self.config.get("llm", {}).get(
+            "planner_model",
+            self.config.get("llm", {}).get("review_model", "claude-sonnet-4-6"),
+        )
+        max_turns = plan_cfg.get("max_turns", 10)
+
+        prof = getattr(self, "_active_profile", None)
+        test_cmd = ""
+        if prof and prof.test_cmd:
+            test_cmd = prof.test_cmd
+        elif self.config.get("tests", {}).get("command"):
+            test_cmd = self.config["tests"]["command"]
+
+        criteria = "\n".join(f"  - {c}" for c in task.acceptance_criteria) or "  (none stated)"
+        kind_hint = f"\nTask kind: {task.kind}" if task.kind and task.kind != "feature" else ""
+        profile_hint = ""
+        if prof:
+            parts = [f"Ecosystem: {prof.ecosystem}" if prof.ecosystem else ""]
+            if prof.test_cmd:
+                parts.append(f"Test command: {prof.test_cmd}")
+            if prof.lint_cmd:
+                parts.append(f"Lint command: {prof.lint_cmd}")
+            profile_hint = "\nRepo profile:\n" + "\n".join(f"  {p}" for p in parts if p) + "\n"
+
+        prompt = (
+            f"You are planning an implementation task for the repo at {repo.path}.\n"
+            f"Explore the codebase to understand the existing architecture before planning.\n\n"
+            f"Task: {task.title}\n"
+            f"Description: {task.description or '(none)'}\n"
+            f"{kind_hint}\n"
+            f"Acceptance criteria:\n{criteria}\n"
+            f"{profile_hint}\n"
+            "FIRST: assess complexity. If this task is a trivial one-line or few-line "
+            "change that can be described in a single sentence, respond with only:\n"
+            "SKIP_PLAN\n\n"
+            "OTHERWISE: produce a detailed implementation plan with these sections:\n"
+            "## FILES TO CHANGE/CREATE\n"
+            "List every file path and a one-line description of the change.\n\n"
+            "## APPROACH\n"
+            "Per-file implementation approach — what to add or modify.\n\n"
+            "## TEST PLAN\n"
+            "Map each acceptance criterion to a specific test. Name the test file and "
+            "describe each test method.\n\n"
+            "## OUT OF SCOPE\n"
+            "Explicitly list what NOT to change. This is a scope guard — the worker "
+            "must not touch files or make changes outside this plan. If existing tests "
+            "or integration code uses a certain convention (e.g. header names, API "
+            "signatures), those are out of scope to rename or refactor.\n\n"
+            "## VERIFICATION\n"
+            f"Exact command(s) to run: {test_cmd or '(discover from the repo)'}\n\n"
+            "Be specific and concrete. Reference actual file paths in the repo.\n"
+        )
+
+        try:
+            planner = ClaudeBackend(model=planner_model, readonly=True)
+            result = await planner.run(
+                prompt, cwd=repo.path, max_turns=max_turns, effort="medium",
+                on_event=self._agent_sink,
+            )
+            plan = (result.final_text or "").strip()
+            if not plan:
+                self.emit("planning", "planner produced no output")
+                return ""
+            if "SKIP_PLAN" in plan[:200]:
+                self.emit("planning", "skipped (trivial — planner assessed as one-line diff)")
+                return ""
+            self.emit("planning", f"plan generated ({len(plan)} chars, "
+                       f"{result.num_turns} turns, {result.tokens_used} tokens)")
+            return plan
+        except Exception as exc:  # noqa: BLE001 — planning is best-effort
+            log.warning("planning step failed (proceeding without plan): %s", exc)
+            self.emit("planning", f"planning failed: {exc}")
+        return ""
 
     async def _maybe_preflight(
         self, task: Task, repo: GitRepo, supervisor: SupervisorHook | None, prompt: str
@@ -1659,48 +1866,131 @@ class Orchestrator:
         # in the wrong tree and the worktree shows "no file changes" (the attempt
         # then fails spuriously). work_dir is the cwd the SDK session runs in.
         repo_dir = work_dir or task.repo_path
+
+        # Plan block: inject the plan generated during PLANNING (Phase 1).
+        # The plan is a pre-reviewed implementation contract the worker follows.
+        plan_block = ""
+        ctx = task.context or {}
+        plan = ctx.get("plan", "")
+        if plan:
+            plan_block = (
+                "IMPLEMENTATION PLAN (follow this plan closely — it was generated by "
+                "exploring the codebase before you started. Respect the OUT OF SCOPE "
+                "section: do NOT change files or conventions not listed in the plan):\n"
+                f"{plan}\n\n"
+            )
+
+        # Prompt ordering: STABLE prefix first (cacheable across retries within
+        # the same repo) → VOLATILE task-specific content last (Phase 2a).
         return (
+            # ── stable prefix ──
             f"You are implementing a software task in the repo at {repo_dir}.\n"
             f"This is your working directory — make ALL edits here (use paths under "
             f"{repo_dir}); do not touch any other checkout of this repo.\n\n"
             f"{profile_block}"
-            f"{multi_block}"
+            f"{rules}\n"
+            + blocker_prompt_suffix()
+            + "\n\n"
+            # ── volatile task-specific content ──
+            + f"{multi_block}"
             f"Task: {task.title}\n"
             f"{('Description: ' + task.description) if task.description else ''}\n\n"
             f"{(kind_directive + chr(10) + chr(10)) if kind_directive else ''}"
             f"Acceptance criteria:\n{criteria}\n\n"
+            f"{plan_block}"
             f"{(digest + chr(10) + chr(10)) if digest else ''}"
             f"{(resume + chr(10) + chr(10)) if resume else ''}"
-            f"{rules}\n"
             + selfcheck.build_prompt(task.title, task.acceptance_criteria)
-            + blocker_prompt_suffix()
         )
+
+    # Hard caps for tiered rule delivery (Phase 5a). These are character counts,
+    # not token counts — at ~4 chars/token they give ~2K and ~1K tokens
+    # respectively. The caps are tested (test_rule_delivery_cap) so they can't
+    # be silently exceeded.
+    _RULES_CRITICAL_CAP = 8000   # chars for high-importance rules (full content)
+    _RULES_RELEVANT_CAP = 4000   # chars for med-importance rules (compact)
 
     def _format_active_memories(self) -> str:
         """Format confirmed rules + skills for prompt injection.
 
-        Returns an empty string if there are none, or a block like:
-          Confirmed rules from past experience:
-            - [rule] Title: content
-            - [skill] Title: content
-        Bounded to 20 entries (≈4k tokens) to avoid blowing the context window.
+        Returns an empty string if there are none.  Importance-tiered delivery
+        (Phase 5a) replaces the old 20-cap / 200-char truncation:
+
+        - **Critical** (importance=high): full content, up to _RULES_CRITICAL_CAP
+        - **Relevant** (importance=med): compact one-liner, up to _RULES_RELEVANT_CAP
+        - **Long-tail** (importance=low): title only, as on-demand lookup hint
         """
         memories = getattr(self, "_active_memories", None)
         if not memories:
             return ""
-        lines: list[str] = []
-        for m in memories[:20]:
-            mem_type = m.get("type", "rule")
-            title = m.get("title", "")
-            content = m.get("content", "")
-            # Compact format: one line per memory.
-            short = content.replace("\n", " ").strip()[:200]
-            lines.append(f"  - [{mem_type}] {title}: {short}")
-        if not lines:
+
+        critical: list[dict] = []
+        relevant: list[dict] = []
+        long_tail: list[dict] = []
+        for m in memories:
+            tags = m.get("tags") or []
+            if "importance:high" in tags:
+                critical.append(m)
+            elif "importance:low" in tags:
+                long_tail.append(m)
+            else:
+                relevant.append(m)
+
+        parts: list[str] = []
+        # Critical: full content, hard-capped
+        if critical:
+            crit_lines: list[str] = []
+            budget = self._RULES_CRITICAL_CAP
+            for m in critical:
+                mem_type = m.get("type", "rule")
+                title = m.get("title", "")
+                content = m.get("content", "").strip()
+                line = f"  - [{mem_type}] {title}: {content}"
+                if budget - len(line) < 0:
+                    break  # hard cap: stop, don't truncate mid-rule
+                crit_lines.append(line)
+                budget -= len(line)
+            if crit_lines:
+                parts.append(
+                    "Critical rules (MUST follow — full content):\n"
+                    + "\n".join(crit_lines)
+                )
+
+        # Relevant: compact one-liner
+        if relevant:
+            rel_lines: list[str] = []
+            budget = self._RULES_RELEVANT_CAP
+            for m in relevant:
+                mem_type = m.get("type", "rule")
+                title = m.get("title", "")
+                content = m.get("content", "").replace("\n", " ").strip()[:200]
+                line = f"  - [{mem_type}] {title}: {content}"
+                if budget - len(line) < 0:
+                    break
+                rel_lines.append(line)
+                budget -= len(line)
+            if rel_lines:
+                parts.append(
+                    "Relevant rules/skills:\n"
+                    + "\n".join(rel_lines)
+                )
+
+        # Long-tail: title-only hints
+        if long_tail:
+            tail_lines = [
+                f"  - [{m.get('type', 'rule')}] {m.get('title', '')}"
+                for m in long_tail[:20]
+            ]
+            parts.append(
+                "Additional context (look up if relevant to your task):\n"
+                + "\n".join(tail_lines)
+            )
+
+        if not parts:
             return ""
         return (
             "\nConfirmed rules/skills from past experience:\n"
-            + "\n".join(lines)
+            + "\n\n".join(parts)
             + "\n"
         )
 

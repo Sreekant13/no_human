@@ -233,6 +233,16 @@ export async function fetchWorkerStatus() {
 
 // ── Onboarding wizard ────────────────────────────────────────────────────────
 
+async function _put(path, body) {
+  const r = await fetch(`${BASE}${path}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`PUT ${path} → ${r.status}`);
+  return r.json();
+}
+
 async function _post(path, body) {
   const r = await fetch(`${BASE}${path}`, {
     method: "POST",
@@ -255,10 +265,43 @@ export const analyzeHistory    = (days = 30) => _post("/api/onboarding/history/a
 export const confirmRules      = (ids)     => _post("/api/onboarding/rules/confirm", { ids });
 export const completeOnboarding = (payload) => _post("/api/onboarding/complete", payload);
 
+// ── Phase 3b: TRACKER board import ───────────────────────────────────────────────
+export async function fetchTrackerBoards() {
+  const r = await fetch(`${BASE}/api/tracker/boards`);
+  if (!r.ok) return { boards: [] };
+  return r.json();
+}
+export async function fetchTrackerBoardItems(boardKey) {
+  const r = await fetch(`${BASE}/api/tracker/boards/${encodeURIComponent(boardKey)}/items`);
+  if (!r.ok) return { items: [], error: `HTTP ${r.status}` };
+  return r.json();
+}
+export async function fetchTrackerSettings() {
+  const r = await fetch(`${BASE}/api/settings/tracker/boards`);
+  if (!r.ok) return { boards: [] };
+  return r.json();
+}
+export const updateTrackerBoards = (boards) => _put("/api/settings/tracker/boards", { boards });
+
 export async function suggestPaths(path) {
   const r = await fetch(`${BASE}/api/fs/suggest?path=${encodeURIComponent(path || "")}`);
   if (!r.ok) return { suggestions: [] };
   return r.json();
+}
+
+// ── Phase 4a: SSE live event stream ──────────────────────────────────────────
+export function connectTaskSSE(taskId, onEvent, onDone) {
+  const url = `${BASE}/api/tasks/${encodeURIComponent(taskId)}/events/stream`;
+  const es = new EventSource(url);
+  es.onmessage = (msg) => {
+    try {
+      const data = JSON.parse(msg.data);
+      if (data.kind === "done") { es.close(); if (onDone) onDone(); return; }
+      if (onEvent) onEvent(data);
+    } catch { /* ignore malformed */ }
+  };
+  es.onerror = () => { es.close(); if (onDone) onDone(); };
+  return es; // caller can es.close() to unsubscribe
 }
 
 // ── WebSocket ───────────────────────────────────────────────────────────────

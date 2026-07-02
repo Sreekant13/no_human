@@ -122,6 +122,7 @@ class GitRepo:
         ":(exclude,glob)**/.devin/**",
         ":(exclude,glob)**/.claude/**",
         ":(exclude,glob)**/HANDOVER.md",
+        ":(exclude,glob)**/PLAN.md",
         ":(exclude,glob)**/.venv/**",
         ":(exclude,glob)**/.venv*/**",
         ":(exclude,glob)**/venv/**",

@@ -46,6 +46,18 @@ def _dedupe_key(f: Finding) -> str:
     return "learn:" + hashlib.sha256(raw.encode()).hexdigest()[:20]
 
 
+def _transcript_sig(t: Transcript) -> str:
+    """Content-signature for a transcript (Phase 7e history cache).
+
+    Based on the messages' content — if the conversation hasn't changed,
+    the signature stays stable and re-analysis is skipped.
+    """
+    raw = "\x1f".join(
+        f"{m.role}:{(m.content or '')[:500]}" for m in t.messages[:50]
+    )
+    return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+
 @dataclass
 class IngestResult:
     proposed: int = 0          # newly-enqueued proposals
@@ -112,15 +124,35 @@ class TranscriptIngester:
     ) -> IngestResult:
         """Analyze transcripts (heuristic + optional LLM pass) and ingest.
 
+        Phase 7e: transcripts whose content-signature is already cached are
+        skipped — makes re-scans fast without losing accuracy. The cache can
+        be cleared with ``store.history_cache_clear()`` for a full re-scan.
+
         The LLM pass runs CONCURRENTLY across transcripts (bounded by
         ``llm_concurrency``) so onboarding doesn't serialize N model calls. A
         transcript whose LLM call fails is skipped (its heuristic findings still
         land) — the pass is additive, never a hard dependency."""
-        findings: list[Finding] = []
+        # Phase 7e: filter out cached transcripts
+        new_transcripts: list[Transcript] = []
+        cached_count = 0
         for t in transcripts:
+            sig = _transcript_sig(t)
+            try:
+                cached = await self.store.history_cache_get(sig)
+            except Exception:  # noqa: BLE001 — cache miss is fine
+                cached = None
+            if cached:
+                cached_count += 1
+            else:
+                new_transcripts.append(t)
+        if cached_count:
+            log.info("history cache: skipped %d unchanged transcripts", cached_count)
+
+        findings: list[Finding] = []
+        for t in new_transcripts:
             findings.extend(analyze_transcript(t))
 
-        if use_llm and self._llm_call is not None and transcripts:
+        if use_llm and self._llm_call is not None and new_transcripts:
             sem = asyncio.Semaphore(max(1, llm_concurrency))
 
             async def _one(t: Transcript) -> list[Finding]:
@@ -128,7 +160,7 @@ class TranscriptIngester:
                     return await analyze_transcript_llm(t, self._llm_call)
 
             for res in await asyncio.gather(
-                *[_one(t) for t in transcripts], return_exceptions=True
+                *[_one(t) for t in new_transcripts], return_exceptions=True
             ):
                 if isinstance(res, list):
                     findings.extend(res)
@@ -137,6 +169,17 @@ class TranscriptIngester:
 
         result = await self.ingest_findings(findings)
         result.transcripts = len(transcripts)
+
+        # Phase 7e: cache all processed transcripts so they're skipped next time
+        for t in new_transcripts:
+            sig = _transcript_sig(t)
+            try:
+                await self.store.history_cache_put(
+                    sig, t.cascade_id, t.title, "",
+                )
+            except Exception:  # noqa: BLE001 — cache write failure is non-fatal
+                pass
+
         return result
 
     async def ingest(self, *, days: int = 30, use_llm: bool = False) -> IngestResult:

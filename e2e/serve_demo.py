@@ -16,6 +16,7 @@ from no_human.config import load_config as _orig_load_config
 import no_human.api.app  # noqa: F401 — ensure the submodule is imported
 from no_human.core.db import Store
 from no_human.core.task import Task, TaskStatus
+from no_human.project_model import Project
 
 # The package __init__ exports `app`, shadowing the submodule on attribute
 # access; fetch the real module object from sys.modules.
@@ -126,6 +127,17 @@ async def seed() -> int:
         "goal": "call calc.fast_matmul()", "evidence": "AttributeError: module 'calc' has no 'fast_matmul'",
         "resume_branch": "no-human/55443322", "resume_commit": "aabb00ff",
     })
+    # Seed a project so the Settings > Projects tab has data.
+    proj = Project.new("demo-project", repo_paths=[demo_repo, "/tmp/demo-repo"])
+    await store.create_project(proj)
+
+    # Seed a confirmed rule so Settings > Rules tab has data.
+    await store.add_memory(
+        mem_type="rule", title="Always add tests",
+        content="Every feature or bugfix must include at least one new test.",
+        tags=["testing"], source="human", confirmed=True,
+    )
+
     n = len(await store.list_tasks())
     await store.close()
     return n
@@ -134,6 +146,7 @@ async def seed() -> int:
 def _fake_load_config():
     c = _orig_load_config()
     c.data["database"]["path"] = TEMP_DB
+    c.data.setdefault("onboarding", {})["completed"] = True
     return c
 
 

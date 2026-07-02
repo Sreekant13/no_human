@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import {
   approveTask, cancelTask, fetchDiff, fetchTask, fetchTaskEvents, pauseTask,
   postReviewComments, replyTask, resumeTask, retryTask, sendBack,
+  connectTaskSSE,
 } from "./api.js";
 
 const STATUS_PILL = {
@@ -318,14 +319,36 @@ function ActivityTab({ taskId, isActive }) {
 
   useEffect(() => {
     let cancelled = false;
+    // Phase 4a: use SSE for active tasks (real-time), poll for inactive.
+    if (isActive) {
+      // Seed with existing events, then stream new ones.
+      // Track seed watermark to avoid duplicates from SSE.
+      let seedTs = 0;
+      fetchTaskEvents(taskId).then((evts) => {
+        if (cancelled) return;
+        setEvents(evts);
+        seedTs = evts.length > 0 ? Math.max(...evts.map(e => e.ts || 0)) : 0;
+      }).catch(() => {});
+      const es = connectTaskSSE(taskId,
+        (evt) => {
+          if (cancelled) return;
+          // Only append events newer than the seed watermark (dedup).
+          if ((evt.ts || 0) > seedTs) {
+            setEvents((prev) => [...prev, evt]);
+          }
+        },
+        () => { /* stream ended — will fall back on next render cycle */ },
+      );
+      return () => { cancelled = true; es.close(); };
+    }
+    // Inactive: slow poll.
     async function poll() {
       while (!cancelled) {
         try {
           const evts = await fetchTaskEvents(taskId);
           if (!cancelled) setEvents(evts);
         } catch { /* ignore */ }
-        // Poll faster while active.
-        await new Promise((r) => setTimeout(r, isActive ? 2000 : 10000));
+        await new Promise((r) => setTimeout(r, 10000));
       }
     }
     poll();
@@ -343,6 +366,7 @@ function ActivityTab({ taskId, isActive }) {
   const lastEvent = events[events.length - 1];
   const isWorking = isActive && lastEvent;
   const lastRole = eventSource(lastEvent);
+  const totalElapsed = events.length > 1 ? events[events.length - 1].ts - events[0].ts : 0;
 
   return (
     <div className="activity-feed">
@@ -351,6 +375,11 @@ function ActivityTab({ taskId, isActive }) {
         <span className="al-role role-agent"><i />Agent — reads &amp; edits code</span>
         <span className="al-role role-supervisor"><i />Supervisor — steers</span>
         <span className="al-role role-reviewer"><i />Reviewer — gates</span>
+        {totalElapsed > 0 && (
+          <span style={{ marginLeft: 'auto', fontSize: '0.7rem', color: 'var(--fg-dim)' }}>
+            {events.length} events · {fmtDuration(totalElapsed)}
+          </span>
+        )}
       </div>
       {isWorking && (
         <div className={`activity-status-bar role-${lastRole}`}>

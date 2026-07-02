@@ -1,0 +1,240 @@
+"""Deterministic scope & dependency guards (EVOLUTION_PLAN Phase 5e).
+
+Three non-LLM guards that fire every time — no "every 5 calls" gap:
+
+1. **Scope guard** (PostToolUse): after an edit, check if the target file was
+   declared in PLAN.md's "FILES TO CHANGE/CREATE" section.  Warn (don't block)
+   when the edit is out-of-scope — the agent gets a nudge to justify or revert.
+
+2. **Dependency-set diff** (commit-time): compare ``pyproject.toml``
+   ``[project.dependencies]`` before vs after — flag any *added* packages so the
+   reviewer can confirm they're necessary (lean-stack constraint).
+
+3. **Forbidden-import regex** (commit-time): scan changed ``.py`` files for
+   imports that violate project constraints (e.g. heavyweight frameworks).
+
+All functions are pure — no LLM calls, no side effects — so they're trivially
+testable and cost zero latency beyond the file reads.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+from pathlib import Path
+from typing import Any, Callable
+
+
+# ── 1. Scope guard ──────────────────────────────────────────────────────── #
+
+_FILES_SECTION = re.compile(
+    r"##\s*FILES\s+TO\s+CHANGE/?CREATE\b(.*?)(?=\n##|\Z)",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def parse_plan_files(plan_text: str) -> set[str]:
+    """Extract declared file paths from PLAN.md's FILES TO CHANGE/CREATE section.
+
+    Returns a set of normalised paths (stripped, no leading ``./``).
+    """
+    m = _FILES_SECTION.search(plan_text)
+    if not m:
+        return set()
+    paths: set[str] = set()
+    for line in m.group(1).splitlines():
+        line = line.strip().lstrip("-•*").strip()
+        if not line:
+            continue
+        # Take the first token that looks like a path (contains a dot or slash)
+        for tok in line.split():
+            tok = tok.strip("`'\"(),:")
+            if "/" in tok or "." in tok:
+                paths.add(tok.removeprefix("./"))
+                break
+    return paths
+
+
+def check_scope(
+    edited_path: str,
+    plan_files: set[str],
+    repo_root: str | Path = "",
+) -> str | None:
+    """Return a warning string if *edited_path* is not in *plan_files*, else None.
+
+    Normalises both sides to repo-relative paths before comparing.
+    """
+    if not plan_files:
+        return None  # no plan → nothing to enforce
+    norm = edited_path.removeprefix("./")
+    if repo_root:
+        try:
+            norm = str(Path(norm).relative_to(repo_root))
+        except ValueError:
+            pass
+    if norm in plan_files:
+        return None
+    # Fuzzy: check if any plan file ends with the edited path's basename
+    base = Path(norm).name
+    if any(Path(pf).name == base for pf in plan_files):
+        return None
+    return (
+        f"[SCOPE] Edit to '{norm}' is outside the declared plan. "
+        "If this is intentional (e.g. a necessary refactor), continue — "
+        "otherwise revert and stay within the planned file list."
+    )
+
+
+# ── 2. Dependency-set diff ──────────────────────────────────────────────── #
+
+_DEP_LINE = re.compile(r"""^\s*['"]?([a-zA-Z0-9_-]+)""")
+
+
+def _parse_deps(text: str) -> set[str]:
+    """Extract package names from a ``[project.dependencies]`` block."""
+    deps: set[str] = set()
+    in_deps = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[project.dependencies]") or stripped == "dependencies = [":
+            in_deps = True
+            continue
+        if in_deps:
+            if stripped.startswith("[") or (stripped == "]"):
+                break
+            m = _DEP_LINE.match(stripped)
+            if m:
+                deps.add(m.group(1).lower())
+    return deps
+
+
+def check_dependency_diff(repo_path: Path) -> list[str]:
+    """Return list of *newly added* dependencies in ``pyproject.toml``.
+
+    Compares HEAD vs the working tree.  Returns an empty list if the file is
+    unchanged or the repo has no ``pyproject.toml``.
+    """
+    pyproject = repo_path / "pyproject.toml"
+    if not pyproject.exists():
+        return []
+    try:
+        before = subprocess.run(
+            ["git", "show", "HEAD:pyproject.toml"],
+            cwd=repo_path, capture_output=True, text=True,
+        )
+        before_deps = _parse_deps(before.stdout or "")
+    except Exception:
+        before_deps = set()
+    after_deps = _parse_deps(pyproject.read_text(encoding="utf-8"))
+    added = sorted(after_deps - before_deps)
+    return added
+
+
+# ── 3. Forbidden-import regex ───────────────────────────────────────────── #
+
+# Default forbidden imports — heavyweight frameworks that violate lean-stack.
+DEFAULT_FORBIDDEN_IMPORTS: list[str] = [
+    r"^import\s+tensorflow\b",
+    r"^from\s+tensorflow\b",
+    r"^import\s+torch\b",
+    r"^from\s+torch\b",
+    r"^import\s+django\b",
+    r"^from\s+django\b",
+]
+
+
+def check_forbidden_imports(
+    changed_files: list[Path],
+    forbidden_patterns: list[str] | None = None,
+) -> list[tuple[str, int, str]]:
+    """Scan *changed_files* for forbidden import patterns.
+
+    Returns a list of ``(filepath, line_number, matched_line)`` tuples.
+    Only checks ``.py`` files.
+    """
+    patterns = [re.compile(p) for p in (forbidden_patterns or DEFAULT_FORBIDDEN_IMPORTS)]
+    findings: list[tuple[str, int, str]] = []
+    for fp in changed_files:
+        if not str(fp).endswith(".py"):
+            continue
+        if not fp.exists():
+            continue
+        try:
+            for i, line in enumerate(fp.read_text(encoding="utf-8").splitlines(), 1):
+                for pat in patterns:
+                    if pat.search(line):
+                        findings.append((str(fp), i, line.strip()))
+                        break
+        except (OSError, UnicodeDecodeError):
+            continue
+    return findings
+
+
+# ── 4. PostToolUse hook for scope guard ─────────────────────────────────── #
+
+_EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+
+
+class ScopeGuardHook:
+    """PostToolUse hook that warns when edits target out-of-plan files."""
+
+    def __init__(
+        self,
+        plan_text: str,
+        repo_path: str | Path,
+        on_event: Callable[[str, str], None] | None = None,
+    ):
+        self.plan_files = parse_plan_files(plan_text)
+        self.repo_root = str(repo_path)
+        self._on_event = on_event or (lambda kind, text: None)
+
+    async def hook(
+        self, input_data: dict, tool_use_id: str | None, context: Any
+    ) -> dict:
+        if not self.plan_files:
+            return {}
+        if input_data.get("tool_name", "") not in _EDIT_TOOLS:
+            return {}
+        raw = (
+            (input_data.get("tool_input") or {}).get("file_path")
+            or (input_data.get("tool_input") or {}).get("path")
+            or (input_data.get("tool_input") or {}).get("notebook_path")
+        )
+        if not raw:
+            return {}
+        warning = check_scope(str(raw), self.plan_files, self.repo_root)
+        if warning is None:
+            return {}
+        self._on_event("scope_warning", warning)
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": warning,
+            }
+        }
+
+
+# ── 5. Commit-time aggregate guard ──────────────────────────────────────── #
+
+def commit_time_checks(
+    repo_path: Path,
+    changed_files: list[Path] | None = None,
+    forbidden_import_patterns: list[str] | None = None,
+) -> list[str]:
+    """Run deterministic guards at commit time. Returns a list of warnings."""
+    warnings: list[str] = []
+    # Dependency diff
+    added = check_dependency_diff(repo_path)
+    if added:
+        warnings.append(
+            f"[DEP] New dependencies added to pyproject.toml: {', '.join(added)}. "
+            "Confirm each is necessary (lean-stack constraint)."
+        )
+    # Forbidden imports
+    if changed_files:
+        hits = check_forbidden_imports(changed_files, forbidden_import_patterns)
+        for fpath, lineno, line in hits:
+            warnings.append(
+                f"[IMPORT] Forbidden import at {fpath}:{lineno}: {line}"
+            )
+    return warnings

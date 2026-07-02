@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { connectWS, createTask, fetchTasks, fetchProjects, fetchWorkerStatus, fetchOnboardingStatus, grillStep } from "./api.js";
+import { connectWS, createTask, fetchTasks, fetchProjects, fetchWorkerStatus, fetchOnboardingStatus, grillStep, fetchTrackerBoards, fetchTrackerBoardItems } from "./api.js";
 import Board from "./Board.jsx";
 import Settings from "./Settings.jsx";
 import Onboarding from "./Onboarding.jsx";
@@ -98,12 +98,19 @@ function NewTaskModal({ onClose, onCreated }) {
   const [grillQuestion, setGrillQuestion] = useState(null);
   const [grillAnswer, setGrillAnswer] = useState("");
   const [grillResult, setGrillResult] = useState(null);
+  // Phase 3b: TRACKER import state
+  const [trackerBoards, setTrackerBoards] = useState([]);
+  const [trackerItems, setTrackerItems] = useState([]);
+  const [trackerLoading, setTrackerLoading] = useState(false);
+  const [trackerSource, setTrackerSource] = useState(false); // true = importing from TRACKER
 
   useEffect(() => {
     fetchProjects().then((p) => {
       setProjects(p || []);
       if (p && p.length > 0) setSelectedProjectId(p[0].id);
     });
+    // Phase 3b: load TRACKER boards (best-effort, no error shown if unavailable)
+    fetchTrackerBoards().then((r) => setTrackerBoards(r.boards || [])).catch(() => {});
   }, []);
 
   async function handleSubmit(e) {
@@ -115,7 +122,7 @@ function NewTaskModal({ onClose, onCreated }) {
       await createTask({
         title: grillResult?.title || title.trim(),
         description: grillResult?.description || description.trim() || null,
-        repo_path: customRepo ? repoPath.trim() || null : null,
+        repo_path: customRepo ? repoPath.trim() || null : (repoPath || null),
         project_id: !customRepo && selectedProjectId ? selectedProjectId : null,
         kind,
         priority,
@@ -194,12 +201,20 @@ function NewTaskModal({ onClose, onCreated }) {
   }
 
   if (grillMode && grillQuestion) {
+    const maxRounds = 5;
+    const progressPct = Math.min(100, (grillQuestion.round / maxRounds) * 100);
     // While processing the answer, show a loading overlay that blocks all interaction.
     if (busy) {
       return (
         <div className="sendback-overlay">
           <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="sendback-label">Intake Grill (Q{grillQuestion.round})</div>
+            <div className="sendback-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span>Intake Grill</span>
+              <span style={{ fontSize: '0.7rem', color: 'var(--fg-dim)' }}>Round {grillQuestion.round}/{maxRounds}</span>
+            </div>
+            <div style={{ height: 3, background: 'var(--border)', borderRadius: 2, marginBottom: '0.5rem' }}>
+              <div style={{ height: '100%', width: `${progressPct}%`, background: 'var(--c-building)', borderRadius: 2, transition: 'width 0.3s' }} />
+            </div>
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2rem 1rem', gap: '1rem' }}>
               <Spinner />
               <div style={{ color: 'var(--text)', fontSize: '0.9rem' }}>Processing your answer...</div>
@@ -216,13 +231,38 @@ function NewTaskModal({ onClose, onCreated }) {
     return (
       <div className="sendback-overlay" onClick={onClose}>
         <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
-          <div className="sendback-label">Intake Grill (Q{grillQuestion.round})</div>
+          <div className="sendback-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span>Intake Grill</span>
+            <span style={{ fontSize: '0.7rem', color: 'var(--fg-dim)' }}>Round {grillQuestion.round}/{maxRounds}</span>
+          </div>
+          <div style={{ height: 3, background: 'var(--border)', borderRadius: 2, marginBottom: '0.5rem' }}>
+            <div style={{ height: '100%', width: `${progressPct}%`, background: 'var(--c-building)', borderRadius: 2, transition: 'width 0.3s' }} />
+          </div>
+          {grillQA.length > 0 && (
+            <div style={{ maxHeight: 100, overflowY: 'auto', fontSize: '0.75rem', color: 'var(--fg-dim)', borderBottom: '1px solid var(--border)', paddingBottom: '0.4rem', marginBottom: '0.4rem' }}>
+              {grillQA.map((qa, i) => (
+                <div key={i} style={{ marginBottom: '0.3rem' }}>
+                  <div><strong>Q{i+1}:</strong> {qa.question}</div>
+                  <div style={{ paddingLeft: '0.5rem', color: 'var(--green)' }}>→ {qa.answer}</div>
+                </div>
+              ))}
+            </div>
+          )}
           <div style={{ fontWeight: 500, margin: '0.5rem 0' }}>{grillQuestion.question}</div>
           {grillQuestion.suggestions.map((s, i) => <button key={i} type="button" className="btn btn-sendback" style={{ display: 'block', width: '100%', textAlign: 'left', marginBottom: '0.3rem', fontSize: '0.8rem' }} onClick={() => setGrillAnswer(s.replace(/^[A-D]:\s*/, ''))}>{s}</button>)}
           <textarea className="sendback-textarea" placeholder="Your answer (or click a suggestion)" value={grillAnswer} onChange={(e) => setGrillAnswer(e.target.value)} rows={2} />
           {error && <div className="new-task-error">{error}</div>}
           <div className="sendback-actions">
             <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
+            <button type="button" className="btn btn-sendback" style={{ fontSize: '0.75rem' }}
+              onClick={async () => {
+                setBusy(true); setError(null);
+                try {
+                  const step = await grillStep({ title: title.trim(), description: description.trim() || null, repo_path: customRepo ? repoPath.trim() || null : null, project_id: !customRepo && selectedProjectId ? selectedProjectId : null, qa_history: [...grillQA, { question: grillQuestion.question, answer: "(skip — use what you have)" }] });
+                  if (step.type === "done") { setGrillResult(step); setGrillQuestion(null); } else { setGrillResult({ title: step.title || title.trim(), description: step.description || description.trim(), acceptance_criteria: step.acceptance_criteria || [] }); setGrillQuestion(null); }
+                } catch (err) { setError(err.message); }
+                finally { setBusy(false); }
+              }}>Skip &amp; finish</button>
             <button className="btn btn-approve" disabled={!grillAnswer.trim()} onClick={submitGrillAnswer}>Answer</button>
           </div>
         </div>
@@ -249,27 +289,65 @@ function NewTaskModal({ onClose, onCreated }) {
             onChange={(e) => setDescription(e.target.value)}
             rows={3}
           />
-          {projects.length > 0 && !customRepo ? (
-            <div className="new-task-row">
-              <select
-                className="new-task-select"
-                style={{ flex: 1 }}
-                value={selectedProjectId}
-                onChange={(e) => setSelectedProjectId(e.target.value)}
-              >
-                {projects.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name} ({p.repo_paths.length} repo{p.repo_paths.length !== 1 ? 's' : ''})
-                  </option>
-                ))}
-              </select>
-              <button
-                type="button"
-                className="btn btn-sendback"
-                style={{ fontSize: '0.75rem', padding: '0.3rem 0.6rem' }}
-                onClick={() => { setCustomRepo(true); setRepoPath(''); }}
-              >other</button>
-            </div>
+          {!customRepo ? (
+            <>
+              {projects.length > 0 ? (
+                <div className="new-task-row">
+                  <label style={{ fontSize: '0.75rem', color: 'var(--fg-dim)', whiteSpace: 'nowrap' }}>Project</label>
+                  <select
+                    className="new-task-select"
+                    style={{ flex: 1 }}
+                    value={selectedProjectId}
+                    onChange={(e) => setSelectedProjectId(e.target.value)}
+                  >
+                    {projects.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name} ({p.repo_paths.length} repo{p.repo_paths.length !== 1 ? 's' : ''})
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    className="btn btn-sendback"
+                    style={{ fontSize: '0.7rem', padding: '0.2rem 0.5rem' }}
+                    onClick={() => { setCustomRepo(true); setRepoPath(''); }}
+                    title="Use a repo path not in any project"
+                  >custom repo</button>
+                </div>
+              ) : (
+                <div style={{ fontSize: '0.8rem', color: 'var(--fg-dim)', padding: '0.3rem 0' }}>
+                  No projects yet.
+                  <button
+                    type="button"
+                    className="btn btn-sendback"
+                    style={{ fontSize: '0.7rem', padding: '0.2rem 0.5rem', marginLeft: '0.5rem' }}
+                    onClick={() => setCustomRepo(true)}
+                  >use repo path</button>
+                </div>
+              )}
+              {/* If a project has multiple repos, let user pick which one to target */}
+              {selectedProjectId && (() => {
+                const proj = projects.find(p => p.id === selectedProjectId);
+                if (!proj || proj.repo_paths.length <= 1) return null;
+                return (
+                  <div className="new-task-row">
+                    <label style={{ fontSize: '0.75rem', color: 'var(--fg-dim)', whiteSpace: 'nowrap' }}>Target repo</label>
+                    <select
+                      className="new-task-select"
+                      style={{ flex: 1 }}
+                      value={repoPath || proj.primary_repo || proj.repo_paths[0]}
+                      onChange={(e) => setRepoPath(e.target.value)}
+                    >
+                      {proj.repo_paths.map((rp) => (
+                        <option key={rp} value={rp}>
+                          {rp.split('/').pop()}{rp === proj.primary_repo ? ' (primary)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                );
+              })()}
+            </>
           ) : (
             <div className="new-task-row">
               <input
@@ -283,9 +361,9 @@ function NewTaskModal({ onClose, onCreated }) {
                 <button
                   type="button"
                   className="btn btn-sendback"
-                  style={{ fontSize: '0.75rem', padding: '0.3rem 0.6rem' }}
-                  onClick={() => { setCustomRepo(false); setSelectedProjectId(projects[0]?.id || ''); }}
-                >list</button>
+                  style={{ fontSize: '0.7rem', padding: '0.2rem 0.5rem' }}
+                  onClick={() => { setCustomRepo(false); setSelectedProjectId(projects[0]?.id || ''); setRepoPath(''); }}
+                >back to projects</button>
               )}
             </div>
           )}
@@ -304,6 +382,36 @@ function NewTaskModal({ onClose, onCreated }) {
               <option value="low">low</option>
             </select>
           </div>
+          {/* Phase 3b: Import from TRACKER */}
+          {trackerBoards.length > 0 && !trackerSource && (
+            <button type="button" className="btn btn-sendback" style={{ width: '100%', fontSize: '0.8rem', marginTop: '0.3rem' }}
+              onClick={async () => {
+                setTrackerSource(true); setTrackerLoading(true);
+                try {
+                  const r = await fetchTrackerBoardItems("all");
+                  setTrackerItems(r.items || []);
+                } catch { setTrackerItems([]); }
+                finally { setTrackerLoading(false); }
+              }}>
+              Import from TRACKER
+            </button>
+          )}
+          {trackerSource && (
+            <div style={{ border: '1px solid var(--border)', borderRadius: 6, padding: '0.5rem', marginTop: '0.3rem', maxHeight: 180, overflowY: 'auto' }}>
+              <div style={{ fontSize: '0.7rem', color: 'var(--fg-dim)', marginBottom: '0.3rem', display: 'flex', justifyContent: 'space-between' }}>
+                <span>TRACKER items</span>
+                <button type="button" style={{ fontSize: '0.65rem', cursor: 'pointer', background: 'none', border: 'none', color: 'var(--fg-dim)' }} onClick={() => { setTrackerSource(false); setTrackerItems([]); }}>✕ close</button>
+              </div>
+              {trackerLoading ? <div style={{ fontSize: '0.8rem', color: 'var(--fg-dim)' }}>Loading…</div>
+                : trackerItems.length === 0 ? <div style={{ fontSize: '0.8rem', color: 'var(--fg-dim)' }}>No items found</div>
+                : trackerItems.map((it) => (
+                  <div key={it.number} style={{ padding: '0.25rem 0', borderBottom: '1px solid var(--border)', cursor: 'pointer', fontSize: '0.8rem' }}
+                    onClick={() => { setTitle(it.title); setDescription(`TRACKER: ${it.number}`); setTrackerSource(false); }}>
+                    <span style={{ fontWeight: 600, marginRight: 6 }}>{it.number}</span>{it.title}
+                  </div>
+                ))}
+            </div>
+          )}
           {error && <div className="new-task-error">{error}</div>}
           <div className="sendback-actions">
             <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
@@ -370,6 +478,17 @@ export default function App() {
     connect();
     return () => wsRef.current?.close();
   }, []);
+
+  if (onboarded === null) {
+    return (
+      <div className="nh-shell">
+        <header className="nh-header"><Brand /></header>
+        <div className="nh-center">
+          <span className="grill-spinner" style={{ width: 28, height: 28 }} />
+        </div>
+      </div>
+    );
+  }
 
   if (onboarded === false) {
     return <Onboarding onComplete={() => setOnboarded(true)} />;

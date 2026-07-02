@@ -171,7 +171,7 @@ async def test_two_repos_run_concurrently_in_worktrees(store, tmp_path):
 
     class Backend:
         async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
-                      on_event=None, supervisor_hook=None):
+                      on_event=None, supervisor_hook=None, **kwargs):
             mutate(cwd)
             return AgentResult(final_text="done", num_turns=1, is_error=False,
                                tokens_used=10, session_id="s", stop_reason="end_turn")

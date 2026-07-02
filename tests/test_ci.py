@@ -465,7 +465,7 @@ class FakeBackend:
         self._mutate = mutate or (lambda cwd: None)
 
     async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None, on_event=None,
-                  supervisor_hook=None):
+                  supervisor_hook=None, **kwargs):
         self._mutate(cwd)
         return AgentResult(final_text="done", num_turns=2, is_error=False,
                            tokens_used=100, session_id="s", stop_reason="end_turn")

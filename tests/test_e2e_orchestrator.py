@@ -52,7 +52,7 @@ class FakeBackend:
         self.mutate = mutate
 
     async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
-                  on_event=None, supervisor_hook=None):
+                  on_event=None, supervisor_hook=None, **kwargs):
         if on_event:
             on_event(AgentEvent("tool_use", tool_name="Edit",
                                 tool_input={"file_path": "calc.py"}))
@@ -62,7 +62,11 @@ class FakeBackend:
 
 
 def _config(tmp_path):
-    return load_config(tmp_path / "config.yaml")
+    cfg = load_config(tmp_path / "config.yaml")
+    # Disable planning by default in tests — no real Claude calls.
+    # Planning-specific tests override this and mock ClaudeBackend.
+    cfg.data.setdefault("planning", {})["enabled"] = False
+    return cfg
 
 
 @pytest.fixture
@@ -458,7 +462,7 @@ class BlockerBackend:
         self._mutate = mutate
 
     async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
-                  on_event=None, supervisor_hook=None):
+                  on_event=None, supervisor_hook=None, **kwargs):
         if self._mutate:
             self._mutate(cwd)
         text = (
@@ -580,7 +584,7 @@ class PromptCapturingBackend:
         self.prompts: list[str] = []
 
     async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None, on_event=None,
-                  supervisor_hook=None):
+                  supervisor_hook=None, **kwargs):
         self.calls += 1
         self.prompts.append(prompt)
         if self.calls == 1:
@@ -679,7 +683,7 @@ async def test_resume_after_wip_checkpoint_rebases_from_main(bare_repo, tmp_path
             self.inner = inner
             self.wip = wip
         async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None, on_event=None,
-                      supervisor_hook=None):
+                      supervisor_hook=None, **kwargs):
             if self.inner.calls == 0:
                 self.wip(cwd)
             return await self.inner.run(prompt, cwd=cwd, max_turns=max_turns,
@@ -722,7 +726,7 @@ class MaxTurnsBackend:
         self.calls = 0
 
     async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
-                  on_event=None, supervisor_hook=None):
+                  on_event=None, supervisor_hook=None, **kwargs):
         self.calls += 1
         if on_event:
             on_event(AgentEvent("result", text="Reached maximum number of turns (40)"))
@@ -833,3 +837,203 @@ async def test_revision_reuses_pr_branch_b5(bare_repo, tmp_path, store):
     attempts = await store.list_attempts(t.id)
     revision_attempt = attempts[-1]
     assert revision_attempt["branch_name"] == original_branch
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1: plan-first worker                                                   #
+#                                                                               #
+# All tests mock ClaudeBackend — no real Claude API calls.  _config() disables  #
+# planning by default; tests that exercise planning re-enable it explicitly.    #
+# --------------------------------------------------------------------------- #
+
+from unittest.mock import patch as _patch
+from no_human.vcs import GitRepo
+
+
+def _planning_config(tmp_path):
+    """Config with planning explicitly enabled (for planning-specific tests)."""
+    cfg = _config(tmp_path)
+    cfg.data["planning"]["enabled"] = True
+    return cfg
+
+
+class PlannerBackend:
+    """A backend that returns a scripted plan text (no real LLM)."""
+
+    def __init__(self, plan_text: str):
+        self._plan = plan_text
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        return AgentResult(final_text=self._plan, num_turns=3, is_error=False,
+                           tokens_used=200, session_id="s", stop_reason="end_turn")
+
+
+class FailingPlannerBackend:
+    """A backend that always raises — simulates SDK auth failure."""
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        raise RuntimeError("no auth token")
+
+
+_SAMPLE_PLAN = (
+    "## FILES TO CHANGE/CREATE\n- calc.py: add mul()\n\n"
+    "## APPROACH\nAdd a mul function.\n\n"
+    "## TEST PLAN\ntest_mul asserts mul(2,3)==6.\n\n"
+    "## OUT OF SCOPE\nDo not rename existing functions.\n\n"
+    "## VERIFICATION\npytest -q\n"
+)
+
+
+async def test_planning_generates_and_stores_plan(bare_repo, tmp_path, store):
+    """_generate_plan stores the plan text in task.context['plan']."""
+    cfg = _planning_config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend",
+                return_value=PlannerBackend(_SAMPLE_PLAN)):
+        result = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert result == _SAMPLE_PLAN.strip()
+    planning_events = [e for e in events if e.get("kind") == "planning"]
+    assert any("plan generated" in e.get("text", "") for e in planning_events)
+
+
+async def test_planning_skips_for_code_review(bare_repo, tmp_path, store):
+    """Planning is gated: code_review kind skips it entirely (no Claude call)."""
+    cfg = _planning_config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("review PR #42", repo_path=str(bare_repo), kind="code_review")
+
+    # No mock needed — code_review returns before creating a backend.
+    result = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert result == ""
+    planning_events = [e for e in events if e.get("kind") == "planning"]
+    assert any("code_review" in e.get("text", "") for e in planning_events)
+
+
+async def test_planning_skips_when_disabled(bare_repo, tmp_path, store):
+    """Planning respects the config gate (no Claude call)."""
+    cfg = _config(tmp_path)  # planning already disabled by _config()
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+
+    # No mock needed — disabled returns before creating a backend.
+    result = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert result == ""
+    planning_events = [e for e in events if e.get("kind") == "planning"]
+    assert any("disabled" in e.get("text", "") for e in planning_events)
+
+
+async def test_planning_skip_plan_response(bare_repo, tmp_path, store):
+    """When the planner assesses a trivial task, SKIP_PLAN bypasses planning."""
+    cfg = _planning_config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("fix typo", repo_path=str(bare_repo))
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend",
+                return_value=PlannerBackend("SKIP_PLAN")):
+        result = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert result == ""
+    planning_events = [e for e in events if e.get("kind") == "planning"]
+    assert any("trivial" in e.get("text", "") for e in planning_events)
+
+
+async def test_planning_failure_is_best_effort(bare_repo, tmp_path, store):
+    """Planning failure doesn't crash — returns empty string (mocked failure)."""
+    cfg = _planning_config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend",
+                return_value=FailingPlannerBackend()):
+        result = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert result == ""
+    planning_events = [e for e in events if e.get("kind") == "planning"]
+    assert any("failed" in e.get("text", "") for e in planning_events)
+
+
+async def test_plan_injected_into_implement_prompt(bare_repo, tmp_path, store):
+    """Plan from task.context is injected into the implement prompt."""
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+    t.context = {"plan": "## FILES TO CHANGE\n- calc.py: add mul()"}
+
+    prompt = orch._build_implement_prompt(t)
+
+    assert "IMPLEMENTATION PLAN" in prompt
+    assert "calc.py: add mul()" in prompt
+    assert "OUT OF SCOPE" in prompt  # the instruction about respecting scope
+
+
+async def test_no_plan_no_plan_block_in_prompt(bare_repo, tmp_path, store):
+    """Without a plan, the implement prompt has no plan block."""
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+
+    prompt = orch._build_implement_prompt(t)
+
+    assert "IMPLEMENTATION PLAN" not in prompt
+
+
+async def test_full_pipeline_with_planning(bare_repo, tmp_path, store):
+    """Full pipeline: planning (mocked) → implement (FakeBackend) → PR.
+
+    This is the integration test that proves planning feeds into the implement
+    prompt and the full lifecycle completes. All LLM calls are mocked.
+    """
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\n"
+            "def mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+
+    cfg = _planning_config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+    await store.create_task(t)
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend",
+                return_value=PlannerBackend(_SAMPLE_PLAN)):
+        outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    # Plan was stored in context
+    refreshed = await store.get_task(t.id)
+    assert refreshed.context.get("plan") == _SAMPLE_PLAN.strip()
+    # Planning event was emitted
+    kinds = [e["kind"] for e in events]
+    assert "planning" in kinds
+    # PLAN.md was written to worktree (but not committed)
+    assert outcome.pr_url and "no-human/" in outcome.pr_url

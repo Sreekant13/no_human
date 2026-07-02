@@ -70,6 +70,34 @@ class Store:
         for col, decl in wanted.items():
             if col not in existing:
                 await self.db.execute(f"ALTER TABLE tasks ADD COLUMN {col} {decl}")
+        # Phase 7d: cache metric columns on attempts (validates Phase 2a caching).
+        cur2 = await self.db.execute("PRAGMA table_info(attempts)")
+        att_existing = {row["name"] for row in await cur2.fetchall()}
+        att_wanted = {
+            "cache_read_tokens": "INTEGER DEFAULT 0",
+            "cache_creation_tokens": "INTEGER DEFAULT 0",
+        }
+        for col, decl in att_wanted.items():
+            if col not in att_existing:
+                await self.db.execute(f"ALTER TABLE attempts ADD COLUMN {col} {decl}")
+        # Phase 6a: test_layers column on projects (JSON-encoded TestPlan layers).
+        cur3 = await self.db.execute("PRAGMA table_info(projects)")
+        proj_existing = {row["name"] for row in await cur3.fetchall()}
+        if "test_layers" not in proj_existing:
+            await self.db.execute(
+                "ALTER TABLE projects ADD COLUMN test_layers TEXT DEFAULT '[]'"
+            )
+        # Phase 7e: history cache table — content-signature keyed so onboarding
+        # doesn't re-extract every request. "Re-scan" forces refresh.
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS history_cache (
+                content_sig TEXT PRIMARY KEY,
+                cascade_id TEXT NOT NULL,
+                title TEXT,
+                findings_json TEXT,
+                ingested_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
 
     # ----------------------------- tasks ---------------------------------- #
 
@@ -321,8 +349,8 @@ class Store:
         from ..project_model import Project
         row = project.to_row()
         await self.db.execute(
-            "INSERT INTO projects (id, name, repo_paths, primary_repo) "
-            "VALUES (:id, :name, :repo_paths, :primary_repo)",
+            "INSERT INTO projects (id, name, repo_paths, primary_repo, test_layers) "
+            "VALUES (:id, :name, :repo_paths, :primary_repo, :test_layers)",
             row,
         )
         await self.db.commit()
@@ -356,8 +384,8 @@ class Store:
         row = project.to_row()
         await self.db.execute(
             "UPDATE projects SET name = :name, repo_paths = :repo_paths, "
-            "primary_repo = :primary_repo, updated_at = :updated_at "
-            "WHERE id = :id",
+            "primary_repo = :primary_repo, test_layers = :test_layers, "
+            "updated_at = :updated_at WHERE id = :id",
             {**row, "updated_at": _now()},
         )
         await self.db.commit()
@@ -368,3 +396,30 @@ class Store:
         )
         await self.db.commit()
         return cur.rowcount > 0
+
+    # ----------------------- history cache (Phase 7e) ---------------------- #
+
+    async def history_cache_get(self, content_sig: str) -> dict | None:
+        """Return cached ingestion result for a transcript content signature."""
+        cur = await self.db.execute(
+            "SELECT * FROM history_cache WHERE content_sig = ?", (content_sig,)
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def history_cache_put(
+        self, content_sig: str, cascade_id: str, title: str, findings_json: str,
+    ) -> None:
+        """Cache ingestion result keyed by content signature (upsert)."""
+        await self.db.execute(
+            "INSERT OR REPLACE INTO history_cache "
+            "(content_sig, cascade_id, title, findings_json) VALUES (?, ?, ?, ?)",
+            (content_sig, cascade_id, title, findings_json),
+        )
+        await self.db.commit()
+
+    async def history_cache_clear(self) -> int:
+        """Clear the entire history cache (Re-scan). Returns rows deleted."""
+        cur = await self.db.execute("DELETE FROM history_cache")
+        await self.db.commit()
+        return cur.rowcount

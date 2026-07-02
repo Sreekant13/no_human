@@ -2,17 +2,22 @@ import { useEffect, useState, useCallback } from "react";
 import {
   addRule, addSkill, confirmLearning, fetchConfig, fetchLearnings,
   fetchRules, fetchSkills, rejectLearning, removeRule, removeSkill,
+  fetchProjects, createProject, updateProject, deleteProject,
+  fetchProfiles, detectRepos, onboardRepo, suggestPaths,
+  fetchTrackerSettings, updateTrackerBoards,
 } from "./api.js";
 
 const TABS = [
+  { key: "projects",  label: "Projects" },
   { key: "rules",     label: "Rules" },
   { key: "skills",    label: "Skills" },
   { key: "learnings", label: "Learnings" },
+  { key: "tracker",       label: "TRACKER Boards" },
   { key: "config",    label: "Config" },
 ];
 
 export default function Settings() {
-  const [tab, setTab] = useState("rules");
+  const [tab, setTab] = useState("projects");
 
   return (
     <div className="settings-page">
@@ -28,9 +33,11 @@ export default function Settings() {
         ))}
       </div>
       <div className="settings-body">
+        {tab === "projects"  && <ProjectsPanel />}
         {tab === "rules"     && <MemoryList kind="rules" fetchFn={fetchRules} addFn={addRule} removeFn={removeRule} />}
         {tab === "skills"    && <MemoryList kind="skills" fetchFn={fetchSkills} addFn={addSkill} removeFn={removeSkill} />}
         {tab === "learnings" && <LearningsPanel />}
+        {tab === "tracker"       && <TrackerBoardsPanel />}
         {tab === "config"    && <ConfigPanel />}
       </div>
     </div>
@@ -302,6 +309,363 @@ function LearningCard({ item, isPending, onAction }) {
           </button>
         </div>
       )}
+    </div>
+  );
+}
+
+/* ── Projects panel ──────────────────────────────────────────────────────── */
+
+function ProjectsPanel() {
+  const [projects, setProjects] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [showAdd, setShowAdd] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    fetchProjects()
+      .then((data) => { setProjects(data || []); setError(null); })
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function handleDelete(id, name) {
+    if (!window.confirm(`Delete project "${name}"? This does not delete the repos.`)) return;
+    try {
+      await deleteProject(id);
+      load();
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
+  return (
+    <div className="memory-panel">
+      <div className="memory-header">
+        <h3 className="memory-title">
+          Projects
+          {!loading && <span className="memory-count">{projects.length}</span>}
+        </h3>
+        <button className="btn btn-new-task" onClick={() => setShowAdd(true)}>
+          + New Project
+        </button>
+      </div>
+      <p className="settings-hint" style={{ margin: '0 0 0.75rem', fontSize: '0.8rem', color: 'var(--fg-dim)' }}>
+        A project groups multiple repos into a single unit of work. When creating a task, you pick a project.
+      </p>
+      {error && <div className="settings-error">{error}</div>}
+      {loading ? (
+        <div className="settings-loading">
+          <span className="grill-spinner" />
+          <span>Loading projects…</span>
+        </div>
+      ) : projects.length === 0 ? (
+        <div className="settings-empty">
+          No projects yet. Create one to group your repos.
+        </div>
+      ) : (
+        <div className="memory-list">
+          {projects.map((proj) => (
+            <ProjectCard
+              key={proj.id}
+              project={proj}
+              onDelete={() => handleDelete(proj.id, proj.name)}
+              onUpdated={load}
+            />
+          ))}
+        </div>
+      )}
+      {showAdd && (
+        <AddProjectModal
+          onClose={() => setShowAdd(false)}
+          onSaved={() => { setShowAdd(false); load(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function ProjectCard({ project, onDelete, onUpdated }) {
+  const [expanded, setExpanded] = useState(false);
+  const [addingRepo, setAddingRepo] = useState(false);
+  const [newRepoPath, setNewRepoPath] = useState("");
+  const [profiling, setProfiling] = useState(false);
+  const [error, setError] = useState(null);
+
+  async function handleAddRepo() {
+    const path = newRepoPath.trim();
+    if (!path) return;
+    setProfiling(true);
+    setError(null);
+    try {
+      await onboardRepo(path);
+      const updated = [...project.repo_paths, path];
+      await updateProject(project.id, { repo_paths: updated });
+      setNewRepoPath("");
+      setAddingRepo(false);
+      onUpdated();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setProfiling(false);
+    }
+  }
+
+  async function handleRemoveRepo(repoPath) {
+    if (!window.confirm(`Remove "${repoPath.split('/').pop()}" from this project?`)) return;
+    try {
+      const updated = project.repo_paths.filter(r => r !== repoPath);
+      await updateProject(project.id, { repo_paths: updated });
+      onUpdated();
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
+  async function handleSetPrimary(repoPath) {
+    try {
+      await updateProject(project.id, { primary_repo: repoPath });
+      onUpdated();
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
+  return (
+    <div className="memory-card project-card">
+      <div className="memory-card-header" style={{ cursor: 'pointer' }} onClick={() => setExpanded(!expanded)}>
+        <span className="memory-card-title" style={{ fontWeight: 600, flex: 1 }}>{project.name}</span>
+        <span className="memory-card-type">{project.repo_paths.length} repo{project.repo_paths.length !== 1 ? 's' : ''}</span>
+        <span style={{ fontSize: '0.75rem', color: 'var(--fg-dim)', marginLeft: '0.5rem' }}>{expanded ? '▾' : '▸'}</span>
+        <button className="memory-card-remove" onClick={(e) => { e.stopPropagation(); onDelete(); }} title="Delete project">✕</button>
+      </div>
+      {expanded && (
+        <div style={{ padding: '0.5rem 0' }}>
+          {project.repo_paths.length === 0 ? (
+            <div style={{ fontSize: '0.8rem', color: 'var(--fg-dim)', padding: '0.25rem 0' }}>No repos in this project yet.</div>
+          ) : (
+            <div className="project-repos">
+              {project.repo_paths.map((rp) => (
+                <div key={rp} className="project-repo-row">
+                  <span className="project-repo-name">{rp.split('/').pop()}</span>
+                  <span className="project-repo-path">{rp}</span>
+                  {rp === project.primary_repo ? (
+                    <span className="project-repo-primary">primary</span>
+                  ) : (
+                    <button className="project-repo-action" onClick={() => handleSetPrimary(rp)} title="Set as primary">★</button>
+                  )}
+                  <button className="project-repo-action danger" onClick={() => handleRemoveRepo(rp)} title="Remove repo">✕</button>
+                </div>
+              ))}
+            </div>
+          )}
+          {error && <div className="new-task-error" style={{ margin: '0.5rem 0' }}>{error}</div>}
+          {addingRepo ? (
+            <div className="project-add-repo">
+              <PathInputSettings value={newRepoPath} onChange={setNewRepoPath} placeholder="Repo path, e.g. ~/git/my-repo" />
+              <button className="btn btn-approve btn-sm" disabled={!newRepoPath.trim() || profiling} onClick={handleAddRepo}>
+                {profiling ? <><span className="grill-spinner" style={{ width: 14, height: 14 }} /> Profiling…</> : 'Add'}
+              </button>
+              <button className="btn btn-sendback btn-sm" onClick={() => { setAddingRepo(false); setNewRepoPath(""); }}>Cancel</button>
+            </div>
+          ) : (
+            <button className="btn btn-sendback btn-sm" style={{ marginTop: '0.5rem' }} onClick={() => setAddingRepo(true)}>+ Add repo</button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PathInputSettings({ value, onChange, placeholder }) {
+  const [opts, setOpts] = useState([]);
+  const listId = "settings-pathlist";
+  useEffect(() => {
+    let live = true;
+    const t = setTimeout(async () => {
+      const res = await suggestPaths(value);
+      if (live) setOpts(res.suggestions || []);
+    }, 150);
+    return () => { live = false; clearTimeout(t); };
+  }, [value]);
+  return (
+    <>
+      <input
+        className="new-task-input" list={listId} value={value}
+        placeholder={placeholder} spellCheck={false} autoFocus
+        onChange={(e) => onChange(e.target.value)}
+        style={{ flex: 1 }}
+      />
+      <datalist id={listId}>
+        {opts.map((o) => (
+          <option key={o.path} value={o.path}>{o.is_repo ? "git repo" : "folder"}</option>
+        ))}
+      </datalist>
+    </>
+  );
+}
+
+function AddProjectModal({ onClose, onSaved }) {
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [scanRoot, setScanRoot] = useState("~/git");
+  const [detected, setDetected] = useState([]);
+  const [selectedRepos, setSelectedRepos] = useState(new Set());
+  const [scanning, setScanning] = useState(false);
+
+  async function handleScan() {
+    setScanning(true);
+    setError(null);
+    try {
+      const res = await detectRepos(scanRoot);
+      setDetected(res.repos || []);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  function toggleRepo(path) {
+    setSelectedRepos((s) => {
+      const n = new Set(s);
+      n.has(path) ? n.delete(path) : n.add(path);
+      return n;
+    });
+  }
+
+  async function handleCreate(e) {
+    if (e) e.preventDefault();
+    if (!name.trim() || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const repoPaths = [...selectedRepos];
+      for (const rp of repoPaths) {
+        try { await onboardRepo(rp); } catch { /* already profiled or best-effort */ }
+      }
+      await createProject({ name: name.trim(), repo_paths: repoPaths });
+      onSaved();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="sendback-overlay" onClick={onClose}>
+      <div className="new-task-modal" style={{ maxWidth: 520 }} onClick={(e) => e.stopPropagation()}>
+        <div className="sendback-label">New Project</div>
+        <form onSubmit={handleCreate}>
+          <input
+            className="new-task-input"
+            placeholder="Project name (required)"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            autoFocus
+          />
+          <div style={{ fontSize: '0.8rem', color: 'var(--fg-dim)', margin: '0.5rem 0 0.25rem' }}>
+            Scan for repos to add:
+          </div>
+          <div className="new-task-row">
+            <PathInputSettings value={scanRoot} onChange={setScanRoot} placeholder="Scan root, e.g. ~/git" />
+            <button type="button" className="btn btn-sendback" disabled={scanning} onClick={handleScan}>
+              {scanning ? <><span className="grill-spinner" style={{ width: 14, height: 14 }} /> Scanning…</> : 'Scan'}
+            </button>
+          </div>
+          {detected.length > 0 && (
+            <div className="ob-repolist" style={{ maxHeight: '180px', margin: '0.5rem 0' }}>
+              {detected.map((r) => (
+                <label key={r.path} className={`ob-repo${selectedRepos.has(r.path) ? " sel" : ""}`} style={{ padding: '0.2rem 0.4rem' }}>
+                  <input type="checkbox" checked={selectedRepos.has(r.path)} onChange={() => toggleRepo(r.path)} />
+                  <span className="ob-repo-name">{r.name}</span>
+                  {r.ecosystem && <span className="ob-tag">{r.ecosystem}</span>}
+                </label>
+              ))}
+            </div>
+          )}
+          {error && <div className="new-task-error">{error}</div>}
+          <div className="sendback-actions">
+            <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
+            <button type="submit" className="btn btn-approve" disabled={!name.trim() || busy}>
+              {busy ? <><span className="grill-spinner" style={{ width: 14, height: 14 }} /> Creating…</> : 'Create Project'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+/* ── TRACKER Boards management (Phase 3b) ────────────────────────────────────── */
+
+function TrackerBoardsPanel() {
+  const [boards, setBoards] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [newBoard, setNewBoard] = useState("");
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    fetchTrackerSettings()
+      .then((r) => setBoards(r.boards || []))
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+  }, []);
+
+  async function addBoard() {
+    const key = newBoard.trim();
+    if (!key || boards.includes(key)) return;
+    const next = [...boards, key].sort();
+    try {
+      await updateTrackerBoards(next);
+      setBoards(next); setNewBoard(""); setError(null);
+    } catch (e) { setError(e.message); }
+  }
+
+  async function removeBoard(key) {
+    const next = boards.filter((b) => b !== key);
+    try {
+      await updateTrackerBoards(next);
+      setBoards(next); setError(null);
+    } catch (e) { setError(e.message); }
+  }
+
+  if (loading) return <div className="settings-empty">Loading…</div>;
+
+  return (
+    <div>
+      <div className="config-hint" style={{ marginBottom: '0.5rem' }}>
+        TRACKER boards to poll for tasks. Board keys like <code>SPRINT-42</code> or team assignment groups.
+      </div>
+      {error && <div className="settings-error" style={{ marginBottom: '0.5rem' }}>{error}</div>}
+      {boards.length === 0 ? (
+        <div className="settings-empty">No boards configured</div>
+      ) : (
+        <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
+          {boards.map((b) => (
+            <li key={b} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.4rem 0', borderBottom: '1px solid var(--border)' }}>
+              <code style={{ fontSize: '0.85rem' }}>{b}</code>
+              <button className="btn btn-sendback" style={{ fontSize: '0.7rem', padding: '0.15rem 0.5rem' }}
+                onClick={() => removeBoard(b)}>Remove</button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.75rem' }}>
+        <input
+          style={{ flex: 1, padding: '0.3rem 0.5rem', fontSize: '0.85rem', border: '1px solid var(--border)', borderRadius: 4, background: 'var(--surface-1)', color: 'var(--text)' }}
+          placeholder="Board key, e.g. SPRINT-42"
+          value={newBoard}
+          onChange={(e) => setNewBoard(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && addBoard()}
+        />
+        <button className="btn btn-approve" style={{ fontSize: '0.8rem', padding: '0.3rem 0.8rem' }}
+          disabled={!newBoard.trim()} onClick={addBoard}>Add</button>
+      </div>
     </div>
   );
 }

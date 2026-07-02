@@ -64,6 +64,8 @@ class Scheduler:
         # Per-task event log: task_id -> deque of {ts, source, kind, text, ...}
         self._event_log: dict[str, deque] = {}
         self._MAX_EVENTS = 200
+        # Phase 4a: SSE — per-task notify so streaming clients wake on new events.
+        self._event_notify: dict[str, asyncio.Event] = {}
 
     @property
     def inflight(self) -> set[str]:
@@ -115,10 +117,13 @@ class Scheduler:
         buf = deque(maxlen=self._MAX_EVENTS)
         self._event_log[task.id] = buf
 
+        notify = self._event_notify.setdefault(task.id, asyncio.Event())
+
         def _sink(event):
             event["ts"] = time.time()
             event["task_id"] = task.id
             buf.append(event)
+            notify.set()
 
         try:
             orch = self.factory()
@@ -145,6 +150,11 @@ class Scheduler:
                 pass
         finally:
             self._inflight.discard(task.id)
+            # Final notify so SSE clients see the task finished, then clean up.
+            if task.id in self._event_notify:
+                self._event_notify[task.id].set()
+                # Don't delete immediately — give SSE 5s to drain.
+                # The SSE endpoint checks inflight and closes after idle ticks.
 
     async def run_forever(
         self, *, stop: asyncio.Event, poll_interval: float = 10.0

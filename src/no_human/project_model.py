@@ -19,6 +19,7 @@ class Project:
     name: str
     repo_paths: list[str] = field(default_factory=list)
     primary_repo: str | None = None
+    test_layers: str = "[]"  # JSON-encoded TestPlan layers (Phase 6a)
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -39,6 +40,7 @@ class Project:
             "name": self.name,
             "repo_paths": json.dumps(self.repo_paths),
             "primary_repo": self.primary_repo,
+            "test_layers": self.test_layers,
         }
 
     @classmethod
@@ -49,9 +51,16 @@ class Project:
             name=d["name"],
             repo_paths=json.loads(d.get("repo_paths") or "[]"),
             primary_repo=d.get("primary_repo"),
+            test_layers=d.get("test_layers") or "[]",
             created_at=d.get("created_at"),
             updated_at=d.get("updated_at"),
         )
+
+    @property
+    def test_plan(self):
+        """Return a TestPlan from the stored layers JSON (Phase 6a)."""
+        from .testing.test_layers import TestPlan
+        return TestPlan.from_json(self.test_layers)
 
     @property
     def linked_repos(self) -> list[str]:
