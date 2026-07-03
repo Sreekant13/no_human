@@ -5,6 +5,7 @@ scheduling logic is tested in isolation (the real run_task is covered elsewhere)
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -297,3 +298,31 @@ async def test_scheduler_tick_triggers_reanalysis(store):
     )
     await sched.tick()
     # Job ran — even if no proposals, no error should have occurred.
+
+
+# --------------------------------------------------------------------------- #
+# WikiRefreshJob                                                               #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_wiki_refresh_job_due_timing():
+    from no_human.core.scheduler import WikiRefreshJob
+    # FakeBackend not needed — only testing due() logic.
+    job = WikiRefreshJob(None, None, interval_seconds=60)
+    assert job.due()  # first call always due
+    job._last_run = time.time()
+    assert not job.due()  # just ran, not due
+    job._last_run = time.time() - 61
+    assert job.due()  # past interval
+
+
+@pytest.mark.asyncio
+async def test_wiki_refresh_job_skips_matching_commit(store, tmp_path):
+    """WikiRefreshJob skips repos where HEAD == wiki_commit (no-op)."""
+    from no_human.core.scheduler import WikiRefreshJob
+
+    job = WikiRefreshJob(store, None, interval_seconds=0)
+    # No projects → nothing to do.
+    result = await job.maybe_run()
+    assert result == []

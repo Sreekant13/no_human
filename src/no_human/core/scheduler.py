@@ -267,3 +267,91 @@ class ReanalysisJob:
             "proposed": result.proposed,
             "duplicates": result.duplicates,
         }
+
+
+# --------------------------------------------------------------------------- #
+# Wiki refresh scheduler                                                       #
+# --------------------------------------------------------------------------- #
+
+
+class WikiRefreshJob:
+    """Regenerates repo wiki docs when ``git rev-parse HEAD`` differs from the
+    stored ``wiki_commit`` in the project profile.
+
+    Same ``due()``/``maybe_run()`` shape as ``ReanalysisJob``; wired into the
+    scheduler loop the same way.
+    """
+
+    def __init__(
+        self,
+        store: Store,
+        backend: Any,
+        *,
+        interval_seconds: float = 3600,  # default: hourly check
+        max_turns: int = 12,
+    ):
+        self.store = store
+        self.backend = backend
+        self.interval = max(60, interval_seconds)
+        self.max_turns = max_turns
+        self._last_run: float = 0.0
+        self._running = False
+
+    def due(self, now: float | None = None) -> bool:
+        return (now or time.time()) - self._last_run >= self.interval
+
+    async def maybe_run(self) -> list[dict] | None:
+        """Check all profiled repos; regenerate wiki where HEAD moved."""
+        if not self.due() or self._running:
+            return None
+        self._running = True
+        try:
+            return await self._run()
+        finally:
+            self._running = False
+            self._last_run = time.time()
+
+    async def _run(self) -> list[dict]:
+        import subprocess
+        from pathlib import Path
+
+        from ..docs_gen import WikiGenerator
+        from ..profile import ProjectProfile
+
+        gen = WikiGenerator(self.backend, max_turns=self.max_turns)
+        results: list[dict] = []
+
+        projects = await self.store.list_projects()
+        for proj in projects:
+            for repo_path in (proj.get("repos") or []):
+                repo = Path(repo_path).expanduser()
+                if not repo.is_dir():
+                    continue
+                profile = ProjectProfile.load(repo)
+                if not profile:
+                    continue
+                # Check HEAD vs stored wiki_commit.
+                try:
+                    r = subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        capture_output=True, text=True, timeout=5,
+                        cwd=repo,
+                    )
+                    head = r.stdout.strip() if r.returncode == 0 else ""
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    continue
+                if not head or head == profile.wiki_commit:
+                    continue
+
+                log.info("wiki refresh: %s HEAD %s (was %s)",
+                         repo, head[:8], profile.wiki_commit[:8] or "none")
+                result = await gen.generate(repo)
+                if not result.error and result.commit_sha:
+                    profile.wiki_commit = result.commit_sha
+                    profile.save()
+                results.append({
+                    "repo": str(repo),
+                    "files": result.files_written,
+                    "error": result.error,
+                })
+        return results

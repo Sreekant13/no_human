@@ -320,18 +320,9 @@ export const extractHistory    = ()        => _post("/api/onboarding/history/ext
 export const analyzeHistory    = (days = 30) => _post("/api/onboarding/history/analyze", { days });
 export const confirmRules      = (ids)     => _post("/api/onboarding/rules/confirm", { ids });
 export const completeOnboarding = (payload) => _post("/api/onboarding/complete", payload);
+export const generateDocs      = (repo_path) => _post("/api/onboarding/docs/generate", { repo_path });
 
-// ── Phase 3b: TRACKER board import ───────────────────────────────────────────────
-export async function fetchTrackerBoards() {
-  const r = await fetch(`${BASE}/api/tracker/boards`);
-  if (!r.ok) return { boards: [] };
-  return _jsonSafe(r, { boards: [] });
-}
-export async function fetchTrackerBoardItems(boardKey) {
-  const r = await fetch(`${BASE}/api/tracker/boards/${encodeURIComponent(boardKey)}/items`);
-  if (!r.ok) return { items: [], error: `HTTP ${r.status}` };
-  return _jsonSafe(r, { items: [], error: "unexpected response" });
-}
+// ── TRACKER settings (used by Settings page; board import removed) ──────────────
 export async function fetchTrackerSettings() {
   const r = await fetch(`${BASE}/api/settings/tracker/boards`);
   if (!r.ok) return { boards: [] };

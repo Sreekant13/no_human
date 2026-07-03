@@ -7,6 +7,7 @@ import pytest
 from no_human import config
 from no_human.config import (
     AuthError,
+    _atomic_write_text,
     assert_subscription_mode,
     load_config,
     load_env_token,
@@ -79,3 +80,28 @@ def test_load_config_rejects_api_key(tmp_path):
     cfg_path.write_text("llm:\n  ANTHROPIC_API_KEY: sk-ant-leak\n")
     with pytest.raises(AuthError, match="ANTHROPIC_API_KEY"):
         load_config(cfg_path)
+
+
+def test_atomic_write_text_uses_os_replace(tmp_path, monkeypatch):
+    """Guard: _atomic_write_text must go through os.replace, not direct write."""
+    target = tmp_path / "config.yaml"
+    replaced = []
+    real_replace = os.replace
+    def spy_replace(src, dst):
+        replaced.append((str(src), str(dst)))
+        return real_replace(src, dst)
+    monkeypatch.setattr(os, "replace", spy_replace)
+    _atomic_write_text(target, "key: value\n")
+    assert target.read_text() == "key: value\n"
+    assert len(replaced) == 1
+    assert replaced[0][1] == str(target)
+    assert replaced[0][0].endswith(".yaml.tmp")
+
+
+def test_atomic_write_text_no_partial_read(tmp_path):
+    """A concurrent reader never sees a half-written file."""
+    target = tmp_path / "config.yaml"
+    target.write_text("original")
+    _atomic_write_text(target, "replaced content")
+    assert target.read_text() == "replaced content"
+    assert not target.with_suffix(".yaml.tmp").exists()

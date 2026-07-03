@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { connectWS, createTask, fetchTasks, fetchProjects, fetchWorkerStatus, fetchOnboardingStatus, grillStep, grillStepSSE, fetchTrackerBoards, fetchTrackerBoardItems } from "./api.js";
+import { connectWS, createTask, fetchTasks, fetchProjects, fetchWorkerStatus, fetchOnboardingStatus, grillStep, grillStepSSE } from "./api.js";
 import Board from "./Board.jsx";
 import Settings from "./Settings.jsx";
 import Onboarding from "./Onboarding.jsx";
@@ -100,19 +100,11 @@ function NewTaskModal({ onClose, onCreated }) {
   const [grillResult, setGrillResult] = useState(null);
   const [grillEvents, setGrillEvents] = useState([]);
   const grillStreamRef = useRef(null);
-  // Phase 3b: TRACKER import state
-  const [trackerBoards, setTrackerBoards] = useState([]);
-  const [trackerItems, setTrackerItems] = useState([]);
-  const [trackerLoading, setTrackerLoading] = useState(false);
-  const [trackerSource, setTrackerSource] = useState(false); // true = importing from TRACKER
-
   useEffect(() => {
     fetchProjects().then((p) => {
       setProjects(p || []);
       if (p && p.length > 0) setSelectedProjectId(p[0].id);
     });
-    // Phase 3b: load TRACKER boards (best-effort, no error shown if unavailable)
-    fetchTrackerBoards().then((r) => setTrackerBoards(r.boards || [])).catch(() => {});
   }, []);
 
   async function handleSubmit(e) {
@@ -419,36 +411,6 @@ function NewTaskModal({ onClose, onCreated }) {
               <option value="low">low</option>
             </select>
           </div>
-          {/* Phase 3b: Import from TRACKER */}
-          {trackerBoards.length > 0 && !trackerSource && (
-            <button type="button" className="btn btn-sendback" style={{ width: '100%', fontSize: '0.8rem', marginTop: '0.3rem' }}
-              onClick={async () => {
-                setTrackerSource(true); setTrackerLoading(true);
-                try {
-                  const r = await fetchTrackerBoardItems("all");
-                  setTrackerItems(r.items || []);
-                } catch { setTrackerItems([]); }
-                finally { setTrackerLoading(false); }
-              }}>
-              Import from TRACKER
-            </button>
-          )}
-          {trackerSource && (
-            <div style={{ border: '1px solid var(--border)', borderRadius: 6, padding: '0.5rem', marginTop: '0.3rem', maxHeight: 180, overflowY: 'auto' }}>
-              <div style={{ fontSize: '0.7rem', color: 'var(--fg-dim)', marginBottom: '0.3rem', display: 'flex', justifyContent: 'space-between' }}>
-                <span>TRACKER items</span>
-                <button type="button" style={{ fontSize: '0.65rem', cursor: 'pointer', background: 'none', border: 'none', color: 'var(--fg-dim)' }} onClick={() => { setTrackerSource(false); setTrackerItems([]); }}>✕ close</button>
-              </div>
-              {trackerLoading ? <div style={{ fontSize: '0.8rem', color: 'var(--fg-dim)' }}>Loading…</div>
-                : trackerItems.length === 0 ? <div style={{ fontSize: '0.8rem', color: 'var(--fg-dim)' }}>No items found</div>
-                : trackerItems.map((it) => (
-                  <div key={it.number} style={{ padding: '0.25rem 0', borderBottom: '1px solid var(--border)', cursor: 'pointer', fontSize: '0.8rem' }}
-                    onClick={() => { setTitle(it.title); setDescription(`TRACKER: ${it.number}`); setTrackerSource(false); }}>
-                    <span style={{ fontWeight: 600, marginRight: 6 }}>{it.number}</span>{it.title}
-                  </div>
-                ))}
-            </div>
-          )}
           {error && <div className="new-task-error">{error}</div>}
           <div className="sendback-actions">
             <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
