@@ -5,7 +5,7 @@
 | [**quickstart.md**](quickstart.md) | **Start here** — from zero to first task in 5 minutes |
 | [configuration.md](configuration.md) | `~/.no_human/config.yaml`, every section + default |
 | [security.md](security.md) | Subscription-auth boundary, the never-merge rule, guards |
-| [adapters.md](adapters.md) | Intake (TRACKER/GitHub/GitLab/Jira), context, VCS, CI backends |
+| [adapters.md](adapters.md) | Intake (TRACKER/GitHub/GitLab), context, VCS, CI backends |
 | [eval.md](eval.md) | Golden set, replay scoring, scorecard/CI gate, shadow mode |
 | [blockers.md](blockers.md) | Part 22 taxonomy, escalation, wake watcher, `nh reply` |
 

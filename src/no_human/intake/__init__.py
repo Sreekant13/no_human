@@ -11,7 +11,6 @@ from .classify import KindVerdict, TaskKind, classify, classify_kind
 from .grill import GrillQuestion, GrillResult, grill_step
 from .github_issues import GitHubAdapter
 from .gitlab_issues import GitLabAdapter
-from .jira import JiraAdapter
 
 __all__ = [
     "SourceRef", "parse_source", "get_adapter", "ingest_from_url",
@@ -27,8 +26,6 @@ def get_adapter(kind: str, config: dict[str, Any] | None = None):
         return GitHubAdapter()
     if kind == "gitlab":
         return GitLabAdapter()
-    if kind == "jira":
-        return JiraAdapter(config)
     raise ValueError(f"no intake adapter for source: {kind}")
 
 
