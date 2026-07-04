@@ -1,109 +1,161 @@
-/* ── no_human board — Jira-style (light, Atlassian blue) ─────────────────── */
-/* Light board surface, white cards, Atlassian blue accent, status lozenges,
-   neutral sans (no serif display). Tokens map to Atlassian Design System
-   neutrals/blue. Every component reads these vars, so the palette retheme
-   cascades app-wide. (Supersedes the prior warm-editorial token set.) */
+/* ── no_human board — dark-first, Atlassian blue accent ─────────────────── */
+/* Dark base surface, elevated cards, Atlassian blue accent, status lozenges.
+   DM Sans (geometric, distinctive) + IBM Plex Mono (code). Tokens cascade
+   app-wide; dark theme is default, light available via [data-theme="light"]. */
 
 :root {
-  /* ── Light neutrals (Atlassian neutral ramp) ── */
-  --base:       #F4F5F7;   /* board canvas */
-  --surface-1:  #FFFFFF;
-  --surface-2:  #EBECF0;   /* columns / pills */
-  --surface-3:  #F1F2F4;   /* hover */
+  /* ── Dark neutrals (default: dark theme) ── */
+  --base:       #0F1117;   /* board canvas — deep navy-black */
+  --surface-1:  #1A1D27;   /* card / raised surface */
+  --surface-2:  #22252F;   /* columns / pills */
+  --surface-3:  #292D3A;   /* hover */
 
-  /* Legacy aliases (existing rules reference these names) → light mapping */
-  --bg:        #F4F5F7;   /* board canvas */
-  --bg-raised: #FFFFFF;   /* rails / header / slide-over */
-  --bg-panel:  #EBECF0;   /* columns / panels */
-  --bg-hover:  #F1F2F4;   /* hover lift */
-  --bg-card:   #FFFFFF;   /* cards */
-  --bg-surface:#EBECF0;
-  --border:    #DFE1E6;
-  --border-hi: #C1C7D0;
-  --border-glow: rgba(12, 102, 228, 0.20);
+  /* Legacy aliases → dark mapping */
+  --bg:        #0F1117;
+  --bg-raised: #1A1D27;
+  --bg-panel:  #22252F;
+  --bg-hover:  #292D3A;
+  --bg-card:   #1A1D27;
+  --bg-surface:#22252F;
+  --border:    #2E3241;
+  --border-hi: #3D4255;
+  --border-glow: rgba(76, 154, 255, 0.25);
 
-  /* Text ramp — Atlassian ink (dark navy) on light. Contrast ≥AA vs --base. */
-  --text:      #172B4D;   /* body / primary ink */
-  --text-hi:   #091E42;   /* headings (darkest) */
-  --text-muted:#44546F;   /* meta */
-  --text-dim:  #626F86;   /* faint meta */
-  --text-body: #172B4D;   /* alias used by onboarding/long-form copy */
+  /* Text ramp — light on dark. Contrast ≥AA vs --base. */
+  --text:      #C9CDD6;   /* body */
+  --text-hi:   #E8ECF2;   /* headings */
+  --text-muted:#8C92A4;   /* meta */
+  --text-dim:  #5C6375;   /* faint meta */
+  --text-body: #C9CDD6;
 
-  /* ── Accent: Atlassian blue. Fills carry --ink (white) labels. ── */
-  --accent-100:#E9F2FF;
+  /* ── Accent: brighter blue for dark bg ── */
+  --accent-100:#1C3A5E;
   --accent-300:#579DFF;
-  --accent-500:#0C66E4;   /* primary blue */
-  --accent-600:#0055CC;   /* hover */
-  --accent-700:#09326C;   /* pressed / strong */
-  --ink:       #FFFFFF;   /* label colour ON blue fills */
+  --accent-500:#4C9AFF;   /* primary blue (brighter on dark) */
+  --accent-600:#2684FF;   /* hover */
+  --accent-700:#0065FF;   /* pressed */
+  --ink:       #FFFFFF;
 
-  /* Legacy accent aliases → blue */
-  --amber:     #0C66E4;
-  --amber-dim: #0055CC;
-  --amber-glow: rgba(12, 102, 228, 0.18);
-  --accent:    #0C66E4;   /* "active/working" → blue */
+  /* Legacy accent aliases */
+  --amber:     #4C9AFF;
+  --amber-dim: #2684FF;
+  --amber-glow: rgba(76, 154, 255, 0.18);
+  --accent:    #4C9AFF;
 
-  /* ── Agent role colours (distinct, Atlassian hues) ── */
-  --agent-worker:     #0C66E4;  /* blue — builds */
-  --agent-supervisor: #974F0C;  /* orange — steers in-flight */
-  --agent-reviewer:   #5E4DB2;  /* purple — gates */
-  --agent-agent:       #1F845A;  /* green — reads & edits code */
+  /* ── Agent role colours (vivid on dark) ── */
+  --agent-worker:     #4C9AFF;
+  --agent-supervisor: #E8A04F;
+  --agent-reviewer:   #9F8FEF;
+  --agent-agent:      #4ADE80;
 
-  /* ── Lifecycle state colours (Atlassian lozenge text hues) ── */
-  --state-working: #0C66E4;  /* blue (In Progress) */
-  --state-waiting: #974F0C;  /* orange (waiting) */
-  --state-blocked: #C9372C;  /* red */
-  --state-done:    #216E4E;  /* green (Done) */
-  --state-failed:  #AE2E24;  /* dark red */
+  /* ── Lifecycle state colours ── */
+  --state-working: #4C9AFF;
+  --state-waiting: #E8A04F;
+  --state-blocked: #EF6B6B;
+  --state-done:    #4ADE80;
+  --state-failed:  #F87171;
 
-  /* Legacy semantic aliases → Atlassian hues */
-  --green:     #216E4E;   /* pass / done */
-  --green-dim: #DCFFF1;   /* lozenge green bg */
-  --red:       #C9372C;   /* error / fail / escalated */
-  --red-dim:   #FFECEB;   /* lozenge red bg */
-  --blue:      #0C66E4;   /* context / link */
-  --blue-dim:  #E9F2FF;   /* lozenge blue bg */
-  --cyan:      #1558BC;   /* code / file / repo chips */
-  --purple:    #5E4DB2;   /* building / traceability / memory */
-  --purple-dim:#F3F0FF;   /* lozenge purple bg */
+  /* Semantic colours */
+  --green:     #4ADE80;
+  --green-dim: rgba(74, 222, 128, 0.12);
+  --red:       #EF6B6B;
+  --red-dim:   rgba(239, 107, 107, 0.12);
+  --blue:      #4C9AFF;
+  --blue-dim:  rgba(76, 154, 255, 0.12);
+  --cyan:      #579DFF;
+  --purple:    #9F8FEF;
+  --purple-dim:rgba(159, 143, 239, 0.12);
 
-  /* Lane accent colours (Atlassian) */
-  --c-intake:   #626F86;  /* grey */
-  --c-context:  #1558BC;  /* blue */
-  --c-building: #0C66E4;  /* blue — in progress */
-  --c-review:   #5E4DB2;  /* purple */
-  --c-testing:  #216E4E;  /* green */
-  --c-awaiting: #0C66E4;  /* blue — needs you */
-  --c-done:     #216E4E;  /* green */
-  --c-escalated:#C9372C;  /* red */
+  /* Lane accent colours */
+  --c-intake:   #5C6375;
+  --c-context:  #579DFF;
+  --c-building: #4C9AFF;
+  --c-review:   #9F8FEF;
+  --c-testing:  #4ADE80;
+  --c-awaiting: #4C9AFF;
+  --c-done:     #4ADE80;
+  --c-escalated:#EF6B6B;
 
-  /* ── Typography — Inter (designed UI sans, Jira-clean) + IBM Plex Mono ── */
-  --font-display: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-ui:   "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  /* ── Typography — DM Sans (geometric, distinctive) + IBM Plex Mono ── */
+  --font-display: "DM Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-ui:   "DM Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, "JetBrains Mono", "SFMono-Regular", monospace;
 
-  /* Radii — Jira uses tight corners */
+  /* Radii */
   --r-sm: 3px;
-  --r-md: 4px;
-  --r-lg: 8px;
-  --r-xl: 8px;
+  --r-md: 6px;
+  --r-lg: 10px;
+  --r-xl: 12px;
   --r-pill: 999px;
 
-  /* Shadows — Atlassian elevation (low-alpha navy on light) */
-  --shadow-card:  0 1px 1px rgba(9,30,66,0.25), 0 0 1px rgba(9,30,66,0.13);
-  --shadow-hover: 0 4px 8px rgba(9,30,66,0.16), 0 0 1px rgba(9,30,66,0.31);
-  --shadow-modal: 0 8px 16px rgba(9,30,66,0.25), 0 0 1px rgba(9,30,66,0.31);
+  /* Shadows — dark mode elevation uses transparency + subtle blue glow */
+  --shadow-card:  0 1px 3px rgba(0,0,0,0.4), 0 0 1px rgba(76,154,255,0.08);
+  --shadow-hover: 0 4px 12px rgba(0,0,0,0.5), 0 0 1px rgba(76,154,255,0.15);
+  --shadow-modal: 0 12px 40px rgba(0,0,0,0.6), 0 0 1px rgba(76,154,255,0.12);
 
-  /* Timing — referenced by onboarding & transitions */
+  /* Timing */
   --dur-fast:      0.15s;
   --dur-base:      0.25s;
   --ease-standard: cubic-bezier(0.2, 0, 0.38, 0.9);
   --ease-out:      cubic-bezier(0.16, 1, 0.3, 1);
 
-  /* Semantic status (used by wiki gen buttons in Onboarding) */
+  /* Semantic status */
+  --success: #4ADE80;
+  --danger:  #EF6B6B;
+  --fg-dim:  var(--text-dim);
+}
+
+/* ── Light theme override ── */
+[data-theme="light"] {
+  --base:       #F4F5F7;
+  --surface-1:  #FFFFFF;
+  --surface-2:  #EBECF0;
+  --surface-3:  #F1F2F4;
+  --bg:        #F4F5F7;
+  --bg-raised: #FFFFFF;
+  --bg-panel:  #EBECF0;
+  --bg-hover:  #F1F2F4;
+  --bg-card:   #FFFFFF;
+  --bg-surface:#EBECF0;
+  --border:    #DFE1E6;
+  --border-hi: #C1C7D0;
+  --border-glow: rgba(12, 102, 228, 0.20);
+  --text:      #172B4D;
+  --text-hi:   #091E42;
+  --text-muted:#44546F;
+  --text-dim:  #626F86;
+  --text-body: #172B4D;
+  --accent-100:#E9F2FF;
+  --accent-500:#0C66E4;
+  --accent-600:#0055CC;
+  --accent-700:#09326C;
+  --amber:     #0C66E4;
+  --amber-dim: #0055CC;
+  --amber-glow: rgba(12, 102, 228, 0.18);
+  --accent:    #0C66E4;
+  --agent-worker:     #0C66E4;
+  --agent-supervisor: #974F0C;
+  --agent-reviewer:   #5E4DB2;
+  --agent-agent:      #1F845A;
+  --state-working: #0C66E4;
+  --state-waiting: #974F0C;
+  --state-blocked: #C9372C;
+  --state-done:    #216E4E;
+  --state-failed:  #AE2E24;
+  --green:     #216E4E;
+  --green-dim: #DCFFF1;
+  --red:       #C9372C;
+  --red-dim:   #FFECEB;
+  --blue:      #0C66E4;
+  --blue-dim:  #E9F2FF;
+  --cyan:      #1558BC;
+  --purple:    #5E4DB2;
+  --purple-dim:#F3F0FF;
+  --shadow-card:  0 1px 1px rgba(9,30,66,0.25), 0 0 1px rgba(9,30,66,0.13);
+  --shadow-hover: 0 4px 8px rgba(9,30,66,0.16), 0 0 1px rgba(9,30,66,0.31);
+  --shadow-modal: 0 8px 16px rgba(9,30,66,0.25), 0 0 1px rgba(9,30,66,0.31);
   --success: #216E4E;
   --danger:  #C9372C;
-  --fg-dim:  var(--text-dim);
 }
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -141,7 +193,7 @@ html, body, #root {
   gap: 24px;
   height: 52px;
   padding: 0 28px;
-  background: var(--bg-raised);
+  background: linear-gradient(180deg, var(--bg-raised) 0%, color-mix(in oklab, var(--bg-raised) 92%, var(--bg)) 100%);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   z-index: 10;
@@ -158,9 +210,9 @@ html, body, #root {
   background: linear-gradient(
     90deg,
     transparent 0%,
-    rgba(12, 102, 228, 0.2) 20%,
-    rgba(12, 102, 228, 0.4) 50%,
-    rgba(12, 102, 228, 0.2) 80%,
+    rgba(76, 154, 255, 0.2) 20%,
+    rgba(76, 154, 255, 0.45) 50%,
+    rgba(76, 154, 255, 0.2) 80%,
     transparent 100%
   );
 }
@@ -250,8 +302,11 @@ html, body, #root {
   overflow-x: auto;
   overflow-y: hidden;
   padding: 12px 12px 0;
-  /* Jira boards are a flat light canvas — no grain, dot-grid, or glow. */
-  background: var(--bg);
+  /* Layered gradient canvas — subtle depth, not flat */
+  background:
+    radial-gradient(ellipse 60% 40% at 20% 0%, rgba(76, 154, 255, 0.06) 0%, transparent 60%),
+    radial-gradient(ellipse 50% 50% at 80% 100%, rgba(159, 143, 239, 0.04) 0%, transparent 55%),
+    var(--bg);
 }
 
 /* ── LANE ─────────────────────────────────────────────────────────────────── */
@@ -261,7 +316,7 @@ html, body, #root {
   flex-direction: column;
   flex: 1 1 0;
   min-width: 240px;
-  background: rgba(255,255,255,0.012);
+  background: rgba(255,255,255,0.02);
   border-radius: var(--r-md) var(--r-md) 0 0;
   margin: 0 3px;
   overflow: hidden;
@@ -982,8 +1037,8 @@ html, body, #root {
   padding: 11px 14px;
   border-top: 1px solid var(--border);
   line-height: 1.65;
-  background: #f8f9fa;
-  border-left: 3px solid #0C66E4;
+  background: var(--bg-panel);
+  border-left: 3px solid var(--accent-500);
 }
 
 .ci-evidence {
@@ -992,7 +1047,7 @@ html, body, #root {
   padding: 4px 14px 10px;
   font-style: italic;
   line-height: 1.5;
-  background: #f8f9fa;
+  background: var(--bg-panel);
 }
 
 /* Post-to-PR footer row */
@@ -1400,16 +1455,16 @@ html, body, #root {
 .pill-testing, .pill-awaiting_approval, .pill-done, .pill-escalated,
 .pill-failed { border-color: transparent !important; }
 
-.pill-pending          { color: #44546F; background: #DCDFE4; }
-.pill-context          { color: #0055CC; background: #E9F2FF; }
-.pill-planning         { color: #5E4DB2; background: #F3F0FF; }
-.pill-implementing     { color: #0055CC; background: #E9F2FF; }
-.pill-reviewing        { color: #5E4DB2; background: #F3F0FF; }
-.pill-testing          { color: #206A83; background: #E7F9FF; }
-.pill-awaiting_approval{ color: #974F0C; background: #FFF7D6; }
-.pill-done             { color: #216E4E; background: #DCFFF1; }
-.pill-escalated        { color: #AE2E24; background: #FFECEB; }
-.pill-failed           { color: #AE2E24; background: #FFECEB; }
+.pill-pending          { color: var(--text-muted); background: var(--bg-panel); }
+.pill-context          { color: var(--blue); background: var(--blue-dim); }
+.pill-planning         { color: var(--purple); background: var(--purple-dim); }
+.pill-implementing     { color: var(--blue); background: var(--blue-dim); }
+.pill-reviewing        { color: var(--purple); background: var(--purple-dim); }
+.pill-testing          { color: var(--cyan); background: rgba(87, 157, 255, 0.12); }
+.pill-awaiting_approval{ color: var(--agent-supervisor); background: rgba(232, 160, 79, 0.12); }
+.pill-done             { color: var(--green); background: var(--green-dim); }
+.pill-escalated        { color: var(--red); background: var(--red-dim); }
+.pill-failed           { color: var(--red); background: var(--red-dim); }
 
 /* loading / error states */
 .nh-center {
@@ -2094,11 +2149,12 @@ html, body, #root {
   justify-content: center;
   padding: 56px 24px 80px;
   background:
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E"),
-    radial-gradient(ellipse 70% 50% at 50% -8%, rgba(12, 102, 228,0.10) 0%, transparent 60%),
-    radial-gradient(ellipse 50% 40% at 85% 110%, rgba(12, 102, 228,0.06) 0%, transparent 55%),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E"),
+    radial-gradient(ellipse 70% 50% at 50% -8%, rgba(76, 154, 255, 0.12) 0%, transparent 60%),
+    radial-gradient(ellipse 50% 40% at 85% 110%, rgba(159, 143, 239, 0.08) 0%, transparent 55%),
+    radial-gradient(ellipse 40% 30% at 10% 60%, rgba(74, 222, 128, 0.04) 0%, transparent 50%),
     var(--base);
-  background-size: 140px 140px, 100% 100%, 100% 100%, 100% 100%;
+  background-size: 140px 140px, 100% 100%, 100% 100%, 100% 100%, 100% 100%;
 }
 .ob-stage { width: min(720px, 100%); display: flex; flex-direction: column; gap: 22px; }
 
@@ -2114,7 +2170,7 @@ html, body, #root {
 
 /* card */
 .ob-card {
-  background: linear-gradient(180deg, var(--surface-2), var(--surface-1));
+  background: linear-gradient(180deg, var(--surface-2) 0%, var(--surface-1) 100%);
   border: 1px solid var(--border);
   border-radius: var(--r-lg);
   box-shadow: var(--shadow-pop, var(--shadow-modal));
@@ -2176,9 +2232,9 @@ html, body, #root {
 
 /* importance label on proposed rules */
 .ob-rule-imp { font-family: var(--font-ui); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; padding: 2px 7px; border-radius: var(--r-pill); margin-left: 6px; }
-.imp-high { color: #AE2E24; background: #FFECEB; }
-.imp-med  { color: #974F0C; background: #FFF7D6; }
-.imp-low  { color: #44546F; background: #DCDFE4; }
+.imp-high { color: var(--red); background: var(--red-dim); }
+.imp-med  { color: var(--agent-supervisor); background: rgba(232, 160, 79, 0.12); }
+.imp-low  { color: var(--text-muted); background: var(--bg-panel); }
 
 /* fields */
 .ob-field { display: flex; flex-direction: column; gap: 8px; }
