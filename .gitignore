@@ -22,5 +22,9 @@ secrets/
 # Test scratch
 /tmp_e2e/
 
+# IDE-generated (skills, local settings)
+.claude/
+.windsurf/
+
 # web build
 web/node_modules/
