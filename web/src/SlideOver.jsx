@@ -622,11 +622,14 @@ function SystemTab({ taskId, task, isActive }) {
   const activeConn = isActive ? activeConnection(events) : null;
   const totalElapsed = events.length > 1 ? events[events.length - 1].ts - events[0].ts : 0;
 
-  // Tree layout:
-  //   Row 0: Orchestrator — centered
-  //   Row 1: Worker (left) + Reviewer (right)
-  //   Row 2: Supervisor (below Worker)
-  //   Row 3: Dynamic subagents (below Worker, if any spawned)
+  // Only show nodes that have events — the diagram builds up dynamically.
+  const has = (id) => agentStates[id] && agentStates[id].count > 0;
+  const hasWorker     = has("worker");
+  const hasAgent      = has("agent");
+  const hasSupervisor = has("supervisor");
+  const hasReviewer   = has("reviewer");
+  const hasRow1       = hasAgent || hasReviewer;
+
   const worker     = AGENTS.find(a => a.id === "worker");
   const agent      = AGENTS.find(a => a.id === "agent");
   const supervisor = AGENTS.find(a => a.id === "supervisor");
@@ -635,43 +638,67 @@ function SystemTab({ taskId, task, isActive }) {
   return (
     <div className="sys-view">
       <div className="sys-tree">
-        {/* Row 0: Worker */}
-        <div className="sys-tree-row">
-          <AgentNode agent={worker} state={agentStates.worker} isActive={isActive} onClick={() => setModalAgent(worker)} />
-        </div>
+        {/* Row 0: Orchestrator — always first to fire */}
+        {hasWorker && (
+          <div className="sys-tree-row">
+            <AgentNode agent={worker} state={agentStates.worker} isActive={isActive} onClick={() => setModalAgent(worker)} />
+          </div>
+        )}
 
-        {/* Connection: Worker → Agent + Worker → Reviewer */}
-        <div className="sys-tree-lines">
-          <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
-            {/* Worker down-center to split */}
-            <path d="M 340 0 L 340 20" className={`sys-tree-line${activeConn === "worker-agent" ? " active" : ""}`} />
-            {/* Split left to Agent */}
-            <path d="M 340 20 C 340 40, 200 40, 200 48" className={`sys-tree-line${activeConn === "worker-agent" ? " active" : ""}`} />
-            <path d="M 340 20 C 340 40, 200 40, 200 48" className={`sys-tree-flow${activeConn === "worker-agent" ? " active" : ""}`} />
-            {/* Split right to Reviewer */}
-            <path d="M 340 20 C 340 40, 480 40, 480 48" className={`sys-tree-line${activeConn === "reviewer-worker" ? " active" : ""}`} />
-            <path d="M 340 20 C 340 40, 480 40, 480 48" className={`sys-tree-flow${activeConn === "reviewer-worker" ? " active" : ""}`} />
-          </svg>
-        </div>
+        {/* Connection: Orchestrator → Agent / Reviewer (only when both sides exist) */}
+        {hasWorker && hasRow1 && (
+          <div className="sys-tree-lines">
+            <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
+              {hasAgent && hasReviewer && (
+                <>
+                  {/* Center stem splits left + right */}
+                  <path d="M 340 0 L 340 20" className={`sys-tree-line${activeConn === "worker-agent" ? " active" : ""}`} />
+                  <path d="M 340 20 C 340 40, 200 40, 200 48" className={`sys-tree-line${activeConn === "worker-agent" ? " active" : ""}`} />
+                  <path d="M 340 20 C 340 40, 200 40, 200 48" className={`sys-tree-flow${activeConn === "worker-agent" ? " active" : ""}`} />
+                  <path d="M 340 20 C 340 40, 480 40, 480 48" className={`sys-tree-line${activeConn === "reviewer-worker" ? " active" : ""}`} />
+                  <path d="M 340 20 C 340 40, 480 40, 480 48" className={`sys-tree-flow${activeConn === "reviewer-worker" ? " active" : ""}`} />
+                </>
+              )}
+              {hasAgent && !hasReviewer && (
+                <>
+                  <path d="M 340 0 L 340 48" className={`sys-tree-line${activeConn === "worker-agent" ? " active" : ""}`} />
+                  <path d="M 340 0 L 340 48" className={`sys-tree-flow${activeConn === "worker-agent" ? " active" : ""}`} />
+                </>
+              )}
+              {hasReviewer && !hasAgent && (
+                <>
+                  <path d="M 340 0 L 340 48" className={`sys-tree-line${activeConn === "reviewer-worker" ? " active" : ""}`} />
+                  <path d="M 340 0 L 340 48" className={`sys-tree-flow${activeConn === "reviewer-worker" ? " active" : ""}`} />
+                </>
+              )}
+            </svg>
+          </div>
+        )}
 
-        {/* Row 1: Agent + Reviewer */}
-        <div className="sys-tree-row">
-          <AgentNode agent={agent} state={agentStates.agent} isActive={isActive} onClick={() => setModalAgent(agent)} />
-          <AgentNode agent={reviewer} state={agentStates.reviewer} isActive={isActive} onClick={() => setModalAgent(reviewer)} />
-        </div>
+        {/* Row 1: Agent + Reviewer (only those that participated) */}
+        {hasRow1 && (
+          <div className="sys-tree-row">
+            {hasAgent && <AgentNode agent={agent} state={agentStates.agent} isActive={isActive} onClick={() => setModalAgent(agent)} />}
+            {hasReviewer && <AgentNode agent={reviewer} state={agentStates.reviewer} isActive={isActive} onClick={() => setModalAgent(reviewer)} />}
+          </div>
+        )}
 
-        {/* Connection: Agent → Supervisor */}
-        <div className="sys-tree-lines">
-          <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
-            <path d="M 200 0 L 200 24 C 200 44, 280 44, 280 48" className={`sys-tree-line${activeConn === "agent-supervisor" || activeConn === "supervisor-agent" ? " active" : ""}`} />
-            <path d="M 200 0 L 200 24 C 200 44, 280 44, 280 48" className={`sys-tree-flow${activeConn === "agent-supervisor" ? " active" : ""}`} />
-          </svg>
-        </div>
+        {/* Connection: Agent → Supervisor (only when both exist) */}
+        {hasAgent && hasSupervisor && (
+          <div className="sys-tree-lines">
+            <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
+              <path d="M 200 0 L 200 24 C 200 44, 280 44, 280 48" className={`sys-tree-line${activeConn === "agent-supervisor" || activeConn === "supervisor-agent" ? " active" : ""}`} />
+              <path d="M 200 0 L 200 24 C 200 44, 280 44, 280 48" className={`sys-tree-flow${activeConn === "agent-supervisor" ? " active" : ""}`} />
+            </svg>
+          </div>
+        )}
 
         {/* Row 2: Supervisor */}
-        <div className="sys-tree-row">
-          <AgentNode agent={supervisor} state={agentStates.supervisor} isActive={isActive} onClick={() => setModalAgent(supervisor)} />
-        </div>
+        {hasSupervisor && (
+          <div className="sys-tree-row">
+            <AgentNode agent={supervisor} state={agentStates.supervisor} isActive={isActive} onClick={() => setModalAgent(supervisor)} />
+          </div>
+        )}
 
         {/* Row 3: Dynamic subagents spawned by the Worker */}
         {subagents.length > 0 && (
