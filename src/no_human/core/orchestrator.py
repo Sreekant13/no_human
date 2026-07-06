@@ -189,6 +189,8 @@ class Orchestrator:
         self._sink = event_sink or (lambda e: None)
         self.context_gatherer = context_gatherer
         self.reviewer = reviewer
+        if self.reviewer is not None:
+            self.reviewer._on_event = self._reviewer_sink
         self.ci_runner = ci_runner
         self.learning_queue = learning_queue
 
@@ -240,6 +242,19 @@ class Orchestrator:
                 if not hasattr(self, "_agent_edited_files"):
                     self._agent_edited_files: set[str] = set()
                 self._agent_edited_files.add(str(path))
+
+    def _reviewer_sink(self, event: AgentEvent) -> None:
+        """Forward reviewer-internal agent events with source='reviewer'."""
+        self._sink(
+            {
+                "source": "reviewer",
+                "kind": event.kind,
+                "text": event.text,
+                "tool_name": event.tool_name,
+                "tool_input": event.tool_input,
+                **event.meta,
+            }
+        )
 
     # ------------------------------ driver --------------------------------- #
 
