@@ -68,7 +68,7 @@ async def _mk_tasks(store, n):
 async def test_pool_cap_and_no_double_dispatch(store):
     hold = asyncio.Event()
     fake = FakeOrch(store, hold=hold)
-    sched = Scheduler(store, lambda: fake, max_workers=2)
+    sched = Scheduler(store, lambda task=None: fake, max_workers=2)
     await _mk_tasks(store, 3)
 
     started1 = await sched.tick()
@@ -91,7 +91,7 @@ async def test_pool_cap_and_no_double_dispatch(store):
 
 async def test_inflight_task_not_reclaimed(store):
     fake = FakeOrch(store, hold=asyncio.Event())  # never releases
-    sched = Scheduler(store, lambda: fake, max_workers=4)
+    sched = Scheduler(store, lambda task=None: fake, max_workers=4)
     ids = await _mk_tasks(store, 2)
 
     await sched.tick()
@@ -106,7 +106,7 @@ async def test_quota_pause_gates_the_whole_pool(store):
     now = datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc)
     resets = (now + timedelta(hours=1)).isoformat()
     fake = FakeOrch(store, quota_first=True, quota_resets=resets)
-    sched = Scheduler(store, lambda: fake, max_workers=2)
+    sched = Scheduler(store, lambda task=None: fake, max_workers=2)
     await _mk_tasks(store, 1)
 
     await sched.tick(now=now)
@@ -187,7 +187,7 @@ async def test_two_repos_run_concurrently_in_worktrees(store, tmp_path):
     cfg.data["concurrency"] = {"enabled": True, "max_workers": 2,
                                "worktree_root": str(tmp_path / "wt")}
 
-    def factory():
+    def factory(task=None):
         return Orchestrator(store, cfg.data, Backend(), SlackNotifier(None),
                             reviewer=Reviewer())
 
@@ -221,7 +221,7 @@ async def test_wake_watcher_ticked_and_implementing_is_claimable(store):
 
     wake = FakeWake()
     fake = FakeOrch(store, hold=asyncio.Event())
-    sched = Scheduler(store, lambda: fake, max_workers=2, wake_watcher=wake)
+    sched = Scheduler(store, lambda task=None: fake, max_workers=2, wake_watcher=wake)
 
     # A task already in IMPLEMENTING (e.g. just resumed) is claimable.
     t = Task.new("resumed", repo_path="/tmp/x")
@@ -292,7 +292,7 @@ async def test_scheduler_tick_triggers_reanalysis(store):
     job = ReanalysisJob(store, interval_seconds=0, days=1)
     fake = FakeOrch(store, hold=asyncio.Event())
     sched = Scheduler(
-        store, lambda: fake, max_workers=1,
+        store, lambda task=None: fake, max_workers=1,
         on_event=lambda k, t: events.append((k, t)),
         reanalysis_job=job,
     )

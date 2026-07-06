@@ -50,6 +50,11 @@ def test_parked_states_resume_to_active():
         assert can_transition(parked, S.IMPLEMENTING)
 
 
+def test_parked_states_can_resume_to_pending():
+    for parked in (S.BLOCKED, S.AWAITING_INPUT, S.PAUSED_QUOTA, S.ESCALATED):
+        assert can_transition(parked, S.PENDING)
+
+
 def test_failed_is_terminal():
     for s in S:
         if s is S.FAILED:
@@ -77,3 +82,19 @@ def test_task_roundtrip_serialization():
     assert back.id == t.id
     assert back.acceptance_criteria == ["a", "b"]
     assert back.status is S.TESTING
+
+
+def test_task_parent_id_roundtrip():
+    t = Task.new("child task", repo_path="/tmp/r", parent_id="abc123")
+    assert t.parent_id == "abc123"
+    row = t.to_row()
+    assert row["parent_id"] == "abc123"
+    back = Task.from_row(row)
+    assert back.parent_id == "abc123"
+
+
+def test_task_parent_id_default_none():
+    t = Task.new("standalone task", repo_path="/tmp/r")
+    assert t.parent_id is None
+    row = t.to_row()
+    assert row["parent_id"] is None

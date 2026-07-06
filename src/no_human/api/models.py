@@ -71,6 +71,7 @@ class TaskOut(BaseModel):
     repo_path: str | None = None
     blocker: dict | None = None
     context: dict | None = None
+    parent_id: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
     attempts: list[AttemptOut] = []
@@ -90,6 +91,7 @@ class TaskOut(BaseModel):
             repo_path=task.repo_path,
             blocker=task.blocker,
             context=task.context,
+            parent_id=task.parent_id,
             created_at=task.created_at,
             updated_at=task.updated_at,
             attempts=[AttemptOut.from_row(a) for a in attempts],
@@ -126,6 +128,9 @@ class TaskSummaryOut(BaseModel):
     blocker_category: str | None = None
     blocker_wake_condition: str | None = None
     last_activity: str | None = None
+    backend: str | None = None  # "claude" or "devin"
+    total_tokens: int | None = None
+    parent_id: str | None = None
 
     @classmethod
     def from_task(
@@ -150,6 +155,15 @@ class TaskSummaryOut(BaseModel):
             blocker_q = task.blocker.get("question")
             blocker_cat = task.blocker.get("category")
             blocker_wake = task.blocker.get("wake_condition")
+        # Per-task backend from config dict.
+        task_backend = None
+        if hasattr(task, "config") and isinstance(task.config, dict):
+            task_backend = task.config.get("backend")
+        # Sum tokens across all attempts.
+        total_tokens = None
+        if attempts:
+            toks = [a.get("tokens_used") or 0 for a in attempts]
+            total_tokens = sum(toks) if any(t > 0 for t in toks) else None
         return cls(
             id=task.id,
             external_id=task.external_id,
@@ -169,6 +183,9 @@ class TaskSummaryOut(BaseModel):
             blocker_category=blocker_cat,
             blocker_wake_condition=blocker_wake,
             last_activity=_last_activity(task, attempts),
+            backend=task_backend,
+            total_tokens=total_tokens,
+            parent_id=task.parent_id,
         )
 
 
@@ -180,6 +197,7 @@ class CreateTaskRequest(BaseModel):
     kind: str = "feature"
     priority: str = "medium"
     acceptance_criteria: list[str] = []
+    backend: str | None = None  # "claude" or "devin"; None = use global config
 
 
 class SendBackRequest(BaseModel):

@@ -48,7 +48,7 @@ class Scheduler:
     def __init__(
         self,
         store: Store,
-        orchestrator_factory: Callable[[], object],
+        orchestrator_factory: Callable[..., object],
         *,
         max_workers: int = 2,
         wake_watcher: object | None = None,
@@ -140,7 +140,7 @@ class Scheduler:
             notify.set()
 
         try:
-            orch = self.factory()
+            orch = self.factory(task)
             orch._sink = _sink
             outcome = await orch.run_task(task)
             # 7.4: a quota park pauses the whole pool until the reset time.

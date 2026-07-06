@@ -21,6 +21,9 @@ from claude_agent_sdk import (
     HookContext,
     HookMatcher,
     ResultMessage,
+    TaskNotificationMessage,
+    TaskProgressMessage,
+    TaskStartedMessage,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
@@ -208,6 +211,36 @@ class ClaudeBackend:
                                     f"{len(text)} chars — use Grep or offset to see more]"
                                 )
                             yield AgentEvent("tool_result", text=text)
+                elif isinstance(message, TaskStartedMessage):
+                    yield AgentEvent(
+                        "subagent_start",
+                        text=message.description,
+                        meta={
+                            "task_id": message.task_id,
+                            "task_type": message.task_type,
+                            "session_id": message.session_id,
+                        },
+                    )
+                elif isinstance(message, TaskProgressMessage):
+                    yield AgentEvent(
+                        "subagent_progress",
+                        text=message.description,
+                        meta={
+                            "task_id": message.task_id,
+                            "last_tool_name": message.last_tool_name,
+                            "session_id": message.session_id,
+                        },
+                    )
+                elif isinstance(message, TaskNotificationMessage):
+                    yield AgentEvent(
+                        "subagent_done",
+                        text=message.summary,
+                        meta={
+                            "task_id": message.task_id,
+                            "status": message.status,
+                            "session_id": message.session_id,
+                        },
+                    )
                 elif isinstance(message, ResultMessage):
                     usage = message.usage or {}
                     tokens = int(usage.get("input_tokens", 0)) + int(

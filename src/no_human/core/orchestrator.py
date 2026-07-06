@@ -15,7 +15,9 @@ wired as a state with a stubbed taxonomy (full Part 22 in Phase 5).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -68,6 +70,34 @@ def _summarize_tool_sig(tool: str, inp: dict) -> str:
         return inp.get("command") or inp.get("cmd") or ""
     first = next(iter(inp.values()), "") if inp else ""
     return str(first)[:80]
+
+
+_DECOMPOSE_RE = re.compile(
+    r"DECOMPOSE_PLAN_START\s*```(?:json)?\s*(\{.*?\})\s*```\s*DECOMPOSE_PLAN_END",
+    re.DOTALL,
+)
+
+
+def _parse_decomposition(plan_text: str) -> dict | None:
+    """Extract a decomposition plan from DECOMPOSE_PLAN markers.
+
+    Returns the parsed dict if found and valid, None otherwise (fail-safe:
+    a parse failure falls through to the normal single-agent path).
+    """
+    m = _DECOMPOSE_RE.search(plan_text)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except (json.JSONDecodeError, ValueError) as exc:
+        log.warning("decomposition JSON parse failed: %s", exc)
+        return None
+    if not isinstance(data, dict) or not data.get("decompose"):
+        return None
+    if not isinstance(data.get("subtasks"), list) or not data["subtasks"]:
+        log.warning("decomposition plan has no subtasks")
+        return None
+    return data
 
 
 @dataclass
@@ -308,6 +338,22 @@ class Orchestrator:
                 task.context = ctx
                 await self.store.update_task(task)
 
+            # Compound task decomposition: if the planner detected complexity
+            # and emitted a DECOMPOSE_PLAN, hand off to the LeadAgent.
+            decomposition = (task.context or {}).get("decomposition")
+            if decomposition and decomposition.get("decompose"):
+                from .lead_agent import LeadAgent
+                lead = LeadAgent(
+                    self.store, config=self.config, emit=self.emit,
+                )
+                subtasks = await lead.decompose(task, decomposition)
+                self.emit(
+                    "state", "compound",
+                    status="implementing",
+                    subtask_count=len(subtasks),
+                )
+                return await lead.drive(task)
+
         # Capture the base branch once and PERSIST it on the task. Re-deriving
         # from current_branch() is wrong on two axes: (1) within a run, after a
         # failed attempt the head points at a feature branch; (2) across runs, a
@@ -426,12 +472,24 @@ class Orchestrator:
                 f"{self.config['git']['branch_prefix']}{task.id[:8]}"
                 f"{f'-{attempt_n}' if attempt_n > 1 else ''}"
             )
-            # base is passed from run_task (captured once before the attempt loop) so
-            # we always branch off the original base, not a prior attempt's branch.
+            # If the previous attempt left a WIP-PARTIAL commit, branch from
+            # that instead of from the original base — this preserves 40+ turns
+            # of implementation work instead of starting from scratch.
+            wip_sha = (ctx.get("handoff") or {}).get("wip_sha", "")
+            effective_base = base
+            if wip_sha and attempt_n > 1:
+                try:
+                    repo._run("rev-parse", "--verify", wip_sha, check=True)
+                    effective_base = wip_sha
+                    self.emit("resume_wip", f"branching from WIP-PARTIAL {wip_sha[:8]}")
+                except Exception:  # noqa: BLE001 — fall back to base if WIP is gone
+                    pass
+            if effective_base is None:
+                effective_base = repo.current_branch()
             if base is None:
-                base = repo.current_branch()
+                base = effective_base
             try:
-                repo.create_branch(branch, base=base)
+                repo.create_branch(branch, base=effective_base)
             except ProtectedBranch as exc:
                 return await self._escalate(task, str(exc))
         await self.store.update_attempt(attempt_id, branch_name=branch)
@@ -530,15 +588,80 @@ class Orchestrator:
         if sdk_skills:
             extra["skills"] = sdk_skills
 
-        result = await self.backend.run(
-            prompt,
-            cwd=repo.path,
-            max_turns=self.bounds.max_turns_per_attempt,
-            effort="high",
-            on_event=self._agent_sink,
-            supervisor_hook=supervisor,
-            **extra,
-        )
+        # Materialize built-in subagent definitions so the SDK can delegate
+        # focused sub-tasks (e.g. read-only research) to sandboxed agents.
+        self._materialize_subagents(repo.path, task)
+
+        # Materialize the verify skill with the repo's proven test command
+        # so the agent can re-read it after context compaction.
+        self._materialize_verify_skill(repo.path)
+
+        # Write compact project instructions to .claude/instructions.md so the
+        # SDK can read them automatically and they survive context compaction.
+        self._materialize_compact_instructions(repo.path, task)
+
+        # --- env_setup: run pre-agent setup commands, inject env vars ---
+        setup_cmds = (task.config or {}).get("env_setup", [])
+        teardown_cmds = (task.config or {}).get("env_teardown", [])
+        saved_env: dict[str, str | None] = {}
+        if setup_cmds:
+            import subprocess as _sp
+            self.emit("env_setup", f"running {len(setup_cmds)} setup command(s)")
+            for cmd in setup_cmds:
+                try:
+                    # Run with env-export wrapper so we can capture exported vars.
+                    proc = _sp.run(
+                        cmd, shell=True, capture_output=True, text=True,
+                        timeout=120, cwd=str(repo.path),
+                    )
+                    if proc.returncode != 0:
+                        detail = (f"env_setup failed (rc={proc.returncode}): "
+                                  f"{proc.stderr.strip()[:200]}")
+                        self.emit("env_setup_failed", detail)
+                        await self.store.update_attempt(
+                            attempt_id, status="failed", failure_reason=detail)
+                        return TaskOutcome(
+                            task, status=TaskStatus.FAILED, detail=detail)
+                except _sp.TimeoutExpired:
+                    detail = f"env_setup timed out (120s): {cmd[:80]}"
+                    self.emit("env_setup_failed", detail)
+                    await self.store.update_attempt(
+                        attempt_id, status="failed", failure_reason=detail)
+                    return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+
+        # Inject env vars from task config into process environment.
+        env_vars: dict[str, str] = (task.config or {}).get("env_vars", {})
+        for k, v in env_vars.items():
+            saved_env[k] = os.environ.get(k)
+            os.environ[k] = v
+
+        try:
+            result = await self.backend.run(
+                prompt,
+                cwd=repo.path,
+                max_turns=self.bounds.max_turns_per_attempt,
+                effort="high",
+                on_event=self._agent_sink,
+                supervisor_hook=supervisor,
+                **extra,
+            )
+        finally:
+            # Restore original env, run teardown commands.
+            for k, orig in saved_env.items():
+                if orig is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = orig
+            if teardown_cmds:
+                import subprocess as _sp
+                self.emit("env_teardown", f"running {len(teardown_cmds)} teardown command(s)")
+                for cmd in teardown_cmds:
+                    try:
+                        _sp.run(cmd, shell=True, capture_output=True,
+                                timeout=60, cwd=str(repo.path))
+                    except Exception:  # noqa: BLE001 — teardown is best-effort
+                        log.warning("env_teardown command failed: %s", cmd[:80])
+
         await self.store.update_attempt(
             attempt_id, turns_used=result.num_turns, tokens_used=result.tokens_used,
             cache_read_tokens=result.cache_read_tokens,
@@ -556,13 +679,28 @@ class Orchestrator:
             is_stuck = stuck.record(result.final_text or reason)
             if is_stuck:
                 self.emit("stuck", "same agent-error signature repeated; resetting context")
+            # Checkpoint uncommitted work so the next attempt can resume from
+            # it instead of starting from scratch. This prevents losing 40+
+            # turns of implementation when max_turns is hit.
+            wip_sha = ""
+            if repo.has_changes():
+                try:
+                    wip_commit = repo.commit_all(
+                        f"[WIP-PARTIAL] {self._commit_message(task)}"
+                    )
+                    wip_sha = wip_commit.sha
+                    self.emit("checkpoint", f"WIP-PARTIAL {wip_sha[:8]} "
+                              f"({wip_commit.files_changed} files preserved)")
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("WIP checkpoint on max_turns failed: %s", exc)
             detail = f"agent run did not complete ({reason})"
             await self.store.update_attempt(
                 attempt_id, status="failed", failure_reason=detail,
+                commit_sha=wip_sha or None,
             )
             # C2: persist a handoff digest so the next attempt can resume
             # cleanly from where this one left off.
-            await self._persist_handoff(task, result, repo)
+            await self._persist_handoff(task, result, repo, wip_sha=wip_sha)
             self.emit("agent_error", detail)
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
 
@@ -579,6 +717,21 @@ class Orchestrator:
 
         # --- commit (deterministic) ---
         if not repo.has_changes():
+            # Investigation tasks may produce findings without code changes —
+            # that is a valid outcome, not a failure.
+            if task.kind == "investigation" and (result.final_text or "").strip():
+                findings = (result.final_text or "").strip()
+                task.context = {**(task.context or {}), "findings": findings}
+                await self.store.update_task(task)
+                await self.store.update_attempt(
+                    attempt_id, status="succeeded",
+                    failure_reason=None,
+                )
+                detail = f"investigation complete (report-only, no code changes)"
+                self.emit("investigation_report", detail)
+                await self.store.set_status(task, TaskStatus.DONE, validate=False)
+                self.emit("state", "done", status="done")
+                return TaskOutcome(task, status=TaskStatus.DONE, detail=detail)
             detail = "agent produced no file changes"
             await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
@@ -1926,6 +2079,140 @@ class Orchestrator:
             )
         return materialized
 
+    def _materialize_compact_instructions(self, repo_path: Path, task: Task) -> None:
+        """Write compact project instructions to ``.claude/instructions.md``.
+
+        This file is automatically read by the Claude SDK and survives context
+        compaction (unlike the system prompt). Contains:
+          - Proven test command
+          - Key confirmed rules/memories
+          - Task-specific directives
+          - Ecosystem info
+
+        Written under ``.claude/`` which is excluded from git staging
+        (``_EPHEMERAL``), so it never appears in PR diffs. Overwritten each
+        attempt to stay current.
+        """
+        sections: list[str] = []
+
+        # 1. Ecosystem + test command from profile.
+        prof = getattr(self, "_active_profile", None)
+        if prof:
+            if prof.ecosystem:
+                sections.append(f"**Ecosystem:** {prof.ecosystem}")
+            if prof.test_cmd:
+                sections.append(
+                    f"**Test command (proven):**\n```\n{prof.test_cmd}\n```\n"
+                    "Use this exact command. Do not guess alternatives."
+                )
+
+        # 2. Confirmed rules from memories.
+        rules_lines: list[str] = []
+        for m in (getattr(self, "_active_memories", None) or []):
+            mtype = m.get("type", "")
+            if mtype == "rule":
+                content = m.get("content", "").strip()
+                if content:
+                    rules_lines.append(f"- {content}")
+        if rules_lines:
+            sections.append("**Project rules:**\n" + "\n".join(rules_lines))
+
+        # 3. Task-specific kind directive.
+        kind_dir = self._kind_directive(task)
+        if kind_dir:
+            sections.append(f"**Task kind:** {task.kind}\n{kind_dir}")
+
+        if not sections:
+            return
+
+        instructions = "# no_human project instructions\n\n" + "\n\n".join(sections) + "\n"
+        inst_path = repo_path / ".claude" / "instructions.md"
+        try:
+            inst_path.parent.mkdir(parents=True, exist_ok=True)
+            inst_path.write_text(instructions, encoding="utf-8")
+        except OSError as exc:
+            log.warning("failed to write compact instructions: %s", exc)
+
+    def _materialize_verify_skill(self, repo_path: Path) -> None:
+        """Write a ``verify`` skill to ``.claude/skills/`` with the repo's proven
+        test command, so the agent can re-read it after context compaction.
+
+        This complements the test_cmd injection in the implement prompt — the
+        prompt may be lost during long sessions, but the skill file on disk
+        persists. Overwritten each attempt so it stays current.
+        """
+        prof = getattr(self, "_active_profile", None)
+        if not prof or not prof.test_cmd:
+            return
+        skill_path = repo_path / ".claude" / "skills" / "no_human_verify" / "SKILL.md"
+        try:
+            skill_path.parent.mkdir(parents=True, exist_ok=True)
+            skill_path.write_text(
+                "---\n"
+                "name: no_human_verify\n"
+                "description: Run the repo's proven test suite\n"
+                "---\n\n"
+                "## How to verify changes\n\n"
+                f"Run the proven test command:\n\n```\n{prof.test_cmd}\n```\n\n"
+                "This command was proven during onboarding and is the ONLY "
+                "reliable way to run tests in this repo. Do not guess alternative "
+                "test commands.\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            log.warning("failed to materialize verify skill: %s", exc)
+
+    def _materialize_subagents(self, repo_path: Path, task: Task) -> None:
+        """Write built-in subagent definitions to ``.claude/agents/`` so the SDK
+        can delegate focused sub-tasks.
+
+        Subagent .md files are NOT committed — ``.claude/**`` is excluded by
+        ``_EPHEMERAL`` in ``vcs/git.py``.
+
+        Built-in subagents:
+          - ``no_human_researcher``: read-only codebase exploration (grep, read),
+            no edits. Used automatically by the SDK when the agent decides it
+            needs focused investigation.
+        """
+        agents_dir = repo_path / ".claude" / "agents"
+
+        # Subagent definitions — each has a name, description, and instruction body.
+        builtins = [
+            {
+                "name": "no_human_researcher",
+                "description": "Read-only codebase researcher for focused investigation",
+                "instructions": (
+                    "You are a focused codebase researcher. Your job is to find specific "
+                    "information in the codebase and report back with precise file paths "
+                    "and line numbers.\n\n"
+                    "RULES:\n"
+                    "- NEVER edit files. You are read-only.\n"
+                    "- Use grep, read, and glob tools to explore.\n"
+                    "- Always cite exact file paths and line numbers.\n"
+                    "- Return a concise summary of what you found.\n"
+                    "- If you cannot find what was asked for, say so explicitly."
+                ),
+                "allowed_tools": ["Read", "Grep", "Glob", "Bash"],
+            },
+        ]
+
+        for agent in builtins:
+            agent_path = agents_dir / f"{agent['name']}.md"
+            if agent_path.exists():
+                continue
+            try:
+                agents_dir.mkdir(parents=True, exist_ok=True)
+                tools_line = ", ".join(agent["allowed_tools"])
+                agent_path.write_text(
+                    f"---\nname: {agent['name']}\n"
+                    f"description: {agent['description']}\n"
+                    f"allowed_tools: [{tools_line}]\n---\n\n"
+                    f"{agent['instructions']}\n",
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                log.warning("failed to materialize subagent %r: %s", agent["name"], exc)
+
     async def _generate_plan(self, task: Task, repo: GitRepo) -> str:
         """Generate a detailed implementation plan before the implement loop.
 
@@ -1996,7 +2283,28 @@ class Orchestrator:
             "signatures), those are out of scope to rename or refactor.\n\n"
             "## VERIFICATION\n"
             f"Exact command(s) to run: {test_cmd or '(discover from the repo)'}\n\n"
-            "Be specific and concrete. Reference actual file paths in the repo.\n"
+            "Be specific and concrete. Reference actual file paths in the repo.\n\n"
+            "## COMPOUND TASK ASSESSMENT\n"
+            "If this task is too complex for a single agent session — e.g. many "
+            "distinct areas of code, investigation needed before implementation, "
+            "multiple repos, broad test coverage, or exploratory debugging across "
+            "many files — emit a decomposition plan.\n\n"
+            "Wrap the decomposition in DECOMPOSE_PLAN_START / DECOMPOSE_PLAN_END "
+            "markers with a JSON block inside a fenced code block:\n"
+            "DECOMPOSE_PLAN_START\n"
+            "```json\n"
+            '{"decompose": true, "justification": "...", "subtasks": '
+            '[{"title": "...", "kind": "investigation|feature|bugfix|test_gap", '
+            '"description": "...", "acceptance_criteria": ["..."], '
+            '"depends_on": [], "repo_path": "..."}]}\n'
+            "```\n"
+            "DECOMPOSE_PLAN_END\n\n"
+            "Rules for decomposition:\n"
+            "- Each sub-task must be independently testable and reviewable.\n"
+            "- Each sub-task must have a clear justification. No duplicates.\n"
+            "- Maximum 50 sub-tasks. Prefer fewer, larger sub-tasks.\n"
+            "- Only decompose if a single agent session truly cannot handle it.\n"
+            "- If you decompose, do NOT also produce a normal plan above.\n"
         )
 
         try:
@@ -2012,6 +2320,19 @@ class Orchestrator:
             if "SKIP_PLAN" in plan[:200]:
                 self.emit("planning", "skipped (trivial — planner assessed as one-line diff)")
                 return ""
+            # Check for compound task decomposition markers.
+            decomp = _parse_decomposition(plan)
+            if decomp is not None:
+                ctx = task.context or {}
+                ctx["decomposition"] = decomp
+                task.context = ctx
+                await self.store.update_task(task)
+                self.emit(
+                    "planning",
+                    f"compound task detected: {len(decomp.get('subtasks', []))} "
+                    f"sub-tasks ({result.num_turns} turns, {result.tokens_used} tokens)",
+                )
+                return plan
             self.emit("planning", f"plan generated ({len(plan)} chars, "
                        f"{result.num_turns} turns, {result.tokens_used} tokens)")
             return plan
@@ -2072,11 +2393,20 @@ class Orchestrator:
 
         rules = (
             "Rules:\n"
+            "  CRITICAL — NEVER SKIP A TASK. Everything the user gives you, you CAN do.\n"
+            "  Never claim inability or skip work because you assume you can't do it.\n"
+            "  If you hit a real blocker, report it with evidence — but NEVER refuse\n"
+            "  without trying first. Find a way.\n\n"
             "  - Verify with evidence: run commands, read their output; don't assert.\n"
             "    'I think it works' is NOT evidence. Run the command and show the output.\n"
             "  - Minimal, focused edits. No comments unless the WHY is non-obvious.\n"
             "  - Add or update tests for your change and run them.\n"
             + (f"  - Run unit tests with: {test_cmd_str}\n"
+               f"    EARLY VERIFICATION: Run this command EARLY (within your first few tool\n"
+               f"    calls) to confirm the test environment works. If it fails due to missing\n"
+               f"    plugins, conftest issues, or argument errors, fix the invocation BEFORE\n"
+               f"    spending turns on implementation. Do NOT wait until the end to discover\n"
+               f"    the test suite is broken.\n"
                f"    You MUST run this command and confirm ALL tests pass before finishing.\n"
                f"    Paste the full output as evidence.\n"
                if test_cmd_str else
@@ -2112,6 +2442,16 @@ class Orchestrator:
             "    or generate build artifacts in the repo. Use the existing environment.\n"
             "    If dependencies are needed, add them to the project's dependency file\n"
             "    (requirements.txt, pyproject.toml, package.json, pom.xml, etc.).\n"
+            "  Standing discipline (apply at every step, not just at the end):\n"
+            "  - Verify everything. No assumptions — read the actual code before changing\n"
+            "    it, run commands and cite their output. Don't trust any file:line reference\n"
+            "    without confirming it yourself first — the codebase may have moved.\n"
+            "  - Rank every decision 1–10 and only proceed on a 10. If a step isn't a 10,\n"
+            "    stop and close the gap before moving to the next step.\n"
+            "  - Devil's advocate before acting. For each change, explicitly write down what\n"
+            "    could break, then address it before you make the change — not after.\n"
+            "  - Review every change as a staff engineer would. No sloppy patches, no\n"
+            "    unrequested abstractions, no scope creep.\n"
         )
         # Append confirmed rules + skills from the learning queue (Phase G).
         extra = self._format_active_memories()
@@ -2324,14 +2664,26 @@ class Orchestrator:
             summary = handoff.get("summary", "")
             files = handoff.get("changed_files", [])
             turns = handoff.get("turns_used", "?")
-            parts.append(
+            wip = handoff.get("wip_sha", "")
+            resume_lines = [
                 f"The previous attempt ran out of turns ({turns} used) and left "
-                f"partial work. Here is what it reported:\n"
-                f"  {summary[:600]}\n"
-                + (f"  Files touched: {', '.join(files[:15])}\n" if files else "")
-                + "Inspect the working tree to see what is already done — do NOT "
-                "redo work. Pick up where it left off."
+                f"partial work{' (committed as WIP-PARTIAL ' + wip[:8] + ')' if wip else ''}."
+            ]
+            if files:
+                resume_lines.append(
+                    f"  Files already modified: {', '.join(files[:15])}"
+                )
+            if summary and not summary.startswith("Claude Code returned"):
+                resume_lines.append(f"  Last status: {summary[:600]}")
+            resume_lines.append(
+                "CRITICAL: Your working tree ALREADY CONTAINS the partial implementation.\n"
+                "  1. READ the files listed above to understand what is already done.\n"
+                "  2. Do NOT redo work that is already complete.\n"
+                "  3. Pick up where the previous attempt left off.\n"
+                "  4. Focus remaining turns on completing unfinished acceptance criteria\n"
+                "     and running the test suite."
             )
+            parts.append("\n".join(resume_lines))
         ci_fail = ctx.get("ci_failure")
         if ci_fail:
             tests = ci_fail.get("failing_tests") or []
@@ -2346,7 +2698,9 @@ class Orchestrator:
             )
         return "\n\n".join(parts)
 
-    async def _persist_handoff(self, task: Task, result, repo) -> None:
+    async def _persist_handoff(
+        self, task: Task, result, repo, *, wip_sha: str = "",
+    ) -> None:
         """C2: persist a compact handoff record on turn-budget exhaustion or
         error so the next attempt resumes with context of what was accomplished.
 
@@ -2354,22 +2708,30 @@ class Orchestrator:
           - summary: the agent's last output (capped to 800 chars)
           - changed_files: files modified in the working tree
           - commit: last-good commit SHA if any
+          - wip_sha: WIP-PARTIAL commit SHA (if partial work was checkpointed)
         """
         ctx = task.context or {}
         summary = (result.final_text or "").strip()[:800]
         changed: list[str] = []
-        commit_sha = ""
+        commit_sha = wip_sha
         try:
-            if repo.has_changes():
+            if not commit_sha:
+                commit_sha = repo.head_sha()
+            # List files from the WIP commit (already committed) or working tree.
+            if wip_sha:
+                raw = repo._run("diff", "--name-only", "HEAD~1", "HEAD", check=False)
+            elif repo.has_changes():
                 raw = repo._run("status", "--porcelain", check=False)
-                changed = [ln[3:].strip() for ln in raw.splitlines() if ln.strip()][:30]
-            commit_sha = repo.head_sha()
+            else:
+                raw = ""
+            changed = [ln.lstrip(" MADRCU?!").strip() for ln in raw.splitlines() if ln.strip()][:30]
         except Exception:  # noqa: BLE001
             pass
         ctx["handoff"] = {
             "summary": summary,
             "changed_files": changed,
             "commit": commit_sha,
+            "wip_sha": wip_sha,
             "turns_used": result.num_turns,
         }
         task.context = ctx

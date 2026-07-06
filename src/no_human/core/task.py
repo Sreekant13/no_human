@@ -109,6 +109,7 @@ def _allowed_transitions() -> dict[TaskStatus, frozenset[TaskStatus]]:
     for state in resumable:
         table[state] |= _ACTIVE
         table[state].add(TaskStatus.FAILED)
+        table[state].add(TaskStatus.PENDING)  # LeadAgent unblocks dep-gated sub-tasks
 
     return {k: frozenset(v) for k, v in table.items()}
 
@@ -154,13 +155,14 @@ class Task:
     context: dict[str, Any] = field(default_factory=dict)
     plan: dict[str, Any] = field(default_factory=dict)
     config: dict[str, Any] = field(default_factory=dict)
+    parent_id: str | None = None
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
 
     @staticmethod
     def new(title: str, *, source: str = "freeform", repo_path: str | None = None,
             description: str | None = None, external_id: str | None = None,
-            kind: str = "feature") -> "Task":
+            kind: str = "feature", parent_id: str | None = None) -> "Task":
         return Task(
             id=uuid.uuid4().hex,
             source=source,
@@ -169,6 +171,7 @@ class Task:
             repo_path=repo_path,
             external_id=external_id,
             kind=kind,
+            parent_id=parent_id,
         )
 
     def to_row(self) -> dict[str, Any]:
@@ -191,6 +194,7 @@ class Task:
             "context": json.dumps(self.context),
             "plan": json.dumps(self.plan),
             "config": json.dumps(self.config),
+            "parent_id": self.parent_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -215,6 +219,7 @@ class Task:
             context=json.loads(row["context"] or "{}"),
             plan=json.loads(row["plan"] or "{}"),
             config=json.loads(row["config"] or "{}"),
+            parent_id=row.get("parent_id"),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

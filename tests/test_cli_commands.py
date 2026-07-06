@@ -261,3 +261,31 @@ def test_test_cmd_help():
     assert "full" in result.output
     assert "slow" in result.output
     assert "zero llm tokens" in result.output.lower()
+
+
+# --------------------------------------------------------------------------- #
+# nh agents                                                                     #
+# --------------------------------------------------------------------------- #
+
+def test_agents_shows_active(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.IMPLEMENTING, title="doing work")
+    _seed_attempt(db, task_id, turns_used=5, tokens_used=1234)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["agents"])
+
+    assert result.exit_code == 0, result.output
+    assert "doing work" in result.output
+    assert "implementing" in result.output.lower()
+
+
+def test_agents_empty(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    _seed_task(db, TaskStatus.DONE, title="finished")
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["agents"])
+
+    assert result.exit_code == 0
+    assert "no active" in result.output.lower()

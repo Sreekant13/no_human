@@ -142,7 +142,7 @@ class GitRepo:
         self._run("add", "-A", "--", ".", *self._EPHEMERAL)
 
     def has_changes(self) -> bool:
-        return bool(self._run("status", "--porcelain"))
+        return bool(self._run("status", "--porcelain", "--", ".", *self._EPHEMERAL))
 
     def commit_all(self, message: str) -> CommitResult:
         branch = self.current_branch()

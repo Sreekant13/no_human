@@ -131,6 +131,80 @@ def _discover_client() -> LanguageServerClient:
     )
 
 
+def _discover_all_clients() -> list[LanguageServerClient]:
+    """Discover ALL responding language servers across all IDE windows.
+
+    Each Devin/Windsurf IDE window runs its own ``language_server_*`` process
+    with a unique CSRF token. To collect conversations from every window, we
+    iterate all language_server processes and return every client that responds
+    to ``GetAllCascadeTrajectories``.
+
+    Returns at least one client or raises ``IDENotRunningError``.
+    """
+    try:
+        import psutil
+    except ImportError:
+        raise ImportError(
+            "psutil is required for IDE history extraction. "
+            "Install with: pip install psutil   (or: uv add psutil)"
+        )
+
+    # Group candidates by PID → (token, [(host, port), ...])
+    pid_candidates: dict[int, tuple[str, list[tuple[str, int]]]] = {}
+
+    for proc in psutil.process_iter(["pid", "name"]):
+        name = proc.info.get("name") or ""
+        if "language_server" not in name and "language_" not in name:
+            continue
+        try:
+            env = proc.environ()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            continue
+        token = env.get("WINDSURF_CSRF_TOKEN")
+        if not token:
+            continue
+        try:
+            conns = proc.net_connections()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            continue
+        ports = [(conn.laddr.ip, conn.laddr.port)
+                 for conn in conns if conn.status == "LISTEN" and conn.laddr]
+        if ports:
+            pid_candidates[proc.pid] = (token, ports)
+
+    if not pid_candidates:
+        raise IDENotRunningError(
+            "No Windsurf/Devin language server found. Is the IDE running?"
+        )
+
+    clients: list[LanguageServerClient] = []
+    seen_pids: set[int] = set()
+
+    for pid, (token, ports) in pid_candidates.items():
+        for host, port in ports:
+            client = LanguageServerClient(host=host, port=port, csrf_token=token)
+            try:
+                result = client.call("GetAllCascadeTrajectories")
+                if "trajectorySummaries" in result:
+                    log.info("connected to language server pid=%d on %s:%d", pid, host, port)
+                    if pid not in seen_pids:
+                        clients.append(client)
+                        seen_pids.add(pid)
+                    break  # one responding port per PID is enough
+            except Exception:
+                continue
+
+    if not clients:
+        total = sum(len(p) for _, p in pid_candidates.values())
+        raise IDENotRunningError(
+            f"Found {total} candidate ports across {len(pid_candidates)} "
+            "process(es) but none responded. The IDE may be starting up."
+        )
+
+    log.info("discovered %d language server(s)", len(clients))
+    return clients
+
+
 def _extract_messages(steps: list[dict]) -> list[Message]:
     """Pull user/assistant messages from raw trajectory steps."""
     messages: list[Message] = []
@@ -159,20 +233,33 @@ def extract_transcripts(
     """Extract all conversation transcripts from the last ``days`` days.
 
     Returns a list of ``Transcript`` objects sorted by creation time.
-    If *client* is ``None``, auto-discovers the local language server.
+    If *client* is ``None``, auto-discovers ALL local language servers and
+    merges conversations from every IDE window (deduped by cascade_id).
     """
-    if client is None:
-        client = _discover_client()
+    if client is not None:
+        clients = [client]
+    else:
+        clients = _discover_all_clients()
 
-    summaries = client.call("GetAllCascadeTrajectories").get(
-        "trajectorySummaries", {}
-    )
-    log.info("found %d total conversations", len(summaries))
+    # Merge summaries from all servers, dedup by cascade_id.
+    all_summaries: dict[str, tuple[dict, LanguageServerClient]] = {}
+    for c in clients:
+        try:
+            sums = c.call("GetAllCascadeTrajectories").get("trajectorySummaries", {})
+            for cid, summary in sums.items():
+                if cid not in all_summaries:
+                    all_summaries[cid] = (summary, c)
+        except Exception:
+            log.warning("failed to list trajectories from %s:%d", c.host, c.port)
+
+    summaries_with_clients = all_summaries
+    log.info("found %d total conversations across %d server(s)",
+             len(summaries_with_clients), len(clients))
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     transcripts: list[Transcript] = []
 
-    for cid, summary in summaries.items():
+    for cid, (summary, src_client) in summaries_with_clients.items():
         created = summary.get("createdTime", "")
         if created:
             dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
@@ -188,7 +275,7 @@ def extract_transcripts(
 
         log.info("fetching %s (%d steps)...", title, step_count)
         try:
-            raw_steps = client.call(
+            raw_steps = src_client.call(
                 "GetCascadeTrajectorySteps", {"cascadeId": cid}
             ).get("steps", [])
         except Exception:

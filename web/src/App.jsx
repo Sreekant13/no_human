@@ -2,6 +2,7 @@ import { useEffect, useReducer, useRef, useState } from "react";
 import { connectWS, createTask, fetchTasks, fetchProjects, fetchWorkerStatus, fetchOnboardingStatus, grillStep, grillStepSSE } from "./api.js";
 import Board from "./Board.jsx";
 import Settings from "./Settings.jsx";
+import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
 import { LegionLogo } from "./Logo.jsx";
 
@@ -87,6 +88,7 @@ function NewTaskModal({ onClose, onCreated }) {
   const [repoPath, setRepoPath] = useState("");
   const [kind, setKind] = useState("feature");
   const [priority, setPriority] = useState("medium");
+  const [backend, setBackend] = useState("claude");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [projects, setProjects] = useState([]);
@@ -121,6 +123,7 @@ function NewTaskModal({ onClose, onCreated }) {
         kind,
         priority,
         acceptance_criteria: grillResult?.acceptance_criteria || [],
+        backend,
       });
       onCreated();
       onClose();
@@ -183,11 +186,18 @@ function NewTaskModal({ onClose, onCreated }) {
       <div className="sendback-overlay" onClick={onClose}>
         <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
           <div className="sendback-label">Refined Spec</div>
-          <div style={{ padding: '0.5rem 0' }}>
-            <div style={{ fontWeight: 600, marginBottom: '0.3rem' }}>{grillResult.title}</div>
-            {grillResult.description && <div style={{ fontSize: '0.85rem', color: 'var(--fg-dim)', marginBottom: '0.5rem' }}>{grillResult.description}</div>}
-            <div style={{ fontSize: '0.8rem', fontWeight: 600, marginBottom: '0.2rem' }}>Acceptance Criteria:</div>
-            {grillResult.acceptance_criteria.map((ac, i) => <div key={i} style={{ fontSize: '0.8rem', color: 'var(--green)', paddingLeft: '0.5rem' }}>{i + 1}. {ac}</div>)}
+          <div className="grill-spec">
+            <div className="grill-spec-title">{grillResult.title}</div>
+            {grillResult.description && <div className="grill-spec-desc">{grillResult.description}</div>}
+            <div className="grill-spec-section-label">Acceptance Criteria</div>
+            <ul className="grill-ac-list">
+              {grillResult.acceptance_criteria.map((ac, i) => (
+                <li key={i} className="grill-ac-item">
+                  <span className="grill-ac-num">{i + 1}.</span>
+                  <span>{ac}</span>
+                </li>
+              ))}
+            </ul>
           </div>
           {error && <div className="new-task-error">{error}</div>}
           <div className="sendback-actions">
@@ -205,20 +215,20 @@ function NewTaskModal({ onClose, onCreated }) {
       <div className="sendback-overlay" onClick={onClose}>
         <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
           <div className="sendback-label">Intake Grill</div>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2rem 1rem', gap: '1rem' }}>
+          <div className="grill-loading">
             <Spinner />
-            <div style={{ color: 'var(--text)', fontSize: '0.9rem' }}>Exploring the codebase...</div>
+            <div className="grill-loading-text">Exploring the codebase...</div>
             {grillEvents.length > 0 && (
-              <div style={{ width: '100%', maxHeight: 120, overflowY: 'auto', fontSize: '0.75rem', color: 'var(--fg-dim)', fontFamily: 'var(--font-mono)', borderTop: '1px solid var(--border)', paddingTop: '0.4rem' }}>
+              <div className="grill-explore-log">
                 {grillEvents.map((ev, i) => (
-                  <div key={i} style={{ padding: '0.1rem 0', opacity: i === grillEvents.length - 1 ? 1 : 0.6 }}>
-                    {ev.kind === 'tool_use' ? `⚙ ${ev.text}` : ev.text}
+                  <div key={i} className="grill-explore-entry" style={{ opacity: i === grillEvents.length - 1 ? 1 : 0.5 }}>
+                    {ev.kind === 'tool_use' ? `\u2699 ${ev.text}` : ev.text}
                   </div>
                 ))}
               </div>
             )}
             {grillEvents.length === 0 && (
-              <div style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>This usually takes 15–30 seconds</div>
+              <div className="grill-loading-hint">This usually takes 15–30 seconds</div>
             )}
           </div>
           <div className="sendback-actions">
@@ -232,22 +242,21 @@ function NewTaskModal({ onClose, onCreated }) {
   if (grillMode && grillQuestion) {
     const maxRounds = 5;
     const progressPct = Math.min(100, (grillQuestion.round / maxRounds) * 100);
-    // While processing the answer, show a loading overlay that blocks all interaction.
     if (busy) {
       return (
         <div className="sendback-overlay">
           <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="sendback-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <span>Intake Grill</span>
-              <span style={{ fontSize: '0.7rem', color: 'var(--fg-dim)' }}>Round {grillQuestion.round}/{maxRounds}</span>
+            <div className="grill-header">
+              <div className="sendback-label">Intake Grill</div>
+              <span className="grill-round-badge">Round {grillQuestion.round}/{maxRounds}</span>
             </div>
-            <div style={{ height: 3, background: 'var(--border)', borderRadius: 2, marginBottom: '0.5rem' }}>
-              <div style={{ height: '100%', width: `${progressPct}%`, background: 'var(--c-building)', borderRadius: 2, transition: 'width 0.3s' }} />
+            <div className="grill-progress-bar">
+              <div className="grill-progress-fill" style={{ width: `${progressPct}%` }} />
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2rem 1rem', gap: '1rem' }}>
+            <div className="grill-loading">
               <Spinner />
-              <div style={{ color: 'var(--text)', fontSize: '0.9rem' }}>Processing your answer...</div>
-              <div style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>Refining the next question based on your input</div>
+              <div className="grill-loading-text">Processing your answer...</div>
+              <div className="grill-loading-hint">Refining the next question based on your input</div>
             </div>
             {error && <div className="new-task-error">{error}</div>}
             <div className="sendback-actions">
@@ -260,34 +269,39 @@ function NewTaskModal({ onClose, onCreated }) {
     return (
       <div className="sendback-overlay" onClick={onClose}>
         <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
-          <div className="sendback-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span>Intake Grill</span>
-            <span style={{ fontSize: '0.7rem', color: 'var(--fg-dim)' }}>Round {grillQuestion.round}/{maxRounds}</span>
+          <div className="grill-header">
+            <div className="sendback-label">Intake Grill</div>
+            <span className="grill-round-badge">Round {grillQuestion.round}/{maxRounds}</span>
           </div>
-          <div style={{ height: 3, background: 'var(--border)', borderRadius: 2, marginBottom: '0.5rem' }}>
-            <div style={{ height: '100%', width: `${progressPct}%`, background: 'var(--c-building)', borderRadius: 2, transition: 'width 0.3s' }} />
+          <div className="grill-progress-bar">
+            <div className="grill-progress-fill" style={{ width: `${progressPct}%` }} />
           </div>
           {grillQA.length > 0 && (
-            <div style={{ maxHeight: 100, overflowY: 'auto', fontSize: '0.75rem', color: 'var(--fg-dim)', borderBottom: '1px solid var(--border)', paddingBottom: '0.4rem', marginBottom: '0.4rem' }}>
+            <div className="grill-qa-history">
               {grillQA.map((qa, i) => (
-                <div key={i} style={{ marginBottom: '0.3rem' }}>
+                <div key={i} className="grill-qa-item">
                   <div><strong>Q{i+1}:</strong> {qa.question}</div>
-                  <div style={{ paddingLeft: '0.5rem', color: 'var(--green)' }}>→ {qa.answer}</div>
+                  <div className="grill-qa-answer">{"\u2192"} {qa.answer}</div>
                 </div>
               ))}
             </div>
           )}
-          <div style={{ fontWeight: 500, margin: '0.5rem 0' }}>{grillQuestion.question}</div>
-          {grillQuestion.suggestions.map((s, i) => <button key={i} type="button" className="btn btn-sendback" style={{ display: 'block', width: '100%', textAlign: 'left', marginBottom: '0.3rem', fontSize: '0.8rem' }} onClick={() => setGrillAnswer(s.replace(/^[A-D]:\s*/, ''))}>{s}</button>)}
-          <textarea className="sendback-textarea" placeholder="Your answer (or click a suggestion)" value={grillAnswer} onChange={(e) => setGrillAnswer(e.target.value)} rows={2} />
+          <div className="ntm-field">
+            <div className="ntm-label">Question</div>
+            <div style={{ fontWeight: 500, fontSize: '14px', lineHeight: 1.5, margin: '4px 0 12px' }}>{grillQuestion.question}</div>
+          </div>
+          {grillQuestion.suggestions.map((s, i) => (
+            <button key={i} type="button" className="grill-suggestion" onClick={() => setGrillAnswer(s.replace(/^[A-D]:\s*/, ''))}>{s}</button>
+          ))}
+          <textarea className="sendback-textarea" placeholder="Your answer (or click a suggestion above)" value={grillAnswer} onChange={(e) => setGrillAnswer(e.target.value)} rows={2} style={{ marginTop: '8px' }} />
           {error && <div className="new-task-error">{error}</div>}
           <div className="sendback-actions">
             <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
-            <button type="button" className="btn btn-sendback" style={{ fontSize: '0.75rem' }}
+            <button type="button" className="btn btn-sendback btn-sm"
               onClick={async () => {
                 setBusy(true); setError(null);
                 try {
-                  const step = await grillStep({ title: title.trim(), description: description.trim() || null, repo_path: customRepo ? repoPath.trim() || null : null, project_id: !customRepo && selectedProjectId ? selectedProjectId : null, qa_history: [...grillQA, { question: grillQuestion.question, answer: "(skip — use what you have)" }] });
+                  const step = await grillStep({ title: title.trim(), description: description.trim() || null, repo_path: customRepo ? repoPath.trim() || null : null, project_id: !customRepo && selectedProjectId ? selectedProjectId : null, qa_history: [...grillQA, { question: grillQuestion.question, answer: "(skip \u2014 use what you have)" }] });
                   if (step.type === "done") { setGrillResult(step); setGrillQuestion(null); } else { setGrillResult({ title: step.title || title.trim(), description: step.description || description.trim(), acceptance_criteria: step.acceptance_criteria || [] }); setGrillQuestion(null); }
                 } catch (err) { setError(err.message); }
                 finally { setBusy(false); }
@@ -304,112 +318,139 @@ function NewTaskModal({ onClose, onCreated }) {
       <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
         <div className="sendback-label">New Task</div>
         <form onSubmit={(e) => { e.preventDefault(); startGrill(); }} style={busy ? { opacity: 0.6, pointerEvents: 'none' } : {}}>
-          <input
-            className="new-task-input"
-            placeholder="Task title (required)"
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            autoFocus
-          />
-          <textarea
-            className="sendback-textarea"
-            placeholder="Description (optional)"
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-            rows={3}
-          />
-          {!customRepo ? (
-            <>
-              {projects.length > 0 ? (
-                <div className="new-task-row">
-                  <label style={{ fontSize: '0.75rem', color: 'var(--fg-dim)', whiteSpace: 'nowrap' }}>Project</label>
-                  <select
-                    className="new-task-select"
-                    style={{ flex: 1 }}
-                    value={selectedProjectId}
-                    onChange={(e) => setSelectedProjectId(e.target.value)}
-                  >
-                    {projects.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name} ({p.repo_paths.length} repo{p.repo_paths.length !== 1 ? 's' : ''})
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    className="btn btn-sendback"
-                    style={{ fontSize: '0.7rem', padding: '0.2rem 0.5rem' }}
-                    onClick={() => { setCustomRepo(true); setRepoPath(''); }}
-                    title="Use a repo path not in any project"
-                  >custom repo</button>
-                </div>
-              ) : (
-                <div style={{ fontSize: '0.8rem', color: 'var(--fg-dim)', padding: '0.3rem 0' }}>
-                  No projects yet.
-                  <button
-                    type="button"
-                    className="btn btn-sendback"
-                    style={{ fontSize: '0.7rem', padding: '0.2rem 0.5rem', marginLeft: '0.5rem' }}
-                    onClick={() => setCustomRepo(true)}
-                  >use repo path</button>
-                </div>
-              )}
-              {/* If a project has multiple repos, let user pick which one to target */}
-              {selectedProjectId && (() => {
-                const proj = projects.find(p => p.id === selectedProjectId);
-                if (!proj || proj.repo_paths.length <= 1) return null;
-                return (
+          <div className="ntm-field">
+            <label className="ntm-label">Title</label>
+            <input
+              className="new-task-input ntm-title"
+              placeholder="What needs to be done?"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              autoFocus
+            />
+          </div>
+          <div className="ntm-field">
+            <label className="ntm-label">Description</label>
+            <textarea
+              className="sendback-textarea"
+              placeholder="Additional context, constraints, or acceptance criteria (optional)"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              rows={3}
+            />
+          </div>
+          <hr className="ntm-section-divider" />
+          <div className="ntm-field">
+            <label className="ntm-label">Repository</label>
+            {!customRepo ? (
+              <>
+                {projects.length > 0 ? (
                   <div className="new-task-row">
-                    <label style={{ fontSize: '0.75rem', color: 'var(--fg-dim)', whiteSpace: 'nowrap' }}>Target repo</label>
                     <select
                       className="new-task-select"
-                      style={{ flex: 1 }}
-                      value={repoPath || proj.primary_repo || proj.repo_paths[0]}
-                      onChange={(e) => setRepoPath(e.target.value)}
+                      value={selectedProjectId}
+                      onChange={(e) => setSelectedProjectId(e.target.value)}
                     >
-                      {proj.repo_paths.map((rp) => (
-                        <option key={rp} value={rp}>
-                          {rp.split('/').pop()}{rp === proj.primary_repo ? ' (primary)' : ''}
+                      {projects.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name} ({p.repo_paths.length} repo{p.repo_paths.length !== 1 ? 's' : ''})
                         </option>
                       ))}
                     </select>
+                    <button
+                      type="button"
+                      className="btn btn-sendback btn-sm"
+                      onClick={() => { setCustomRepo(true); setRepoPath(''); }}
+                      title="Use a repo path not in any project"
+                    >custom path</button>
                   </div>
-                );
-              })()}
-            </>
-          ) : (
+                ) : (
+                  <div className="ntm-hint">
+                    No projects yet.
+                    <button
+                      type="button"
+                      className="btn btn-sendback btn-sm"
+                      style={{ marginLeft: '8px' }}
+                      onClick={() => setCustomRepo(true)}
+                    >use repo path</button>
+                  </div>
+                )}
+                {selectedProjectId && (() => {
+                  const proj = projects.find(p => p.id === selectedProjectId);
+                  if (!proj || proj.repo_paths.length <= 1) return null;
+                  return (
+                    <div className="new-task-row" style={{ marginTop: '8px' }}>
+                      <select
+                        className="new-task-select"
+                        value={repoPath || proj.primary_repo || proj.repo_paths[0]}
+                        onChange={(e) => setRepoPath(e.target.value)}
+                      >
+                        {proj.repo_paths.map((rp) => (
+                          <option key={rp} value={rp}>
+                            {rp.split('/').pop()}{rp === proj.primary_repo ? ' (primary)' : ''}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  );
+                })()}
+              </>
+            ) : (
+              <div className="new-task-row">
+                <input
+                  className="new-task-input"
+                  style={{ flex: 1, marginBottom: 0 }}
+                  placeholder="~/git/my-project"
+                  value={repoPath}
+                  onChange={(e) => setRepoPath(e.target.value)}
+                />
+                {projects.length > 0 && (
+                  <button
+                    type="button"
+                    className="btn btn-sendback btn-sm"
+                    onClick={() => { setCustomRepo(false); setSelectedProjectId(projects[0]?.id || ''); setRepoPath(''); }}
+                  >back to projects</button>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="ntm-field">
+            <label className="ntm-label">Classification</label>
             <div className="new-task-row">
-              <input
-                className="new-task-input"
-                style={{ flex: 1 }}
-                placeholder="Repo path, e.g. ~/git/my-project"
-                value={repoPath}
-                onChange={(e) => setRepoPath(e.target.value)}
-              />
-              {projects.length > 0 && (
-                <button
-                  type="button"
-                  className="btn btn-sendback"
-                  style={{ fontSize: '0.7rem', padding: '0.2rem 0.5rem' }}
-                  onClick={() => { setCustomRepo(false); setSelectedProjectId(projects[0]?.id || ''); setRepoPath(''); }}
-                >back to projects</button>
-              )}
+              <select className="new-task-select" value={kind} onChange={(e) => setKind(e.target.value)}>
+                <option value="feature">feature</option>
+                <option value="bugfix">bugfix</option>
+                <option value="ci_fix">ci_fix</option>
+                <option value="test_gap">test_gap</option>
+                <option value="investigation">investigation</option>
+                <option value="code_review">code_review</option>
+              </select>
+              <select className="new-task-select" value={priority} onChange={(e) => setPriority(e.target.value)}>
+                <option value="high">high</option>
+                <option value="medium">medium</option>
+                <option value="low">low</option>
+              </select>
             </div>
-          )}
-          <div className="new-task-row">
-            <select className="new-task-select" value={kind} onChange={(e) => setKind(e.target.value)}>
-              <option value="feature">feature</option>
-              <option value="bugfix">bugfix</option>
-              <option value="ci_fix">ci_fix</option>
-              <option value="test_gap">test_gap</option>
-              <option value="investigation">investigation</option>
-              <option value="code_review">code_review</option>
-            </select>
-            <select className="new-task-select" value={priority} onChange={(e) => setPriority(e.target.value)}>
-              <option value="high">high</option>
-              <option value="medium">medium</option>
-              <option value="low">low</option>
-            </select>
+          </div>
+          <div className="ntm-field">
+            <label className="ntm-label">Run with</label>
+            <div className="ntm-backend-toggle">
+              <button
+                type="button"
+                className={`ntm-backend-btn${backend === "claude" ? " active" : ""}`}
+                onClick={() => setBackend("claude")}
+              >
+                <span className="ntm-backend-icon">{"\u2318"}</span>
+                Claude Code
+              </button>
+              <button
+                type="button"
+                className={`ntm-backend-btn${backend === "devin" ? " active" : ""}`}
+                onClick={() => setBackend("devin")}
+              >
+                <span className="ntm-backend-icon">{"\u25C7"}</span>
+                Devin
+              </button>
+            </div>
           </div>
           {error && <div className="new-task-error">{error}</div>}
           <div className="sendback-actions">
@@ -521,6 +562,7 @@ export default function App() {
         <Brand />
         <nav className="nh-nav">
           <button className={`nh-nav-btn${page === "board" ? " active" : ""}`} onClick={() => setPage("board")}>Board</button>
+          <button className={`nh-nav-btn${page === "stats" ? " active" : ""}`} onClick={() => setPage("stats")}>Stats</button>
           <button className={`nh-nav-btn${page === "settings" ? " active" : ""}`} onClick={() => setPage("settings")}>Settings</button>
         </nav>
         <div className="nh-header-right">
@@ -544,6 +586,7 @@ export default function App() {
           <Board tasks={tasks} />
         </>
       )}
+      {page === "stats" && <Stats tasks={tasks} />}
       {page === "settings" && <Settings />}
       {showNewTask && (
         <NewTaskModal

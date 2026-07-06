@@ -1090,3 +1090,279 @@ async def test_doom_loop_emits_stuck_event(bare_repo, tmp_path, store):
     stuck_events = [e for e in events if e.get("kind") == "stuck"]
     assert len(stuck_events) >= 1
     assert "doom-loop" in stuck_events[0]["text"]
+
+
+# --------------------------------------------------------------------------- #
+# Investigation tasks that produce findings but no code changes should         #
+# complete as DONE with a report, not FAILED.                                  #
+# --------------------------------------------------------------------------- #
+
+class ReportOnlyBackend:
+    """Backend that returns findings text but makes no file changes."""
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        return AgentResult(
+            final_text="Root cause: the medstarhr instance stopped sending events "
+                       "at 2026-07-04T18:00Z due to a misconfigured retention policy.",
+            num_turns=5, is_error=False, tokens_used=500,
+            session_id="s", stop_reason="end_turn",
+        )
+
+
+async def test_investigation_report_only_completes_as_done(bare_repo, tmp_path, store):
+    """An investigation task that produces findings but no file changes → DONE."""
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, ReportOnlyBackend(), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("investigate data drop", repo_path=str(bare_repo),
+                 kind="investigation")
+    t.acceptance_criteria = ["identify root cause of data drop"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.DONE, f"expected DONE, got {outcome.status}"
+    assert "report-only" in outcome.detail
+    # Findings stored in task context
+    refreshed = await store.find_task(t.id)
+    assert "findings" in (refreshed.context or {})
+    assert "medstarhr" in refreshed.context["findings"]
+    # Attempt marked succeeded, not failed
+    attempts = await store.list_attempts(t.id)
+    assert attempts[-1]["status"] == "succeeded"
+    # investigation_report event emitted
+    kinds = [e["kind"] for e in events]
+    assert "investigation_report" in kinds
+
+
+async def test_investigation_with_code_changes_follows_normal_path(bare_repo, tmp_path, store):
+    """An investigation that also fixes the bug should follow the normal commit→PR flow."""
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\n"
+            "def mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None))
+    t = Task.new("investigate and fix bug", repo_path=str(bare_repo),
+                 kind="investigation")
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    # Should follow normal PR flow, not the report-only path
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert outcome.pr_url and "no-human/" in outcome.pr_url
+
+
+async def test_non_investigation_no_changes_still_fails(bare_repo, tmp_path, store):
+    """A feature task with no file changes should still FAIL (not get the report path)."""
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, ReportOnlyBackend(), SlackNotifier(None))
+    t = Task.new("add feature", repo_path=str(bare_repo), kind="feature")
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    # After exhausting max_attempts with no changes, the orchestrator escalates.
+    assert outcome.status in (TaskStatus.FAILED, TaskStatus.ESCALATED)
+
+
+# --------------------------------------------------------------------------- #
+# env_setup / env_vars / env_teardown                                          #
+# --------------------------------------------------------------------------- #
+
+async def test_env_vars_injected_during_agent_run(bare_repo, tmp_path, store):
+    """env_vars in task.config are visible to the agent and restored after."""
+    import os
+    sentinel_key = "_NH_TEST_ENV_SENTINEL"
+    assert sentinel_key not in os.environ  # clean slate
+
+    captured = {}
+
+    class EnvCapturingBackend:
+        async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                      on_event=None, supervisor_hook=None, **kwargs):
+            captured["val"] = os.environ.get(sentinel_key)
+            # Produce a file change so the task doesn't fail.
+            (cwd / "calc.py").write_text(
+                "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+            (cwd / "test_calc.py").write_text(
+                "from calc import add, mul\n\n"
+                "def test_add():\n    assert add(1, 2) == 3\n\n"
+                "def test_mul():\n    assert mul(2, 3) == 6\n")
+            return AgentResult(final_text="done", num_turns=2, is_error=False,
+                               tokens_used=100, session_id="s", stop_reason="end_turn")
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, EnvCapturingBackend(), SlackNotifier(None))
+    t = Task.new("test env", repo_path=str(bare_repo))
+    t.config = {"env_vars": {sentinel_key: "hello_nh"}}
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert captured["val"] == "hello_nh"
+    # Cleaned up after
+    assert sentinel_key not in os.environ
+
+
+async def test_env_setup_failure_aborts_attempt(bare_repo, tmp_path, store):
+    """A failing env_setup command should abort the attempt before the agent runs."""
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("test setup fail", repo_path=str(bare_repo))
+    t.config = {"env_setup": ["exit 1"]}
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    # Should fail/escalate due to setup failure
+    assert outcome.status in (TaskStatus.FAILED, TaskStatus.ESCALATED)
+    kinds = [e["kind"] for e in events]
+    assert "env_setup_failed" in kinds
+
+
+# --------------------------------------------------------------------------- #
+# Subagent materialization                                                     #
+# --------------------------------------------------------------------------- #
+
+async def test_subagents_materialized_before_agent_run(bare_repo, tmp_path, store):
+    """Built-in subagent .md files are written to .claude/agents/ before the agent runs."""
+    agents_dir_existed = {}
+
+    class CheckingBackend:
+        async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                      on_event=None, supervisor_hook=None, **kwargs):
+            # Check that subagent files exist DURING the agent run.
+            agents_dir = cwd / ".claude" / "agents"
+            agents_dir_existed["exists"] = agents_dir.exists()
+            agents_dir_existed["researcher"] = (agents_dir / "no_human_researcher.md").exists()
+            # Produce file changes so the task completes.
+            (cwd / "calc.py").write_text(
+                "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+            (cwd / "test_calc.py").write_text(
+                "from calc import add, mul\n\n"
+                "def test_add():\n    assert add(1, 2) == 3\n\n"
+                "def test_mul():\n    assert mul(2, 3) == 6\n")
+            return AgentResult(final_text="done", num_turns=2, is_error=False,
+                               tokens_used=100, session_id="s", stop_reason="end_turn")
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, CheckingBackend(), SlackNotifier(None))
+    t = Task.new("test subagents", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert agents_dir_existed.get("exists"), ".claude/agents/ dir not created"
+    assert agents_dir_existed.get("researcher"), "no_human_researcher.md not materialized"
+
+    # Verify the file content is valid YAML frontmatter + instructions.
+    researcher_md = (bare_repo / ".claude" / "agents" / "no_human_researcher.md").read_text()
+    assert "name: no_human_researcher" in researcher_md
+    assert "NEVER edit files" in researcher_md
+
+
+# --------------------------------------------------------------------------- #
+# Verify skill materialization                                                 #
+# --------------------------------------------------------------------------- #
+
+async def test_verify_skill_materialized_with_test_cmd(bare_repo, tmp_path, store):
+    """When a confirmed profile exists, a verify skill with the test_cmd is materialized."""
+    from no_human.profile import ProjectProfile
+    skill_found = {}
+
+    class SkillCheckingBackend:
+        async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                      on_event=None, supervisor_hook=None, **kwargs):
+            skill_path = cwd / ".claude" / "skills" / "no_human_verify" / "SKILL.md"
+            skill_found["exists"] = skill_path.exists()
+            if skill_path.exists():
+                skill_found["content"] = skill_path.read_text()
+            (cwd / "calc.py").write_text(
+                "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+            (cwd / "test_calc.py").write_text(
+                "from calc import add, mul\n\n"
+                "def test_add():\n    assert add(1, 2) == 3\n\n"
+                "def test_mul():\n    assert mul(2, 3) == 6\n")
+            return AgentResult(final_text="done", num_turns=2, is_error=False,
+                               tokens_used=100, session_id="s", stop_reason="end_turn")
+
+    marker = bare_repo / ".verify_skill_ran"
+    prof = ProjectProfile(
+        repo_path=str(bare_repo), ecosystem="custom",
+        test_cmd=f"sh -c 'echo ran > {marker}; exit 0'",
+        derived_from=["test"], proven={"test_cmd": True}, confirmed=True,
+    )
+    await store.upsert_profile(prof)
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, SkillCheckingBackend(), SlackNotifier(None))
+    t = Task.new("test verify skill", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert skill_found.get("exists"), "verify skill not materialized"
+    assert "echo ran" in skill_found["content"]
+    assert "proven" in skill_found["content"].lower()
+
+
+# --------------------------------------------------------------------------- #
+# Compact instructions materialization                                         #
+# --------------------------------------------------------------------------- #
+
+async def test_compact_instructions_materialized(bare_repo, tmp_path, store):
+    """Compact instructions (.claude/instructions.md) are written before the agent runs."""
+    from no_human.profile import ProjectProfile
+    instructions_found = {}
+
+    class InstructionsCheckingBackend:
+        async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                      on_event=None, supervisor_hook=None, **kwargs):
+            inst_path = cwd / ".claude" / "instructions.md"
+            instructions_found["exists"] = inst_path.exists()
+            if inst_path.exists():
+                instructions_found["content"] = inst_path.read_text()
+            (cwd / "calc.py").write_text(
+                "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+            (cwd / "test_calc.py").write_text(
+                "from calc import add, mul\n\n"
+                "def test_add():\n    assert add(1, 2) == 3\n\n"
+                "def test_mul():\n    assert mul(2, 3) == 6\n")
+            return AgentResult(final_text="done", num_turns=2, is_error=False,
+                               tokens_used=100, session_id="s", stop_reason="end_turn")
+
+    marker = bare_repo / ".inst_test_ran"
+    prof = ProjectProfile(
+        repo_path=str(bare_repo), ecosystem="python",
+        test_cmd=f"sh -c 'echo ran > {marker}; exit 0'",
+        derived_from=["test"], proven={"test_cmd": True}, confirmed=True,
+    )
+    await store.upsert_profile(prof)
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, InstructionsCheckingBackend(), SlackNotifier(None))
+    t = Task.new("test instructions", repo_path=str(bare_repo), kind="investigation")
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert instructions_found.get("exists"), ".claude/instructions.md not created"
+    content = instructions_found["content"]
+    assert "python" in content.lower()
+    assert "INVESTIGATION" in content.upper()

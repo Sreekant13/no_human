@@ -66,10 +66,14 @@ class Store:
         wanted = {
             "kind": "TEXT DEFAULT 'feature'",
             "linked_repos": "TEXT",  # JSON list of additional repo paths
+            "parent_id": "TEXT",  # LeadAgent: compound task sub-task linkage
         }
         for col, decl in wanted.items():
             if col not in existing:
                 await self.db.execute(f"ALTER TABLE tasks ADD COLUMN {col} {decl}")
+        await self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id)"
+        )
         # Phase 7d: cache metric columns on attempts (validates Phase 2a caching).
         cur2 = await self.db.execute("PRAGMA table_info(attempts)")
         att_existing = {row["name"] for row in await cur2.fetchall()}
@@ -164,7 +168,7 @@ class Store:
                  external_id=:external_id, source=:source, title=:title,
                  description=:description, requirements=:requirements,
                  acceptance_criteria=:acceptance_criteria, repo_path=:repo_path,
-                 kind=:kind,
+                 kind=:kind, parent_id=:parent_id,
                  status=:status, blocker=:blocker, wake_check_at=:wake_check_at,
                  priority=:priority, context=:context, plan=:plan, config=:config,
                  updated_at=:updated_at
@@ -173,6 +177,22 @@ class Store:
         )
         await self.db.commit()
         return task
+
+    async def list_subtasks(self, parent_id: str) -> list[Task]:
+        """Return all sub-tasks of a compound parent task."""
+        cur = await self.db.execute(
+            "SELECT * FROM tasks WHERE parent_id = ? ORDER BY created_at",
+            (parent_id,),
+        )
+        rows = await cur.fetchall()
+        return [Task.from_row(dict(r)) for r in rows]
+
+    async def count_subtasks(self, parent_id: str) -> int:
+        cur = await self.db.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE parent_id = ?", (parent_id,)
+        )
+        row = await cur.fetchone()
+        return int(row["n"]) if row else 0
 
     # ---------------------------- attempts --------------------------------- #
 

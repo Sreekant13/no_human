@@ -1,0 +1,381 @@
+"""LeadAgent: decomposition, DAG validation, sub-task lifecycle, and parsing."""
+
+import json
+
+import pytest
+
+from no_human.core.db import Store
+from no_human.core.lead_agent import DecompositionError, LeadAgent
+from no_human.core.orchestrator import TaskOutcome, _parse_decomposition
+from no_human.core.task import Task, TaskStatus
+
+
+@pytest.fixture
+async def store(tmp_path):
+    s = await Store(tmp_path / "t.db").connect()
+    yield s
+    await s.close()
+
+
+# ------------------------------------------------------------------ #
+# _parse_decomposition                                                #
+# ------------------------------------------------------------------ #
+
+def test_parse_decomposition_valid():
+    plan = (
+        "Some plan text...\n"
+        "DECOMPOSE_PLAN_START\n"
+        "```json\n"
+        '{"decompose": true, "justification": "complex", '
+        '"subtasks": [{"title": "A", "kind": "investigation"}]}\n'
+        "```\n"
+        "DECOMPOSE_PLAN_END\n"
+    )
+    result = _parse_decomposition(plan)
+    assert result is not None
+    assert result["decompose"] is True
+    assert len(result["subtasks"]) == 1
+    assert result["subtasks"][0]["title"] == "A"
+
+
+def test_parse_decomposition_no_markers():
+    assert _parse_decomposition("just a normal plan") is None
+
+
+def test_parse_decomposition_invalid_json():
+    plan = (
+        "DECOMPOSE_PLAN_START\n"
+        "```json\n"
+        "{invalid json}\n"
+        "```\n"
+        "DECOMPOSE_PLAN_END\n"
+    )
+    assert _parse_decomposition(plan) is None
+
+
+def test_parse_decomposition_empty_subtasks():
+    plan = (
+        "DECOMPOSE_PLAN_START\n"
+        "```json\n"
+        '{"decompose": true, "subtasks": []}\n'
+        "```\n"
+        "DECOMPOSE_PLAN_END\n"
+    )
+    assert _parse_decomposition(plan) is None
+
+
+def test_parse_decomposition_no_decompose_flag():
+    plan = (
+        "DECOMPOSE_PLAN_START\n"
+        "```json\n"
+        '{"decompose": false, "subtasks": [{"title": "A"}]}\n'
+        "```\n"
+        "DECOMPOSE_PLAN_END\n"
+    )
+    assert _parse_decomposition(plan) is None
+
+
+# ------------------------------------------------------------------ #
+# DAG validation                                                      #
+# ------------------------------------------------------------------ #
+
+def test_dag_valid():
+    specs = [
+        {"title": "A", "depends_on": []},
+        {"title": "B", "depends_on": ["A"]},
+        {"title": "C", "depends_on": ["A", "B"]},
+    ]
+    LeadAgent._validate_dag(specs)  # should not raise
+
+
+def test_dag_cycle_detected():
+    specs = [
+        {"title": "A", "depends_on": ["C"]},
+        {"title": "B", "depends_on": ["A"]},
+        {"title": "C", "depends_on": ["B"]},
+    ]
+    with pytest.raises(DecompositionError, match="cycle"):
+        LeadAgent._validate_dag(specs)
+
+
+def test_dag_unknown_dependency():
+    specs = [
+        {"title": "A", "depends_on": ["Z"]},
+    ]
+    with pytest.raises(DecompositionError, match="unknown"):
+        LeadAgent._validate_dag(specs)
+
+
+def test_dag_self_cycle():
+    specs = [
+        {"title": "A", "depends_on": ["A"]},
+    ]
+    with pytest.raises(DecompositionError, match="cycle"):
+        LeadAgent._validate_dag(specs)
+
+
+# ------------------------------------------------------------------ #
+# decompose()                                                         #
+# ------------------------------------------------------------------ #
+
+async def test_decompose_creates_subtasks(store):
+    parent = Task.new("upgrade everything", repo_path="/tmp/r")
+    await store.create_task(parent)
+
+    plan = {
+        "decompose": True,
+        "subtasks": [
+            {"title": "Investigate", "kind": "investigation",
+             "description": "find stuff", "acceptance_criteria": ["found it"]},
+            {"title": "Implement", "kind": "feature",
+             "description": "do stuff", "depends_on": ["Investigate"]},
+        ],
+    }
+    lead = LeadAgent(store)
+    created = await lead.decompose(parent, plan)
+
+    assert len(created) == 2
+
+    # First sub-task: no deps → PENDING.
+    assert created[0].title == "Investigate"
+    assert created[0].kind == "investigation"
+    assert created[0].parent_id == parent.id
+    assert created[0].status == TaskStatus.PENDING
+    assert created[0].repo_path == parent.repo_path
+
+    # Second sub-task: has deps → BLOCKED.
+    assert created[1].title == "Implement"
+    assert created[1].parent_id == parent.id
+    assert created[1].status == TaskStatus.BLOCKED
+    assert created[1].blocker is not None
+    assert created[1].blocker["category"] == "DEPENDENCY_WAIT"
+
+    # Verify DB persistence.
+    subs = await store.list_subtasks(parent.id)
+    assert len(subs) == 2
+
+
+async def test_decompose_inherits_backend(store):
+    parent = Task.new("big task", repo_path="/tmp/r")
+    parent.config = {"backend": "devin"}
+    await store.create_task(parent)
+
+    plan = {
+        "decompose": True,
+        "subtasks": [{"title": "sub", "kind": "feature"}],
+    }
+    lead = LeadAgent(store)
+    created = await lead.decompose(parent, plan)
+    assert created[0].config.get("backend") == "devin"
+
+
+async def test_decompose_rejects_too_many_subtasks(store):
+    parent = Task.new("huge", repo_path="/tmp/r")
+    await store.create_task(parent)
+
+    plan = {
+        "decompose": True,
+        "subtasks": [{"title": f"sub-{i}", "kind": "feature"} for i in range(51)],
+    }
+    lead = LeadAgent(store)
+    with pytest.raises(DecompositionError, match="max"):
+        await lead.decompose(parent, plan)
+
+
+async def test_decompose_rejects_empty(store):
+    parent = Task.new("empty", repo_path="/tmp/r")
+    await store.create_task(parent)
+
+    lead = LeadAgent(store)
+    with pytest.raises(DecompositionError, match="no subtasks"):
+        await lead.decompose(parent, {"decompose": True, "subtasks": []})
+
+
+async def test_decompose_rejects_missing_title(store):
+    parent = Task.new("no title sub", repo_path="/tmp/r")
+    await store.create_task(parent)
+
+    plan = {
+        "decompose": True,
+        "subtasks": [{"kind": "feature", "description": "missing title"}],
+    }
+    lead = LeadAgent(store)
+    with pytest.raises(DecompositionError, match="no title"):
+        await lead.decompose(parent, plan)
+
+
+# ------------------------------------------------------------------ #
+# _unblock_ready()                                                    #
+# ------------------------------------------------------------------ #
+
+async def test_unblock_ready_moves_to_pending(store):
+    parent = Task.new("parent", repo_path="/tmp/r")
+    await store.create_task(parent)
+
+    dep = Task.new("dep", repo_path="/tmp/r", parent_id=parent.id)
+    dep.status = TaskStatus.DONE
+    await store.create_task(dep)
+
+    blocked = Task.new("blocked", repo_path="/tmp/r", parent_id=parent.id)
+    blocked.status = TaskStatus.BLOCKED
+    blocked.blocker = {"category": "DEPENDENCY_WAIT",
+                       "wake_condition": "subtask_deps_met"}
+    blocked.context = {"depends_on_ids": [dep.id]}
+    await store.create_task(blocked)
+
+    lead = LeadAgent(store)
+    count = await lead._unblock_ready(parent.id)
+    assert count == 1
+
+    refreshed = await store.get_task(blocked.id)
+    assert refreshed.status == TaskStatus.PENDING
+    assert refreshed.blocker is None
+
+
+async def test_unblock_ready_keeps_blocked_when_deps_not_met(store):
+    parent = Task.new("parent", repo_path="/tmp/r")
+    await store.create_task(parent)
+
+    dep = Task.new("dep", repo_path="/tmp/r", parent_id=parent.id)
+    dep.status = TaskStatus.IMPLEMENTING
+    await store.create_task(dep)
+
+    blocked = Task.new("blocked", repo_path="/tmp/r", parent_id=parent.id)
+    blocked.status = TaskStatus.BLOCKED
+    blocked.blocker = {"category": "DEPENDENCY_WAIT",
+                       "wake_condition": "subtask_deps_met"}
+    blocked.context = {"depends_on_ids": [dep.id]}
+    await store.create_task(blocked)
+
+    lead = LeadAgent(store)
+    count = await lead._unblock_ready(parent.id)
+    assert count == 0
+
+    refreshed = await store.get_task(blocked.id)
+    assert refreshed.status == TaskStatus.BLOCKED
+
+
+# ------------------------------------------------------------------ #
+# parent_id round-trip                                                #
+# ------------------------------------------------------------------ #
+
+async def test_parent_id_roundtrip(store):
+    parent = Task.new("parent", repo_path="/tmp/r")
+    await store.create_task(parent)
+
+    child = Task.new("child", repo_path="/tmp/r", parent_id=parent.id)
+    await store.create_task(child)
+
+    got = await store.get_task(child.id)
+    assert got.parent_id == parent.id
+
+
+async def test_list_subtasks(store):
+    parent = Task.new("parent", repo_path="/tmp/r")
+    other = Task.new("other", repo_path="/tmp/r")
+    child1 = Task.new("c1", repo_path="/tmp/r", parent_id=parent.id)
+    child2 = Task.new("c2", repo_path="/tmp/r", parent_id=parent.id)
+    for t in [parent, other, child1, child2]:
+        await store.create_task(t)
+
+    subs = await store.list_subtasks(parent.id)
+    assert {s.id for s in subs} == {child1.id, child2.id}
+
+    count = await store.count_subtasks(parent.id)
+    assert count == 2
+
+    # Other task has no children.
+    assert await store.count_subtasks(other.id) == 0
+
+
+# ------------------------------------------------------------------ #
+# Quality gate                                                        #
+# ------------------------------------------------------------------ #
+
+async def test_quality_gate_passes_when_tests_succeed(store, tmp_path):
+    """Quality gate runs the repo's test command; on pass → DONE."""
+    import subprocess
+    repo = tmp_path / "qg_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "u@e"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "u"], check=True, capture_output=True)
+    (repo / "f.py").write_text("x = 1\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+
+    from no_human.profile import ProjectProfile
+    prof = ProjectProfile(
+        repo_path=str(repo), ecosystem="custom",
+        test_cmd="exit 0",
+        derived_from=["test"], proven={"test_cmd": True}, confirmed=True,
+    )
+    await store.upsert_profile(prof)
+
+    parent = Task.new("compound", repo_path=str(repo))
+    await store.create_task(parent)
+
+    sub = Task.new("sub", repo_path=str(repo), parent_id=parent.id)
+    sub.status = TaskStatus.DONE
+    await store.create_task(sub)
+
+    events = []
+    config = {"lead_agent": {"quality_gate": True, "poll_interval": 0.01}}
+    lead = LeadAgent(store, config=config, emit=lambda kind, text, **kw: events.append(kind))
+    outcome = await lead.drive(parent)
+
+    assert outcome.status is TaskStatus.DONE
+    assert "quality_gate" in events
+
+
+async def test_quality_gate_escalates_on_test_failure(store, tmp_path):
+    """Quality gate escalates when integration tests fail."""
+    import subprocess
+    repo = tmp_path / "qg_repo_fail"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "u@e"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "u"], check=True, capture_output=True)
+    (repo / "f.py").write_text("x = 1\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+
+    from no_human.profile import ProjectProfile
+    prof = ProjectProfile(
+        repo_path=str(repo), ecosystem="custom",
+        test_cmd="echo 'FAIL: assertion error'; exit 1",
+        derived_from=["test"], proven={"test_cmd": True}, confirmed=True,
+    )
+    await store.upsert_profile(prof)
+
+    parent = Task.new("compound fail", repo_path=str(repo))
+    await store.create_task(parent)
+
+    sub = Task.new("sub", repo_path=str(repo), parent_id=parent.id)
+    sub.status = TaskStatus.DONE
+    await store.create_task(sub)
+
+    events = []
+    config = {"lead_agent": {"quality_gate": True, "poll_interval": 0.01}}
+    lead = LeadAgent(store, config=config, emit=lambda kind, text, **kw: events.append(kind))
+    outcome = await lead.drive(parent)
+
+    assert outcome.status is TaskStatus.ESCALATED
+    assert "quality_gate_failed" in events
+
+
+async def test_quality_gate_skipped_when_disabled(store):
+    """Quality gate is off by default — all-done → DONE without tests."""
+    parent = Task.new("compound default", repo_path="/tmp/r")
+    await store.create_task(parent)
+
+    sub = Task.new("sub", repo_path="/tmp/r", parent_id=parent.id)
+    sub.status = TaskStatus.DONE
+    await store.create_task(sub)
+
+    events = []
+    lead = LeadAgent(store, emit=lambda kind, text, **kw: events.append(kind))
+    outcome = await lead.drive(parent)
+
+    assert outcome.status is TaskStatus.DONE
+    assert "quality_gate" not in events

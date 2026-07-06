@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from ..agent.claude_backend import AgentResult, ClaudeBackend
+from ..agent.claude_backend import AgentResult
 from ..review.selfcheck import ChecklistItem
 from ..core.task import Task
 
@@ -344,13 +344,17 @@ class AdversarialReviewer:
         self,
         *,
         model: str = "claude-sonnet-4-6",
-        backend: ClaudeBackend | None = None,
+        backend: Any | None = None,
         on_event: Callable | None = None,
     ):
-        self._backend = backend or ClaudeBackend(
-            model=model,
-            readonly=True,
-        )
+        if backend is not None:
+            self._backend = backend
+        else:
+            from ..agent.claude_backend import ClaudeBackend
+            self._backend = ClaudeBackend(
+                model=model,
+                readonly=True,
+            )
         self._on_event = on_event
 
     async def review(

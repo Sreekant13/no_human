@@ -21,7 +21,7 @@ const STATUS_PILL = {
 export default function SlideOver({ taskId, onClose, refreshKey = 0 }) {
   const [task, setTask] = useState(null);
   const [diff, setDiff] = useState("");
-  const [tab, setTab] = useState("activity");
+  const [tab, setTab] = useState("system");
   const [busy, setBusy] = useState(false);
   const [sbOpen, setSbOpen] = useState(false);
   const [sbMsg, setSbMsg] = useState("");
@@ -164,7 +164,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0 }) {
 
         {/* tabs */}
         <div className="so-tabs">
-          {["activity", "details", "review", "diff", "attempts"].map((t) => (
+          {["system", "activity", "details", "review", "diff", "attempts"].map((t) => (
             <button
               key={t}
               className={`so-tab${tab === t ? " active" : ""}`}
@@ -178,6 +178,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0 }) {
         {/* body */}
         <div className="so-body">
           {flash && <FlashBanner msg={flash} onDismiss={() => setFlash(null)} />}
+          {tab === "system"   && <SystemTab taskId={taskId} task={task} isActive={isActive} />}
           {tab === "activity" && <ActivityTab taskId={taskId} isActive={isActive} />}
           {tab === "details"  && <DetailsTab task={task} />}
           {tab === "review"   && <ReviewTab task={task} diff={diff} />}
@@ -306,11 +307,426 @@ const SOURCE_BY_KIND = {
   review_start: "reviewer", review: "reviewer", review_error: "reviewer",
   tamper: "reviewer",
   tool_use: "agent", agent_text: "agent",
+  subagent_start: "agent", subagent_progress: "agent", subagent_done: "agent",
 };
 function eventSource(e) {
-  return e.source || SOURCE_BY_KIND[e.kind] || "worker";
+  const src = e.source || SOURCE_BY_KIND[e.kind] || "worker";
+  // Backend emits source:"orchestrator" but the Orchestrator node id is "worker".
+  if (src === "orchestrator") return "worker";
+  return src;
 }
-const ROLE_LABEL = { worker: "Worker", supervisor: "Supervisor", reviewer: "Reviewer", agent: "Agent" };
+const ROLE_LABEL = { worker: "Orchestrator", supervisor: "Supervisor", reviewer: "Reviewer", agent: "Worker" };
+
+// Discover subagents from events at render time
+function discoverSubagents(events) {
+  const subs = new Map(); // task_id → { id, label, type, desc, status }
+  for (const e of events) {
+    if (e.kind === "subagent_start") {
+      const tid = e.task_id;
+      if (tid && !subs.has(tid)) {
+        subs.set(tid, {
+          id: `sub-${tid}`,
+          label: (e.text || "Subagent").slice(0, 40),
+          type: (e.task_type || "SUBAGENT").toUpperCase(),
+          icon: "◇",
+          desc: e.text || "Spawned by worker",
+          color: "var(--agent-agent)",
+          subagentTaskId: tid,
+          status: "active",
+        });
+      }
+    } else if (e.kind === "subagent_done") {
+      const tid = e.task_id;
+      const sub = subs.get(tid);
+      if (sub) sub.status = e.status === "completed" ? "done" : "error";
+    }
+  }
+  return [...subs.values()];
+}
+
+// ── Agent definitions for the system diagram ───────────────────────────────
+const AGENTS = [
+  { id: "worker",     label: "Orchestrator", type: "ORCHESTRATOR", icon: "⚙",  desc: "Drives the task pipeline: context, planning, attempts, review",
+    color: "var(--agent-worker)" },
+  { id: "agent",      label: "Worker",       type: "AGENT",        icon: "⌨",  desc: "The Claude session that reads & edits code",
+    color: "var(--agent-agent)" },
+  { id: "supervisor", label: "Supervisor",   type: "MONITOR",      icon: "◉",  desc: "Course-corrects the worker every N tool calls",
+    color: "var(--agent-supervisor)" },
+  { id: "reviewer",   label: "Reviewer",     type: "QUALITY GATE", icon: "✓",  desc: "Adversarial review, tests, tamper check",
+    color: "var(--agent-reviewer)" },
+];
+
+function deriveAgentStatus(events, agentId) {
+  const agentEvents = events.filter(e => eventSource(e) === agentId);
+  if (agentEvents.length === 0) return { status: "idle", count: 0, lastText: "" };
+  const last = agentEvents[agentEvents.length - 1];
+  const hasError = agentEvents.some(e => e.kind === "failed" || e.kind === "attempt_failed" || e.kind === "agent_error" || e.kind === "review_error");
+  const hasDone = events.some(e => e.kind === "state" && /done/i.test(e.text));
+  const hasReviewPass = agentEvents.some(e => e.kind === "review" && /pass/i.test(e.text));
+  let status = "active";
+  if (hasDone || hasReviewPass) status = "done";
+  if (hasError && !hasDone) status = "error";
+  return { status, count: agentEvents.length, lastText: last.text || "" };
+}
+
+function activeConnection(events) {
+  if (events.length === 0) return null;
+  const src = eventSource(events[events.length - 1]);
+  const map = { worker: "worker-agent", agent: "agent-supervisor", supervisor: "supervisor-agent", reviewer: "reviewer-worker" };
+  return map[src] || null;
+}
+
+// Parse URLs in text and return React elements with clickable links
+function linkify(text) {
+  if (!text) return text;
+  const urlRe = /(https?:\/\/[^\s<>)"',]+)/g;
+  const urlTest = /^https?:\/\//;
+  const parts = text.split(urlRe);
+  if (parts.length === 1) return text;
+  return parts.map((part, i) =>
+    urlTest.test(part)
+      ? <a key={i} href={part} target="_blank" rel="noreferrer">{part.length > 80 ? part.slice(0, 77) + "…" : part}</a>
+      : part
+  );
+}
+
+// Render a single event with rich formatting
+function RichEvent({ event, elapsed, role }) {
+  const kind = event.kind;
+  const text = event.text || "";
+
+  let body;
+  if (kind === "tool_use") {
+    const toolName = event.tool_name || text.split(" ")[0] || "tool";
+    const args = event.tool_input
+      ? Object.entries(event.tool_input).map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`).join(", ")
+      : text.replace(toolName, "").trim();
+    body = (
+      <div className="rich-tool">
+        <span className="rich-tool-name">{toolName}</span>
+        <span className="rich-tool-args" title={args}>{args}</span>
+      </div>
+    );
+  } else if (kind === "state") {
+    body = (
+      <div className="rich-status-change">
+        <span className="rich-status-arrow">→</span>
+        <span className="rich-status-badge">{text}</span>
+      </div>
+    );
+  } else if (kind === "commit") {
+    const hashMatch = text.match(/([a-f0-9]{7,40})/);
+    body = (
+      <div className="rich-commit">
+        {hashMatch && <span className="rich-commit-hash">{hashMatch[1].slice(0, 7)}</span>}
+        <span className="rich-commit-msg">{linkify(text.replace(hashMatch?.[0] || "", "").trim())}</span>
+      </div>
+    );
+  } else if (kind === "review") {
+    const passed = /pass/i.test(text);
+    body = (
+      <div className="rich-review-verdict">
+        <span className={`rich-verdict-chip ${passed ? "pass" : "fail"}`}>
+          {passed ? "PASSED" : "FAILED"}
+        </span>
+        <span className="rich-body">{linkify(text)}</span>
+      </div>
+    );
+  } else if (kind === "tests" || kind === "lint" || kind === "quality_gate" || kind === "quality_gate_failed") {
+    const passed = kind !== "quality_gate_failed" && (/pass/i.test(text) || /clean/i.test(text));
+    const label = kind.startsWith("quality_gate") ? "QUALITY GATE" : kind === "tests" ? "TESTS" : "LINT";
+    body = (
+      <div className="rich-review-verdict">
+        <span className={`rich-verdict-chip ${passed ? "pass" : "fail"}`}>
+          {label} {passed ? "PASS" : "FAIL"}
+        </span>
+        <span className="rich-body">{linkify(text)}</span>
+      </div>
+    );
+  } else if (kind === "env_setup_failed") {
+    body = (
+      <div className="rich-review-verdict">
+        <span className="rich-verdict-chip fail">ENV SETUP FAILED</span>
+        <span className="rich-body">{linkify(text)}</span>
+      </div>
+    );
+  } else if (kind === "agent_text") {
+    body = <div className="rich-agent-prose">{linkify(text)}</div>;
+  } else {
+    body = <span className="rich-body">{linkify(text)}</span>;
+  }
+
+  return (
+    <div className={`activity-event-rich role-${role} ak-${kind}`}>
+      <div className="rich-meta">
+        <span className="rich-ts">{fmtTs(event.ts)}</span>
+        <span className="rich-role">{ROLE_LABEL[role]}</span>
+        <span className={`rich-kind ak-${kind}`}>{eventLabel(kind)}</span>
+        {elapsed > 2 && <span className="rich-elapsed">+{fmtDuration(elapsed)}</span>}
+      </div>
+      {body}
+    </div>
+  );
+}
+
+// A single node card in the tree diagram
+function AgentNode({ agent, state, isActive, onClick }) {
+  const running = isActive && state.status === "active";
+  let cls = "sys-node";
+  if (running) cls += " active-node";
+  if (state.status === "done") cls += " done-node";
+  if (state.status === "error") cls += " error-node";
+  return (
+    <div
+      className={cls}
+      style={{ "--node-color": agent.color }}
+      onClick={onClick}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && onClick()}
+      title={`Click to view ${agent.label} logs`}
+    >
+      {running && <div className="sys-node-running-indicator"><span className="sys-node-running-dot" /><span>Running</span></div>}
+      <div className="sys-node-header">
+        <div className="sys-node-icon">{agent.icon}</div>
+        <span className="sys-node-type">{agent.type}</span>
+      </div>
+      <div className="sys-node-name">{agent.label}</div>
+      <div className="sys-node-body">
+        <div className="sys-node-meta">
+          <span className="sys-node-meta-label">Status:</span>
+          <span className={`sys-node-status-badge s-${state.status}`}>{state.status}</span>
+          <span className="sys-node-events-count">{state.count} events</span>
+        </div>
+        {state.lastText && <div className="sys-node-last-text" title={state.lastText}>{state.lastText}</div>}
+      </div>
+    </div>
+  );
+}
+
+// Agent log modal — opens when clicking a node
+function AgentLogModal({ agent, events, onClose }) {
+  const endRef = useRef(null);
+  const agentEvents = agent.subagentTaskId
+    ? events.filter(e => (e.kind === "subagent_start" || e.kind === "subagent_progress" || e.kind === "subagent_done") && e.task_id === agent.subagentTaskId)
+    : events.filter(e => eventSource(e) === agent.id);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [agentEvents.length]);
+
+  useEffect(() => {
+    function onKey(e) { if (e.key === "Escape") onClose(); }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const elapsed = agentEvents.length > 1 ? agentEvents[agentEvents.length - 1].ts - agentEvents[0].ts : 0;
+
+  return (
+    <div className="sys-modal-backdrop" onClick={onClose}>
+      <div className="sys-modal" style={{ "--node-color": agent.color }} onClick={(e) => e.stopPropagation()}>
+        <div className="sys-modal-header">
+          <div className="sys-modal-icon">{agent.icon}</div>
+          <div className="sys-modal-titles">
+            <div className="sys-modal-type">{agent.type}</div>
+            <div className="sys-modal-name">{agent.label}</div>
+          </div>
+          <button className="sys-modal-close" onClick={onClose} aria-label="Close">✕</button>
+        </div>
+        <div className="sys-modal-stats">
+          <div className="sys-modal-stat">
+            Events: <span className="sys-modal-stat-val">{agentEvents.length}</span>
+          </div>
+          {elapsed > 0 && (
+            <div className="sys-modal-stat">
+              Duration: <span className="sys-modal-stat-val">{fmtDuration(elapsed)}</span>
+            </div>
+          )}
+          <div className="sys-modal-stat">
+            {agent.desc}
+          </div>
+        </div>
+        <div className="sys-modal-log">
+          {agentEvents.length === 0 ? (
+            <div className="sys-modal-empty">No events from this agent yet.</div>
+          ) : (
+            agentEvents.map((e, i) => {
+              const prev = i > 0 ? agentEvents[i - 1] : null;
+              const dt = prev ? e.ts - prev.ts : 0;
+              return <RichEvent key={i} event={e} elapsed={dt} role={eventSource(e)} />;
+            })
+          )}
+          <div ref={endRef} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SystemTab({ taskId, task, isActive }) {
+  const [events, setEvents] = useState([]);
+  const [modalAgent, setModalAgent] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (isActive) {
+      let seedTs = 0;
+      fetchTaskEvents(taskId).then((evts) => {
+        if (cancelled) return;
+        setEvents(evts);
+        seedTs = evts.length > 0 ? Math.max(...evts.map(e => e.ts || 0)) : 0;
+      }).catch(() => {});
+      const es = connectTaskSSE(taskId,
+        (evt) => {
+          if (cancelled) return;
+          if ((evt.ts || 0) > seedTs) {
+            setEvents((prev) => [...prev, evt]);
+          }
+        },
+        () => {},
+      );
+      return () => { cancelled = true; es.close(); };
+    }
+    async function poll() {
+      while (!cancelled) {
+        try {
+          const evts = await fetchTaskEvents(taskId);
+          if (!cancelled) setEvents(evts);
+        } catch { /* ignore */ }
+        await new Promise((r) => setTimeout(r, 10000));
+      }
+    }
+    poll();
+    return () => { cancelled = true; };
+  }, [taskId, isActive]);
+
+  // Derive per-agent status
+  const agentStates = {};
+  for (const a of AGENTS) {
+    agentStates[a.id] = deriveAgentStatus(events, a.id);
+  }
+
+  // Discover dynamically-spawned subagents from events
+  const subagents = discoverSubagents(events);
+  // Subagent events are attributed to the worker (agent) — derive their
+  // status from the discovery function instead of deriveAgentStatus.
+  for (const sub of subagents) {
+    const subEvents = events.filter(e =>
+      (e.kind === "subagent_start" || e.kind === "subagent_progress" || e.kind === "subagent_done")
+      && e.task_id === sub.subagentTaskId
+    );
+    agentStates[sub.id] = { status: sub.status, count: subEvents.length, lastText: subEvents.length > 0 ? subEvents[subEvents.length - 1].text || "" : "" };
+  }
+
+  const activeConn = isActive ? activeConnection(events) : null;
+  const totalElapsed = events.length > 1 ? events[events.length - 1].ts - events[0].ts : 0;
+
+  // Tree layout:
+  //   Row 0: Orchestrator — centered
+  //   Row 1: Worker (left) + Reviewer (right)
+  //   Row 2: Supervisor (below Worker)
+  //   Row 3: Dynamic subagents (below Worker, if any spawned)
+  const worker     = AGENTS.find(a => a.id === "worker");
+  const agent      = AGENTS.find(a => a.id === "agent");
+  const supervisor = AGENTS.find(a => a.id === "supervisor");
+  const reviewer   = AGENTS.find(a => a.id === "reviewer");
+
+  return (
+    <div className="sys-view">
+      <div className="sys-tree">
+        {/* Row 0: Worker */}
+        <div className="sys-tree-row">
+          <AgentNode agent={worker} state={agentStates.worker} isActive={isActive} onClick={() => setModalAgent(worker)} />
+        </div>
+
+        {/* Connection: Worker → Agent + Worker → Reviewer */}
+        <div className="sys-tree-lines">
+          <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
+            {/* Worker down-center to split */}
+            <path d="M 340 0 L 340 20" className={`sys-tree-line${activeConn === "worker-agent" ? " active" : ""}`} />
+            {/* Split left to Agent */}
+            <path d="M 340 20 C 340 40, 200 40, 200 48" className={`sys-tree-line${activeConn === "worker-agent" ? " active" : ""}`} />
+            <path d="M 340 20 C 340 40, 200 40, 200 48" className={`sys-tree-flow${activeConn === "worker-agent" ? " active" : ""}`} />
+            {/* Split right to Reviewer */}
+            <path d="M 340 20 C 340 40, 480 40, 480 48" className={`sys-tree-line${activeConn === "reviewer-worker" ? " active" : ""}`} />
+            <path d="M 340 20 C 340 40, 480 40, 480 48" className={`sys-tree-flow${activeConn === "reviewer-worker" ? " active" : ""}`} />
+          </svg>
+        </div>
+
+        {/* Row 1: Agent + Reviewer */}
+        <div className="sys-tree-row">
+          <AgentNode agent={agent} state={agentStates.agent} isActive={isActive} onClick={() => setModalAgent(agent)} />
+          <AgentNode agent={reviewer} state={agentStates.reviewer} isActive={isActive} onClick={() => setModalAgent(reviewer)} />
+        </div>
+
+        {/* Connection: Agent → Supervisor */}
+        <div className="sys-tree-lines">
+          <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
+            <path d="M 200 0 L 200 24 C 200 44, 280 44, 280 48" className={`sys-tree-line${activeConn === "agent-supervisor" || activeConn === "supervisor-agent" ? " active" : ""}`} />
+            <path d="M 200 0 L 200 24 C 200 44, 280 44, 280 48" className={`sys-tree-flow${activeConn === "agent-supervisor" ? " active" : ""}`} />
+          </svg>
+        </div>
+
+        {/* Row 2: Supervisor */}
+        <div className="sys-tree-row">
+          <AgentNode agent={supervisor} state={agentStates.supervisor} isActive={isActive} onClick={() => setModalAgent(supervisor)} />
+        </div>
+
+        {/* Row 3: Dynamic subagents spawned by the Worker */}
+        {subagents.length > 0 && (
+          <>
+            <div className="sys-tree-lines">
+              <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
+                <path d="M 200 0 L 200 48" className="sys-tree-line active" />
+                <path d="M 200 0 L 200 48" className="sys-tree-flow active" />
+              </svg>
+            </div>
+            <div className="sys-tree-row">
+              {subagents.map(sub => (
+                <AgentNode key={sub.id} agent={sub} state={agentStates[sub.id]} isActive={isActive} onClick={() => setModalAgent(sub)} />
+              ))}
+            </div>
+          </>
+        )}
+
+        {/* Summary stats */}
+        <div className="sys-summary">
+          <div className="sys-summary-item">
+            <span>Events:</span>
+            <span className="sys-summary-value">{events.length}</span>
+          </div>
+          {totalElapsed > 0 && (
+            <div className="sys-summary-item">
+              <span>Duration:</span>
+              <span className="sys-summary-value">{fmtDuration(totalElapsed)}</span>
+            </div>
+          )}
+          {task?.attempt_count > 0 && (
+            <div className="sys-summary-item">
+              <span>Attempt:</span>
+              <span className="sys-summary-value">#{task.attempt_count}</span>
+            </div>
+          )}
+          {events.length === 0 && (
+            <div className="sys-summary-item" style={{ color: 'var(--text-dim)' }}>
+              {isActive ? "Waiting for events…" : "No events recorded."}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Agent log modal */}
+      {modalAgent && (
+        <AgentLogModal
+          agent={modalAgent}
+          events={events}
+          onClose={() => setModalAgent(null)}
+        />
+      )}
+    </div>
+  );
+}
 
 
 function ActivityTab({ taskId, isActive }) {
@@ -371,10 +787,10 @@ function ActivityTab({ taskId, isActive }) {
   return (
     <div className="activity-feed">
       <div className="activity-legend">
-        <span className="al-role role-worker"><i />Worker — orchestrates</span>
-        <span className="al-role role-agent"><i />Agent — reads &amp; edits code</span>
-        <span className="al-role role-supervisor"><i />Supervisor — steers</span>
-        <span className="al-role role-reviewer"><i />Reviewer — gates</span>
+        <span className="al-role role-worker"><i />Orchestrator — drives pipeline</span>
+        <span className="al-role role-agent"><i />Worker — reads &amp; edits code</span>
+        <span className="al-role role-supervisor"><i />Supervisor — course-corrects</span>
+        <span className="al-role role-reviewer"><i />Reviewer — gates quality</span>
         {totalElapsed > 0 && (
           <span style={{ marginLeft: 'auto', fontSize: '0.7rem', color: 'var(--fg-dim)' }}>
             {events.length} events · {fmtDuration(totalElapsed)}
@@ -393,17 +809,7 @@ function ActivityTab({ taskId, isActive }) {
         {events.map((e, i) => {
           const elapsed = i > 0 ? e.ts - events[i - 1].ts : 0;
           const role = eventSource(e);
-          return (
-            <div key={i} className={`activity-event role-${role} ak-${e.kind}`}>
-              <div className="activity-meta">
-                <span className="activity-ts">{fmtTs(e.ts)}</span>
-                <span className="activity-role">{ROLE_LABEL[role]}</span>
-                <span className={`activity-kind ak-${e.kind}`}>{eventLabel(e.kind)}</span>
-                {elapsed > 2 && <span className="activity-elapsed">+{fmtDuration(elapsed)}</span>}
-              </div>
-              <span className="activity-text">{e.text}</span>
-            </div>
-          );
+          return <RichEvent key={i} event={e} elapsed={elapsed} role={role} />;
         })}
         <div ref={endRef} />
       </div>
@@ -441,6 +847,30 @@ const EVENT_LABELS = {
   tool_use: "Tool",
   agent_text: "Agent",
   supervisor_decision: "Supervisor",
+  // env setup/teardown (Item 2)
+  env_setup: "Env setup",
+  env_setup_failed: "Env setup failed",
+  env_teardown: "Env teardown",
+  // skills & subagents (Items 3, 4)
+  skills_materialized: "Skills loaded",
+  skills_loaded: "Skills",
+  // investigation report (Item 1)
+  investigation_report: "Investigation report",
+  // checkpoint & resume (existing, unlabelled)
+  checkpoint: "Checkpoint",
+  resume_wip: "Resume WIP",
+  // compound tasks / lead agent (Item 5)
+  decompose: "Decompose",
+  compound_done: "Compound done",
+  quality_gate: "Quality gate",
+  quality_gate_failed: "Quality gate failed",
+  unblock: "Unblock",
+  retry: "Retry",
+  escalate: "Escalate",
+  // subagent events
+  subagent_start: "Subagent",
+  subagent_progress: "Subagent",
+  subagent_done: "Subagent done",
 };
 
 function eventLabel(kind) {
@@ -455,6 +885,7 @@ function fmtDuration(secs) {
 
 function DetailsTab({ task }) {
   if (!task) return <div className="so-diff-empty">Loading…</div>;
+  const findings = task.context?.findings;
   return (
     <>
       {task.description && (
@@ -471,6 +902,12 @@ function DetailsTab({ task }) {
               <li key={i}>{c}</li>
             ))}
           </ul>
+        </section>
+      )}
+      {findings && (
+        <section>
+          <div className="so-section-label">Investigation findings</div>
+          <pre className="so-findings">{findings}</pre>
         </section>
       )}
       {task.blocker && <BlockerSection blocker={task.blocker} />}
