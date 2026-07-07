@@ -43,6 +43,28 @@ def test_parse_plan_files_empty_section():
     assert parse_plan_files(plan) == set()
 
 
+def test_parse_plan_files_table_and_extensionless():
+    """Regression: the planner sometimes emits this section as a markdown
+    table, and extension-less filenames (Jenkinsfile, Makefile) must not be
+    dropped — this was silently missing `Jenkinsfile` entirely, causing
+    every legitimate edit to it to fire a false [SCOPE] warning."""
+    plan = textwrap.dedent("""\
+        ## FILES TO CHANGE/CREATE
+
+        | File | Change |
+        |------|--------|
+        | `Jenkinsfile` | Add integration test stage |
+        | `.no_human/project.yml` | Add required credential |
+
+        ---
+
+        ## TEST PLAN
+        ...
+    """)
+    result = parse_plan_files(plan)
+    assert result == {"Jenkinsfile", ".no_human/project.yml"}
+
+
 # ── check_scope ───────────────────────────────────────────────────────── #
 
 

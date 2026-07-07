@@ -101,6 +101,7 @@ function NewTaskModal({ onClose, onCreated }) {
   const [grillAnswer, setGrillAnswer] = useState("");
   const [grillResult, setGrillResult] = useState(null);
   const [grillEvents, setGrillEvents] = useState([]);
+  const [evalVerdict, setEvalVerdict] = useState(null);
   const grillStreamRef = useRef(null);
   useEffect(() => {
     fetchProjects().then((p) => {
@@ -163,13 +164,14 @@ function NewTaskModal({ onClose, onCreated }) {
           .catch((e) => { setError(e.message); setGrillMode(false); })
           .finally(() => setBusy(false));
       },
+      (evalData) => setEvalVerdict(evalData),
     );
   }
 
   function startGrill() {
     if (!title.trim() || busy) return;
     setBusy(true); setError(null); setGrillMode(true);
-    setGrillQA([]); setGrillQuestion(null); setGrillResult(null);
+    setGrillQA([]); setGrillQuestion(null); setGrillResult(null); setEvalVerdict(null);
     _startGrillSSE(_grillParams([]));
   }
 
@@ -188,6 +190,25 @@ function NewTaskModal({ onClose, onCreated }) {
           <div className="sendback-label">Refined Spec</div>
           <div className="grill-spec">
             <div className="grill-spec-title">{grillResult.title}</div>
+            {evalVerdict && (
+              <div className="eval-verdict-card">
+                <span className={`eval-badge eval-${evalVerdict.verdict}`}>
+                  {evalVerdict.verdict.toUpperCase()}
+                </span>
+                {evalVerdict.dimensions && (
+                  <span className="eval-dims">
+                    {Object.entries(evalVerdict.dimensions).map(([k, v]) => (
+                      <span key={k} className={`eval-dim ${v ? 'dim-pass' : 'dim-fail'}`}>
+                        {k.replace(/_/g, ' ')}
+                      </span>
+                    ))}
+                  </span>
+                )}
+                {evalVerdict.rationale && (
+                  <div className="eval-rationale">{evalVerdict.rationale}</div>
+                )}
+              </div>
+            )}
             {grillResult.description && <div className="grill-spec-desc">{grillResult.description}</div>}
             <div className="grill-spec-section-label">Acceptance Criteria</div>
             <ul className="grill-ac-list">
@@ -570,14 +591,16 @@ export default function App() {
           {page === "board" && (
             <button className="btn btn-new-task" onClick={() => setShowNewTask(true)}>+ New Task</button>
           )}
-          {workerStatus?.running && (
-            <div
-              className={`nh-ws-dot live`}
-              style={{ background: workerStatus.inflight > 0 ? 'var(--accent)' : 'var(--green)' }}
-              title={`worker: ${workerStatus.inflight}/${workerStatus.max_workers} tasks`}
-            />
+          {workerStatus?.running && workerStatus.inflight > 0 && (
+            <div className="nh-status-indicator" title={`${workerStatus.inflight} of ${workerStatus.max_workers} worker slots in use`}>
+              <div className="nh-ws-dot live" style={{ background: 'var(--accent)' }} />
+              <span className="nh-status-label">Working ({workerStatus.inflight})</span>
+            </div>
           )}
-          <div className={`nh-ws-dot${wsLive ? " live" : ""}`} title={wsLive ? "live" : "reconnecting"} />
+          <div className="nh-status-indicator" title={wsLive ? "Browser is connected to the no_human server" : "Connection lost — reconnecting…"}>
+            <div className={`nh-ws-dot${wsLive ? " live" : ""}`} />
+            <span className="nh-status-label">{wsLive ? "Connected" : "Reconnecting…"}</span>
+          </div>
         </div>
       </header>
       {page === "board" && (

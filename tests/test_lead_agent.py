@@ -83,7 +83,7 @@ def test_dag_valid():
     specs = [
         {"title": "A", "depends_on": []},
         {"title": "B", "depends_on": ["A"]},
-        {"title": "C", "depends_on": ["A", "B"]},
+        {"title": "C", "depends_on": ["B"]},
     ]
     LeadAgent._validate_dag(specs)  # should not raise
 
@@ -111,6 +111,17 @@ def test_dag_self_cycle():
         {"title": "A", "depends_on": ["A"]},
     ]
     with pytest.raises(DecompositionError, match="cycle"):
+        LeadAgent._validate_dag(specs)
+
+
+def test_dag_rejects_multi_parent():
+    """v1: multi-parent (diamond) dependencies are not supported."""
+    specs = [
+        {"title": "A", "depends_on": []},
+        {"title": "B", "depends_on": []},
+        {"title": "C", "depends_on": ["A", "B"]},
+    ]
+    with pytest.raises(DecompositionError, match="multi-parent"):
         LeadAgent._validate_dag(specs)
 
 
@@ -232,6 +243,58 @@ async def test_unblock_ready_moves_to_pending(store):
     assert refreshed.blocker is None
 
 
+async def test_unblock_ready_propagates_base_branch(store):
+    """When dep A completes with pr_branch, dependent B gets it as base_branch."""
+    parent = Task.new("parent", repo_path="/tmp/r")
+    await store.create_task(parent)
+
+    dep = Task.new("dep", repo_path="/tmp/r", parent_id=parent.id)
+    dep.status = TaskStatus.DONE
+    dep.context = {"pr_branch": "no-human/dep-branch-abc"}
+    await store.create_task(dep)
+
+    blocked = Task.new("blocked", repo_path="/tmp/r", parent_id=parent.id)
+    blocked.status = TaskStatus.BLOCKED
+    blocked.blocker = {"category": "DEPENDENCY_WAIT",
+                       "wake_condition": "subtask_deps_met"}
+    blocked.context = {"depends_on_ids": [dep.id]}
+    await store.create_task(blocked)
+
+    lead = LeadAgent(store)
+    count = await lead._unblock_ready(parent.id)
+    assert count == 1
+
+    refreshed = await store.get_task(blocked.id)
+    assert refreshed.status == TaskStatus.PENDING
+    assert refreshed.context["base_branch"] == "no-human/dep-branch-abc"
+
+
+async def test_unblock_ready_no_pr_branch_uses_default(store):
+    """When dep finishes without pr_branch (e.g. investigation), no base_branch is set."""
+    parent = Task.new("parent", repo_path="/tmp/r")
+    await store.create_task(parent)
+
+    dep = Task.new("dep", repo_path="/tmp/r", parent_id=parent.id)
+    dep.status = TaskStatus.DONE
+    dep.context = {}  # no pr_branch — investigation task
+    await store.create_task(dep)
+
+    blocked = Task.new("blocked", repo_path="/tmp/r", parent_id=parent.id)
+    blocked.status = TaskStatus.BLOCKED
+    blocked.blocker = {"category": "DEPENDENCY_WAIT",
+                       "wake_condition": "subtask_deps_met"}
+    blocked.context = {"depends_on_ids": [dep.id]}
+    await store.create_task(blocked)
+
+    lead = LeadAgent(store)
+    count = await lead._unblock_ready(parent.id)
+    assert count == 1
+
+    refreshed = await store.get_task(blocked.id)
+    assert refreshed.status == TaskStatus.PENDING
+    assert "base_branch" not in refreshed.context
+
+
 async def test_unblock_ready_keeps_blocked_when_deps_not_met(store):
     parent = Task.new("parent", repo_path="/tmp/r")
     await store.create_task(parent)
@@ -289,6 +352,95 @@ async def test_list_subtasks(store):
 
 
 # ------------------------------------------------------------------ #
+# park_parent()                                                       #
+# ------------------------------------------------------------------ #
+
+async def test_park_parent_sets_compound_parent_status(store):
+    """park_parent() sets status to COMPOUND_PARENT and returns immediately."""
+    parent = Task.new("compound", repo_path="/tmp/r")
+    parent.status = TaskStatus.IMPLEMENTING
+    await store.create_task(parent)
+
+    lead = LeadAgent(store)
+    outcome = await lead.park_parent(parent)
+
+    assert outcome.status is TaskStatus.COMPOUND_PARENT
+    refreshed = await store.get_task(parent.id)
+    assert refreshed.status is TaskStatus.COMPOUND_PARENT
+
+
+# ------------------------------------------------------------------ #
+# check_completion()                                                   #
+# ------------------------------------------------------------------ #
+
+async def test_check_completion_still_in_progress(store):
+    """check_completion returns False when sub-tasks are still running."""
+    parent = Task.new("compound", repo_path="/tmp/r")
+    parent.status = TaskStatus.COMPOUND_PARENT
+    await store.create_task(parent)
+
+    sub = Task.new("sub", repo_path="/tmp/r", parent_id=parent.id)
+    sub.status = TaskStatus.IMPLEMENTING
+    await store.create_task(sub)
+
+    lead = LeadAgent(store)
+    finished = await lead.check_completion(parent)
+    assert finished is False
+
+    refreshed = await store.get_task(parent.id)
+    assert refreshed.status is TaskStatus.COMPOUND_PARENT
+
+
+async def test_check_completion_retries_failed_subtask(store):
+    """check_completion retries a failed sub-task once."""
+    parent = Task.new("compound", repo_path="/tmp/r")
+    parent.status = TaskStatus.COMPOUND_PARENT
+    await store.create_task(parent)
+
+    sub = Task.new("sub", repo_path="/tmp/r", parent_id=parent.id)
+    sub.status = TaskStatus.FAILED
+    await store.create_task(sub)
+
+    events = []
+    lead = LeadAgent(store, emit=lambda kind, text, **kw: events.append(kind))
+    finished = await lead.check_completion(parent)
+
+    assert finished is False
+    assert "retry" in events
+    refreshed_sub = await store.get_task(sub.id)
+    assert refreshed_sub.status is TaskStatus.PENDING
+
+
+async def test_check_completion_escalates_after_retry(store):
+    """check_completion escalates if a sub-task fails after retry."""
+    parent = Task.new("compound", repo_path="/tmp/r")
+    parent.status = TaskStatus.COMPOUND_PARENT
+    parent.context = {"retried_subtask_ids": []}
+    await store.create_task(parent)
+
+    sub = Task.new("sub", repo_path="/tmp/r", parent_id=parent.id)
+    sub.status = TaskStatus.FAILED
+    await store.create_task(sub)
+
+    events = []
+    lead = LeadAgent(store, emit=lambda kind, text, **kw: events.append(kind))
+
+    # First call: retries
+    await lead.check_completion(parent)
+    # Simulate sub-task failing again
+    await store.set_status(sub, TaskStatus.FAILED, validate=False)
+
+    # Refresh parent from DB (retry updated context)
+    parent = await store.get_task(parent.id)
+    finished = await lead.check_completion(parent)
+
+    assert finished is True
+    assert "escalate" in events
+    refreshed = await store.get_task(parent.id)
+    assert refreshed.status is TaskStatus.ESCALATED
+
+
+# ------------------------------------------------------------------ #
 # Quality gate                                                        #
 # ------------------------------------------------------------------ #
 
@@ -322,9 +474,12 @@ async def test_quality_gate_passes_when_tests_succeed(store, tmp_path):
     events = []
     config = {"lead_agent": {"quality_gate": True, "poll_interval": 0.01}}
     lead = LeadAgent(store, config=config, emit=lambda kind, text, **kw: events.append(kind))
-    outcome = await lead.drive(parent)
+    await store.set_status(parent, TaskStatus.COMPOUND_PARENT, validate=False)
+    finished = await lead.check_completion(parent)
 
-    assert outcome.status is TaskStatus.DONE
+    assert finished is True
+    refreshed = await store.get_task(parent.id)
+    assert refreshed.status is TaskStatus.DONE
     assert "quality_gate" in events
 
 
@@ -358,9 +513,12 @@ async def test_quality_gate_escalates_on_test_failure(store, tmp_path):
     events = []
     config = {"lead_agent": {"quality_gate": True, "poll_interval": 0.01}}
     lead = LeadAgent(store, config=config, emit=lambda kind, text, **kw: events.append(kind))
-    outcome = await lead.drive(parent)
+    await store.set_status(parent, TaskStatus.COMPOUND_PARENT, validate=False)
+    finished = await lead.check_completion(parent)
 
-    assert outcome.status is TaskStatus.ESCALATED
+    assert finished is True
+    refreshed = await store.get_task(parent.id)
+    assert refreshed.status is TaskStatus.ESCALATED
     assert "quality_gate_failed" in events
 
 
@@ -375,7 +533,10 @@ async def test_quality_gate_skipped_when_disabled(store):
 
     events = []
     lead = LeadAgent(store, emit=lambda kind, text, **kw: events.append(kind))
-    outcome = await lead.drive(parent)
+    await store.set_status(parent, TaskStatus.COMPOUND_PARENT, validate=False)
+    finished = await lead.check_completion(parent)
 
-    assert outcome.status is TaskStatus.DONE
+    assert finished is True
+    refreshed = await store.get_task(parent.id)
+    assert refreshed.status is TaskStatus.DONE
     assert "quality_gate" not in events

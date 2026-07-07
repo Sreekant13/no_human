@@ -121,6 +121,8 @@ class ClaudeBackend:
         supervisor_hook: SupervisorHook | None = None,
         lint_hook: Any | None = None,
         skills: list[str] | None = None,
+        thinking: bool = False,
+        max_thinking_tokens: int | None = None,
     ) -> ClaudeAgentOptions:
         hooks: dict = {
             "PreToolUse": [
@@ -147,6 +149,11 @@ class ClaudeBackend:
             post_hooks.append(sv.hook)
         if post_hooks:
             hooks["PostToolUse"] = [HookMatcher(matcher=None, hooks=post_hooks)]
+        kwargs: dict[str, Any] = {}
+        if thinking:
+            kwargs["thinking"] = True
+            if max_thinking_tokens:
+                kwargs["max_thinking_tokens"] = max_thinking_tokens
         return ClaudeAgentOptions(
             model=self.model,
             cwd=str(cwd),
@@ -156,6 +163,7 @@ class ClaudeBackend:
             resume=resume,
             hooks=hooks,
             skills=skills or None,
+            **kwargs,
         )
 
     async def stream(
@@ -169,11 +177,14 @@ class ClaudeBackend:
         supervisor_hook: SupervisorHook | None = None,
         lint_hook: Any | None = None,
         skills: list[str] | None = None,
+        thinking: bool = False,
+        max_thinking_tokens: int | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run the agent, yielding normalized events; the final event is ``result``."""
         options = self._options(cwd, max_turns, effort=effort, resume=resume,
                                 supervisor_hook=supervisor_hook, lint_hook=lint_hook,
-                                skills=skills)
+                                skills=skills, thinking=thinking,
+                                max_thinking_tokens=max_thinking_tokens)
         # The SDK signals terminal conditions (notably hitting max_turns) by
         # *raising* a bare Exception from inside query(). It usually emits a
         # ResultMessage first ("agent done: N turns") and THEN raises, so we
@@ -295,6 +306,8 @@ class ClaudeBackend:
         supervisor_hook: SupervisorHook | None = None,
         lint_hook: Any | None = None,
         skills: list[str] | None = None,
+        thinking: bool = False,
+        max_thinking_tokens: int | None = None,
     ) -> AgentResult:
         """Run to completion, optionally forwarding each event, return the result."""
         final = AgentResult(
@@ -304,6 +317,7 @@ class ClaudeBackend:
         async for event in self.stream(
             prompt, cwd=cwd, max_turns=max_turns, effort=effort, resume=resume,
             supervisor_hook=supervisor_hook, lint_hook=lint_hook, skills=skills,
+            thinking=thinking, max_thinking_tokens=max_thinking_tokens,
         ):
             if on_event is not None:
                 on_event(event)

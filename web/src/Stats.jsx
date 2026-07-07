@@ -92,6 +92,39 @@ function computeStats(tasks) {
   const totalTerminal = doneTasks.length + failedTasks.length;
   const successRate = totalTerminal > 0 ? (doneTasks.length / totalTerminal) * 100 : 0;
 
+  // Token tracking across all tasks
+  const totalTokens = tasks.reduce((s, t) => s + (t.total_tokens || 0), 0);
+  const avgTokensPerTask = doneTasks.length > 0
+    ? tasks.filter(t => t.total_tokens > 0).reduce((s, t) => s + t.total_tokens, 0)
+      / tasks.filter(t => t.total_tokens > 0).length
+    : 0;
+
+  // SDLC metrics — backward-compatible (handles missing fields)
+  const withAttempts = doneTasks.filter(t => t.attempts?.length > 0);
+  const firstAttemptRate = withAttempts.length > 0
+    ? (withAttempts.filter(t => t.attempts.length === 1 && t.attempts[0].review_passed).length / withAttempts.length) * 100
+    : 0;
+  const avgAttempts = withAttempts.length > 0
+    ? withAttempts.reduce((s, t) => s + t.attempts.length, 0) / withAttempts.length
+    : 0;
+  const specCoverage = tasks.length > 0
+    ? (tasks.filter(t => t.context?.spec).length / tasks.length) * 100
+    : 0;
+  let stagnationCount = 0;
+  for (const t of tasks) {
+    if (t.attempts?.length >= 2) {
+      const a1 = t.attempts[t.attempts.length - 2];
+      const a2 = t.attempts[t.attempts.length - 1];
+      const r1 = a1.review_checklist?.items;
+      const r2 = a2.review_checklist?.items;
+      if (r1?.length && r2?.length) {
+        const p1 = r1.filter(it => it.passed).length;
+        const p2 = r2.filter(it => it.passed).length;
+        if (p1 === p2 && p2 < r2.length) stagnationCount++;
+      }
+    }
+  }
+
   return {
     totalCompleted: doneTasks.length,
     totalFailed: failedTasks.length,
@@ -104,6 +137,12 @@ function computeStats(tasks) {
     dailyCounts,
     kindBreakdown,
     successRate,
+    totalTokens,
+    avgTokensPerTask,
+    firstAttemptRate,
+    avgAttempts,
+    specCoverage,
+    stagnationCount,
   };
 }
 
@@ -342,6 +381,43 @@ export default function Stats({ tasks }) {
           </div>
           <div className="stats-card-sub">
             {stats.totalCompleted} done &middot; {stats.totalFailed} failed
+          </div>
+        </div>
+
+        <div className="stats-card">
+          <div className="stats-card-label">Token Usage</div>
+          <div className="stats-card-value">{fmtTokens(stats.totalTokens)}</div>
+          <div className="stats-card-sub">
+            est. {estimateCost(stats.totalTokens)}
+            {stats.avgTokensPerTask > 0 && ` · avg ${fmtTokens(stats.avgTokensPerTask)}/task`}
+          </div>
+        </div>
+
+        <div className="stats-card" data-testid="stat-first-attempt">
+          <div className="stats-card-label">First-Attempt Pass</div>
+          <div className="stats-card-value">
+            {stats.firstAttemptRate > 0 ? `${stats.firstAttemptRate.toFixed(0)}%` : "\u2014"}
+          </div>
+          <div className="stats-card-sub">
+            avg {stats.avgAttempts > 0 ? stats.avgAttempts.toFixed(1) : "\u2014"} attempts/task
+          </div>
+        </div>
+
+        <div className="stats-card" data-testid="stat-spec-coverage">
+          <div className="stats-card-label">Spec Coverage</div>
+          <div className="stats-card-value">
+            {stats.specCoverage > 0 ? `${stats.specCoverage.toFixed(0)}%` : "\u2014"}
+          </div>
+          <div className="stats-card-sub">
+            {tasks.filter(t => t.context?.spec).length} of {tasks.length} tasks
+          </div>
+        </div>
+
+        <div className="stats-card" data-testid="stat-stagnation">
+          <div className="stats-card-label">Stagnation</div>
+          <div className="stats-card-value">{stats.stagnationCount}</div>
+          <div className="stats-card-sub">
+            tasks with unchanged pass rate
           </div>
         </div>
       </div>

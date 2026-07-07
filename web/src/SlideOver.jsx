@@ -1,9 +1,30 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import {
-  approveTask, cancelTask, fetchDiff, fetchTask, fetchTaskEvents, pauseTask,
-  postReviewComments, replyTask, resumeTask, retryTask, sendBack,
+  approveTask, cancelTask, fetchDiff, fetchSubtasks, fetchTask, fetchTaskEvents,
+  pauseTask, postReviewComments, replyTask, resumeTask, retryTask, sendBack,
   connectTaskSSE,
 } from "./api.js";
+import Markdown from "./Markdown.jsx";
+
+// ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
+const IconCheck = ({ size = 14, className = "" }) => (
+  <svg className={`nh-icon ${className}`} width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 8 7 12 13 4" /></svg>
+);
+const IconX = ({ size = 14, className = "" }) => (
+  <svg className={`nh-icon ${className}`} width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="4" y1="4" x2="12" y2="12" /><line x1="12" y1="4" x2="4" y2="12" /></svg>
+);
+const IconChevronDown = ({ size = 14 }) => (
+  <svg className="nh-icon" width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="4 6 8 10 12 6" /></svg>
+);
+const IconChevronRight = ({ size = 14 }) => (
+  <svg className="nh-icon" width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 4 10 8 6 12" /></svg>
+);
+const IconAlertTriangle = ({ size = 14 }) => (
+  <svg className="nh-icon" width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M8 2L1.5 13.5h13L8 2z" /><line x1="8" y1="6.5" x2="8" y2="9.5" /><circle cx="8" cy="11.5" r="0.5" fill="currentColor" stroke="none" /></svg>
+);
+const IconInfo = ({ size = 14 }) => (
+  <svg className="nh-icon" width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="8" cy="8" r="6.5" /><line x1="8" y1="7" x2="8" y2="11" /><circle cx="8" cy="5" r="0.5" fill="currentColor" stroke="none" /></svg>
+);
 
 const STATUS_PILL = {
   pending:            "pill-pending",
@@ -159,12 +180,12 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0 }) {
               {task.status}
             </span>
           )}
-          <button className="so-close" onClick={onClose} ref={closeRef} aria-label="Close">✕</button>
+          <button className="so-close" onClick={onClose} ref={closeRef} aria-label="Close"><IconX size={16} /></button>
         </div>
 
         {/* tabs */}
         <div className="so-tabs">
-          {["system", "activity", "details", "review", "diff", "attempts"].map((t) => (
+          {["system", "activity", ...(task?.parent_id || task?.status === "compound_parent" ? ["subtasks"] : []), "details", "spec", "review", "diff", "attempts"].map((t) => (
             <button
               key={t}
               className={`so-tab${tab === t ? " active" : ""}`}
@@ -179,8 +200,10 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0 }) {
         <div className="so-body">
           {flash && <FlashBanner msg={flash} onDismiss={() => setFlash(null)} />}
           {tab === "system"   && <SystemTab taskId={taskId} task={task} isActive={isActive} />}
-          {tab === "activity" && <ActivityTab taskId={taskId} isActive={isActive} />}
+          {tab === "activity" && <ActivityTab taskId={taskId} task={task} isActive={isActive} />}
+          {tab === "subtasks" && <SubtasksTab taskId={taskId} />}
           {tab === "details"  && <DetailsTab task={task} />}
+          {tab === "spec"     && <SpecTab task={task} onRefresh={() => fetchTask(taskId).then(setTask)} />}
           {tab === "review"   && <ReviewTab task={task} diff={diff} />}
           {tab === "diff"     && <DiffTab diff={diff} />}
           {tab === "attempts" && <AttemptsTab task={task} />}
@@ -293,7 +316,7 @@ function FlashBanner({ msg, onDismiss }) {
   return (
     <div className="flash-banner">
       <span>{msg}</span>
-      <button className="flash-banner-dismiss" onClick={onDismiss}>✕</button>
+      <button className="flash-banner-dismiss" onClick={onDismiss}><IconX size={14} /></button>
     </div>
   );
 }
@@ -315,7 +338,7 @@ function eventSource(e) {
   if (src === "orchestrator") return "worker";
   return src;
 }
-const ROLE_LABEL = { worker: "Orchestrator", supervisor: "Supervisor", reviewer: "Reviewer", agent: "Worker" };
+const ROLE_LABEL = { worker: "Orchestrator", supervisor: "Supervisor", reviewer: "Reviewer", agent: "Coder" };
 
 // Discover subagents from events at render time
 function discoverSubagents(events) {
@@ -348,7 +371,7 @@ function discoverSubagents(events) {
 const AGENTS = [
   { id: "worker",     label: "Orchestrator", type: "ORCHESTRATOR", icon: "⚙",  desc: "Drives the task pipeline: context, planning, attempts, review",
     color: "var(--agent-worker)" },
-  { id: "agent",      label: "Worker",       type: "AGENT",        icon: "⌨",  desc: "The Claude session that reads & edits code",
+  { id: "agent",      label: "Coder",        type: "AGENT",        icon: "⌨",  desc: "The Claude session that reads & edits code",
     color: "var(--agent-agent)" },
   { id: "supervisor", label: "Supervisor",   type: "MONITOR",      icon: "◉",  desc: "Course-corrects the worker every N tool calls",
     color: "var(--agent-supervisor)" },
@@ -390,6 +413,101 @@ function linkify(text) {
   );
 }
 
+// Group consecutive same-tool events for collapsed display.
+function groupConsecutiveEvents(events) {
+  const result = [];
+  let i = 0;
+  while (i < events.length) {
+    const e = events[i];
+    // Only group consecutive Read/View calls — most common noise source.
+    if (e.kind === "tool_use" && (e.tool_name === "Read" || e.tool_name === "View")) {
+      const group = [e];
+      let j = i + 1;
+      while (j < events.length && events[j].kind === "tool_use" && events[j].tool_name === e.tool_name) {
+        group.push(events[j]);
+        j++;
+      }
+      if (group.length >= 3) {
+        result.push({ _group: true, tool: e.tool_name, events: group, ts: e.ts, firstIdx: i });
+        i = j;
+        continue;
+      }
+    }
+    result.push(e);
+    i++;
+  }
+  return result;
+}
+
+// Extract file basename from a tool_use event.
+function toolFile(event) {
+  const inp = event.tool_input || {};
+  const path = inp.file_path || inp.path || inp.notebook_path || "";
+  return path ? path.split("/").pop() : "";
+}
+
+// Collapsed group of consecutive same-tool events.
+function GroupedEvents({ group, role }) {
+  const [expanded, setExpanded] = useState(false);
+  const files = group.events.map(toolFile).filter(Boolean);
+  const shown = files.slice(0, 3);
+  const rest = files.length - shown.length;
+  const elapsed = group.events[group.events.length - 1].ts - group.events[0].ts;
+
+  return (
+    <div className={`activity-event-rich role-${role} ak-tool_use event-group`}>
+      <div className="rich-meta">
+        <span className="rich-ts">{fmtTs(group.ts)}</span>
+        <span className="rich-role">{ROLE_LABEL[role]}</span>
+        <span className="rich-kind ak-tool_use">{group.tool}</span>
+        {elapsed > 2 && <span className="rich-elapsed">+{fmtDuration(elapsed)}</span>}
+      </div>
+      <div className="rich-tool-group" onClick={() => setExpanded(!expanded)} role="button" tabIndex={0}>
+        <span className="rich-tool-name">{group.tool}</span>
+        <span className="rich-group-count">{group.events.length} files</span>
+        {shown.map((f, i) => <span key={i} className="rich-file-chip">{f}</span>)}
+        {rest > 0 && <span className="rich-group-more">+{rest}</span>}
+        <span className="rich-group-toggle">{expanded ? "▾" : "▸"}</span>
+      </div>
+      {expanded && (
+        <div className="rich-group-detail">
+          {group.events.map((e, i) => (
+            <div key={i} className="rich-group-item">
+              <span className="rich-file-chip">{toolFile(e) || "file"}</span>
+              {e.result_preview && <pre className="rich-tool-result">{e.result_preview}</pre>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Collapsed-by-default reasoning block ("Thought for Ns") — extended-thinking
+// content is verbose and low-signal at a glance, but shouldn't be discarded.
+function ThinkingBlock({ text, elapsed }) {
+  const [expanded, setExpanded] = useState(false);
+  const label = elapsed > 1 ? `Thought for ${fmtDuration(elapsed)}` : "Thinking";
+  return (
+    <div className="rich-thinking">
+      <button
+        type="button"
+        className="rich-thinking-toggle"
+        onClick={() => setExpanded(!expanded)}
+        aria-expanded={expanded}
+      >
+        {expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+        <span>{label}</span>
+      </button>
+      {expanded && (
+        <div className="rich-thinking-body">
+          <Markdown>{text}</Markdown>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Render a single event with rich formatting
 function RichEvent({ event, elapsed, role }) {
   const kind = event.kind;
@@ -398,13 +516,23 @@ function RichEvent({ event, elapsed, role }) {
   let body;
   if (kind === "tool_use") {
     const toolName = event.tool_name || text.split(" ")[0] || "tool";
-    const args = event.tool_input
-      ? Object.entries(event.tool_input).map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`).join(", ")
-      : text.replace(toolName, "").trim();
+    const file = toolFile(event);
+    // `text` is already a human-readable one-liner from the backend
+    // (e.g. "Read metrics-core-query-service/Jenkinsfile", "Run `wc -l ...`") — show
+    // the remainder after the tool name/file chip rather than re-deriving
+    // raw tool_input (which would just repeat absolute paths verbosely).
+    const args = text.replace(toolName, "").trim();
+    const preview = (event.result_preview || "").trim();
     body = (
       <div className="rich-tool">
-        <span className="rich-tool-name">{toolName}</span>
-        <span className="rich-tool-args" title={args}>{args}</span>
+        <div className="rich-tool-row">
+          <span className="rich-tool-name">{toolName}</span>
+          {file && <span className="rich-file-chip">{file}</span>}
+          <span className="rich-tool-args" title={args}>
+            {file ? args.replace(new RegExp(`[^=]*${file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^,]*,?\\s*`), "").trim() : args}
+          </span>
+        </div>
+        {preview && <pre className="rich-tool-result">{preview}</pre>}
       </div>
     );
   } else if (kind === "state") {
@@ -451,7 +579,9 @@ function RichEvent({ event, elapsed, role }) {
       </div>
     );
   } else if (kind === "agent_text") {
-    body = <div className="rich-agent-prose">{linkify(text)}</div>;
+    body = <div className="rich-agent-prose"><Markdown>{text}</Markdown></div>;
+  } else if (kind === "thinking") {
+    body = <ThinkingBlock text={text} elapsed={elapsed} />;
   } else {
     body = <span className="rich-body">{linkify(text)}</span>;
   }
@@ -532,7 +662,7 @@ function AgentLogModal({ agent, events, onClose }) {
             <div className="sys-modal-type">{agent.type}</div>
             <div className="sys-modal-name">{agent.label}</div>
           </div>
-          <button className="sys-modal-close" onClick={onClose} aria-label="Close">✕</button>
+          <button className="sys-modal-close" onClick={onClose} aria-label="Close"><IconX size={16} /></button>
         </div>
         <div className="sys-modal-stats">
           <div className="sys-modal-stat">
@@ -634,6 +764,16 @@ function SystemTab({ taskId, task, isActive }) {
   const agent      = AGENTS.find(a => a.id === "agent");
   const supervisor = AGENTS.find(a => a.id === "supervisor");
   const reviewer   = AGENTS.find(a => a.id === "reviewer");
+
+  if (events.length === 0) {
+    return (
+      <div className="sys-view">
+        <div className="so-diff-empty">
+          {isActive ? "Waiting for events…" : "No events recorded for this task."}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="sys-view">
@@ -756,7 +896,57 @@ function SystemTab({ taskId, task, isActive }) {
 }
 
 
-function ActivityTab({ taskId, isActive }) {
+// ── Sub-tasks tab for compound parents ───────────────────────────────────
+const STATUS_ICON = { done: "[ok]", failed: "[x]", pending: "[.]", implementing: "[~]", reviewing: "[?]", blocked: "[!]", compound_parent: "[+]" };
+
+function SubtasksTab({ taskId }) {
+  const [subs, setSubs] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      const data = await fetchSubtasks(taskId);
+      if (!cancelled) { setSubs(data); setLoading(false); }
+    }
+    load();
+    const iv = setInterval(load, 5000);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, [taskId]);
+
+  if (loading) return <div className="so-diff-empty">Loading sub-tasks…</div>;
+  if (subs.length === 0) return <div className="so-diff-empty">No sub-tasks.</div>;
+
+  const done = subs.filter(s => s.status === "done").length;
+
+  return (
+    <div className="subtasks-tab">
+      <div className="subtasks-header">
+        <span className="subtasks-progress">{done} / {subs.length} complete</span>
+        <div className="subtasks-bar">
+          <div className="subtasks-bar-fill" style={{ width: `${(done / subs.length) * 100}%` }} />
+        </div>
+      </div>
+      <div className="subtasks-list">
+        {subs.map(s => (
+          <div key={s.id} className={`subtask-card status-${s.status}`}>
+            <span className="subtask-icon">{STATUS_ICON[s.status] || "·"}</span>
+            <div className="subtask-info">
+              <span className="subtask-title">{s.title}</span>
+              <span className="subtask-meta">
+                {s.status}{s.kind !== "feature" ? ` · ${s.kind}` : ""}
+                {s.live_status ? ` · ${s.live_status}` : ""}
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+function ActivityTab({ taskId, task, isActive }) {
   const [events, setEvents] = useState([]);
   const endRef = useRef(null);
 
@@ -803,13 +993,33 @@ function ActivityTab({ taskId, isActive }) {
   }, [events.length]);
 
   if (events.length === 0) {
-    return <div className="so-diff-empty">{isActive ? "Waiting for events…" : "No events recorded."}</div>;
+    return (
+      <div className="activity-feed">
+        <div className="so-diff-empty">
+          {isActive ? "Waiting for events…" : "No events recorded for this task."}
+        </div>
+      </div>
+    );
   }
 
   const lastEvent = events[events.length - 1];
   const isWorking = isActive && lastEvent;
   const lastRole = eventSource(lastEvent);
   const totalElapsed = events.length > 1 ? events[events.length - 1].ts - events[0].ts : 0;
+
+  // Turn counter: count tool_use events from the agent since the last attempt_start.
+  let turnCount = 0;
+  let maxTurns = null;
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i].kind === "attempt_start") {
+      maxTurns = events[i].max_turns || null;
+      break;
+    }
+    if (events[i].kind === "tool_use" && eventSource(events[i]) === "agent") {
+      turnCount++;
+    }
+  }
+  const turnPct = maxTurns ? Math.min(100, (turnCount / maxTurns) * 100) : null;
 
   return (
     <div className="activity-feed">
@@ -832,9 +1042,49 @@ function ActivityTab({ taskId, isActive }) {
           </span>
         </div>
       )}
+      {isWorking && turnCount > 0 && (
+        <div className="turn-counter">
+          <span className="turn-label">Turn {turnCount}{maxTurns ? ` / ${maxTurns}` : ""}</span>
+          {turnPct !== null && (
+            <div className="turn-bar">
+              <div className="turn-bar-fill" style={{ width: `${turnPct}%` }} />
+            </div>
+          )}
+        </div>
+      )}
+      {(() => {
+        const planFiles = (task?.context?.spec?.files_to_change) || [];
+        if (planFiles.length === 0) return null;
+        const editedBasenames = new Set(
+          events
+            .filter(e => e.kind === "tool_use" && ["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(e.tool_name))
+            .map(e => toolFile(e))
+            .filter(Boolean)
+        );
+        const extraFiles = [...editedBasenames].filter(f => !planFiles.some(pf => pf.endsWith(f)));
+        return (
+          <div className="plan-tracker">
+            <span className="plan-tracker-label">Files:</span>
+            {planFiles.map((f, i) => {
+              const base = f.split("/").pop();
+              const done = editedBasenames.has(base);
+              return <span key={i} className={`plan-file ${done ? "done" : ""}`}>{done ? "[x]" : "[ ]"} {base}</span>;
+            })}
+            {extraFiles.map((f, i) => (
+              <span key={`x-${i}`} className="plan-file extra">[+] {f}</span>
+            ))}
+          </div>
+        );
+      })()}
       <div className="activity-log">
-        {events.map((e, i) => {
-          const elapsed = i > 0 ? e.ts - events[i - 1].ts : 0;
+        {groupConsecutiveEvents(events).map((item, i) => {
+          if (item._group) {
+            const role = eventSource(item.events[0]);
+            return <GroupedEvents key={`g-${item.firstIdx}`} group={item} role={role} />;
+          }
+          const e = item;
+          const prevTs = i > 0 ? (events[Math.max(0, events.indexOf(e) - 1)] || e).ts : e.ts;
+          const elapsed = e.ts - prevTs;
           const role = eventSource(e);
           return <RichEvent key={i} event={e} elapsed={elapsed} role={role} />;
         })}
@@ -873,6 +1123,7 @@ const EVENT_LABELS = {
   bounds: "Bounds",
   tool_use: "Tool",
   agent_text: "Agent",
+  thinking: "Reasoning",
   supervisor_decision: "Supervisor",
   // env setup/teardown (Item 2)
   env_setup: "Env setup",
@@ -898,6 +1149,7 @@ const EVENT_LABELS = {
   subagent_start: "Subagent",
   subagent_progress: "Subagent",
   subagent_done: "Subagent done",
+  review_posted: "Review posted to PR",
 };
 
 function eventLabel(kind) {
@@ -924,10 +1176,21 @@ function DetailsTab({ task }) {
       {task.acceptance_criteria?.length > 0 && (
         <section>
           <div className="so-section-label">Acceptance criteria</div>
-          <ul className="so-criteria">
-            {task.acceptance_criteria.map((c, i) => (
-              <li key={i}>{c}</li>
-            ))}
+          <ul className="so-criteria" data-testid="criteria-list">
+            {task.acceptance_criteria.map((c, i) => {
+              const progress = task.context?.progress?.acceptance_criteria?.[i];
+              const status = progress?.status;
+              return (
+                <li key={i} className={`criterion-tracked ${status || "not_started"}`}>
+                  <span className="criterion-status-icon">
+                    {status === "done" && <IconCheck size={12} />}
+                    {status === "in_progress" && <span className="criterion-spinner" />}
+                  </span>
+                  <span>{c}</span>
+                  {progress?.evidence && <div className="criterion-evidence">{progress.evidence}</div>}
+                </li>
+              );
+            })}
           </ul>
         </section>
       )}
@@ -945,6 +1208,104 @@ function DetailsTab({ task }) {
         </section>
       )}
     </>
+  );
+}
+
+function SpecTab({ task, onRefresh }) {
+  const [requestingChanges, setRequestingChanges] = useState(false);
+  const [changeNote, setChangeNote] = useState("");
+  const [specBusy, setSpecBusy] = useState(false);
+  if (!task) return <div className="so-diff-empty">Loading…</div>;
+  const spec = task.context?.spec;
+  const hasSpec = !!(spec && (spec.approach || spec.files_to_change?.length ||
+    spec.test_plan || spec.out_of_scope?.length || spec.verification));
+  if (!hasSpec) {
+    return (
+      <div className="so-diff-empty" data-testid="spec-empty">
+        {["code_review", "investigation", "ci_fix"].includes(task.kind)
+          ? `Spec generation doesn't apply to ${task.kind} tasks.`
+          : ["pending", "context", "planning"].includes(task.status)
+          ? "Spec not generated yet."
+          : "No spec available for this task."}
+      </div>
+    );
+  }
+  const planSize = spec.files_to_change?.length || 0;
+  return (
+    <div data-testid="spec-tab">
+      {spec.files_to_change?.length > 0 && (
+        <section>
+          <div className="so-section-label">Files to Change</div>
+          <div className="spec-file-list">
+            {spec.files_to_change.map((f, i) => (
+              <div key={i} className="spec-file-item">
+                <span className="spec-file-path">{f}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+      {spec.approach && (
+        <section>
+          <div className="so-section-label">Approach</div>
+          <Markdown>{spec.approach}</Markdown>
+        </section>
+      )}
+      {spec.test_plan && (
+        <section>
+          <div className="so-section-label">Test Plan</div>
+          <Markdown>{spec.test_plan}</Markdown>
+        </section>
+      )}
+      {spec.out_of_scope?.length > 0 && (
+        <section>
+          <div className="so-section-label">Out of Scope</div>
+          <ul className="so-criteria spec-out-of-scope">{spec.out_of_scope.map((r, i) => <li key={i}><Markdown>{r}</Markdown></li>)}</ul>
+        </section>
+      )}
+      {spec.verification && (
+        <section>
+          <div className="so-section-label">Verification</div>
+          <Markdown>{spec.verification}</Markdown>
+        </section>
+      )}
+      {(task.context?.plan_size_warning || planSize > 8) && (
+        <div className="spec-plan-warning" data-testid="plan-size-warning">
+          <IconAlertTriangle size={14} /> Large plan ({planSize} files) — consider decomposing
+        </div>
+      )}
+      {task.status === "awaiting_input" && spec && (
+        <div className="spec-approval-gate" data-testid="spec-approval-gate">
+          {!requestingChanges ? (
+            <div className="spec-approval-actions">
+              <button className="btn-approve" disabled={specBusy} onClick={async () => {
+                setSpecBusy(true);
+                try { await replyTask(task.id, "spec approved"); if (onRefresh) onRefresh(); }
+                catch { /* handled by parent */ }
+                finally { setSpecBusy(false); }
+              }}>Approve Spec</button>
+              <button className="btn-request-changes" disabled={specBusy}
+                onClick={() => setRequestingChanges(true)}>Request Changes</button>
+            </div>
+          ) : (
+            <div className="spec-change-request">
+              <textarea className="spec-change-textarea" rows={3}
+                placeholder="Describe what needs to change…"
+                value={changeNote} onChange={(e) => setChangeNote(e.target.value)} />
+              <div className="spec-approval-actions">
+                <button className="btn-approve" disabled={specBusy || !changeNote.trim()} onClick={async () => {
+                  setSpecBusy(true);
+                  try { await replyTask(task.id, changeNote.trim()); if (onRefresh) onRefresh(); }
+                  catch { /* handled by parent */ }
+                  finally { setSpecBusy(false); setRequestingChanges(false); setChangeNote(""); }
+                }}>Submit Changes</button>
+                <button className="btn-cancel" onClick={() => { setRequestingChanges(false); setChangeNote(""); }}>Cancel</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1149,6 +1510,9 @@ function ReviewTab({ task, diff }) {
               : <span className="verdict-fail">FAILED</span>
             }
           </span>
+          {checklist.items.length >= 5 && (
+            <span className="review-cap-indicator" data-testid="review-cap">(capped at 5 items)</span>
+          )}
           <div className="review-header-actions">
             {ciUrl && (
               <a href={ciUrl} target="_blank" rel="noreferrer" className="ci-link">
@@ -1169,12 +1533,35 @@ function ReviewTab({ task, diff }) {
             )}
           </div>
         </div>
+        {checklist.stages && (
+          <div className="review-stages" data-testid="review-stages">
+            <span className={`review-stage-badge ${checklist.stages.spec_compliance?.passed ? "pass" : "fail"}`}>
+              Stage 1: Spec Compliance — {checklist.stages.spec_compliance?.passed ? "PASSED" : "FAILED"}
+            </span>
+            <span className={`review-stage-badge ${checklist.stages.code_quality?.passed ? "pass" : "fail"}`}>
+              Stage 2: Code Quality — {checklist.stages.code_quality?.passed ? "PASSED" : "FAILED"}
+            </span>
+          </div>
+        )}
+        {checklist.stages && !checklist.stages.spec_compliance?.passed && (
+          <div className="unmet-criteria" data-testid="unmet-criteria">
+            <div className="so-section-label">Unmet Criteria</div>
+            <ul className="unmet-list">
+              {checklist.items.filter(it => !it.passed).map((it, i) => (
+                <li key={i} className="unmet-item">
+                  <span className="ci-icon fail"><IconX size={12} /></span>
+                  <span>{it.label}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         <div className="so-checklist">
           {checklist.items.map((item, i) => (
             <div key={i} className={`checklist-item ${item.passed ? "pass" : "fail"}`}>
               {/* header row: icon + title + file chip */}
               <div className="ci-header">
-                <span className="ci-icon">{item.passed ? "✓" : "✗"}</span>
+                <span className="ci-icon">{item.passed ? <IconCheck size={14} /> : <IconX size={14} />}</span>
                 <span className="ci-title">{item.label}</span>
                 {item.file && (
                   <span className="ci-filechip" title={item.file + (item.line > 0 ? `:${item.line}` : "")}>
@@ -1231,11 +1618,19 @@ function ReviewTab({ task, diff }) {
             className="raw-toggle"
             onClick={() => setRawOpen((o) => !o)}
           >
-            {rawOpen ? "▼" : "▶"} Reviewer reasoning
+            {rawOpen ? <IconChevronDown size={14} /> : <IconChevronRight size={14} />} Reviewer reasoning
           </button>
           {rawOpen && (
             <pre className="raw-output">{rawOutput}</pre>
           )}
+        </section>
+      )}
+      {(checklist.suggested_next || lastAttempt?.suggested_next) && (
+        <section>
+          <div className="review-suggested-next" data-testid="suggested-next">
+            <IconInfo size={14} />
+            <span>{checklist.suggested_next || lastAttempt.suggested_next}</span>
+          </div>
         </section>
       )}
     </>
@@ -1247,8 +1642,8 @@ function TestResultCard({ result }) {
   return (
     <div className="test-result-card">
       <div className="test-result-stats">
-        <span className="test-result-pass">✓ {passed ?? 0} passed</span>
-        {(failed ?? 0) > 0 && <span className="test-result-fail">✗ {failed} failed</span>}
+        <span className="test-result-pass"><IconCheck size={12} /> {passed ?? 0} passed</span>
+        {(failed ?? 0) > 0 && <span className="test-result-fail"><IconX size={12} /> {failed} failed</span>}
         <span className="test-result-dim">{total ?? 0} total</span>
       </div>
       {output && <pre className="raw-output">{output.slice(0, 2000)}</pre>}
@@ -1292,8 +1687,58 @@ function AttemptsTab({ task }) {
     return <div className="so-diff-empty">No attempts yet.</div>;
   }
 
+  const getAttemptPassRate = (a) => {
+    const items = a.review_checklist?.items;
+    if (!items?.length) return null;
+    return items.filter(it => it.passed).length;
+  };
+  const attempts = task.attempts;
+  let stagnant = false;
+  if (attempts.length >= 2) {
+    const last = getAttemptPassRate(attempts[attempts.length - 1]);
+    const prev = getAttemptPassRate(attempts[attempts.length - 2]);
+    const total = attempts[attempts.length - 1]?.review_checklist?.items?.length || 0;
+    if (last !== null && prev !== null && last === prev && last < total) stagnant = true;
+  }
+  const passRates = attempts.map(a => {
+    const items = a.review_checklist?.items;
+    if (!items?.length) return null;
+    return { passed: items.filter(it => it.passed).length, total: items.length };
+  });
+  const hasRates = passRates.filter(Boolean).length >= 2;
+
   return (
     <>
+      {stagnant && (
+        <div className="stagnation-warning" data-testid="stagnation-warning">
+          <IconAlertTriangle size={14} />
+          <span>No progress between last two attempts — review pass rate unchanged</span>
+        </div>
+      )}
+      {hasRates && (
+        <div className="pass-rate-trend" data-testid="pass-rate-trend">
+          <span className="pass-rate-label">Review pass rate:</span>
+          {passRates.map((r, i) => r && (
+            <span key={i} className="pass-rate-item">
+              {i > 0 && <span className="pass-rate-arrow">→</span>}
+              <span className={r.passed === r.total ? "pass-rate-full" : "pass-rate-partial"}>
+                {r.passed}/{r.total}
+              </span>
+            </span>
+          ))}
+        </div>
+      )}
+      {(() => {
+        const withTests = attempts.filter(a => a.test_results?.test_count > 0).length;
+        return withTests > 0 && (
+          <div className="tdd-metric" data-testid="tdd-metric">
+            <span className="pass-rate-label">Test adoption:</span>
+            <span className={withTests === attempts.length ? "pass-rate-full" : "pass-rate-partial"}>
+              {withTests}/{attempts.length} attempts ran tests
+            </span>
+          </div>
+        );
+      })()}
       {[...task.attempts].reverse().map((a) => (
         <div key={a.id} className="attempt-row">
           <div className="attempt-number">Attempt #{a.attempt_number}</div>
@@ -1304,11 +1749,19 @@ function AttemptsTab({ task }) {
             </div>
           )}
           <div className="attempt-status">
-            {a.review_passed != null && (
-              <span className={`attempt-badge ${a.review_passed ? "pass" : "fail"}`}>
-                review {a.review_passed ? "pass" : "fail"}
-              </span>
-            )}
+            {a.review_passed != null && (() => {
+              const passed = !!a.review_passed;
+              let label = passed ? "review passed" : "issues found";
+              if (!passed && a.review_checklist?.items) {
+                const n = a.review_checklist.items.filter(it => !it.passed).length;
+                if (n > 0) label = `${n} issue${n > 1 ? "s" : ""} found`;
+              }
+              return (
+                <span className={`attempt-badge ${passed ? "pass" : "fail"}`}>
+                  {label}
+                </span>
+              );
+            })()}
             {a.ci_status && (
               <span className={`attempt-badge ${a.ci_status === "success" ? "pass" : "fail"}`}>
                 CI {a.ci_status}

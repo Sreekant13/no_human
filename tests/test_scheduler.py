@@ -326,3 +326,155 @@ async def test_wiki_refresh_job_skips_matching_commit(store, tmp_path):
     # No projects → nothing to do.
     result = await job.maybe_run()
     assert result == []
+
+
+# --------------------------------------------------------------------------- #
+# _summarize_event                                                             #
+# --------------------------------------------------------------------------- #
+
+from no_human.core.scheduler import _summarize_event
+
+
+def test_summarize_event_tool_use_read():
+    ev = {"kind": "tool_use", "tool_name": "Read", "tool_input": {"file_path": "/a/b/foo.py"}}
+    assert _summarize_event(ev) == "reading foo.py"
+
+
+def test_summarize_event_tool_use_edit():
+    ev = {"kind": "tool_use", "tool_name": "Edit", "tool_input": {"file_path": "/x/bar.js"}}
+    assert _summarize_event(ev) == "editing bar.js"
+
+
+def test_summarize_event_tool_use_bash():
+    ev = {"kind": "tool_use", "tool_name": "Bash", "tool_input": {"command": "pytest -x"}, "text": ""}
+    assert _summarize_event(ev) == "running: pytest -x"
+
+
+def test_summarize_event_state():
+    ev = {"kind": "state", "text": "implementing"}
+    assert _summarize_event(ev) == "implementing"
+
+
+def test_summarize_event_commit():
+    ev = {"kind": "commit", "text": "abc1234 fix bug"}
+    assert _summarize_event(ev) == "committing changes"
+
+
+def test_summarize_event_tests():
+    ev = {"kind": "tests", "text": "3 passed"}
+    assert _summarize_event(ev) == "running tests"
+
+
+def test_summarize_event_irrelevant():
+    ev = {"kind": "unknown_event", "text": "noise"}
+    assert _summarize_event(ev) is None
+
+
+# --------------------------------------------------------------------------- #
+# _check_compound_parent via Scheduler                                         #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_check_compound_parent_marks_done(store):
+    """When all sub-tasks are DONE, the parent transitions to DONE."""
+    parent = Task.new("compound", repo_path="/tmp/r")
+    await store.create_task(parent)
+    await store.set_status(parent, TaskStatus.IMPLEMENTING, validate=False)
+    await store.set_status(parent, TaskStatus.COMPOUND_PARENT, validate=False)
+
+    sub = Task.new("sub", repo_path="/tmp/r", parent_id=parent.id)
+    sub.status = TaskStatus.DONE
+    await store.create_task(sub)
+
+    events = []
+    sched = Scheduler(
+        store, lambda task=None: None, max_workers=1,
+        on_event=lambda k, t: events.append((k, t)),
+    )
+
+    await sched._check_compound_parent(sub)
+
+    refreshed = await store.get_task(parent.id)
+    assert refreshed.status == TaskStatus.DONE
+    assert any(k == "compound_resolved" for k, _ in events)
+
+
+@pytest.mark.asyncio
+async def test_check_compound_parent_ignores_non_compound(store):
+    """If parent is not COMPOUND_PARENT, _check_compound_parent is a no-op."""
+    parent = Task.new("normal", repo_path="/tmp/r")
+    await store.create_task(parent)
+
+    sub = Task.new("sub", repo_path="/tmp/r", parent_id=parent.id)
+    sub.status = TaskStatus.DONE
+    await store.create_task(sub)
+
+    sched = Scheduler(store, lambda task=None: None, max_workers=1)
+    await sched._check_compound_parent(sub)
+
+    refreshed = await store.get_task(parent.id)
+    assert refreshed.status == TaskStatus.PENDING  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_live_status_populated_via_sink(store):
+    """_sink callback populates _live_status on the scheduler."""
+    hold = asyncio.Event()
+
+    class FakeOrchWithSink:
+        async def run_task(self, task):
+            # Simulate a tool_use event via the _sink callback
+            self._sink({
+                "kind": "tool_use",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/a/b/test.py"},
+                "text": "Read test.py",
+            })
+            hold.set()
+            await asyncio.sleep(0.01)
+            await store.set_status(task, TaskStatus.DONE, validate=False)
+            return SimpleNamespace(status=TaskStatus.DONE, task=task)
+
+    orch = FakeOrchWithSink()
+    sched = Scheduler(store, lambda task=None: orch, max_workers=1)
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+
+    await sched.tick()
+    await hold.wait()
+    assert sched.get_live_status(t.id) == "reading test.py"
+
+    await asyncio.sleep(0.05)  # let run finish
+    # After task finishes, live_status should be cleared.
+    assert sched.get_live_status(t.id) is None
+
+
+@pytest.mark.asyncio
+async def test_events_persisted_to_store_on_task_finish(store):
+    """After a run finishes, its events are durably saved via store.save_events
+    so they survive a server restart (Activity/System tabs)."""
+    hold = asyncio.Event()
+
+    class FakeOrchWithSink:
+        async def run_task(self, task):
+            self._sink({"kind": "tool_use", "tool_name": "Read",
+                        "tool_input": {"file_path": "/a/b/test.py"}, "text": "Read test.py"})
+            self._sink({"kind": "result", "text": "done"})
+            await store.set_status(task, TaskStatus.DONE, validate=False)
+            hold.set()
+            return SimpleNamespace(status=TaskStatus.DONE, task=task)
+
+    orch = FakeOrchWithSink()
+    sched = Scheduler(store, lambda task=None: orch, max_workers=1)
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+
+    await sched.tick()
+    await hold.wait()
+    await asyncio.sleep(0.05)  # let the finally block's save_events land
+
+    persisted = await store.list_events(t.id)
+    assert len(persisted) == 2
+    assert persisted[0]["kind"] == "tool_use"
+    assert persisted[1]["kind"] == "result"

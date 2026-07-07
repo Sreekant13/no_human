@@ -12,7 +12,7 @@ import SlideOver from "./SlideOver.jsx";
 // (they'll auto-resolve), those WITHOUT go to Needs You (human must act).
 const LANES = [
   { key: "needs_you",    label: "Needs You",    accent: "var(--c-awaiting)",  statuses: ["awaiting_approval", "awaiting_input", "escalated"], loud: true, needsYou: true },
-  { key: "working",      label: "Working",      accent: "var(--c-building)",  statuses: ["pending", "context", "planning", "implementing", "reviewing", "testing"], showSubStatus: true },
+  { key: "working",      label: "Working",      accent: "var(--c-building)",  statuses: ["pending", "context", "planning", "implementing", "reviewing", "testing", "compound_parent"], showSubStatus: true },
   { key: "waiting",      label: "Waiting",      accent: "var(--c-context)",   statuses: ["blocked", "paused_quota"], autoWait: true },
   { key: "failed",       label: "Failed",       accent: "var(--c-escalated)", statuses: ["failed"] },
   { key: "done",         label: "Done",         accent: "var(--c-done)",      statuses: ["done"] },
@@ -152,7 +152,13 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
       {isActive && <div className="card-active-pulse" title="agent is working on this" />}
       <div className="card-id">{task.id.slice(0, 8)}</div>
       <div className="card-title">{task.title}</div>
-      {task.description_short && (
+      {task.live_status && isActive && (
+        <div className="card-live-status">{task.live_status}</div>
+      )}
+      {task.subtask_progress && (
+        <div className="card-subtask-progress">sub-tasks {task.subtask_progress}</div>
+      )}
+      {task.description_short && !task.live_status && (
         <div className="card-description">{task.description_short}</div>
       )}
       {task.blocker_question && isAwaiting && (
@@ -167,12 +173,13 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
         {task.kind && task.kind !== "feature" && (
           <span className={`card-kind kind-${task.kind}`}>{task.kind}</span>
         )}
+        {task.has_spec && <span className="card-spec-badge">spec</span>}
         {showSubStatus && (
           <span className={`card-substatus substatus-${task.status}`}>{task.status}</span>
         )}
         {task.attempt_count > 0 && (
           <span className="card-attempts">
-            att {task.attempt_count}{task.last_turns != null ? ` · ${task.last_turns}t` : ""}
+            att {task.attempt_count}{task.last_turns != null ? ` · ${task.last_turns}t` : ""}{task.total_tokens > 0 ? ` · ${task.total_tokens >= 1000000 ? `${(task.total_tokens/1000000).toFixed(1)}M` : task.total_tokens >= 1000 ? `${(task.total_tokens/1000).toFixed(0)}k` : task.total_tokens} tok` : ""}
           </span>
         )}
         {priority === "high" && <span className="card-priority card-priority-high">HI</span>}

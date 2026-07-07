@@ -81,7 +81,7 @@ export async function grillStep({ title, description, repo_path, project_id, qa_
 
 // ── Grill SSE streaming ─────────────────────────────────────────────────────
 
-export function grillStepSSE({ title, description, repo_path, project_id, qa_history }, onEvent, onResult, onError) {
+export function grillStepSSE({ title, description, repo_path, project_id, qa_history }, onEvent, onResult, onError, onEval) {
   // POST-based SSE: we need to fetch as a stream since EventSource only does GET.
   const ctrl = new AbortController();
   (async () => {
@@ -111,7 +111,9 @@ export function grillStepSSE({ title, description, repo_path, project_id, qa_his
           try {
             const data = JSON.parse(line.slice(6));
             if (data.kind === "done") { return; }
-            if (data.kind === "grill_result" || data.kind === "grill_question") {
+            if (data.kind === "eval_verdict") {
+              if (onEval) onEval(data);
+            } else if (data.kind === "grill_result" || data.kind === "grill_question") {
               if (onResult) onResult(data);
             } else if (data.kind === "error") {
               if (onError) onError(new Error(data.text || "grill error"));
@@ -264,6 +266,12 @@ export async function deleteProject(id) {
 
 export async function fetchTaskEvents(taskId) {
   const r = await fetch(`${BASE}/api/tasks/${taskId}/events`);
+  if (!r.ok) return [];
+  return r.json();
+}
+
+export async function fetchSubtasks(taskId) {
+  const r = await fetch(`${BASE}/api/tasks/${taskId}/subtasks`);
   if (!r.ok) return [];
   return r.json();
 }

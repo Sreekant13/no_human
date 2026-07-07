@@ -205,6 +205,63 @@ def test_summarize_tool():
     assert _summarize_tool("UnknownTool", {"val": "x"}) == "UnknownTool x"
 
 
+def test_format_events_attaches_tool_result_preview():
+    """tool_result events must not be silently dropped — the activity feed
+    needs the actual output of a tool call, not just the call signature."""
+    from no_human.api.app import _format_events
+
+    events = [
+        {"source": "agent", "kind": "tool_use", "tool_name": "Read",
+         "tool_input": {"file_path": "/repo/Jenkinsfile"}, "ts": 1.0},
+        {"source": "agent", "kind": "tool_result", "text": "stage('Build') { ... }", "ts": 1.1},
+        {"source": "agent", "kind": "tool_use", "tool_name": "Bash",
+         "tool_input": {"command": "wc -l Jenkinsfile"}, "ts": 2.0},
+        {"source": "agent", "kind": "tool_result", "text": "812 Jenkinsfile", "ts": 2.1},
+    ]
+    out = _format_events(events)
+    assert len(out) == 2  # tool_result events don't produce their own entries
+    assert out[0]["kind"] == "tool_use"
+    assert out[0]["tool_name"] == "Read"
+    assert out[0]["result_preview"] == "stage('Build') { ... }"
+    assert out[1]["result_preview"] == "812 Jenkinsfile"
+
+
+def test_format_events_truncates_long_result_preview():
+    from no_human.api.app import _format_events, _RESULT_PREVIEW_CAP
+
+    events = [
+        {"source": "agent", "kind": "tool_use", "tool_name": "Read",
+         "tool_input": {"file_path": "/repo/big.py"}, "ts": 1.0},
+        {"source": "agent", "kind": "tool_result", "text": "x" * 5000, "ts": 1.1},
+    ]
+    out = _format_events(events)
+    assert len(out[0]["result_preview"]) == _RESULT_PREVIEW_CAP + 1  # + ellipsis
+    assert out[0]["result_preview"].endswith("…")
+
+
+def test_format_events_tool_result_with_no_pending_tool_use_is_dropped():
+    from no_human.api.app import _format_events
+
+    events = [{"source": "agent", "kind": "tool_result", "text": "orphaned", "ts": 1.0}]
+    assert _format_events(events) == []
+
+
+def test_format_events_surfaces_thinking_blocks():
+    """Extended-thinking content used to be silently dropped — the UI needs
+    it (collapsed by default) to explain *why* the agent did something."""
+    from no_human.api.app import _format_events
+
+    events = [
+        {"source": "agent", "kind": "thinking", "text": "Let me check the existing stage first.", "ts": 1.0},
+        {"source": "agent", "kind": "tool_use", "tool_name": "Read",
+         "tool_input": {"file_path": "/repo/Jenkinsfile"}, "ts": 1.1},
+    ]
+    out = _format_events(events)
+    assert out[0]["kind"] == "thinking"
+    assert out[0]["text"] == "Let me check the existing stage first."
+    assert out[1]["kind"] == "tool_use"
+
+
 @pytest.mark.asyncio
 async def test_grill_step_on_event_passthrough():
     """When on_event is provided, grill_step forwards it to backend.run."""

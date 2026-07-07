@@ -45,7 +45,7 @@ from ..testing import runner
 from ..vcs import GitRepo, ProtectedBranch, open_pr
 from .bounds import Bounds, QuotaExhausted, StuckDetector
 from .db import Store
-from .task import Task, TaskStatus
+from .task import Task, TaskSpec, TaskStatus
 
 log = logging.getLogger("no_human.orchestrator")
 
@@ -199,6 +199,9 @@ class Orchestrator:
     def emit(self, kind: str, text: str = "", **meta: Any) -> None:
         self._sink({"source": "orchestrator", "kind": kind, "text": text, **meta})
 
+    def _emit_review(self, kind: str, text: str = "", **meta: Any) -> None:
+        self._sink({"source": "reviewer", "kind": kind, "text": text, **meta})
+
     def _agent_sink(self, event: AgentEvent) -> None:
         self._sink(
             {
@@ -346,10 +349,39 @@ class Orchestrator:
             await self._gather_context(task)
             await self.store.set_status(task, TaskStatus.PLANNING)
             self.emit("state", "planning", status="planning")
+
+            # D1/D9: run intake evaluator for tasks that skipped the grill
+            # wizard (TRACKER/board-sourced). Advisory — never blocks pipeline.
+            if not (task.context or {}).get("eval_result"):
+                try:
+                    from ..intake.evaluator import evaluate_spec
+                    eval_out = await evaluate_spec(
+                        task.title,
+                        task.description or "",
+                        task.acceptance_criteria or [],
+                    )
+                    if eval_out:
+                        ctx = task.context or {}
+                        ctx["eval_result"] = eval_out.as_dict()
+                        task.context = ctx
+                        await self.store.update_task(task)
+                        self.emit(
+                            "eval", eval_out.verdict.value,
+                            verdict=eval_out.verdict.value,
+                        )
+                except Exception:  # noqa: BLE001
+                    log.debug("intake evaluator skipped (advisory)", exc_info=True)
+
             plan_text = await self._generate_plan(task, repo)
             if plan_text:
                 ctx = task.context or {}
                 ctx["plan"] = plan_text
+                # D2: parse structured spec from plan text.
+                spec = TaskSpec.from_plan(plan_text)
+                ctx["spec"] = spec.as_dict()
+                # D5: flag large plans so the UI can warn.
+                if len(spec.files_to_change) > 8:
+                    ctx["plan_size_warning"] = True
                 task.context = ctx
                 await self.store.update_task(task)
 
@@ -364,10 +396,10 @@ class Orchestrator:
                 subtasks = await lead.decompose(task, decomposition)
                 self.emit(
                     "state", "compound",
-                    status="implementing",
+                    status="compound_parent",
                     subtask_count=len(subtasks),
                 )
-                return await lead.drive(task)
+                return await lead.park_parent(task)
 
         # Capture the base branch once and PERSIST it on the task. Re-deriving
         # from current_branch() is wrong on two axes: (1) within a run, after a
@@ -427,10 +459,25 @@ class Orchestrator:
                 for m in (self._active_memories or [])
                 if m.get("type") == "skill"
             }
-            # Merge: disk skills not already in DB
+            # Merge: disk skills not already in DB.
+            # Phase 5: opt-in relevance filter for user-level skills.
+            filter_user = self.config.get("filter_user_skills", False)
+            task_keywords: set[str] = set()
+            if filter_user:
+                from ..history.skills import USER_SKILLS
+                raw = f"{task.title or ''} {task.repo_path or ''}"
+                task_keywords = {w.lower() for w in raw.split() if len(w) > 2}
             for s in disk_skills:
-                if s.name not in db_skill_titles:
-                    self._discovered_skills.append(s.name)
+                if s.name in db_skill_titles:
+                    continue
+                # Filter user-level skills by keyword relevance if enabled.
+                if filter_user and Path(s.source).is_relative_to(USER_SKILLS):
+                    desc_words = {w.lower() for w in
+                                  f"{s.name} {s.description}".split() if len(w) > 2}
+                    if not task_keywords & desc_words:
+                        log.debug("skill %r filtered (no keyword overlap)", s.name)
+                        continue
+                self._discovered_skills.append(s.name)
             all_skill_names = sorted(
                 db_skill_titles | {s.name for s in disk_skills}
             )
@@ -443,7 +490,8 @@ class Orchestrator:
 
         outcome = TaskOutcome(task, status=task.status, detail="")
         for attempt_n in range(1, self.bounds.max_attempts + 1):
-            self.emit("attempt_start", f"attempt {attempt_n}/{self.bounds.max_attempts}")
+            self.emit("attempt_start", f"attempt {attempt_n}/{self.bounds.max_attempts}",
+                      max_turns=self.bounds.max_turns_per_attempt)
             try:
                 outcome = await self._run_attempt(task, repo, attempt_n, base_branch)
             except QuotaExhausted as exc:
@@ -454,6 +502,49 @@ class Orchestrator:
             if outcome.status != TaskStatus.FAILED:
                 return outcome
             self.emit("attempt_failed", outcome.detail)
+
+            # D6: stagnation detection — if the last 2 attempts have identical
+            # review pass rates and neither is 100%, the agent is stuck.
+            if attempt_n >= 2:
+                attempts = await self.store.list_attempts(task.id)
+                if len(attempts) >= 2:
+                    def _pass_rate(a: dict) -> float | None:
+                        rc = a.get("review_checklist")
+                        if isinstance(rc, str):
+                            try:
+                                rc = json.loads(rc)
+                            except (ValueError, TypeError):
+                                return None
+                        if not isinstance(rc, dict):
+                            return None
+                        items = rc.get("items", [])
+                        if not items:
+                            return None
+                        return sum(1 for i in items if i.get("passed")) / len(items)
+
+                    r1 = _pass_rate(attempts[-1])
+                    r2 = _pass_rate(attempts[-2])
+                    if r1 is not None and r2 is not None and r1 == r2 and r1 < 1.0:
+                        ctx = task.context or {}
+                        ctx["stagnation_detected"] = True
+                        task.context = ctx
+                        await self.store.update_task(task)
+                        blocker = Blocker(
+                            category=BlockerCategory.STAGNATION,
+                            transient=False, confidence=0.9, goal=task.title,
+                            root_cause_hypothesis=(
+                                f"Review pass rate stuck at {r1:.0%} for 2 consecutive "
+                                f"attempts — the agent is not making progress."
+                            ),
+                            question=(
+                                "The agent appears stuck. Should the task be revised, "
+                                "decomposed, or manually investigated?"
+                            ),
+                        )
+                        return await self._raise_blocker(
+                            task, blocker, repo=repo, branch=base_branch,
+                            escalate_now=True,
+                        )
 
         # Bounds exhausted -> escalate with a diagnosis built from the attempts
         # (never fake done). 22.3: ≤2 distinct alternatives, then escalate.
@@ -649,6 +740,21 @@ class Orchestrator:
         for k, v in env_vars.items():
             saved_env[k] = os.environ.get(k)
             os.environ[k] = v
+
+        # Phase 6: enable extended thinking for complex tasks.
+        ctx = task.context or {}
+        spec_d = ctx.get("spec", {})
+        use_thinking = (
+            len(spec_d.get("files_to_change", [])) > 4
+            or ctx.get("plan_size_warning")
+            or (ctx.get("eval_result", {}).get("verdict") == "decompose")
+        )
+        if use_thinking:
+            extra["thinking"] = True
+            extra["max_thinking_tokens"] = self.config.get(
+                "max_thinking_tokens", 10_000,
+            )
+            self.emit("thinking_enabled", "extended thinking on (complex task)")
 
         try:
             result = await self.backend.run(
@@ -881,7 +987,7 @@ class Orchestrator:
             # blindly re-implementing. This reuses the bounded attempt loop
             # (max_attempts) — the tamper guard still fires first on every round,
             # so the worker cannot weaken tests to satisfy the reviewer.
-            await self._record_review_feedback(task, failed)
+            await self._record_review_feedback(task, failed, decision.suggested_next)
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
         await self.store.update_attempt(
             attempt_id,
@@ -1059,6 +1165,37 @@ class Orchestrator:
                 detail = f"CI failed: {ci_result.summary}"
                 await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
                 return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+
+        # --- CI_GATE pipeline trigger (opt-in) ---
+        ci_gate_cfg = self.config.get("ci_gate", {})
+        pipeline_map = ci_gate_cfg.get("repo_pipeline_map", {})
+        repo_key = str(repo.path).rstrip("/").rsplit("/", 1)[-1] if repo else ""
+        if repo_key and repo_key in pipeline_map:
+            try:
+                from ..ci_gate.runner import trigger_pipeline, poll_pipeline
+                self.emit("state", "testing", status="testing")
+                pid = trigger_pipeline(
+                    pipeline_name=pipeline_map[repo_key],
+                    repo_path=str(repo.path),
+                    ref=branch or "main",
+                )
+                self.emit("ci_gate_trigger", f"pipeline {pid} triggered")
+                poll_result = await poll_pipeline(
+                    project_path=ci_gate_cfg.get("project_path", repo_key),
+                    pipeline_id=pid,
+                    hostname=ci_gate_cfg.get("hostname"),
+                    poll_interval=ci_gate_cfg.get("poll_interval", 30),
+                    timeout=ci_gate_cfg.get("timeout", 1800),
+                    emit=self.emit,
+                )
+                if not poll_result.passed:
+                    detail = f"CI_GATE pipeline {pid} {poll_result.status}"
+                    await self.store.update_attempt(
+                        attempt_id, status="failed", failure_reason=detail,
+                    )
+                    return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("CI_GATE trigger failed (proceeding to PR): %s", exc)
 
         # --- finalize: push + open PR (NEVER merge) + notify ---
         return await self._finalize(
@@ -1416,7 +1553,10 @@ class Orchestrator:
         task.context = ctx
         await self.store.update_task(task)
 
-    async def _record_review_feedback(self, task: Task, failed_items: list) -> None:
+    async def _record_review_feedback(
+        self, task: Task, failed_items: list,
+        suggested_next: str | None = None,
+    ) -> None:
         """Persist the reviewer's failed checklist items so the NEXT attempt's
         prompt targets them (EVOLUTION_PLAN §2.2). Cited evidence (file:line) and
         the actionable comment are kept; the worker re-implements against the named
@@ -1433,6 +1573,8 @@ class Orchestrator:
             }
             for i in (failed_items or [])[:6]
         ]
+        if suggested_next:
+            ctx["review_suggested_next"] = suggested_next
         task.context = ctx
         await self.store.update_task(task)
 
@@ -1467,7 +1609,7 @@ class Orchestrator:
             profile_ctx = "\n".join(f"  {p}" for p in parts if p)
         confirmed_rules = self._format_active_memories() or ""
 
-        self.emit("review_start", "running independent staff-level reviewer")
+        self._emit_review("review_start", "running independent staff-level reviewer")
         try:
             decision = await self.reviewer.review(
                 task,
@@ -1480,15 +1622,15 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001
             # Reviewer crash → fail closed (never pass-through on error).
             from ..review.selfcheck import ChecklistItem
-            self.emit("review_error", str(exc))
+            self._emit_review("review_error", str(exc))
             return ReviewDecision(
                 passed=False,
                 checklist=[ChecklistItem("reviewer run", False, f"reviewer crashed: {exc}")],
             )
 
         verdict = "PASS" if decision.passed else "FAIL"
-        self.emit("review", verdict, passed=decision.passed,
-                  failed_count=len(decision.failed_items))
+        self._emit_review("review", verdict, passed=decision.passed,
+                         failed_count=len(decision.failed_items))
         return decision
 
     # ─────────────────── code review pipeline ────────────────────────── #
@@ -1571,7 +1713,7 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001
             self.emit("review_error", f"could not fetch PR comments: {exc}")
 
-        self.emit("review_start", f"running staff-level code review on {pr_url}")
+        self._emit_review("review_start", f"running staff-level code review on {pr_url}")
         if self.reviewer is None:
             return await self._fail(task, "no reviewer configured for code_review tasks")
 
@@ -1588,7 +1730,7 @@ class Orchestrator:
                 pr_comments=pr_comments_text,
             )
         except Exception as exc:  # noqa: BLE001
-            self.emit("review_error", str(exc))
+            self._emit_review("review_error", str(exc))
             return await self._fail(task, f"reviewer crashed: {exc}")
 
         # Store the review result.
@@ -1603,12 +1745,63 @@ class Orchestrator:
         n_failed = len(decision.failed_items)
         detail = f"code review {verdict}: {n_failed} issue(s) found" if not decision.passed \
             else f"code review {verdict}: all checks passed"
-        self.emit("review", detail, passed=decision.passed, failed_count=n_failed)
+        self._emit_review("review", detail, passed=decision.passed, failed_count=n_failed)
+
+        # Best-effort: post the review checklist as a PR comment.
+        await self._post_review_to_pr(pr_url, decision)
 
         # Mark done — code reviews don't need approval.
         await self.store.set_status(task, TaskStatus.DONE, validate=False)
         self.emit("state", "done", status="done")
         return TaskOutcome(task, status=TaskStatus.DONE, detail=detail)
+
+    async def _post_review_to_pr(
+        self, pr_url: str, decision: ReviewDecision,
+    ) -> None:
+        """Post the review checklist as a PR comment. Best-effort — never blocks."""
+        import subprocess
+        items = decision.checklist or []
+        if not items:
+            return
+        failed = [it for it in items if not it.passed]
+        if not failed:
+            return  # nothing to post if everything passed
+        lines = []
+        for item in failed:
+            comment = item.comment or item.evidence or item.label
+            if item.file and item.line:
+                lines.append(f"`{item.file}:{item.line}` — {comment}")
+            else:
+                lines.append(comment)
+        body = "\n\n".join(lines)
+
+        # Parse the PR URL to get hostname/owner/repo/number.
+        m = re.match(
+            r"https?://([^/]+)/([^/]+)/([^/]+)/(?:pull|merge_requests)/(\d+)",
+            pr_url,
+        )
+        if not m:
+            log.debug("_post_review_to_pr: cannot parse PR URL %s", pr_url)
+            return
+        hostname, owner, repo, pr_number = m.group(1), m.group(2), m.group(3), m.group(4)
+
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                [
+                    "gh", "api", "--hostname", hostname,
+                    "-X", "POST",
+                    f"repos/{owner}/{repo}/issues/{pr_number}/comments",
+                    "-f", f"body={body}",
+                ],
+                capture_output=True, text=True, timeout=15,
+            )
+            if proc.returncode == 0:
+                self.emit("review_posted", f"review posted to {pr_url}")
+            else:
+                log.warning("review comment post failed: %s", proc.stderr.strip()[:200])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("review comment post failed: %s", exc)
 
     def _extract_pr_url(self, task: Task) -> str | None:
         """Extract a PR/MR URL from the task title or description."""
@@ -2137,6 +2330,13 @@ class Orchestrator:
         if kind_dir:
             sections.append(f"**Task kind:** {task.kind}\n{kind_dir}")
 
+        # 4. Subagent advisory.
+        sections.append(
+            "**Subagent:** For focused multi-file investigation before editing, "
+            "consider delegating to the `no_human_researcher` subagent to keep "
+            "your own context budget free for implementation."
+        )
+
         if not sections:
             return
 
@@ -2287,7 +2487,13 @@ class Orchestrator:
             "## FILES TO CHANGE/CREATE\n"
             "List every file path and a one-line description of the change.\n\n"
             "## APPROACH\n"
-            "Per-file implementation approach — what to add or modify.\n\n"
+            "Per-file implementation approach — what to add or modify. If this task "
+            "integrates with an external system (CI/build API, VCS/PR API, webhooks, "
+            "cloud/k8s, etc.), explicitly enumerate: the full set of states/statuses "
+            "the system can return (not just the happy path), whether each call is "
+            "destructive/replacing or additive (e.g. does it wipe existing config), "
+            "and whether repeated calls are idempotent (e.g. comment posting, "
+            "artifact writes).\n\n"
             "## TEST PLAN\n"
             "Map each acceptance criterion to a specific test. Name the test file and "
             "describe each test method.\n\n"
@@ -2299,11 +2505,19 @@ class Orchestrator:
             "## VERIFICATION\n"
             f"Exact command(s) to run: {test_cmd or '(discover from the repo)'}\n\n"
             "Be specific and concrete. Reference actual file paths in the repo.\n\n"
+            "IMPORTANT: Limit your plan to at most 8 tasks/files unless decomposing.\n"
+            "If the task genuinely requires more, explain why — but default to the\n"
+            "smallest plan that meets the criteria.\n\n"
             "## COMPOUND TASK ASSESSMENT\n"
             "If this task is too complex for a single agent session — e.g. many "
             "distinct areas of code, investigation needed before implementation, "
             "multiple repos, broad test coverage, or exploratory debugging across "
             "many files — emit a decomposition plan.\n\n"
+            "Example: a change touching only 1-2 files but bundling 3+ unrelated "
+            "external-system concerns (build API, CI pipeline polling, PR/comment "
+            "pagination, error-classification logic) is compound by CONCERN count, "
+            "not file count. Each concern becomes a linearly-chained sub-task "
+            "(each depends_on the previous) so review stays focused.\n\n"
             "Wrap the decomposition in DECOMPOSE_PLAN_START / DECOMPOSE_PLAN_END "
             "markers with a JSON block inside a fenced code block:\n"
             "DECOMPOSE_PLAN_START\n"
@@ -2318,6 +2532,8 @@ class Orchestrator:
             "- Each sub-task must be independently testable and reviewable.\n"
             "- Each sub-task must have a clear justification. No duplicates.\n"
             "- Maximum 50 sub-tasks. Prefer fewer, larger sub-tasks.\n"
+            "- Each sub-task may depend on at most ONE other sub-task "
+            "(linear chains only — no diamond/multi-parent dependencies).\n"
             "- Only decompose if a single agent session truly cannot handle it.\n"
             "- If you decompose, do NOT also produce a normal plan above.\n"
         )
@@ -2674,6 +2890,11 @@ class Orchestrator:
                 "skip, or delete any test to satisfy the reviewer:\n"
                 + "\n".join(lines)
             )
+        suggested_next = ctx.get("review_suggested_next")
+        if suggested_next:
+            parts.append(
+                f"Reviewer's suggested focus for this retry: {suggested_next}"
+            )
         handoff = ctx.get("handoff")
         if handoff:
             summary = handoff.get("summary", "")
@@ -2711,6 +2932,15 @@ class Orchestrator:
                 + "\n".join(f"    {ln}" for ln in
                             (ci_fail.get("detail", "")).splitlines()[:30])
             )
+        # D3: inject test case plan from structured spec.
+        spec = ctx.get("spec") or {}
+        test_plan = spec.get("test_plan", "")
+        if test_plan:
+            parts.append(
+                "Test plan from the spec — write tests that cover these:\n"
+                + test_plan
+            )
+
         return "\n\n".join(parts)
 
     async def _persist_handoff(

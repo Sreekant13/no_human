@@ -44,6 +44,49 @@ def _parse_iso(value: str | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def _summarize_event(event: dict) -> str | None:
+    """Extract a short human-readable summary from an event dict.
+
+    Returns None for events that are not worth showing as a live status.
+    """
+    kind = event.get("kind", "")
+    text = event.get("text", "")
+
+    if kind == "tool_use":
+        tool = event.get("tool_name") or text.split(" ", 1)[0] or "tool"
+        inp = event.get("tool_input") or {}
+        path = inp.get("file_path") or inp.get("path") or inp.get("notebook_path") or ""
+        basename = path.rsplit("/", 1)[-1] if path else ""
+        if tool in ("Read", "View"):
+            return f"reading {basename}" if basename else "reading file"
+        if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+            return f"editing {basename}" if basename else "editing file"
+        if tool in ("Bash", "Terminal"):
+            cmd = inp.get("command", "")[:60]
+            return f"running: {cmd}" if cmd else "running command"
+        if tool == "Search":
+            return f"searching: {inp.get('query', '')[:50]}"
+        return f"{tool.lower()} {basename}".strip()
+
+    if kind == "state":
+        return text  # e.g. "implementing", "reviewing"
+    if kind == "commit":
+        return "committing changes"
+    if kind in ("tests", "lint"):
+        return f"running {kind}"
+    if kind in ("review_start", "review"):
+        return "reviewing code"
+    if kind == "attempt_start":
+        return text  # e.g. "attempt 1/3"
+    if kind == "context_gather" or kind == "context":
+        return "gathering context"
+    if kind == "supervisor":
+        return "supervisor check"
+    if kind == "decompose":
+        return "decomposing into sub-tasks"
+    return None
+
+
 class Scheduler:
     def __init__(
         self,
@@ -54,6 +97,7 @@ class Scheduler:
         wake_watcher: object | None = None,
         on_event: Callable[[str, str], None] | None = None,
         reanalysis_job: ReanalysisJob | None = None,
+        config: dict | None = None,
     ):
         self.store = store
         self.factory = orchestrator_factory
@@ -63,15 +107,25 @@ class Scheduler:
         self._on_event = on_event or (lambda kind, text: None)
         self._quota_cooldown_until: datetime | None = None
         self.reanalysis = reanalysis_job
+        self._config = config or {}
         # Per-task event log: task_id -> deque of {ts, source, kind, text, ...}
         self._event_log: dict[str, deque] = {}
         self._MAX_EVENTS = 200
         # Phase 4a: SSE — per-task notify so streaming clients wake on new events.
         self._event_notify: dict[str, asyncio.Event] = {}
+        # Compound-parent completion: per-parent lock prevents race conditions
+        # when multiple sub-tasks complete concurrently.
+        self._compound_locks: dict[str, asyncio.Lock] = {}
+        # Live status: short human-readable summary of what the agent is doing.
+        self._live_status: dict[str, str] = {}
 
     @property
     def inflight(self) -> set[str]:
         return set(self._inflight)
+
+    def get_live_status(self, task_id: str) -> str | None:
+        """Return the latest live status summary for a task, or None."""
+        return self._live_status.get(task_id)
 
     def _in_quota_cooldown(self, now: datetime) -> bool:
         return self._quota_cooldown_until is not None and now < self._quota_cooldown_until
@@ -138,6 +192,9 @@ class Scheduler:
             event["task_id"] = task.id
             buf.append(event)
             notify.set()
+            summary = _summarize_event(event)
+            if summary:
+                self._live_status[task.id] = summary
 
         try:
             orch = self.factory(task)
@@ -164,11 +221,59 @@ class Scheduler:
                 pass
         finally:
             self._inflight.discard(task.id)
+            self._live_status.pop(task.id, None)
             # Final notify so SSE clients see the task finished, then clean up.
             if task.id in self._event_notify:
                 self._event_notify[task.id].set()
                 # Don't delete immediately — give SSE 5s to drain.
                 # The SSE endpoint checks inflight and closes after idle ticks.
+
+            # Persist this run's events so Activity/System tabs survive a
+            # server restart (the in-memory buffer is lost on restart).
+            try:
+                await self.store.save_events(task.id, list(buf))
+            except Exception:  # noqa: BLE001 — persistence must not break the pool
+                log.warning("failed to persist events for task %s", task.id[:8])
+
+            # Compound-parent completion: if this task is a sub-task, check
+            # whether the parent compound task should transition.
+            await self._check_compound_parent(task)
+
+    async def _check_compound_parent(self, task) -> None:
+        """After a sub-task finishes, check if the parent should complete."""
+        parent_id = getattr(task, "parent_id", None)
+        if not parent_id:
+            return
+        try:
+            parent = await self.store.get_task(parent_id)
+        except Exception:  # noqa: BLE001
+            return
+        if parent is None or parent.status != TaskStatus.COMPOUND_PARENT:
+            return
+
+        # Per-parent lock: prevents two concurrent sub-task completions from
+        # racing on the same parent's check_completion.
+        lock = self._compound_locks.setdefault(parent_id, asyncio.Lock())
+        async with lock:
+            try:
+                from .lead_agent import LeadAgent
+                lead = LeadAgent(
+                    self.store,
+                    config=self._config,
+                    emit=lambda kind, text, **kw: self._on_event(kind, text),
+                )
+                finished = await lead.check_completion(parent)
+                if finished:
+                    self._compound_locks.pop(parent_id, None)
+                    self._on_event(
+                        "compound_resolved",
+                        f"parent {parent_id[:8]} → {parent.status.value}",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "compound completion check failed for %s: %s",
+                    parent_id[:8], exc,
+                )
 
     async def run_forever(
         self, *, stop: asyncio.Event, poll_interval: float = 10.0

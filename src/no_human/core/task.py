@@ -18,6 +18,8 @@ class TaskStatus(str, Enum):
     REVIEWING = "reviewing"
     TESTING = "testing"
     AWAITING_APPROVAL = "awaiting_approval"
+    # compound parent — parked while sub-tasks execute (frees worker slot)
+    COMPOUND_PARENT = "compound_parent"
     # off-ramps
     BLOCKED = "blocked"
     AWAITING_INPUT = "awaiting_input"
@@ -111,6 +113,13 @@ def _allowed_transitions() -> dict[TaskStatus, frozenset[TaskStatus]]:
         table[state].add(TaskStatus.FAILED)
         table[state].add(TaskStatus.PENDING)  # LeadAgent unblocks dep-gated sub-tasks
 
+    # Compound parent: implementing → compound_parent (park),
+    # compound_parent → done / failed / escalated (scheduler callback).
+    table[TaskStatus.IMPLEMENTING].add(TaskStatus.COMPOUND_PARENT)
+    table[TaskStatus.COMPOUND_PARENT] |= {
+        TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.ESCALATED,
+    }
+
     return {k: frozenset(v) for k, v in table.items()}
 
 
@@ -134,6 +143,91 @@ def assert_transition(src: TaskStatus, dst: TaskStatus) -> None:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass
+class TaskSpec:
+    """Structured spec extracted from the planner's output."""
+    files_to_change: list[str] = field(default_factory=list)
+    approach: str = ""
+    test_plan: str = ""
+    out_of_scope: list[str] = field(default_factory=list)
+    verification: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "files_to_change": self.files_to_change,
+            "approach": self.approach,
+            "test_plan": self.test_plan,
+            "out_of_scope": self.out_of_scope,
+            "verification": self.verification,
+        }
+
+    @staticmethod
+    def from_plan(plan_text: str) -> "TaskSpec":
+        """Parse structured sections from the planner's markdown output."""
+        import re as _re
+        sections: dict[str, str] = {}
+        current: str | None = None
+        lines: list[str] = []
+        for line in plan_text.splitlines():
+            m = _re.match(r"^##\s+(.+)", line)
+            if m:
+                if current:
+                    sections[current] = "\n".join(lines).strip()
+                current = m.group(1).strip().upper()
+                lines = []
+            else:
+                lines.append(line)
+        if current:
+            sections[current] = "\n".join(lines).strip()
+
+        def _list_items(text: str) -> list[str]:
+            items = []
+            for l in text.splitlines():
+                s = l.strip()
+                # Skip markdown horizontal rules ("---", "***", ...) — these
+                # separate sections in the planner's output and would otherwise
+                # be mis-parsed as an empty bullet item.
+                if _re.match(r"^[-*_]{3,}$", s):
+                    continue
+                if s.startswith(("-", "*")):
+                    item = s.lstrip("-*").strip()
+                    if item:
+                        items.append(item)
+            return items
+
+        def _table_files(text: str) -> list[str]:
+            """Extract file paths from the first column of a markdown table.
+
+            The planner sometimes emits FILES TO CHANGE/CREATE as a
+            `| File | Change |` table instead of a bullet list.
+            """
+            files = []
+            for l in text.splitlines():
+                s = l.strip()
+                if not s.startswith("|"):
+                    continue
+                if _re.match(r"^\|[\s:-]+\|", s):
+                    continue  # separator row, e.g. |------|------|
+                cells = [c.strip().strip("`").strip() for c in s.strip("|").split("|")]
+                if not cells or not cells[0]:
+                    continue
+                if cells[0].lower() in ("file", "files", "path"):
+                    continue  # header row
+                files.append(cells[0])
+            return files
+
+        files_section = sections.get("FILES TO CHANGE/CREATE", "")
+        files_to_change = _list_items(files_section) or _table_files(files_section)
+
+        return TaskSpec(
+            files_to_change=files_to_change,
+            approach=sections.get("APPROACH", ""),
+            test_plan=sections.get("TEST PLAN", ""),
+            out_of_scope=_list_items(sections.get("OUT OF SCOPE", "")),
+            verification=sections.get("VERIFICATION", ""),
+        )
 
 
 @dataclass

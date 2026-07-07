@@ -27,32 +27,44 @@ from typing import Any, Callable
 
 # ── 1. Scope guard ──────────────────────────────────────────────────────── #
 
-_FILES_SECTION = re.compile(
-    r"##\s*FILES\s+TO\s+CHANGE/?CREATE\b(.*?)(?=\n##|\Z)",
-    re.DOTALL | re.IGNORECASE,
-)
-
-
 def parse_plan_files(plan_text: str) -> set[str]:
     """Extract declared file paths from PLAN.md's FILES TO CHANGE/CREATE section.
 
+    Delegates section extraction to ``TaskSpec.from_plan`` (single source of
+    truth for plan-markdown parsing), then applies path-token extraction to
+    handle items that include descriptions (e.g. ``src/foo.py — add bar``).
+
+    Extension-less filenames (``Jenkinsfile``, ``Makefile``) are preserved.
     Returns a set of normalised paths (stripped, no leading ``./``).
     """
-    m = _FILES_SECTION.search(plan_text)
-    if not m:
-        return set()
+    from ..core.task import TaskSpec
+
+    spec = TaskSpec.from_plan(plan_text)
     paths: set[str] = set()
-    for line in m.group(1).splitlines():
-        line = line.strip().lstrip("-•*").strip()
-        if not line:
-            continue
-        # Take the first token that looks like a path (contains a dot or slash)
-        for tok in line.split():
-            tok = tok.strip("`'\"(),:")
-            if "/" in tok or "." in tok:
-                paths.add(tok.removeprefix("./"))
-                break
+    for item in spec.files_to_change:
+        tok = _extract_path_token(item)
+        if tok:
+            paths.add(tok.removeprefix("./"))
     return paths
+
+
+def _extract_path_token(text: str) -> str | None:
+    """Extract the first path-like token from a file-list item.
+
+    Handles items that include descriptions after the path
+    (e.g. ``src/foo.py — add validation``) and bare filenames
+    with no extension or slash (e.g. ``Jenkinsfile``).
+    """
+    tokens = text.split()
+    for tok in tokens:
+        tok = tok.strip("`'\"(),:")
+        if not tok:
+            continue
+        if "/" in tok or "." in tok:
+            return tok
+        if len(tokens) == 1:
+            return tok
+    return None
 
 
 def check_scope(

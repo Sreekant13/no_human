@@ -24,6 +24,9 @@ class AttemptOut(BaseModel):
     ci_status: str | None = None
     failure_reason: str | None = None
     turns_used: int | None = None
+    tokens_used: int | None = None
+    cache_read_tokens: int | None = None
+    cache_creation_tokens: int | None = None
     status: str | None = None
     started_at: str | None = None
     completed_at: str | None = None
@@ -52,6 +55,9 @@ class AttemptOut(BaseModel):
             ci_status=row.get("ci_status"),
             failure_reason=row.get("failure_reason"),
             turns_used=row.get("turns_used"),
+            tokens_used=row.get("tokens_used"),
+            cache_read_tokens=row.get("cache_read_tokens"),
+            cache_creation_tokens=row.get("cache_creation_tokens"),
             status=row.get("status"),
             started_at=row.get("started_at"),
             completed_at=row.get("completed_at"),
@@ -131,6 +137,9 @@ class TaskSummaryOut(BaseModel):
     backend: str | None = None  # "claude" or "devin"
     total_tokens: int | None = None
     parent_id: str | None = None
+    has_spec: bool = False
+    live_status: str | None = None
+    subtask_progress: str | None = None
 
     @classmethod
     def from_task(
@@ -186,6 +195,7 @@ class TaskSummaryOut(BaseModel):
             backend=task_backend,
             total_tokens=total_tokens,
             parent_id=task.parent_id,
+            has_spec=bool((task.context or {}).get("spec")),
         )
 
 

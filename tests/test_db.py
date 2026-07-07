@@ -78,3 +78,30 @@ async def test_list_memories_project_scoped(store):
     # No project filter → all rows (back-compat).
     everything = await store.list_memories(confirmed=True)
     assert {m["title"] for m in everything} == {"ra", "rb", "rg"}
+
+
+async def test_save_and_list_events_persist_across_restart(tmp_path):
+    """Events saved via save_events survive a Store reconnect (simulated restart)."""
+    t = Task.new("x", repo_path="/tmp/r")
+    db_path = tmp_path / "events.db"
+
+    s1 = await Store(db_path).connect()
+    await s1.create_task(t)
+    events = [
+        {"ts": 1.0, "kind": "tool_use", "source": "agent", "tool_name": "Read"},
+        {"ts": 2.0, "kind": "result", "source": "orchestrator", "text": "done"},
+    ]
+    await s1.save_events(t.id, events)
+    await s1.close()
+
+    # Simulate a server restart: fresh Store instance, same db file.
+    s2 = await Store(db_path).connect()
+    persisted = await s2.list_events(t.id)
+    assert len(persisted) == 2
+    assert persisted[0]["kind"] == "tool_use"
+    assert persisted[1]["text"] == "done"
+    await s2.close()
+
+
+async def test_list_events_empty_for_unknown_task(store):
+    assert await store.list_events("no-such-task") == []

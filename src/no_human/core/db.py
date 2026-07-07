@@ -322,6 +322,27 @@ class Store:
         await self.db.commit()
         return cur.rowcount > 0
 
+    # ----------------------- task events (persisted) ----------------------- #
+
+    async def save_events(self, task_id: str, events: list[dict[str, Any]]) -> None:
+        """Persist a batch of task events so they survive a server restart."""
+        if not events:
+            return
+        await self.db.executemany(
+            "INSERT INTO task_events (task_id, ts, data) VALUES (?, ?, ?)",
+            [(task_id, e.get("ts", 0), json.dumps(e)) for e in events],
+        )
+        await self.db.commit()
+
+    async def list_events(self, task_id: str) -> list[dict[str, Any]]:
+        """Return persisted events for a task, ordered oldest → newest."""
+        cur = await self.db.execute(
+            "SELECT data FROM task_events WHERE task_id = ? ORDER BY ts ASC, id ASC",
+            (task_id,),
+        )
+        rows = await cur.fetchall()
+        return [json.loads(r["data"]) for r in rows]
+
     # ----------------------- project profiles ----------------------------- #
 
     async def upsert_profile(self, profile: "ProjectProfile") -> None:

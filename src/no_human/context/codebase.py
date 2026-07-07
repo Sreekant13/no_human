@@ -48,9 +48,10 @@ class CodebaseSource:
 
     # Vendored / generated trees that pollute relevance — never search these.
     _EXCLUDE_DIRS = (
-        ".git", "node_modules", "dist", "build", "target", ".venv", "venv",
+        ".git", "node_modules", "dist", "build", "target", ".venv*", "venv*",
         "vendor", "__pycache__", ".idea", ".gradle", "coverage", "out",
         ".next", ".nuxt", ".cache", "public", "static",
+        ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", "htmlcov",
     )
     _EXCLUDE_GLOBS = (
         "*.min.js", "*.map", "*.lock", "*.snap", "*.bundle.js",

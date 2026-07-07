@@ -30,6 +30,7 @@ class BlockerCategory(str, Enum):
     SCOPE_EXPLOSION = "SCOPE_EXPLOSION"
     IMPOSSIBLE = "IMPOSSIBLE"
     NOVEL_UNKNOWN = "NOVEL_UNKNOWN"
+    STAGNATION = "STAGNATION"
 
     @classmethod
     def coerce(cls, value: str | "BlockerCategory") -> "BlockerCategory":

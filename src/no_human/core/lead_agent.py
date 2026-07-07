@@ -2,17 +2,16 @@
 
 Lifecycle:
   1. Planner detects complexity → emits a DECOMPOSE_PLAN block
-  2. Orchestrator._drive() creates a LeadAgent and calls decompose() + drive()
+  2. Orchestrator._drive() creates a LeadAgent and calls decompose() + park()
   3. decompose() creates sub-tasks in the DB with parent_id linkage
-  4. drive() polls sub-task completion, unblocks dependents, handles failures
-  5. When all sub-tasks complete → returns success to the parent orchestrator
+  4. park() sets the parent to COMPOUND_PARENT and returns immediately,
+     freeing the worker slot for sub-tasks to use
+  5. Scheduler._run() calls check_completion() after each sub-task finishes
+  6. check_completion() unblocks dependents, handles failures, and marks
+     the parent DONE when all sub-tasks complete
 
 Sub-tasks are first-class tasks dispatched by the existing Scheduler.tick().
 The LeadAgent never runs agents directly — it only creates/monitors tasks.
-
-Known limitation (v1): the parent task's orchestrator coroutine is blocked in
-the drive() poll loop, consuming one worker slot for the entire compound task
-duration. Increase max_workers if running compound tasks frequently.
 """
 
 from __future__ import annotations
@@ -149,105 +148,123 @@ class LeadAgent:
         return created
 
     # ---------------------------------------------------------------------- #
-    # DAG execution loop                                                      #
+    # Park (non-blocking) — replaces the old blocking drive() poll loop       #
     # ---------------------------------------------------------------------- #
 
-    async def drive(self, parent: Task) -> "TaskOutcome":
-        """Poll sub-tasks until all complete or a failure escalates."""
+    async def park_parent(self, parent: Task) -> "TaskOutcome":
+        """Set parent to COMPOUND_PARENT and return immediately.
+
+        The worker slot is freed as soon as this returns.  Sub-task
+        completion is detected by the Scheduler calling check_completion()
+        after each sub-task finishes.
+        """
         from .orchestrator import TaskOutcome
 
-        retried: set[str] = set()
+        await self.store.set_status(
+            parent, TaskStatus.COMPOUND_PARENT, validate=False,
+        )
+        self._emit(
+            "state", "compound_parent",
+            status="compound_parent",
+        )
+        return TaskOutcome(
+            parent, status=TaskStatus.COMPOUND_PARENT,
+            detail="parked — sub-tasks dispatched to scheduler",
+        )
 
-        while True:
-            subtasks = await self.store.list_subtasks(parent.id)
-            if not subtasks:
-                return TaskOutcome(
-                    parent, status=TaskStatus.FAILED,
-                    detail="compound task has no sub-tasks",
-                )
+    # ---------------------------------------------------------------------- #
+    # Completion check — called by the Scheduler after each sub-task ends     #
+    # ---------------------------------------------------------------------- #
 
-            # Classify sub-task states.
-            done = [t for t in subtasks if t.status == TaskStatus.DONE]
-            failed = [t for t in subtasks if t.status == TaskStatus.FAILED]
-            blocked = [
-                t for t in subtasks if t.status == TaskStatus.BLOCKED
-            ]
-            active = [
-                t for t in subtasks
-                if t.status not in TERMINAL_STATES
-                and t.status != TaskStatus.BLOCKED
-            ]
+    async def check_completion(self, parent: Task) -> bool:
+        """Evaluate compound task progress after a sub-task finishes.
 
-            # All done?
-            if len(done) == len(subtasks):
-                # Quality gate: optionally run a brief integration check before
-                # marking the parent as done. Config-gated (default off).
-                gate_cfg = self.config.get("lead_agent", {})
-                if gate_cfg.get("quality_gate", False):
-                    gate_result = await self._run_quality_gate(parent, done)
-                    if gate_result is not None:
-                        return gate_result
+        Returns True if the parent reached a terminal state (DONE, FAILED,
+        ESCALATED) and False if sub-tasks are still in progress.
+        """
+        subtasks = await self.store.list_subtasks(parent.id)
+        if not subtasks:
+            await self.store.set_status(
+                parent, TaskStatus.FAILED, validate=False,
+            )
+            return True
 
-                self._emit(
-                    "compound_done",
-                    f"all {len(subtasks)} sub-tasks completed",
-                )
+        done = [t for t in subtasks if t.status == TaskStatus.DONE]
+        failed = [t for t in subtasks if t.status == TaskStatus.FAILED]
+
+        # Unblock sub-tasks whose dependencies are now met.
+        unblocked = await self._unblock_ready(parent.id, subtasks)
+        if unblocked:
+            self._emit("unblock", f"unblocked {unblocked} sub-task(s)")
+
+        # All done → quality gate → mark parent DONE.
+        if len(done) == len(subtasks):
+            gate_cfg = self.config.get("lead_agent", {})
+            if gate_cfg.get("quality_gate", False):
+                gate_result = await self._run_quality_gate(parent, done)
+                if gate_result is not None:
+                    return True  # quality gate set parent to ESCALATED
+
+            self._emit(
+                "compound_done",
+                f"all {len(subtasks)} sub-tasks completed",
+            )
+            await self.store.set_status(
+                parent, TaskStatus.DONE, validate=False,
+            )
+            return True
+
+        # Handle failures: retry once (via context flag), then escalate.
+        for t in failed:
+            retried_ids = set((parent.context or {}).get("retried_subtask_ids", []))
+            if t.id not in retried_ids:
+                retried_ids.add(t.id)
+                ctx = parent.context or {}
+                ctx["retried_subtask_ids"] = list(retried_ids)
+                parent.context = ctx
+                await self.store.update_task(parent)
+                log.info("retrying failed sub-task %s", t.id[:8])
+                self._emit("retry", f"retrying sub-task: {t.title}")
                 await self.store.set_status(
-                    parent, TaskStatus.DONE, validate=False,
+                    t, TaskStatus.PENDING, validate=False,
                 )
-                return TaskOutcome(
-                    parent, status=TaskStatus.DONE,
-                    detail=f"compound task completed: {len(subtasks)} sub-tasks",
+            else:
+                self._emit(
+                    "escalate",
+                    f"sub-task failed after retry: {t.title}",
                 )
+                parent.blocker = {
+                    "category": "SCOPE_EXPLOSION",
+                    "question": (
+                        f"Sub-task '{t.title}' failed after retry. "
+                        f"Review the failure and decide how to proceed."
+                    ),
+                    "goal": parent.title,
+                    "confidence": 0.8,
+                }
+                await self.store.update_task(parent)
+                await self.store.set_status(
+                    parent, TaskStatus.ESCALATED, validate=False,
+                )
+                return True
 
-            # Handle failures: retry once, then escalate.
-            for t in failed:
-                if t.id not in retried:
-                    retried.add(t.id)
-                    log.info("retrying failed sub-task %s", t.id[:8])
-                    self._emit("retry", f"retrying sub-task: {t.title}")
-                    await self.store.set_status(
-                        t, TaskStatus.PENDING, validate=False,
-                    )
-                else:
-                    self._emit(
-                        "escalate",
-                        f"sub-task failed after retry: {t.title}",
-                    )
-                    parent.blocker = {
-                        "category": "SCOPE_EXPLOSION",
-                        "question": (
-                            f"Sub-task '{t.title}' failed after retry. "
-                            f"Review the failure and decide how to proceed."
-                        ),
-                        "goal": parent.title,
-                        "confidence": 0.8,
-                    }
-                    await self.store.update_task(parent)
-                    await self.store.set_status(
-                        parent, TaskStatus.ESCALATED, validate=False,
-                    )
-                    return TaskOutcome(
-                        parent, status=TaskStatus.ESCALATED,
-                        detail=f"sub-task '{t.title}' failed after retry",
-                    )
-
-            # Unblock sub-tasks whose dependencies are now met.
-            unblocked = await self._unblock_ready(parent.id, subtasks)
-            if unblocked:
-                self._emit("unblock", f"unblocked {unblocked} sub-task(s)")
-
-            # Still working — wait and poll again.
-            await asyncio.sleep(self.poll_interval)
+        return False  # still in progress
 
     async def _unblock_ready(
         self, parent_id: str, subtasks: list[Task] | None = None,
     ) -> int:
-        """Move sub-tasks from BLOCKED→PENDING when all deps are DONE."""
+        """Move sub-tasks from BLOCKED→PENDING when all deps are DONE.
+
+        Branch-chaining: if the single dependency produced a PR branch
+        (``context["pr_branch"]``), propagate it as ``context["base_branch"]``
+        on the dependent sub-task so it starts from the dependency's work
+        instead of the pre-decomposition base.
+        """
         if subtasks is None:
             subtasks = await self.store.list_subtasks(parent_id)
 
         done_ids = {t.id for t in subtasks if t.status == TaskStatus.DONE}
+        task_by_id = {t.id: t for t in subtasks}
         unblocked = 0
 
         for t in subtasks:
@@ -258,6 +275,28 @@ class LeadAgent:
                 continue
             dep_ids = (t.context or {}).get("depends_on_ids", [])
             if not dep_ids or all(d in done_ids for d in dep_ids):
+                # Branch-chaining: propagate dependency's PR branch.
+                if len(dep_ids) == 1:
+                    dep_task = task_by_id.get(dep_ids[0])
+                    dep_branch = (
+                        (dep_task.context or {}).get("pr_branch")
+                        if dep_task else None
+                    )
+                    if dep_branch:
+                        ctx = t.context or {}
+                        ctx["base_branch"] = dep_branch
+                        t.context = ctx
+                        log.info(
+                            "chain base_branch=%s from dep %s → sub-task %s",
+                            dep_branch, dep_ids[0][:8], t.id[:8],
+                        )
+                    else:
+                        log.warning(
+                            "dep %s has no pr_branch; sub-task %s will use "
+                            "default base branch",
+                            dep_ids[0][:8], t.id[:8],
+                        )
+
                 t.blocker = None
                 await self.store.update_task(t)
                 await self.store.set_status(t, TaskStatus.PENDING)
@@ -354,14 +393,27 @@ class LeadAgent:
 
     @staticmethod
     def _validate_dag(subtask_specs: list[dict]) -> None:
-        """Topological sort to detect cycles. Raises DecompositionError on cycle."""
+        """Topological sort to detect cycles. Raises DecompositionError on cycle.
+
+        v1 scope: linear chains only — each sub-task may depend on at most one
+        other sub-task.  Multi-parent dependencies (diamond DAGs) are rejected
+        because branch-chaining cannot safely determine a base branch when
+        multiple parents produce independent PR branches.
+        """
         titles = {s.get("title", "").strip() for s in subtask_specs}
         adj: dict[str, list[str]] = defaultdict(list)
         in_degree: dict[str, int] = {t: 0 for t in titles}
 
         for spec in subtask_specs:
             title = spec.get("title", "").strip()
-            for dep in spec.get("depends_on", []):
+            deps = spec.get("depends_on", [])
+            if len(deps) > 1:
+                raise DecompositionError(
+                    f"subtask '{title}' has {len(deps)} dependencies — "
+                    "multi-parent decomposition not yet supported. "
+                    "Restructure as a linear chain or independent sub-tasks."
+                )
+            for dep in deps:
                 dep = dep.strip()
                 if dep not in titles:
                     raise DecompositionError(

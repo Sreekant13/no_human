@@ -41,13 +41,15 @@ class ReviewDecision:
     passed: bool
     checklist: list[ChecklistItem] = field(default_factory=list)
     raw_output: str = ""
+    suggested_next: str | None = None
+    stages: dict[str, Any] | None = None
 
     @property
     def failed_items(self) -> list[ChecklistItem]:
         return [i for i in self.checklist if not i.passed]
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "passed": self.passed,
             "items": [
                 {
@@ -61,6 +63,11 @@ class ReviewDecision:
             ],
             "raw_output": self.raw_output or None,
         }
+        if self.stages:
+            d["stages"] = self.stages
+        if self.suggested_next:
+            d["suggested_next"] = self.suggested_next
+        return d
 
 
 def _git_diff(repo_path: Path, before: str = "HEAD~1", after: str = "HEAD") -> tuple[str, int]:
@@ -148,37 +155,56 @@ def _build_review_prompt(
         "Your ONLY job is to find flaws. Do NOT trust the implementer's work.\n"
         "Try to REFUTE the claim that this task is 'done.' Be adversarial.\n\n"
         + tool_policy
-        + "Review the diff in THREE explicit passes. Each pass produces checklist\n"
-        "items, and EVERY item must cite concrete evidence (a file:line from the\n"
-        "diff, a line of command/test output, or a specific failing input).\n"
+        + "Review the diff in TWO stages. Each stage produces checklist items,\n"
+        "and EVERY item must cite concrete evidence (a file:line from the diff,\n"
+        "a line of command/test output, or a specific failing input).\n"
         "An item with no cited evidence is not a valid finding.\n\n"
-        "PASS 1: CORRECTNESS — does the code actually meet each acceptance\n"
-        "  criterion? Trace the changed code against every criterion. Does it\n"
-        "  return what it claims? Are the tests real (not asserting trivia)?\n"
-        "PASS 2: ARCHITECTURE — is this the right approach or a workaround? Does\n"
-        "  it follow the existing patterns/conventions shown in the profile? Any\n"
+        "STAGE 1 — SPEC COMPLIANCE:\n"
+        "  Does the code actually meet each acceptance criterion? Trace the\n"
+        "  changed code against every criterion. Does it return what it claims?\n"
+        "  Are the tests real (not asserting trivia)?\n\n"
+        "STAGE 2 — CODE QUALITY:\n"
+        "  ARCHITECTURE — is this the right approach or a workaround? Does it\n"
+        "  follow the existing patterns/conventions shown in the profile? Any\n"
         "  layering, coupling, or abstraction problems?\n"
-        "PASS 3: EDGE CASES — error handling, empty/null/boundary inputs,\n"
-        "  security (injection, auth, secrets), concurrency, performance.\n\n"
+        "  EDGE CASES — error handling, empty/null/boundary inputs, security\n"
+        "  (injection, auth, secrets), concurrency, performance.\n"
+        "  EXTERNAL INTEGRATIONS — for any call to an external system (CI/build\n"
+        "  API, VCS/PR API, webhooks, cloud/k8s), is the full state space handled\n"
+        "  (not just the happy path)? Does any call destructively replace state\n"
+        "  when it should merge/add? Are repeated calls (comments, artifacts,\n"
+        "  triggers) idempotent?\n\n"
         "For each finding, cite the specific file:line from the diff.\n\n"
+        "Limit your output to at most 5 checklist items. If you find more than 5\n"
+        "issues, consolidate the least critical ones into a single 'minor issues'\n"
+        "item. Focus your detailed items on the most impactful findings.\n\n"
         "Rules:\n"
         + tool_rule
         + "  - Pass/fail only. No numeric scores.\n"
         "  - 'passed: true' means ALL criteria are demonstrably met.\n\n"
         "Output EXACTLY this format (and NOTHING after it):\n\n"
         "REVIEW_JSON_START\n"
-        '{"passed": true_or_false, "items": [\n'
+        '{"passed": true_or_false,\n'
+        ' "stages": {"spec_compliance": {"passed": true_or_false},\n'
+        '            "code_quality": {"passed": true_or_false}},\n'
+        ' "suggested_next": "one-sentence hint for the next attempt" or null,\n'
+        ' "items": [\n'
         '  {"label": "short label", "passed": true_or_false,\n'
         '   "evidence": "detailed explanation of the finding",\n'
         '   "file": "path/to/file.py", "line": 42,\n'
-        '   "comment": "The review comment to post on the PR (concise, actionable)"}\n'
+        '   "comment": "PR comment written in a natural, human voice"}\n'
         "]}\n"
         "REVIEW_JSON_END\n\n"
         "For each item:\n"
         "  - 'file' must be the path exactly as shown in the diff header (e.g. 'src/foo.py')\n"
         "  - 'line' must be a line number from the RIGHT side of the diff (new file)\n"
-        "  - 'comment' should be a concise, actionable PR comment suitable for posting\n"
-        "  - For general observations with no specific line, set file to '' and line to 0\n\n"
+        "  - 'comment' must read like a real engineer wrote it in a code review.\n"
+        "    Write in first person, be direct, vary your sentence structure.\n"
+        "    No bullet lists, no bold text, no headers, no markdown formatting.\n"
+        "    Don't start with 'This', 'The', or 'I noticed'. Just say what's wrong\n"
+        "    and what you'd do instead, the way you'd talk to a colleague.\n"
+        "  - For general observations with no specific line, set file to '' and line to 0\n"
+        "  - 'suggested_next' helps the implementing agent focus its retry — set to null if passed\n\n"
         f"{profile_section}"
         f"{rules_section}\n"
         # ── volatile task-specific content ──
@@ -264,7 +290,10 @@ def _build_code_review_prompt(
         "  it follow the existing patterns/conventions shown in the profile? Any\n"
         "  layering, coupling, or abstraction problems?\n"
         "PASS 3: EDGE CASES — error handling, empty/null/boundary inputs,\n"
-        "  security (injection, auth, secrets), concurrency, performance.\n\n"
+        "  security (injection, auth, secrets), concurrency, performance. For any\n"
+        "  call to an external system (CI/build API, VCS/PR API, webhooks), verify\n"
+        "  the full state space is handled, no call destructively replaces state\n"
+        "  when it should merge/add, and repeated calls are idempotent.\n\n"
         "For each finding, cite the specific file:line from the diff or file.\n\n"
         "Rules:\n"
         "  - You MAY use read/search tools to inspect full files for context.\n"
@@ -280,13 +309,17 @@ def _build_code_review_prompt(
         '   "severity": "critical|high|medium|low|nit",\n'
         '   "evidence": "detailed explanation of the finding",\n'
         '   "file": "path/to/file.py", "line": 42,\n'
-        '   "comment": "The review comment to post on the PR (concise, actionable)"}\n'
+        '   "comment": "PR comment written in a natural, human voice"}\n'
         "]}\n"
         "REVIEW_JSON_END\n\n"
         "For each item:\n"
         "  - 'file' must be the path exactly as shown in the diff header (e.g. 'src/foo.py')\n"
         "  - 'line' must be a line number from the RIGHT side of the diff (new file)\n"
-        "  - 'comment' should be a concise, actionable PR comment suitable for posting\n"
+        "  - 'comment' must read like a real engineer wrote it in a code review.\n"
+        "    Write in first person, be direct, vary your sentence structure.\n"
+        "    No bullet lists, no bold text, no headers, no markdown formatting.\n"
+        "    Don't start with 'This', 'The', or 'I noticed'. Just say what's wrong\n"
+        "    and what you'd do instead, the way you'd talk to a colleague.\n"
         "  - For general observations with no specific line, set file to '' and line to 0\n\n"
         f"{profile_section}"
         f"{rules_section}\n"
@@ -334,7 +367,13 @@ def _parse_review_output(text: str) -> ReviewDecision:
     # Reviewer's explicit "passed" field AND all items must agree.
     all_pass = all(i.passed for i in items)
     passed = bool(data.get("passed", False)) and all_pass
-    return ReviewDecision(passed=passed, checklist=items, raw_output=text)
+    # D4: extract two-stage verdicts and suggested_next (backward-compatible).
+    stages = data.get("stages") if isinstance(data.get("stages"), dict) else None
+    suggested_next = data.get("suggested_next") if isinstance(data.get("suggested_next"), str) else None
+    return ReviewDecision(
+        passed=passed, checklist=items, raw_output=text,
+        suggested_next=suggested_next, stages=stages,
+    )
 
 
 class AdversarialReviewer:
