@@ -97,6 +97,7 @@ class Scheduler:
         wake_watcher: object | None = None,
         on_event: Callable[[str, str], None] | None = None,
         reanalysis_job: ReanalysisJob | None = None,
+        wiki_refresh_job: "WikiRefreshJob | None" = None,
         config: dict | None = None,
     ):
         self.store = store
@@ -107,6 +108,7 @@ class Scheduler:
         self._on_event = on_event or (lambda kind, text: None)
         self._quota_cooldown_until: datetime | None = None
         self.reanalysis = reanalysis_job
+        self.wiki_refresh = wiki_refresh_job
         self._config = config or {}
         # Per-task event log: task_id -> deque of {ts, source, kind, text, ...}
         self._event_log: dict[str, deque] = {}
@@ -174,6 +176,17 @@ class Scheduler:
                     )
             except Exception as exc:  # noqa: BLE001 — never kill the pool
                 log.warning("re-analysis failed: %s", exc)
+        # M-A: periodic repo-wiki refresh (best-effort, never blocks dispatch).
+        if self.wiki_refresh is not None:
+            try:
+                wiki_result = await self.wiki_refresh.maybe_run()
+                if wiki_result:
+                    self._on_event(
+                        "wiki_refresh",
+                        f"refreshed wiki for {len(wiki_result)} repo(s)",
+                    )
+            except Exception as exc:  # noqa: BLE001 — never kill the pool
+                log.warning("wiki refresh failed: %s", exc)
         return started
 
     def task_events(self, task_id: str) -> list[dict]:
