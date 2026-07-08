@@ -471,3 +471,12 @@ class Store:
         cur = await self.db.execute("DELETE FROM history_cache")
         await self.db.commit()
         return cur.rowcount
+
+    async def list_history_cache(self) -> list[dict[str, Any]]:
+        """All cached IDE-transcript ingestion results (title + findings),
+        most recent first — for `nh recall` to search alongside tasks/memories."""
+        cur = await self.db.execute(
+            "SELECT * FROM history_cache ORDER BY ingested_at DESC"
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]

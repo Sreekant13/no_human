@@ -153,6 +153,74 @@ def test_skills_list_empty(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# B3: nh skills propose — agent-proposed, human-confirmed                     #
+# --------------------------------------------------------------------------- #
+
+def test_skills_propose_queues_unconfirmed(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(
+        cli, ["skills", "propose", "--title", "Retry flaky Jenkins polls",
+              "--content", "Poll status 3x with backoff before failing.",
+              "--tag", "ci"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    assert "proposed" in result.output.lower()
+
+    # Queued, NOT confirmed — must not appear as an active/confirmed skill.
+    confirmed = _list_memories(db, confirmed=True, mem_type="skill")
+    assert confirmed == []
+    pending = _list_memories(db, confirmed=False, source="proposed", mem_type="skill")
+    assert len(pending) == 1
+    assert pending[0]["title"] == "Retry flaky Jenkins polls"
+    assert pending[0]["source"] == "proposed"
+
+
+def test_skills_propose_does_not_appear_in_skills_list(tmp_path, monkeypatch):
+    """`skills list` shows only CONFIRMED skills — a proposal is inert until
+    a human runs `nh learnings --confirm`."""
+    db = tmp_path / "test.db"
+    runner = _make_runner(db, monkeypatch)
+
+    runner.invoke(
+        cli, ["skills", "propose", "--title", "Unconfirmed idea",
+              "--content", "Not yet trusted."],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(cli, ["skills", "list"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert "no confirmed skills" in result.output
+    assert "Unconfirmed idea" not in result.output
+
+
+def test_skills_propose_then_confirm_promotes_it(tmp_path, monkeypatch):
+    """The proposal reaches the SAME confirm gate as post-task learnings —
+    `nh learnings --confirm` promotes it to an active, confirmed skill."""
+    db = tmp_path / "test.db"
+    runner = _make_runner(db, monkeypatch)
+
+    runner.invoke(
+        cli, ["skills", "propose", "--title", "Reusable approach",
+              "--content", "Do X before Y."],
+        catch_exceptions=False,
+    )
+    pending = _list_memories(db, confirmed=False, source="proposed")
+    assert len(pending) == 1
+    mem_id = pending[0]["id"]
+
+    result = runner.invoke(cli, ["learnings", "--confirm", mem_id[:8]],
+                           catch_exceptions=False)
+    assert result.exit_code == 0
+    assert "confirmed" in result.output.lower()
+
+    confirmed = _list_memories(db, confirmed=True, mem_type="skill")
+    assert len(confirmed) == 1
+    assert confirmed[0]["title"] == "Reusable approach"
+
+
+# --------------------------------------------------------------------------- #
 # PR3: Progressive skill disclosure — discover_skills unit tests               #
 # --------------------------------------------------------------------------- #
 
