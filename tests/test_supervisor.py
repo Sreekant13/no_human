@@ -199,6 +199,44 @@ class TestBuildPrompt:
         import re
         assert not re.search(r"score\s+\d+\s*[-–]\s*10", prompt, re.IGNORECASE)
 
+    def test_scope_block_present_when_declared_files(self):
+        # P5: with a declared file set, the prompt surfaces scope + drift guidance.
+        prompt = build_evaluation_prompt(
+            task_title="t", acceptance_criteria=["x"], rules="r",
+            profile_context="", window=[], total_calls=0,
+            declared_files="  - src/a.py\n  - src/b.py",
+        )
+        assert "SCOPE" in prompt
+        assert "src/a.py" in prompt and "src/b.py" in prompt
+        assert "PATTERN" in prompt  # only CORRECT on a pattern of unjustified drift
+        assert "justified" in prompt.lower()
+
+    def test_no_scope_block_when_no_declared_files(self):
+        # P5: advisory-when-empty — no declared set → no scope block at all.
+        prompt = build_evaluation_prompt(
+            task_title="t", acceptance_criteria=["x"], rules="r",
+            profile_context="", window=[], total_calls=0,
+        )
+        assert "the plan declared these files" not in prompt
+
+    async def test_hook_passes_declared_files_into_prompt(self):
+        # P5: declared_files given to the hook reach the evaluation prompt.
+        seen = {}
+
+        async def capture_llm(prompt):
+            seen["prompt"] = prompt
+            return "SUPERVISOR_CONTINUE"
+
+        hook = SupervisorHook(
+            task_title="t", acceptance_criteria=["x"], rules="",
+            llm_call=capture_llm, check_every=1,
+            declared_files=["src/only_this.py"],
+        )
+        hook.record("Edit", {"file_path": "src/other.py"}, "ok")
+        await hook.evaluate()
+        assert "src/only_this.py" in seen["prompt"]
+        assert "SCOPE" in seen["prompt"]
+
 
 # ── Sprint 2: pre-flight plan check ──────────────────────────────────────── #
 

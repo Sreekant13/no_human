@@ -174,6 +174,7 @@ def build_evaluation_prompt(
     total_calls: int,
     skills: str = "",
     recent_text: str = "",
+    declared_files: str = "",
 ) -> str:
     """Build the prompt sent to the supervisor LLM."""
     criteria = "\n".join(f"  - {c}" for c in acceptance_criteria) or "  (none)"
@@ -190,6 +191,19 @@ def build_evaluation_prompt(
         f"What the agent recently SAID (watch for unverified claims / 'I can't'):\n"
         f"{recent_text}\n\n" if recent_text else ""
     )
+    # P5: scope drift. Only present when the plan declared a file set — matches
+    # the deterministic scope guard's advisory-when-empty behaviour. Framed
+    # conservatively so legitimate refactors are not falsely corrected.
+    scope_block = (
+        "SCOPE — the plan declared these files to change/create:\n"
+        f"{declared_files}\n"
+        "The agent MAY edit files outside this set when justified (a necessary "
+        "refactor, or a file the plan missed). Only CORRECT if there is a PATTERN "
+        "of edits outside this set with NO stated justification — then list the "
+        "declared files and tell it to justify the out-of-scope edits or revert "
+        "them.\n\n"
+        if declared_files else ""
+    )
     return (
         "You are the Supervisor of an autonomous coding agent. You stand in for a "
         "senior engineer watching over the agent's shoulder. Your ONLY job is to "
@@ -201,6 +215,7 @@ def build_evaluation_prompt(
         f"Rules the agent must follow:\n{rules}\n\n"
         f"Recent tool calls ({len(window)} of {total_calls} total):\n{calls_block}\n\n"
         f"{said_block}"
+        f"{scope_block}"
         "Evaluate the agent's recent actions. Respond with EXACTLY ONE block:\n\n"
         f"{_TAG_CONTINUE}\n"
         "(Agent is on track. No correction needed.)\n\n"
@@ -282,12 +297,16 @@ class SupervisorHook:
         check_every: int = 5,
         window_size: int = _WINDOW_SIZE,
         on_decision: Callable[[SupervisorDecision], None] | None = None,
+        declared_files: list[str] | None = None,
     ):
         self.task_title = task_title
         self.acceptance_criteria = acceptance_criteria
         self.rules = rules
         self.profile_context = profile_context
         self.skills = skills or []
+        # P5: the plan's declared FILES TO CHANGE/CREATE set, so the supervisor
+        # can catch out-of-scope drift. Empty → scope check is a no-op (advisory).
+        self.declared_files = declared_files or []
         self._llm_call = llm_call
         self.check_every = max(1, check_every)
         self._window: deque[ToolCallRecord] = deque(maxlen=window_size)
@@ -316,6 +335,13 @@ class SupervisorHook:
     def _skills_text(self) -> str:
         return "\n".join(f"  - {s}" for s in self.skills) if self.skills else ""
 
+    def _declared_files_text(self) -> str:
+        # Bound the list so a large plan can't bloat the every-N prompt.
+        return (
+            "\n".join(f"  - {f}" for f in self.declared_files[:20])
+            if self.declared_files else ""
+        )
+
     @property
     def should_evaluate(self) -> bool:
         """True when it's time to run the LLM evaluation."""
@@ -343,6 +369,7 @@ class SupervisorHook:
             total_calls=self._call_count,
             skills=self._skills_text(),
             recent_text=recent_text,
+            declared_files=self._declared_files_text(),
         )
         try:
             raw = await self._llm_call(prompt)
