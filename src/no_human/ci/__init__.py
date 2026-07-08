@@ -82,6 +82,10 @@ def ci_from_config(config: dict[str, Any]) -> CIBackend | None:
             poll_interval=int(ci_conf.get("poll_interval", 30)),
             result_parser=ci_conf.get("result_parser", "surefire"),
             wake_hint=ci_conf.get("wake_hint", ""),
+            auth=ci_conf.get("auth", "token"),
+            crumb_path=ci_conf.get("crumb_path", "crumbIssuer/api/json"),
+            storage_state_path=ci_conf.get("storage_state_path"),
+            cookie_auto_refresh=bool(ci_conf.get("cookie_auto_refresh", True)),
         )
 
     if backend == "ghe_checkruns":

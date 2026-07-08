@@ -10,9 +10,16 @@ Three modes (``ci.mode``):
                     parks the task with a wake hint rather than faking the step.
 
 Access is over the Jenkins REST JSON API via ``curl`` (no new runtime dep, reuses
-the ``_run_cmd`` subprocess seam so tests inject recorded fixtures). Credentials
-come from ``JENKINS_USER`` / ``JENKINS_API_TOKEN`` in ``~/.no_human/.env`` (chmod
-600) or the process env — NEVER from config.yaml or the repo, and never logged.
+the ``_run_cmd`` subprocess seam so tests inject recorded fixtures). Two auth
+modes (``ci.auth``):
+  - ``token``  DEFAULT: basic auth from ``JENKINS_USER`` / ``JENKINS_API_TOKEN``.
+  - ``cookie`` form-login session cookie (CloudBees build.example.com rejects
+               API-token basic auth). The cookie is captured once via a
+               Playwright form login (see ``jenkins_session``), reused headlessly
+               from the persisted ``storage_state``, auto-refreshed on expiry,
+               and a CSRF crumb is attached to write (POST) requests.
+Credentials come from ``~/.no_human/.env`` (chmod 600) or the process env —
+NEVER from config.yaml or the repo, and never logged.
 
 Trust rule (§3.4): an unreachable or un-run build never reads as green. A status
 API that won't answer is treated as an infra failure (park/retry), not a pass.
@@ -79,6 +86,11 @@ class JenkinsCI(CIBackend):
         poll_interval: int = 30,
         result_parser: str = "surefire",
         wake_hint: str = "",
+        auth: str = "token",
+        crumb_path: str = "crumbIssuer/api/json",
+        storage_state_path: str | None = None,
+        cookie_auto_refresh: bool = True,
+        cookie_provider: Any = None,  # Callable[[bool], dict[str, str]]; test seam
         _run_cmd: Any = None,  # override for testing
     ):
         self.job = job.strip("/")
@@ -89,6 +101,19 @@ class JenkinsCI(CIBackend):
         self.poll_interval = poll_interval
         self.result_parser = result_parser
         self._run_cmd = _run_cmd or _subprocess_run
+        # Auth: "token" (basic auth, default) or "cookie" (form-login session
+        # cookie — Jenkins here rejects API-token basic auth). Cookie auth also
+        # attaches a CSRF crumb on write (POST) requests.
+        self.auth = auth
+        self.crumb_path = crumb_path.strip("/")
+        self.cookie_auto_refresh = cookie_auto_refresh
+        self._cookie_provider = cookie_provider
+        if storage_state_path is None:
+            from .jenkins_session import DEFAULT_STATE
+            storage_state_path = DEFAULT_STATE
+        self.storage_state_path = storage_state_path
+        self._cookies_cache: dict[str, str] | None = None
+        self._crumb_cache: tuple[str, str] | None = None
         # Credentials: explicit args win, else the private .env / process env.
         # Loaded lazily and never echoed.
         if user is None or token is None:
@@ -234,15 +259,31 @@ class JenkinsCI(CIBackend):
         )
 
     def _access(self, doing: str) -> CIResult:
-        # Name the missing key precisely: if no token at all, the token is the
-        # blocker; if a user but no token, still the token.
+        codes = "/".join(map(str, _ACCESS_CODES))
+        if self.auth == "cookie":
+            # Cookie auth already tried a session refresh before surfacing this;
+            # the remediation is to (re)establish the SSO session, not a token.
+            return CIResult(
+                pipeline_id="", pipeline_url=f"{self.base_url}/{self.job}",
+                status=PipelineStatus.FAILED, access_failure=True,
+                access_env_key="SSO_PASSWORD",
+                parsed_output=(
+                    f"Jenkins denied access ({codes}) while {doing} for job "
+                    f"{self.job}. The session cookie is missing/expired and could "
+                    "not be refreshed. Set SSO_USERNAME / SSO_PASSWORD in "
+                    "~/.no_human/.env (chmod 600) and ensure Playwright is "
+                    "installed, or grant the account access to this job."
+                ),
+            )
+        # Token auth: if no token at all, the token is the blocker; if a user but
+        # no token, still the token.
         env_key = "JENKINS_API_TOKEN" if not self.token else "JENKINS_USER"
         return CIResult(
             pipeline_id="", pipeline_url=f"{self.base_url}/{self.job}",
             status=PipelineStatus.FAILED, access_failure=True,
             access_env_key=env_key,
             parsed_output=(
-                f"Jenkins denied access ({'/'.join(map(str, _ACCESS_CODES))}) while "
+                f"Jenkins denied access ({codes}) while "
                 f"{doing} for job {self.job}. Set JENKINS_USER / JENKINS_API_TOKEN "
                 "in ~/.no_human/.env (chmod 600), or grant the account access to "
                 "this job."
@@ -257,17 +298,67 @@ class JenkinsCI(CIBackend):
             return None
         return _loads(body)
 
-    def _curl(self, url: str, method: str = "GET") -> tuple[str | None, str]:
+    def _curl(self, url: str, method: str = "GET",
+              _allow_refresh: bool = True) -> tuple[str | None, str]:
         """Return (body, kind) where kind is 'ok' | 'access' | 'infra'. We omit
         curl -f so HTTP 4xx/5xx still return a body + status (via -w marker) and
-        we can tell 401/403 (access) apart from a 5xx/connection error (infra)."""
+        we can tell 401/403 (access) apart from a 5xx/connection error (infra).
+
+        Auth: cookie mode attaches the session cookie jar (and a CSRF crumb for
+        writes); token mode uses basic auth. On an access wall under cookie auth
+        we force one session refresh and retry (handles an expired session)."""
         cmd = ["curl", "-sS", "-w", f"\n{_HTTP_MARKER}%{{http_code}}"]
         if method != "GET":
             cmd += ["-X", method]
-        if self.user and self.token:
+        if self.auth == "cookie":
+            cookies = self._cookies()
+            if cookies:
+                cmd += ["-b", "; ".join(f"{k}={v}" for k, v in cookies.items())]
+            if method != "GET":
+                crumb = self._get_crumb()
+                if crumb:
+                    cmd += ["-H", f"{crumb[0]}: {crumb[1]}"]
+        elif self.user and self.token:
             cmd += ["-u", f"{self.user}:{self.token}"]
         cmd.append(url)
-        return _interpret_curl(self._run_cmd(cmd))
+        body, kind = _interpret_curl(self._run_cmd(cmd))
+        if kind == "access" and self.auth == "cookie" and _allow_refresh:
+            # Session likely expired: drop caches, force a re-login, retry once.
+            self._crumb_cache = None
+            if self._cookies(force_refresh=True):
+                return self._curl(url, method, _allow_refresh=False)
+        return body, kind
+
+    def _cookies(self, force_refresh: bool = False) -> dict[str, str]:
+        """Session cookie jar for cookie auth. Cached per instance; a provider
+        (or the default storage_state-backed one) supplies/refreshes it."""
+        if force_refresh:
+            self._cookies_cache = None
+        if self._cookies_cache is None:
+            if self._cookie_provider is not None:
+                self._cookies_cache = self._cookie_provider(force_refresh) or {}
+            else:
+                from .jenkins_session import get_session_cookies
+                self._cookies_cache = get_session_cookies(
+                    self.base_url, self.storage_state_path,
+                    auto_refresh=self.cookie_auto_refresh,
+                    force_refresh=force_refresh,
+                ) or {}
+        return self._cookies_cache
+
+    def _get_crumb(self) -> tuple[str, str] | None:
+        """Fetch (and cache) the Jenkins CSRF crumb (field, value) for writes.
+        Returns None if the crumb issuer is unavailable (older Jenkins with CSRF
+        off) — the POST then proceeds without a crumb."""
+        if self._crumb_cache is None:
+            body, kind = self._curl(f"{self.base_url}/{self.crumb_path}",
+                                    _allow_refresh=False)
+            if kind == "ok" and body:
+                d = _loads(body)
+                if isinstance(d, dict) and d.get("crumbRequestField"):
+                    self._crumb_cache = (d["crumbRequestField"],
+                                         str(d.get("crumb", "")))
+        return self._crumb_cache
 
 
 def _loads(text: str) -> Any | None:
