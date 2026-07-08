@@ -12,14 +12,30 @@ enriched acceptance criteria. Advisory — never blocks the pipeline.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from ..core.jsonparse import loads_lenient
+
 log = logging.getLogger("no_human.evaluator")
+
+
+def _render(template: str, **fields: str) -> str:
+    """Substitute ``{name}`` placeholders WITHOUT ``str.format``.
+
+    These prompt templates embed a literal JSON example (``{"verdict": ...}``).
+    ``str.format`` would parse those braces as replacement fields — the field
+    name ends at the ``:``, so it looks up ``kwargs['"verdict"']`` and raises
+    ``KeyError('"verdict"')``, silently disabling the evaluator for every task.
+    A plain ``.replace`` per field leaves all other braces untouched.
+    """
+    out = template
+    for key, value in fields.items():
+        out = out.replace("{" + key + "}", value)
+    return out
 
 
 class EvalVerdict(str, Enum):
@@ -93,7 +109,8 @@ async def evaluate_spec(
         from ..agent.claude_backend import ClaudeBackend
         be = backend or ClaudeBackend(model="claude-sonnet-4-6", readonly=True)
         criteria_text = "\n".join(f"  - {c}" for c in acceptance_criteria) or "  (none)"
-        prompt = _EVAL_PROMPT.format(
+        prompt = _render(
+            _EVAL_PROMPT,
             title=title,
             description=description or "(none)",
             criteria=criteria_text,
@@ -105,7 +122,7 @@ async def evaluate_spec(
         if not m:
             log.warning("evaluator produced no parseable EVAL_JSON block")
             return None
-        data = json.loads(m.group(1))
+        data = loads_lenient(m.group(1))
         verdict = EvalVerdict(data.get("verdict", "accept"))
         return EvalResult(
             verdict=verdict,
@@ -115,4 +132,62 @@ async def evaluate_spec(
         )
     except Exception as exc:  # noqa: BLE001 — advisory, never blocks
         log.warning("evaluator failed (proceeding without eval): %s", exc)
+        return None
+
+
+_ASSUMPTIONS_JSON = re.compile(
+    r"ASSUMPTIONS_JSON_START\s*(.*?)\s*ASSUMPTIONS_JSON_END", re.DOTALL)
+
+_ASSUMPTIONS_PROMPT = (
+    "An autonomous coding agent must proceed on this task WITHOUT asking a human "
+    "any questions. For each ambiguous or underspecified point, state the single "
+    "most reasonable assumption the agent will proceed under. Be concrete, "
+    "minimal, and prefer the interpretation a senior engineer would pick. These "
+    "assumptions will be surfaced in the pull request for a human to catch at "
+    "review time.\n\n"
+    "Output EXACTLY:\n"
+    "ASSUMPTIONS_JSON_START\n"
+    '{"assumptions": ["...", "..."]}\n'
+    "ASSUMPTIONS_JSON_END\n\n"
+    "Task:\n"
+    "Title: {title}\n"
+    "Description: {description}\n"
+    "Acceptance criteria:\n{criteria}\n"
+)
+
+
+async def resolve_assumptions(
+    title: str,
+    description: str,
+    acceptance_criteria: list[str],
+    *,
+    backend: Any | None = None,
+) -> list[str] | None:
+    """For an ambiguous spec, return the assumptions the agent will proceed
+    under so it never has to stop and ask a human (megaplan P2 / decision #1).
+    Returns None on failure (advisory — never blocks the pipeline)."""
+    try:
+        import tempfile
+        from pathlib import Path
+        from ..agent.claude_backend import ClaudeBackend
+        be = backend or ClaudeBackend(model="claude-sonnet-4-6", readonly=True)
+        criteria_text = "\n".join(f"  - {c}" for c in acceptance_criteria) or "  (none)"
+        prompt = _render(
+            _ASSUMPTIONS_PROMPT,
+            title=title,
+            description=description or "(none)",
+            criteria=criteria_text,
+        )
+        result = await be.run(prompt, max_turns=1, effort="low",
+                              cwd=Path(tempfile.gettempdir()))
+        m = _ASSUMPTIONS_JSON.search(result.final_text or "")
+        if not m:
+            return None
+        data = loads_lenient(m.group(1))
+        items = data.get("assumptions")
+        if isinstance(items, list) and items:
+            return [str(x) for x in items][:10]
+        return None
+    except Exception as exc:  # noqa: BLE001 — advisory, never blocks
+        log.warning("assumption resolution failed (proceeding without): %s", exc)
         return None

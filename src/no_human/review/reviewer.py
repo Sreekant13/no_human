@@ -24,6 +24,7 @@ from typing import Any, Callable
 
 from ..agent.claude_backend import AgentResult
 from ..review.selfcheck import ChecklistItem
+from ..core.jsonparse import loads_lenient
 from ..core.task import Task
 
 _REVIEW_JSON = re.compile(r"REVIEW_JSON_START\s*(.*?)\s*REVIEW_JSON_END", re.DOTALL)
@@ -78,6 +79,33 @@ def _git_diff(repo_path: Path, before: str = "HEAD~1", after: str = "HEAD") -> t
     )
     raw = proc.stdout or ""
     return raw[:_DIFF_CAP], len(raw)
+
+
+_INVOCATION_ERROR_RE = re.compile(
+    r"error: unrecognized arguments"
+    r"|no tests ran"
+    r"|no tests collected"
+    r"|ModuleNotFoundError"
+    r"|ImportError"
+    r"|command not found",
+    re.IGNORECASE,
+)
+
+
+def _annotated_test_output(test_output: str) -> str:
+    """Wrap test_output for the review prompt, prepending a note if it looks
+    like the test runner crashed (invocation error) rather than tests failing."""
+    body = test_output or "(no test output provided)"
+    if test_output and _INVOCATION_ERROR_RE.search(test_output):
+        return (
+            "Test results:\n"
+            "NOTE: The test runner encountered an invocation error (not a test failure). "
+            "The test command itself failed before any tests could run. This is a test "
+            "infrastructure issue. Evaluate the diff on its own merits — do not reject "
+            "solely because tests couldn't execute.\n"
+            f"```\n{body}\n```\n"
+        )
+    return f"Test results:\n```\n{body}\n```\n"
 
 
 def _build_review_prompt(
@@ -214,8 +242,8 @@ def _build_review_prompt(
         f"Task: {task.title}\n"
         f"Acceptance criteria:\n{criteria}\n\n"
         + diff_section
-        + f"Test results:\n```\n{test_output or '(no test output provided)'}\n```\n"
-        f"{held_section}"
+        + _annotated_test_output(test_output)
+        + f"{held_section}"
         + rules_pass
         + scope_pass
     )
@@ -348,7 +376,7 @@ def _parse_review_output(text: str) -> ReviewDecision:
             raw_output=text or "",
         )
     try:
-        data = json.loads(m.group(1))
+        data = loads_lenient(m.group(1))
     except json.JSONDecodeError as exc:
         return ReviewDecision(
             passed=False,
