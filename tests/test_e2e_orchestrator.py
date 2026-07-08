@@ -950,22 +950,31 @@ async def test_planning_generates_and_stores_plan(bare_repo, tmp_path, store):
 
 
 class PromptCapturingPlannerBackend:
-    """Captures the planner prompt so tests can assert on its content."""
+    """Captures every prompt sent to this backend so tests can assert on
+    content. A list, not a single attribute: MoA planning (on by default)
+    fans out multiple calls (one per proposer + one aggregator) through the
+    same patched backend, so the last call alone isn't representative."""
 
     def __init__(self, plan_text: str):
         self._plan = plan_text
-        self.prompt = None
+        self.prompts: list[str] = []
+
+    @property
+    def prompt(self) -> str | None:
+        """Back-compat: the most recent prompt, for single-call call sites."""
+        return self.prompts[-1] if self.prompts else None
 
     async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
                   on_event=None, supervisor_hook=None, **kwargs):
-        self.prompt = prompt
+        self.prompts.append(prompt)
         return AgentResult(final_text=self._plan, num_turns=3, is_error=False,
                            tokens_used=200, session_id="s", stop_reason="end_turn")
 
 
 async def test_planner_prompt_no_child_tasks_by_default(bare_repo, tmp_path, store):
     """By default the planner is told to delegate in-session, NOT to emit a
-    DECOMPOSE_PLAN (which would create child tasks)."""
+    DECOMPOSE_PLAN (which would create child tasks). Checked across every MoA
+    proposer prompt — each carries the full base prompt plus its own lens."""
     cfg = _planning_config(tmp_path)
     orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
                         SlackNotifier(None))
@@ -975,9 +984,10 @@ async def test_planner_prompt_no_child_tasks_by_default(bare_repo, tmp_path, sto
     with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=backend):
         await orch._generate_plan(t, GitRepo(bare_repo))
 
-    assert "DECOMPOSE_PLAN_START" not in backend.prompt
-    assert "IN-SESSION DELEGATION" in backend.prompt
-    assert "must never create new tasks" in backend.prompt
+    assert backend.prompts
+    assert all("DECOMPOSE_PLAN_START" not in p for p in backend.prompts)
+    assert any("IN-SESSION DELEGATION" in p for p in backend.prompts)
+    assert any("must never create new tasks" in p for p in backend.prompts)
 
 
 async def test_planner_prompt_decompose_when_enabled(bare_repo, tmp_path, store):
@@ -992,7 +1002,7 @@ async def test_planner_prompt_decompose_when_enabled(bare_repo, tmp_path, store)
     with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=backend):
         await orch._generate_plan(t, GitRepo(bare_repo))
 
-    assert "DECOMPOSE_PLAN_START" in backend.prompt
+    assert any("DECOMPOSE_PLAN_START" in p for p in backend.prompts)
 
 
 async def test_planning_skips_for_code_review(bare_repo, tmp_path, store):
@@ -1059,6 +1069,187 @@ async def test_planning_failure_is_best_effort(bare_repo, tmp_path, store):
     assert result == ""
     planning_events = [e for e in events if e.get("kind") == "planning"]
     assert any("failed" in e.get("text", "") for e in planning_events)
+
+
+# --------------------------------------------------------------------------- #
+# B1: MoA (Mixture-of-Agents) planning fan-out — on by default.               #
+# --------------------------------------------------------------------------- #
+
+class MoAFakeBackend:
+    """Stands in for every ClaudeBackend(...) construction during one MoA
+    plan generation (proposers + aggregator all route through the same
+    patched instance). Scripted by inspecting each incoming prompt: a
+    "LENS (name)" marker identifies a proposer call, an "=== PROPOSAL ("
+    marker identifies the aggregator call; anything else is the
+    single-proposer fallback path."""
+
+    def __init__(self, proposals: dict[str, str] | None = None,
+                 aggregate_text: str = "", fail_lenses: set[str] | None = None,
+                 single_path_text: str = ""):
+        self.proposals = proposals or {}
+        self.aggregate_text = aggregate_text
+        self.fail_lenses = fail_lenses or set()
+        self.single_path_text = single_path_text
+        self.prompts: list[str] = []
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        self.prompts.append(prompt)
+        for lens_name in self.fail_lenses:
+            if f"LENS ({lens_name})" in prompt:
+                raise RuntimeError(f"simulated failure for {lens_name}")
+        for lens_name, text in self.proposals.items():
+            if f"LENS ({lens_name})" in prompt:
+                return AgentResult(final_text=text, num_turns=2, is_error=False,
+                                   tokens_used=50, session_id="s", stop_reason="end_turn")
+        if "=== PROPOSAL (" in prompt:
+            return AgentResult(final_text=self.aggregate_text, num_turns=3,
+                               is_error=False, tokens_used=100, session_id="s",
+                               stop_reason="end_turn")
+        return AgentResult(final_text=self.single_path_text, num_turns=1,
+                           is_error=False, tokens_used=20, session_id="s",
+                           stop_reason="end_turn")
+
+
+def _moa_config(tmp_path, **overrides):
+    cfg = _planning_config(tmp_path)
+    cfg.data["llm"]["moa_planning"] = {"enabled": True, "proposers": 3, **overrides}
+    return cfg
+
+
+async def test_moa_planning_enabled_by_default():
+    """The whole point of building MoA planning was for it to actually run —
+    it must be on, not sitting inert behind an opt-in flag nobody sets."""
+    from no_human.config import DEFAULT_CONFIG
+    assert DEFAULT_CONFIG["llm"]["moa_planning"]["enabled"] is True
+
+
+async def test_moa_planning_synthesizes_proposals(bare_repo, tmp_path, store):
+    """3 proposers + 1 aggregator, all through the same patched backend;
+    the aggregator's output is what _generate_plan returns."""
+    cfg = _moa_config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+    await store.create_task(t)
+
+    fake = MoAFakeBackend(
+        proposals={
+            "minimal-first": _SAMPLE_PLAN,
+            "risk-first": _SAMPLE_PLAN.replace("mul", "mul_edge"),
+            "test-first": _SAMPLE_PLAN.replace("test_mul", "test_mul_first"),
+        },
+        aggregate_text="## FILES TO CHANGE/CREATE\n- calc.py: synthesized\n",
+    )
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
+        result = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert result == "## FILES TO CHANGE/CREATE\n- calc.py: synthesized"
+    assert len(fake.prompts) == 4  # 3 proposers + 1 aggregator, no fallback
+    moa_events = [e for e in events if e.get("kind") == "planning_moa"]
+    assert any("synthesized" in e.get("text", "") for e in moa_events)
+    planning_events = [e for e in events if e.get("kind") == "planning"]
+    assert any("plan generated" in e.get("text", "") for e in planning_events)
+
+
+async def test_moa_aggregator_prompt_forbids_numeric_score(bare_repo, tmp_path, store):
+    """CLAUDE.md #3: evidence-based review/synthesis, never a numeric
+    self-score. The aggregator prompt must not invite one."""
+    import re as _re
+    cfg = _moa_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    fake = MoAFakeBackend(
+        proposals={"minimal-first": _SAMPLE_PLAN, "risk-first": _SAMPLE_PLAN,
+                   "test-first": _SAMPLE_PLAN},
+        aggregate_text=_SAMPLE_PLAN,
+    )
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
+        await orch._generate_plan(t, GitRepo(bare_repo))
+
+    agg_prompt = fake.prompts[-1]
+    assert "=== PROPOSAL (" in agg_prompt
+    assert "numeric score" in agg_prompt.lower()
+    assert not _re.search(r"score\s+\d+\s*[-–]\s*10", agg_prompt, _re.IGNORECASE)
+
+
+async def test_moa_planning_falls_back_on_insufficient_proposers(bare_repo, tmp_path, store):
+    """2 of 3 proposers fail → too few for a meaningful synthesis → falls
+    back to the normal single-proposer path (same patched backend)."""
+    cfg = _moa_config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    fake = MoAFakeBackend(
+        proposals={"minimal-first": _SAMPLE_PLAN},
+        fail_lenses={"risk-first", "test-first"},
+        single_path_text=_SAMPLE_PLAN,
+    )
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
+        result = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert result == _SAMPLE_PLAN.strip()
+    moa_events = [e for e in events if e.get("kind") == "planning_moa"]
+    assert any("falling back" in e.get("text", "") for e in moa_events)
+    planning_events = [e for e in events if e.get("kind") == "planning"]
+    assert any("plan generated" in e.get("text", "") for e in planning_events)
+
+
+async def test_moa_planning_uses_decompose_proposal_directly(bare_repo, tmp_path, store):
+    """A confident compound-task signal from ONE proposer is used directly —
+    never blended/averaged with the other proposals."""
+    decompose_text = (
+        "DECOMPOSE_PLAN_START\n```json\n"
+        '{"decompose": true, "justification": "multi-concern", "subtasks": '
+        '[{"title": "A", "kind": "feature", "description": "d", '
+        '"acceptance_criteria": ["x"], "depends_on": [], "repo_path": "."}]}\n'
+        "```\nDECOMPOSE_PLAN_END\n"
+    )
+    cfg = _moa_config(tmp_path)
+    cfg.data["decomposition"] = {"enabled": True}
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("compound task", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    fake = MoAFakeBackend(proposals={
+        "minimal-first": _SAMPLE_PLAN,
+        "risk-first": decompose_text,
+        "test-first": _SAMPLE_PLAN,
+    })
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
+        result = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert result == decompose_text.strip()
+    assert t.context["decomposition"]["decompose"] is True
+    assert len(fake.prompts) == 3  # only the 3 proposers — no aggregator call
+    planning_events = [e for e in events if e.get("kind") == "planning"]
+    assert any("compound task detected" in e.get("text", "") for e in planning_events)
+
+
+async def test_moa_planning_can_be_disabled(bare_repo, tmp_path, store):
+    """Explicitly opting out reverts to exactly one planner call."""
+    cfg = _planning_config(tmp_path)
+    cfg.data["llm"]["moa_planning"] = {"enabled": False}
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend",
+                return_value=PlannerBackend(_SAMPLE_PLAN)) as mocked:
+        result = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert result == _SAMPLE_PLAN.strip()
+    assert mocked.call_count == 1
 
 
 async def test_plan_injected_into_implement_prompt(bare_repo, tmp_path, store):
