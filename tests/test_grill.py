@@ -262,6 +262,29 @@ def test_format_events_surfaces_thinking_blocks():
     assert out[1]["kind"] == "tool_use"
 
 
+def test_format_events_surfaces_subagents():
+    """Subagent lifecycle events must survive _format_events so the System
+    view's agent tree can discover dynamically-spawned subagents on initial
+    load and for finished tasks — not only via the live SSE stream."""
+    from no_human.api.app import _format_events
+
+    events = [
+        {"source": "agent", "kind": "subagent_start", "text": "research auth flow",
+         "task_id": "sub-1", "task_type": "no_human_researcher", "ts": 1.0},
+        {"source": "agent", "kind": "subagent_progress", "text": "reading files",
+         "task_id": "sub-1", "ts": 1.5},
+        {"source": "agent", "kind": "subagent_done", "text": "found it",
+         "task_id": "sub-1", "status": "completed", "ts": 2.0},
+    ]
+    out = _format_events(events)
+    assert [o["kind"] for o in out] == [
+        "subagent_start", "subagent_progress", "subagent_done",
+    ]
+    assert out[0]["task_id"] == "sub-1"
+    assert out[0]["task_type"] == "no_human_researcher"
+    assert out[2]["status"] == "completed"
+
+
 @pytest.mark.asyncio
 async def test_grill_step_on_event_passthrough():
     """When on_event is provided, grill_step forwards it to backend.run."""
