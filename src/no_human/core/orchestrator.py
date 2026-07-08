@@ -238,6 +238,12 @@ class Orchestrator:
                         f"{detector.doom_loop_threshold}×; "
                         "will reset context on next attempt",
                     )
+                elif detector.detect_ping_pong():
+                    self.emit(
+                        "stuck",
+                        "ping-pong: alternating between two actions; "
+                        "consider a different approach",
+                    )
         if event.kind == "tool_use" and event.tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
             inp = event.tool_input or {}
             path = inp.get("file_path") or inp.get("path") or inp.get("notebook_path") or ""
@@ -245,6 +251,14 @@ class Orchestrator:
                 if not hasattr(self, "_agent_edited_files"):
                     self._agent_edited_files: set[str] = set()
                 self._agent_edited_files.add(str(path))
+                # R2.3 Layer 1: per-file edit count.
+                detector = getattr(self, "_stuck", None)
+                if detector is not None and detector.record_edit(str(path)):
+                    self.emit(
+                        "stuck",
+                        f"edit-loop: {path} edited {detector._edit_counts[str(path)]}×; "
+                        "consider a different approach",
+                    )
 
     def _reviewer_sink(self, event: AgentEvent) -> None:
         """Forward reviewer-internal agent events with source='reviewer'."""
@@ -447,12 +461,14 @@ class Orchestrator:
         # This lets the supervisor's "I can't / skill-exists" detector work for
         # skills that are on-disk but not yet in the DB.
         self._discovered_skills: list[str] = []
+        self._discovered_skills_info: list = []  # SkillInfo objects for compact instructions
         if task.repo_path:
             from ..history.skills import discover_skills
             extra_roots = [Path(task.repo_path) / ".claude" / "skills"]
             disk_skills = await asyncio.to_thread(
                 discover_skills, extra_roots=extra_roots,
             )
+            self._discovered_skills_info = disk_skills
             # Confirmed skill titles from DB
             db_skill_titles = {
                 m.get("title", "")
@@ -502,6 +518,20 @@ class Orchestrator:
             if outcome.status != TaskStatus.FAILED:
                 return outcome
             self.emit("attempt_failed", outcome.detail)
+
+            # R1.6: post-attempt distillation — persist what was tried so the
+            # next attempt can read it instead of starting from scratch.
+            try:
+                ctx = task.context or {}
+                logs: list[str] = ctx.get("attempt_log", [])
+                logs.append(
+                    f"attempt {attempt_n}: {(outcome.detail or 'unknown')[:500]}"
+                )
+                ctx["attempt_log"] = logs[-3:]  # keep last 3 only
+                task.context = ctx
+                await self.store.update_task(task)
+            except Exception:  # noqa: BLE001
+                log.debug("attempt log persistence failed (non-fatal)")
 
             # D6: stagnation detection — if the last 2 attempts have identical
             # review pass rates and neither is 100%, the agent is stuck.
@@ -701,6 +731,18 @@ class Orchestrator:
         # Materialize the verify skill with the repo's proven test command
         # so the agent can re-read it after context compaction.
         self._materialize_verify_skill(repo.path)
+
+        # C7: refresh remote refs so the agent doesn't work on stale branches.
+        try:
+            import subprocess as _sp_fetch
+            await asyncio.to_thread(
+                _sp_fetch.run,
+                ["git", "fetch", "origin"],
+                cwd=str(repo.path), capture_output=True, timeout=30,
+            )
+            self.emit("git_fetch", "refreshed remote refs")
+        except Exception as exc:  # noqa: BLE001
+            log.debug("git fetch best-effort failed: %s", exc)
 
         # Write compact project instructions to .claude/instructions.md so the
         # SDK can read them automatically and they survive context compaction.
@@ -1207,6 +1249,16 @@ class Orchestrator:
         self, task, repo, branch, base, commit, attempt_id, result,
         *, linked_commits: list | None = None,
     ) -> TaskOutcome:
+        # C3: validate base branch against project's declared default.
+        prof = getattr(self, "_active_profile", None)
+        expected_default = getattr(prof, "default_branch", "") if prof else ""
+        if expected_default and base and base != expected_default:
+            self.emit(
+                "warning",
+                f"PR base '{base}' differs from project default_branch "
+                f"'{expected_default}' — verify this is intentional",
+            )
+
         title = self._commit_message(task)
         body = self._pr_body(task, commit, result)
         try:
@@ -1878,22 +1930,34 @@ class Orchestrator:
         return text
 
     def _fetch_pr_diff(self, repo: GitRepo, pr_url: str) -> str:
-        """Fetch the PR diff via git fetch + diff. Supports GitHub and GitLab."""
+        """Fetch the PR diff via git fetch + diff. Supports GitHub and GitLab.
+
+        Falls back to the GHE API (via ``gh api``) when git-fetch of the PR
+        refspec fails — common on GHE instances that don't expose
+        ``pull/N/head`` refs (C4).
+        """
         import re
         import subprocess
 
         # GitHub pattern: .../pull/123
-        gh = re.search(r'/pull/(\d+)', pr_url)
-        if gh:
-            pr_num = gh.group(1)
-            repo._run("fetch", "origin", f"pull/{pr_num}/head:_nh_review_pr")
-            base = repo._run("merge-base", "origin/HEAD", "_nh_review_pr").strip()
-            diff = repo._run("diff", base, "_nh_review_pr", "--no-color")
+        gh_match = re.search(r'/pull/(\d+)', pr_url)
+        if gh_match:
+            pr_num = gh_match.group(1)
             try:
-                repo._run("branch", "-D", "_nh_review_pr")
+                repo._run("fetch", "origin", f"pull/{pr_num}/head:_nh_review_pr")
+                base = repo._run("merge-base", "origin/HEAD", "_nh_review_pr").strip()
+                diff = repo._run("diff", base, "_nh_review_pr", "--no-color")
+                try:
+                    repo._run("branch", "-D", "_nh_review_pr")
+                except Exception:  # noqa: BLE001
+                    pass
+                return diff
             except Exception:  # noqa: BLE001
-                pass
-            return diff
+                log.debug("git fetch of PR refspec failed, trying GHE API")
+            # C4 fallback: use `gh api` (handles GHE auth via gh login state).
+            diff = self._fetch_diff_via_gh_api(pr_url, pr_num, repo.path)
+            if diff:
+                return diff
 
         # GitLab pattern: .../merge_requests/123
         gl = re.search(r'/merge_requests/(\d+)', pr_url)
@@ -1910,6 +1974,32 @@ class Orchestrator:
             return diff
 
         raise ValueError(f"cannot parse PR number from URL: {pr_url}")
+
+    @staticmethod
+    def _fetch_diff_via_gh_api(
+        pr_url: str, pr_num: str, cwd: Path,
+    ) -> str:
+        """Fetch PR diff using ``gh api`` with Accept: diff media type."""
+        import re
+        import subprocess
+
+        # Extract owner/repo from URL.
+        m = re.search(r'(?:github\.com|[^/]+)/([^/]+/[^/]+)/pull/', pr_url)
+        if not m:
+            return ""
+        owner_repo = m.group(1).rstrip(".git")
+        try:
+            proc = subprocess.run(
+                ["gh", "api",
+                 f"repos/{owner_repo}/pulls/{pr_num}",
+                 "-H", "Accept: application/vnd.github.diff"],
+                capture_output=True, text=True, timeout=30, cwd=str(cwd),
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout[:100_000]  # cap at 100KB
+        except Exception:  # noqa: BLE001
+            log.debug("gh api fallback also failed")
+        return ""
 
     # Phase 7a: chunks longer than this are distilled through a readonly backend
     # so raw file bytes never bloat the worker's implement prompt.
@@ -2156,6 +2246,9 @@ class Orchestrator:
             "Systematically narrow down the problem: read logs, run diagnostic "
             "commands, form hypotheses and verify them with evidence. Do NOT guess "
             "or speculate — prove each step. Document your findings as you go. "
+            "Label each finding as HYPOTHESIS (unverified) or CONCLUSION (verified "
+            "with cited evidence: file:line, command output, or data). Never present "
+            "a hypothesis as a conclusion. "
             "If you identify the root cause, propose a fix with evidence that it "
             "addresses the actual problem, not just the symptom. Run the relevant "
             "tests to verify your fix."
@@ -2336,6 +2429,58 @@ class Orchestrator:
             "consider delegating to the `no_human_researcher` subagent to keep "
             "your own context budget free for implementation."
         )
+
+        # 5. Standing rules — persist across context compaction (C12, R1.5).
+        sections.append(
+            "**Standing rules (always apply):**\n"
+            "1. Verify everything — read actual code before changing it, "
+            "run commands and cite output. No assumptions.\n"
+            "2. Rank every decision 1–10, only proceed on a 10.\n"
+            "3. Devil's advocate before acting — write what could break, "
+            "address it before making the change.\n"
+            "4. Review every change as a staff engineer would."
+        )
+
+        # 6. Operational directives (C1, C6, C10, C11).
+        directives = [
+            "Do exactly what the task asks — not what seems easier.",
+            "Verify branch and working directory before each git operation.",
+            "Before claiming inability, check local repos and skills.",
+        ]
+        sections.append(
+            "**Operational directives:**\n"
+            + "\n".join(f"- {d}" for d in directives)
+        )
+
+        # 7. Known local repos (C1, R1.3).
+        try:
+            from ..context.repo_discovery import discover_local_repos
+            repos = discover_local_repos()
+            if repos:
+                repo_lines = [f"- {name}: `{path}`" for name, path in
+                              list(repos.items())[:15]]
+                sections.append(
+                    "**Known local repos:**\n" + "\n".join(repo_lines)
+                )
+        except Exception:  # noqa: BLE001
+            pass  # best-effort — never block the pipeline
+
+        # 8. Skills manifest (C6, R1.3).
+        skills = getattr(self, "_discovered_skills_info", None)
+        if not skills:
+            try:
+                from ..history.skills import discover_skills
+                extra = [repo_path / ".claude" / "skills"] if repo_path else []
+                skills = discover_skills(extra_roots=extra)
+            except Exception:  # noqa: BLE001
+                skills = []
+        if skills:
+            skill_lines = [
+                f"- **{s.name}**: {s.description}" for s in skills[:10]
+            ]
+            sections.append(
+                "**Available skills:**\n" + "\n".join(skill_lines)
+            )
 
         if not sections:
             return
@@ -2894,6 +3039,13 @@ class Orchestrator:
         if suggested_next:
             parts.append(
                 f"Reviewer's suggested focus for this retry: {suggested_next}"
+            )
+        # R1.6: inject distilled attempt log so this attempt doesn't repeat.
+        attempt_log = ctx.get("attempt_log") or []
+        if attempt_log:
+            parts.append(
+                "Previous attempt outcomes (do NOT repeat the same approach):\n"
+                + "\n".join(f"  - {entry}" for entry in attempt_log)
             )
         handoff = ctx.get("handoff")
         if handoff:

@@ -56,21 +56,23 @@ class StuckDetector:
     correct response is to reset context in a fresh session, not to keep
     appending corrections to a stale one.
 
-    Phase 7e extends this with tool-call signature tracking: if the agent
-    repeats the *same sequence of tool calls* (a doom-loop), the detector
-    fires before hitting the error threshold so we reset context early —
-    before the dumb zone, not after.
+    Three detection layers (R2.3, AgentPatterns):
+      1. **Edit-count per file** — same file edited ≥ ``edit_threshold`` times.
+      2. **Doom-loop** — identical tool+input repeated consecutively.
+      3. **Ping-pong** — A-B-A-B alternating pattern (R2.1, Broker).
+    The hard iteration cap (``max_turns``) is Layer 3 — outside this class.
     """
 
     threshold: int = 2
-    # Phase 7e: doom-loop trips after this many consecutive identical
-    # tool-call signatures (a tighter signal than error repeats).
     doom_loop_threshold: int = 3
+    # R2.3 Layer 1: edit-count per file.
+    edit_threshold: int = 5
     _seen: dict[str, int] = field(default_factory=dict)
     _last: str | None = None
-    # Phase 7e: tool-call signature tracking for doom-loop detection.
     _tool_signatures: list[str] = field(default_factory=list)
     _consecutive_repeats: int = 0
+    # R2.3 Layer 1: per-file edit counts.
+    _edit_counts: dict[str, int] = field(default_factory=dict)
 
     def record(self, error_text: str) -> bool:
         """Record a failure. Return True if we are now stuck (reset context)."""
@@ -96,6 +98,38 @@ class StuckDetector:
             self._tool_signatures = self._tool_signatures[-50:]
         return self._consecutive_repeats >= self.doom_loop_threshold
 
+    def record_edit(self, file_path: str) -> bool:
+        """R2.3 Layer 1: track per-file edit count. Return True if looping."""
+        self._edit_counts[file_path] = self._edit_counts.get(file_path, 0) + 1
+        return self._edit_counts[file_path] >= self.edit_threshold
+
+    def detect_ping_pong(self) -> bool:
+        """R2.1: detect A-B-A-B alternating pattern in last 4 tool calls."""
+        sigs = self._tool_signatures
+        if len(sigs) < 4:
+            return False
+        return (sigs[-4] == sigs[-2] and sigs[-3] == sigs[-1]
+                and sigs[-4] != sigs[-3])
+
+    @property
+    def stuck_reason(self) -> str | None:
+        """Return a human-readable reason if any detector fired, else None."""
+        if self._consecutive_repeats >= self.doom_loop_threshold:
+            return (
+                f"doom-loop: identical tool call repeated "
+                f"{self.doom_loop_threshold}× consecutively"
+            )
+        hot_files = [f for f, c in self._edit_counts.items()
+                     if c >= self.edit_threshold]
+        if hot_files:
+            return (
+                f"edit-loop: {hot_files[0]} edited {self._edit_counts[hot_files[0]]}× "
+                f"— consider a different approach"
+            )
+        if self.detect_ping_pong():
+            return "ping-pong: alternating between two actions (A-B-A-B pattern)"
+        return None
+
     @property
     def health(self) -> dict[str, int]:
         """Return context-health signals for telemetry / the supervisor."""
@@ -103,6 +137,8 @@ class StuckDetector:
             "unique_errors": len(self._seen),
             "consecutive_repeats": self._consecutive_repeats,
             "total_tool_calls": len(self._tool_signatures),
+            "max_file_edits": max(self._edit_counts.values(), default=0),
+            "ping_pong": int(self.detect_ping_pong()),
         }
 
     def is_repeat(self, error_text: str) -> bool:
@@ -113,6 +149,7 @@ class StuckDetector:
         self._last = None
         self._tool_signatures.clear()
         self._consecutive_repeats = 0
+        self._edit_counts.clear()
 
 
 class QuotaExhausted(Exception):
