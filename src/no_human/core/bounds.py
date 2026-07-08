@@ -19,6 +19,10 @@ class Bounds:
     max_turns_per_attempt: int = 60
     escalate_after: int = 3
     max_correction_rounds: int = 2
+    # P3 (megaplan): complex tasks (many files / large plan / decompose verdict)
+    # get a larger turn budget so they don't exhaust turns mid-implementation and
+    # fail with an empty diff (B5). Applied only to the complexity-flagged subset.
+    complex_multiplier: float = 1.5
 
     @staticmethod
     def from_config(cfg: dict | None) -> "Bounds":
@@ -28,7 +32,16 @@ class Bounds:
             max_turns_per_attempt=cfg.get("max_turns_per_attempt", 60),
             escalate_after=cfg.get("escalate_after", 3),
             max_correction_rounds=cfg.get("max_correction_rounds", 2),
+            complex_multiplier=cfg.get("complex_multiplier", 1.5),
         )
+
+    def turns_for(self, *, complex_task: bool = False) -> int:
+        """Turn budget for one attempt. Complex tasks get
+        ``max_turns_per_attempt × complex_multiplier`` (megaplan P3 / B5)."""
+        base = self.max_turns_per_attempt
+        if complex_task and self.complex_multiplier > 1:
+            return int(round(base * self.complex_multiplier))
+        return base
 
 
 def error_signature(text: str) -> str:

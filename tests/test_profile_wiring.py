@@ -77,6 +77,30 @@ async def test_proven_but_unconfirmed_or_unproven_blocked(store, tmp_path):
     assert await orch._usable_profile(repo_path) is None
 
 
+async def test_auto_confirm_proven_makes_proven_unconfirmed_usable(store, tmp_path):
+    # P1: a PROVEN but human-unconfirmed profile becomes usable when the
+    # auto_confirm_proven policy is opted in.
+    repo_path = tmp_path / "repo"; repo_path.mkdir()
+    prof = _usable(repo_path); prof.confirmed = False
+    await store.upsert_profile(prof)
+    orch = _orch(store, tmp_path)
+    assert await orch._usable_profile(repo_path) is None      # default: off
+    orch.config.setdefault("profile", {})["auto_confirm_proven"] = True
+    got = await orch._usable_profile(repo_path)
+    assert got is not None and got.test_cmd == "npm test"
+    assert await orch._resolve_test_cmd(_repo(repo_path)) == "npm test"
+
+
+async def test_auto_confirm_proven_still_requires_proof(store, tmp_path):
+    # P1: the policy removes the human click, NEVER the proof requirement.
+    repo_path = tmp_path / "repo"; repo_path.mkdir()
+    prof = _usable(repo_path); prof.confirmed = False; prof.proven = {}
+    await store.upsert_profile(prof)
+    orch = _orch(store, tmp_path)
+    orch.config.setdefault("profile", {})["auto_confirm_proven"] = True
+    assert await orch._usable_profile(repo_path) is None
+
+
 async def test_no_profile_falls_back_to_none(store, tmp_path):
     repo_path = tmp_path / "repo"; repo_path.mkdir()
     orch = _orch(store, tmp_path)

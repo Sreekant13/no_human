@@ -91,6 +91,23 @@ class GitRepo:
     def head_sha(self) -> str:
         return self._run("rev-parse", "HEAD")
 
+    def default_branch(self) -> str:
+        """Best-effort: resolve the remote's actual default branch (origin/HEAD).
+
+        C3: a local checkout's current branch can lag the remote's real default
+        (e.g. an old clone still on "master" after the remote moved to "main").
+        Returns "" if it can't be determined (no origin, detached, offline)."""
+        ref = self._run("symbolic-ref", "-q", "refs/remotes/origin/HEAD", check=False)
+        if ref:
+            return ref.rsplit("/", 1)[-1]
+        out = self._run("remote", "show", "origin", check=False)
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("HEAD branch:"):
+                branch = line.split(":", 1)[1].strip()
+                return "" if branch == "(unknown)" else branch
+        return ""
+
     def checkout(self, branch: str) -> str:
         """Switch to an existing branch (no reset). Used to resume a parked
         task's feature branch."""

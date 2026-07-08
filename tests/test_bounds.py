@@ -39,6 +39,26 @@ def test_bounds_from_config_override():
     assert b.max_turns_per_attempt == 10
 
 
+def test_turns_for_simple_task_uses_base():
+    b = Bounds.from_config(None)  # 60, multiplier 1.5
+    assert b.turns_for(complex_task=False) == 60
+
+
+def test_turns_for_complex_task_scaled():
+    b = Bounds.from_config(None)  # 60 × 1.5 = 90
+    assert b.turns_for(complex_task=True) == 90
+
+
+def test_turns_for_multiplier_one_disables_bump():
+    b = Bounds.from_config({"max_turns_per_attempt": 60, "complex_multiplier": 1.0})
+    assert b.turns_for(complex_task=True) == 60
+
+
+def test_complex_multiplier_from_config():
+    b = Bounds.from_config({"max_turns_per_attempt": 40, "complex_multiplier": 2.0})
+    assert b.turns_for(complex_task=True) == 80
+
+
 # --- Phase 7e: doom-loop detection via tool-call signatures --- #
 
 def test_doom_loop_after_three_identical():
@@ -75,3 +95,74 @@ def test_doom_loop_resets_on_different_call():
     assert d.health["consecutive_repeats"] == 1
     assert d.record_tool_call("Grep", "pattern|/src") is False  # only 2
     assert d.record_tool_call("Grep", "pattern|/src") is True   # 3rd → stuck
+
+
+# --- R2.3 Layer 1: per-file edit-count loop detection --- #
+
+def test_edit_loop_after_threshold():
+    d = StuckDetector(edit_threshold=3)
+    assert d.record_edit("/src/foo.py") is False
+    assert d.record_edit("/src/foo.py") is False
+    assert d.record_edit("/src/foo.py") is True  # 3rd edit → stuck
+
+
+def test_edit_loop_different_files_dont_trigger():
+    d = StuckDetector(edit_threshold=3)
+    assert d.record_edit("/src/foo.py") is False
+    assert d.record_edit("/src/bar.py") is False
+    assert d.record_edit("/src/foo.py") is False  # foo.py only at 2
+
+
+def test_edit_loop_reflected_in_stuck_reason():
+    d = StuckDetector(edit_threshold=2)
+    d.record_edit("/src/foo.py")
+    d.record_edit("/src/foo.py")
+    assert d.stuck_reason is not None
+    assert "edit-loop" in d.stuck_reason
+    assert "/src/foo.py" in d.stuck_reason
+
+
+# --- R2.1: ping-pong (A-B-A-B) detection --- #
+
+def test_ping_pong_detected_on_alternating_pattern():
+    d = StuckDetector()
+    d.record_tool_call("Read", "/a.py")
+    d.record_tool_call("Edit", "/b.py")
+    d.record_tool_call("Read", "/a.py")
+    assert d.detect_ping_pong() is False  # only 3 calls, need 4
+    d.record_tool_call("Edit", "/b.py")
+    assert d.detect_ping_pong() is True  # A-B-A-B
+
+
+def test_ping_pong_not_detected_on_forward_progress():
+    d = StuckDetector()
+    d.record_tool_call("Read", "/a.py")
+    d.record_tool_call("Edit", "/b.py")
+    d.record_tool_call("Read", "/c.py")
+    d.record_tool_call("Edit", "/d.py")
+    assert d.detect_ping_pong() is False
+
+
+def test_ping_pong_reflected_in_stuck_reason():
+    d = StuckDetector()
+    for sig in [("Read", "/a.py"), ("Edit", "/b.py")] * 2:
+        d.record_tool_call(*sig)
+    assert d.stuck_reason is not None
+    assert "ping-pong" in d.stuck_reason
+
+
+def test_stuck_reason_prioritizes_doom_loop_over_others():
+    """doom-loop (identical repeats) should win over a coincidental edit-loop."""
+    d = StuckDetector(doom_loop_threshold=2, edit_threshold=2)
+    d.record_edit("/a.py")
+    d.record_edit("/a.py")  # edit-loop condition also true
+    d.record_tool_call("Edit", "/a.py")
+    d.record_tool_call("Edit", "/a.py")  # doom-loop condition also true
+    assert d.stuck_reason is not None
+    assert d.stuck_reason.startswith("doom-loop")
+
+
+def test_stuck_reason_none_when_healthy():
+    d = StuckDetector()
+    d.record_tool_call("Read", "/a.py")
+    assert d.stuck_reason is None

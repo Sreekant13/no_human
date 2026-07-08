@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from claude_agent_sdk import (
+    AgentDefinition,
     AssistantMessage,
     ClaudeAgentOptions,
     HookContext,
@@ -123,6 +124,7 @@ class ClaudeBackend:
         skills: list[str] | None = None,
         thinking: bool = False,
         max_thinking_tokens: int | None = None,
+        agents: dict[str, AgentDefinition] | None = None,
     ) -> ClaudeAgentOptions:
         hooks: dict = {
             "PreToolUse": [
@@ -154,6 +156,8 @@ class ClaudeBackend:
             kwargs["thinking"] = True
             if max_thinking_tokens:
                 kwargs["max_thinking_tokens"] = max_thinking_tokens
+        if agents:
+            kwargs["agents"] = agents
         return ClaudeAgentOptions(
             model=self.model,
             cwd=str(cwd),
@@ -179,12 +183,14 @@ class ClaudeBackend:
         skills: list[str] | None = None,
         thinking: bool = False,
         max_thinking_tokens: int | None = None,
+        agents: dict[str, AgentDefinition] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run the agent, yielding normalized events; the final event is ``result``."""
         options = self._options(cwd, max_turns, effort=effort, resume=resume,
                                 supervisor_hook=supervisor_hook, lint_hook=lint_hook,
                                 skills=skills, thinking=thinking,
-                                max_thinking_tokens=max_thinking_tokens)
+                                max_thinking_tokens=max_thinking_tokens,
+                                agents=agents)
         # The SDK signals terminal conditions (notably hitting max_turns) by
         # *raising* a bare Exception from inside query(). It usually emits a
         # ResultMessage first ("agent done: N turns") and THEN raises, so we
@@ -308,6 +314,7 @@ class ClaudeBackend:
         skills: list[str] | None = None,
         thinking: bool = False,
         max_thinking_tokens: int | None = None,
+        agents: dict[str, AgentDefinition] | None = None,
     ) -> AgentResult:
         """Run to completion, optionally forwarding each event, return the result."""
         final = AgentResult(
@@ -318,6 +325,7 @@ class ClaudeBackend:
             prompt, cwd=cwd, max_turns=max_turns, effort=effort, resume=resume,
             supervisor_hook=supervisor_hook, lint_hook=lint_hook, skills=skills,
             thinking=thinking, max_thinking_tokens=max_thinking_tokens,
+            agents=agents,
         ):
             if on_event is not None:
                 on_event(event)

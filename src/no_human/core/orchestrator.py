@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -383,6 +384,8 @@ class Orchestrator:
                             "eval", eval_out.verdict.value,
                             verdict=eval_out.verdict.value,
                         )
+                        # P2: act on the verdict instead of only annotating it.
+                        await self._act_on_eval(task, eval_out)
                 except Exception:  # noqa: BLE001
                     log.debug("intake evaluator skipped (advisory)", exc_info=True)
 
@@ -401,8 +404,15 @@ class Orchestrator:
 
             # Compound task decomposition: if the planner detected complexity
             # and emitted a DECOMPOSE_PLAN, hand off to the LeadAgent.
+            # Gated OFF by default: a task must not spawn child tasks. Complex
+            # work is delegated IN-SESSION to sub-agents instead (one task may
+            # still open multiple PRs). Only the explicit decomposition.enabled
+            # switch re-enables the legacy child-task path.
             decomposition = (task.context or {}).get("decomposition")
-            if decomposition and decomposition.get("decompose"):
+            decompose_children = self.config.get(
+                "decomposition", {}
+            ).get("enabled", False)
+            if decompose_children and decomposition and decomposition.get("decompose"):
                 from .lead_agent import LeadAgent
                 lead = LeadAgent(
                     self.store, config=self.config, emit=self.emit,
@@ -665,7 +675,7 @@ class Orchestrator:
 
         # Supervisor hook: a PostToolUse evaluator that course-corrects the
         # working agent in real time (replaces the human-in-the-loop).
-        supervisor = self._build_supervisor(task, str(repo.path))
+        supervisor = self._build_supervisor(task, str(repo.path), plan=plan)
         self._active_supervisor = supervisor  # so _agent_sink can feed it agent prose
         if supervisor is not None:
             self.emit("supervisor", "supervisor active")
@@ -727,6 +737,32 @@ class Orchestrator:
         # Materialize built-in subagent definitions so the SDK can delegate
         # focused sub-tasks (e.g. read-only research) to sandboxed agents.
         self._materialize_subagents(repo.path, task)
+
+        # Wire subagent definitions via the SDK's programmatic API so the
+        # Agent tool is available to the implementing agent.
+        from claude_agent_sdk import AgentDefinition
+        extra["agents"] = {
+            "no_human_researcher": AgentDefinition(
+                description="Read-only codebase researcher for focused investigation",
+                prompt=(
+                    "You are a focused codebase researcher. Your job is to find specific "
+                    "information in the codebase and report back with precise file paths "
+                    "and line numbers.\n\n"
+                    "RULES:\n"
+                    "- NEVER edit files. You are read-only.\n"
+                    "- Use grep, read, and glob tools to explore.\n"
+                    "- Always cite exact file paths and line numbers.\n"
+                    "- If a repo wiki exists under `.no_human/wiki/`, consult "
+                    "the relevant page first before broad grepping — it is "
+                    "advisory; the actual code is authoritative.\n"
+                    "- Return a concise summary of what you found.\n"
+                    "- If you cannot find what was asked for, say so explicitly."
+                ),
+                tools=["Read", "Grep", "Glob", "Bash"],
+                permissionMode="bypassPermissions",
+                maxTurns=10,
+            ),
+        }
 
         # Materialize the verify skill with the repo's proven test command
         # so the agent can re-read it after context compaction.
@@ -798,11 +834,19 @@ class Orchestrator:
             )
             self.emit("thinking_enabled", "extended thinking on (complex task)")
 
+        # P3: complex tasks get a larger turn budget so they don't exhaust turns
+        # mid-implementation and fail with an empty diff (B5).
+        attempt_turns = self.bounds.turns_for(complex_task=bool(use_thinking))
+        if attempt_turns != self.bounds.max_turns_per_attempt:
+            self.emit("turn_budget",
+                      f"complex task: turn budget {attempt_turns} "
+                      f"(base {self.bounds.max_turns_per_attempt})")
+
         try:
             result = await self.backend.run(
                 prompt,
                 cwd=repo.path,
-                max_turns=self.bounds.max_turns_per_attempt,
+                max_turns=attempt_turns,
                 effort="high",
                 on_event=self._agent_sink,
                 supervisor_hook=supervisor,
@@ -857,6 +901,11 @@ class Orchestrator:
                 except Exception as exc:  # noqa: BLE001
                     log.warning("WIP checkpoint on max_turns failed: %s", exc)
             detail = f"agent run did not complete ({reason})"
+            stuck_note = stuck.stuck_reason
+            if stuck_note:
+                detail += f" — {stuck_note}"
+            elif is_stuck:
+                detail += " — same failure signature repeated across attempts"
             await self.store.update_attempt(
                 attempt_id, status="failed", failure_reason=detail,
                 commit_sha=wip_sha or None,
@@ -1093,6 +1142,11 @@ class Orchestrator:
                 detail = f"tests failed: {plan_result.summary}"
                 if is_stuck:
                     self.emit("stuck", "same failure signature repeated; resetting context")
+                stuck_note = stuck.stuck_reason
+                if stuck_note:
+                    detail += f" — {stuck_note}"
+                elif is_stuck:
+                    detail += " — same failure signature repeated across attempts"
                 await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
                 return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
         else:
@@ -1109,12 +1163,29 @@ class Orchestrator:
                 },
             )
             if test_result.ran and not test_result.ok:
-                is_stuck = stuck.record(test_result.output)
-                detail = f"tests failed: {test_result.summary}"
-                if is_stuck:
-                    self.emit("stuck", "same failure signature repeated; resetting context")
-                await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
-                return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+                if getattr(test_result, "invocation_error", False):
+                    self.emit("tests", "test invocation failed — proceeding to review without test evidence", ok=False)
+                    await self.store.update_attempt(
+                        attempt_id,
+                        test_results={
+                            "ran": test_result.ran, "ok": False,
+                            "passed": test_result.passed, "failed": test_result.failed,
+                            "errors": test_result.errors, "tamper_flag": False,
+                            "invocation_error": True,
+                        },
+                    )
+                else:
+                    is_stuck = stuck.record(test_result.output)
+                    detail = f"tests failed: {test_result.summary}"
+                    if is_stuck:
+                        self.emit("stuck", "same failure signature repeated; resetting context")
+                    stuck_note = stuck.stuck_reason
+                    if stuck_note:
+                        detail += f" — {stuck_note}"
+                    elif is_stuck:
+                        detail += " — same failure signature repeated across attempts"
+                    await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
+                    return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
 
         # --- CI (if configured): push branch first, then trigger pipeline ---
         if self.ci_runner is not None:
@@ -1249,9 +1320,17 @@ class Orchestrator:
         self, task, repo, branch, base, commit, attempt_id, result,
         *, linked_commits: list | None = None,
     ) -> TaskOutcome:
-        # C3: validate base branch against project's declared default.
+        # C3: validate base branch against project's declared default. If the
+        # profile never set one, auto-detect the remote's actual default
+        # (origin/HEAD) so a stale local checkout doesn't silently skip this
+        # protection (the "assumed master, remote is main" root cause).
         prof = getattr(self, "_active_profile", None)
         expected_default = getattr(prof, "default_branch", "") if prof else ""
+        if not expected_default:
+            try:
+                expected_default = repo.default_branch()
+            except Exception:  # noqa: BLE001 — best-effort, never block finalize
+                expected_default = ""
         if expected_default and base and base != expected_default:
             self.emit(
                 "warning",
@@ -1260,7 +1339,20 @@ class Orchestrator:
             )
 
         title = self._commit_message(task)
-        body = self._pr_body(task, commit, result)
+        # M-B: surface this attempt's test-layer evidence (incl. advisory /
+        # integration layers) in the PR body. Read-only; best-effort.
+        test_evidence: dict | None = None
+        try:
+            for a in await self.store.list_attempts(task.id):
+                if a.get("id") == attempt_id:
+                    tr = a.get("test_results")
+                    if isinstance(tr, str):
+                        tr = json.loads(tr) if tr else None
+                    test_evidence = tr if isinstance(tr, dict) else None
+                    break
+        except Exception:  # noqa: BLE001 — evidence is advisory, never blocks the PR
+            log.debug("could not load test evidence for PR body", exc_info=True)
+        body = self._pr_body(task, commit, result, test_evidence=test_evidence)
         try:
             pr = open_pr(repo, branch, title, body, base=base,
                          github_hosts=self.config.get("git", {}).get("github_hosts"))
@@ -2078,10 +2170,59 @@ class Orchestrator:
             lines.append(f"  [{c['source']}] {c['title']}")
         return "\n".join(lines)
 
+    async def _act_on_eval(self, task: Task, eval_out: Any) -> None:
+        """P2: act on the intake evaluator's verdict so no human is needed.
+
+        - ENRICH: adopt the stronger acceptance criteria (originals preserved
+          under ``context['original_criteria']`` for traceability).
+        - CLARIFY: resolve the ambiguity into explicit assumptions recorded in
+          ``context['assumptions']`` (surfaced in the PR by P4) and proceed.
+
+        DECOMPOSE is left to the planner's existing DECOMPOSE_PLAN path. All
+        best-effort — any failure logs and returns; never blocks the pipeline."""
+        from ..intake.evaluator import EvalVerdict, resolve_assumptions
+        ctx = task.context or {}
+        try:
+            if (eval_out.verdict == EvalVerdict.ENRICH
+                    and eval_out.enriched_criteria):
+                if task.acceptance_criteria:
+                    ctx.setdefault("original_criteria", list(task.acceptance_criteria))
+                task.acceptance_criteria = list(eval_out.enriched_criteria)
+                task.context = ctx
+                await self.store.update_task(task)
+                self.emit("eval_enriched",
+                          f"adopted {len(eval_out.enriched_criteria)} enriched criteria")
+            elif eval_out.verdict == EvalVerdict.CLARIFY:
+                assumptions = await resolve_assumptions(
+                    task.title, task.description or "",
+                    task.acceptance_criteria or [],
+                )
+                if assumptions:
+                    ctx["assumptions"] = assumptions
+                    task.context = ctx
+                    await self.store.update_task(task)
+                    self.emit("eval_assumptions",
+                              f"proceeding under {len(assumptions)} documented assumption(s)")
+        except Exception:  # noqa: BLE001 — advisory, never blocks
+            log.debug("acting on eval verdict skipped", exc_info=True)
+
+    def _profile_usable_under_policy(self, prof: Any) -> bool:
+        """A profile drives a task if a human confirmed it (``is_usable``), OR —
+        when ``profile.auto_confirm_proven`` is opted in — if its test command
+        was PROVEN to run clean (megaplan P1). Proof (the exact command exited 0
+        in a real subprocess at onboarding) is the safety signal; the flag only
+        removes the human click, never the proof."""
+        if prof is None:
+            return False
+        if prof.is_usable:
+            return True
+        auto = bool(self.config.get("profile", {}).get("auto_confirm_proven", False))
+        return bool(auto and prof.test_cmd and prof.proven.get("test_cmd"))
+
     async def _usable_profile(self, repo_path) -> Any | None:
-        """Return the repo's ProjectProfile only if a human confirmed it AND its
-        test command was proven to run (``is_usable``); else None. Prefer the
-        SQLite mirror; fall back to the repo's ``.no_human/project.yml``."""
+        """Return the repo's ProjectProfile if it may drive a task under the
+        active policy (see ``_profile_usable_under_policy``); else None. Prefer
+        the SQLite mirror; fall back to the repo's ``.no_human/project.yml``."""
         from ..profile import ProjectProfile
         prof = None
         try:
@@ -2093,7 +2234,7 @@ class Orchestrator:
                 prof = ProjectProfile.load(repo_path)
             except Exception:  # noqa: BLE001
                 prof = None
-        return prof if (prof and prof.is_usable) else None
+        return prof if self._profile_usable_under_policy(prof) else None
 
     async def _resolve_test_plan(self, task: Task):
         """Look up the project's TestPlan for layered test execution (PR4).
@@ -2211,6 +2352,8 @@ class Orchestrator:
             "the new behaviour, and run the full unit test suite to confirm "
             "everything passes (paste the output). If integration tests exist, "
             "run them too or verify compatibility."
+            " If the description specifies literal values (URLs, branch refs, "
+            "API params), use them exactly as stated."
         ),
         "bugfix": (
             "This is a BUGFIX. Reproduce the defect with a failing test first, "
@@ -2258,16 +2401,29 @@ class Orchestrator:
     def _kind_directive(self, task: Task) -> str:
         return self._KIND_DIRECTIVES.get(task.kind, "")
 
-    def _build_supervisor(self, task: Task, work_dir: str | None = None) -> SupervisorHook | None:
+    def _build_supervisor(
+        self, task: Task, work_dir: str | None = None, *, plan: str = "",
+    ) -> SupervisorHook | None:
         """Construct a SupervisorHook for the current task, or None if disabled.
 
         The supervisor uses a lightweight LLM call (low effort, short prompt) to
         periodically evaluate the working agent's progress and inject corrections.
+
+        P5: when the plan declares a FILES TO CHANGE/CREATE set, pass it so the
+        supervisor can issue a CORRECT for a pattern of unjustified out-of-scope
+        edits (advisory when the plan declares no files).
         """
         sv_cfg = self.config.get("supervisor", {})
         if not sv_cfg.get("enabled", True):
             return None
         check_every = int(sv_cfg.get("check_every", 5))
+        declared_files: list[str] = []
+        if plan:
+            try:
+                from ..agent.scope_guard import parse_plan_files
+                declared_files = sorted(parse_plan_files(plan))
+            except Exception:  # noqa: BLE001 — scope awareness is best-effort
+                declared_files = []
 
         # Build rules text for the supervisor (same as the implementer sees).
         rules = self._format_active_memories() or ""
@@ -2327,6 +2483,7 @@ class Orchestrator:
             llm_call=sv_llm_call,
             check_every=check_every,
             on_decision=on_decision,
+            declared_files=declared_files,
         )
 
     def _materialize_skills(self, repo_path: Path) -> list[str]:
@@ -2380,6 +2537,46 @@ class Orchestrator:
             )
         return materialized
 
+    # Well-known repo-native agent-instruction files (megaplan P6), highest
+    # precedence first. The SDK is invoked without setting_sources (see
+    # agent/claude_backend.py), so CLAUDE.md is NOT auto-loaded — we inject it.
+    _REPO_INSTRUCTION_FILES: tuple[str, ...] = (
+        "CLAUDE.md",
+        "AGENTS.md",
+        ".cursorrules",
+        ".github/copilot-instructions.md",
+        ".windsurfrules",
+    )
+    _REPO_INSTRUCTION_MAX_CHARS = 3000
+
+    def _repo_instruction_section(self, repo_path: Path) -> str | None:
+        """P6: read the target repo's own agent-instruction files so the agent
+        follows the project's conventions instead of guessing (fewer
+        wrong-convention review retries). Repo-root files plus
+        ``.github/copilot-instructions.md``; each capped. Best-effort — any
+        read error is skipped."""
+        found: list[str] = []
+        for rel in self._REPO_INSTRUCTION_FILES:
+            path = repo_path / rel
+            try:
+                if not path.is_file():
+                    continue
+                text = path.read_text(errors="replace").strip()
+            except OSError:
+                continue
+            if not text:
+                continue
+            if len(text) > self._REPO_INSTRUCTION_MAX_CHARS:
+                text = text[: self._REPO_INSTRUCTION_MAX_CHARS] + "\n… (truncated)"
+            found.append(f"--- {rel} ---\n{text}")
+        if not found:
+            return None
+        return (
+            "**Repo's own conventions (AUTHORITATIVE for this codebase — follow "
+            "these over generic guidance; the standing safety rules below still "
+            "apply):**\n\n" + "\n\n".join(found)
+        )
+
     def _materialize_compact_instructions(self, repo_path: Path, task: Task) -> None:
         """Write compact project instructions to ``.claude/instructions.md``.
 
@@ -2395,6 +2592,21 @@ class Orchestrator:
         attempt to stay current.
         """
         sections: list[str] = []
+
+        # 0. The target repo's own agent-instruction files (megaplan P6).
+        # Highest precedence: the project's conventions govern how code here is
+        # written. Placed first so they frame everything below.
+        repo_instructions = self._repo_instruction_section(repo_path)
+        if repo_instructions:
+            sections.append(repo_instructions)
+
+        # 0b. M-A: the locally-generated repo wiki (docs_gen). Copies the
+        # CANONICAL repo's .no_human/wiki/ into this worktree (commit-excluded)
+        # and injects an INDEX-only reference (never the page bodies). No-op
+        # when the repo has no generated wiki → zero change on the default path.
+        wiki_section = self._wiki_index_section(repo_path, task)
+        if wiki_section:
+            sections.append(wiki_section)
 
         # 1. Ecosystem + test command from profile.
         prof = getattr(self, "_active_profile", None)
@@ -2446,11 +2658,48 @@ class Orchestrator:
             "Do exactly what the task asks — not what seems easier.",
             "Verify branch and working directory before each git operation.",
             "Before claiming inability, check local repos and skills.",
+            "When the spec provides exact values (URLs, ref names, variable values), use them verbatim — do not substitute alternatives.",
         ]
         sections.append(
             "**Operational directives:**\n"
             + "\n".join(f"- {d}" for d in directives)
         )
+
+        # 6b. API interaction patterns (general best practices).
+        sections.append(
+            "**API interaction patterns:**\n"
+            "- Always include a sleep/backoff between polling iterations (minimum 10s for CI/CD APIs).\n"
+            "- Guard every API response parse against error payloads (non-200 status, missing fields).\n"
+            "- Paginate list endpoints — never assume the first page is complete."
+        )
+
+        # 6c. CI/pipeline defensive patterns — injected when the repo has CI files
+        # or the task references pipeline/Jenkinsfile.
+        ci_signals = (
+            (repo_path / "Jenkinsfile").exists()
+            or any(kw in task.title.lower()
+                   for kw in ("jenkinsfile", "pipeline", "ci/cd"))
+            or any(kw in " ".join(task.acceptance_criteria).lower()
+                   for kw in ("jenkinsfile", "pipeline"))
+        )
+        if ci_signals:
+            sections.append(
+                "**CI/Pipeline defensive patterns:**\n"
+                "- Use `curl -f -s` (not just `-s`) so HTTP 4xx/5xx cause a non-zero exit "
+                "instead of silently returning an error body that is parsed as if valid.\n"
+                "- Quote ALL shell variables in curl arguments: "
+                '`--form "ref=${myVar}"` not `--form ref=${myVar}`. '
+                "Unquoted vars break on spaces, slashes, and metacharacters.\n"
+                "- Null-guard every parsed API response field (`.id`, `.status`, etc.): "
+                "if the value is null, fail immediately with a diagnostic message — do not "
+                "let the pipeline proceed with a null value that causes a silent 404 downstream.\n"
+                "- After triggering an upstream job, poll its status for terminal failure — "
+                "do not only poll for the artifact/image. If the job itself failed, fail "
+                "immediately instead of waiting for the timeout.\n"
+                "- Auth tokens are scoped to their issuing service: Jenkins CSRF crumbs "
+                "belong only on Jenkins API calls, GitLab uses PRIVATE-TOKEN, GitHub uses "
+                "Bearer. Never cross-wire credentials between services."
+            )
 
         # 7. Known local repos (C1, R1.3).
         try:
@@ -2492,6 +2741,57 @@ class Orchestrator:
             inst_path.write_text(instructions, encoding="utf-8")
         except OSError as exc:
             log.warning("failed to write compact instructions: %s", exc)
+
+    # Files produced by docs_gen (`nh docs generate` / WikiRefreshJob).
+    _WIKI_PAGES: tuple[tuple[str, str], ...] = (
+        ("architecture.md", "Architecture & design"),
+        ("modules.md", "Modules & entrypoints"),
+        ("conventions.md", "Conventions, testing & CI"),
+    )
+
+    def _wiki_index_section(self, repo_path: Path, task: Task) -> str | None:
+        """M-A: provide the locally-generated repo wiki (docs_gen) to the agent.
+
+        The wiki lives at ``<canonical_repo>/.no_human/wiki/`` (created by
+        ``nh docs generate`` or the WikiRefreshJob). Ephemeral per-task
+        worktrees don't inherit it, so we copy the pages into this worktree's
+        ``.no_human/wiki/`` (commit-excluded) and inject an INDEX-only
+        reference — never the page bodies (that would blow the context budget).
+        Best-effort; returns None when no wiki exists, so the default path is
+        unchanged.
+        """
+        canonical = getattr(task, "repo_path", None)
+        if not canonical:
+            return None
+        try:
+            src = Path(canonical).expanduser() / ".no_human" / "wiki"
+            if not src.is_dir():
+                return None
+            present = [(name, label) for name, label in self._WIKI_PAGES
+                       if (src / name).is_file()]
+            if not present:
+                return None
+            # Copy into this worktree so the agent reads within its own cwd.
+            dest = repo_path / ".no_human" / "wiki"
+            if src.resolve() != dest.resolve():
+                dest.mkdir(parents=True, exist_ok=True)
+                for name, _ in present:
+                    try:
+                        shutil.copyfile(src / name, dest / name)
+                    except OSError:
+                        pass
+            lines = [
+                "**Repo wiki (local, on-demand)** — generated developer docs "
+                "for this repo. Advisory context; the actual code is "
+                "authoritative. Read a page with your Read tool when you need "
+                "that area:",
+            ]
+            for name, label in present:
+                lines.append(f"- {label} → `.no_human/wiki/{name}`")
+            return "\n".join(lines)
+        except Exception:  # noqa: BLE001 — advisory context, never blocks
+            log.debug("wiki index injection skipped", exc_info=True)
+            return None
 
     def _materialize_verify_skill(self, repo_path: Path) -> None:
         """Write a ``verify`` skill to ``.claude/skills/`` with the repo's proven
@@ -2549,6 +2849,9 @@ class Orchestrator:
                     "- NEVER edit files. You are read-only.\n"
                     "- Use grep, read, and glob tools to explore.\n"
                     "- Always cite exact file paths and line numbers.\n"
+                    "- If a repo wiki exists under `.no_human/wiki/`, consult "
+                    "the relevant page first before broad grepping — it is "
+                    "advisory; the actual code is authoritative.\n"
                     "- Return a concise summary of what you found.\n"
                     "- If you cannot find what was asked for, say so explicitly."
                 ),
@@ -2617,6 +2920,64 @@ class Orchestrator:
                 parts.append(f"Lint command: {prof.lint_cmd}")
             profile_hint = "\nRepo profile:\n" + "\n".join(f"  {p}" for p in parts if p) + "\n"
 
+        # A task never spawns child tasks unless the legacy path is explicitly
+        # re-enabled. By default, complexity is handled IN-SESSION: the worker
+        # delegates focused sub-tasks to sub-agents and may open multiple PRs.
+        decompose_children = self.config.get(
+            "decomposition", {}
+        ).get("enabled", False)
+        if decompose_children:
+            compound_section = (
+                "## COMPOUND TASK ASSESSMENT\n"
+                "If this task is too complex for a single agent session — e.g. many "
+                "distinct areas of code, investigation needed before implementation, "
+                "multiple repos, broad test coverage, or exploratory debugging across "
+                "many files — emit a decomposition plan.\n\n"
+                "Example: a change touching only 1-2 files but bundling 3+ unrelated "
+                "external-system concerns (build API, CI pipeline polling, PR/comment "
+                "pagination, error-classification logic) is compound by CONCERN count, "
+                "not file count. Each concern becomes its own sub-task; when the "
+                "concerns are genuinely independent, leave `depends_on` empty so they "
+                "run in PARALLEL (independent sub-tasks are dispatched concurrently). "
+                "Only chain a sub-task (single `depends_on`) when it truly must build "
+                "on another's result.\n\n"
+                "Wrap the decomposition in DECOMPOSE_PLAN_START / DECOMPOSE_PLAN_END "
+                "markers with a JSON block inside a fenced code block:\n"
+                "DECOMPOSE_PLAN_START\n"
+                "```json\n"
+                '{"decompose": true, "justification": "...", "subtasks": '
+                '[{"title": "...", "kind": "investigation|feature|bugfix|test_gap", '
+                '"description": "...", "acceptance_criteria": ["..."], '
+                '"depends_on": [], "repo_path": "..."}]}\n'
+                "```\n"
+                "DECOMPOSE_PLAN_END\n\n"
+                "Rules for decomposition:\n"
+                "- Each sub-task must be independently testable and reviewable.\n"
+                "- Each sub-task must have a clear justification. No duplicates.\n"
+                "- Maximum 50 sub-tasks. Prefer fewer, larger sub-tasks.\n"
+                "- Each sub-task may depend on at most ONE other sub-task "
+                "(no diamond/multi-parent dependencies).\n"
+                "- PREFER independent sub-tasks (empty `depends_on`) when they touch "
+                "separate concerns/files — independents run concurrently (parallel "
+                "developers). Use a single `depends_on` ONLY for a real ordering "
+                "dependency (e.g. a later task extends an earlier task's branch).\n"
+                "- Only decompose if a single agent session truly cannot handle it.\n"
+                "- If you decompose, do NOT also produce a normal plan above.\n"
+            )
+        else:
+            compound_section = (
+                "## COMPLEX TASK — IN-SESSION DELEGATION (no child tasks)\n"
+                "Do NOT split this into separate tasks. All work stays in THIS "
+                "task. If the task spans several independent concerns (e.g. build "
+                "API, CI polling, PR/comment pagination, error classification), "
+                "structure the plan by concern and delegate focused, read-only "
+                "investigation of each concern to the `no_human_researcher` "
+                "sub-agent to keep the implementer's context budget free. The "
+                "implementer then applies the changes for every concern within "
+                "this session. It is acceptable for one task to produce multiple "
+                "commits/PRs, but it must never create new tasks.\n\n"
+            )
+
         prompt = (
             f"You are planning an implementation task for the repo at {repo.path}.\n"
             f"Explore the codebase to understand the existing architecture before planning.\n\n"
@@ -2653,34 +3014,7 @@ class Orchestrator:
             "IMPORTANT: Limit your plan to at most 8 tasks/files unless decomposing.\n"
             "If the task genuinely requires more, explain why — but default to the\n"
             "smallest plan that meets the criteria.\n\n"
-            "## COMPOUND TASK ASSESSMENT\n"
-            "If this task is too complex for a single agent session — e.g. many "
-            "distinct areas of code, investigation needed before implementation, "
-            "multiple repos, broad test coverage, or exploratory debugging across "
-            "many files — emit a decomposition plan.\n\n"
-            "Example: a change touching only 1-2 files but bundling 3+ unrelated "
-            "external-system concerns (build API, CI pipeline polling, PR/comment "
-            "pagination, error-classification logic) is compound by CONCERN count, "
-            "not file count. Each concern becomes a linearly-chained sub-task "
-            "(each depends_on the previous) so review stays focused.\n\n"
-            "Wrap the decomposition in DECOMPOSE_PLAN_START / DECOMPOSE_PLAN_END "
-            "markers with a JSON block inside a fenced code block:\n"
-            "DECOMPOSE_PLAN_START\n"
-            "```json\n"
-            '{"decompose": true, "justification": "...", "subtasks": '
-            '[{"title": "...", "kind": "investigation|feature|bugfix|test_gap", '
-            '"description": "...", "acceptance_criteria": ["..."], '
-            '"depends_on": [], "repo_path": "..."}]}\n'
-            "```\n"
-            "DECOMPOSE_PLAN_END\n\n"
-            "Rules for decomposition:\n"
-            "- Each sub-task must be independently testable and reviewable.\n"
-            "- Each sub-task must have a clear justification. No duplicates.\n"
-            "- Maximum 50 sub-tasks. Prefer fewer, larger sub-tasks.\n"
-            "- Each sub-task may depend on at most ONE other sub-task "
-            "(linear chains only — no diamond/multi-parent dependencies).\n"
-            "- Only decompose if a single agent session truly cannot handle it.\n"
-            "- If you decompose, do NOT also produce a normal plan above.\n"
+            f"{compound_section}"
         )
 
         try:
@@ -3134,14 +3468,70 @@ class Orchestrator:
         task.context = ctx
         await self.store.update_task(task)
 
-    def _pr_body(self, task: Task, commit, result) -> str:
+    def _assumptions_section(self, task: Task) -> str:
+        """P4: surface what the agent assumed and what remains open so the human
+        reviewing the PR catches it in seconds. Built from the P2 intake outputs
+        (documented assumptions, auto-sharpened criteria) plus any recorded
+        blocker diagnosis. Returns "" when there is nothing to flag (clean PRs
+        stay uncluttered)."""
+        ctx = task.context or {}
+        lines: list[str] = []
+        for a in (ctx.get("assumptions") or []):
+            lines.append(f"- {a}")
+        orig = ctx.get("original_criteria")
+        if orig:
+            lines.append(
+                "- Acceptance criteria were auto-sharpened during intake; "
+                "originals: " + "; ".join(str(c) for c in orig)
+            )
+        blk = task.blocker or {}
+        if blk.get("root_cause_hypothesis"):
+            lines.append(f"- Unresolved: {blk['root_cause_hypothesis']}")
+        if blk.get("question"):
+            lines.append(f"- Open question: {blk['question']}")
+        if not lines:
+            return ""
+        return (
+            "## ⚠️ Assumptions & Open Questions\n"
+            "The agent proceeded autonomously under these assumptions — please "
+            "verify at review:\n" + "\n".join(lines) + "\n\n"
+        )
+
+    def _pr_body(self, task: Task, commit, result, *, test_evidence: dict | None = None) -> str:
         criteria = "\n".join(f"- {c}" for c in task.acceptance_criteria) or "- (none stated)"
         return (
             f"Automated change by no_human for task `{task.id[:8]}`.\n\n"
             f"## Task\n{task.title}\n\n"
             f"## Acceptance criteria\n{criteria}\n\n"
+            f"{self._assumptions_section(task)}"
             f"## Implementation summary\n{(result.final_text or '').strip()[:2000]}\n\n"
+            f"{self._test_evidence_section(test_evidence)}"
             f"## Stats\n{commit.files_changed} files, "
             f"+{commit.insertions}/-{commit.deletions}, {result.num_turns} turns.\n\n"
             "> The agent does not merge. A human reviews and merges via `nh approve`."
         )
+
+    @staticmethod
+    def _test_evidence_section(test_evidence: dict | None) -> str:
+        """M-B: render runtime/integration test evidence for the PR body.
+
+        Uses the per-layer summaries collected during the layered test run
+        (blocking + advisory + wake-gated layers), or the single-command
+        aggregate when no layered plan ran. Returns "" when nothing ran so the
+        default path is byte-for-byte unchanged.
+        """
+        if not isinstance(test_evidence, dict):
+            return ""
+        layers = test_evidence.get("layers")
+        if isinstance(layers, list) and layers:
+            lines = "\n".join(f"- {str(s)}" for s in layers)
+            return f"## Test evidence\n{lines}\n\n"
+        if test_evidence.get("ran"):
+            verdict = "PASS" if test_evidence.get("ok") else "FAIL"
+            return (
+                f"## Test evidence\n- tests: {verdict} — "
+                f"{test_evidence.get('passed', 0)} passed, "
+                f"{test_evidence.get('failed', 0)} failed, "
+                f"{test_evidence.get('errors', 0)} errors\n\n"
+            )
+        return ""

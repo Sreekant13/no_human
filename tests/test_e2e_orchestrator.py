@@ -113,6 +113,53 @@ async def test_full_pipeline_opens_local_pr(bare_repo, tmp_path, store):
     assert "pr_open" in kinds and "commit" in kinds
 
 
+async def test_default_branch_auto_detect_warns_on_stale_local_checkout(tmp_path, store):
+    """C3: a local checkout stuck on 'master' while the remote's real default
+    moved to 'main' must be caught even when no ProjectProfile.default_branch
+    was ever confirmed — the auto-detect fallback in GitRepo.default_branch(),
+    not just the pre-existing (opt-in) profile-declared check."""
+    bare = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare)], check=True,
+                   capture_output=True)
+    work = tmp_path / "work"
+    work.mkdir()
+    _git(work, "init", "-b", "main")
+    _git(work, "config", "user.email", "u@e.com")
+    _git(work, "config", "user.name", "u")
+    (work / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    (work / "test_calc.py").write_text(
+        "from calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n"
+    )
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "init")
+    _git(work, "remote", "add", "origin", str(bare))
+    _git(work, "push", "-u", "origin", "main")  # establishes real refs/heads/main
+    _git(work, "checkout", "-b", "master")  # stale local checkout, mismatched
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(work))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    warnings = [e for e in events if e.get("kind") == "warning"]
+    assert any("master" in w["text"] and "main" in w["text"] for w in warnings), (
+        f"expected a default-branch mismatch warning, got: {[e['text'] for e in warnings]}"
+    )
+
+
 async def test_run_task_uses_confirmed_profile_test_command(bare_repo, tmp_path, store):
     """A usable ProjectProfile's proven test_cmd drives the run, not detect_command."""
     from no_human.profile import ProjectProfile
@@ -902,6 +949,52 @@ async def test_planning_generates_and_stores_plan(bare_repo, tmp_path, store):
     assert any("plan generated" in e.get("text", "") for e in planning_events)
 
 
+class PromptCapturingPlannerBackend:
+    """Captures the planner prompt so tests can assert on its content."""
+
+    def __init__(self, plan_text: str):
+        self._plan = plan_text
+        self.prompt = None
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        self.prompt = prompt
+        return AgentResult(final_text=self._plan, num_turns=3, is_error=False,
+                           tokens_used=200, session_id="s", stop_reason="end_turn")
+
+
+async def test_planner_prompt_no_child_tasks_by_default(bare_repo, tmp_path, store):
+    """By default the planner is told to delegate in-session, NOT to emit a
+    DECOMPOSE_PLAN (which would create child tasks)."""
+    cfg = _planning_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    t = Task.new("multi-concern task", repo_path=str(bare_repo))
+    backend = PromptCapturingPlannerBackend(_SAMPLE_PLAN)
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=backend):
+        await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert "DECOMPOSE_PLAN_START" not in backend.prompt
+    assert "IN-SESSION DELEGATION" in backend.prompt
+    assert "must never create new tasks" in backend.prompt
+
+
+async def test_planner_prompt_decompose_when_enabled(bare_repo, tmp_path, store):
+    """The legacy child-task path is only offered when decomposition.enabled."""
+    cfg = _planning_config(tmp_path)
+    cfg.data["decomposition"] = {"enabled": True}
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    t = Task.new("multi-concern task", repo_path=str(bare_repo))
+    backend = PromptCapturingPlannerBackend(_SAMPLE_PLAN)
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=backend):
+        await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert "DECOMPOSE_PLAN_START" in backend.prompt
+
+
 async def test_planning_skips_for_code_review(bare_repo, tmp_path, store):
     """Planning is gated: code_review kind skips it entirely (no Claude call)."""
     cfg = _planning_config(tmp_path)
@@ -1088,6 +1181,52 @@ async def test_doom_loop_emits_stuck_event(bare_repo, tmp_path, store):
     stuck_events = [e for e in events if e.get("kind") == "stuck"]
     assert len(stuck_events) >= 1
     assert "doom-loop" in stuck_events[0]["text"]
+
+
+class DoomLoopThenFailBackend:
+    """Doom-loops on every attempt, then hits max_turns without ever fixing
+    anything — so the stuck signal must survive into the failure detail."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        self.calls += 1
+        if on_event:
+            for _ in range(3):
+                on_event(AgentEvent("tool_use", tool_name="Read",
+                                    tool_input={"file_path": "/src/foo.py"}))
+            on_event(AgentEvent("result", text="Reached maximum number of turns (40)"))
+        return AgentResult(
+            final_text="Reached maximum number of turns (40)",
+            num_turns=max_turns, is_error=True, tokens_used=100,
+            session_id="s", stop_reason="max_turns",
+        )
+
+
+async def test_doom_loop_reason_persists_into_attempt_log(bare_repo, tmp_path, store):
+    """A doom-loop mid-attempt must change what the NEXT attempt is told —
+    otherwise the 'stuck: resetting context' claim is just telemetry (the
+    audited gap). The reason should land in failure_reason (stored per
+    attempt) and in task.context['attempt_log'] (fed into the next attempt's
+    resume digest by _resume_digest)."""
+    cfg = _config(tmp_path)
+    backend = DoomLoopThenFailBackend()
+    events: list[dict] = []
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("trigger doom loop then fail", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.ESCALATED
+    attempts = await store.list_attempts(t.id)
+    assert len(attempts) == cfg.data["bounds"]["max_attempts"]
+    assert all("doom-loop" in (a.get("failure_reason") or "") for a in attempts)
+    assert t.context.get("attempt_log")
+    assert any("doom-loop" in entry for entry in t.context["attempt_log"])
 
 
 # --------------------------------------------------------------------------- #

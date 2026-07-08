@@ -33,7 +33,11 @@ def test_reviewer_small_diff_no_scope_pass():
     task = _task()
     small_diff = "--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-old\n+new\n"
     prompt = _build_review_prompt(task, small_diff, "all passed", "")
-    assert "SCOPE" not in prompt
+    # The gated over-engineering PASS must be absent for small diffs. (The
+    # always-on STAGE-1 "SCOPE CHECK" correctness line is a separate, committed
+    # invariant and is expected in every prompt.)
+    assert "PASS 4: SCOPE" not in prompt
+    assert "SMALLEST change that solves the task" not in prompt
     assert "STAGE 1" in prompt
     assert "CODE QUALITY" in prompt
 
