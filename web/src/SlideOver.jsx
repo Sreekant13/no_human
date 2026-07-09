@@ -5,6 +5,7 @@ import {
   connectTaskSSE,
 } from "./api.js";
 import Markdown from "./Markdown.jsx";
+import { ROLE_LABEL, discoverSubagents, eventSource } from "./eventRoles.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
 const IconCheck = ({ size = 14, className = "" }) => (
@@ -321,56 +322,13 @@ function FlashBanner({ msg, onDismiss }) {
   );
 }
 
-// Which agent role an event belongs to. The orchestrator's event `kind` is
-// already role-specific (the supervisor hook emits `supervisor`, the reviewer
-// emits review_*), so we derive the role here for per-role styling without a
-// backend change. A `source` field on the event (when present) wins.
-const SOURCE_BY_KIND = {
-  supervisor: "supervisor",
-  review_start: "reviewer", review: "reviewer", review_error: "reviewer",
-  tamper: "reviewer",
-  tool_use: "agent", agent_text: "agent",
-  subagent_start: "agent", subagent_progress: "agent", subagent_done: "agent",
-};
-function eventSource(e) {
-  const src = e.source || SOURCE_BY_KIND[e.kind] || "worker";
-  // Backend emits source:"orchestrator" but the Orchestrator node id is "worker".
-  if (src === "orchestrator") return "worker";
-  return src;
-}
-const ROLE_LABEL = { worker: "Orchestrator", supervisor: "Supervisor", reviewer: "Reviewer", agent: "Coder" };
-
-// Discover subagents from events at render time
-function discoverSubagents(events) {
-  const subs = new Map(); // task_id → { id, label, type, desc, status }
-  for (const e of events) {
-    if (e.kind === "subagent_start") {
-      const tid = e.task_id;
-      if (tid && !subs.has(tid)) {
-        subs.set(tid, {
-          id: `sub-${tid}`,
-          label: (e.text || "Subagent").slice(0, 40),
-          type: (e.task_type || "SUBAGENT").toUpperCase(),
-          icon: "◇",
-          desc: e.text || "Spawned by worker",
-          color: "var(--agent-agent)",
-          subagentTaskId: tid,
-          status: "active",
-        });
-      }
-    } else if (e.kind === "subagent_done") {
-      const tid = e.task_id;
-      const sub = subs.get(tid);
-      if (sub) sub.status = e.status === "completed" ? "done" : "error";
-    }
-  }
-  return [...subs.values()];
-}
 
 // ── Agent definitions for the system diagram ───────────────────────────────
 const AGENTS = [
   { id: "worker",     label: "Orchestrator", type: "ORCHESTRATOR", icon: "⚙",  desc: "Drives the task pipeline: context, planning, attempts, review",
     color: "var(--agent-worker)" },
+  { id: "planner",    label: "Planner",      type: "PLANNER",      icon: "◈",  desc: "Fans out independent plan proposals, then synthesizes one",
+    color: "var(--agent-planner)" },
   { id: "agent",      label: "Coder",        type: "AGENT",        icon: "⌨",  desc: "The Claude session that reads & edits code",
     color: "var(--agent-agent)" },
   { id: "supervisor", label: "Supervisor",   type: "MONITOR",      icon: "◉",  desc: "Course-corrects the worker every N tool calls",
@@ -395,7 +353,7 @@ function deriveAgentStatus(events, agentId) {
 function activeConnection(events) {
   if (events.length === 0) return null;
   const src = eventSource(events[events.length - 1]);
-  const map = { worker: "worker-agent", agent: "agent-supervisor", supervisor: "supervisor-agent", reviewer: "reviewer-worker" };
+  const map = { worker: "worker-agent", planner: "worker-planner", agent: "agent-supervisor", supervisor: "supervisor-agent", reviewer: "reviewer-worker" };
   return map[src] || null;
 }
 
@@ -739,8 +697,11 @@ function SystemTab({ taskId, task, isActive }) {
 
   // Discover dynamically-spawned subagents from events
   const subagents = discoverSubagents(events);
-  // Subagent events are attributed to the worker (agent) — derive their
-  // status from the discovery function instead of deriveAgentStatus.
+  // Split by who spawned them. Planning subagents belong under the Planner;
+  // everything else is the Coder's (the Reviewer runs without subagents).
+  const plannerSubs = subagents.filter(s => s.parent === "planner");
+  const coderSubs   = subagents.filter(s => s.parent !== "planner");
+  // Subagent status comes from the discovery function, not deriveAgentStatus.
   for (const sub of subagents) {
     const subEvents = events.filter(e =>
       (e.kind === "subagent_start" || e.kind === "subagent_progress" || e.kind === "subagent_done")
@@ -755,12 +716,14 @@ function SystemTab({ taskId, task, isActive }) {
   // Only show nodes that have events — the diagram builds up dynamically.
   const has = (id) => agentStates[id] && agentStates[id].count > 0;
   const hasWorker     = has("worker");
+  const hasPlanner    = has("planner");
   const hasAgent      = has("agent");
   const hasSupervisor = has("supervisor");
   const hasReviewer   = has("reviewer");
   const hasRow1       = hasAgent || hasReviewer;
 
   const worker     = AGENTS.find(a => a.id === "worker");
+  const planner    = AGENTS.find(a => a.id === "planner");
   const agent      = AGENTS.find(a => a.id === "agent");
   const supervisor = AGENTS.find(a => a.id === "supervisor");
   const reviewer   = AGENTS.find(a => a.id === "reviewer");
@@ -783,6 +746,43 @@ function SystemTab({ taskId, task, isActive }) {
           <div className="sys-tree-row">
             <AgentNode agent={worker} state={agentStates.worker} isActive={isActive} onClick={() => setModalAgent(worker)} />
           </div>
+        )}
+
+        {/* Planning phase: Orchestrator → Planner → its proposer subagents.
+            The Planner always renders alone on its row, so every connector here
+            is a centered stem (x=340) and Row 1's two-column geometry below
+            stays exactly as it was. */}
+        {hasWorker && hasPlanner && (
+          <div className="sys-tree-lines">
+            <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
+              <path d="M 340 0 L 340 48" className={`sys-tree-line${activeConn === "worker-planner" ? " active" : ""}`} />
+              <path d="M 340 0 L 340 48" className={`sys-tree-flow${activeConn === "worker-planner" ? " active" : ""}`} />
+            </svg>
+          </div>
+        )}
+
+        {hasPlanner && (
+          <div className="sys-tree-row">
+            <AgentNode agent={planner} state={agentStates.planner} isActive={isActive} onClick={() => setModalAgent(planner)} />
+          </div>
+        )}
+
+        {hasPlanner && plannerSubs.length > 0 && (
+          <>
+            <div className="sys-tree-lines">
+              <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
+                <path d="M 340 0 L 340 48" className="sys-tree-line active" />
+                <path d="M 340 0 L 340 48" className="sys-tree-flow active" />
+              </svg>
+            </div>
+            <div className="sys-tree-row">
+              <div className="sys-subagent-group">
+                {plannerSubs.map(sub => (
+                  <AgentNode key={sub.id} agent={sub} state={agentStates[sub.id]} isActive={isActive} onClick={() => setModalAgent(sub)} />
+                ))}
+              </div>
+            </div>
+          </>
         )}
 
         {/* Connection: Orchestrator → Agent / Reviewer (only when both sides exist) */}
@@ -840,13 +840,13 @@ function SystemTab({ taskId, task, isActive }) {
           </div>
         )}
 
-        {/* Row 3: Dynamic subagents spawned by the Worker. Subagents are
-            always children of Coder specifically (never Reviewer), so the
-            connector must land on Coder's actual column — x=200 when
-            Reviewer also renders (2-column Row 1), x=340 (dead center)
-            when Coder renders alone — matching the same convention the
-            Orchestrator→Row1 connector above already uses. */}
-        {subagents.length > 0 && (
+        {/* Row 3: subagents the Coder spawned. Planning subagents render under
+            the Planner above, so everything left here is a child of Coder
+            specifically (never Reviewer) and the connector lands on Coder's
+            actual column — x=200 when Reviewer also renders (2-column Row 1),
+            x=340 (dead center) when Coder renders alone — the same convention
+            the Orchestrator→Row1 connector above uses. */}
+        {coderSubs.length > 0 && (
           <>
             <div className="sys-tree-lines">
               <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
@@ -855,8 +855,8 @@ function SystemTab({ taskId, task, isActive }) {
               </svg>
             </div>
             <div className="sys-tree-row">
-              <div style={{ display: "flex", gap: "32px" }}>
-                {subagents.map(sub => (
+              <div className="sys-subagent-group">
+                {coderSubs.map(sub => (
                   <AgentNode key={sub.id} agent={sub} state={agentStates[sub.id]} isActive={isActive} onClick={() => setModalAgent(sub)} />
                 ))}
               </div>

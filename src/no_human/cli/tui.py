@@ -15,7 +15,7 @@ from textual.widgets import Footer, Header, RichLog, Static
 
 from ..agent.claude_backend import ClaudeBackend
 from ..core.db import Store
-from ..core.orchestrator import Orchestrator
+from ..core.orchestrator import Orchestrator, is_agent_session
 from ..notify.slack import SlackNotifier
 
 
@@ -57,7 +57,7 @@ class WatchApp(App):
     def _sink(self, event: dict) -> None:
         log = self.query_one("#log", RichLog)
         src, kind, text = event.get("source"), event.get("kind"), event.get("text", "")
-        if src == "agent":
+        if is_agent_session(src):
             if kind == "tool_use":
                 args = event.get("tool_input") or {}
                 summary = ", ".join(f"{k}={str(v)[:50]}" for k, v in list(args.items())[:3])

@@ -16,10 +16,23 @@ cd "$(dirname "$0")/.."
 MODE="${1:-full}"
 shift 2>/dev/null || true
 
+# The board's role-attribution logic (web/src/eventRoles.js) decides which agent
+# each event is drawn as. It is pure JS, so node's built-in runner exercises it —
+# no extra dependency. Skipped when node isn't installed.
+run_web_tests() {
+  if command -v node >/dev/null 2>&1; then
+    echo "=== Running web tests (node --test) ==="
+    (cd web && node --test src/)
+  else
+    echo "=== Skipping web tests (node not installed) ==="
+  fi
+}
+
 case "$MODE" in
   fast)
     echo "=== Running fast tests only (skipping slow) ==="
     uv run pytest -q --tb=short -n auto -m "not slow" "$@"
+    run_web_tests
     ;;
   slow)
     echo "=== Running slow tests only ==="
@@ -28,6 +41,7 @@ case "$MODE" in
   full|*)
     echo "=== Running full test suite ==="
     uv run pytest -q --tb=short -n auto "$@"
+    run_web_tests
     ;;
 esac
 

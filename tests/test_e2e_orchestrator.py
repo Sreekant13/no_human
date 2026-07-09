@@ -1283,6 +1283,66 @@ async def test_moa_planning_synthesizes_proposals(bare_repo, tmp_path, store):
     assert any("plan generated" in e.get("text", "") for e in planning_events)
 
 
+async def test_moa_announces_the_fan_out_and_attributes_each_lens(
+    bare_repo, tmp_path, store,
+):
+    """The fan-out used to emit nothing until synthesis, minutes later, and the
+    three proposers' events were indistinguishable from each other."""
+    cfg = _moa_config(tmp_path)
+    events: list[dict] = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    fake = MoAFakeBackend(
+        proposals={"minimal-first": _SAMPLE_PLAN, "risk-first": _SAMPLE_PLAN,
+                   "test-first": _SAMPLE_PLAN},
+        aggregate_text="## FILES TO CHANGE/CREATE\n- calc.py: synthesized\n",
+    )
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
+        await orch._generate_plan(t, GitRepo(bare_repo))
+
+    moa = [e for e in events if e.get("kind") == "planning_moa"]
+
+    # 1. The fan-out announces itself, names every lens, and names the model.
+    fan_out = next(e for e in moa if "fanning out" in e["text"])
+    assert fan_out["model"] == cfg.data["llm"]["planner_model"]
+    assert fan_out["proposers"] == ["minimal-first", "risk-first", "test-first"]
+    for lens in ("minimal-first", "risk-first", "test-first"):
+        assert lens in fan_out["text"]
+
+    # 2. Each proposer reports its own completion, tagged with its lens.
+    finished = {e["lens"] for e in moa if "finished" in e["text"]}
+    assert finished == {"minimal-first", "risk-first", "test-first"}
+
+    # 3. The fan-out is announced before any proposer finishes.
+    assert moa.index(fan_out) == 0
+
+
+async def test_moa_reports_a_failed_proposer_by_lens(bare_repo, tmp_path, store):
+    cfg = _moa_config(tmp_path)
+    events: list[dict] = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    fake = MoAFakeBackend(
+        proposals={"minimal-first": _SAMPLE_PLAN, "risk-first": _SAMPLE_PLAN,
+                   "test-first": _SAMPLE_PLAN},
+        aggregate_text="## FILES TO CHANGE/CREATE\n- calc.py: synthesized\n",
+        fail_lenses={"risk-first"},
+    )
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
+        await orch._generate_plan(t, GitRepo(bare_repo))
+
+    moa = [e for e in events if e.get("kind") == "planning_moa"]
+    failed = [e for e in moa if "failed" in e["text"]]
+    assert len(failed) == 1
+    assert failed[0]["lens"] == "risk-first"
+
+
 async def test_moa_aggregator_prompt_forbids_numeric_score(bare_repo, tmp_path, store):
     """CLAUDE.md #3: evidence-based review/synthesis, never a numeric
     self-score. The aggregator prompt must not invite one."""
@@ -1511,6 +1571,71 @@ async def test_stale_plan_file_is_removed_when_this_run_has_no_plan(
     await orch.run_task(t)
 
     assert not stale.exists()
+
+
+# --------------------------------------------------------------------------- #
+# Role attribution on agent events (the System view reads `source`)            #
+# --------------------------------------------------------------------------- #
+
+def _bare_orch(sink):
+    """An Orchestrator with only the event sink wired — enough for _agent_sink."""
+    orch = Orchestrator.__new__(Orchestrator)
+    orch._sink = sink
+    return orch
+
+
+def test_agent_sink_defaults_to_the_coder_role():
+    events: list[dict] = []
+    _bare_orch(events.append)._agent_sink(AgentEvent("tool_use", tool_name="Read"))
+    assert events[0]["source"] == "agent"
+    assert events[0]["tool_name"] == "Read"
+
+
+def test_sink_for_stamps_the_role_on_every_event():
+    events: list[dict] = []
+    orch = _bare_orch(events.append)
+    orch._sink_for("planner:test-first")(AgentEvent("tool_use", tool_name="Grep"))
+    orch._sink_for("aggregator")(AgentEvent("text", text="synthesizing"))
+    assert [e["source"] for e in events] == ["planner:test-first", "aggregator"]
+
+
+def test_sink_for_gives_each_concurrent_proposer_its_own_lens():
+    """The MoA proposers run under asyncio.gather; a shared _active_role attr
+    would hand every one of them whichever lens was assigned last."""
+    events: list[dict] = []
+    orch = _bare_orch(events.append)
+    sinks = [orch._sink_for(f"planner:{lens}")
+             for lens in ("minimal-first", "risk-first", "test-first")]
+    # Interleave, as concurrent proposers do.
+    for s in sinks:
+        s(AgentEvent("tool_use", tool_name="Read"))
+    for s in reversed(sinks):
+        s(AgentEvent("subagent_start", text="Investigate Jenkinsfile structure"))
+    assert [e["source"] for e in events] == [
+        "planner:minimal-first", "planner:risk-first", "planner:test-first",
+        "planner:test-first", "planner:risk-first", "planner:minimal-first",
+    ]
+
+
+def test_planner_tool_calls_do_not_feed_the_implementers_doom_loop_detector():
+    """The planner is read-only and runs before the attempt. Its repeated Reads
+    must not trip the coder's doom-loop detector, nor land in the edited-file
+    set — the worker pool reuses one Orchestrator across tasks."""
+    from no_human.core.bounds import StuckDetector
+
+    events: list[dict] = []
+    orch = _bare_orch(events.append)
+    orch._stuck = StuckDetector()
+
+    planner = orch._sink_for("planner:risk-first")
+    for _ in range(5):
+        planner(AgentEvent("tool_use", tool_name="Read",
+                           tool_input={"file_path": "/src/foo.py"}))
+    planner(AgentEvent("tool_use", tool_name="Edit",
+                       tool_input={"file_path": "/src/foo.py"}))
+
+    assert not any(e["kind"] == "stuck" for e in events)
+    assert not getattr(orch, "_agent_edited_files", set())
 
 
 # --------------------------------------------------------------------------- #
