@@ -1955,6 +1955,80 @@ async def test_non_investigation_no_changes_still_fails(bare_repo, tmp_path, sto
 
 
 # --------------------------------------------------------------------------- #
+# A3: the zero-diff attempt breaker                                            #
+# --------------------------------------------------------------------------- #
+
+class ZeroDiffBackend:
+    """Edits nothing and says the work is already done — verbatim in spirit to
+    what task d9d458b5's agent said on all three of its attempts."""
+
+    STATEMENT = ("The implementation is already complete. I made zero edits. "
+                 "I did not need to fabricate changes — doing so would violate "
+                 "the 'smallest change' rule.")
+
+    def __init__(self):
+        self.prompts: list[str] = []
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        self.prompts.append(prompt)
+        return AgentResult(final_text=self.STATEMENT, num_turns=5, is_error=False,
+                           tokens_used=100, session_id="s", stop_reason="end_turn")
+
+
+async def test_two_zero_diff_attempts_escalate_with_the_agents_reason(
+    bare_repo, tmp_path, store
+):
+    """d9d458b5 burned 3 attempts × ~18 turns re-running an agent against a repo
+    it never modified, then escalated with 'agent produced no file changes' ×3 —
+    while the agent's actual reason ("already complete, I won't fabricate") was
+    discarded. Two attempts, then escalate carrying that reason."""
+    cfg = _config(tmp_path)
+    backend = ZeroDiffBackend()
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None))
+    t = Task.new("add feature", repo_path=str(bare_repo), kind="feature")
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.ESCALATED
+    # bounds.max_attempts is 3 — the third never ran.
+    assert len(backend.prompts) == 2
+    assert len(await store.list_attempts(t.id)) == 2
+
+    blocker = outcome.task.blocker
+    assert blocker["category"] == "AMBIGUITY"
+    assert "fabricate changes" in blocker["evidence"]
+    assert blocker["tried"]  # the per-attempt log, for the human reading it
+
+
+async def test_zero_diff_preamble_appears_on_retry_and_forbids_fabrication(
+    bare_repo, tmp_path, store
+):
+    """The corrective preamble must name the two valid outcomes without implying
+    an edit has to appear — the agent it addresses may well be right."""
+    cfg = _config(tmp_path)
+    backend = ZeroDiffBackend()
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None))
+    t = Task.new("add feature", repo_path=str(bare_repo), kind="feature")
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    first, second = backend.prompts
+    assert "FINISHED WITHOUT EDITING ANY FILE" not in first
+    assert "FINISHED WITHOUT EDITING ANY FILE" in second
+    assert "Do NOT invent an edit" in second
+    # And every attempt offers the sanctioned "already satisfied" exit, so an
+    # agent that is right can say so on attempt 1 instead of looking like a stall.
+    for prompt in (first, second):
+        assert "ALREADY satisfied by the existing code" in prompt
+        assert "not a silent no-op" in prompt
+        # …and it must not become an escape hatch from work the agent can do.
+        assert "avoid finishing doable work" in prompt
+
+
+# --------------------------------------------------------------------------- #
 # env_setup / env_vars / env_teardown                                          #
 # --------------------------------------------------------------------------- #
 
