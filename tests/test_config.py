@@ -105,3 +105,10 @@ def test_atomic_write_text_no_partial_read(tmp_path):
     _atomic_write_text(target, "replaced content")
     assert target.read_text() == "replaced content"
     assert not target.with_suffix(".yaml.tmp").exists()
+
+
+def test_no_fake_auto_pr_switch():
+    """`git.auto_pr` was a config key nothing read — it looked like a safety
+    switch and was not one. A fake off-switch is worse than none."""
+    from no_human.config import DEFAULT_CONFIG
+    assert "auto_pr" not in DEFAULT_CONFIG["git"]
