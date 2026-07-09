@@ -1,0 +1,101 @@
+# M0.5 — the cost baseline
+
+Every later milestone is measured against this. Captured 2026-07-10 from the
+operational DB, before any M1–M5 work landed.
+
+Reproduce with:
+
+    sqlite3 -readonly ~/.no_human/no_human.db < docs/baseline_queries.sql
+
+## The one number that matters
+
+`no_human has never opened an authored PR.`
+
+```
+$ sqlite3 -readonly ~/.no_human/no_human.db \
+    "SELECT COUNT(*) AS attempts_with_pr_url FROM attempts WHERE pr_url IS NOT NULL;"
+0
+```
+
+This is the M0 exit criterion, and it is currently zero. It stays the headline
+number until an authored PR exists.
+
+## The flagship run — task `84251cb2` (CI_GATE integration-test pipeline)
+
+Status `blocked`. Stopped by budget, not by a defect: two real reviewer findings
+away from a PR. Work preserved on `scratch/dev/84251cb2-5`
+(1 commit ahead of `origin/dev`).
+
+```
+$ sqlite3 -readonly ~/.no_human/no_human.db \
+   "SELECT attempt_number, status, turns_used, tokens_used, cache_read_tokens,
+           COALESCE(review_passed,'-') rev
+    FROM attempts WHERE task_id LIKE '84251cb2%' ORDER BY attempt_number;"
+
+attempt  status       turns  tokens  cache_read  review
+1        in_progress  41     58743   3145988     -
+2        failed       17     6016     981499     -
+3        failed       23     8840    1249705     -
+4        failed       22     8896    1146606     -
+5        failed       21     6568    1028431     -
+6        in_progress  22     9200    1272586     -
+7        failed       20     7948    1072746     0
+8        failed       41     26955   3230320     0
+9        in_progress   0        0          0     -
+```
+
+Wall clock **3.09 h**, **865 events**, **9 attempts**.
+
+Two observations the numbers force:
+
+- `bounds.max_attempts` is 3, yet nine attempts exist. Each `nh reply` / resume
+  starts a *fresh* bounded loop, so the bound is per-run, not per-task. Nothing
+  caps a task's lifetime spend.
+- Attempts 1, 6 and 9 are still `in_progress`. An attempt row is never closed
+  when the process is killed, so `status` on `attempts` cannot be trusted as a
+  completion signal.
+
+## Where the money goes — per-role token burn
+
+```
+$ sqlite3 -readonly ~/.no_human/no_human.db "
+  SELECT json_extract(data,'\$.source') AS role,
+         SUM(COALESCE(json_extract(data,'\$.cache_read_tokens'),0)) AS cache_read,
+         SUM(COALESCE(json_extract(data,'\$.tokens_used'),0))       AS tokens,
+         SUM(COALESCE(json_extract(data,'\$.num_turns'),0))         AS turns
+  FROM task_events
+  WHERE task_id LIKE '84251cb2%' AND json_extract(data,'\$.kind')='result'
+  GROUP BY role ORDER BY cache_read DESC;"
+
+role                    cache_read   tokens   turns
+agent (coder)           13,127,881   133,166   207
+planner:risk-first         348,113    32,506    14
+planner:minimal-first      259,137    19,180    16
+planner:test-first          59,668    23,016     6
+reviewer                    15,230    25,243     2
+aggregator                  15,230    10,850     1
+                        ----------
+total                   13,825,259
+```
+
+**The coder is 95.0% of all cache-read tokens.** That is the M3 target, and it
+is the reason the dead `_distill_large_chunks` path was never worth fixing: it
+addressed under 1% of the burn.
+
+Cost of this run: **~$620** of a $1000 Claude Enterprise budget. Two bugs since
+fixed inflated it — duplicate execution (`2f2b229`) ran two orchestrators, and
+the zero-diff bug (`8034df1`) burned four attempts that produced nothing.
+
+## Derived denominators for later milestones
+
+| Metric | M0 baseline |
+| --- | --- |
+| PRs opened | 0 |
+| PRs merged | 0 |
+| Coder cache-read per attempt | ~1.64 M (13.13 M / 8 sessions) |
+| Coder share of cache-read | 95.0 % |
+| Attempts per task (flagship) | 9 |
+| Wall clock (flagship) | 3.09 h |
+
+M3's exit criterion — coder cache-read per attempt ≤ 50% of baseline — means
+**≤ ~820 K per attempt**, with review-pass and repro-gate outcomes unchanged.
