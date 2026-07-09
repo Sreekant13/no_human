@@ -478,3 +478,43 @@ async def test_events_persisted_to_store_on_task_finish(store):
     assert len(persisted) == 2
     assert persisted[0]["kind"] == "tool_use"
     assert persisted[1]["kind"] == "result"
+
+
+@pytest.mark.asyncio
+async def test_sink_preserves_subagent_task_id(store):
+    """A subagent event's own task_id (the SDK's per-dispatch Task-tool id,
+    e.g. from claude_backend.py's subagent_start meta) must survive _sink
+    untouched — it is a different concept from "which no_human task is
+    this" and must not be overwritten. Regression for a bug where every
+    distinct subagent dispatch collapsed to one node in the System view
+    because _sink unconditionally stamped the outer task's id over it."""
+    hold = asyncio.Event()
+
+    class FakeOrchWithSubagentEvents:
+        async def run_task(self, task):
+            self._sink({"kind": "subagent_start", "text": "Research A",
+                        "task_id": "sdk-dispatch-aaa"})
+            self._sink({"kind": "subagent_start", "text": "Research B",
+                        "task_id": "sdk-dispatch-bbb"})
+            # An ordinary event with no task_id of its own still gets the
+            # no_human task's id backfilled (existing, still-needed behavior).
+            self._sink({"kind": "tool_use", "tool_name": "Read"})
+            hold.set()
+            await store.set_status(task, TaskStatus.DONE, validate=False)
+            return SimpleNamespace(status=TaskStatus.DONE, task=task)
+
+    orch = FakeOrchWithSubagentEvents()
+    sched = Scheduler(store, lambda task=None: orch, max_workers=1)
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+
+    await sched.tick()
+    await hold.wait()
+
+    events = sched.task_events(t.id)
+    subagent_ids = {e["task_id"] for e in events if e["kind"] == "subagent_start"}
+    assert subagent_ids == {"sdk-dispatch-aaa", "sdk-dispatch-bbb"}, (
+        "distinct subagent dispatches must keep distinct task_ids"
+    )
+    tool_use = next(e for e in events if e["kind"] == "tool_use")
+    assert tool_use["task_id"] == t.id  # backfilled, no id of its own

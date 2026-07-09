@@ -202,7 +202,12 @@ class Scheduler:
 
         def _sink(event):
             event["ts"] = time.time()
-            event["task_id"] = task.id
+            # Don't clobber a subagent event's own task_id (the SDK's per-
+            # dispatch Task-tool id, set in claude_backend.py's meta) — it's
+            # a completely different concept from "which no_human task is
+            # this," and overwriting it collapsed every distinct subagent
+            # dispatch in a run down to one node in the System view.
+            event.setdefault("task_id", task.id)
             buf.append(event)
             notify.set()
             summary = _summarize_event(event)

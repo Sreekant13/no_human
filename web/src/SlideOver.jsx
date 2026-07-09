@@ -840,19 +840,30 @@ function SystemTab({ taskId, task, isActive }) {
           </div>
         )}
 
-        {/* Row 3: Dynamic subagents spawned by the Worker */}
+        {/* Row 3: Dynamic subagents spawned by the Worker. Subagents are
+            always children of Coder specifically (never Reviewer), so the
+            connector must land on Coder's actual column — x=200 when
+            Reviewer also renders (2-column Row 1), x=340 (dead center)
+            when Coder renders alone — matching the same convention the
+            Orchestrator→Row1 connector above already uses. */}
         {subagents.length > 0 && (
           <>
             <div className="sys-tree-lines">
               <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
-                <path d="M 200 0 L 200 48" className="sys-tree-line active" />
-                <path d="M 200 0 L 200 48" className="sys-tree-flow active" />
+                <path d={`M ${hasReviewer ? 200 : 340} 0 L ${hasReviewer ? 200 : 340} 48`} className="sys-tree-line active" />
+                <path d={`M ${hasReviewer ? 200 : 340} 0 L ${hasReviewer ? 200 : 340} 48`} className="sys-tree-flow active" />
               </svg>
             </div>
             <div className="sys-tree-row">
-              {subagents.map(sub => (
-                <AgentNode key={sub.id} agent={sub} state={agentStates[sub.id]} isActive={isActive} onClick={() => setModalAgent(sub)} />
-              ))}
+              <div style={{ display: "flex", gap: "32px" }}>
+                {subagents.map(sub => (
+                  <AgentNode key={sub.id} agent={sub} state={agentStates[sub.id]} isActive={isActive} onClick={() => setModalAgent(sub)} />
+                ))}
+              </div>
+              {/* Invisible spacer mirroring Reviewer's column so the
+                  subagent group centers under Coder's column instead of
+                  the full row width — same trick as Row 1's real layout. */}
+              {hasReviewer && <div className="sys-node" style={{ visibility: "hidden" }} aria-hidden="true" />}
             </div>
           </>
         )}
