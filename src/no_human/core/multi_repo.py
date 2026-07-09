@@ -97,6 +97,30 @@ def cross_repo_context(task: Task, current_repo: str) -> str:
     return "\n".join(lines)
 
 
+def linked_repos_block(task: Task) -> str:
+    """Path map of the task's linked repos, for the read-only planner (D19).
+
+    The planner explores with ``cwd`` set to the primary repo and was never told
+    the linked repos exist, so it planned around them — assuming files it could
+    have read were "not on disk".  Returns "" for single-repo tasks, leaving
+    their prompt byte-identical.
+    """
+    repos = all_repo_paths(task)
+    linked = repos[1:] if task.repo_path else repos
+    if not linked:
+        return ""
+    lines = ["LINKED REPOSITORIES (checked out on this machine — read them):"]
+    lines += [f"  - {p}" for p in linked]
+    lines.append("")
+    lines.append(
+        "They are part of this task's context. Read them with the same tools you "
+        "use on the primary repo, by absolute path. Never assume a linked repo is "
+        "absent or unreadable — open it and look. If the change spans one, name "
+        "its files by absolute path in FILES TO CHANGE/CREATE."
+    )
+    return "\n".join(lines) + "\n\n"
+
+
 def validate_linked_repos(task: Task) -> list[str]:
     """Validate that all linked repos exist. Returns list of errors."""
     errors: list[str] = []

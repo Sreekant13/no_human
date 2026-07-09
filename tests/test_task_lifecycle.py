@@ -240,3 +240,32 @@ def test_config_path(tmp_path, monkeypatch):
     assert result.exit_code == 0
     # Rich may wrap the long path; check the filename appears.
     assert "config.yaml" in result.output
+
+
+# --------------------------------------------------------------------------- #
+# nh task add — linked-repo validation (D19)                                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_task_add_rejects_a_linked_repo_that_is_not_a_checkout(tmp_path, monkeypatch):
+    """D19: click already rejects a *missing* --linked-repo (Path(exists=True)).
+    A path that exists but is not a git checkout used to sail through intake and
+    then be dropped by a bare `continue` mid-attempt, after the planner had
+    already written a plan naming its files."""
+    db = tmp_path / "test.db"
+    runner = _make_runner(db, monkeypatch)
+    primary = tmp_path / "primary"
+    (primary / ".git").mkdir(parents=True)
+    not_a_checkout = tmp_path / "metrics-core-service"
+    not_a_checkout.mkdir()
+
+    result = runner.invoke(cli, [
+        "task", "add", "--title", "multi-repo task",
+        "--repo", str(primary),
+        "--linked-repo", str(not_a_checkout),
+        "--no-grill", "--no-run",
+    ], catch_exceptions=False)
+
+    assert result.exit_code == 1
+    assert "not a git repo" in result.output
+    assert "metrics-core-service" in result.output

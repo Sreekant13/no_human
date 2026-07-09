@@ -1121,6 +1121,48 @@ async def test_planner_prompt_no_child_tasks_by_default(bare_repo, tmp_path, sto
     assert any("must never create new tasks" in p for p in backend.prompts)
 
 
+def _base_prompts(backend):
+    """Prompts derived from the planner base prompt — every MoA proposer's, and
+    the single planner's. The MoA aggregator's prompt carries only the drafts."""
+    return [p for p in backend.prompts
+            if "You are planning an implementation task" in p]
+
+
+async def test_planner_prompt_carries_linked_repos(bare_repo, tmp_path, store):
+    """D19: the planner runs with cwd=primary repo and was never told the linked
+    repos exist, so it planned around them as if they were not on disk. Every
+    proposer must get the path map."""
+    cfg = _planning_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    t = Task.new("multi-repo task", repo_path=str(bare_repo))
+    t.linked_repos = ["/repos/metrics-core-service"]
+    backend = PromptCapturingPlannerBackend(_SAMPLE_PLAN)
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=backend):
+        await orch._generate_plan(t, GitRepo(bare_repo))
+
+    prompts = _base_prompts(backend)
+    assert prompts
+    assert all("/repos/metrics-core-service" in p for p in prompts)
+    assert all("Never assume a linked repo is absent" in p for p in prompts)
+
+
+async def test_planner_prompt_unchanged_for_single_repo(bare_repo, tmp_path, store):
+    """No linked repos → no block, so the cacheable prefix is untouched."""
+    cfg = _planning_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    t = Task.new("single-repo task", repo_path=str(bare_repo))
+    backend = PromptCapturingPlannerBackend(_SAMPLE_PLAN)
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=backend):
+        await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert backend.prompts
+    assert all("LINKED REPOSITORIES" not in p for p in backend.prompts)
+
+
 async def test_planner_prompt_decompose_when_enabled(bare_repo, tmp_path, store):
     """The legacy child-task path is only offered when decomposition.enabled."""
     cfg = _planning_config(tmp_path)
@@ -1742,6 +1784,44 @@ def test_repeated_edits_to_a_real_file_still_trip_the_edit_loop():
     assert len(stuck) == 1
     assert "edit-loop" in stuck[0]["text"]
     assert orch._agent_edited_files == {"/repo/src/calc.py"}
+
+
+async def test_unstageable_linked_repo_is_announced_not_swallowed(
+    bare_repo, tmp_path, store
+):
+    """D19: a linked repo that is not a git checkout used to be dropped by a bare
+    `continue` — no event, no log the board could show. The planner still named
+    its files, and nothing there could ever be committed. It stays non-fatal (the
+    primary repo's work is worth doing) but it must be visible."""
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+
+    missing = tmp_path / "metrics-core-service-not-a-checkout"
+    missing.mkdir()
+
+    cfg = _config(tmp_path)
+    events: list[dict] = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("multi-repo task", repo_path=str(bare_repo))
+    t.linked_repos = [str(missing)]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL  # non-fatal
+    announced = [e for e in events if e.get("kind") == "linked_repo"]
+    assert len(announced) == 1
+    assert announced[0]["ok"] is False
+    assert str(missing) in announced[0]["text"]
+    assert "not a git checkout" in announced[0]["text"]
 
 
 class DoomLoopThenFailBackend:

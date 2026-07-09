@@ -15,6 +15,7 @@ from no_human.core.multi_repo import (
     MultiRepoOutcome,
     all_repo_paths,
     cross_repo_context,
+    linked_repos_block,
     validate_linked_repos,
     store_multi_repo_outcome,
 )
@@ -74,6 +75,35 @@ def test_cross_repo_context_linked_repo_current():
     ctx = cross_repo_context(t, "/repos/b")
     assert "LINKED repo" in ctx
     assert "/repos/a" in ctx
+
+
+# --------------------------------------------------------------------------- #
+# linked_repos_block (D19 — the planner's path map)                            #
+# --------------------------------------------------------------------------- #
+
+
+def test_linked_repos_block_empty_for_single_repo():
+    """Single-repo prompts must stay byte-identical (prompt-cache prefix)."""
+    assert linked_repos_block(Task.new("t", repo_path="/repos/a")) == ""
+
+
+def test_linked_repos_block_lists_linked_not_primary():
+    t = Task.new("t", repo_path="/repos/a")
+    t.linked_repos = ["/repos/metrics-core-service"]
+    block = linked_repos_block(t)
+    assert "/repos/metrics-core-service" in block
+    # The primary repo is already named elsewhere in the planner prompt.
+    assert "/repos/a" not in block
+    # The instruction that answers D19's "not on disk" assumption.
+    assert "Never assume a linked repo is absent" in block
+
+
+def test_linked_repos_block_ignores_primary_listed_as_linked():
+    t = Task.new("t", repo_path="/repos/a")
+    t.linked_repos = ["/repos/a", "/repos/b"]
+    block = linked_repos_block(t)
+    assert "/repos/b" in block
+    assert block.count("/repos/a") == 0
 
 
 # --------------------------------------------------------------------------- #
