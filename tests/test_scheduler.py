@@ -581,3 +581,47 @@ async def test_flushed_events_are_not_duplicated_by_the_final_flush(store):
     persisted = await store.list_events(t.id)
     assert len(persisted) == 3
     assert [e["tool_name"] for e in persisted] == ["Read0", "Read1", "Read2"]
+
+
+# --------------------------------------------------------------------------- #
+# The pool is never wider than the worktree isolation allows                   #
+# --------------------------------------------------------------------------- #
+
+def test_pool_is_clamped_to_one_when_concurrency_is_disabled():
+    """The live config was exactly this, and the server announced
+    '2 worker(s) · concurrent' while Orchestrator._concurrency_enabled() was
+    False — so two tasks would share one checkout with no worktree."""
+    from no_human.core.scheduler import resolve_max_workers
+
+    workers, warning = resolve_max_workers(
+        {"concurrency": {"enabled": False, "max_workers": 2}})
+    assert workers == 1
+    assert warning and "concurrency.enabled is false" in warning
+
+
+def test_an_explicit_worker_flag_is_clamped_too():
+    from no_human.core.scheduler import resolve_max_workers
+
+    workers, warning = resolve_max_workers(
+        {"concurrency": {"enabled": False, "max_workers": 1}}, override=4)
+    assert workers == 1, "a flag must not buy unisolated parallelism"
+    assert warning
+
+
+def test_concurrency_enabled_honours_the_configured_width():
+    from no_human.core.scheduler import resolve_max_workers
+
+    assert resolve_max_workers({"concurrency": {"enabled": True, "max_workers": 3}}) == (3, None)
+    assert resolve_max_workers(
+        {"concurrency": {"enabled": True, "max_workers": 1}}, override=4) == (4, None)
+
+
+def test_resolve_max_workers_defaults_are_serial_and_silent():
+    from no_human.core.scheduler import resolve_max_workers
+
+    assert resolve_max_workers({}) == (1, None)
+    assert resolve_max_workers({"concurrency": {}}) == (1, None)
+    # A single worker with concurrency off is the normal case: no warning.
+    assert resolve_max_workers({"concurrency": {"enabled": False, "max_workers": 1}}) == (1, None)
+    # Degenerate values never produce a zero-width pool.
+    assert resolve_max_workers({"concurrency": {"enabled": True, "max_workers": 0}}) == (1, None)

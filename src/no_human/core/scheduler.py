@@ -35,6 +35,33 @@ log = logging.getLogger("no_human.scheduler")
 _CLAIMABLE = (TaskStatus.PENDING, TaskStatus.IMPLEMENTING)
 
 
+def resolve_max_workers(
+    config: dict, *, override: int | None = None,
+) -> tuple[int, str | None]:
+    """Effective pool size, plus a warning when a request for >1 is refused.
+
+    Worktree isolation is gated on ``concurrency.enabled``
+    (``Orchestrator._concurrency_enabled``), but the pool used to be sized from
+    ``concurrency.max_workers`` alone. With ``enabled: false, max_workers: 2``
+    the server announced "2 worker(s) · concurrent" and two tasks could run in
+    the SAME checkout with no isolation, stomping each other's branch and index.
+
+    The pool must never be wider than the isolation allows. The CLI and the
+    server lifespan both resolve it here; they used to compute it separately,
+    which is how the announcement and the real pool were free to disagree.
+    """
+    conc = config.get("concurrency", {}) or {}
+    enabled = bool(conc.get("enabled", False))
+    requested = max(1, int(override or conc.get("max_workers", 1) or 1))
+    if not enabled and requested > 1:
+        return 1, (
+            f"concurrency.enabled is false — running 1 worker, not {requested}. "
+            "Parallel tasks would share one checkout with no worktree isolation. "
+            "Set concurrency.enabled: true to run them in parallel."
+        )
+    return requested, None
+
+
 def _parse_iso(value: str | None) -> datetime | None:
     if not value:
         return None
