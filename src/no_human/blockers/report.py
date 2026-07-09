@@ -12,7 +12,7 @@ import json
 import re
 from typing import Any
 
-from .taxonomy import Blocker, BlockerCategory
+from .taxonomy import Blocker, BlockerCategory, BlockerOption
 
 # The agent is asked to emit its blocker report between these markers.
 _BLOCKER_JSON = re.compile(
@@ -37,7 +37,13 @@ def parse_blocker(text: str) -> Blocker | None:
         return None
     if not isinstance(data, dict):
         return None
-    return Blocker.from_dict(data)
+    blocker = Blocker.from_dict(data)
+    # Trust boundary. The agent proposes answers; it never gets to attach the
+    # action that applies one. An agent-authored `set_task_config` would let it
+    # raise the size limit that just blocked it — resolving a blocker by
+    # weakening the gate.
+    blocker.options = [BlockerOption(label=o.label) for o in blocker.options]
+    return blocker
 
 
 def render_report(blocker: Blocker, *, task_title: str, task_id: str) -> str:
@@ -69,7 +75,7 @@ def render_report(blocker: Blocker, *, task_title: str, task_id: str) -> str:
     if b.question:
         lines.append(b.question)
         if b.options:
-            lines += [f"  - [{i+1}] {opt}" for i, opt in enumerate(b.options)]
+            lines += [f"  - [{i+1}] {opt.label}" for i, opt in enumerate(b.options)]
     else:
         lines.append("(no specific question — review the diagnosis above)")
     lines += [

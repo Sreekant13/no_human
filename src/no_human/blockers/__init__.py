@@ -9,9 +9,11 @@ from .report import (
     parse_blocker,
     render_report,
 )
+from .actions import ActionError, apply_action
 from .taxonomy import (
     Blocker,
     BlockerCategory,
+    BlockerOption,
     Route,
     resume_checkpoint,
     route_for,
@@ -20,8 +22,11 @@ from .taxonomy import (
 from .wake import WakeWatcher, parse_duration
 
 __all__ = [
+    "ActionError",
+    "apply_action",
     "Blocker",
     "BlockerCategory",
+    "BlockerOption",
     "Route",
     "resume_checkpoint",
     "route_for",

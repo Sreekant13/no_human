@@ -6,6 +6,7 @@ import {
 } from "./api.js";
 import Markdown from "./Markdown.jsx";
 import { ROLE_LABEL, discoverSubagents, eventSource, modelsByNode } from "./eventRoles.js";
+import { normalizeOption } from "./blockerOptions.js";
 import { busPaths, columnCenters } from "./treeLayout.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
@@ -1302,8 +1303,8 @@ function BlockerSection({ blocker: b }) {
           <div className="blocker-field-body">{b.question}</div>
           {b.options?.length > 0 && (
             <ul className="blocker-options">
-              {b.options.map((opt, i) => (
-                <li key={i}>[{i + 1}] {opt}</li>
+              {b.options.map(normalizeOption).map((opt, i) => (
+                <li key={i}>[{i + 1}] {opt.label}</li>
               ))}
             </ul>
           )}

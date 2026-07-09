@@ -2250,6 +2250,33 @@ def test_size_limits_honour_a_per_task_override(tmp_path, store):
     assert "605 > 500" in orch._over_size_limits(commit, None)
 
 
+def test_scope_explosion_option_action_derives_from_the_observed_size(tmp_path, store):
+    """D14: the option 'raise the limit for this task' must carry the limit that
+    actually lets this commit through — rounded up from what it measured, never
+    a hardcoded number, and only for the limit that was breached."""
+    cfg = _config(tmp_path)
+    cfg.data["safety"] = {"max_files_changed": 20, "max_lines_changed": 500}
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None), SlackNotifier(None))
+    t = Task.new("ci_gate", repo_path="/tmp/x")
+
+    # 605 lines over a 500 limit → 700. Files are within limit → left alone.
+    action = orch._size_override_action(
+        _SimpleNamespace(insertions=605, deletions=0, files_changed=3), t)
+    assert action == {"set_task_config": {"max_lines_changed": 700}}
+
+    # Only files breached → only the file limit is offered.
+    action = orch._size_override_action(
+        _SimpleNamespace(insertions=10, deletions=0, files_changed=25), t)
+    assert action == {"set_task_config": {"max_files_changed": 25}}
+
+    # Applying the action clears the very gate that produced it.
+    from no_human.blockers import apply_action
+    commit = _SimpleNamespace(insertions=605, deletions=0, files_changed=3)
+    assert orch._over_size_limits(commit, t) is not None
+    apply_action(t, orch._size_override_action(commit, t))
+    assert orch._over_size_limits(commit, t) is None
+
+
 async def test_reply_resumes_from_the_wip_blocked_checkpoint(bare_repo, tmp_path, store):
     """D15: the blocker printed 'Resume with: nh reply <id>', but the resume path
     read ctx['handoff']['wip_sha'] — written only when an attempt runs out of

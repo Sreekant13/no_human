@@ -98,6 +98,42 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+@dataclass
+class BlockerOption:
+    """One answer a human can give, optionally carrying the action that makes it
+    real.
+
+    ``SCOPE_EXPLOSION`` offered "raise the limit for this task" long before
+    anything could raise a limit, so answering that way regenerated the same
+    blocker. An option with an ``action`` is applied by ``nh`` or the board when
+    the human picks it; an option without one is just a label, submitted as the
+    free-text answer exactly as ``nh reply`` has always behaved.
+
+    The agent may never attach an action — that would let it resolve a blocker
+    by weakening its own gate. ``parse_blocker`` strips actions at that boundary.
+    """
+
+    label: str
+    action: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"label": self.label, "action": self.action}
+
+    @classmethod
+    def coerce(cls, raw: Any) -> "BlockerOption":
+        """Normalise the three shapes in the wild: an option, a bare string (old
+        rows in ``tasks.blocker``, and every agent-raised blocker), or a dict."""
+        if isinstance(raw, cls):
+            return raw
+        if isinstance(raw, dict):
+            action = raw.get("action")
+            return cls(
+                label=str(raw.get("label", "")),
+                action=action if isinstance(action, dict) and action else None,
+            )
+        return cls(label=str(raw))
+
+
 def resume_checkpoint(blocker: dict[str, Any] | None) -> dict[str, str] | None:
     """The [WIP-BLOCKED] commit a resumed task should continue from, or None.
 
@@ -126,12 +162,18 @@ class Blocker:
     confidence: float = 0.0                # 0-1; low confidence biases to escalate
     tried: list[str] = field(default_factory=list)
     question: str | None = None            # the ONE decision/info needed
-    options: list[str] = field(default_factory=list)
+    options: list[BlockerOption] = field(default_factory=list)
     resume_branch: str = ""
     resume_commit: str = ""
     goal: str = ""                         # the step it was attempting (22.4 #1)
     evidence: str = ""                      # exact command + output (22.4 #2)
     raised_at: str = field(default_factory=_now)
+
+    def __post_init__(self) -> None:
+        # `options` is list[BlockerOption] unconditionally, whoever built it:
+        # from_dict off an old row of bare strings, an agent's JSON, or a caller
+        # that still passes labels.
+        self.options = [BlockerOption.coerce(o) for o in (self.options or [])]
 
     @property
     def route(self) -> Route:
@@ -146,7 +188,7 @@ class Blocker:
             "confidence": self.confidence,
             "tried": list(self.tried),
             "question": self.question,
-            "options": list(self.options),
+            "options": [o.to_dict() for o in self.options],
             "resume_branch": self.resume_branch,
             "resume_commit": self.resume_commit,
             "goal": self.goal,
@@ -164,7 +206,7 @@ class Blocker:
             confidence=float(data.get("confidence", 0.0) or 0.0),
             tried=list(data.get("tried", []) or []),
             question=data.get("question"),
-            options=list(data.get("options", []) or []),
+            options=[BlockerOption.coerce(o) for o in (data.get("options") or [])],
             resume_branch=data.get("resume_branch", ""),
             resume_commit=data.get("resume_commit", ""),
             goal=data.get("goal", ""),

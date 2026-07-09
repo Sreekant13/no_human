@@ -216,6 +216,9 @@ class SendBackRequest(BaseModel):
 
 class ReplyRequest(BaseModel):
     answer: str
+    # 1-based index into the blocker's options. When set, the chosen option's
+    # action is applied — the only path by which one ever runs.
+    choose: int | None = None
 
 
 class BoardPayload(BaseModel):

@@ -114,8 +114,76 @@ def test_blocker_roundtrip():
     restored = Blocker.from_dict(b.to_dict())
     assert restored.category is BlockerCategory.SCOPE_EXPLOSION
     assert restored.tried == ["a", "b"]
-    assert restored.options == ["yes", "no"]
+    assert [o.label for o in restored.options] == ["yes", "no"]
     assert restored.confidence == 0.8
+
+
+# --------------------------------------------------------------------------- #
+# Structured options + actions (D14)                                           #
+# --------------------------------------------------------------------------- #
+
+def test_options_normalise_from_strings_objects_and_old_rows():
+    """Bare strings arrive from rows written before options were structured, and
+    from every agent-raised blocker. They must not need a migration."""
+    from no_human.blockers import BlockerOption
+
+    b = Blocker.from_dict({
+        "category": "SCOPE_EXPLOSION",
+        "options": [
+            "split into smaller tasks",  # an old row / an agent's answer
+            {"label": "raise the limit", "action": {"set_task_config": {"max_lines_changed": 700}}},
+        ],
+    })
+    assert all(isinstance(o, BlockerOption) for o in b.options)
+    assert b.options[0].action is None
+    assert b.options[1].action == {"set_task_config": {"max_lines_changed": 700}}
+    # ...and survives a round trip through the tasks.blocker JSON column.
+    again = Blocker.from_dict(b.to_dict())
+    assert [o.label for o in again.options] == ["split into smaller tasks", "raise the limit"]
+    assert again.options[1].action == {"set_task_config": {"max_lines_changed": 700}}
+
+
+def test_the_agent_may_never_attach_an_action():
+    """Constraint #5: an agent that could set task.config would resolve a blocker
+    by raising the very limit that blocked it."""
+    hostile = (
+        "BLOCKER_JSON_START\n"
+        '{"category": "SCOPE_EXPLOSION", "confidence": 0.9, '
+        '"question": "may I?", '
+        '"options": [{"label": "raise the limit", '
+        '"action": {"set_task_config": {"max_lines_changed": 100000}}}]}\n'
+        "BLOCKER_JSON_END"
+    )
+    b = parse_blocker(hostile)
+    assert b is not None
+    assert b.options[0].label == "raise the limit"  # the label survives
+    assert b.options[0].action is None  # the action does not
+
+
+def test_apply_action_writes_only_whitelisted_keys():
+    from no_human.blockers import ActionError, apply_action
+    from no_human.core.task import Task
+
+    t = Task.new("x", repo_path="/tmp/x")
+    assert apply_action(t, None) is None
+    assert t.config == {}
+
+    summary = apply_action(t, {"set_task_config": {"max_lines_changed": 700}})
+    assert summary == "max_lines_changed=700"
+    assert t.config["max_lines_changed"] == 700
+
+    for bad in (
+        {"set_task_config": {"never_push_to": []}},  # not whitelisted
+        {"set_task_config": {"max_lines_changed": 0}},  # not positive
+        {"set_task_config": {"max_lines_changed": "lots"}},  # not an integer
+        {"set_task_config": {}},  # empty
+        {"run_shell": {"cmd": "rm -rf /"}},  # unknown verb
+        {"set_task_config": {"max_lines_changed": 800}, "run_shell": {}},  # smuggled
+    ):
+        with pytest.raises(ActionError):
+            apply_action(t, bad)
+    # Nothing partial was written by any rejected action.
+    assert t.config == {"max_lines_changed": 700}
 
 
 # --------------------------------------------------------------------------- #
