@@ -112,3 +112,15 @@ def test_no_fake_auto_pr_switch():
     switch and was not one. A fake off-switch is worse than none."""
     from no_human.config import DEFAULT_CONFIG
     assert "auto_pr" not in DEFAULT_CONFIG["git"]
+
+
+def test_supervisor_has_its_own_model_key():
+    """The supervisor rode on review_model, so it silently ran at the reviewer's
+    tier — an inherited choice nobody made. CLAUDE.md #7 (amended) puts it on
+    Sonnet 5."""
+    from no_human.config import DEFAULT_CONFIG
+    llm = DEFAULT_CONFIG["llm"]
+    assert llm["supervisor_model"] == "claude-sonnet-5"
+    assert llm["primary_model"] == "claude-sonnet-5"
+    assert llm["review_model"] == "claude-opus-4-8"
+    assert llm["planner_model"] == "claude-opus-4-8"

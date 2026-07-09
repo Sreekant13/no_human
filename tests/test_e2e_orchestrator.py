@@ -2207,3 +2207,21 @@ async def test_models_are_recorded_before_planning_not_just_at_attempt_start(
     first_models = kinds.index("models")
     assert first_models < kinds.index("state"), "models must precede context/planning"
     assert events[first_models]["models"]["coder"] == "claude-sonnet-5"
+
+
+async def test_supervisor_model_is_recorded_and_is_not_the_reviewers(tmp_path, store):
+    """It must be visible which model supervises: the role used to inherit
+    review_model and nothing recorded that it had."""
+    cfg = _config(tmp_path)
+    backend = FakeBackend(lambda cwd: None)
+    backend.model = "claude-sonnet-5"
+    reviewer = _SimpleNamespace(model=cfg.data["llm"]["review_model"])
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None),
+                        reviewer=reviewer)
+
+    models = orch._active_models()
+    assert models["supervisor"] == "claude-sonnet-5"
+    assert models["reviewer"] == "claude-opus-4-8"
+    assert models["supervisor"] != models["reviewer"], (
+        "the supervisor must no longer inherit the reviewer's tier"
+    )
