@@ -6,6 +6,7 @@ import {
 } from "./api.js";
 import Markdown from "./Markdown.jsx";
 import { ROLE_LABEL, discoverSubagents, eventSource, modelsByNode } from "./eventRoles.js";
+import { busPaths, columnCenters } from "./treeLayout.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
 const IconCheck = ({ size = 14, className = "" }) => (
@@ -350,12 +351,6 @@ function deriveAgentStatus(events, agentId) {
   return { status, count: agentEvents.length, lastText: last.text || "" };
 }
 
-function activeConnection(events) {
-  if (events.length === 0) return null;
-  const src = eventSource(events[events.length - 1]);
-  const map = { worker: "worker-agent", planner: "worker-planner", agent: "agent-supervisor", supervisor: "supervisor-agent", reviewer: "reviewer-worker" };
-  return map[src] || null;
-}
 
 // Parse URLs in text and return React elements with clickable links
 function linkify(text) {
@@ -696,12 +691,10 @@ function SystemTab({ taskId, task, isActive }) {
     agentStates[a.id] = deriveAgentStatus(events, a.id);
   }
 
-  // Discover dynamically-spawned subagents from events
+  // Discover dynamically-spawned subagents from events, grouped by the role
+  // that spawned them — each role column owns its own children.
   const subagents = discoverSubagents(events);
-  // Split by who spawned them. Planning subagents belong under the Planner;
-  // everything else is the Coder's (the Reviewer runs without subagents).
-  const plannerSubs = subagents.filter(s => s.parent === "planner");
-  const coderSubs   = subagents.filter(s => s.parent !== "planner");
+  const subsOf = (roleId) => subagents.filter(s => s.parent === roleId);
   // Subagent status comes from the discovery function, not deriveAgentStatus.
   for (const sub of subagents) {
     const subEvents = events.filter(e =>
@@ -711,29 +704,43 @@ function SystemTab({ taskId, task, isActive }) {
     agentStates[sub.id] = { status: sub.status, count: subEvents.length, lastText: subEvents.length > 0 ? subEvents[subEvents.length - 1].text || "" : "" };
   }
 
-  const activeConn = isActive ? activeConnection(events) : null;
   const totalElapsed = events.length > 1 ? events[events.length - 1].ts - events[0].ts : 0;
 
   // Only show nodes that have events — the diagram builds up dynamically.
   const has = (id) => agentStates[id] && agentStates[id].count > 0;
   const hasWorker     = has("worker");
-  const hasPlanner    = has("planner");
-  const hasAgent      = has("agent");
   const hasSupervisor = has("supervisor");
-  const hasReviewer   = has("reviewer");
-  const hasRow1       = hasAgent || hasReviewer;
 
   // Label each node with the model that actually ran it (from the `models`
   // event), so "the coder is Sonnet 5" is verifiable at a glance rather than
   // assumed from a config file that may be shadowing the real default.
   const nodeModels = modelsByNode(events);
   const withModel  = (a) => (a && nodeModels[a.id] ? { ...a, model: nodeModels[a.id] } : a);
+  const node       = (id) => withModel(AGENTS.find(a => a.id === id));
 
   const worker     = AGENTS.find(a => a.id === "worker");
-  const planner    = withModel(AGENTS.find(a => a.id === "planner"));
-  const agent      = withModel(AGENTS.find(a => a.id === "agent"));
-  const supervisor = AGENTS.find(a => a.id === "supervisor");
-  const reviewer   = withModel(AGENTS.find(a => a.id === "reviewer"));
+  const supervisor = withModel(AGENTS.find(a => a.id === "supervisor"));
+
+  // The three roles the Orchestrator drives, in pipeline order. Each is a
+  // sibling column hanging off the root, owning its own subagents — the
+  // Planner is NOT an ancestor of the Coder. The Supervisor is not a role of
+  // its own: it watches the Coder, so it hangs under the Coder's column.
+  const columns = ["planner", "agent", "reviewer"]
+    .filter(has)
+    .map(id => ({
+      id,
+      agent: node(id),
+      state: agentStates[id],
+      subs: subsOf(id),
+      monitor: id === "agent" && hasSupervisor ? supervisor : null,
+    }));
+
+  const centers = columnCenters(columns.length);
+  const bus     = busPaths(centers);
+  // Which column the most recent event belongs to (the Supervisor lights up
+  // the Coder's column, since that is where it hangs).
+  const lastSrc    = events.length ? eventSource(events[events.length - 1]) : null;
+  const activeCol  = isActive ? (lastSrc === "supervisor" ? "agent" : lastSrc) : null;
 
   if (events.length === 0) {
     return (
@@ -755,124 +762,55 @@ function SystemTab({ taskId, task, isActive }) {
           </div>
         )}
 
-        {/* Planning phase: Orchestrator → Planner → its proposer subagents.
-            The Planner always renders alone on its row, so every connector here
-            is a centered stem (x=340) and Row 1's two-column geometry below
-            stays exactly as it was. */}
-        {hasWorker && hasPlanner && (
+        {/* Orchestrator → its role columns. One stem, one bus, one drop per
+            column: no column is ever fed by another column's drop. */}
+        {hasWorker && columns.length > 0 && (
           <div className="sys-tree-lines">
             <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
-              <path d="M 340 0 L 340 48" className={`sys-tree-line${activeConn === "worker-planner" ? " active" : ""}`} />
-              <path d="M 340 0 L 340 48" className={`sys-tree-flow${activeConn === "worker-planner" ? " active" : ""}`} />
+              {bus.stem && <path d={bus.stem} className="sys-tree-line" />}
+              {bus.bus && <path d={bus.bus} className="sys-tree-line" />}
+              {bus.drops.length === 0 && bus.stem && (
+                <path d={bus.stem} className={`sys-tree-flow${activeCol ? " active" : ""}`} />
+              )}
+              {bus.drops.map((d, i) => (
+                <g key={columns[i].id}>
+                  <path d={d} className="sys-tree-line" />
+                  <path d={d} className={`sys-tree-flow${activeCol === columns[i].id ? " active" : ""}`} />
+                </g>
+              ))}
             </svg>
           </div>
         )}
 
-        {hasPlanner && (
-          <div className="sys-tree-row">
-            <AgentNode agent={planner} state={agentStates.planner} isActive={isActive} onClick={() => setModalAgent(planner)} />
-          </div>
-        )}
+        {/* The role columns. Each owns its subagents; the Coder also owns the
+            Supervisor that watches it. */}
+        {columns.length > 0 && (
+          <div className="sys-columns">
+            {columns.map(col => (
+              <div className="sys-col" key={col.id}>
+                <AgentNode agent={col.agent} state={col.state} isActive={isActive}
+                           onClick={() => setModalAgent(col.agent)} />
 
-        {hasPlanner && plannerSubs.length > 0 && (
-          <>
-            <div className="sys-tree-lines">
-              <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
-                <path d="M 340 0 L 340 48" className="sys-tree-line active" />
-                <path d="M 340 0 L 340 48" className="sys-tree-flow active" />
-              </svg>
-            </div>
-            <div className="sys-tree-row">
-              <div className="sys-subagent-group">
-                {plannerSubs.map(sub => (
-                  <AgentNode key={sub.id} agent={sub} state={agentStates[sub.id]} isActive={isActive} onClick={() => setModalAgent(sub)} />
-                ))}
+                {(col.monitor || col.subs.length > 0) && <div className="sys-col-stem" />}
+
+                {col.monitor && (
+                  <div className="sys-col-children">
+                    <AgentNode agent={col.monitor} state={agentStates.supervisor}
+                               isActive={isActive} onClick={() => setModalAgent(col.monitor)} />
+                  </div>
+                )}
+
+                {col.subs.length > 0 && (
+                  <div className="sys-col-children">
+                    {col.subs.map(sub => (
+                      <AgentNode key={sub.id} agent={sub} state={agentStates[sub.id]}
+                                 isActive={isActive} onClick={() => setModalAgent(sub)} />
+                    ))}
+                  </div>
+                )}
               </div>
-            </div>
-          </>
-        )}
-
-        {/* Connection: Orchestrator → Agent / Reviewer (only when both sides exist) */}
-        {hasWorker && hasRow1 && (
-          <div className="sys-tree-lines">
-            <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
-              {hasAgent && hasReviewer && (
-                <>
-                  {/* Center stem splits left + right */}
-                  <path d="M 340 0 L 340 20" className={`sys-tree-line${activeConn === "worker-agent" ? " active" : ""}`} />
-                  <path d="M 340 20 C 340 40, 200 40, 200 48" className={`sys-tree-line${activeConn === "worker-agent" ? " active" : ""}`} />
-                  <path d="M 340 20 C 340 40, 200 40, 200 48" className={`sys-tree-flow${activeConn === "worker-agent" ? " active" : ""}`} />
-                  <path d="M 340 20 C 340 40, 480 40, 480 48" className={`sys-tree-line${activeConn === "reviewer-worker" ? " active" : ""}`} />
-                  <path d="M 340 20 C 340 40, 480 40, 480 48" className={`sys-tree-flow${activeConn === "reviewer-worker" ? " active" : ""}`} />
-                </>
-              )}
-              {hasAgent && !hasReviewer && (
-                <>
-                  <path d="M 340 0 L 340 48" className={`sys-tree-line${activeConn === "worker-agent" ? " active" : ""}`} />
-                  <path d="M 340 0 L 340 48" className={`sys-tree-flow${activeConn === "worker-agent" ? " active" : ""}`} />
-                </>
-              )}
-              {hasReviewer && !hasAgent && (
-                <>
-                  <path d="M 340 0 L 340 48" className={`sys-tree-line${activeConn === "reviewer-worker" ? " active" : ""}`} />
-                  <path d="M 340 0 L 340 48" className={`sys-tree-flow${activeConn === "reviewer-worker" ? " active" : ""}`} />
-                </>
-              )}
-            </svg>
+            ))}
           </div>
-        )}
-
-        {/* Row 1: Agent + Reviewer (only those that participated) */}
-        {hasRow1 && (
-          <div className="sys-tree-row">
-            {hasAgent && <AgentNode agent={agent} state={agentStates.agent} isActive={isActive} onClick={() => setModalAgent(agent)} />}
-            {hasReviewer && <AgentNode agent={reviewer} state={agentStates.reviewer} isActive={isActive} onClick={() => setModalAgent(reviewer)} />}
-          </div>
-        )}
-
-        {/* Connection: Agent → Supervisor (only when both exist) */}
-        {hasAgent && hasSupervisor && (
-          <div className="sys-tree-lines">
-            <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
-              <path d="M 200 0 L 200 24 C 200 44, 280 44, 280 48" className={`sys-tree-line${activeConn === "agent-supervisor" || activeConn === "supervisor-agent" ? " active" : ""}`} />
-              <path d="M 200 0 L 200 24 C 200 44, 280 44, 280 48" className={`sys-tree-flow${activeConn === "agent-supervisor" ? " active" : ""}`} />
-            </svg>
-          </div>
-        )}
-
-        {/* Row 2: Supervisor */}
-        {hasSupervisor && (
-          <div className="sys-tree-row">
-            <AgentNode agent={supervisor} state={agentStates.supervisor} isActive={isActive} onClick={() => setModalAgent(supervisor)} />
-          </div>
-        )}
-
-        {/* Row 3: subagents the Coder spawned. Planning subagents render under
-            the Planner above, so everything left here is a child of Coder
-            specifically (never Reviewer) and the connector lands on Coder's
-            actual column — x=200 when Reviewer also renders (2-column Row 1),
-            x=340 (dead center) when Coder renders alone — the same convention
-            the Orchestrator→Row1 connector above uses. */}
-        {coderSubs.length > 0 && (
-          <>
-            <div className="sys-tree-lines">
-              <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
-                <path d={`M ${hasReviewer ? 200 : 340} 0 L ${hasReviewer ? 200 : 340} 48`} className="sys-tree-line active" />
-                <path d={`M ${hasReviewer ? 200 : 340} 0 L ${hasReviewer ? 200 : 340} 48`} className="sys-tree-flow active" />
-              </svg>
-            </div>
-            <div className="sys-tree-row">
-              <div className="sys-subagent-group">
-                {coderSubs.map(sub => (
-                  <AgentNode key={sub.id} agent={sub} state={agentStates[sub.id]} isActive={isActive} onClick={() => setModalAgent(sub)} />
-                ))}
-              </div>
-              {/* Invisible spacer mirroring Reviewer's column so the
-                  subagent group centers under Coder's column instead of
-                  the full row width — same trick as Row 1's real layout. */}
-              {hasReviewer && <div className="sys-node" style={{ visibility: "hidden" }} aria-hidden="true" />}
-            </div>
-          </>
         )}
 
         {/* Summary stats */}

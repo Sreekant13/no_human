@@ -139,3 +139,41 @@ test("an unknown role never invents a node", () => {
   assert.deepEqual(modelsByNode([{ kind: "models", models: { aggregator: "x" } }]), {});
   assert.deepEqual(modelsByNode([{ kind: "models", models: { distiller: "x" } }]), {});
 });
+
+test("a backgrounded shell command is not a subagent", () => {
+  // The SDK reports background Bash with the same events as an Agent dispatch,
+  // distinguished only by task_type. Run 61406d02 put 14 bash one-liners on the
+  // Coder node as though it had spawned 14 agents.
+  const subs = discoverSubagents([
+    { kind: "subagent_start", source: "agent", task_id: "bts1nfycu",
+      task_type: "local_bash",
+      text: "source .venv312/bin/activate && python run_tests.py 2>&1 | tail -80" },
+    { kind: "subagent_start", source: "planner:minimal-first", task_id: "a92dcf7c",
+      task_type: "local_agent", text: "Investigate Jenkinsfile structure" },
+    { kind: "subagent_done", task_id: "bts1nfycu", status: "completed" },
+  ]);
+  assert.equal(subs.length, 1);
+  assert.equal(subs[0].label, "Investigate Jenkinsfile structure");
+  assert.equal(subs[0].parent, "planner");
+});
+
+test("an unknown task_type is still shown (visible beats hidden)", () => {
+  const subs = discoverSubagents([
+    { kind: "subagent_start", source: "agent", task_id: "x", text: "future thing" },
+    { kind: "subagent_start", source: "agent", task_id: "y", task_type: "local_agent", text: "z" },
+  ]);
+  assert.equal(subs.length, 2);
+});
+
+test("the Orchestrator does not take credit for the roles it emits for", () => {
+  // Run 61406d02 emitted 18 supervisor events via self.emit(), all carrying
+  // source:"orchestrator" — so the Supervisor node never rendered at all.
+  assert.equal(eventSource({ source: "orchestrator", kind: "supervisor_decision" }), "supervisor");
+  assert.equal(eventSource({ source: "orchestrator", kind: "supervisor" }), "supervisor");
+  assert.equal(eventSource({ source: "orchestrator", kind: "review_error" }), "reviewer");
+  assert.equal(eventSource({ source: "orchestrator", kind: "tamper" }), "reviewer");
+  // Its own events still belong to it.
+  assert.equal(eventSource({ source: "orchestrator", kind: "state" }), "worker");
+  assert.equal(eventSource({ source: "orchestrator", kind: "commit" }), "worker");
+  assert.equal(eventSource({ source: "orchestrator", kind: "stuck" }), "worker");
+});

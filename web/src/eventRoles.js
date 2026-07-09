@@ -22,10 +22,20 @@ export const ROLE_LABEL = {
   reviewer: "Reviewer", agent: "Coder",
 };
 
+// Kinds the Orchestrator emits *on behalf of another role*. It calls self.emit()
+// for the supervisor's decisions and some review outcomes, so those events carry
+// source:"orchestrator" and used to be credited to the Orchestrator — which is
+// why the Supervisor node never appeared at all despite 18 events of its own.
+const ORCHESTRATOR_EMITS_FOR = {
+  supervisor: "supervisor", supervisor_decision: "supervisor",
+  review_start: "reviewer", review: "reviewer", review_error: "reviewer",
+  tamper: "reviewer",
+};
+
 export function eventSource(e) {
   const src = e.source || SOURCE_BY_KIND[e.kind] || "worker";
   // Backend emits source:"orchestrator" but the Orchestrator node id is "worker".
-  if (src === "orchestrator") return "worker";
+  if (src === "orchestrator") return ORCHESTRATOR_EMITS_FOR[e.kind] || "worker";
   // MoA proposers are stamped `planner:<lens>` and the synthesis step
   // `aggregator`. They are all the planning phase, so they share one node; the
   // raw source stays on the event, and the per-lens split shows up as separate
@@ -63,11 +73,18 @@ export function modelsByNode(events) {
 // Discover subagents from events at render time. Each one is attributed to the
 // role that spawned it — a planner proposer's investigation subagent is not the
 // Coder's work, and rendering it under Coder is how the diagram used to lie.
+// The SDK reports a backgrounded shell command with the same subagent_start /
+// subagent_done events it uses for a real Agent-tool dispatch, distinguished
+// only by task_type. Drawing `local_bash` as a node put fourteen bash
+// one-liners on the diagram as though the Coder had spawned fourteen agents.
+const NOT_A_SUBAGENT = new Set(["local_bash"]);
+
 export function discoverSubagents(events) {
   const subs = new Map(); // task_id → { id, label, type, desc, status, parent }
   for (const e of events) {
     if (e.kind === "subagent_start") {
       const tid = e.task_id;
+      if (NOT_A_SUBAGENT.has(e.task_type)) continue;
       if (tid && !subs.has(tid)) {
         const parent = eventSource(e);
         const lens = eventLens(e);
