@@ -6,6 +6,7 @@ Blocks, before execution:
   - destructive shell (`rm -rf`, history rewrites) — a circuit breaker that
     fires even under bypass permissions
   - `git merge` of any kind — the agent never merges (§3.2)
+  - interactive prompts (`AskUserQuestion`) — nobody is at the keyboard (§22)
 
 The orchestrator wraps :func:`evaluate` in a Claude Agent SDK PreToolUse hook;
 keeping the policy a pure function lets us unit-test it without the SDK.
@@ -19,6 +20,23 @@ import shlex
 from dataclasses import dataclass
 
 WRITE_TOOLS = {"Write", "Edit", "NotebookEdit", "MultiEdit"}
+
+# Tools that block on a human answer. Every no_human session is headless, so
+# these silently return nothing and the agent fills the gap with a guess — we
+# observed a planner proposer call AskUserQuestion, get no answer, and write
+# "No answer given — I'll default to ...". Denying is only half the fix: the
+# reason has to tell the agent what to do instead, or it just retries.
+INTERACTIVE_TOOLS = {"AskUserQuestion"}
+
+_NO_HUMAN_REASON = (
+    "{tool} is unavailable: this session is headless and no human will ever "
+    "answer it. Do not retry it and do not silently guess. If you cannot make "
+    "verifiable progress without the answer, stop and emit a structured blocker "
+    "report (BLOCKER_JSON_START/BLOCKER_JSON_END) with the question in the "
+    "'question' field and your candidate answers in 'options'. Otherwise pick "
+    "the most defensible option and state the assumption, and the evidence for "
+    "it, explicitly in your output."
+)
 
 # Destructive shell patterns — matched against the full command string.
 _RM_RF = re.compile(r"\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|-rf|-fr)\b")
@@ -81,11 +99,15 @@ def evaluate(
     readonly: bool = False,
 ) -> GuardDecision:
     """Return allow/deny for a single proposed tool call."""
-    # 0. Reviewer / read-only mode: block ALL writes unconditionally.
+    # 0. Interactive prompts — denied in every role, readonly or not.
+    if tool_name in INTERACTIVE_TOOLS:
+        return GuardDecision(False, _NO_HUMAN_REASON.format(tool=tool_name))
+
+    # 1. Reviewer / read-only mode: block ALL writes unconditionally.
     if readonly and tool_name in WRITE_TOOLS:
         return GuardDecision(False, f"read-only session: {tool_name} blocked")
 
-    # 1. Writes to forbidden paths.
+    # 2. Writes to forbidden paths.
     if tool_name in WRITE_TOOLS:
         path = (
             tool_input.get("file_path")
@@ -96,7 +118,7 @@ def evaluate(
         if path and _path_forbidden(str(path), forbidden_paths):
             return GuardDecision(False, f"write to forbidden path blocked: {path}")
 
-    # 2. Shell command policy.
+    # 3. Shell command policy.
     if tool_name == "Bash":
         cmd = str(tool_input.get("command", ""))
         if _RM_RF.search(cmd):

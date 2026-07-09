@@ -14,6 +14,29 @@ def test_allows_normal_edit():
     assert _ev("Edit", {"file_path": "src/app.py"}).allow
 
 
+def test_blocks_ask_user_question():
+    # The exact call a planner proposer made in run 0305e5ce, after which it
+    # received nothing and wrote "No answer given — I'll default to ...".
+    d = _ev("AskUserQuestion", {"questions": [{
+        "question": "The spec says to verify kubectl cluster access on the Jenkins "
+                    "agent before choosing the cleanup mechanism, but that can only "
+                    "be confirmed at runtime. How should I proceed?",
+        "header": "Cleanup path",
+        "multiSelect": False,
+        "options": [{"label": "kubectl first, GitLab fallback", "description": "..."}],
+    }]})
+    assert not d.allow
+    # The deny reason must redirect, or the agent just retries the tool.
+    assert "BLOCKER_JSON_START" in d.reason
+    assert "do not silently guess" in d.reason.lower()
+
+
+def test_blocks_ask_user_question_in_readonly_reviewer_too():
+    d = guard.evaluate("AskUserQuestion", {}, forbidden_paths=FORBIDDEN,
+                       never_push_to=PROTECTED, readonly=True)
+    assert not d.allow
+
+
 def test_blocks_write_to_env():
     assert not _ev("Write", {"file_path": ".env"}).allow
     assert not _ev("Write", {"file_path": "config/secrets/db.key"}).allow
