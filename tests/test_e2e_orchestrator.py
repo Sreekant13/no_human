@@ -1875,6 +1875,42 @@ def test_drafts_in_agent_owned_dirs_do_not_trip_the_edit_loop():
     assert not getattr(orch, "_agent_edited_files", set())
 
 
+def test_a_worktree_is_not_mistaken_for_an_agent_owned_dir():
+    """Concurrency worktrees live at ~/.no_human/worktrees/<task_id>, so EVERY
+    source file inside one has a `.no_human` component in its absolute path.
+    Without the repo root to strip, `is_agent_owned` swallows the whole worktree:
+    `_agent_edited_files` stays empty (so the commit degrades from commit_paths to
+    commit_all) and the edit-loop detector never counts a thing."""
+    from no_human.core.bounds import StuckDetector
+
+    worktree = "/Users/u/.no_human/worktrees/abc123"
+    events: list[dict] = []
+    orch = _bare_orch(events.append)
+    orch._stuck = StuckDetector()
+    orch._active_repo_root = worktree
+    _draft_then_read(orch, f"{worktree}/src/calc.py")
+
+    stuck = [e for e in events if e.get("kind") == "stuck"]
+    assert len(stuck) == 1
+    assert "edit-loop" in stuck[0]["text"]
+    assert orch._agent_edited_files == {f"{worktree}/src/calc.py"}
+
+
+def test_scratch_inside_a_worktree_is_still_agent_owned():
+    """…while a genuine `.no_human/scratch/` *inside* the worktree stays exempt."""
+    from no_human.core.bounds import StuckDetector
+
+    worktree = "/Users/u/.no_human/worktrees/abc123"
+    events: list[dict] = []
+    orch = _bare_orch(events.append)
+    orch._stuck = StuckDetector()
+    orch._active_repo_root = worktree
+    _draft_then_read(orch, f"{worktree}/.no_human/scratch/draft.groovy")
+
+    assert not [e for e in events if e.get("kind") == "stuck"]
+    assert not getattr(orch, "_agent_edited_files", set())
+
+
 def test_repeated_edits_to_a_real_file_still_trip_the_edit_loop():
     """Positive control for the exemption above — a real source file must still
     be caught, otherwise the D18 fix silently disables edit-loop detection."""
@@ -2549,7 +2585,7 @@ async def test_intake_evaluator_failure_does_not_block_pipeline(
     bare_repo, tmp_path, store, monkeypatch,
 ):
     """Evaluator failure is advisory — task proceeds normally."""
-    async def failing_evaluate_spec(title, desc, criteria, *, backend=None):
+    async def failing_evaluate_spec(title, desc, criteria, *, backend=None, model=None):
         raise RuntimeError("evaluator crashed")
 
     monkeypatch.setattr(

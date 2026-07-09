@@ -125,6 +125,21 @@ def test_check_forbidden_imports_skips_non_python(tmp_path):
 # ── agent-owned paths (D18) ───────────────────────────────────────────── #
 
 
+def test_agent_owned_dirs_are_all_excluded_from_every_git_diff():
+    """Both guards rest on one premise: nothing in these dirs can reach a commit.
+    That is enforced by `vcs/git.py::_EPHEMERAL`, a separate hand-maintained list.
+    Deriving AGENT_OWNED_DIRS from it is not safe (it also excludes `.env`, and a
+    bug there would commit a secret), so lock the two together with a test: add a
+    dir to _EPHEMERAL without adding it here and edits to it start counting as
+    scope violations and edit-loops again — the bug that killed task 61406d02."""
+    from no_human.agent.scope_guard import AGENT_OWNED_DIRS
+    from no_human.vcs.git import GitRepo
+
+    excluded = " ".join(GitRepo._EPHEMERAL)
+    for d in AGENT_OWNED_DIRS:
+        assert f"**/{d}/**" in excluded, f"{d!r} is not excluded by _EPHEMERAL"
+
+
 def test_is_agent_owned_relative_and_absolute():
     assert is_agent_owned(".no_human/draft.groovy")
     assert is_agent_owned("/repo/.no_human/draft.groovy")
