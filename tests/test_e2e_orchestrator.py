@@ -1285,8 +1285,13 @@ class MoAFakeBackend:
 
 
 def _moa_config(tmp_path, **overrides):
+    """Config for tests of MoA *mechanics*. `min_signals=0` fans out
+    unconditionally, so these tests exercise the proposer/aggregator path rather
+    than the B2 complexity gate (which has its own tests below)."""
     cfg = _planning_config(tmp_path)
-    cfg.data["llm"]["moa_planning"] = {"enabled": True, "proposers": 3, **overrides}
+    cfg.data["llm"]["moa_planning"] = {
+        "enabled": True, "proposers": 3, "min_signals": 0, **overrides,
+    }
     return cfg
 
 
@@ -1362,6 +1367,106 @@ async def test_moa_announces_the_fan_out_and_attributes_each_lens(
 
     # 3. The fan-out is announced before any proposer finishes.
     assert moa.index(fan_out) == 0
+
+
+# --------------------------------------------------------------------------- #
+# B2: the MoA complexity gate                                                  #
+# --------------------------------------------------------------------------- #
+
+def _gate_cfg(**overrides):
+    from no_human.config import DEFAULT_CONFIG
+    return {**DEFAULT_CONFIG["llm"]["moa_planning"], **overrides}
+
+
+def test_moa_signals_none_for_a_trivial_task():
+    from no_human.core.orchestrator import _moa_complexity_signals
+    t = Task.new("fix a typo in the README", repo_path="/r", kind="bugfix")
+    assert _moa_complexity_signals(t, _gate_cfg()) == []
+
+
+def test_moa_signals_for_the_ci_gate_task_shape():
+    """The real CI_GATE task (61406d02): kind=feature, 10 acceptance criteria, a
+    9309-char description, and — once D19/A2 stages it — one linked repo."""
+    from no_human.core.orchestrator import _moa_complexity_signals
+    t = Task.new("Per-PR CI_GATE Integration Test Pipeline", repo_path="/r",
+                 kind="feature", description="x" * 9309)
+    t.acceptance_criteria = [f"criterion {i}" for i in range(10)]
+    t.linked_repos = ["/repos/metrics-core-service"]
+    assert set(_moa_complexity_signals(t, _gate_cfg())) == {
+        "multi-repo", "feature", "many-criteria", "long-spec",
+    }
+
+
+def test_moa_signals_read_the_evaluator_verdict():
+    from no_human.core.orchestrator import _moa_complexity_signals
+    t = Task.new("t", repo_path="/r", kind="bugfix")
+    t.context = {"eval_result": {"verdict": "clarify"}}
+    assert _moa_complexity_signals(t, _gate_cfg()) == ["ambiguous-spec"]
+
+
+async def test_moa_gate_skips_the_fan_out_for_a_simple_task(
+    bare_repo, tmp_path, store
+):
+    """One signal (kind=feature) is below min_signals=2, so a bare task takes the
+    single-planner path instead of paying for three Opus proposers."""
+    cfg = _planning_config(tmp_path)  # default moa_planning: min_signals=2
+    events: list[dict] = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("small change", repo_path=str(bare_repo))
+    backend = PromptCapturingPlannerBackend(_SAMPLE_PLAN)
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=backend):
+        await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert len(backend.prompts) == 1                    # single planner, no fan-out
+    assert not [e for e in events if e.get("kind") == "planning_moa"]
+    gate = next(e for e in events if "MoA gate" in e.get("text", ""))
+    assert gate["signals"] == ["feature"]
+    assert "single planner" in gate["text"]
+
+
+async def test_moa_gate_fans_out_for_a_complex_task(bare_repo, tmp_path, store):
+    """Two signals (feature + many-criteria) meet the bar: 3 proposers + 1
+    aggregator."""
+    cfg = _planning_config(tmp_path)
+    events: list[dict] = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("big change", repo_path=str(bare_repo))
+    t.acceptance_criteria = [f"criterion {i}" for i in range(6)]
+    fake = MoAFakeBackend(
+        proposals={"minimal-first": _SAMPLE_PLAN, "risk-first": _SAMPLE_PLAN,
+                   "test-first": _SAMPLE_PLAN},
+        aggregate_text="## FILES TO CHANGE/CREATE\n- calc.py: synthesized\n",
+    )
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
+        await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert len(fake.prompts) == 4                       # 3 proposers + aggregator
+    gate = next(e for e in events if "MoA gate" in e.get("text", ""))
+    assert set(gate["signals"]) == {"feature", "many-criteria"}
+
+
+async def test_min_signals_zero_restores_unconditional_moa(
+    bare_repo, tmp_path, store
+):
+    """The documented escape hatch: min_signals=0 is the pre-B2 behavior."""
+    cfg = _moa_config(tmp_path)  # pins min_signals=0
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    t = Task.new("trivial", repo_path=str(bare_repo), kind="bugfix")
+    fake = MoAFakeBackend(
+        proposals={"minimal-first": _SAMPLE_PLAN, "risk-first": _SAMPLE_PLAN,
+                   "test-first": _SAMPLE_PLAN},
+        aggregate_text="## FILES TO CHANGE/CREATE\n- calc.py: synthesized\n",
+    )
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
+        await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert len(fake.prompts) == 4  # fans out despite zero complexity signals
 
 
 async def test_moa_reports_a_failed_proposer_by_lens(bare_repo, tmp_path, store):
