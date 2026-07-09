@@ -2134,6 +2134,96 @@ async def test_zero_diff_preamble_appears_on_retry_and_forbids_fabrication(
 
 
 # --------------------------------------------------------------------------- #
+# B3: the suite ran twice per happy path                                       #
+# --------------------------------------------------------------------------- #
+
+def _count_test_runs(monkeypatch):
+    """Count real `runner.run_tests` invocations, keeping its behavior."""
+    from no_human.testing import runner as _runner
+    calls: list[str] = []
+    real = _runner.run_tests
+
+    def counting(repo_path, test_cmd=None, *a, **kw):
+        calls.append(str(test_cmd))
+        return real(repo_path, test_cmd, *a, **kw)
+
+    monkeypatch.setattr("no_human.core.orchestrator.runner.run_tests", counting)
+    return calls
+
+
+async def test_the_suite_runs_once_per_attempt_not_twice(
+    bare_repo, tmp_path, store, monkeypatch
+):
+    """`_run_review` runs the suite for the reviewer's evidence, then TESTING ran
+    the identical command against the identical commit. One run, two consumers.
+
+    A reviewer must be wired: without one `_run_review` returns an advisory pass
+    before ever running tests, so the duplicate never appears."""
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+    calls = _count_test_runs(monkeypatch)
+    cfg = _config(tmp_path)
+    events: list[dict] = []
+    reviewer = FakeReviewer(ReviewDecision(
+        passed=True,
+        checklist=[ChecklistItem("mul implemented", True, "calc.py:4 returns a*b")],
+    ))
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=events.append, reviewer=reviewer)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert len(calls) == 1, f"suite ran {len(calls)}× in one attempt"
+    reuse = [e for e in events if e.get("kind") == "tests" and e.get("cached")]
+    assert len(reuse) == 1
+    assert "reused the reviewer's run" in reuse[0]["text"]
+
+
+async def test_a_dirty_tree_never_reuses_a_cached_pass(bare_repo, tmp_path, store):
+    """A cached result feeding the review gate would be a false pass. If the tree
+    moved under us, re-run — correctness outranks the saved subprocess."""
+    from no_human.vcs import GitRepo
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    repo = GitRepo(bare_repo)
+
+    first, cached = await orch._run_tests_once(repo, "true")
+    assert cached is False
+    _, cached = await orch._run_tests_once(repo, "true")
+    assert cached is True, "a clean tree at the same commit should reuse"
+
+    # Someone touched a tracked source file after the cached run.
+    (bare_repo / "calc.py").write_text("def add(a, b):\n    return 999\n")
+    _, cached = await orch._run_tests_once(repo, "true")
+    assert cached is False, "a dirty tree must force a fresh run"
+
+
+async def test_a_different_command_is_not_a_cache_hit(bare_repo, tmp_path, store):
+    """The layered TestPlan path runs different commands than the reviewer's."""
+    from no_human.vcs import GitRepo
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    repo = GitRepo(bare_repo)
+
+    await orch._run_tests_once(repo, "true")
+    _, cached = await orch._run_tests_once(repo, "true -x")
+    assert cached is False
+
+
+# --------------------------------------------------------------------------- #
 # D21 / B4: context distillation belongs on the utility tier                   #
 # --------------------------------------------------------------------------- #
 
