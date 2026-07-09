@@ -243,8 +243,35 @@ class GitRepo:
         self._run("commit", "-m", _sanitize_commit_message(message))
         return CommitResult(branch=branch, sha=self.head_sha(), **self._diffstat())
 
-    def _diffstat(self) -> dict[str, int]:
-        out = self._run("diff", "--shortstat", "HEAD~1", "HEAD", check=False)
+    def commits_ahead(self, base: str) -> int:
+        """How many commits this branch adds on top of *base*.
+
+        A resumed attempt (`nh reply`) starts from a [WIP-BLOCKED] checkpoint that
+        is already committed, so `has_changes()` is False while the branch still
+        carries the whole change. Asking git which is true is the only honest way
+        to tell "nothing was done" from "it was done last time".
+        """
+        out = self._run("rev-list", "--count", f"{base}..HEAD", check=False).strip()
+        try:
+            return int(out)
+        except ValueError:
+            return 0
+
+    def head_commit(self, base: str) -> CommitResult:
+        """Describe HEAD as a commit against *base* — for work already committed.
+
+        Three-dot (merge-base..HEAD), matching the range the reviewer reads. A
+        two-dot ``base HEAD`` would report commits that landed on *base* since we
+        branched as deletions of ours.
+        """
+        return CommitResult(
+            branch=self.current_branch(), sha=self.head_sha(),
+            **self._diffstat(f"{base}...HEAD"),
+        )
+
+    def _diffstat(self, *refs: str) -> dict[str, int]:
+        out = self._run("diff", "--shortstat", *(refs or ("HEAD~1", "HEAD")),
+                        check=False)
         files = insertions = deletions = 0
         for part in out.split(","):
             part = part.strip()

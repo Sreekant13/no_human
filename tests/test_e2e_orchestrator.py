@@ -2143,6 +2143,81 @@ async def test_two_zero_diff_attempts_escalate_with_the_agents_reason(
     assert blocker["tried"]  # the per-attempt log, for the human reading it
 
 
+async def test_work_already_committed_on_the_branch_is_not_zero_diff(
+    bare_repo, tmp_path, store
+):
+    """`nh reply` (D15) resumes from a [WIP-BLOCKED] checkpoint whose work is
+    already committed. The agent correctly adds nothing, but `has_changes()` only
+    sees the working tree, so the attempt was failed as "agent produced no file
+    changes". Task 84251cb2 had 645 lines committed against dev and was killed for
+    it twice. The change is the branch's diff against base — ask git."""
+    from no_human.vcs import GitRepo
+
+    repo = GitRepo(bare_repo)
+    base = repo.current_branch()
+    repo.create_branch("scratch/resumed", base=base)
+    (bare_repo / "calc.py").write_text(
+        "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+    (bare_repo / "test_calc.py").write_text(
+        "from calc import add, mul\n\n"
+        "def test_add():\n    assert add(1, 2) == 3\n\n"
+        "def test_mul():\n    assert mul(2, 3) == 6\n")
+    committed = repo.commit_all("WIP-BLOCKED: prior attempt's work")
+
+    assert not repo.has_changes()               # the tree is clean…
+    assert repo.commits_ahead(base) == 1        # …but the branch carries the work
+    head = repo.head_commit(base)
+    assert head.sha == committed.sha
+    assert head.files_changed == 2 and head.insertions > 0
+
+    # Restore the checkout; the checkpoint commit stays reachable by sha.
+    repo._run("checkout", base)
+
+
+async def test_a_resumed_attempt_reviews_the_checkpoint_instead_of_failing(
+    bare_repo, tmp_path, store
+):
+    """End-to-end: `nh reply` sets context['resume_from'], so the attempt branches
+    from the [WIP-BLOCKED] commit. The agent adds nothing (there is nothing to
+    add), `has_changes()` is False, and the attempt used to die as "agent produced
+    no file changes" — twice, then escalate. It must instead review what is on the
+    branch and reach a PR."""
+    from no_human.vcs import GitRepo
+
+    repo = GitRepo(bare_repo)
+    base = repo.current_branch()
+    repo.create_branch("scratch/checkpoint", base=base)
+    (bare_repo / "calc.py").write_text(
+        "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+    (bare_repo / "test_calc.py").write_text(
+        "from calc import add, mul\n\n"
+        "def test_add():\n    assert add(1, 2) == 3\n\n"
+        "def test_mul():\n    assert mul(2, 3) == 6\n")
+    checkpoint = repo.commit_all("[WIP-BLOCKED] prior attempt's work")
+    repo._run("checkout", base)
+
+    cfg = _config(tmp_path)
+    events: list[dict] = []
+    reviewer = FakeReviewer(ReviewDecision(
+        passed=True,
+        checklist=[ChecklistItem("mul implemented", True, "calc.py:4 returns a*b")],
+    ))
+    # A backend that edits nothing — exactly what a resumed coder does.
+    orch = Orchestrator(store, cfg.data, ZeroDiffBackend(), SlackNotifier(None),
+                        event_sink=events.append, reviewer=reviewer)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.context = {"resume_from": {"sha": checkpoint.sha}}
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    assert not [e for e in events if e.get("kind") == "attempt_failed"]
+    resumed = [e for e in events if e.get("kind") == "commit" and e.get("resumed")]
+    assert len(resumed) == 1
+    assert resumed[0]["files_changed"] == 2
+
+
 async def test_zero_diff_preamble_appears_on_retry_and_forbids_fabrication(
     bare_repo, tmp_path, store
 ):
