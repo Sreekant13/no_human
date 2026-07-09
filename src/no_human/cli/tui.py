@@ -13,10 +13,8 @@ from textual.app import App, ComposeResult
 from textual.containers import Vertical
 from textual.widgets import Footer, Header, RichLog, Static
 
-from ..agent.claude_backend import ClaudeBackend
 from ..core.db import Store
-from ..core.orchestrator import Orchestrator, is_agent_session
-from ..notify.slack import SlackNotifier
+from ..core.orchestrator import is_agent_session
 
 
 class WatchApp(App):
@@ -84,16 +82,14 @@ class WatchApp(App):
                 log.write(f"[red]no task matching {self.task_id}[/]")
                 return
             log.write(f"[b]{t.title}[/]")
-            backend = ClaudeBackend(
-                model=self.config.primary_model,
-                forbidden_paths=self.config["safety"]["forbidden_paths"],
-                never_push_to=self.config["git"]["never_push_to"],
+            # One production construction site. This used to build its own
+            # Orchestrator and forgot the reviewer, so `nh watch` drove tasks
+            # all the way to a PR with the review gate silently pass-through.
+            from .commands import _build_orchestrator
+
+            orch = _build_orchestrator(
+                self.config, store, event_sink=self._sink, task=t
             )
-            notifier = SlackNotifier(self.config["notifications"].get("slack_webhook_url"))
-            from ..context import ContextGatherer, build_default_sources
-            gatherer = ContextGatherer(build_default_sources(store, self.config.data))
-            orch = Orchestrator(store, self.config.data, backend, notifier,
-                                event_sink=self._sink, context_gatherer=gatherer)
             outcome = await orch.run_task(t)
             log.write(f"[bold]── {outcome.status.value} ──[/]")
             if outcome.pr_url:

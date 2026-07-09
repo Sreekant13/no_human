@@ -309,3 +309,63 @@ def test_reply_does_not_run_the_task_when_the_server_is_up(tmp_path, monkeypatch
     assert result.exit_code == 0
     assert ran == [], "the CLI ran the task while the server owned it"
     assert "picked it up" in result.output
+
+
+def _cancel_flag(db_path: Path, task_id: str) -> str | None:
+    async def _go():
+        async with Store(db_path) as s:
+            return await s.get_cancel_request(task_id)
+    return asyncio.run(_go())
+
+
+def test_pause_defers_the_status_to_the_running_server(tmp_path, monkeypatch):
+    """With a server up, the orchestrator owns the task's status. The CLI raises
+    the stop flag and stops there; writing BLOCKED from here would race the
+    attempt that is still running and lose its [WIP-BLOCKED] checkpoint."""
+    import no_human.cli.commands as cmd_mod
+
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.IMPLEMENTING)
+    runner = _make_runner(db, monkeypatch)
+    monkeypatch.setattr(cmd_mod, "_server_owns_worker", lambda _cfg: True)
+
+    result = runner.invoke(cli, ["task", "pause", task_id], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert _cancel_flag(db, task_id) == "user paused via CLI"
+    assert _get_task(db, task_id).status is TaskStatus.IMPLEMENTING
+
+
+def test_pause_without_a_server_parks_the_task_itself(tmp_path, monkeypatch):
+    """No server means nothing is running, so this process is the only writer:
+    park the task and consume the flag in one go."""
+    import no_human.cli.commands as cmd_mod
+
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.IMPLEMENTING)
+    runner = _make_runner(db, monkeypatch)
+    monkeypatch.setattr(cmd_mod, "_server_owns_worker", lambda _cfg: False)
+
+    result = runner.invoke(cli, ["task", "pause", task_id], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert _get_task(db, task_id).status is TaskStatus.BLOCKED
+    assert _cancel_flag(db, task_id) is None
+
+
+def test_resume_withdraws_a_pending_stop(tmp_path, monkeypatch):
+    """Otherwise the next attempt honours the stale flag and parks straight back."""
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.BLOCKED)
+    runner = _make_runner(db, monkeypatch)
+
+    async def _flag():
+        async with Store(db) as s:
+            await s.request_cancel(task_id, "user paused")
+    asyncio.run(_flag())
+
+    result = runner.invoke(cli, ["task", "resume", task_id], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert _cancel_flag(db, task_id) is None
+    assert _get_task(db, task_id).status is TaskStatus.IMPLEMENTING

@@ -38,6 +38,14 @@ _CODE_REVIEW_TIMEOUT = 600  # seconds — larger diffs need more time
 _OUTPUT_CAP = 4000
 
 
+class ReviewerUnavailable(RuntimeError):
+    """No reviewer is wired, so the review gate cannot run.
+
+    Raised instead of returning a passing decision: the gate must fail closed,
+    never silently become a rubber stamp (CLAUDE.md #3).
+    """
+
+
 @dataclass
 class ReviewDecision:
     passed: bool

@@ -67,6 +67,13 @@ class Store:
             "kind": "TEXT DEFAULT 'feature'",
             "linked_repos": "TEXT",  # JSON list of additional repo paths
             "parent_id": "TEXT",  # LeadAgent: compound task sub-task linkage
+            # Cooperative cancellation. A dedicated column, NOT task.context:
+            # the CLI and the running orchestrator both hold a Task copy, and
+            # `update_task` rewrites the whole mutable surface from it — so a
+            # flag in `context` is clobbered by whichever writer flushes last.
+            # `update_task`'s column list deliberately omits this one, leaving
+            # the CLI its sole writer and the orchestrator its sole consumer.
+            "cancel_requested": "TEXT",  # reason, or NULL for "keep running"
         }
         for col, decl in wanted.items():
             if col not in existing:
@@ -184,6 +191,32 @@ class Store:
         )
         await self.db.commit()
         return task
+
+    async def request_cancel(self, task_id: str, reason: str) -> None:
+        """Ask a running task to stop at its next cooperative checkpoint.
+
+        A targeted UPDATE of one column: it must not read-modify-write the task
+        row, or it would race the orchestrator that owns every other column.
+        """
+        await self.db.execute(
+            "UPDATE tasks SET cancel_requested = ? WHERE id = ?", (reason, task_id)
+        )
+        await self.db.commit()
+
+    async def get_cancel_request(self, task_id: str) -> str | None:
+        """The pending cancellation reason for *task_id*, or None."""
+        cur = await self.db.execute(
+            "SELECT cancel_requested FROM tasks WHERE id = ?", (task_id,)
+        )
+        row = await cur.fetchone()
+        return row["cancel_requested"] if row else None
+
+    async def clear_cancel_request(self, task_id: str) -> None:
+        """Drop a pending cancellation, once honoured or withdrawn."""
+        await self.db.execute(
+            "UPDATE tasks SET cancel_requested = NULL WHERE id = ?", (task_id,)
+        )
+        await self.db.commit()
 
     async def list_subtasks(self, parent_id: str) -> list[Task]:
         """Return all sub-tasks of a compound parent task."""

@@ -68,6 +68,12 @@ def _config(tmp_path):
     # Disable planning by default in tests — no real Claude calls.
     # Planning-specific tests override this and mock ClaudeBackend.
     cfg.data.setdefault("planning", {})["enabled"] = False
+    # These tests exercise the pipeline around the review gate, not the gate
+    # itself, and most construct an Orchestrator with no reviewer. In
+    # production that now escalates (the gate fails closed); here the skip is
+    # deliberate and must be stated. The gate's own behaviour is covered by
+    # tests/test_review_fail_closed.py.
+    cfg.data.setdefault("reviewer", {})["allow_advisory"] = True
     return cfg
 
 
