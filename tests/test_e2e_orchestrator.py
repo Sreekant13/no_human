@@ -407,6 +407,71 @@ async def test_reviewer_fails_blocks_pr_and_loops(bare_repo, tmp_path, store):
     assert all(a["review_passed"] == 0 for a in attempts)
 
 
+class SequencedFakeReviewer:
+    """Returns a different scripted ReviewDecision per call, in order (the
+    last one repeats if more calls arrive than decisions) — for testing
+    multi-attempt review-driven retry behavior where each attempt's
+    findings genuinely differ."""
+
+    def __init__(self, decisions: list):
+        self._decisions = decisions
+        self.calls: list = []
+
+    async def review(self, task, *, repo_path, test_output="", held_out_output="",
+                     before_ref="HEAD~1", after_ref="HEAD", **kwargs):
+        self.calls.append({"task_id": task.id})
+        idx = min(len(self.calls) - 1, len(self._decisions) - 1)
+        return self._decisions[idx]
+
+
+async def test_stagnation_not_triggered_by_different_findings_same_rate(bare_repo, tmp_path, store):
+    """D6 regression: a matching 0% pass rate across 2 attempts must NOT be
+    treated as stagnation when the specific failing findings are entirely
+    different each time — that is real incremental progress (previous
+    issues fixed, new ones surfaced), not the agent stuck repeating the
+    same mistake. Modeled on a real run that hit exactly this pattern."""
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\n"
+            "def mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+
+    decisions = [
+        ReviewDecision(passed=False, checklist=[
+            ChecklistItem("commitSha undefined reference", False, "Jenkinsfile:883"),
+            ChecklistItem("PR comment pagination missing per_page param", False, "Jenkinsfile:760"),
+        ]),
+        ReviewDecision(passed=False, checklist=[
+            ChecklistItem("Image reuse broken across Jenkins agents", False, "Jenkinsfile:653"),
+            ChecklistItem("Selfcheck fixture passes for the wrong reason", False, "scripts/x.groovy:52"),
+        ]),
+        ReviewDecision(passed=True, checklist=[
+            ChecklistItem("all findings addressed", True, "verified"),
+        ]),
+    ]
+    cfg = _config(tmp_path)
+    reviewer = SequencedFakeReviewer(decisions)
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        reviewer=reviewer)
+    t = Task.new("fix things", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["things are fixed"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    # Must reach and succeed on attempt 3 — NOT escalate after attempt 2 on
+    # a false stagnation positive (both attempts scored 0%, but zero
+    # findings recurred between them).
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert outcome.pr_url is not None
+    assert len(reviewer.calls) == 3
+
+
 async def test_implement_prompt_uses_worktree_dir_not_primary_checkout(bare_repo, tmp_path, store):
     """Regression (validation found this): in concurrency mode the agent runs in a
     per-task worktree, so the prompt must point at that working dir — NOT
