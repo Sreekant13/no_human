@@ -31,6 +31,7 @@ _REVIEW_JSON = re.compile(r"REVIEW_JSON_START\s*(.*?)\s*REVIEW_JSON_END", re.DOT
 
 _REVIEW_TURNS = 10
 _DIFF_CAP = 60_000  # chars — ~15K tokens, fits in 200K context alongside test output
+_FILES_CAP = 80_000  # chars — full text of the changed files, ~20K tokens
 _CODE_REVIEW_DIFF_CAP = 120_000  # code_review tasks: ~30K tokens, fits in 200K context
 _CODE_REVIEW_TURNS = 15
 _CODE_REVIEW_TIMEOUT = 600  # seconds — larger diffs need more time
@@ -81,6 +82,75 @@ def _git_diff(repo_path: Path, before: str = "HEAD~1", after: str = "HEAD") -> t
     return raw[:_DIFF_CAP], len(raw)
 
 
+def _changed_paths(repo_path: Path, before: str, after: str) -> list[str]:
+    """Paths that exist at `after`. Deletions are skipped (no text to show);
+    for a rename, the new path is returned."""
+    proc = subprocess.run(
+        ["git", "diff", "--name-status", "-M", f"{before}..{after}"],
+        cwd=repo_path, capture_output=True, text=True, errors="replace",
+    )
+    paths: list[str] = []
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2 or parts[0].startswith("D"):
+            continue
+        paths.append(parts[-1])
+    return paths
+
+
+def _file_text(repo_path: Path, after: str, path: str) -> str | None:
+    """Full text of `path` at `after`, or None if unreadable or binary."""
+    proc = subprocess.run(
+        ["git", "show", f"{after}:{path}"], cwd=repo_path, capture_output=True,
+    )
+    if proc.returncode != 0:
+        return None
+    if b"\x00" in proc.stdout:  # binary — never inline it
+        return None
+    return proc.stdout.decode("utf-8", errors="replace")
+
+
+def _full_file_context(
+    repo_path: Path, before: str, after: str, *, cap: int = _FILES_CAP,
+) -> tuple[str, list[str]]:
+    """Return (rendered_block, paths_omitted_because_they_did_not_fit).
+
+    A diff shows only changed hunks, so a declaration a few lines above a hunk
+    is invisible to the reviewer. It then "finds" an undefined symbol that is
+    defined in plain sight. Attaching the full text of each changed file closes
+    that blind spot.
+
+    Files are included **whole or not at all**. Truncating a file mid-way would
+    reintroduce the very bug this prevents: the cut could land above the
+    declaration being checked, and the reviewer cannot tell the difference
+    between "not present" and "not shown". Smallest-first packing fits the most
+    files; whatever does not fit is named so the reviewer can read it with its
+    tools.
+    """
+    texts: dict[str, str] = {}
+    for p in _changed_paths(repo_path, before, after):
+        t = _file_text(repo_path, after, p)
+        if t is not None:
+            texts[p] = t
+
+    included: list[tuple[str, str]] = []
+    omitted: list[str] = []
+    used = 0
+    for p, t in sorted(texts.items(), key=lambda kv: (len(kv[1]), kv[0])):
+        entry = len(t) + len(p) + 32  # +header
+        if used + entry > cap:
+            omitted.append(p)
+            continue
+        used += entry
+        included.append((p, t))
+
+    included.sort(key=lambda kv: kv[0])
+    block = "".join(
+        f"--- {p} (full text @ {after}) ---\n{t}\n" for p, t in included
+    )
+    return block, sorted(omitted)
+
+
 _INVOCATION_ERROR_RE = re.compile(
     r"error: unrecognized arguments"
     r"|no tests ran"
@@ -117,6 +187,9 @@ def _build_review_prompt(
     diff_total_len: int = 0,
     profile_context: str = "",
     confirmed_rules: str = "",
+    full_files: str = "",
+    omitted_files: list[str] | None = None,
+    allow_tools: bool = True,
 ) -> str:
     criteria = "\n".join(f"  - {c}" for c in task.acceptance_criteria) or "  (none stated)"
     held_section = (
@@ -135,18 +208,23 @@ def _build_review_prompt(
     # Prompt ordering: STABLE protocol first → VOLATILE task/diff last (Phase 2a).
     is_truncated = diff_total_len > len(diff)
 
-    if is_truncated:
+    # A diff shows only changed hunks. Telling the reviewer the diff is
+    # "complete and authoritative" and forbidding it from reading files made it
+    # flag symbols as undefined that were declared a few lines outside a hunk —
+    # a false positive that cost a full attempt on two separate runs. In gate
+    # mode the reviewer always keeps its read-only tools.
+    if allow_tools:
         tool_policy = (
-            "You MAY use read/search tools to inspect full file contents when the\n"
-            "diff below is truncated. Do NOT modify any files.\n\n"
+            "You MAY use read/search tools (Read, Grep, Glob) to inspect any file in\n"
+            "the repository. Do NOT modify any files.\n"
+            "MUST: before asserting that a symbol is undefined, missing, unassigned,\n"
+            "or orphaned, read the full file and confirm it. A declaration outside\n"
+            "the changed hunks is still present in the code.\n\n"
         )
         tool_rule = (
-            "  - You MAY use read/search tools to inspect truncated files.\n"
+            "  - You MAY use read/search tools; you MUST use them before claiming a\n"
+            "    symbol is undefined, missing, or orphaned.\n"
             "  - Do NOT modify any files.\n"
-        )
-        diff_section = (
-            f"Diff (TRUNCATED from {diff_total_len:,} to {len(diff):,} chars — use your"
-            f" read tools to inspect any file whose diff is cut off):\n```\n{diff}\n```\n\n"
         )
     else:
         tool_policy = (
@@ -154,7 +232,31 @@ def _build_review_prompt(
             "Everything you need is provided below. Respond with text ONLY.\n\n"
         )
         tool_rule = "  - Do NOT use tools, run commands, or read files.\n"
-        diff_section = f"Diff (complete and authoritative):\n```\n{diff}\n```\n\n"
+
+    if is_truncated:
+        diff_section = (
+            f"Diff (TRUNCATED from {diff_total_len:,} to {len(diff):,} chars — use your"
+            f" read tools to inspect any file whose diff is cut off):\n```\n{diff}\n```\n\n"
+        )
+    else:
+        diff_section = (
+            "Diff (every changed hunk; code outside these hunks is NOT shown here):\n"
+            f"```\n{diff}\n```\n\n"
+        )
+
+    files_section = ""
+    if full_files:
+        files_section = (
+            "Full text of the changed files — authoritative. Check here before\n"
+            "claiming a symbol is not defined:\n"
+            f"{full_files}\n"
+        )
+    if omitted_files:
+        files_section += (
+            "Changed files NOT included in full (too large): "
+            + ", ".join(omitted_files)
+            + " — read them with your tools before making any claim about them.\n\n"
+        )
 
     next_pass = 4
     rules_pass = ""
@@ -242,6 +344,7 @@ def _build_review_prompt(
         f"Task: {task.title}\n"
         f"Acceptance criteria:\n{criteria}\n\n"
         + diff_section
+        + files_section
         + _annotated_test_output(test_output)
         + f"{held_section}"
         + rules_pass
@@ -465,11 +568,17 @@ class AdversarialReviewer:
             )
 
         # Gate mode (default): original adversarial review.
+        full_files, omitted_files = "", []
         if diff_override:
+            # Caller supplied the diff; there are no refs to read files from, and
+            # _fast_review runs single-turn with no tools.
             diff = diff_override[:_DIFF_CAP]
             diff_total_len = len(diff_override)
         else:
             diff, diff_total_len = _git_diff(repo_path, before_ref, after_ref)
+            full_files, omitted_files = _full_file_context(
+                repo_path, before_ref, after_ref,
+            )
         prompt = _build_review_prompt(
             task,
             diff,
@@ -478,6 +587,9 @@ class AdversarialReviewer:
             diff_total_len=diff_total_len,
             profile_context=profile_context,
             confirmed_rules=confirmed_rules,
+            full_files=full_files,
+            omitted_files=omitted_files,
+            allow_tools=not diff_override,
         )
 
         # When the diff is already provided, use a single-turn call (no tools).
