@@ -46,7 +46,7 @@ async def test_enrich_adopts_criteria_and_preserves_original(store, tmp_path):
 
 
 async def test_clarify_records_assumptions(store, tmp_path, monkeypatch):
-    async def _fake_resolve(title, description, criteria, *, backend=None):
+    async def _fake_resolve(title, description, criteria, *, backend=None, model=None):
         return ["assume the header is X-Instance-Id"]
     monkeypatch.setattr(ev, "resolve_assumptions", _fake_resolve)
 

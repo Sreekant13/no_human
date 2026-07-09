@@ -2029,6 +2029,46 @@ async def test_zero_diff_preamble_appears_on_retry_and_forbids_fabrication(
 
 
 # --------------------------------------------------------------------------- #
+# D21 / B4: context distillation belongs on the utility tier                   #
+# --------------------------------------------------------------------------- #
+
+class _Chunk:
+    def __init__(self, content, source="file", title="big.py"):
+        self.content, self.source, self.title = content, source, title
+
+
+async def test_distillation_runs_on_the_utility_model_not_the_reviewer(
+    tmp_path, store
+):
+    """D21: `_distill_large_chunks` read llm.review_model, so every oversized
+    context chunk spent one Opus session to produce a summary only the coder
+    ever reads. The reviewer's gate never sees it."""
+    seen: list[str] = []
+
+    class _Backend:
+        def __init__(self, *, model, readonly=False, **_):
+            seen.append(model)
+
+        async def run(self, prompt, *, cwd, max_turns, effort=None, **kwargs):
+            return AgentResult(final_text="a short summary", num_turns=1,
+                               is_error=False, tokens_used=0, session_id="s",
+                               stop_reason="end_turn")
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    chunk = _Chunk("x" * (orch._CHUNK_DISTILL_THRESHOLD + 1))
+    t = Task.new("t", repo_path=str(tmp_path))
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend", _Backend):
+        await orch._distill_large_chunks([chunk], t)
+
+    assert seen == [cfg.data["llm"]["utility_model"]]
+    assert "opus" not in seen[0]
+    assert chunk.content.startswith("[distilled]")
+
+
+# --------------------------------------------------------------------------- #
 # env_setup / env_vars / env_teardown                                          #
 # --------------------------------------------------------------------------- #
 
@@ -2232,7 +2272,7 @@ async def test_intake_evaluator_runs_for_non_grill_tasks(
 
     eval_called = {}
 
-    async def fake_evaluate_spec(title, desc, criteria, *, backend=None):
+    async def fake_evaluate_spec(title, desc, criteria, *, backend=None, model=None):
         eval_called["yes"] = True
         return EvalResult(
             verdict=EvalVerdict.DECOMPOSE,
@@ -2280,7 +2320,7 @@ async def test_intake_evaluator_skipped_when_already_evaluated(
     """Tasks that already have eval_result (grill path) skip re-evaluation."""
     eval_called = {}
 
-    async def fake_evaluate_spec(title, desc, criteria, *, backend=None):
+    async def fake_evaluate_spec(title, desc, criteria, *, backend=None, model=None):
         eval_called["yes"] = True
 
     monkeypatch.setattr(

@@ -124,3 +124,27 @@ def test_supervisor_has_its_own_model_key():
     assert llm["primary_model"] == "claude-sonnet-5"
     assert llm["review_model"] == "claude-opus-4-8"
     assert llm["planner_model"] == "claude-opus-4-8"
+
+
+def test_utility_tier_exists_and_does_not_touch_the_four_gates():
+    """CLAUDE.md #7 (amended 2026-07-09): a utility tier for advisory
+    summarize/classify/distill jobs. It must never become a gate."""
+    from no_human.config import DEFAULT_CONFIG
+    llm = DEFAULT_CONFIG["llm"]
+    assert llm["utility_model"] == "claude-haiku-4-5"
+    for gate in ("primary_model", "planner_model", "review_model",
+                 "supervisor_model"):
+        assert llm[gate] != llm["utility_model"], (
+            f"{gate} must not run on the utility tier"
+        )
+
+
+def test_utility_model_property_survives_a_config_that_predates_the_key():
+    """~/.no_human/config.yaml is written once and deep-merged forever. A config
+    frozen before the utility tier existed must still resolve the new default,
+    not crash and not silently fall back to a gate model."""
+    from pathlib import Path
+    from no_human.config import Config, DEFAULT_CONFIG
+    stale = Config(data={"llm": {"auth_mode": "subscription"}},
+                   path=Path("/nonexistent/config.yaml"))
+    assert stale.utility_model == DEFAULT_CONFIG["llm"]["utility_model"]

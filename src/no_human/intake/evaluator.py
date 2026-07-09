@@ -95,19 +95,33 @@ _EVAL_PROMPT = (
 )
 
 
+def _default_utility_model() -> str:
+    """The configured default, read from the schema rather than a literal.
+
+    Both entry points below used to hardcode ``claude-opus-4-8``, so a config
+    change could never reach them. Callers that hold a resolved config should
+    pass ``model=`` explicitly; this is the floor, not the policy.
+    """
+    from ..config import DEFAULT_CONFIG
+    return DEFAULT_CONFIG["llm"]["utility_model"]
+
+
 async def evaluate_spec(
     title: str,
     description: str,
     acceptance_criteria: list[str],
     *,
     backend: Any | None = None,
+    model: str | None = None,
 ) -> EvalResult | None:
     """Run the intake quality evaluator. Returns None on failure (advisory)."""
     try:
         import tempfile
         from pathlib import Path
         from ..agent.claude_backend import ClaudeBackend
-        be = backend or ClaudeBackend(model="claude-opus-4-8", readonly=True)
+        be = backend or ClaudeBackend(
+            model=model or _default_utility_model(), readonly=True,
+        )
         criteria_text = "\n".join(f"  - {c}" for c in acceptance_criteria) or "  (none)"
         prompt = _render(
             _EVAL_PROMPT,
@@ -162,6 +176,7 @@ async def resolve_assumptions(
     acceptance_criteria: list[str],
     *,
     backend: Any | None = None,
+    model: str | None = None,
 ) -> list[str] | None:
     """For an ambiguous spec, return the assumptions the agent will proceed
     under so it never has to stop and ask a human (megaplan P2 / decision #1).
@@ -170,7 +185,9 @@ async def resolve_assumptions(
         import tempfile
         from pathlib import Path
         from ..agent.claude_backend import ClaudeBackend
-        be = backend or ClaudeBackend(model="claude-opus-4-8", readonly=True)
+        be = backend or ClaudeBackend(
+            model=model or _default_utility_model(), readonly=True,
+        )
         criteria_text = "\n".join(f"  - {c}" for c in acceptance_criteria) or "  (none)"
         prompt = _render(
             _ASSUMPTIONS_PROMPT,
