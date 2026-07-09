@@ -85,8 +85,9 @@ def _discover_client() -> LanguageServerClient:
         import psutil
     except ImportError:
         raise ImportError(
-            "psutil is required for IDE history extraction. "
-            "Install with: pip install psutil   (or: uv add psutil)"
+            "psutil is required for IDE history extraction. It is a declared "
+            "dependency, so this environment is stale — reinstall no_human "
+            "(uv tool install --force --editable .)"
         )
 
     candidates: list[tuple[str, int, str]] = []  # (host, port, token)
@@ -145,8 +146,9 @@ def _discover_all_clients() -> list[LanguageServerClient]:
         import psutil
     except ImportError:
         raise ImportError(
-            "psutil is required for IDE history extraction. "
-            "Install with: pip install psutil   (or: uv add psutil)"
+            "psutil is required for IDE history extraction. It is a declared "
+            "dependency, so this environment is stale — reinstall no_human "
+            "(uv tool install --force --editable .)"
         )
 
     # Group candidates by PID → (token, [(host, port), ...])
