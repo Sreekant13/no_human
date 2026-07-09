@@ -9,13 +9,21 @@ from .report import (
     parse_blocker,
     render_report,
 )
-from .taxonomy import Blocker, BlockerCategory, Route, route_for, triage
+from .taxonomy import (
+    Blocker,
+    BlockerCategory,
+    Route,
+    resume_checkpoint,
+    route_for,
+    triage,
+)
 from .wake import WakeWatcher, parse_duration
 
 __all__ = [
     "Blocker",
     "BlockerCategory",
     "Route",
+    "resume_checkpoint",
     "route_for",
     "triage",
     "parse_blocker",

@@ -2248,3 +2248,95 @@ def test_size_limits_honour_a_per_task_override(tmp_path, store):
 
     # No task, or no override: global config governs.
     assert "605 > 500" in orch._over_size_limits(commit, None)
+
+
+async def test_reply_resumes_from_the_wip_blocked_checkpoint(bare_repo, tmp_path, store):
+    """D15: the blocker printed 'Resume with: nh reply <id>', but the resume path
+    read ctx['handoff']['wip_sha'] — written only when an attempt runs out of
+    turns — and gated it on attempt_n > 1, which a resumed run never reaches
+    because it restarts its numbering at 1. The checkpoint was discarded and 41
+    turns were re-done from base."""
+    from no_human.blockers import resume_checkpoint
+
+    def leave_wip(cwd):
+        (cwd / "wip_marker.py").write_text("# many turns of work\n")
+
+    bjson = (
+        '{"category": "DEPENDENCY_WAIT", "confidence": 0.9, '
+        '"wake_condition": "pr_merged:org/repo#42", '
+        '"root_cause_hypothesis": "needs #42", "goal": "g", "evidence": "e"}'
+    )
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, BlockerBackend(bjson, mutate=leave_wip),
+                        SlackNotifier(None))
+    t = Task.new("resume me", repo_path=str(bare_repo))
+    await store.create_task(t)
+    await orch.run_task(t)
+
+    blocked = await store.get_task(t.id)
+    assert blocked.status is TaskStatus.BLOCKED
+    checkpoint = resume_checkpoint(blocked.blocker)
+    assert checkpoint and checkpoint["sha"]
+
+    # Exactly what `nh reply` now does before handing the task back to the loop.
+    ctx = blocked.context or {}
+    ctx["resume_from"] = checkpoint
+    blocked.context = ctx
+    await store.update_task(blocked)
+    await store.set_status(blocked, TaskStatus.IMPLEMENTING, validate=False)
+
+    events: list[dict] = []
+    orch2 = Orchestrator(
+        store, cfg.data,
+        FakeBackend(lambda cwd: (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n")),
+        SlackNotifier(None), event_sink=events.append,
+    )
+    await orch2.run_task(blocked)
+
+    assert any(e.get("kind") == "resume_wip" for e in events), \
+        "the resumed attempt must branch from the [WIP-BLOCKED] checkpoint"
+
+    attempts = await store.list_attempts(blocked.id)
+    resumed = attempts[-1]
+    # The work survived: the checkpoint is an ancestor of the resumed branch.
+    tree = subprocess.run(["git", "ls-tree", "-r", "--name-only", resumed["branch_name"]],
+                          cwd=bare_repo, capture_output=True, text=True).stdout
+    assert "wip_marker.py" in tree, "the checkpointed work was thrown away"
+
+    # Branch names never collide, or `git checkout -B` would reset the branch
+    # holding the checkpoint and destroy it.
+    names = [a["branch_name"] for a in attempts if a["branch_name"]]
+    assert len(names) == len(set(names)), f"branch names collided: {names}"
+    assert [a["attempt_number"] for a in attempts] == list(range(1, len(attempts) + 1))
+
+
+def test_review_base_is_the_merge_base_not_head_parent(tmp_path, store):
+    """A resumed attempt carries the [WIP-BLOCKED] commit on its own branch, so
+    HEAD~1 would show the reviewer only the delta over the checkpoint."""
+    from no_human.vcs.git import GitRepo
+
+    work = tmp_path / "r"
+    work.mkdir()
+    _git(work, "init", "-b", "main")
+    _git(work, "config", "user.email", "u@e.com")
+    _git(work, "config", "user.name", "u")
+    (work / "a.txt").write_text("1\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "base")
+    base_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=work,
+                              capture_output=True, text=True).stdout.strip()
+    _git(work, "checkout", "-b", "feature")
+    (work / "a.txt").write_text("2\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "[WIP-BLOCKED] partial")
+    (work / "b.txt").write_text("3\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "finish")
+
+    orch = Orchestrator(store, _config(tmp_path).data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    repo = GitRepo(work)
+    assert orch._review_base(repo, "main") == base_sha  # whole change, both commits
+    assert orch._review_base(repo, None) == "HEAD~1"  # no base → unchanged default
+    assert orch._review_base(repo, "no-such-branch") == "HEAD~1"  # never blocks review

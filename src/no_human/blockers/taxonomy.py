@@ -98,6 +98,22 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def resume_checkpoint(blocker: dict[str, Any] | None) -> dict[str, str] | None:
+    """The [WIP-BLOCKED] commit a resumed task should continue from, or None.
+
+    ``_raise_blocker`` checkpoints the working tree and records the sha here
+    before parking the task. Only a human-authorised resume (`nh reply`, or the
+    board) copies it onto the task, where the next attempt branches from it
+    instead of throwing tens of turns of work away and starting from base.
+    """
+    if not isinstance(blocker, dict):
+        return None
+    sha = blocker.get("resume_commit") or ""
+    if not sha:
+        return None
+    return {"sha": sha, "branch": blocker.get("resume_branch") or ""}
+
+
 @dataclass
 class Blocker:
     """Structured blocker report (PLAN.md 22.1). Never prose — a human acts on
