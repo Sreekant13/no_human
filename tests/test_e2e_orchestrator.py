@@ -1446,8 +1446,71 @@ async def test_full_pipeline_with_planning(bare_repo, tmp_path, store):
     # Planning event was emitted
     kinds = [e["kind"] for e in events]
     assert "planning" in kinds
-    # PLAN.md was written to worktree (but not committed)
     assert outcome.pr_url and "no-human/" in outcome.pr_url
+
+
+async def test_plan_file_is_scoped_to_no_human_dir_and_cleaned_up(
+    bare_repo, tmp_path, store,
+):
+    """The plan is materialized for the agent, then removed.
+
+    Serial mode has no worktree, so ``repo.path`` is the user's primary
+    checkout: a root-level PLAN.md outlives the run and the next task's planner
+    reads it back as repo content.
+    """
+    seen: dict[str, bool] = {}
+
+    def mutate(cwd):
+        # Observed from inside the agent session, while the run is live.
+        seen["under_no_human"] = (cwd / ".no_human" / "PLAN.md").is_file()
+        seen["at_root"] = (cwd / "PLAN.md").exists()
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+
+    cfg = _planning_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+    await store.create_task(t)
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend",
+                return_value=PlannerBackend(_SAMPLE_PLAN)):
+        outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert seen["under_no_human"], "the agent never saw the plan on disk"
+    assert not seen["at_root"], "the plan must not be written to the checkout root"
+    # Nothing survives the run in either location.
+    assert not (bare_repo / ".no_human" / "PLAN.md").exists()
+    assert not (bare_repo / "PLAN.md").exists()
+
+
+async def test_stale_plan_file_is_removed_when_this_run_has_no_plan(
+    bare_repo, tmp_path, store,
+):
+    """A plan left behind by a crashed run is never inherited by the next one."""
+    stale = bare_repo / ".no_human" / "PLAN.md"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("# a previous run's plan — must not leak into this one\n")
+
+    def mutate(cwd):
+        assert not (cwd / ".no_human" / "PLAN.md").exists(), "stale plan visible to agent"
+        (cwd / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+
+    cfg = _config(tmp_path)  # planning disabled → no plan for this task
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None))
+    t = Task.new("tweak add()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    assert not stale.exists()
 
 
 # --------------------------------------------------------------------------- #
