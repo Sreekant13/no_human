@@ -90,3 +90,29 @@ def test_readonly_still_blocks_destructive_bash():
                               readonly=True)
     assert not _ro("Bash", {"command": "rm -rf ."}).allow
     assert not _ro("Bash", {"command": "git merge origin/main"}).allow
+
+
+# --------------------------------------------------------------------------- #
+# The hook the SDK actually calls (not just the pure policy underneath)        #
+# --------------------------------------------------------------------------- #
+
+async def test_pretooluse_hook_denies_ask_user_question():
+    """guard.evaluate is pure, but what the Agent SDK invokes is the hook that
+    wraps it. Assert the wire format the SDK acts on, not just the policy."""
+    from no_human.agent.claude_backend import _make_guard_hook
+
+    hook = _make_guard_hook(FORBIDDEN, PROTECTED)
+    out = await hook({"tool_name": "AskUserQuestion", "tool_input": {}}, None, None)
+
+    hso = out["hookSpecificOutput"]
+    assert hso["hookEventName"] == "PreToolUse"
+    assert hso["permissionDecision"] == "deny"
+    assert "BLOCKER_JSON_START" in hso["permissionDecisionReason"]
+
+
+async def test_pretooluse_hook_allows_a_normal_tool():
+    from no_human.agent.claude_backend import _make_guard_hook
+
+    hook = _make_guard_hook(FORBIDDEN, PROTECTED)
+    out = await hook({"tool_name": "Read", "tool_input": {"file_path": "a.py"}}, None, None)
+    assert out == {}, "an allowed tool must return an empty hook result"
