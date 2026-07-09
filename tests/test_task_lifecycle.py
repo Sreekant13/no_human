@@ -269,3 +269,43 @@ def test_task_add_rejects_a_linked_repo_that_is_not_a_checkout(tmp_path, monkeyp
     assert result.exit_code == 1
     assert "not a git repo" in result.output
     assert "metrics-core-service" in result.output
+
+
+# --------------------------------------------------------------------------- #
+# Duplicate execution: the server's scheduler already claims the task          #
+# --------------------------------------------------------------------------- #
+
+
+def test_server_owns_worker_is_false_when_nothing_is_listening():
+    """Any failure to reach the server means "no server" — a false positive would
+    silently strand the task, a false negative only restores the old behavior."""
+    import no_human.cli.commands as cmd_mod
+
+    class _Cfg(dict):
+        def get(self, k, d=None):
+            return {"server": {"host": "127.0.0.1", "port": 1}}.get(k, d)
+
+    assert cmd_mod._server_owns_worker(_Cfg()) is False
+
+
+def test_reply_does_not_run_the_task_when_the_server_is_up(tmp_path, monkeypatch):
+    """`nh reply` sets the task to IMPLEMENTING, which scheduler._CLAIMABLE picks
+    up. Running it in-process too gave task 84251cb2 two orchestrators on one git
+    checkout — duplicate commit/reviewing events and a doubled escalation."""
+    import no_human.cli.commands as cmd_mod
+
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.BLOCKED)
+    runner = _make_runner(db, monkeypatch)
+
+    monkeypatch.setattr(cmd_mod, "_server_owns_worker", lambda _cfg: True)
+    ran: list[str] = []
+    monkeypatch.setattr(cmd_mod, "_build_orchestrator",
+                        lambda *a, **k: ran.append("built") or (_ for _ in ()).throw(
+                            AssertionError("orchestrator must not run in-process")))
+
+    result = runner.invoke(cli, ["reply", task_id, "go on"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert ran == [], "the CLI ran the task while the server owned it"
+    assert "picked it up" in result.output
