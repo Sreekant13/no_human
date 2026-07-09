@@ -7,8 +7,8 @@ a fenced JUDGE_JSON block and **failing closed** (no block → not a match), the
 same discipline as the adversarial reviewer.
 
 The judge is injectable so the eval harness runs offline in tests; the default
-uses the review model (claude-sonnet-4-6) — deliberately a *different* model
-from the implementer (claude-opus-4-8).
+uses the review model (claude-opus-4-8) — deliberately a *different* model
+from the implementer (claude-sonnet-5).
 """
 
 from __future__ import annotations
@@ -76,7 +76,7 @@ def parse_verdict(text: str) -> JudgeVerdict:
 class IntentJudge:
     """Runs the different-model judge over (agent_diff, known_good_diff)."""
 
-    def __init__(self, *, model: str = "claude-sonnet-4-6", backend: Any | None = None):
+    def __init__(self, *, model: str = "claude-opus-4-8", backend: Any | None = None):
         self.model = model
         self._backend = backend  # lazily constructed to avoid SDK import at module load
 

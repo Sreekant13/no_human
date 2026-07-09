@@ -68,8 +68,8 @@ def test_load_config_generates_default(tmp_path):
     cfg_path = tmp_path / "config.yaml"
     cfg = load_config(cfg_path)
     assert cfg_path.exists()
-    assert cfg.primary_model == "claude-opus-4-8"
-    assert cfg.review_model == "claude-sonnet-4-6"
+    assert cfg.primary_model == "claude-sonnet-5"
+    assert cfg.review_model == "claude-opus-4-8"
     assert cfg["approval"]["auto_merge_on_approval"] is False
     # the metered key must never appear anywhere in the generated config
     assert "ANTHROPIC_API_KEY" not in cfg_path.read_text()

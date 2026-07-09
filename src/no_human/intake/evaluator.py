@@ -107,7 +107,7 @@ async def evaluate_spec(
         import tempfile
         from pathlib import Path
         from ..agent.claude_backend import ClaudeBackend
-        be = backend or ClaudeBackend(model="claude-sonnet-4-6", readonly=True)
+        be = backend or ClaudeBackend(model="claude-opus-4-8", readonly=True)
         criteria_text = "\n".join(f"  - {c}" for c in acceptance_criteria) or "  (none)"
         prompt = _render(
             _EVAL_PROMPT,
@@ -170,7 +170,7 @@ async def resolve_assumptions(
         import tempfile
         from pathlib import Path
         from ..agent.claude_backend import ClaudeBackend
-        be = backend or ClaudeBackend(model="claude-sonnet-4-6", readonly=True)
+        be = backend or ClaudeBackend(model="claude-opus-4-8", readonly=True)
         criteria_text = "\n".join(f"  - {c}" for c in acceptance_criteria) or "  (none)"
         prompt = _render(
             _ASSUMPTIONS_PROMPT,
