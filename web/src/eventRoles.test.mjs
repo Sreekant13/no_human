@@ -99,16 +99,30 @@ test("old persisted events (source:'agent' on everything) still render", () => {
 });
 
 test("each node is labelled with the model that actually ran it", () => {
+  // Exactly the map the orchestrator emitted on run 61406d02.
   const models = modelsByNode([
     { kind: "state", text: "implementing" },
     { kind: "models", models: { coder: "claude-sonnet-5", planner: "claude-opus-4-8",
-                                reviewer: "claude-opus-4-8" } },
+                                reviewer: "claude-opus-4-8",
+                                supervisor: "claude-sonnet-5" } },
   ]);
   assert.deepEqual(models, {
     agent: "claude-sonnet-5",
     planner: "claude-opus-4-8",
     reviewer: "claude-opus-4-8",
+    supervisor: "claude-sonnet-5",
   });
+});
+
+test("every role the orchestrator emits maps to a real node", () => {
+  // A role with no node silently loses its model label — which is how the
+  // Supervisor ended up as the only unlabelled node right after its tier
+  // changed. Keep this in step with Orchestrator._active_models().
+  const emitted = ["coder", "planner", "reviewer", "supervisor"];
+  const mapped = modelsByNode([
+    { kind: "models", models: Object.fromEntries(emitted.map((r) => [r, "m"])) },
+  ]);
+  assert.equal(Object.keys(mapped).length, emitted.length);
 });
 
 test("a later attempt's models win, and events without them are ignored", () => {
@@ -122,5 +136,6 @@ test("a later attempt's models win, and events without them are ignored", () => 
 });
 
 test("an unknown role never invents a node", () => {
-  assert.deepEqual(modelsByNode([{ kind: "models", models: { supervisor: "x" } }]), {});
+  assert.deepEqual(modelsByNode([{ kind: "models", models: { aggregator: "x" } }]), {});
+  assert.deepEqual(modelsByNode([{ kind: "models", models: { distiller: "x" } }]), {});
 });

@@ -44,7 +44,9 @@ export function eventLens(e) {
 // to each role. Map those role names onto the diagram's node ids so each node
 // can say which model ran it — the check that would have caught a frozen
 // config.yaml inverting coder and reviewer.
-const MODEL_ROLE_TO_NODE = { coder: "agent", planner: "planner", reviewer: "reviewer" };
+const MODEL_ROLE_TO_NODE = {
+  coder: "agent", planner: "planner", reviewer: "reviewer", supervisor: "supervisor",
+};
 
 export function modelsByNode(events) {
   const out = {};
