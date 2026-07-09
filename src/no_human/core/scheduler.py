@@ -113,6 +113,10 @@ class Scheduler:
         # Per-task event log: task_id -> deque of {ts, source, kind, text, ...}
         self._event_log: dict[str, deque] = {}
         self._MAX_EVENTS = 200
+        # Events are flushed to SQLite while the run is live, not just at the
+        # end: a crash used to lose the entire history, and the in-memory buffer
+        # above is capped, so a chatty run silently dropped its earliest events.
+        self._EVENT_FLUSH_INTERVAL = 2.0
         # Phase 4a: SSE — per-task notify so streaming clients wake on new events.
         self._event_notify: dict[str, asyncio.Event] = {}
         # Compound-parent completion: per-parent lock prevents race conditions
@@ -200,6 +204,11 @@ class Scheduler:
 
         notify = self._event_notify.setdefault(task.id, asyncio.Event())
 
+        # Events not yet written to SQLite. `save_events` INSERTs, so only the
+        # unflushed tail may be handed to it — re-sending `buf` would duplicate
+        # every row.
+        pending: list[dict] = []
+
         def _sink(event):
             event["ts"] = time.time()
             # Don't clobber a subagent event's own task_id (the SDK's per-
@@ -209,10 +218,39 @@ class Scheduler:
             # dispatch in a run down to one node in the System view.
             event.setdefault("task_id", task.id)
             buf.append(event)
+            pending.append(event)
             notify.set()
             summary = _summarize_event(event)
             if summary:
                 self._live_status[task.id] = summary
+
+        async def _flush_events() -> None:
+            """Drain `pending` into SQLite. Never raises — persistence must not
+            break the pool (a failed batch is dropped, exactly as before)."""
+            if not pending:
+                return
+            batch, pending[:] = list(pending), []
+            try:
+                await self.store.save_events(task.id, batch)
+            except Exception:  # noqa: BLE001 — persistence must not break the pool
+                log.warning("failed to persist %d events for task %s",
+                            len(batch), task.id[:8])
+
+        # Stopped by an event, not by cancel(): cancelling could land inside
+        # save_events after the batch was already taken off `pending`, dropping
+        # it. CancelledError is not an Exception, so _flush_events can't absorb it.
+        stop_flusher = asyncio.Event()
+
+        async def _flusher() -> None:
+            while not stop_flusher.is_set():
+                try:
+                    await asyncio.wait_for(stop_flusher.wait(),
+                                           timeout=self._EVENT_FLUSH_INTERVAL)
+                except asyncio.TimeoutError:
+                    pass
+                await _flush_events()
+
+        flusher = asyncio.create_task(_flusher())
 
         try:
             orch = self.factory(task)
@@ -246,12 +284,10 @@ class Scheduler:
                 # Don't delete immediately — give SSE 5s to drain.
                 # The SSE endpoint checks inflight and closes after idle ticks.
 
-            # Persist this run's events so Activity/System tabs survive a
-            # server restart (the in-memory buffer is lost on restart).
-            try:
-                await self.store.save_events(task.id, list(buf))
-            except Exception:  # noqa: BLE001 — persistence must not break the pool
-                log.warning("failed to persist events for task %s", task.id[:8])
+            # Stop the periodic flusher, then write whatever it hasn't taken.
+            stop_flusher.set()
+            await flusher
+            await _flush_events()
 
             # Compound-parent completion: if this task is a sub-task, check
             # whether the parent compound task should transition.

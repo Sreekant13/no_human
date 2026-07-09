@@ -518,3 +518,66 @@ async def test_sink_preserves_subagent_task_id(store):
     )
     tool_use = next(e for e in events if e["kind"] == "tool_use")
     assert tool_use["task_id"] == t.id  # backfilled, no id of its own
+
+
+# --------------------------------------------------------------------------- #
+# Events are persisted while the run is live, not only after it ends           #
+# --------------------------------------------------------------------------- #
+
+async def test_events_are_persisted_mid_run(store):
+    """A crash used to lose the whole history: save_events ran once, in the
+    `finally`. Mid-run the API served 133 events while task_events held 0."""
+    mid_run_rows: list[int] = []
+
+    class FakeOrchObservingItsOwnPersistence:
+        _sink = staticmethod(lambda e: None)
+
+        async def run_task(self, task):
+            for i in range(5):
+                self._sink({"kind": "tool_use", "tool_name": f"Read{i}"})
+            # Give the flusher a chance to run while we are still "in" the task.
+            await asyncio.sleep(0.05)
+            mid_run_rows.append(len(await store.list_events(task.id)))
+            await store.set_status(task, TaskStatus.DONE, validate=False)
+            return SimpleNamespace(status=TaskStatus.DONE, task=task)
+
+    orch = FakeOrchObservingItsOwnPersistence()
+    sched = Scheduler(store, lambda task=None: orch, max_workers=1)
+    sched._EVENT_FLUSH_INTERVAL = 0.01
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+
+    await sched.tick()
+    while sched.inflight:
+        await asyncio.sleep(0.01)
+
+    assert mid_run_rows == [5], "events must reach SQLite before the run ends"
+    # And the final flush must not re-insert what was already written.
+    assert len(await store.list_events(t.id)) == 5
+
+
+async def test_flushed_events_are_not_duplicated_by_the_final_flush(store):
+    """save_events INSERTs. Handing it the full buffer on every flush would
+    write each event once per flush."""
+    class SlowFakeOrch:
+        _sink = staticmethod(lambda e: None)
+
+        async def run_task(self, task):
+            for i in range(3):
+                self._sink({"kind": "tool_use", "tool_name": f"Read{i}"})
+                await asyncio.sleep(0.03)   # several flush intervals elapse
+            await store.set_status(task, TaskStatus.DONE, validate=False)
+            return SimpleNamespace(status=TaskStatus.DONE, task=task)
+
+    sched = Scheduler(store, lambda task=None: SlowFakeOrch(), max_workers=1)
+    sched._EVENT_FLUSH_INTERVAL = 0.01
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+
+    await sched.tick()
+    while sched.inflight:
+        await asyncio.sleep(0.01)
+
+    persisted = await store.list_events(t.id)
+    assert len(persisted) == 3
+    assert [e["tool_name"] for e in persisted] == ["Read0", "Read1", "Read2"]
