@@ -6,12 +6,15 @@ from pathlib import Path
 import pytest
 
 from no_human.agent.scope_guard import (
+    SCRATCH_DIR,
     ScopeGuardHook,
     check_dependency_diff,
     check_forbidden_imports,
     check_scope,
     commit_time_checks,
+    is_agent_owned,
     parse_plan_files,
+    scratch_redirect,
 )
 
 
@@ -119,6 +122,47 @@ def test_check_forbidden_imports_skips_non_python(tmp_path):
     assert check_forbidden_imports([js_file]) == []
 
 
+# ── agent-owned paths (D18) ───────────────────────────────────────────── #
+
+
+def test_is_agent_owned_relative_and_absolute():
+    assert is_agent_owned(".no_human/draft.groovy")
+    assert is_agent_owned("/repo/.no_human/draft.groovy")
+    assert is_agent_owned("/repo/.claude/settings.json")
+    assert not is_agent_owned("/repo/src/foo.py")
+
+
+def test_is_agent_owned_relative_to_repo_root():
+    """A repo living under an agent-owned dir must not read as wholly owned."""
+    assert not is_agent_owned("/home/u/.claude/repo/src/foo.py", "/home/u/.claude/repo")
+
+
+def test_check_scope_exempts_agent_owned_dirs():
+    """D18: the coder drafted in `.no_human/` and got '[SCOPE] … revert' on every
+    write. `.no_human/` never reaches a diff, so it cannot be out of scope."""
+    plan_files = {"src/foo.py"}
+    assert check_scope(".no_human/ci_gate_stage_draft.groovy", plan_files) is None
+    assert check_scope("/repo/.no_human/draft.groovy", plan_files, "/repo") is None
+    # …while a genuinely unplanned source file is still flagged.
+    assert check_scope("src/other.py", plan_files) is not None
+
+
+def test_scratch_redirect_points_at_the_scratch_dir_and_never_says_revert():
+    msg = scratch_redirect("/repo/.no_human/draft.groovy", "/repo")
+    assert msg is not None
+    assert SCRATCH_DIR in msg
+    assert "revert" not in msg.lower()
+
+
+def test_scratch_redirect_silent_inside_the_scratch_dir():
+    assert scratch_redirect(f"{SCRATCH_DIR}/notes.md") is None
+    assert scratch_redirect(f"/repo/{SCRATCH_DIR}/notes.md", "/repo") is None
+
+
+def test_scratch_redirect_ignores_ordinary_paths():
+    assert scratch_redirect("src/foo.py") is None
+
+
 # ── ScopeGuardHook ────────────────────────────────────────────────────── #
 
 
@@ -134,6 +178,38 @@ async def test_scope_guard_hook_warns_on_out_of_plan():
     assert "additionalContext" in result.get("hookSpecificOutput", {})
     assert len(events) == 1
     assert events[0][0] == "scope_warning"
+
+
+@pytest.mark.asyncio
+async def test_scope_guard_hook_nudges_once_per_agent_owned_path():
+    """The nudge reaches the agent every time (it is the tool's feedback), but
+    the event log records it once — five identical warnings was the D18 noise."""
+    plan = "## FILES TO CHANGE/CREATE\n- src/foo.py\n"
+    events = []
+    hook = ScopeGuardHook(plan, "/repo", on_event=lambda k, t: events.append((k, t)))
+    call = {"tool_name": "Write",
+            "tool_input": {"file_path": "/repo/.no_human/draft.groovy"}}
+
+    first = await hook.hook(call, "id1", None)
+    second = await hook.hook(call, "id2", None)
+
+    assert SCRATCH_DIR in first["hookSpecificOutput"]["additionalContext"]
+    assert SCRATCH_DIR in second["hookSpecificOutput"]["additionalContext"]
+    assert [k for k, _ in events] == ["scratch_redirect"]
+
+
+@pytest.mark.asyncio
+async def test_scope_guard_hook_silent_inside_scratch_dir():
+    plan = "## FILES TO CHANGE/CREATE\n- src/foo.py\n"
+    events = []
+    hook = ScopeGuardHook(plan, "/repo", on_event=lambda k, t: events.append((k, t)))
+    result = await hook.hook(
+        {"tool_name": "Write",
+         "tool_input": {"file_path": f"/repo/{SCRATCH_DIR}/notes.md"}},
+        "id1", None,
+    )
+    assert result == {}
+    assert events == []
 
 
 @pytest.mark.asyncio

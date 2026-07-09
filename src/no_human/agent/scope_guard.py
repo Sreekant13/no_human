@@ -25,6 +25,64 @@ from pathlib import Path
 from typing import Any, Callable
 
 
+# ── 0. Agent-owned paths ────────────────────────────────────────────────── #
+
+#: Directories owned by agent tooling.  Every one of them is excluded from every
+#: git diff (``vcs/git.py::_EPHEMERAL``), so nothing written inside them can ever
+#: reach a commit or a PR.  Two consequences the guards below rely on: an edit
+#: there cannot *be* a scope violation, and rewriting one repeatedly is not an
+#: edit-loop.  no_human itself writes ``.no_human/PLAN.md`` for the agent to read.
+AGENT_OWNED_DIRS = frozenset({".no_human", ".claude", ".devin", ".windsurf"})
+
+#: Repo-relative scratch directory the coder is told to use for drafts and notes.
+SCRATCH_DIR = ".no_human/scratch"
+_SCRATCH_PARTS = Path(SCRATCH_DIR).parts
+
+
+def _relative(path: str | Path, repo_root: str | Path = "") -> Path:
+    """Best-effort repo-relative view of *path* (unchanged if not under root)."""
+    p = Path(str(path).removeprefix("./"))
+    if repo_root:
+        try:
+            return p.relative_to(repo_root)
+        except ValueError:
+            pass
+    return p
+
+
+def is_agent_owned(path: str | Path, repo_root: str | Path = "") -> bool:
+    """True when *path* lives inside a directory owned by agent tooling.
+
+    When *repo_root* is unknown the check runs against the absolute path, so a
+    repo checked out *inside* an agent-owned directory would read as wholly
+    agent-owned.  That only disables two advisory guards — never correctness.
+    """
+    return any(part in AGENT_OWNED_DIRS for part in _relative(path, repo_root).parts)
+
+
+def scratch_redirect(
+    edited_path: str | Path, repo_root: str | Path = ""
+) -> str | None:
+    """Nudge for edits to agent-owned dirs outside the blessed scratch path.
+
+    Deliberately never says "revert": the old scope warning did, and an agent
+    dutifully rewriting the same ignored file tripped the per-file edit-loop
+    detector and killed the task (task 61406d02).
+    """
+    if not is_agent_owned(edited_path, repo_root):
+        return None
+    rel = _relative(edited_path, repo_root)
+    if rel.parts[: len(_SCRATCH_PARTS)] == _SCRATCH_PARTS:
+        return None  # already in the blessed scratch dir — nothing to say
+    return (
+        f"[SCRATCH] '{rel}' is inside an agent-owned directory. Those are excluded "
+        f"from every git diff, so nothing written there can reach the PR. If this "
+        f"file is part of the change, write it to a real path in the repo. If it is "
+        f"a draft, note, or throwaway, put it under `{SCRATCH_DIR}/` and move on — "
+        f"do not rewrite it in place."
+    )
+
+
 # ── 1. Scope guard ──────────────────────────────────────────────────────── #
 
 def parse_plan_files(plan_text: str) -> set[str]:
@@ -76,6 +134,8 @@ def check_scope(
 
     Normalises both sides to repo-relative paths before comparing.
     """
+    if is_agent_owned(edited_path, repo_root):
+        return None  # excluded from every git diff — cannot be out of scope
     if not plan_files:
         return None  # no plan → nothing to enforce
     norm = edited_path.removeprefix("./")
@@ -199,12 +259,20 @@ class ScopeGuardHook:
         self.plan_files = parse_plan_files(plan_text)
         self.repo_root = str(repo_path)
         self._on_event = on_event or (lambda kind, text: None)
+        self._nudged: set[str] = set()
+
+    @staticmethod
+    def _context(message: str) -> dict:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": message,
+            }
+        }
 
     async def hook(
         self, input_data: dict, tool_use_id: str | None, context: Any
     ) -> dict:
-        if not self.plan_files:
-            return {}
         if input_data.get("tool_name", "") not in _EDIT_TOOLS:
             return {}
         raw = (
@@ -214,16 +282,21 @@ class ScopeGuardHook:
         )
         if not raw:
             return {}
+        # Checked before the plan gate: an edit to an agent-owned dir is never a
+        # scope violation, with or without a declared plan.
+        nudge = scratch_redirect(str(raw), self.repo_root)
+        if nudge is not None:
+            if str(raw) not in self._nudged:
+                self._nudged.add(str(raw))
+                self._on_event("scratch_redirect", nudge)
+            return self._context(nudge)
+        if not self.plan_files:
+            return {}
         warning = check_scope(str(raw), self.plan_files, self.repo_root)
         if warning is None:
             return {}
         self._on_event("scope_warning", warning)
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": warning,
-            }
-        }
+        return self._context(warning)
 
 
 # ── 5. Commit-time aggregate guard ──────────────────────────────────────── #

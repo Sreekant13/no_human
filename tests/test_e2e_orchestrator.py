@@ -1693,6 +1693,57 @@ async def test_doom_loop_emits_stuck_event(bare_repo, tmp_path, store):
     assert "doom-loop" in stuck_events[0]["text"]
 
 
+# --------------------------------------------------------------------------- #
+# D18: drafts in agent-owned dirs must not trip the per-file edit-loop         #
+# --------------------------------------------------------------------------- #
+
+def _draft_then_read(orch, path: str) -> None:
+    """Write *path* 5× (edit_threshold), interleaving distinct reads.
+
+    The interleaving keeps the doom-loop detector (3× identical consecutive
+    signature) and the ping-pong detector (A-B-A-B) quiet, so the only detector
+    under test is the per-file edit count.
+    """
+    for i in range(5):
+        orch._agent_sink(AgentEvent("tool_use", tool_name="Write",
+                                    tool_input={"file_path": path}))
+        orch._agent_sink(AgentEvent("tool_use", tool_name="Read",
+                                    tool_input={"file_path": f"/repo/src/m{i}.py"}))
+
+
+def test_drafts_in_agent_owned_dirs_do_not_trip_the_edit_loop():
+    """Task 61406d02 died here: the coder drafted in `.no_human/`, the scope
+    guard told it to "revert and stay within the planned file list", and the
+    rewrite tripped the edit-loop. `.no_human/` is excluded from every git diff,
+    so those writes are neither committable nor a doom signal.
+    """
+    from no_human.core.bounds import StuckDetector
+
+    events: list[dict] = []
+    orch = _bare_orch(events.append)
+    orch._stuck = StuckDetector()
+    _draft_then_read(orch, "/repo/.no_human/ci_gate_stage_draft.groovy")
+
+    assert not [e for e in events if e.get("kind") == "stuck"]
+    assert not getattr(orch, "_agent_edited_files", set())
+
+
+def test_repeated_edits_to_a_real_file_still_trip_the_edit_loop():
+    """Positive control for the exemption above — a real source file must still
+    be caught, otherwise the D18 fix silently disables edit-loop detection."""
+    from no_human.core.bounds import StuckDetector
+
+    events: list[dict] = []
+    orch = _bare_orch(events.append)
+    orch._stuck = StuckDetector()
+    _draft_then_read(orch, "/repo/src/calc.py")
+
+    stuck = [e for e in events if e.get("kind") == "stuck"]
+    assert len(stuck) == 1
+    assert "edit-loop" in stuck[0]["text"]
+    assert orch._agent_edited_files == {"/repo/src/calc.py"}
+
+
 class DoomLoopThenFailBackend:
     """Doom-loops on every attempt, then hits max_turns without ever fixing
     anything — so the stuck signal must survive into the failure detail."""
