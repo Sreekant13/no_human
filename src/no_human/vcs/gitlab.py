@@ -5,13 +5,16 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from ._labels import label_args
+
 
 def is_gitlab_remote(url: str) -> bool:
     return "gitlab" in url
 
 
 def open_mr(
-    repo_path: Path, branch: str, title: str, body: str, *, base: str = "main"
+    repo_path: Path, branch: str, title: str, body: str, *, base: str = "main",
+    labels: list[str] | None = None,
 ) -> str:
     """Create an MR and return its URL. Requires `glab` auth.
 
@@ -27,6 +30,7 @@ def open_mr(
             "--description", body,
             "--no-merge",
             "--yes",
+            *label_args(labels),
         ],
         cwd=repo_path, capture_output=True, text=True,
     )

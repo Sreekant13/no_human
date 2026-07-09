@@ -113,6 +113,70 @@ async def test_full_pipeline_opens_local_pr(bare_repo, tmp_path, store):
     assert "pr_open" in kinds and "commit" in kinds
 
 
+async def _run_and_capture_pr_labels(bare_repo, tmp_path, store, monkeypatch,
+                                     *, git_labels=None, task_config=None):
+    """Run the pipeline to _finalize and return the labels passed to open_pr."""
+    from no_human.core import orchestrator as orch_mod
+
+    captured = {}
+    real_open_pr = orch_mod.open_pr
+
+    def spy_open_pr(repo, branch, title, body, **kwargs):
+        captured["labels"] = kwargs.get("labels")
+        return real_open_pr(repo, branch, title, body,
+                            **{k: v for k, v in kwargs.items() if k != "labels"})
+
+    monkeypatch.setattr(orch_mod, "open_pr", spy_open_pr)
+
+    cfg = _config(tmp_path)
+    if git_labels is not None:
+        cfg.data["git"]["pr_labels"] = git_labels
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+    if task_config is not None:
+        t.config = task_config
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    return captured["labels"]
+
+
+async def test_pr_labels_come_from_git_config(bare_repo, tmp_path, store, monkeypatch):
+    labels = await _run_and_capture_pr_labels(
+        bare_repo, tmp_path, store, monkeypatch, git_labels=["V17"])
+    assert labels == ["V17"]
+
+
+async def test_task_config_overrides_global_pr_labels(bare_repo, tmp_path, store,
+                                                      monkeypatch):
+    labels = await _run_and_capture_pr_labels(
+        bare_repo, tmp_path, store, monkeypatch,
+        git_labels=["V17"], task_config={"pr_labels": ["V18"]})
+    assert labels == ["V18"]
+
+
+async def test_task_can_opt_out_of_global_pr_labels(bare_repo, tmp_path, store,
+                                                    monkeypatch):
+    """An explicit [] on the task means "no labels" — not "fall back to global"."""
+    labels = await _run_and_capture_pr_labels(
+        bare_repo, tmp_path, store, monkeypatch,
+        git_labels=["V17"], task_config={"pr_labels": []})
+    assert labels == []
+
+
 async def test_default_branch_auto_detect_warns_on_stale_local_checkout(tmp_path, store):
     """C3: a local checkout stuck on 'master' while the remote's real default
     moved to 'main' must be caught even when no ProjectProfile.default_branch

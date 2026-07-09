@@ -5,6 +5,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from ._labels import label_args
+
 
 def is_github_remote(url: str, extra_hosts: tuple[str, ...] | list[str] = ()) -> bool:
     """True for github.com or any configured GitHub Enterprise host.
@@ -19,13 +21,19 @@ def is_github_remote(url: str, extra_hosts: tuple[str, ...] | list[str] = ()) ->
 
 
 def open_pr(
-    repo_path: Path, branch: str, title: str, body: str, *, base: str = "main"
+    repo_path: Path, branch: str, title: str, body: str, *, base: str = "main",
+    labels: list[str] | None = None,
 ) -> str:
     """Create a draft PR and return its URL. Requires `gh` auth.
 
     Idempotent: if a PR already exists for ``branch`` (e.g. when revising after a
     human PR comment, which pushes onto the same branch), return the existing PR's
     URL instead of failing — the push has already updated it. Never merges.
+
+    ``labels`` are applied at creation time, not after, so a CI job that validates
+    labels on PR-open never observes an unlabelled PR. A label that doesn't exist
+    on the repo makes `gh` fail the whole create — that surfaces as a loud error
+    rather than a silently mislabelled PR.
     """
     proc = subprocess.run(
         [
@@ -35,6 +43,7 @@ def open_pr(
             "--title", title,
             "--body", body,
             "--draft",
+            *label_args(labels),
         ],
         cwd=repo_path, capture_output=True, text=True,
     )
