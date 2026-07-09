@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from .db import Store
+from .events import EventPersister
 from .task import TaskStatus
 
 log = logging.getLogger("no_human.scheduler")
@@ -204,10 +205,11 @@ class Scheduler:
 
         notify = self._event_notify.setdefault(task.id, asyncio.Event())
 
-        # Events not yet written to SQLite. `save_events` INSERTs, so only the
-        # unflushed tail may be handed to it — re-sending `buf` would duplicate
-        # every row.
-        pending: list[dict] = []
+        # Events reach SQLite while the run is live, so a crash can't take the
+        # whole history with it (and `buf` above is capped, so a chatty run used
+        # to drop its earliest events even on a clean finish).
+        persister = EventPersister(self.store, task.id,
+                                   interval=self._EVENT_FLUSH_INTERVAL)
 
         def _sink(event):
             event["ts"] = time.time()
@@ -218,40 +220,13 @@ class Scheduler:
             # dispatch in a run down to one node in the System view.
             event.setdefault("task_id", task.id)
             buf.append(event)
-            pending.append(event)
+            persister.record(event)
             notify.set()
             summary = _summarize_event(event)
             if summary:
                 self._live_status[task.id] = summary
 
-        async def _flush_events() -> None:
-            """Drain `pending` into SQLite. Never raises — persistence must not
-            break the pool (a failed batch is dropped, exactly as before)."""
-            if not pending:
-                return
-            batch, pending[:] = list(pending), []
-            try:
-                await self.store.save_events(task.id, batch)
-            except Exception:  # noqa: BLE001 — persistence must not break the pool
-                log.warning("failed to persist %d events for task %s",
-                            len(batch), task.id[:8])
-
-        # Stopped by an event, not by cancel(): cancelling could land inside
-        # save_events after the batch was already taken off `pending`, dropping
-        # it. CancelledError is not an Exception, so _flush_events can't absorb it.
-        stop_flusher = asyncio.Event()
-
-        async def _flusher() -> None:
-            while not stop_flusher.is_set():
-                try:
-                    await asyncio.wait_for(stop_flusher.wait(),
-                                           timeout=self._EVENT_FLUSH_INTERVAL)
-                except asyncio.TimeoutError:
-                    pass
-                await _flush_events()
-
-        flusher = asyncio.create_task(_flusher())
-
+        persister.start()
         try:
             orch = self.factory(task)
             orch._sink = _sink
@@ -285,9 +260,7 @@ class Scheduler:
                 # The SSE endpoint checks inflight and closes after idle ticks.
 
             # Stop the periodic flusher, then write whatever it hasn't taken.
-            stop_flusher.set()
-            await flusher
-            await _flush_events()
+            await persister.aclose()
 
             # Compound-parent completion: if this task is a sub-task, check
             # whether the parent compound task should transition.
