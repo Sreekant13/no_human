@@ -84,6 +84,9 @@ class Store:
             # recorded it, which is how a frozen config.yaml silently inverted
             # coder and reviewer for a week.
             "models": "TEXT DEFAULT '{}'",
+            # Which subscription paid for this attempt (profile name, never a
+            # token). NULL on attempts that predate auth profiles.
+            "auth_profile": "TEXT",
         }
         for col, decl in att_wanted.items():
             if col not in att_existing:
