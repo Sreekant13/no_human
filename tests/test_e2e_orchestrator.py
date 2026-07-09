@@ -2703,6 +2703,45 @@ async def test_supervisor_model_is_recorded_and_is_not_the_reviewers(tmp_path, s
     )
 
 
+def test_no_size_cap_by_default(tmp_path, store):
+    """A line/file count cannot tell a legitimately large change from a runaway
+    refactor, and the check runs after the commit — so it never saved compute, it
+    only stopped lint, tests, the reviewer and the PR from running. Task 84251cb2
+    wrote a correct 645-line Jenkinsfile stage and was escalated for it.
+
+    Scope is guarded semantically instead: the plan's FILES TO CHANGE list, the
+    tamper guard, the evidence-based reviewer, and the human approving the PR."""
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None), SlackNotifier(None))
+    huge = _SimpleNamespace(insertions=10_000, deletions=5_000, files_changed=300)
+
+    assert cfg.data["safety"]["max_lines_changed"] is None
+    assert cfg.data["safety"]["max_files_changed"] is None
+    assert orch._over_size_limits(huge, Task.new("big", repo_path="/tmp/x")) is None
+
+
+def test_an_opted_in_cap_still_escalates(tmp_path, store):
+    """The cap is off, not gone: an install that wants one still gets it."""
+    cfg = _config(tmp_path)
+    cfg.data["safety"]["max_lines_changed"] = 500
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None), SlackNotifier(None))
+    commit = _SimpleNamespace(insertions=605, deletions=0, files_changed=3)
+
+    assert "max_lines_changed (605 > 500)" in orch._over_size_limits(
+        commit, Task.new("ci_gate", repo_path="/tmp/x")
+    )
+
+
+def test_a_non_positive_cap_means_unlimited(tmp_path, store):
+    """0 is a natural way to spell "no cap"; it must not block every commit."""
+    cfg = _config(tmp_path)
+    cfg.data["safety"] = {"max_files_changed": 0, "max_lines_changed": 0}
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None), SlackNotifier(None))
+    commit = _SimpleNamespace(insertions=1, deletions=0, files_changed=1)
+
+    assert orch._over_size_limits(commit, Task.new("t", repo_path="/tmp/x")) is None
+
+
 def test_size_limits_honour_a_per_task_override(tmp_path, store):
     """The SCOPE_EXPLOSION blocker offers the human 'raise the limit for this
     task', but the limit was read from global config alone — answering that way
