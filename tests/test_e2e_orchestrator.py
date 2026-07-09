@@ -2225,3 +2225,26 @@ async def test_supervisor_model_is_recorded_and_is_not_the_reviewers(tmp_path, s
     assert models["supervisor"] != models["reviewer"], (
         "the supervisor must no longer inherit the reviewer's tier"
     )
+
+
+def test_size_limits_honour_a_per_task_override(tmp_path, store):
+    """The SCOPE_EXPLOSION blocker offers the human 'raise the limit for this
+    task', but the limit was read from global config alone — answering that way
+    produced the identical blocker on the next attempt."""
+    cfg = _config(tmp_path)
+    cfg.data["safety"] = {"max_files_changed": 20, "max_lines_changed": 500}
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None), SlackNotifier(None))
+    commit = _SimpleNamespace(insertions=605, deletions=0, files_changed=3)
+
+    t = Task.new("ci_gate", repo_path="/tmp/x")
+    assert "max_lines_changed (605 > 500)" in orch._over_size_limits(commit, t)
+
+    t.config = {"max_lines_changed": 800}
+    assert orch._over_size_limits(commit, t) is None
+
+    # The file limit is independent and still applies.
+    t.config = {"max_lines_changed": 800, "max_files_changed": 2}
+    assert "max_files_changed (3 > 2)" in orch._over_size_limits(commit, t)
+
+    # No task, or no override: global config governs.
+    assert "605 > 500" in orch._over_size_limits(commit, None)
