@@ -7,6 +7,8 @@ Blocks, before execution:
     fires even under bypass permissions
   - `git merge` of any kind — the agent never merges (§3.2)
   - interactive prompts (`AskUserQuestion`) — nobody is at the keyboard (§22)
+  - background polling (`Monitor`, `TaskStop`, `ToolSearch`) in a read-only
+    session — a planner does not need to busy-wait on its own subagents
 
 The orchestrator wraps :func:`evaluate` in a Claude Agent SDK PreToolUse hook;
 keeping the policy a pure function lets us unit-test it without the SDK.
@@ -27,6 +29,27 @@ WRITE_TOOLS = {"Write", "Edit", "NotebookEdit", "MultiEdit"}
 # "No answer given — I'll default to ...". Denying is only half the fix: the
 # reason has to tell the agent what to do instead, or it just retries.
 INTERACTIVE_TOOLS = {"AskUserQuestion"}
+
+# Background-orchestration tools. A read-only session (planner, aggregator,
+# reviewer) explores and reports; it never needs to run work in the background
+# and poll for it. Observed in run 0305e5ce/087e2d3a: the `test-first` proposer
+# used ToolSearch to discover Monitor and TaskStop, spawned two real research
+# subagents, then spawned FIVE more subagents whose entire job was to wait for
+# them ("idle wait for agent a422b247…", "idle until agent 2 completes"). It
+# burned 100 events against the `minimal-first` lens's 22 for the same one plan
+# draft, and gathered nothing with any of it.
+#
+# The `Agent` tool is deliberately NOT denied: it returns its result directly.
+# The `risk-first` lens proves it — three subagents, zero Monitor/TaskStop calls,
+# draft delivered.
+BACKGROUND_TOOLS = {"Monitor", "TaskStop", "ToolSearch"}
+
+_NO_POLLING_REASON = (
+    "{tool} is unavailable in a read-only session. The Agent tool returns its "
+    "result to you directly when the subagent finishes — do not spawn helpers "
+    "to wait for it, and do not poll. Read, Grep, Glob, Bash and Agent are all "
+    "you need; use them and write your report."
+)
 
 _NO_HUMAN_REASON = (
     "{tool} is unavailable: this session is headless and no human will ever "
@@ -103,9 +126,12 @@ def evaluate(
     if tool_name in INTERACTIVE_TOOLS:
         return GuardDecision(False, _NO_HUMAN_REASON.format(tool=tool_name))
 
-    # 1. Reviewer / read-only mode: block ALL writes unconditionally.
+    # 1. Reviewer / read-only mode: block ALL writes, and the polling tools that
+    #    let a planner invent a busy-wait loop instead of doing its job.
     if readonly and tool_name in WRITE_TOOLS:
         return GuardDecision(False, f"read-only session: {tool_name} blocked")
+    if readonly and tool_name in BACKGROUND_TOOLS:
+        return GuardDecision(False, _NO_POLLING_REASON.format(tool=tool_name))
 
     # 2. Writes to forbidden paths.
     if tool_name in WRITE_TOOLS:

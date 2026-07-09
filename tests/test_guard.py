@@ -116,3 +116,37 @@ async def test_pretooluse_hook_allows_a_normal_tool():
     hook = _make_guard_hook(FORBIDDEN, PROTECTED)
     out = await hook({"tool_name": "Read", "tool_input": {"file_path": "a.py"}}, None, None)
     assert out == {}, "an allowed tool must return an empty hook result"
+
+
+# --------------------------------------------------------------------------- #
+# A read-only planner must not busy-wait on its own subagents                  #
+# --------------------------------------------------------------------------- #
+
+def _ro(tool, inp=None):
+    return guard.evaluate(tool, inp or {}, forbidden_paths=FORBIDDEN,
+                          never_push_to=PROTECTED, readonly=True)
+
+
+def test_readonly_session_cannot_poll_for_its_subagents():
+    """Run 087e2d3a: the test-first proposer used ToolSearch to find Monitor and
+    TaskStop, then spawned five subagents whose only job was to wait for two
+    other subagents — 100 events against minimal-first's 22, for the same one
+    plan draft."""
+    for tool in ("Monitor", "TaskStop", "ToolSearch"):
+        d = _ro(tool)
+        assert not d.allow, f"{tool} must be denied in a read-only session"
+        assert "do not poll" in d.reason
+
+
+def test_readonly_session_keeps_the_tools_it_actually_needs():
+    """The Agent tool returns its result directly — risk-first spawned three
+    subagents with zero Monitor calls. Denying it would break real research."""
+    for tool in ("Read", "Grep", "Glob", "Agent"):
+        assert _ro(tool, {"file_path": "Jenkinsfile"}).allow, f"{tool} must stay"
+    assert _ro("Bash", {"command": "git log --oneline -5"}).allow
+
+
+def test_the_coder_may_still_use_background_tools():
+    """Only read-only sessions are restricted; the implementer is not."""
+    for tool in ("Monitor", "TaskStop", "ToolSearch"):
+        assert _ev(tool, {}).allow, f"{tool} must remain available to the coder"
