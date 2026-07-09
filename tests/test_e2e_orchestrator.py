@@ -2184,3 +2184,26 @@ def test_active_models_reads_the_live_objects_not_the_config(tmp_path, store):
     models = orch._active_models()
     assert models["coder"] == "the-model-really-bound"
     assert models["reviewer"] == "reviewer-really-bound"
+
+
+async def test_models_are_recorded_before_planning_not_just_at_attempt_start(
+    bare_repo, tmp_path, store,
+):
+    """A task killed during planning must still say which model held which role.
+    Observed live: 166 events survived a SIGKILL and not one named a model,
+    because the only `models` event fired at attempt start."""
+    cfg = _config(tmp_path)
+    events: list[dict] = []
+    backend = FakeBackend(lambda cwd: None)
+    backend.model = "claude-sonnet-5"
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    kinds = [e["kind"] for e in events]
+    first_models = kinds.index("models")
+    assert first_models < kinds.index("state"), "models must precede context/planning"
+    assert events[first_models]["models"]["coder"] == "claude-sonnet-5"
