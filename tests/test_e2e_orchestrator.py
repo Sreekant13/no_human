@@ -5,9 +5,11 @@ push -> open local PR -> awaiting_approval) without spending LLM quota. A second
 case proves the tamper guard blocks a test-weakening change and escalates.
 """
 
+import json
 import subprocess
 
 import pytest
+from types import SimpleNamespace as _SimpleNamespace
 
 from no_human.agent.claude_backend import AgentEvent, AgentResult
 from no_human.config import load_config
@@ -2134,3 +2136,51 @@ async def test_intake_evaluator_failure_does_not_block_pipeline(
     outcome = await orch.run_task(t)
     # Task proceeds past evaluator failure — not stuck.
     assert outcome is not None
+
+
+# --------------------------------------------------------------------------- #
+# Which model ran which role is recorded (the blind spot that hid config drift) #
+# --------------------------------------------------------------------------- #
+
+async def test_attempt_records_the_model_bound_to_each_role(bare_repo, tmp_path, store):
+    def mutate(cwd):
+        (cwd / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+
+    cfg = _config(tmp_path)
+    events: list[dict] = []
+    backend = FakeBackend(mutate)
+    backend.model = "claude-sonnet-5"
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("tweak add()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    # 1. Emitted, so it lands in the log, the board and task_events.
+    ev = next(e for e in events if e["kind"] == "models")
+    assert ev["models"]["coder"] == "claude-sonnet-5"
+    assert ev["models"]["planner"] == cfg.data["llm"]["planner_model"]
+    assert "claude-sonnet-5" in ev["text"]
+
+    # 2. Persisted on the attempt row.
+    rows = await store.db.execute(
+        "SELECT models FROM attempts WHERE task_id = ?", (t.id,))
+    row = await rows.fetchone()
+    assert json.loads(row["models"])["coder"] == "claude-sonnet-5"
+
+
+def test_active_models_reads_the_live_objects_not_the_config(tmp_path, store):
+    """Reading config is exactly what hid the drift: a frozen config.yaml
+    shadows the default, so config and reality disagreed for a week."""
+    cfg = _config(tmp_path)
+    cfg.data["llm"]["primary_model"] = "a-model-that-is-not-actually-running"
+
+    backend = FakeBackend(lambda cwd: None)
+    backend.model = "the-model-really-bound"
+    reviewer = _SimpleNamespace(model="reviewer-really-bound")
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None), reviewer=reviewer)
+
+    models = orch._active_models()
+    assert models["coder"] == "the-model-really-bound"
+    assert models["reviewer"] == "reviewer-really-bound"

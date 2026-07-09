@@ -5,7 +5,7 @@ import {
   connectTaskSSE,
 } from "./api.js";
 import Markdown from "./Markdown.jsx";
-import { ROLE_LABEL, discoverSubagents, eventSource } from "./eventRoles.js";
+import { ROLE_LABEL, discoverSubagents, eventSource, modelsByNode } from "./eventRoles.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
 const IconCheck = ({ size = 14, className = "" }) => (
@@ -580,6 +580,7 @@ function AgentNode({ agent, state, isActive, onClick }) {
         <span className="sys-node-type">{agent.type}</span>
       </div>
       <div className="sys-node-name">{agent.label}</div>
+      {agent.model && <div className="sys-node-model" title={agent.model}>{agent.model}</div>}
       <div className="sys-node-body">
         <div className="sys-node-meta">
           <span className="sys-node-meta-label">Status:</span>
@@ -722,11 +723,17 @@ function SystemTab({ taskId, task, isActive }) {
   const hasReviewer   = has("reviewer");
   const hasRow1       = hasAgent || hasReviewer;
 
+  // Label each node with the model that actually ran it (from the `models`
+  // event), so "the coder is Sonnet 5" is verifiable at a glance rather than
+  // assumed from a config file that may be shadowing the real default.
+  const nodeModels = modelsByNode(events);
+  const withModel  = (a) => (a && nodeModels[a.id] ? { ...a, model: nodeModels[a.id] } : a);
+
   const worker     = AGENTS.find(a => a.id === "worker");
-  const planner    = AGENTS.find(a => a.id === "planner");
-  const agent      = AGENTS.find(a => a.id === "agent");
+  const planner    = withModel(AGENTS.find(a => a.id === "planner"));
+  const agent      = withModel(AGENTS.find(a => a.id === "agent"));
   const supervisor = AGENTS.find(a => a.id === "supervisor");
-  const reviewer   = AGENTS.find(a => a.id === "reviewer");
+  const reviewer   = withModel(AGENTS.find(a => a.id === "reviewer"));
 
   if (events.length === 0) {
     return (

@@ -40,6 +40,24 @@ export function eventLens(e) {
   return src.startsWith("planner:") ? src.slice("planner:".length) : null;
 }
 
+// The orchestrator emits one `models` event per attempt naming the model bound
+// to each role. Map those role names onto the diagram's node ids so each node
+// can say which model ran it — the check that would have caught a frozen
+// config.yaml inverting coder and reviewer.
+const MODEL_ROLE_TO_NODE = { coder: "agent", planner: "planner", reviewer: "reviewer" };
+
+export function modelsByNode(events) {
+  const out = {};
+  for (const e of events) {
+    if (e.kind !== "models" || !e.models) continue;
+    for (const [role, model] of Object.entries(e.models)) {
+      const node = MODEL_ROLE_TO_NODE[role];
+      if (node && model) out[node] = model;   // a later attempt wins
+    }
+  }
+  return out;
+}
+
 // Discover subagents from events at render time. Each one is attributed to the
 // role that spawned it — a planner proposer's investigation subagent is not the
 // Coder's work, and rendering it under Coder is how the diagram used to lie.

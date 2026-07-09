@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { ROLE_LABEL, discoverSubagents, eventLens, eventSource } from "./eventRoles.js";
+import { ROLE_LABEL, discoverSubagents, eventLens, eventSource, modelsByNode } from "./eventRoles.js";
 
 test("planner lenses and the aggregator fold onto one Planner node", () => {
   assert.equal(eventSource({ source: "planner" }), "planner");
@@ -96,4 +96,31 @@ test("old persisted events (source:'agent' on everything) still render", () => {
   ]);
   assert.equal(subs[0].parent, "agent");
   assert.equal(subs[0].lens, null);
+});
+
+test("each node is labelled with the model that actually ran it", () => {
+  const models = modelsByNode([
+    { kind: "state", text: "implementing" },
+    { kind: "models", models: { coder: "claude-sonnet-5", planner: "claude-opus-4-8",
+                                reviewer: "claude-opus-4-8" } },
+  ]);
+  assert.deepEqual(models, {
+    agent: "claude-sonnet-5",
+    planner: "claude-opus-4-8",
+    reviewer: "claude-opus-4-8",
+  });
+});
+
+test("a later attempt's models win, and events without them are ignored", () => {
+  assert.deepEqual(modelsByNode([]), {});
+  assert.deepEqual(modelsByNode([{ kind: "models" }]), {});
+  const models = modelsByNode([
+    { kind: "models", models: { coder: "old-model" } },
+    { kind: "models", models: { coder: "claude-sonnet-5" } },
+  ]);
+  assert.equal(models.agent, "claude-sonnet-5");
+});
+
+test("an unknown role never invents a node", () => {
+  assert.deepEqual(modelsByNode([{ kind: "models", models: { supervisor: "x" } }]), {});
 });

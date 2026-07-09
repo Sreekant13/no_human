@@ -425,6 +425,9 @@ class AdversarialReviewer:
                 model=model,
                 readonly=True,
             )
+        # The model actually bound to this reviewer, read back from the backend
+        # so an injected one reports itself rather than the default kwarg.
+        self.model = getattr(self._backend, "model", model)
         self._on_event = on_event
 
     async def review(

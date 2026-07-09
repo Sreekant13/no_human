@@ -80,6 +80,10 @@ class Store:
         att_wanted = {
             "cache_read_tokens": "INTEGER DEFAULT 0",
             "cache_creation_tokens": "INTEGER DEFAULT 0",
+            # Which model actually ran which role on this attempt. Nothing
+            # recorded it, which is how a frozen config.yaml silently inverted
+            # coder and reviewer for a week.
+            "models": "TEXT DEFAULT '{}'",
         }
         for col, decl in att_wanted.items():
             if col not in att_existing:
