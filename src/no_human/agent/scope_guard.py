@@ -34,6 +34,12 @@ from typing import Any, Callable
 #: edit-loop.  no_human itself writes ``.no_human/PLAN.md`` for the agent to read.
 AGENT_OWNED_DIRS = frozenset({".no_human", ".claude", ".devin", ".windsurf"})
 
+#: Agent-authored files, likewise excluded from every git diff wherever they sit.
+#: The orchestrator's own comment (core/orchestrator.py, plan materialization)
+#: records why: a root ``PLAN.md`` outlives the run and the next planner reads it
+#: back as repo content. Same class as the dirs above, not a build artifact.
+AGENT_OWNED_FILES = frozenset({"PLAN.md", "HANDOVER.md"})
+
 #: Repo-relative scratch directory the coder is told to use for drafts and notes.
 SCRATCH_DIR = ".no_human/scratch"
 _SCRATCH_PARTS = Path(SCRATCH_DIR).parts
@@ -53,11 +59,15 @@ def _relative(path: str | Path, repo_root: str | Path = "") -> Path:
 def is_agent_owned(path: str | Path, repo_root: str | Path = "") -> bool:
     """True when *path* lives inside a directory owned by agent tooling.
 
-    When *repo_root* is unknown the check runs against the absolute path, so a
-    repo checked out *inside* an agent-owned directory would read as wholly
-    agent-owned.  That only disables two advisory guards — never correctness.
+    Pass *repo_root* whenever it is known.  Without it the check runs against the
+    absolute path, and a checkout that lives *inside* an agent-owned directory —
+    a concurrency worktree under ``~/.no_human/worktrees/`` is exactly that —
+    reads as wholly agent-owned, switching both guards off.
     """
-    return any(part in AGENT_OWNED_DIRS for part in _relative(path, repo_root).parts)
+    rel = _relative(path, repo_root)
+    if any(part in AGENT_OWNED_DIRS for part in rel.parts):
+        return True
+    return rel.name in AGENT_OWNED_FILES
 
 
 def scratch_redirect(
@@ -75,11 +85,11 @@ def scratch_redirect(
     if rel.parts[: len(_SCRATCH_PARTS)] == _SCRATCH_PARTS:
         return None  # already in the blessed scratch dir — nothing to say
     return (
-        f"[SCRATCH] '{rel}' is inside an agent-owned directory. Those are excluded "
-        f"from every git diff, so nothing written there can reach the PR. If this "
-        f"file is part of the change, write it to a real path in the repo. If it is "
-        f"a draft, note, or throwaway, put it under `{SCRATCH_DIR}/` and move on — "
-        f"do not rewrite it in place."
+        f"[SCRATCH] '{rel}' is an agent-owned path, excluded from every git diff, "
+        f"so nothing written there can reach the PR. If this file is part of the "
+        f"change, write it to a real path in the repo. If it is a draft, note, or "
+        f"throwaway, put it under `{SCRATCH_DIR}/` and move on — do not rewrite it "
+        f"in place."
     )
 
 

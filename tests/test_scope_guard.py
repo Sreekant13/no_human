@@ -132,12 +132,28 @@ def test_agent_owned_dirs_are_all_excluded_from_every_git_diff():
     bug there would commit a secret), so lock the two together with a test: add a
     dir to _EPHEMERAL without adding it here and edits to it start counting as
     scope violations and edit-loops again — the bug that killed task 61406d02."""
-    from no_human.agent.scope_guard import AGENT_OWNED_DIRS
+    from no_human.agent.scope_guard import AGENT_OWNED_DIRS, AGENT_OWNED_FILES
     from no_human.vcs.git import GitRepo
 
     excluded = " ".join(GitRepo._EPHEMERAL)
     for d in AGENT_OWNED_DIRS:
         assert f"**/{d}/**" in excluded, f"{d!r} is not excluded by _EPHEMERAL"
+    for f in AGENT_OWNED_FILES:
+        assert f"**/{f}" in excluded, f"{f!r} is not excluded by _EPHEMERAL"
+
+
+def test_agent_authored_files_are_never_scope_violations():
+    """`_EPHEMERAL` drops `**/PLAN.md` and `**/HANDOVER.md` from every diff, so a
+    coder that writes one gets a scope warning for a file it can never commit —
+    the D18 shape, one directory over."""
+    plan_files = {"src/foo.py"}
+    assert check_scope("PLAN.md", plan_files) is None
+    assert check_scope("docs/HANDOVER.md", plan_files) is None
+    assert is_agent_owned("/repo/PLAN.md", "/repo")
+    nudge = scratch_redirect("PLAN.md")
+    assert nudge is not None and SCRATCH_DIR in nudge
+    # …and an ordinary markdown file is still policed.
+    assert check_scope("docs/README.md", plan_files) is not None
 
 
 def test_is_agent_owned_relative_and_absolute():
