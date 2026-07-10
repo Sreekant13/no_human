@@ -125,8 +125,11 @@ class _ReviewerBackend:
         return self._results.pop(0)
 
 
+# NB: the parser reads "items", not "checklist". This fixture originally used
+# "checklist", so items parsed as [] — and the test only passed because of the
+# vacuous-pass bug (empty checklist + passed:true ⇒ pass) the gate fix removed.
 _VERDICT = (
-    'REVIEW_JSON_START {"passed": true, "checklist": '
+    'REVIEW_JSON_START {"passed": true, "items": '
     '[{"label": "ok", "passed": true, "evidence": "calc.py:1"}]} REVIEW_JSON_END'
 )
 _MAX_TURNS_ERROR = "Claude Code returned an error result: Reached maximum number of turns (10)"
@@ -170,9 +173,12 @@ async def test_a_real_failing_verdict_is_never_retried_or_swallowed(tmp_path):
     """A genuine FAIL is a finding, not an infra error: return it on round one."""
     from no_human.review.reviewer import AdversarialReviewer
 
+    # "items", not "checklist" — with the wrong key this asserted False for the
+    # wrong reason (empty checklist fails closed) instead of the failing finding.
     fail = (
-        'REVIEW_JSON_START {"passed": false, "checklist": '
-        '[{"label": "bug", "passed": false, "evidence": "calc.py:3"}]} REVIEW_JSON_END'
+        'REVIEW_JSON_START {"passed": false, "items": '
+        '[{"label": "bug", "passed": false, "severity": "high", '
+        '"evidence": "calc.py:3"}]} REVIEW_JSON_END'
     )
     backend = _ReviewerBackend(_FakeAgentResult(fail))
     decision = await AdversarialReviewer(backend=backend)._agent_review("p", tmp_path)

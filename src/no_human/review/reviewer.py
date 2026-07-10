@@ -79,6 +79,17 @@ class ReviewDecision:
     def failed_items(self) -> list[ChecklistItem]:
         return [i for i in self.checklist if not i.passed]
 
+    @property
+    def blocking_items(self) -> list[ChecklistItem]:
+        """Failing findings the reviewer graded critical/high/medium, or left
+        unclassified. These, and only these, fail the gate."""
+        return [i for i in self.checklist if _is_blocking(i)]
+
+    @property
+    def advisory_items(self) -> list[ChecklistItem]:
+        """Failing findings graded low/nit: surfaced to the human, never blocking."""
+        return [i for i in self.failed_items if not _is_blocking(i)]
+
     def as_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "passed": self.passed,
@@ -337,13 +348,32 @@ def _build_review_prompt(
         "  when it should merge/add? Are repeated calls (comments, artifacts,\n"
         "  triggers) idempotent?\n\n"
         "For each finding, cite the specific file:line from the diff.\n\n"
+        "Classify every finding with a severity, exactly one of:\n"
+        "  critical — data loss, security hole, or the change cannot work at all\n"
+        "  high     — a real defect that will fire in normal use\n"
+        "  medium   — a real defect on a plausible path, or a missed acceptance\n"
+        "             criterion\n"
+        "  low      — works, but should be better: naming, duplication, style\n"
+        "  nit      — cosmetic, or a preference\n"
+        "Severity is a classification, never a score. critical/high/medium block\n"
+        "the change; low/nit are recorded for the human and do not block.\n\n"
+        "Judge SCOPE against the acceptance criteria above, not against your own\n"
+        "taste. If the change does something the criteria do not ask for, that is\n"
+        "'low' at most — unless it introduces a correctness, security or\n"
+        "reliability defect, in which case grade the defect on its own merits. Do\n"
+        "not demand work the criteria do not require.\n\n"
         "Limit your output to at most 5 checklist items. If you find more than 5\n"
-        "issues, consolidate the least critical ones into a single 'minor issues'\n"
-        "item. Focus your detailed items on the most impactful findings.\n\n"
+        "issues, consolidate ONLY the low/nit ones into a single 'minor issues'\n"
+        "item with severity 'nit'. NEVER put a medium-or-higher finding in that\n"
+        "bucket — report it as its own item. Focus your detailed items on the most\n"
+        "impactful findings.\n\n"
         "Rules:\n"
         + tool_rule
         + "  - Pass/fail only. No numeric scores.\n"
-        "  - 'passed: true' means ALL criteria are demonstrably met.\n\n"
+        "  - 'passed: true' means ALL criteria are demonstrably met.\n"
+        "  - Set 'passed: true' when the only remaining findings are low/nit.\n"
+        "  - Every item MUST carry a severity. An unclassified finding is treated\n"
+        "    as blocking.\n\n"
         "Output EXACTLY this format (and NOTHING after it):\n\n"
         "REVIEW_JSON_START\n"
         '{"passed": true_or_false,\n'
@@ -352,6 +382,7 @@ def _build_review_prompt(
         ' "suggested_next": "one-sentence hint for the next attempt" or null,\n'
         ' "items": [\n'
         '  {"label": "short label", "passed": true_or_false,\n'
+        '   "severity": "critical|high|medium|low|nit",\n'
         '   "evidence": "detailed explanation of the finding",\n'
         '   "file": "path/to/file.py", "line": 42,\n'
         '   "comment": "PR comment written in a natural, human voice"}\n'
@@ -495,6 +526,18 @@ def _build_code_review_prompt(
     )
 
 
+# Severities that block the gate. Anything a reviewer leaves unclassified is
+# blocking too: the gate degrades safe, never open.
+ADVISORY_SEVERITIES = frozenset({"low", "nit"})
+
+
+def _is_blocking(item: ChecklistItem) -> bool:
+    """A failing finding blocks unless the reviewer graded it low or nit."""
+    if item.passed:
+        return False
+    return (item.severity or "").strip().lower() not in ADVISORY_SEVERITIES
+
+
 def _reached_no_verdict(decision: ReviewDecision) -> bool:
     """True when the reviewer emitted no REVIEW_JSON block at all.
 
@@ -539,16 +582,43 @@ def _parse_review_output(text: str) -> ReviewDecision:
         )
         for i in (data.get("items") or [])
     ]
-    # Reviewer's explicit "passed" field AND all items must agree.
-    all_pass = all(i.passed for i in items)
-    passed = bool(data.get("passed", False)) and all_pass
-    # D4: extract two-stage verdicts and suggested_next (backward-compatible).
     stages = data.get("stages") if isinstance(data.get("stages"), dict) else None
     suggested_next = data.get("suggested_next") if isinstance(data.get("suggested_next"), str) else None
     return ReviewDecision(
-        passed=passed, checklist=items, raw_output=text,
+        passed=_gate_verdict(items, data, stages),
+        checklist=items, raw_output=text,
         suggested_next=suggested_next, stages=stages,
     )
+
+
+def _gate_verdict(
+    items: list[ChecklistItem], data: dict[str, Any], stages: dict | None
+) -> bool:
+    """Decide the gate deterministically from the reviewer's own evidence.
+
+    The old rule was ``reviewer.passed AND every item passed``. The gate prompt
+    tells the reviewer to consolidate surplus findings into a single 'minor
+    issues' item — so on any diff with more than five findings the reviewer
+    manufactured a failing item, and the gate could never pass. That is why
+    no_human had never opened a reviewed PR: not the tasks, the arithmetic.
+
+    Now a *blocking* finding is one the reviewer graded critical/high/medium —
+    or did not grade at all. low/nit findings are recorded and surfaced to the
+    human, and never block. Every other way out fails closed:
+      - no items at all: absence of evidence is not evidence of passing;
+      - `spec_compliance` false: a missed acceptance criterion is never a nit;
+      - reviewer says `passed: false` while flagging nothing: it disagrees with
+        its own checklist, so trust the "no".
+    """
+    if not items:
+        return False
+    if stages and stages.get("spec_compliance", {}).get("passed") is False:
+        return False
+    if any(_is_blocking(i) for i in items):
+        return False
+    reviewer_passed = bool(data.get("passed", False))
+    any_failing = any(not i.passed for i in items)
+    return reviewer_passed or any_failing
 
 
 class AdversarialReviewer:

@@ -1,0 +1,180 @@
+"""The review gate was arithmetically unpassable (M2.2, forced by task 84251cb2).
+
+`passed = reviewer.passed AND every item passed`, while the gate prompt told the
+reviewer to "consolidate the least critical ones into a single 'minor issues'
+item". So any diff with more than five findings manufactured a failing item and
+the gate could never pass. That, not task difficulty, is why no_human had never
+opened a reviewed PR.
+
+A blocking finding is now one graded critical/high/medium — or ungraded. low and
+nit are recorded for the human and never block. Every other route fails closed.
+"""
+
+import json
+
+import pytest
+
+from no_human.review.reviewer import (
+    ADVISORY_SEVERITIES,
+    ReviewDecision,
+    _build_review_prompt,
+    _parse_review_output,
+)
+from no_human.review.selfcheck import ChecklistItem
+from no_human.core.task import Task
+
+
+def _decision(items, *, passed=True, stages=None) -> ReviewDecision:
+    payload = {"passed": passed, "items": items}
+    if stages is not None:
+        payload["stages"] = stages
+    return _parse_review_output(
+        "REVIEW_JSON_START " + json.dumps(payload) + " REVIEW_JSON_END"
+    )
+
+
+def _item(label, ok, sev, **kw):
+    return {"label": label, "passed": ok, "severity": sev,
+            "evidence": kw.get("evidence", "f.py:1"), **kw}
+
+
+# ------------------------- the bug that blocked every PR -------------------- #
+
+
+def test_a_nit_alone_no_longer_fails_the_gate():
+    """The exact shape the reviewer emitted on attempts 15, 16 and 17 of task
+    84251cb2: real work, plus one bucket item literally called 'Minor issues'.
+
+    Reverting `_gate_verdict` to `reviewer.passed and all_pass` fails this."""
+    d = _decision(
+        [
+            _item("criteria met", True, "medium"),
+            _item("Minor issues", False, "nit"),
+        ],
+        passed=False,  # the reviewer's own reflex "no"
+    )
+    assert d.passed is True
+    assert [i.label for i in d.advisory_items] == ["Minor issues"]
+    assert d.blocking_items == []
+
+
+@pytest.mark.parametrize("sev", ["critical", "high", "medium"])
+def test_a_real_defect_still_fails_the_gate(sev):
+    d = _decision([_item("zero tests reports PASSED", False, sev)], passed=False)
+    assert d.passed is False
+    assert len(d.blocking_items) == 1
+
+
+@pytest.mark.parametrize("sev", sorted(ADVISORY_SEVERITIES))
+def test_advisory_severities_are_recorded_but_do_not_block(sev):
+    d = _decision([_item("ok", True, "low"), _item("style", False, sev)])
+    assert d.passed is True
+    assert len(d.advisory_items) == 1
+
+
+# ------------------------------- fail closed -------------------------------- #
+
+
+def test_an_unclassified_finding_blocks():
+    """A reviewer that omits severity must not thereby wave a defect through."""
+    d = _decision([_item("something is wrong", False, "")], passed=False)
+    assert d.passed is False
+    assert d.blocking_items and d.advisory_items == []
+
+
+def test_an_unknown_severity_blocks():
+    d = _decision([_item("weird", False, "trivial-ish")], passed=False)
+    assert d.passed is False
+
+
+def test_no_items_at_all_fails_closed():
+    """Absence of evidence is not evidence of passing."""
+    assert _decision([], passed=True).passed is False
+
+
+def test_a_missed_acceptance_criterion_is_never_a_nit():
+    """spec_compliance false blocks even if every item is graded nit."""
+    d = _decision(
+        [_item("Minor issues", False, "nit")],
+        passed=True,
+        stages={"spec_compliance": {"passed": False},
+                "code_quality": {"passed": True}},
+    )
+    assert d.passed is False
+
+
+def test_reviewer_saying_no_while_flagging_nothing_is_trusted():
+    """It disagrees with its own checklist; take the 'no'."""
+    d = _decision([_item("all good", True, "nit")], passed=False)
+    assert d.passed is False
+
+
+def test_a_clean_review_passes():
+    d = _decision([_item("criteria met", True, "nit")], passed=True)
+    assert d.passed is True
+    assert d.advisory_items == []
+
+
+def test_severity_is_case_and_space_insensitive():
+    d = _decision([_item("x", False, "  NIT  ")], passed=True)
+    assert d.passed is True
+
+
+# ----------------------- the prompt that caused it -------------------------- #
+
+
+def test_the_gate_prompt_asks_for_severity():
+    """It never did — only the code_review prompt did — so every gate finding
+    arrived with severity='' and nothing could be treated as a nit."""
+    t = Task.new("x")
+    t.acceptance_criteria = ["does the thing"]
+    prompt = _build_review_prompt(t, "diff", "", "", diff_total_len=4)
+    assert "severity" in prompt
+    assert "critical" in prompt and "nit" in prompt
+
+
+def test_the_gate_prompt_forbids_bucketing_real_defects():
+    t = Task.new("x")
+    prompt = _build_review_prompt(t, "diff", "", "", diff_total_len=4)
+    assert "ONLY the low/nit ones" in prompt
+    # the clause wraps in the prompt source; compare on normalized whitespace
+    flat = " ".join(prompt.split())
+    assert "NEVER put a medium-or-higher finding in that bucket" in flat
+
+
+def test_the_gate_prompt_judges_scope_against_the_criteria():
+    """The reviewer demanded a parser self-check on attempt 14, then called it
+    out of scope on 15, 16 and 17. Scope is judged against the criteria, not
+    against taste."""
+    t = Task.new("x")
+    prompt = _build_review_prompt(t, "diff", "", "", diff_total_len=4)
+    flat = " ".join(prompt.split())
+    assert "Judge SCOPE against the acceptance criteria" in flat
+    assert "Do not demand work the criteria do not require." in flat
+
+
+def test_severity_is_a_classification_not_a_score():
+    """CLAUDE.md #3: never numeric self-scoring."""
+    t = Task.new("x")
+    prompt = _build_review_prompt(t, "diff", "", "", diff_total_len=4)
+    assert "never a score" in prompt
+    assert "No numeric scores" in prompt
+    for n in ("1-10", "1–10", "score of"):
+        assert n not in prompt
+
+
+# --------------- the coder is fed what actually blocks ---------------------- #
+
+
+def test_blocking_and_advisory_partition_the_failures():
+    d = ReviewDecision(
+        passed=False,
+        checklist=[
+            ChecklistItem("a", False, severity="high"),
+            ChecklistItem("b", False, severity="nit"),
+            ChecklistItem("c", True, severity="low"),
+        ],
+    )
+    assert [i.label for i in d.blocking_items] == ["a"]
+    assert [i.label for i in d.advisory_items] == ["b"]
+    assert {i.label for i in d.failed_items} == {"a", "b"}
