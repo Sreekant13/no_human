@@ -8,6 +8,7 @@ import Markdown from "./Markdown.jsx";
 import { ROLE_LABEL, discoverSubagents, eventSource, modelsByNode } from "./eventRoles.js";
 import { normalizeOption } from "./blockerOptions.js";
 import { busPaths, columnCenters } from "./treeLayout.js";
+import { agentSummary, taskSummary } from "./summaries.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
 const IconCheck = ({ size = 14, className = "" }) => (
@@ -536,6 +537,18 @@ function RichEvent({ event, elapsed, role }) {
     body = <div className="rich-agent-prose"><Markdown>{text}</Markdown></div>;
   } else if (kind === "thinking") {
     body = <ThinkingBlock text={text} elapsed={elapsed} />;
+  } else if (kind === "supervisor_decision") {
+    // `text` is only the verdict word; the guidance lives in `message`.
+    // Rendering just the word made 33 real corrections look like noise.
+    const isCorrection = text === "correct";
+    body = (
+      <div className="rich-supervisor">
+        <span className={`rich-verdict-chip ${isCorrection ? "fail" : "pass"}`}>
+          {isCorrection ? "COURSE-CORRECT" : "ON TRACK"}
+        </span>
+        {event.message && <span className="rich-body">{linkify(event.message)}</span>}
+      </div>
+    );
   } else {
     body = <span className="rich-body">{linkify(text)}</span>;
   }
@@ -590,6 +603,36 @@ function AgentNode({ agent, state, isActive, onClick }) {
 }
 
 // Agent log modal — opens when clicking a node
+// One digest card for both surfaces: an agent's modal and the Activity page.
+// Deterministic (summaries.js) — no model call, computed from the same events
+// the raw feed shows, so it can't say anything the feed doesn't back up.
+function SummaryCard({ summary }) {
+  if (!summary) return null;
+  return (
+    <div className="digest-card">
+      <div className="digest-headline">{summary.headline}</div>
+      <div className="digest-facts">
+        {summary.facts.map(([label, value]) => (
+          <div className="digest-fact" key={label}>
+            <span className="digest-fact-label">{label}</span>
+            <span className="digest-fact-value">{value}</span>
+          </div>
+        ))}
+      </div>
+      {summary.highlights.length > 0 && (
+        <ul className="digest-highlights">
+          {summary.highlights.map((h, i) => <li key={i}>{h}</li>)}
+        </ul>
+      )}
+      {summary.issues.length > 0 && (
+        <ul className="digest-issues">
+          {summary.issues.map((h, i) => <li key={i}>{h}</li>)}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function AgentLogModal({ agent, events, onClose }) {
   const endRef = useRef(null);
   const agentEvents = agent.subagentTaskId
@@ -632,6 +675,7 @@ function AgentLogModal({ agent, events, onClose }) {
             {agent.desc}
           </div>
         </div>
+        <SummaryCard summary={agentSummary(events, agent)} />
         <div className="sys-modal-log">
           {agentEvents.length === 0 ? (
             <div className="sys-modal-empty">No events from this agent yet.</div>
@@ -1033,6 +1077,7 @@ function ActivityTab({ taskId, task, isActive }) {
           </div>
         );
       })()}
+      <SummaryCard summary={taskSummary(events)} />
       <div className="activity-log">
         {groupConsecutiveEvents(events).map((item, i) => {
           if (item._group) {
