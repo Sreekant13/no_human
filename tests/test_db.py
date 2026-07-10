@@ -105,3 +105,81 @@ async def test_save_and_list_events_persist_across_restart(tmp_path):
 
 async def test_list_events_empty_for_unknown_task(store):
     assert await store.list_events("no-such-task") == []
+
+
+async def test_merge_context_concurrent_writers_both_survive(tmp_path):
+    """The lost-update class behind the 2026-07-10 incident: two writers
+    holding stale Task copies clobber each other via update_task. merge_context
+    must let concurrent merges of different keys BOTH land — same connection
+    and across connections (the CLI and the server are different processes)."""
+    import asyncio
+    from no_human.core.db import Store
+    from no_human.core.task import Task
+
+    db = tmp_path / "nh.db"
+    async with Store(db) as s:
+        t = Task.new("x", repo_path="/tmp/x")
+        t.context = {"seed": 1}
+        await s.create_task(t)
+        await asyncio.gather(
+            s.merge_context(t.id, {"watcher_key": "a", "nested": {"w": 1}}),
+            s.merge_context(t.id, {"coder_key": "b", "nested": {"c": 2}}),
+        )
+        ctx = (await s.get_task(t.id)).context
+        assert ctx["seed"] == 1
+        assert ctx["watcher_key"] == "a" and ctx["coder_key"] == "b"
+        assert ctx["nested"] == {"w": 1, "c": 2}  # recursive merge, no clobber
+
+    # Cross-connection (cross-process shape): a second Store on the same file.
+    async with Store(db) as s1, Store(db) as s2:
+        tid = t.id
+        await asyncio.gather(
+            s1.merge_context(tid, {"proc1": True}),
+            s2.merge_context(tid, {"proc2": True}),
+        )
+        ctx = (await s1.get_task(tid)).context
+        assert ctx["proc1"] is True and ctx["proc2"] is True
+
+
+async def test_merge_context_none_deletes_and_lists_replace(tmp_path):
+    from no_human.core.db import Store
+    from no_human.core.task import Task
+    async with Store(tmp_path / "nh.db") as s:
+        t = Task.new("x", repo_path="/tmp/x")
+        t.context = {"ci_gate": {"pipeline_id": "1"}, "rounds": [1, 2]}
+        await s.create_task(t)
+        merged = await s.merge_context(t.id, {"ci_gate": None, "rounds": [3]})
+        assert "ci_gate" not in merged
+        assert merged["rounds"] == [3]
+
+
+async def test_append_context_list_is_atomic_and_creates(tmp_path):
+    import asyncio
+    from no_human.core.db import Store
+    from no_human.core.task import Task
+    async with Store(tmp_path / "nh.db") as s:
+        t = Task.new("x", repo_path="/tmp/x")
+        await s.create_task(t)
+        await asyncio.gather(
+            s.append_context_list(t.id, "send_back_feedback", {"m": "a"}),
+            s.append_context_list(t.id, "send_back_feedback", {"m": "b"}),
+        )
+        fb = (await s.get_task(t.id)).context["send_back_feedback"]
+        assert sorted(x["m"] for x in fb) == ["a", "b"]  # both appends land
+
+
+async def test_update_task_columns_never_touches_context(tmp_path):
+    from no_human.core.db import Store
+    from no_human.core.task import Task, TaskStatus
+    async with Store(tmp_path / "nh.db") as s:
+        t = Task.new("x", repo_path="/tmp/x")
+        t.context = {"fresh": 1}
+        await s.create_task(t)
+        # Another writer merges while our copy is stale.
+        await s.merge_context(t.id, {"concurrent": True})
+        t.context = {"fresh": 1}  # stale copy — would clobber via update_task
+        t.blocker = {"category": "AMBIGUITY", "question": "?"}
+        await s.update_task_columns(t)
+        fresh = await s.get_task(t.id)
+        assert fresh.context.get("concurrent") is True  # survived
+        assert fresh.blocker["category"] == "AMBIGUITY"  # column written

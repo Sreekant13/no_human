@@ -260,11 +260,12 @@ class WakeWatcher:
         last = _parse_iso((task.context or {}).get("last_wake_tick"))
         if last and now - last < self.HEARTBEAT:
             return
-        ctx = task.context or {}
-        ctx["last_wake_tick"] = now.isoformat()
-        task.context = ctx
         try:
-            await self.store.update_task(task)
+            # Atomic merge — the heartbeat must never clobber a concurrent
+            # writer's context (it did: the watcher ticks every parked task
+            # while the CLI and gate write the same rows).
+            task.context = await self.store.merge_context(
+                task.id, {"last_wake_tick": now.isoformat()})
             await self.store.save_events(task.id, [{
                 "source": "watcher", "kind": "wake_tick",
                 "text": f"watcher checked ({task.status.value}): nothing to do",
@@ -316,18 +317,19 @@ class WakeWatcher:
         Resume re-enters the loop in a fresh session seeded with the report
         (22.5) — the orchestrator picks it up from the [WIP-BLOCKED] checkpoint.
         """
-        ctx = task.context or {}
-        ctx["resumed_at"] = now_iso()
-        ctx["resume_reason"] = "wake_condition_satisfied"
+        patch = {
+            "resumed_at": now_iso(),
+            "resume_reason": "wake_condition_satisfied",
+        }
         # Same contract as `nh reply` / `nh task resume`: continue from the
         # checkpoint the blocker recorded, or the next attempt branches from a
         # stale sha and discards the parked attempt's committed work.
         checkpoint = resume_checkpoint(task.blocker)
         if checkpoint:
-            ctx["resume_from"] = checkpoint
-        task.context = ctx
+            patch["resume_from"] = checkpoint
+        task.context = await self.store.merge_context(task.id, patch)
         task.wake_check_at = None
-        await self.store.update_task(task)
+        await self.store.update_task_columns(task)
         await self.store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
         await self._emit(task, "resumed", f"{task.id[:8]} wake condition satisfied")
         return "resumed"
@@ -349,9 +351,10 @@ class WakeWatcher:
         comments = [c for c in comments if not self._is_self_or_bot(c)]
         if not comments:
             return None
-        rounds = self._append_comments_as_feedback(task, comments)
-        (task.context or {}).setdefault("pr_comment_ref", pr_ref)
-        await self.store.update_task(task)
+        rounds = await self._append_comments_as_feedback(task, comments)
+        if not (task.context or {}).get("pr_comment_ref"):
+            task.context = await self.store.merge_context(
+                task.id, {"pr_comment_ref": pr_ref})
         await self._emit(task, "pr_feedback", f"{task.id[:8]} got {len(comments)} PR comment(s)")
         return rounds
 
@@ -386,14 +389,15 @@ class WakeWatcher:
         return (self._is_bot_author(getattr(comment, "author", ""))
                 or is_agent_comment(getattr(comment, "body", None)))
 
-    @staticmethod
-    def _append_comments_as_feedback(task: Task, comments: list) -> int:
+    async def _append_comments_as_feedback(self, task: Task, comments: list) -> int:
         """Append PR comments to send_back_feedback; bump revision_rounds.
 
-        Mutates ``task.context`` (caller persists). Returns the new round count.
+        Each entry lands via an atomic list append (concurrent writers both
+        survive); the rounds counter is read-then-merge (worst case under two
+        watchers: an off-by-one round count, never lost feedback). Refreshes
+        ``task.context`` from the store. Returns the new round count.
         """
-        ctx = task.context or {}
-        feedback = ctx.get("send_back_feedback") or []
+        entries = []
         for c in comments:
             # Support both PrComment objects and plain dicts/strings.
             if hasattr(c, "body"):
@@ -413,14 +417,16 @@ class WakeWatcher:
                 msg = f"[{loc}] {msg}"
             if diff_hunk:
                 msg += f"\n\nContext:\n```\n{str(diff_hunk)[:500]}\n```"
-            feedback.append({
+            entries.append({
                 "at": created, "message": msg, "author": author,
                 "source": "pr_comment",
             })
-        ctx["send_back_feedback"] = feedback
-        rounds = int(ctx.get("revision_rounds", 0)) + 1
-        ctx["revision_rounds"] = rounds
-        task.context = ctx
+        for entry in entries:
+            await self.store.append_context_list(
+                task.id, "send_back_feedback", entry)
+        rounds = int((task.context or {}).get("revision_rounds", 0)) + 1
+        task.context = await self.store.merge_context(
+            task.id, {"revision_rounds": rounds})
         return rounds
 
     async def _check_open_pr(self, task: Task) -> str | None:
@@ -464,7 +470,7 @@ class WakeWatcher:
             )
             data["root_cause_hypothesis"] = f"PR closed unmerged: {url}"
             task.blocker = data
-            await self.store.update_task(task)
+            await self.store.update_task_columns(task)
             await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
             await self._emit(task, "pr_closed", f"{task.id[:8]} PR closed unmerged: {url}")
             return "escalated_pr_closed"
@@ -511,9 +517,8 @@ class WakeWatcher:
                 excerpt = ""
         names = ", ".join(c.get("name", "?") for c in failing)
         rounds = int(ctx.get("pr_ci_rounds") or 0) + 1
-        ctx["pr_ci_rounds"] = rounds
-        ctx["pr_ci_last_sig"] = signature
-        task.context = ctx
+        task.context = await self.store.merge_context(
+            task.id, {"pr_ci_rounds": rounds, "pr_ci_last_sig": signature})
 
         if rounds > self.max_ci_fix_rounds:
             data = task.blocker or {}
@@ -525,7 +530,7 @@ class WakeWatcher:
             data["root_cause_hypothesis"] = f"PR CI failing: {names}"
             data["evidence"] = (excerpt or failing[0].get("link", ""))[:1500]
             task.blocker = data
-            await self.store.update_task(task)
+            await self.store.update_task_columns(task)
             await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
             await self._emit(
                 task, "escalated_ci",
@@ -540,13 +545,10 @@ class WakeWatcher:
             + "Fix the cause on the same branch; the push updates the PR and "
               "re-runs the checks."
         )
-        feedback = ctx.get("send_back_feedback") or []
-        feedback.append({
+        await self.store.append_context_list(task.id, "send_back_feedback", {
             "at": now_iso(), "message": message, "author": "ci", "source": "pr_ci",
         })
-        ctx["send_back_feedback"] = feedback
-        task.context = ctx
-        await self.store.update_task(task)
+        task.context = await self.store.merge_context(task.id, {})
         await self._emit(
             task, "pr_ci_red",
             f"{task.id[:8]} CI failing ({names}) — fix round {rounds}/{self.max_ci_fix_rounds}",
@@ -577,8 +579,12 @@ class WakeWatcher:
         except Exception as exc:  # noqa: BLE001 — the gate must never kill the watcher
             log.warning("CI_GATE gate step failed for %s: %s", task.id[:8], exc)
             return None, None
-        # The gate mutates task.context (its state machine) — persist always.
-        await self.store.update_task(task)
+        # The gate mutates task.context["ci_gate"] in memory (its state
+        # machine) — persist that subtree atomically. RFC 7396: an empty dict
+        # merges nothing, so a cleared state ({}) must become None (delete).
+        state = (task.context or {}).get("ci_gate")
+        task.context = await self.store.merge_context(
+            task.id, {"ci_gate": state if state else None})
 
         if outcome.action == "skip":
             return outcome, None
@@ -610,7 +616,7 @@ class WakeWatcher:
             )
             data["root_cause_hypothesis"] = outcome.reason
             task.blocker = data
-            await self.store.update_task(task)
+            await self.store.update_task_columns(task)
             await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
             await self._emit(task, "ci_gate_refused",
                              f"{task.id[:8]} CI_GATE cannot run: {outcome.reason}")
@@ -618,11 +624,10 @@ class WakeWatcher:
 
         # failed — bounded send-back, counted per pipeline run (a new run only
         # ever starts on a new PR head, so each failure is a distinct signature).
-        ctx = task.context or {}
         names = ", ".join(outcome.failing_jobs) or "pipeline"
-        rounds = int(ctx.get("ci_gate_fix_rounds") or 0) + 1
-        ctx["ci_gate_fix_rounds"] = rounds
-        task.context = ctx
+        rounds = int((task.context or {}).get("ci_gate_fix_rounds") or 0) + 1
+        task.context = await self.store.merge_context(
+            task.id, {"ci_gate_fix_rounds": rounds})
         if rounds > self.max_ci_gate_fix_rounds:
             data = task.blocker or {}
             data["category"] = "NOVEL_UNKNOWN"
@@ -633,7 +638,7 @@ class WakeWatcher:
             data["root_cause_hypothesis"] = f"CI_GATE integration failing: {names}"
             data["evidence"] = (outcome.log_excerpt or outcome.web_url)[:1500]
             task.blocker = data
-            await self.store.update_task(task)
+            await self.store.update_task_columns(task)
             await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
             await self._emit(
                 task, "ci_gate_fail",
@@ -650,14 +655,11 @@ class WakeWatcher:
             + "Fix the cause on the same branch; the push updates the PR and "
               "the validation re-runs on the new head."
         )
-        feedback = ctx.get("send_back_feedback") or []
-        feedback.append({
+        await self.store.append_context_list(task.id, "send_back_feedback", {
             "at": now_iso(), "message": message, "author": "ci_gate",
             "source": "ci_gate",
         })
-        ctx["send_back_feedback"] = feedback
-        task.context = ctx
-        await self.store.update_task(task)
+        task.context = await self.store.merge_context(task.id, {})
         await self._emit(
             task, "ci_gate_fail",
             f"{task.id[:8]} CI_GATE failing ({names}) — fix round "
@@ -696,21 +698,18 @@ class WakeWatcher:
             # Bot chatter only (CI result tables etc.): move the cursor so the
             # same comments are never reconsidered, but do not burn an attempt.
             if newest:
-                ctx["pr_comment_since"] = newest
-                task.context = ctx
-                await self.store.update_task(task)
+                task.context = await self.store.merge_context(
+                    task.id, {"pr_comment_since": newest})
             await self._emit(
                 task, "pr_feedback_skipped",
                 f"{task.id[:8]} ignored {len(fresh)} bot comment(s) "
                 f"({', '.join(sorted({getattr(c, 'author', '?') for c in fresh}))})",
             )
             return None
-        rounds = self._append_comments_as_feedback(task, human)
-        ctx = task.context or {}
+        rounds = await self._append_comments_as_feedback(task, human)
         if newest:
-            ctx["pr_comment_since"] = newest
-        task.context = ctx
-        await self.store.update_task(task)
+            task.context = await self.store.merge_context(
+                task.id, {"pr_comment_since": newest})
         await self._emit(task, "pr_feedback", f"{task.id[:8]} got {len(human)} new PR comment(s)")
 
         if rounds > self.max_revision_rounds:
@@ -728,7 +727,7 @@ class WakeWatcher:
             "human can decide rather than revising indefinitely."
         )
         task.blocker = data
-        await self.store.update_task(task)
+        await self.store.update_task_columns(task)
         if task.status != TaskStatus.ESCALATED:
             await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
         await self._emit(
@@ -745,7 +744,7 @@ class WakeWatcher:
             + data.get("root_cause_hypothesis", "")
         ).strip()
         task.blocker = data
-        await self.store.update_task(task)
+        await self.store.update_task_columns(task)
         if task.status != TaskStatus.ESCALATED:
             await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
         await self._emit(task, "escalated_timeout", f"{task.id[:8]} parked past max duration")

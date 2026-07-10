@@ -192,6 +192,76 @@ class Store:
         await self.db.commit()
         return task
 
+    async def merge_context(self, task_id: str, patch: dict) -> dict:
+        """Atomically merge *patch* into the task's context (RFC 7396).
+
+        The lost-update fix for concurrent context writers: `update_task`
+        rewrites the whole context blob from a Task copy, so the watcher, the
+        CLI and the orchestrator (different coroutines AND different
+        processes) clobber each other — whichever flushes last wins (the
+        cancel_requested column above documents the same failure). A single
+        `json_patch` UPDATE is atomic under SQLite's write serialization, so
+        concurrent merges of different keys both survive, across processes.
+
+        Semantics (RFC 7396): nested dicts merge recursively; lists/scalars
+        replace; a ``None`` value DELETES the key. Returns the merged context.
+        """
+        await self.db.execute(
+            """UPDATE tasks SET
+                 context = json_patch(COALESCE(context, '{}'), ?),
+                 updated_at = ?
+               WHERE id = ?""",
+            (json.dumps(patch), _now(), task_id),
+        )
+        await self.db.commit()
+        cur = await self.db.execute(
+            "SELECT context FROM tasks WHERE id = ?", (task_id,))
+        row = await cur.fetchone()
+        return json.loads(row[0]) if row and row[0] else {}
+
+    async def append_context_list(self, task_id: str, key: str, item: dict) -> None:
+        """Atomically append *item* to the context list at *key* (created if
+        absent). List appends cannot be expressed as a merge patch (RFC 7396
+        replaces arrays wholesale), so this uses json_set's '[#]' append —
+        one UPDATE, no read-modify-write."""
+        assert "." not in key and "[" not in key, "flat keys only"
+        await self.db.execute(
+            f"""UPDATE tasks SET
+                 context = json_set(
+                   json_patch(COALESCE(context, '{{}}'),
+                              CASE WHEN json_extract(COALESCE(context,'{{}}'),
+                                        '$.{key}') IS NULL
+                                   THEN json_object('{key}', json_array())
+                                   ELSE '{{}}' END),
+                   '$.{key}[#]', json(?)),
+                 updated_at = ?
+               WHERE id = ?""",
+            (json.dumps(item), _now(), task_id),
+        )
+        await self.db.commit()
+
+    async def update_task_columns(self, task: Task) -> Task:
+        """Persist the task's mutable columns EXCEPT context. Multi-writer
+        zones (watcher, CLI, gate) must write context only via merge_context/
+        append_context_list — this companion writes the rest without
+        clobbering concurrent context merges with a stale blob."""
+        task.updated_at = _now()
+        row = task.to_row()
+        await self.db.execute(
+            """UPDATE tasks SET
+                 external_id=:external_id, source=:source, title=:title,
+                 description=:description, requirements=:requirements,
+                 acceptance_criteria=:acceptance_criteria, repo_path=:repo_path,
+                 kind=:kind, parent_id=:parent_id,
+                 status=:status, blocker=:blocker, wake_check_at=:wake_check_at,
+                 priority=:priority, plan=:plan, config=:config,
+                 updated_at=:updated_at
+               WHERE id=:id""",
+            row,
+        )
+        await self.db.commit()
+        return task
+
     async def request_cancel(self, task_id: str, reason: str) -> None:
         """Ask a running task to stop at its next cooperative checkpoint.
 
