@@ -41,6 +41,8 @@ MECHANISMS: list[tuple[str, tuple[str, ...], str]] = [
     ("stuck_detection", ("stuck",), "zero = no attempt ever looped (or detector dead)"),
     ("pr_open", ("pr_open",), "zero = no task has ever reached a PR"),
     ("pr_open_retry", ("pr_open_retry",), "zero is good — no transient forge failures"),
+    ("advisory_degradations", ("advisory",),
+     "zero is good — no subsystem silently degraded mid-run"),
     ("pr_watch_ladder",
      ("merged", "pr_closed", "pr_feedback", "pr_feedback_skipped", "pr_ci_red",
       "escalated_ci", "escalated_revisions", "escalated_timeout", "resumed"),
