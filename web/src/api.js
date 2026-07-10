@@ -54,6 +54,19 @@ export async function replyTask(id, answer) {
   return r.json();
 }
 
+// W2.4: answer a blocker by choosing option N (1-based). The server applies
+// the option's action (if any) and resumes — the only path that may apply
+// actions, and it runs on a human's click.
+export async function chooseBlockerOption(id, choose) {
+  const r = await fetch(`${BASE}/api/tasks/${id}/reply`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ choose }),
+  });
+  if (!r.ok) throw new Error(`POST reply(choose) → ${r.status}`);
+  return r.json();
+}
+
 export async function sendBack(id, message) {
   const r = await fetch(`${BASE}/api/tasks/${id}/send-back`, {
     method: "POST",

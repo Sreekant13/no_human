@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import {
-  approveTask, cancelTask, fetchDiff, fetchSubtasks, fetchTask, fetchTaskEvents,
+  approveTask, cancelTask, chooseBlockerOption, fetchDiff, fetchSubtasks,
+  fetchTask, fetchTaskEvents,
   pauseTask, postReviewComments, replyTask, resumeTask, retryTask, sendBack,
   connectTaskSSE,
 } from "./api.js";
 import Markdown from "./Markdown.jsx";
 import { ROLE_LABEL, discoverSubagents, eventSource, modelsByNode } from "./eventRoles.js";
-import { normalizeOption } from "./blockerOptions.js";
+import { hasAction, normalizeOption } from "./blockerOptions.js";
 import { currentFunctionality, groupFunctionalities } from "./functionalities.js";
 import { agentSummary, taskSummary } from "./summaries.js";
 
@@ -1234,7 +1235,8 @@ function DetailsTab({ task }) {
           <pre className="so-findings">{findings}</pre>
         </section>
       )}
-      {task.blocker && <BlockerSection blocker={task.blocker} />}
+      {task.blocker && <BlockerSection blocker={task.blocker} taskId={task.id}
+                                       taskStatus={task.status} />}
       {task.repo_path && (
         <section>
           <div className="so-section-label">Repo</div>
@@ -1343,9 +1345,28 @@ function SpecTab({ task, onRefresh }) {
   );
 }
 
-function BlockerSection({ blocker: b }) {
+function BlockerSection({ blocker: b, taskId, taskStatus }) {
   const cat = b.category ? String(b.category).replace(/_/g, " ") : null;
   const pct = b.confidence != null ? `${Math.round(b.confidence * 100)}%` : null;
+  // W2.4: options are buttons — one click answers the blocker (and applies
+  // its action server-side). Disabled after the first click: a double-click
+  // must never double-resume. Parked states only; a non-parked task's
+  // blocker record is history, not a live question.
+  const [chosen, setChosen] = useState(null);   // index being submitted
+  const [choiceErr, setChoiceErr] = useState(null);
+  const parked = ["blocked", "awaiting_input", "escalated", "paused_quota"]
+    .includes(taskStatus);
+  async function choose(i) {
+    if (chosen != null) return;
+    setChosen(i);
+    setChoiceErr(null);
+    try {
+      await chooseBlockerOption(taskId, i + 1);  // API is 1-based
+    } catch (e) {
+      setChoiceErr(e?.message || "reply failed");
+      setChosen(null);                           // let the human retry
+    }
+  }
   return (
     <section>
       <div className="so-section-label blocker-label">Blocker</div>
@@ -1381,13 +1402,29 @@ function BlockerSection({ blocker: b }) {
           {b.options?.length > 0 && (
             <ul className="blocker-options">
               {b.options.map(normalizeOption).map((opt, i) => (
-                <li key={i}>[{i + 1}] {opt.label}</li>
+                <li key={i}>
+                  {parked && taskId ? (
+                    <button
+                      className="blocker-option-btn"
+                      disabled={chosen != null}
+                      onClick={() => choose(i)}
+                    >
+                      {chosen === i ? "…" : `[${i + 1}]`} {opt.label}
+                      {hasAction(opt) ? " ⚡" : ""}
+                    </button>
+                  ) : (
+                    <>[{i + 1}] {opt.label}</>
+                  )}
+                </li>
               ))}
             </ul>
           )}
-          <div className="blocker-reply-hint">
-            Reply: <code>nh reply {"{id}"} "&lt;answer&gt;"</code>
-          </div>
+          {choiceErr && <div className="blocker-choice-err">{choiceErr}</div>}
+          {parked && (
+            <div className="blocker-reply-hint">
+              …or answer free-form with the Reply button above.
+            </div>
+          )}
         </div>
       )}
       {b.wake_condition && (
