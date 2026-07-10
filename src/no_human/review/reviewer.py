@@ -74,6 +74,9 @@ class ReviewDecision:
     raw_output: str = ""
     suggested_next: str | None = None
     stages: dict[str, Any] | None = None
+    # Blocking findings demoted because their file:line citation did not check
+    # out ("label: reason" strings) — surfaced so the round shows the demotion.
+    demoted_citations: list[str] = field(default_factory=list)
 
     @property
     def failed_items(self) -> list[ChecklistItem]:
@@ -408,6 +411,8 @@ def _build_review_prompt(
         "REVIEW_JSON_END\n\n"
         "For each item:\n"
         "  - 'file' must be the path exactly as shown in the diff header (e.g. 'src/foo.py')\n"
+        "  - a finding graded critical/high/medium MUST cite the exact file and line of "
+        "the defect; a citation that does not exist in the repo demotes the finding to advisory\n"
         "  - 'line' must be a line number from the RIGHT side of the diff (new file)\n"
         "  - 'comment' must read like a real engineer wrote it in a code review.\n"
         "    Write in first person, be direct, vary your sentence structure.\n"
@@ -527,6 +532,8 @@ def _build_code_review_prompt(
         "REVIEW_JSON_END\n\n"
         "For each item:\n"
         "  - 'file' must be the path exactly as shown in the diff header (e.g. 'src/foo.py')\n"
+        "  - a finding graded critical/high/medium MUST cite the exact file and line of "
+        "the defect; a citation that does not exist in the repo demotes the finding to advisory\n"
         "  - 'line' must be a line number from the RIGHT side of the diff (new file)\n"
         "  - 'comment' must read like a real engineer wrote it in a code review.\n"
         "    Write in first person, be direct, vary your sentence structure.\n"
@@ -569,7 +576,69 @@ def _reached_no_verdict(decision: ReviewDecision) -> bool:
     )
 
 
-def _parse_review_output(text: str) -> ReviewDecision:
+def _citation_fails(
+    item: ChecklistItem, repo_path: Path, before_ref: str
+) -> str | None:
+    """Why the item's file:line citation does not check out, or None.
+
+    None also for items with no citation at all — absence is not punished,
+    only a citation that names something which does not exist (2411.03079:
+    hallucinated locations are the reviewer-FP channel that survives severity
+    grading). A file missing from the worktree but present at ``before_ref``
+    is a deleted-file finding and verifies fine.
+    """
+    rel = (item.file or "").strip()
+    if not rel:
+        return None
+    try:
+        resolved = (repo_path / rel).resolve()
+        inside = resolved.is_relative_to(repo_path.resolve())
+    except (OSError, ValueError):
+        return f"unresolvable path {rel!r}"
+    if not inside:
+        return f"{rel!r} escapes the repo"
+    if resolved.is_file():
+        if item.line > 0:
+            try:
+                with open(resolved, encoding="utf-8", errors="ignore") as fh:
+                    n_lines = sum(1 for _ in fh)
+            except OSError:
+                return None  # our read failed — never demote on our own error
+            if item.line > n_lines:
+                return f"{rel} has {n_lines} lines, cited line {item.line}"
+        return None
+    probe = subprocess.run(
+        ["git", "cat-file", "-e", f"{before_ref}:{rel}"],
+        cwd=repo_path, capture_output=True,
+    )
+    if probe.returncode == 0:
+        return None
+    return f"{rel} not found in the worktree or at {before_ref}"
+
+
+def _verify_citations(
+    items: list[ChecklistItem], repo_path: Path, before_ref: str
+) -> list[str]:
+    """Demote blocking findings whose citations don't check out. Mutates items."""
+    demoted: list[str] = []
+    for item in items:
+        if item.passed or not _is_blocking(item):
+            continue
+        reason = _citation_fails(item, repo_path, before_ref)
+        if reason:
+            item.severity = "low"
+            item.evidence = (
+                f"{item.evidence}\n[citation rule] cited location did not check "
+                f"out ({reason}) — demoted to advisory. Re-raise with a "
+                "verifiable file:line citation."
+            ).strip()
+            demoted.append(f"{item.label}: {reason}")
+    return demoted
+
+
+def _parse_review_output(
+    text: str, repo_path: Path | None = None, before_ref: str = "HEAD~1",
+) -> ReviewDecision:
     m = _REVIEW_JSON.search(text or "")
     if not m:
         return ReviewDecision(
@@ -601,12 +670,16 @@ def _parse_review_output(text: str) -> ReviewDecision:
         )
         for i in (data.get("items") or [])
     ]
+    # The citation rule runs BEFORE the verdict: a blocking finding whose
+    # cited location does not exist is advisory, and must not fail the gate.
+    demoted = _verify_citations(items, repo_path, before_ref) if repo_path else []
     stages = data.get("stages") if isinstance(data.get("stages"), dict) else None
     suggested_next = data.get("suggested_next") if isinstance(data.get("suggested_next"), str) else None
     return ReviewDecision(
         passed=_gate_verdict(items, data, stages),
         checklist=items, raw_output=text,
         suggested_next=suggested_next, stages=stages,
+        demoted_citations=demoted,
     )
 
 
@@ -727,12 +800,13 @@ class AdversarialReviewer:
         # When the diff is already provided, use a single-turn call (no tools).
         # The model has everything it needs in the prompt — no repo exploration.
         if diff_override:
-            return await self._fast_review(prompt, repo_path)
+            return await self._fast_review(prompt, repo_path, before_ref=before_ref)
 
         # Full agent session for post-implementation reviews (needs to read files).
-        return await self._agent_review(prompt, repo_path)
+        return await self._agent_review(prompt, repo_path, before_ref=before_ref)
 
-    async def _fast_review(self, prompt: str, repo_path: Path) -> ReviewDecision:
+    async def _fast_review(self, prompt: str, repo_path: Path,
+                           *, before_ref: str = "HEAD~1") -> ReviewDecision:
         """Single-turn review — diff already in prompt, no tools needed."""
         try:
             result: AgentResult = await asyncio.wait_for(
@@ -751,11 +825,13 @@ class AdversarialReviewer:
                 checklist=[ChecklistItem("timeout", False,
                     "reviewer timed out after 180s — fail closed")],
             )
-        return _parse_review_output(result.final_text or "")
+        return _parse_review_output(result.final_text or "",
+                                    repo_path=repo_path, before_ref=before_ref)
 
     async def _agent_review(
         self, prompt: str, repo_path: Path,
         *, max_turns: int = _REVIEW_TURNS, timeout: int = _REVIEW_TIMEOUT,
+        before_ref: str = "HEAD~1",
     ) -> ReviewDecision:
         """Multi-turn review — model can explore the repo with read-only tools.
 
@@ -775,6 +851,7 @@ class AdversarialReviewer:
             budget = max_turns * (2 ** round_n)
             decision, reason = await self._review_once(
                 prompt, repo_path, max_turns=budget, timeout=timeout,
+                before_ref=before_ref,
             )
             if decision is not None:
                 return decision
@@ -793,6 +870,7 @@ class AdversarialReviewer:
 
     async def _review_once(
         self, prompt: str, repo_path: Path, *, max_turns: int, timeout: int,
+        before_ref: str = "HEAD~1",
     ) -> tuple[ReviewDecision | None, str]:
         """One reviewer session.
 
@@ -823,9 +901,11 @@ class AdversarialReviewer:
             return None, f"timed out after {timeout}s"
 
         # Try final_text first, then all captured text.
-        decision = _parse_review_output(result.final_text or "")
+        decision = _parse_review_output(result.final_text or "",
+                                        repo_path=repo_path, before_ref=before_ref)
         if _reached_no_verdict(decision):
-            decision = _parse_review_output("\n".join(all_text_parts))
+            decision = _parse_review_output("\n".join(all_text_parts),
+                                            repo_path=repo_path, before_ref=before_ref)
         if _reached_no_verdict(decision):
             reason = result.stop_reason or "no REVIEW_JSON block"
             if getattr(result, "is_error", False):
