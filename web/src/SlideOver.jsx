@@ -45,7 +45,11 @@ const STATUS_PILL = {
   failed:             "pill-failed",
 };
 
-export default function SlideOver({ taskId, onClose, refreshKey = 0 }) {
+export default function SlideOver({ taskId, onClose, refreshKey = 0,
+                                    reviewQueue = [], onJump = null }) {
+  // W2.5: the review queue — the next awaiting-approval task after this one,
+  // so five reviews feel like one pass instead of five board round-trips.
+  const nextInQueue = reviewQueue.find((id) => id !== taskId) || null;
   const [task, setTask] = useState(null);
   const [diff, setDiff] = useState("");
   const [tab, setTab] = useState("system");
@@ -102,7 +106,9 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0 }) {
     setBusy(true);
     try {
       await approveTask(taskId);
-      setFlash("Approval recorded. Merge the PR in your git host.");
+      const remaining = reviewQueue.filter((id) => id !== taskId).length;
+      setFlash("Approval recorded. Merge the PR in your git host."
+        + (remaining ? ` ${remaining} more waiting — use Next review.` : ""));
       const updated = await fetchTask(taskId);
       setTask(updated);
     } catch (e) {
@@ -231,6 +237,13 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0 }) {
             {isAwaiting && (
               <button className="btn btn-sendback" onClick={() => setSbOpen(true)} disabled={busy}>
                 Send back
+              </button>
+            )}
+            {nextInQueue && onJump && (
+              <button className="btn btn-next-review" disabled={busy}
+                      onClick={() => onJump(nextInQueue)}
+                      title="Jump to the next task awaiting approval">
+                Next review →
               </button>
             )}
             {isParked && (

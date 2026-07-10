@@ -78,6 +78,14 @@ export default function Board({ tasks }) {
           taskId={selectedId}
           onClose={closeTask}
           refreshKey={refreshKey}
+          reviewQueue={tasks
+            .filter((t) => t.status === "awaiting_approval")
+            .sort((a, b) => (a.created_at || "").localeCompare(b.created_at || ""))
+            .map((t) => t.id)}
+          onJump={(id) => {
+            prevUpdatedAtRef.current = null;
+            setSelectedId(id);
+          }}
         />
       )}
     </>
