@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
@@ -261,7 +262,7 @@ class WakeWatcher:
         task.wake_check_at = None
         await self.store.update_task(task)
         await self.store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
-        self._on_event("resumed", f"{task.id[:8]} wake condition satisfied")
+        await self._emit(task, "resumed", f"{task.id[:8]} wake condition satisfied")
         return "resumed"
 
     async def _inject_pr_feedback(self, task: Task, condition: str) -> int | None:
@@ -285,8 +286,23 @@ class WakeWatcher:
         rounds = self._append_comments_as_feedback(task, comments)
         (task.context or {}).setdefault("pr_comment_ref", pr_ref)
         await self.store.update_task(task)
-        self._on_event("pr_feedback", f"{task.id[:8]} got {len(comments)} PR comment(s)")
+        await self._emit(task, "pr_feedback", f"{task.id[:8]} got {len(comments)} PR comment(s)")
         return rounds
+
+    async def _emit(self, task: Task, kind: str, text: str) -> None:
+        """Persist a watcher action as a task event and mirror it to the host.
+
+        Persistence is unconditional: the board and the DB record must show
+        what the watcher did even when the host wires no callback — the server
+        ran with a silent watcher for exactly that reason.
+        """
+        try:
+            await self.store.save_events(task.id, [
+                {"source": "watcher", "kind": kind, "text": text, "ts": time.time()},
+            ])
+        except Exception:  # noqa: BLE001 — visibility must never break the action
+            log.warning("failed to persist watcher event %r", kind, exc_info=True)
+        self._on_event(kind, text)
 
     def _is_bot_author(self, author: str) -> bool:
         """Comments from bots (CI result tables, status dashboards) are not
@@ -361,7 +377,7 @@ class WakeWatcher:
                 log.warning("failed to poll PR state for %s: %s", task.id[:8], exc)
         if state == "MERGED":
             await self.store.set_status(task, TaskStatus.DONE, validate=False)
-            self._on_event("merged", f"{task.id[:8]} PR merged by a human: {url}")
+            await self._emit(task, "merged", f"{task.id[:8]} PR merged by a human: {url}")
             return "merged"
         if state == "CLOSED":
             data = task.blocker or {}
@@ -374,7 +390,7 @@ class WakeWatcher:
             task.blocker = data
             await self.store.update_task(task)
             await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
-            self._on_event("pr_closed", f"{task.id[:8]} PR closed unmerged: {url}")
+            await self._emit(task, "pr_closed", f"{task.id[:8]} PR closed unmerged: {url}")
             return "escalated_pr_closed"
 
         acted = await self._check_approval_pr_comments(task)
@@ -429,8 +445,8 @@ class WakeWatcher:
             task.blocker = data
             await self.store.update_task(task)
             await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
-            self._on_event(
-                "escalated_ci",
+            await self._emit(
+                task, "escalated_ci",
                 f"{task.id[:8]} PR CI red past {self.max_ci_fix_rounds} rounds: {names}",
             )
             return "escalated_ci"
@@ -449,8 +465,8 @@ class WakeWatcher:
         ctx["send_back_feedback"] = feedback
         task.context = ctx
         await self.store.update_task(task)
-        self._on_event(
-            "pr_ci_red",
+        await self._emit(
+            task, "pr_ci_red",
             f"{task.id[:8]} CI failing ({names}) — fix round {rounds}/{self.max_ci_fix_rounds}",
         )
         return await self._resume(task)
@@ -489,8 +505,8 @@ class WakeWatcher:
                 ctx["pr_comment_since"] = newest
                 task.context = ctx
                 await self.store.update_task(task)
-            self._on_event(
-                "pr_feedback_skipped",
+            await self._emit(
+                task, "pr_feedback_skipped",
                 f"{task.id[:8]} ignored {len(fresh)} bot comment(s) "
                 f"({', '.join(sorted({getattr(c, 'author', '?') for c in fresh}))})",
             )
@@ -501,7 +517,7 @@ class WakeWatcher:
             ctx["pr_comment_since"] = newest
         task.context = ctx
         await self.store.update_task(task)
-        self._on_event("pr_feedback", f"{task.id[:8]} got {len(human)} new PR comment(s)")
+        await self._emit(task, "pr_feedback", f"{task.id[:8]} got {len(human)} new PR comment(s)")
 
         if rounds > self.max_revision_rounds:
             await self._escalate_revisions(task, rounds)
@@ -521,8 +537,8 @@ class WakeWatcher:
         await self.store.update_task(task)
         if task.status != TaskStatus.ESCALATED:
             await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
-        self._on_event(
-            "escalated_revisions",
+        await self._emit(
+            task, "escalated_revisions",
             f"{task.id[:8]} exceeded {self.max_revision_rounds} PR-revision rounds",
         )
 
@@ -538,7 +554,7 @@ class WakeWatcher:
         await self.store.update_task(task)
         if task.status != TaskStatus.ESCALATED:
             await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
-        self._on_event("escalated_timeout", f"{task.id[:8]} parked past max duration")
+        await self._emit(task, "escalated_timeout", f"{task.id[:8]} parked past max duration")
 
 
 def now_iso() -> str:

@@ -152,6 +152,11 @@ async def test_bot_comments_never_trigger_a_revision(store):
     assert not fresh.context.get("send_back_feedback")
     assert fresh.context["pr_comment_since"] == "2026-07-10T11:16:00Z"
     assert any(k == "pr_feedback_skipped" for k, _ in events)
+    # The skip is persisted as a task event even with no host callback wired —
+    # the server ran with a completely silent watcher for exactly this reason.
+    persisted = await store.list_events(t.id)
+    assert any(e["kind"] == "pr_feedback_skipped" and e["source"] == "watcher"
+               for e in persisted)
 
 
 async def test_human_comment_mixed_with_bot_chatter_injects_only_the_human(store):
