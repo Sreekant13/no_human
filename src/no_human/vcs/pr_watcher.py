@@ -394,6 +394,65 @@ async def default_pr_checks(ref: str) -> list[dict]:
     return checks
 
 
+def _gh_repo_and_number(ref: str) -> tuple[str, str] | None:
+    """Normalize a PR ref (URL or ``owner/repo#n``) to gh's (repo_arg, number).
+
+    GitHub/GHE only — returns None for GitLab or unparseable refs.
+    """
+    if ref.startswith("http"):
+        parsed = parse_pr_url(ref)
+        if not parsed or parsed[0] != "github":
+            return None
+        _, host, slug, num = parsed
+        return f"{host}/{slug}", str(num)
+    if "#" in ref:
+        repo, _, num_str = ref.partition("#")
+        return repo, num_str
+    return None
+
+
+async def default_pr_head(ref: str) -> str:
+    """The PR's current head commit SHA, or "" (unknown must never look like
+    a real head — the CI_GATE gate keys its once-per-head guard on this)."""
+    if not shutil.which("gh"):
+        return ""
+    target = _gh_repo_and_number(ref)
+    if not target:
+        return ""
+    repo_arg, num_str = target
+    out = await _run_cli(
+        ["gh", "pr", "view", num_str, "--repo", repo_arg, "--json", "headRefOid"]
+    )
+    if not out:
+        return ""
+    try:
+        return str(json.loads(out).get("headRefOid") or "")
+    except json.JSONDecodeError:
+        return ""
+
+
+async def default_pr_files(ref: str) -> list[str]:
+    """Changed file paths of the PR, or [] (unknown). The CI_GATE gate treats
+    an empty list as unclassifiable and refuses latest_dev images for it only
+    when runtime code might be touched — callers decide."""
+    if not shutil.which("gh"):
+        return []
+    target = _gh_repo_and_number(ref)
+    if not target:
+        return []
+    repo_arg, num_str = target
+    out = await _run_cli(
+        ["gh", "pr", "view", num_str, "--repo", repo_arg, "--json", "files"]
+    )
+    if not out:
+        return []
+    try:
+        files = json.loads(out).get("files") or []
+        return [f.get("path", "") for f in files if f.get("path")]
+    except json.JSONDecodeError:
+        return []
+
+
 async def default_ci_log_excerpt(link: str) -> str:
     """A short excerpt of a failing Jenkins build's console log, or "".
 

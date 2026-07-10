@@ -80,6 +80,7 @@ class WakeWatcher:
         pr_checks: Callable[[str], Awaitable[list[dict]]] | None = None,
         ci_log: Callable[[str], Awaitable[str]] | None = None,
         on_event: Callable[[str, str], None] | None = None,
+        ci_gate_gate: Any = None,
     ):
         self.store = store
         blockers_cfg = (config or {}).get("blockers", {})
@@ -99,6 +100,10 @@ class WakeWatcher:
         # human). Counted per distinct failure signature, so a re-run of the
         # same red check doesn't burn a round.
         self.max_ci_fix_rounds = int(blockers_cfg.get("max_ci_fix_rounds", 3))
+        # Bounded CI_GATE-integration-failure → fix cycles (M6), same pattern.
+        self.max_ci_gate_fix_rounds = int(
+            blockers_cfg.get("max_ci_gate_fix_rounds", 3)
+        )
         # Comment authors whose PR comments never trigger a revision. Live
         # incident: system-codeadmin posts a unit-test-results table on every
         # build, which the comment rung injected as human feedback and resumed
@@ -118,6 +123,42 @@ class WakeWatcher:
         self._pr_checks = pr_checks
         self._ci_log = ci_log
         self._on_event = on_event or (lambda kind, text: None)
+        # The post-PR CI_GATE integration gate (M6). Injectable for tests;
+        # by default built here (the single wiring point for all three hosts)
+        # and only when ci_gate.enabled — otherwise the rung is a no-op.
+        if ci_gate_gate is None and (config or {}).get("ci_gate", {}).get("enabled"):
+            ci_gate_gate = self._default_ci_gate_gate(config)
+        self._ci_gate_gate = ci_gate_gate
+
+    @staticmethod
+    def _default_ci_gate_gate(config: dict):
+        """Build the real gate (gh/glab/kubectl-backed). Lazy import so hosts
+        that never enable CI_GATE pay nothing; returns None if wiring fails —
+        the watcher must keep running without the rung, not crash."""
+        try:
+            from ..ci_gate.gate import CiGate
+            from ..vcs.pr_watcher import (
+                default_pr_checks, default_pr_files, default_pr_head,
+                parse_pr_url, post_reply_comment,
+            )
+
+            async def _post_comment(url: str, body: str) -> bool:
+                parsed = parse_pr_url(url)
+                if not parsed or parsed[0] != "github":
+                    return False
+                _, host, slug, num = parsed
+                return await post_reply_comment(f"{host}/{slug}#{num}", body)
+
+            return CiGate(
+                config,
+                pr_head=default_pr_head,
+                pr_files=default_pr_files,
+                pr_checks=default_pr_checks,
+                post_comment=_post_comment,
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("CI_GATE gate wiring failed — rung disabled", exc_info=True)
+            return None
 
     # ----------------------------- condition ------------------------------- #
 
@@ -422,7 +463,13 @@ class WakeWatcher:
         acted = await self._check_approval_pr_comments(task)
         if acted:
             return acted
-        return await self._check_pr_ci(task, url)
+        acted = await self._check_pr_ci(task, url)
+        if acted:
+            return acted
+        # 5. CI_GATE integration gate (M6): PR CI is green (or unknown, which
+        #    the gate re-checks explicitly) — run the integration validation
+        #    once per PR head, bounded send-back on failure.
+        return await self._check_ci_gate_integration(task, url)
 
     async def _check_pr_ci(self, task: Task, url: str) -> str | None:
         """Rung 4: react to a red check on the open PR's head, bounded."""
@@ -494,6 +541,111 @@ class WakeWatcher:
         await self._emit(
             task, "pr_ci_red",
             f"{task.id[:8]} CI failing ({names}) — fix round {rounds}/{self.max_ci_fix_rounds}",
+        )
+        return await self._resume(task)
+
+    async def _check_ci_gate_integration(self, task: Task, url: str) -> str | None:
+        """Rung 5 (M6): run the CI_GATE integration validation post-PR, gated.
+
+        The gate object owns eligibility, the once-per-head + in-flight +
+        namespace duplicate guards, triggering, polling one status call per
+        tick, and posting the PR results comment. This method owns what the
+        verdict DOES to the task: pass → stays awaiting_approval (a human
+        still merges); fail → bounded send-back to the coder, then escalate;
+        refused (code PR needing a PR-built image) → honest escalation.
+        """
+        if self._ci_gate_gate is None:
+            return None
+        try:
+            outcome = await self._ci_gate_gate.step(task, url)
+        except Exception as exc:  # noqa: BLE001 — the gate must never kill the watcher
+            log.warning("CI_GATE gate step failed for %s: %s", task.id[:8], exc)
+            return None
+        # The gate mutates task.context (its state machine) — persist always.
+        await self.store.update_task(task)
+
+        if outcome.action == "skip":
+            return None
+        if outcome.action == "blocked":
+            await self._emit(task, "ci_gate_blocked",
+                             f"{task.id[:8]} CI_GATE: {outcome.reason}")
+            return None
+        if outcome.action == "triggered":
+            await self._emit(task, "ci_gate_trigger",
+                             f"{task.id[:8]} CI_GATE: {outcome.reason}")
+            return "ci_gate_triggered"
+        if outcome.action == "waiting":
+            await self._emit(task, "ci_gate_poll",
+                             f"{task.id[:8]} CI_GATE: {outcome.reason}")
+            return None
+        if outcome.action == "passed":
+            await self._emit(
+                task, "ci_gate_pass",
+                f"{task.id[:8]} CI_GATE integration PASSED: {outcome.web_url}"
+                + (" (PR comment posted)" if outcome.comment_posted else ""),
+            )
+            return "ci_gate_passed"
+        if outcome.action == "refused":
+            data = task.blocker or {}
+            data["category"] = "NOVEL_UNKNOWN"
+            data["question"] = (
+                "CI_GATE validation is required but cannot run honestly: "
+                f"{outcome.reason} Proceed without it, or wire the PR-image build?"
+            )
+            data["root_cause_hypothesis"] = outcome.reason
+            task.blocker = data
+            await self.store.update_task(task)
+            await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
+            await self._emit(task, "ci_gate_refused",
+                             f"{task.id[:8]} CI_GATE cannot run: {outcome.reason}")
+            return "escalated_ci_gate_refused"
+
+        # failed — bounded send-back, counted per pipeline run (a new run only
+        # ever starts on a new PR head, so each failure is a distinct signature).
+        ctx = task.context or {}
+        names = ", ".join(outcome.failing_jobs) or "pipeline"
+        rounds = int(ctx.get("ci_gate_fix_rounds") or 0) + 1
+        ctx["ci_gate_fix_rounds"] = rounds
+        task.context = ctx
+        if rounds > self.max_ci_gate_fix_rounds:
+            data = task.blocker or {}
+            data["category"] = "NOVEL_UNKNOWN"
+            data["question"] = (
+                f"CI_GATE integration still failing after {rounds - 1} autonomous "
+                f"fix round(s). Failing: {names}. Advise, or take over?"
+            )
+            data["root_cause_hypothesis"] = f"CI_GATE integration failing: {names}"
+            data["evidence"] = (outcome.log_excerpt or outcome.web_url)[:1500]
+            task.blocker = data
+            await self.store.update_task(task)
+            await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
+            await self._emit(
+                task, "ci_gate_fail",
+                f"{task.id[:8]} CI_GATE red past {self.max_ci_gate_fix_rounds} "
+                f"rounds: {names} — escalated",
+            )
+            return "escalated_ci_gate"
+
+        message = (
+            f"The CI_GATE integration validation failed. Job(s): {names}.\n"
+            f"Pipeline: {outcome.web_url}\n"
+            + (f"Log tail:\n```\n{outcome.log_excerpt}\n```\n"
+               if outcome.log_excerpt else "")
+            + "Fix the cause on the same branch; the push updates the PR and "
+              "the validation re-runs on the new head."
+        )
+        feedback = ctx.get("send_back_feedback") or []
+        feedback.append({
+            "at": now_iso(), "message": message, "author": "ci_gate",
+            "source": "ci_gate",
+        })
+        ctx["send_back_feedback"] = feedback
+        task.context = ctx
+        await self.store.update_task(task)
+        await self._emit(
+            task, "ci_gate_fail",
+            f"{task.id[:8]} CI_GATE failing ({names}) — fix round "
+            f"{rounds}/{self.max_ci_gate_fix_rounds}",
         )
         return await self._resume(task)
 
