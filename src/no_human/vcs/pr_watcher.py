@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -310,3 +311,120 @@ async def post_reply_comment(pr_ref: str, message: str) -> bool:
         return out is not None
 
     return False
+
+
+async def default_pr_state(ref: str) -> str:
+    """The PR's lifecycle state via gh: "MERGED" | "CLOSED" | "OPEN" | "".
+
+    "" means unknown (no gh, unparseable ref, network error) — callers must
+    treat unknown as "no action", never as closed. An awaiting-approval task
+    previously watched only comments, so a merged PR left it parked forever
+    and a closed-unmerged PR was polled until the end of time.
+    """
+    if not shutil.which("gh"):
+        return ""
+    if ref.startswith("http"):
+        parsed = parse_pr_url(ref)
+        if not parsed or parsed[0] != "github":
+            return ""
+        _, host, slug, num = parsed
+        repo_arg, num_str = f"{host}/{slug}", str(num)
+    elif "#" in ref:
+        repo, _, num_str = ref.partition("#")
+        repo_arg = repo
+    else:
+        return ""
+    out = await _run_cli(
+        ["gh", "pr", "view", num_str, "--repo", repo_arg, "--json", "state"]
+    )
+    if not out:
+        return ""
+    try:
+        return str(json.loads(out).get("state") or "").upper()
+    except json.JSONDecodeError:
+        return ""
+
+
+async def default_pr_checks(ref: str) -> list[dict]:
+    """The PR head's CI checks, normalized: [{name, status, link}].
+
+    status ∈ "fail" | "pass" | "pending". Sources both GitHub check-runs
+    (conclusion) and commit statuses (state) from statusCheckRollup — the
+    Jenkins integration on code.example.com reports plain commit statuses
+    (e.g. continuous-integration/jenkins/pr-head), which `gh pr checks`
+    renders but scripts often miss. Empty list = unknown/no checks.
+    """
+    if not shutil.which("gh"):
+        return []
+    if ref.startswith("http"):
+        parsed = parse_pr_url(ref)
+        if not parsed or parsed[0] != "github":
+            return []
+        _, host, slug, num = parsed
+        repo_arg, num_str = f"{host}/{slug}", str(num)
+    elif "#" in ref:
+        repo, _, num_str = ref.partition("#")
+        repo_arg = repo
+    else:
+        return []
+    out = await _run_cli([
+        "gh", "pr", "view", num_str, "--repo", repo_arg,
+        "--json", "statusCheckRollup",
+    ])
+    if not out:
+        return []
+    try:
+        rollup = json.loads(out).get("statusCheckRollup") or []
+    except json.JSONDecodeError:
+        return []
+    checks: list[dict] = []
+    for c in rollup:
+        name = c.get("name") or c.get("context") or "unnamed check"
+        raw = (c.get("conclusion") or c.get("state") or "").upper()
+        if raw in ("FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"):
+            status = "fail"
+        elif raw in ("SUCCESS", "NEUTRAL", "SKIPPED"):
+            status = "pass"
+        else:  # PENDING, EXPECTED, IN_PROGRESS, QUEUED, "" (still running)
+            status = "pending"
+        checks.append({
+            "name": name, "status": status,
+            "link": c.get("targetUrl") or c.get("detailsUrl") or "",
+        })
+    return checks
+
+
+async def default_ci_log_excerpt(link: str) -> str:
+    """A short excerpt of a failing Jenkins build's console log, or "".
+
+    Proven against build.example.com: `<build>/consoleText` answers HTTP Basic
+    with the SSO credentials from ~/.no_human/.env (the browser URL the human
+    sees is an SSO redirect, but the API path takes Basic auth). The corporate
+    chain is self-signed, so verification is disabled for this host — the
+    excerpt feeds a prompt, it is not an integrity boundary. Best-effort by
+    design: "" simply means the feedback carries only the check name + link.
+    """
+    if "/display/redirect" in link:
+        link = link.split("/display/redirect")[0]
+    if not link.startswith("http"):
+        return ""
+    user = os.environ.get("SSO_USERNAME")
+    password = os.environ.get("SSO_PASSWORD")
+    if not (user and password):
+        return ""
+    import httpx
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=25, auth=(user, password)) as client:
+            resp = await client.get(link.rstrip("/") + "/consoleText")
+            if resp.status_code != 200:
+                return ""
+            text = resp.text
+    except Exception as exc:  # noqa: BLE001 — a log fetch must never break the watcher
+        log.warning("CI log fetch failed for %s: %s", link[:80], exc)
+        return ""
+    lines = text.splitlines()
+    for i, ln in enumerate(lines):
+        low = ln.lower()
+        if "error" in low or "exception" in low or "failure" in low:
+            return "\n".join(lines[max(0, i - 2): i + 18])[:2000]
+    return "\n".join(lines[-15:])[:2000]

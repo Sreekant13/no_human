@@ -16,6 +16,7 @@ The condition grammar is deliberately tiny and machine-checkable:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -74,6 +75,9 @@ class WakeWatcher:
         ci_green: CiGreenChecker | None = None,
         ci_terminal: CiTerminalChecker | None = None,
         pr_comment: PrCommentChecker | None = None,
+        pr_state: Callable[[str], Awaitable[str]] | None = None,
+        pr_checks: Callable[[str], Awaitable[list[dict]]] | None = None,
+        ci_log: Callable[[str], Awaitable[str]] | None = None,
         on_event: Callable[[str, str], None] | None = None,
     ):
         self.store = store
@@ -89,10 +93,18 @@ class WakeWatcher:
         self.max_revision_rounds = int(
             (config or {}).get("bounds", {}).get("max_correction_rounds", 2)
         )
+        # Cap on autonomous CI-failure → fix cycles on an open PR (Jules /
+        # Copilot pattern: bounded rounds, then hand the specific failure to a
+        # human). Counted per distinct failure signature, so a re-run of the
+        # same red check doesn't burn a round.
+        self.max_ci_fix_rounds = int(blockers_cfg.get("max_ci_fix_rounds", 3))
         self._pr_merged = pr_merged
         self._ci_green = ci_green
         self._ci_terminal = ci_terminal
         self._pr_comment = pr_comment
+        self._pr_state = pr_state
+        self._pr_checks = pr_checks
+        self._ci_log = ci_log
         self._on_event = on_event or (lambda kind, text: None)
 
     # ----------------------------- condition ------------------------------- #
@@ -183,10 +195,12 @@ class WakeWatcher:
         return actions
 
     async def _evaluate(self, task: Task, *, now: datetime) -> str | None:
-        # An open PR (B4): poll it for new human comments and revise on them.
-        # It NEVER times out — a PR may wait for human approval indefinitely.
+        # An open PR: shepherd it. Merged → done; closed-unmerged → escalate;
+        # new human comments → revise (B4); red CI on the PR head → bounded fix
+        # loop (M1). It NEVER times out — a PR may wait for human approval
+        # indefinitely.
         if task.status == TaskStatus.AWAITING_APPROVAL:
-            return await self._check_approval_pr_comments(task)
+            return await self._check_open_pr(task)
 
         blocker = Blocker.from_dict(task.blocker) if task.blocker else None
         raised_at = _parse_iso(blocker.raised_at if blocker else None) \
@@ -297,6 +311,126 @@ class WakeWatcher:
         ctx["revision_rounds"] = rounds
         task.context = ctx
         return rounds
+
+    async def _check_open_pr(self, task: Task) -> str | None:
+        """The awaiting-approval priority ladder, one rung per tick.
+
+        1. **Merged** → DONE. The agent only ever *observes* merged-ness —
+           the never-merge constraint is untouched. (Before this ladder, a
+           merged PR left its task parked as awaiting_approval forever.)
+        2. **Closed unmerged** → ESCALATED with a question (previously polled
+           until the end of time).
+        3. **New human comments** → inject + revise (existing B4 path).
+        4. **Red CI on the PR head** → bounded fix loop: fetch the failing
+           check's log, feed it back, resume onto the PR branch. Rounds are
+           counted per distinct failure *signature* — a re-run of the same red
+           check never burns a round — and past the cap the specific failing
+           check is handed to the human. This is the gap PR #531 exposed: the
+           Jenkinsfile died in Jenkins' CPS compiler while every local check
+           passed, and nothing was watching.
+        """
+        ctx = task.context or {}
+        url = ctx.get("pr_watch")
+        if not url:
+            return None
+
+        state = ""
+        if self._pr_state is not None:
+            try:
+                state = (await self._pr_state(url)) or ""
+            except Exception as exc:  # noqa: BLE001 — a poll error must not crash the watcher
+                log.warning("failed to poll PR state for %s: %s", task.id[:8], exc)
+        if state == "MERGED":
+            await self.store.set_status(task, TaskStatus.DONE, validate=False)
+            self._on_event("merged", f"{task.id[:8]} PR merged by a human: {url}")
+            return "merged"
+        if state == "CLOSED":
+            data = task.blocker or {}
+            data["category"] = "AMBIGUITY"
+            data["question"] = (
+                "The PR was closed without merging. Abandon the task, or rework "
+                "and reopen?"
+            )
+            data["root_cause_hypothesis"] = f"PR closed unmerged: {url}"
+            task.blocker = data
+            await self.store.update_task(task)
+            await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
+            self._on_event("pr_closed", f"{task.id[:8]} PR closed unmerged: {url}")
+            return "escalated_pr_closed"
+
+        acted = await self._check_approval_pr_comments(task)
+        if acted:
+            return acted
+        return await self._check_pr_ci(task, url)
+
+    async def _check_pr_ci(self, task: Task, url: str) -> str | None:
+        """Rung 4: react to a red check on the open PR's head, bounded."""
+        if self._pr_checks is None:
+            return None
+        try:
+            checks = await self._pr_checks(url)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("failed to poll PR checks for %s: %s", task.id[:8], exc)
+            return None
+        failing = [c for c in checks if c.get("status") == "fail"]
+        if not failing:
+            return None
+        # A distinct-failure signature: re-runs of the same red set are free.
+        signature = hashlib.sha256(
+            "|".join(sorted(c.get("name", "") for c in failing)).encode()
+        ).hexdigest()[:16]
+        ctx = task.context or {}
+        if ctx.get("pr_ci_last_sig") == signature:
+            return None  # already acted on this exact failure; wait for a new head
+        excerpt = ""
+        if self._ci_log is not None and failing[0].get("link"):
+            try:
+                excerpt = await self._ci_log(failing[0]["link"])
+            except Exception:  # noqa: BLE001 — the log is a bonus, not a dependency
+                excerpt = ""
+        names = ", ".join(c.get("name", "?") for c in failing)
+        rounds = int(ctx.get("pr_ci_rounds") or 0) + 1
+        ctx["pr_ci_rounds"] = rounds
+        ctx["pr_ci_last_sig"] = signature
+        task.context = ctx
+
+        if rounds > self.max_ci_fix_rounds:
+            data = task.blocker or {}
+            data["category"] = "NOVEL_UNKNOWN"
+            data["question"] = (
+                f"CI on the PR is still red after {rounds - 1} autonomous fix "
+                f"round(s). Failing: {names}. Advise, or take over?"
+            )
+            data["root_cause_hypothesis"] = f"PR CI failing: {names}"
+            data["evidence"] = (excerpt or failing[0].get("link", ""))[:1500]
+            task.blocker = data
+            await self.store.update_task(task)
+            await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
+            self._on_event(
+                "escalated_ci",
+                f"{task.id[:8]} PR CI red past {self.max_ci_fix_rounds} rounds: {names}",
+            )
+            return "escalated_ci"
+
+        message = (
+            f"The PR's CI is failing. Check(s): {names}.\n"
+            f"Link: {failing[0].get('link', '')}\n"
+            + (f"Log excerpt:\n```\n{excerpt}\n```\n" if excerpt else "")
+            + "Fix the cause on the same branch; the push updates the PR and "
+              "re-runs the checks."
+        )
+        feedback = ctx.get("send_back_feedback") or []
+        feedback.append({
+            "at": now_iso(), "message": message, "author": "ci", "source": "pr_ci",
+        })
+        ctx["send_back_feedback"] = feedback
+        task.context = ctx
+        await self.store.update_task(task)
+        self._on_event(
+            "pr_ci_red",
+            f"{task.id[:8]} CI failing ({names}) — fix round {rounds}/{self.max_ci_fix_rounds}",
+        )
+        return await self._resume(task)
 
     async def _check_approval_pr_comments(self, task: Task) -> str | None:
         """Poll an awaiting-approval PR for NEW human comments (B4).
