@@ -48,18 +48,31 @@ def open_pr(
     we push the branch and return a ``local`` marker — the push itself proves the
     branch/commit/PR-open code path without touching a real forge.
     """
-    repo.push(branch)
+    # Classify the remote BEFORE pushing. The old order pushed first and gave
+    # any unrecognized https host a fake `local-pr://` marker afterwards — the
+    # branch landed on a forge we couldn't even name, and the task reported
+    # success with a PR URL that opens nothing.
     url = repo.remote_url() or ""
+    is_github = github.is_github_remote(url, github_hosts or [])
+    is_gitlab = gitlab.is_gitlab_remote(url)
+    if not is_github and not is_gitlab and url.startswith(("http://", "https://", "git@")):
+        raise RuntimeError(
+            f"remote host not recognized as GitHub or GitLab: {url!r} — "
+            "refusing to push. Add the host to git.github_hosts if it is a "
+            "GitHub Enterprise instance."
+        )
 
-    if github.is_github_remote(url, github_hosts or []):
+    repo.push(branch)
+    if is_github:
         return PrResult(github.open_pr(repo.path, branch, title, body, base=base,
                                        labels=labels),
                         "github", branch)
-    if gitlab.is_gitlab_remote(url):
+    if is_gitlab:
         return PrResult(gitlab.open_mr(repo.path, branch, title, body, base=base,
                                        labels=labels),
                         "gitlab", branch)
 
-    # Local / unknown remote: branch is pushed, no forge PR to open.
+    # Local (file-path) remote — the Phase 0 testing target: no PR API, the
+    # push itself proves the branch/commit/PR-open path.
     marker = f"local-pr://{Path(url).name or 'remote'}/{branch}"
     return PrResult(marker, "local", branch)
