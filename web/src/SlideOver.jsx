@@ -693,66 +693,39 @@ function AgentLogModal({ agent, events, onClose }) {
   );
 }
 
-// One stage of the pipeline strip. A native <button> so keyboard and disabled
-// semantics come free; --fx-color scopes the stage's hue to everything inside.
-function FxCard({ g, isCurrent, expanded, onToggle }) {
-  return (
-    <button
-      className={`fx-card s-${g.status}${isCurrent ? " current" : ""}${expanded ? " open" : ""}`}
-      style={{ "--fx-color": g.color }}
-      onClick={onToggle}
-      disabled={!g.present}
-      aria-expanded={expanded}
-      title={g.desc}
-    >
-      <div className="fx-card-top">
-        <span className="fx-icon" aria-hidden="true">{g.icon}</span>
-        <span className="fx-label">{g.label}</span>
-        {isCurrent && <span className="fx-live-dot" role="img" aria-label="running now" />}
-      </div>
-      <div className="fx-card-meta">
-        <span className={`fx-status s-${g.status}`}>{g.status}</span>
-        {g.present && (
-          <span className="fx-counts">
-            {g.agentCount} agent{g.agentCount === 1 ? "" : "s"} · {g.eventCount} ev
-          </span>
-        )}
-      </div>
-      {g.model && <div className="fx-model" title={g.model}>{g.model}</div>}
-      {g.lastText && <div className="fx-last" title={g.lastText}>{g.lastText}</div>}
-      <div className={`fx-chevron${expanded ? " open" : ""}`} aria-hidden="true">
-        <IconChevronDown size={12} />
-      </div>
-    </button>
-  );
-}
-
-// The connector between two stages. `flowing` animates toward the stage that
-// is currently running — motion marks where the pipeline actually is.
-function FxLink({ flowing, done }) {
-  return <div className={`fx-link${flowing ? " flowing" : ""}${done ? " done" : ""}`} aria-hidden="true" />;
-}
-
-// The expanded view of one functionality: its primary agent on top, the agents
-// it spawned (supervisor, research subagents) fanned out beneath.
-function FxTree({ g, agentStates, node, isActive, onOpen }) {
+// One lane of the functionality board: the stage's status header on top,
+// its full agent tree always visible beneath — nothing hidden behind clicks.
+// The arrow out of a header flows when the NEXT stage is the one running.
+function FxLane({ g, isCurrent, flowOut, agentStates, node, isActive, onOpen }) {
   const hasPrimary = g.roles.includes(g.primary);
-  const primary = hasPrimary ? node(g.primary) : null;
   const children = [
     ...(g.id === "coding" && g.roles.includes("supervisor") ? [node("supervisor")] : []),
     ...g.subs,
   ];
   return (
-    <div className="fx-tree" style={{ "--fx-color": g.color }}>
-      <div className="fx-tree-head">
-        <span className="fx-tree-title">{g.label}</span>
-        <span className="fx-tree-desc">{g.desc}</span>
+    <div className={`fx-lane s-${g.status}${isCurrent ? " current" : ""}`}
+         style={{ "--fx-color": g.color }}>
+      <div className={`fx-head${flowOut ? " flow-out" : ""}`} title={g.desc}>
+        <div className="fx-head-top">
+          <span className="fx-icon" aria-hidden="true">{g.icon}</span>
+          <span className="fx-label">{g.label}</span>
+          {isCurrent && <span className="fx-live-dot" role="img" aria-label="running now" />}
+        </div>
+        <div className="fx-head-meta">
+          <span className={`fx-status s-${g.status}`}>{g.status}</span>
+          {g.present && (
+            <span className="fx-counts">
+              {g.agentCount} agent{g.agentCount === 1 ? "" : "s"} · {g.eventCount} ev
+            </span>
+          )}
+        </div>
+        {g.model && <div className="fx-model" title={g.model}>{g.model}</div>}
       </div>
       {hasPrimary || children.length > 0 ? (
-        <div className="sys-col fx-tree-col">
+        <div className="sys-col fx-lane-tree">
           {hasPrimary && (
-            <AgentNode agent={primary} state={agentStates[g.primary]}
-                       isActive={isActive} onClick={() => onOpen(primary)} />
+            <AgentNode agent={node(g.primary)} state={agentStates[g.primary]}
+                       isActive={isActive} onClick={() => onOpen(node(g.primary))} />
           )}
           {hasPrimary && children.length > 0 && <div className="sys-col-stem" />}
           {children.length > 0 && (
@@ -767,7 +740,7 @@ function FxTree({ g, agentStates, node, isActive, onOpen }) {
           )}
         </div>
       ) : (
-        <div className="fx-tree-empty">This stage hasn't started yet.</div>
+        <div className="fx-lane-empty">not started yet</div>
       )}
     </div>
   );
@@ -776,18 +749,7 @@ function FxTree({ g, agentStates, node, isActive, onOpen }) {
 function SystemTab({ taskId, task, isActive }) {
   const [events, setEvents] = useState([]);
   const [modalAgent, setModalAgent] = useState(null);
-  const [expandedFx, setExpandedFx] = useState(null);
-  // Follow the pipeline (auto-expand the running stage) only until the user
-  // clicks a card — after that, their choice wins.
-  const fxTouched = useRef(false);
   const currentFx = currentFunctionality(events, isActive);
-  useEffect(() => {
-    if (!fxTouched.current && currentFx) setExpandedFx(currentFx);
-  }, [currentFx]);
-  const toggleFx = (id) => {
-    fxTouched.current = true;
-    setExpandedFx((x) => (x === id ? null : id));
-  };
 
   useEffect(() => {
     let cancelled = false;
@@ -853,7 +815,6 @@ function SystemTab({ taskId, task, isActive }) {
   // order the orchestrator drives them. Each groups its roles and their
   // subagents; clicking one expands that stage's agent tree.
   const groups = groupFunctionalities({ agentStates, subagents, models: nodeModels, events });
-  const expandedGroup = groups.find((g) => g.id === expandedFx && g.present) || null;
 
   if (events.length === 0) {
     return (
@@ -868,30 +829,18 @@ function SystemTab({ taskId, task, isActive }) {
   return (
     <div className="sys-view">
       <div className="sys-tree">
-        {/* The pipeline strip: one card per functionality, connectors animate
-            toward the stage that is running right now. */}
-        <div className="fx-pipeline">
-          {groups.map((g, i) => [
-            i > 0 && (
-              <FxLink key={`link-${g.id}`}
-                      flowing={isActive && currentFx === g.id}
-                      done={groups[i - 1].status === "done"} />
-            ),
-            <FxCard key={g.id} g={g}
+        {/* The functionality board: four lanes, every agent and subagent
+            visible at once. The arrow between headers flows toward the stage
+            that is running right now. */}
+        <div className="fx-board">
+          {groups.map((g, i) => (
+            <FxLane key={g.id} g={g}
                     isCurrent={isActive && currentFx === g.id}
-                    expanded={expandedFx === g.id}
-                    onToggle={() => toggleFx(g.id)} />,
-          ])}
-        </div>
-
-        {/* The expanded functionality's agent tree. */}
-        <div className={`fx-detail-wrap${expandedGroup ? " open" : ""}`}>
-          <div className="fx-detail-inner">
-            {expandedGroup && (
-              <FxTree g={expandedGroup} agentStates={agentStates} node={node}
-                      isActive={isActive} onOpen={setModalAgent} />
-            )}
-          </div>
+                    flowOut={isActive && i + 1 < groups.length
+                             && currentFx === groups[i + 1].id}
+                    agentStates={agentStates} node={node}
+                    isActive={isActive} onOpen={setModalAgent} />
+          ))}
         </div>
 
         {/* Summary stats */}
