@@ -98,6 +98,17 @@ class WakeWatcher:
         # human). Counted per distinct failure signature, so a re-run of the
         # same red check doesn't burn a round.
         self.max_ci_fix_rounds = int(blockers_cfg.get("max_ci_fix_rounds", 3))
+        # Comment authors whose PR comments never trigger a revision. Live
+        # incident: system-codeadmin posts a unit-test-results table on every
+        # build, which the comment rung injected as human feedback and resumed
+        # the task — one wasted attempt per PR, forever. "[bot]" logins are
+        # always ignored on top of this list. In-code default rather than
+        # config.py DEFAULTS because a user yaml `blockers:` section replaces
+        # that map wholesale (the deep-merge shadowing trap).
+        self.ignore_comment_authors = {
+            str(a).lower()
+            for a in blockers_cfg.get("ignore_comment_authors", ["system-codeadmin"])
+        }
         self._pr_merged = pr_merged
         self._ci_green = ci_green
         self._ci_terminal = ci_terminal
@@ -267,6 +278,8 @@ class WakeWatcher:
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to fetch PR comments for injection: %s", exc)
             return None
+        comments = [c for c in comments
+                    if not self._is_bot_author(getattr(c, "author", ""))]
         if not comments:
             return None
         rounds = self._append_comments_as_feedback(task, comments)
@@ -274,6 +287,12 @@ class WakeWatcher:
         await self.store.update_task(task)
         self._on_event("pr_feedback", f"{task.id[:8]} got {len(comments)} PR comment(s)")
         return rounds
+
+    def _is_bot_author(self, author: str) -> bool:
+        """Comments from bots (CI result tables, status dashboards) are not
+        operator feedback and must never trigger a revision attempt."""
+        a = (author or "").lower()
+        return a.endswith("[bot]") or a in self.ignore_comment_authors
 
     @staticmethod
     def _append_comments_as_feedback(task: Task, comments: list) -> int:
@@ -462,13 +481,27 @@ class WakeWatcher:
 
         # Advance the cursor past everything we've now seen (newest wins).
         newest = max((getattr(c, "created_at", "") or "") for c in comments)
-        rounds = self._append_comments_as_feedback(task, fresh)
+        human = [c for c in fresh if not self._is_bot_author(getattr(c, "author", ""))]
+        if not human:
+            # Bot chatter only (CI result tables etc.): move the cursor so the
+            # same comments are never reconsidered, but do not burn an attempt.
+            if newest:
+                ctx["pr_comment_since"] = newest
+                task.context = ctx
+                await self.store.update_task(task)
+            self._on_event(
+                "pr_feedback_skipped",
+                f"{task.id[:8]} ignored {len(fresh)} bot comment(s) "
+                f"({', '.join(sorted({getattr(c, 'author', '?') for c in fresh}))})",
+            )
+            return None
+        rounds = self._append_comments_as_feedback(task, human)
         ctx = task.context or {}
         if newest:
             ctx["pr_comment_since"] = newest
         task.context = ctx
         await self.store.update_task(task)
-        self._on_event("pr_feedback", f"{task.id[:8]} got {len(fresh)} new PR comment(s)")
+        self._on_event("pr_feedback", f"{task.id[:8]} got {len(human)} new PR comment(s)")
 
         if rounds > self.max_revision_rounds:
             await self._escalate_revisions(task, rounds)

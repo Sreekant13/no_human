@@ -27,11 +27,11 @@ async def _approval_task(store, url="https://code.example.com/dev/x/pull/531"):
     return t
 
 
-def _watcher(store, *, state="OPEN", checks=None, log="", events=None):
+def _watcher(store, *, state="OPEN", checks=None, log="", events=None, comments=None):
     async def pr_state(url): return state
     async def pr_checks(url): return checks or []
     async def ci_log(link): return log
-    async def pr_comment(url): return []
+    async def pr_comment(url): return comments or []
     return WakeWatcher(
         store, {}, pr_state=pr_state, pr_checks=pr_checks, ci_log=ci_log,
         pr_comment=pr_comment,
@@ -122,6 +122,52 @@ async def test_ci_rounds_cap_escalates_with_the_named_check(store):
     fresh = await store.get_task(t.id)
     assert fresh.status is TaskStatus.ESCALATED
     assert "check-4" in (fresh.blocker or {}).get("question", "")
+
+
+class _Comment:
+    def __init__(self, author, body, created_at):
+        self.author = author
+        self.body = body
+        self.created_at = created_at
+        self.path = self.line = self.diff_hunk = None
+
+
+async def test_bot_comments_never_trigger_a_revision(store):
+    """Live incident: system-codeadmin's per-build test-results table was
+    injected as operator feedback and resumed the task straight into the
+    budget gate — one wasted attempt per PR. Bot chatter must advance the
+    cursor (never reconsidered) without resuming."""
+    t = await _approval_task(store)
+    t.context["pr_comment_since"] = "2026-07-10T00:00:00Z"
+    await store.update_task(t)
+    bots = [
+        _Comment("system-codeadmin", "## Unit Test Results\n583 passed", "2026-07-10T11:15:52Z"),
+        _Comment("renovate[bot]", "dep dashboard", "2026-07-10T11:16:00Z"),
+    ]
+    events = []
+    out = await _watcher(store, comments=bots, events=events)._check_open_pr(t)
+    assert out is None
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.AWAITING_APPROVAL
+    assert not fresh.context.get("send_back_feedback")
+    assert fresh.context["pr_comment_since"] == "2026-07-10T11:16:00Z"
+    assert any(k == "pr_feedback_skipped" for k, _ in events)
+
+
+async def test_human_comment_mixed_with_bot_chatter_injects_only_the_human(store):
+    t = await _approval_task(store)
+    t.context["pr_comment_since"] = "2026-07-10T00:00:00Z"
+    await store.update_task(t)
+    mixed = [
+        _Comment("system-codeadmin", "## Unit Test Results", "2026-07-10T11:15:52Z"),
+        _Comment("dev", "please rename the stage", "2026-07-10T11:20:00Z"),
+    ]
+    out = await _watcher(store, comments=mixed)._check_open_pr(t)
+    assert out == "resumed"
+    fresh = await store.get_task(t.id)
+    fb = fresh.context["send_back_feedback"]
+    assert len(fb) == 1
+    assert "rename the stage" in fb[0]["message"]
 
 
 async def test_pending_or_green_checks_do_nothing(store):
