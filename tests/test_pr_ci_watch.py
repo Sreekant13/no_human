@@ -183,6 +183,20 @@ async def test_pending_or_green_checks_do_nothing(store):
     assert (await store.get_task(t.id)).status is TaskStatus.AWAITING_APPROVAL
 
 
+async def test_an_idle_tick_leaves_a_throttled_heartbeat(store):
+    """A healthy parked task produces no action events, which used to be
+    indistinguishable from a dead watcher. The tick now persists one
+    wake_tick per task per hour — proof of life without event spam."""
+    t = await _approval_task(store)
+    w = _watcher(store)  # green checks, no comments: nothing to do
+    await w.tick()
+    await w.tick()  # immediately again — must not duplicate
+    evs = [e for e in await store.list_events(t.id) if e["kind"] == "wake_tick"]
+    assert len(evs) == 1
+    assert evs[0]["source"] == "watcher"
+    assert (await store.get_task(t.id)).status is TaskStatus.AWAITING_APPROVAL
+
+
 async def test_unknown_state_never_closes_or_completes(store):
     """gh missing / network down ⇒ state "" — must fall through, not act."""
     t = await _approval_task(store)

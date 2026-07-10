@@ -204,7 +204,33 @@ class WakeWatcher:
                 action = await self._evaluate(task, now=now)
                 if action:
                     actions.append((task.id, action))
+                else:
+                    await self._heartbeat(task, now=now)
         return actions
+
+    # Throttled liveness proof. A healthy parked task produces no action
+    # events (the watcher acts only on change), which is indistinguishable
+    # from a dead watcher in the record — the server ran one for a full day.
+    # One wake_tick per task per hour bounds the noise while making "the
+    # watcher is checking this task" a queryable fact (`nh doctor` reads it).
+    HEARTBEAT = timedelta(hours=1)
+
+    async def _heartbeat(self, task: Task, *, now: datetime) -> None:
+        last = _parse_iso((task.context or {}).get("last_wake_tick"))
+        if last and now - last < self.HEARTBEAT:
+            return
+        ctx = task.context or {}
+        ctx["last_wake_tick"] = now.isoformat()
+        task.context = ctx
+        try:
+            await self.store.update_task(task)
+            await self.store.save_events(task.id, [{
+                "source": "watcher", "kind": "wake_tick",
+                "text": f"watcher checked ({task.status.value}): nothing to do",
+                "ts": time.time(),
+            }])
+        except Exception:  # noqa: BLE001 — a heartbeat must never break the tick
+            log.warning("wake heartbeat failed for %s", task.id[:8], exc_info=True)
 
     async def _evaluate(self, task: Task, *, now: datetime) -> str | None:
         # An open PR: shepherd it. Merged → done; closed-unmerged → escalate;
