@@ -227,6 +227,7 @@ def _build_review_prompt(
     diff_total_len: int = 0,
     profile_context: str = "",
     confirmed_rules: str = "",
+    prior_rounds: str = "",
     full_files: str = "",
     omitted_files: list[str] | None = None,
     allow_tools: bool = True,
@@ -244,6 +245,23 @@ def _build_review_prompt(
         f"\nConfirmed rules from past experience (the team learned these the hard way):\n"
         f"{confirmed_rules}\n"
         if confirmed_rules else ""
+    )
+    # Review continuity. You are a fresh context, but this is not the first
+    # round — without memory the gate oscillated live: round 14 demanded a
+    # self-check be enforced, round 15 demanded the enforcement be gated,
+    # rounds 16–17 demanded it all be removed as out of scope. Each round was
+    # "right" in isolation; together they were an unbounded polish loop.
+    continuity_section = (
+        "\nREVIEW CONTINUITY — prior rounds and operator decisions:\n"
+        f"{prior_rounds}\n"
+        "Rules for continuity:\n"
+        "  - Do NOT re-litigate a finding a prior round raised and the coder\n"
+        "    addressed, and do NOT reverse a prior round's request, unless you\n"
+        "    cite NEW evidence (file:line) that the resolution is wrong.\n"
+        "  - Operator answers above are binding. A scope question they settle\n"
+        "    is settled — it is not a finding of any severity.\n"
+        "  - New findings in code untouched by prior rounds are always fair.\n"
+        if prior_rounds else ""
     )
     # Prompt ordering: STABLE protocol first → VOLATILE task/diff last (Phase 2a).
     is_truncated = diff_total_len > len(diff)
@@ -399,7 +417,8 @@ def _build_review_prompt(
         "  - For general observations with no specific line, set file to '' and line to 0\n"
         "  - 'suggested_next' helps the implementing agent focus its retry — set to null if passed\n\n"
         f"{profile_section}"
-        f"{rules_section}\n"
+        f"{rules_section}"
+        f"{continuity_section}\n"
         # ── volatile task-specific content ──
         f"Task: {task.title}\n"
         f"Acceptance criteria:\n{criteria}\n\n"
@@ -656,6 +675,7 @@ class AdversarialReviewer:
         diff_override: str | None = None,
         profile_context: str = "",
         confirmed_rules: str = "",
+        prior_rounds: str = "",
         mode: str = "gate",
         pr_comments: str = "",
     ) -> ReviewDecision:
@@ -698,6 +718,7 @@ class AdversarialReviewer:
             diff_total_len=diff_total_len,
             profile_context=profile_context,
             confirmed_rules=confirmed_rules,
+            prior_rounds=prior_rounds,
             full_files=full_files,
             omitted_files=omitted_files,
             allow_tools=not diff_override,
