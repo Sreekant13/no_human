@@ -121,6 +121,65 @@ async def test_full_pipeline_opens_local_pr(bare_repo, tmp_path, store):
     assert "pr_open" in kinds and "commit" in kinds
 
 
+async def test_repro_gate_runs_advisory_inside_the_pipeline(bare_repo, tmp_path, store):
+    """The coder declares its demonstrating test; the gate proves both
+    directions and emits its verdict — without changing the outcome."""
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+        (cwd / ".no_human").mkdir(exist_ok=True)
+        (cwd / ".no_human" / "repro_tests.json").write_text(
+            '{"tests": ["test_calc.py::test_mul"]}'
+        )
+
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    gate = [e for e in events if e["kind"] == "repro_gate"]
+    assert len(gate) == 1
+    assert gate[0]["verdict"] == "pass", gate[0]
+    # test_mul fails on the base (no mul) and passes after — a true repro.
+
+
+async def test_repro_gate_waives_loudly_without_a_manifest(bare_repo, tmp_path, store):
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    gate = [e for e in events if e["kind"] == "repro_gate"]
+    assert len(gate) == 1 and gate[0]["verdict"] == "waived"
+
+
 async def test_transient_pr_open_failure_retries_instead_of_escalating(
         bare_repo, tmp_path, store, monkeypatch):
     """Live incident: `gh pr create` returned an EOF after a successful push

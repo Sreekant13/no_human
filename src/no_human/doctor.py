@@ -45,6 +45,9 @@ MECHANISMS: list[tuple[str, tuple[str, ...], str]] = [
      "zero is good — no subsystem silently degraded mid-run"),
     ("citation_rule", ("review_citation_demoted",),
      "zero is good — no hallucinated citation tried to block the gate"),
+    ("repro_gate", ("repro_gate",),
+     "zero with attempts reaching review = the gate is off or dead; "
+     "high waived-share means coders aren't writing manifests"),
     ("pr_watch_ladder",
      ("merged", "pr_closed", "pr_feedback", "pr_feedback_skipped", "pr_ci_red",
       "escalated_ci", "escalated_revisions", "escalated_timeout", "resumed"),
