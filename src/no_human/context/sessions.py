@@ -30,8 +30,41 @@ class SessionsSource:
             (*params, self.limit),
         )
         rows = await cur.fetchall()
-        return [
+        chunks = [
             ContextChunk(source="sessions", title=f"[{r['type']}] {r['title']}",
                          content=r["content"][:2000])
+            for r in rows
+        ]
+        chunks += await self._recall_failures(terms)
+        return chunks
+
+    async def _recall_failures(self, terms: list[str]) -> list[ContextChunk]:
+        """W3.3: ranked full-text recall over the failure/fix record
+        (events_fts, migration 0006) — "a similar failure was handled in
+        task X" reaches the planner/coder instead of being rediscovered.
+        Advisory context only; empty on any FTS error (older DBs, odd
+        tokens) — recall must never break gathering."""
+        # FTS5 treats bare punctuation as operators; quote each term.
+        query = " OR ".join('"' + t.replace('"', "") + '"' for t in terms if t)
+        if not query:
+            return []
+        try:
+            cur = await self.store.db.execute(
+                """SELECT te.task_id, json_extract(te.data, '$.kind'),
+                          substr(json_extract(te.data, '$.text'), 1, 700)
+                   FROM events_fts f JOIN task_events te ON te.id = f.rowid
+                   WHERE events_fts MATCH ? ORDER BY rank LIMIT 3""",
+                (query,),
+            )
+            rows = await cur.fetchall()
+        except Exception:  # noqa: BLE001 — recall is a bonus, never a blocker
+            return []
+        return [
+            ContextChunk(
+                source="sessions",
+                title=f"[past {r[1]}] task {str(r[0])[:8]}",
+                content=f"A similar {r[1]} was recorded on task "
+                        f"{str(r[0])[:8]}:\n{r[2]}",
+            )
             for r in rows
         ]
