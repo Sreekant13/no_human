@@ -3205,3 +3205,25 @@ def test_failed_tests_event_carries_the_output_tail():
     ok_result = SimpleNamespace(ok=True, output="all good")
     tail2 = "" if ok_result.ok else ok_result.output
     assert tail2 == ""
+
+
+async def test_worktree_tasks_resolve_the_primary_repos_profile(bare_repo, tmp_path, store):
+    """First parallel run (2026-07-11): all three worktree tasks lost their
+    proven test command because the profile lookup used the WORKTREE path —
+    the DB row is keyed by the primary path. Worktrees must resolve through
+    git's common-dir to the primary."""
+    import subprocess as sp
+    from no_human.core.orchestrator import Orchestrator
+
+    primary = str(bare_repo)
+    wt = tmp_path / "wt"
+    sp.run(["git", "-C", primary, "worktree", "add", str(wt), "HEAD"],
+           capture_output=True, check=True)
+    try:
+        resolved = Orchestrator._primary_repo_path(str(wt))
+        assert resolved == primary
+        # The primary itself resolves to None (already primary).
+        assert Orchestrator._primary_repo_path(primary) is None
+    finally:
+        sp.run(["git", "-C", primary, "worktree", "remove", "--force", str(wt)],
+               capture_output=True)
