@@ -381,6 +381,11 @@ const AGENTS = [
     color: "var(--agent-supervisor)" },
   { id: "reviewer",   label: "Reviewer",     type: "QUALITY GATE", icon: "✓",  desc: "Adversarial review, tests, tamper check",
     color: "var(--agent-reviewer)" },
+  // The post-PR watcher (W2.1): without this node its agentState was never
+  // derived, so the Shepherding stage could not light up even after the
+  // events reached the client (the second half of the same starvation bug).
+  { id: "watcher",    label: "Watcher",      type: "SHEPHERD",     icon: "☂",  desc: "Post-PR: merge watch, feedback injection, CI fixes, CI_GATE gate",
+    color: "var(--agent-worker)" },
 ];
 
 const _ERROR_KINDS = new Set(["failed", "attempt_failed", "agent_error", "review_error"]);
