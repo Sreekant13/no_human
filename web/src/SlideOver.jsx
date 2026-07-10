@@ -7,7 +7,7 @@ import {
 import Markdown from "./Markdown.jsx";
 import { ROLE_LABEL, discoverSubagents, eventSource, modelsByNode } from "./eventRoles.js";
 import { normalizeOption } from "./blockerOptions.js";
-import { busPaths, columnCenters } from "./treeLayout.js";
+import { currentFunctionality, groupFunctionalities } from "./functionalities.js";
 import { agentSummary, taskSummary } from "./summaries.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
@@ -693,9 +693,101 @@ function AgentLogModal({ agent, events, onClose }) {
   );
 }
 
+// One stage of the pipeline strip. A native <button> so keyboard and disabled
+// semantics come free; --fx-color scopes the stage's hue to everything inside.
+function FxCard({ g, isCurrent, expanded, onToggle }) {
+  return (
+    <button
+      className={`fx-card s-${g.status}${isCurrent ? " current" : ""}${expanded ? " open" : ""}`}
+      style={{ "--fx-color": g.color }}
+      onClick={onToggle}
+      disabled={!g.present}
+      aria-expanded={expanded}
+      title={g.desc}
+    >
+      <div className="fx-card-top">
+        <span className="fx-icon" aria-hidden="true">{g.icon}</span>
+        <span className="fx-label">{g.label}</span>
+        {isCurrent && <span className="fx-live-dot" role="img" aria-label="running now" />}
+      </div>
+      <div className="fx-card-meta">
+        <span className={`fx-status s-${g.status}`}>{g.status}</span>
+        {g.present && (
+          <span className="fx-counts">
+            {g.agentCount} agent{g.agentCount === 1 ? "" : "s"} · {g.eventCount} ev
+          </span>
+        )}
+      </div>
+      {g.model && <div className="fx-model" title={g.model}>{g.model}</div>}
+      {g.lastText && <div className="fx-last" title={g.lastText}>{g.lastText}</div>}
+      <div className={`fx-chevron${expanded ? " open" : ""}`} aria-hidden="true">
+        <IconChevronDown size={12} />
+      </div>
+    </button>
+  );
+}
+
+// The connector between two stages. `flowing` animates toward the stage that
+// is currently running — motion marks where the pipeline actually is.
+function FxLink({ flowing, done }) {
+  return <div className={`fx-link${flowing ? " flowing" : ""}${done ? " done" : ""}`} aria-hidden="true" />;
+}
+
+// The expanded view of one functionality: its primary agent on top, the agents
+// it spawned (supervisor, research subagents) fanned out beneath.
+function FxTree({ g, agentStates, node, isActive, onOpen }) {
+  const hasPrimary = g.roles.includes(g.primary);
+  const primary = hasPrimary ? node(g.primary) : null;
+  const children = [
+    ...(g.id === "coding" && g.roles.includes("supervisor") ? [node("supervisor")] : []),
+    ...g.subs,
+  ];
+  return (
+    <div className="fx-tree" style={{ "--fx-color": g.color }}>
+      <div className="fx-tree-head">
+        <span className="fx-tree-title">{g.label}</span>
+        <span className="fx-tree-desc">{g.desc}</span>
+      </div>
+      {hasPrimary || children.length > 0 ? (
+        <div className="sys-col fx-tree-col">
+          {hasPrimary && (
+            <AgentNode agent={primary} state={agentStates[g.primary]}
+                       isActive={isActive} onClick={() => onOpen(primary)} />
+          )}
+          {hasPrimary && children.length > 0 && <div className="sys-col-stem" />}
+          {children.length > 0 && (
+            <div className="sys-col-children">
+              {children.map((c, i) => (
+                <div className="fx-child" style={{ "--i": i }} key={c.id}>
+                  <AgentNode agent={c} state={agentStates[c.id]}
+                             isActive={isActive} onClick={() => onOpen(c)} />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="fx-tree-empty">This stage hasn't started yet.</div>
+      )}
+    </div>
+  );
+}
+
 function SystemTab({ taskId, task, isActive }) {
   const [events, setEvents] = useState([]);
   const [modalAgent, setModalAgent] = useState(null);
+  const [expandedFx, setExpandedFx] = useState(null);
+  // Follow the pipeline (auto-expand the running stage) only until the user
+  // clicks a card — after that, their choice wins.
+  const fxTouched = useRef(false);
+  const currentFx = currentFunctionality(events, isActive);
+  useEffect(() => {
+    if (!fxTouched.current && currentFx) setExpandedFx(currentFx);
+  }, [currentFx]);
+  const toggleFx = (id) => {
+    fxTouched.current = true;
+    setExpandedFx((x) => (x === id ? null : id));
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -739,7 +831,6 @@ function SystemTab({ taskId, task, isActive }) {
   // Discover dynamically-spawned subagents from events, grouped by the role
   // that spawned them — each role column owns its own children.
   const subagents = discoverSubagents(events);
-  const subsOf = (roleId) => subagents.filter(s => s.parent === roleId);
   // Subagent status comes from the discovery function, not deriveAgentStatus.
   for (const sub of subagents) {
     const subEvents = events.filter(e =>
@@ -751,11 +842,6 @@ function SystemTab({ taskId, task, isActive }) {
 
   const totalElapsed = events.length > 1 ? events[events.length - 1].ts - events[0].ts : 0;
 
-  // Only show nodes that have events — the diagram builds up dynamically.
-  const has = (id) => agentStates[id] && agentStates[id].count > 0;
-  const hasWorker     = has("worker");
-  const hasSupervisor = has("supervisor");
-
   // Label each node with the model that actually ran it (from the `models`
   // event), so "the coder is Sonnet 5" is verifiable at a glance rather than
   // assumed from a config file that may be shadowing the real default.
@@ -763,29 +849,11 @@ function SystemTab({ taskId, task, isActive }) {
   const withModel  = (a) => (a && nodeModels[a.id] ? { ...a, model: nodeModels[a.id] } : a);
   const node       = (id) => withModel(AGENTS.find(a => a.id === id));
 
-  const worker     = AGENTS.find(a => a.id === "worker");
-  const supervisor = withModel(AGENTS.find(a => a.id === "supervisor"));
-
-  // The three roles the Orchestrator drives, in pipeline order. Each is a
-  // sibling column hanging off the root, owning its own subagents — the
-  // Planner is NOT an ancestor of the Coder. The Supervisor is not a role of
-  // its own: it watches the Coder, so it hangs under the Coder's column.
-  const columns = ["planner", "agent", "reviewer"]
-    .filter(has)
-    .map(id => ({
-      id,
-      agent: node(id),
-      state: agentStates[id],
-      subs: subsOf(id),
-      monitor: id === "agent" && hasSupervisor ? supervisor : null,
-    }));
-
-  const centers = columnCenters(columns.length);
-  const bus     = busPaths(centers);
-  // Which column the most recent event belongs to (the Supervisor lights up
-  // the Coder's column, since that is where it hangs).
-  const lastSrc    = events.length ? eventSource(events[events.length - 1]) : null;
-  const activeCol  = isActive ? (lastSrc === "supervisor" ? "agent" : lastSrc) : null;
+  // The page's top layer: the four functionalities of the pipeline, in the
+  // order the orchestrator drives them. Each groups its roles and their
+  // subagents; clicking one expands that stage's agent tree.
+  const groups = groupFunctionalities({ agentStates, subagents, models: nodeModels, events });
+  const expandedGroup = groups.find((g) => g.id === expandedFx && g.present) || null;
 
   if (events.length === 0) {
     return (
@@ -800,63 +868,31 @@ function SystemTab({ taskId, task, isActive }) {
   return (
     <div className="sys-view">
       <div className="sys-tree">
-        {/* Row 0: Orchestrator — always first to fire */}
-        {hasWorker && (
-          <div className="sys-tree-row">
-            <AgentNode agent={worker} state={agentStates.worker} isActive={isActive} onClick={() => setModalAgent(worker)} />
+        {/* The pipeline strip: one card per functionality, connectors animate
+            toward the stage that is running right now. */}
+        <div className="fx-pipeline">
+          {groups.map((g, i) => [
+            i > 0 && (
+              <FxLink key={`link-${g.id}`}
+                      flowing={isActive && currentFx === g.id}
+                      done={groups[i - 1].status === "done"} />
+            ),
+            <FxCard key={g.id} g={g}
+                    isCurrent={isActive && currentFx === g.id}
+                    expanded={expandedFx === g.id}
+                    onToggle={() => toggleFx(g.id)} />,
+          ])}
+        </div>
+
+        {/* The expanded functionality's agent tree. */}
+        <div className={`fx-detail-wrap${expandedGroup ? " open" : ""}`}>
+          <div className="fx-detail-inner">
+            {expandedGroup && (
+              <FxTree g={expandedGroup} agentStates={agentStates} node={node}
+                      isActive={isActive} onOpen={setModalAgent} />
+            )}
           </div>
-        )}
-
-        {/* Orchestrator → its role columns. One stem, one bus, one drop per
-            column: no column is ever fed by another column's drop. */}
-        {hasWorker && columns.length > 0 && (
-          <div className="sys-tree-lines">
-            <svg viewBox="0 0 680 48" preserveAspectRatio="xMidYMid meet">
-              {bus.stem && <path d={bus.stem} className="sys-tree-line" />}
-              {bus.bus && <path d={bus.bus} className="sys-tree-line" />}
-              {bus.drops.length === 0 && bus.stem && (
-                <path d={bus.stem} className={`sys-tree-flow${activeCol ? " active" : ""}`} />
-              )}
-              {bus.drops.map((d, i) => (
-                <g key={columns[i].id}>
-                  <path d={d} className="sys-tree-line" />
-                  <path d={d} className={`sys-tree-flow${activeCol === columns[i].id ? " active" : ""}`} />
-                </g>
-              ))}
-            </svg>
-          </div>
-        )}
-
-        {/* The role columns. Each owns its subagents; the Coder also owns the
-            Supervisor that watches it. */}
-        {columns.length > 0 && (
-          <div className="sys-columns">
-            {columns.map(col => (
-              <div className="sys-col" key={col.id}>
-                <AgentNode agent={col.agent} state={col.state} isActive={isActive}
-                           onClick={() => setModalAgent(col.agent)} />
-
-                {(col.monitor || col.subs.length > 0) && <div className="sys-col-stem" />}
-
-                {col.monitor && (
-                  <div className="sys-col-children">
-                    <AgentNode agent={col.monitor} state={agentStates.supervisor}
-                               isActive={isActive} onClick={() => setModalAgent(col.monitor)} />
-                  </div>
-                )}
-
-                {col.subs.length > 0 && (
-                  <div className="sys-col-children">
-                    {col.subs.map(sub => (
-                      <AgentNode key={sub.id} agent={sub} state={agentStates[sub.id]}
-                                 isActive={isActive} onClick={() => setModalAgent(sub)} />
-                    ))}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
+        </div>
 
         {/* Summary stats */}
         <div className="sys-summary">
