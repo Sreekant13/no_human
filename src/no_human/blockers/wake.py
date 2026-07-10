@@ -375,13 +375,17 @@ class WakeWatcher:
         failing = [c for c in checks if c.get("status") == "fail"]
         if not failing:
             return None
-        # A distinct-failure signature: re-runs of the same red set are free.
+        # A distinct-failure signature. The link carries the build number, so
+        # polling the same red build repeatedly while parked is free, but a NEW
+        # build failing the same checks (the coder's fix didn't take) is a new
+        # round. Names alone deadlocked here: after one fix push, the same
+        # failing names read as "already handled" and the watcher went silent.
         signature = hashlib.sha256(
-            "|".join(sorted(c.get("name", "") for c in failing)).encode()
+            "|".join(sorted(f"{c.get('name', '')}@{c.get('link', '')}" for c in failing)).encode()
         ).hexdigest()[:16]
         ctx = task.context or {}
         if ctx.get("pr_ci_last_sig") == signature:
-            return None  # already acted on this exact failure; wait for a new head
+            return None  # already acted on this exact run; wait for a new build
         excerpt = ""
         if self._ci_log is not None and failing[0].get("link"):
             try:

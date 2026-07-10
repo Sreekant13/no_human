@@ -90,6 +90,21 @@ async def test_the_same_failure_signature_never_burns_a_second_round(store):
     assert (await store.get_task(t.id)).context["pr_ci_rounds"] == 1
 
 
+async def test_a_new_build_failing_the_same_checks_is_a_new_round(store):
+    """The fix push re-ran CI (new build number in the link) and the same
+    checks failed again — that must inject fresh feedback, not read as
+    "already handled". Signing on names alone deadlocked exactly here."""
+    t = await _approval_task(store)
+    assert await _watcher(store, checks=[FAIL_CHECK])._check_open_pr(t) == "resumed"
+    rerun = {**FAIL_CHECK, "link": FAIL_CHECK["link"].replace("/2/", "/3/")}
+    t = await store.get_task(t.id)
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+    assert await _watcher(store, checks=[rerun])._check_open_pr(t) == "resumed"
+    fresh = await store.get_task(t.id)
+    assert fresh.context["pr_ci_rounds"] == 2
+    assert len(fresh.context["send_back_feedback"]) == 2
+
+
 async def test_ci_rounds_cap_escalates_with_the_named_check(store):
     t = await _approval_task(store)
     w = _watcher(store, checks=[FAIL_CHECK])
