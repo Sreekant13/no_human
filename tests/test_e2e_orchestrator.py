@@ -1719,6 +1719,28 @@ async def test_plan_injected_into_implement_prompt(bare_repo, tmp_path, store):
     assert "OUT OF SCOPE" in prompt  # the instruction about respecting scope
 
 
+async def test_a_long_plan_inlines_only_its_head(bare_repo, tmp_path, store):
+    """Transcript diet (M3): an inlined plan is cache-read on EVERY turn of
+    the session. Past the threshold only the head inlines; the coder is told
+    to read .no_human/PLAN.md first and grep it selectively."""
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    t = Task.new("big refactor", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["x"]
+    head = "## OBJECTIVE\nrefactor the flux capacitor\n"
+    tail_marker = "UNIQUE-TAIL-SENTINEL"
+    t.context = {"plan": head + ("filler line\n" * 800) + tail_marker}
+    assert len(t.context["plan"]) > orch._PLAN_INLINE_MAX
+
+    prompt = orch._build_implement_prompt(t)
+
+    assert "READ IT FIRST" in prompt and ".no_human/PLAN.md" in prompt
+    assert "flux capacitor" in prompt, "the head must inline for orientation"
+    assert tail_marker not in prompt, "the tail must NOT be in every cached turn"
+    assert "OUT OF SCOPE" in prompt
+
+
 async def test_no_plan_no_plan_block_in_prompt(bare_repo, tmp_path, store):
     """Without a plan, the implement prompt has no plan block."""
     cfg = _config(tmp_path)
