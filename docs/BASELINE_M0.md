@@ -99,3 +99,46 @@ the zero-diff bug (`8034df1`) burned four attempts that produced nothing.
 
 M3's exit criterion — coder cache-read per attempt ≤ 50% of baseline — means
 **≤ ~820 K per attempt**, with review-pass and repro-gate outcomes unchanged.
+
+---
+
+# M0.9 re-snapshot (2026-07-10, post gate-severity fix) — the real M3 denominator
+
+The M0.5 numbers above were captured while the review gate was arithmetically
+unpassable, so they measure a system spending tokens against a wall. This
+snapshot is the honest denominator: same queries, same DB, after the severity
+gate, review continuity, lifetime budget, and the post-PR CI watch landed.
+
+## The one number that mattered — no longer zero
+
+```
+attempts_with_pr_url = 4
+```
+
+PR #531 exists and has passed the gate three times: attempt 21 (first reviewed
+PR in the project's history), attempt 22 (CPS `MethodTooLargeException` fix,
+operator-rejected round), attempt 23 (the first fully autonomous post-PR CI
+fix round — the WakeWatcher saw the red Jenkins checks, injected the console
+log, and resumed the coder with no human in the loop).
+
+## Flagship totals (task `84251cb2`, cumulative)
+
+| Metric | M0.5 | M0.9 |
+| --- | --- | --- |
+| Attempts | 9 | 23 |
+| Review passes | 0 | 4 (attempts 20–23) |
+| PRs opened | 0 | 1 (PR #531, draft) |
+| Wall clock | 3.09 h | 17.73 h |
+| Events | 865 | 2,645 |
+| Coder cache-read | 13.13 M | 64.32 M |
+| Coder share of cache-read | 95.0 % | **93.1 %** |
+
+Coder cache-read per attempt-with-coder-activity: **~3.06 M** (64.32 M over 21
+attempts that ran a coder session). The number *rose* after the gate fix —
+passing attempts run longer than attempts dying against a broken gate (the
+three passing attempts averaged 5.6 M each). M3's ≤ 50% exit is therefore
+**≤ ~1.53 M per attempt** against this snapshot, not the M0.5 one.
+
+The structural fact is unchanged: the coder session is 93% of all burn.
+Planner fan-out, reviewer, and aggregator together are under 7% — M3's levers
+(transcript diet, repo-map seed, segmentation) all point at the coder.
