@@ -49,8 +49,37 @@ def test_blocks_rm_rf():
     assert _ev("Bash", {"command": "rm file.txt"}).allow  # non-recursive ok
 
 
-def test_blocks_git_merge():
-    assert not _ev("Bash", {"command": "git merge origin/main"}).allow
+def test_blocks_merging_a_pull_request():
+    """The agent never merges (§3.2). Until 2026-07-10 only `git merge` was
+    blocked — which is not how a PR gets merged. `gh pr merge` sailed through,
+    and PR #531 was opened by an agent with nothing stopping it merging."""
+    assert not _ev("Bash", {"command": "gh pr merge 531 --squash"}).allow
+    assert not _ev("Bash", {"command": "glab mr merge 12"}).allow
+    assert not _ev(
+        "Bash", {"command": "gh api -X PUT repos/o/r/pulls/531/merge"}
+    ).allow
+
+
+def test_allows_the_agent_to_merge_into_its_own_branch():
+    """User, 2026-07-10: the agent may commit, push its own branch, merge a ref
+    into it, and open a PR. Only merging the PR is forbidden. A local merge can
+    never reach a protected branch, because the push is denied."""
+    assert _ev("Bash", {"command": "git merge origin/dev"}).allow
+    assert _ev("Bash", {"command": "git commit -m 'fix'"}).allow
+    assert _ev("Bash", {"command": "git push -u origin scratch/dev/x"}).allow
+    assert _ev("Bash", {"command": "gh pr create --base dev --head scratch/x"}).allow
+
+
+def test_the_pr_base_branch_must_be_pushable_by_nobody():
+    """`never_push_to` lists main/master/release/* — but metrics-core's base is `dev`,
+    so `git push origin HEAD:dev` merged without review. The orchestrator adds
+    the task's base to the protected list per attempt."""
+    d = guard.evaluate(
+        "Bash", {"command": "git push origin HEAD:dev"},
+        forbidden_paths=FORBIDDEN, never_push_to=[*PROTECTED, "dev"],
+    )
+    assert not d.allow
+    assert "merging without review" in d.reason
 
 
 def test_blocks_push_to_protected():
@@ -89,7 +118,15 @@ def test_readonly_still_blocks_destructive_bash():
         return guard.evaluate(tool, inp, forbidden_paths=FORBIDDEN, never_push_to=PROTECTED,
                               readonly=True)
     assert not _ro("Bash", {"command": "rm -rf ."}).allow
+    # A read-only session explores and reports; it never writes. Relaxing the
+    # blanket `git merge` ban for the coder must not relax it for the reviewer.
     assert not _ro("Bash", {"command": "git merge origin/main"}).allow
+    assert not _ro("Bash", {"command": "git commit -m x"}).allow
+    assert not _ro("Bash", {"command": "git push origin x"}).allow
+    assert not _ro("Bash", {"command": "gh pr create --base dev"}).allow
+    # ...but reading the repo is the whole point of the session
+    assert _ro("Bash", {"command": "git log --oneline -5"}).allow
+    assert _ro("Bash", {"command": "git diff HEAD~1"}).allow
 
 
 # --------------------------------------------------------------------------- #

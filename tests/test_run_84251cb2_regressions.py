@@ -189,3 +189,94 @@ def test_a_high_turn_cap_is_only_safe_because_pause_is_real():
     assert hasattr(Orchestrator, "_honor_cancel")
     assert hasattr(_Store, "request_cancel")
     assert issubclass(CancelRequested, Exception)
+
+
+# ---- 5. the agent opened PR #531 and committed as the human ----------------- #
+
+
+def _orch_for_guards(store, tmp_path):
+    from no_human.core.orchestrator import Orchestrator
+    from no_human.notify.slack import SlackNotifier
+    from no_human.config import load_config
+
+    class _Backend:
+        model = "claude-sonnet-5"
+        never_push_to = ["main"]
+
+    class _Reviewer:
+        model = "claude-opus-4-8"
+        _on_event = None
+
+    cfg = load_config(tmp_path / "config.yaml")
+    return Orchestrator(store, cfg.data, _Backend(), SlackNotifier(None),
+                        reviewer=_Reviewer())
+
+
+async def test_the_pr_base_branch_is_protected_from_the_agent(store, tmp_path):
+    """`git.never_push_to` is main/master/release/*. metrics-core's base is `dev`, so
+    `git push origin HEAD:dev` was allowed — merging with no PR and no review."""
+    orch = _orch_for_guards(store, tmp_path)
+    task = Task.new("t", repo_path="/r")
+
+    orch._protect_base_branch(task, "dev")
+    assert "dev" in orch.backend.never_push_to
+    assert "main" in orch.backend.never_push_to
+
+
+async def test_base_protection_is_rebuilt_per_attempt_not_accumulated(store, tmp_path):
+    """One backend is reused across tasks; task B must not inherit task A's base."""
+    orch = _orch_for_guards(store, tmp_path)
+    orch._protect_base_branch(Task.new("a", repo_path="/r"), "dev")
+    orch._protect_base_branch(Task.new("b", repo_path="/r"), "trunk")
+    assert "trunk" in orch.backend.never_push_to
+    assert "dev" not in orch.backend.never_push_to
+
+
+async def test_base_protection_also_covers_the_context_base(store, tmp_path):
+    orch = _orch_for_guards(store, tmp_path)
+    task = Task.new("t", repo_path="/r")
+    task.context = {"base_branch": "dev"}
+    orch._protect_base_branch(task, None)
+    assert "dev" in orch.backend.never_push_to
+
+
+async def test_agent_commits_carry_the_machine_identity(store, tmp_path):
+    """PR #531's commit was authored `dev <dev@example.com>`.
+    CLAUDE.md #2 requires a distinct identity: the history must say plainly
+    which commits a machine wrote. GitRepo passes `-c user.name` for its own
+    commits, but a `git commit` the agent runs in Bash inherits the operator's
+    global config."""
+    orch = _orch_for_guards(store, tmp_path)
+    env = orch._agent_git_identity()
+    assert env["GIT_AUTHOR_NAME"] == "no_human"
+    assert env["GIT_COMMITTER_NAME"] == "no_human"
+    assert "no-human@" in env["GIT_AUTHOR_EMAIL"]
+    assert "eyal" not in " ".join(env.values()).lower()
+
+
+def test_run_attempt_protects_the_base_before_the_agent_session_starts():
+    """The helper is useless if nothing calls it. Deleting the call site left the
+    whole suite green, so pin the wiring: the base must be protected before the
+    coder's session — and therefore its Bash tool — can run."""
+    import inspect
+    from no_human.core.orchestrator import Orchestrator
+
+    src = inspect.getsource(Orchestrator._run_attempt)
+    assert "self._protect_base_branch(" in src, "nothing protects the PR base"
+    assert src.index("self._protect_base_branch(") < src.index("self.backend.run("), (
+        "the base must be protected before the agent gets a Bash tool"
+    )
+
+
+async def test_a_task_cannot_override_the_agent_git_identity(store, tmp_path):
+    """`env_vars` from task.config are injected into the agent's environment.
+    The identity must win, or a task could re-attribute its commits to a human."""
+    import inspect
+    from no_human.core.orchestrator import Orchestrator
+
+    src = inspect.getsource(Orchestrator._run_attempt)
+    idx_task_vars = src.index('.get("env_vars", {})')
+    idx_identity = src.index("self._agent_git_identity()")
+    assert idx_identity > idx_task_vars, (
+        "the identity must be merged AFTER task env_vars so it overrides them"
+    )

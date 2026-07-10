@@ -2,13 +2,24 @@
 
 Blocks, before execution:
   - writes/edits to forbidden paths (.env, secrets/, *.key, *.pem, ...)
-  - pushes/force-updates to protected branches (never_push_to)
+  - pushes/force-updates to protected branches (never_push_to) — which must
+    include the PR's *base* branch, or "never merge" is trivially bypassed by
+    pushing straight to it
+  - merging a pull/merge request (`gh pr merge`, `glab mr merge`, and the
+    equivalent REST call). This is constraint §3.2 — the agent never merges —
+    and until 2026-07-10 nothing enforced it: only `git merge` was blocked,
+    which is not how a PR gets merged.
   - destructive shell (`rm -rf`, history rewrites) — a circuit breaker that
     fires even under bypass permissions
-  - `git merge` of any kind — the agent never merges (§3.2)
   - interactive prompts (`AskUserQuestion`) — nobody is at the keyboard (§22)
   - background polling (`Monitor`, `TaskStop`, `ToolSearch`) in a read-only
     session — a planner does not need to busy-wait on its own subagents
+
+Deliberately allowed (user, 2026-07-10): the agent may `git commit`, `git push`
+its own branch, `git merge` another ref *into* that branch, and open a PR. Only
+merging the PR is forbidden. A local merge cannot reach a protected branch
+because the push is denied, so the branch-level `git merge` ban was protecting
+nothing and blocked the legitimate "rebase/merge base into my branch" workflow.
 
 The orchestrator wraps :func:`evaluate` in a Claude Agent SDK PreToolUse hook;
 keeping the policy a pure function lets us unit-test it without the SDK.
@@ -66,6 +77,27 @@ _RM_RF = re.compile(r"\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|-rf|-fr)\b")
 _GIT_DESTRUCTIVE = re.compile(
     r"\bgit\s+(push\s+.*--force|push\s+.*-f\b|reset\s+--hard\s+\S|"
     r"clean\s+-[a-z]*f|filter-branch|update-ref\s+-d)"
+)
+
+# Merging the PR — the one action that is always a human's (§3.2). `git merge`
+# is NOT this: a PR is merged through the forge, and that is what must be denied.
+_FORGE_MERGE = re.compile(
+    r"\b(?:gh\s+pr\s+merge"           # gh pr merge 531 --squash
+    r"|glab\s+mr\s+merge"             # glab mr merge 12
+    r"|gh\s+api\b[^|;&]*?/(?:pulls|merge_requests)/\d+/merge"  # the REST call
+    r"|glab\s+api\b[^|;&]*?/merge_requests/\d+/merge)"
+)
+
+# Any git/forge command that mutates history or a remote. A read-only session
+# (planner, aggregator, reviewer) explores and reports; it never writes. Dropping
+# the blanket `git merge` ban would otherwise have let a reviewer commit.
+_GIT_WRITE = re.compile(
+    r"\bgit\s+(?:commit|push|merge|rebase|cherry-pick|revert|am|apply|tag"
+    r"|reset|restore|stash|branch|checkout|switch)\b"
+)
+_FORGE_WRITE = re.compile(
+    r"\b(?:gh\s+pr\s+(?:create|merge|close|edit|ready|review)"
+    r"|glab\s+mr\s+(?:create|merge|close|update))\b"
 )
 
 
@@ -147,17 +179,31 @@ def evaluate(
     # 3. Shell command policy.
     if tool_name == "Bash":
         cmd = str(tool_input.get("command", ""))
+        if readonly and (_GIT_WRITE.search(cmd) or _FORGE_WRITE.search(cmd)):
+            return GuardDecision(
+                False,
+                f"read-only session: git/forge write blocked: {cmd}. Read the "
+                "repo and report; you do not change it.",
+            )
         if _RM_RF.search(cmd):
             return GuardDecision(False, f"destructive command blocked (rm -rf): {cmd}")
         if _GIT_DESTRUCTIVE.search(cmd):
             return GuardDecision(False, f"destructive git command blocked: {cmd}")
-        if re.search(r"\bgit\s+merge\b", cmd):
+        if _FORGE_MERGE.search(cmd):
             return GuardDecision(
-                False, "git merge blocked — the agent never merges (human-only)"
+                False,
+                "merging a pull/merge request is blocked — the agent never "
+                "merges. Open the PR, push your fixes to its branch, and stop. "
+                "A human merges it (`nh approve`).",
             )
         if re.search(r"\bgit\s+push\b", cmd) and _push_targets_protected(
             cmd, never_push_to
         ):
-            return GuardDecision(False, f"push to protected branch blocked: {cmd}")
+            return GuardDecision(
+                False,
+                f"push to protected branch blocked: {cmd}. Push to your own "
+                "branch and open a PR instead — pushing to the base branch is "
+                "merging without review.",
+            )
 
     return GuardDecision(True)
