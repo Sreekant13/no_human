@@ -7,15 +7,19 @@ read-only guard so it can inspect the repo but cannot modify it.
 Contract:
   - Returns a pass/fail ``ReviewDecision`` with evidence-backed ``ChecklistItem``s.
   - Never emits a numeric score (1–10). The result is always bool.
-  - If the session produces no parseable structured block, the decision is
-    fail-closed (not pass-through) — the absence of evidence is not evidence of
-    passing.
+  - If the session produces no parseable structured block, the gate has not run.
+    It never passes — the absence of evidence is not evidence of passing — and
+    it no longer returns a *failing* decision either: after one bounded retry it
+    raises :class:`ReviewerUnavailable` so the task escalates. A failing
+    decision would be fed to the coder as a finding to fix, spending one of its
+    bounded attempts on a defect nobody ever found (task 84251cb2, attempt 13).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -27,9 +31,22 @@ from ..review.selfcheck import ChecklistItem
 from ..core.jsonparse import loads_lenient
 from ..core.task import Task
 
+log = logging.getLogger(__name__)
+
 _REVIEW_JSON = re.compile(r"REVIEW_JSON_START\s*(.*?)\s*REVIEW_JSON_END", re.DOTALL)
 
-_REVIEW_TURNS = 10
+# 10 was set when the reviewer could not read files. D16 gave it read-only tools,
+# and it now spends most turns fetching the code it cites — the grounding that
+# kills false positives. On task 84251cb2 it exhausted 10 turns exploring a
+# 1300-line Jenkinsfile and never emitted its verdict, which cost the coder its
+# last bounded attempt for a defect that did not exist.
+_REVIEW_TURNS = 30
+_REVIEW_TIMEOUT = 600
+# Constraint #4: retry only on infra failures, and boundedly. A reviewer that
+# never reaches a verdict is an infra failure, not a finding.
+_REVIEW_INFRA_RETRIES = 1
+# The sentinel `_parse_review_output` returns when no REVIEW_JSON block was found.
+_NO_VERDICT_LABEL = "structured output present"
 _DIFF_CAP = 60_000  # chars — ~15K tokens, fits in 200K context alongside test output
 _FILES_CAP = 80_000  # chars — full text of the changed files, ~20K tokens
 _CODE_REVIEW_DIFF_CAP = 120_000  # code_review tasks: ~30K tokens, fits in 200K context
@@ -39,10 +56,14 @@ _OUTPUT_CAP = 4000
 
 
 class ReviewerUnavailable(RuntimeError):
-    """No reviewer is wired, so the review gate cannot run.
+    """The review gate could not run: no reviewer is wired, or it reached no
+    verdict after its bounded retries.
 
-    Raised instead of returning a passing decision: the gate must fail closed,
-    never silently become a rubber stamp (CLAUDE.md #3).
+    Raised instead of returning a decision. A passing decision would make the
+    gate a rubber stamp (CLAUDE.md #3); a *failing* one is subtler and just as
+    wrong — its checklist becomes feedback the coder is told to act on, so a
+    reviewer that merely ran out of turns costs the coder a bounded attempt for
+    a defect nobody found.
     """
 
 
@@ -474,13 +495,25 @@ def _build_code_review_prompt(
     )
 
 
+def _reached_no_verdict(decision: ReviewDecision) -> bool:
+    """True when the reviewer emitted no REVIEW_JSON block at all.
+
+    That is the gate failing to run — not a finding against the diff.
+    """
+    return (
+        not decision.passed
+        and bool(decision.checklist)
+        and decision.checklist[0].label == _NO_VERDICT_LABEL
+    )
+
+
 def _parse_review_output(text: str) -> ReviewDecision:
     m = _REVIEW_JSON.search(text or "")
     if not m:
         return ReviewDecision(
             passed=False,
             checklist=[ChecklistItem(
-                "structured output present",
+                _NO_VERDICT_LABEL,
                 False,
                 "reviewer produced no parseable REVIEW_JSON block — fail closed",
             )],
@@ -631,9 +664,50 @@ class AdversarialReviewer:
 
     async def _agent_review(
         self, prompt: str, repo_path: Path,
-        *, max_turns: int = _REVIEW_TURNS, timeout: int = 300,
+        *, max_turns: int = _REVIEW_TURNS, timeout: int = _REVIEW_TIMEOUT,
     ) -> ReviewDecision:
-        """Multi-turn review — model can explore the repo with read-only tools."""
+        """Multi-turn review — model can explore the repo with read-only tools.
+
+        A reviewer that never reaches a verdict has not found a defect: the gate
+        simply did not run. Returning its fail-closed decision is worse than it
+        looks — the checklist item "reviewer produced no parseable REVIEW_JSON"
+        is fed back to the *coder* as a finding to fix, and it spends one of the
+        coder's bounded attempts on a defect that does not exist. That is what
+        ended task 84251cb2's last attempt.
+
+        So: retry once with a larger budget (constraint #4 — infra-only, bounded),
+        then raise :class:`ReviewerUnavailable` so the task escalates honestly.
+        No path here ever turns a missing verdict into a pass.
+        """
+        last_reason = "unknown"
+        for round_n in range(_REVIEW_INFRA_RETRIES + 1):
+            budget = max_turns * (2 ** round_n)
+            decision, reason = await self._review_once(
+                prompt, repo_path, max_turns=budget, timeout=timeout,
+            )
+            if decision is not None:
+                return decision
+            last_reason = reason
+            log.warning(
+                "reviewer reached no verdict (%s) on round %d/%d (budget %d turns)",
+                reason, round_n + 1, _REVIEW_INFRA_RETRIES + 1, budget,
+            )
+
+        raise ReviewerUnavailable(
+            f"the reviewer reached no verdict after {_REVIEW_INFRA_RETRIES + 1} "
+            f"rounds ({last_reason}). The review gate did not run, so this diff "
+            "is unreviewed. Escalating rather than passing it — or blaming the "
+            "coder for a finding that was never made."
+        )
+
+    async def _review_once(
+        self, prompt: str, repo_path: Path, *, max_turns: int, timeout: int,
+    ) -> tuple[ReviewDecision | None, str]:
+        """One reviewer session.
+
+        Returns ``(decision, "")`` on a real verdict — pass or fail — and
+        ``(None, reason)`` when the gate could not run at all.
+        """
         all_text_parts: list[str] = []
         original_on_event = self._on_event
 
@@ -655,15 +729,15 @@ class AdversarialReviewer:
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
-            return ReviewDecision(
-                passed=False,
-                checklist=[ChecklistItem("timeout", False,
-                    f"reviewer timed out after {timeout}s — fail closed")],
-            )
+            return None, f"timed out after {timeout}s"
+
         # Try final_text first, then all captured text.
         decision = _parse_review_output(result.final_text or "")
-        if not decision.passed and decision.checklist and \
-                decision.checklist[0].label == "structured output present":
-            full_text = "\n".join(all_text_parts)
-            decision = _parse_review_output(full_text)
-        return decision
+        if _reached_no_verdict(decision):
+            decision = _parse_review_output("\n".join(all_text_parts))
+        if _reached_no_verdict(decision):
+            reason = result.stop_reason or "no REVIEW_JSON block"
+            if getattr(result, "is_error", False):
+                reason = f"reviewer session error ({reason})"
+            return None, reason
+        return decision, ""
