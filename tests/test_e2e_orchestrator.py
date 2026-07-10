@@ -121,6 +121,7 @@ async def test_full_pipeline_opens_local_pr(bare_repo, tmp_path, store):
     assert "pr_open" in kinds and "commit" in kinds
 
 
+@pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
 async def test_repro_gate_runs_advisory_inside_the_pipeline(bare_repo, tmp_path, store):
     """The coder declares its demonstrating test; the gate proves both
     directions and emits its verdict — without changing the outcome."""
@@ -275,6 +276,7 @@ async def test_pr_labels_come_from_git_config(bare_repo, tmp_path, store, monkey
     assert labels == ["V17"]
 
 
+@pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
 async def test_task_config_overrides_global_pr_labels(bare_repo, tmp_path, store,
                                                       monkeypatch):
     labels = await _run_and_capture_pr_labels(
@@ -603,6 +605,7 @@ class SequencedFakeReviewer:
         return self._decisions[idx]
 
 
+@pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
 async def test_stagnation_not_triggered_by_different_findings_same_rate(bare_repo, tmp_path, store):
     """D6 regression: a matching 0% pass rate across 2 attempts must NOT be
     treated as stagnation when the specific failing findings are entirely
@@ -1754,6 +1757,7 @@ async def test_no_plan_no_plan_block_in_prompt(bare_repo, tmp_path, store):
     assert "IMPLEMENTATION PLAN" not in prompt
 
 
+@pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
 async def test_full_pipeline_with_planning(bare_repo, tmp_path, store):
     """Full pipeline: planning (mocked) → implement (FakeBackend) → PR.
 
@@ -1835,6 +1839,7 @@ async def test_plan_file_is_scoped_to_no_human_dir_and_cleaned_up(
     assert not (bare_repo / "PLAN.md").exists()
 
 
+@pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
 async def test_stale_plan_file_is_removed_when_this_run_has_no_plan(
     bare_repo, tmp_path, store,
 ):
@@ -2164,6 +2169,7 @@ class ReportOnlyBackend:
         )
 
 
+@pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
 async def test_investigation_report_only_completes_as_done(bare_repo, tmp_path, store):
     """An investigation task that produces findings but no file changes → DONE."""
     cfg = _config(tmp_path)
@@ -2549,6 +2555,7 @@ async def test_env_vars_injected_during_agent_run(bare_repo, tmp_path, store):
     assert sentinel_key not in os.environ
 
 
+@pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
 async def test_env_setup_failure_aborts_attempt(bare_repo, tmp_path, store):
     """A failing env_setup command should abort the attempt before the agent runs."""
     cfg = _config(tmp_path)
@@ -2828,6 +2835,7 @@ async def test_intake_evaluator_failure_does_not_block_pipeline(
 # Which model ran which role is recorded (the blind spot that hid config drift) #
 # --------------------------------------------------------------------------- #
 
+@pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
 async def test_attempt_records_the_model_bound_to_each_role(bare_repo, tmp_path, store):
     def mutate(cwd):
         (cwd / "calc.py").write_text("def add(a, b):\n    return a + b\n")
@@ -3002,6 +3010,7 @@ def test_scope_explosion_option_action_derives_from_the_observed_size(tmp_path, 
     assert orch._over_size_limits(commit, t) is None
 
 
+@pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
 async def test_reply_resumes_from_the_wip_blocked_checkpoint(bare_repo, tmp_path, store):
     """D15: the blocker printed 'Resume with: nh reply <id>', but the resume path
     read ctx['handoff']['wip_sha'] — written only when an attempt runs out of
@@ -3119,6 +3128,7 @@ def test_pr_body_carries_the_review_evidence_dossier():
     assert "**PASSED**" in Orchestrator._review_evidence_section(t3)
 
 
+@pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
 async def test_bugfix_without_repro_evidence_is_sent_back(bare_repo, tmp_path, store):
     """W1.2 (Agentless): a BUGFIX must prove the bug — a waived/failed repro
     verdict blocks before any reviewer tokens, with the fix instructions fed

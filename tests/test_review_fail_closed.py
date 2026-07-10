@@ -60,6 +60,7 @@ async def test_advisory_pass_through_requires_the_explicit_flag(store, tmp_path)
     assert "NOT reviewed" in advisory["text"]
 
 
+@pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
 async def test_a_missing_reviewer_escalates_instead_of_opening_a_pr(
     store, bare_repo, tmp_path
 ):

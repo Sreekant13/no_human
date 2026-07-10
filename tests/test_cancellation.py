@@ -161,6 +161,7 @@ class _PauseMidSessionBackend:
         raise AssertionError("the session was never interrupted")
 
 
+@pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
 async def test_pause_stops_the_session_and_checkpoints_the_work(
     store, bare_repo, tmp_path, monkeypatch
 ):
