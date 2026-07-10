@@ -346,8 +346,7 @@ class WakeWatcher:
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to fetch PR comments for injection: %s", exc)
             return None
-        comments = [c for c in comments
-                    if not self._is_bot_author(getattr(c, "author", ""))]
+        comments = [c for c in comments if not self._is_self_or_bot(c)]
         if not comments:
             return None
         rounds = self._append_comments_as_feedback(task, comments)
@@ -376,6 +375,16 @@ class WakeWatcher:
         operator feedback and must never trigger a revision attempt."""
         a = (author or "").lower()
         return a.endswith("[bot]") or a in self.ignore_comment_authors
+
+    def _is_self_or_bot(self, comment) -> bool:
+        """A comment that must never trigger a revision: bot chatter OR
+        no_human's own output. Author identity can't catch the latter — the
+        product posts under the operator's gh login (the 2026-07-10 incident:
+        the CI_GATE results comment resumed its own task) — so bodies carry
+        AGENT_COMMENT_MARKER and are filtered here."""
+        from ..vcs.pr_watcher import is_agent_comment
+        return (self._is_bot_author(getattr(comment, "author", ""))
+                or is_agent_comment(getattr(comment, "body", None)))
 
     @staticmethod
     def _append_comments_as_feedback(task: Task, comments: list) -> int:
@@ -682,7 +691,7 @@ class WakeWatcher:
 
         # Advance the cursor past everything we've now seen (newest wins).
         newest = max((getattr(c, "created_at", "") or "") for c in comments)
-        human = [c for c in fresh if not self._is_bot_author(getattr(c, "author", ""))]
+        human = [c for c in fresh if not self._is_self_or_bot(c)]
         if not human:
             # Bot chatter only (CI result tables etc.): move the cursor so the
             # same comments are never reconsidered, but do not burn an attempt.

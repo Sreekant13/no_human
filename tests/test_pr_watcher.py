@@ -237,3 +237,25 @@ async def test_pr_comment_inline_formatting(store):
     assert "[src/handler.py:55]" in fb["message"]
     assert "Null check missing" in fb["message"]
     assert "if value is not None" in fb["message"]
+
+
+async def test_post_reply_comment_stamps_the_agent_marker(monkeypatch):
+    """Every comment no_human posts must carry the invisible marker — it is
+    the only thing distinguishing the product's comments from the operator's
+    (same gh login; the 2026-07-10 self-resume incident)."""
+    from no_human.vcs import pr_watcher
+
+    captured = {}
+
+    async def fake_run_cli(cmd):
+        captured["cmd"] = cmd
+        return "ok"
+
+    monkeypatch.setattr(pr_watcher, "_run_cli", fake_run_cli)
+    ok = await pr_watcher.post_reply_comment("host/o/r#5", "hello reviewer")
+    assert ok
+    body = captured["cmd"][captured["cmd"].index("--body") + 1]
+    assert body.startswith(pr_watcher.AGENT_COMMENT_MARKER)
+    assert "hello reviewer" in body
+    assert pr_watcher.is_agent_comment(body)
+    assert not pr_watcher.is_agent_comment("hello reviewer")

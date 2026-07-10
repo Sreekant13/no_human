@@ -287,11 +287,29 @@ async def check_pr_comments(
 # Post reply comment (after agent addresses feedback)
 # ---------------------------------------------------------------------------
 
+# Invisible HTML comment stamped on every PR comment no_human posts. The
+# forge renders it as nothing, and copy-pasting the rendered comment does not
+# carry it — so a human quoting agent output is never misclassified. Load-
+# bearing: comments are posted under the operator's own gh login, so author
+# identity CANNOT distinguish the product's comments from the human's — the
+# 2026-07-10 incident (the CI_GATE results comment resumed its own task into
+# the budget gate) is exactly this gap.
+AGENT_COMMENT_MARKER = "<!-- no_human-agent-comment -->"
+
+
+def is_agent_comment(body: str | None) -> bool:
+    """True if a PR comment body was authored by no_human itself."""
+    return bool(body) and AGENT_COMMENT_MARKER in body
+
+
 async def post_reply_comment(pr_ref: str, message: str) -> bool:
     """Post a reply comment on a PR/MR after addressing feedback.
 
+    Every body is stamped with AGENT_COMMENT_MARKER so the wake watcher can
+    recognize the product's own comments (see marker docstring).
     Returns True on success.
     """
+    message = f"{AGENT_COMMENT_MARKER}\n{message}"
     if "!" in pr_ref:
         project_id, _, iid_str = pr_ref.partition("!")
         out = await _run_cli([
