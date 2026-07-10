@@ -693,6 +693,11 @@ function AgentLogModal({ agent, events, onClose }) {
   );
 }
 
+const clipText = (s, n) => {
+  const x = (s || "").replace(/\s+/g, " ").trim();
+  return x.length > n ? x.slice(0, n - 1) + "…" : x;
+};
+
 // One lane of the functionality board: the stage's status header on top,
 // its full agent tree always visible beneath — nothing hidden behind clicks.
 // The arrow out of a header flows when the NEXT stage is the one running.
@@ -826,9 +831,32 @@ function SystemTab({ taskId, task, isActive }) {
     );
   }
 
+  // The one line the operator needs first: running where, or waiting on what.
+  const banner = (() => {
+    const st = task?.status || "";
+    if (st === "awaiting_approval") return {
+      cls: "waiting", text: "Waiting for you — review & merge the PR", icon: "⏸" };
+    if (st === "escalated" || st === "awaiting_input") return {
+      cls: "waiting",
+      text: `Waiting for you — ${clipText((task?.blocker || {}).question || "a decision is needed (see Activity)", 110)}`,
+      icon: "⏸" };
+    if (isActive) {
+      const fx = groups.find((g) => g.id === currentFx);
+      return { cls: "running", text: `Running — ${fx ? fx.label : "starting"}`, icon: "●" };
+    }
+    if (st === "done") return { cls: "done", text: "Done — PR merged", icon: "✓" };
+    return null;
+  })();
+
   return (
     <div className="sys-view">
       <div className="sys-tree">
+        {banner && (
+          <div className={`fx-banner ${banner.cls}`}>
+            <span className="fx-banner-icon" aria-hidden="true">{banner.icon}</span>
+            {banner.text}
+          </div>
+        )}
         {/* The functionality board: four lanes, every agent and subagent
             visible at once. The arrow between headers flows toward the stage
             that is running right now. */}
