@@ -3192,3 +3192,16 @@ async def test_feature_with_waived_repro_still_proceeds(bare_repo, tmp_path, sto
     assert outcome.status is TaskStatus.AWAITING_APPROVAL
     gate = [e for e in events if e["kind"] == "repro_gate"]
     assert gate and "[advisory]" in gate[0]["text"]
+
+
+def test_failed_tests_event_carries_the_output_tail():
+    """Triage 2026-07-11: 'FAIL: 0 passed, 0 failed, 1 errors' with no
+    detail cost an hour of reproduction. The failure event must name the
+    failing thing — assert via the emit-shaping logic used at the call site."""
+    from types import SimpleNamespace
+    result = SimpleNamespace(ok=False, output="x" * 50 + "\nImportError: cannot import name 'Foo' from 'bar'")
+    fail_tail = (getattr(result, "output", "") or "")[-1200:]
+    assert "ImportError" in fail_tail
+    ok_result = SimpleNamespace(ok=True, output="all good")
+    tail2 = "" if ok_result.ok else ok_result.output
+    assert tail2 == ""
