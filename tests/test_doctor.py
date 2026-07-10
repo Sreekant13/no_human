@@ -128,3 +128,23 @@ async def test_ci_gate_integration_is_an_enumerated_mechanism(store):
     d = await diagnose(store)
     m = next(m for m in d.mechanisms if m["name"] == "ci_gate_integration")
     assert m["count"] == 2
+
+
+async def test_spurious_budget_escalation_after_ci_gate_pass_contradicts(store):
+    """The 2026-07-10 shape: validation passed, no new coder work, yet the
+    task sits escalated BUDGET_EXHAUSTED — a resume fired on a non-human
+    trigger."""
+    t = Task.new("x", repo_path="/tmp/x")
+    await store.create_task(t)
+    await store.save_events(t.id, [
+        _ev("pr_open"), _ev("attempt_start"), _ev("ci_gate_pass"),
+    ])
+    t.blocker = {"category": "BUDGET_EXHAUSTED", "question": "raise?"}
+    await store.update_task(t)
+    await store.set_status(t, TaskStatus.ESCALATED, validate=False)
+    d = await diagnose(store)
+    assert any("SPURIOUS ESCALATION" in c for c in d.contradictions)
+    # Real coder work AFTER the pass = a legitimate escalation — no flag.
+    await store.save_events(t.id, [_ev("attempt_start")])
+    d = await diagnose(store)
+    assert not any("SPURIOUS ESCALATION" in c for c in d.contradictions)

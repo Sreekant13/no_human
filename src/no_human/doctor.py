@@ -167,6 +167,32 @@ async def diagnose(store: Store) -> Diagnosis:
             "integration run was triggered and never passed."
         )
 
+    # A task that escalated BUDGET_EXHAUSTED after its integration validation
+    # passed, with no new coder work in between, was almost certainly resumed
+    # by something that wasn't human feedback (the 2026-07-10 self-comment
+    # incident) — the spend was already capped, so the escalation is noise
+    # pointing at a resume-trigger bug, not at the budget.
+    cur = await store.db.execute(
+        """SELECT t.id FROM tasks t
+           WHERE t.status = 'escalated'
+             AND json_extract(t.blocker, '$.category') = 'BUDGET_EXHAUSTED'
+             AND EXISTS (
+               SELECT 1 FROM task_events e WHERE e.task_id = t.id
+               AND json_extract(e.data, '$.kind') = 'ci_gate_pass')
+             AND NOT EXISTS (
+               SELECT 1 FROM task_events e2 WHERE e2.task_id = t.id
+               AND json_extract(e2.data, '$.kind') = 'attempt_start'
+               AND e2.ts > (SELECT MAX(e3.ts) FROM task_events e3
+                            WHERE e3.task_id = t.id
+                            AND json_extract(e3.data, '$.kind') = 'ci_gate_pass'))""")
+    for (task_id,) in await cur.fetchall():
+        d.contradictions.append(
+            f"SPURIOUS ESCALATION: task {task_id[:8]} escalated "
+            "BUDGET_EXHAUSTED after its integration validation passed with no "
+            "new coder work — a resume fired on a non-human trigger. Repair: "
+            "nh task restore-approval."
+        )
+
     # Per-status required evidence: a task claiming a status must have the
     # events that back the claim.
     for status, kinds in REQUIRED_EVIDENCE.items():
