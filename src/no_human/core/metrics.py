@@ -60,6 +60,27 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
            ORDER BY ts DESC LIMIT 10""")
     rejection_reasons = [r[0] for r in await cur.fetchall() if r[0]]
 
+    # Cache economics (P0.3): cache_creation is full-price input; cache_read
+    # is ~10% price. A rising creation share means the prompt prefix is being
+    # rebuilt instead of reused — the failure mode all context work must
+    # avoid (93% of lifetime burn is coder cache-reads).
+    cur = await db.execute(
+        """SELECT COUNT(*),
+                  COALESCE(SUM(COALESCE(cache_creation_tokens, 0)), 0),
+                  COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0)
+           FROM attempts WHERE COALESCE(cache_read_tokens, 0) > 0
+              OR COALESCE(cache_creation_tokens, 0) > 0""")
+    n_attempts, sum_creation, sum_read = await cur.fetchone()
+    cache_economics = {
+        "attempts_measured": n_attempts,
+        "cache_creation_total": sum_creation,
+        "cache_read_total": sum_read,
+        "creation_per_attempt": sum_creation // n_attempts if n_attempts else 0,
+        "read_per_attempt": sum_read // n_attempts if n_attempts else 0,
+        "creation_share": round(sum_creation / (sum_creation + sum_read), 4)
+        if (sum_creation + sum_read) else None,
+    }
+
     # CI_GATE integration gate (M6): runs started / passed / failed.
     cur = await db.execute(
         """SELECT json_extract(data, '$.kind'), COUNT(*)
@@ -95,4 +116,5 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
         "recent_rejection_reasons": rejection_reasons,
         "repro_gate_verdicts": repro,
         "ci_gate": ci_gate,
+        "cache_economics": cache_economics,
     }

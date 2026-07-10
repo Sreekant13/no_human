@@ -72,3 +72,30 @@ async def test_ci_gate_counts_come_from_the_events(store):
 async def test_ci_gate_block_is_zeroes_on_an_empty_db(store):
     m = await compute_metrics(store)
     assert m["ci_gate"] == {"triggered": 0, "passed": 0, "failed": 0}
+
+
+async def test_cache_economics_expose_the_creation_share(store):
+    """P0.3: a rising cache_creation share means the prompt prefix is being
+    rebuilt (full price) instead of reused (~10% price) — the number every
+    context change must be judged against."""
+    t = Task.new("x", repo_path="/tmp/x")
+    await store.create_task(t)
+    a1 = await store.create_attempt(t.id, attempt_number=1)
+    a2 = await store.create_attempt(t.id, attempt_number=2)
+    await store.update_attempt(a1, cache_creation_tokens=100_000,
+                               cache_read_tokens=900_000)
+    await store.update_attempt(a2, cache_creation_tokens=300_000,
+                               cache_read_tokens=700_000)
+    m = await compute_metrics(store)
+    ce = m["cache_economics"]
+    assert ce["attempts_measured"] == 2
+    assert ce["cache_creation_total"] == 400_000
+    assert ce["cache_read_total"] == 1_600_000
+    assert ce["creation_per_attempt"] == 200_000
+    assert ce["creation_share"] == 0.2
+
+
+async def test_cache_economics_zero_state(store):
+    m = await compute_metrics(store)
+    assert m["cache_economics"]["attempts_measured"] == 0
+    assert m["cache_economics"]["creation_share"] is None
