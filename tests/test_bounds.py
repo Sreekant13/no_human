@@ -28,9 +28,12 @@ def test_not_stuck_on_progress():
 
 
 def test_bounds_from_config_defaults():
+    """Assert against the dataclass, not a literal: this test used to hardcode
+    60, so it was a third copy of a default that already lived in two places."""
     b = Bounds.from_config(None)
-    assert b.max_attempts == 3
-    assert b.max_turns_per_attempt == 60
+    assert b == Bounds()
+    assert b.max_attempts == Bounds().max_attempts
+    assert b.max_turns_per_attempt == Bounds().max_turns_per_attempt
 
 
 def test_bounds_from_config_override():
@@ -40,13 +43,15 @@ def test_bounds_from_config_override():
 
 
 def test_turns_for_simple_task_uses_base():
-    b = Bounds.from_config(None)  # 60, multiplier 1.5
-    assert b.turns_for(complex_task=False) == 60
+    b = Bounds.from_config(None)
+    assert b.turns_for(complex_task=False) == b.max_turns_per_attempt
 
 
 def test_turns_for_complex_task_scaled():
-    b = Bounds.from_config(None)  # 60 × 1.5 = 90
-    assert b.turns_for(complex_task=True) == 90
+    b = Bounds.from_config(None)
+    expected = int(b.max_turns_per_attempt * b.complex_multiplier)
+    assert b.turns_for(complex_task=True) == expected
+    assert expected > b.max_turns_per_attempt
 
 
 def test_turns_for_multiplier_one_disables_bump():

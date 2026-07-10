@@ -203,6 +203,11 @@ class ClaudeBackend:
         # treats the attempt as failed rather than crashing or committing
         # half-finished work.
         last_turns = last_tokens = 0
+        # Carried onto the corrective error event below. run() keeps the LAST
+        # result event, so anything missing there is lost: an attempt that hit
+        # max_turns used to record 0 cache-read tokens — the attempts that burn
+        # the most reporting nothing at all.
+        last_cache_read = last_cache_creation = 0
         last_session: str | None = None
         try:
             async for message in query(prompt=prompt, options=options):
@@ -267,6 +272,7 @@ class ClaudeBackend:
                     cache_creation = int(usage.get("cache_creation_input_tokens", 0))
                     denials = [str(d) for d in (message.permission_denials or [])]
                     last_turns, last_tokens = message.num_turns, tokens
+                    last_cache_read, last_cache_creation = cache_read, cache_creation
                     last_session = message.session_id
                     yield AgentEvent(
                         "result",
@@ -297,6 +303,8 @@ class ClaudeBackend:
                     "stop_reason": "max_turns" if is_max_turns else "error",
                     "denials": [],
                     "api_error_status": None,
+                    "cache_read_tokens": last_cache_read,
+                    "cache_creation_tokens": last_cache_creation,
                 },
             )
 

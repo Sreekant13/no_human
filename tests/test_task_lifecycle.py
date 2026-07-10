@@ -56,6 +56,11 @@ def _make_runner(path: Path, monkeypatch) -> CliRunner:
 
     monkeypatch.setattr(cmd_mod, "load_config", lambda: _Cfg())
     monkeypatch.setattr(cmd_mod, "assert_subscription_mode", lambda **kw: None)
+    # `_server_owns_worker` really does HTTP to 127.0.0.1:8420, so pause/cancel
+    # would branch on whether a server happens to be running on the developer's
+    # machine — green with none up, red with one. Default to "no server"; the
+    # tests about the handover set it True themselves.
+    monkeypatch.setattr(cmd_mod, "_server_owns_worker", lambda _cfg: False)
     return CliRunner()
 
 
@@ -369,3 +374,34 @@ def test_resume_withdraws_a_pending_stop(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert _cancel_flag(db, task_id) is None
     assert _get_task(db, task_id).status is TaskStatus.IMPLEMENTING
+
+
+def test_resume_continues_from_the_blockers_checkpoint(tmp_path, monkeypatch):
+    """`nh task resume` used to clear the blocker without reading its
+    resume_commit, so the next attempt branched from a stale `resume_from` and
+    silently discarded the parked attempt's committed work (task 84251cb2,
+    attempt 11: a correct pagination fix at 06cd40fc)."""
+    from no_human.blockers.taxonomy import Blocker, BlockerCategory
+
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.ESCALATED)
+
+    async def _park():
+        async with Store(db) as s:
+            t = await s.find_task(task_id)
+            b = Blocker(category=BlockerCategory.NOVEL_UNKNOWN, transient=False,
+                        confidence=0.9, goal="g", root_cause_hypothesis="exhausted")
+            b.resume_commit = "06cd40fc" * 5
+            b.resume_branch = "dev"
+            t.blocker = b.to_dict()
+            t.context = {"resume_from": {"sha": "0e22fe3d" * 5, "branch": "dev"}}
+            await s.update_task(t)
+    asyncio.run(_park())
+
+    runner = _make_runner(db, monkeypatch)
+    result = runner.invoke(cli, ["task", "resume", task_id], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    t = _get_task(db, task_id)
+    assert t.context["resume_from"]["sha"] == "06cd40fc" * 5
+    assert t.status is TaskStatus.IMPLEMENTING

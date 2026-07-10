@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 
 @dataclass
@@ -16,7 +16,23 @@ class Bounds:
     """Per-task / per-attempt caps, sourced from config ``bounds``."""
 
     max_attempts: int = 3
-    max_turns_per_attempt: int = 60
+    # Measured on task 84251cb2 (docs/BASELINE_M0.md): 22 turns to reach the
+    # reviewer, and >40 to act on its three findings — that run escalated
+    # mid-fix at a cap of 40, having already committed a correct fix. A cap
+    # that stops a nearly-finished attempt wastes the whole attempt's burn.
+    #
+    # Set to 500 by the user (2026-07-10): give a real task room to finish.
+    # Know what this cap is and is not. It is NOT a cost control — it is the
+    # last-resort stop for an agent that has stopped making progress, and it is
+    # the ONLY one: constraint #5 forbids interrupting mid-attempt, so the stuck
+    # and doom-loop detectors emit an advisory event and let the attempt run on.
+    # Attempt 11 burned 3.4M cache-read in 41 turns while looping on one file;
+    # the same loop has ~12x that headroom here. What makes 500 safe to hold is
+    # that `nh task pause` became real cooperative cancellation on this date —
+    # a runaway now stops in seconds and checkpoints its work, instead of
+    # burning to the cap. Do not raise this further without also giving the
+    # stuck detector teeth.
+    max_turns_per_attempt: int = 500
     escalate_after: int = 3
     max_correction_rounds: int = 2
     # P3 (megaplan): complex tasks (many files / large plan / decompose verdict)
@@ -26,14 +42,15 @@ class Bounds:
 
     @staticmethod
     def from_config(cfg: dict | None) -> "Bounds":
-        cfg = cfg or {}
-        return Bounds(
-            max_attempts=cfg.get("max_attempts", 3),
-            max_turns_per_attempt=cfg.get("max_turns_per_attempt", 60),
-            escalate_after=cfg.get("escalate_after", 3),
-            max_correction_rounds=cfg.get("max_correction_rounds", 2),
-            complex_multiplier=cfg.get("complex_multiplier", 1.5),
-        )
+        """Config overrides; every default lives on the dataclass, once.
+
+        This used to repeat each default as a literal here, so the dataclass,
+        this function and ``DEFAULT_CONFIG`` were three places to change and
+        two places to forget. Unknown keys are ignored rather than crashing on
+        a hand-edited config.
+        """
+        known = {f.name for f in fields(Bounds)}
+        return Bounds(**{k: v for k, v in (cfg or {}).items() if k in known})
 
     def turns_for(self, *, complex_task: bool = False) -> int:
         """Turn budget for one attempt. Complex tasks get

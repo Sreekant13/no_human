@@ -237,6 +237,16 @@ class Store:
     # ---------------------------- attempts --------------------------------- #
 
     async def create_attempt(self, task_id: str, attempt_number: int) -> str:
+        # An earlier attempt of this task still 'in_progress' cannot be running:
+        # attempts are serial, so a new one starting means the old process died
+        # (kill -9, crash) without ever closing its row. Left alone, those rows
+        # make `attempts.status` untrustworthy as a completion signal — the
+        # baseline had three of them. Close them for what they are.
+        await self.db.execute(
+            "UPDATE attempts SET status = 'interrupted' "
+            "WHERE task_id = ? AND status = 'in_progress' AND attempt_number < ?",
+            (task_id, attempt_number),
+        )
         attempt_id = uuid.uuid4().hex
         await self.db.execute(
             "INSERT INTO attempts (id, task_id, attempt_number) VALUES (?, ?, ?)",

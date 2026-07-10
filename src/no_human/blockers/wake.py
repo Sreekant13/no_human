@@ -23,7 +23,7 @@ from typing import Any, Awaitable, Callable
 
 from ..core.db import Store
 from ..core.task import Task, TaskStatus
-from .taxonomy import Blocker
+from .taxonomy import Blocker, resume_checkpoint
 
 log = logging.getLogger("no_human.wake")
 
@@ -226,6 +226,12 @@ class WakeWatcher:
         ctx = task.context or {}
         ctx["resumed_at"] = now_iso()
         ctx["resume_reason"] = "wake_condition_satisfied"
+        # Same contract as `nh reply` / `nh task resume`: continue from the
+        # checkpoint the blocker recorded, or the next attempt branches from a
+        # stale sha and discards the parked attempt's committed work.
+        checkpoint = resume_checkpoint(task.blocker)
+        if checkpoint:
+            ctx["resume_from"] = checkpoint
         task.context = ctx
         task.wake_check_at = None
         await self.store.update_task(task)
