@@ -55,6 +55,9 @@ MECHANISMS: list[tuple[str, tuple[str, ...], str]] = [
     ("pr_watch_heartbeat", ("wake_tick",),
      "zero while tasks sit parked = the watcher is silent or dead "
      "(it was, until 2026-07-10 — events before then were never persisted)"),
+    ("ci_gate_integration", ("ci_gate_trigger", "ci_gate_pass", "ci_gate_fail"),
+     "zero = the post-PR CI_GATE gate never ran — fine while ci_gate.enabled "
+     "is off, dead if a governed PR sat green without a run"),
 ]
 
 # A parked task whose newest watcher evidence is older than this is unshepherded.
@@ -147,6 +150,22 @@ async def diagnose(store: Store) -> Diagnosis:
                 f"WATCHER STALE: {parked} task(s) parked but the newest watcher "
                 f"evidence is {age_h:.1f}h old (heartbeat is hourly)."
             )
+
+    # A CI_GATE validation that STARTED must have finished green before the
+    # task may claim done — a done task whose integration run never passed is
+    # a verdict without its evidence (the M6 contradiction).
+    cur = await store.db.execute(
+        """SELECT t.id FROM tasks t WHERE t.status = 'done' AND EXISTS (
+              SELECT 1 FROM task_events e WHERE e.task_id = t.id
+              AND json_extract(e.data, '$.kind') = 'ci_gate_trigger')
+           AND NOT EXISTS (
+              SELECT 1 FROM task_events e WHERE e.task_id = t.id
+              AND json_extract(e.data, '$.kind') = 'ci_gate_pass')""")
+    for (task_id,) in await cur.fetchall():
+        d.contradictions.append(
+            f"CI_GATE UNPROVEN: task {task_id[:8]} is 'done' but its CI_GATE "
+            "integration run was triggered and never passed."
+        )
 
     # Per-status required evidence: a task claiming a status must have the
     # events that back the claim.

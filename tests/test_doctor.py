@@ -101,3 +101,30 @@ async def test_unreviewed_pr_is_a_contradiction(store):
     await store.save_events(t.id, [_ev("pr_open"), _ev("tests")])
     d = await diagnose(store)
     assert any("UNREVIEWED" in c for c in d.contradictions)
+
+
+async def test_ci_gate_triggered_but_never_passed_on_a_done_task_contradicts(store):
+    """M6: a done task whose CI_GATE integration run started and never went
+    green is a verdict without its evidence."""
+    t = Task.new("x", repo_path="/tmp/x")
+    await store.create_task(t)
+    await store.save_events(t.id, [
+        _ev("pr_open"), _ev("review"), _ev("tests"),
+        _ev("ci_gate_trigger"),
+    ])
+    await store.set_status(t, TaskStatus.DONE, validate=False)
+    d = await diagnose(store)
+    assert any("CI_GATE UNPROVEN" in c for c in d.contradictions)
+    # The pass event clears it.
+    await store.save_events(t.id, [_ev("ci_gate_pass")])
+    d = await diagnose(store)
+    assert not any("CI_GATE UNPROVEN" in c for c in d.contradictions)
+
+
+async def test_ci_gate_integration_is_an_enumerated_mechanism(store):
+    t = Task.new("x", repo_path="/tmp/x")
+    await store.create_task(t)
+    await store.save_events(t.id, [_ev("ci_gate_trigger"), _ev("ci_gate_pass")])
+    d = await diagnose(store)
+    m = next(m for m in d.mechanisms if m["name"] == "ci_gate_integration")
+    assert m["count"] == 2

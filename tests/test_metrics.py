@@ -56,3 +56,19 @@ async def test_the_north_star_numbers_add_up(store):
     assert m["review_pass"] == 1 and m["review_fail"] == 1
     assert m["repro_gate_verdicts"] == {"waived": 1}
     assert any("off-by-one" in r for r in m["recent_rejection_reasons"])
+
+
+async def test_ci_gate_counts_come_from_the_events(store):
+    t = Task.new("x", repo_path="/tmp/x")
+    await store.create_task(t)
+    await store.save_events(t.id, [
+        _ev("ci_gate_trigger"), _ev("ci_gate_trigger"),
+        _ev("ci_gate_pass"), _ev("ci_gate_fail"),
+    ])
+    m = await compute_metrics(store)
+    assert m["ci_gate"] == {"triggered": 2, "passed": 1, "failed": 1}
+
+
+async def test_ci_gate_block_is_zeroes_on_an_empty_db(store):
+    m = await compute_metrics(store)
+    assert m["ci_gate"] == {"triggered": 0, "passed": 0, "failed": 0}

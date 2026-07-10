@@ -554,37 +554,44 @@ class WakeWatcher:
         still merges); fail → bounded send-back to the coder, then escalate;
         refused (code PR needing a PR-built image) → honest escalation.
         """
+        _outcome, action = await self._ci_gate_step(task, url)
+        return action
+
+    async def _ci_gate_step(self, task: Task, url: str) -> tuple[Any, str | None]:
+        """One CI_GATE gate step + its task-level consequence. Returns
+        (gate outcome | None, watcher action | None) — `nh ci_gate run` drives
+        this directly so the manual path IS the watcher path."""
         if self._ci_gate_gate is None:
-            return None
+            return None, None
         try:
             outcome = await self._ci_gate_gate.step(task, url)
         except Exception as exc:  # noqa: BLE001 — the gate must never kill the watcher
             log.warning("CI_GATE gate step failed for %s: %s", task.id[:8], exc)
-            return None
+            return None, None
         # The gate mutates task.context (its state machine) — persist always.
         await self.store.update_task(task)
 
         if outcome.action == "skip":
-            return None
+            return outcome, None
         if outcome.action == "blocked":
             await self._emit(task, "ci_gate_blocked",
                              f"{task.id[:8]} CI_GATE: {outcome.reason}")
-            return None
+            return outcome, None
         if outcome.action == "triggered":
             await self._emit(task, "ci_gate_trigger",
                              f"{task.id[:8]} CI_GATE: {outcome.reason}")
-            return "ci_gate_triggered"
+            return outcome, "ci_gate_triggered"
         if outcome.action == "waiting":
             await self._emit(task, "ci_gate_poll",
                              f"{task.id[:8]} CI_GATE: {outcome.reason}")
-            return None
+            return outcome, None
         if outcome.action == "passed":
             await self._emit(
                 task, "ci_gate_pass",
                 f"{task.id[:8]} CI_GATE integration PASSED: {outcome.web_url}"
                 + (" (PR comment posted)" if outcome.comment_posted else ""),
             )
-            return "ci_gate_passed"
+            return outcome, "ci_gate_passed"
         if outcome.action == "refused":
             data = task.blocker or {}
             data["category"] = "NOVEL_UNKNOWN"
@@ -598,7 +605,7 @@ class WakeWatcher:
             await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
             await self._emit(task, "ci_gate_refused",
                              f"{task.id[:8]} CI_GATE cannot run: {outcome.reason}")
-            return "escalated_ci_gate_refused"
+            return outcome, "escalated_ci_gate_refused"
 
         # failed — bounded send-back, counted per pipeline run (a new run only
         # ever starts on a new PR head, so each failure is a distinct signature).
@@ -624,7 +631,7 @@ class WakeWatcher:
                 f"{task.id[:8]} CI_GATE red past {self.max_ci_gate_fix_rounds} "
                 f"rounds: {names} — escalated",
             )
-            return "escalated_ci_gate"
+            return outcome, "escalated_ci_gate"
 
         message = (
             f"The CI_GATE integration validation failed. Job(s): {names}.\n"
@@ -647,7 +654,7 @@ class WakeWatcher:
             f"{task.id[:8]} CI_GATE failing ({names}) — fix round "
             f"{rounds}/{self.max_ci_gate_fix_rounds}",
         )
-        return await self._resume(task)
+        return outcome, await self._resume(task)
 
     async def _check_approval_pr_comments(self, task: Task) -> str | None:
         """Poll an awaiting-approval PR for NEW human comments (B4).

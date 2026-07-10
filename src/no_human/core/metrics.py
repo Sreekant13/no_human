@@ -60,6 +60,20 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
            ORDER BY ts DESC LIMIT 10""")
     rejection_reasons = [r[0] for r in await cur.fetchall() if r[0]]
 
+    # CI_GATE integration gate (M6): runs started / passed / failed.
+    cur = await db.execute(
+        """SELECT json_extract(data, '$.kind'), COUNT(*)
+           FROM task_events
+           WHERE json_extract(data, '$.kind')
+                 IN ('ci_gate_trigger', 'ci_gate_pass', 'ci_gate_fail')
+           GROUP BY 1""")
+    ci_gate_raw = {r[0]: r[1] for r in await cur.fetchall()}
+    ci_gate = {
+        "triggered": ci_gate_raw.get("ci_gate_trigger", 0),
+        "passed": ci_gate_raw.get("ci_gate_pass", 0),
+        "failed": ci_gate_raw.get("ci_gate_fail", 0),
+    }
+
     # Repro-gate verdict split (advisory data — decides when "required" ships).
     cur = await db.execute(
         """SELECT COALESCE(json_extract(data, '$.verdict'), '?'), COUNT(*)
@@ -80,4 +94,5 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
         "review_fail": review_fail or 0,
         "recent_rejection_reasons": rejection_reasons,
         "repro_gate_verdicts": repro,
+        "ci_gate": ci_gate,
     }
