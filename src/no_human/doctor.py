@@ -193,6 +193,29 @@ async def diagnose(store: Store) -> Diagnosis:
             "nh task restore-approval."
         )
 
+    # W2.6: orphaned worktrees. A crash between acquire and cleanup leaves a
+    # full checkout under ~/.no_human/worktrees/<task_id> holding a stale git
+    # registration in the primary repo — invisible until the next acquire
+    # fails or the disk fills. A worktree whose task is not currently ACTIVE
+    # is an orphan (worktrees are disposable by design; resume re-creates).
+    from .config import NO_HUMAN_HOME
+    wt_root = NO_HUMAN_HOME / "worktrees"
+    if wt_root.is_dir():
+        active = {
+            row[0] for row in await (await store.db.execute(
+                "SELECT id FROM tasks WHERE status IN "
+                "('pending','context','planning','implementing',"
+                "'reviewing','testing')")).fetchall()
+        }
+        for entry in sorted(wt_root.iterdir()):
+            if entry.is_dir() and entry.name not in active:
+                d.contradictions.append(
+                    f"ORPHANED WORKTREE: {entry} has no active task — a "
+                    "crashed run left its checkout behind; remove it with "
+                    f"`git worktree remove --force {entry}` (from the primary "
+                    "repo) or delete the directory and `git worktree prune`."
+                )
+
     # Per-status required evidence: a task claiming a status must have the
     # events that back the claim.
     for status, kinds in REQUIRED_EVIDENCE.items():

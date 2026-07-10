@@ -148,3 +148,25 @@ async def test_spurious_budget_escalation_after_ci_gate_pass_contradicts(store):
     await store.save_events(t.id, [_ev("attempt_start")])
     d = await diagnose(store)
     assert not any("SPURIOUS ESCALATION" in c for c in d.contradictions)
+
+
+async def test_orphaned_worktree_is_a_contradiction(store, tmp_path, monkeypatch):
+    """W2.6: a crashed run's worktree lingers invisibly until the next acquire
+    fails or the disk fills. A worktree without an ACTIVE task must be flagged;
+    one owned by a running task must not."""
+    import no_human.doctor as doctor_mod
+    fake_home = tmp_path / ".no_human"
+    (fake_home / "worktrees" / "deadbeef1234").mkdir(parents=True)
+    monkeypatch.setattr("no_human.config.NO_HUMAN_HOME", fake_home)
+
+    d = await diagnose(store)
+    assert any("ORPHANED WORKTREE" in c and "deadbeef1234" in c
+               for c in d.contradictions)
+
+    # The same worktree owned by an actively-implementing task: not an orphan.
+    t = Task.new("active", repo_path="/tmp/x")
+    t.id = "deadbeef1234"
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.IMPLEMENTING, validate=False)
+    d = await diagnose(store)
+    assert not any("ORPHANED WORKTREE" in c for c in d.contradictions)
