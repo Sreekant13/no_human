@@ -10,6 +10,7 @@ import { ROLE_LABEL, discoverSubagents, eventSource, modelsByNode } from "./even
 import { hasAction, normalizeOption } from "./blockerOptions.js";
 import { currentFunctionality, groupFunctionalities } from "./functionalities.js";
 import { agentSummary, taskSummary } from "./summaries.js";
+import { estimateCost, fmtTokens } from "./cost.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
 const IconCheck = ({ size = 14, className = "" }) => (
@@ -180,6 +181,11 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0 }) {
             <div className="so-id">{task?.id ?? taskId}</div>
             <div className="so-title" id="so-dialog-title">{task?.title ?? "Loading…"}</div>
           </div>
+          {task?.total_tokens > 0 && (
+            <span className="so-cost" title="tokens used · indicative cost">
+              {fmtTokens(task.total_tokens)} tok · {estimateCost(task.total_tokens)}
+            </span>
+          )}
           {task && (
             <span className={`so-status-pill ${pillClass}`}>
               {task.status}
