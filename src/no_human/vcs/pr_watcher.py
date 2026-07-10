@@ -408,8 +408,12 @@ async def default_ci_log_excerpt(link: str) -> str:
         link = link.split("/display/redirect")[0]
     if not link.startswith("http"):
         return ""
-    user = os.environ.get("SSO_USERNAME")
-    password = os.environ.get("SSO_PASSWORD")
+    # The credentials live in ~/.no_human/.env; the server process does not
+    # export them, so reading os.environ alone would always come up empty.
+    from ..config import load_env_var
+
+    user = load_env_var("SSO_USERNAME")
+    password = load_env_var("SSO_PASSWORD")
     if not (user and password):
         return ""
     import httpx
