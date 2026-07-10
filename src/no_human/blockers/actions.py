@@ -10,9 +10,10 @@ Two rules hold this together:
     `parse_blocker` strips actions off anything the agent emits. Letting the
     agent set `task.config` would let it resolve a blocker by weakening the very
     gate that raised it.
-  - **One verb, whitelisted keys.** `set_task_config` may write exactly the two
-    size limits `_over_size_limits` reads. This is not an action engine; adding a
-    verb should take a deliberate change here, not a new key in a JSON blob.
+  - **One verb, whitelisted keys.** `set_task_config` may write exactly the
+    size limits and lifetime caps the orchestrator reads as per-task
+    overrides. This is not an action engine; adding a verb should take a
+    deliberate change here, not a new key in a JSON blob.
 """
 
 from __future__ import annotations
@@ -24,8 +25,12 @@ if TYPE_CHECKING:  # pragma: no cover — typing only, avoids an import cycle
 
 SET_TASK_CONFIG = "set_task_config"
 
-# Exactly the keys `Orchestrator._size_limits` honours as a per-task override.
-ALLOWED_TASK_CONFIG_KEYS = frozenset({"max_lines_changed", "max_files_changed"})
+# Exactly the per-task overrides the orchestrator honours: the two size
+# limits (`_size_limits`) and the two lifetime caps (`_lifetime_limits`).
+ALLOWED_TASK_CONFIG_KEYS = frozenset({
+    "max_lines_changed", "max_files_changed",
+    "lifetime_attempts", "lifetime_tokens",
+})
 
 
 class ActionError(ValueError):

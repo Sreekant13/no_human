@@ -285,6 +285,23 @@ class Store:
         row = await cur.fetchone()
         return int(row["n"]) if row else 0
 
+    async def lifetime_usage(self, task_id: str) -> tuple[int, int]:
+        """(attempts, tokens) spent over the task's WHOLE life, resumes included.
+
+        Tokens = in/out + cache reads — cache reads are where the real burn
+        lives (93–95% of it), so a budget that ignored them would be theater.
+        Interrupted/killed rows count: they spent the attempt even if their
+        token columns under-report (pre-1638427 rows recorded zero).
+        """
+        cur = await self.db.execute(
+            "SELECT COUNT(*) AS n, "
+            "COALESCE(SUM(COALESCE(tokens_used, 0) + COALESCE(cache_read_tokens, 0)), 0) AS toks "
+            "FROM attempts WHERE task_id = ?",
+            (task_id,),
+        )
+        row = await cur.fetchone()
+        return (int(row["n"]), int(row["toks"])) if row else (0, 0)
+
     # --------------------------- memories ---------------------------------- #
     # The human-confirmed learning queue (PLAN.md 4.5): proposals land here
     # with confirmed=0 and never enter the active rule set until a human

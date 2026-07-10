@@ -31,6 +31,9 @@ class BlockerCategory(str, Enum):
     IMPOSSIBLE = "IMPOSSIBLE"
     NOVEL_UNKNOWN = "NOVEL_UNKNOWN"
     STAGNATION = "STAGNATION"
+    # The task's lifetime budget (attempts or tokens, resumes included) is
+    # spent. Raised by the harness, never the agent.
+    BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
 
     @classmethod
     def coerce(cls, value: str | "BlockerCategory") -> "BlockerCategory":
@@ -86,6 +89,9 @@ _ROUTING: dict[BlockerCategory, Route] = {
     BlockerCategory.IMPOSSIBLE: Route(
         TaskStatus.ESCALATED, notify_now=True, parked=False),
     BlockerCategory.NOVEL_UNKNOWN: Route(
+        TaskStatus.ESCALATED, notify_now=True, parked=False),
+    # Spending more is a human's call, never a retry's.
+    BlockerCategory.BUDGET_EXHAUSTED: Route(
         TaskStatus.ESCALATED, notify_now=True, parked=False),
 }
 

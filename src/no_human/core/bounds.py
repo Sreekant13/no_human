@@ -39,6 +39,17 @@ class Bounds:
     # get a larger turn budget so they don't exhaust turns mid-implementation and
     # fail with an empty diff (B5). Applied only to the complexity-flagged subset.
     complex_multiplier: float = 1.5
+    # Lifetime caps across the task's WHOLE life, resumes included.
+    # `max_attempts` bounds ONE loop; every `nh reply`/resume starts a fresh
+    # loop, which is how task 84251cb2 reached attempt 17 and 21.2M cache-read
+    # tokens without any cap ever firing. Exceeding either cap raises a
+    # BUDGET_EXHAUSTED blocker whose option can raise the budget for that one
+    # task — the human decides, the loop never silently continues. 9 attempts =
+    # three full bounded loops; 25M tokens sits just above the worst observed
+    # single-task burn, so the next task to approach that record parks instead
+    # of setting a new one.
+    lifetime_attempts: int = 9
+    lifetime_tokens: int = 25_000_000
 
     @staticmethod
     def from_config(cfg: dict | None) -> "Bounds":
