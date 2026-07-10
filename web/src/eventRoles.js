@@ -91,7 +91,7 @@ export function discoverSubagents(events) {
         subs.set(tid, {
           id: `sub-${tid}`,
           label: (e.text || "Subagent").slice(0, 40),
-          type: (e.task_type || "SUBAGENT").toUpperCase(),
+          type: (e.task_type || "SUBAGENT").replace(/_/g, " ").toUpperCase(),
           icon: "◇",
           desc: lens
             ? `${e.text || "Subagent"} — spawned by the ${lens} proposer`

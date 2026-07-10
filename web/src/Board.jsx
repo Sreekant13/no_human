@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import SlideOver from "./SlideOver.jsx";
+import { groupFailedByTitle } from "./boardGroups.js";
 
 // Lanes are organized by WHAT ACTION THE HUMAN NEEDS TO TAKE:
 //   Needs You  — tasks waiting for a human decision (approve, reply, or advise)
@@ -103,6 +104,25 @@ function Lane({ lane, tasks, onSelect }) {
       <div className="lane-body">
         {tasks.length === 0 ? (
           <div className="lane-empty">·</div>
+        ) : lane.key === "failed" ? (
+          // U4: same-title failures collapse to the newest + a count — one
+          // stubborn task retried five ways must not bury the board.
+          groupFailedByTitle(tasks).map(({ task, collapsedCount }) => (
+            <div key={task.id} className="failed-group">
+              <TaskCard
+                task={task}
+                accent={lane.accent}
+                isAwaiting={!!lane.needsYou}
+                showSubStatus={lane.showSubStatus}
+                onClick={(e) => onSelect(task.id, e.currentTarget)}
+              />
+              {collapsedCount > 0 && (
+                <div className="failed-group-count" title="Older failed runs with this title — open the card to see attempts">
+                  +{collapsedCount} older with this title
+                </div>
+              )}
+            </div>
+          ))
         ) : (
           tasks.map((task) => (
             <TaskCard

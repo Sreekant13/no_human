@@ -53,6 +53,9 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   const [task, setTask] = useState(null);
   const [diff, setDiff] = useState("");
   const [tab, setTab] = useState("system");
+  // U3: an awaiting-approval task opens on the review surface — the diff +
+  // dossier + approve is THE job at that point; System is one click away.
+  const openedReviewFirst = useRef(false);
   const [busy, setBusy] = useState(false);
   const [sbOpen, setSbOpen] = useState(false);
   const [sbMsg, setSbMsg] = useState("");
@@ -62,9 +65,19 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   const dialogRef = useRef(null);
   const closeRef = useRef(null);
 
+  // A NEW task resets the review-first latch; a refreshKey bump must not —
+  // it would yank the user back to the review tab on every WS update.
+  useEffect(() => { openedReviewFirst.current = false; }, [taskId]);
+
   // Re-fetch whenever taskId changes OR when Board signals a WS update
   useEffect(() => {
-    fetchTask(taskId).then(setTask).catch(() => {});
+    fetchTask(taskId).then((t) => {
+      setTask(t);
+      if (!openedReviewFirst.current && t?.status === "awaiting_approval") {
+        openedReviewFirst.current = true;  // once per open; user clicks win after
+        setTab("review");
+      }
+    }).catch(() => {});
     fetchDiff(taskId).then(setDiff).catch(() => {});
   }, [taskId, refreshKey]);
 
@@ -194,7 +207,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
           )}
           {task && (
             <span className={`so-status-pill ${pillClass}`}>
-              {task.status}
+              {String(task.status).replace(/_/g, " ")}
             </span>
           )}
           <button className="so-close" onClick={onClose} ref={closeRef} aria-label="Close"><IconX size={16} /></button>
@@ -267,8 +280,18 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
               </button>
             )}
             {!isTerminal && (
-              <button className="btn btn-lifecycle btn-cancel" onClick={() => handleLifecycle("cancel")} disabled={busy}>
-                Cancel
+              // Destructive action: spatially separated from the primary CTA
+              // (it used to sit as an equal sibling next to Approve — the
+              // classic danger-adjacency mistake) and demoted to a quiet
+              // text button. Still one click, still confirmable by the
+              // lifecycle handler.
+              <button
+                className="btn-cancel-quiet"
+                onClick={() => handleLifecycle("cancel")}
+                disabled={busy}
+                title="Cancel this task (destructive)"
+              >
+                Cancel task
               </button>
             )}
           </div>
@@ -360,16 +383,29 @@ const AGENTS = [
     color: "var(--agent-reviewer)" },
 ];
 
+const _ERROR_KINDS = new Set(["failed", "attempt_failed", "agent_error", "review_error"]);
+// Milestones that mean "the task recovered past its failures": a failure
+// OLDER than any of these is history, not the present state. Before this
+// rule, one failed attempt painted the Orchestrator node ERROR forever —
+// a green, merge-ready task read as broken (2026-07-11 persona walk).
+const _RECOVERY = (e) =>
+  e.kind === "pr_open" || e.kind === "ci_gate_pass" || e.kind === "merged"
+  || (e.kind === "review" && /pass/i.test(e.text || ""))
+  || (e.kind === "state" && /awaiting_approval|done/i.test(e.text || ""));
+
 function deriveAgentStatus(events, agentId) {
   const agentEvents = events.filter(e => eventSource(e) === agentId);
   if (agentEvents.length === 0) return { status: "idle", count: 0, lastText: "" };
   const last = agentEvents[agentEvents.length - 1];
-  const hasError = agentEvents.some(e => e.kind === "failed" || e.kind === "attempt_failed" || e.kind === "agent_error" || e.kind === "review_error");
+  const lastErrorTs = agentEvents.reduce(
+    (m, e) => (_ERROR_KINDS.has(e.kind) && (e.ts || 0) > m ? e.ts : m), 0);
+  const lastRecoveryTs = events.reduce(
+    (m, e) => (_RECOVERY(e) && (e.ts || 0) > m ? e.ts : m), 0);
   const hasDone = events.some(e => e.kind === "state" && /done/i.test(e.text));
   const hasReviewPass = agentEvents.some(e => e.kind === "review" && /pass/i.test(e.text));
   let status = "active";
   if (hasDone || hasReviewPass) status = "done";
-  if (hasError && !hasDone) status = "error";
+  if (lastErrorTs > 0 && lastErrorTs > lastRecoveryTs && !hasDone) status = "error";
   return { status, count: agentEvents.length, lastText: last.text || "" };
 }
 
@@ -982,6 +1018,11 @@ function SubtasksTab({ taskId }) {
 
 function ActivityTab({ taskId, task, isActive }) {
   const [events, setEvents] = useState([]);
+  // U1: only the newest N events enter the DOM. Rendering a long task's
+  // full history (2015 events on 84251cb2) froze the tab exactly when the
+  // task was interesting; derivations (turn counter, summary, plan tracker)
+  // still see the full array.
+  const [windowSize, setWindowSize] = useState(150);
   const endRef = useRef(null);
 
   useEffect(() => {
@@ -1112,17 +1153,30 @@ function ActivityTab({ taskId, task, isActive }) {
       })()}
       <SummaryCard summary={taskSummary(events)} />
       <div className="activity-log">
-        {groupConsecutiveEvents(events).map((item, i) => {
-          if (item._group) {
-            const role = eventSource(item.events[0]);
-            return <GroupedEvents key={`g-${item.firstIdx}`} group={item} role={role} />;
-          }
-          const e = item;
-          const prevTs = i > 0 ? (events[Math.max(0, events.indexOf(e) - 1)] || e).ts : e.ts;
-          const elapsed = e.ts - prevTs;
-          const role = eventSource(e);
-          return <RichEvent key={i} event={e} elapsed={elapsed} role={role} />;
-        })}
+        {events.length > windowSize && (
+          <button
+            className="activity-load-older"
+            onClick={() => setWindowSize((s) => s + 300)}
+          >
+            Show older events ({events.length - windowSize} hidden)
+          </button>
+        )}
+        {(() => {
+          const visible = events.length > windowSize
+            ? events.slice(-windowSize) : events;
+          return groupConsecutiveEvents(visible).map((item, i) => {
+            if (item._group) {
+              const role = eventSource(item.events[0]);
+              return <GroupedEvents key={`g-${item.firstIdx}`} group={item} role={role} />;
+            }
+            const e = item;
+            const prevTs = i > 0
+              ? (visible[Math.max(0, visible.indexOf(e) - 1)] || e).ts : e.ts;
+            const elapsed = e.ts - prevTs;
+            const role = eventSource(e);
+            return <RichEvent key={i} event={e} elapsed={elapsed} role={role} />;
+          });
+        })()}
         <div ref={endRef} />
       </div>
     </div>
