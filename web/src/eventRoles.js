@@ -19,7 +19,7 @@ export const SOURCE_BY_KIND = {
 
 export const ROLE_LABEL = {
   worker: "Orchestrator", planner: "Planner", supervisor: "Supervisor",
-  reviewer: "Reviewer", agent: "Coder",
+  reviewer: "Reviewer", agent: "Coder", watcher: "Watcher",
 };
 
 // Kinds the Orchestrator emits *on behalf of another role*. It calls self.emit()

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   FUNCTIONALITIES, FX_OF_ROLE, currentFunctionality, groupFunctionalities,
 } from "./functionalities.js";
+import { eventSource } from "./eventRoles.js";
 
 const idle = { status: "idle", count: 0, lastText: "" };
 
@@ -75,4 +76,10 @@ test("a subagent with an unknown parent lands in Orchestrating, not nowhere", ()
   const orch = groups.find((g) => g.id === "orchestrating");
   assert.equal(orch.subs.length, 1);
   assert.equal(orch.status, "active");
+});
+
+test("watcher events land in the Shepherding stage, not Orchestrating", () => {
+  const ci_gateEvent = { kind: "ci_gate_pass", source: "watcher", text: "PASSED" };
+  assert.equal(FX_OF_ROLE[eventSource(ci_gateEvent)], "shepherding");
+  assert.ok(FUNCTIONALITIES.some((f) => f.id === "shepherding"));
 });

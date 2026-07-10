@@ -1165,6 +1165,25 @@ const EVENT_LABELS = {
   subagent_progress: "Subagent",
   subagent_done: "Subagent done",
   review_posted: "Review posted to PR",
+  // post-PR watcher ladder (blockers/wake.py) — merged/comments/CI/CI_GATE
+  merged: "PR merged",
+  pr_closed: "PR closed",
+  pr_feedback: "PR feedback",
+  pr_feedback_skipped: "Bot comments ignored",
+  pr_ci_red: "PR CI red",
+  escalated_ci: "CI escalated",
+  escalated_revisions: "Revisions escalated",
+  escalated_timeout: "Park timeout",
+  resumed: "Resumed",
+  wake_tick: "Watcher heartbeat",
+  state_repaired: "State repaired",
+  // CI_GATE integration gate (M6)
+  ci_gate_trigger: "CI_GATE triggered",
+  ci_gate_poll: "CI_GATE running",
+  ci_gate_pass: "CI_GATE passed",
+  ci_gate_fail: "CI_GATE failed",
+  ci_gate_blocked: "CI_GATE blocked",
+  ci_gate_refused: "CI_GATE refused",
 };
 
 function eventLabel(kind) {

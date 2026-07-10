@@ -144,6 +144,32 @@ function subagentSummary(evs, agent) {
   };
 }
 
+// The post-PR watcher: what it is shepherding right now (CI_GATE verdicts,
+// CI-fix rounds, comment injections, the merge). One glance answers "is the
+// autonomous post-PR loop alive and what did it last do".
+function watcherSummary(evs) {
+  const ci_gatePass = evs.filter((e) => e.kind === "ci_gate_pass").length;
+  const ci_gateFail = evs.filter((e) => e.kind === "ci_gate_fail").length;
+  const ciRounds = evs.filter((e) => e.kind === "pr_ci_red").length;
+  const feedback = evs.filter((e) => e.kind === "pr_feedback").length;
+  const merged = evs.some((e) => e.kind === "merged");
+  const last = evs[evs.length - 1];
+  const facts = [["Events", String(evs.length)]];
+  if (ci_gatePass || ci_gateFail) {
+    facts.push(["CI_GATE", `${ci_gatePass} passed / ${ci_gateFail} failed`]);
+  }
+  if (ciRounds) facts.push(["CI fix rounds", String(ciRounds)]);
+  if (feedback) facts.push(["Feedback injections", String(feedback)]);
+  return {
+    headline: merged
+      ? "PR merged by a human — task done"
+      : `shepherding the PR — ${evs.length} watcher event(s) over ${fmtDur(span(evs))}`,
+    facts,
+    highlights: [`Now: ${clip(last.text || last.kind, 140)}`],
+    issues: ci_gateFail ? [`CI_GATE failed ${ci_gateFail} time(s)`] : [],
+  };
+}
+
 export function agentSummary(allEvents, agent) {
   const evs = agent.subagentTaskId
     ? allEvents.filter(
@@ -157,6 +183,7 @@ export function agentSummary(allEvents, agent) {
     case "planner": return plannerSummary(evs, allEvents);
     case "reviewer": return reviewerSummary(evs);
     case "supervisor": return supervisorSummary(evs);
+    case "watcher": return watcherSummary(evs);
     default: {
       return {
         headline: `${evs.length} orchestration events over ${fmtDur(span(evs))}`,
@@ -198,6 +225,12 @@ export function taskSummary(events) {
   if (budget) facts.push(["Budget", clip(budget.text, 60)]);
   if (models) facts.push(["Models", clip(models.text, 110)]);
   if (pr) facts.push(["PR", pr.text]);
+  const ci_gate = events.filter(
+    (e) => e.kind === "ci_gate_pass" || e.kind === "ci_gate_fail").pop();
+  if (ci_gate) {
+    facts.push(["CI_GATE",
+      ci_gate.kind === "ci_gate_pass" ? "integration passed" : "integration FAILED"]);
+  }
 
   return {
     headline: pr

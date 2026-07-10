@@ -19,11 +19,19 @@ export const FUNCTIONALITIES = [
   { id: "reviewing", label: "Reviewing", icon: "✓", primary: "reviewer",
     roles: ["reviewer"], color: "var(--agent-reviewer)",
     desc: "Adversarial gate: review, tests, tamper check" },
+  // The post-PR watcher (blockers/wake.py): merged→done, comment injection,
+  // red-CI fix loop, CI_GATE integration gate. Its events carry
+  // source:"watcher" and used to mis-attribute to Orchestrating — the whole
+  // autonomous post-PR ladder was invisible on the board.
+  { id: "shepherding", label: "Shepherding", icon: "☂", primary: "watcher",
+    roles: ["watcher"], color: "var(--agent-worker)",
+    desc: "Post-PR: merge watch, feedback, CI fixes, CI_GATE gate" },
 ];
 
 export const FX_OF_ROLE = {
   worker: "orchestrating", planner: "planning",
   agent: "coding", supervisor: "coding", reviewer: "reviewing",
+  watcher: "shepherding",
 };
 
 // Which functionality the most recent event belongs to — the "you are here"
