@@ -121,6 +121,54 @@ async def test_full_pipeline_opens_local_pr(bare_repo, tmp_path, store):
     assert "pr_open" in kinds and "commit" in kinds
 
 
+async def test_transient_pr_open_failure_retries_instead_of_escalating(
+        bare_repo, tmp_path, store, monkeypatch):
+    """Live incident: `gh pr create` returned an EOF after a successful push
+    and the task escalated as if a human were needed. One retry must absorb
+    it (open_pr is idempotent on the forges we target)."""
+    from no_human.core import orchestrator as orch_mod
+
+    real_open_pr = orch_mod.open_pr
+    calls = {"n": 0}
+
+    def flaky_open_pr(repo, branch, title, body, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("gh pr create failed: unexpected EOF")
+        return real_open_pr(repo, branch, title, body, **kwargs)
+
+    async def no_sleep(_secs):
+        return None
+
+    monkeypatch.setattr(orch_mod, "open_pr", flaky_open_pr)
+    monkeypatch.setattr(orch_mod.asyncio, "sleep", no_sleep)
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert calls["n"] == 2
+    kinds = [e["kind"] for e in events]
+    assert "pr_open_retry" in kinds and "pr_open" in kinds
+
+
 async def _run_and_capture_pr_labels(bare_repo, tmp_path, store, monkeypatch,
                                      *, git_labels=None, task_config=None):
     """Run the pipeline to _finalize and return the labels passed to open_pr."""
