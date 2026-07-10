@@ -3092,3 +3092,93 @@ def test_review_base_is_the_merge_base_not_head_parent(tmp_path, store):
     assert orch._review_base(repo, "main") == base_sha  # whole change, both commits
     assert orch._review_base(repo, None) == "HEAD~1"  # no base → unchanged default
     assert orch._review_base(repo, "no-such-branch") == "HEAD~1"  # never blocks review
+
+
+def test_pr_body_carries_the_review_evidence_dossier():
+    """W1.6: the PR body is the human's review surface — the reviewer's
+    verdict trail must be on it, not buried in the transcript."""
+    from no_human.core.orchestrator import Orchestrator
+    t = Task.new("dossier", repo_path="/tmp/x")
+    t.context = {"review_history": [
+        {"round": 1, "passed": False,
+         "blocking": ["Image build failure treated as non-fatal",
+                      "Zero tests reports PASSED"]},
+        {"round": 2, "passed": True, "blocking": []},
+    ]}
+    section = Orchestrator._review_evidence_section(t)
+    assert "## Review evidence" in section
+    assert "review rounds: 2" in section
+    assert "**PASSED**" in section
+    assert "Image build failure" in section
+    # No review ran → section vanishes, body unchanged.
+    t2 = Task.new("no-review", repo_path="/tmp/x")
+    assert Orchestrator._review_evidence_section(t2) == ""
+    # The DB stores context values as strings sometimes — survive that.
+    t3 = Task.new("stringly", repo_path="/tmp/x")
+    t3.context = {"review_history": "[{'round': 1, 'passed': True, 'blocking': []}]"}
+    assert "**PASSED**" in Orchestrator._review_evidence_section(t3)
+
+
+async def test_bugfix_without_repro_evidence_is_sent_back(bare_repo, tmp_path, store):
+    """W1.2 (Agentless): a BUGFIX must prove the bug — a waived/failed repro
+    verdict blocks before any reviewer tokens, with the fix instructions fed
+    to the next attempt."""
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+        # no repro manifest → verdict "waived"
+
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("fix mul() bug", repo_path=str(bare_repo), kind="bugfix")
+    t.acceptance_criteria = ["mul works"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    gate = [e for e in events if e["kind"] == "repro_gate"]
+    assert gate and gate[0]["verdict"] == "waived"
+    assert "[required]" in gate[0]["text"]
+    # The attempt died at the gate — before review — and the coder got told.
+    fresh = await store.get_task(t.id)
+    fb = (fresh.context or {}).get("send_back_feedback") or []
+    assert any(f.get("source") == "repro_gate" for f in fb)
+    assert any("repro gate waived" in (a.get("failure_reason") or "")
+               for a in await store.list_attempts(t.id))
+    assert outcome.status is not TaskStatus.AWAITING_APPROVAL
+
+
+async def test_feature_with_waived_repro_still_proceeds(bare_repo, tmp_path, store):
+    """The gate is advisory for non-bugfix kinds — a feature without a repro
+    manifest must flow to review/PR exactly as before (conservative
+    enforcement: classification decides, never the gate)."""
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))  # kind=feature
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    gate = [e for e in events if e["kind"] == "repro_gate"]
+    assert gate and "[advisory]" in gate[0]["text"]
