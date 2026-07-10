@@ -353,14 +353,24 @@ export async function suggestPaths(path) {
 export function connectTaskSSE(taskId, onEvent, onDone) {
   const url = `${BASE}/api/tasks/${encodeURIComponent(taskId)}/events/stream`;
   const es = new EventSource(url);
+  // W2.3: transient errors must NOT end the stream — closing here silently
+  // froze long-running tasks in the UI. EventSource reconnects natively and
+  // replays Last-Event-ID (the server keys frames by event ts), so we only
+  // give up after sustained failure with nothing received in between.
+  let consecutiveErrors = 0;
   es.onmessage = (msg) => {
+    consecutiveErrors = 0;
     try {
       const data = JSON.parse(msg.data);
       if (data.kind === "done") { es.close(); if (onDone) onDone(); return; }
       if (onEvent) onEvent(data);
     } catch { /* ignore malformed */ }
   };
-  es.onerror = () => { es.close(); if (onDone) onDone(); };
+  es.onerror = () => {
+    consecutiveErrors += 1;
+    if (consecutiveErrors >= 10) { es.close(); if (onDone) onDone(); }
+    // else: let the native reconnect (with Last-Event-ID) do its job.
+  };
   return es; // caller can es.close() to unsubscribe
 }
 

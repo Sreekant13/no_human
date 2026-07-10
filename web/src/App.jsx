@@ -5,6 +5,7 @@ import Settings from "./Settings.jsx";
 import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
 import { LegionLogo } from "./Logo.jsx";
+import { newlyNeedsYou, notificationBody, titleWithBadge } from "./notifications.js";
 
 const NEEDS_YOU_STATUSES = new Set(["awaiting_approval", "awaiting_input", "escalated"]);
 const PROGRESS_STATUSES  = new Set(["pending", "context", "planning", "implementing", "reviewing", "testing"]);
@@ -489,6 +490,7 @@ function NewTaskModal({ onClose, onCreated }) {
 export default function App() {
   const [tasks, dispatch] = useReducer(tasksReducer, []);
   const [wsLive, setWsLive] = useState(false);
+  const prevTasksRef = useRef([]);
   const [fetchError, setFetchError] = useState(null);
   const [showNewTask, setShowNewTask] = useState(false);
   const [page, setPage] = useState("board");
@@ -520,6 +522,33 @@ export default function App() {
     poll();
     const id = setInterval(poll, 10000);
     return () => clearInterval(id);
+  }, []);
+
+  // Needs-You notifications (W2.2): the tab title always carries the count;
+  // the Notification API fires per NEW arrival when granted and the tab is
+  // hidden. Permission is requested on the first user gesture (browsers
+  // block gesture-less requests); denied/unsupported degrades to the badge.
+  useEffect(() => {
+    const needy = tasks.filter((t) => NEEDS_YOU_STATUSES.has(t.status));
+    document.title = titleWithBadge(needy.length);
+    const fresh = newlyNeedsYou(prevTasksRef.current, tasks, NEEDS_YOU_STATUSES);
+    prevTasksRef.current = tasks;
+    if (fresh.length && typeof Notification !== "undefined"
+        && Notification.permission === "granted" && document.hidden) {
+      for (const t of fresh.slice(0, 3)) {
+        try {
+          new Notification("no_human — needs you", { body: notificationBody(t) });
+        } catch { /* a notification is a bonus, never an error */ }
+      }
+    }
+  }, [tasks]);
+
+  useEffect(() => {
+    if (typeof Notification === "undefined"
+        || Notification.permission !== "default") return undefined;
+    const ask = () => { Notification.requestPermission().catch(() => {}); };
+    window.addEventListener("pointerdown", ask, { once: true });
+    return () => window.removeEventListener("pointerdown", ask);
   }, []);
 
   // WebSocket
