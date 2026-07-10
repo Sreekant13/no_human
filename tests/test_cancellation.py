@@ -178,7 +178,9 @@ async def test_pause_stops_the_session_and_checkpoints_the_work(
         store, cfg.data, _PauseMidSessionBackend(store, task.id),
         SlackNotifier(None), event_sink=events.append,
     )
-    outcome = await asyncio.wait_for(orch.run_task(task), timeout=60)
+    # 60s flaked twice under xdist load (isolated runtime is 40-53s); the
+    # timeout guards against a hang, not against a slow machine.
+    outcome = await asyncio.wait_for(orch.run_task(task), timeout=180)
 
     assert outcome.status is TaskStatus.BLOCKED
     assert outcome.pr_url is None
