@@ -1757,6 +1757,24 @@ async def test_no_plan_no_plan_block_in_prompt(bare_repo, tmp_path, store):
     assert "IMPLEMENTATION PLAN" not in prompt
 
 
+async def test_debug_preamble_only_on_retry(bare_repo, tmp_path, store):
+    """1.5: a first attempt has no debug preamble (byte-identical); a retry
+    (attempt_log present) steers the coder to root-cause via no_human_debug."""
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+
+    first = orch._build_implement_prompt(t)
+    assert "no_human_debug" not in first and "A PRIOR ATTEMPT" not in first
+
+    t.context = {"attempt_log": ["attempt 1: tests failed: 0 passed, 1 errors"]}
+    retry = orch._build_implement_prompt(t)
+    assert "A PRIOR ATTEMPT ON THIS TASK FAILED" in retry
+    assert "no_human_debug" in retry and "patch-guess" in retry
+
+
 @pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
 async def test_full_pipeline_with_planning(bare_repo, tmp_path, store):
     """Full pipeline: planning (mocked) → implement (FakeBackend) → PR.

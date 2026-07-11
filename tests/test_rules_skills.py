@@ -328,3 +328,19 @@ def test_materialize_skills_sanitizes_names(tmp_path):
     names = Orchestrator._materialize_skills(orch, tmp_path)
     assert "my-cool_skill" in names
     assert (tmp_path / ".claude" / "skills" / "my-cool_skill" / "SKILL.md").exists()
+
+
+def test_materialize_practice_skills_writes_tdd_debug_done(tmp_path):
+    """1.5: the coder gets concise TDD / systematic-debugging / verify-before-
+    done skills on disk, each a valid SKILL.md with frontmatter."""
+    from no_human.core.orchestrator import Orchestrator
+    orch = object.__new__(Orchestrator)  # method uses only the class attr + log
+    orch._materialize_practice_skills(tmp_path)
+    skills_dir = tmp_path / ".claude" / "skills"
+    for name in ("no_human_tdd", "no_human_debug", "no_human_done"):
+        sk = skills_dir / name / "SKILL.md"
+        assert sk.exists(), f"{name} not materialized"
+        assert sk.read_text().startswith(f"---\nname: {name}\ndescription: ")
+    # systematic-debugging is the net-new lever: root-cause, don't patch-guess
+    debug = (skills_dir / "no_human_debug" / "SKILL.md").read_text().lower()
+    assert "root cause" in debug and "patch-guess" in debug
