@@ -43,3 +43,12 @@ test("Review PR and Needs Answer are both loud, human-facing lanes", () => {
   assert.equal(review.statuses.length, 1);            // only awaiting_approval
   assert.ok(answer.statuses.includes("escalated"));
 });
+
+test("Review PR sits immediately before Done and is review-coloured", () => {
+  const keys = LANES.map((l) => l.key);
+  assert.equal(keys.indexOf("review") + 1, keys.indexOf("done"));  // beside Done
+  const review = LANES.find((l) => l.key === "review");
+  const working = LANES.find((l) => l.key === "working");
+  assert.equal(review.accent, "var(--c-review)");     // its own colour…
+  assert.notEqual(review.accent, working.accent);      // …not Working's blue
+});
