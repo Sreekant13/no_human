@@ -391,7 +391,11 @@ export default function Stats({ tasks }) {
           </div>
         </div>
 
-        <div className="stats-card">
+        <div className={`stats-card${
+          stats.totalCompleted + stats.totalFailed > 0
+            ? (stats.successRate < 50 ? " stats-card-bad"
+               : stats.successRate >= 80 ? " stats-card-good" : "")
+            : ""}`}>
           <div className="stats-card-label">Success Rate</div>
           <div className="stats-card-value">
             {stats.totalCompleted + stats.totalFailed > 0
@@ -412,25 +416,27 @@ export default function Stats({ tasks }) {
           </div>
         </div>
 
-        <div className="stats-card" data-testid="stat-first-attempt">
-          <div className="stats-card-label">First-Attempt Pass</div>
-          <div className="stats-card-value">
-            {stats.firstAttemptRate > 0 ? `${stats.firstAttemptRate.toFixed(0)}%` : "\u2014"}
+        {/* First-attempt-pass and spec-coverage only when they have data \u2014
+            an empty "\u2014" tile is clutter, not information (D3 declutter). */}
+        {stats.avgAttempts > 0 && (
+          <div className="stats-card" data-testid="stat-first-attempt">
+            <div className="stats-card-label">First-Attempt Pass</div>
+            <div className="stats-card-value">{stats.firstAttemptRate.toFixed(0)}%</div>
+            <div className="stats-card-sub">
+              avg {stats.avgAttempts.toFixed(1)} attempts/task
+            </div>
           </div>
-          <div className="stats-card-sub">
-            avg {stats.avgAttempts > 0 ? stats.avgAttempts.toFixed(1) : "\u2014"} attempts/task
-          </div>
-        </div>
+        )}
 
-        <div className="stats-card" data-testid="stat-spec-coverage">
-          <div className="stats-card-label">Spec Coverage</div>
-          <div className="stats-card-value">
-            {stats.specCoverage > 0 ? `${stats.specCoverage.toFixed(0)}%` : "\u2014"}
+        {stats.specCoverage > 0 && (
+          <div className="stats-card" data-testid="stat-spec-coverage">
+            <div className="stats-card-label">Spec Coverage</div>
+            <div className="stats-card-value">{stats.specCoverage.toFixed(0)}%</div>
+            <div className="stats-card-sub">
+              {tasks.filter(t => t.context?.spec).length} of {tasks.length} tasks
+            </div>
           </div>
-          <div className="stats-card-sub">
-            {tasks.filter(t => t.context?.spec).length} of {tasks.length} tasks
-          </div>
-        </div>
+        )}
 
         <div className="stats-card" data-testid="stat-stagnation">
           <div className="stats-card-label">Stagnation</div>
