@@ -3249,3 +3249,17 @@ def test_out_of_scope_becomes_a_forbidden_block_in_the_prompt():
     t2 = Task.new("y", repo_path="/tmp/x")
     t2.context = {"spec": {"test_plan": "x"}}
     assert "OUT OF SCOPE" not in orch._resume_digest(t2)
+
+
+def test_pr_url_parts_delegates_to_canonical_parser():
+    """EH2: _parse_pr_url_parts now delegates to vcs.pr_watcher.parse_pr_url —
+    one grammar, not four. Pin the shape it returns."""
+    from no_human.core.orchestrator import Orchestrator
+    P = Orchestrator._parse_pr_url_parts
+    assert P("https://code.example.com/dev/metrics-core-query-service/pull/513") == \
+        ("github", "dev/metrics-core-query-service", 513)
+    assert P("https://gitlab.com/org/repo/-/merge_requests/42") == \
+        ("gitlab", "org%2Frepo", 42)
+    assert P("https://gitlab.acme.net/ci_gate/customer/metrics-core-service/-/merge_requests/7") == \
+        ("gitlab", "ci_gate%2Fcustomer%2Fmetrics-core-service", 7)
+    assert P("not a url") is None
