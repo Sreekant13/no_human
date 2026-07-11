@@ -625,3 +625,14 @@ def test_resolve_max_workers_defaults_are_serial_and_silent():
     assert resolve_max_workers({"concurrency": {"enabled": False, "max_workers": 1}}) == (1, None)
     # Degenerate values never produce a zero-width pool.
     assert resolve_max_workers({"concurrency": {"enabled": True, "max_workers": 0}}) == (1, None)
+
+
+def test_bounded_xdist_workers():
+    """The CPU-oversubscription guard (2026-07-11): 3 tasks × pytest -n auto
+    on 12 cores must not spawn 36 workers."""
+    from no_human.core.scheduler import bounded_xdist_workers
+    assert bounded_xdist_workers(3, 12, None) == "4"      # 12//3
+    assert bounded_xdist_workers(5, 12, None) == "2"      # 12//5
+    assert bounded_xdist_workers(20, 12, None) == "1"     # floor at 1
+    assert bounded_xdist_workers(1, 12, None) is None     # serial: untouched
+    assert bounded_xdist_workers(3, 12, "8") is None      # explicit choice kept

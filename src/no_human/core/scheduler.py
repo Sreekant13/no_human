@@ -62,6 +62,20 @@ def resolve_max_workers(
     return requested, None
 
 
+def bounded_xdist_workers(
+    max_workers: int, cpu_count: int, existing: str | None,
+) -> str | None:
+    """The value to set for PYTEST_XDIST_AUTO_NUM_WORKERS, or None to leave it.
+
+    N parallel tasks each running `pytest -n auto` spawn N×cpu workers on cpu
+    cores (2026-07-11: 3×12 on 12 → every run timed out). Bound each task's
+    auto count to cpu//max_workers. Serial mode (max_workers≤1) and an
+    already-set value are left untouched — never lower an explicit choice."""
+    if max_workers <= 1 or existing:
+        return None
+    return str(max(1, (cpu_count or 2) // max_workers))
+
+
 def _parse_iso(value: str | None) -> datetime | None:
     if not value:
         return None
