@@ -209,3 +209,48 @@ def test_wiki_generator_regeneration_replaces_block(fake_repo):
     assert claude_md.count(_WIKI_BLOCK_START) == 1
     # Latest content.
     assert (fake_repo / WIKI_DIR / "architecture.md").read_text().startswith("# Arch v2")
+
+
+import subprocess as _sp
+
+
+def _init_repo(path):
+    _sp.run(["git", "init", "-q"], cwd=path, check=True)
+    _sp.run(["git", "config", "user.email", "t@t"], cwd=path, check=True)
+    _sp.run(["git", "config", "user.name", "t"], cwd=path, check=True)
+    (path / "a.py").write_text("x = 1\n")
+    _sp.run(["git", "add", "-A"], cwd=path, check=True)
+    _sp.run(["git", "commit", "-qm", "init"], cwd=path, check=True)
+    return _sp.run(["git", "rev-parse", "HEAD"], cwd=path,
+                   capture_output=True, text=True).stdout.strip()
+
+
+async def test_wiki_refresh_skips_when_head_unchanged(tmp_path):
+    """W3.6: HEAD == last wiki commit → no backend call, skipped=True."""
+    sha = _init_repo(tmp_path)
+    fake = FakeBackend('```json\n{"architecture":"a","modules":"m","conventions":"c"}\n```')
+    res = await WikiGenerator(fake).generate(tmp_path, since_sha=sha)
+    assert res.skipped is True
+    assert fake.calls == []          # zero cost when nothing changed
+
+
+async def test_wiki_refresh_uses_diff_prompt_when_head_moved(tmp_path):
+    sha = _init_repo(tmp_path)
+    (tmp_path / "b.py").write_text("y = 2\n")
+    _sp.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    _sp.run(["git", "commit", "-qm", "add b"], cwd=tmp_path, check=True)
+    fake = FakeBackend('```json\n{"architecture":"a","modules":"m","conventions":"c"}\n```')
+    res = await WikiGenerator(fake).generate(tmp_path, since_sha=sha)
+    assert res.skipped is False
+    assert len(fake.calls) == 1
+    assert "UPDATE" in fake.calls[0]["prompt"]      # refresh prompt, not full
+    assert "b.py" in fake.calls[0]["prompt"]         # the diff seeded it
+
+
+async def test_wiki_full_generation_without_since_sha(tmp_path):
+    _init_repo(tmp_path)
+    fake = FakeBackend('```json\n{"architecture":"a","modules":"m","conventions":"c"}\n```')
+    res = await WikiGenerator(fake).generate(tmp_path)
+    assert res.skipped is False
+    assert len(fake.calls) == 1
+    assert "UPDATE" not in fake.calls[0]["prompt"]   # full-generation prompt

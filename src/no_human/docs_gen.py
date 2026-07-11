@@ -46,6 +46,7 @@ class WikiResult:
     files_written: list[str] = field(default_factory=list)
     commit_sha: str = ""
     error: str = ""
+    skipped: bool = False   # W3.6: HEAD unchanged since last wiki — no cost
 
 
 PROMPT = (
@@ -64,6 +65,18 @@ PROMPT = (
 )
 
 
+REFRESH_PROMPT = (
+    "You maintain the developer wiki (`.no_human/wiki/*.md`) for {repo}. It was "
+    "last generated at commit {since}. Do NOT modify anything — only read.\n\n"
+    "These files changed since then:\n{changes}\n\n"
+    "Read the existing wiki and the changed files, then UPDATE the three "
+    "sections to reflect the changes — keep everything still accurate, revise "
+    "only what the diff affected. Respond with ONLY a fenced ```json block "
+    'with keys "architecture", "modules", "conventions" (full updated markdown '
+    "for each, as before)."
+)
+
+
 class WikiGenerator:
     """Generate repo wiki docs via a bounded Agent SDK session.
 
@@ -75,16 +88,35 @@ class WikiGenerator:
         self.backend = backend
         self.max_turns = max_turns
 
-    async def generate(self, repo_path: str | Path) -> WikiResult:
-        """Run the wiki generation session and write files."""
+    async def generate(
+        self, repo_path: str | Path, *, since_sha: str | None = None,
+    ) -> WikiResult:
+        """Run the wiki generation session and write files.
+
+        W3.6 incremental refresh: when *since_sha* (the last wiki_commit) is
+        given and equals HEAD, the wiki is up to date — return skipped with no
+        backend call (OpenWiki's --update gate). When it differs, the agent is
+        pointed at the diff since then and asked to UPDATE the existing wiki
+        rather than regenerate from scratch. No *since_sha* → full generation."""
         repo = Path(repo_path).expanduser().resolve()
         if not repo.is_dir():
             return WikiResult(repo_path=str(repo), error=f"not a directory: {repo}")
 
         commit_sha = _git_head(repo)
 
+        if since_sha and commit_sha and since_sha == commit_sha:
+            return WikiResult(repo_path=str(repo), commit_sha=commit_sha,
+                              skipped=True)
+
+        prompt = PROMPT.format(repo=repo)
+        if since_sha and commit_sha and since_sha != commit_sha:
+            changed = _git_diff_stat(repo, since_sha)
+            if changed:
+                prompt = REFRESH_PROMPT.format(repo=repo, since=since_sha[:8],
+                                               changes=changed)
+
         result = await self.backend.run(
-            PROMPT.format(repo=repo),
+            prompt,
             cwd=repo,
             max_turns=self.max_turns,
             effort="low",
@@ -192,3 +224,19 @@ def _git_head(repo: Path) -> str:
         return r.stdout.strip() if r.returncode == 0 else ""
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return ""
+
+
+def _git_diff_stat(repo: Path, since_sha: str, *, max_chars: int = 3000) -> str:
+    """`git diff --stat <since>..HEAD`, capped — the changed-file summary that
+    seeds the incremental wiki refresh. Empty on any git failure (caller then
+    falls back to a full regeneration)."""
+    try:
+        r = subprocess.run(
+            ["git", "diff", "--stat", f"{since_sha}..HEAD"],
+            capture_output=True, text=True, timeout=10, cwd=repo,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
+    if r.returncode != 0:
+        return ""
+    return (r.stdout or "").strip()[:max_chars]
