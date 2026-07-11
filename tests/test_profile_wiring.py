@@ -166,3 +166,51 @@ async def test_no_rules_is_identical_to_resolve_test_cmd(store, tmp_path):
     orch._agent_edited_files = {str(repo_path / "web" / "App.jsx")}
     cmd, cwd = await orch._resolve_test_target(_repo(repo_path))
     assert cmd == "npm test" and cwd is None
+
+
+async def test_resumed_web_change_routes_to_web_when_no_session_edits(store, tmp_path):
+    """On RESUME the coder may make no new edits (the work is already committed
+    at the [WIP-BLOCKED] checkpoint), so _agent_edited_files is empty. Routing
+    must fall back to the attempt's committed change set — else a resumed web
+    task wrongly runs the backend suite. This is the exact shape that stalled
+    the dogfood tasks (537a1535)."""
+    repo_path = tmp_path / "repo"; repo_path.mkdir()
+    (repo_path / "web").mkdir()
+    await store.upsert_profile(_multilang(repo_path))
+    orch = _orch(store, tmp_path)
+    orch._agent_edited_files = set()  # resume: nothing edited this session
+    repo = SimpleNamespace(
+        path=repo_path,
+        changed_files=lambda: ["web/src/relativeTime.js",
+                               "web/src/relativeTime.test.mjs"],
+    )
+    cmd, cwd = await orch._resolve_test_target(repo)
+    assert cmd == "node --test src/"
+    assert str(cwd) == str(repo_path / "web")
+
+
+async def test_no_edits_and_no_committed_diff_uses_default(store, tmp_path):
+    """No signal at all (empty session edits, empty diff) → the default."""
+    repo_path = tmp_path / "repo"; repo_path.mkdir()
+    await store.upsert_profile(_multilang(repo_path))
+    orch = _orch(store, tmp_path)
+    orch._agent_edited_files = set()
+    repo = SimpleNamespace(path=repo_path, changed_files=lambda: [])
+    cmd, cwd = await orch._resolve_test_target(repo)
+    assert cmd == "uv run pytest -q" and cwd is None
+
+
+async def test_changed_files_failure_falls_back_to_default(store, tmp_path):
+    """A git error while reading the committed diff must never crash routing —
+    it degrades to the default command."""
+    repo_path = tmp_path / "repo"; repo_path.mkdir()
+    await store.upsert_profile(_multilang(repo_path))
+    orch = _orch(store, tmp_path)
+    orch._agent_edited_files = set()
+
+    def _boom():
+        raise RuntimeError("git exploded")
+
+    repo = SimpleNamespace(path=repo_path, changed_files=_boom)
+    cmd, cwd = await orch._resolve_test_target(repo)
+    assert cmd == "uv run pytest -q" and cwd is None
