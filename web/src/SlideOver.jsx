@@ -252,7 +252,11 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
                 Send back
               </button>
             )}
-            {nextInQueue && onJump && (
+            {isAwaiting && nextInQueue && onJump && (
+              // Review-queue navigation belongs to the review flow only. It used
+              // to show on ANY drawer with a pending review in the queue — so a
+              // BLOCKED task's action bar led with "Next review →" instead of the
+              // Reply/Resume it actually needs.
               <button className="btn btn-next-review" disabled={busy}
                       onClick={() => onJump(nextInQueue)}
                       title="Jump to the next task awaiting approval">
