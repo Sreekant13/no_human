@@ -70,6 +70,12 @@ REQUIRED_EVIDENCE: dict[str, tuple[str, ...]] = {
     "done": ("pr_open",),
 }
 
+# Task kinds that legitimately finish WITHOUT opening a PR — a standalone code
+# review produces cited comments, an investigation produces findings. Demanding
+# a pr_open of them is a false positive (it flagged the done code_review task
+# f71107e9 every run). Only applies to the pr_open requirement.
+PR_LESS_KINDS: tuple[str, ...] = ("code_review", "investigation")
+
 
 @dataclass
 class Diagnosis:
@@ -228,11 +234,20 @@ async def diagnose(store: Store) -> Diagnosis:
     # events that back the claim.
     for status, kinds in REQUIRED_EVIDENCE.items():
         placeholders = ",".join("?" for _ in kinds)
+        # A code-review / investigation task finishes with an artifact, not a
+        # PR — don't demand pr_open evidence of it.
+        kind_filter = ""
+        kind_params: tuple[str, ...] = ()
+        if kinds == ("pr_open",):
+            kf_ph = ",".join("?" for _ in PR_LESS_KINDS)
+            kind_filter = f" AND COALESCE(t.kind, '') NOT IN ({kf_ph})"
+            kind_params = PR_LESS_KINDS
         cur = await store.db.execute(
-            f"""SELECT t.id FROM tasks t WHERE t.status = ? AND NOT EXISTS (
+            f"""SELECT t.id FROM tasks t WHERE t.status = ?{kind_filter}
+                AND NOT EXISTS (
                   SELECT 1 FROM task_events e WHERE e.task_id = t.id
                   AND json_extract(e.data, '$.kind') IN ({placeholders}))""",
-            (status, *kinds),
+            (status, *kind_params, *kinds),
         )
         for (task_id,) in await cur.fetchall():
             d.evidence_gaps.append(

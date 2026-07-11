@@ -177,3 +177,22 @@ async def test_orphaned_worktree_is_a_contradiction(store, tmp_path, monkeypatch
     await store.set_status(t, TaskStatus.IMPLEMENTING, validate=False)
     d = await diagnose(store)
     assert not any("ORPHANED WORKTREE" in c for c in d.contradictions)
+
+
+async def test_done_code_review_needs_no_pr_open(store):
+    """A standalone code-review finishes with cited comments, not a PR — 'done'
+    without pr_open must NOT be flagged as an evidence gap for it (false positive
+    that flagged f71107e9 every run). A done FEATURE task still must have one."""
+    cr = Task.new("review PR 123", repo_path="/tmp/x")
+    cr.kind = "code_review"
+    await store.create_task(cr)
+    await store.set_status(cr, TaskStatus.DONE, validate=False)
+    d = await diagnose(store)
+    assert not any(cr.id[:8] in g and "pr_open" in g for g in d.evidence_gaps)
+
+    feat = Task.new("add feature", repo_path="/tmp/x")
+    feat.kind = "feature"
+    await store.create_task(feat)
+    await store.set_status(feat, TaskStatus.DONE, validate=False)
+    d = await diagnose(store)
+    assert any(feat.id[:8] in g and "pr_open" in g for g in d.evidence_gaps)
