@@ -1,35 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import SlideOver from "./SlideOver.jsx";
 import { groupFailedByTitle } from "./boardGroups.js";
-
-// Lanes are organized by WHAT ACTION THE HUMAN NEEDS TO TAKE:
-//   Needs You  — tasks waiting for a human decision (approve, reply, or advise)
-//   Working    — agent is actively processing (pending through testing)
-//   Waiting    — auto-resolvable (will wake on its own, no human needed)
-//   Failed     — terminal (separate from resolvable states)
-//   Done       — completed
-//
-// "blocked" tasks are split: those WITH a wake_condition go to Waiting
-// (they'll auto-resolve), those WITHOUT go to Needs You (human must act).
-const LANES = [
-  { key: "needs_you",    label: "Needs You",    accent: "var(--c-awaiting)",  statuses: ["awaiting_approval", "awaiting_input", "escalated"], loud: true, needsYou: true },
-  { key: "working",      label: "Working",      accent: "var(--c-building)",  statuses: ["pending", "context", "planning", "implementing", "reviewing", "testing", "compound_parent"], showSubStatus: true },
-  { key: "waiting",      label: "Waiting",      accent: "var(--c-context)",   statuses: ["blocked", "paused_quota"], autoWait: true },
-  { key: "failed",       label: "Failed",       accent: "var(--c-escalated)", statuses: ["failed"] },
-  { key: "done",         label: "Done",         accent: "var(--c-done)",      statuses: ["done"] },
-];
-
-// "blocked" tasks are routed dynamically: if the blocker has a wake_condition
-// the task will auto-resolve → Waiting lane. Otherwise → Needs You lane.
-function routeTask(task) {
-  if (task.status === "blocked") {
-    return task.blocker_wake_condition ? "waiting" : "needs_you";
-  }
-  for (const lane of LANES) {
-    if (lane.statuses.includes(task.status)) return lane.key;
-  }
-  return "working";
-}
+import { LANES, routeTask } from "./boardLanes.js";
 
 export default function Board({ tasks }) {
   const [selectedId, setSelectedId] = useState(null);

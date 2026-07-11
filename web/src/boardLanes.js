@@ -1,0 +1,33 @@
+// Lanes are organized by WHAT ACTION THE HUMAN NEEDS TO TAKE. The single
+// "Needs You" lane conflated two very different asks — a finished PR to
+// review/approve vs a stuck task needing a decision/clarification — so it is
+// split into two loud lanes:
+//   Review PR    — awaiting_approval: a PR is up, review and approve/merge
+//   Needs Answer — awaiting_input / escalated / blocked-without-wake: the agent
+//                  needs a human decision, answer, or clarification to proceed
+//   Working      — agent is actively processing (pending through testing)
+//   Waiting      — auto-resolvable (will wake on its own, no human needed)
+//   Failed       — terminal
+//   Done         — completed
+//
+// Pure so the routing is node --test'd. Board.jsx consumes LANES + routeTask.
+export const LANES = [
+  { key: "review",  label: "Review PR",    accent: "var(--c-awaiting)",  statuses: ["awaiting_approval"], loud: true, needsYou: true },
+  { key: "answer",  label: "Needs Answer", accent: "var(--c-escalated)", statuses: ["awaiting_input", "escalated"], loud: true, needsYou: true },
+  { key: "working", label: "Working",      accent: "var(--c-building)",  statuses: ["pending", "context", "planning", "implementing", "reviewing", "testing", "compound_parent"], showSubStatus: true },
+  { key: "waiting", label: "Waiting",      accent: "var(--c-context)",   statuses: ["blocked", "paused_quota"], autoWait: true },
+  { key: "failed",  label: "Failed",       accent: "var(--c-escalated)", statuses: ["failed"] },
+  { key: "done",    label: "Done",         accent: "var(--c-done)",      statuses: ["done"] },
+];
+
+// "blocked" is routed dynamically: WITH a wake_condition it auto-resolves →
+// Waiting; WITHOUT, a human must act → Needs Answer.
+export function routeTask(task) {
+  if (task.status === "blocked") {
+    return task.blocker_wake_condition ? "waiting" : "answer";
+  }
+  for (const lane of LANES) {
+    if (lane.statuses.includes(task.status)) return lane.key;
+  }
+  return "working";
+}
