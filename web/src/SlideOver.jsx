@@ -7,6 +7,7 @@ import {
 } from "./api.js";
 import Markdown from "./Markdown.jsx";
 import { ROLE_LABEL, discoverSubagents, eventSource, modelsByNode } from "./eventRoles.js";
+import { deriveAgentStatus } from "./pipelineStatus.js";
 import { hasAction, normalizeOption } from "./blockerOptions.js";
 import { currentFunctionality, groupFunctionalities } from "./functionalities.js";
 import { agentSummary, taskSummary } from "./summaries.js";
@@ -391,33 +392,6 @@ const AGENTS = [
   { id: "watcher",    label: "Watcher",      type: "SHEPHERD",     icon: "☂",  desc: "Post-PR: merge watch, feedback injection, CI fixes, CI_GATE gate",
     color: "var(--agent-worker)" },
 ];
-
-const _ERROR_KINDS = new Set(["failed", "attempt_failed", "agent_error", "review_error"]);
-// Milestones that mean "the task recovered past its failures": a failure
-// OLDER than any of these is history, not the present state. Before this
-// rule, one failed attempt painted the Orchestrator node ERROR forever —
-// a green, merge-ready task read as broken (2026-07-11 persona walk).
-const _RECOVERY = (e) =>
-  e.kind === "pr_open" || e.kind === "ci_gate_pass" || e.kind === "merged"
-  || (e.kind === "review" && /pass/i.test(e.text || ""))
-  || (e.kind === "state" && /awaiting_approval|done/i.test(e.text || ""));
-
-function deriveAgentStatus(events, agentId) {
-  const agentEvents = events.filter(e => eventSource(e) === agentId);
-  if (agentEvents.length === 0) return { status: "idle", count: 0, lastText: "" };
-  const last = agentEvents[agentEvents.length - 1];
-  const lastErrorTs = agentEvents.reduce(
-    (m, e) => (_ERROR_KINDS.has(e.kind) && (e.ts || 0) > m ? e.ts : m), 0);
-  const lastRecoveryTs = events.reduce(
-    (m, e) => (_RECOVERY(e) && (e.ts || 0) > m ? e.ts : m), 0);
-  const hasDone = events.some(e => e.kind === "state" && /done/i.test(e.text));
-  const hasReviewPass = agentEvents.some(e => e.kind === "review" && /pass/i.test(e.text));
-  let status = "active";
-  if (hasDone || hasReviewPass) status = "done";
-  if (lastErrorTs > 0 && lastErrorTs > lastRecoveryTs && !hasDone) status = "error";
-  return { status, count: agentEvents.length, lastText: last.text || "" };
-}
-
 
 // Parse URLs in text and return React elements with clickable links
 function linkify(text) {
