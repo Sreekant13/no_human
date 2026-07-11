@@ -16,8 +16,8 @@ import json
 from typing import Any
 
 
-def _tags_of(memory: dict[str, Any]) -> list[str]:
-    raw = memory.get("tags")
+def _json_list(raw: Any) -> list[str]:
+    """A stored JSON array (or a real list) → list[str]; anything else → []."""
     if not raw:
         return []
     if isinstance(raw, list):
@@ -27,6 +27,10 @@ def _tags_of(memory: dict[str, Any]) -> list[str]:
     except (ValueError, TypeError):
         return []
     return [str(t) for t in parsed] if isinstance(parsed, list) else []
+
+
+def _tags_of(memory: dict[str, Any]) -> list[str]:
+    return _json_list(memory.get("tags"))
 
 
 def memory_is_triggered(memory: dict[str, Any], haystack: str) -> bool:
@@ -45,3 +49,28 @@ def filter_triggered(
 ) -> list[dict[str, Any]]:
     """The subset of *memories* whose trigger fires for this task."""
     return [m for m in memories if memory_is_triggered(m, haystack)]
+
+
+def playbook_is_triggered(playbook: dict[str, Any], haystack: str) -> bool:
+    """True if this playbook (1.4) applies to a task whose text is *haystack*.
+
+    Unlike a memory (no tags → always inject), a playbook with NO trigger
+    keywords NEVER auto-matches — a heavy, specific procedure must not attach
+    itself to unrelated tasks. Keywords match case-insensitively as substrings.
+    """
+    kws = [k for k in _json_list(playbook.get("trigger_keywords")) if k.strip()]
+    if not kws:
+        return False  # no trigger → manual-only, never auto-injected
+    low = haystack.lower()
+    return any(k.lower() in low for k in kws)
+
+
+def select_playbook(
+    playbooks: list[dict[str, Any]], haystack: str,
+) -> dict[str, Any] | None:
+    """The single best-matching playbook for a task (the first that triggers).
+    At most one is injected, to keep the coder prompt focused."""
+    for pb in playbooks:
+        if playbook_is_triggered(pb, haystack):
+            return pb
+    return None

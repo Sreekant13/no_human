@@ -183,3 +183,15 @@ async def test_update_task_columns_never_touches_context(tmp_path):
         fresh = await s.get_task(t.id)
         assert fresh.context.get("concurrent") is True  # survived
         assert fresh.blocker["category"] == "AMBIGUITY"  # column written
+
+
+async def test_playbook_crud_and_project_scope(store):
+    """1.4: operator playbooks round-trip; project scope includes globals."""
+    pid = await store.add_playbook(
+        title="P", trigger_keywords=["x"], procedure="do",
+        postconditions=["done"], project="/tmp/r")
+    await store.add_playbook(title="G", trigger_keywords=["y"])  # global
+    scoped = await store.list_playbooks(project="/tmp/r")
+    assert {p["title"] for p in scoped} == {"P", "G"}
+    assert await store.delete_playbook(pid[:8]) is True
+    assert {p["title"] for p in await store.list_playbooks()} == {"G"}

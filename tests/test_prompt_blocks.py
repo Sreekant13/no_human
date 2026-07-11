@@ -2,7 +2,32 @@
 
 from types import SimpleNamespace
 
-from no_human.core.prompt_blocks import build_profile_block, build_rules_block
+from no_human.core.prompt_blocks import (
+    build_playbook_block,
+    build_profile_block,
+    build_rules_block,
+)
+
+
+def test_playbook_block_empty_when_no_playbook():
+    assert build_playbook_block(None) == ""
+    assert build_playbook_block({}) == ""
+    assert build_playbook_block({"title": "x"}) == ""  # title only, no body → empty
+
+
+def test_playbook_block_renders_all_sections():
+    blk = build_playbook_block({
+        "title": "Migration",
+        "procedure": "1. write migration\n2. run it",
+        "postconditions": '["schema versioned", "backfill idempotent"]',
+        "forbidden": '["never drop a column"]',
+        "required_from_user": '["target branch"]',
+    })
+    assert "PLAYBOOK — Migration" in blk
+    assert "1. write migration" in blk
+    assert "Done means ALL of these are TRUE" in blk and "schema versioned" in blk
+    assert "FORBIDDEN" in blk and "never drop a column" in blk
+    assert "Required from the operator" in blk and "target branch" in blk
 
 
 def test_rules_block_core_discipline_always_present():

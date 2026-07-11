@@ -436,6 +436,54 @@ class Store:
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
+    # ----------------------------- playbooks ------------------------------ #
+
+    async def add_playbook(
+        self, *, title: str, trigger_keywords: list[str] | None = None,
+        procedure: str = "", postconditions: list[str] | None = None,
+        forbidden: list[str] | None = None,
+        required_from_user: list[str] | None = None,
+        project: str | None = None,
+    ) -> str:
+        """Insert an operator-authored playbook (1.4). Returns its id."""
+        pb_id = uuid.uuid4().hex
+        await self.db.execute(
+            """INSERT INTO playbooks
+                 (id, title, trigger_keywords, procedure, postconditions,
+                  forbidden, required_from_user, project)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (pb_id, title, json.dumps(trigger_keywords or []), procedure,
+             json.dumps(postconditions or []), json.dumps(forbidden or []),
+             json.dumps(required_from_user or []), project),
+        )
+        await self.db.commit()
+        return pb_id
+
+    async def list_playbooks(
+        self, *, project: str | None = None, include_global: bool = True,
+    ) -> list[dict[str, Any]]:
+        """All playbooks, optionally scoped to a project (globals included
+        unless ``include_global`` is False). Mirrors ``list_memories``."""
+        clauses, params = [], []
+        if project is not None:
+            if include_global:
+                clauses.append("(project = ? OR project IS NULL)")
+            else:
+                clauses.append("project = ?")
+            params.append(project)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        cur = await self.db.execute(
+            f"SELECT * FROM playbooks{where} ORDER BY created_at DESC", params
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def delete_playbook(self, prefix: str) -> bool:
+        cur = await self.db.execute(
+            "DELETE FROM playbooks WHERE id = ? OR id LIKE ?",
+            (prefix, prefix + "%"))
+        await self.db.commit()
+        return cur.rowcount > 0
+
     async def find_memory(self, prefix: str) -> dict[str, Any] | None:
         cur = await self.db.execute(
             "SELECT * FROM memories WHERE id = ? OR id LIKE ? LIMIT 2",

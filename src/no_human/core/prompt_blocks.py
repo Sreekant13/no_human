@@ -10,10 +10,50 @@ digest, resume digest, plan) stay in the orchestrator for now.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from ..blockers import Blocker
 from .task import Task
+
+
+def build_playbook_block(playbook: dict[str, Any] | None) -> str:
+    """1.4: inject a matched Devin-style playbook — the reusable procedure for
+    this task shape. Pure. The Postconditions ('done = these are TRUE') are the
+    highest-leverage part; Forbidden reinforces the safety rails. Empty → ''."""
+    if not playbook:
+        return ""
+
+    def _lst(key: str) -> list[str]:
+        raw = playbook.get(key)
+        if isinstance(raw, list):
+            return [str(x) for x in raw]
+        try:
+            v = json.loads(raw) if raw else []
+        except (ValueError, TypeError):
+            return []
+        return [str(x) for x in v] if isinstance(v, list) else []
+
+    title = playbook.get("title") or "playbook"
+    procedure = (playbook.get("procedure") or "").strip()
+    post, forbidden, required = _lst("postconditions"), _lst("forbidden"), _lst("required_from_user")
+    if not (procedure or post or forbidden or required):
+        return ""
+    lines = [f"PLAYBOOK — {title} (a proven procedure for this kind of task; "
+             "follow it, but the acceptance criteria still govern):"]
+    if procedure:
+        lines.append("  Procedure:")
+        lines += [f"    {ln}" for ln in procedure.splitlines() if ln.strip()]
+    if post:
+        lines.append("  Done means ALL of these are TRUE (verify each, cite evidence):")
+        lines += [f"    - {p}" for p in post]
+    if forbidden:
+        lines.append("  FORBIDDEN (hard stop — do NOT):")
+        lines += [f"    - {f}" for f in forbidden]
+    if required:
+        lines.append("  Required from the operator (if missing, emit a blocker asking for it):")
+        lines += [f"    - {r}" for r in required]
+    return "\n".join(lines) + "\n\n"
 
 
 def build_resume_digest(task: Task) -> str:
