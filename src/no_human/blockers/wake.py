@@ -100,6 +100,11 @@ class WakeWatcher:
         # human). Counted per distinct failure signature, so a re-run of the
         # same red check doesn't burn a round.
         self.max_ci_fix_rounds = int(blockers_cfg.get("max_ci_fix_rounds", 3))
+        # Stuck-active watchdog threshold (minutes). Default 40 > the 30-min
+        # run_tests timeout, so a long test never trips it; a genuinely hung
+        # session does. 0 disables.
+        self.stuck_active_minutes = float(
+            blockers_cfg.get("stuck_active_minutes", 40))
         # Bounded CI_GATE-integration-failure → fix cycles (M6), same pattern.
         self.max_ci_gate_fix_rounds = int(
             blockers_cfg.get("max_ci_gate_fix_rounds", 3)
@@ -247,7 +252,49 @@ class WakeWatcher:
                     actions.append((task.id, action))
                 else:
                     await self._heartbeat(task, now=now)
+        # Stuck-active watchdog: a task frozen mid-run (e.g. a hung Agent-SDK
+        # session that even the reviewer's own timeout can't cancel — observed
+        # 2026-07-11) would otherwise sit in an active state forever, holding a
+        # worker slot and never failing honestly. Escalate one with NO event
+        # for longer than the threshold (set above the 30-min test timeout, so
+        # a legitimately long test run never trips it).
+        for status in (TaskStatus.IMPLEMENTING, TaskStatus.REVIEWING,
+                       TaskStatus.TESTING, TaskStatus.PLANNING,
+                       TaskStatus.CONTEXT):
+            for task in await self.store.list_tasks(status):
+                if await self._escalate_if_stalled(task, now=now):
+                    actions.append((task.id, "escalated_stalled"))
         return actions
+
+    async def _escalate_if_stalled(self, task: Task, *, now: datetime) -> bool:
+        """Escalate a task that has emitted no event for longer than the
+        stuck-active threshold. Returns True iff it escalated."""
+        if self.stuck_active_minutes <= 0:
+            return False  # watchdog disabled
+        if getattr(task, "cancel_requested", None):
+            return False  # a pause is already in flight; let it land
+        last_ts = await self.store.last_event_ts(task.id)
+        if last_ts is None:
+            return False  # never emitted — leave to the normal loop / startup
+        age_min = (now.timestamp() - last_ts) / 60.0
+        if age_min < self.stuck_active_minutes:
+            return False
+        data = task.blocker or {}
+        data["category"] = "NOVEL_UNKNOWN"
+        data["question"] = (
+            f"This task stalled in {task.status.value} — no activity for "
+            f"{age_min:.0f} min. The agent/reviewer session likely hung. "
+            "Resume to retry, or take over?")
+        data["root_cause_hypothesis"] = (
+            f"no event for {age_min:.0f} min while {task.status.value}; "
+            "probable hung Agent-SDK session")
+        task.blocker = data
+        await self.store.update_task_columns(task)
+        await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
+        await self._emit(task, "escalated_stalled",
+                         f"{task.id[:8]} stalled in {task.status.value} "
+                         f"({age_min:.0f}m no activity) — escalated")
+        return True
 
     # Throttled liveness proof. A healthy parked task produces no action
     # events (the watcher acts only on change), which is indistinguishable

@@ -480,6 +480,14 @@ class Store:
         rows = await cur.fetchall()
         return [json.loads(r["data"]) for r in rows]
 
+    async def last_event_ts(self, task_id: str) -> float | None:
+        """Epoch seconds of the newest persisted event, or None if none. Used
+        by the stuck-active-task watchdog to detect a task frozen mid-run."""
+        cur = await self.db.execute(
+            "SELECT MAX(ts) FROM task_events WHERE task_id = ?", (task_id,))
+        row = await cur.fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
     # ----------------------- project profiles ----------------------------- #
 
     async def upsert_profile(self, profile: "ProjectProfile") -> None:
