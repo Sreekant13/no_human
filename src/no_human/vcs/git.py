@@ -161,6 +161,30 @@ class GitRepo:
     def has_changes(self) -> bool:
         return bool(self._run("status", "--porcelain", "--", ".", *self._EPHEMERAL))
 
+    def uncommitted_source_files(self) -> list[str]:
+        """Non-ephemeral SOURCE files still uncommitted after a commit — a
+        completeness guard for the committed state.
+
+        A coder-created file left OUT of the commit yields a broken PR — e.g.
+        App.jsx importing an uncommitted favicon.js — that passes every gate
+        because tests run against the WORKTREE (which still holds the file),
+        not the committed tree. Returns the leftover source paths (empty when
+        the commit captured everything), so the caller can fail the attempt
+        instead of opening a broken PR."""
+        out = self._run("status", "--porcelain", check=False).strip()
+        leftovers: list[str] = []
+        for line in out.splitlines():
+            rel = line[3:].strip() if len(line) > 3 else ""
+            if rel.startswith('"') and rel.endswith('"'):
+                rel = rel[1:-1]
+            if " -> " in rel:            # rename: "old -> new"
+                rel = rel.split(" -> ", 1)[1]
+            if not rel or self._is_ephemeral_path(rel):
+                continue
+            if Path(rel).suffix.lower() in self._CODE_EXTS:
+                leftovers.append(rel)
+        return leftovers
+
     def commit_all(self, message: str) -> CommitResult:
         branch = self.current_branch()
         if _branch_protected(branch, self.never_push_to):
