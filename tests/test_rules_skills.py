@@ -344,3 +344,30 @@ def test_materialize_practice_skills_writes_tdd_debug_done(tmp_path):
     # systematic-debugging is the net-new lever: root-cause, don't patch-guess
     debug = (skills_dir / "no_human_debug" / "SKILL.md").read_text().lower()
     assert "root cause" in debug and "patch-guess" in debug
+
+
+def test_review_url_queues_a_code_review_task(tmp_path, monkeypatch):
+    """2.1: `nh review <pr-url>` queues a standalone code_review task."""
+    db = tmp_path / "t.db"
+    runner = _make_runner(db, monkeypatch)
+    url = "https://github.com/org/repo/pull/42"
+    res = runner.invoke(cli, ["review", url, "--repo", str(tmp_path)])
+    assert res.exit_code == 0, res.output
+    assert "queued code review" in res.output
+
+    async def _tasks():
+        async with Store(db) as s:
+            return await s.list_tasks()
+    tasks = asyncio.run(_tasks())
+    assert len(tasks) == 1
+    assert tasks[0].kind == "code_review"
+    assert url in (tasks[0].description or "")
+
+
+def test_review_non_url_target_is_treated_as_task_id(tmp_path, monkeypatch):
+    """A non-URL target still shows a checklist / reports no match (not queued)."""
+    db = tmp_path / "t.db"
+    runner = _make_runner(db, monkeypatch)
+    res = runner.invoke(cli, ["review", "deadbeef"])
+    assert "queued code review" not in res.output
+    assert "no task matching" in res.output

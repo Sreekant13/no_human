@@ -77,6 +77,12 @@ class ReviewDecision:
     # Blocking findings demoted because their file:line citation did not check
     # out ("label: reason" strings) — surfaced so the round shows the demotion.
     demoted_citations: list[str] = field(default_factory=list)
+    # Token usage of the reviewer session(s) that produced this decision, so the
+    # code_review attempt records real cost instead of 0 (f71107e9 read as a
+    # 0-token "done" that hid a real review with 4 findings).
+    tokens_used: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
 
     @property
     def failed_items(self) -> list[ChecklistItem]:
@@ -825,8 +831,12 @@ class AdversarialReviewer:
                 checklist=[ChecklistItem("timeout", False,
                     "reviewer timed out after 180s — fail closed")],
             )
-        return _parse_review_output(result.final_text or "",
-                                    repo_path=repo_path, before_ref=before_ref)
+        decision = _parse_review_output(result.final_text or "",
+                                        repo_path=repo_path, before_ref=before_ref)
+        decision.tokens_used = result.tokens_used
+        decision.cache_read_tokens = getattr(result, "cache_read_tokens", 0)
+        decision.cache_creation_tokens = getattr(result, "cache_creation_tokens", 0)
+        return decision
 
     async def _agent_review(
         self, prompt: str, repo_path: Path,
@@ -911,4 +921,7 @@ class AdversarialReviewer:
             if getattr(result, "is_error", False):
                 reason = f"reviewer session error ({reason})"
             return None, reason
+        decision.tokens_used = result.tokens_used
+        decision.cache_read_tokens = getattr(result, "cache_read_tokens", 0)
+        decision.cache_creation_tokens = getattr(result, "cache_creation_tokens", 0)
         return decision, ""
