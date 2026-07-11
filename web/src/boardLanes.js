@@ -16,13 +16,16 @@
 // so it sits right beside Done and is coloured with the semantic review purple
 // (--c-review) — NOT the blue of Working, which is what made it look like just
 // another in-progress lane.
+// `emptyHint` / `emptyIcon` give each lane an intentional empty state instead of
+// a blank void — the WORKING and WAITING columns are often empty and used to
+// read as dead space. Copy is calm and explains the *meaning* of empty here.
 export const LANES = [
-  { key: "answer",  label: "Needs Answer", accent: "var(--c-answer)",    statuses: ["awaiting_input", "escalated"], loud: true, needsYou: true },
-  { key: "working", label: "Working",      accent: "var(--c-building)",  statuses: ["pending", "context", "planning", "implementing", "reviewing", "testing", "compound_parent"], showSubStatus: true },
-  { key: "waiting", label: "Waiting",      accent: "var(--c-context)",   statuses: ["blocked", "paused_quota"], autoWait: true },
-  { key: "failed",  label: "Failed",       accent: "var(--c-escalated)", statuses: ["failed"] },
-  { key: "review",  label: "Review PR",    accent: "var(--c-review)",    statuses: ["awaiting_approval"], loud: true, needsYou: true },
-  { key: "done",    label: "Done",         accent: "var(--c-done)",      statuses: ["done"] },
+  { key: "answer",  label: "Needs Answer", accent: "var(--c-answer)",    statuses: ["awaiting_input", "escalated"], loud: true, needsYou: true, emptyIcon: "✓", emptyHint: "All caught up — nothing needs your input" },
+  { key: "working", label: "Working",      accent: "var(--c-building)",  statuses: ["pending", "context", "planning", "implementing", "reviewing", "testing", "compound_parent"], showSubStatus: true, emptyIcon: "○", emptyHint: "No tasks in flight" },
+  { key: "waiting", label: "Waiting",      accent: "var(--c-context)",   statuses: ["blocked", "paused_quota"], autoWait: true, emptyIcon: "◷", emptyHint: "Nothing parked — waiting tasks wake themselves" },
+  { key: "failed",  label: "Failed",       accent: "var(--c-escalated)", statuses: ["failed"], emptyIcon: "○", emptyHint: "No failures" },
+  { key: "review",  label: "Review PR",    accent: "var(--c-review)",    statuses: ["awaiting_approval"], loud: true, needsYou: true, emptyIcon: "○", emptyHint: "No PRs waiting for review" },
+  { key: "done",    label: "Done",         accent: "var(--c-done)",      statuses: ["done"], emptyIcon: "○", emptyHint: "Nothing shipped yet" },
 ];
 
 // "blocked" is routed dynamically: WITH a wake_condition it auto-resolves →

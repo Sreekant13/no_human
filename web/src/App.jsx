@@ -7,6 +7,7 @@ import Onboarding from "./Onboarding.jsx";
 import { LegionLogo } from "./Logo.jsx";
 import { newlyNeedsYou, notificationBody, titleWithBadge } from "./notifications.js";
 import { isNeedsYou } from "./boardLanes.js";
+import { useEscapeKey } from "./useEscapeKey.js";
 
 const PROGRESS_STATUSES  = new Set(["pending", "context", "planning", "implementing", "reviewing", "testing"]);
 
@@ -104,6 +105,10 @@ function NewTaskModal({ onClose, onCreated }) {
   const [grillEvents, setGrillEvents] = useState([]);
   const [evalVerdict, setEvalVerdict] = useState(null);
   const grillStreamRef = useRef(null);
+  // Escape closes the dialog — same escape route the overlay-click already
+  // gives, but for keyboard users. Suppressed while a submit is in flight so
+  // Escape can't discard a task that's already being created.
+  useEscapeKey(onClose, !busy);
   useEffect(() => {
     fetchProjects().then((p) => {
       setProjects(p || []);

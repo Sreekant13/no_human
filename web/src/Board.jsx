@@ -67,7 +67,7 @@ export default function Board({ tasks }) {
 
 function Lane({ lane, tasks, onSelect }) {
   return (
-    <div className={`lane lane-${lane.key}${lane.loud ? " lane-loud" : ""}`}>
+    <div className={`lane lane-${lane.key}${lane.loud ? " lane-loud" : ""}${tasks.length > 0 ? " lane-has-tasks" : ""}`}>
       <div className="lane-header">
         <div className="lane-dot" style={{ background: lane.accent }} />
         <div className="lane-title">{lane.label}</div>
@@ -75,7 +75,10 @@ function Lane({ lane, tasks, onSelect }) {
       </div>
       <div className="lane-body">
         {tasks.length === 0 ? (
-          <div className="lane-empty">·</div>
+          <div className={`lane-empty${lane.needsYou ? " lane-empty-clear" : ""}`}>
+            <span className="lane-empty-icon" aria-hidden="true">{lane.emptyIcon || "·"}</span>
+            <span className="lane-empty-text">{lane.emptyHint || ""}</span>
+          </div>
         ) : lane.key === "failed" ? (
           // U4: same-title failures collapse to the newest + a count — one
           // stubborn task retried five ways must not bury the board.
