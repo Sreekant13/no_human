@@ -27,6 +27,24 @@ async def test_empty_db_yields_zeros_not_crashes(store):
     m = await compute_metrics(store)
     assert m["prs_opened"] == 0 and m["prs_merged"] == 0
     assert m["attempts_per_pr"] is None and m["tokens_per_pr"] is None
+    assert m["error_breakdown"] == {}
+
+
+async def test_error_breakdown_groups_agent_errors_by_class(store):
+    """0.2/0.3: /api/metrics surfaces WHERE attempts waste tokens — refusal
+    (fail-fast) vs retryable rate_limited vs a genuine error; pre-0.3 events
+    with no class fall into 'unclassified'."""
+    t = Task.new("x", repo_path="/tmp/x")
+    await store.create_task(t)
+    await store.save_events(t.id, [
+        _ev("agent_error", error_class="refusal"),
+        _ev("agent_error", error_class="refusal"),
+        _ev("agent_error", error_class="rate_limited"),
+        _ev("agent_error"),  # no class → unclassified
+        _ev("review", passed=1),  # unrelated kind must not count
+    ])
+    eb = (await compute_metrics(store))["error_breakdown"]
+    assert eb == {"refusal": 2, "rate_limited": 1, "unclassified": 1}
 
 
 async def test_the_north_star_numbers_add_up(store):

@@ -102,6 +102,17 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
            GROUP BY 1""")
     repro = {r[0]: r[1] for r in await cur.fetchall()}
 
+    # Error-class breakdown (0.2/0.3): how terminal agent errors split, so the
+    # wasted-attempt causes are visible — a refusal (fail-fast, needs a human)
+    # vs a retryable rate-limit/infra vs a genuine error. Populated by
+    # _classify_error; agent_error events from before it group as 'unclassified'.
+    cur = await db.execute(
+        """SELECT COALESCE(json_extract(data, '$.error_class'), 'unclassified'),
+                  COUNT(*)
+           FROM task_events WHERE json_extract(data, '$.kind') = 'agent_error'
+           GROUP BY 1""")
+    error_breakdown = {r[0]: r[1] for r in await cur.fetchall()}
+
     total_cache_read = sum(p["cache_read"] for p in by_profile)
     total_tokens = sum(p["tokens"] for p in by_profile)
     return {
@@ -117,4 +128,5 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
         "repro_gate_verdicts": repro,
         "ci_gate": ci_gate,
         "cache_economics": cache_economics,
+        "error_breakdown": error_breakdown,
     }
