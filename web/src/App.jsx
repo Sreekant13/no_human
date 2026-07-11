@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { connectWS, createTask, fetchTasks, fetchProjects, fetchWorkerStatus, fetchOnboardingStatus, grillStep, grillStepSSE } from "./api.js";
+import { connectWS, createTask, uploadAttachment, fetchTasks, fetchProjects, fetchWorkerStatus, fetchOnboardingStatus, grillStep, grillStepSSE } from "./api.js";
 import Board from "./Board.jsx";
 import Settings from "./Settings.jsx";
 import Stats from "./Stats.jsx";
@@ -95,6 +95,7 @@ function NewTaskModal({ onClose, onCreated }) {
   const [backend, setBackend] = useState("claude");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const [files, setFiles] = useState([]);  // screenshots / documents to attach
   const [projects, setProjects] = useState([]);
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [customRepo, setCustomRepo] = useState(false);
@@ -124,7 +125,7 @@ function NewTaskModal({ onClose, onCreated }) {
     setBusy(true);
     setError(null);
     try {
-      await createTask({
+      const created = await createTask({
         title: grillResult?.title || title.trim(),
         description: grillResult?.description || description.trim() || null,
         repo_path: customRepo ? repoPath.trim() || null : (repoPath || null),
@@ -134,6 +135,12 @@ function NewTaskModal({ onClose, onCreated }) {
         acceptance_criteria: grillResult?.acceptance_criteria || [],
         backend,
       });
+      // Attach any screenshots/documents to the new task (best-effort — a failed
+      // upload must not lose the task that was already created).
+      for (const f of files) {
+        try { await uploadAttachment(created.id, f); }
+        catch (err) { console.error("attachment upload failed", f.name, err); }
+      }
       onCreated();
       onClose();
     } catch (err) {
@@ -366,6 +373,20 @@ function NewTaskModal({ onClose, onCreated }) {
               onChange={(e) => setDescription(e.target.value)}
               rows={3}
             />
+          </div>
+          <div className="ntm-field">
+            <label className="ntm-label">Attachments <span className="ntm-hint">(screenshots, documents — the agent reads them)</span></label>
+            <input
+              type="file"
+              className="ntm-file"
+              multiple
+              onChange={(e) => setFiles(Array.from(e.target.files || []))}
+            />
+            {files.length > 0 && (
+              <div className="ntm-file-list">
+                {files.map((f) => f.name).join(", ")}
+              </div>
+            )}
           </div>
           <hr className="ntm-section-divider" />
           <div className="ntm-field">

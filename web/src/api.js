@@ -38,6 +38,16 @@ export async function createTask({ title, description, repo_path, project_id, ki
   return r.json();
 }
 
+export async function uploadAttachment(taskId, file) {
+  const fd = new FormData();
+  fd.append("file", file);
+  const r = await fetch(`${BASE}/api/tasks/${taskId}/attachments`, {
+    method: "POST", body: fd,
+  });
+  if (!r.ok) throw new Error(`upload ${file.name} → ${r.status}`);
+  return r.json();
+}
+
 export async function approveTask(id) {
   const r = await fetch(`${BASE}/api/tasks/${id}/approve`, { method: "POST" });
   if (!r.ok) throw new Error(`POST approve → ${r.status}`);
