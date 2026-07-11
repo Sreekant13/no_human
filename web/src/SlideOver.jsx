@@ -1787,15 +1787,21 @@ function ReviewTab({ task, diff }) {
 }
 
 function TestResultCard({ result }) {
-  const { passed, failed, total, output } = result;
+  const passed = result.passed ?? 0;
+  const failed = result.failed ?? 0;
+  const errors = result.errors ?? 0;
+  // node --test reports no explicit total, which rendered a contradictory
+  // "55 passed · 0 total"; derive it from the parts when absent.
+  const total = result.total ?? (passed + failed + errors);
   return (
     <div className="test-result-card">
       <div className="test-result-stats">
-        <span className="test-result-pass"><IconCheck size={12} /> {passed ?? 0} passed</span>
-        {(failed ?? 0) > 0 && <span className="test-result-fail"><IconX size={12} /> {failed} failed</span>}
-        <span className="test-result-dim">{total ?? 0} total</span>
+        <span className="test-result-pass"><IconCheck size={12} /> {passed} passed</span>
+        {failed > 0 && <span className="test-result-fail"><IconX size={12} /> {failed} failed</span>}
+        {errors > 0 && <span className="test-result-fail"><IconX size={12} /> {errors} errors</span>}
+        {total > 0 && <span className="test-result-dim">{total} total</span>}
       </div>
-      {output && <pre className="raw-output">{output.slice(0, 2000)}</pre>}
+      {result.output && <pre className="raw-output">{result.output.slice(0, 2000)}</pre>}
     </div>
   );
 }
