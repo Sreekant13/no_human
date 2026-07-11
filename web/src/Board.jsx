@@ -174,6 +174,7 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
           <span className={`card-kind kind-${task.kind}`}>{task.kind}</span>
         )}
         {task.has_spec && <span className="card-spec-badge">spec</span>}
+        {task.cancelled && <span className="card-cancelled-badge">cancelled</span>}
         {showSubStatus && (
           <span className={`card-substatus substatus-${task.status}`}>{task.status}</span>
         )}
