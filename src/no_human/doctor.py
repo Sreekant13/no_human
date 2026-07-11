@@ -201,19 +201,27 @@ async def diagnose(store: Store) -> Diagnosis:
     from .config import NO_HUMAN_HOME
     wt_root = NO_HUMAN_HOME / "worktrees"
     if wt_root.is_dir():
-        active = {
-            row[0] for row in await (await store.db.execute(
-                "SELECT id FROM tasks WHERE status IN "
-                "('pending','context','planning','implementing',"
-                "'reviewing','testing')")).fetchall()
-        }
+        # A worktree is this store's orphan only if its dir name is a task
+        # KNOWN to this store but not currently active. A worktree whose id
+        # isn't in this store at all belongs to a different install/db (or is
+        # an isolated test's tmp DB against the real ~/.no_human) — not our
+        # concern, and flagging it made the empty-DB doctor test fail.
+        rows = await (await store.db.execute(
+            "SELECT id, status FROM tasks")).fetchall()
+        known = {r[0]: r[1] for r in rows}
+        active_states = {"pending", "context", "planning",
+                         "implementing", "reviewing", "testing"}
         for entry in sorted(wt_root.iterdir()):
-            if entry.is_dir() and entry.name not in active:
+            if not entry.is_dir():
+                continue
+            st = known.get(entry.name)
+            if st is not None and st not in active_states:
                 d.contradictions.append(
-                    f"ORPHANED WORKTREE: {entry} has no active task — a "
-                    "crashed run left its checkout behind; remove it with "
-                    f"`git worktree remove --force {entry}` (from the primary "
-                    "repo) or delete the directory and `git worktree prune`."
+                    f"ORPHANED WORKTREE: {entry} — its task is {st}, not "
+                    "active; a crashed/finished run left the checkout behind. "
+                    f"Remove it with `git worktree remove --force {entry}` "
+                    "(from the primary repo) or delete it and "
+                    "`git worktree prune`."
                 )
 
     # Per-status required evidence: a task claiming a status must have the
