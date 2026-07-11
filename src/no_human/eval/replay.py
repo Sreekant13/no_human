@@ -18,7 +18,10 @@ in tests without spending quota.
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -195,17 +198,26 @@ class ReplayRunner:
             return True
         # Run the held-out tests against the agent's result (current checkout),
         # with the repo root on PYTHONPATH so top-level modules import cleanly.
-        import os
-
         held = work / "tests" / "held_out"
         held.mkdir(parents=True, exist_ok=True)
         test_file = held / "test_eval_holdout.py"
         test_file.write_text(golden.held_out_tests)
-        proc = subprocess.run(
-            ["python", "-m", "pytest", "-q", str(test_file)],
-            cwd=work, capture_output=True, text=True,
+        # sys.executable (not "python"): the server shell has python3 but no
+        # `python`, so a raw "python" here died with the same env failure that
+        # dominated the task ledger. Bounded + process-group-killed so a hung
+        # held-out test can't wedge the eval indefinitely (0.4).
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "pytest", "-q", str(test_file)],
+            cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             env={**os.environ, "PYTHONPATH": str(work)},
+            start_new_session=True,
         )
+        try:
+            proc.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.communicate()
+            return False
         return proc.returncode == 0
 
     async def _intent_match(

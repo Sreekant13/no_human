@@ -15,8 +15,10 @@ Read-only by design; ``nh doctor`` renders the result.
 from __future__ import annotations
 
 import json
+import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .core.db import Store
@@ -82,6 +84,9 @@ class Diagnosis:
     mechanisms: list[dict[str, Any]] = field(default_factory=list)
     contradictions: list[str] = field(default_factory=list)
     evidence_gaps: list[str] = field(default_factory=list)
+    # Non-blocking notices (resource leaks, prunable leftovers). Deliberately
+    # NOT part of `healthy` — an advisory must never fail the doctor gate.
+    advisories: list[str] = field(default_factory=list)
 
     @property
     def healthy(self) -> bool:
@@ -229,6 +234,24 @@ async def diagnose(store: Store) -> Diagnosis:
                     "(from the primary repo) or delete it and "
                     "`git worktree prune`."
                 )
+
+    # 0.4: leaked eval sandboxes. The eval harness clones into
+    # tempfile.mkdtemp(nh-eval-*/nh-shadow-*); a crash before cleanup used to
+    # leave them behind (the cleanup is now in eval/harness.py). Advisory — a
+    # disk leak, not a state contradiction, so it never fails the doctor gate.
+    # >2h old avoids flagging a sandbox from an eval that is still running.
+    tmp_root = Path(tempfile.gettempdir())
+    stale_cut = time.time() - 2 * 3600
+    for pat in ("nh-eval-*", "nh-shadow-*"):
+        for entry in sorted(tmp_root.glob(pat)):
+            try:
+                if entry.is_dir() and entry.stat().st_mtime < stale_cut:
+                    d.advisories.append(
+                        f"LEAKED EVAL SANDBOX: {entry} (>2h old) — a crashed eval "
+                        f"left it behind; `rm -rf {entry}` to reclaim disk."
+                    )
+            except OSError:
+                pass
 
     # Per-status required evidence: a task claiming a status must have the
     # events that back the claim.

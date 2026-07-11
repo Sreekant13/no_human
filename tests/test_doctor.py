@@ -43,6 +43,27 @@ async def test_the_testing_dead_pattern_is_a_contradiction(store):
     assert not d.healthy
 
 
+async def test_stale_eval_sandbox_is_an_advisory_not_a_contradiction(store):
+    """0.4: a leaked eval sandbox is surfaced as an advisory — it must inform
+    without failing the doctor gate (healthy stays True)."""
+    import os
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    sandbox = Path(tempfile.gettempdir()) / f"nh-eval-doctortest-{os.getpid()}"
+    sandbox.mkdir(exist_ok=True)
+    old = time.time() - 3 * 3600  # older than the 2h staleness cutoff
+    os.utime(sandbox, (old, old))
+    try:
+        d = await diagnose(store)
+        assert any(str(sandbox) in a for a in d.advisories)
+        assert not any(str(sandbox) in c for c in d.contradictions)
+        assert d.healthy, "an advisory must never fail the doctor gate"
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
 async def test_the_silent_watcher_pattern_is_a_contradiction(store):
     """A task parked at awaiting_approval with zero watcher events ever."""
     t = Task.new("x", repo_path="/tmp/x")

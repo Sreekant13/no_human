@@ -8,6 +8,7 @@ and produces the draft PR locally — without pushing — for human comparison.
 
 from __future__ import annotations
 
+import shutil
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,18 +46,26 @@ async def run_eval(
     )
     scores: list[TaskScore] = []
 
+    created_tmp = workdir is None
     base_tmp = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="nh-eval-"))
-    for golden in tasks:
-        task_dir = base_tmp / golden.id
-        task_dir.mkdir(parents=True, exist_ok=True)
-        score = await runner.run_one(golden, workdir=task_dir)
-        scores.append(score)
-        if on_event:
-            on_event({"kind": "golden_done", "task": golden.id, "correct": score.correct})
+    try:
+        for golden in tasks:
+            task_dir = base_tmp / golden.id
+            task_dir.mkdir(parents=True, exist_ok=True)
+            score = await runner.run_one(golden, workdir=task_dir)
+            scores.append(score)
+            if on_event:
+                on_event({"kind": "golden_done", "task": golden.id, "correct": score.correct})
 
-    card = Scorecard(scores=scores, created_at=now)
-    gate = ci_gate(card, previous)
-    return EvalRun(scorecard=card, gate=gate, previous=previous)
+        card = Scorecard(scores=scores, created_at=now)
+        gate = ci_gate(card, previous)
+        return EvalRun(scorecard=card, gate=gate, previous=previous)
+    finally:
+        # We own the sandbox only when we created it; a caller-supplied workdir
+        # is theirs. Best-effort so cleanup never masks a real error (0.4 —
+        # nh-eval-* dirs used to leak on every run, crash or not).
+        if created_tmp:
+            shutil.rmtree(base_tmp, ignore_errors=True)
 
 
 @dataclass
@@ -88,6 +97,7 @@ async def run_shadow(
     from ..core.task import Task
     from ..notify.slack import SlackNotifier
 
+    created_tmp = workdir is None
     base_tmp = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="nh-shadow-"))
     sandbox = base_tmp / "clone"
     # Local clone: no network, isolated from the real repo + remote.
@@ -116,3 +126,7 @@ async def run_shadow(
         )
     finally:
         await store.close()
+        # ShadowResult (incl. draft_diff) is already built before this runs, so
+        # the clone is safe to drop. Only when we created the tmp (0.4).
+        if created_tmp:
+            shutil.rmtree(base_tmp, ignore_errors=True)
