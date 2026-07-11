@@ -178,11 +178,41 @@ class GitRepo:
     # extension — if the file was already in the repo, the agent must have
     # modified it intentionally.
     _CODE_EXTS = frozenset((
-        ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".go",
-        ".rs", ".rb", ".c", ".cpp", ".h", ".cs", ".swift", ".scala",
-        ".sh", ".bash", ".zsh", ".sql", ".html", ".css", ".scss",
-        ".gradle",
+        ".py", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts",
+        ".java", ".kt", ".go", ".rs", ".rb", ".c", ".cpp", ".h", ".cs",
+        ".swift", ".scala", ".sh", ".bash", ".zsh", ".sql", ".html", ".css",
+        ".scss", ".vue", ".svelte", ".gradle",
     ))
+
+    # Ephemeral path components/files that must never be committed even when the
+    # agent's edited-file list or the untracked scan surfaces them. This mirrors
+    # _EPHEMERAL, but is applied in PYTHON: `git add -- <literal paths>
+    # :(exclude,glob)…` silently DROPS explicitly-listed *untracked* files when
+    # exclude pathspecs are mixed in (a git pathspec gotcha — it dropped every
+    # coder-created file, favicon.js and the whole *.test.mjs suite, from PR #2).
+    # So we filter the curated list here and `git add` it clean.
+    _EPHEMERAL_DIRS = frozenset((
+        "__pycache__", ".pytest_cache", "node_modules", ".no_human", ".windsurf",
+        ".devin", ".claude", "venv", ".tox", ".mypy_cache", ".ruff_cache",
+        "dist", "build", ".idea", ".vscode",
+    ))
+    _EPHEMERAL_FILES = frozenset((
+        ".DS_Store", ".coverage", ".env", "HANDOVER.md", "PLAN.md",
+    ))
+
+    @classmethod
+    def _is_ephemeral_path(cls, rel: str) -> bool:
+        """True if a repo-relative path is an ephemeral artifact (venv, caches,
+        build output, agent-owned dirs, editor cruft) — mirrors _EPHEMERAL."""
+        p = Path(rel)
+        for part in p.parts:
+            if part in cls._EPHEMERAL_DIRS:
+                return True
+            if part.startswith(".venv") or part.endswith(".egg-info"):
+                return True
+        if p.name in cls._EPHEMERAL_FILES:
+            return True
+        return p.suffix.lower() in (".pyc", ".pyo")
 
     def commit_paths(self, paths: list[str], message: str) -> CommitResult:
         """Stage and commit only the listed *paths* — files the agent
@@ -231,10 +261,16 @@ class GitRepo:
             ext = Path(u).suffix.lower()
             if ext in self._CODE_EXTS:
                 rel_paths.append(u)
-        # Dedupe.
-        rel_paths = list(dict.fromkeys(rel_paths))
+        # Dedupe and drop ephemeral artifacts. We MUST filter in Python rather
+        # than pass :(exclude) pathspecs to `git add` alongside the literal
+        # paths: git silently drops explicitly-listed untracked files when
+        # exclude pathspecs are mixed in (the bug that stripped favicon.js and
+        # every *.test.mjs from PR #2). With a pre-filtered list, a plain add
+        # stages exactly what we intend.
+        rel_paths = [r for r in dict.fromkeys(rel_paths)
+                     if not self._is_ephemeral_path(r)]
         if rel_paths:
-            self._run("add", "--", *rel_paths, *self._EPHEMERAL)
+            self._run("add", "--", *rel_paths)
         # If no files were actually staged (e.g. agent only used Bash to
         # create files), fall back to stage_all so the commit isn't empty.
         staged = self._run("diff", "--cached", "--name-only", check=False).strip()
