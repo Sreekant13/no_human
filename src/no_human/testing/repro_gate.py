@@ -27,6 +27,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,20 +70,32 @@ def _test_files(tests: list[str]) -> list[str]:
     return list(seen)
 
 
-def _run_pytest(tests: list[str], cwd: Path, env: dict) -> tuple[bool, str]:
-    """(all_passed, tail_of_output). Never raises."""
+def _run_pytest(tests: list[str], cwd: Path, env: dict) -> tuple[bool, bool, str]:
+    """(ran, all_passed, tail_of_output). Never raises.
+
+    ``ran`` is False when pytest could not be launched or execute at all
+    (missing interpreter, timeout, collection error with 0 tests) — an
+    ENVIRONMENT failure, which the caller must classify as "error" (advisory)
+    rather than "fail" (a real fails-before/passes-after verdict). Uses
+    ``sys.executable`` — the interpreter no_human runs under, which has
+    pytest — because a bare ``python`` does not exist in a uv/venv project
+    (the 2026-07-11 bug: every bugfix task escalated on
+    "could not run pytest: No such file or directory: 'python'")."""
     try:
         proc = subprocess.run(
-            ["python", "-m", "pytest", "-x", "-q", "--no-header", *tests],
+            [sys.executable, "-m", "pytest", "-x", "-q", "--no-header", *tests],
             cwd=cwd, env=env, capture_output=True, text=True,
             timeout=_RUN_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        return False, f"timed out after {_RUN_TIMEOUT}s"
+        return False, False, f"timed out after {_RUN_TIMEOUT}s"
     except OSError as exc:
-        return False, f"could not run pytest: {exc}"
+        return False, False, f"could not run pytest: {exc}"
     out = (proc.stdout + proc.stderr)[-2000:]
-    return proc.returncode == 0, out
+    # pytest exit 5 = "no tests collected" — an environment/selection problem,
+    # not a test verdict. Anything that ran at least one test gives 0-4.
+    ran = proc.returncode != 5 and "no tests ran" not in out.lower()
+    return ran, proc.returncode == 0, out
 
 
 def run_repro_gate(repo_path: Path, base_ref: str) -> ReproResult:
@@ -110,7 +123,12 @@ def run_repro_gate(repo_path: Path, base_ref: str) -> ReproResult:
             "— a listed repro test may not be deleted"])
     after_env = {**env, "PYTHONPATH": os.pathsep.join(
         [str(repo_path), str(repo_path / "src"), env.get("PYTHONPATH", "")])}
-    ok_after, out_after = _run_pytest(tests, repo_path, after_env)
+    ran_after, ok_after, out_after = _run_pytest(tests, repo_path, after_env)
+    if not ran_after:
+        # Could not RUN the tests (env/interpreter/collection) — "can't verify"
+        # is not "doesn't pass". Advisory error, never blocks the task.
+        return ReproResult("error", tests=tests, reasons=[
+            f"repro tests could not be executed:\n{out_after}"])
     if not ok_after:
         return ReproResult("fail", tests=tests, reasons=[
             "passes-after failed — the declared repro tests do not pass on "
@@ -134,7 +152,10 @@ def run_repro_gate(repo_path: Path, base_ref: str) -> ReproResult:
             shutil.copy2(src, dst)
         before_env = {**env, "PYTHONPATH": os.pathsep.join(
             [str(worktree), str(worktree / "src"), env.get("PYTHONPATH", "")])}
-        ok_before, _out_before = _run_pytest(tests, worktree, before_env)
+        ran_before, ok_before, out_before = _run_pytest(tests, worktree, before_env)
+        if not ran_before:
+            return ReproResult("error", tests=tests, reasons=[
+                f"base-tree repro run could not execute:\n{out_before}"])
         if ok_before:
             return ReproResult("fail", tests=tests, reasons=[
                 "fails-before failed — the declared repro tests already pass "

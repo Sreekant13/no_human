@@ -113,3 +113,56 @@ async def test_profile_loaded_from_repo_yaml_when_not_in_store(store, tmp_path):
     orch = _orch(store, tmp_path)
     prof = await orch._usable_profile(repo_path)
     assert prof is not None and prof.test_cmd == "npm test"
+
+
+def _multilang(repo_path):
+    """A profile with change-scoped test commands (web vs default)."""
+    return ProjectProfile(
+        repo_path=str(repo_path), ecosystem="python",
+        install_cmd="uv sync", test_cmd="uv run pytest -q",
+        test_commands=[{"glob": "web/**", "command": "node --test src/", "cwd": "web"}],
+        derived_from=["pyproject.toml"], proven={"test_cmd": True}, confirmed=True,
+    )
+
+
+async def test_web_only_change_routes_to_web_tests(store, tmp_path):
+    repo_path = tmp_path / "repo"; repo_path.mkdir()
+    (repo_path / "web").mkdir()
+    await store.upsert_profile(_multilang(repo_path))
+    orch = _orch(store, tmp_path)
+    orch._agent_edited_files = {str(repo_path / "web" / "src" / "App.jsx")}
+    cmd, cwd = await orch._resolve_test_target(_repo(repo_path))
+    assert cmd == "node --test src/"
+    assert str(cwd) == str(repo_path / "web")
+
+
+async def test_python_change_uses_the_default_command(store, tmp_path):
+    repo_path = tmp_path / "repo"; repo_path.mkdir()
+    await store.upsert_profile(_multilang(repo_path))
+    orch = _orch(store, tmp_path)
+    orch._agent_edited_files = {str(repo_path / "src" / "no_human" / "x.py")}
+    cmd, cwd = await orch._resolve_test_target(_repo(repo_path))
+    assert cmd == "uv run pytest -q" and cwd is None
+
+
+async def test_mixed_change_falls_back_to_the_safe_default(store, tmp_path):
+    """A change spanning web AND python is not unanimous — run the heavier
+    default, never a partial validation."""
+    repo_path = tmp_path / "repo"; repo_path.mkdir()
+    await store.upsert_profile(_multilang(repo_path))
+    orch = _orch(store, tmp_path)
+    orch._agent_edited_files = {
+        str(repo_path / "web" / "a.jsx"), str(repo_path / "src" / "b.py")}
+    cmd, cwd = await orch._resolve_test_target(_repo(repo_path))
+    assert cmd == "uv run pytest -q" and cwd is None
+
+
+async def test_no_rules_is_identical_to_resolve_test_cmd(store, tmp_path):
+    """Zero-degradation guarantee: a profile without test_commands behaves
+    exactly as _resolve_test_cmd (no cwd, same command)."""
+    repo_path = tmp_path / "repo"; repo_path.mkdir()
+    await store.upsert_profile(_usable(repo_path))
+    orch = _orch(store, tmp_path)
+    orch._agent_edited_files = {str(repo_path / "web" / "App.jsx")}
+    cmd, cwd = await orch._resolve_test_target(_repo(repo_path))
+    assert cmd == "npm test" and cwd is None
