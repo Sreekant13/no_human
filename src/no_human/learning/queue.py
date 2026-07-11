@@ -28,6 +28,21 @@ TYPE_FACT = "fact"
 TYPE_RULE = "rule"
 TYPE_ANTI_PATTERN = "anti_pattern"
 
+# Failure categories that are transient/resource/environmental, not a reusable
+# code lesson. A budget cap, an infra flake, a quota wall, a waiting-on-dep, or
+# a missing credential recurs because of the environment — capturing it as a
+# durable anti-pattern floods the human's confirm queue with noise (the queue
+# reached 197 pending, almost all BUDGET_EXHAUSTED + env-failure artifacts).
+# Genuine anti-patterns (NOVEL_UNKNOWN, STAGNATION, SCOPE_EXPLOSION, IMPOSSIBLE,
+# AMBIGUITY) still propose.
+NON_LEARNABLE_CATEGORIES = frozenset({
+    "TRANSIENT_INFRA",
+    "QUOTA",
+    "DEPENDENCY_WAIT",
+    "BUDGET_EXHAUSTED",
+    "MISSING_ACCESS",
+})
+
 
 def _sig(*parts: str) -> str:
     """Stable dedupe signature so the same lesson isn't proposed twice."""
@@ -95,6 +110,10 @@ class LearningQueue:
         # Failure / structural blocker → anti-pattern (22.8).
         if blocker:
             cat = blocker.get("category", "NOVEL_UNKNOWN")
+            # Transient/resource/environmental failures are not reusable code
+            # lessons — don't durably propose them (they flooded the queue).
+            if str(cat).upper() in NON_LEARNABLE_CATEGORIES or blocker.get("transient"):
+                return None
             cause = blocker.get("root_cause_hypothesis", "")
             tried = blocker.get("tried", []) or []
             title = f"Anti-pattern [{cat}]: {task.title}"[:120]

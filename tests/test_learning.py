@@ -89,7 +89,7 @@ async def test_reject_removes_proposal(queue):
 @pytest.mark.asyncio
 async def test_dedupe_same_lesson(queue):
     """The same lesson proposed twice is deduped (one queue entry)."""
-    blocker = {"category": "QUOTA", "root_cause_hypothesis": "hit the cap"}
+    blocker = {"category": "NOVEL_UNKNOWN", "root_cause_hypothesis": "hit the cap"}
     first = await queue.propose_from_outcome(
         _task(), status=TaskStatus.ESCALATED, blocker=blocker)
     second = await queue.propose_from_outcome(
@@ -103,12 +103,36 @@ async def test_dedupe_same_lesson(queue):
 async def test_distinct_lessons_not_deduped(queue):
     a = await queue.propose_from_outcome(
         _task(), status=TaskStatus.ESCALATED,
-        blocker={"category": "QUOTA", "root_cause_hypothesis": "cap A"})
+        blocker={"category": "NOVEL_UNKNOWN", "root_cause_hypothesis": "cap A"})
     b = await queue.propose_from_outcome(
         _task(), status=TaskStatus.ESCALATED,
-        blocker={"category": "MISSING_ACCESS", "root_cause_hypothesis": "cause B"})
+        blocker={"category": "STAGNATION", "root_cause_hypothesis": "cause B"})
     assert a and b and a != b
     assert len(await queue.pending()) == 2
+
+
+@pytest.mark.asyncio
+async def test_transient_and_resource_blockers_do_not_propose(queue):
+    """A budget cap, infra flake, quota wall, dependency wait, or missing-access
+    gap is environmental — not a reusable code lesson. Proposing a durable
+    anti-pattern for each is what flooded the confirm queue to 197 pending."""
+    for cat in ("BUDGET_EXHAUSTED", "TRANSIENT_INFRA", "QUOTA",
+                "DEPENDENCY_WAIT", "MISSING_ACCESS"):
+        mem_id = await queue.propose_from_outcome(
+            _task(), status=TaskStatus.ESCALATED,
+            blocker={"category": cat, "root_cause_hypothesis": f"{cat} happened"})
+        assert mem_id is None, f"{cat} should not propose a durable learning"
+    assert await queue.pending() == []
+
+
+@pytest.mark.asyncio
+async def test_transient_flag_suppresses_proposal(queue):
+    """An otherwise-learnable category flagged transient=True is suppressed too."""
+    mem_id = await queue.propose_from_outcome(
+        _task(), status=TaskStatus.ESCALATED,
+        blocker={"category": "NOVEL_UNKNOWN", "transient": True,
+                 "root_cause_hypothesis": "a flake"})
+    assert mem_id is None
 
 
 @pytest.mark.asyncio
