@@ -140,3 +140,15 @@ async def test_parked_blocker_does_not_propose():
     # _build returns None when there is neither success nor a blocker.
     q = LearningQueue.__new__(LearningQueue)  # no store needed for _build
     assert q._build(_task(), status=TaskStatus.BLOCKED, blocker=None, summary="") is None
+
+
+def test_mine_reply_captures_reusable_rules_only():
+    """2.3: an operator reply that states a rule becomes a learning; a plain
+    answer or noise does not."""
+    from no_human.history.analyzer import mine_reply
+    assert mine_reply("never commit the .env file")[0] == "rule"
+    assert mine_reply("always run the tests before pushing")[0] == "rule"
+    assert mine_reply("you seem stuck, try another approach")[0] == "anti_pattern"
+    assert mine_reply("yes, proceed with that") is None
+    assert mine_reply("<bash-stdout>never add x</bash-stdout>") is None
+    assert mine_reply("") is None

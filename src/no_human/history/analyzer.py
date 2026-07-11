@@ -163,6 +163,20 @@ def analyze_transcript(transcript: Transcript) -> list[Finding]:
     return findings
 
 
+def mine_reply(text: str) -> tuple[str, str] | None:
+    """A reusable preference stated in an operator's reply → (category,
+    description), or None (2.3, CodeRabbit 'learnings'). Same signal patterns and
+    noise filter as transcript mining, so an operator answering a review/blocker
+    ("we always run X first") can seed the human-confirmed learning queue — which
+    future reviews then apply."""
+    if not text or _is_noise_message(text):
+        return None
+    for pattern, category, desc in _COMPILED:
+        if pattern.search(text):
+            return category, desc
+    return None
+
+
 def analyze_all(transcripts: list[Transcript]) -> list[Finding]:
     """Analyze all transcripts, returning deduplicated findings."""
     all_findings: list[Finding] = []
