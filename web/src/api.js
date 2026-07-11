@@ -245,6 +245,19 @@ export async function fetchProfiles() {
   return r.json();
 }
 
+// The north-star numbers straight from the record (PRs merged/opened,
+// tokens-per-PR, review verdicts, cache economics). Null when unavailable so
+// Stats degrades to its client-side aggregates.
+export async function fetchMetrics() {
+  try {
+    const r = await fetch(`${BASE}/api/metrics`);
+    if (!r.ok) return null;
+    return r.json();
+  } catch {
+    return null;
+  }
+}
+
 export async function fetchProjects() {
   const r = await fetch(`${BASE}/api/projects`);
   if (!r.ok) return [];

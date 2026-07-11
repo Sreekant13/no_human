@@ -1,4 +1,6 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { fetchMetrics } from "./api.js";
+import { northStarTiles } from "./northStar.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -318,6 +320,9 @@ function TaskTable({ tasks }) {
 
 export default function Stats({ tasks }) {
   const stats = useMemo(() => computeStats(tasks), [tasks]);
+  const [metrics, setMetrics] = useState(null);
+  useEffect(() => { fetchMetrics().then(setMetrics); }, [tasks.length]);
+  const northStar = northStarTiles(metrics);
 
   if (tasks.length === 0) {
     return (
@@ -341,6 +346,20 @@ export default function Stats({ tasks }) {
           {stats.totalTasks} total tasks &middot; {stats.totalCompleted} completed
         </div>
       </div>
+
+      {/* North-star row (D1): the real delivery numbers from /api/metrics —
+          "completed" above counts 0-token code reviews, these do not. */}
+      {northStar.length > 0 && (
+        <div className="stats-northstar">
+          {northStar.map((t) => (
+            <div key={t.label} className={`ns-tile ns-${t.tone}`}>
+              <div className="ns-label">{t.label}</div>
+              <div className="ns-value">{t.value}</div>
+              <div className="ns-sub">{t.sub}</div>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Primary metric cards */}
       <div className="stats-cards">
