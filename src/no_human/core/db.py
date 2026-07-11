@@ -484,6 +484,35 @@ class Store:
         await self.db.commit()
         return cur.rowcount > 0
 
+    # --------------------------- PR merge order (2.2) --------------------- #
+
+    async def add_pr_edge(self, *, child_pr: str, parent_pr: str,
+                          project: str | None = None) -> None:
+        """Record that child_pr must merge AFTER parent_pr (2.2)."""
+        await self.db.execute(
+            "INSERT OR IGNORE INTO pr_edges (child_pr, parent_pr, project) "
+            "VALUES (?, ?, ?)", (child_pr, parent_pr, project))
+        await self.db.commit()
+
+    async def list_pr_edges(
+        self, *, project: str | None = None,
+    ) -> list[tuple[str, str]]:
+        """All (child_pr, parent_pr) edges, optionally scoped to a project."""
+        if project is not None:
+            cur = await self.db.execute(
+                "SELECT child_pr, parent_pr FROM pr_edges "
+                "WHERE project = ? OR project IS NULL", (project,))
+        else:
+            cur = await self.db.execute("SELECT child_pr, parent_pr FROM pr_edges")
+        return [(r["child_pr"], r["parent_pr"]) for r in await cur.fetchall()]
+
+    async def delete_pr_edges_for(self, pr: str) -> int:
+        """Remove every edge touching a PR (e.g. once it merges or closes)."""
+        cur = await self.db.execute(
+            "DELETE FROM pr_edges WHERE child_pr = ? OR parent_pr = ?", (pr, pr))
+        await self.db.commit()
+        return cur.rowcount
+
     async def find_memory(self, prefix: str) -> dict[str, Any] | None:
         cur = await self.db.execute(
             "SELECT * FROM memories WHERE id = ? OR id LIKE ? LIMIT 2",

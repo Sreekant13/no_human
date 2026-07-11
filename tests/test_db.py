@@ -195,3 +195,15 @@ async def test_playbook_crud_and_project_scope(store):
     assert {p["title"] for p in scoped} == {"P", "G"}
     assert await store.delete_playbook(pid[:8]) is True
     assert {p["title"] for p in await store.list_playbooks()} == {"G"}
+
+
+async def test_pr_edges_round_trip(store):
+    """2.2: PR dependency edges round-trip and clear when a PR merges."""
+    await store.add_pr_edge(child_pr="pr/2", parent_pr="pr/1")
+    await store.add_pr_edge(child_pr="pr/3", parent_pr="pr/2")
+    await store.add_pr_edge(child_pr="pr/2", parent_pr="pr/1")  # dup → ignored
+    edges = await store.list_pr_edges()
+    assert set(edges) == {("pr/2", "pr/1"), ("pr/3", "pr/2")}
+    removed = await store.delete_pr_edges_for("pr/2")
+    assert removed == 2  # both edges touching pr/2
+    assert await store.list_pr_edges() == []
