@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import SlideOver from "./SlideOver.jsx";
 import { groupFailedByTitle } from "./boardGroups.js";
 import { LANES, routeTask } from "./boardLanes.js";
+import { taskProgress } from "./taskProgress.js";
 
 export default function Board({ tasks }) {
   const [selectedId, setSelectedId] = useState(null);
@@ -160,6 +161,19 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
       )}
       {task.subtask_progress && (
         <div className="card-subtask-progress">sub-tasks {task.subtask_progress}</div>
+      )}
+      {isActive && taskProgress(task.status) != null && (
+        <div
+          className="card-progress"
+          title={`~${taskProgress(task.status)}% through the pipeline (${task.status})`}
+          role="progressbar"
+          aria-valuenow={taskProgress(task.status)}
+          aria-valuemin={0}
+          aria-valuemax={100}
+        >
+          <div className="card-progress-fill"
+               style={{ width: `${taskProgress(task.status)}%` }} />
+        </div>
       )}
       {task.description_short && !task.live_status && (
         <div className="card-description">{task.description_short}</div>
