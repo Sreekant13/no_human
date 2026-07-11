@@ -371,3 +371,35 @@ def test_review_non_url_target_is_treated_as_task_id(tmp_path, monkeypatch):
     res = runner.invoke(cli, ["review", "deadbeef"])
     assert "queued code review" not in res.output
     assert "no task matching" in res.output
+
+
+def test_investigate_creates_an_investigation_task(tmp_path, monkeypatch):
+    """2.6: `nh investigate <q>` queues a read-only investigation task."""
+    db = tmp_path / "t.db"
+    runner = _make_runner(db, monkeypatch)
+    res = runner.invoke(cli, ["investigate", "why does the export drop rows?",
+                              "--repo", str(tmp_path)])
+    assert res.exit_code == 0, res.output
+    assert "investigating" in res.output
+
+    async def _tasks():
+        async with Store(db) as s:
+            return await s.list_tasks()
+    tasks = asyncio.run(_tasks())
+    assert len(tasks) == 1 and tasks[0].kind == "investigation"
+
+
+def test_investigate_show_prints_the_report(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    runner = _make_runner(db, monkeypatch)
+
+    async def _seed():
+        from no_human.core.task import Task
+        async with Store(db) as s:
+            t = Task.new("q", repo_path="/tmp/r", kind="investigation")
+            t.context = {"findings": "ROOT CAUSE: the consumer offset reset."}
+            await s.create_task(t)
+            return t.id
+    tid = asyncio.run(_seed())
+    res = runner.invoke(cli, ["investigate", "--show", tid[:8]])
+    assert "ROOT CAUSE" in res.output
