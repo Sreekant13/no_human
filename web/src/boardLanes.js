@@ -17,7 +17,7 @@
 // (--c-review) — NOT the blue of Working, which is what made it look like just
 // another in-progress lane.
 export const LANES = [
-  { key: "answer",  label: "Needs Answer", accent: "var(--c-escalated)", statuses: ["awaiting_input", "escalated"], loud: true, needsYou: true },
+  { key: "answer",  label: "Needs Answer", accent: "var(--c-answer)",    statuses: ["awaiting_input", "escalated"], loud: true, needsYou: true },
   { key: "working", label: "Working",      accent: "var(--c-building)",  statuses: ["pending", "context", "planning", "implementing", "reviewing", "testing", "compound_parent"], showSubStatus: true },
   { key: "waiting", label: "Waiting",      accent: "var(--c-context)",   statuses: ["blocked", "paused_quota"], autoWait: true },
   { key: "failed",  label: "Failed",       accent: "var(--c-escalated)", statuses: ["failed"] },
@@ -35,4 +35,14 @@ export function routeTask(task) {
     if (lane.statuses.includes(task.status)) return lane.key;
   }
   return "working";
+}
+
+const NEEDS_YOU_LANES = new Set(LANES.filter((l) => l.needsYou).map((l) => l.key));
+
+// SINGLE source of truth for "this task needs a human" — the same routing the
+// board uses. A status-only set drifted from the lanes (blocked-without-wake
+// sits in Needs Answer but a status set missed it, so the header said "6 need
+// you" while the lanes showed 7). Count, badge, and notifications all use this.
+export function isNeedsYou(task) {
+  return NEEDS_YOU_LANES.has(routeTask(task));
 }

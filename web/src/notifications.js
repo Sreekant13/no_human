@@ -15,14 +15,16 @@ export function titleWithBadge(count) {
 // Tasks that ENTERED a needs-you status between two board snapshots — the
 // set to notify about. A task already needing you (page reload, reconnect)
 // never re-fires; a task leaving and re-entering (revise → park again) does.
-export function newlyNeedsYou(prevTasks, tasks, needsYouStatuses) {
+// ``isNeedy`` is a predicate (task -> bool) — the same one the board routes
+// with — so "needs you" here can never drift from the lanes.
+export function newlyNeedsYou(prevTasks, tasks, isNeedy) {
   const wasNeedy = new Set(
     (prevTasks || [])
-      .filter((t) => needsYouStatuses.has(t.status))
+      .filter((t) => isNeedy(t))
       .map((t) => t.id),
   );
   return (tasks || []).filter(
-    (t) => needsYouStatuses.has(t.status) && !wasNeedy.has(t.id),
+    (t) => isNeedy(t) && !wasNeedy.has(t.id),
   );
 }
 

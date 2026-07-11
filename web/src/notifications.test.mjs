@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { newlyNeedsYou, notificationBody, titleWithBadge } from "./notifications.js";
 
-const NEEDY = new Set(["awaiting_approval", "awaiting_input", "escalated"]);
+// newlyNeedsYou now takes a predicate (matches the board's isNeedsYou).
+const NEEDY = (t) => ["awaiting_approval", "awaiting_input", "escalated"].includes(t.status);
 
 test("title badge carries the needs-you count", () => {
   assert.equal(titleWithBadge(0), "no_human");

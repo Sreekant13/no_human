@@ -6,8 +6,8 @@ import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
 import { LegionLogo } from "./Logo.jsx";
 import { newlyNeedsYou, notificationBody, titleWithBadge } from "./notifications.js";
+import { isNeedsYou } from "./boardLanes.js";
 
-const NEEDS_YOU_STATUSES = new Set(["awaiting_approval", "awaiting_input", "escalated"]);
 const PROGRESS_STATUSES  = new Set(["pending", "context", "planning", "implementing", "reviewing", "testing"]);
 
 // Header brand: logo + wordmark + tagline. Used in the main and error headers.
@@ -31,7 +31,7 @@ function fmtAge(seconds) {
 }
 
 function OverviewStrip({ tasks }) {
-  const needsYou   = tasks.filter(t => NEEDS_YOU_STATUSES.has(t.status));
+  const needsYou   = tasks.filter(isNeedsYou);
   const failed     = tasks.filter(t => t.status === "failed").length;
   const inProgress = tasks.filter(t => PROGRESS_STATUSES.has(t.status)).length;
 
@@ -529,9 +529,9 @@ export default function App() {
   // hidden. Permission is requested on the first user gesture (browsers
   // block gesture-less requests); denied/unsupported degrades to the badge.
   useEffect(() => {
-    const needy = tasks.filter((t) => NEEDS_YOU_STATUSES.has(t.status));
+    const needy = tasks.filter(isNeedsYou);
     document.title = titleWithBadge(needy.length);
-    const fresh = newlyNeedsYou(prevTasksRef.current, tasks, NEEDS_YOU_STATUSES);
+    const fresh = newlyNeedsYou(prevTasksRef.current, tasks, isNeedsYou);
     prevTasksRef.current = tasks;
     if (fresh.length && typeof Notification !== "undefined"
         && Notification.permission === "granted" && document.hidden) {

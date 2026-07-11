@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { LANES, routeTask } from "./boardLanes.js";
+import { LANES, routeTask, isNeedsYou } from "./boardLanes.js";
 
 test("awaiting_approval routes to its OWN 'Review PR' lane, not a catch-all", () => {
   assert.equal(routeTask({ status: "awaiting_approval" }), "review");
@@ -51,4 +51,24 @@ test("Review PR sits immediately before Done and is review-coloured", () => {
   const working = LANES.find((l) => l.key === "working");
   assert.equal(review.accent, "var(--c-review)");     // its own colour…
   assert.notEqual(review.accent, working.accent);      // …not Working's blue
+});
+
+test("Needs Answer (act to unblock) is a different colour from Failed (dead)", () => {
+  const answer = LANES.find((l) => l.key === "answer");
+  const failed = LANES.find((l) => l.key === "failed");
+  assert.notEqual(answer.accent, failed.accent);  // both were identical red before
+});
+
+test("isNeedsYou matches the board's lanes exactly (the header-count fix)", () => {
+  assert.equal(isNeedsYou({ status: "awaiting_approval" }), true);   // Review PR
+  assert.equal(isNeedsYou({ status: "escalated" }), true);          // Needs Answer
+  assert.equal(isNeedsYou({ status: "awaiting_input" }), true);     // Needs Answer
+  // the case the status-only count missed: blocked WITHOUT a wake condition
+  // sits in Needs Answer, so it DOES need you (header said 6, lanes showed 7).
+  assert.equal(isNeedsYou({ status: "blocked" }), true);
+  // …but blocked WITH a wake condition auto-resolves → Waiting → not "needs you".
+  assert.equal(isNeedsYou({ status: "blocked", blocker_wake_condition: "ci_green_on:main" }), false);
+  assert.equal(isNeedsYou({ status: "implementing" }), false);
+  assert.equal(isNeedsYou({ status: "done" }), false);
+  assert.equal(isNeedsYou({ status: "failed" }), false);
 });
