@@ -97,6 +97,24 @@ def _clean_title(title: str) -> str:
     return t.strip() or "untitled conversation"
 
 
+def _project_from_workspaces(workspaces: list[str]) -> str:
+    """The repo path a conversation happened in, from its workspace URIs. The
+    ingester stamps it as the memory's ``project`` so mined rules can be scoped
+    to the repo they came from — a conversation in the Metricsdb repo shouldn't
+    surface its rules to a no_human task. Strips the ``file://`` scheme so the
+    value matches ``task.repo_path`` (a filesystem path). Empty when unknown."""
+    for w in workspaces or []:
+        if not w:
+            continue
+        path = w
+        if path.startswith("file://"):
+            path = path[len("file://"):]
+        path = path.rstrip("/")
+        if path:
+            return path
+    return ""
+
+
 @dataclass
 class Finding:
     """A single learning extracted from a conversation."""
@@ -108,12 +126,14 @@ class Finding:
     tags: list[str] = field(default_factory=list)
     source_message: int = -1  # 0-based index of the message in the transcript
     importance: str = "med"   # coarse label low|med|high — NEVER a numeric score
+    project: str = ""         # repo path the conversation happened in (for scoping)
 
 
 def analyze_transcript(transcript: Transcript) -> list[Finding]:
     """Scan a single transcript for user corrections and rules."""
     findings: list[Finding] = []
     seen_sigs: set[str] = set()
+    project = _project_from_workspaces(transcript.workspaces)
 
     for idx, msg in enumerate(transcript.messages):
         if msg.role != "user":
@@ -137,6 +157,7 @@ def analyze_transcript(transcript: Transcript) -> list[Finding]:
                     source_title=transcript.title,
                     tags=["history", category, "user_correction"],
                     source_message=idx,
+                    project=project,
                 ))
 
     return findings
@@ -213,6 +234,8 @@ def parse_llm_findings(text: str, transcript: Transcript) -> list[Finding]:
         log.warning("LLM analyzer: unparseable JSON block; skipping")
         return []
     out: list[Finding] = []
+    project = _project_from_workspaces(transcript.workspaces)
+    clean_title = _clean_title(transcript.title)
     for raw in (data.get("findings") or []):
         category = str(raw.get("category", "rule")).strip().lower()
         if category not in _VALID_CATEGORIES:
@@ -231,13 +254,14 @@ def parse_llm_findings(text: str, transcript: Transcript) -> list[Finding]:
         content = rule + (f"\nAnti-pattern: {anti}" if anti else "")
         out.append(Finding(
             category=category,
-            title=f"{rule[:110]} ({transcript.title})"[:120],
+            title=f"{rule[:110]} ({clean_title})"[:120],
             content=content,
             source_transcript=transcript.cascade_id,
             source_title=transcript.title,
             tags=["history", category, "llm", f"importance:{importance}"],
             source_message=src_msg,
             importance=importance,
+            project=project,
         ))
     return out
 

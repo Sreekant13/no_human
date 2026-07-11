@@ -81,6 +81,44 @@ async def test_provenance_carried_in_tags(store):
     assert "msg:7" in tags
 
 
+def test_project_derived_from_workspace_uri():
+    from no_human.history.analyzer import _project_from_workspaces
+    assert _project_from_workspaces(
+        ["file:///Users/e/git/acme/master/no_human"]) == "/Users/e/git/acme/master/no_human"
+    assert _project_from_workspaces(["/plain/path/"]) == "/plain/path"  # trailing slash trimmed
+    assert _project_from_workspaces(["", "file:///second/repo"]) == "/second/repo"  # skips blank
+    assert _project_from_workspaces([]) == ""
+    assert _project_from_workspaces(None) == ""
+
+
+async def test_mined_rule_is_scoped_to_the_conversations_repo(store):
+    """A rule mined from a Metricsdb conversation must NOT surface as a global rule —
+    it carries the repo it came from so a no_human task doesn't see it. This is
+    the driver of the 197-item confirm-queue flood (all mined rules had empty
+    project and were therefore unscoped)."""
+    metrics-core = Transcript(
+        cascade_id="c-metrics-core", title="Metricsdb Troubleshooting", created="2026-06-17",
+        messages=[Message("user", "always verify the fix by running the tests", "STEP")],
+        workspaces=["file:///Users/e/git/metrics-core"],
+    )
+    ing = TranscriptIngester(store)
+    res = await ing.ingest_transcripts([metrics-core])
+    assert res.proposed >= 1
+    pending = await LearningQueue(store).pending()
+    assert pending[0]["project"] == "/Users/e/git/metrics-core"
+
+
+async def test_a_conversation_without_a_workspace_stays_unscoped(store):
+    """No workspace → project stays empty (backward compatible, not a crash)."""
+    t = Transcript(
+        cascade_id="c-nows", title="Ad-hoc", created="2026-06-17",
+        messages=[Message("user", "never commit secrets to the repo", "STEP")],
+    )
+    await TranscriptIngester(store).ingest_transcripts([t])
+    pending = await LearningQueue(store).pending()
+    assert pending[0]["project"] in (None, "")
+
+
 async def test_dedupe_key_distinguishes_content():
     a = _dedupe_key(_finding(content="rule A"))
     b = _dedupe_key(_finding(content="rule B"))

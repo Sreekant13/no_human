@@ -97,7 +97,10 @@ class TranscriptIngester:
                 title=f.title,
                 content=f.content,
                 tags=tags,
-                project=None,
+                # Scope the mined rule to the repo the conversation happened in
+                # (empty → unscoped, as before). A no_human task shouldn't see
+                # rules mined from an unrelated repo's chats.
+                project=f.project or None,
                 source="proposed",
                 confirmed=False,
                 dedupe_key=_dedupe_key(f),
