@@ -13,6 +13,7 @@ import pytest
 from no_human.core.db import Store
 from no_human.history.analyzer import (
     Finding,
+    analyze_transcript,
     build_llm_prompt,
     parse_llm_findings,
 )
@@ -92,6 +93,46 @@ async def test_ingest_transcripts_runs_heuristic(store):
     res = await ing.ingest_transcripts([_transcript()])
     assert res.transcripts == 1
     assert res.proposed >= 1  # the heuristic catches "never commit" / "stop guessing"
+
+
+def test_command_output_masquerading_as_user_is_not_mined():
+    """Slash-command expansions and local/bash command output arrive as
+    user-role content but are not the user typing a rule. A signal phrase
+    matched inside one is a false positive — this is what flooded the confirm
+    queue with junk like "(<local-command-stdout>Set model to Sonnet 4…)"."""
+    noisy = Transcript(
+        cascade_id="c-noise", title="Session", created="2026-06-17",
+        messages=[
+            # Real user rule → mined.
+            Message("user", "always verify the fix by running the tests", "STEP"),
+            # Command output that happens to contain "never"/"always" → skipped.
+            Message("user", "<local-command-stdout>Set model to Sonnet 4. "
+                            "Never mind, always on.</local-command-stdout>", "STEP"),
+            Message("user", "<command-name>/model</command-name> always", "STEP"),
+            Message("user", "<system-reminder>never do X</system-reminder>", "STEP"),
+        ],
+    )
+    findings = analyze_transcript(noisy)
+    assert len(findings) == 1, "only the genuine free-text rule should be mined"
+    assert "verify the fix" in findings[0].content
+    assert "local-command-stdout" not in findings[0].title.lower()
+
+
+def test_garbage_conversation_title_is_sanitized_in_proposal_title():
+    """A genuine user rule from a conversation whose TITLE field is command
+    stdout (ANSI codes / <local-command-stdout>) must still be mined, but the
+    proposal title must not carry the machinery — it becomes a neutral label."""
+    t = Transcript(
+        cascade_id="c-badtitle",
+        title="<local-command-stdout>Set model to \x1b[1mSonnet 4.6\x1b[22m</local-command-stdout>",
+        created="2026-06-17",
+        messages=[Message("user", "always run the tests before pushing", "STEP")],
+    )
+    findings = analyze_transcript(t)
+    assert len(findings) == 1
+    assert "local-command-stdout" not in findings[0].title.lower()
+    assert "\x1b" not in findings[0].title
+    assert "untitled conversation" in findings[0].title
 
 
 # --------------------------------------------------------------------------- #

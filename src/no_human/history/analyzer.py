@@ -49,6 +49,53 @@ _CORRECTION_PATTERNS: list[tuple[str, str, str]] = [
 _COMPILED = [(re.compile(p, re.IGNORECASE), cat, desc)
              for p, cat, desc in _CORRECTION_PATTERNS]
 
+# Transcript machinery that arrives as *user*-role content but is NOT the user
+# typing a rule: slash-command expansions, local/bash command output, and
+# harness-injected reminders. A signal phrase matched inside one of these is a
+# false positive — it is what flooded the confirm queue with junk proposals
+# titled e.g. "(<local-command-stdout>Set model to Sonnet 4…)". A genuine
+# free-text rule never carries these markers, so their presence disqualifies
+# the whole message from correction-mining.
+_NOISE_MARKERS = (
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "<system-reminder>",
+    "<function_calls>",
+    "<function_results>",
+)
+
+
+def _is_noise_message(content: str) -> bool:
+    """True if the message is transcript machinery, not a user-typed rule."""
+    if not content or not content.strip():
+        return True
+    low = content.lower()
+    return any(marker in low for marker in _NOISE_MARKERS)
+
+
+# ANSI escape sequences (e.g. from a slash-command's stdout) leak into titles.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _clean_title(title: str) -> str:
+    """A transcript's own title field is sometimes command stdout (ANSI codes,
+    ``<local-command-stdout>`` blocks). Strip machinery so the proposal title
+    the human reads is legible; fall back to a neutral label when nothing
+    usable remains."""
+    if not title:
+        return "untitled conversation"
+    t = _ANSI.sub("", title)
+    low = t.lower()
+    if any(marker in low for marker in _NOISE_MARKERS):
+        return "untitled conversation"
+    return t.strip() or "untitled conversation"
+
 
 @dataclass
 class Finding:
@@ -71,6 +118,8 @@ def analyze_transcript(transcript: Transcript) -> list[Finding]:
     for idx, msg in enumerate(transcript.messages):
         if msg.role != "user":
             continue
+        if _is_noise_message(msg.content):
+            continue
 
         for pattern, category, desc in _COMPILED:
             if pattern.search(msg.content):
@@ -79,7 +128,7 @@ def analyze_transcript(transcript: Transcript) -> list[Finding]:
                     continue
                 seen_sigs.add(sig)
 
-                title = f"{desc} ({transcript.title})"
+                title = f"{desc} ({_clean_title(transcript.title)})"
                 findings.append(Finding(
                     category=category,
                     title=title[:120],
