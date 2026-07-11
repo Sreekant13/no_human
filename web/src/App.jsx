@@ -6,6 +6,7 @@ import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
 import { LegionLogo } from "./Logo.jsx";
 import { newlyNeedsYou, notificationBody, titleWithBadge } from "./notifications.js";
+import { shouldTriggerNewTask } from "./keyboardShortcut.js";
 import { isNeedsYou } from "./boardLanes.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 
@@ -555,6 +556,17 @@ export default function App() {
     window.addEventListener("pointerdown", ask, { once: true });
     return () => window.removeEventListener("pointerdown", ask);
   }, []);
+
+  // Global 'n' opens the New Task modal (unless typing or a modal is open).
+  useEffect(() => {
+    function onKeyDown(e) {
+      if (shouldTriggerNewTask(e, { modalOpen: showNewTask })) {
+        setShowNewTask(true);
+      }
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [showNewTask]);
 
   // WebSocket
   useEffect(() => {
