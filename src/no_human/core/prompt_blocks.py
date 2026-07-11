@@ -210,6 +210,86 @@ def build_rules_block(
     )
 
 
+def build_memories_block(
+    memories: list[dict] | None, critical_cap: int, relevant_cap: int,
+) -> str:
+    """Format confirmed rules + skills for prompt injection (importance-tiered).
+    Pure: takes the active memories and the char budgets. '' when none.
+
+    - Critical (importance=high): full content, up to ``critical_cap``
+    - Relevant (importance=med): compact one-liner, up to ``relevant_cap``
+    - Long-tail (importance=low): title only, as on-demand lookup hint
+    """
+    if not memories:
+        return ""
+    critical: list[dict] = []
+    relevant: list[dict] = []
+    long_tail: list[dict] = []
+    for m in memories:
+        tags = m.get("tags") or []
+        if "importance:high" in tags:
+            critical.append(m)
+        elif "importance:low" in tags:
+            long_tail.append(m)
+        else:
+            relevant.append(m)
+
+    parts: list[str] = []
+    if critical:
+        crit_lines: list[str] = []
+        budget = critical_cap
+        for m in critical:
+            mem_type = m.get("type", "rule")
+            title = m.get("title", "")
+            content = m.get("content", "").strip()
+            line = f"  - [{mem_type}] {title}: {content}"
+            if budget - len(line) < 0:
+                break  # hard cap: stop, don't truncate mid-rule
+            crit_lines.append(line)
+            budget -= len(line)
+        if crit_lines:
+            parts.append(
+                "Critical rules (MUST follow — full content):\n"
+                + "\n".join(crit_lines)
+            )
+
+    if relevant:
+        rel_lines: list[str] = []
+        budget = relevant_cap
+        for m in relevant:
+            mem_type = m.get("type", "rule")
+            title = m.get("title", "")
+            content = m.get("content", "").replace("\n", " ").strip()[:200]
+            line = f"  - [{mem_type}] {title}: {content}"
+            if budget - len(line) < 0:
+                break
+            rel_lines.append(line)
+            budget -= len(line)
+        if rel_lines:
+            parts.append(
+                "Relevant rules/skills:\n"
+                + "\n".join(rel_lines)
+            )
+
+    if long_tail:
+        tail_lines = [
+            f"  - [{m.get('type', 'rule')}] {m.get('title', '')}"
+            for m in long_tail[:20]
+        ]
+        parts.append(
+            "Additional context (look up if relevant to your task):\n"
+            + "\n".join(tail_lines)
+        )
+
+    if not parts:
+        return ""
+    return (
+        "\nConfirmed rules/skills from past experience:\n"
+        + "\n\n".join(parts)
+        + "\n"
+    )
+
+
 def build_profile_block(prof: Any) -> str:
     """The 'Project profile (confirmed)' block, or '' when there is no profile.
     Tells the agent the repo's ecosystem/commands so it doesn't waste turns

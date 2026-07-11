@@ -73,3 +73,26 @@ def test_resume_digest_surfaces_blocker_and_reply():
     assert "resuming a previously-blocked task" in d
     assert "category: AMBIGUITY" in d
     assert "A human answered your blocking question" in d and "A: A." in d
+
+
+def test_memories_block_empty_and_tiered():
+    from no_human.core.prompt_blocks import build_memories_block
+    assert build_memories_block(None, 8000, 4000) == ""
+    assert build_memories_block([], 8000, 4000) == ""
+    mems = [
+        {"type": "rule", "title": "C", "content": "full", "tags": ["importance:high"]},
+        {"type": "skill", "title": "R", "content": "compact", "tags": ["importance:med"]},
+        {"type": "rule", "title": "T", "tags": ["importance:low"]},
+    ]
+    b = build_memories_block(mems, 8000, 4000)
+    assert "Critical rules (MUST follow" in b and "[rule] C: full" in b
+    assert "Relevant rules/skills" in b and "[skill] R: compact" in b
+    assert "Additional context" in b and "[rule] T" in b
+
+
+def test_memories_block_critical_cap_stops_not_truncates():
+    from no_human.core.prompt_blocks import build_memories_block
+    big = {"type": "rule", "title": "X", "content": "y" * 100, "tags": ["importance:high"]}
+    # cap smaller than one line → that line is dropped whole, no partial rule
+    b = build_memories_block([big], 10, 4000)
+    assert "yyyy" not in b
