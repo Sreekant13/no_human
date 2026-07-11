@@ -3227,3 +3227,25 @@ async def test_worktree_tasks_resolve_the_primary_repos_profile(bare_repo, tmp_p
     finally:
         sp.run(["git", "-C", primary, "worktree", "remove", "--force", str(wt)],
                capture_output=True)
+
+
+def test_out_of_scope_becomes_a_forbidden_block_in_the_prompt():
+    """W3.5 (Devin playbook): the spec's out_of_scope is surfaced to the coder
+    as a hard FORBIDDEN constraint, from the first attempt — not discovered
+    late by the reviewer as scope creep."""
+    from no_human.core.orchestrator import Orchestrator
+    orch = Orchestrator.__new__(Orchestrator)
+    t = Task.new("add helper", repo_path="/tmp/x")
+    t.context = {"spec": {
+        "test_plan": "cover the happy path",
+        "out_of_scope": ["do not touch the auth module",
+                         "do not change the DB schema"],
+    }}
+    digest = orch._resume_digest(t)
+    assert "OUT OF SCOPE" in digest
+    assert "do not touch the auth module" in digest
+    assert "do not change the DB schema" in digest
+    # No out_of_scope → no forbidden block.
+    t2 = Task.new("y", repo_path="/tmp/x")
+    t2.context = {"spec": {"test_plan": "x"}}
+    assert "OUT OF SCOPE" not in orch._resume_digest(t2)
