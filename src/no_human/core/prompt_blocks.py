@@ -12,6 +12,121 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..blockers import Blocker
+from .task import Task
+
+
+def build_resume_digest(task: Task) -> str:
+    """Seed a resumed task's fresh session with the prior blocker report and
+    any human reply (22.5) — not a stale, bloated context. Pure: reads only
+    ``task.blocker`` and ``task.context``."""
+    parts: list[str] = []
+    if task.blocker:
+        b = Blocker.from_dict(task.blocker)
+        parts.append(
+            "You are resuming a previously-blocked task. Prior diagnosis:\n"
+            f"  category: {b.category.value}\n"
+            f"  why: {b.root_cause_hypothesis}\n"
+            f"  tried: {'; '.join(b.tried) if b.tried else '(none)'}"
+        )
+    ctx = task.context or {}
+    replies = ctx.get("human_replies") or []
+    if replies:
+        latest = replies[-1]
+        parts.append(
+            "A human answered your blocking question:\n"
+            f"  Q: {latest.get('question', '')}\n"
+            f"  A: {latest.get('answer', '')}\n"
+            "Use this answer; do NOT re-ask. Do not lower the bar."
+        )
+    feedback = ctx.get("send_back_feedback") or []
+    if feedback:
+        parts.append(
+            "Reviewer/human send-back feedback to address:\n"
+            + "\n".join(f"  - {f.get('message', '')}" for f in feedback[-3:])
+        )
+    review_fb = ctx.get("review_feedback") or []
+    if review_fb:
+        lines = []
+        for f in review_fb:
+            loc = f"{f.get('file', '')}:{f.get('line', 0)}" if f.get("file") else ""
+            detail = f.get("comment") or f.get("evidence") or ""
+            lines.append(f"  - {f.get('label', '')}{f' ({loc})' if loc else ''}: {detail}")
+        parts.append(
+            "The independent staff reviewer FAILED your previous attempt on "
+            "these specific, cited findings. Fix each one — do NOT weaken, "
+            "skip, or delete any test to satisfy the reviewer:\n"
+            + "\n".join(lines)
+        )
+    suggested_next = ctx.get("review_suggested_next")
+    if suggested_next:
+        parts.append(
+            f"Reviewer's suggested focus for this retry: {suggested_next}"
+        )
+    # R1.6: inject distilled attempt log so this attempt doesn't repeat.
+    attempt_log = ctx.get("attempt_log") or []
+    if attempt_log:
+        parts.append(
+            "Previous attempt outcomes (do NOT repeat the same approach):\n"
+            + "\n".join(f"  - {entry}" for entry in attempt_log)
+        )
+    handoff = ctx.get("handoff")
+    if handoff:
+        summary = handoff.get("summary", "")
+        files = handoff.get("changed_files", [])
+        turns = handoff.get("turns_used", "?")
+        wip = handoff.get("wip_sha", "")
+        resume_lines = [
+            f"The previous attempt ran out of turns ({turns} used) and left "
+            f"partial work{' (committed as WIP-PARTIAL ' + wip[:8] + ')' if wip else ''}."
+        ]
+        if files:
+            resume_lines.append(
+                f"  Files already modified: {', '.join(files[:15])}"
+            )
+        if summary and not summary.startswith("Claude Code returned"):
+            resume_lines.append(f"  Last status: {summary[:600]}")
+        resume_lines.append(
+            "CRITICAL: Your working tree ALREADY CONTAINS the partial implementation.\n"
+            "  1. READ the files listed above to understand what is already done.\n"
+            "  2. Do NOT redo work that is already complete.\n"
+            "  3. Pick up where the previous attempt left off.\n"
+            "  4. Focus remaining turns on completing unfinished acceptance criteria\n"
+            "     and running the test suite."
+        )
+        parts.append("\n".join(resume_lines))
+    ci_fail = ctx.get("ci_failure")
+    if ci_fail:
+        tests = ci_fail.get("failing_tests") or []
+        parts.append(
+            "The remote CI build for your previous attempt FAILED. Fix the "
+            "actual failure — do NOT weaken, skip, or delete tests to go green.\n"
+            f"  pipeline: {ci_fail.get('url', '')}\n"
+            + (f"  failing tests: {', '.join(tests[:10])}\n" if tests else "")
+            + "  details:\n"
+            + "\n".join(f"    {ln}" for ln in
+                        (ci_fail.get("detail", "")).splitlines()[:30])
+        )
+    # D3: inject test case plan from structured spec.
+    spec = ctx.get("spec") or {}
+    test_plan = spec.get("test_plan", "")
+    if test_plan:
+        parts.append(
+            "Test plan from the spec — write tests that cover these:\n"
+            + test_plan
+        )
+    # W3.5 (Devin playbook): the spec's out_of_scope is the FORBIDDEN list.
+    out_of_scope = spec.get("out_of_scope")
+    if out_of_scope:
+        items = (out_of_scope if isinstance(out_of_scope, list)
+                 else [out_of_scope])
+        forbidden = "\n".join(f"  - {str(x)}" for x in items if str(x).strip())
+        if forbidden:
+            parts.append(
+                "OUT OF SCOPE — do NOT do any of these (the spec forbids "
+                "them; touching them fails review):\n" + forbidden)
+    return "\n\n".join(parts)
+
 
 def build_rules_block(
     test_cmd_str: str, integration_cmd_str: str, ci_name: str | None,

@@ -52,3 +52,24 @@ def test_profile_block_lists_the_repo_commands():
     assert "Remote CI: gitlab (x/y)" in b
     assert "Lint command" not in b   # empty lint_cmd omitted
     assert b.endswith("\n\n")
+
+
+def test_resume_digest_empty_when_fresh():
+    from no_human.core.prompt_blocks import build_resume_digest
+    from no_human.core.task import Task, TaskStatus
+    t = Task(id="a", source="test", title="x", status=TaskStatus.IMPLEMENTING,
+             acceptance_criteria=["c"])
+    assert build_resume_digest(t) == ""
+
+
+def test_resume_digest_surfaces_blocker_and_reply():
+    from no_human.core.prompt_blocks import build_resume_digest
+    from no_human.core.task import Task, TaskStatus
+    t = Task(id="a", source="test", title="x", status=TaskStatus.IMPLEMENTING,
+             acceptance_criteria=["c"],
+             blocker={"category": "AMBIGUITY", "root_cause_hypothesis": "unclear", "tried": ["a"]},
+             context={"human_replies": [{"question": "Q?", "answer": "A."}]})
+    d = build_resume_digest(t)
+    assert "resuming a previously-blocked task" in d
+    assert "category: AMBIGUITY" in d
+    assert "A human answered your blocking question" in d and "A: A." in d
