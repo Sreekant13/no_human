@@ -140,6 +140,9 @@ class TaskSummaryOut(BaseModel):
     has_spec: bool = False
     live_status: str | None = None
     subtask_progress: str | None = None
+    # A task an operator cancelled ends in FAILED status but is not a capability
+    # failure — set so Stats can keep it out of the success-rate denominator.
+    cancelled: bool = False
 
     @classmethod
     def from_task(
@@ -196,6 +199,7 @@ class TaskSummaryOut(BaseModel):
             total_tokens=total_tokens,
             parent_id=task.parent_id,
             has_spec=bool((task.context or {}).get("spec")),
+            cancelled=bool((task.context or {}).get("cancel_reason")),
         )
 
 

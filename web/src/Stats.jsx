@@ -30,7 +30,10 @@ function computeStats(tasks) {
   const sevenDaysAgo = new Date(now.getTime() - 7 * 86400 * 1000);
 
   const doneTasks = tasks.filter(t => t.status === "done");
-  const failedTasks = tasks.filter(t => t.status === "failed");
+  // An operator-cancelled task ends in FAILED status but is not a capability
+  // failure — keep it out of the failure count and the success-rate denominator.
+  const cancelledTasks = tasks.filter(t => t.status === "failed" && t.cancelled);
+  const failedTasks = tasks.filter(t => t.status === "failed" && !t.cancelled);
 
   // Tasks with valid timestamps
   const doneWithTimes = doneTasks
@@ -130,6 +133,7 @@ function computeStats(tasks) {
   return {
     totalCompleted: doneTasks.length,
     totalFailed: failedTasks.length,
+    totalCancelled: cancelledTasks.length,
     totalTasks: tasks.length,
     tasksPerDay,
     avgDuration,
@@ -404,6 +408,7 @@ export default function Stats({ tasks }) {
           </div>
           <div className="stats-card-sub">
             {stats.totalCompleted} done &middot; {stats.totalFailed} failed
+            {stats.totalCancelled > 0 && <> &middot; {stats.totalCancelled} cancelled</>}
           </div>
         </div>
 
