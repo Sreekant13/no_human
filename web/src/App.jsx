@@ -6,6 +6,7 @@ import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
 import { LegionLogo } from "./Logo.jsx";
 import { newlyNeedsYou, notificationBody, titleWithBadge } from "./notifications.js";
+import { setFavicon } from "./favicon.js";
 import { shouldTriggerNewTask } from "./keyboardShortcut.js";
 import { isNeedsYou } from "./boardLanes.js";
 import { useEscapeKey } from "./useEscapeKey.js";
@@ -547,6 +548,12 @@ export default function App() {
         } catch { /* a notification is a bonus, never an error */ }
       }
     }
+  }, [tasks]);
+
+  // Favicon dot: surface an awaiting_approval task even when the tab title
+  // (badge) isn't visible, e.g. a pinned tab.
+  useEffect(() => {
+    setFavicon(tasks.some((t) => t.status === "awaiting_approval"));
   }, [tasks]);
 
   useEffect(() => {
