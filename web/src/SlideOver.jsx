@@ -1445,7 +1445,11 @@ function BlockerSection({ blocker: b, taskId, taskStatus }) {
           <div className="blocker-field-body">{b.evidence}</div>
         </div>
       )}
-      {b.root_cause_hypothesis && (
+      {b.root_cause_hypothesis && b.root_cause_hypothesis !== b.question && (
+        // When a task is operator-paused with a single reason, the same string
+        // lands in both root_cause_hypothesis and question — don't print it
+        // twice under two labels. Keep the actionable "Question for you" block
+        // (it carries the reply/options) and drop the redundant "Why blocked".
         <div className="blocker-field">
           <div className="blocker-field-label">Why blocked</div>
           <div className="blocker-field-body">{b.root_cause_hypothesis}</div>
