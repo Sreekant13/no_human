@@ -618,8 +618,13 @@ export default function App() {
     return (
       <div className="nh-shell">
         <header className="nh-header"><Brand /></header>
-        <div className="nh-center">
-          <span className="grill-spinner" style={{ width: 28, height: 28 }} />
+        <div className="nh-board board-skeleton" aria-busy="true" aria-label="Loading board">
+          {[0, 1, 2, 3, 4, 5].map((i) => (
+            <div className="sk-lane" key={i}>
+              <div className="skeleton sk-head" />
+              {[0, 1, 2].map((j) => <div className="skeleton sk-card" key={j} />)}
+            </div>
+          ))}
         </div>
       </div>
     );
