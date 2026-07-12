@@ -144,7 +144,7 @@ class WakeWatcher:
             from ..ci_gate.gate import CiGate
             from ..vcs.pr_watcher import (
                 default_pr_checks, default_pr_files, default_pr_head,
-                parse_pr_url, post_reply_comment,
+                parse_pr_url, upsert_agent_comment,
             )
 
             async def _post_comment(url: str, body: str) -> bool:
@@ -152,7 +152,9 @@ class WakeWatcher:
                 if not parsed or parsed[0] != "github":
                     return False
                 _, host, slug, num = parsed
-                return await post_reply_comment(f"{host}/{slug}#{num}", body)
+                # UPDATE the one CI_GATE comment instead of posting a new one every
+                # attempt (PR #531 piled up 17 near-identical comments).
+                return await upsert_agent_comment(f"{host}/{slug}#{num}", body, key="ci_gate")
 
             return CiGate(
                 config,

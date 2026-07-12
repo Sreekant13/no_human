@@ -259,3 +259,50 @@ async def test_post_reply_comment_stamps_the_agent_marker(monkeypatch):
     assert "hello reviewer" in body
     assert pr_watcher.is_agent_comment(body)
     assert not pr_watcher.is_agent_comment("hello reviewer")
+
+
+# ── upsert_agent_comment: update one comment, never pile up (PR #531 had 17) ──
+
+async def test_upsert_updates_existing_github_comment_instead_of_posting_new(monkeypatch):
+    import no_human.vcs.pr_watcher as pw
+
+    calls = []
+
+    async def fake_run(cmd):
+        calls.append(cmd)
+        joined = " ".join(cmd)
+        if "/issues/" in joined and joined.endswith("--paginate"):
+            # an existing agent comment for key "ci_gate"
+            return '[{"id": 99, "body": "<!-- no_human-agent-comment --><!-- nh:ci_gate -->\\nold"}]'
+        return "{}"  # PATCH/POST succeed
+
+    monkeypatch.setattr(pw, "_run_cli", fake_run)
+    ok = await pw.upsert_agent_comment("code.example.com/dev/metrics-core-query-service#531", "new status", key="ci_gate")
+    assert ok is True
+    # It PATCHed comment 99, and did NOT POST a new one.
+    assert any("PATCH" in " ".join(c) and "/issues/comments/99" in " ".join(c) for c in calls)
+    assert not any("-X" in c and "POST" in c and "/issues/531/comments" in " ".join(c) for c in calls)
+
+
+async def test_upsert_creates_when_none_exists(monkeypatch):
+    import no_human.vcs.pr_watcher as pw
+
+    calls = []
+
+    async def fake_run(cmd):
+        calls.append(cmd)
+        if " ".join(cmd).endswith("--paginate"):
+            return "[]"  # no existing comment
+        return "{}"
+
+    monkeypatch.setattr(pw, "_run_cli", fake_run)
+    ok = await pw.upsert_agent_comment("code.example.com/dev/r#5", "hi", key="ci_gate")
+    assert ok is True
+    assert any("POST" in c for c in calls if isinstance(c, list) for c in [" ".join(c)]) or \
+        any("POST" in " ".join(c) for c in calls)
+
+
+def test_upsert_body_never_says_no_human_visibly():
+    # The visible text must not mention no_human; only the invisible HTML marker does.
+    from no_human.vcs.pr_watcher import AGENT_COMMENT_MARKER
+    assert AGENT_COMMENT_MARKER.startswith("<!--")  # invisible

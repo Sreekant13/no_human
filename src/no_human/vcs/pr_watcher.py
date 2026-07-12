@@ -331,6 +331,61 @@ async def post_reply_comment(pr_ref: str, message: str) -> bool:
     return False
 
 
+def _find_marker_id(list_json: str | None, marker: str) -> str | None:
+    """First comment/note id whose body contains *marker*, or None."""
+    if not list_json:
+        return None
+    try:
+        for c in json.loads(list_json):
+            if marker in (c.get("body") or ""):
+                return str(c.get("id"))
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return None
+
+
+async def upsert_agent_comment(pr_ref: str, message: str, key: str = "") -> bool:
+    """Post OR update the ONE agent comment scoped by *key* on a PR/MR.
+
+    Re-runs must UPDATE a single comment, not pile up: the CI_GATE gate posting a
+    fresh comment on every one of its 23 attempts is how PR #531 ended up with 17
+    near-identical comments. *key* (e.g. "ci_gate") scopes the comment so distinct
+    report types each keep exactly one, updated in place. Falls back to a plain
+    create if listing/patching isn't possible. Never mentions "no_human" in the
+    visible body — the marker is an invisible HTML comment.
+    """
+    submarker = f"<!-- nh:{key} -->" if key else ""
+    body = f"{AGENT_COMMENT_MARKER}{submarker}\n{message}"
+    find = submarker or AGENT_COMMENT_MARKER
+
+    if "!" in pr_ref:  # GitLab MR: "project!iid"
+        project, _, iid = pr_ref.partition("!")
+        base = f"projects/{project}/merge_requests/{iid}/notes"
+        nid = _find_marker_id(await _run_cli(["glab", "api", f"{base}?per_page=100"]), find)
+        if nid and await _run_cli(["glab", "api", "--method", "PUT",
+                                   f"{base}/{nid}", "--field", f"body={body}"]) is not None:
+            return True
+        return await _run_cli(["glab", "api", "--method", "POST", base,
+                               "--field", f"body={body}"]) is not None
+
+    if "#" in pr_ref:  # GitHub/GHE: "host/owner/repo#num"
+        repo, _, num = pr_ref.partition("#")
+        host, _, slug = repo.partition("/")
+        hostarg = ["--hostname", host] if host else []
+        listing = await _run_cli(["gh", "api", *hostarg,
+                                  f"repos/{slug}/issues/{num}/comments", "--paginate"])
+        cid = _find_marker_id(listing, find)
+        if cid and await _run_cli(["gh", "api", *hostarg, "-X", "PATCH",
+                                   f"repos/{slug}/issues/comments/{cid}",
+                                   "-f", f"body={body}"]) is not None:
+            return True
+        return await _run_cli(["gh", "api", *hostarg, "-X", "POST",
+                               f"repos/{slug}/issues/{num}/comments",
+                               "-f", f"body={body}"]) is not None
+
+    return False
+
+
 async def default_pr_state(ref: str) -> str:
     """The PR's lifecycle state via gh: "MERGED" | "CLOSED" | "OPEN" | "".
 

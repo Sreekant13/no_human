@@ -13,6 +13,7 @@ import { hasAction, normalizeOption } from "./blockerOptions.js";
 import { currentFunctionality, groupFunctionalities } from "./functionalities.js";
 import { agentSummary, taskSummary } from "./summaries.js";
 import { estimateCost, fmtTokens } from "./cost.js";
+import { formatDuration } from "./formatDuration.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
 const IconCheck = ({ size = 14, className = "" }) => (
@@ -203,8 +204,10 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
             <div className="so-title" id="so-dialog-title">{task?.title ?? "Loading…"}</div>
           </div>
           {task?.total_tokens > 0 && (
-            <span className="so-cost" title="tokens used · indicative cost">
+            <span className="so-cost" title="cost meter: tokens · indicative $ · wall-time · attempts">
               {fmtTokens(task.total_tokens)} tok · {estimateCost(task.total_tokens)}
+              {task.wall_seconds != null && ` · ${formatDuration(Math.round(task.wall_seconds))}`}
+              {task.attempt_count > 0 && ` · ${task.attempt_count} attempt${task.attempt_count > 1 ? "s" : ""}`}
             </span>
           )}
           {task && (
