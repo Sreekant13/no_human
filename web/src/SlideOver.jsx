@@ -1301,7 +1301,9 @@ function DetailsTab({ task }) {
       )}
       {findings && (
         <section>
-          <div className="so-section-label">Investigation findings</div>
+          <div className="so-section-label">
+            {task.kind === "design_doc" ? "Design document" : "Investigation findings"}
+          </div>
           <pre className="so-findings">{findings}</pre>
         </section>
       )}
@@ -1328,7 +1330,7 @@ function SpecTab({ task, onRefresh }) {
   if (!hasSpec) {
     return (
       <div className="so-diff-empty" data-testid="spec-empty">
-        {["code_review", "investigation", "ci_fix"].includes(task.kind)
+        {["code_review", "investigation", "design_doc", "ci_fix"].includes(task.kind)
           ? `Spec generation doesn't apply to ${task.kind} tasks.`
           : ["pending", "context", "planning"].includes(task.status)
           ? "Spec not generated yet."

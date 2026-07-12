@@ -474,6 +474,7 @@ function NewTaskModal({ onClose, onCreated }) {
                 <option value="ci_fix">ci_fix</option>
                 <option value="test_gap">test_gap</option>
                 <option value="investigation">investigation</option>
+                <option value="design_doc">design doc</option>
                 <option value="code_review">code_review</option>
               </select>
               <select className="new-task-select" value={priority} onChange={(e) => setPriority(e.target.value)}>

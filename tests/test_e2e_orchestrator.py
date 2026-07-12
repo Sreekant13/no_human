@@ -3305,3 +3305,25 @@ def test_pr_url_parts_delegates_to_canonical_parser():
     assert parse_pr_url("https://gitlab.acme.net/ci_gate/customer/metrics-core-service/-/merge_requests/7") == \
         ("gitlab", "gitlab.acme.net", "ci_gate%2Fcustomer%2Fmetrics-core-service", 7)
     assert parse_pr_url("not a url") is None
+
+
+async def test_design_doc_report_only_completes_as_done(bare_repo, tmp_path, store):
+    """A design_doc task is a READ-ONLY deliverable: findings (the document)
+    with no file changes complete as DONE — reusing the investigation rails."""
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, ReportOnlyBackend(), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("Write a design doc for the retention pipeline",
+                 repo_path=str(bare_repo), kind="design_doc")
+    t.acceptance_criteria = ["document covers options and a recommendation"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.DONE, f"expected DONE, got {outcome.status}"
+    assert "report-only" in outcome.detail
+    refreshed = await store.find_task(t.id)
+    assert "findings" in (refreshed.context or {})
+    attempts = await store.list_attempts(t.id)
+    assert attempts[-1]["status"] == "succeeded"
