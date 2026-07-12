@@ -313,7 +313,10 @@ class Store:
         # make `attempts.status` untrustworthy as a completion signal — the
         # baseline had three of them. Close them for what they are.
         await self.db.execute(
-            "UPDATE attempts SET status = 'interrupted' "
+            "UPDATE attempts SET status = 'interrupted', "
+            "failure_reason = COALESCE(NULLIF(TRIM(failure_reason), ''), "
+            "'interrupted: superseded by a newer attempt — the prior worker "
+            "process died without closing its row') "
             "WHERE task_id = ? AND status = 'in_progress' AND attempt_number < ?",
             (task_id, attempt_number),
         )
@@ -328,6 +331,21 @@ class Store:
     async def update_attempt(self, attempt_id: str, **fields: Any) -> None:
         if not fields:
             return
+        # Observability backstop (C2): a failed attempt with no stated reason
+        # is undiagnosable — task 6cfdb936 burned attempts on exactly that.
+        # When the caller marks failed without a reason AND the row has none,
+        # stamp a loud sentinel instead of leaving silence. Never clobbers a
+        # reason set by an earlier update.
+        if fields.get("status") == "failed" and not fields.get("failure_reason"):
+            fields.pop("failure_reason", None)
+            cur = await self.db.execute(
+                "SELECT COALESCE(failure_reason, '') FROM attempts WHERE id = ?",
+                (attempt_id,))
+            row = await cur.fetchone()
+            if row is not None and not row[0].strip():
+                fields["failure_reason"] = (
+                    "(no failure reason recorded — observability gap; "
+                    "report which stage failed silently)")
         # JSON-encode dict/list values transparently.
         clean = {
             k: (json.dumps(v) if isinstance(v, (dict, list)) else v)

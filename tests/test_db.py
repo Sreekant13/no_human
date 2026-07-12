@@ -207,3 +207,37 @@ async def test_pr_edges_round_trip(store):
     removed = await store.delete_pr_edges_for("pr/2")
     assert removed == 2  # both edges touching pr/2
     assert await store.list_pr_edges() == []
+
+
+async def test_failed_attempt_never_has_an_empty_reason(store):
+    """Store-level backstop (C2): a failed attempt with no reason is an
+    observability bug — the row gets a loud sentinel instead of silence."""
+    t = Task.new("x", repo_path="/tmp/r")
+    await store.create_task(t)
+    a = await store.create_attempt(t.id, 1)
+    await store.update_attempt(a, status="failed", test_results={"ok": False})
+    row = (await store.list_attempts(t.id))[-1]
+    assert "no failure reason recorded" in (row["failure_reason"] or "")
+
+
+async def test_failed_attempt_backstop_never_clobbers_a_real_reason(store):
+    t = Task.new("x", repo_path="/tmp/r")
+    await store.create_task(t)
+    a = await store.create_attempt(t.id, 1)
+    await store.update_attempt(a, failure_reason="tests failed: 1 failed")
+    await store.update_attempt(a, status="failed")  # status set later
+    row = (await store.list_attempts(t.id))[-1]
+    assert row["failure_reason"] == "tests failed: 1 failed"
+
+
+async def test_interrupted_attempts_get_a_reason_stamped(store):
+    """Crash-orphaned rows (marked interrupted by the next create_attempt)
+    must say why they stopped — they evaded both the failed-only backstop and
+    the failed-only doctor check."""
+    t = Task.new("x", repo_path="/tmp/r")
+    await store.create_task(t)
+    await store.create_attempt(t.id, 1)          # stays in_progress (crash)
+    await store.create_attempt(t.id, 2)          # marks #1 interrupted
+    rows = await store.list_attempts(t.id)
+    assert rows[0]["status"] == "interrupted"
+    assert "superseded by a newer attempt" in (rows[0]["failure_reason"] or "")

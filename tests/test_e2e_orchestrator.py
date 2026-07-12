@@ -485,6 +485,13 @@ async def test_tamper_weakening_is_blocked_and_escalates(bare_repo, tmp_path, st
     assert refreshed.blocker is not None
     # nothing was pushed as an approvable PR
     assert outcome.pr_url is None
+    # The attempt row must SAY why it failed — tamper failures recorded only
+    # test_results, leaving failure_reason empty (the "post-implement failure
+    # reason came back EMPTY" observability gap, C2).
+    attempts = await store.list_attempts(t.id)
+    assert attempts[-1]["status"] == "failed"
+    assert (attempts[-1]["failure_reason"] or "").strip(), \
+        "tamper-failed attempt has an empty failure_reason"
 
 
 # --------------------------------------------------------------------------- #

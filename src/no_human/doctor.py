@@ -76,7 +76,7 @@ REQUIRED_EVIDENCE: dict[str, tuple[str, ...]] = {
 # review produces cited comments, an investigation produces findings. Demanding
 # a pr_open of them is a false positive (it flagged the done code_review task
 # f71107e9 every run). Only applies to the pr_open requirement.
-PR_LESS_KINDS: tuple[str, ...] = ("code_review", "investigation")
+PR_LESS_KINDS: tuple[str, ...] = ("code_review", "investigation", "design_doc")
 
 
 @dataclass
@@ -277,6 +277,20 @@ async def diagnose(store: Store) -> Diagnosis:
                 f"task {task_id[:8]} is '{status}' with no {'/'.join(kinds)} "
                 "event — the status is not backed by evidence."
             )
+
+    # A failed attempt must SAY why (C2): an empty failure_reason is exactly
+    # the "post-implement failure came back empty" gap that made task 6cfdb936
+    # undiagnosable for 6 attempts. The store backstop prevents new ones; this
+    # catches historical rows and any path that bypasses the store.
+    cur = await store.db.execute(
+        """SELECT id, task_id, status FROM attempts
+           WHERE status IN ('failed', 'interrupted')
+           AND COALESCE(TRIM(failure_reason), '') = ''""")
+    for (attempt_id, task_id, a_status) in await cur.fetchall():
+        d.evidence_gaps.append(
+            f"attempt {attempt_id[:8]} (task {task_id[:8]}) is '{a_status}' "
+            "with an empty failure_reason — the stop is undiagnosable."
+        )
     cur = await store.db.execute(
         "SELECT id, blocker FROM tasks WHERE status = 'escalated'"
     )

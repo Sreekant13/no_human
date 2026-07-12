@@ -217,3 +217,45 @@ async def test_done_code_review_needs_no_pr_open(store):
     await store.set_status(feat, TaskStatus.DONE, validate=False)
     d = await diagnose(store)
     assert any(feat.id[:8] in g and "pr_open" in g for g in d.evidence_gaps)
+
+
+async def test_doctor_flags_failed_attempts_with_empty_reason(tmp_path):
+    """Historical rows (and any path that bypasses the store backstop) must
+    surface as an evidence gap, not stay invisible."""
+    from no_human.core.db import Store
+    from no_human.core.task import Task
+    from no_human.doctor import diagnose
+
+    store = await Store(tmp_path / "d.db").connect()
+    try:
+        t = Task.new("x", repo_path="/tmp/r")
+        await store.create_task(t)
+        a = await store.create_attempt(t.id, 1)
+        # bypass the backstop deliberately (simulates a historical row)
+        await store.db.execute(
+            "UPDATE attempts SET status='failed', failure_reason=NULL WHERE id=?",
+            (a,))
+        await store.db.commit()
+        d = await diagnose(store)
+        assert any("failure_reason" in g for g in d.evidence_gaps), d.evidence_gaps
+    finally:
+        await store.close()
+
+
+async def test_doctor_accepts_report_only_design_doc_as_done(tmp_path):
+    """design_doc joins PR_LESS_KINDS: done-without-PR is its success shape
+    (this fix was silently dropped from PR #29 — pinned this time)."""
+    from no_human.core.db import Store
+    from no_human.core.task import Task, TaskStatus
+    from no_human.doctor import diagnose
+
+    store = await Store(tmp_path / "d.db").connect()
+    try:
+        t = Task.new("design doc", repo_path="/tmp/r", kind="design_doc")
+        await store.create_task(t)
+        await store.db.execute("UPDATE tasks SET status='done' WHERE id=?", (t.id,))
+        await store.db.commit()
+        d = await diagnose(store)
+        assert not any(t.id[:8] in g for g in d.evidence_gaps), d.evidence_gaps
+    finally:
+        await store.close()
