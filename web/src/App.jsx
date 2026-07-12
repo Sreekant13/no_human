@@ -666,28 +666,26 @@ export default function App() {
     );
   }
 
+  const needYou = tasks.filter(isNeedsYou).length;
   return (
-    <div className="nh-shell">
-      <header className="nh-header">
-        <Brand />
-        <nav className="nh-nav">
-          <button className={`nh-nav-btn${page === "board" ? " active" : ""}`} onClick={() => setPage("board")}>Board</button>
-          <button className={`nh-nav-btn${page === "stats" ? " active" : ""}`} onClick={() => setPage("stats")}>Stats</button>
-          <button className={`nh-nav-btn${page === "settings" ? " active" : ""}`} onClick={() => setPage("settings")}>Settings</button>
+    <div className="nh-shell nh-shell-cc">
+      <aside className="nh-sidebar">
+        <div className="nh-sidebar-brand"><Brand /></div>
+        <nav className="nh-sidenav">
+          {[["board", "Board"], ["stats", "Stats"], ["settings", "Settings"]].map(([k, label]) => (
+            <button
+              key={k}
+              className={`nh-sidenav-btn${page === k ? " active" : ""}`}
+              onClick={() => setPage(k)}
+            >
+              {label}
+              {k === "board" && needYou > 0 && (
+                <span className="nh-sidenav-badge" title={`${needYou} need you`}>{needYou}</span>
+              )}
+            </button>
+          ))}
         </nav>
-        <div className="nh-header-right">
-          <span className="legion-credit">Developed by eyalgolan</span>
-          <button
-            className="nh-theme-toggle"
-            onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
-            title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
-            aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
-          >
-            {theme === "dark" ? "☀" : "☾"}
-          </button>
-          {page === "board" && (
-            <button className="btn btn-new-task" onClick={() => setShowNewTask(true)}>+ New Task</button>
-          )}
+        <div className="nh-sidebar-foot">
           {workerStatus?.running && workerStatus.inflight > 0 && (
             <div className="nh-status-indicator" title={`${workerStatus.inflight} of ${workerStatus.max_workers} worker slots in use`}>
               <div className="nh-ws-dot live" style={{ background: 'var(--accent)' }} />
@@ -698,16 +696,30 @@ export default function App() {
             <div className={`nh-ws-dot${wsLive ? " live" : ""}`} />
             <span className="nh-status-label">{wsLive ? "Connected" : "Reconnecting…"}</span>
           </div>
+          <div className="nh-sidebar-row">
+            <button
+              className="nh-theme-toggle"
+              onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+              title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+              aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+            >
+              {theme === "dark" ? "☀" : "☾"}
+            </button>
+            <span className="legion-credit">by eyalgolan</span>
+          </div>
         </div>
-      </header>
-      {page === "board" && (
-        <>
-          <OverviewStrip tasks={tasks} />
-          <Board tasks={tasks} />
-        </>
-      )}
-      {page === "stats" && <Stats tasks={tasks} />}
-      {page === "settings" && <Settings />}
+      </aside>
+      <main className="nh-main">
+        {page === "board" && (
+          <div className="nh-main-bar">
+            <OverviewStrip tasks={tasks} />
+            <button className="btn btn-new-task" onClick={() => setShowNewTask(true)}>+ New Task</button>
+          </div>
+        )}
+        {page === "board" && <Board tasks={tasks} />}
+        {page === "stats" && <Stats tasks={tasks} />}
+        {page === "settings" && <Settings />}
+      </main>
       {showNewTask && (
         <NewTaskModal
           onClose={() => setShowNewTask(false)}
