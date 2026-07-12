@@ -68,3 +68,64 @@ def discover_skills(*, extra_roots: list[Path] | None = None) -> list[SkillInfo]
     skills = sorted(found.values(), key=lambda s: s.name)
     log.info("discovered %d Claude Code skills", len(skills))
     return skills
+
+
+# C1 seed-context diet: every skill delivered to the coder costs context on
+# EVERY turn of the session, so user-level skills are relevance-filtered.
+# Deliberately separate from context/base.py keywords() (case-preserving code
+# identifiers used as grep keys) and orchestrator._label_tokens (review-label
+# similarity): those need whole identifiers, this needs sub-token overlap.
+# Tokens split on non-alphanumerics — 'metrics-core-query-service' must match skill
+# 'metrics-core-troubleshoot' (whitespace-split matching filtered every metrics-core skill
+# from metrics-core tasks). Stopwords keep shared English filler from counting as
+# relevance, or the filter would keep everything.
+_STOPWORDS = frozenset(
+    "the and for with that this from are was has have not you all its can "
+    "use run get set new one two how what when where which your our their "
+    "into onto over under out off per via any each every some more most "
+    "than then them they there here also just only very will would should "
+    "could may might must been being does did done make made task tasks "
+    "file files code test tests".split()
+)
+
+
+def _tokens(text: str) -> set[str]:
+    return {
+        t for t in re.split(r"[^a-z0-9]+", text.lower())
+        if len(t) > 2 and t not in _STOPWORDS
+    }
+
+
+def skill_matches_task(skill: SkillInfo, task_text: str) -> bool:
+    """True when the skill's name/description shares a meaningful token with
+    the task's title/description/repo path."""
+    return bool(_tokens(task_text) & _tokens(f"{skill.name} {skill.description}"))
+
+
+def relevant_skill_names(
+    disk_skills: list[SkillInfo],
+    db_skill_titles: set[str],
+    task_text: str,
+    *,
+    filter_user: bool = True,
+) -> list[str]:
+    """Names of discovered skills to deliver to the coder session.
+
+    DB-confirmed skills are delivered separately and never repeated here.
+    Project-level skills (materialized learnings, repo-local skills) are always
+    kept; only user-level (~/.claude/skills) ones are relevance-filtered —
+    they are the operator's personal toolbox, mostly for OTHER projects.
+    """
+    names: list[str] = []
+    for s in disk_skills:
+        if s.name in db_skill_titles:
+            continue
+        if (
+            filter_user
+            and Path(s.source).is_relative_to(USER_SKILLS)
+            and not skill_matches_task(s, task_text)
+        ):
+            log.debug("skill %r filtered (no relevance to task)", s.name)
+            continue
+        names.append(s.name)
+    return names

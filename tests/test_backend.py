@@ -136,3 +136,25 @@ def test_thinking_is_a_dict_not_a_bool(tmp_path):
 
     opts_off = b._options(tmp_path, 40, thinking=False)
     assert not opts_off.thinking  # None / absent when not requested
+
+
+def test_precompact_hook_registered_when_on_compact_set(tmp_path):
+    """C1(a): compaction visibility. When the orchestrator passes on_compact,
+    the SDK options must carry a PreCompact hook — the only way to KNOW whether
+    the CLI's auto-compaction ever fires for coder sessions (it never has been
+    observed; sessions end ~160k tokens, under the ~92% threshold)."""
+    b = ClaudeBackend(model="claude-opus-4-8")
+    opts = b._options(tmp_path, 40, on_compact=lambda trigger: None)
+    assert "PreCompact" in opts.hooks
+
+    opts_off = b._options(tmp_path, 40)
+    assert "PreCompact" not in (opts_off.hooks or {})
+
+
+async def test_precompact_hook_reports_trigger_and_allows():
+    """The hook is pure telemetry: it forwards the trigger and never blocks."""
+    calls = []
+    hook = claude_backend._make_compact_hook(calls.append)
+    out = await hook({"trigger": "auto"}, None, None)
+    assert out == {}
+    assert calls == ["auto"]

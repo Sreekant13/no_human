@@ -92,6 +92,21 @@ def _make_guard_hook(
     return hook
 
 
+def _make_compact_hook(on_compact: Callable[[str], None]) -> Callable[..., Awaitable[dict]]:
+    """Build a PreCompact hook: pure telemetry, never blocks. Compaction had
+    never been OBSERVED for coder sessions (they end ~160k tokens, under the
+    CLI's auto-compact threshold) — this makes every firing visible (C1a)."""
+
+    async def hook(input_data: dict, tool_use_id: str | None, context: HookContext):
+        try:
+            on_compact(str((input_data or {}).get("trigger") or "auto"))
+        except Exception:  # noqa: BLE001 — telemetry must never break the session
+            pass
+        return {}
+
+    return hook
+
+
 class ClaudeBackend:
     """Drives one Agent SDK session per call to :meth:`run`."""
 
@@ -125,6 +140,7 @@ class ClaudeBackend:
         thinking: bool = False,
         max_thinking_tokens: int | None = None,
         agents: dict[str, AgentDefinition] | None = None,
+        on_compact: Callable[[str], None] | None = None,
     ) -> ClaudeAgentOptions:
         hooks: dict = {
             "PreToolUse": [
@@ -151,6 +167,10 @@ class ClaudeBackend:
             post_hooks.append(sv.hook)
         if post_hooks:
             hooks["PostToolUse"] = [HookMatcher(matcher=None, hooks=post_hooks)]
+        if on_compact is not None:
+            hooks["PreCompact"] = [
+                HookMatcher(matcher=None, hooks=[_make_compact_hook(on_compact)])
+            ]
         kwargs: dict[str, Any] = {}
         if thinking:
             # The SDK's `thinking` is a dict (ThinkingConfig), not a bool. Passing
@@ -190,13 +210,14 @@ class ClaudeBackend:
         thinking: bool = False,
         max_thinking_tokens: int | None = None,
         agents: dict[str, AgentDefinition] | None = None,
+        on_compact: Callable[[str], None] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run the agent, yielding normalized events; the final event is ``result``."""
         options = self._options(cwd, max_turns, effort=effort, resume=resume,
                                 supervisor_hook=supervisor_hook, lint_hook=lint_hook,
                                 skills=skills, thinking=thinking,
                                 max_thinking_tokens=max_thinking_tokens,
-                                agents=agents)
+                                agents=agents, on_compact=on_compact)
         # The SDK signals terminal conditions (notably hitting max_turns) by
         # *raising* a bare Exception from inside query(). It usually emits a
         # ResultMessage first ("agent done: N turns") and THEN raises, so we
@@ -336,6 +357,7 @@ class ClaudeBackend:
         thinking: bool = False,
         max_thinking_tokens: int | None = None,
         agents: dict[str, AgentDefinition] | None = None,
+        on_compact: Callable[[str], None] | None = None,
     ) -> AgentResult:
         """Run to completion, optionally forwarding each event, return the result."""
         final = AgentResult(
@@ -346,7 +368,7 @@ class ClaudeBackend:
             prompt, cwd=cwd, max_turns=max_turns, effort=effort, resume=resume,
             supervisor_hook=supervisor_hook, lint_hook=lint_hook, skills=skills,
             thinking=thinking, max_thinking_tokens=max_thinking_tokens,
-            agents=agents,
+            agents=agents, on_compact=on_compact,
         ):
             if on_event is not None:
                 on_event(event)
