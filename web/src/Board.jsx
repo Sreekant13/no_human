@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { fmtTokens, totalBurn } from "./cost.js";
 import SlideOver from "./SlideOver.jsx";
 import { groupFailedByTitle } from "./boardGroups.js";
 import { LANES, routeTask, isWaiting } from "./boardLanes.js";
@@ -204,7 +205,7 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
         )}
         {task.attempt_count > 0 && (
           <span className="card-attempts">
-            att {task.attempt_count}{task.last_turns != null ? ` · ${task.last_turns}t` : ""}{task.total_tokens > 0 ? ` · ${task.total_tokens >= 1000000 ? `${(task.total_tokens/1000000).toFixed(1)}M` : task.total_tokens >= 1000 ? `${(task.total_tokens/1000).toFixed(0)}k` : task.total_tokens} tok` : ""}
+            att {task.attempt_count}{task.last_turns != null ? ` · ${task.last_turns}t` : ""}{totalBurn(task.total_tokens, task.total_cache_read) > 0 ? ` · ${fmtTokens(totalBurn(task.total_tokens, task.total_cache_read))} tok` : ""}
           </span>
         )}
         {priority === "high" && <span className="card-priority card-priority-high">HI</span>}

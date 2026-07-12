@@ -85,3 +85,12 @@ export function groupFunctionalities({ agentStates, subagents, models = {}, even
     };
   });
 }
+
+
+// A non-running task (parked / escalated / awaiting approval / terminal) has
+// nothing executing: any state still reading "active" is stale, and it must
+// render as done — never as live work. Errors stay errors.
+export function clampAgentState(state, taskActive) {
+  if (taskActive || !state || state.status !== "active") return state;
+  return { ...state, status: "done" };
+}

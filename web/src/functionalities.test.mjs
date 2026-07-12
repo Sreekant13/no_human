@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   FUNCTIONALITIES, FX_OF_ROLE, currentFunctionality, groupFunctionalities,
+  clampAgentState,
 } from "./functionalities.js";
 import { eventSource } from "./eventRoles.js";
 
@@ -82,4 +83,18 @@ test("watcher events land in the Shepherding stage, not Orchestrating", () => {
   const ci_gateEvent = { kind: "ci_gate_pass", source: "watcher", text: "PASSED" };
   assert.equal(FX_OF_ROLE[eventSource(ci_gateEvent)], "shepherding");
   assert.ok(FUNCTIONALITIES.some((f) => f.id === "shepherding"));
+});
+
+test("clampAgentState: stale active reads done on a non-running task", () => {
+  assert.deepEqual(
+    clampAgentState({ status: "active", count: 5, lastText: "x" }, false),
+    { status: "done", count: 5, lastText: "x" });
+  // running task: untouched
+  assert.equal(
+    clampAgentState({ status: "active", count: 5, lastText: "x" }, true).status,
+    "active");
+  // errors are never masked
+  assert.equal(
+    clampAgentState({ status: "error", count: 1, lastText: "" }, false).status,
+    "error");
 });

@@ -12,7 +12,7 @@ import { taskProgress } from "./taskProgress.js";
 import { hasAction, normalizeOption } from "./blockerOptions.js";
 import { currentFunctionality, groupFunctionalities } from "./functionalities.js";
 import { agentSummary, taskSummary } from "./summaries.js";
-import { estimateCost, fmtTokens } from "./cost.js";
+import { estimateCost, fmtTokens, totalBurn } from "./cost.js";
 import { formatDuration } from "./formatDuration.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
@@ -203,9 +203,9 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
             <div className="so-id">{task?.id ?? taskId}</div>
             <div className="so-title" id="so-dialog-title">{task?.title ?? "Loading…"}</div>
           </div>
-          {task?.total_tokens > 0 && (
-            <span className="so-cost" title="cost meter: tokens · indicative $ · wall-time · attempts">
-              {fmtTokens(task.total_tokens)} tok · {estimateCost(task.total_tokens)}
+          {(task?.total_tokens > 0 || task?.total_cache_read > 0) && (
+            <span className="so-cost" title="cost meter: total burn (fresh + cache-read tokens) · indicative $ · wall-time · attempts">
+              {fmtTokens(totalBurn(task.total_tokens, task.total_cache_read))} tok · {estimateCost(task.total_tokens, task.total_cache_read)}
               {task.wall_seconds != null && ` · ${formatDuration(Math.round(task.wall_seconds))}`}
               {task.attempt_count > 0 && ` · ${task.attempt_count} attempt${task.attempt_count > 1 ? "s" : ""}`}
             </span>
@@ -842,10 +842,13 @@ function SystemTab({ taskId, task, isActive }) {
     return () => { cancelled = true; };
   }, [taskId, isActive]);
 
-  // Derive per-agent status
+  // Derive per-agent status. On a task that is NOT running (parked,
+  // escalated, awaiting approval, done, failed) nothing is executing — a
+  // badge stuck on "active" is a lie the operator acts on (task 6cfdb936
+  // showed 5 ACTIVE stages while escalated with zero live sessions).
   const agentStates = {};
   for (const a of AGENTS) {
-    agentStates[a.id] = deriveAgentStatus(events, a.id);
+    agentStates[a.id] = clampAgentState(deriveAgentStatus(events, a.id), isActive);
   }
 
   // Discover dynamically-spawned subagents from events, grouped by the role
@@ -857,7 +860,9 @@ function SystemTab({ taskId, task, isActive }) {
       (e.kind === "subagent_start" || e.kind === "subagent_progress" || e.kind === "subagent_done")
       && e.task_id === sub.subagentTaskId
     );
-    agentStates[sub.id] = { status: sub.status, count: subEvents.length, lastText: subEvents.length > 0 ? subEvents[subEvents.length - 1].text || "" : "" };
+    agentStates[sub.id] = clampAgentState(
+      { status: sub.status, count: subEvents.length, lastText: subEvents.length > 0 ? subEvents[subEvents.length - 1].text || "" : "" },
+      isActive);
   }
 
   const totalElapsed = events.length > 1 ? events[events.length - 1].ts - events[0].ts : 0;
