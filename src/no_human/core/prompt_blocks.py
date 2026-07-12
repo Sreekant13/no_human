@@ -170,9 +170,31 @@ def build_resume_digest(task: Task) -> str:
 
 def build_rules_block(
     test_cmd_str: str, integration_cmd_str: str, ci_name: str | None,
+    routing_rules: list[dict] | None = None,
 ) -> str:
     """The implement-prompt Rules section. ``ci_name`` is the remote CI runner's
-    name, or None when there is none (mirrors ``self.ci_runner``)."""
+    name, or None when there is none (mirrors ``self.ci_runner``).
+
+    ``routing_rules`` is the profile's change-scoped test routing (the same
+    ``test_commands`` globs the orchestrator's gate uses). When present, the
+    coder is told to run the suite MATCHING its change instead of the
+    repo-wide default — a web-only helper must not run (and then wait on)
+    the whole backend suite (task 70e3bd1b burned ~10 of 22 turns that way)."""
+    routing_block = ""
+    if routing_rules:
+        rows = "".join(
+            f"      files matching {r.get('glob')} -> run `{r.get('command')}`"
+            + (f" (from {r.get('cwd')}/)" if r.get("cwd") else "") + "\n"
+            for r in routing_rules if r.get("glob") and r.get("command")
+        )
+        if rows:
+            routing_block = (
+                f"    CHANGE-SCOPED ROUTING (same table the harness gate uses):\n"
+                f"{rows}"
+                f"      anything else -> run the default `{test_cmd_str}`\n"
+                f"    If ALL files you changed match one rule, that rule's command IS\n"
+                f"    your final gate — do NOT also run the repo-wide default.\n"
+            )
     return (
         "Rules:\n"
         "  CRITICAL — NEVER SKIP A TASK. Everything the user gives you, you CAN do.\n"
@@ -191,8 +213,12 @@ def build_rules_block(
            f"    broken environment at the end.\n"
            f"    ITERATE on the specific test file(s) you add or change (fast) — do NOT\n"
            f"    re-run the whole suite on every edit; a large suite costs minutes each run.\n"
-           f"    FINAL GATE: run the full command `{test_cmd_str}` exactly ONCE at the end\n"
-           f"    and confirm ALL tests pass. Paste the full output as evidence.\n"
+           f"    FINAL GATE: run the full command for YOUR change scope exactly ONCE at\n"
+           f"    the end and confirm ALL tests pass. Paste the full output as evidence.\n"
+           + routing_block +
+           f"    NEVER babysit a long run: no `sleep`-and-poll loops waiting on a suite.\n"
+           f"    The harness independently runs the authoritative change-scoped gate\n"
+           f"    after you finish — your job is the scoped evidence, not the marathon.\n"
            if test_cmd_str else
            "  - Run the project's test suite and confirm all tests pass before finishing.\n")
         + "  - REPRO MANIFEST: if this repo's tests run with pytest, write\n"
