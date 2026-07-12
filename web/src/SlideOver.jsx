@@ -8,6 +8,7 @@ import {
 import Markdown from "./Markdown.jsx";
 import { ROLE_LABEL, discoverSubagents, eventSource, modelsByNode } from "./eventRoles.js";
 import { deriveAgentStatus } from "./pipelineStatus.js";
+import { taskProgress } from "./taskProgress.js";
 import { hasAction, normalizeOption } from "./blockerOptions.js";
 import { currentFunctionality, groupFunctionalities } from "./functionalities.js";
 import { agentSummary, taskSummary } from "./summaries.js";
@@ -213,6 +214,16 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
           )}
           <button className="so-close" onClick={onClose} ref={closeRef} aria-label="Close"><IconX size={16} /></button>
         </div>
+        {task && taskProgress(task.status) != null && (
+          <div className="so-progress"
+               title={`~${taskProgress(task.status)}% through the pipeline (${task.status})`}
+               role="progressbar" aria-valuenow={taskProgress(task.status)}
+               aria-valuemin={0} aria-valuemax={100}>
+            <div className="so-progress-fill"
+                 style={{ width: `${taskProgress(task.status)}%` }} />
+            <span className="so-progress-label">{taskProgress(task.status)}%</span>
+          </div>
+        )}
 
         {/* tabs */}
         <div className="so-tabs">
