@@ -290,11 +290,17 @@ class ClaudeBackend:
                         },
                     )
         except Exception as exc:  # noqa: BLE001 — SDK raises bare Exception on terminal errors
+            import traceback
             msg = str(exc)
             is_max_turns = "maximum number of turns" in msg.lower()
+            # Preserve the traceback for genuine errors — a bare "'bool' object is
+            # not subscriptable" with no file:line burned 3 attempts undiagnosably
+            # (task 6cfdb936). max_turns is not an error, so it keeps the clean msg.
+            tb = "" if is_max_turns else traceback.format_exc()
+            text = msg if is_max_turns else f"{msg}\n\n{tb[-3000:]}".strip()
             yield AgentEvent(
                 "result",
-                text=msg,
+                text=text,
                 meta={
                     "num_turns": last_turns or (max_turns if is_max_turns else 0),
                     "is_error": True,
@@ -305,6 +311,7 @@ class ClaudeBackend:
                     "api_error_status": None,
                     "cache_read_tokens": last_cache_read,
                     "cache_creation_tokens": last_cache_creation,
+                    "traceback": tb[-4000:] or None,
                 },
             )
 

@@ -96,3 +96,28 @@ async def test_stream_yields_a_result_event_on_error(tmp_path, monkeypatch):
     assert events[0].kind == "result"
     assert events[0].meta["is_error"] is True
     assert events[0].meta["stop_reason"] == "max_turns"
+
+
+async def test_genuine_error_preserves_traceback_for_diagnosis(tmp_path, monkeypatch):
+    """A bare "'bool' object is not subscriptable" with no file:line burned 3
+    attempts undiagnosably (task 6cfdb936). Genuine errors must carry the
+    traceback so the crash is diagnosable."""
+    monkeypatch.setattr(
+        claude_backend, "query", _fake_query("'bool' object is not subscriptable"),
+    )
+    result = await ClaudeBackend(model="claude-opus-4-8").run(
+        "do it", cwd=tmp_path, max_turns=40)
+    assert result.is_error is True
+    assert "'bool' object is not subscriptable" in result.final_text
+    assert "Traceback" in result.final_text  # the diagnostic frames are preserved
+
+
+async def test_max_turns_stays_clean_without_a_traceback(tmp_path, monkeypatch):
+    """max_turns is not a crash — its message stays clean, no traceback noise."""
+    monkeypatch.setattr(
+        claude_backend, "query",
+        _fake_query("Claude Code returned an error result: Reached maximum number of turns (40)"),
+    )
+    result = await ClaudeBackend(model="claude-opus-4-8").run(
+        "x", cwd=tmp_path, max_turns=40)
+    assert "Traceback" not in result.final_text
