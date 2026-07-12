@@ -1502,15 +1502,38 @@ def test_moa_signals_none_for_a_trivial_task():
 
 def test_moa_signals_for_the_ci_gate_task_shape():
     """The real CI_GATE task (61406d02): kind=feature, 10 acceptance criteria, a
-    9309-char description, and — once D19/A2 stages it — one linked repo."""
+    9309-char description, and — once D19/A2 stages it — one linked repo.
+    kind=feature is NOT a signal: every dogfood helper is a feature, so it
+    acted as a permanent +1 that let any enriched helper fan out 3 Opus
+    proposers (task 6e64c555 live, 2026-07-12)."""
     from no_human.core.orchestrator import _moa_complexity_signals
     t = Task.new("Per-PR CI_GATE Integration Test Pipeline", repo_path="/r",
                  kind="feature", description="x" * 9309)
     t.acceptance_criteria = [f"criterion {i}" for i in range(10)]
     t.linked_repos = ["/repos/metrics-core-service"]
     assert set(_moa_complexity_signals(t, _gate_cfg())) == {
-        "multi-repo", "feature", "many-criteria", "long-spec",
+        "multi-repo", "many-criteria", "long-spec",
     }
+
+
+def test_moa_counts_operator_criteria_not_enriched_ones():
+    """Intake enrichment turned 2 operator criteria into 10 on a kebab-case
+    helper, which tripped many-criteria and fanned out 3 Opus proposers
+    (917k cache-read of planning on a trivial task, measured live). The gate
+    must count the criteria the OPERATOR stated, preserved by _act_on_eval
+    in context['original_criteria']."""
+    from no_human.core.orchestrator import _moa_complexity_signals
+    t = Task.new("Add a kebabCase helper", repo_path="/r", kind="feature")
+    t.acceptance_criteria = [f"enriched {i}" for i in range(10)]
+    t.context = {"original_criteria": ["converts inputs", "tests pass"]}
+    assert _moa_complexity_signals(t, _gate_cfg()) == []
+
+
+def test_moa_feature_kind_alone_is_not_complexity():
+    from no_human.core.orchestrator import _moa_complexity_signals
+    t = Task.new("Add a helper", repo_path="/r", kind="feature")
+    t.acceptance_criteria = ["works", "tested"]
+    assert _moa_complexity_signals(t, _gate_cfg()) == []
 
 
 def test_moa_signals_read_the_evaluator_verdict():
@@ -1523,8 +1546,9 @@ def test_moa_signals_read_the_evaluator_verdict():
 async def test_moa_gate_skips_the_fan_out_for_a_simple_task(
     bare_repo, tmp_path, store
 ):
-    """One signal (kind=feature) is below min_signals=2, so a bare task takes the
-    single-planner path instead of paying for three Opus proposers."""
+    """No signals fire for a bare task (kind=feature is deliberately not a
+    signal), so it takes the single-planner path instead of paying for three
+    Opus proposers."""
     cfg = _planning_config(tmp_path)  # default moa_planning: min_signals=2
     events: list[dict] = []
     orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
@@ -1538,18 +1562,19 @@ async def test_moa_gate_skips_the_fan_out_for_a_simple_task(
     assert len(backend.prompts) == 1                    # single planner, no fan-out
     assert not [e for e in events if e.get("kind") == "planning_moa"]
     gate = next(e for e in events if "MoA gate" in e.get("text", ""))
-    assert gate["signals"] == ["feature"]
+    assert gate["signals"] == []
     assert "single planner" in gate["text"]
 
 
 async def test_moa_gate_fans_out_for_a_complex_task(bare_repo, tmp_path, store):
-    """Two signals (feature + many-criteria) meet the bar: 3 proposers + 1
+    """Two signals (many-criteria + long-spec) meet the bar: 3 proposers + 1
     aggregator."""
     cfg = _planning_config(tmp_path)
     events: list[dict] = []
     orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
                         SlackNotifier(None), event_sink=events.append)
-    t = Task.new("big change", repo_path=str(bare_repo))
+    t = Task.new("big change", repo_path=str(bare_repo),
+                 description="x" * 2500)
     t.acceptance_criteria = [f"criterion {i}" for i in range(6)]
     fake = MoAFakeBackend(
         proposals={"minimal-first": _SAMPLE_PLAN, "risk-first": _SAMPLE_PLAN,
@@ -1562,7 +1587,7 @@ async def test_moa_gate_fans_out_for_a_complex_task(bare_repo, tmp_path, store):
 
     assert len(fake.prompts) == 4                       # 3 proposers + aggregator
     gate = next(e for e in events if "MoA gate" in e.get("text", ""))
-    assert set(gate["signals"]) == {"feature", "many-criteria"}
+    assert set(gate["signals"]) == {"long-spec", "many-criteria"}
 
 
 async def test_min_signals_zero_restores_unconditional_moa(

@@ -71,3 +71,26 @@ async def test_accept_verdict_is_noop(store, tmp_path):
     assert got.acceptance_criteria == ["keep me"]
     assert "assumptions" not in (got.context or {})
     assert "original_criteria" not in (got.context or {})
+
+
+async def test_enrich_preserves_empty_original_criteria(store, tmp_path):
+    """A board-created task states NO criteria — exactly when ENRICH fires.
+    original_criteria must record [] so the MoA complexity gate counts what
+    the operator stated, not the evaluator's own enrichment (which fanned
+    3 Opus proposers out on a kebab-case helper, task 6e64c555)."""
+    t = Task.new("quick task", repo_path="/r")
+    assert not t.acceptance_criteria
+    await store.create_task(t)
+    orch = _orch(store, tmp_path)
+    eval_out = EvalResult(
+        verdict=EvalVerdict.ENRICH,
+        enriched_criteria=[f"enriched {i}" for i in range(6)],
+    )
+    await orch._act_on_eval(t, eval_out)
+
+    got = await store.get_task(t.id)
+    assert got.acceptance_criteria == [f"enriched {i}" for i in range(6)]
+    assert got.context["original_criteria"] == []
+
+    from no_human.core.orchestrator import _moa_complexity_signals
+    assert _moa_complexity_signals(got, {"criteria_threshold": 5}) == []
