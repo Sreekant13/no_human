@@ -8,6 +8,7 @@ import { LegionLogo } from "./Logo.jsx";
 import { newlyNeedsYou, notificationBody, titleWithBadge } from "./notifications.js";
 import { setFavicon } from "./favicon.js";
 import { formatBytes } from "./formatBytes.js";
+import { pluralize } from "./pluralize.js";
 import { shouldTriggerNewTask } from "./keyboardShortcut.js";
 import { isNeedsYou } from "./boardLanes.js";
 import { useEscapeKey } from "./useEscapeKey.js";
@@ -403,7 +404,7 @@ function NewTaskModal({ onClose, onCreated }) {
                     >
                       {projects.map((p) => (
                         <option key={p.id} value={p.id}>
-                          {p.name} ({p.repo_paths.length} repo{p.repo_paths.length !== 1 ? 's' : ''})
+                          {p.name} ({p.repo_paths.length} {pluralize(p.repo_paths.length, "repo")})
                         </option>
                       ))}
                     </select>
