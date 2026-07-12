@@ -7,6 +7,7 @@ import Onboarding from "./Onboarding.jsx";
 import { LegionLogo } from "./Logo.jsx";
 import { newlyNeedsYou, notificationBody, titleWithBadge } from "./notifications.js";
 import { setFavicon } from "./favicon.js";
+import { formatBytes } from "./formatBytes.js";
 import { shouldTriggerNewTask } from "./keyboardShortcut.js";
 import { isNeedsYou } from "./boardLanes.js";
 import { useEscapeKey } from "./useEscapeKey.js";
@@ -384,7 +385,7 @@ function NewTaskModal({ onClose, onCreated }) {
             />
             {files.length > 0 && (
               <div className="ntm-file-list">
-                {files.map((f) => f.name).join(", ")}
+                {files.map((f) => `${f.name} (${formatBytes(f.size)})`).join(", ")}
               </div>
             )}
           </div>
