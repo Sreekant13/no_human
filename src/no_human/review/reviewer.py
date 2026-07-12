@@ -232,6 +232,55 @@ def _annotated_test_output(test_output: str) -> str:
     return f"Test results:\n```\n{body}\n```\n"
 
 
+# The exact verdict contract _parse_review_output expects — shared by the main
+# review prompt and the angle prompts so the two can never drift apart.
+_VERDICT_FORMAT = (
+    "Output EXACTLY this format (and NOTHING after it):\n\n"
+    "REVIEW_JSON_START\n"
+    '{"passed": true_or_false,\n'
+    ' "stages": {"spec_compliance": {"passed": true_or_false},\n'
+    '            "code_quality": {"passed": true_or_false}},\n'
+    ' "suggested_next": "one-sentence hint for the next attempt" or null,\n'
+    ' "items": [\n'
+    '  {"label": "short label", "passed": true_or_false,\n'
+    '   "severity": "critical|high|medium|low|nit",\n'
+    '   "evidence": "detailed explanation of the finding",\n'
+    '   "file": "path/to/file.py", "line": 42,\n'
+    '   "comment": "PR comment written in a natural, human voice"}\n'
+    "]}\n"
+    "REVIEW_JSON_END\n\n"
+    "For each item:\n"
+    "  - 'file' must be the path exactly as shown in the diff header (e.g. 'src/foo.py')\n"
+    "  - a finding graded critical/high/medium MUST cite the exact file and line of "
+    "the defect; a citation that does not exist in the repo demotes the finding to advisory\n"
+    "  - 'line' must be a line number from the RIGHT side of the diff (new file)\n"
+    "  - 'comment' must read like a real engineer wrote it in a code review.\n"
+    "    Write in first person, be direct, vary your sentence structure.\n"
+    "    No bullet lists, no bold text, no headers, no markdown formatting.\n"
+    "    Don't start with 'This', 'The', or 'I noticed'. Just say what's wrong\n"
+    "    and what you'd do instead, the way you'd talk to a colleague.\n"
+    "  - For general observations with no specific line, set file to '' and line to 0\n"
+    "  - 'suggested_next' helps the implementing agent focus its retry — set to null if passed\n\n"
+)
+
+
+def _build_angle_prompt(task: Task, diff: str, focus: str) -> str:
+    """A dedicated single-concern prompt for an angle pass. Deliberately NOT
+    the full adversarial template — gluing a 'security only' preface onto a
+    prompt that also demands spec/scope checks produced self-contradicting
+    instructions and mislabeled ordinary findings as [angle] ones."""
+    criteria = "\n".join(f"  - {c}" for c in task.acceptance_criteria) or "  (none stated)"
+    return (
+        f"You are a focused code reviewer. {focus}\n"
+        "Report ONLY findings inside that focus; if there are none, pass.\n"
+        "Findings must cite file:line from the diff below.\n\n"
+        + _VERDICT_FORMAT
+        + f"Task: {task.title}\n"
+        f"Acceptance criteria (context only — do NOT review compliance):\n{criteria}\n\n"
+        "The diff under review:\n```diff\n" + diff + "\n```\n"
+    )
+
+
 def _build_review_prompt(
     task: Task,
     diff: str,
@@ -406,33 +455,8 @@ def _build_review_prompt(
         "  - Set 'passed: true' when the only remaining findings are low/nit.\n"
         "  - Every item MUST carry a severity. An unclassified finding is treated\n"
         "    as blocking.\n\n"
-        "Output EXACTLY this format (and NOTHING after it):\n\n"
-        "REVIEW_JSON_START\n"
-        '{"passed": true_or_false,\n'
-        ' "stages": {"spec_compliance": {"passed": true_or_false},\n'
-        '            "code_quality": {"passed": true_or_false}},\n'
-        ' "suggested_next": "one-sentence hint for the next attempt" or null,\n'
-        ' "items": [\n'
-        '  {"label": "short label", "passed": true_or_false,\n'
-        '   "severity": "critical|high|medium|low|nit",\n'
-        '   "evidence": "detailed explanation of the finding",\n'
-        '   "file": "path/to/file.py", "line": 42,\n'
-        '   "comment": "PR comment written in a natural, human voice"}\n'
-        "]}\n"
-        "REVIEW_JSON_END\n\n"
-        "For each item:\n"
-        "  - 'file' must be the path exactly as shown in the diff header (e.g. 'src/foo.py')\n"
-        "  - a finding graded critical/high/medium MUST cite the exact file and line of "
-        "the defect; a citation that does not exist in the repo demotes the finding to advisory\n"
-        "  - 'line' must be a line number from the RIGHT side of the diff (new file)\n"
-        "  - 'comment' must read like a real engineer wrote it in a code review.\n"
-        "    Write in first person, be direct, vary your sentence structure.\n"
-        "    No bullet lists, no bold text, no headers, no markdown formatting.\n"
-        "    Don't start with 'This', 'The', or 'I noticed'. Just say what's wrong\n"
-        "    and what you'd do instead, the way you'd talk to a colleague.\n"
-        "  - For general observations with no specific line, set file to '' and line to 0\n"
-        "  - 'suggested_next' helps the implementing agent focus its retry — set to null if passed\n\n"
-        f"{profile_section}"
+        + _VERDICT_FORMAT
+        + f"{profile_section}"
         f"{rules_section}"
         f"{continuity_section}\n"
         # ── volatile task-specific content ──
@@ -573,6 +597,62 @@ def _is_blocking(item: ChecklistItem) -> bool:
     if item.passed:
         return False
     return (item.severity or "").strip().lower() not in ADVISORY_SEVERITIES
+
+
+# ── C3-G1: tier-gated multi-angle review ────────────────────────────────────
+# Complex-tier diffs get two extra single-turn angle passes (security,
+# test-adequacy) run in parallel with the same parser/citation rules — the
+# Qodo-2.0 recall pattern, gated by tier so a trivial helper never pays for
+# it. Angles ADD findings; they can flip pass→fail, never fail→pass.
+REVIEW_ANGLES: tuple[tuple[str, str], ...] = (
+    ("security", "SECURITY ONLY: injection, secrets/credential exposure, "
+     "path traversal, unsafe deserialization/subprocess/shell use, authz "
+     "bypass, SSRF. Ignore style, scope, and general correctness."),
+    ("tests", "TEST ADEQUACY ONLY: do the added/changed tests genuinely "
+     "exercise the change (real assertions on behavior, failure cases, "
+     "boundaries)? Flag tautological or mocked-to-green tests. Ignore style "
+     "and general correctness."),
+)
+
+
+def _title_tokens(s: str) -> set[str]:
+    return {t for t in re.split(r"[^a-z0-9]+", (s or "").lower()) if len(t) > 2}
+
+
+def merge_angle_findings(
+    main: ReviewDecision,
+    angles: list[tuple[str, ReviewDecision]],
+) -> ReviewDecision:
+    """Fold angle-pass findings into the main decision.
+
+    A failed angle item is appended (label prefixed "[angle]") unless it
+    duplicates an existing checklist item (token-set Jaccard >= 0.5). The
+    decision can only get STRICTER: pass flips to fail when a new item is
+    blocking; a fail never flips back.
+    """
+    appended: list[ChecklistItem] = []
+    for name, d in angles:
+        main.tokens_used += d.tokens_used
+        main.cache_read_tokens += d.cache_read_tokens
+        main.cache_creation_tokens += d.cache_creation_tokens
+        main.demoted_citations.extend(d.demoted_citations)
+        for item in d.failed_items:
+            toks = _title_tokens(item.label)
+            dup = any(
+                toks and (len(toks & _title_tokens(ex.label))
+                          / max(1, len(toks | _title_tokens(ex.label)))) >= 0.5
+                for ex in main.checklist + appended
+            )
+            if dup:
+                continue
+            # "name:" not "[name]" — Rich console markup eats bracketed
+            # prefixes in `nh review` output.
+            item.label = f"{name}: {item.label}"
+            appended.append(item)
+    main.checklist.extend(appended)
+    if any(_is_blocking(i) for i in appended):
+        main.passed = False
+    return main
 
 
 def _reached_no_verdict(decision: ReviewDecision) -> bool:
@@ -811,10 +891,54 @@ class AdversarialReviewer:
         # When the diff is already provided, use a single-turn call (no tools).
         # The model has everything it needs in the prompt — no repo exploration.
         if diff_override:
-            return await self._fast_review(prompt, repo_path, before_ref=before_ref)
+            decision = await self._fast_review(prompt, repo_path, before_ref=before_ref)
+        else:
+            # Full agent session for post-implementation reviews (needs to read files).
+            decision = await self._agent_review(prompt, repo_path, before_ref=before_ref)
 
-        # Full agent session for post-implementation reviews (needs to read files).
-        return await self._agent_review(prompt, repo_path, before_ref=before_ref)
+        # C3-G1: complex-tier tasks get parallel single-turn angle passes.
+        # Angles are ADDITIVE and best-effort: one that times out or crashes
+        # is dropped with a visible note — it must never fail the gate by
+        # itself (the fail-closed rule belongs to the MAIN review only).
+        if self._tier_wants_angles(task):
+            angle_prompts = [
+                (name, _build_angle_prompt(task, diff, focus))
+                for name, focus in REVIEW_ANGLES
+            ]
+            results = await asyncio.gather(
+                *(self._fast_review(pr, repo_path, before_ref=before_ref)
+                  for _, pr in angle_prompts),
+                return_exceptions=True,
+            )
+            angle_decisions: list[tuple[str, ReviewDecision]] = []
+            for i, r in enumerate(results):
+                name = angle_prompts[i][0]
+                skipped = None
+                if not isinstance(r, ReviewDecision):
+                    skipped = str(r)[:120]
+                elif any(i2.label == "timeout" for i2 in r.checklist):
+                    skipped = "timed out"
+                if skipped is not None:
+                    log.warning("review angle %r skipped: %s", name, skipped)
+                    decision.checklist.append(ChecklistItem(
+                        f"{name} angle did not run ({skipped})", True,
+                        "advisory — the extra angle pass was skipped; the main "
+                        "review still gates"))
+                    continue
+                angle_decisions.append((name, r))
+            if angle_decisions:
+                decision = merge_angle_findings(decision, angle_decisions)
+        return decision
+
+    @staticmethod
+    def _tier_wants_angles(task: Task) -> bool:
+        """Angles run only for complex-tier tasks (the tier can only make the
+        review STRICTER — tiers change effort, never safety)."""
+        try:
+            from ..core.complexity import is_complex
+            return is_complex(task)
+        except Exception:  # noqa: BLE001 — angles are additive, never required
+            return False
 
     async def _fast_review(self, prompt: str, repo_path: Path,
                            *, before_ref: str = "HEAD~1") -> ReviewDecision:
