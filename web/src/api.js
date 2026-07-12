@@ -261,6 +261,29 @@ export async function fetchProfiles() {
   return r.json();
 }
 
+// C3-G3: the repos the operator knows (for the repo-understanding picker).
+export async function fetchRepos() {
+  try {
+    const r = await fetch(`${BASE}/api/repos`);
+    if (!r.ok) return [];
+    return r.json();
+  } catch {
+    return [];
+  }
+}
+
+// C3-G3: what no_human understands about one known repo (profile + cached
+// repo map + matched playbooks). Null when the repo is unknown/unavailable.
+export async function fetchRepoUnderstanding(path) {
+  try {
+    const r = await fetch(`${BASE}/api/repo?path=${encodeURIComponent(path)}`);
+    if (!r.ok) return null;
+    return r.json();
+  } catch {
+    return null;
+  }
+}
+
 // The north-star numbers straight from the record (PRs merged/opened,
 // tokens-per-PR, review verdicts, cache economics). Null when unavailable so
 // Stats degrades to its client-side aggregates.

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchMetrics } from "./api.js";
+import { fetchMetrics, fetchRepos, fetchRepoUnderstanding } from "./api.js";
 import { estimateCost, fmtTokens } from "./cost.js";
 import { northStarTiles } from "./northStar.js";
+import { profileRows, profileStatus } from "./repoView.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -314,6 +315,92 @@ function TaskTable({ tasks }) {
 
 // ── Main Stats Component ─────────────────────────────────────────────────────
 
+// C3-G3: what no_human understands about a repo — its onboarded profile, the
+// cached repo map, and matched playbooks. Read-only; NO indexing, NO RAG. Lets
+// the operator see what the coder sees, without opening a task.
+function RepoUnderstanding() {
+  const [repos, setRepos] = useState([]);
+  const [selected, setSelected] = useState("");
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => { fetchRepos().then(setRepos); }, []);
+  useEffect(() => {
+    if (!selected) { setData(null); setLoading(false); return; }
+    let ignore = false;   // drop a stale response when the repo is switched fast
+    setLoading(true);
+    fetchRepoUnderstanding(selected).then((d) => {
+      if (ignore) return;
+      setData(d);
+      setLoading(false);
+    });
+    return () => { ignore = true; };
+  }, [selected]);
+
+  if (repos.length === 0) return null;   // nothing onboarded yet — no empty widget
+
+  return (
+    <div className="stats-section" data-testid="repo-understanding">
+      <h3 className="stats-section-title">Repository Understanding</h3>
+      <div className="stats-section-sub">
+        What no_human knows about a repo — profile, structure map, and playbooks
+      </div>
+      <select
+        className="repo-understanding-select"
+        data-testid="repo-understanding-select"
+        value={selected}
+        onChange={(e) => setSelected(e.target.value)}
+      >
+        <option value="">Select a repo&hellip;</option>
+        {repos.map((r) => (
+          <option key={r.repo_path} value={r.repo_path}>{r.name}</option>
+        ))}
+      </select>
+
+      {loading && <div className="stats-section-sub">Loading&hellip;</div>}
+
+      {data && (
+        <div className="repo-understanding-body">
+          <div className="repo-understanding-status">{profileStatus(data.profile)}</div>
+
+          {profileRows(data.profile).length > 0 && (
+            <table className="repo-understanding-profile">
+              <tbody>
+                {profileRows(data.profile).map((row) => (
+                  <tr key={row.label}>
+                    <td className="repo-understanding-key">{row.label}</td>
+                    <td className="repo-understanding-val">{row.value}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          {data.playbooks.length > 0 && (
+            <div className="repo-understanding-playbooks">
+              <div className="repo-understanding-subhead">
+                Playbooks ({data.playbooks.length})
+              </div>
+              <ul>
+                {data.playbooks.map((p, i) => (
+                  <li key={i}>{p.title}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div className="repo-understanding-subhead">Structure map</div>
+          {data.repo_map
+            ? <pre className="repo-understanding-map">{data.repo_map}</pre>
+            : <div className="stats-section-sub">
+                No cached map (the repo path may be unavailable on this host).
+              </div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Stats({ tasks }) {
   const stats = useMemo(() => computeStats(tasks), [tasks]);
   const [metrics, setMetrics] = useState(null);
@@ -460,6 +547,9 @@ export default function Stats({ tasks }) {
           <KindBar breakdown={stats.kindBreakdown} total={stats.totalCompleted} />
         </div>
       )}
+
+      {/* Repository Understanding (C3-G3) */}
+      <RepoUnderstanding />
 
       {/* Task table */}
       <div className="stats-section">
