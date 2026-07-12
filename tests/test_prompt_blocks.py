@@ -45,6 +45,10 @@ def test_rules_block_test_cmd_switches_to_early_verification():
     assert "Run unit tests with: uv run pytest -q" in r
     assert "EARLY VERIFICATION" in r
     assert "Run the project's test suite" not in r
+    # Cost fix: iterate on scoped tests, run the full suite once as the final
+    # gate — stops the coder re-running a 1300-test suite on every edit.
+    assert "ITERATE on the specific test file" in r
+    assert "FINAL GATE" in r and "exactly ONCE" in r
 
 
 def test_rules_block_ci_line_only_without_integration_cmd():
