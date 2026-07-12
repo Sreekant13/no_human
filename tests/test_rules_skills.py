@@ -337,7 +337,7 @@ def test_materialize_practice_skills_writes_tdd_debug_done(tmp_path):
     orch = object.__new__(Orchestrator)  # method uses only the class attr + log
     orch._materialize_practice_skills(tmp_path)
     skills_dir = tmp_path / ".claude" / "skills"
-    for name in ("no_human_tdd", "no_human_debug", "no_human_done"):
+    for name in ("no_human_tdd", "no_human_debug", "no_human_done", "no_human_focus"):
         sk = skills_dir / name / "SKILL.md"
         assert sk.exists(), f"{name} not materialized"
         assert sk.read_text().startswith(f"---\nname: {name}\ndescription: ")
