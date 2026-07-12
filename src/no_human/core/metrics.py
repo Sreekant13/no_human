@@ -42,6 +42,23 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
         for r in await cur.fetchall()
     ]
 
+    # Per complexity tier (C1.5): cost AND quality, so a cheaper setting
+    # is kept only where quality holds — measured, never assumed.
+    cur = await db.execute(
+        """SELECT COALESCE(json_extract(t.context, '$.complexity_tier'),
+                           'unclassified') AS tier,
+                  COUNT(*) AS attempts,
+                  COALESCE(SUM(COALESCE(a.tokens_used, 0)), 0) AS tokens,
+                  COALESCE(SUM(COALESCE(a.cache_read_tokens, 0)), 0) AS cache_read,
+                  SUM(CASE WHEN a.status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded
+           FROM attempts a JOIN tasks t ON t.id = a.task_id
+           GROUP BY tier ORDER BY attempts DESC""")
+    by_tier = [
+        {"tier": r[0], "attempts": r[1], "tokens": r[2], "cache_read": r[3],
+         "succeeded": r[4] or 0}
+        for r in await cur.fetchall()
+    ]
+
     # Gate outcomes: review verdicts and what blocked. The rejection reasons
     # are the review-fail event texts — the operator's "why is it failing"
     # list, most recent first.
@@ -122,6 +139,7 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
         "attempts_per_pr": round(attempts_total / prs_opened, 1) if prs_opened else None,
         "tokens_per_pr": (total_tokens + total_cache_read) // prs_opened if prs_opened else None,
         "by_auth_profile": by_profile,
+        "by_tier": by_tier,
         "review_pass": review_pass or 0,
         "review_fail": review_fail or 0,
         "recent_rejection_reasons": rejection_reasons,
