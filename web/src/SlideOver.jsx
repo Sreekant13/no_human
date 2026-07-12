@@ -10,7 +10,7 @@ import { ROLE_LABEL, discoverSubagents, eventSource, modelsByNode } from "./even
 import { deriveAgentStatus } from "./pipelineStatus.js";
 import { taskProgress } from "./taskProgress.js";
 import { hasAction, normalizeOption } from "./blockerOptions.js";
-import { currentFunctionality, groupFunctionalities } from "./functionalities.js";
+import { clampAgentState, currentFunctionality, groupFunctionalities } from "./functionalities.js";
 import { agentSummary, taskSummary } from "./summaries.js";
 import { estimateCost, fmtTokens, totalBurn } from "./cost.js";
 import { formatDuration } from "./formatDuration.js";
