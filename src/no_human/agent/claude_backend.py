@@ -153,9 +153,15 @@ class ClaudeBackend:
             hooks["PostToolUse"] = [HookMatcher(matcher=None, hooks=post_hooks)]
         kwargs: dict[str, Any] = {}
         if thinking:
-            kwargs["thinking"] = True
-            if max_thinking_tokens:
-                kwargs["max_thinking_tokens"] = max_thinking_tokens
+            # The SDK's `thinking` is a dict (ThinkingConfig), not a bool. Passing
+            # True made subprocess_cli do True["type"] → "'bool' object is not
+            # subscriptable", crashing EVERY thinking-enabled (complex) task
+            # (task 6cfdb936, all attempts). Enabled with a budget, else adaptive.
+            kwargs["thinking"] = (
+                {"type": "enabled", "budget_tokens": max_thinking_tokens}
+                if max_thinking_tokens
+                else {"type": "adaptive"}
+            )
         if agents:
             kwargs["agents"] = agents
         return ClaudeAgentOptions(

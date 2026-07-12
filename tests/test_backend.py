@@ -121,3 +121,18 @@ async def test_max_turns_stays_clean_without_a_traceback(tmp_path, monkeypatch):
     result = await ClaudeBackend(model="claude-opus-4-8").run(
         "x", cwd=tmp_path, max_turns=40)
     assert "Traceback" not in result.final_text
+
+
+def test_thinking_is_a_dict_not_a_bool(tmp_path):
+    """The SDK's `thinking` is a ThinkingConfig dict; passing True crashed every
+    complex (thinking-enabled) task with 'bool' object is not subscriptable
+    (task 6cfdb936)."""
+    b = ClaudeBackend(model="claude-opus-4-8")
+    opts = b._options(tmp_path, 40, thinking=True)
+    assert isinstance(opts.thinking, dict) and opts.thinking["type"] == "adaptive"
+
+    opts_budget = b._options(tmp_path, 40, thinking=True, max_thinking_tokens=8000)
+    assert opts_budget.thinking == {"type": "enabled", "budget_tokens": 8000}
+
+    opts_off = b._options(tmp_path, 40, thinking=False)
+    assert not opts_off.thinking  # None / absent when not requested
