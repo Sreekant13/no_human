@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { LANES, routeTask, isNeedsYou } from "./boardLanes.js";
+import { LANES, routeTask, isNeedsYou, isWaiting } from "./boardLanes.js";
 
 test("awaiting_approval routes to its OWN 'Review PR' lane, not a catch-all", () => {
   assert.equal(routeTask({ status: "awaiting_approval" }), "review");
@@ -19,16 +19,31 @@ test("a PR-approval task and a clarification task land in DIFFERENT lanes", () =
   );
 });
 
-test("blocked splits on wake_condition: auto → Waiting, else → Needs Answer", () => {
-  assert.equal(routeTask({ status: "blocked", blocker_wake_condition: "ci_green_on:main" }), "waiting");
+test("blocked splits on wake_condition: auto-resolving → Working, else → Needs Answer", () => {
+  // No separate Waiting column: a self-resolving blocked task sits in Working,
+  // marked parked on the card (isWaiting), not in a mostly-empty column.
+  assert.equal(routeTask({ status: "blocked", blocker_wake_condition: "ci_green_on:main" }), "working");
   assert.equal(routeTask({ status: "blocked" }), "answer");
 });
 
-test("working / done / failed route as before", () => {
+test("working / done / failed route as before; paused_quota joins Working", () => {
   assert.equal(routeTask({ status: "implementing" }), "working");
   assert.equal(routeTask({ status: "done" }), "done");
   assert.equal(routeTask({ status: "failed" }), "failed");
-  assert.equal(routeTask({ status: "paused_quota" }), "waiting");
+  assert.equal(routeTask({ status: "paused_quota" }), "working");
+});
+
+test("there is no separate Waiting lane anymore", () => {
+  assert.equal(LANES.find((l) => l.key === "waiting"), undefined);
+  assert.equal(LANES.length, 5);
+});
+
+test("isWaiting flags parked-but-self-resolving tasks (the old Waiting column, on the card)", () => {
+  assert.equal(isWaiting({ status: "paused_quota" }), true);
+  assert.equal(isWaiting({ status: "blocked", blocker_wake_condition: "ci_green_on:main" }), true);
+  assert.equal(isWaiting({ status: "blocked" }), false);         // needs a human → not waiting
+  assert.equal(isWaiting({ status: "implementing" }), false);    // actively working
+  assert.equal(isWaiting({ status: "done" }), false);
 });
 
 test("an unknown status falls back to Working, never lost", () => {

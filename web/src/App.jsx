@@ -63,7 +63,7 @@ function OverviewStrip({ tasks }) {
       {oldestSec !== null && (
         <>
           <span className="ov-sep">·</span>
-          <span>oldest waiting: <span className="ov-oldest">{fmtAge(oldestSec)}</span></span>
+          <span>waiting on you: <span className="ov-oldest">{fmtAge(oldestSec)}</span></span>
         </>
       )}
     </div>

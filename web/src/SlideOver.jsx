@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import {
   approveTask, cancelTask, chooseBlockerOption, fetchDiff, fetchSubtasks,
-  fetchTask, fetchTaskEvents,
+  fetchTask, fetchTaskEvents, finishReview,
   pauseTask, postReviewComments, replyTask, resumeTask, retryTask, sendBack,
   connectTaskSSE,
 } from "./api.js";
@@ -1582,6 +1582,16 @@ function ReviewTab({ task, diff }) {
   const [rawOpen, setRawOpen] = useState(false);
   const [posted, setPosted] = useState({});  // index → "ok" | "error" | "busy"
   const [postingAll, setPostingAll] = useState(false);
+  const [finishing, setFinishing] = useState(false);
+
+  async function handleFinishReview() {
+    setFinishing(true);
+    try {
+      await finishReview(task.id);  // → done; the WS task_updated refreshes the board/drawer
+    } catch {
+      setFinishing(false);
+    }
+  }
 
   if (!task) return <div className="so-diff-empty">Loading…</div>;
 
@@ -1636,6 +1646,112 @@ function ReviewTab({ task, diff }) {
 
   const allFailedPosted = failedIndices.length > 0 &&
     failedIndices.every((i) => posted[i] === "ok");
+
+  // A standalone code_review of someone else's PR is NOT a build gate — the job
+  // is "here are the comments, approve the ones to post in your name". The
+  // pass/fail-stage-criteria framing below is for the build gate; give code
+  // reviews their own plain, unambiguous surface.
+  if (task.kind === "code_review") {
+    const comments = checklist.items
+      .map((it, i) => ({ it, i }))
+      .filter(({ it }) => !it.passed);
+    const prUrl = task.context?.pr_url;
+    const prShort = prUrl ? prUrl.replace(/^https?:\/\//, "") : null;
+    const allPosted = comments.length > 0 && comments.every(({ i }) => posted[i] === "ok");
+    const nUnposted = comments.filter(({ i }) => posted[i] !== "ok").length;
+    return (
+      <div className="cr-approve">
+        <div className="cr-approve-head">
+          <div className="cr-approve-title">
+            {comments.length} review comment{comments.length !== 1 ? "s" : ""}
+          </div>
+          {prShort && (
+            <a href={prUrl} target="_blank" rel="noreferrer" className="cr-approve-pr">
+              on {prShort} ↗
+            </a>
+          )}
+        </div>
+        <div className="cr-approve-warn">
+          These post as comments <strong>in your name</strong>. Nothing is sent
+          until you approve — read each one, then post the ones you agree with.
+        </div>
+        {comments.length === 0 ? (
+          <div className="so-diff-empty">
+            The reviewer found nothing to comment on — no comments to post.
+          </div>
+        ) : (
+          <>
+            <div className="cr-approve-actions">
+              {prUrl && !allPosted && (
+                <button className="btn btn-approve" onClick={handlePostAll} disabled={postingAll}>
+                  {postingAll ? "Posting…" : `Approve & post all ${nUnposted}`}
+                </button>
+              )}
+              {allPosted && (
+                <span className="review-posted-badge">✓ All {comments.length} posted</span>
+              )}
+              {!prUrl && <span className="cr-nopr">No PR URL — cannot post from here.</span>}
+              {/* You decide when the review is done — post all, some, or none.
+                  A code_review has no PR of its own to merge, so it won't
+                  self-complete; this takes it to Done. */}
+              <button
+                className="btn btn-finish-review"
+                onClick={handleFinishReview}
+                disabled={finishing}
+                title="Mark this review done — whether or not you posted every comment"
+              >
+                {finishing ? "Finishing…" : "Finish review →"}
+              </button>
+            </div>
+            <div className="cr-comment-list">
+              {comments.map(({ it, i }) => (
+                <div key={i} className="cr-comment">
+                  <div className="cr-comment-loc">
+                    {it.file ? (
+                      <span className="ci-filechip" title={it.file}>
+                        {it.file.split("/").slice(-2).join("/")}{it.line > 0 ? `:${it.line}` : ""}
+                      </span>
+                    ) : (
+                      <span className="cr-general">general comment</span>
+                    )}
+                    {it.severity && (
+                      <span className={`cr-sev cr-sev-${String(it.severity).toLowerCase()}`}>
+                        {it.severity}
+                      </span>
+                    )}
+                    {posted[i] === "ok" && <span className="post-badge post-ok">✓ posted</span>}
+                  </div>
+                  {it.file && <CommentHunk diff={diff} file={it.file} line={it.line} />}
+                  <div className="cr-comment-body">{it.comment || it.evidence || it.label}</div>
+                  {prUrl && posted[i] !== "ok" && (
+                    <div className="ci-post-row">
+                      <button
+                        className="btn btn-post-one"
+                        onClick={() => handlePostOne(i)}
+                        disabled={posted[i] === "busy"}
+                      >
+                        {posted[i] === "busy" ? "Posting…"
+                          : posted[i] === "error" ? "Retry post"
+                          : "Approve & post this"}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+        {rawOutput && (
+          <section>
+            <button className="raw-toggle" onClick={() => setRawOpen((o) => !o)}>
+              {rawOpen ? <IconChevronDown size={14} /> : <IconChevronRight size={14} />} Reviewer's full reasoning
+            </button>
+            {rawOpen && <pre className="raw-output">{rawOutput}</pre>}
+          </section>
+        )}
+      </div>
+    );
+  }
 
   return (
     <>

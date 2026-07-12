@@ -54,6 +54,12 @@ export async function approveTask(id) {
   return r.json();
 }
 
+export async function finishReview(id) {
+  const r = await fetch(`${BASE}/api/tasks/${id}/finish-review`, { method: "POST" });
+  if (!r.ok) throw new Error(`POST finish-review → ${r.status}`);
+  return r.json();
+}
+
 export async function replyTask(id, answer) {
   const r = await fetch(`${BASE}/api/tasks/${id}/reply`, {
     method: "POST",

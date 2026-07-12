@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import SlideOver from "./SlideOver.jsx";
 import { groupFailedByTitle } from "./boardGroups.js";
-import { LANES, routeTask } from "./boardLanes.js";
+import { LANES, routeTask, isWaiting } from "./boardLanes.js";
 import { taskProgress } from "./taskProgress.js";
 
 export default function Board({ tasks }) {
@@ -138,11 +138,13 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
   const priority = task.priority ?? "medium";
 
   const isActive = ACTIVE_STATUSES.has(task.status);
+  const waiting = isWaiting(task);
 
   let cardCls = "task-card";
   if (isAwaiting) cardCls += " awaiting";
   if (isStale) cardCls += " stale";
   if (isActive) cardCls += " active-working";
+  if (waiting) cardCls += " waiting-parked";
 
   return (
     <div
@@ -154,6 +156,11 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
       onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && onClick(e)}
     >
       {isActive && <div className="card-active-pulse" title="agent is working on this" />}
+      {waiting && (
+        <div className="card-waiting-tag" title={task.blocker_wake_condition || "will resume on its own"}>
+          ◷ {task.status === "paused_quota" ? "waits for quota" : "waits for its own signal"}
+        </div>
+      )}
       <div className="card-id">{task.id.slice(0, 8)}</div>
       <div className="card-title">{task.title}</div>
       {task.live_status && isActive && (

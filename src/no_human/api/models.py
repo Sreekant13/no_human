@@ -114,6 +114,29 @@ def _last_activity(task: "Task", attempts: list[dict] | None) -> str | None:
     return max(candidates) or None
 
 
+def _wall_seconds(created_at: str | None, last_activity: str | None) -> float | None:
+    """Wall-clock seconds a task has been alive (created → last activity).
+
+    The time half of the per-task cost meter (tokens is the other half). Cost is
+    best-effort telemetry: any missing or unparseable timestamp returns None
+    rather than raising.
+    """
+    if not created_at or not last_activity:
+        return None
+    from datetime import datetime
+
+    def _p(s: str):
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            return None
+
+    a, b = _p(created_at), _p(last_activity)
+    if a is None or b is None:
+        return None
+    return max(0.0, (b - a).total_seconds())
+
+
 class TaskSummaryOut(BaseModel):
     id: str
     external_id: str | None = None
@@ -136,6 +159,7 @@ class TaskSummaryOut(BaseModel):
     last_activity: str | None = None
     backend: str | None = None  # "claude" or "devin"
     total_tokens: int | None = None
+    wall_seconds: float | None = None  # created → last activity; time half of the cost meter
     parent_id: str | None = None
     has_spec: bool = False
     live_status: str | None = None
@@ -197,6 +221,7 @@ class TaskSummaryOut(BaseModel):
             last_activity=_last_activity(task, attempts),
             backend=task_backend,
             total_tokens=total_tokens,
+            wall_seconds=_wall_seconds(task.created_at, _last_activity(task, attempts)),
             parent_id=task.parent_id,
             has_spec=bool((task.context or {}).get("spec")),
             cancelled=bool((task.context or {}).get("cancel_reason")),
