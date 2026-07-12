@@ -184,6 +184,16 @@ class ClaudeBackend:
             )
         if agents:
             kwargs["agents"] = agents
+        if skills or not self.readonly:
+            # Project scope ONLY, for every writing (coder) session and any
+            # session with skills. Left unset, the SDK defaults skill sessions
+            # to ["user", "project"] — the operator's plugins, personal
+            # settings, and EVERY ~/.claude skill in the coder's per-turn
+            # context — and skill-less sessions to NO sources at all (so the
+            # target repo's CLAUDE.md wouldn't load). Relevant user skills are
+            # copied into the working tree by the orchestrator instead.
+            # Read-only sessions (reviewer/planner/supervisor) stay hermetic.
+            kwargs["setting_sources"] = ["project"]
         return ClaudeAgentOptions(
             model=self.model,
             cwd=str(cwd),

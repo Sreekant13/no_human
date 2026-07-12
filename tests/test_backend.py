@@ -158,3 +158,25 @@ async def test_precompact_hook_reports_trigger_and_allows():
     out = await hook({"trigger": "auto"}, None, None)
     assert out == {}
     assert calls == ["auto"]
+
+
+def test_coder_sessions_are_project_scoped(tmp_path):
+    """C1-i2: passing skills= must pin setting_sources to ["project"] — the
+    SDK's implicit default adds "user", which loads the operator's plugins
+    (superpowers et al.), personal settings, and EVERY user skill into every
+    coder session's context. Relevant user skills are delivered by copying
+    them into the working tree instead (see _materialize_skills)."""
+    b = ClaudeBackend(model="claude-opus-4-8")
+    opts = b._options(tmp_path, 40, skills=["a", "b"])
+    assert opts.setting_sources == ["project"]
+
+    # A coder session with NO skills is still project-scoped — otherwise the
+    # target repo's CLAUDE.md would not load for it (and consistency of the
+    # prompt prefix across tasks would break).
+    opts_bare = b._options(tmp_path, 40)
+    assert opts_bare.setting_sources == ["project"]
+
+    # Read-only sessions (reviewer/planner/supervisor) stay hermetic.
+    r = ClaudeBackend(model="claude-opus-4-8", readonly=True)
+    opts_ro = r._options(tmp_path, 40)
+    assert opts_ro.setting_sources is None
