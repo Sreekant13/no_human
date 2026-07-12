@@ -170,6 +170,40 @@ async def test_a_reviewer_that_recovers_on_the_retry_returns_its_verdict(tmp_pat
     assert decision.passed is True
 
 
+async def test_review_timeout_halves_the_retry_window_on_a_hang(tmp_path, monkeypatch):
+    """A hung/saturated reviewer (timeout, not turn exhaustion) must not be
+    granted a second FULL window — a 50-line diff sat 20min in review (2×600s)
+    in prod. The retry's window is halved; the task escalates ~5min sooner."""
+    import asyncio
+    import time as _time
+
+    import no_human.review.reviewer as rv
+
+    # Small floor so the shrink is observable in a fast test.
+    monkeypatch.setattr(rv, "_REVIEW_MIN_RETRY_TIMEOUT", 0.05)
+
+    windows: list[float] = []
+
+    class _HangingBackend:
+        async def run(self, prompt, *, cwd, max_turns, effort=None, on_event=None, **kw):
+            start = _time.monotonic()
+            try:
+                await asyncio.sleep(5)  # never finishes inside the wait_for window
+            except asyncio.CancelledError:
+                windows.append(_time.monotonic() - start)
+                raise
+            return _FakeAgentResult(_VERDICT)
+
+    with pytest.raises(ReviewerUnavailable, match="no verdict"):
+        await rv.AdversarialReviewer(backend=_HangingBackend())._agent_review(
+            "p", tmp_path, timeout=0.4
+        )
+
+    assert len(windows) == 2, "one bounded infra retry (constraint #4)"
+    # Round 2's window was ~half of round 1's — not another full 0.4s.
+    assert windows[1] < windows[0] * 0.75
+
+
 async def test_a_real_failing_verdict_is_never_retried_or_swallowed(tmp_path):
     """A genuine FAIL is a finding, not an infra error: return it on round one."""
     from no_human.review.reviewer import AdversarialReviewer

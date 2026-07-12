@@ -45,6 +45,11 @@ _REVIEW_TIMEOUT = 600
 # Constraint #4: retry only on infra failures, and boundedly. A reviewer that
 # never reaches a verdict is an infra failure, not a finding.
 _REVIEW_INFRA_RETRIES = 1
+# On a *timeout* (hung/saturated reviewer, not turn-starved) the retry's window
+# is halved down to this floor rather than granted another full one — a hang
+# won't clear in a second full window, it just doubles how long a task sits
+# blocked in review. Floored so the retry still gets a fair chance.
+_REVIEW_MIN_RETRY_TIMEOUT = 120
 # The sentinel `_parse_review_output` returns when no REVIEW_JSON block was found.
 _NO_VERDICT_LABEL = "structured output present"
 _DIFF_CAP = 60_000  # chars — ~15K tokens, fits in 200K context alongside test output
@@ -857,15 +862,24 @@ class AdversarialReviewer:
         No path here ever turns a missing verdict into a pass.
         """
         last_reason = "unknown"
+        round_timeout = timeout
         for round_n in range(_REVIEW_INFRA_RETRIES + 1):
             budget = max_turns * (2 ** round_n)
             decision, reason = await self._review_once(
-                prompt, repo_path, max_turns=budget, timeout=timeout,
+                prompt, repo_path, max_turns=budget, timeout=round_timeout,
                 before_ref=before_ref,
             )
             if decision is not None:
                 return decision
             last_reason = reason
+            # A *timeout* means the reviewer is hung/saturated, not turn-starved,
+            # so granting another full window just doubles the wall-time a task
+            # sits blocked in review (a 50-line diff sat 20min in prod: 2×600s).
+            # Halve the next round's window — the turn budget still doubles for
+            # the turn-exhaustion case the retry actually exists for. Never turns
+            # a missing verdict into a pass; only escalates a hang sooner.
+            if reason.startswith("timed out"):
+                round_timeout = max(_REVIEW_MIN_RETRY_TIMEOUT, round_timeout // 2)
             log.warning(
                 "reviewer reached no verdict (%s) on round %d/%d (budget %d turns)",
                 reason, round_n + 1, _REVIEW_INFRA_RETRIES + 1, budget,
