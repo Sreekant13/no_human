@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchMetrics } from "./api.js";
+import { estimateCost, fmtTokens } from "./cost.js";
 import { northStarTiles } from "./northStar.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -98,10 +99,13 @@ function computeStats(tasks) {
   const successRate = totalTerminal > 0 ? (doneTasks.length / totalTerminal) * 100 : 0;
 
   // Token tracking across all tasks
-  const totalTokens = tasks.reduce((s, t) => s + (t.total_tokens || 0), 0);
+  // Burn = fresh + cache-read tokens (the same definition as the drawer and
+  // board — tokens_used alone hides 90%+ of real spend, C1).
+  const burnOf = (t) => (t.total_tokens || 0) + (t.total_cache_read || 0);
+  const totalTokens = tasks.reduce((s, t) => s + burnOf(t), 0);
   const avgTokensPerTask = doneTasks.length > 0
-    ? tasks.filter(t => t.total_tokens > 0).reduce((s, t) => s + t.total_tokens, 0)
-      / tasks.filter(t => t.total_tokens > 0).length
+    ? tasks.filter(t => burnOf(t) > 0).reduce((s, t) => s + burnOf(t), 0)
+      / Math.max(1, tasks.filter(t => burnOf(t) > 0).length)
     : 0;
 
   // SDLC metrics — backward-compatible (handles missing fields)
@@ -144,6 +148,8 @@ function computeStats(tasks) {
     kindBreakdown,
     successRate,
     totalTokens,
+    totalTokensFresh: tasks.reduce((s, t) => s + (t.total_tokens || 0), 0),
+    totalTokensCache: tasks.reduce((s, t) => s + (t.total_cache_read || 0), 0),
     avgTokensPerTask,
     firstAttemptRate,
     avgAttempts,
@@ -236,22 +242,8 @@ function KindBar({ breakdown, total }) {
 
 // ── Token cost estimate ──────────────────────────────────────────────────────
 
-function fmtTokens(n) {
-  if (n == null) return "\u2014";
-  if (n < 1000) return `${n}`;
-  if (n < 1000000) return `${(n / 1000).toFixed(1)}k`;
-  return `${(n / 1000000).toFixed(2)}M`;
-}
-
-// Rough cost estimate for subscription tokens (Claude subscription pricing).
-// This is purely indicative — actual billing depends on the plan.
-function estimateCost(tokens) {
-  if (tokens == null || tokens === 0) return "\u2014";
-  // ~$0.003 per 1k input tokens as a rough proxy for blended usage
-  const est = (tokens / 1000) * 0.003;
-  if (est < 0.01) return "<$0.01";
-  return `$${est.toFixed(2)}`;
-}
+// fmtTokens/estimateCost come from cost.js — the ONE home (a local copy here
+// silently shadowed the blended cache-read pricing and kept est. fresh-only).
 
 // ── Task table ───────────────────────────────────────────────────────────────
 
@@ -310,8 +302,8 @@ function TaskTable({ tasks }) {
                   {t.backend === "devin" ? "Devin" : "Claude Code"}
                 </span>
               </td>
-              <td className="stats-td stats-td-mono stats-td-right">{fmtTokens(t.total_tokens)}</td>
-              <td className="stats-td stats-td-mono stats-td-right">{estimateCost(t.total_tokens)}</td>
+              <td className="stats-td stats-td-mono stats-td-right">{fmtTokens((t.total_tokens || 0) + (t.total_cache_read || 0) || null)}</td>
+              <td className="stats-td stats-td-mono stats-td-right">{estimateCost(t.total_tokens, t.total_cache_read)}</td>
             </tr>
           ))}
         </tbody>
@@ -416,7 +408,7 @@ export default function Stats({ tasks }) {
           <div className="stats-card-label">Token Usage</div>
           <div className="stats-card-value">{fmtTokens(stats.totalTokens)}</div>
           <div className="stats-card-sub">
-            est. {estimateCost(stats.totalTokens)}
+            est. {estimateCost(stats.totalTokensFresh, stats.totalTokensCache)}
             {stats.avgTokensPerTask > 0 && ` · avg ${fmtTokens(stats.avgTokensPerTask)}/task`}
           </div>
         </div>
