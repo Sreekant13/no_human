@@ -523,6 +523,15 @@ export default function App() {
   const [showNewTask, setShowNewTask] = useState(false);
   const [page, setPage] = useState("board");
   const [workerStatus, setWorkerStatus] = useState(null);
+  // Theme: persisted choice, else the OS preference. Light mode was fully built
+  // but unreachable (no toggle) — this exposes it.
+  const [theme, setTheme] = useState(() =>
+    localStorage.getItem("nh-theme")
+    || (window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark"));
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("nh-theme", theme);
+  }, [theme]);
   // null = checking; false = needs onboarding; true = onboarded. Fail-open so a
   // missing/old endpoint never blocks an existing user at the board.
   const [onboarded, setOnboarded] = useState(null);
@@ -667,6 +676,14 @@ export default function App() {
         </nav>
         <div className="nh-header-right">
           <span className="legion-credit">Developed by eyalgolan</span>
+          <button
+            className="nh-theme-toggle"
+            onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+            title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+            aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+          >
+            {theme === "dark" ? "☀" : "☾"}
+          </button>
           {page === "board" && (
             <button className="btn btn-new-task" onClick={() => setShowNewTask(true)}>+ New Task</button>
           )}
