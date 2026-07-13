@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchMetrics, fetchRepos, fetchRepoUnderstanding } from "./api.js";
+import { fetchMetrics, fetchRepos, fetchRepoUnderstanding, searchEvents } from "./api.js";
 import { estimateCost, fmtTokens } from "./cost.js";
 import { northStarTiles } from "./northStar.js";
 import { profileRows, profileStatus } from "./repoView.js";
+import { kindLabel, groupByTask } from "./searchView.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -401,6 +402,68 @@ function RepoUnderstanding() {
   );
 }
 
+// C3-G4: cross-task search over the failure/fix record (events_fts). Debounced;
+// results grouped by task. Answers "how was a failure like this handled before?"
+function SessionSearch() {
+  const [q, setQ] = useState("");
+  const [results, setResults] = useState([]);
+  const [searched, setSearched] = useState(false);
+
+  useEffect(() => {
+    const term = q.trim();
+    if (!term) { setResults([]); setSearched(false); return; }
+    let ignore = false;
+    const h = setTimeout(() => {
+      searchEvents(term).then((r) => {
+        if (ignore) return;
+        setResults(r);
+        setSearched(true);
+      });
+    }, 250);   // debounce so each keystroke isn't a request
+    return () => { ignore = true; clearTimeout(h); };
+  }, [q]);
+
+  const groups = groupByTask(results);
+
+  return (
+    <div className="stats-section" data-testid="session-search">
+      <h3 className="stats-section-title">Search history</h3>
+      <div className="stats-section-sub">
+        Full-text search across every task's failures, reviews, and blockers
+      </div>
+      <input
+        type="search"
+        className="session-search-input"
+        data-testid="session-search-input"
+        placeholder="e.g. ImportError, timeout, tamper…"
+        value={q}
+        onChange={(e) => setQ(e.target.value)}
+      />
+      {searched && groups.length === 0 && (
+        <div className="stats-section-sub">No matches.</div>
+      )}
+      {groups.length > 0 && (
+        <ul className="session-search-results">
+          {groups.map((g) => (
+            <li key={g.task_id} className="session-search-group">
+              <div className="session-search-task">
+                <span className="session-search-taskid">{g.task_id.slice(0, 8)}</span>
+                {g.task_title}
+              </div>
+              {g.hits.map((h, i) => (
+                <div key={i} className="session-search-hit">
+                  <span className="session-search-kind">{kindLabel(h.kind)}</span>
+                  <span className="session-search-snippet">{h.snippet}</span>
+                </div>
+              ))}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 export default function Stats({ tasks }) {
   const stats = useMemo(() => computeStats(tasks), [tasks]);
   const [metrics, setMetrics] = useState(null);
@@ -550,6 +613,9 @@ export default function Stats({ tasks }) {
 
       {/* Repository Understanding (C3-G3) */}
       <RepoUnderstanding />
+
+      {/* Cross-task session search (C3-G4) */}
+      <SessionSearch />
 
       {/* Task table */}
       <div className="stats-section">

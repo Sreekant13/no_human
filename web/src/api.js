@@ -284,6 +284,19 @@ export async function fetchRepoUnderstanding(path) {
   }
 }
 
+// C3-G4: cross-task full-text search over the failure/fix record. [] on any
+// error or empty query so the search box degrades quietly.
+export async function searchEvents(q) {
+  if (!q || !q.trim()) return [];
+  try {
+    const r = await fetch(`${BASE}/api/search?q=${encodeURIComponent(q)}`);
+    if (!r.ok) return [];
+    return await r.json();   // await so a malformed body rejects INSIDE this try
+  } catch {
+    return [];
+  }
+}
+
 // The north-star numbers straight from the record (PRs merged/opened,
 // tokens-per-PR, review verdicts, cache economics). Null when unavailable so
 // Stats degrades to its client-side aggregates.
