@@ -45,11 +45,16 @@ class Bounds:
     # tokens without any cap ever firing. Exceeding either cap raises a
     # BUDGET_EXHAUSTED blocker whose option can raise the budget for that one
     # task — the human decides, the loop never silently continues. 9 attempts =
-    # three full bounded loops; 25M tokens sits just above the worst observed
-    # single-task burn, so the next task to approach that record parks instead
-    # of setting a new one.
+    # three full bounded loops. 8M tokens: the enterprise profile now bills PER
+    # TOKEN, so the cap is a cost guardrail, not just a doom-loop stop. Measured
+    # 2026-07-13 (29 tasks): the largest PR-producing task burned 6.15M and every
+    # other success ≤1.71M — NO success sat above 6.15M. Six failed/parked tasks
+    # sat above 8M (CI_GATE 61.5M + 10.18M, metrics-core 20.8M, and ordinary failed feature
+    # tasks at 22.8M/15M/12.7M). So 8M clears every real success with headroom and
+    # parks a runaway an order of magnitude sooner than the old 25M did (which the
+    # 61.5M task blew past entirely, across resumes).
     lifetime_attempts: int = 9
-    lifetime_tokens: int = 25_000_000
+    lifetime_tokens: int = 8_000_000
 
     @staticmethod
     def from_config(cfg: dict | None) -> "Bounds":

@@ -74,11 +74,27 @@ async def test_token_cap_fires_even_with_few_attempts(store):
     """One monster attempt (the 3.4M-cache-read shape) must count."""
     t = Task.new("burn", repo_path="/tmp/x")
     await store.create_task(t)
-    await _spend(store, t.id, attempts=2, tokens_each=13_000_000)  # 26M > 25M
+    await _spend(store, t.id, attempts=2, tokens_each=13_000_000)  # 26M > 8M cap
 
     b = await _orch(store)._check_lifetime_budget(t)
     assert b is not None
     assert "tokens" in b.root_cause_hypothesis
+
+
+async def test_default_token_cap_parks_a_9M_burn(store):
+    """The 8M default (measured 2026-07-13): the largest PR-producing task in the
+    corpus burned 6.15M; everything else that succeeded was ≤1.71M. Only the parked
+    CI_GATE/metrics-core runaways (20.8M, 61.5M) sat above 8M. A ~9M task must park under the
+    DEFAULT — it would NOT have parked at the old 25M cap."""
+    from no_human.core.bounds import Bounds
+    assert Bounds().lifetime_tokens == 8_000_000
+
+    t = Task.new("nine-million", repo_path="/tmp/x")
+    await store.create_task(t)
+    await _spend(store, t.id, attempts=2, tokens_each=4_500_000)  # 9M > 8M, < old 25M
+
+    b = await _orch(store)._check_lifetime_budget(t)  # default bounds, no override
+    assert b is not None and "tokens" in b.root_cause_hypothesis
 
 
 async def test_the_raise_option_actually_raises_and_unblocks(store):
