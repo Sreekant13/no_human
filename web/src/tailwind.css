@@ -1,0 +1,15 @@
+/* Task 5.0 token-bridge entry.
+   base    = Preflight, gated OFF by corePlugins.preflight (see tailwind.config.js).
+   utilities/components carry the bridged color/font tokens.
+
+   PRECEDENCE (important): Tailwind v3 emits FLAT CSS — no @layer at-rules — so
+   nothing here wins by cascade layer. What keeps the un-migrated plain-CSS screens
+   pixel-stable is SOURCE ORDER: main.jsx imports this file BEFORE styles.css, so at
+   equal specificity the later styles.css rule wins. KEEP THIS IMPORT FIRST —
+   reordering silently flips precedence and Tailwind utilities start overriding
+   un-migrated component CSS. (tokenBridge.test.mjs pins the order.)
+   Corollary for migration: a migrated element must DROP the old class, not merely
+   add a bridged color utility, since the utility is emitted before styles.css. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
