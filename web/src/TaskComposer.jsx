@@ -1,0 +1,426 @@
+import { useState, useEffect, useRef } from "react";
+import { fetchProjects, fetchConfig } from "./api.js";
+import { COMPOSER_KINDS, kindByValue, needsPrUrl } from "./composerKinds.js";
+import { splitPrompt } from "./promptSplit.js";
+import { greetingName } from "./greeting.js";
+import { hasPrRef } from "./prRefs.js";
+import { formatBytes } from "./formatBytes.js";
+import { pluralize } from "./pluralize.js";
+import { useEscapeKey } from "./useEscapeKey.js";
+
+// The new-task composer (Task 5A) — one prompt, kind chips, inline controls.
+//
+// FIRST screen migrated to Tailwind (Task 5.0 bridge): utilities resolve to the
+// same CSS variables the plain-CSS screens use, so light/dark come from the
+// existing [data-theme] blocks.
+//
+// It owns the composed spec and hands it to the parent, which runs the intake
+// grill exactly as the old form branch did. It never creates the task itself.
+// The parent re-seeds it via `initial` so a failed grill never loses the prompt.
+
+// ONE control system. Two Preflight-off hazards are handled here, once:
+//   1. `border` alone sets border-WIDTH. Preflight normally supplies
+//      `border-style: solid`; without it the computed style stays `none`, which
+//      forces the width back to 0 — the border vanishes on a <div>, and a <button>
+//      falls back to the UA `outset` bevel. Every bordered control states
+//      `border-solid` explicitly. (Measured in Chromium: 0px/none without it.)
+//   2. A control that states no background keeps the native `buttonface` grey.
+// Surface rule: a control sits on `bg-panel` (the input surface) or on `bg-card`
+// (the dialog) and takes the OTHER token as its fill, so its edge always reads.
+// (Never use an /opacity modifier on a bridged colour: the tokens are hex, not
+// channel triplets, so `bg-accent/30` would not resolve.)
+const CTL =
+  "inline-flex h-10 shrink-0 cursor-pointer items-center justify-center rounded-full " +
+  "border border-solid font-ui text-sm transition-colors";
+const ON_PANEL = `${CTL} border-line bg-card text-text-muted hover:bg-hover hover:text-text`;
+const ON_CARD = `${CTL} border-line bg-panel text-text-muted hover:bg-hover hover:text-text`;
+// `text-base` is the --base token: dark ink on the light-blue dark-theme accent,
+// near-white on the strong light-theme accent — the trick .btn-approve already
+// used. Plain `text-white` reads at 2.85:1 on the dark accent, a WCAG AA failure
+// on the primary action.
+const ACCENT = `${CTL} border-accent bg-accent text-base hover:border-accent-600 hover:bg-accent-600`;
+const GHOST = `${CTL} border-transparent bg-transparent text-text-muted hover:text-text`;
+
+const SELECT =
+  "w-full cursor-pointer appearance-none border-0 bg-transparent p-0 pr-6 font-ui " +
+  "text-sm text-text outline-none";
+
+const TEXT_FIELD =
+  "h-10 w-full rounded-full border border-solid border-line bg-panel px-5 font-mono " +
+  "text-sm text-text outline-none transition-colors placeholder:text-text-muted " +
+  "focus:border-accent";
+
+// A <select> dressed as a control: the native caret is stripped and redrawn in a
+// token colour. `outline-none` on the <select> would leave a keyboard user with no
+// focus indication at all, so the wrapper carries the focus state instead.
+function SelectPill({ children, onPanel = false, grow = false, ...rest }) {
+  return (
+    <div
+      className={
+        `${onPanel ? ON_PANEL : ON_CARD} relative px-5 focus-within:border-accent ` +
+        (grow ? "min-w-0 flex-1 justify-start" : "")
+      }
+    >
+      <select className={SELECT} {...rest}>
+        {children}
+      </select>
+      <span
+        aria-hidden="true"
+        className="pointer-events-none absolute right-4 font-ui text-xs text-text-muted"
+      >
+        ▾
+      </span>
+    </div>
+  );
+}
+
+export default function TaskComposer({ busy, error, initial, onStart, onClose }) {
+  // Seeded from `initial`: the parent unmounts this component for the duration of
+  // the grill, so a grill that FAILS would otherwise drop the operator back into an
+  // empty composer — prompt, attachments, kind and PR URL all gone.
+  const [prompt, setPrompt] = useState(initial?.prompt ?? "");
+  const [kind, setKind] = useState(initial?.kind ?? "feature");
+  const [prUrl, setPrUrl] = useState(initial?.prUrl ?? "");
+  const [priority, setPriority] = useState(initial?.priority ?? "medium");
+  const [backend, setBackend] = useState(initial?.backend ?? "claude");
+  const [files, setFiles] = useState(initial?.files ?? []);
+  const [projects, setProjects] = useState([]);
+  const [selectedProjectId, setSelectedProjectId] = useState(initial?.projectId ?? "");
+  const [repoPath, setRepoPath] = useState(initial?.repoPath ?? "");
+  const [customRepo, setCustomRepo] = useState(Boolean(initial?.customRepo));
+  const [config, setConfig] = useState(null);
+  const fileInputRef = useRef(null);
+  const dialogRef = useRef(null);
+
+  // Escape closes the composer — suppressed while a submit is in flight so it
+  // cannot discard a task that is already being created.
+  useEscapeKey(onClose, !busy);
+
+  useEffect(() => {
+    fetchProjects().then((p) => {
+      setProjects(p || []);
+      // Only default the project when none is chosen — a re-seeded composer must
+      // keep the operator's pick.
+      setSelectedProjectId((cur) => cur || (p && p.length > 0 ? p[0].id : ""));
+    });
+    // The greeting is best-effort: no config, no name, no error.
+    fetchConfig().then(setConfig).catch(() => {});
+  }, []);
+
+  // `role="dialog" aria-modal` promises the rest of the page is inert, but no
+  // browser enforces that for Tab. Keep focus inside, and hand it back on close.
+  useEffect(() => {
+    const previous = document.activeElement;
+    function onKeyDown(e) {
+      if (e.key !== "Tab" || !dialogRef.current) return;
+      const items = [...dialogRef.current.querySelectorAll("button, select, textarea, input")]
+        .filter((el) => !el.disabled && el.type !== "file" && el.offsetParent !== null);
+      if (items.length === 0) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      if (previous && typeof previous.focus === "function") previous.focus();
+    };
+  }, []);
+
+  const { title, description } = splitPrompt(prompt);
+  const name = greetingName(config);
+  const project = projects.find((p) => p.id === selectedProjectId);
+  const selectedChip = kindByValue(kind);
+
+  // A code_review task is failed by the backend unless a PR/MR ref reaches it in
+  // the title or description, so submit stays closed until one does. The prompt
+  // counts too — pasting the URL there must never be blocked by the URL field.
+  const prRefMissing = needsPrUrl(kind) && !hasPrRef(prompt) && !hasPrRef(prUrl);
+  const hasRepo = customRepo ? repoPath.trim() : selectedProjectId || repoPath.trim();
+  const canSubmit = Boolean(title) && Boolean(hasRepo) && !prRefMissing && !busy;
+  // With no projects, the free-text path IS the only input — a toggle there would
+  // be a no-op button whose only effect is wiping what was typed.
+  const showRepoToggle = projects.length > 0;
+  const freeTextRepo = customRepo || projects.length === 0;
+
+  function handleSubmit(e) {
+    if (e) e.preventDefault();
+    if (!canSubmit) return;
+    // The PR URL rides in the description — that is where parse_pr_refs looks.
+    const fullDescription =
+      [description, needsPrUrl(kind) ? prUrl.trim() : ""].filter(Boolean).join("\n\n") || null;
+    onStart({
+      title,
+      description: fullDescription,
+      kind,
+      priority,
+      backend,
+      files,
+      repoPath: freeTextRepo ? repoPath.trim() || null : repoPath || null,
+      projectId: !customRepo && selectedProjectId ? selectedProjectId : null,
+      // Echoed back as `initial` if the grill fails, so nothing typed is lost.
+      prompt,
+      prUrl,
+      customRepo,
+    });
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/70 p-4 backdrop-blur-sm sm:items-center sm:p-8"
+      onClick={onClose}
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="New task"
+        className="relative max-h-[90vh] w-full max-w-5xl overflow-y-auto rounded-3xl border border-solid border-line bg-card px-6 py-10 shadow-2xl sm:px-14 sm:py-12"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close"
+          className={`${GHOST} absolute right-5 top-5 w-10 text-lg hover:bg-hover`}
+        >
+          ×
+        </button>
+
+        <div className="mb-9 text-center">
+          <h2 className="font-display text-4xl font-semibold tracking-tight text-text-hi sm:text-5xl">
+            {name ? `Hey there, ${name}` : "Hey there"}
+          </h2>
+          <p className="mt-3 font-ui text-base text-text-muted">What should I work on?</p>
+        </div>
+
+        <form onSubmit={handleSubmit} className={busy ? "pointer-events-none opacity-60" : ""}>
+          {/* One large input surface: the prompt and the controls that qualify it. */}
+          <div className="rounded-2xl border border-solid border-line bg-panel p-4 transition-colors focus-within:border-accent sm:p-5">
+            <textarea
+              className="min-h-[180px] w-full resize-none border-0 bg-transparent px-2 py-1 font-ui text-lg leading-relaxed text-text outline-none placeholder:text-text-muted sm:min-h-[200px]"
+              autoFocus
+              placeholder="Describe the task. The first line becomes its title."
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              onKeyDown={(e) => {
+                // Cmd/Ctrl+Enter submits, the way every chat composer does.
+                if ((e.metaKey || e.ctrlKey) && e.key === "Enter") handleSubmit(e);
+              }}
+            />
+
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={(e) => setFiles(Array.from(e.target.files || []))}
+              />
+              <button
+                type="button"
+                className={`${ON_PANEL} w-10 text-lg`}
+                onClick={() => fileInputRef.current?.click()}
+                title="Attach screenshots or documents — the agent reads them"
+                aria-label="Attach files"
+              >
+                +
+              </button>
+
+              <SelectPill
+                onPanel
+                value={priority}
+                onChange={(e) => setPriority(e.target.value)}
+                aria-label="Priority"
+              >
+                <option value="high">high priority</option>
+                <option value="medium">medium priority</option>
+                <option value="low">low priority</option>
+              </SelectPill>
+
+              {/* Segmented control: one pill, two halves — same height as its siblings. */}
+              <div
+                role="radiogroup"
+                aria-label="Backend"
+                className="flex h-10 shrink-0 overflow-hidden rounded-full border border-solid border-line"
+              >
+                {[
+                  { id: "claude", label: "Claude Code" },
+                  { id: "devin", label: "Devin" },
+                ].map((b) => (
+                  <button
+                    key={b.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={backend === b.id}
+                    onClick={() => setBackend(b.id)}
+                    className={
+                      "cursor-pointer border-0 px-5 font-ui text-sm transition-colors " +
+                      (backend === b.id
+                        ? "bg-accent text-base"
+                        : "bg-card text-text-muted hover:bg-hover hover:text-text")
+                    }
+                  >
+                    {b.label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="ml-auto flex items-center gap-2">
+                <button type="button" className={`${GHOST} px-5`} onClick={onClose}>
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={!canSubmit}
+                  className={`${ACCENT} px-6 font-medium disabled:cursor-not-allowed disabled:opacity-40`}
+                >
+                  {busy ? "Exploring repo…" : "Next →"}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* What shape of work this is. One choice out of many → radios, not toggles. */}
+          <div role="radiogroup" aria-label="Task kind" className="mt-4 flex flex-wrap gap-2">
+            {COMPOSER_KINDS.map((chip) => {
+              const selected = chip.kind === kind;
+              return (
+                <button
+                  key={chip.kind}
+                  type="button"
+                  role="radio"
+                  aria-checked={selected}
+                  onClick={() => setKind(chip.kind)}
+                  className={`${selected ? ACCENT : ON_CARD} px-5`}
+                >
+                  {chip.label}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* The hint lived only in a `title` tooltip — invisible to keyboard and
+              touch users. Show the selected kind's meaning instead. */}
+          {selectedChip && (
+            <p className="mt-2 px-5 font-ui text-sm text-text-muted">{selectedChip.hint}</p>
+          )}
+
+          {needsPrUrl(kind) && (
+            <div className="mt-3">
+              <input
+                className={TEXT_FIELD}
+                placeholder="https://github.com/owner/repo/pull/123"
+                value={prUrl}
+                onChange={(e) => setPrUrl(e.target.value)}
+                aria-label="PR or MR URL"
+                aria-describedby="pr-url-hint"
+              />
+              <p
+                id="pr-url-hint"
+                role={prRefMissing ? "alert" : undefined}
+                className={`mt-2 px-5 font-ui text-sm ${prRefMissing ? "" : "text-text-muted"}`}
+                style={prRefMissing ? { color: "var(--red)" } : undefined}
+              >
+                {prRefMissing
+                  ? "Paste the PR/MR to review — a full URL, or a “host/owner/repo PR #123” reference."
+                  : "The agent fetches this diff, reviews it, and drafts comments for your approval."}
+              </p>
+            </div>
+          )}
+
+          {/* Where the work happens. */}
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            {!freeTextRepo ? (
+              <SelectPill
+                grow
+                value={selectedProjectId}
+                onChange={(e) => {
+                  setSelectedProjectId(e.target.value);
+                  // Otherwise a repo picked inside the OLD project rides along.
+                  setRepoPath("");
+                }}
+                aria-label="Project"
+              >
+                {projects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} ({p.repo_paths.length} {pluralize(p.repo_paths.length, "repo")})
+                  </option>
+                ))}
+              </SelectPill>
+            ) : (
+              <input
+                className={`${TEXT_FIELD} min-w-0 flex-1`}
+                placeholder="~/git/my-project"
+                value={repoPath}
+                onChange={(e) => setRepoPath(e.target.value)}
+                aria-label="Repository path"
+              />
+            )}
+
+            {!freeTextRepo && project && project.repo_paths.length > 1 && (
+              <SelectPill
+                value={repoPath || project.primary_repo || project.repo_paths[0]}
+                onChange={(e) => setRepoPath(e.target.value)}
+                aria-label="Repository"
+              >
+                {project.repo_paths.map((rp) => (
+                  <option key={rp} value={rp}>
+                    {rp.split("/").pop()}
+                    {rp === project.primary_repo ? " (primary)" : ""}
+                  </option>
+                ))}
+              </SelectPill>
+            )}
+
+            {showRepoToggle && (
+              <button
+                type="button"
+                className={`${ON_CARD} px-5`}
+                onClick={() => {
+                  const next = !customRepo;
+                  setCustomRepo(next);
+                  // Leaving custom mode clears the free text and restores a project;
+                  // ENTERING it keeps whatever was already typed.
+                  if (!next) {
+                    setRepoPath("");
+                    setSelectedProjectId(projects[0]?.id || "");
+                  }
+                }}
+              >
+                {customRepo ? "back to projects" : "custom path"}
+              </button>
+            )}
+          </div>
+
+          {projects.length === 0 && (
+            <p className="mt-2 px-5 font-ui text-sm text-text-muted">
+              No projects yet — give the path of the repo to work in.
+            </p>
+          )}
+
+          {files.length > 0 && (
+            <div className="mt-3 px-5 font-ui text-sm text-text-muted">
+              {files.map((f) => `${f.name} (${formatBytes(f.size)})`).join(", ")}
+            </div>
+          )}
+
+          {error && (
+            <div
+              className="mt-4 rounded-2xl px-5 py-4 font-ui text-sm"
+              style={{ color: "var(--red)", background: "var(--red-dim)" }}
+            >
+              {error}
+            </div>
+          )}
+        </form>
+      </div>
+    </div>
+  );
+}

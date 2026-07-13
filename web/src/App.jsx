@@ -1,14 +1,15 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { connectWS, createTask, uploadAttachment, fetchTasks, fetchProjects, fetchWorkerStatus, fetchOnboardingStatus, grillStep, grillStepSSE } from "./api.js";
+import { connectWS, createTask, uploadAttachment, fetchTasks, fetchWorkerStatus, fetchOnboardingStatus, grillStep, grillStepSSE } from "./api.js";
 import Board from "./Board.jsx";
 import Settings from "./Settings.jsx";
 import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
+import TaskComposer from "./TaskComposer.jsx";
 import { LegionLogo } from "./Logo.jsx";
 import { newlyNeedsYou, notificationBody, titleWithBadge } from "./notifications.js";
 import { setFavicon } from "./favicon.js";
-import { formatBytes } from "./formatBytes.js";
-import { pluralize } from "./pluralize.js";
+import { needsPrUrl } from "./composerKinds.js";
+import { hasPrRef } from "./prRefs.js";
 import { shouldTriggerNewTask } from "./keyboardShortcut.js";
 import { isNeedsYou } from "./boardLanes.js";
 import { useEscapeKey } from "./useEscapeKey.js";
@@ -89,18 +90,11 @@ function Spinner() {
 }
 
 function NewTaskModal({ onClose, onCreated }) {
-  const [title, setTitle] = useState("");
-  const [description, setDescription] = useState("");
-  const [repoPath, setRepoPath] = useState("");
-  const [kind, setKind] = useState("feature");
-  const [priority, setPriority] = useState("medium");
-  const [backend, setBackend] = useState("claude");
+  // The composed spec, handed over by TaskComposer when the operator hits Next.
+  // Null until then — the composer owns its own field state (see TaskComposer.jsx).
+  const [fields, setFields] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
-  const [files, setFiles] = useState([]);  // screenshots / documents to attach
-  const [projects, setProjects] = useState([]);
-  const [selectedProjectId, setSelectedProjectId] = useState("");
-  const [customRepo, setCustomRepo] = useState(false);
   // B2: grill state
   const [grillMode, setGrillMode] = useState(false);
   const [grillQA, setGrillQA] = useState([]);
@@ -110,36 +104,43 @@ function NewTaskModal({ onClose, onCreated }) {
   const [grillEvents, setGrillEvents] = useState([]);
   const [evalVerdict, setEvalVerdict] = useState(null);
   const grillStreamRef = useRef(null);
-  // Escape closes the dialog — same escape route the overlay-click already
-  // gives, but for keyboard users. Suppressed while a submit is in flight so
-  // Escape can't discard a task that's already being created.
-  useEscapeKey(onClose, !busy);
-  useEffect(() => {
-    fetchProjects().then((p) => {
-      setProjects(p || []);
-      if (p && p.length > 0) setSelectedProjectId(p[0].id);
-    });
-  }, []);
+  // Escape closes the dialog — same escape route the overlay-click already gives,
+  // but for keyboard users. Suppressed while a submit is in flight so Escape can't
+  // discard a task that's already being created. Bound ONLY on the grill branches:
+  // the composer binds its own, and a state where both are mounted (a failed grill)
+  // would otherwise fire onClose twice.
+  const showingGrill = grillMode || Boolean(grillResult);
+  useEscapeKey(onClose, !busy && showingGrill);
 
   async function handleSubmit(e) {
     if (e) e.preventDefault();
-    if (!title.trim() || busy) return;
+    if (!fields || busy) return;
     setBusy(true);
     setError(null);
     try {
+      const title = grillResult?.title || fields.title;
+      let description = grillResult?.description || fields.description;
+      // The grill REWRITES the spec, and its prompt has no instruction to preserve
+      // URLs. A code_review task whose refined text dropped the PR link would be
+      // failed at the gate (orchestrator: parse_pr_refs over title+description), so
+      // re-attach the operator's original reference when the rewrite lost it.
+      if (needsPrUrl(fields.kind) && !hasPrRef(`${title} ${description || ""}`)) {
+        const original = [fields.prUrl?.trim(), fields.description].find(hasPrRef);
+        if (original) description = [description, original].filter(Boolean).join("\n\n");
+      }
       const created = await createTask({
-        title: grillResult?.title || title.trim(),
-        description: grillResult?.description || description.trim() || null,
-        repo_path: customRepo ? repoPath.trim() || null : (repoPath || null),
-        project_id: !customRepo && selectedProjectId ? selectedProjectId : null,
-        kind,
-        priority,
+        title,
+        description,
+        repo_path: fields.repoPath,
+        project_id: fields.projectId,
+        kind: fields.kind,
+        priority: fields.priority,
         acceptance_criteria: grillResult?.acceptance_criteria || [],
-        backend,
+        backend: fields.backend,
       });
       // Attach any screenshots/documents to the new task (best-effort — a failed
       // upload must not lose the task that was already created).
-      for (const f of files) {
+      for (const f of fields.files || []) {
         try { await uploadAttachment(created.id, f); }
         catch (err) { console.error("attachment upload failed", f.name, err); }
       }
@@ -152,11 +153,15 @@ function NewTaskModal({ onClose, onCreated }) {
     }
   }
 
-  function _grillParams(qaOverride) {
+  // `spec` defaults to the committed fields; startGrill passes them explicitly
+  // because it runs in the same tick as setFields (state is not yet visible).
+  function _grillParams(qaOverride, spec = fields) {
     return {
-      title: title.trim(), description: description.trim() || null,
-      repo_path: customRepo ? repoPath.trim() || null : null,
-      project_id: !customRepo && selectedProjectId ? selectedProjectId : null,
+      title: spec.title, description: spec.description,
+      // A project resolves its own repo server-side, so repo_path is sent only
+      // when there is no project — preserving the pre-composer behaviour.
+      repo_path: spec.projectId ? null : spec.repoPath,
+      project_id: spec.projectId,
       qa_history: qaOverride ?? [],
     };
   }
@@ -185,11 +190,12 @@ function NewTaskModal({ onClose, onCreated }) {
     );
   }
 
-  function startGrill() {
-    if (!title.trim() || busy) return;
+  function startGrill(spec) {
+    if (!spec?.title || busy) return;
+    setFields(spec);
     setBusy(true); setError(null); setGrillMode(true);
     setGrillQA([]); setGrillQuestion(null); setGrillResult(null); setEvalVerdict(null);
-    _startGrillSSE(_grillParams([]));
+    _startGrillSSE(_grillParams([], spec));
   }
 
   function submitGrillAnswer() {
@@ -339,8 +345,8 @@ function NewTaskModal({ onClose, onCreated }) {
               onClick={async () => {
                 setBusy(true); setError(null);
                 try {
-                  const step = await grillStep({ title: title.trim(), description: description.trim() || null, repo_path: customRepo ? repoPath.trim() || null : null, project_id: !customRepo && selectedProjectId ? selectedProjectId : null, qa_history: [...grillQA, { question: grillQuestion.question, answer: "(skip \u2014 use what you have)" }] });
-                  if (step.type === "done") { setGrillResult(step); setGrillQuestion(null); } else { setGrillResult({ title: step.title || title.trim(), description: step.description || description.trim(), acceptance_criteria: step.acceptance_criteria || [] }); setGrillQuestion(null); }
+                  const step = await grillStep(_grillParams([...grillQA, { question: grillQuestion.question, answer: "(skip \u2014 use what you have)" }]));
+                  if (step.type === "done") { setGrillResult(step); setGrillQuestion(null); } else { setGrillResult({ title: step.title || fields.title, description: step.description || fields.description, acceptance_criteria: step.acceptance_criteria || [] }); setGrillQuestion(null); }
                 } catch (err) { setError(err.message); }
                 finally { setBusy(false); }
               }}>Skip &amp; finish</button>
@@ -352,169 +358,16 @@ function NewTaskModal({ onClose, onCreated }) {
   }
 
   return (
-    <div className="sendback-overlay" onClick={onClose}>
-      <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
-        <div className="sendback-label">New Task</div>
-        <form onSubmit={(e) => { e.preventDefault(); startGrill(); }} style={busy ? { opacity: 0.6, pointerEvents: 'none' } : {}}>
-          <div className="ntm-field">
-            <label className="ntm-label">Title</label>
-            <input
-              className="new-task-input ntm-title"
-              placeholder="What needs to be done?"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              autoFocus
-            />
-          </div>
-          <div className="ntm-field">
-            <label className="ntm-label">Description</label>
-            <textarea
-              className="sendback-textarea"
-              placeholder="Additional context, constraints, or acceptance criteria (optional)"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              rows={3}
-            />
-          </div>
-          <div className="ntm-field">
-            <label className="ntm-label">Attachments <span className="ntm-hint">(screenshots, documents — the agent reads them)</span></label>
-            <input
-              type="file"
-              className="ntm-file"
-              multiple
-              onChange={(e) => setFiles(Array.from(e.target.files || []))}
-            />
-            {files.length > 0 && (
-              <div className="ntm-file-list">
-                {files.map((f) => `${f.name} (${formatBytes(f.size)})`).join(", ")}
-              </div>
-            )}
-          </div>
-          <hr className="ntm-section-divider" />
-          <div className="ntm-field">
-            <label className="ntm-label">Repository</label>
-            {!customRepo ? (
-              <>
-                {projects.length > 0 ? (
-                  <div className="new-task-row">
-                    <select
-                      className="new-task-select"
-                      value={selectedProjectId}
-                      onChange={(e) => setSelectedProjectId(e.target.value)}
-                    >
-                      {projects.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.name} ({p.repo_paths.length} {pluralize(p.repo_paths.length, "repo")})
-                        </option>
-                      ))}
-                    </select>
-                    <button
-                      type="button"
-                      className="btn btn-sendback btn-sm"
-                      onClick={() => { setCustomRepo(true); setRepoPath(''); }}
-                      title="Use a repo path not in any project"
-                    >custom path</button>
-                  </div>
-                ) : (
-                  <div className="ntm-hint">
-                    No projects yet.
-                    <button
-                      type="button"
-                      className="btn btn-sendback btn-sm"
-                      style={{ marginLeft: '8px' }}
-                      onClick={() => setCustomRepo(true)}
-                    >use repo path</button>
-                  </div>
-                )}
-                {selectedProjectId && (() => {
-                  const proj = projects.find(p => p.id === selectedProjectId);
-                  if (!proj || proj.repo_paths.length <= 1) return null;
-                  return (
-                    <div className="new-task-row" style={{ marginTop: '8px' }}>
-                      <select
-                        className="new-task-select"
-                        value={repoPath || proj.primary_repo || proj.repo_paths[0]}
-                        onChange={(e) => setRepoPath(e.target.value)}
-                      >
-                        {proj.repo_paths.map((rp) => (
-                          <option key={rp} value={rp}>
-                            {rp.split('/').pop()}{rp === proj.primary_repo ? ' (primary)' : ''}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  );
-                })()}
-              </>
-            ) : (
-              <div className="new-task-row">
-                <input
-                  className="new-task-input"
-                  style={{ flex: 1, marginBottom: 0 }}
-                  placeholder="~/git/my-project"
-                  value={repoPath}
-                  onChange={(e) => setRepoPath(e.target.value)}
-                />
-                {projects.length > 0 && (
-                  <button
-                    type="button"
-                    className="btn btn-sendback btn-sm"
-                    onClick={() => { setCustomRepo(false); setSelectedProjectId(projects[0]?.id || ''); setRepoPath(''); }}
-                  >back to projects</button>
-                )}
-              </div>
-            )}
-          </div>
-          <div className="ntm-field">
-            <label className="ntm-label">Classification</label>
-            <div className="new-task-row">
-              <select className="new-task-select" value={kind} onChange={(e) => setKind(e.target.value)}>
-                <option value="feature">feature</option>
-                <option value="bugfix">bugfix</option>
-                <option value="ci_fix">ci_fix</option>
-                <option value="test_gap">test_gap</option>
-                <option value="investigation">investigation</option>
-                <option value="design_doc">design doc</option>
-                <option value="code_review">code_review</option>
-              </select>
-              <select className="new-task-select" value={priority} onChange={(e) => setPriority(e.target.value)}>
-                <option value="high">high</option>
-                <option value="medium">medium</option>
-                <option value="low">low</option>
-              </select>
-            </div>
-          </div>
-          <div className="ntm-field">
-            <label className="ntm-label">Run with</label>
-            <div className="ntm-backend-toggle">
-              <button
-                type="button"
-                className={`ntm-backend-btn${backend === "claude" ? " active" : ""}`}
-                onClick={() => setBackend("claude")}
-              >
-                <span className="ntm-backend-icon">{"\u2318"}</span>
-                Claude Code
-              </button>
-              <button
-                type="button"
-                className={`ntm-backend-btn${backend === "devin" ? " active" : ""}`}
-                onClick={() => setBackend("devin")}
-              >
-                <span className="ntm-backend-icon">{"\u25C7"}</span>
-                Devin
-              </button>
-            </div>
-          </div>
-          {error && <div className="new-task-error">{error}</div>}
-          <div className="sendback-actions">
-            <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
-            <button type="submit" className="btn btn-approve" disabled={!title.trim() || (!selectedProjectId && !repoPath.trim()) || busy}>
-              {busy ? "Exploring repo\u2026" : "Next \u2192"}
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
+    <TaskComposer
+      busy={busy}
+      error={error}
+      // Re-seed after a failed grill: this component was unmounted for the grill's
+      // duration, so without `initial` the operator would come back to an empty
+      // composer with their prompt, attachments and kind gone.
+      initial={fields}
+      onStart={startGrill}
+      onClose={onClose}
+    />
   );
 }
 
@@ -601,6 +454,9 @@ export default function App() {
   useEffect(() => {
     function onKeyDown(e) {
       if (shouldTriggerNewTask(e, { modalOpen: showNewTask })) {
+        // Swallow the keystroke: the composer autofocuses its textarea, so an
+        // un-prevented "n" types itself into the prompt it just opened.
+        e.preventDefault();
         setShowNewTask(true);
       }
     }
