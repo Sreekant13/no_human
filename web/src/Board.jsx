@@ -4,6 +4,12 @@ import SlideOver from "./SlideOver.jsx";
 import { groupFailedByTitle } from "./boardGroups.js";
 import { LANES, routeTask, isWaiting } from "./boardLanes.js";
 import { taskProgress } from "./taskProgress.js";
+import { topByRecency } from "./laneView.js";
+
+// 5B: how many cards a collapsible lane shows before the expand arrow. 4 keeps
+// every lane visible without vertical scroll on a typical viewport; the count
+// badge still shows the true total, so nothing is hidden from awareness.
+const LANE_TOP_N = 4;
 
 export default function Board({ tasks }) {
   const [selectedId, setSelectedId] = useState(null);
@@ -68,6 +74,37 @@ export default function Board({ tasks }) {
 }
 
 function Lane({ lane, tasks, onSelect }) {
+  const [expanded, setExpanded] = useState(false);
+  // Human-gate lanes (Needs Answer, Review PR) NEVER collapse — every task there
+  // needs action; hiding one behind an arrow defeats the board. Only the
+  // in-flight/outcome lanes (Working, Failed, Done), which grow unbounded, do.
+  const collapsible = !lane.needsYou;
+  const isFailed = lane.key === "failed";
+  // U4: the failed lane collapses same-title dupes first; top-N composes with it
+  // by operating on the GROUPED rows (not raw tasks), so counts never double.
+  const rows = isFailed ? groupFailedByTitle(tasks) : tasks;
+
+  // Drop a stale expand once the lane fits within top-N: the Working lane churns
+  // (tasks drain then a new batch arrives), and a lingering expanded=true would
+  // re-inflate the re-grown lane the user never expanded. Resetting while it fits
+  // is invisible (all rows already show) and re-growth then starts collapsed.
+  useEffect(() => {
+    if (expanded && rows.length <= LANE_TOP_N) setExpanded(false);
+  }, [expanded, rows.length]);
+
+  let visible = rows;
+  let hiddenCount = 0;
+  if (collapsible) {
+    const tsOf = isFailed
+      ? (g) => g.task.last_activity || g.task.updated_at || g.task.created_at || ""
+      : undefined;
+    const r = topByRecency(rows, expanded ? rows.length : LANE_TOP_N, tsOf);
+    visible = r.visible;
+    hiddenCount = r.hiddenCount;
+  }
+  const showToggle =
+    collapsible && (hiddenCount > 0 || (expanded && rows.length > LANE_TOP_N));
+
   return (
     <div className={`lane lane-${lane.key}${lane.loud ? " lane-loud" : ""}${tasks.length > 0 ? " lane-has-tasks" : ""}`}>
       <div className="lane-header">
@@ -81,10 +118,10 @@ function Lane({ lane, tasks, onSelect }) {
             <span className="lane-empty-icon" aria-hidden="true">{lane.emptyIcon || "·"}</span>
             <span className="lane-empty-text">{lane.emptyHint || ""}</span>
           </div>
-        ) : lane.key === "failed" ? (
+        ) : isFailed ? (
           // U4: same-title failures collapse to the newest + a count — one
           // stubborn task retried five ways must not bury the board.
-          groupFailedByTitle(tasks).map(({ task, collapsedCount }) => (
+          visible.map(({ task, collapsedCount }) => (
             <div key={task.id} className="failed-group">
               <TaskCard
                 task={task}
@@ -101,7 +138,7 @@ function Lane({ lane, tasks, onSelect }) {
             </div>
           ))
         ) : (
-          tasks.map((task) => (
+          visible.map((task) => (
             <TaskCard
               key={task.id}
               task={task}
@@ -111,6 +148,20 @@ function Lane({ lane, tasks, onSelect }) {
               onClick={(e) => onSelect(task.id, e.currentTarget)}
             />
           ))
+        )}
+        {showToggle && (
+          <button
+            type="button"
+            className={`lane-more${expanded ? " lane-more-open" : ""}`}
+            aria-expanded={expanded}
+            aria-label={expanded ? `Show fewer in ${lane.label}` : `Show ${hiddenCount} more in ${lane.label}`}
+            onClick={() => setExpanded((v) => !v)}
+          >
+            <span className="lane-more-text">
+              {expanded ? "Show fewer" : `Show ${hiddenCount} more`}
+            </span>
+            <span className="lane-more-arrow" aria-hidden="true">▾</span>
+          </button>
         )}
       </div>
     </div>
