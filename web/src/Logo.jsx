@@ -3,7 +3,7 @@
 export function LegionLogo({ size = 30 }) {
   return (
     <svg className="legion-logo" width={size} height={size} viewBox="0 0 32 32"
-         role="img" aria-label="Legion" fill="none">
+         role="img" aria-label="no_human" fill="none">
       <defs>
         <linearGradient id="legion-grad" x1="0" y1="0" x2="1" y2="1">
           <stop offset="0" stopColor="#4C9AFF" />
