@@ -2,14 +2,41 @@
   "name": "no-human-desktop",
   "version": "0.1.0",
   "private": true,
-  "description": "Desktop shell for the no_human board — attaches to (or launches) the local nh server and wraps it in a native window.",
+  "description": "Desktop shell for the no_human board \u2014 attaches to (or launches) the local nh server and wraps it in a native window.",
   "type": "module",
   "main": "main.mjs",
   "scripts": {
     "desktop": "electron .",
-    "test": "node --test ."
+    "test": "node --test .",
+    "dist": "electron-builder --mac dmg --publish never",
+    "dist:dir": "electron-builder --mac dir --publish never"
   },
   "devDependencies": {
-    "electron": "38.2.1"
+    "electron": "38.2.1",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "dev.nohuman.board",
+    "productName": "no_human",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.mjs",
+      "server.mjs",
+      "preload.cjs",
+      "error.html",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg"
+      ],
+      "identity": null
+    }
+  },
+  "overrides": {
+    "@noble/hashes": "^1.5.0"
   }
 }
