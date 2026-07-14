@@ -78,8 +78,12 @@ class NorthStarCard:
 
     @property
     def corrections_avoided(self) -> int:
-        """Human corrections the original sessions needed, for tasks no_human
-        completed unattended — the babysitting no_human removed."""
+        """Follow-up user messages the original sessions needed, for tasks
+        no_human completed unattended. HONEST LABEL (review F4): this is a
+        PROXY — user_messages-1 counts every follow-up ("thanks", new
+        sub-asks), not only true corrections. Classifying real corrections
+        needs a utility-model pass (future work); every surface says
+        "follow-ups (proxy)" until then."""
         return sum(s.orig_corrections for s in self.ran if s.goal_satisfied)
 
     @property
@@ -219,14 +223,15 @@ def render_northstar_md(card: NorthStarCard,
         "nh side includes coder+reviewer, NOT yet planner/supervisor (B2)",
         f"- Total non-cache tokens: nh {agg['total_nh_tokens']:,} vs original "
         f"{agg['total_orig_tokens']:,}",
-        f"- **Human corrections avoided: {agg['corrections_avoided']}**",
+        f"- **Original-session follow-ups avoided (proxy for corrections): "
+        f"{agg['corrections_avoided']}**",
         f"- Honest-escalation rate on gated tasks: "
         f"{agg['honest_escalation_rate']:.0%}",
         "",
         "## Per-task",
         "",
         "| task | outcome | satisfied | nh tokens | orig tokens | cost ratio | "
-        "orig corrections | notes |",
+        "orig follow-ups (proxy) | notes |",
         "|---|---|---|---|---|---|---|---|",
     ]
     # PRIVACY: only hand-curated (PR-reviewed) core specs get per-task rows

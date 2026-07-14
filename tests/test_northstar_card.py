@@ -114,6 +114,7 @@ def test_render_md_has_headline_and_no_numeric_selfscore():
     card.scores[0].subset = "core"   # only curated rows are rendered
     md = render_northstar_md(card)
     assert "Median token ratio" in md
-    assert "corrections avoided" in md.lower()
+    assert "follow-ups avoided (proxy for corrections)" in md.lower()
+    assert "orig follow-ups (proxy)" in md   # per-task table too (review)
     assert "| ns-1 |" in md
     assert "/10" not in md

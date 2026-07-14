@@ -51,8 +51,9 @@ _MACHINE_DIR_MARKERS = (
 # both the benchmark and the learning miner. Matched against the start of the
 # session's FIRST user message.
 _MACHINE_PROMPT_PREFIXES = (
-    # harvested from src/no_human prompt templates (grep '"You are ' + known
-    # non-"You are" template openers); keep in sync when adding agent prompts
+    # Sources: no_human's own prompt templates (grep '"You are ' in src/)
+    # PLUS the operator's other automation that spawns Claude sessions
+    # (incident-monitor's SRE prompts). Keep in sync when adding agent prompts.
     "You are the Supervisor of an autonomous coding agent",
     "You are the Supervisor reviewing an autonomous coding agent",
     "You are implementing a software task",       # "in/on the repo at" variants
@@ -71,7 +72,7 @@ _MACHINE_PROMPT_PREFIXES = (
     "You are synthesizing the BEST implementation plan",
     "You are an expert SRE analyzing a production",  # issue + incident variants
     "Summarize this context for a developer working on",
-    "Fetch the diff for PR",
+    "Fetch the diff for http",   # template emits "Fetch the diff for {url}"
 )
 
 
