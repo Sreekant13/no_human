@@ -9,12 +9,21 @@
 import { app, BrowserWindow, shell } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEFAULT_ORIGIN, isAppOrigin, probe, waitForServer } from "./server.mjs";
+import {
+  DEFAULT_ORIGIN,
+  ensureServer,
+  isAppOrigin,
+  probe,
+  stopServer,
+} from "./server.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ORIGIN = process.env.NH_ORIGIN || DEFAULT_ORIGIN;
 
 let win = null;
+// E2: retain the ensure result — its child is the ONLY legitimate kill
+// target on quit. An attached (operator-started) server is never stopped.
+let serverState = null;
 
 // Defense-in-depth (review finding): only ever hand web schemes to the OS —
 // the board sanitizes its links today, but the shell must not TRUST that.
@@ -53,12 +62,15 @@ function routeExternally(contents) {
 }
 
 async function loadBoardOrError(w) {
-  if (await waitForServer(ORIGIN, 4000)) {
+  // E2: attach when the operator's server is up; otherwise spawn
+  // `nh start --no-open` and wait. Failure renders error.html — never blank.
+  serverState = await ensureServer({ origin: ORIGIN });
+  if (serverState.status !== "failed") {
     await w.loadURL(ORIGIN);
     return;
   }
   await w.loadFile(path.join(__dirname, "error.html"), {
-    query: { origin: ORIGIN },
+    query: { origin: ORIGIN, reason: serverState.reason },
   });
 }
 
@@ -99,7 +111,11 @@ if (!gotLock) {
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
-  // E1: closing the window quits (tray/hide-on-close arrives in E3). The
-  // shell never owns the server in E1, so quitting never stops nh.
+  // Closing the window quits (tray/hide-on-close arrives in E3). E2: on
+  // quit, stop the server ONLY if this shell spawned it — stopServer's
+  // gating guarantees an attached (operator-owned) server is untouched.
   app.on("window-all-closed", () => app.quit());
+  app.on("before-quit", () => {
+    if (stopServer(serverState)) serverState = null;
+  });
 }
