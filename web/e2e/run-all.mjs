@@ -30,6 +30,7 @@ const SUITES = [
   ["outcomes (3-lane board)", "outcomes.mjs"],
   ["mobile nav", "mobile-nav.mjs"],
   ["live flows (needs :8420)", "live-flows.mjs"],
+  ["electron shell (needs :8420 + desktop install)", "electron-smoke.mjs"],
 ];
 
 const run = (file) =>
