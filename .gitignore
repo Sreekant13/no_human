@@ -34,3 +34,7 @@ web/node_modules/
 # level up and ARE tracked.
 eval/northstar_tasks/generated/
 eval/results/northstar/
+
+# desktop shell
+desktop/node_modules/
+desktop/dist/

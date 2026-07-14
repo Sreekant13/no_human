@@ -1,0 +1,15 @@
+{
+  "name": "no-human-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop shell for the no_human board — attaches to (or launches) the local nh server and wraps it in a native window.",
+  "type": "module",
+  "main": "main.mjs",
+  "scripts": {
+    "desktop": "electron .",
+    "test": "node --test ."
+  },
+  "devDependencies": {
+    "electron": "38.2.1"
+  }
+}

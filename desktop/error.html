@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>no_human — server not reachable</title>
+<style>
+  :root { color-scheme: dark light; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    background: #12141C; color: #E6E8F0;
+    font: 15px/1.6 -apple-system, "SF Pro Text", Helvetica, Arial, sans-serif;
+  }
+  main { max-width: 34rem; padding: 2rem; }
+  h1 { font-size: 1.15rem; margin: 0 0 .75rem; }
+  code {
+    background: #1A1D27; border: 1px solid #2A2E3D; border-radius: 6px;
+    padding: .1rem .4rem; font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: .85em;
+  }
+  .steps { color: #A8ADC0; margin: 1rem 0; }
+  a.retry {
+    display: inline-block; margin-top: 1rem; padding: .5rem 1.1rem;
+    border: 1px solid #4C6FFF; border-radius: 8px; color: #E6E8F0;
+    text-decoration: none;
+  }
+  a.retry:hover { background: #1A1F35; }
+</style>
+<main>
+  <h1>The no_human server isn’t reachable</h1>
+  <p class="steps">
+    The desktop shell attaches to the local server. Start it in a terminal:
+    <br /><code>nh start --no-open</code>
+    <br />then retry. (If <code>nh</code> isn’t installed:
+    <code>uv tool install --editable ~/git/acme/master/no_human</code>)
+  </p>
+  <a class="retry" href="nh://retry">Retry connection</a>
+</main>
