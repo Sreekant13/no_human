@@ -264,6 +264,65 @@ def test_cli_bench_run_wiring_end_to_end(tmp_path, monkeypatch):
     assert "success" in result.output
 
 
+def test_cli_bench_run_survives_a_crashing_task(tmp_path, monkeypatch):
+    """A single task's hard crash (SDK CLI dying on quota saturation killed a
+    LIVE baseline at 3/10 and lost every partial result) must be recorded as
+    crashed and the run must continue to the next spec."""
+    import yaml as _yaml
+    from click.testing import CliRunner
+    from no_human.cli import commands as cmds
+    from no_human.cli.commands import cli
+    from no_human.eval.bench_task import BenchTask
+    from no_human.eval.northstar import BenchScore
+
+    d = tmp_path / "specs"
+    d.mkdir()
+    for i in range(2):
+        spec = BenchTask(id=f"ns-crash{i}", title="t", request="r",
+                         subset="core", runnable=True)
+        (d / f"ns-crash{i}.yaml").write_text(_yaml.safe_dump(spec.to_dict()))
+
+    class _Cfg:
+        data = {"llm": {}}
+        primary_model = "m"
+        review_model = "m"
+        def __getitem__(self, k):
+            return {"safety": {"forbidden_paths": []},
+                    "git": {"never_push_to": []}}[k]
+    monkeypatch.setattr(cmds, "_bootstrap", lambda *a, **kw: (_Cfg(), None))
+
+    calls = []
+
+    class _CrashThenSkip:
+        def __init__(self, *a, **kw): ...
+        async def run_one(self, spec, *, workdir):
+            calls.append(spec.id)
+            if len(calls) == 1:
+                raise RuntimeError("Stream closed")
+            return BenchScore(
+                task_id=spec.id, title=spec.title, outcome_status="skipped",
+                goal_satisfied=None, escalated_honestly=False, mergeable=None,
+                nh_tokens=0, nh_cache_tokens=0, nh_cache_creation_tokens=0,
+                nh_turns=0, nh_wall_clock_s=0.0, orig_tokens=0,
+                orig_cache_tokens=0, orig_cache_creation_tokens=0,
+                orig_wall_clock_s=0.0, orig_corrections=0,
+                subset=spec.subset, notes="stub")
+    monkeypatch.setattr("no_human.eval.northstar.NorthStarRunner", _CrashThenSkip)
+    monkeypatch.setattr("no_human.eval.northstar_card.RESULTS_DIR", tmp_path / "res")
+    monkeypatch.setattr("no_human.eval.northstar_card.REPORT_MD",
+                        tmp_path / "NS.md")
+
+    result = CliRunner().invoke(cli, ["bench", "run", "--specs-dir", str(d)])
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 2, "the run must continue past the crash"
+    assert "crashed" in result.output
+    import json as _json
+    saved = _json.loads((tmp_path / "res" / "latest.json").read_text())
+    crashed = [x for x in saved["scores"] if x["outcome_status"] == "crashed"]
+    assert len(crashed) == 1 and crashed[0]["goal_satisfied"] is False
+
+
 def test_cli_bench_run_exits_1_without_specs(tmp_path):
     from click.testing import CliRunner
     from no_human.cli.commands import cli
