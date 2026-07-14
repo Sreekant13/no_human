@@ -28,3 +28,9 @@ secrets/
 
 # web build
 web/node_modules/
+
+# north-star bench: the raw built corpus is verbatim operator conversation
+# content (personal + enterprise) — never committed. Curated specs live one
+# level up and ARE tracked.
+eval/northstar_tasks/generated/
+eval/results/northstar/

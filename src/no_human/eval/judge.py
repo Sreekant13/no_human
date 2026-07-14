@@ -73,6 +73,87 @@ def parse_verdict(text: str) -> JudgeVerdict:
     )
 
 
+@dataclass
+class GoalVerdict:
+    satisfied: bool
+    evidence: str = ""
+    raw_output: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"satisfied": self.satisfied, "evidence": self.evidence}
+
+
+def build_goal_prompt(request: str, criteria: list[str], agent_diff: str,
+                      outcome_status: str) -> str:
+    crit = "\n".join(f"  - {c}" for c in criteria) or "  (none stated)"
+    return (
+        "You are an impartial evaluation judge. A developer made this request "
+        "to an autonomous coding system:\n\n"
+        f"=== REQUEST ===\n{request[:6000]}\n\n"
+        f"=== ACCEPTANCE CRITERIA (may be empty) ===\n{crit}\n\n"
+        f"The system finished with status: {outcome_status}\n"
+        "Its complete change as a diff:\n\n"
+        f"=== AGENT DIFF ===\n{agent_diff[:10000]}\n\n"
+        "Decide whether the change SATISFIES WHAT WAS ASKED. You have read "
+        "access to the repository at the current path — verify claims and "
+        "cite the files/lines you actually checked. Calibration: do not be "
+        "lenient; a partial, broken, or off-target change is NOT satisfied. "
+        "Never give a numeric score.\n\n"
+        "Emit your verdict between markers exactly:\n"
+        "JUDGE_JSON_START\n"
+        '{"satisfied": true|false, "evidence": "cited files/lines and the '
+        'reasons"}\n'
+        "JUDGE_JSON_END"
+    )
+
+
+def parse_goal_verdict(text: str) -> GoalVerdict:
+    """Fail closed: no parseable JUDGE_JSON block → not satisfied."""
+    if not text:
+        return GoalVerdict(False, "judge produced no output", text)
+    m = _JUDGE_JSON.search(text)
+    if not m:
+        return GoalVerdict(False, "no JUDGE_JSON block found", text)
+    try:
+        data = json.loads(m.group(1))
+    except (json.JSONDecodeError, ValueError):
+        return GoalVerdict(False, "malformed JUDGE_JSON", text)
+    return GoalVerdict(
+        satisfied=bool(data.get("satisfied", False)),
+        evidence=str(data.get("evidence", "")),
+        raw_output=text,
+    )
+
+
+class GoalJudge:
+    """North-star bench judge: did the result reach what the operator asked?
+
+    Deliberately sees ONLY the spec's request/criteria and the agent's diff —
+    never the source transcript or the original solution (no-cheating
+    invariant). Same fail-closed JUDGE_JSON discipline as IntentJudge; runs on
+    the review model (different from the implementer)."""
+
+    def __init__(self, *, model: str = "claude-opus-4-8", backend: Any | None = None):
+        self.model = model
+        self._backend = backend
+
+    def _ensure_backend(self) -> Any:
+        if self._backend is None:
+            from ..agent.claude_backend import ClaudeBackend
+            self._backend = ClaudeBackend(model=self.model, readonly=True)
+        return self._backend
+
+    async def judge(
+        self, *, request: str, criteria: list[str], agent_diff: str,
+        outcome_status: str, repo_path: str | None = None,
+    ) -> GoalVerdict:
+        prompt = build_goal_prompt(request, criteria, agent_diff, outcome_status)
+        backend = self._ensure_backend()
+        result = await backend.run(
+            prompt, cwd=repo_path, max_turns=10, effort="high")
+        return parse_goal_verdict(getattr(result, "final_text", "") or "")
+
+
 class IntentJudge:
     """Runs the different-model judge over (agent_diff, known_good_diff)."""
 
