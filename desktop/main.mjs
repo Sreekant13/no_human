@@ -116,7 +116,9 @@ async function loadBoardOrError(w) {
   // `nh start --no-open` and wait. Failure renders error.html — never blank.
   serverState = await ensureServer({ origin: ORIGIN });
   if (serverState.status !== "failed") {
-    await w.loadURL(ORIGIN);
+    // Belt to the server's no-cache header: revalidate the app shell
+    // document on every launch (hashed assets still cache-hit).
+    await w.loadURL(ORIGIN, { extraHeaders: "Cache-Control: no-cache" });
     return;
   }
   await w.loadFile(path.join(__dirname, "error.html"), {
