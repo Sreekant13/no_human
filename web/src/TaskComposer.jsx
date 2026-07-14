@@ -173,6 +173,9 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
 
   return (
     <div
+      // data-nested-modal: any dialog that can sit above the task drawer must claim Escape,
+      // or the drawer's own handler closes IT too and the typed prompt is gone.
+      data-nested-modal
       className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/70 p-4 backdrop-blur-sm sm:items-center sm:p-8"
       onClick={onClose}
     >

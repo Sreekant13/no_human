@@ -461,7 +461,11 @@ export default function App() {
   // Global 'n' opens the New Task modal (unless typing or a modal is open).
   useEffect(() => {
     function onKeyDown(e) {
-      if (shouldTriggerNewTask(e, { modalOpen: showNewTask })) {
+      // The drawer autofocuses its close BUTTON, which is not an editable tag — so without
+      // this the "n" shortcut opened the composer *behind* the open drawer (z-50 under the
+      // drawer's 101), where it held focus invisibly and one Escape then closed both.
+      const drawerOpen = Boolean(document.querySelector(".slideover"));
+      if (shouldTriggerNewTask(e, { modalOpen: showNewTask || drawerOpen })) {
         // Swallow the keystroke: the composer autofocuses its textarea, so an
         // un-prevented "n" types itself into the prompt it just opened.
         e.preventDefault();

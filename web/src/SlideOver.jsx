@@ -56,32 +56,54 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   const [task, setTask] = useState(null);
   const [diff, setDiff] = useState("");
   const [tab, setTab] = useState("system");
-  // U3: an awaiting-approval task opens on the review surface — the diff +
-  // dossier + approve is THE job at that point; System is one click away.
-  const openedReviewFirst = useRef(false);
+  // U3: the drawer opens on the surface that can CLEAR this task's gate — the diff +
+  // approve for a review, the question + its canned answers for a parked task. System
+  // is one click away.
+  const openedFirstTab = useRef(false);
   const [busy, setBusy] = useState(false);
   const [sbOpen, setSbOpen] = useState(false);
   const [sbMsg, setSbMsg] = useState("");
   const [replyOpen, setReplyOpen] = useState(false);
   const [replyMsg, setReplyMsg] = useState("");
+  const closeSb = useCallback(() => setSbOpen(false), []);
+  const closeReply = useCallback(() => setReplyOpen(false), []);
+  const sbRef = useNestedModalKeys(sbOpen, closeSb);
+  const replyRef = useNestedModalKeys(replyOpen, closeReply);
   const [flash, setFlash] = useState(null);
   const dialogRef = useRef(null);
   const closeRef = useRef(null);
 
   // A NEW task resets the review-first latch; a refreshKey bump must not —
   // it would yank the user back to the review tab on every WS update.
-  useEffect(() => { openedReviewFirst.current = false; }, [taskId]);
+  useEffect(() => { openedFirstTab.current = false; }, [taskId]);
 
   // Re-fetch whenever taskId changes OR when Board signals a WS update
   useEffect(() => {
+    // A late response from the PREVIOUS task must never paint under the new one's
+    // header: "Next review →" swaps taskId while these are in flight, and Approve
+    // would then post against a task whose diff the operator never saw.
+    let stale = false;
     fetchTask(taskId).then((t) => {
+      if (stale) return;
       setTask(t);
-      if (!openedReviewFirst.current && t?.status === "awaiting_approval") {
-        openedReviewFirst.current = true;  // once per open; user clicks win after
-        setTab("review");
+      if (!openedFirstTab.current && t) {
+        // The drawer opens on the surface that explains the gate. Review was already
+        // handled; a parked task's blocker — its question, category and evidence — lives in
+        // Details, so opening on System buried the question behind a pipeline diagram. (The
+        // Reply button is in the persistent action bar on every tab, and no parked task in
+        // the live DB carries one-click `options` — so this surfaces the QUESTION, which is
+        // the honest claim.)
+        const dest = t.status === "awaiting_approval" ? "review"
+          : PARKED_STATUSES.has(t.status) ? "details"
+          : null;
+        if (dest) {
+          openedFirstTab.current = true;  // once per open; user clicks win after
+          setTab(dest);
+        }
       }
     }).catch(() => {});
-    fetchDiff(taskId).then(setDiff).catch(() => {});
+    fetchDiff(taskId).then((d) => { if (!stale) setDiff(d); }).catch(() => {});
+    return () => { stale = true; };
   }, [taskId, refreshKey]);
 
   // Escape-to-close + focus trap
@@ -89,7 +111,14 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
     closeRef.current?.focus();
 
     function onKeyDown(e) {
-      if (e.key === "Escape") { onClose(); return; }
+      if (e.key === "Escape") {
+        // A modal ABOVE the drawer owns the key: closing both would also destroy the
+        // feedback the operator just typed into send-back/reply. The agent-log modal
+        // is a child component, so its state is not visible here — the DOM is.
+        if (document.querySelector("[data-nested-modal]")) return;
+        onClose();
+        return;
+      }
       if (e.key !== "Tab") return;
       const el = dialogRef.current;
       if (!el) return;
@@ -111,7 +140,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   }, [onClose]);
 
   const isAwaiting = task?.status === "awaiting_approval";
-  const isParked = task?.status === "awaiting_input" || task?.status === "blocked" || task?.status === "escalated";
+  const isParked = PARKED_STATUSES.has(task?.status);
   const isActive = ["pending", "context", "planning", "implementing", "reviewing", "testing"].includes(task?.status);
   const isFailed = task?.status === "failed";
   const isTerminal = task?.status === "done" || task?.status === "failed";
@@ -319,8 +348,9 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
 
       {/* send-back modal */}
       {sbOpen && (
-        <div className="sendback-overlay" onClick={() => setSbOpen(false)}>
-          <div className="sendback-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="sendback-overlay" data-nested-modal onClick={() => setSbOpen(false)}>
+          <div className="sendback-modal" ref={sbRef} role="dialog" aria-modal="true"
+               aria-label="Send back with feedback" onClick={(e) => e.stopPropagation()}>
             <div className="sendback-label">Send back with feedback</div>
             <textarea
               className="sendback-textarea"
@@ -347,8 +377,9 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
 
       {/* reply modal */}
       {replyOpen && (
-        <div className="sendback-overlay" onClick={() => setReplyOpen(false)}>
-          <div className="sendback-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="sendback-overlay" data-nested-modal onClick={() => setReplyOpen(false)}>
+          <div className="sendback-modal" ref={replyRef} role="dialog" aria-modal="true"
+               aria-label="Reply to blocker question" onClick={(e) => e.stopPropagation()}>
             <div className="sendback-label">Reply to blocker question</div>
             <textarea
               className="sendback-textarea"
@@ -382,7 +413,7 @@ function FlashBanner({ msg, onDismiss }) {
   return (
     <div className="flash-banner">
       <span>{msg}</span>
-      <button className="flash-banner-dismiss" onClick={onDismiss}><IconX size={14} /></button>
+      <button className="flash-banner-dismiss" onClick={onDismiss} aria-label="Dismiss"><IconX size={14} /></button>
     </div>
   );
 }
@@ -422,6 +453,50 @@ function linkify(text) {
 }
 
 // Group consecutive same-tool events for collapsed display.
+// A modal above the drawer owns both Escape and Tab while it is open: the drawer's handlers
+// stand down for it (see the [data-nested-modal] guard), and the drawer's focus trap only
+// covers .slideover, of which these modals are siblings.
+function useNestedModalKeys(open, onClose) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    function onKey(e) {
+      if (e.key === "Escape") {
+        // No stopPropagation: the drawer's listener is on the same target and already ran —
+        // it stands down via the [data-nested-modal] guard, which is what actually protects
+        // the drawer (and the text typed into this modal).
+        onClose();
+        return;
+      }
+      if (e.key !== "Tab" || !ref.current) return;
+      const items = [...ref.current.querySelectorAll("button, textarea, input, select, [href]")]
+        .filter((el) => !el.disabled && el.offsetParent !== null);
+      if (items.length === 0) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+  return ref;
+}
+
+// The statuses whose gate is cleared in the Details tab — the blocker question, its
+// evidence, and the one-click canned answers all live there.
+// The statuses whose gate the operator clears IN the drawer (Reply / Resume / the blocker's
+// options). Deliberately NOT paused_quota: the backend parks it without a blocker record
+// (orchestrator._park_quota) and `isParked` gives it no Reply/Resume buttons, so sending it
+// to Details would strand it on a tab emptier than the System one it came from — its gate is
+// a budget raise, not an answer. One definition; `isParked` reads it too.
+const PARKED_STATUSES = new Set(["awaiting_input", "blocked", "escalated"]);
+
 function groupConsecutiveEvents(events) {
   const result = [];
   let i = 0;
@@ -470,7 +545,19 @@ function GroupedEvents({ group, role }) {
         <span className="rich-kind ak-tool_use">{group.tool}</span>
         {elapsed > 2 && <span className="rich-elapsed">+{fmtDuration(elapsed)}</span>}
       </div>
-      <div className="rich-tool-group" onClick={() => setExpanded(!expanded)} role="button" tabIndex={0}>
+      <div
+        className="rich-tool-group"
+        onClick={() => setExpanded(!expanded)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setExpanded((v) => !v);
+          }
+        }}
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+      >
         <span className="rich-tool-name">{group.tool}</span>
         <span className="rich-group-count">{group.events.length} files</span>
         {shown.map((f, i) => <span key={i} className="rich-file-chip">{f}</span>)}
@@ -705,7 +792,7 @@ function AgentLogModal({ agent, events, onClose }) {
   const elapsed = agentEvents.length > 1 ? agentEvents[agentEvents.length - 1].ts - agentEvents[0].ts : 0;
 
   return (
-    <div className="sys-modal-backdrop" onClick={onClose}>
+    <div className="sys-modal-backdrop" data-nested-modal onClick={onClose}>
       <div className="sys-modal" style={{ "--node-color": agent.color }} onClick={(e) => e.stopPropagation()}>
         <div className="sys-modal-header">
           <div className="sys-modal-icon">{agent.icon}</div>
@@ -1166,17 +1253,30 @@ function ActivityTab({ taskId, task, isActive }) {
         {(() => {
           const visible = events.length > windowSize
             ? events.slice(-windowSize) : events;
-          return groupConsecutiveEvents(visible).map((item, i) => {
+          // Keys are the event's ABSOLUTE index in the (append-only) feed, not its index
+          // in the sliding window: a window index shifts on every streamed event, which
+          // silently re-attached an expanded reasoning block to a different event.
+          const offset = events.length - visible.length;
+          // `prevTs` walks forward with the render instead of `visible.indexOf(e)` — that
+          // was a linear scan per row, per render, on every SSE frame (a real task here
+          // has 2,015 events).
+          let prevTs = visible.length > 0 ? visible[0].ts : 0;
+          let idx = 0;  // position in `visible`, walked forward — never searched for.
+          return groupConsecutiveEvents(visible).map((item) => {
             if (item._group) {
               const role = eventSource(item.events[0]);
-              return <GroupedEvents key={`g-${item.firstIdx}`} group={item} role={role} />;
+              const key = `g-${offset + idx}`;
+              idx += item.events.length;
+              prevTs = item.events[item.events.length - 1].ts;
+              return <GroupedEvents key={key} group={item} role={role} />;
             }
             const e = item;
-            const prevTs = i > 0
-              ? (visible[Math.max(0, visible.indexOf(e) - 1)] || e).ts : e.ts;
+            const key = `e-${offset + idx}`;
+            idx += 1;
             const elapsed = e.ts - prevTs;
+            prevTs = e.ts;
             const role = eventSource(e);
-            return <RichEvent key={i} event={e} elapsed={elapsed} role={role} />;
+            return <RichEvent key={key} event={e} elapsed={elapsed} role={role} />;
           });
         })()}
         <div ref={endRef} />

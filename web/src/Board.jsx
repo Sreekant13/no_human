@@ -56,6 +56,12 @@ export default function Board({ tasks }) {
       </div>
       {selectedId && (
         <SlideOver
+          // Remount on a task switch. Without this the drawer keeps the PREVIOUS task's
+          // `task`/`diff` state while already bound to the new id, so "Next review →" showed
+          // task A's header, id and diff with an enabled Approve that posted against B.
+          // (A key change only fires on selectedId — a refreshKey bump still re-renders in
+          // place, so a WS update never flashes an empty drawer.)
+          key={selectedId}
           taskId={selectedId}
           onClose={closeTask}
           refreshKey={refreshKey}
