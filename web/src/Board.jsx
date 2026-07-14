@@ -1,8 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { fmtTokens, totalBurn } from "./cost.js";
 import SlideOver from "./SlideOver.jsx";
-import { groupFailedByTitle } from "./boardGroups.js";
-import { LANES, routeTask, isWaiting, isRealFailure } from "./boardLanes.js";
+import { BOARD_LANES, routeTask, isWaiting } from "./boardLanes.js";
 import { taskProgress } from "./taskProgress.js";
 import { topPrioritised } from "./laneView.js";
 
@@ -45,7 +44,9 @@ export default function Board({ tasks }) {
   return (
     <>
       <div className="nh-board">
-        {LANES.map((lane) => (
+        {/* 5D: only the GATE lanes. Done and Failed are outcomes — they live behind the two
+            buttons above the connection indicator, which open the task table. */}
+        {BOARD_LANES.map((lane) => (
           <Lane
             key={lane.key}
             lane={lane}
@@ -85,10 +86,9 @@ function Lane({ lane, tasks, onSelect }) {
   // needs action; hiding one behind an arrow defeats the board. Only the
   // in-flight/outcome lanes (Working, Failed, Done), which grow unbounded, do.
   const collapsible = !lane.needsYou;
-  const isFailed = lane.key === "failed";
-  // U4: the failed lane collapses same-title dupes first; top-N composes with it
-  // by operating on the GROUPED rows (not raw tasks), so counts never double.
-  const rows = isFailed ? groupFailedByTitle(tasks) : tasks;
+  // 5D: the Failed lane left the board, and with it the same-title collapse — that graveyard
+  // problem now lives on the Failed OUTCOME table, which is where the failures are.
+  const rows = tasks;
 
   // Drop a stale expand once the lane fits within top-N: the Working lane churns
   // (tasks drain then a new batch arrives), and a lingering expanded=true would
@@ -101,13 +101,7 @@ function Lane({ lane, tasks, onSelect }) {
   let visible = rows;
   let hiddenCount = 0;
   if (collapsible) {
-    const tsOf = isFailed
-      ? (g) => g.task.last_activity || g.task.updated_at || g.task.created_at || ""
-      : undefined;
-    // A cancelled task also ends in `failed` status, so a run of cancels would push the
-    // one REAL failure — the only row that wants attention — behind "Show N more".
-    const isPriority = isFailed ? (g) => isRealFailure(g.task) : null;
-    const r = topPrioritised(rows, expanded ? rows.length : LANE_TOP_N, tsOf, isPriority);
+    const r = topPrioritised(rows, expanded ? rows.length : LANE_TOP_N);
     visible = r.visible;
     hiddenCount = r.hiddenCount;
   }
@@ -127,25 +121,6 @@ function Lane({ lane, tasks, onSelect }) {
             <span className="lane-empty-icon" aria-hidden="true">{lane.emptyIcon || "·"}</span>
             <span className="lane-empty-text">{lane.emptyHint || ""}</span>
           </div>
-        ) : isFailed ? (
-          // U4: same-title failures collapse to the newest + a count — one
-          // stubborn task retried five ways must not bury the board.
-          visible.map(({ task, collapsedCount }) => (
-            <div key={task.id} className="failed-group">
-              <TaskCard
-                task={task}
-                accent={lane.accent}
-                isAwaiting={!!lane.needsYou}
-                showSubStatus={lane.showSubStatus}
-                onClick={(e) => onSelect(task.id, e.currentTarget)}
-              />
-              {collapsedCount > 0 && (
-                <div className="failed-group-count" title="Older failed runs with this title — open the card to see attempts">
-                  +{collapsedCount} older with this title
-                </div>
-              )}
-            </div>
-          ))
         ) : (
           visible.map((task) => (
             <TaskCard
@@ -197,6 +172,11 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
   const age = relativeTime(activityTs);
   const isStale = STALE_STATUSES.has(task.status) && ageSec > STALE_THRESHOLD_S;
   const priority = task.priority ?? "medium";
+  const burn = totalBurn({
+    used: task.total_tokens,
+    creation: task.total_cache_creation,
+    read: task.total_cache_read,
+  });
 
   const isActive = ACTIVE_STATUSES.has(task.status);
   const waiting = isWaiting(task);
@@ -283,7 +263,7 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
         )}
         {task.attempt_count > 0 && (
           <span className="card-attempts">
-            att {task.attempt_count}{task.last_turns != null ? ` · ${task.last_turns}t` : ""}{totalBurn(task.total_tokens, task.total_cache_read) > 0 ? ` · ${fmtTokens(totalBurn(task.total_tokens, task.total_cache_read))} tok` : ""}
+            att {task.attempt_count}{task.last_turns != null ? ` · ${task.last_turns}t` : ""}{burn > 0 ? ` · ${fmtTokens(burn)} tok` : ""}
           </span>
         )}
         {priority === "high" && <span className="card-priority card-priority-high">HI</span>}

@@ -132,12 +132,30 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
 
     total_cache_read = sum(p["cache_read"] for p in by_profile)
     total_tokens = sum(p["tokens"] for p in by_profile)
+
+    # The reviewer's burn, kept apart from the coder's so per-tier/per-profile attribution stays
+    # honest — but surfaced, so the UI can finally price the whole run instead of the coder half.
+    cur = await db.execute(
+        """SELECT COALESCE(SUM(COALESCE(review_tokens_used, 0)), 0),
+                  COALESCE(SUM(COALESCE(review_cache_creation_tokens, 0)), 0),
+                  COALESCE(SUM(COALESCE(review_cache_read_tokens, 0)), 0)
+           FROM attempts""")
+    rev_used, rev_creation, rev_read = await cur.fetchone()
     return {
         "prs_opened": prs_opened or 0,
         "prs_merged": prs_merged or 0,
         "attempts_total": attempts_total or 0,
         "attempts_per_pr": round(attempts_total / prs_opened, 1) if prs_opened else None,
         "tokens_per_pr": (total_tokens + total_cache_read) // prs_opened if prs_opened else None,
+        # The raw in+out total. `tokens_per_pr` folds it together with cache-read AND
+        # divides by prs_OPENED, so it cannot be priced honestly on its own: cache-read is
+        # a tenth of the price, cache-CREATION is not in it at all, and a "per merged PR"
+        # figure needs prs_merged. Emitting the buckets lets one cost function serve the
+        # per-PR tile, the lifetime tile and the task table, so they cannot disagree.
+        "tokens_used_total": total_tokens,
+        "review_tokens_used_total": rev_used or 0,
+        "review_cache_creation_total": rev_creation or 0,
+        "review_cache_read_total": rev_read or 0,
         "by_auth_profile": by_profile,
         "by_tier": by_tier,
         "review_pass": review_pass or 0,

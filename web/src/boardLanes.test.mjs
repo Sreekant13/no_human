@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { LANES, routeTask, isNeedsYou, isWaiting, isRealFailure } from "./boardLanes.js";
+import { LANES, routeTask, isNeedsYou, isWaiting, isRealFailure, BOARD_LANES, OUTCOME_LANES } from "./boardLanes.js";
 
 test("awaiting_approval routes to its OWN 'Review PR' lane, not a catch-all", () => {
   assert.equal(routeTask({ status: "awaiting_approval" }), "review");
@@ -100,4 +100,29 @@ test("isRealFailure excludes operator-cancelled tasks", () => {
   assert.equal(isRealFailure({ status: "awaiting_input" }), false);
   assert.equal(isRealFailure(null), false);
   assert.equal(isRealFailure(undefined), false);
+});
+
+// 5D (operator): the board shows only the three GATE lanes. Done and Failed are outcomes, not
+// gates — they leave the board and live behind two buttons that open a table.
+test("the board renders exactly three lanes: needs-answer, working, review", () => {
+  assert.deepEqual(BOARD_LANES.map((l) => l.key), ["answer", "working", "review"]);
+});
+
+test("the outcome lanes are still LANES — dropping them from the board must not drop them from ROUTING", () => {
+  // The trap: filter LANES itself and routeTask can no longer place a done/failed task, so it
+  // falls through to "working" and finished work reappears as in-flight.
+  assert.equal(routeTask({ status: "done" }), "done");
+  assert.equal(routeTask({ status: "failed" }), "failed");
+  assert.deepEqual(OUTCOME_LANES.map((l) => l.key), ["failed", "done"]);
+  // ...and the gate lanes still route as before.
+  assert.equal(routeTask({ status: "awaiting_input" }), "answer");
+  assert.equal(routeTask({ status: "implementing" }), "working");
+  assert.equal(routeTask({ status: "awaiting_approval" }), "review");
+});
+
+test("each outcome lane carries the outline colour its button uses", () => {
+  const failed = OUTCOME_LANES.find((l) => l.key === "failed");
+  const done = OUTCOME_LANES.find((l) => l.key === "done");
+  assert.match(failed.accent, /--c-escalated/);   // red
+  assert.match(done.accent, /--c-done/);          // green
 });

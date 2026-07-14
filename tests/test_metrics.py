@@ -117,3 +117,60 @@ async def test_cache_economics_zero_state(store):
     m = await compute_metrics(store)
     assert m["cache_economics"]["attempts_measured"] == 0
     assert m["cache_economics"]["creation_share"] is None
+
+
+async def test_metrics_expose_the_three_cost_buckets(store):
+    """The UI cannot price a burn honestly from ``tokens_per_pr`` alone.
+
+    ``tokens_per_pr`` is ``(tokens_used + cache_read) // prs_OPENED`` — it excludes
+    cache-CREATION entirely and divides by opened, not merged. Pricing it as if it were
+    fresh tokens (or splitting it by ``creation_share``, whose universe is
+    ``creation + read``) is a category error: the Stats page ended up showing two blended
+    rates 20% apart on the same screen. Emit the raw buckets so ONE cost function can
+    serve every surface and they cannot drift apart.
+    """
+    t = Task.new("t", repo_path="/r")
+    await store.create_task(t)
+    a = await store.create_attempt(t.id, 1)
+    await store.update_attempt(
+        a, tokens_used=150, cache_read_tokens=1500, cache_creation_tokens=90,
+        pr_url="https://forge/pr/9",
+    )
+
+    m = await compute_metrics(store)
+
+    assert m["tokens_used_total"] == 150          # in + out only
+    assert m["cache_economics"]["cache_creation_total"] == 90
+    assert m["cache_economics"]["cache_read_total"] == 1500
+    assert m["prs_opened"] == 1 and m["prs_merged"] == 0
+
+
+async def test_reviewer_tokens_are_persisted_and_priced(store):
+    """The reviewer's burn was thrown away, so no cost surface could see it.
+
+    ``_run_review`` returns a ReviewDecision carrying tokens_used / cache_read_tokens /
+    cache_creation_tokens, and the orchestrator never wrote them down: the DB held the CODER's
+    tokens only. The Stats tile is the first surface to make an absolute dollar claim, so it had
+    to say "coder spend" — with 59 Opus-4-8 review runs over full diffs costing nothing on the
+    record. Persist them in their OWN columns (coder attribution stays intact for by_tier) and
+    surface the totals so the UI can price true spend.
+    """
+    t = Task.new("t", repo_path="/r")
+    await store.create_task(t)
+    a = await store.create_attempt(t.id, 1)
+    await store.update_attempt(
+        a, tokens_used=100, cache_read_tokens=1000, cache_creation_tokens=50,
+        review_tokens_used=30, review_cache_read_tokens=400, review_cache_creation_tokens=20,
+        pr_url="https://forge/pr/1",
+    )
+
+    m = await compute_metrics(store)
+
+    # The coder's buckets are untouched...
+    assert m["tokens_used_total"] == 100
+    assert m["cache_economics"]["cache_creation_total"] == 50
+    assert m["cache_economics"]["cache_read_total"] == 1000
+    # ...and the reviewer's are now on the record, separately.
+    assert m["review_tokens_used_total"] == 30
+    assert m["review_cache_creation_total"] == 20
+    assert m["review_cache_read_total"] == 400

@@ -19,10 +19,21 @@
 export const LANES = [
   { key: "answer",  label: "Needs Answer", accent: "var(--c-answer)",    statuses: ["awaiting_input", "escalated"], loud: true, needsYou: true, emptyIcon: "✓", emptyHint: "All caught up — nothing needs your input" },
   { key: "working", label: "Working",      accent: "var(--c-building)",  statuses: ["pending", "context", "planning", "implementing", "reviewing", "testing", "compound_parent", "paused_quota"], showSubStatus: true, emptyIcon: "○", emptyHint: "No tasks in flight" },
-  { key: "failed",  label: "Failed",       accent: "var(--c-escalated)", statuses: ["failed"], emptyIcon: "○", emptyHint: "No failures" },
+  { key: "failed",  label: "Failed",       accent: "var(--c-escalated)", statuses: ["failed"], outcome: true, emptyIcon: "○", emptyHint: "No failures" },
   { key: "review",  label: "Review PR",    accent: "var(--c-review)",    statuses: ["awaiting_approval"], loud: true, needsYou: true, emptyIcon: "○", emptyHint: "No PRs waiting for review" },
-  { key: "done",    label: "Done",         accent: "var(--c-done)",      statuses: ["done"], emptyIcon: "○", emptyHint: "Nothing shipped yet" },
+  { key: "done",    label: "Done",         accent: "var(--c-done)",      statuses: ["done"], outcome: true, emptyIcon: "○", emptyHint: "Nothing shipped yet" },
 ];
+
+// 5D: the board shows only the lanes that represent a GATE — something the human owes. Done and
+// Failed are OUTCOMES: they competed for width with the three lanes that actually need attention,
+// and an outcome list reads better as a sortable table than as a column of cards. They move to two
+// buttons above the connection indicator, which open that table.
+//
+// They stay in LANES on purpose: LANES is also the ROUTING table (routeTask iterates it), so
+// filtering it here would make a done task fall through to "working" — finished work would come
+// back as in-flight.
+export const BOARD_LANES = LANES.filter((l) => !l.outcome);
+export const OUTCOME_LANES = LANES.filter((l) => l.outcome);
 
 // "blocked" routes dynamically: WITH a wake_condition it self-resolves → Working
 // (shown as parked on the card); WITHOUT, a human must act → Needs Answer.

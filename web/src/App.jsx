@@ -5,6 +5,7 @@ import Settings from "./Settings.jsx";
 import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
 import TaskComposer from "./TaskComposer.jsx";
+import Outcomes from "./Outcomes.jsx";
 import { LegionLogo } from "./Logo.jsx";
 import { newlyNeedsYou, notificationBody, titleWithBadge } from "./notifications.js";
 import { setFavicon } from "./favicon.js";
@@ -387,6 +388,10 @@ export default function App() {
   const [showNewTask, setShowNewTask] = useState(false);
   const [page, setPage] = useState("board");
   const [workerStatus, setWorkerStatus] = useState(null);
+  const doneCount = tasks.filter((t) => t.status === "done").length;
+  const failedCount = tasks.filter(isRealFailure).length;
+  const cancelledCount = tasks.filter((t) => t.status === "failed" && t.cancelled).length;
+
   // Theme: persisted choice, else the OS preference. Light mode was fully built
   // but unreachable (no toggle) — this exposes it.
   const [theme, setTheme] = useState(() =>
@@ -556,6 +561,24 @@ export default function App() {
           ))}
         </nav>
         <div className="nh-sidebar-foot">
+          {/* 5D: the outcomes. They are not gates, so they are not lanes — they sit here, above
+              the connection indicator, and open a table of their tasks. */}
+          <div className="nh-outcomes">
+            <button
+              className={`nh-outcome-btn nh-outcome-done${page === "done" ? " active" : ""}`}
+              onClick={() => setPage("done")}
+              title="Tasks that shipped"
+            >
+              Done<span className="nh-outcome-count">{doneCount}</span>
+            </button>
+            <button
+              className={`nh-outcome-btn nh-outcome-failed${page === "failed" ? " active" : ""}`}
+              onClick={() => setPage("failed")}
+              title={cancelledCount > 0 ? `${failedCount} failed · ${cancelledCount} cancelled` : "Tasks that failed"}
+            >
+              Failed<span className="nh-outcome-count">{failedCount}</span>
+            </button>
+          </div>
           {workerStatus?.running && workerStatus.inflight > 0 && (
             <div className="nh-status-indicator" title={`${workerStatus.inflight} of ${workerStatus.max_workers} worker slots in use`}>
               <div className="nh-ws-dot live" style={{ background: 'var(--accent)' }} />
@@ -587,6 +610,8 @@ export default function App() {
           </div>
         )}
         {page === "board" && <Board tasks={tasks} />}
+        {page === "done" && <Outcomes tasks={tasks} lane="done" />}
+        {page === "failed" && <Outcomes tasks={tasks} lane="failed" />}
         {page === "stats" && <Stats tasks={tasks} />}
         {page === "settings" && <Settings />}
       </main>

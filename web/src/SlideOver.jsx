@@ -12,7 +12,7 @@ import { taskProgress } from "./taskProgress.js";
 import { hasAction, normalizeOption } from "./blockerOptions.js";
 import { clampAgentState, currentFunctionality, groupFunctionalities } from "./functionalities.js";
 import { agentSummary, taskSummary } from "./summaries.js";
-import { estimateCost, fmtTokens, totalBurn } from "./cost.js";
+import { costOf, fmtCost, fmtTokens, totalBurn } from "./cost.js";
 import { formatDuration } from "./formatDuration.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
@@ -234,7 +234,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
           </div>
           {(task?.total_tokens > 0 || task?.total_cache_read > 0) && (
             <span className="so-cost" title="cost meter: total burn (fresh + cache-read tokens) · indicative $ · wall-time · attempts">
-              {fmtTokens(totalBurn(task.total_tokens, task.total_cache_read))} tok · {estimateCost(task.total_tokens, task.total_cache_read)}
+              {fmtTokens(totalBurn({ used: task.total_tokens, creation: task.total_cache_creation, read: task.total_cache_read }))} tok · {fmtCost(costOf({ used: task.total_tokens, creation: task.total_cache_creation, read: task.total_cache_read }))}
               {task.wall_seconds != null && ` · ${formatDuration(Math.round(task.wall_seconds))}`}
               {task.attempt_count > 0 && ` · ${task.attempt_count} attempt${task.attempt_count > 1 ? "s" : ""}`}
             </span>

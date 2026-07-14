@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { fetchMetrics, fetchRepos, fetchRepoUnderstanding, searchEvents } from "./api.js";
-import { estimateCost, fmtTokens } from "./cost.js";
+import { costOf, fmtCost, fmtTokens, lifetimeCost, totalBurn } from "./cost.js";
 import { northStarTiles } from "./northStar.js";
+import TaskTable from "./TaskTable.jsx";
 import { isRealFailure } from "./boardLanes.js";
 import { profileRows, profileStatus } from "./repoView.js";
 import { kindLabel, groupByTask } from "./searchView.js";
@@ -104,7 +105,7 @@ function computeStats(tasks) {
   // Token tracking across all tasks
   // Burn = fresh + cache-read tokens (the same definition as the drawer and
   // board — tokens_used alone hides 90%+ of real spend, C1).
-  const burnOf = (t) => (t.total_tokens || 0) + (t.total_cache_read || 0);
+  const burnOf = (t) => totalBurn({ used: t.total_tokens, creation: t.total_cache_creation, read: t.total_cache_read });
   const totalTokens = tasks.reduce((s, t) => s + burnOf(t), 0);
   const avgTokensPerTask = doneTasks.length > 0
     ? tasks.filter(t => burnOf(t) > 0).reduce((s, t) => s + burnOf(t), 0)
@@ -151,8 +152,6 @@ function computeStats(tasks) {
     kindBreakdown,
     successRate,
     totalTokens,
-    totalTokensFresh: tasks.reduce((s, t) => s + (t.total_tokens || 0), 0),
-    totalTokensCache: tasks.reduce((s, t) => s + (t.total_cache_read || 0), 0),
     avgTokensPerTask,
     firstAttemptRate,
     avgAttempts,
@@ -163,38 +162,106 @@ function computeStats(tasks) {
 
 // ── Sparkline (pure SVG) ─────────────────────────────────────────────────────
 
-function Sparkline({ data, width = 320, height = 64 }) {
+// Daily completions. Rebuilt against the dataviz anti-patterns (UI_AUDIT M8): the old one
+// stretched every bar (`preserveAspectRatio="none"`), drew a ZERO day as a 1px mark — so an
+// empty month read as a broken dotted baseline rather than "nothing shipped" — and put the
+// dates only in a hover <title>, i.e. the tooltip was the only way to read a value.
+//
+// One series, so no legend (the section title names it). Zero days are a recessive baseline
+// rule, not marks. The busiest day is direct-labelled and the axis carries first/mid/last
+// dates, so every value is reachable without hovering.
+// The SVG must render 1:1 at its container's width. A fixed 640-wide viewBox scales
+// uniformly, so at 390px the whole chart — axis dates included — shrank to ~5px type,
+// illegible on exactly the viewport that has no hover tooltip either.
+function useContainerWidth(fallback = 640) {
+  const ref = useRef(null);
+  const [width, setWidth] = useState(fallback);
+  useLayoutEffect(() => {
+    // Seed from the real box BEFORE the browser paints: starting at the 640 fallback made the
+    // chart paint upscaled and then snap, a visible layout jump on every mount.
+    const el = ref.current;
+    if (el) {
+      const w = Math.round(el.getBoundingClientRect().width);
+      if (w > 0) setWidth(Math.max(240, w));
+    }
+  }, []);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === "undefined") return undefined;
+    const ro = new ResizeObserver(([entry]) => {
+      const w = Math.round(entry.contentRect.width);
+      if (w > 0) setWidth(Math.max(240, w));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return [ref, width];
+}
+
+const CHART_H = 88;
+const AXIS_H = 18;
+// The max hairline and a full-height bar must land on the SAME line, or the annotation lies.
+const GRID_Y = 6;
+
+function Sparkline({ data, width = 640 }) {
   if (!data || data.length === 0) return null;
-  const max = Math.max(...data.map(d => d.count), 1);
-  const barW = Math.max(1, (width - (data.length - 1) * 2) / data.length);
+  const max = Math.max(...data.map((d) => d.count), 1);
   const gap = 2;
+  const barW = Math.max(1, (width - (data.length - 1) * gap) / data.length);
+  const plotH = CHART_H - AXIS_H;
+  const peakIdx = data.reduce((best, d, i) => (d.count > data[best].count ? i : best), 0);
+  const hasAny = data.some((d) => d.count > 0);
 
   return (
     <svg
       className="stats-sparkline"
-      viewBox={`0 0 ${width} ${height}`}
-      preserveAspectRatio="none"
+      width={width}
+      height={CHART_H}
+      viewBox={`0 0 ${width} ${CHART_H}`}
       role="img"
-      aria-label="Daily completions chart"
+      aria-label={
+        hasAny
+          ? `Daily completions, last ${data.length} days. Busiest day ${data[peakIdx].label} with ${data[peakIdx].count}.`
+          : `Daily completions, last ${data.length} days. Nothing completed.`
+      }
     >
+      {/* A hairline at the max, one shade off the surface — the scale, without a grid. */}
+      {hasAny && (
+        <>
+          <line x1={0} y1={GRID_Y} x2={width} y2={GRID_Y} className="stats-spark-grid" />
+          <text x={width} y={GRID_Y + 11} textAnchor="end" className="stats-spark-gridlabel">{max}</text>
+        </>
+      )}
       {data.map((d, i) => {
-        const barH = Math.max(1, (d.count / max) * (height - 4));
         const x = i * (barW + gap);
-        const y = height - barH;
+        // A zero day is the ABSENCE of a bar. It needs no mark: the axis rule below already
+        // draws the baseline across the full width, and a 1px rect in the axis colour added no
+        // pixels — only a hover-only tooltip on something invisible.
+        if (d.count === 0) return null;
+        const barH = Math.max(2, (d.count / max) * (plotH - GRID_Y));
         return (
-          <g key={i}>
-            <rect
-              x={x}
-              y={y}
-              width={barW}
-              height={barH}
-              rx={2}
-              className={`stats-sparkline-bar${d.count > 0 ? " has-data" : ""}`}
-            />
+          <rect
+            key={i}
+            x={x}
+            y={plotH - barH}
+            width={barW}
+            height={barH}
+            rx={2}
+            className="stats-sparkline-bar has-data"
+          >
             <title>{`${d.label}: ${d.count} task${d.count !== 1 ? "s" : ""}`}</title>
-          </g>
+          </rect>
         );
       })}
+      <line x1={0} y1={plotH} x2={width} y2={plotH} className="stats-spark-axis" />
+      {/* Dates on the axis: the chart said "last 30 days" but never said WHICH days. */}
+      <text x={0} y={CHART_H - 4} className="stats-spark-tick">{data[0].label}</text>
+      <text x={width / 2} y={CHART_H - 4} textAnchor="middle" className="stats-spark-tick">
+        {data[Math.floor(data.length / 2)].label}
+      </text>
+      <text x={width} y={CHART_H - 4} textAnchor="end" className="stats-spark-tick">
+        {data[data.length - 1].label}
+      </text>
     </svg>
   );
 }
@@ -250,70 +317,6 @@ function KindBar({ breakdown, total }) {
 
 // ── Task table ───────────────────────────────────────────────────────────────
 
-const STATUS_DOT = {
-  done: "var(--green)",
-  failed: "var(--red)",
-  implementing: "var(--accent-500)",
-  reviewing: "var(--amber)",
-  testing: "var(--purple)",
-};
-
-function TaskTable({ tasks }) {
-  const rows = useMemo(() => {
-    return tasks
-      .map(t => {
-        const created = parseTS(t.created_at);
-        const updated = parseTS(t.updated_at);
-        const duration = created && updated ? (updated.getTime() - created.getTime()) / 1000 : null;
-        return { ...t, duration, _sortKey: updated ? updated.getTime() : 0 };
-      })
-      .sort((a, b) => b._sortKey - a._sortKey);
-  }, [tasks]);
-
-  if (rows.length === 0) return null;
-
-  return (
-    <div className="stats-table-wrap">
-      <table className="stats-table">
-        <thead>
-          <tr>
-            <th className="stats-th stats-th-name">Task</th>
-            <th className="stats-th">Status</th>
-            <th className="stats-th">Duration</th>
-            <th className="stats-th">Project</th>
-            <th className="stats-th">Runner</th>
-            <th className="stats-th stats-th-right">Tokens</th>
-            <th className="stats-th stats-th-right">Est. Cost</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map(t => (
-            <tr key={t.id} className="stats-tr">
-              <td className="stats-td stats-td-name" title={t.title}>
-                {t.title}
-              </td>
-              <td className="stats-td">
-                <span className="stats-status-dot" style={{ background: STATUS_DOT[t.status] || "var(--text-dim)" }} />
-                {t.status}
-              </td>
-              <td className="stats-td stats-td-mono">
-                {t.duration != null && t.duration > 0 ? fmtDuration(t.duration) : "\u2014"}
-              </td>
-              <td className="stats-td">{t.repo_name || "\u2014"}</td>
-              <td className="stats-td">
-                <span className={`stats-runner-badge runner-${t.backend || "claude"}`}>
-                  {t.backend === "devin" ? "Devin" : "Claude Code"}
-                </span>
-              </td>
-              <td className="stats-td stats-td-mono stats-td-right">{fmtTokens((t.total_tokens || 0) + (t.total_cache_read || 0) || null)}</td>
-              <td className="stats-td stats-td-mono stats-td-right">{estimateCost(t.total_tokens, t.total_cache_read)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
 
 // ── Main Stats Component ─────────────────────────────────────────────────────
 
@@ -468,6 +471,7 @@ function SessionSearch() {
 export default function Stats({ tasks }) {
   const stats = useMemo(() => computeStats(tasks), [tasks]);
   const [metrics, setMetrics] = useState(null);
+  const [chartRef, chartWidth] = useContainerWidth();
   useEffect(() => { fetchMetrics().then(setMetrics); }, [tasks.length]);
   const northStar = northStarTiles(metrics);
 
@@ -559,7 +563,7 @@ export default function Stats({ tasks }) {
           <div className="stats-card-label">Token Usage</div>
           <div className="stats-card-value">{fmtTokens(stats.totalTokens)}</div>
           <div className="stats-card-sub">
-            est. {estimateCost(stats.totalTokensFresh, stats.totalTokensCache)}
+            est. {fmtCost(lifetimeCost(metrics))}
             {stats.avgTokensPerTask > 0 && ` · avg ${fmtTokens(stats.avgTokensPerTask)}/task`}
           </div>
         </div>
@@ -599,8 +603,8 @@ export default function Stats({ tasks }) {
       <div className="stats-section">
         <h3 className="stats-section-title">Daily Completions</h3>
         <div className="stats-section-sub">Last 30 days</div>
-        <div className="stats-chart-wrap">
-          <Sparkline data={stats.dailyCounts} width={640} height={80} />
+        <div className="stats-chart-wrap" ref={chartRef}>
+          <Sparkline data={stats.dailyCounts} width={chartWidth} />
         </div>
       </div>
 

@@ -87,6 +87,13 @@ class Store:
         att_wanted = {
             "cache_read_tokens": "INTEGER DEFAULT 0",
             "cache_creation_tokens": "INTEGER DEFAULT 0",
+            # The REVIEWER's burn, in its own columns. It was thrown away after the verdict,
+            # so the DB held only the coder's tokens and no cost surface could price the gate
+            # (59 Opus-4-8 runs over full diffs, costing nothing on the record). Separate from
+            # the coder's so by_tier/by_profile keep attributing coder spend to the coder.
+            "review_tokens_used": "INTEGER DEFAULT 0",
+            "review_cache_read_tokens": "INTEGER DEFAULT 0",
+            "review_cache_creation_tokens": "INTEGER DEFAULT 0",
             # Which model actually ran which role on this attempt. Nothing
             # recorded it, which is how a frozen config.yaml silently inverted
             # coder and reviewer for a week.

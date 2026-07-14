@@ -45,6 +45,28 @@ Status key: ✅ fixed · ⬜ open
 | M12 | ✅ | Drawer | **O(n²) in the live feed:** `visible.indexOf(e)` per row, per render, re-run on every SSE frame (a real task here has 2,015 events). `SlideOver.jsx:1176` | use the map index |
 | M13 | ⬜ | Settings | The project-card header is a keyboard-inert `<div>`; expanding a project is the only route to its repos and test plan, and it is mouse-only. `Settings.jsx:461` | make it a `<button>` |
 
+## OPERATOR-REQUESTED — board restructure (2026-07-14)
+
+Requested directly by the operator. This supersedes parts of M6 (lane widths) and N3
+(the caught-up empty state), because two of the six lanes leave the board entirely.
+
+| # | Status | What |
+|---|---|---|
+| R1 | ⬜ | **The board shows THREE lanes only: Needs Answer · Working · Review PR.** Done and Failed are outcomes, not gates — they compete for width with the lanes that actually need the human. Removing them gives the three gate lanes the space M6 was fighting for. |
+| R2 | ⬜ | **Done and Failed become two buttons in the bottom-left corner, above the "Connected" indicator** — Done with a **green** outline, Failed with a **red** outline. |
+| R3 | ⬜ | **Clicking either opens a screen with those tasks in a TABLE view** (not a lane of cards): the table is the right form for an outcome list you scan and sort, and it is where a count, a date, a cost and a PR link belong. |
+
+Design notes for the implementer (verify each before building):
+- `boardLanes.js` `LANES` is the single source for the board's columns, and `routeTask()` already
+  routes by *what the human owes*. Removing two lanes must NOT change routing — a done/failed task
+  still has a lane key; it is just not rendered as a column.
+- The counts stay honest: the Failed button's count must use `isRealFailure` (cancels are not
+  failures — see M2), and it should surface the cancelled count separately rather than hiding it.
+- The task table already exists on Stats (`Stats.jsx` — the task table with tokens/cost/PR columns).
+  Reuse that component rather than building a second table.
+- Keep the keyboard path: the buttons are `<button>`s, and the table rows must open the same drawer
+  the board cards do (Enter included — see B2).
+
 ## MINOR
 
 | # | Status | Defect |

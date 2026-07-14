@@ -2,28 +2,54 @@
 // actually trusts, derived from /api/metrics — NOT "completed tasks", which
 // counts 0-token code reviews as deliveries. Pure so node --test can pin it.
 
-import { estimateCost, fmtTokens } from "./cost.js";
+import { fmtCost, lifetimeCost } from "./cost.js";
 
-// tone: "good" | "bad" | "neutral" drives the semantic color of the value.
+// tone: "good" | "bad" | "neutral" drives the semantic colour of the value.
+//
+// Colour is spent ONLY where a real threshold exists. It used to be handed out for
+// "non-zero" (PRs merged) and withheld from a perfect score (Stagnation: 0), so four green
+// tiles in a row taught the operator nothing — the colour carried no signal. Volume numbers
+// (how many, how much) are neutral; quality numbers (did the gate hold, is the cache working)
+// carry the colour.
 export function northStarTiles(metrics) {
   if (!metrics) return [];
   const merged = metrics.prs_merged ?? 0;
   const opened = metrics.prs_opened ?? 0;
-  const tpp = metrics.tokens_per_pr;
   const rPass = metrics.review_pass ?? 0;
   const rFail = metrics.review_fail ?? 0;
   const share = metrics.cache_economics?.creation_share;
+
+  // Cost is the headline concern, so it is a VALUE, not a subtitle under a token count.
+  //
+  // It is computed from the three RAW buckets and divided by prs_MERGED. Two earlier models
+  // were wrong: pricing the total burn at the fresh rate ($29.98), and splitting that total
+  // by `creation_share` ($3.93) — a category error, because `tokens_per_pr` contains no
+  // cache-creation while that share's universe is creation+read, AND it divides by prs_OPENED,
+  // so a "per merged PR" label sat on a per-opened-PR number. The lifetime tile on the same
+  // page divides this identical cost by nothing, so the two can no longer imply different rates.
+  // Coder + reviewer. (The planner/supervisor run inside the coder's session, so their burn is
+  // already in tokens_used_total; the REVIEWER is a separate fresh-context run and was the one
+  // being discarded.)
+  const lifetime = lifetimeCost(metrics);
+  const costPerPr = merged > 0 && lifetime ? lifetime / merged : null;
+
   return [
     {
       label: "PRs merged",
       value: String(merged),
       sub: `${opened} opened · human-merged`,
-      tone: merged > 0 ? "good" : "bad",
+      // Zero shipped IS a threshold — the product is not delivering. But "more than zero"
+      // is not a threshold for GOOD, and green-for-non-zero is what made the colour mean
+      // nothing across four tiles.
+      tone: merged === 0 ? "bad" : "neutral",
     },
     {
-      label: "Tokens / merged PR",
-      value: tpp != null && merged > 0 ? fmtTokens(tpp) : "—",
-      sub: tpp != null && merged > 0 ? `est. ${estimateCost(tpp)}` : "no merge yet",
+      label: "Cost / merged PR",
+      value: fmtCost(costPerPr),
+      sub:
+        costPerPr == null
+          ? (merged === 0 ? "no merge yet" : "no token data yet")
+          : `${fmtCost(lifetime)} spent · ${merged} merged`,
       tone: "neutral",
     },
     {
