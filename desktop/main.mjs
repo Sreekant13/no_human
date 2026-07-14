@@ -6,7 +6,7 @@
 // If the server isn't reachable, a friendly error page renders with retry —
 // a blank window is the one unacceptable failure mode.
 
-import { app, BrowserWindow, shell } from "electron";
+import { app, BrowserWindow, Menu, nativeImage, shell, Tray } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -24,6 +24,56 @@ let win = null;
 // E2: retain the ensure result — its child is the ONLY legitimate kill
 // target on quit. An attached (operator-started) server is never stopped.
 let serverState = null;
+let tray = null;
+let quitting = false;
+
+// 16x16 template circle, GENERATED + verified by scripts (review finding:
+// the previous hand-typed base64 was corrupt — invisible tray, dead feature).
+// desktop/trayIcon.test.mjs decodes + inflates it so corruption can't return.
+export const TRAY_ICON_B64 =
+  "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAARUlEQVR42mNgoCHoQcNkafwP" +
+  "xUQbhK4RHeM1hJBmgoYQoxnZELJsx+kKUjRjdQVVDKDICxQHIlWikeKERJWkTJXMRBIAAFkt" +
+  "fBGd64lBAAAAAElFTkSuQmCC";
+
+function trayIcon() {
+  const img = nativeImage.createFromBuffer(Buffer.from(TRAY_ICON_B64, "base64"));
+  img.setTemplateImage(true);
+  return img;
+}
+
+function serverLabel() {
+  if (!serverState) return "server: probing…";
+  return {
+    attached: "server: attached (operator-owned)",
+    spawned: "server: spawned by the app",
+    failed: `server: unreachable (${serverState.reason})`,
+  }[serverState.status] ?? "server: unknown";
+}
+
+function buildTray() {
+  tray = new Tray(trayIcon());
+  tray.setToolTip("no_human");
+  const rebuild = () => tray.setContextMenu(Menu.buildFromTemplate([
+    { label: "Open no_human", click: showWindow },
+    { label: serverLabel(), enabled: false },
+    { type: "separator" },
+    { label: "Quit no_human", click: () => { quitting = true; app.quit(); } },
+  ]));
+  rebuild();
+  tray.on("click", showWindow);
+  // Keep the server line fresh when the menu is about to show (macOS builds
+  // the menu lazily, so rebuilding on click keeps it truthful).
+  tray.on("mouse-enter", rebuild);
+}
+
+function showWindow() {
+  if (win && !win.isDestroyed()) {
+    win.show();
+    win.focus();
+  } else {
+    createWindow();
+  }
+}
 
 // Defense-in-depth (review finding): only ever hand web schemes to the OS —
 // the board sanitizes its links today, but the shell must not TRUST that.
@@ -81,7 +131,13 @@ async function createWindow() {
     minWidth: 720,
     minHeight: 480,
     title: "no_human",
-    backgroundColor: "#12141C",
+    // Native-Mac chrome (operator: "Claude-desktop-grade look"): content
+    // extends under a hidden-inset title bar; traffic lights float over the
+    // sidebar's brand zone, which the web app makes draggable when it
+    // detects the shell. Base color = the board's real --bg token.
+    titleBarStyle: "hiddenInset",
+    trafficLightPosition: { x: 18, y: 18 },
+    backgroundColor: "#0F1117",
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -91,6 +147,14 @@ async function createWindow() {
     },
   });
   win.on("closed", () => { win = null; });
+  // E3 (darwin): closing HIDES to the tray — the board keeps polling and
+  // notifications keep coming. Quit is explicit: tray menu or Cmd-Q.
+  win.on("close", (e) => {
+    if (process.platform === "darwin" && !quitting) {
+      e.preventDefault();
+      win.hide();
+    }
+  });
   routeExternally(win.webContents);
   await loadBoardOrError(win);
 }
@@ -107,15 +171,21 @@ if (!gotLock) {
       win.focus();
     }
   });
-  app.whenReady().then(createWindow);
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  app.whenReady().then(async () => {
+    // Tray failure must never abort startup (review: a bad image on some
+    // platforms throws here, and this runs BEFORE the window exists).
+    try { buildTray(); } catch (err) { console.error("tray failed:", err); }
+    await createWindow();
   });
-  // Closing the window quits (tray/hide-on-close arrives in E3). E2: on
-  // quit, stop the server ONLY if this shell spawned it — stopServer's
-  // gating guarantees an attached (operator-owned) server is untouched.
-  app.on("window-all-closed", () => app.quit());
+  app.on("activate", () => showWindow());
+  // E3: on darwin the app lives in the tray after window close; only an
+  // explicit quit tears down. Elsewhere, all-windows-closed still quits.
+  app.on("window-all-closed", () => {
+    if (process.platform !== "darwin") app.quit();
+  });
   app.on("before-quit", () => {
+    quitting = true;
+    // E2 gating: stops ONLY a shell-spawned server; attached is untouched.
     if (stopServer(serverState)) serverState = null;
   });
 }

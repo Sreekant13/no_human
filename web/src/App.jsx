@@ -391,6 +391,13 @@ export default function App() {
     document.documentElement.setAttribute("data-theme", theme);
     localStorage.setItem("nh-theme", theme);
   }, [theme]);
+  // Desktop shell (Electron) marks itself via the preload bridge; the class
+  // gates the inset-title-bar accommodations (drag region + traffic-light
+  // clearance) so the browser experience is untouched.
+  useEffect(() => {
+    document.documentElement.classList.toggle(
+      "nh-in-shell", Boolean(window.nhDesktop?.shell));
+  }, []);
   // null = checking; false = needs onboarding; true = onboarded. Fail-open so a
   // missing/old endpoint never blocks an existing user at the board.
   const [onboarded, setOnboarded] = useState(null);
