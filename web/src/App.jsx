@@ -13,6 +13,7 @@ import { needsPrUrl } from "./composerKinds.js";
 import { hasPrRef } from "./prRefs.js";
 import { shouldTriggerNewTask } from "./keyboardShortcut.js";
 import { isNeedsYou, isRealFailure } from "./boardLanes.js";
+import { tasksReducer } from "./tasksReducer.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 
 const PROGRESS_STATUSES  = new Set(["pending", "context", "planning", "implementing", "reviewing", "testing"]);
@@ -68,30 +69,19 @@ function OverviewStrip({ tasks }) {
             </>}
           </>
       }
-      <span className="ov-sep">·</span>
-      <span>{inProgress} working</span>
       {oldestSec !== null && (
         <>
           <span className="ov-sep">·</span>
-          <span>waiting on you: <span className="ov-oldest">{fmtAge(oldestSec)}</span></span>
+          <span className={`ov-oldest${oldestSec > 24 * 3600 ? " ov-oldest-stale" : ""}`}>
+            oldest {fmtAge(oldestSec)}
+          </span>
         </>
       )}
+      {/* "0 working" is noise on a phone — the Working lane already says so. The gate AGE is not. */}
+      <span className="ov-sep ov-hide-narrow">·</span>
+      <span className="ov-hide-narrow">{inProgress} working</span>
     </div>
   );
-}
-
-function tasksReducer(state, action) {
-  switch (action.type) {
-    case "set":
-      return action.tasks;
-    case "sync": {
-      const map = Object.fromEntries(state.map((t) => [t.id, t]));
-      action.tasks.forEach((t) => { map[t.id] = t; });
-      return Object.values(map);
-    }
-    default:
-      return state;
-  }
 }
 
 function Spinner() {
@@ -483,7 +473,10 @@ export default function App() {
 
   // WebSocket
   useEffect(() => {
+    let disposed = false;
+    let retry = null;
     function connect() {
+      if (disposed) return;
       const ws = connectWS((msg) => {
         if (msg.tasks) dispatch({ type: "sync", tasks: msg.tasks });
         if (msg.worker) setWorkerStatus(prev => ({ ...prev, ...msg.worker, running: true }));
@@ -491,12 +484,19 @@ export default function App() {
       ws.onopen = () => setWsLive(true);
       ws.onclose = () => {
         setWsLive(false);
-        setTimeout(connect, 3000);
+        if (!disposed) retry = setTimeout(connect, 3000);
       };
       wsRef.current = ws;
     }
     connect();
-    return () => wsRef.current?.close();
+    return () => {
+      // The retry id was never captured, so the cleanup could not cancel it: close() fires
+      // onclose, which 3s later built ANOTHER socket that overwrote wsRef and orphaned the
+      // previous one — two live sockets both dispatching into the reducer.
+      disposed = true;
+      if (retry) clearTimeout(retry);
+      wsRef.current?.close();
+    };
   }, []);
 
   if (onboarded === null) {
@@ -603,6 +603,13 @@ export default function App() {
         </div>
       </aside>
       <main className="nh-main">
+        <h1 className="sr-only">
+          {page === "board" ? "Task board"
+            : page === "done" ? "Done tasks"
+            : page === "failed" ? "Failed tasks"
+            : page === "stats" ? "Performance"
+            : "Settings"}
+        </h1>
         {page === "board" && (
           <div className="nh-main-bar">
             <OverviewStrip tasks={tasks} />

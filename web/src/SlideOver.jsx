@@ -902,8 +902,14 @@ function SystemTab({ taskId, task, isActive }) {
       let seedTs = 0;
       fetchTaskEvents(taskId).then((evts) => {
         if (cancelled) return;
-        setEvents(evts);
         seedTs = evts.length > 0 ? Math.max(...evts.map(e => e.ts || 0)) : 0;
+        // MERGE, don't replace: `seedTs` is 0 until this resolves, so anything the stream
+        // delivers during the fetch window is appended — and a plain setEvents(evts) then
+        // threw those away permanently (the stream never re-sends them).
+        setEvents((streamed) => {
+          const duringFetch = streamed.filter((e) => (e.ts || 0) > seedTs);
+          return duringFetch.length > 0 ? [...evts, ...duringFetch] : evts;
+        });
       }).catch(() => {});
       const es = connectTaskSSE(taskId,
         (evt) => {

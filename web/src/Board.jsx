@@ -215,8 +215,10 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
           ◷ {task.status === "paused_quota" ? "waits for quota" : "waits for its own signal"}
         </div>
       )}
-      <div className="card-id">{task.id.slice(0, 8)}</div>
-      <div className="card-title">{task.title}</div>
+      <div className="card-title-row">
+        <div className="card-title">{task.title}</div>
+        <div className="card-id" title="task id — use it with `nh <id>`">{task.id.slice(0, 8)}</div>
+      </div>
       {task.live_status && isActive && (
         <div className="card-live-status">{task.live_status}</div>
       )}

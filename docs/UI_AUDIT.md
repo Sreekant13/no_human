@@ -43,7 +43,7 @@ Status key: ✅ fixed · ⬜ open
 | M10 | ✅ | Light theme | **The lane columns vanish in light mode.** `.lane`, `.lane-empty`, `.lane-failed` and the amber "this column is blocking you" glow are all `rgba(255,255,255,…)` literals — invisible on a light canvas. The strongest hierarchy cue on the board is dark-only. `styles.css:473` | token surfaces + `color-mix` glows |
 | M11 | ✅ | Drawer | **Sliding-window index keys** — rows are keyed by index into `events.slice(-N)`, so every streamed event shifts every key and an expanded reasoning block re-attaches to a different event. `SlideOver.jsx:1169` | key on `ts`+kind |
 | M12 | ✅ | Drawer | **O(n²) in the live feed:** `visible.indexOf(e)` per row, per render, re-run on every SSE frame (a real task here has 2,015 events). `SlideOver.jsx:1176` | use the map index |
-| M13 | ⬜ | Settings | The project-card header is a keyboard-inert `<div>`; expanding a project is the only route to its repos and test plan, and it is mouse-only. `Settings.jsx:461` | make it a `<button>` |
+| M13 | ✅ | Settings | The project-card header is a keyboard-inert `<div>`; expanding a project is the only route to its repos and test plan, and it is mouse-only. `Settings.jsx:461` | make it a `<button>` |
 
 ## OPERATOR-REQUESTED — board restructure (2026-07-14)
 
@@ -72,17 +72,17 @@ Design notes for the implementer (verify each before building):
 | # | Status | Defect |
 |---|---|---|
 | N1 | ✅ | `.rich-tool-group` is `role="button"` with no `onKeyDown` — focusable, announced as a button, dead to Enter/Space. `SlideOver.jsx:473` |
-| N2 | ⬜ | The "Show N more" lane expander sits below the fold in the very lanes that need it. `styles.css` — make it `position: sticky; bottom: 0` |
-| N3 | ⬜ | Prominence inversion: the green "No PRs waiting for review" panel out-shouts every real gate card. A caught-up lane should be a quiet checkmark, not a billboard. |
-| N4 | ⬜ | "waiting on you: 5d" — the freshest signal on the board — is truncated to `wa…` on mobile and is 12px grey on desktop. |
+| N2 | ✅ | The "Show N more" lane expander sits below the fold in the very lanes that need it. `styles.css` — make it `position: sticky; bottom: 0` |
+| N3 | ✅ | Prominence inversion: the green "No PRs waiting for review" panel out-shouts every real gate card. A caught-up lane should be a quiet checkmark, not a billboard. |
+| N4 | ✅ | "waiting on you: 5d" — the freshest signal on the board — is truncated to `wa…` on mobile and is 12px grey on desktop. |
 | N5 | ⬜ | Composer: the kind chips and repo pills sit *outside* the card's border, unlabeled, while priority (least consequential) sits inside it. |
-| N6 | ⬜ | Every card spends its top line — the strongest position — on an 8-char hex id. `Board.jsx:216` |
+| N6 | ✅ | Every card spends its top line — the strongest position — on an 8-char hex id. `Board.jsx:216` |
 | N7 | ✅ | Icon-only dismiss button with no accessible name. `SlideOver.jsx:385` |
-| N8 | ⬜ | WebSocket reconnect `setTimeout` id is never captured, so the cleanup cannot cancel it. `App.jsx:468` |
-| N9 | ⬜ | SSE seed race: events streamed during the initial fetch are replaced away and never re-fetched. `SlideOver.jsx:812` |
-| N10 | ⬜ | 16 provably-dead CSS classes (`activity-*` flat feed, `nh-nav*`, `sys-tree*`, `ob-eyebrow`, `checklist-post-action`) — proven dead by enumerating every dynamic `className` template. |
-| N11 | ⬜ | Board, Stats and Settings render no `<h1>`; the board page has zero headings, so a screen reader gets no document outline. |
-| N12 | ⬜ | `tasksReducer` "sync" never deletes — a task removed server-side lingers until reload. `App.jsx:78` |
+| N8 | ✅ | WebSocket reconnect `setTimeout` id is never captured, so the cleanup cannot cancel it. `App.jsx:468` |
+| N9 | ✅ | SSE seed race: events streamed during the initial fetch are replaced away and never re-fetched. `SlideOver.jsx:812` |
+| N10 | ✅ | 16 provably-dead CSS classes (`activity-*` flat feed, `nh-nav*`, `sys-tree*`, `ob-eyebrow`, `checklist-post-action`) — proven dead by enumerating every dynamic `className` template. |
+| N11 | ✅ | Board, Stats and Settings render no `<h1>`; the board page has zero headings, so a screen reader gets no document outline. |
+| N12 | ✅ | `tasksReducer` "sync" never deletes — a task removed server-side lingers until reload. `App.jsx:78` |
 | N13 | ⬜ | 320px (iPhone SE 1st gen): the nav overflows behind a suppressed scrollbar; still reachable by swipe, but the affordance is gone. |
 
 ---
