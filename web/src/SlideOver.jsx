@@ -707,40 +707,6 @@ function RichEvent({ event, elapsed, role }) {
 }
 
 // A single node card in the tree diagram
-function AgentNode({ agent, state, isActive, onClick }) {
-  const running = isActive && state.status === "active";
-  let cls = "sys-node";
-  if (running) cls += " active-node";
-  if (state.status === "done") cls += " done-node";
-  if (state.status === "error") cls += " error-node";
-  return (
-    <div
-      className={cls}
-      style={{ "--node-color": agent.color }}
-      onClick={onClick}
-      role="button"
-      tabIndex={0}
-      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && onClick()}
-      title={`Click to view ${agent.label} logs`}
-    >
-      {running && <div className="sys-node-running-indicator"><span className="sys-node-running-dot" /><span>Running</span></div>}
-      <div className="sys-node-header">
-        <div className="sys-node-icon">{agent.icon}</div>
-        <span className="sys-node-type">{agent.type}</span>
-      </div>
-      <div className="sys-node-name">{agent.label}</div>
-      {agent.model && <div className="sys-node-model" title={agent.model}>{agent.model}</div>}
-      <div className="sys-node-body">
-        <div className="sys-node-meta">
-          <span className="sys-node-meta-label">Status:</span>
-          <span className={`sys-node-status-badge s-${state.status}`}>{state.status}</span>
-          <span className="sys-node-events-count">{state.count} events</span>
-        </div>
-        {state.lastText && <div className="sys-node-last-text" title={state.lastText}>{state.lastText}</div>}
-      </div>
-    </div>
-  );
-}
 
 // Agent log modal — opens when clicking a node
 // One digest card for both surfaces: an agent's modal and the Activity page.
@@ -841,6 +807,26 @@ const clipText = (s, n) => {
 // One lane of the functionality board: the stage's status header on top,
 // its full agent tree always visible beneath — nothing hidden behind clicks.
 // The arrow out of a header flows when the NEXT stage is the one running.
+
+// M7: one compact row per role — the stage head already carries status/
+// counts/model, so the row only needs identity + a live status dot + the
+// click-through to the full AgentLogModal. Replaces the AgentNode cards
+// that repeated the head's facts at ~150px each.
+function RoleRow({ agent, state, isActive, onClick }) {
+  if (!agent) return null;
+  const status = (state && state.status) || "idle";
+  return (
+    <button type="button" className={`fx-role-row s-${status}`} onClick={onClick}
+            title={`${agent.label} — open full log`}>
+      <span className="fx-role-icon" aria-hidden="true">{agent.icon}</span>
+      <span className="fx-role-name">{agent.label}</span>
+      {agent.model && <span className="fx-role-model">{agent.model.replace("claude-", "")}</span>}
+      <span className={`fx-role-dot s-${status}`} aria-label={status} />
+      <span className="fx-role-chev" aria-hidden="true">›</span>
+    </button>
+  );
+}
+
 function FxLane({ g, isCurrent, flowOut, agentStates, node, isActive, onOpen }) {
   const hasPrimary = g.roles.includes(g.primary);
   const children = [
@@ -850,7 +836,10 @@ function FxLane({ g, isCurrent, flowOut, agentStates, node, isActive, onOpen }) 
   return (
     <div className={`fx-lane s-${g.status}${isCurrent ? " current" : ""}`}
          style={{ "--fx-color": g.color }}>
-      <div className={`fx-head${flowOut ? " flow-out" : ""}`} title={g.desc}>
+      <div className={`fx-head${flowOut ? " flow-out" : ""}`} title={g.desc}
+           role="button" tabIndex={0}
+           onClick={() => hasPrimary && onOpen(node(g.primary))}
+           onKeyDown={(e) => { if ((e.key === "Enter" || e.key === " ") && hasPrimary) { e.preventDefault(); onOpen(node(g.primary)); } }}>
         <div className="fx-head-top">
           <span className="fx-icon" aria-hidden="true">{g.icon}</span>
           <span className="fx-label">{g.label}</span>
@@ -867,22 +856,15 @@ function FxLane({ g, isCurrent, flowOut, agentStates, node, isActive, onOpen }) 
         {g.model && <div className="fx-model" title={g.model}>{g.model}</div>}
       </div>
       {hasPrimary || children.length > 0 ? (
-        <div className="sys-col fx-lane-tree">
+        <div className="fx-role-list">
           {hasPrimary && (
-            <AgentNode agent={node(g.primary)} state={agentStates[g.primary]}
-                       isActive={isActive} onClick={() => onOpen(node(g.primary))} />
+            <RoleRow agent={node(g.primary)} state={agentStates[g.primary]}
+                     isActive={isActive} onClick={() => onOpen(node(g.primary))} />
           )}
-          {hasPrimary && children.length > 0 && <div className="sys-col-stem" />}
-          {children.length > 0 && (
-            <div className="sys-col-children">
-              {children.map((c, i) => (
-                <div className="fx-child" style={{ "--i": i }} key={c.id}>
-                  <AgentNode agent={c} state={agentStates[c.id]}
-                             isActive={isActive} onClick={() => onOpen(c)} />
-                </div>
-              ))}
-            </div>
-          )}
+          {children.map((c) => (
+            <RoleRow key={c.id} agent={c} state={agentStates[c.id]}
+                     isActive={isActive} onClick={() => onOpen(c)} />
+          ))}
         </div>
       ) : (
         <div className="fx-lane-empty">not started yet</div>
