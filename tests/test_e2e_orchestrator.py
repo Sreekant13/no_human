@@ -494,6 +494,49 @@ async def test_tamper_weakening_is_blocked_and_escalates(bare_repo, tmp_path, st
         "tamper-failed attempt has an empty failure_reason"
 
 
+class _GutTestInOwnCommitBackend:
+    """Guts the existing test inside its OWN git commit (the shape a resumed
+    attempt's [WIP-BLOCKED] checkpoint has), then leaves only an innocent
+    uncommitted change for the orchestrator to commit."""
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        (cwd / "calc.py").write_text("def add(a, b):\n    return 0  # broken\n")
+        (cwd / "test_calc.py").write_text(
+            "from calc import add\n\ndef test_add():\n    pass\n"
+        )
+        _git(cwd, "add", "-A")
+        _git(cwd, "commit", "-m", "[WIP] make tests green")
+        (cwd / "notes.md").write_text("did the work\n")
+        if on_event:
+            on_event(AgentEvent("tool_use", tool_name="Write",
+                                tool_input={"file_path": "notes.md"}))
+        return AgentResult(final_text="done", num_turns=2, is_error=False,
+                           tokens_used=100, session_id="s", stop_reason="end_turn")
+
+
+async def test_tamper_guard_sees_the_whole_branch_not_just_the_last_commit(
+    bare_repo, tmp_path, store
+):
+    """ARCH_REVIEW B2 #3: the guard used to diff HEAD~1..HEAD while the
+    reviewer and the PR ship merge-base..HEAD — so test-gutting buried in an
+    earlier commit of the branch (a resumed attempt's checkpoint, or a commit
+    the agent made itself) sailed through. The guard must inspect the same
+    range that ships."""
+    cfg = _config(tmp_path)
+    orch = Orchestrator(
+        store, cfg.data, _GutTestInOwnCommitBackend(), SlackNotifier(None)
+    )
+    t = Task.new("make tests green", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.ESCALATED
+    assert "tamper" in outcome.detail.lower()
+    assert outcome.pr_url is None
+
+
 # --------------------------------------------------------------------------- #
 # Phase 2: adversarial reviewer gate                                           #
 # --------------------------------------------------------------------------- #

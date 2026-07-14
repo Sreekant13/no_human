@@ -270,6 +270,24 @@ class ClaudeBackend:
                                     f"{len(text)} chars — use Grep or offset to see more]"
                                 )
                             yield AgentEvent("tool_result", text=text)
+                    # Per-message usage → a running mid-attempt total in the
+                    # orchestrator's sink (B2 #2). Summing these per-call
+                    # numbers reproduces the ResultMessage's cumulative
+                    # totals, so the running counter and the final ledger
+                    # count the same tokens.
+                    usage = message.usage or {}
+                    if usage:
+                        yield AgentEvent(
+                            "usage",
+                            meta={
+                                "tokens_used": int(usage.get("input_tokens", 0))
+                                + int(usage.get("output_tokens", 0)),
+                                "cache_read_tokens": int(
+                                    usage.get("cache_read_input_tokens", 0)),
+                                "cache_creation_tokens": int(
+                                    usage.get("cache_creation_input_tokens", 0)),
+                            },
+                        )
                 elif isinstance(message, TaskStartedMessage):
                     yield AgentEvent(
                         "subagent_start",

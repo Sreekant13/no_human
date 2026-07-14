@@ -23,15 +23,13 @@ class Bounds:
     #
     # Set to 500 by the user (2026-07-10): give a real task room to finish.
     # Know what this cap is and is not. It is NOT a cost control — it is the
-    # last-resort stop for an agent that has stopped making progress, and it is
-    # the ONLY one: constraint #5 forbids interrupting mid-attempt, so the stuck
-    # and doom-loop detectors emit an advisory event and let the attempt run on.
-    # Attempt 11 burned 3.4M cache-read in 41 turns while looping on one file;
-    # the same loop has ~12x that headroom here. What makes 500 safe to hold is
-    # that `nh task pause` became real cooperative cancellation on this date —
-    # a runaway now stops in seconds and checkpoints its work, instead of
-    # burning to the cap. Do not raise this further without also giving the
-    # stuck detector teeth.
+    # last-resort stop for an agent that has stopped making progress. It is no
+    # longer the only one: since ARCH_REVIEW B2 #1 the stuck detectors have a
+    # HARD tier (doom_loop_abort/edit_abort below) that ends the attempt
+    # deterministically, work checkpointed — the advisory tier still only
+    # emits telemetry. Attempt 11 once burned 3.4M cache-read in 41 turns
+    # looping on one file with ~12x that headroom here; that class of runaway
+    # now aborts at the hard threshold instead of burning to this cap.
     max_turns_per_attempt: int = 500
     escalate_after: int = 3
     max_correction_rounds: int = 2
@@ -113,6 +111,15 @@ class StuckDetector:
     doom_loop_threshold: int = 3
     # R2.3 Layer 1: edit-count per file.
     edit_threshold: int = 5
+    # Hard-abort tier (ARCH_REVIEW B2 #1). The advisory thresholds above emit
+    # telemetry; crossing a hard threshold ends the ATTEMPT (StuckAbort in the
+    # orchestrator's sink — work checkpointed, bounded loop retries with fresh
+    # context). Set far above the advisory tier so they fire only on
+    # unambiguous runaways: 9 identical consecutive calls, one file edited
+    # 15×, or 12 consecutive calls alternating between the same two actions.
+    doom_loop_abort: int = 9
+    edit_abort: int = 15
+    ping_pong_abort_window: int = 12
     _seen: dict[str, int] = field(default_factory=dict)
     _last: str | None = None
     _tool_signatures: list[str] = field(default_factory=list)
@@ -149,13 +156,17 @@ class StuckDetector:
         self._edit_counts[file_path] = self._edit_counts.get(file_path, 0) + 1
         return self._edit_counts[file_path] >= self.edit_threshold
 
-    def detect_ping_pong(self) -> bool:
-        """R2.1: detect A-B-A-B alternating pattern in last 4 tool calls."""
+    def detect_ping_pong(self, window: int = 4) -> bool:
+        """R2.1: detect an A-B-A-B alternating pattern in the last ``window``
+        tool calls (4 = advisory; ``ping_pong_abort_window`` = hard)."""
         sigs = self._tool_signatures
-        if len(sigs) < 4:
+        if len(sigs) < window:
             return False
-        return (sigs[-4] == sigs[-2] and sigs[-3] == sigs[-1]
-                and sigs[-4] != sigs[-3])
+        tail = sigs[-window:]
+        a, b = tail[0], tail[1]
+        if a == b:
+            return False
+        return all(s == (a if i % 2 == 0 else b) for i, s in enumerate(tail))
 
     @property
     def stuck_reason(self) -> str | None:
@@ -174,6 +185,27 @@ class StuckDetector:
             )
         if self.detect_ping_pong():
             return "ping-pong: alternating between two actions (A-B-A-B pattern)"
+        return None
+
+    @property
+    def hard_stuck_reason(self) -> str | None:
+        """A reason iff a HARD threshold is crossed — the abort tier, not the
+        advisory one. The orchestrator's sink raises StuckAbort on this."""
+        if self._consecutive_repeats >= self.doom_loop_abort:
+            return (
+                f"doom-loop: identical tool call repeated "
+                f"{self._consecutive_repeats}× consecutively"
+            )
+        hot = [(f, c) for f, c in self._edit_counts.items()
+               if c >= self.edit_abort]
+        if hot:
+            path, count = max(hot, key=lambda fc: fc[1])
+            return f"edit-loop: {path} edited {count}×"
+        if self.detect_ping_pong(self.ping_pong_abort_window):
+            return (
+                f"ping-pong: alternating between two actions for "
+                f"{self.ping_pong_abort_window} consecutive calls"
+            )
         return None
 
     @property

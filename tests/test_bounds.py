@@ -171,3 +171,55 @@ def test_stuck_reason_none_when_healthy():
     d = StuckDetector()
     d.record_tool_call("Read", "/a.py")
     assert d.stuck_reason is None
+
+
+# ------------------- hard-abort thresholds (ARCH_REVIEW B2 #1) -------------- #
+# Advisory thresholds emit telemetry; hard thresholds end the attempt. A
+# recognized loop used to be allowed to burn the whole 500-turn budget (live
+# precedent: 3.4M cache-read in 41 turns). The hard tier is deliberately far
+# above the advisory tier so it only fires on unambiguous runaways.
+
+
+def test_hard_stuck_none_below_doom_abort_threshold():
+    d = StuckDetector()
+    for _ in range(d.doom_loop_abort - 1):
+        d.record_tool_call("Bash", "pytest -x")
+    assert d.stuck_reason is not None  # advisory fired long ago
+    assert d.hard_stuck_reason is None  # but no abort yet
+
+
+def test_hard_stuck_doom_loop_at_abort_threshold():
+    d = StuckDetector()
+    for _ in range(d.doom_loop_abort):
+        d.record_tool_call("Bash", "pytest -x")
+    assert d.hard_stuck_reason is not None
+    assert "doom-loop" in d.hard_stuck_reason
+
+
+def test_hard_stuck_edit_loop_at_abort_threshold():
+    d = StuckDetector()
+    for _ in range(d.edit_abort - 1):
+        d.record_edit("/a.py")
+    assert d.hard_stuck_reason is None
+    d.record_edit("/a.py")
+    assert d.hard_stuck_reason is not None
+    assert "edit-loop" in d.hard_stuck_reason
+
+
+def test_hard_stuck_sustained_ping_pong():
+    d = StuckDetector()
+    for _ in range(5):  # 10 alternating calls — advisory, not abort
+        d.record_tool_call("Read", "/a.py")
+        d.record_tool_call("Edit", "/b.py")
+    assert d.hard_stuck_reason is None
+    d.record_tool_call("Read", "/a.py")
+    d.record_tool_call("Edit", "/b.py")  # 12 alternating calls — sustained
+    assert d.hard_stuck_reason is not None
+    assert "ping-pong" in d.hard_stuck_reason
+
+
+def test_hard_stuck_not_fooled_by_progress():
+    d = StuckDetector()
+    for i in range(30):
+        d.record_tool_call("Read", f"/file{i}.py")
+    assert d.hard_stuck_reason is None
