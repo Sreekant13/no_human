@@ -32,3 +32,29 @@ export function topByRecency(items, n, tsOf = defaultTs) {
     hiddenCount: Math.max(0, sorted.length - take),
   };
 }
+
+/**
+ * Like {@link topByRecency}, but items matching `isPriority` take the visible slots
+ * FIRST, each group still ordered by recency.
+ *
+ * The Failed lane needs this: a cancelled task ends in `failed` status, so ten cancels
+ * push the one REAL failure — the only row that wants attention — behind "Show N more"
+ * purely because a cancel happened to be more recent.
+ *
+ * With no predicate this is exactly {@link topByRecency}.
+ */
+export function topPrioritised(items, n, tsOf = defaultTs, isPriority = null) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return { visible: [], hiddenCount: 0 };
+  }
+  if (!isPriority) return topByRecency(items, n, tsOf);
+
+  const priority = items.filter((x) => isPriority(x));
+  const rest = items.filter((x) => !isPriority(x));
+  const top = topByRecency(priority, n, tsOf);
+  const fill = topByRecency(rest, Math.max(0, n - top.visible.length), tsOf);
+  return {
+    visible: [...top.visible, ...fill.visible],
+    hiddenCount: top.hiddenCount + fill.hiddenCount,
+  };
+}

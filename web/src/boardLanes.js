@@ -55,3 +55,12 @@ const NEEDS_YOU_LANES = new Set(LANES.filter((l) => l.needsYou).map((l) => l.key
 export function isNeedsYou(task) {
   return NEEDS_YOU_LANES.has(routeTask(task));
 }
+
+// A cancelled task ends in FAILED status but is NOT a capability failure. The board's
+// overview strip counted every `failed` row, so a board with 1 real failure and 10
+// operator-cancelled tasks shouted "11 failed" — a permanent red alarm competing with
+// the actual gates. Stats already excluded cancels; this is now the one definition both
+// surfaces share.
+export function isRealFailure(task) {
+  return Boolean(task) && task.status === "failed" && !task.cancelled;
+}

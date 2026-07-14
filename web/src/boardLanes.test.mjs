@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { LANES, routeTask, isNeedsYou, isWaiting } from "./boardLanes.js";
+import { LANES, routeTask, isNeedsYou, isWaiting, isRealFailure } from "./boardLanes.js";
 
 test("awaiting_approval routes to its OWN 'Review PR' lane, not a catch-all", () => {
   assert.equal(routeTask({ status: "awaiting_approval" }), "review");
@@ -86,4 +86,18 @@ test("isNeedsYou matches the board's lanes exactly (the header-count fix)", () =
   assert.equal(isNeedsYou({ status: "implementing" }), false);
   assert.equal(isNeedsYou({ status: "done" }), false);
   assert.equal(isNeedsYou({ status: "failed" }), false);
+});
+
+// A cancelled task ends in FAILED status but is not a capability failure. The board's
+// overview strip counted it as one, so "11 failed" was really 1 failure + 10 cancels —
+// a permanent red alarm, 91% self-inflicted, competing with the real gates. Stats got
+// this right (Stats.jsx) while the board did not; this is the shared definition.
+test("isRealFailure excludes operator-cancelled tasks", () => {
+  assert.equal(isRealFailure({ status: "failed", cancelled: false }), true);
+  assert.equal(isRealFailure({ status: "failed" }), true);
+  assert.equal(isRealFailure({ status: "failed", cancelled: true }), false);
+  assert.equal(isRealFailure({ status: "done" }), false);
+  assert.equal(isRealFailure({ status: "awaiting_input" }), false);
+  assert.equal(isRealFailure(null), false);
+  assert.equal(isRealFailure(undefined), false);
 });

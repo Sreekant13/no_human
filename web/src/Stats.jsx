@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { fetchMetrics, fetchRepos, fetchRepoUnderstanding, searchEvents } from "./api.js";
 import { estimateCost, fmtTokens } from "./cost.js";
 import { northStarTiles } from "./northStar.js";
+import { isRealFailure } from "./boardLanes.js";
 import { profileRows, profileStatus } from "./repoView.js";
 import { kindLabel, groupByTask } from "./searchView.js";
 
@@ -36,7 +37,7 @@ function computeStats(tasks) {
   // An operator-cancelled task ends in FAILED status but is not a capability
   // failure — keep it out of the failure count and the success-rate denominator.
   const cancelledTasks = tasks.filter(t => t.status === "failed" && t.cancelled);
-  const failedTasks = tasks.filter(t => t.status === "failed" && !t.cancelled);
+  const failedTasks = tasks.filter(isRealFailure);
 
   // Tasks with valid timestamps
   const doneWithTimes = doneTasks

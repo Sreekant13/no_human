@@ -11,7 +11,7 @@ import { setFavicon } from "./favicon.js";
 import { needsPrUrl } from "./composerKinds.js";
 import { hasPrRef } from "./prRefs.js";
 import { shouldTriggerNewTask } from "./keyboardShortcut.js";
-import { isNeedsYou } from "./boardLanes.js";
+import { isNeedsYou, isRealFailure } from "./boardLanes.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 
 const PROGRESS_STATUSES  = new Set(["pending", "context", "planning", "implementing", "reviewing", "testing"]);
@@ -38,7 +38,11 @@ function fmtAge(seconds) {
 
 function OverviewStrip({ tasks }) {
   const needsYou   = tasks.filter(isNeedsYou);
-  const failed     = tasks.filter(t => t.status === "failed").length;
+  const failed     = tasks.filter(isRealFailure).length;
+  // Cancels also end in `failed` status and sit in the Failed lane, so the lane's badge
+  // counts them. Naming them here keeps the strip and the lane from contradicting each
+  // other — "1 failed" over a lane badged 11 is worse than either number alone.
+  const cancelled  = tasks.filter(t => t.status === "failed" && t.cancelled).length;
   const inProgress = tasks.filter(t => PROGRESS_STATUSES.has(t.status)).length;
 
   const oldestSec = needsYou.length > 0
@@ -56,6 +60,10 @@ function OverviewStrip({ tasks }) {
             {failed > 0 && <>
               <span className="ov-sep">·</span>
               <span className="ov-escalated">{failed} failed</span>
+            </>}
+            {cancelled > 0 && <>
+              <span className="ov-sep">·</span>
+              <span>{cancelled} cancelled</span>
             </>}
           </>
       }

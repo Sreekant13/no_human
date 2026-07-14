@@ -2,9 +2,9 @@ import { useState, useRef, useEffect } from "react";
 import { fmtTokens, totalBurn } from "./cost.js";
 import SlideOver from "./SlideOver.jsx";
 import { groupFailedByTitle } from "./boardGroups.js";
-import { LANES, routeTask, isWaiting } from "./boardLanes.js";
+import { LANES, routeTask, isWaiting, isRealFailure } from "./boardLanes.js";
 import { taskProgress } from "./taskProgress.js";
-import { topByRecency } from "./laneView.js";
+import { topPrioritised } from "./laneView.js";
 
 // 5B: how many cards a collapsible lane shows before the expand arrow. 4 keeps
 // every lane visible without vertical scroll on a typical viewport; the count
@@ -98,7 +98,10 @@ function Lane({ lane, tasks, onSelect }) {
     const tsOf = isFailed
       ? (g) => g.task.last_activity || g.task.updated_at || g.task.created_at || ""
       : undefined;
-    const r = topByRecency(rows, expanded ? rows.length : LANE_TOP_N, tsOf);
+    // A cancelled task also ends in `failed` status, so a run of cancels would push the
+    // one REAL failure — the only row that wants attention — behind "Show N more".
+    const isPriority = isFailed ? (g) => isRealFailure(g.task) : null;
+    const r = topPrioritised(rows, expanded ? rows.length : LANE_TOP_N, tsOf, isPriority);
     visible = r.visible;
     hiddenCount = r.hiddenCount;
   }
@@ -205,7 +208,20 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
       onClick={onClick}
       role="button"
       tabIndex={0}
-      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && onClick(e)}
+      onKeyDown={(e) => {
+        // Only when the CARD itself is focused: keydown from the PR-link descendant
+        // bubbles here, and preventDefault would cancel the anchor's own activation —
+        // Enter on a focused PR link would open the drawer instead of the PR.
+        if (e.target !== e.currentTarget) return;
+        // preventDefault is load-bearing: without it, Enter opens the drawer, the
+        // drawer autofocuses its close button in the same event flush, and Enter's
+        // default activation then CLICKS that button — the drawer opened and shut
+        // within one keypress. (It also stops Space from scrolling the lane.)
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick(e);
+        }
+      }}
     >
       {isActive && <div className="card-active-pulse" title="agent is working on this" />}
       {waiting && (
@@ -238,7 +254,12 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
         <div className="card-description">{task.description_short}</div>
       )}
       {task.blocker_question && isAwaiting && (
-        <div className="card-blocker-q">{task.blocker_question}</div>
+        <div className="card-blocker-q">
+          {/* The clamp lives on an inner span: `overflow:hidden` clips at the PADDING
+              box, so a padded clamped box lets the next line show through its bottom
+              padding as a sliced sliver of text. */}
+          <span>{task.blocker_question}</span>
+        </div>
       )}
       {isAwaiting && actionHint(task) && (
         <div className="card-action-hint">{actionHint(task)}</div>
