@@ -21,6 +21,7 @@ from typing import Any
 from .northstar import BenchScore
 
 RESULTS_DIR = Path(__file__).resolve().parents[3] / "eval" / "results" / "northstar"
+REPORT_MD = Path(__file__).resolve().parents[3] / "docs" / "NORTH_STAR_BENCH.md"
 
 
 @dataclass

@@ -140,6 +140,37 @@ def test_excludes_no_human_machine_sessions(roots):
     assert [t.cascade_id for t in out] == ["cc:real"]
 
 
+def test_excludes_no_human_agent_prompt_sessions(roots):
+    """no_human's own agent sessions (supervisor/coder/planner/intake/review
+    prompts) run with cwd = the REAL repo, so the directory filter misses
+    them. They are machine-authored requests — corpus poison for both the
+    bench and the learning miner — and must be excluded by prompt signature.
+    (Found live: 994-spec corpus was dominated by supervisor-prompt sessions.)"""
+    ent, _ = roots
+    for i, preamble in enumerate((
+        "You are the Supervisor of an autonomous coding agent. You stand in",
+        "You are implementing a software task in the repo at /Users/x/repo",
+        "You are planning an implementation task for the repo at /Users/x",
+        "You are a relentless intake interviewer for an autonomous coding",
+        "You are a Staff Software Engineer performing an independent code review",
+        "You are an impartial evaluation judge.",
+    )):
+        lines = [
+            _line("user", preamble + " ... details follow",
+                  ts="2026-07-01T10:00:00.000Z"),
+            _line("assistant", "ok", ts="2026-07-01T10:01:00.000Z",
+                  usage=USAGE_2),
+            _line("user", "CONTINUE", ts="2026-07-01T10:02:00.000Z"),
+        ]
+        _write_session(ent, "-Users-op-git-repo", f"agent{i}", lines)
+    # A real operator conversation in the same project dir survives.
+    _write_session(ent, "-Users-op-git-repo", "real", _rich_session_lines())
+
+    out = extract_claude_code_transcripts(days=36500, roots=[ent],
+                                          min_user_msgs=1)
+    assert [t.cascade_id for t in out] == ["cc:real"]
+
+
 def test_min_user_msgs_parameter(roots):
     ent, _ = roots
     one_shot = [

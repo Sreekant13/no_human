@@ -158,6 +158,20 @@ def test_resumed_sessions_dedupe_by_first_request(tmp_path):
 
 # ---------------------------- non-runnable --------------------------------- #
 
+def test_windsurf_workspaces_resolve_repo_path(tmp_path):
+    """Windsurf/Devin transcripts carry `workspaces` (file:// URIs), not cwd —
+    without the fallback the ENTIRE original 89-conversation corpus builds as
+    non-runnable (found live: all Windsurf specs skipped 'repo missing')."""
+    repo = _git_repo(tmp_path)
+    t = _transcript(cwd="", branch="")
+    t.workspaces = [f"file://{repo}/"]
+    t.source = "windsurf"
+    build_bench_tasks([t], out_dir=tmp_path / "specs")
+    spec = load_bench_tasks(tmp_path / "specs")[0]
+    assert spec.runnable is True
+    assert spec.repo["path"] == str(repo)
+
+
 def test_missing_repo_marked_not_runnable(tmp_path):
     t = _transcript(cwd="/nope/definitely/missing")
     (path,) = build_bench_tasks([t], out_dir=tmp_path / "specs")
@@ -197,6 +211,57 @@ def test_cli_bench_build_writes_specs(tmp_path, monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert len(list(out.glob("ns-*.yaml"))) == 1
+
+
+def test_cli_bench_run_wiring_end_to_end(tmp_path, monkeypatch):
+    """Exercise bench run PAST the no-specs exit (the live baseline launch
+    crashed on a NameError this path would have caught): specs present,
+    _bootstrap stubbed, runner stubbed to skip — the command must reach the
+    card/report stage and exit 0."""
+    import yaml as _yaml
+    from click.testing import CliRunner
+    from no_human.cli import commands as cmds
+    from no_human.cli.commands import cli
+    from no_human.eval.bench_task import BenchTask
+    from no_human.eval.northstar import BenchScore
+
+    d = tmp_path / "specs"
+    d.mkdir()
+    spec = BenchTask(id="ns-wire1", title="t", request="r", subset="core",
+                     runnable=False, skip_reason="wiring test")
+    (d / "ns-wire1.yaml").write_text(_yaml.safe_dump(spec.to_dict()))
+
+    class _Cfg:
+        data = {"llm": {}}
+        primary_model = "m"
+        review_model = "m"
+        def __getitem__(self, k):
+            return {"safety": {"forbidden_paths": []},
+                    "git": {"never_push_to": []}}[k]
+
+    monkeypatch.setattr(cmds, "_bootstrap", lambda *a, **kw: (_Cfg(), None))
+
+    class _StubRunner:
+        def __init__(self, *a, **kw): ...
+        async def run_one(self, spec, *, workdir):
+            return BenchScore(
+                task_id=spec.id, title=spec.title, outcome_status="skipped",
+                goal_satisfied=None, escalated_honestly=False, mergeable=None,
+                nh_tokens=0, nh_cache_tokens=0, nh_cache_creation_tokens=0,
+                nh_turns=0, nh_wall_clock_s=0.0, orig_tokens=0,
+                orig_cache_tokens=0, orig_cache_creation_tokens=0,
+                orig_wall_clock_s=0.0, orig_corrections=0,
+                subset=spec.subset, notes="stub")
+    monkeypatch.setattr("no_human.eval.northstar.NorthStarRunner", _StubRunner)
+    monkeypatch.setattr("no_human.eval.northstar_card.RESULTS_DIR",
+                        tmp_path / "results")
+    monkeypatch.setattr("no_human.eval.northstar_card.REPORT_MD",
+                        tmp_path / "NORTH_STAR_BENCH.md")
+
+    result = CliRunner().invoke(
+        cli, ["bench", "run", "--specs-dir", str(d)])
+    assert result.exit_code == 0, result.output
+    assert "success" in result.output
 
 
 def test_cli_bench_run_exits_1_without_specs(tmp_path):

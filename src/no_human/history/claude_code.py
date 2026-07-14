@@ -43,6 +43,38 @@ _MACHINE_DIR_MARKERS = (
 )
 
 
+# no_human's OWN agent sessions (supervisor / coder / planner / intake /
+# standalone reviewer / eval judges) often run with cwd = the operator's REAL
+# repo, so the directory markers above miss them. Their first "user" message
+# is a machine-authored prompt template — a session opening with one of these
+# is no_human talking to itself, never the operator, and is corpus poison for
+# both the benchmark and the learning miner. Matched against the start of the
+# session's FIRST user message.
+_MACHINE_PROMPT_PREFIXES = (
+    # harvested from src/no_human prompt templates (grep '"You are ' + known
+    # non-"You are" template openers); keep in sync when adding agent prompts
+    "You are the Supervisor of an autonomous coding agent",
+    "You are the Supervisor reviewing an autonomous coding agent",
+    "You are implementing a software task",       # "in/on the repo at" variants
+    "You are planning an implementation task",
+    "You are a relentless intake interviewer",
+    "You are a Staff Software Engineer performing",   # independent + per-PR
+    "You are an impartial evaluation judge",
+    "You are a focused code reviewer",
+    "You are a focused codebase researcher",
+    "You are a spec quality evaluator",
+    "You are diagnosing why an autonomous coding agent",
+    "You are documenting the repository at",
+    "You are mining a developer",
+    "You are onboarding a repository at",
+    "You are resuming a previously-blocked task",
+    "You are synthesizing the BEST implementation plan",
+    "You are an expert SRE analyzing a production",  # issue + incident variants
+    "Summarize this context for a developer working on",
+    "Fetch the diff for PR",
+)
+
+
 def _root_label(root: Path) -> str:
     """Source label from the config dir the projects root lives in."""
     parent = root.parent.name
@@ -150,6 +182,9 @@ def _parse_session(
     user_msgs = [m for m in messages if m.role == "user"]
     if len(user_msgs) < min_user_msgs:
         return None  # trivial/probe session — below the caller's floor
+    if user_msgs and user_msgs[0].content.lstrip().startswith(
+            _MACHINE_PROMPT_PREFIXES):
+        return None  # no_human's own agent session, not the operator
     return Transcript(
         cascade_id=f"cc:{path.stem}",
         title=title or f"Claude Code session {path.stem[:8]}",

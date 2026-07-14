@@ -169,7 +169,12 @@ def build_bench_tasks(
         seen_requests.add(req_hash)
 
         tid = f"ns-{hashlib.sha256(t.cascade_id.encode()).hexdigest()[:8]}"
+        # Claude Code carries cwd; Windsurf/Devin carry workspace URIs — the
+        # original 89-conversation corpus is ALL workspaces-shaped.
         cwd = getattr(t, "cwd", "") or ""
+        if not cwd:
+            from ..history.analyzer import _project_from_workspaces
+            cwd = _project_from_workspaces(getattr(t, "workspaces", []) or [])
         branch = getattr(t, "git_branch", "") or ""
         runnable, skip_reason, pin = True, "", ""
 
