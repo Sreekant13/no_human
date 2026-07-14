@@ -43,6 +43,16 @@ class Transcript:
     messages: list[Message] = field(default_factory=list)
     step_count: int = 0
     workspaces: list[str] = field(default_factory=list)
+    # Original-session economics (north-star benchmark; populated by the
+    # Claude Code extractor, empty/zero for sources that can't provide them).
+    usage: dict[str, int] = field(default_factory=dict)  # 4 token buckets
+    started: str = ""       # ISO 8601 first message timestamp
+    ended: str = ""         # ISO 8601 last message timestamp
+    cwd: str = ""           # working directory the session ran in
+    git_branch: str = ""    # branch checked out at session time
+    source: str = ""        # "cc:enterprise" | "cc:personal" | "windsurf" | ""
+    corrections: int = 0    # non-noise user messages after the first — the
+                            # babysitting signal the benchmark compares against
 
 
 class IDENotRunningError(Exception):
@@ -288,6 +298,7 @@ def extract_transcripts(
         if not messages:
             continue
 
+        user_msgs = [m for m in messages if m.role == "user"]
         transcripts.append(Transcript(
             cascade_id=cid,
             title=title,
@@ -295,6 +306,8 @@ def extract_transcripts(
             messages=messages,
             step_count=step_count,
             workspaces=workspaces,
+            source="windsurf",
+            corrections=max(0, len(user_msgs) - 1),
         ))
 
     transcripts.sort(key=lambda t: t.created)

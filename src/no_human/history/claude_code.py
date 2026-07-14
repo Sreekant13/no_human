@@ -24,11 +24,39 @@ from .extractor import Message, Transcript
 log = logging.getLogger("no_human.history")
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+# The operator's machine holds TWO Claude config dirs: ~/.claude (enterprise)
+# and ~/.claude-personal (personal). "All conversations" means both.
+DEFAULT_ROOTS = (
+    CLAUDE_PROJECTS,
+    Path.home() / ".claude-personal" / "projects",
+)
+
+# Encoded-cwd project dirs that are machine-generated, not the operator's own
+# conversations: no_human's eval/shadow sandboxes, pytest tmp repos, agent
+# worktrees, scratchpads, and anything under a temp root. Substrings of the
+# ENCODED path (cwd with "/" -> "-"), matched case-insensitively.
+_MACHINE_DIR_MARKERS = (
+    "tmp", "scratchpad", "worktree",       # original filter (agent/CI throwaways)
+    "-var-folders-",                        # macOS $TMPDIR (…/var/folders/…)
+    "nh-eval-", "nh-shadow-",               # no_human's own eval/shadow runs
+    "pytest-of-",                           # pytest tmp_path factories
+)
+
+
+def _root_label(root: Path) -> str:
+    """Source label from the config dir the projects root lives in."""
+    parent = root.parent.name
+    if parent == ".claude-personal":
+        return "cc:personal"
+    if parent == ".claude":
+        return "cc:enterprise"
+    return f"cc:{parent or 'other'}"
 
 # Lines that are plumbing, not real human input — never treat as rules.
 _NOISE_PREFIXES = (
     "<local-command-caveat>", "<command-name>", "<command-message>",
     "<command-args>", "<command-stdout>", "<command-stderr>",
+    "<local-command-stdout>", "<local-command-stderr>",
     "<bash-input>", "<bash-stdout>", "<bash-stderr>", "Caveat:",
     "[Request interrupted", "<system-reminder>",
 )
@@ -53,11 +81,25 @@ def _is_noise(text: str) -> bool:
     return not t or t.startswith(_NOISE_PREFIXES)
 
 
-def _parse_session(path: Path) -> Transcript | None:
-    """Parse one session JSONL into a Transcript (or None if too thin/noisy)."""
+def _parse_session(
+    path: Path, *, source: str = "", min_user_msgs: int = 2,
+) -> Transcript | None:
+    """Parse one session JSONL into a Transcript (or None if too thin/noisy).
+
+    Besides the prose the learning pipeline consumes, this extracts the
+    session's original economics for the north-star benchmark: per-bucket
+    token usage summed over (non-sidechain) assistant lines, first/last
+    message timestamps, the cwd/branch the session ran against, and the
+    corrections count (non-noise user messages after the first).
+    """
     messages: list[Message] = []
     created = ""
     title = ""
+    usage: dict[str, int] = {}
+    started = ""
+    ended = ""
+    cwd = ""
+    git_branch = ""
     try:
         with path.open(encoding="utf-8") as fh:
             for line in fh:
@@ -75,13 +117,30 @@ def _parse_session(path: Path) -> Transcript | None:
                     continue
                 msg = o.get("message") or {}
                 role = msg.get("role", t)
+                if role == "assistant":
+                    u = msg.get("usage")
+                    if isinstance(u, dict):
+                        for bucket in ("input_tokens", "output_tokens",
+                                       "cache_read_input_tokens",
+                                       "cache_creation_input_tokens"):
+                            v = u.get(bucket)
+                            if isinstance(v, (int, float)):
+                                usage[bucket] = usage.get(bucket, 0) + int(v)
                 text = _text_from_content(msg.get("content")).strip()
                 if role == "user" and _is_noise(text):
                     continue
                 if not text:
                     continue
+                ts = o.get("timestamp", "")
+                if ts:
+                    started = started or ts
+                    ended = ts
+                if not cwd and o.get("cwd"):
+                    cwd = str(o["cwd"])
+                if not git_branch and o.get("gitBranch"):
+                    git_branch = str(o["gitBranch"])
                 if not created:
-                    created = o.get("timestamp", "")
+                    created = ts
                 if role == "user" and not title:
                     title = text.replace("\n", " ")[:80]
                 messages.append(Message(role=role, content=text, step_type=t))
@@ -89,49 +148,67 @@ def _parse_session(path: Path) -> Transcript | None:
         return None
 
     user_msgs = [m for m in messages if m.role == "user"]
-    if len(user_msgs) < 2:
-        return None  # trivial/probe session — nothing to learn
+    if len(user_msgs) < min_user_msgs:
+        return None  # trivial/probe session — below the caller's floor
     return Transcript(
         cascade_id=f"cc:{path.stem}",
         title=title or f"Claude Code session {path.stem[:8]}",
         created=created,
         messages=messages,
         step_count=len(messages),
+        usage=usage,
+        started=started,
+        ended=ended,
+        cwd=cwd,
+        git_branch=git_branch,
+        source=source,
+        corrections=max(0, len(user_msgs) - 1),
     )
 
 
 def extract_claude_code_transcripts(
-    *, days: int = 30, limit: int = 80, root: Path | None = None,
+    *,
+    days: int = 30,
+    limit: int = 80,
+    roots: list[Path] | tuple[Path, ...] | None = None,
+    min_user_msgs: int = 2,
 ) -> list[Transcript]:
     """Read recent Claude Code sessions into Transcripts.
 
-    Bounded: only sessions modified within ``days``, the ``limit`` most recent,
-    and skips throwaway sessions whose project path is a temp dir (agent/CI
-    worktrees, not the user's real work)."""
-    base = root or CLAUDE_PROJECTS
-    if not base.is_dir():
-        return []
+    Reads EVERY config root (default: ~/.claude AND ~/.claude-personal — the
+    operator's enterprise and personal histories). Bounded: only sessions
+    modified within ``days``, the ``limit`` most recent overall, and skips
+    machine-generated sessions (no_human's own eval/shadow/worktree runs,
+    pytest tmp repos, anything under a temp root — see _MACHINE_DIR_MARKERS).
+    ``min_user_msgs`` is the substance floor: the learning pipeline keeps the
+    historical >=2 (needs a correction to learn from); the benchmark corpus
+    passes 1 (a one-shot request is still a real task)."""
+    bases = [Path(r) for r in (roots if roots is not None else DEFAULT_ROOTS)]
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
-    files: list[Path] = []
-    for proj in base.iterdir():
-        if not proj.is_dir():
+    files: list[tuple[Path, str]] = []
+    for base in bases:
+        if not base.is_dir():
             continue
-        name = proj.name.lower()
-        if "tmp" in name or "scratchpad" in name or "worktree" in name:
-            continue  # throwaway agent/CI sessions, not the user's history
-        for f in proj.glob("*.jsonl"):
-            try:
-                if f.stat().st_mtime >= cutoff:
-                    files.append(f)
-            except OSError:
+        label = _root_label(base)
+        for proj in base.iterdir():
+            if not proj.is_dir():
                 continue
-    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            name = proj.name.lower()
+            if any(marker in name for marker in _MACHINE_DIR_MARKERS):
+                continue  # machine-generated, not the operator's history
+            for f in proj.glob("*.jsonl"):
+                try:
+                    if f.stat().st_mtime >= cutoff:
+                        files.append((f, label))
+                except OSError:
+                    continue
+    files.sort(key=lambda pair: pair[0].stat().st_mtime, reverse=True)
 
     out: list[Transcript] = []
-    for f in files[:limit]:
-        tr = _parse_session(f)
+    for f, label in files[:limit]:
+        tr = _parse_session(f, source=label, min_user_msgs=min_user_msgs)
         if tr is not None:
             out.append(tr)
-    log.info("Claude Code: %d transcripts from %d recent session files",
-             len(out), min(len(files), limit))
+    log.info("Claude Code: %d transcripts from %d recent session files "
+             "across %d roots", len(out), min(len(files), limit), len(bases))
     return out

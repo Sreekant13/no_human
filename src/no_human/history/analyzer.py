@@ -115,6 +115,15 @@ def _project_from_workspaces(workspaces: list[str]) -> str:
     return ""
 
 
+def _project_of(transcript: Transcript) -> str:
+    """Project scope for mined rules: workspace URIs (Windsurf) with a
+    fallback to the session ``cwd`` (Claude Code transcripts carry no
+    workspaces — without the fallback every CC-mined rule was global and a
+    personal-repo correction could surface in an enterprise task)."""
+    return (_project_from_workspaces(transcript.workspaces)
+            or getattr(transcript, "cwd", "") or "")
+
+
 @dataclass
 class Finding:
     """A single learning extracted from a conversation."""
@@ -133,7 +142,7 @@ def analyze_transcript(transcript: Transcript) -> list[Finding]:
     """Scan a single transcript for user corrections and rules."""
     findings: list[Finding] = []
     seen_sigs: set[str] = set()
-    project = _project_from_workspaces(transcript.workspaces)
+    project = _project_of(transcript)
 
     for idx, msg in enumerate(transcript.messages):
         if msg.role != "user":
@@ -248,7 +257,7 @@ def parse_llm_findings(text: str, transcript: Transcript) -> list[Finding]:
         log.warning("LLM analyzer: unparseable JSON block; skipping")
         return []
     out: list[Finding] = []
-    project = _project_from_workspaces(transcript.workspaces)
+    project = _project_of(transcript)
     clean_title = _clean_title(transcript.title)
     for raw in (data.get("findings") or []):
         category = str(raw.get("category", "rule")).strip().lower()
