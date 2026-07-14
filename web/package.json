@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "e2e": "node e2e/run-all.mjs"
   },
   "dependencies": {
     "react": "^19.0.0",

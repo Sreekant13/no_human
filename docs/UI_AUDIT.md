@@ -31,15 +31,15 @@ Status key: ✅ fixed · ⬜ open
 
 | # | Status | Screen | Defect | Fix |
 |---|---|---|---|---|
-| M1 | ⬜ | Stats | **Two cost figures disagree by ~10×.** `northStar.js:26` calls `estimateCost(tpp)` with ONE arg, pricing total burn at the fresh rate → "9.99M · est. $29.98"; two tiles below, `Stats.jsx:561` correctly calls `estimateCost(fresh, cache)` → "169.87M · est. $55.54". Taken literally: 13 merged PRs cost $390, and lifetime is $55.54. Cost is the one number that must be trustworthy. | split `tokens_per_pr` into fresh/cache, or derive the blended rate; make `estimateCost` require both args so the footgun can't be re-armed |
+| M1 | ✅ | Stats | **Two cost figures disagree by ~10×.** `northStar.js:26` calls `estimateCost(tpp)` with ONE arg, pricing total burn at the fresh rate → "9.99M · est. $29.98"; two tiles below, `Stats.jsx:561` correctly calls `estimateCost(fresh, cache)` → "169.87M · est. $55.54". Taken literally: 13 merged PRs cost $390, and lifetime is $55.54. Cost is the one number that must be trustworthy. | split `tokens_per_pr` into fresh/cache, or derive the blended rate; make `estimateCost` require both args so the footgun can't be re-armed |
 | M2 | ✅ | Board | **"11 failed" is a lie** — it is 1 failure and 10 cancellations. `App.jsx:41` counts `status === "failed"` with no `cancelled` filter, while `Stats.jsx:38` does it right. The board's loudest red number is 91% self-inflicted noise, competing with the real "6 need you". | exclude cancelled from the count; group same-title rows in the answer lane as the failed lane already does |
 | M3 | ✅ | Drawer | **One Escape closes a nested modal *and* the whole drawer** (two unconditional listeners), destroying feedback the operator just typed into send-back/reply. Those modals are also outside the focus trap. `SlideOver.jsx:88-111,700` | guard the drawer handler while a nested modal is open; give the modals their own trap |
 | M4 | ✅ | Drawer | **Unguarded fetch race:** "Next review →" swaps `taskId` while `fetchTask`/`fetchDiff` are in flight; a late response paints task A's diff under task B's title, and Approve posts against B. `SlideOver.jsx:76-85` | stale-flag the effect |
 | M5 | ✅ | Board | **Card text is sliced mid-word** (no ellipsis) — a URL or path is cut through a glyph. `overflow-wrap` computes to `normal` under `overflow:hidden`. Measured at 390px: `scrollWidth 250 / clientWidth 180`. `styles.css:654` | `overflow-wrap: anywhere` on `.card-title`, `.card-description`, `.card-blocker-q` |
 | M6 | ✅ | Board, 1440px | **The DONE lane is cut off on a MacBook.** 5 lanes × 240px + padding = 1254px into 1208px available, behind a 6px transparent scrollbar. Also: the gate lanes and the Done lane are *exactly* the same width — size, the strongest hierarchy channel, is unused. `styles.css:468` | narrow the lanes; weight the gate lanes (`flex: 1.25`) over Done (`0.85`) |
 | M7 | ⬜ | Drawer | **The System tab prints the same three facts twice** (stage row *and* agent cards) and pays ~600px of vertical space for it; `.sys-node-model` has no horizontal padding and clips against the card border. It is the default tab and the lowest-density surface in the app. `styles.css:931` | collapse to the stage chips (which are good) as the click target into `AgentLogModal`; fix the padding |
-| M8 | ⬜ | Stats | **The Daily Completions chart is ~90% empty**, has no axis labels or dates, stretches its bars (`preserveAspectRatio="none"`), and draws zero-days as a 1px tick that reads as a broken baseline. It says "the tool is barely used" — the opposite of the data. `Stats.jsx:602` | drop the stretch; label first/mid/last day; distinct zero-day tick; consider a 7-day window |
-| M9 | ⬜ | Stats | **Cost is never a headline** (always a subtitle), and the green/plain tone system has no legible rule — "PRs merged: 13" is green because it is non-zero, "Stagnation: 0" is plain although 0 is the best value. Four green tiles in a row means the colour carries no signal. `northStar.js` | promote a Spend tile; colour only where a threshold exists |
+| M8 | ✅ | Stats | **The Daily Completions chart is ~90% empty**, has no axis labels or dates, stretches its bars (`preserveAspectRatio="none"`), and draws zero-days as a 1px tick that reads as a broken baseline. It says "the tool is barely used" — the opposite of the data. `Stats.jsx:602` | drop the stretch; label first/mid/last day; distinct zero-day tick; consider a 7-day window |
+| M9 | ✅ | Stats | **Cost is never a headline** (always a subtitle), and the green/plain tone system has no legible rule — "PRs merged: 13" is green because it is non-zero, "Stagnation: 0" is plain although 0 is the best value. Four green tiles in a row means the colour carries no signal. `northStar.js` | promote a Spend tile; colour only where a threshold exists |
 | M10 | ✅ | Light theme | **The lane columns vanish in light mode.** `.lane`, `.lane-empty`, `.lane-failed` and the amber "this column is blocking you" glow are all `rgba(255,255,255,…)` literals — invisible on a light canvas. The strongest hierarchy cue on the board is dark-only. `styles.css:473` | token surfaces + `color-mix` glows |
 | M11 | ✅ | Drawer | **Sliding-window index keys** — rows are keyed by index into `events.slice(-N)`, so every streamed event shifts every key and an expanded reasoning block re-attaches to a different event. `SlideOver.jsx:1169` | key on `ts`+kind |
 | M12 | ✅ | Drawer | **O(n²) in the live feed:** `visible.indexOf(e)` per row, per render, re-run on every SSE frame (a real task here has 2,015 events). `SlideOver.jsx:1176` | use the map index |
@@ -52,9 +52,9 @@ Requested directly by the operator. This supersedes parts of M6 (lane widths) an
 
 | # | Status | What |
 |---|---|---|
-| R1 | ⬜ | **The board shows THREE lanes only: Needs Answer · Working · Review PR.** Done and Failed are outcomes, not gates — they compete for width with the lanes that actually need the human. Removing them gives the three gate lanes the space M6 was fighting for. |
-| R2 | ⬜ | **Done and Failed become two buttons in the bottom-left corner, above the "Connected" indicator** — Done with a **green** outline, Failed with a **red** outline. |
-| R3 | ⬜ | **Clicking either opens a screen with those tasks in a TABLE view** (not a lane of cards): the table is the right form for an outcome list you scan and sort, and it is where a count, a date, a cost and a PR link belong. |
+| R1 | ✅ | **The board shows THREE lanes only: Needs Answer · Working · Review PR.** Done and Failed are outcomes, not gates — they compete for width with the lanes that actually need the human. Removing them gives the three gate lanes the space M6 was fighting for. |
+| R2 | ✅ | **Done and Failed become two buttons in the bottom-left corner, above the "Connected" indicator** — Done with a **green** outline, Failed with a **red** outline. |
+| R3 | ✅ | **Clicking either opens a screen with those tasks in a TABLE view** (not a lane of cards): the table is the right form for an outcome list you scan and sort, and it is where a count, a date, a cost and a PR link belong. |
 
 Design notes for the implementer (verify each before building):
 - `boardLanes.js` `LANES` is the single source for the board's columns, and `routeTask()` already
@@ -100,6 +100,17 @@ Design notes for the implementer (verify each before building):
 - **M2b's first fix was a NO-OP on live data** — `topPrioritised` read `cancelled` off a group's
   representative, and the representative was itself a cancel. Fixed at the source (a real failure
   now outranks a cancel as the group's head) with a test for the composition the app actually runs.
+
+## Still open (carried to the next session)
+
+| # | Screen | Defect | Note |
+|---|---|---|---|
+| M7 | Drawer | The System tab prints the same three facts twice (the stage row AND the agent cards) and pays ~600px of vertical space for it — while being the DEFAULT tab. | A **redesign**, not a bug fix: collapse to the stage chips (which are good) as the click target into `AgentLogModal`, the best-designed surface in the app. Its two mechanical defects are already fixed. |
+| N5 | Composer | The kind chips and repo pills sit *outside* the card's border, unlabeled, while priority (the least consequential control) sits inside it. | |
+| N13 | Nav | 320px (iPhone SE 1st gen): the nav overflows behind a suppressed scrollbar — reachable by swipe, but the affordance is gone. | 360 / 390 / 1440 are clean. |
+| N14 | Error header | `.legion-credit` is `white-space: nowrap` and gets hard-clipped mid-word at ≤360px by `.nh-shell { overflow: hidden }`. | Same class as the mobile-nav overflow; the hide rule is scoped to `.nh-sidebar-foot`, so it does not reach this one. |
+| N15 | Sidebar | The 360px fit has only ~3px of headroom: with a worker in flight the "Working (N)" dot grows the footer 48→66px, silently stealing width from the nav. | `min-width: 0` on the footer, or hide the dot under 640px. |
+| P1 | Tooling | **No lint, and nothing renders a component.** `no-undef` would have caught the blank-page bug for free. Mitigated (not fixed) by `npm run e2e`, which hard-fails on any page error. | Needs a devDependency (eslint or a jsdom smoke test); frontend deps have been approved before (Tailwind). |
 
 ## Already fixed this cycle
 
