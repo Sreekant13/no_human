@@ -64,10 +64,9 @@ class BenchScore:
         cheaper than the babysat session. None when the original is unknown.
 
         nh_tokens INCLUDES the reviewer (B1 angle-4 finding: coder-only
-        summation rigged the ratio in no_human's favor). Planner/supervisor
-        burn is not yet persisted to any column (tracked as a B2 fix) — until
-        it lands, this ratio still under-counts no_human on complex-tier
-        tasks; the report labels it accordingly."""
+        summation rigged the ratio in no_human's favor). Planner burn lands in plan_* columns (B2 #5); supervisor/
+        distillation burn is still uncaptured (B2 #6) — a small residual
+        under-count, labeled in the report."""
         if self.orig_tokens <= 0:
             return None
         return self.nh_tokens / self.orig_tokens
@@ -155,10 +154,27 @@ def _setup_sandbox(spec: BenchTask, workdir: Path) -> Path:
 
 
 def _ref_signature(repo: Path) -> str:
-    """Cheap tamper check for the SOURCE repo: all refs + their targets."""
+    """Tamper check for the SOURCE repo: the refs a bench escape would touch.
+
+    NOT all refs. A live repo has automation of its own — incident-monitor's
+    data-* branches carry alert state pushed continuously by the operator's
+    jobs, and comparing every ref made an unrelated background push look like
+    a bench escape (it crashed two specs on a run where the bench wrote
+    nothing). The bench can only ever create refs under the agent's own
+    namespaces, so the signature watches exactly those plus the refs a task
+    could rewrite: HEAD's branch and any no-human/* or bench-* ref.
+    """
     try:
-        return subprocess.run(["git", "for-each-ref"], cwd=repo,
-                              capture_output=True, text=True).stdout
+        out = subprocess.run(
+            ["git", "for-each-ref",
+             "--format=%(refname) %(objectname)",
+             "refs/heads/no-human/", "refs/heads/bench-", "refs/heads/nh-"],
+            cwd=repo, capture_output=True, text=True).stdout
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                              capture_output=True, text=True).stdout.strip()
+        branch = subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=repo,
+                                capture_output=True, text=True).stdout.strip()
+        return f"{out}\nHEAD {branch} {head}\n"
     except OSError:
         return ""
 
@@ -239,12 +255,18 @@ class NorthStarRunner:
         # rigged the north-star ratio; planner/supervisor columns pending B2).
         nh_tokens = sum(int(a.get("tokens_used") or 0)
                         + int(a.get("review_tokens_used") or 0)
+                        + int(a.get("plan_tokens_used") or 0)
+                        + int(a.get("utility_tokens_used") or 0)
                         for a in attempts)
         nh_cache = sum(int(a.get("cache_read_tokens") or 0)
                        + int(a.get("review_cache_read_tokens") or 0)
+                       + int(a.get("plan_cache_read_tokens") or 0)
+                       + int(a.get("utility_cache_read_tokens") or 0)
                        for a in attempts)
         nh_creation = sum(int(a.get("cache_creation_tokens") or 0)
                           + int(a.get("review_cache_creation_tokens") or 0)
+                          + int(a.get("plan_cache_creation_tokens") or 0)
+                          + int(a.get("utility_cache_creation_tokens") or 0)
                           for a in attempts)
         turns = sum(int(a.get("turns_used") or 0) for a in attempts)
         orig = spec.original or {}
@@ -285,9 +307,13 @@ class NorthStarRunner:
             agent_diff = subprocess.run(
                 ["git", "diff", base_sha, "HEAD"], cwd=work,
                 capture_output=True, text=True).stdout
+            # The deliverable for investigation/code_review/design_doc kinds
+            # is the REPORT, not a diff — the first baseline scored those as
+            # failures purely because the judge only ever saw an empty diff.
             verdict = await self.goal_judge.judge(
                 request=spec.request, criteria=spec.acceptance_criteria,
                 agent_diff=agent_diff, outcome_status=status.value,
+                report=(getattr(outcome, "detail", "") or ""),
                 repo_path=str(work))
             score.goal_satisfied = bool(verdict.satisfied) and \
                 score.mergeable in (True, None)

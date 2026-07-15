@@ -94,6 +94,19 @@ class Store:
             "review_tokens_used": "INTEGER DEFAULT 0",
             "review_cache_read_tokens": "INTEGER DEFAULT 0",
             "review_cache_creation_tokens": "INTEGER DEFAULT 0",
+            # PLANNING burn (single planner, MoA proposers, aggregator): ran on
+            # separate readonly backends and was persisted NOWHERE — the docs
+            # even claimed it lived "inside the coder's session" (ARCH_REVIEW
+            # #5; ~917k cache-read priced at $0 on one measured task). Written
+            # once, onto the attempt row of the attempt the plan fed.
+            "plan_tokens_used": "INTEGER DEFAULT 0",
+            "plan_cache_read_tokens": "INTEGER DEFAULT 0",
+            "plan_cache_creation_tokens": "INTEGER DEFAULT 0",
+            # UTILITY-tier burn (supervisor checks, distillation,
+            # stuck-hypothesis) — discarded entirely before B2 #6.
+            "utility_tokens_used": "INTEGER DEFAULT 0",
+            "utility_cache_read_tokens": "INTEGER DEFAULT 0",
+            "utility_cache_creation_tokens": "INTEGER DEFAULT 0",
             # Which model actually ran which role on this attempt. Nothing
             # recorded it, which is how a frozen config.yaml silently inverted
             # coder and reviewer for a week.
@@ -105,6 +118,15 @@ class Store:
         for col, decl in att_wanted.items():
             if col not in att_existing:
                 await self.db.execute(f"ALTER TABLE attempts ADD COLUMN {col} {decl}")
+        # D2 #3 curator: memories gain a recoverable archive flag — the
+        # curator NEVER deletes (broker invariant); archived rows leave the
+        # pending queue but stay queryable.
+        cur_m = await self.db.execute("PRAGMA table_info(memories)")
+        mem_existing = {row["name"] for row in await cur_m.fetchall()}
+        if "archived" not in mem_existing:
+            await self.db.execute(
+                "ALTER TABLE memories ADD COLUMN archived INTEGER DEFAULT 0")
+
         # Phase 6a: test_layers column on projects (JSON-encoded TestPlan layers).
         cur3 = await self.db.execute("PRAGMA table_info(projects)")
         proj_existing = {row["name"] for row in await cur3.fetchall()}
@@ -373,6 +395,20 @@ class Store:
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
+    async def attempts_by_task(self) -> dict[str, list[dict[str, Any]]]:
+        """All attempts, grouped by task — ONE query.
+
+        B2 #16: the board issued list_attempts PER TASK, every 2 seconds, per
+        connected socket (an N+1 over the whole task history on every tick).
+        """
+        cur = await self.db.execute(
+            "SELECT * FROM attempts ORDER BY task_id, attempt_number")
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for r in await cur.fetchall():
+            row = dict(r)
+            grouped.setdefault(row["task_id"], []).append(row)
+        return grouped
+
     async def count_attempts(self, task_id: str) -> int:
         cur = await self.db.execute(
             "SELECT COUNT(*) AS n FROM attempts WHERE task_id = ?", (task_id,)
@@ -430,7 +466,7 @@ class Store:
     async def list_memories(
         self, *, confirmed: bool | None = None, source: str | None = None,
         mem_type: str | None = None, project: str | None = None,
-        include_global: bool = True,
+        include_global: bool = True, include_archived: bool = False,
     ) -> list[dict[str, Any]]:
         """List memories, optionally scoped to a project.
 
@@ -439,6 +475,9 @@ class Store:
         False. When ``project`` is None, no project filter is applied (all rows).
         """
         clauses, params = [], []
+        if not include_archived:
+            # archived is NULL on rows that predate the column — treat as live
+            clauses.append("(archived IS NULL OR archived = 0)")
         if confirmed is not None:
             clauses.append("confirmed = ?")
             params.append(1 if confirmed else 0)
@@ -545,6 +584,16 @@ class Store:
         )
         rows = await cur.fetchall()
         return dict(rows[0]) if len(rows) == 1 else None
+
+    async def archive_memory(self, mem_id: str, reason: str = "") -> bool:
+        """Recoverable archive (curator action — never a delete). The reason
+        is appended to content so recovery keeps the audit trail."""
+        suffix = f"\n\n[archived: {reason}]" if reason else ""
+        cur = await self.db.execute(
+            "UPDATE memories SET archived = 1, content = content || ? "
+            "WHERE id = ? AND archived = 0", (suffix, mem_id))
+        await self.db.commit()
+        return cur.rowcount > 0
 
     async def confirm_memory(self, mem_id: str) -> bool:
         """Promote a proposed memory into the active set (one-click confirm)."""

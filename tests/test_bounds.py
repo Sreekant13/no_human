@@ -83,13 +83,6 @@ def test_doom_loop_not_triggered_by_interleaved():
     assert d.record_tool_call("Read", "/src/foo.py") is False  # only 2
 
 
-def test_doom_loop_health_reflects_state():
-    d = StuckDetector(doom_loop_threshold=3)
-    d.record_tool_call("Read", "/a.py")
-    d.record_tool_call("Read", "/a.py")
-    h = d.health
-    assert h["consecutive_repeats"] == 2
-    assert h["total_tool_calls"] == 2
 
 
 def test_doom_loop_resets_on_different_call():
@@ -97,7 +90,6 @@ def test_doom_loop_resets_on_different_call():
     d.record_tool_call("Read", "/a.py")
     d.record_tool_call("Read", "/a.py")
     d.record_tool_call("Grep", "pattern|/src")  # different → resets
-    assert d.health["consecutive_repeats"] == 1
     assert d.record_tool_call("Grep", "pattern|/src") is False  # only 2
     assert d.record_tool_call("Grep", "pattern|/src") is True   # 3rd → stuck
 

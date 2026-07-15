@@ -612,6 +612,15 @@ REVIEW_ANGLES: tuple[tuple[str, str], ...] = (
      "exercise the change (real assertions on behavior, failure cases, "
      "boundaries)? Flag tautological or mocked-to-green tests. Ignore style "
      "and general correctness."),
+    # D2 #6 (cc10x failure-hunter): the bug class reviewers most often miss —
+    # code that cannot fail loudly. Report-only, cite lines.
+    ("silent-failure", "SILENT FAILURES ONLY: empty catch blocks, exceptions "
+     "swallowed or logged-and-continued where the caller needs the failure, "
+     "discarded return values that carry errors, bare except/except Exception "
+     "with a pass, error paths that return a success-shaped value, retries "
+     "that hide a permanent fault. For each: cite the file:line and say what "
+     "the caller wrongly believes succeeded. Ignore style, scope, security, "
+     "and test coverage — other passes own those."),
 )
 
 
@@ -900,7 +909,10 @@ class AdversarialReviewer:
         # Angles are ADDITIVE and best-effort: one that times out or crashes
         # is dropped with a visible note — it must never fail the gate by
         # itself (the fail-closed rule belongs to the MAIN review only).
-        if self._tier_wants_angles(task):
+        # B2 #11: angles can only ADD findings / keep a fail failed — they can
+        # never flip fail→pass — so running them after a decided FAIL is pure
+        # Opus cost. Short-circuit on the main verdict.
+        if decision.passed and self._tier_wants_angles(task):
             angle_prompts = [
                 (name, _build_angle_prompt(task, diff, focus))
                 for name, focus in REVIEW_ANGLES

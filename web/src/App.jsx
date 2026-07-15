@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { connectWS, createTask, uploadAttachment, fetchTasks, fetchWorkerStatus, fetchOnboardingStatus, grillStep, grillStepSSE } from "./api.js";
+import { connectWS, createTask, uploadAttachment, fetchTasks, fetchWorkerStatus, fetchQueueHealth, fetchOnboardingStatus, grillStep, grillStepSSE } from "./api.js";
 import Board from "./Board.jsx";
 import Settings from "./Settings.jsx";
 import Stats from "./Stats.jsx";
@@ -378,6 +378,7 @@ export default function App() {
   const [showNewTask, setShowNewTask] = useState(false);
   const [page, setPage] = useState("board");
   const [workerStatus, setWorkerStatus] = useState(null);
+  const [queueHealth, setQueueHealth] = useState(null);
   const doneCount = tasks.filter((t) => t.status === "done").length;
   const failedCount = tasks.filter(isRealFailure).length;
   const cancelledCount = tasks.filter((t) => t.status === "failed" && t.cancelled).length;
@@ -421,6 +422,7 @@ export default function App() {
   useEffect(() => {
     function poll() {
       fetchWorkerStatus().then(setWorkerStatus).catch(() => {});
+      fetchQueueHealth().then(setQueueHealth).catch(() => {});
     }
     poll();
     const id = setInterval(poll, 10000);
@@ -486,7 +488,9 @@ export default function App() {
       if (disposed) return;
       const ws = connectWS((msg) => {
         if (msg.tasks) dispatch({ type: "sync", tasks: msg.tasks });
-        if (msg.worker) setWorkerStatus(prev => ({ ...prev, ...msg.worker, running: true }));
+        // inflight rides the WS frame; `running` stays the REST poll's
+        // authority (a WS frame from a worker-less server said running:true).
+        if (msg.worker) setWorkerStatus(prev => ({ ...prev, ...msg.worker }));
       });
       ws.onopen = () => setWsLive(true);
       ws.onclose = () => {
@@ -590,6 +594,33 @@ export default function App() {
             <div className="nh-status-indicator" title={`${workerStatus.inflight} of ${workerStatus.max_workers} worker slots in use`}>
               <div className="nh-ws-dot live" style={{ background: 'var(--accent)' }} />
               <span className="nh-status-label">Working ({workerStatus.inflight})</span>
+            </div>
+          )}
+          {queueHealth?.stuck && (
+            <div className="nh-alarm" role="alert" title={queueHealth.stuck_reason}>
+              Queue stuck — {queueHealth.open_tasks} open, nothing finishing
+            </div>
+          )}
+          {!queueHealth?.stuck && queueHealth?.eta_minutes != null && queueHealth.open_tasks > 0 && (
+            <div className="nh-status-indicator" title={`${queueHealth.completed_in_window} finished in the last ${queueHealth.window_minutes} min`}>
+              <div className="nh-ws-dot live" />
+              <span className="nh-status-label">
+                Drains in ~{queueHealth.eta_minutes < 60
+                  ? `${Math.round(queueHealth.eta_minutes)}m`
+                  : `${(queueHealth.eta_minutes / 60).toFixed(1)}h`}
+              </span>
+            </div>
+          )}
+          {workerStatus && workerStatus.running === false && (
+            <div className="nh-alarm" role="alert"
+                 title="The API is up but no worker claims tasks — replies and retries will sit as Working forever until nh start runs with a worker.">
+              Worker offline — tasks won't progress
+            </div>
+          )}
+          {workerStatus?.watcher_error && (
+            <div className="nh-alarm" role="alert"
+                 title={`WakeWatcher failed to start: ${workerStatus.watcher_error}. Parked tasks will not wake until the server restarts cleanly.`}>
+              Wake watcher down — parked tasks won't wake
             </div>
           )}
           <div className="nh-status-indicator" title={wsLive ? "Browser is connected to the no_human server" : "Connection lost — reconnecting…"}>

@@ -367,6 +367,12 @@ export async function postReviewComments(taskId, items = null) {
   return r.json();
 }
 
+export async function fetchQueueHealth() {
+  const r = await fetch(`${BASE}/api/queue/health`);
+  if (!r.ok) throw new Error("queue health failed");
+  return r.json();
+}
+
 export async function fetchWorkerStatus() {
   const r = await fetch(`${BASE}/api/worker/status`);
   if (!r.ok) return { running: false, inflight: 0, max_workers: 0 };

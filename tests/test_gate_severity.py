@@ -178,3 +178,37 @@ def test_blocking_and_advisory_partition_the_failures():
     assert [i.label for i in d.blocking_items] == ["a"]
     assert [i.label for i in d.advisory_items] == ["b"]
     assert {i.label for i in d.failed_items} == {"a", "b"}
+
+
+async def test_angle_passes_skipped_after_a_decided_fail(monkeypatch, tmp_path):
+    """B2 #11: angles can never flip fail→pass — running them after a decided
+    FAIL is pure reviewer-model cost. They must not run."""
+    from no_human.review.reviewer import AdversarialReviewer, ReviewDecision
+
+    r = AdversarialReviewer(model="claude-opus-4-8")
+    calls = {"fast": 0}
+
+    async def fake_fast(prompt, repo_path, before_ref="HEAD~1"):
+        calls["fast"] += 1
+        return ReviewDecision(passed=False, raw_output="FAIL")
+    monkeypatch.setattr(r, "_fast_review", fake_fast)
+    monkeypatch.setattr(r, "_tier_wants_angles", lambda task: True)
+
+    class T:
+        id = "t1"; title = "x"; kind = "feature"; context = {}
+        acceptance_criteria = []
+    d = await r.review(T(), repo_path=str(tmp_path), diff_override="--- a\n+++ b")
+    assert d.passed is False
+    assert calls["fast"] == 1, "angle passes ran after a decided FAIL"
+
+
+def test_silent_failure_angle_is_registered_and_distinct():
+    """D2 #6: the failure-hunter lens (cc10x) — the bug class reviewers miss."""
+    from no_human.review.reviewer import REVIEW_ANGLES
+
+    names = [n for n, _ in REVIEW_ANGLES]
+    assert names == ["security", "tests", "silent-failure"]
+    focus = dict(REVIEW_ANGLES)["silent-failure"]
+    assert "empty catch" in focus and "swallowed" in focus
+    # Each angle must stay single-purpose or they re-review each other's work.
+    assert "security" not in focus.split("Ignore")[0].lower()

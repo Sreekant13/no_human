@@ -64,6 +64,11 @@ const NEEDS_YOU_LANES = new Set(LANES.filter((l) => l.needsYou).map((l) => l.key
 // sits in Needs Answer but a status set missed it, so the header said "6 need
 // you" while the lanes showed 7). Count, badge, and notifications all use this.
 export function isNeedsYou(task) {
+  // B2 #19: an APPROVED PR still sits in awaiting_approval until the merge
+  // lands — it is not waiting on you any more, so it must stop shouting in
+  // "N need you". It STAYS in the Review lane (routing is untouched: LANES is
+  // also the routing table) but renders as "approved — merge pending".
+  if (task?.approved_at) return false;
   return NEEDS_YOU_LANES.has(routeTask(task));
 }
 

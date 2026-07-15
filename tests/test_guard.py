@@ -187,3 +187,115 @@ def test_the_coder_may_still_use_background_tools():
     """Only read-only sessions are restricted; the implementer is not."""
     for tool in ("Monitor", "TaskStop", "ToolSearch"):
         assert _ev(tool, {}).allow, f"{tool} must remain available to the coder"
+
+
+# ---------------------- D2 #2: tool-time tamper guards --------------------- #
+# The tamper gate fires at attempt END — after 1-3M tokens are spent. These
+# deterministic denials convert that whole wasted attempt into a 1-turn
+# correction the coder sees immediately.
+
+def test_test_file_deletion_denied_at_tool_time():
+    for cmd in ("rm tests/test_core.py",
+                "git rm -f tests/test_api.py",
+                "rm -f web/src/laneView.test.mjs"):
+        d = guard.evaluate("Bash", {"command": cmd},
+                     forbidden_paths=[], never_push_to=[])
+        assert not d.allow, cmd
+        assert "test" in d.reason.lower()
+
+def test_legitimate_moves_and_non_test_deletes_still_allowed():
+    for cmd in ("git mv tests/test_old.py tests/test_new.py",
+                "rm build/artifact.bin",
+                "rm notes.md"):
+        d = guard.evaluate("Bash", {"command": cmd},
+                     forbidden_paths=[], never_push_to=[])
+        assert d.allow, cmd
+
+def test_no_human_yml_writes_denied():
+    d = guard.evaluate("Write", {"file_path": ".no_human.yml"},
+                 forbidden_paths=[], never_push_to=[])
+    assert not d.allow
+    d2 = guard.evaluate("Edit", {"file_path": "/repo/.no_human.yml"},
+                  forbidden_paths=[], never_push_to=[])
+    assert not d2.allow
+    d3 = guard.evaluate("Bash", {"command": "sed -i '' 's/a/b/' .no_human.yml"},
+                  forbidden_paths=[], never_push_to=[])
+    assert not d3.allow
+
+def test_reading_no_human_yml_still_allowed():
+    d = guard.evaluate("Read", {"file_path": ".no_human.yml"},
+                 forbidden_paths=[], never_push_to=[])
+    assert d.allow
+
+
+# ------------------ Phase C: the re-read whale (57.8k/turn) ---------------- #
+
+def test_unbounded_read_of_a_huge_file_is_redirected_not_denied(tmp_path):
+    big = tmp_path / "huge.py"
+    big.write_text("x = 1\n" * 5000)
+    d = guard.evaluate("Read", {"file_path": str(big)},
+                       forbidden_paths=[], never_push_to=[])
+    assert not d.allow
+    # It must TEACH the cheaper move, not just refuse.
+    assert "offset/limit" in d.reason and "Grep" in d.reason
+    assert "5000 lines" in d.reason
+
+
+def test_scoped_read_of_a_huge_file_is_allowed(tmp_path):
+    big = tmp_path / "huge.py"
+    big.write_text("x = 1\n" * 5000)
+    d = guard.evaluate("Read", {"file_path": str(big), "limit": 200, "offset": 100},
+                       forbidden_paths=[], never_push_to=[])
+    assert d.allow
+
+
+def test_whole_file_read_of_a_normal_file_is_untouched(tmp_path):
+    ok = tmp_path / "small.py"
+    ok.write_text("x = 1\n" * 300)
+    d = guard.evaluate("Read", {"file_path": str(ok)},
+                       forbidden_paths=[], never_push_to=[])
+    assert d.allow
+
+
+def test_unstattable_path_never_blocks_a_read(tmp_path):
+    """The guard must never fail a call because it could not measure a file."""
+    d = guard.evaluate("Read", {"file_path": str(tmp_path / "nope.py")},
+                       forbidden_paths=[], never_push_to=[])
+    assert d.allow
+
+
+def test_read_redirect_does_not_fire_for_readonly_sessions(tmp_path):
+    """Review #6: reviewer/researcher are one-shot — no re-read loop, so the
+    read redirect must not degrade them."""
+    big = tmp_path / "huge.py"
+    big.write_text("x = 1\n" * 5000)
+    d = guard.evaluate("Read", {"file_path": str(big)},
+                       forbidden_paths=[], never_push_to=[], readonly=True)
+    assert d.allow
+
+
+def test_read_redirect_exempts_data_files(tmp_path):
+    """Review #6: a big JSON/lockfile needs whole-file context and is rarely
+    re-read many times."""
+    for name in ("data.json", "pnpm-lock.yaml", "schema.sql"):
+        f = tmp_path / name
+        f.write_text("x\n" * 5000)
+        d = guard.evaluate("Read", {"file_path": str(f)},
+                           forbidden_paths=[], never_push_to=[])
+        assert d.allow, name
+
+
+def test_rm_of_build_artifacts_is_not_blocked_as_test_deletion(tmp_path):
+    """Review #7: .test.js.map and coverage xml are build output, not source."""
+    for cmd in ("rm dist/app.test.js.map",
+                "rm coverage/test_results.xml",
+                "rm build/report.test.js.map"):
+        d = guard.evaluate("Bash", {"command": cmd},
+                           forbidden_paths=[], never_push_to=[])
+        assert d.allow, cmd
+
+
+def test_rm_of_real_source_test_still_blocked(tmp_path):
+    d = guard.evaluate("Bash", {"command": "rm tests/test_core.py"},
+                       forbidden_paths=[], never_push_to=[])
+    assert not d.allow

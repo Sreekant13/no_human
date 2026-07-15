@@ -94,9 +94,11 @@ def test_sandbox_guard_raises_on_escaping_origin(tmp_path, monkeypatch):
 
 
 def test_ref_signature_detects_source_mutation(tmp_path):
+    """The escape shapes: an agent-namespace branch, or HEAD moving. (A
+    generic unrelated branch is NOT an escape — see the data-* test below.)"""
     repo = _src_repo(tmp_path)
     before = _ref_signature(repo)
-    subprocess.run(["git", "branch", "sneaky"], cwd=repo, check=True,
+    subprocess.run(["git", "branch", "no-human/sneaky"], cwd=repo, check=True,
                    capture_output=True)
     assert _ref_signature(repo) != before
 
@@ -271,3 +273,40 @@ def test_goal_judge_parse_fails_closed():
     assert v2.satisfied is True and "app.py:2" in v2.evidence
     v3 = parse_goal_verdict("JUDGE_JSON_START\nnot json\nJUDGE_JSON_END")
     assert v3.satisfied is False
+
+
+def test_ref_signature_ignores_unrelated_branch_activity(tmp_path):
+    """A live repo has its own automation (incident-monitor pushes alert state
+    to data-* branches continuously). An unrelated branch moving is NOT a
+    bench escape — it crashed two specs on a run where the bench wrote
+    nothing. Only agent-namespace refs and HEAD are watched."""
+    repo = _src_repo(tmp_path)
+    before = _ref_signature(repo)
+
+    # The operator's automation pushes to its own data branch mid-run.
+    subprocess.run(["git", "branch", "data-metrics-core"], cwd=repo, check=True,
+                   capture_output=True)
+    assert _ref_signature(repo) == before, "unrelated branch tripped the guard"
+
+    # A real escape — an agent-namespace branch appearing — still trips it.
+    subprocess.run(["git", "branch", "no-human/deadbeef"], cwd=repo,
+                   check=True, capture_output=True)
+    assert _ref_signature(repo) != before, "a real escape must still be caught"
+
+
+def test_goal_prompt_tells_the_judge_an_empty_diff_can_be_correct():
+    """The first baseline scored investigations/code-reviews as failures purely
+    because the judge only ever saw an empty diff — the report IS the
+    deliverable for those kinds."""
+    from no_human.eval.judge import build_goal_prompt
+
+    p = build_goal_prompt("what are the allowed columns?", [], "", "done",
+                          report="The allowed columns are a, b, c (handler.py:101).")
+    assert "AGENT REPORT" in p
+    assert "EMPTY DIFF IS CORRECT" in p
+    assert "handler.py:101" in p
+    assert "(no file changes)" in p
+
+    # A code change with no report still judges on the diff alone.
+    p2 = build_goal_prompt("fix the bug", [], "--- a\n+++ b\n", "done")
+    assert "AGENT REPORT" not in p2

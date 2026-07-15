@@ -141,6 +141,19 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
                   COALESCE(SUM(COALESCE(review_cache_read_tokens, 0)), 0)
            FROM attempts""")
     rev_used, rev_creation, rev_read = await cur.fetchone()
+    # B2 #5/#6 (review #2): planning + utility burn ran on separate backends
+    # and now has its own columns. Surface it here too, or /api/metrics
+    # under-counts by the whole planning slice while the bench counts it —
+    # the surfaces-disagree class this cost work exists to kill.
+    cur = await db.execute(
+        """SELECT COALESCE(SUM(COALESCE(plan_tokens_used, 0)
+                             + COALESCE(utility_tokens_used, 0)), 0),
+                  COALESCE(SUM(COALESCE(plan_cache_read_tokens, 0)
+                             + COALESCE(utility_cache_read_tokens, 0)), 0),
+                  COALESCE(SUM(COALESCE(plan_cache_creation_tokens, 0)
+                             + COALESCE(utility_cache_creation_tokens, 0)), 0)
+           FROM attempts""")
+    aux_used, aux_read, aux_creation = await cur.fetchone()
     return {
         "prs_opened": prs_opened or 0,
         "prs_merged": prs_merged or 0,
@@ -156,6 +169,9 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
         "review_tokens_used_total": rev_used or 0,
         "review_cache_creation_total": rev_creation or 0,
         "review_cache_read_total": rev_read or 0,
+        "aux_tokens_used_total": aux_used or 0,
+        "aux_cache_read_total": aux_read or 0,
+        "aux_cache_creation_total": aux_creation or 0,
         "by_auth_profile": by_profile,
         "by_tier": by_tier,
         "review_pass": review_pass or 0,
@@ -166,3 +182,44 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
         "cache_economics": cache_economics,
         "error_breakdown": error_breakdown,
     }
+
+async def playbook_outcomes(store) -> list[dict]:
+    """D2 #5 (Devin June-2026): which playbooks actually PAY?
+
+    Joins the playbook_accessed event to each task's outcome and burn. A
+    playbook that correlates with escalations and high spend is a liability,
+    not an asset — the mined-playbook set can finally be pruned on evidence
+    instead of vibes. Pure SQL over what is already recorded.
+    """
+    db = store.db
+    cur = await db.execute(
+        """
+        WITH used AS (
+          SELECT DISTINCT
+                 e.task_id AS task_id,
+                 TRIM(REPLACE(json_extract(e.data, '$.text'),
+                              'applying playbook: ', '')) AS playbook
+          FROM task_events e
+          WHERE json_extract(e.data, '$.kind') = 'playbook_accessed'
+        )
+        SELECT u.playbook                                       AS playbook,
+               COUNT(DISTINCT t.id)                             AS tasks,
+               SUM(CASE WHEN t.status IN ('awaiting_approval','done')
+                        THEN 1 ELSE 0 END)                      AS reached_gate,
+               SUM(CASE WHEN t.status IN ('escalated','failed')
+                        THEN 1 ELSE 0 END)                      AS escalated_or_failed,
+               COALESCE(SUM(a.tokens_used + a.cache_read_tokens), 0) AS tokens,
+               COUNT(a.id)                                      AS attempts
+        FROM used u
+        JOIN tasks t     ON t.id = u.task_id
+        LEFT JOIN attempts a ON a.task_id = t.id
+        GROUP BY u.playbook
+        ORDER BY tasks DESC
+        """
+    )
+    rows = [dict(r) for r in await cur.fetchall()]
+    for r in rows:
+        tasks = r["tasks"] or 0
+        r["gate_rate"] = round((r["reached_gate"] or 0) / tasks, 3) if tasks else 0.0
+        r["tokens_per_task"] = int((r["tokens"] or 0) / tasks) if tasks else 0
+    return rows

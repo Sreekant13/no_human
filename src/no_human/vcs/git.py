@@ -161,7 +161,9 @@ class GitRepo:
     def has_changes(self) -> bool:
         return bool(self._run("status", "--porcelain", "--", ".", *self._EPHEMERAL))
 
-    def uncommitted_source_files(self) -> list[str]:
+    def uncommitted_source_files(
+        self, coder_touched: set[str] | None = None,
+    ) -> list[str]:
         """Non-ephemeral SOURCE files still uncommitted after a commit — a
         completeness guard for the committed state.
 
@@ -182,6 +184,13 @@ class GitRepo:
             if not rel or self._is_ephemeral_path(rel):
                 continue
             if Path(rel).suffix.lower() in self._CODE_EXTS:
+                leftovers.append(rel)
+            elif coder_touched and rel in coder_touched:
+                # B2 #7: a non-code leftover the coder ITSELF touched
+                # (Dockerfile, yaml, requirements, proto) is intentional work
+                # missing from the commit — the favicon incident class in its
+                # non-code shape. Untouched non-code leftovers stay ignored:
+                # they are test side-effects, exactly why _CODE_EXTS exists.
                 leftovers.append(rel)
         return leftovers
 

@@ -84,7 +84,7 @@ class GoalVerdict:
 
 
 def build_goal_prompt(request: str, criteria: list[str], agent_diff: str,
-                      outcome_status: str) -> str:
+                      outcome_status: str, report: str = "") -> str:
     crit = "\n".join(f"  - {c}" for c in criteria) or "  (none stated)"
     return (
         "You are an impartial evaluation judge. A developer made this request "
@@ -93,8 +93,14 @@ def build_goal_prompt(request: str, criteria: list[str], agent_diff: str,
         f"=== ACCEPTANCE CRITERIA (may be empty) ===\n{crit}\n\n"
         f"The system finished with status: {outcome_status}\n"
         "Its complete change as a diff:\n\n"
-        f"=== AGENT DIFF ===\n{agent_diff[:10000]}\n\n"
-        "Decide whether the change SATISFIES WHAT WAS ASKED. You have read "
+        f"=== AGENT DIFF ===\n{agent_diff[:10000] or '(no file changes)'}\n\n"
+        + (f"=== AGENT REPORT (the deliverable for questions, investigations, "
+           f"code reviews and design docs — an EMPTY DIFF IS CORRECT for these "
+           f"kinds) ===\n{report[:10000]}\n\n" if report else "")
+        + "Decide whether the work SATISFIES WHAT WAS ASKED. Judge the "
+        "DELIVERABLE THE REQUEST ASKED FOR: a code change is judged on the "
+        "diff; a question, investigation, or code review is judged on the "
+        "report — do NOT require a diff for those. You have read "
         "access to the repository at the current path — verify claims and "
         "cite the files/lines you actually checked. Calibration: do not be "
         "lenient; a partial, broken, or off-target change is NOT satisfied. "
@@ -145,9 +151,10 @@ class GoalJudge:
 
     async def judge(
         self, *, request: str, criteria: list[str], agent_diff: str,
-        outcome_status: str, repo_path: str | None = None,
+        outcome_status: str, repo_path: str | None = None, report: str = "",
     ) -> GoalVerdict:
-        prompt = build_goal_prompt(request, criteria, agent_diff, outcome_status)
+        prompt = build_goal_prompt(request, criteria, agent_diff,
+                                   outcome_status, report=report)
         backend = self._ensure_backend()
         result = await backend.run(
             prompt, cwd=repo_path, max_turns=10, effort="high")

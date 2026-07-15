@@ -31,8 +31,6 @@ class Bounds:
     # looping on one file with ~12x that headroom here; that class of runaway
     # now aborts at the hard threshold instead of burning to this cap.
     max_turns_per_attempt: int = 500
-    escalate_after: int = 3
-    max_correction_rounds: int = 2
     # P3 (megaplan): complex tasks (many files / large plan / decompose verdict)
     # get a larger turn budget so they don't exhaust turns mid-implementation and
     # fail with an empty diff (B5). Applied only to the complexity-flagged subset.
@@ -208,16 +206,6 @@ class StuckDetector:
             )
         return None
 
-    @property
-    def health(self) -> dict[str, int]:
-        """Return context-health signals for telemetry / the supervisor."""
-        return {
-            "unique_errors": len(self._seen),
-            "consecutive_repeats": self._consecutive_repeats,
-            "total_tool_calls": len(self._tool_signatures),
-            "max_file_edits": max(self._edit_counts.values(), default=0),
-            "ping_pong": int(self.detect_ping_pong()),
-        }
 
     def is_repeat(self, error_text: str) -> bool:
         return error_signature(error_text) in self._seen

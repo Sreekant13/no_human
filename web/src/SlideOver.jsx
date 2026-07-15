@@ -233,8 +233,8 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
             <div className="so-title" id="so-dialog-title">{task?.title ?? "Loading…"}</div>
           </div>
           {(task?.total_tokens > 0 || task?.total_cache_read > 0) && (
-            <span className="so-cost" title="cost meter: total burn (fresh + cache-read tokens) · indicative $ · wall-time · attempts">
-              {fmtTokens(totalBurn({ used: task.total_tokens, creation: task.total_cache_creation, read: task.total_cache_read }))} tok · {fmtCost(costOf({ used: task.total_tokens, creation: task.total_cache_creation, read: task.total_cache_read }))}
+            <span className="so-cost" title="cost meter: coder + reviewer + planner burn (fresh + cache-read tokens) · indicative $ · wall-time · attempts">
+              {fmtTokens(totalBurn({ used: task.total_tokens, creation: task.total_cache_creation, read: task.total_cache_read }) + totalBurn({ used: task.total_review_tokens, creation: task.total_review_cache_creation, read: task.total_review_cache_read }) + totalBurn({ used: task.total_aux_tokens, creation: task.total_aux_cache_creation, read: task.total_aux_cache_read }))} tok · {fmtCost(costOf({ used: task.total_tokens, creation: task.total_cache_creation, read: task.total_cache_read }) + costOf({ used: task.total_review_tokens, creation: task.total_review_cache_creation, read: task.total_review_cache_read }) + costOf({ used: task.total_aux_tokens, creation: task.total_aux_cache_creation, read: task.total_aux_cache_read }))}
               {task.wall_seconds != null && ` · ${formatDuration(Math.round(task.wall_seconds))}`}
               {task.attempt_count > 0 && ` · ${task.attempt_count} attempt${task.attempt_count > 1 ? "s" : ""}`}
             </span>

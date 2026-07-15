@@ -151,7 +151,13 @@ def test_bounds_defaults_have_exactly_one_source_of_truth():
     from no_human.config import DEFAULT_CONFIG
 
     defaults = Bounds()
+    # max_correction_rounds is deliberately config-only: it is consumed by
+    # blockers/wake.py, NOT the Bounds dataclass (B2 #17 deleted the inert
+    # dataclass field but kept the live config key).
+    WAKE_ONLY = {"max_correction_rounds"}
     for key, value in DEFAULT_CONFIG["bounds"].items():
+        if key in WAKE_ONLY:
+            continue
         assert getattr(defaults, key) == value, (
             f"DEFAULT_CONFIG['bounds']['{key}'] has drifted from Bounds.{key}"
         )

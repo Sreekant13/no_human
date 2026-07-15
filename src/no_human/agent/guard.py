@@ -34,6 +34,20 @@ from dataclasses import dataclass
 
 WRITE_TOOLS = {"Write", "Edit", "NotebookEdit", "MultiEdit"}
 
+# Phase C — the measured whale: the coder re-reads 57.8k tokens EVERY turn
+# (76 real attempts: 2.21M cache-read / 33.2 turns). The seed is ~6.4k of it;
+# the rest is accumulated tool output, and an unbounded whole-file Read of a
+# huge file is re-sent on every subsequent turn for the rest of the attempt.
+# So a Read with no limit on a file above this many lines is REDIRECTED (never
+# denied — a denial would just loop) to the scoped form the coder already
+# knows: offset/limit, or Grep to find the relevant region first.
+_READ_LINES_BUDGET = 2000
+# Data/config/lock files often NEED whole-file context (a partial parse is
+# useless) and are rarely re-read many times — exempt from the read redirect.
+_WHOLE_READ_OK_EXTS = frozenset((
+    "json", "yaml", "yml", "toml", "lock", "csv", "xml", "sql", "txt", "md",
+))
+
 # Tools that block on a human answer. Every no_human session is headless, so
 # these silently return nothing and the agent fills the gap with a guess — we
 # observed a planner proposer call AskUserQuestion, get no answer, and write
@@ -73,6 +87,23 @@ _NO_HUMAN_REASON = (
 )
 
 # Destructive shell patterns — matched against the full command string.
+# D2 #2: deleting test files via the shell used to surface only at the
+# END-of-attempt tamper gate — after the whole attempt's tokens were spent.
+# Denied at tool time instead; `git mv` renames stay allowed. Covers rm /
+# git rm on tests/ dirs and test_*/**.test.* file shapes.
+_RM_TESTS = re.compile(
+    r"\b(?:git\s+)?rm\b[^|;&]*?"
+    # a tests/ dir, or a source test file — but NOT build/coverage artifacts
+    # (dist/coverage/*.map, test_results.xml). Require a source extension.
+    r"(?:\btests?/|/tests?/|"
+    r"\btest_[\w-]+\.(?:py|js|mjs|cjs|jsx|ts|tsx|rb|go|rs|java)(?![\w.])|"
+    r"[\w-]+\.test\.(?:js|mjs|cjs|jsx|ts|tsx)(?![\w.]))",
+    re.IGNORECASE)
+# The repo's no_human config is the operator's contract with the agent — the
+# agent never edits it (add-or-tighten is a HUMAN action).
+_NO_HUMAN_YML_WRITE = re.compile(
+    r"(?:sed\s+-i|>\s*|>>\s*|tee\s+)[^|;&]*\.no_human\.ya?ml", re.IGNORECASE)
+
 _RM_RF = re.compile(r"\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|-rf|-fr)\b")
 _GIT_DESTRUCTIVE = re.compile(
     r"\bgit\s+(push\s+.*--force|push\s+.*-f\b|reset\s+--hard\s+\S|"
@@ -145,6 +176,16 @@ def _push_targets_protected(cmd: str, never_push_to: list[str]) -> bool:
     return False
 
 
+def _line_count(path: str) -> int:
+    """Lines in a file, or 0 when unknowable (missing/binary/unreadable) —
+    the guard must never fail a tool call because it could not stat a file."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read().count(b"\n")
+    except (OSError, ValueError):
+        return 0
+
+
 def evaluate(
     tool_name: str,
     tool_input: dict,
@@ -165,6 +206,23 @@ def evaluate(
     if readonly and tool_name in BACKGROUND_TOOLS:
         return GuardDecision(False, _NO_POLLING_REASON.format(tool=tool_name))
 
+    # 1b. Phase C: unbounded reads of huge files are redirected, not denied.
+    # ONLY in the coder loop (readonly reviewer/researcher sessions are one-shot
+    # — no re-read cost; the researcher is the agent that ABSORBS big reads) and
+    # NOT for data/config files that genuinely need whole-file context (review #6).
+    if (not readonly and tool_name == "Read"
+            and not tool_input.get("limit")):
+        path = str(tool_input.get("file_path") or "")
+        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        n = _line_count(path)
+        if n > _READ_LINES_BUDGET and ext not in _WHOLE_READ_OK_EXTS:
+            return GuardDecision(
+                False,
+                f"{path} is {n} lines — reading it whole puts all of it in "
+                f"context and RE-SENDS it on every remaining turn. Read the "
+                f"part you need (offset/limit), or Grep for the symbol first. "
+                f"Whole-file reads are fine under {_READ_LINES_BUDGET} lines.")
+
     # 2. Writes to forbidden paths.
     if tool_name in WRITE_TOOLS:
         path = (
@@ -175,6 +233,12 @@ def evaluate(
         )
         if path and _path_forbidden(str(path), forbidden_paths):
             return GuardDecision(False, f"write to forbidden path blocked: {path}")
+        if path and str(path).rstrip("/").endswith((".no_human.yml", ".no_human.yaml")):
+            return GuardDecision(
+                False,
+                ".no_human.yml is the operator's contract with the agent — "
+                "the agent never edits it. Propose the change in the PR body "
+                "instead.")
 
     # 3. Shell command policy.
     if tool_name == "Bash":
@@ -185,6 +249,19 @@ def evaluate(
                 f"read-only session: git/forge write blocked: {cmd}. Read the "
                 "repo and report; you do not change it.",
             )
+        if _RM_TESTS.search(cmd):
+            return GuardDecision(
+                False,
+                f"deleting test files is blocked at tool time: {cmd}. Renames "
+                "go through `git mv`; a genuine removal needs the human "
+                "(state it in the PR body) — the tamper gate would fail this "
+                "attempt at the end anyway, so this denial saves you the "
+                "attempt.")
+        if _NO_HUMAN_YML_WRITE.search(cmd):
+            return GuardDecision(
+                False,
+                ".no_human.yml is the operator's contract with the agent — "
+                "the agent never edits it.")
         if _RM_RF.search(cmd):
             return GuardDecision(False, f"destructive command blocked (rm -rf): {cmd}")
         if _GIT_DESTRUCTIVE.search(cmd):

@@ -126,3 +126,15 @@ test("each outcome lane carries the outline colour its button uses", () => {
   assert.match(failed.accent, /--c-escalated/);   // red
   assert.match(done.accent, /--c-done/);          // green
 });
+
+test("B2 #19: an approved PR stops shouting in 'need you' but keeps its lane", () => {
+  const approved = { id: "a", status: "awaiting_approval", approved_at: "2026-07-15T00:00:00Z" };
+  const unreviewed = { id: "b", status: "awaiting_approval" };
+
+  assert.equal(isNeedsYou(approved), false, "approved must leave the need-you count");
+  assert.equal(isNeedsYou(unreviewed), true, "un-reviewed still needs the human");
+
+  // Routing is UNTOUCHED — LANES is also the routing table (the known trap):
+  // the approved task stays visible in the Review lane.
+  assert.equal(routeTask(approved), routeTask(unreviewed));
+});
