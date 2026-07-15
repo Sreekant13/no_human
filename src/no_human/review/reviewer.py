@@ -264,12 +264,24 @@ _VERDICT_FORMAT = (
 )
 
 
-def _build_angle_prompt(task: Task, diff: str, focus: str) -> str:
+def _build_angle_prompt(task: Task, diff: str, focus: str,
+                        diff_total_len: int = 0) -> str:
     """A dedicated single-concern prompt for an angle pass. Deliberately NOT
     the full adversarial template — gluing a 'security only' preface onto a
     prompt that also demands spec/scope checks produced self-contradicting
     instructions and mislabeled ordinary findings as [angle] ones."""
     criteria = "\n".join(f"  - {c}" for c in task.acceptance_criteria) or "  (none stated)"
+    # B2 #20: angles run single-turn with no tools, so a diff truncated at
+    # _DIFF_CAP is ALL they can see. Silently reviewing the head and passing
+    # is a false-pass; tell the angle it is looking at a partial diff so it
+    # scopes its verdict to what it saw rather than clearing the whole change.
+    truncated = diff_total_len and diff_total_len > len(diff)
+    trunc_note = (
+        f"\n\nNOTE: this diff is TRUNCATED — you are seeing {len(diff):,} of "
+        f"{diff_total_len:,} chars. Judge ONLY the part shown; a PASS means "
+        "'nothing in your focus in the visible portion', not 'the whole change "
+        "is clean'."
+        if truncated else "")
     return (
         f"You are a focused code reviewer. {focus}\n"
         "Report ONLY findings inside that focus; if there are none, pass.\n"
@@ -277,7 +289,7 @@ def _build_angle_prompt(task: Task, diff: str, focus: str) -> str:
         + _VERDICT_FORMAT
         + f"Task: {task.title}\n"
         f"Acceptance criteria (context only — do NOT review compliance):\n{criteria}\n\n"
-        "The diff under review:\n```diff\n" + diff + "\n```\n"
+        "The diff under review:\n```diff\n" + diff + "\n```" + trunc_note + "\n"
     )
 
 
@@ -914,7 +926,8 @@ class AdversarialReviewer:
         # Opus cost. Short-circuit on the main verdict.
         if decision.passed and self._tier_wants_angles(task):
             angle_prompts = [
-                (name, _build_angle_prompt(task, diff, focus))
+                (name, _build_angle_prompt(task, diff, focus,
+                                           diff_total_len=diff_total_len))
                 for name, focus in REVIEW_ANGLES
             ]
             results = await asyncio.gather(
