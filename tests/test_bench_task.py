@@ -345,3 +345,94 @@ def test_pin_resolves_to_commit_before_session(tmp_path):
     build_bench_tasks([t], out_dir=tmp_path / "specs")
     spec = load_bench_tasks(tmp_path / "specs")[0]
     assert spec.repo["pin"] == first_sha
+
+
+def test_cli_bench_run_checkpoints_and_resumes(tmp_path, monkeypatch):
+    """A mid-run death (quota 'Stream closed' killed the expanded run at 3/14)
+    must not waste completed specs: each spec checkpoints, and --resume skips
+    the already-scored ones."""
+    import json as _json
+    import yaml as _yaml
+    from click.testing import CliRunner
+    from no_human.cli import commands as cmds
+    from no_human.cli.commands import cli
+    from no_human.eval.bench_task import BenchTask
+    from no_human.eval.northstar import BenchScore
+
+    d = tmp_path / "specs"
+    d.mkdir()
+    for i in range(3):
+        spec = BenchTask(id=f"ns-r{i}", title="t", request="r", subset="core",
+                         runnable=True)
+        (d / f"ns-r{i}.yaml").write_text(_yaml.safe_dump(spec.to_dict()))
+
+    class _Cfg:
+        data = {"llm": {}}
+        primary_model = review_model = "m"
+        def __getitem__(self, k):
+            return {"safety": {"forbidden_paths": []},
+                    "git": {"never_push_to": []}}[k]
+    monkeypatch.setattr(cmds, "_bootstrap", lambda *a, **kw: (_Cfg(), None))
+    res_dir = tmp_path / "res"
+    monkeypatch.setattr("no_human.eval.northstar_card.RESULTS_DIR", res_dir)
+    monkeypatch.setattr("no_human.eval.northstar_card.REPORT_MD", tmp_path / "N.md")
+
+    seen = []
+
+    def _score(spec):
+        return BenchScore(
+            task_id=spec.id, title=spec.title, outcome_status="skipped",
+            goal_satisfied=None, escalated_honestly=False, mergeable=None,
+            nh_tokens=0, nh_cache_tokens=0, nh_cache_creation_tokens=0,
+            nh_turns=0, nh_wall_clock_s=0.0, orig_tokens=0, orig_cache_tokens=0,
+            orig_cache_creation_tokens=0, orig_wall_clock_s=0.0,
+            orig_corrections=0, subset=spec.subset, notes="stub")
+
+    class _DieOnThird:
+        def __init__(self, *a, **kw): ...
+        async def run_one(self, spec, *, workdir):
+            seen.append(spec.id)
+            if len(seen) == 3:
+                # A hook-thread error escapes `except Exception` and kills the
+                # process — the exact case the checkpoint protects (the caught
+                # kind completes and cleans up).
+                raise KeyboardInterrupt("Stream closed (process killed)")
+            return _score(spec)
+    monkeypatch.setattr("no_human.eval.northstar.NorthStarRunner", _DieOnThird)
+
+    # First run: 2 succeed, the 3rd hard-kills the process — the checkpoint
+    # must hold the 2 completed specs.
+    CliRunner().invoke(cli, ["bench", "run", "--specs-dir", str(d)])
+    ckpt = _json.loads((res_dir / "progress.json").read_text())
+    assert len({s["task_id"] for s in ckpt["scores"]}) >= 2
+
+    # Resume: the 2 already-scored specs are skipped.
+    seen.clear()
+
+    class _AllSkip:
+        def __init__(self, *a, **kw): ...
+        async def run_one(self, spec, *, workdir):
+            seen.append(spec.id)
+            return _score(spec)
+    monkeypatch.setattr("no_human.eval.northstar.NorthStarRunner", _AllSkip)
+    CliRunner().invoke(cli, ["bench", "run", "--specs-dir", str(d), "--resume"])
+    assert "ns-r0" not in seen and "ns-r1" not in seen, "resume re-ran done specs"
+
+    # The checkpointed specs must survive INTO the final card, not just be
+    # skipped-and-dropped — latest.json holds all 3, and the checkpoint is gone.
+    final = _json.loads((res_dir / "latest.json").read_text())
+    assert {s["task_id"] for s in final["scores"]} == {"ns-r0", "ns-r1", "ns-r2"}
+    assert not (res_dir / "progress.json").exists(), "clean run left a checkpoint"
+
+    # A checkpoint from a DIFFERENT spec set must not bleed foreign specs into
+    # latest.json (the gate baseline) — resume filters to this run's ids.
+    (res_dir / "progress.json").write_text(_json.dumps({
+        "created_at": "x", "label": "stale",
+        "scores": [_score(BenchTask(id="ns-foreign", title="t", request="r",
+                                    subset="core", runnable=True)).as_dict()],
+    }))
+    seen.clear()
+    CliRunner().invoke(cli, ["bench", "run", "--specs-dir", str(d), "--resume"])
+    final2 = _json.loads((res_dir / "latest.json").read_text())
+    assert "ns-foreign" not in {s["task_id"] for s in final2["scores"]}, \
+        "resume leaked a foreign spec into the baseline"

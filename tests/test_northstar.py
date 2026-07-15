@@ -225,8 +225,9 @@ class _StubGoalJudge:
         self.seen: dict = {}
 
     async def judge(self, *, request, criteria, agent_diff, outcome_status,
-                    repo_path):
-        self.seen = {"request": request, "agent_diff": agent_diff}
+                    repo_path, report=""):
+        self.seen = {"request": request, "agent_diff": agent_diff,
+                     "report": report}
         from no_human.eval.judge import GoalVerdict
         return GoalVerdict(satisfied=self._satisfied,
                            evidence="stub: verified f() returns 2")
@@ -253,9 +254,13 @@ async def test_run_one_end_to_end_push_proof(tmp_path):
     assert score.outcome_status == "awaiting_approval"
     assert score.goal_satisfied is True
     assert score.nh_tokens > 0
-    assert score.token_ratio is not None and score.token_ratio < 1.0
-    # No-cheating: the judge never saw the transcript — only request + diff.
-    assert set(judge.seen) == {"request", "agent_diff"}
+    # token_ratio is computed from the fake backend's tokens vs the spec's
+    # original — with stub numbers only its presence is meaningful, not its
+    # magnitude (the real magnitude is what the live bench measures).
+    assert score.token_ratio is not None
+    # No-cheating: the judge sees request + diff + the agent's REPORT (the
+    # deliverable for investigation/review kinds) — never the transcript.
+    assert set(judge.seen) == {"request", "agent_diff", "report"}
     assert "return 2" in judge.seen["agent_diff"]
     # Push-proofing held: source repo refs untouched.
     assert _ref_signature(repo) == refs_before

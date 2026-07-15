@@ -13,6 +13,7 @@ is measured, not judged.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import median
@@ -120,8 +121,14 @@ class NorthStarCard:
         }
 
     def save(self, path: Path) -> None:
+        # Atomic write: the bench checkpoint is re-saved after every spec and
+        # the process gets hard-killed on quota saturation ("Stream closed").
+        # A truncate-in-place write caught mid-kill would leave a corrupt file
+        # and silently discard every completed spec on the next --resume.
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.as_dict(), indent=2))
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(self.as_dict(), indent=2))
+        os.replace(tmp, path)
 
     @staticmethod
     def load(path: Path) -> "NorthStarCard | None":
