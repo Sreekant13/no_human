@@ -290,8 +290,12 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
             </div>
           </div>
 
-          {/* What shape of work this is. One choice out of many → radios, not toggles. */}
-          <div role="radiogroup" aria-label="Task kind" className="mt-4 flex flex-wrap gap-2">
+          {/* What shape of work this is. One choice out of many → radios, not toggles.
+              N5: the two most consequential groups (kind, repo) sat unlabeled
+              outside the card while priority (least consequential) sat inside —
+              visible eyebrows give the hierarchy back without moving anything. */}
+          <p className="mt-4 px-1 font-ui text-xs uppercase tracking-wide text-text-dim" id="kind-eyebrow">Kind</p>
+          <div role="radiogroup" aria-labelledby="kind-eyebrow" className="mt-1.5 flex flex-wrap gap-2">
             {COMPOSER_KINDS.map((chip) => {
               const selected = chip.kind === kind;
               return (
@@ -339,7 +343,8 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
           )}
 
           {/* Where the work happens. */}
-          <div className="mt-3 flex flex-wrap items-center gap-2">
+          <p className="mt-3 px-1 font-ui text-xs uppercase tracking-wide text-text-dim">Repository</p>
+          <div className="mt-1.5 flex flex-wrap items-center gap-2">
             {!freeTextRepo ? (
               <SelectPill
                 grow
