@@ -15,6 +15,7 @@ solution.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import time
 from dataclasses import dataclass
@@ -308,8 +309,15 @@ class NorthStarRunner:
 
         score.mergeable = self._holdout_ok(spec, work)
         if self.goal_judge is not None:
+            # The orchestrator commits the coder's work to the PR branch and may
+            # leave the work-dir HEAD at base — so `git diff base..HEAD` misses the
+            # deliverable and the judge false-fails a real PR (found live:
+            # ns-f5cb4cb0's committed review files sat on the PR branch while HEAD
+            # was at base → empty diff → scored a "fabrication"). Diff against the
+            # PR branch the orchestrator recorded, when there is one.
+            diff_ref = self._agent_diff_ref(outcome, work)
             agent_diff = subprocess.run(
-                ["git", "diff", base_sha, "HEAD"], cwd=work,
+                ["git", "diff", base_sha, diff_ref], cwd=work,
                 capture_output=True, text=True).stdout
             # The deliverable for investigation/code_review/design_doc kinds
             # is the REPORT, not a diff — the first baseline scored those as
@@ -329,6 +337,27 @@ class NorthStarRunner:
             score.goal_satisfied = score.mergeable in (True, None)
             score.notes = "no judge injected; holdout-only scoring"
         return score
+
+    @staticmethod
+    def _agent_diff_ref(outcome, work: Path) -> str:
+        """The ref to diff the agent's work against. The orchestrator can leave
+        the work-dir HEAD at base while the coder's commits live on the PR branch,
+        so prefer the recorded ``pr_branch`` (local ref, then ``origin/``) when it
+        exists — else fall back to HEAD. Fixes false-empty diffs that made the
+        judge score a real PR as a fabrication."""
+        ctx = getattr(getattr(outcome, "task", None), "context", None) or {}
+        pr_branch = ctx.get("pr_branch")
+        if pr_branch:
+            for cand in (pr_branch, f"origin/{pr_branch}"):
+                if subprocess.run(["git", "rev-parse", "--verify", cand],
+                                  cwd=work, capture_output=True).returncode == 0:
+                    return cand
+            # Recorded but unresolvable — WARN rather than silently fall back to
+            # HEAD, which would re-mask the empty-diff false-failure (review nit).
+            logging.getLogger(__name__).warning(
+                "bench: pr_branch %r not resolvable in %s — diffing HEAD (may "
+                "under-capture the deliverable)", pr_branch, work)
+        return "HEAD"
 
     def _holdout_ok(self, spec: BenchTask, work: Path) -> bool | None:
         if not spec.holdout:

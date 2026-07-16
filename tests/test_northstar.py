@@ -425,6 +425,55 @@ async def test_intent_judge_also_retries_on_transient(monkeypatch):
     assert be.calls == 2 and v.match is True
 
 
+@pytest.mark.asyncio
+async def test_score_diffs_against_pr_branch_not_head(tmp_path):
+    """The orchestrator can leave the work-dir HEAD at base while the coder's
+    commits live on the PR branch — the runner must diff against `pr_branch` or a
+    REAL PR is fed to the judge as an empty diff and scored a 'fabrication' (found
+    live: ns-f5cb4cb0's 3 review files were committed on the PR branch, HEAD at
+    base → empty diff → false failure)."""
+    import subprocess as sp
+    from no_human.core.task import TaskStatus
+
+    work = tmp_path / "work"
+    work.mkdir()
+    for a in (["init", "-b", "main"], ["config", "user.email", "t@t"],
+              ["config", "user.name", "t"]):
+        sp.run(["git", *a], cwd=work, check=True, capture_output=True)
+    (work / "base.txt").write_text("x")
+    sp.run(["git", "add", "-A"], cwd=work, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "base"], cwd=work, check=True, capture_output=True)
+    base_sha = sp.run(["git", "rev-parse", "HEAD"], cwd=work,
+                      capture_output=True, text=True).stdout.strip()
+    # coder work on the PR branch, then HEAD goes BACK to base (the bug scenario)
+    sp.run(["git", "checkout", "-b", "pr-x"], cwd=work, check=True, capture_output=True)
+    (work / "review.md").write_text("the review deliverable")
+    sp.run(["git", "add", "-A"], cwd=work, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "coder work"], cwd=work, check=True, capture_output=True)
+    sp.run(["git", "checkout", "main"], cwd=work, check=True, capture_output=True)
+
+    class _Task:
+        context = {"pr_branch": "pr-x"}
+
+    class _Outcome:
+        status = TaskStatus.AWAITING_APPROVAL
+        detail = ""
+        report = ""
+        task = _Task()
+
+    judge = _StubGoalJudge()
+    runner = NorthStarRunner({}, backend_factory=lambda s: None, goal_judge=judge)
+    spec = BenchTask(id="ns-x", title="t", request="r",
+                     repo={"path": str(work), "pin": "HEAD"})
+    # sanity: base..HEAD (the OLD behaviour) would be empty
+    old = sp.run(["git", "diff", base_sha, "HEAD"], cwd=work,
+                 capture_output=True, text=True).stdout
+    assert "review.md" not in old
+    await runner._score(spec, _Outcome(), work, base_sha, attempts=[], elapsed=1.0)
+    assert "review.md" in judge.seen["agent_diff"]
+    assert "the review deliverable" in judge.seen["agent_diff"]
+
+
 def test_render_shows_per_project_breakdown(tmp_path):
     """The suite spans 8 real repos — the operator asked for MULTIPLE projects, so
     the report must break cost/quality down BY PROJECT. `project` also survives the
