@@ -282,3 +282,137 @@ async def test_mid_attempt_budget_cross_parks_behind_budget_exhausted(
     # report zero tokens (that's how 21.2M once slipped past every cap)
     attempts = await store.list_attempts(task.id)
     assert attempts[0]["tokens_used"] >= 50_000
+
+
+# ------------------- per-attempt token cap (v6 taxonomy) -------------------- #
+# Four live specs burned the ENTIRE 8M lifetime budget in attempt #1 — the
+# ceiling was armed with the remaining LIFETIME budget, so the bounded loop
+# never got a second attempt. The attempt cap ends the ATTEMPT (work
+# checkpointed, loop retries with fresh context); only the lifetime cap parks.
+
+
+def test_sink_attempt_cap_beats_a_larger_remaining_budget(store, tmp_path):
+    orch = _orch(store, tmp_path)
+    orch._active_task_id = "task-1"
+    orch._begin_attempt_accounting(
+        "task-1", remaining_tokens=1_000_000, attempt_cap=1_000)
+    ev = AgentEvent("usage", meta={"tokens_used": 600, "cache_read_tokens": 0,
+                                   "cache_creation_tokens": 0})
+    orch._agent_sink(ev, role=CODER_ROLE)  # 600 — under the cap
+    with pytest.raises(BudgetAbort, match="attempt cap"):
+        orch._agent_sink(ev, role=CODER_ROLE)  # 1,200 — over the cap
+
+
+def test_sink_lifetime_ceiling_still_wins_when_smaller(store, tmp_path):
+    orch = _orch(store, tmp_path)
+    orch._active_task_id = "task-1"
+    orch._begin_attempt_accounting(
+        "task-1", remaining_tokens=1_000, attempt_cap=1_000_000)
+    ev = AgentEvent("usage", meta={"tokens_used": 600, "cache_read_tokens": 0,
+                                   "cache_creation_tokens": 0})
+    orch._agent_sink(ev, role=CODER_ROLE)
+    with pytest.raises(BudgetAbort, match="lifetime"):
+        orch._agent_sink(ev, role=CODER_ROLE)
+
+
+class _TokenGusherThenFixBackend:
+    """Attempt 1 gushes past the ATTEMPT cap (WIP on disk); attempt 2 works."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            (cwd / "calc.py").write_text("def add(a, b):\n    return a + b\n# WIP\n")
+            for _ in range(500):
+                if on_event:
+                    on_event(AgentEvent("usage", meta={
+                        "tokens_used": 30_000, "cache_read_tokens": 0,
+                        "cache_creation_tokens": 0}))
+            raise AssertionError("attempt cap never aborted the attempt")
+        if on_event:
+            on_event(AgentEvent("tool_use", tool_name="Edit",
+                                tool_input={"file_path": "calc.py"}))
+        _mutate(cwd)
+        return AgentResult(final_text="done", num_turns=2, is_error=False,
+                           tokens_used=100, session_id="s", stop_reason="end_turn")
+
+
+async def test_attempt_cap_fails_the_attempt_and_the_loop_retries(
+    store, bare_repo, tmp_path
+):
+    task = Task.new("add mul()", repo_path=str(bare_repo))
+    task.acceptance_criteria = ["mul(a,b) returns a*b"]
+    task.config = {"attempt_tokens": 50_000}  # lifetime cap (8M) stays far away
+    await store.create_task(task)
+
+    backend = _TokenGusherThenFixBackend()
+    orch = _orch(store, tmp_path, backend=backend)
+    outcome = await orch.run_task(task)
+
+    # ended the ATTEMPT, not the task: the bounded loop got its retry
+    assert backend.calls == 2
+    reloaded = await store.find_task(task.id)
+    assert (reloaded.blocker or {}).get("category") != "BUDGET_EXHAUSTED"
+
+    attempts = await store.list_attempts(task.id)
+    first = attempts[0]
+    assert first["status"] == "failed"
+    assert "attempt cap" in (first["failure_reason"] or "")
+    # the attempt's true spend was recorded, not zero
+    assert first["tokens_used"] >= 50_000
+
+    # attempt 1's work survived as a checkpoint
+    log = subprocess.run(
+        ["git", "log", "--all", "--pretty=%s"], cwd=bare_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "[WIP-PARTIAL]" in log
+
+
+class _TokenGusherWithWipBackend:
+    """Gushes past the LIFETIME cap with WIP on disk — the park must keep the
+    dirty tree for _raise_blocker's [WIP-BLOCKED] checkpoint (resume_commit)."""
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        (cwd / "calc.py").write_text("def add(a, b):\n    return a + b\n# WIP\n")
+        for _ in range(500):
+            if on_event:
+                on_event(AgentEvent("usage", meta={
+                    "tokens_used": 30_000, "cache_read_tokens": 0,
+                    "cache_creation_tokens": 0}))
+        raise AssertionError("budget cross never aborted the attempt")
+
+
+async def test_lifetime_park_still_records_a_resume_checkpoint(
+    store, bare_repo, tmp_path
+):
+    """Regression guard for the attempt-cap change: the WIP-PARTIAL checkpoint
+    must fire ONLY on the attempt-cap path — a pre-emptive commit on the
+    lifetime path would clean the tree before _raise_blocker's [WIP-BLOCKED]
+    checkpoint and lose the blocker's resume_commit."""
+    task = Task.new("add mul()", repo_path=str(bare_repo))
+    task.config = {"lifetime_tokens": 50_000}
+    await store.create_task(task)
+
+    orch = _orch(store, tmp_path, backend=_TokenGusherWithWipBackend())
+    await orch.run_task(task)
+
+    reloaded = await store.find_task(task.id)
+    blocker = reloaded.blocker or {}
+    assert blocker.get("category") == "BUDGET_EXHAUSTED"
+    assert blocker.get("resume_commit"), (
+        "lifetime park lost its [WIP-BLOCKED] resume checkpoint")
+    # Mutation-proof (review D8): resume_commit alone is a tautology —
+    # _checkpoint_wip returns head_sha even on a clean tree. The park's
+    # checkpoint must be the [WIP-BLOCKED] one; a pre-emptive [WIP-PARTIAL]
+    # on this path would clean the tree first and mislabel the park point.
+    log = subprocess.run(
+        ["git", "log", "--all", "--pretty=%s"], cwd=bare_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "[WIP-BLOCKED]" in log
+    assert "[WIP-PARTIAL]" not in log

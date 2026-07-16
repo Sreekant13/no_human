@@ -548,3 +548,56 @@ def test_render_shows_per_project_breakdown(tmp_path):
     p = tmp_path / "card.json"
     c.save(p)
     assert NorthStarCard.load(p).scores[0].project == "metrics-core"
+
+
+# ------------------------- kind classification ----------------------------- #
+
+def test_bench_task_is_classified_like_the_product():
+    """The product front door (`nh` → classify_kind) routes report-shaped work
+    to its read-only pipelines; the bench must replay through the SAME routing
+    or every review/question/plan spec grinds the feature pipeline (v6
+    taxonomy, 2026-07-16: 4 "is my answer the deliverable?" parks + report-
+    shaped 8M budget burns)."""
+    from no_human.eval.northstar import _bench_task
+
+    review = _bench_task(
+        _spec(Path("."), title="review this PR https://forge.example/x/y/pull/42",
+              request="review it as an experienced engineer"),
+        Path("/tmp/work"))
+    assert review.kind == "code_review"
+
+    repo_review = _bench_task(
+        _spec(Path("."), title="do an in-depth code review of the export module",
+              request="review it as an experienced engineer"),
+        Path("/tmp/work"))
+    assert repo_review.kind == "investigation"
+
+    question = _bench_task(
+        _spec(Path("."), title="what are the allowed columns in the export endpoint",
+              request="answer with citations"),
+        Path("/tmp/work"))
+    assert question.kind == "investigation"
+
+    plain = _bench_task(
+        _spec(Path("."), title="Add a dark-mode toggle to the settings page",
+              request="implement it"),
+        Path("/tmp/work"))
+    assert plain.kind == "feature"
+    assert plain.repo_path == "/tmp/work"
+    assert plain.acceptance_criteria == []
+
+
+@pytest.mark.asyncio
+async def test_done_report_terminal_is_a_gate_state(tmp_path):
+    """Review D9: report-deliverable pipelines (investigation / design_doc /
+    clean code_review) terminate DONE with the report as the deliverable —
+    the scorer must judge that report, not auto-fail the status."""
+    from no_human.core.task import TaskStatus
+    repo = _src_repo(tmp_path)
+    runner = NorthStarRunner({}, backend_factory=lambda s: None)
+    score = await runner._score(
+        _spec(repo), _FakeOutcome(TaskStatus.DONE), tmp_path, "sha",
+        attempts=[{"tokens_used": 100, "cache_read_tokens": 0, "turns_used": 2}],
+        elapsed=2.0)
+    assert "did not reach the human gate" not in (score.notes or "")
+    assert score.goal_satisfied is not False  # judge decides (None here: no judge)

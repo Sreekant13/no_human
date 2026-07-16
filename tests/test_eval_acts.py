@@ -94,3 +94,58 @@ async def test_enrich_preserves_empty_original_criteria(store, tmp_path):
 
     from no_human.core.orchestrator import _moa_complexity_signals
     assert _moa_complexity_signals(got, {"criteria_threshold": 5}) == []
+
+
+async def test_missing_context_resolves_assumptions_even_on_accept(
+    store, tmp_path, monkeypatch
+):
+    """v6 taxonomy: tasks that passed intake still parked mid-run on AMBIGUITY.
+    An explicit no_missing_context=false is the evaluator saying 'the agent
+    will hit an information gap' — resolve assumptions up front regardless of
+    the headline verdict."""
+    async def _fake_resolve(title, description, criteria, *, backend=None, model=None):
+        return ["assume the export endpoint means /api/data/export"]
+    monkeypatch.setattr(ev, "resolve_assumptions", _fake_resolve)
+
+    t = Task.new("underspecified but clear task", repo_path="/r")
+    await store.create_task(t)
+    orch = _orch(store, tmp_path)
+    eval_out = EvalResult(
+        verdict=EvalVerdict.ACCEPT,
+        dimensions={"clear_objective": True, "no_missing_context": False},
+    )
+    await orch._act_on_eval(t, eval_out)
+
+    got = await store.get_task(t.id)
+    assert got.context["assumptions"] == [
+        "assume the export endpoint means /api/data/export"]
+
+
+async def test_missing_dimensions_default_to_no_assumptions(store, tmp_path):
+    t = Task.new("clear task", repo_path="/r")
+    await store.create_task(t)
+    orch = _orch(store, tmp_path)
+    await orch._act_on_eval(t, EvalResult(verdict=EvalVerdict.ACCEPT, dimensions={}))
+    got = await store.get_task(t.id)
+    assert "assumptions" not in (got.context or {})
+
+
+async def test_enrich_with_missing_context_does_both(store, tmp_path, monkeypatch):
+    async def _fake_resolve(title, description, criteria, *, backend=None, model=None):
+        return ["assume X"]
+    monkeypatch.setattr(ev, "resolve_assumptions", _fake_resolve)
+
+    t = Task.new("enrichable underspecified task", repo_path="/r")
+    t.acceptance_criteria = ["original"]
+    await store.create_task(t)
+    orch = _orch(store, tmp_path)
+    eval_out = EvalResult(
+        verdict=EvalVerdict.ENRICH,
+        enriched_criteria=["sharper"],
+        dimensions={"no_missing_context": False},
+    )
+    await orch._act_on_eval(t, eval_out)
+
+    got = await store.get_task(t.id)
+    assert got.acceptance_criteria == ["sharper"]
+    assert got.context["assumptions"] == ["assume X"]

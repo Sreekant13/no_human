@@ -31,8 +31,12 @@ from .bench_task import BenchTask
 BackendFactory = Callable[[BenchTask], Any]
 
 # Off-ramps that count as "reached the human gate" for gate-kind outcomes vs
-# honest-escalation outcomes (expect_escalation specs).
-_GATE_STATES = {TaskStatus.AWAITING_APPROVAL}
+# honest-escalation outcomes (expect_escalation specs). DONE is a gate state
+# too (review D9): report-deliverable pipelines (investigation / design_doc /
+# clean code_review) terminate DONE with the report as the deliverable — the
+# judge evaluates that report; auto-failing DONE would score every successful
+# rerouted report task ❌ without the judge ever seeing it.
+_GATE_STATES = {TaskStatus.AWAITING_APPROVAL, TaskStatus.DONE}
 _HONEST_STOPS = {TaskStatus.ESCALATED, TaskStatus.AWAITING_INPUT,
                  TaskStatus.BLOCKED}
 
@@ -182,6 +186,20 @@ def _ref_signature(repo: Path) -> str:
         return ""
 
 
+def _bench_task(spec: BenchTask, work: Path) -> Task:
+    """Build the orchestrator Task for a spec EXACTLY as the product front door
+    would — including kind classification (`nh` runs classify_kind at intake,
+    cli/commands.py). Without it every replayed task defaulted to the feature
+    pipeline, so review/question/plan specs never reached their read-only
+    report terminals (v6 taxonomy, 2026-07-16)."""
+    from ..intake.classify import classify_kind
+
+    task = Task.new(spec.title, repo_path=str(work), description=spec.request)
+    task.acceptance_criteria = list(spec.acceptance_criteria)
+    task.kind = classify_kind(task).kind.value
+    return task
+
+
 class NorthStarRunner:
     """Mirrors eval.replay.ReplayRunner but for real-repo bench specs."""
 
@@ -210,9 +228,7 @@ class NorthStarRunner:
                 SlackNotifier(None), reviewer=self.reviewer,
                 event_sink=self._event_sink,
             )
-            task = Task.new(spec.title, repo_path=str(work),
-                            description=spec.request)
-            task.acceptance_criteria = list(spec.acceptance_criteria)
+            task = _bench_task(spec, work)
             await store.create_task(task)
 
             t0 = time.monotonic()

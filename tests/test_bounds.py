@@ -215,3 +215,31 @@ def test_hard_stuck_not_fooled_by_progress():
     for i in range(30):
         d.record_tool_call("Read", f"/file{i}.py")
     assert d.hard_stuck_reason is None
+
+
+def test_attempt_tokens_default_and_override():
+    """Per-attempt spend cap (v6: four specs burned the whole 8M lifetime
+    budget in attempt #1). Default must clear the largest measured successful
+    attempt (3.06M complex-tier cache-read) with headroom, and stay well under
+    the lifetime cap so the bounded loop keeps at least two real attempts."""
+    b = Bounds()
+    assert b.attempt_tokens == 4_000_000
+    assert b.attempt_tokens > 3_060_000        # measured complex attempt
+    assert b.attempt_tokens <= b.lifetime_tokens // 2
+    assert Bounds.from_config({"attempt_tokens": 123}).attempt_tokens == 123
+
+
+def test_investigation_overlay_keeps_base_caps():
+    """Review D10: the investigation/design_doc bounds overlay must inherit
+    the configured token caps, not silently revert them to dataclass
+    defaults for exactly the kinds that produce reports."""
+    base = {"attempt_tokens": 123, "lifetime_tokens": 456,
+            "max_attempts": 3, "max_turns_per_attempt": 500}
+    inv = {"max_attempts": 8, "max_turns_per_attempt": 80}
+    merged = {**base, "max_attempts": inv["max_attempts"],
+              "max_turns_per_attempt": inv["max_turns_per_attempt"]}
+    b = Bounds.from_config(merged)
+    assert b.max_attempts == 8
+    assert b.max_turns_per_attempt == 80
+    assert b.attempt_tokens == 123
+    assert b.lifetime_tokens == 456

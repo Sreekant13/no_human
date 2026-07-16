@@ -51,6 +51,16 @@ class Bounds:
     # 61.5M task blew past entirely, across resumes).
     lifetime_attempts: int = 9
     lifetime_tokens: int = 8_000_000
+    # Per-ATTEMPT spend cap (v6 taxonomy, 2026-07-16): four live specs burned
+    # the entire 8M lifetime budget in attempt #1 — the mid-attempt watch was
+    # armed with the remaining LIFETIME budget, so the bounded loop never got a
+    # second attempt. Crossing THIS cap ends the attempt (work checkpointed,
+    # loop retries with fresh context — the StuckAbort semantics); only the
+    # lifetime cap parks behind BUDGET_EXHAUSTED. 4M clears the largest
+    # measured successful attempt (complex tier: 3.06M cache-read) with ~30%
+    # headroom and leaves the loop at least two real attempts inside 8M.
+    # Per-task overridable via task.config["attempt_tokens"] (human-only).
+    attempt_tokens: int = 4_000_000
 
     @staticmethod
     def from_config(cfg: dict | None) -> "Bounds":

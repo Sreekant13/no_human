@@ -2278,6 +2278,10 @@ async def test_investigation_report_only_completes_as_done(bare_repo, tmp_path, 
 
     assert outcome.status is TaskStatus.DONE, f"expected DONE, got {outcome.status}"
     assert "report-only" in outcome.detail
+    # v7 live find: the judge was fed the placeholder detail because the DONE
+    # outcome never carried the findings — the #85 bug class on this terminal.
+    # The deliverable must ride on outcome.report, like every other producer.
+    assert "medstarhr" in outcome.report
     # Findings stored in task context
     refreshed = await store.find_task(t.id)
     assert "findings" in (refreshed.context or {})
@@ -3373,7 +3377,50 @@ async def test_design_doc_report_only_completes_as_done(bare_repo, tmp_path, sto
 
     assert outcome.status is TaskStatus.DONE, f"expected DONE, got {outcome.status}"
     assert "report-only" in outcome.detail
+    # v7 live find: the judge was fed the placeholder detail because the DONE
+    # outcome never carried the findings — the #85 bug class on this terminal.
+    # The deliverable must ride on outcome.report, like every other producer.
+    assert "medstarhr" in outcome.report
     refreshed = await store.find_task(t.id)
     assert "findings" in (refreshed.context or {})
     attempts = await store.list_attempts(t.id)
     assert attempts[-1]["status"] == "succeeded"
+
+
+class _CleanReviewer:
+    """Reviewer stub: passes the review with zero findings."""
+
+    async def review(self, task, **kwargs):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            passed=True, failed_items=[], checklist=[],
+            as_dict=lambda: {"passed": True, "items": []},
+            raw_output="Reviewed thoroughly: LGTM, no defects found.",
+            tokens_used=10, cache_read_tokens=0, cache_creation_tokens=0,
+        )
+
+
+async def test_clean_code_review_done_carries_the_review_as_report(
+    bare_repo, tmp_path, store, monkeypatch
+):
+    """v7 live find (placeholder-bug class): a clean-pass code review ended
+    DONE with only the terse draft-count detail — the REVIEW itself is the
+    deliverable and must ride on outcome.report, symmetric with the
+    drafts→AWAITING_APPROVAL producer."""
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), reviewer=_CleanReviewer())
+    t = Task.new("review this PR https://forge.example/x/y/pull/42",
+                 repo_path=str(bare_repo), kind="code_review")
+    await store.create_task(t)
+    monkeypatch.setattr(orch, "_fetch_pr_diff",
+                        lambda repo, url: "diff --git a/f.py b/f.py\n+x = 1\n")
+
+    async def _no_comments(pr_url):
+        return ""
+    monkeypatch.setattr(orch, "_fetch_pr_comments_text", _no_comments)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.DONE
+    assert "LGTM" in outcome.report

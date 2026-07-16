@@ -125,3 +125,15 @@ def test_memories_block_critical_cap_stops_not_truncates():
     # cap smaller than one line → that line is dropped whole, no partial rule
     b = build_memories_block([big], 10, 4000)
     assert "yyyy" not in b
+
+
+def test_rules_block_ask_vs_act_decision_rule():
+    """v6 taxonomy: the coder parked completable tasks on AMBIGUITY questions.
+    The rule must license proceeding under a documented reversible assumption
+    while PRESERVING the honest-escalation carve-outs (access, destructive)."""
+    r = build_rules_block("uv run pytest -q", "", None)
+    assert "ASK-VS-ACT" in r
+    assert "reasonable, REVERSIBLE" in r
+    assert "MISSING_ACCESS" in r
+    # the anti-tamper rule must survive any rules-block edit
+    assert "NEVER weaken, skip, or delete a test" in r
