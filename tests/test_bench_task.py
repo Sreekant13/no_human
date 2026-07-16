@@ -146,9 +146,9 @@ def test_committed_core_specs_are_valid_and_honest():
     assert len(ids) == len(set(ids)), "duplicate spec ids in the curated suite"
     core = [s for s in specs if s.subset == "core"]
     # No-shrink guard (the operator's tamper-guard philosophy applied to the
-    # bench): the curated core suite is 24 after G-2 + the restored hard gated
-    # task; a drop is intentional and must update this floor visibly.
-    assert len(core) >= 24, f"curated core suite shrank: {len(core)}"
+    # bench): the curated core suite is 36 after the multi-project expansion; a
+    # drop is intentional and must update this floor visibly.
+    assert len(core) >= 36, f"curated core suite shrank: {len(core)}"
     for s in core:
         assert s.id.startswith("ns-"), s.id
         assert s.title.strip(), f"{s.id}: empty title"
