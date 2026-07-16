@@ -37,7 +37,7 @@ Status key: ✅ fixed · ⬜ open
 | M4 | ✅ | Drawer | **Unguarded fetch race:** "Next review →" swaps `taskId` while `fetchTask`/`fetchDiff` are in flight; a late response paints task A's diff under task B's title, and Approve posts against B. `SlideOver.jsx:76-85` | stale-flag the effect |
 | M5 | ✅ | Board | **Card text is sliced mid-word** (no ellipsis) — a URL or path is cut through a glyph. `overflow-wrap` computes to `normal` under `overflow:hidden`. Measured at 390px: `scrollWidth 250 / clientWidth 180`. `styles.css:654` | `overflow-wrap: anywhere` on `.card-title`, `.card-description`, `.card-blocker-q` |
 | M6 | ✅ | Board, 1440px | **The DONE lane is cut off on a MacBook.** 5 lanes × 240px + padding = 1254px into 1208px available, behind a 6px transparent scrollbar. Also: the gate lanes and the Done lane are *exactly* the same width — size, the strongest hierarchy channel, is unused. `styles.css:468` | narrow the lanes; weight the gate lanes (`flex: 1.25`) over Done (`0.85`) |
-| M7 | ⬜ | Drawer | **The System tab prints the same three facts twice** (stage row *and* agent cards) and pays ~600px of vertical space for it; `.sys-node-model` has no horizontal padding and clips against the card border. It is the default tab and the lowest-density surface in the app. `styles.css:931` | collapse to the stage chips (which are good) as the click target into `AgentLogModal`; fix the padding |
+| M7 | ✅ | Drawer | **The System tab prints the same three facts twice** (stage row *and* agent cards) and pays ~600px of vertical space for it; `.sys-node-model` has no horizontal padding and clips against the card border. It is the default tab and the lowest-density surface in the app. **Fixed #72** — `RoleRow` (SlideOver.jsx:815) is one compact row per role that replaces the AgentNode cards; stage head is the `AgentLogModal` click target; padding fixed. | collapse to the stage chips (which are good) as the click target into `AgentLogModal`; fix the padding |
 | M8 | ✅ | Stats | **The Daily Completions chart is ~90% empty**, has no axis labels or dates, stretches its bars (`preserveAspectRatio="none"`), and draws zero-days as a 1px tick that reads as a broken baseline. It says "the tool is barely used" — the opposite of the data. `Stats.jsx:602` | drop the stretch; label first/mid/last day; distinct zero-day tick; consider a 7-day window |
 | M9 | ✅ | Stats | **Cost is never a headline** (always a subtitle), and the green/plain tone system has no legible rule — "PRs merged: 13" is green because it is non-zero, "Stagnation: 0" is plain although 0 is the best value. Four green tiles in a row means the colour carries no signal. `northStar.js` | promote a Spend tile; colour only where a threshold exists |
 | M10 | ✅ | Light theme | **The lane columns vanish in light mode.** `.lane`, `.lane-empty`, `.lane-failed` and the amber "this column is blocking you" glow are all `rgba(255,255,255,…)` literals — invisible on a light canvas. The strongest hierarchy cue on the board is dark-only. `styles.css:473` | token surfaces + `color-mix` glows |
@@ -103,19 +103,19 @@ Design notes for the implementer (verify each before building):
 
 ## Still open (carried to the next session)
 
-> **Doc-staleness correction (2026-07-16, G-5 verify):** N5, N13, and P1 were
-> marked ⬜ open here but had already SHIPPED in #74 (verified against the live
-> tree: `TaskComposer.jsx:296` eyebrows; `styles.css:296` 359px fade mask;
-> `eslint.config.mjs` + `npm run lint` clean). Removed from this table. The plan's
-> warning held — the checkbox lied; the code was checked. Remaining items below are
-> genuine but were NOT re-verified this pass (M7 is a redesign; N14/N15 are 360px
-> edge-clips) — check the live UI before trusting them too.
+> **Doc-staleness corrections (2026-07-16):** N5, N13, P1 had already SHIPPED in
+> #74 (verified live); **M7 had already SHIPPED in #72** — `RoleRow` (SlideOver.jsx:815)
+> is exactly the "compact row per role that Replaces the AgentNode cards that
+> repeated the head's facts", with the stage head as the `AgentLogModal` click
+> target. The audit's "redesign" was already done; the checkbox lagged (again — check
+> the live UI, not the box). **N14 + N15 fixed this pass** (see below). Nothing
+> structural remains open.
 
-| # | Screen | Defect | Note |
-|---|---|---|---|
-| M7 | Drawer | The System tab prints the same three facts twice (the stage row AND the agent cards) and pays ~600px of vertical space for it — while being the DEFAULT tab. | A **redesign**, not a bug fix: collapse to the stage chips (which are good) as the click target into `AgentLogModal`, the best-designed surface in the app. Its two mechanical defects are already fixed. |
-| N14 | Error header | `.legion-credit` is `white-space: nowrap` and gets hard-clipped mid-word at ≤360px by `.nh-shell { overflow: hidden }`. | Same class as the mobile-nav overflow; the hide rule is scoped to `.nh-sidebar-foot`, so it does not reach this one. |
-| N15 | Sidebar | The 360px fit has only ~3px of headroom: with a worker in flight the "Working (N)" dot grows the footer 48→66px, silently stealing width from the nav. | `min-width: 0` on the footer, or hide the dot under 640px. |
+**All closed.** N14 (error-header credit) — removed `white-space: nowrap` from
+`.legion-credit` so it wraps instead of clipping mid-word at ≤360px
+(`styles.css:466`). N15 (sidebar footer stealing nav width at ≤360px) — the row-mode
+footer + its status labels now `min-width:0` / truncate so the nav (`flex:1`) always
+wins (`styles.css`, ≤640px block). Both are monotonic (yield space, never take more).
 
 ## Already fixed this cycle
 
