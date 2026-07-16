@@ -469,9 +469,59 @@ async def test_score_diffs_against_pr_branch_not_head(tmp_path):
     old = sp.run(["git", "diff", base_sha, "HEAD"], cwd=work,
                  capture_output=True, text=True).stdout
     assert "review.md" not in old
+    # sanity: the file is absent from the work dir while HEAD is at base
+    assert not (work / "review.md").exists()
     await runner._score(spec, _Outcome(), work, base_sha, attempts=[], elapsed=1.0)
     assert "review.md" in judge.seen["agent_diff"]
     assert "the review deliverable" in judge.seen["agent_diff"]
+    # the runner checked out the PR branch, so the judge's own ls/git checks in
+    # repo_path now SEE the deliverable (not just the agent_diff).
+    assert (work / "review.md").exists()
+    assert (work / "review.md").read_text() == "the review deliverable"
+
+
+@pytest.mark.asyncio
+async def test_holdout_runs_against_pr_branch_not_base(tmp_path):
+    """Review positive finding: the HOLDOUT tests must run against the coder's
+    work (on the PR branch), not the base pin — on master they ran at base and
+    force-failed a passing deliverable. #94's checkout makes them run on the branch."""
+    import subprocess as sp
+    from no_human.core.task import TaskStatus
+
+    work = tmp_path / "work"
+    work.mkdir()
+    for a in (["init", "-b", "main"], ["config", "user.email", "t@t"],
+              ["config", "user.name", "t"]):
+        sp.run(["git", *a], cwd=work, check=True, capture_output=True)
+    (work / "app.py").write_text("def f():\n    return 1\n")   # base: f()==1
+    sp.run(["git", "add", "-A"], cwd=work, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "base"], cwd=work, check=True, capture_output=True)
+    base_sha = sp.run(["git", "rev-parse", "HEAD"], cwd=work,
+                      capture_output=True, text=True).stdout.strip()
+    sp.run(["git", "checkout", "-b", "pr-x"], cwd=work, check=True, capture_output=True)
+    (work / "app.py").write_text("def f():\n    return 2\n")   # coder: f()==2
+    sp.run(["git", "add", "-A"], cwd=work, check=True, capture_output=True)
+    sp.run(["git", "commit", "-m", "coder"], cwd=work, check=True, capture_output=True)
+    sp.run(["git", "checkout", "main"], cwd=work, check=True, capture_output=True)
+
+    class _Task:
+        context = {"pr_branch": "pr-x"}
+
+    class _Outcome:
+        status = TaskStatus.AWAITING_APPROVAL
+        detail = ""
+        report = ""
+        task = _Task()
+
+    runner = NorthStarRunner({}, backend_factory=lambda s: None, goal_judge=None)
+    spec = BenchTask(id="ns-h", title="t", request="r",
+                     repo={"path": str(work), "pin": "HEAD"},
+                     holdout="from app import f\ndef test_f():\n    assert f() == 2\n")
+    score = await runner._score(spec, _Outcome(), work, base_sha, attempts=[], elapsed=1.0)
+    # The holdout passed ONLY because it ran against the coder's branch (f()==2),
+    # not base (f()==1) — on master this was False, forcing goal_satisfied False.
+    assert score.mergeable is True
+    assert score.goal_satisfied is True
 
 
 def test_render_shows_per_project_breakdown(tmp_path):

@@ -307,29 +307,44 @@ class NorthStarRunner:
             score.notes = f"did not reach the human gate ({status.value})"
             return score
 
-        score.mergeable = self._holdout_ok(spec, work)
+        # Put the work dir on the coder's PR branch. The orchestrator commits the
+        # coder's work there and can leave HEAD at the base pin — so the holdout
+        # tests AND the judge's own filesystem checks (ls / git status in
+        # repo_path) would otherwise see BASE and contradict the real work
+        # (verified live: ns-f5cb4cb0's 3 review files appear only after checking
+        # out the PR branch; the judge ran `ls`/`git status`, saw none, and
+        # false-scored a "fabrication"). #92 fixed the agent_diff; this makes the
+        # holdout + judge repo view consistent with it. FORCE the checkout: the
+        # deliverable is COMMITTED on the branch, so uncommitted sandbox cruft that
+        # could block a plain checkout is not part of the PR — a silent
+        # keep-HEAD-at-base would reintroduce the exact empty-view bug (review D1).
+        diff_ref = self._agent_diff_ref(outcome, work)
+        if diff_ref != "HEAD":
+            r = subprocess.run(["git", "checkout", "-q", "-f", "--detach", diff_ref],
+                               cwd=work, capture_output=True)
+            if r.returncode != 0:
+                logging.getLogger(__name__).warning(
+                    "bench: could not checkout %s in %s — judge repo view is stale, "
+                    "may under-score: %s", diff_ref, work, r.stderr.decode()[:200])
+        # Judge FIRST, on the clean coder work — BEFORE _holdout_ok writes its own
+        # tests/bench_holdout/ file into the tree, which a judge told to `ls`/`git
+        # status` would otherwise see and puzzle over (review D2).
+        verdict = None
         if self.goal_judge is not None:
-            # The orchestrator commits the coder's work to the PR branch and may
-            # leave the work-dir HEAD at base — so `git diff base..HEAD` misses the
-            # deliverable and the judge false-fails a real PR (found live:
-            # ns-f5cb4cb0's committed review files sat on the PR branch while HEAD
-            # was at base → empty diff → scored a "fabrication"). Diff against the
-            # PR branch the orchestrator recorded, when there is one.
-            diff_ref = self._agent_diff_ref(outcome, work)
+            # Diff base against the PR branch (robust even if the checkout failed —
+            # the coder's commits live there regardless). The judge also sees the
+            # agent's REPORT (its answer/review/plan), preferred over the terse
+            # status `detail`.
             agent_diff = subprocess.run(
                 ["git", "diff", base_sha, diff_ref], cwd=work,
                 capture_output=True, text=True).stdout
-            # The deliverable for investigation/code_review/design_doc kinds
-            # is the REPORT, not a diff — the first baseline scored those as
-            # failures purely because the judge only ever saw an empty diff.
             verdict = await self.goal_judge.judge(
                 request=spec.request, criteria=spec.acceptance_criteria,
                 agent_diff=agent_diff, outcome_status=status.value,
-                # The deliverable is the agent's substantive REPORT (its answer/
-                # review/plan), not the terse status `detail`. Prefer `report`;
-                # fall back to `detail` only when the outcome carries no report.
                 report=(getattr(outcome, "report", "") or getattr(outcome, "detail", "") or ""),
                 repo_path=str(work))
+        score.mergeable = self._holdout_ok(spec, work)
+        if verdict is not None:
             score.goal_satisfied = bool(verdict.satisfied) and \
                 score.mergeable in (True, None)
             score.notes = verdict.evidence[:400]
