@@ -321,3 +321,92 @@ def test_goal_prompt_tells_the_judge_an_empty_diff_can_be_correct():
     # A code change with no report still judges on the diff alone.
     p2 = build_goal_prompt("fix the bug", [], "--- a\n+++ b\n", "done")
     assert "AGENT REPORT" not in p2
+
+
+class _JudgeBackend:
+    """Fake backend: returns `replies` in order. A reply is a str (final_text,
+    is_error=False) or a (str, is_error) tuple."""
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = 0
+
+    async def run(self, prompt, *, cwd=None, max_turns=10, effort="high"):
+        from no_human.agent.claude_backend import AgentResult
+        r = self.replies[min(self.calls, len(self.replies) - 1)]
+        text, is_err = r if isinstance(r, tuple) else (r, False)
+        self.calls += 1
+        return AgentResult(final_text=text, num_turns=1, is_error=is_err,
+                           tokens_used=1, session_id="s", stop_reason="end_turn")
+
+
+_GOOD_JUDGE = ('JUDGE_JSON_START\n{"satisfied": true, "evidence": "ok"}\n'
+               'JUDGE_JSON_END')
+# START but no END marker — the real "Stream closed" truncation signature; the
+# regex needs both markers, so this parses to "no JUDGE_JSON block found".
+_TRUNCATED_JUDGE = 'JUDGE_JSON_START\n{"satisfied": true, "evidence": "partial'
+
+
+def _no_backoff(monkeypatch):
+    monkeypatch.setattr("no_human.eval.judge._RETRY_BACKOFF_S", 0)
+
+
+@pytest.mark.asyncio
+async def test_goal_judge_retries_once_on_transient_empty_reply(monkeypatch):
+    """An EMPTY judge reply (Stream-closed) is transient: retry once rather than
+    fail-close and discard the spec's measurement (lost ns-44d180f9 in v3)."""
+    from no_human.eval.judge import GoalJudge
+    _no_backoff(monkeypatch)
+    be = _JudgeBackend(["", _GOOD_JUDGE])   # empty first, valid on retry
+    v = await GoalJudge(backend=be).judge(
+        request="r", criteria=[], agent_diff="d", outcome_status="awaiting_approval")
+    assert be.calls == 2 and v.satisfied is True
+
+
+@pytest.mark.asyncio
+async def test_goal_judge_retries_on_truncated_block_reply(monkeypatch):
+    """The likelier real signature: a non-empty reply TRUNCATED before the END
+    marker → 'no JUDGE_JSON block found' → also retried (covers _JUDGE_TRANSIENT[1])."""
+    from no_human.eval.judge import GoalJudge
+    _no_backoff(monkeypatch)
+    be = _JudgeBackend([_TRUNCATED_JUDGE, _GOOD_JUDGE])
+    v = await GoalJudge(backend=be).judge(
+        request="r", criteria=[], agent_diff="d", outcome_status="awaiting_approval")
+    assert be.calls == 2 and v.satisfied is True
+
+
+@pytest.mark.asyncio
+async def test_goal_judge_retries_on_backend_is_error(monkeypatch):
+    """The STRUCTURED transient signal: the backend flags is_error (review D2) →
+    retry, even if the (garbage) text didn't happen to match a sentinel string."""
+    from no_human.eval.judge import GoalJudge
+    _no_backoff(monkeypatch)
+    be = _JudgeBackend([("stream error text", True), _GOOD_JUDGE])
+    v = await GoalJudge(backend=be).judge(
+        request="r", criteria=[], agent_diff="d", outcome_status="awaiting_approval")
+    assert be.calls == 2 and v.satisfied is True
+
+
+@pytest.mark.asyncio
+async def test_goal_judge_fails_closed_after_the_retry(monkeypatch):
+    """A PERSISTENT transient still fails closed after the one retry — the retry
+    rescues a blip, it does not loop or credit a non-answer."""
+    from no_human.eval.judge import GoalJudge
+    _no_backoff(monkeypatch)
+    be = _JudgeBackend(["", ""])    # empty both times
+    v = await GoalJudge(backend=be).judge(
+        request="r", criteria=[], agent_diff="d", outcome_status="awaiting_approval")
+    assert be.calls == 2            # tried exactly twice, no infinite loop
+    assert v.satisfied is False     # still fails closed
+
+
+@pytest.mark.asyncio
+async def test_goal_judge_does_not_retry_a_malformed_block(monkeypatch):
+    """A malformed-JSON reply (BOTH markers present, bad JSON) means the judge
+    answered substantively — a format bug, not a transient. Do NOT retry."""
+    from no_human.eval.judge import GoalJudge
+    _no_backoff(monkeypatch)
+    be = _JudgeBackend(["JUDGE_JSON_START\n{not json}\nJUDGE_JSON_END"])
+    v = await GoalJudge(backend=be).judge(
+        request="r", criteria=[], agent_diff="d", outcome_status="awaiting_approval")
+    assert be.calls == 1            # no retry
+    assert v.satisfied is False

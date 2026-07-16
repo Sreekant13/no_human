@@ -13,6 +13,7 @@ from the implementer (claude-sonnet-5).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass
@@ -113,6 +114,22 @@ def build_goal_prompt(request: str, criteria: list[str], agent_diff: str,
     )
 
 
+#: Fail-closed evidence strings that signal a TRANSIENT judge reply (empty or
+#: truncated before the JUDGE_JSON block) — the quota-stress "Stream closed"
+#: signature. GoalJudge.judge retries once on these OR on a backend error flag
+#: (`AgentResult.is_error`). "malformed JUDGE_JSON" is deliberately excluded: a
+#: block was present, so the judge answered — retrying a format bug just doubles
+#: cost.
+_JUDGE_TRANSIENT = ("judge produced no output", "no JUDGE_JSON block found")
+
+#: Backoff before the single retry. The transient IS quota saturation, so an
+#: instant re-issue tends to reproduce the truncation (review D1) — a short pause
+#: lets the blip clear. Module-level so tests set it to 0. Far below the CI
+#: infra-retry's 2 min: this is one LLM call inside a multi-hour run, not a pod
+#: reschedule.
+_RETRY_BACKOFF_S = 15.0
+
+
 def parse_goal_verdict(text: str) -> GoalVerdict:
     """Fail closed: no parseable JUDGE_JSON block → not satisfied."""
     if not text:
@@ -156,9 +173,27 @@ class GoalJudge:
         prompt = build_goal_prompt(request, criteria, agent_diff,
                                    outcome_status, report=report)
         backend = self._ensure_backend()
-        result = await backend.run(
-            prompt, cwd=repo_path, max_turns=10, effort="high")
-        return parse_goal_verdict(getattr(result, "final_text", "") or "")
+        # Retry ONCE on an empty / block-less reply — the quota-stress signature
+        # ("Stream closed" truncates the judge mid-reply, observed in
+        # expanded-core-v3). A transient blip must not fail-close a spec and lose
+        # its measurement (mirrors the CI infra-retry policy). A genuine
+        # block-less reply persists and still fails closed after the retry; a
+        # malformed-JSON reply is NOT retried — the judge answered substantively,
+        # so that's a format bug, not a transient.
+        verdict = None
+        for attempt in range(2):
+            result = await backend.run(
+                prompt, cwd=repo_path, max_turns=10, effort="high")
+            verdict = parse_goal_verdict(getattr(result, "final_text", "") or "")
+            # Transient = the backend flagged an error (the structured signal) OR
+            # the reply was empty / truncated before the JUDGE_JSON block.
+            transient = (getattr(result, "is_error", False)
+                         or verdict.evidence in _JUDGE_TRANSIENT)
+            if not transient:
+                return verdict
+            if attempt == 0:            # back off once, before the single retry
+                await asyncio.sleep(_RETRY_BACKOFF_S)
+        return verdict
 
 
 class IntentJudge:
