@@ -153,6 +153,7 @@ class NorthStarCard:
             orig_corrections=s["orig_corrections"],
             expected_escalation=bool(s.get("expected_escalation", False)),
             subset=s.get("subset", "full"),
+            project=s.get("project", ""),
             notes=s.get("notes", ""),
         ) for s in data.get("scores", [])]
         return NorthStarCard(scores=scores,
@@ -255,6 +256,28 @@ def render_northstar_md(card: NorthStarCard,
             f"{(s.notes or '')[:80].replace('|', '/')} |")
     if hidden:
         lines.append(f"\n_{hidden} non-core task(s) included in the aggregates only (privacy: raw corpus rows never enter git)._")
+
+    # Per-project view (the operator's suite spans multiple real repos — show
+    # cost/quality by project). Aggregate-only (repo name + counts + median
+    # cost), so it's privacy-safe over ALL scores, not just core.
+    from collections import defaultdict
+    proj: dict = defaultdict(lambda: {"n": 0, "ok": 0, "esc": 0, "ratios": []})
+    for s in card.scores:
+        p = s.project or "?"
+        proj[p]["n"] += 1
+        proj[p]["ok"] += 1 if s.goal_satisfied else 0
+        proj[p]["esc"] += 1 if s.escalated_honestly else 0
+        if s.cost_ratio is not None:
+            proj[p]["ratios"].append(s.cost_ratio)
+    if len(proj) > 1:
+        lines += ["", "## Per-project", "",
+                  "| project | tasks | satisfied | honest-escalations | median cost |",
+                  "|---|---|---|---|---|"]
+        for p in sorted(proj):
+            a = proj[p]
+            med = f"{median(a['ratios']):.3f}" if a["ratios"] else "—"
+            lines.append(f"| {p} | {a['n']} | {a['ok']}/{a['n']} | {a['esc']} | {med} |")
+
     if history:
         lines += ["", "## History (key changes)", "",
                   "| date | label | success | median ratio |", "|---|---|---|---|"]

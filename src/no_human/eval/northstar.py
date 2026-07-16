@@ -56,6 +56,7 @@ class BenchScore:
     orig_corrections: int
     expected_escalation: bool = False   # spec said: correct = honest stop
     subset: str = "full"                # "core" = hand-curated, PR-reviewed
+    project: str = ""                   # repo basename — per-project payoff view
     notes: str = ""
 
     @property
@@ -106,6 +107,7 @@ class BenchScore:
             "orig_corrections": self.orig_corrections,
             "expected_escalation": self.expected_escalation,
             "subset": self.subset,
+            "project": self.project,
             "token_ratio": (round(self.token_ratio, 3)
                             if self.token_ratio is not None else None),
             "cost_ratio": (round(self.cost_ratio, 3)
@@ -244,6 +246,7 @@ class NorthStarRunner:
             orig_corrections=int(orig.get("corrections", 0)),
             expected_escalation=spec.expect_escalation,
             subset=spec.subset,
+            project=Path(spec.repo.get("path", "") or "").name,
             notes=f"skipped: {spec.skip_reason}",
         )
 
@@ -288,6 +291,7 @@ class NorthStarRunner:
             orig_corrections=int(orig.get("corrections", 0)),
             expected_escalation=spec.expect_escalation,
             subset=spec.subset,
+            project=Path(spec.repo.get("path", "") or "").name,
         )
 
         if spec.expect_escalation:

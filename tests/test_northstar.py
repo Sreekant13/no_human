@@ -423,3 +423,29 @@ async def test_intent_judge_also_retries_on_transient(monkeypatch):
     v = await IntentJudge(backend=be).judge(
         task_title="t", criteria=[], agent_diff="d", known_good_diff="ref")
     assert be.calls == 2 and v.match is True
+
+
+def test_render_shows_per_project_breakdown(tmp_path):
+    """The suite spans 8 real repos — the operator asked for MULTIPLE projects, so
+    the report must break cost/quality down BY PROJECT. `project` also survives the
+    save/load JSON round-trip."""
+    from no_human.eval.northstar import BenchScore
+    from no_human.eval.northstar_card import NorthStarCard, render_northstar_md
+
+    def mk(tid, proj, sat):
+        return BenchScore(
+            task_id=tid, title="t", outcome_status="awaiting_approval",
+            goal_satisfied=sat, escalated_honestly=False, mergeable=None,
+            nh_tokens=1, nh_cache_tokens=0, nh_cache_creation_tokens=0, nh_turns=1,
+            nh_wall_clock_s=1.0, orig_tokens=1, orig_cache_tokens=0,
+            orig_cache_creation_tokens=0, orig_wall_clock_s=1.0, orig_corrections=0,
+            subset="core", project=proj)
+
+    c = NorthStarCard(scores=[mk("ns-a", "metrics-core", True), mk("ns-b", "metrics-core", False),
+                              mk("ns-c", "analytics-export", True)], created_at="x", label="t")
+    md = render_northstar_md(c)
+    assert "## Per-project" in md
+    assert "| metrics-core | 2 | 1/2" in md and "| analytics-export | 1 | 1/1" in md
+    p = tmp_path / "card.json"
+    c.save(p)
+    assert NorthStarCard.load(p).scores[0].project == "metrics-core"
