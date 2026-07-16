@@ -313,7 +313,10 @@ class NorthStarRunner:
             verdict = await self.goal_judge.judge(
                 request=spec.request, criteria=spec.acceptance_criteria,
                 agent_diff=agent_diff, outcome_status=status.value,
-                report=(getattr(outcome, "detail", "") or ""),
+                # The deliverable is the agent's substantive REPORT (its answer/
+                # review/plan), not the terse status `detail`. Prefer `report`;
+                # fall back to `detail` only when the outcome carries no report.
+                report=(getattr(outcome, "report", "") or getattr(outcome, "detail", "") or ""),
                 repo_path=str(work))
             score.goal_satisfied = bool(verdict.satisfied) and \
                 score.mergeable in (True, None)

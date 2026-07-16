@@ -262,6 +262,12 @@ async def test_run_one_end_to_end_push_proof(tmp_path):
     # deliverable for investigation/review kinds) — never the transcript.
     assert set(judge.seen) == {"request", "agent_diff", "report"}
     assert "return 2" in judge.seen["agent_diff"]
+    # The report is the coder's ACTUAL final output (answer/review/plan), not the
+    # terse "PR opened; awaiting human approval" status. expanded-core-v2 found
+    # the judge was fed that placeholder, so every report-deliverable task
+    # (question/review/plan) failed with an empty report. `final_text` is "done".
+    assert judge.seen["report"] == "done"
+    assert "awaiting human approval" not in judge.seen["report"]
     # Push-proofing held: source repo refs untouched.
     assert _ref_signature(repo) == refs_before
 
