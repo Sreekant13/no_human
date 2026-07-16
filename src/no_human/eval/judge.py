@@ -218,6 +218,17 @@ class IntentJudge:
             return JudgeVerdict(False, "no known-good diff provided")
         prompt = build_judge_prompt(task_title, criteria, agent_diff, known_good_diff)
         backend = self._ensure_backend()
-        result = await backend.run(
-            prompt, cwd=repo_path, max_turns=10, effort="high")
-        return parse_verdict(getattr(result, "final_text", "") or "")
+        # Same transient-retry as GoalJudge (review D3): a Stream-closed / empty
+        # reply must not silently fail-close the intent-match eval either.
+        verdict = None
+        for attempt in range(2):
+            result = await backend.run(
+                prompt, cwd=repo_path, max_turns=10, effort="high")
+            verdict = parse_verdict(getattr(result, "final_text", "") or "")
+            transient = (getattr(result, "is_error", False)
+                         or verdict.evidence in _JUDGE_TRANSIENT)
+            if not transient:
+                return verdict
+            if attempt == 0:
+                await asyncio.sleep(_RETRY_BACKOFF_S)
+        return verdict

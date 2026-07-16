@@ -410,3 +410,16 @@ async def test_goal_judge_does_not_retry_a_malformed_block(monkeypatch):
         request="r", criteria=[], agent_diff="d", outcome_status="awaiting_approval")
     assert be.calls == 1            # no retry
     assert v.satisfied is False
+
+
+@pytest.mark.asyncio
+async def test_intent_judge_also_retries_on_transient(monkeypatch):
+    """IntentJudge (the replay eval path, `nh eval replay`) has the SAME
+    transient-retry as GoalJudge — review D3 consistency."""
+    from no_human.eval.judge import IntentJudge
+    _no_backoff(monkeypatch)
+    good = 'JUDGE_JSON_START\n{"match": true, "evidence": "ok"}\nJUDGE_JSON_END'
+    be = _JudgeBackend(["", good])   # empty first, valid on retry
+    v = await IntentJudge(backend=be).judge(
+        task_title="t", criteria=[], agent_diff="d", known_good_diff="ref")
+    assert be.calls == 2 and v.match is True
