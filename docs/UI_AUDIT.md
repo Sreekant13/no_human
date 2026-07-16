@@ -75,7 +75,7 @@ Design notes for the implementer (verify each before building):
 | N2 | ✅ | The "Show N more" lane expander sits below the fold in the very lanes that need it. `styles.css` — make it `position: sticky; bottom: 0` |
 | N3 | ✅ | Prominence inversion: the green "No PRs waiting for review" panel out-shouts every real gate card. A caught-up lane should be a quiet checkmark, not a billboard. |
 | N4 | ✅ | "waiting on you: 5d" — the freshest signal on the board — is truncated to `wa…` on mobile and is 12px grey on desktop. |
-| N5 | ⬜ | Composer: the kind chips and repo pills sit *outside* the card's border, unlabeled, while priority (least consequential) sits inside it. |
+| N5 | ✅ | Composer: the kind chips and repo pills sit *outside* the card's border, unlabeled, while priority (least consequential) sits inside it. **Fixed #74** — visible `Kind`/`Repo` eyebrow labels (`TaskComposer.jsx:296`). |
 | N6 | ✅ | Every card spends its top line — the strongest position — on an 8-char hex id. `Board.jsx:216` |
 | N7 | ✅ | Icon-only dismiss button with no accessible name. `SlideOver.jsx:385` |
 | N8 | ✅ | WebSocket reconnect `setTimeout` id is never captured, so the cleanup cannot cancel it. `App.jsx:468` |
@@ -83,7 +83,7 @@ Design notes for the implementer (verify each before building):
 | N10 | ✅ | 16 provably-dead CSS classes (`activity-*` flat feed, `nh-nav*`, `sys-tree*`, `ob-eyebrow`, `checklist-post-action`) — proven dead by enumerating every dynamic `className` template. |
 | N11 | ✅ | Board, Stats and Settings render no `<h1>`; the board page has zero headings, so a screen reader gets no document outline. |
 | N12 | ✅ | `tasksReducer` "sync" never deletes — a task removed server-side lingers until reload. `App.jsx:78` |
-| N13 | ⬜ | 320px (iPhone SE 1st gen): the nav overflows behind a suppressed scrollbar; still reachable by swipe, but the affordance is gone. |
+| N13 | ✅ | 320px (iPhone SE 1st gen): the nav overflows behind a suppressed scrollbar; still reachable by swipe, but the affordance is gone. **Fixed #74** — right-edge fade mask scoped to `@media (max-width:359px)` (`styles.css:296`). |
 
 ---
 
@@ -103,14 +103,19 @@ Design notes for the implementer (verify each before building):
 
 ## Still open (carried to the next session)
 
+> **Doc-staleness correction (2026-07-16, G-5 verify):** N5, N13, and P1 were
+> marked ⬜ open here but had already SHIPPED in #74 (verified against the live
+> tree: `TaskComposer.jsx:296` eyebrows; `styles.css:296` 359px fade mask;
+> `eslint.config.mjs` + `npm run lint` clean). Removed from this table. The plan's
+> warning held — the checkbox lied; the code was checked. Remaining items below are
+> genuine but were NOT re-verified this pass (M7 is a redesign; N14/N15 are 360px
+> edge-clips) — check the live UI before trusting them too.
+
 | # | Screen | Defect | Note |
 |---|---|---|---|
 | M7 | Drawer | The System tab prints the same three facts twice (the stage row AND the agent cards) and pays ~600px of vertical space for it — while being the DEFAULT tab. | A **redesign**, not a bug fix: collapse to the stage chips (which are good) as the click target into `AgentLogModal`, the best-designed surface in the app. Its two mechanical defects are already fixed. |
-| N5 | Composer | The kind chips and repo pills sit *outside* the card's border, unlabeled, while priority (the least consequential control) sits inside it. | |
-| N13 | Nav | 320px (iPhone SE 1st gen): the nav overflows behind a suppressed scrollbar — reachable by swipe, but the affordance is gone. | 360 / 390 / 1440 are clean. |
 | N14 | Error header | `.legion-credit` is `white-space: nowrap` and gets hard-clipped mid-word at ≤360px by `.nh-shell { overflow: hidden }`. | Same class as the mobile-nav overflow; the hide rule is scoped to `.nh-sidebar-foot`, so it does not reach this one. |
 | N15 | Sidebar | The 360px fit has only ~3px of headroom: with a worker in flight the "Working (N)" dot grows the footer 48→66px, silently stealing width from the nav. | `min-width: 0` on the footer, or hide the dot under 640px. |
-| P1 | Tooling | **No lint, and nothing renders a component.** `no-undef` would have caught the blank-page bug for free. Mitigated (not fixed) by `npm run e2e`, which hard-fails on any page error. | Needs a devDependency (eslint or a jsdom smoke test); frontend deps have been approved before (Tailwind). |
 
 ## Already fixed this cycle
 
