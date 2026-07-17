@@ -298,6 +298,7 @@ class SupervisorHook:
         window_size: int = _WINDOW_SIZE,
         on_decision: Callable[[SupervisorDecision], None] | None = None,
         declared_files: list[str] | None = None,
+        budget_status: Callable[[], tuple[int, int] | None] | None = None,
     ):
         self.task_title = task_title
         self.acceptance_criteria = acceptance_criteria
@@ -313,6 +314,11 @@ class SupervisorHook:
         self._recent_text: deque[str] = deque(maxlen=_TEXT_BUFFER)
         self._call_count = 0
         self._on_decision = on_decision
+        # v8 budget nudge: (spent, ceiling) for the RUNNING attempt, or None.
+        # Deterministic and LLM-free; checked on every PostToolUse so the
+        # wrap-up correction lands BEFORE the sink's hard BudgetAbort.
+        self.budget_status = budget_status
+        self._budget_warned = False
 
     def record(self, tool_name: str, tool_input: dict, tool_response: Any) -> None:
         """Record a completed tool call in the sliding window."""
@@ -421,6 +427,37 @@ class SupervisorHook:
             tool_input=input_data.get("tool_input", {}),
             tool_response=input_data.get("tool_response"),
         )
+
+        # Budget nudge (research §8: preemptive forced generation): at 85% of
+        # the armed attempt ceiling, ONE deterministic correction telling the
+        # agent to write its deliverable NOW — the ns-0e7bf1ae class died with
+        # the answer unwritten because only the 100% hard abort existed. Runs
+        # every call (not on the LLM cadence) and never blocks on its own error.
+        if self.budget_status is not None and not self._budget_warned:
+            try:
+                status = self.budget_status()
+            except Exception:  # noqa: BLE001 — advisory, never break the hook
+                status = None
+            if status is not None and status[1] > 0:
+                spent, ceiling = status
+                if spent >= 0.85 * ceiling:
+                    self._budget_warned = True
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PostToolUse",
+                            "additionalContext": (
+                                f"[SUPERVISOR] BUDGET: you have spent "
+                                f"{spent:,} of this attempt's {ceiling:,}-token "
+                                "budget; the attempt is force-stopped at 100%. "
+                                "STOP exploring NOW and produce your final "
+                                "deliverable immediately with the evidence you "
+                                "already have. Any criterion you cannot cite "
+                                "evidence for is NOT-MET — report it honestly. "
+                                "Do NOT fabricate results or edits to look "
+                                "finished."
+                            ),
+                        }
+                    }
 
         if not self.should_evaluate:
             return {}

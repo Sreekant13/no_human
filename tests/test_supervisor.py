@@ -479,3 +479,56 @@ class TestSupervisorHook:
         )
         assert len(decisions) == 1
         assert decisions[0].action == "continue"
+
+
+# ── Budget wrap-up nudge (v8: force the deliverable before the hard abort) ── #
+
+class TestBudgetNudge:
+    @staticmethod
+    def _hook(budget_status, check_every=100):
+        async def fake_llm(prompt):
+            return "SUPERVISOR_CONTINUE"
+        return SupervisorHook(
+            task_title="t", acceptance_criteria=["x"], rules="",
+            llm_call=fake_llm, check_every=check_every,
+            budget_status=budget_status,
+        )
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_no_injection(self):
+        hook = self._hook(lambda: (1_000_000, 4_000_000))
+        out = await hook.hook({"tool_name": "Read", "tool_input": {}}, None, None)
+        assert out == {}
+        assert hook._call_count == 1  # record still happened
+
+    @pytest.mark.asyncio
+    async def test_above_threshold_injects_once_with_numbers(self):
+        hook = self._hook(lambda: (3_600_000, 4_000_000))
+        out = await hook.hook({"tool_name": "Read", "tool_input": {}}, None, None)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        assert "BUDGET" in ctx
+        assert "3,600,000" in ctx and "4,000,000" in ctx
+        # honesty rails: the nudge must never license faking completion
+        assert "NOT-MET" in ctx
+        assert "fabricate" in ctx
+        # one-shot: the second crossing stays silent
+        out2 = await hook.hook({"tool_name": "Read", "tool_input": {}}, None, None)
+        assert out2 == {}
+
+    @pytest.mark.asyncio
+    async def test_raising_or_absent_budget_status_never_crashes(self):
+        def boom():
+            raise RuntimeError("unarmed")
+        hook = self._hook(boom)
+        out = await hook.hook({"tool_name": "Read", "tool_input": {}}, None, None)
+        assert out == {}
+        hook_none = self._hook(None)
+        out = await hook_none.hook({"tool_name": "Read", "tool_input": {}}, None, None)
+        assert out == {}
+
+    @pytest.mark.asyncio
+    async def test_none_status_and_zero_ceiling_are_noops(self):
+        hook = self._hook(lambda: None)
+        assert await hook.hook({"tool_name": "R", "tool_input": {}}, None, None) == {}
+        hook0 = self._hook(lambda: (100, 0))
+        assert await hook0.hook({"tool_name": "R", "tool_input": {}}, None, None) == {}

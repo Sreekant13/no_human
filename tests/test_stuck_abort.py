@@ -416,3 +416,29 @@ async def test_lifetime_park_still_records_a_resume_checkpoint(
     ).stdout
     assert "[WIP-BLOCKED]" in log
     assert "[WIP-PARTIAL]" not in log
+
+
+# ── v8: the budget nudge closure `_build_supervisor` wires into the hook ──── #
+
+
+def test_supervisor_budget_status_reads_the_armed_accounting(store, tmp_path):
+    """The nudge must count EXACTLY what the hard abort counts (in/out +
+    cache reads) and be scoped to the running task (worker-pool reuse)."""
+    orch = _orch(store, tmp_path)
+    t = Task.new("investigate", repo_path=str(tmp_path))
+    hook = orch._build_supervisor(t, str(tmp_path))
+    assert hook is not None and hook.budget_status is not None
+
+    # Unarmed → None (never crashes).
+    assert hook.budget_status() is None
+
+    orch._begin_attempt_accounting(t.id, remaining_tokens=9_999_999,
+                                   attempt_cap=4_000_000)
+    orch._attempt_usage["tokens_used"] = 100
+    orch._attempt_usage["cache_read_tokens"] = 200
+    orch._attempt_usage["cache_creation_tokens"] = 7_777  # must NOT count
+    assert hook.budget_status() == (300, 4_000_000)
+
+    # Armed for a DIFFERENT task → None.
+    orch._begin_attempt_accounting("other-task", remaining_tokens=1_000)
+    assert hook.budget_status() is None
