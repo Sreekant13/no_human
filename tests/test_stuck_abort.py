@@ -118,6 +118,8 @@ def test_cache_creation_does_not_count_toward_the_cap(store, tmp_path):
 # ------------------------------ the backend -------------------------------- #
 
 
+@pytest.mark.real_backend  # exercises the REAL ClaudeBackend.stream
+# over a mocked SDK client — the hermetic stub must not replace it.
 async def test_stream_yields_usage_events_per_assistant_message(tmp_path, monkeypatch):
     from claude_agent_sdk import AssistantMessage
     from claude_agent_sdk.types import TextBlock
@@ -145,6 +147,8 @@ async def test_stream_yields_usage_events_per_assistant_message(tmp_path, monkey
     assert usage[0].meta["cache_creation_tokens"] == 7
 
 
+@pytest.mark.real_backend  # exercises the REAL ClaudeBackend.stream
+# over a mocked SDK client — the hermetic stub must not replace it.
 async def test_per_message_sum_equals_result_cumulative(tmp_path, monkeypatch):
     """Review F2: an ABORTED attempt records the per-message SUM while a normal
     attempt records the ResultMessage cumulative. Pin our arithmetic: on the

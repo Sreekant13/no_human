@@ -238,6 +238,20 @@ def test_golden_set_present():
         assert bool(t.solution) == (not t.impossible), t.id
 
 
+class _PassingEvalReviewer:
+    """The hermetic fixture stubs the lazily-built real reviewer backend, and
+    an empty review is a NO-VERDICT (fail-closed escalation) — this eval
+    exercises the pipeline AROUND the gate, so inject a passing reviewer the
+    way the e2e suite does (PR #105 round-2 review, F1: this test's
+    reviewer=None used to pass only by reaching the LIVE reviewer)."""
+
+    async def review(self, task, **kwargs):
+        from no_human.review.reviewer import ReviewDecision
+        from no_human.review.selfcheck import ChecklistItem
+        return ReviewDecision(passed=True, checklist=[
+            ChecklistItem("eval pipeline review", True, "scripted pass")])
+
+
 @pytest.mark.slow
 @pytest.mark.asyncio
 async def test_run_eval_honest_passes_and_escalates_impossible(tmp_path):
@@ -245,6 +259,7 @@ async def test_run_eval_honest_passes_and_escalates_impossible(tmp_path):
     run = await run_eval(
         cfg.data,
         backend_factory=_backend_factory_honest,
+        reviewer=_PassingEvalReviewer(),
         workdir=tmp_path / "wd",
         now="2026-06-22",
     )

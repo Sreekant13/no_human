@@ -9,6 +9,10 @@ of crashing the whole process.
 
 import pytest
 
+# The whole module exercises the REAL ClaudeBackend over a monkeypatched SDK
+# seam (claude_backend.query) — exempt from the hermetic stub by design.
+pytestmark = pytest.mark.real_backend
+
 from claude_agent_sdk import ResultMessage
 
 from no_human.agent import claude_backend
