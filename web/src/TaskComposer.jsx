@@ -84,7 +84,11 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   const [priority, setPriority] = useState(initial?.priority ?? "medium");
   const [backend, setBackend] = useState(initial?.backend ?? "claude");
   const [files, setFiles] = useState(initial?.files ?? []);
-  const [projects, setProjects] = useState([]);
+  // undefined = fetch in flight · [] = genuinely none. The initial-[]
+  // ambiguity showed 'No projects yet' during the load window and then
+  // REFLOWED the repo control under the operator (same loading≠empty
+  // class as the Stats est-loader; probed live: false for ~1-4s).
+  const [projects, setProjects] = useState(undefined);
   const [selectedProjectId, setSelectedProjectId] = useState(initial?.projectId ?? "");
   const [repoPath, setRepoPath] = useState(initial?.repoPath ?? "");
   const [customRepo, setCustomRepo] = useState(Boolean(initial?.customRepo));
@@ -94,11 +98,22 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
 
   // Escape closes the composer — suppressed while a submit is in flight so it
   // cannot discard a task that is already being created.
+  // Live view of the typed repo path for the projects-resolve effect (state
+  // captured at mount would be stale by resolve time).
+  const repoPathRef = useRef("");
+  useEffect(() => { repoPathRef.current = repoPath; });
+
   useEscapeKey(onClose, !busy);
 
   useEffect(() => {
     fetchProjects().then((p) => {
       setProjects(p || []);
+      // A path TYPED during the load window must survive the picker's
+      // arrival: without this, resolve swapped the control and submit
+      // silently shipped the auto-defaulted project instead of the typed
+      // repo (PR #116 review, medium — probe-proven). Non-empty free text
+      // pins custom mode; the existing toggle proves the preserve path.
+      setCustomRepo((cur) => cur || Boolean(repoPathRef.current?.trim()));
       // Only default the project when none is chosen — a re-seeded composer must
       // keep the operator's pick.
       setSelectedProjectId((cur) => cur || (p && p.length > 0 ? p[0].id : ""));
@@ -135,7 +150,7 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
 
   const { title, description } = splitPrompt(prompt);
   const name = greetingName(config);
-  const project = projects.find((p) => p.id === selectedProjectId);
+  const project = (projects ?? []).find((p) => p.id === selectedProjectId);
   const selectedChip = kindByValue(kind);
 
   // A code_review task is failed by the backend unless a PR/MR ref reaches it in
@@ -146,8 +161,11 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   const canSubmit = Boolean(title) && Boolean(hasRepo) && !prRefMissing && !busy;
   // With no projects, the free-text path IS the only input — a toggle there would
   // be a no-op button whose only effect is wiping what was typed.
-  const showRepoToggle = projects.length > 0;
-  const freeTextRepo = customRepo || projects.length === 0;
+  const loaded = projects !== undefined;
+  const showRepoToggle = loaded && projects.length > 0;
+  // While loading, keep the free-text field (no swap-under-cursor when the
+  // picker arrives is unavoidable, but the false claim below is).
+  const freeTextRepo = customRepo || !loaded || projects.length === 0;
 
   function handleSubmit(e) {
     if (e) e.preventDefault();
@@ -356,7 +374,7 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
                 }}
                 aria-label="Project"
               >
-                {projects.map((p) => (
+                {(projects ?? []).map((p) => (
                   <option key={p.id} value={p.id}>
                     {p.name} ({p.repo_paths.length} {pluralize(p.repo_paths.length, "repo")})
                   </option>
@@ -407,7 +425,7 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
             )}
           </div>
 
-          {projects.length === 0 && (
+          {loaded && projects.length === 0 && (
             <p className="mt-2 px-5 font-ui text-sm text-text-muted">
               No projects yet — give the path of the repo to work in.
             </p>
