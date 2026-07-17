@@ -10,7 +10,7 @@ import { topPrioritised } from "./laneView.js";
 // badge still shows the true total, so nothing is hidden from awareness.
 const LANE_TOP_N = 4;
 
-export default function Board({ tasks }) {
+export default function Board({ tasks, pendingOpenId, onPendingOpenHandled }) {
   const [selectedId, setSelectedId] = useState(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const triggerRef = useRef(null);
@@ -32,6 +32,16 @@ export default function Board({ tasks }) {
     prevUpdatedAtRef.current = null; // reset so first open always fetches
     setSelectedId(id);
   }
+
+  // A clicked notification lands here even when Board wasn't mounted at
+  // click time: App parks the task id in state; this opens it on mount (or
+  // immediately when already mounted) and hands the id back as consumed.
+  useEffect(() => {
+    if (pendingOpenId) {
+      openTask(pendingOpenId, null);
+      onPendingOpenHandled?.();
+    }
+  }, [pendingOpenId]);
 
   function closeTask() {
     setSelectedId(null);

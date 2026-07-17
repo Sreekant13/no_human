@@ -13,6 +13,8 @@ import { needsPrUrl } from "./composerKinds.js";
 import { hasPrRef } from "./prRefs.js";
 import { shouldTriggerNewTask } from "./keyboardShortcut.js";
 import { isNeedsYou, isRealFailure } from "./boardLanes.js";
+import { ledgerSummary } from "./nightLedger.js";
+import { fmtCost } from "./cost.js";
 import { tasksReducer } from "./tasksReducer.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 
@@ -36,6 +38,31 @@ function fmtAge(seconds) {
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
   return `${Math.floor(seconds / 86400)}d`;
+}
+
+function NightLedger({ tasks }) {
+  // The signature module: what no_human did in the last 24h, in the sidebar's
+  // dead space. Derived from the same task list as the lanes (one source, one
+  // truth) — a quiet board should read "calm instrument", never "dead app".
+  const s = ledgerSummary(tasks);
+  const cost = fmtCost(s.cost);
+  return (
+    <div className="nh-ledger" aria-label="last 24 hours summary">
+      <div className="nh-ledger-title">last 24h</div>
+      {s.quiet
+        ? <div className="nh-ledger-quiet">quiet — nothing shipped, nothing owed</div>
+        : (
+          <div className="nh-ledger-rows">
+            <div className="nh-ledger-row"><b>{s.done}</b> shipped</div>
+            <div className="nh-ledger-row"><b>{s.parked}</b> waiting on you</div>
+            {s.failed > 0 && (
+              <div className="nh-ledger-row nh-ledger-bad"><b>{s.failed}</b> failed</div>
+            )}
+            {cost !== "—" && <div className="nh-ledger-row nh-ledger-cost"><b>{cost}</b> spent</div>}
+          </div>
+        )}
+    </div>
+  );
 }
 
 function OverviewStrip({ tasks }) {
@@ -377,6 +404,7 @@ export default function App() {
   const [fetchError, setFetchError] = useState(null);
   const [showNewTask, setShowNewTask] = useState(false);
   const [page, setPage] = useState("board");
+  const [pendingOpenId, setPendingOpenId] = useState(null);
   const [workerStatus, setWorkerStatus] = useState(null);
   const [queueHealth, setQueueHealth] = useState(null);
   const doneCount = tasks.filter((t) => t.status === "done").length;
@@ -442,7 +470,18 @@ export default function App() {
         && Notification.permission === "granted" && document.hidden) {
       for (const t of fresh.slice(0, 3)) {
         try {
-          new Notification("no_human — needs you", { body: notificationBody(t) });
+          const n = new Notification("no_human — needs you", { body: notificationBody(t) });
+          // Clicking the toast must LAND somewhere: focus the window (the
+          // desktop shell restores it from the tray) and open the task that
+          // fired it — the operator's next action is always answering it.
+          n.onclick = () => {
+            window.focus();
+            setPage("board");
+            // Board is conditionally mounted: an event dispatched here is
+            // lost when the operator was on another page (PR #104 review,
+            // medium). A pending id survives until Board mounts and opens it.
+            setPendingOpenId(t.id);
+          };
         } catch { /* a notification is a bonus, never an error */ }
       }
     }
@@ -571,6 +610,7 @@ export default function App() {
             </button>
           ))}
         </nav>
+        <NightLedger tasks={tasks} />
         <div className="nh-sidebar-foot">
           {/* 5D: the outcomes. They are not gates, so they are not lanes — they sit here, above
               the connection indicator, and open a table of their tasks. */}
@@ -654,7 +694,7 @@ export default function App() {
             <button className="btn btn-new-task" onClick={() => setShowNewTask(true)}>+ New Task</button>
           </div>
         )}
-        {page === "board" && <Board tasks={tasks} />}
+        {page === "board" && <Board tasks={tasks} pendingOpenId={pendingOpenId} onPendingOpenHandled={() => setPendingOpenId(null)} />}
         {page === "done" && <Outcomes tasks={tasks} lane="done" />}
         {page === "failed" && <Outcomes tasks={tasks} lane="failed" />}
         {page === "stats" && <Stats tasks={tasks} />}

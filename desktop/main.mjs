@@ -6,7 +6,8 @@
 // If the server isn't reachable, a friendly error page renders with retry —
 // a blank window is the one unacceptable failure mode.
 
-import { app, BrowserWindow, Menu, nativeImage, shell, Tray } from "electron";
+import { app, BrowserWindow, Menu, nativeImage, nativeTheme, shell, Tray } from "electron";
+import { parseBadgeCount } from "./badge.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -139,7 +140,9 @@ async function createWindow() {
     // detects the shell. Base color = the board's real --bg token.
     titleBarStyle: "hiddenInset",
     trafficLightPosition: { x: 18, y: 18 },
-    backgroundColor: "#0F1117",
+    // Pre-paint color follows the OS theme — a light-mode launch used to
+    // flash dark before first paint (shell audit, 2026-07-17).
+    backgroundColor: nativeTheme.shouldUseDarkColors ? "#0F1117" : "#F4F5F7",
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -156,6 +159,13 @@ async function createWindow() {
       e.preventDefault();
       win.hide();
     }
+  });
+  // Dock/taskbar badge mirrors the web app's own "(N) no_human" title —
+  // the count the board derives with isNeedsYou. No IPC, no second truth.
+  win.webContents.on("page-title-updated", (_e, title) => {
+    const count = parseBadgeCount(title);
+    if (count === null) return; // foreign title (error page) — keep the last truthful badge
+    try { app.setBadgeCount(count); } catch { /* linux without libunity */ }
   });
   routeExternally(win.webContents);
   await loadBoardOrError(win);
