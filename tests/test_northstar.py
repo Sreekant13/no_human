@@ -80,8 +80,11 @@ def test_sandbox_guard_raises_on_escaping_origin(tmp_path, monkeypatch):
     real_git = ns._git
 
     def sabotaged(cwd, *args):
-        if args[:2] == ("remote", "set-url"):
-            return real_git(cwd, "remote", "set-url", "origin", str(repo))
+        # The setup re-points origin via `remote add` (post-clonefile it may
+        # not exist to set-url) — redirect that add at the REAL repo to
+        # simulate an escape.
+        if args[:2] == ("remote", "add"):
+            return real_git(cwd, "remote", "add", "origin", str(repo))
         return real_git(cwd, *args)
 
     monkeypatch.setattr(ns, "_git", sabotaged)
@@ -601,3 +604,108 @@ async def test_done_report_terminal_is_a_gate_state(tmp_path):
         elapsed=2.0)
     assert "did not reach the human gate" not in (score.notes or "")
     assert score.goal_satisfied is not False  # judge decides (None here: no judge)
+
+
+def test_sandbox_copy_is_instant_isolated_and_survives_a_dirty_source(tmp_path):
+    """v8's two crashes were `git clone --no-hardlinks` COPYING a 3.8GB
+    object store onto a starved disk. The fix is an APFS clonefile copy —
+    instant at any size — and review of the hardlink alternative PROVED
+    shared object inodes can be written through into the operator's live
+    repo, so the property pinned here is ISOLATION: no object inode is
+    shared. The source may also be DIRTY (v7's ns-4092c756 crashed checking
+    out over one); the sandbox must come up clean at the pin regardless."""
+    import subprocess
+    from types import SimpleNamespace
+    from no_human.eval.northstar import _setup_sandbox
+
+    src = tmp_path / "src"
+    src.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(src)], check=True)
+    (src / "a.txt").write_text("x" * 4096)
+    for cmd in (["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t",
+                                "commit", "-qm", "init"], ["gc", "-q"]):
+        subprocess.run(["git", "-C", str(src), *cmd], check=True)
+    # Dirty the source: a tracked-file edit AND an untracked file.
+    (src / "a.txt").write_text("DIRTY")
+    (src / "untracked.tmp").write_text("stray")
+
+    spec = SimpleNamespace(repo={"path": str(src), "pin": "HEAD"})
+    # Production pre-creates the workdir; without it cp -Rc fails on
+    # the missing parent and the test silently pins the FALLBACK git
+    # clone instead of the clonefile path (review F3).
+    (tmp_path / "wd").mkdir(exist_ok=True)
+    work = _setup_sandbox(spec, tmp_path / "wd")
+
+    # Isolation: no shared object inodes with the source store.
+    src_packs = {p.name: p.stat().st_ino
+                 for p in (src / ".git" / "objects" / "pack").glob("*.pack")}
+    assert src_packs, "fixture must have a pack"
+    for p in (work / ".git" / "objects" / "pack").glob("*.pack"):
+        assert p.stat().st_ino != src_packs.get(p.name), (
+            f"{p.name} shares an inode with the source — the write-through "
+            "corruption vector is back")
+    # Clean at the pin despite the dirty source.
+    assert (work / "a.txt").read_text() == "x" * 4096
+    assert not (work / "untracked.tmp").exists()
+    # And the source's dirt was untouched.
+    assert (src / "a.txt").read_text() == "DIRTY"
+
+
+def test_sandbox_copy_strips_source_hooks(tmp_path):
+    """Clone parity: a file copy carries ACTIVE hooks (metrics-core-query-service
+    ships a pre-push) that would execute foreign code on sandbox pushes —
+    git clone never copies hooks."""
+    import subprocess
+    from types import SimpleNamespace
+    from no_human.eval.northstar import _setup_sandbox
+
+    src = tmp_path / "src"
+    src.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(src)], check=True)
+    (src / "a.txt").write_text("x")
+    subprocess.run(["git", "-C", str(src), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(src), "-c", "user.email=t@t",
+                    "-c", "user.name=t", "commit", "-qm", "init"], check=True)
+    hook = src / ".git" / "hooks" / "pre-push"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+
+    # Production pre-creates the workdir; without it cp -Rc fails on
+    # the missing parent and the test silently pins the FALLBACK git
+    # clone instead of the clonefile path (review F3).
+    (tmp_path / "wd").mkdir(exist_ok=True)
+    work = _setup_sandbox(SimpleNamespace(repo={"path": str(src), "pin": "HEAD"}),
+                          tmp_path / "wd")
+    assert not (work / ".git" / "hooks" / "pre-push").exists(), (
+        "the source's active pre-push rode into the sandbox — it would "
+        "execute on every coder push")
+
+
+def test_sandbox_strips_every_ride_along_remote(tmp_path):
+    """Review F4: the copy carries ALL of the source's remotes while the
+    push-proof guard resolves only origin — an upstream remote would be a
+    guard-invisible escape. After setup, origin→local bare is the ONLY
+    remote."""
+    import subprocess
+    from types import SimpleNamespace
+    from no_human.eval.northstar import _setup_sandbox
+
+    src = tmp_path / "src"
+    src.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(src)], check=True)
+    (src / "a.txt").write_text("x")
+    subprocess.run(["git", "-C", str(src), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(src), "-c", "user.email=t@t",
+                    "-c", "user.name=t", "commit", "-qm", "init"], check=True)
+    subprocess.run(["git", "-C", str(src), "remote", "add", "origin",
+                    "https://example.com/REAL.git"], check=True)
+    subprocess.run(["git", "-C", str(src), "remote", "add", "upstream",
+                    "https://example.com/REAL-UPSTREAM.git"], check=True)
+
+    (tmp_path / "wd").mkdir(exist_ok=True)
+    work = _setup_sandbox(SimpleNamespace(repo={"path": str(src), "pin": "HEAD"}),
+                          tmp_path / "wd")
+    remotes = subprocess.run(["git", "remote", "-v"], cwd=work,
+                             capture_output=True, text=True).stdout
+    assert "upstream" not in remotes and "example.com" not in remotes, remotes
+    assert str(tmp_path / "wd" / "remote.git") in remotes

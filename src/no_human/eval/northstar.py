@@ -16,7 +16,9 @@ solution.
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -127,16 +129,55 @@ def _git(cwd: Path, *args: str) -> str:
     return out.stdout.strip()
 
 
+def _sandbox_copy(src: Path, dst: Path) -> None:
+    """Copy a repo into a sandbox with ISOLATED inodes, fast.
+
+    Darwin/APFS: `cp -c` clonefile — instant copy-on-write, new inodes, so
+    no write in the sandbox can ever reach the source (review of PR #115
+    proved hardlinked object stores CAN be written through). Elsewhere:
+    `git clone --no-hardlinks` — slower, equally isolated."""
+    if sys.platform == "darwin":
+        proc = subprocess.run(["cp", "-Rc", str(src), str(dst)],
+                              capture_output=True)
+        if proc.returncode == 0:
+            # Clone parity: a file copy carries the source's ACTIVE hooks
+            # (metrics-core-query-service ships a pre-push), which would execute
+            # foreign code on the coder's sandbox pushes — git clone never
+            # copies hooks. Strip them.
+            hooks = dst / ".git" / "hooks"
+            if hooks.exists():
+                shutil.rmtree(hooks)
+                hooks.mkdir()
+            return
+        # cp failed (mid-copy ENOSPC, exotic volume) — clear any partial
+        # dst or the fallback clone dies on "destination not empty",
+        # masking the real error (review F5).
+        if dst.exists():
+            shutil.rmtree(dst)
+    subprocess.run(["git", "clone", "--no-hardlinks", str(src), str(dst)],
+                   check=True, capture_output=True)
+
+
 def _setup_sandbox(spec: BenchTask, workdir: Path) -> Path:
     """Clone the real repo at the spec's pin; re-point origin to a local bare.
 
-    The clone uses --no-hardlinks so the sandbox shares nothing mutable with
-    the source repo's object store."""
+    The sandbox is an APFS clonefile copy (cp -c): instant copy-on-write at
+    any size — v8's two crashes were `git clone --no-hardlinks` COPYING a
+    3.8GB object store onto a starved disk (exit 128) — with fully ISOLATED
+    inodes. Hardlinked clones were rejected in review by experiment: a
+    sandboxed `chmod +w` + in-place append writes THROUGH a shared object
+    inode into the operator's live repo, and neither the guard nor the
+    ref-signature tamper check sees it. Non-APFS platforms fall back to the
+    slow-but-isolated copy clone."""
     src = Path(spec.repo.get("path", ""))
     work = workdir / "work"
-    subprocess.run(["git", "clone", "--no-hardlinks", str(src), str(work)],
-                   check=True, capture_output=True)
+    _sandbox_copy(src, work)
     pin = spec.repo.get("pin") or "HEAD"
+    # The source may be DIRTY (uncommitted/untracked files ride along in a
+    # file-level copy, and v7's ns-4092c756 crash was a checkout over a dirty
+    # tree): force the worktree to exactly the pinned commit, clean.
+    _git(work, "reset", "--hard", "HEAD" if pin == "HEAD" else pin)
+    _git(work, "clean", "-fdx")
     if pin != "HEAD":
         _git(work, "checkout", "--detach", pin)
         # The coder needs a branch to work from.
@@ -147,7 +188,18 @@ def _setup_sandbox(spec: BenchTask, workdir: Path) -> Path:
     bare = workdir / "remote.git"
     subprocess.run(["git", "init", "--bare", str(bare)],
                    check=True, capture_output=True)
-    _git(work, "remote", "set-url", "origin", str(bare))
+    # A copied repo carries the SOURCE's remotes (possibly none, possibly
+    # several — the push-proof guard resolves only origin, so a ride-along
+    # upstream would be a guard-invisible escape, review F4). Remove them
+    # ALL, then add origin at the local bare.
+    existing = subprocess.run(["git", "remote"], cwd=work,
+                              capture_output=True, text=True).stdout.split()
+    for r in existing:
+        subprocess.run(["git", "remote", "remove", r], cwd=work,
+                       capture_output=True)
+    subprocess.run(["git", "config", "--unset-all", "remote.pushDefault"],
+                   cwd=work, capture_output=True)
+    _git(work, "remote", "add", "origin", str(bare))
 
     # HARD GUARD — BEFORE any push (review finding: guard-after-push detects
     # an escape only after the write has landed in the real repo).

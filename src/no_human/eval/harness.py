@@ -100,9 +100,28 @@ async def run_shadow(
     created_tmp = workdir is None
     base_tmp = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="nh-shadow-"))
     sandbox = base_tmp / "clone"
-    # Local clone: no network, isolated from the real repo + remote.
-    subprocess.run(["git", "clone", "--no-hardlinks", repo_path, str(sandbox)],
-                   check=True, capture_output=True, text=True)
+    # Local sandbox copy: no network, isolated inodes, instant on APFS
+    # (same class as the bench sandbox — see northstar._sandbox_copy).
+    from .northstar import _sandbox_copy
+    _sandbox_copy(Path(repo_path), sandbox)
+    subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=sandbox,
+                   check=True, capture_output=True)
+    subprocess.run(["git", "clean", "-fdx"], cwd=sandbox,
+                   check=True, capture_output=True)
+    # Push-proof (review F2): the copy carries the source's REAL remotes and
+    # the orchestrator pushes at finalize — strip them all and point origin
+    # at a throwaway local bare so ShadowResult's "never pushes" is true by
+    # construction, not by luck.
+    shadow_bare = base_tmp / "shadow-remote.git"
+    subprocess.run(["git", "init", "--bare", str(shadow_bare)],
+                   check=True, capture_output=True)
+    _remotes = subprocess.run(["git", "remote"], cwd=sandbox,
+                              capture_output=True, text=True).stdout.split()
+    for _r in _remotes:
+        subprocess.run(["git", "remote", "remove", _r], cwd=sandbox,
+                       capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(shadow_bare)],
+                   cwd=sandbox, check=True, capture_output=True)
     base_sha = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=sandbox, capture_output=True, text=True
     ).stdout.strip()
