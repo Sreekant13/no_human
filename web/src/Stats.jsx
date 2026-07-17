@@ -470,9 +470,16 @@ function SessionSearch() {
 
 export default function Stats({ tasks }) {
   const stats = useMemo(() => computeStats(tasks), [tasks]);
-  const [metrics, setMetrics] = useState(null);
+  // undefined = fetch in flight (loader) · null = fetch FAILED (honest
+  // 'unavailable') · object = loaded. A failed refetch keeps the loaded value
+  // — a dollar figure must never be replaced by a fake loader (PR #108
+  // review, medium: a 500 rendered a permanent lying 'est. loading…').
+  const [metrics, setMetrics] = useState(undefined);
   const [chartRef, chartWidth] = useContainerWidth();
-  useEffect(() => { fetchMetrics().then(setMetrics); }, [tasks.length]);
+  useEffect(() => {
+    fetchMetrics().then((m) =>
+      setMetrics((prev) => (m === null && prev ? prev : m)));
+  }, [tasks.length]);
   const northStar = northStarTiles(metrics);
 
   if (tasks.length === 0) {
@@ -563,7 +570,11 @@ export default function Stats({ tasks }) {
           <div className="stats-card-label">Token Usage</div>
           <div className="stats-card-value">{fmtTokens(stats.totalTokens)}</div>
           <div className="stats-card-sub">
-            est. {fmtCost(lifetimeCost(metrics))}
+            {metrics === undefined
+              ? <span className="stats-loading">est. loading…</span>
+              : metrics === null
+                ? <>est. unavailable</>
+                : <>est. {fmtCost(lifetimeCost(metrics))}</>}
             {stats.avgTokensPerTask > 0 && ` · avg ${fmtTokens(stats.avgTokensPerTask)}/task`}
           </div>
         </div>
