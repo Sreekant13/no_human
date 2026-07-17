@@ -415,7 +415,10 @@ class NorthStarRunner:
         if verdict is not None:
             score.goal_satisfied = bool(verdict.satisfied) and \
                 score.mergeable in (True, None)
-            score.notes = verdict.evidence[:400]
+            # 2000, not 400: the drill of every done-but-unsatisfied spec
+            # starts from this field, and 400 chars cut ns-7ef821b2's verdict
+            # off mid-"BUT ..." — the reason it failed was unrecoverable.
+            score.notes = verdict.evidence[:2000]
         else:
             score.goal_satisfied = score.mergeable in (True, None)
             score.notes = "no judge injected; holdout-only scoring"
