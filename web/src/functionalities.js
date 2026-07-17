@@ -1,4 +1,4 @@
-// The System page's top layer: the pipeline's four functionalities, in the
+// The System page's top layer: the pipeline's five functionalities, in the
 // order the orchestrator actually drives them. Roles (eventRoles.js) say who
 // emitted an event; functionalities say which stage of the SDLC that work
 // belongs to. Split out of SlideOver so the grouping is testable with

@@ -97,17 +97,19 @@ export default function TaskTable({ tasks, onSelect = null, emptyHint = null }) 
                   </span>
                 )}
               </td>
-              <td className="stats-td">
+              <td className="stats-td stats-td-status">
                 <span
                   className="stats-status-dot"
                   style={{ background: STATUS_DOT[t.status] || "var(--text-dim)" }}
                 />
-                {t.cancelled ? "cancelled" : t.status}
+                {t.cancelled ? "cancelled" : t.status.replace(/_/g, " ")}
               </td>
               <td className="stats-td stats-td-mono">
                 {t.duration != null && t.duration > 0 ? fmtDuration(t.duration) : "—"}
               </td>
-              <td className="stats-td">{t.repo_name || "—"}</td>
+              <td className="stats-td stats-td-project" title={t.repo_name || undefined}>
+                {t.repo_name || "—"}
+              </td>
               <td className="stats-td">
                 <span className={`stats-runner-badge runner-${t.backend || "claude"}`}>
                   {t.backend === "devin" ? "Devin" : "Claude Code"}

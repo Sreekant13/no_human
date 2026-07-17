@@ -815,15 +815,19 @@ const clipText = (s, n) => {
 // counts/model, so the row only needs identity + a live status dot + the
 // click-through to the full AgentLogModal. Replaces the AgentNode cards
 // that repeated the head's facts at ~150px each.
-function RoleRow({ agent, state, isActive, onClick }) {
+function RoleRow({ agent, state, isActive, onClick, laneModel }) {
   if (!agent) return null;
   const status = (state && state.status) || "idle";
+  // The lane head already prints its primary's model in full; repeating it
+  // here truncates to "op…" in a 160px lane — show a row's model only when
+  // it differs from the lane's (e.g. a haiku researcher under the coder).
+  const showModel = agent.model && agent.model !== laneModel;
   return (
     <button type="button" className={`fx-role-row s-${status}`} onClick={onClick}
             title={`${agent.label} — open full log`}>
       <span className="fx-role-icon" aria-hidden="true">{agent.icon}</span>
       <span className="fx-role-name">{agent.label}</span>
-      {agent.model && <span className="fx-role-model">{agent.model.replace("claude-", "")}</span>}
+      {showModel && <span className="fx-role-model">{agent.model.replace("claude-", "")}</span>}
       <span className={`fx-role-dot s-${status}`} aria-label={status} />
       <span className="fx-role-chev" aria-hidden="true">›</span>
     </button>
@@ -862,11 +866,13 @@ function FxLane({ g, isCurrent, flowOut, agentStates, node, isActive, onOpen }) 
         <div className="fx-role-list">
           {hasPrimary && (
             <RoleRow agent={node(g.primary)} state={agentStates[g.primary]}
-                     isActive={isActive} onClick={() => onOpen(node(g.primary))} />
+                     isActive={isActive} laneModel={g.model}
+                     onClick={() => onOpen(node(g.primary))} />
           )}
           {children.map((c) => (
             <RoleRow key={c.id} agent={c} state={agentStates[c.id]}
-                     isActive={isActive} onClick={() => onOpen(c)} />
+                     isActive={isActive} laneModel={g.model}
+                     onClick={() => onOpen(c)} />
           ))}
         </div>
       ) : (
@@ -952,7 +958,7 @@ function SystemTab({ taskId, task, isActive }) {
   const withModel  = (a) => (a && nodeModels[a.id] ? { ...a, model: nodeModels[a.id] } : a);
   const node       = (id) => withModel(AGENTS.find(a => a.id === id));
 
-  // The page's top layer: the four functionalities of the pipeline, in the
+  // The page's top layer: the five functionalities of the pipeline, in the
   // order the orchestrator drives them. Each groups its roles and their
   // subagents; clicking one expands that stage's agent tree.
   const groups = groupFunctionalities({ agentStates, subagents, models: nodeModels, events });
@@ -993,7 +999,7 @@ function SystemTab({ taskId, task, isActive }) {
             {banner.text}
           </div>
         )}
-        {/* The functionality board: four lanes, every agent and subagent
+        {/* The functionality board: five lanes, every agent and subagent
             visible at once. The arrow between headers flows toward the stage
             that is running right now. */}
         <div className="fx-board">
