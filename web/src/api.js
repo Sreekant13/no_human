@@ -304,7 +304,10 @@ export async function fetchMetrics() {
   try {
     const r = await fetch(`${BASE}/api/metrics`);
     if (!r.ok) return null;
-    return r.json();
+    // await so a malformed body rejects INSIDE this try (same fix as
+    // searchEvents) — un-awaited, a 200-with-bad-JSON rejected outside the
+    // catch and left Stats' loader spinning forever (PR #108 review, low).
+    return await r.json();
   } catch {
     return null;
   }
