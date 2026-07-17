@@ -13,5 +13,9 @@ export default defineConfig({
   build: {
     outDir: "dist",
     assetsDir: "assets",
+    // Never inline assets as data: URIs — the CSP is font-src 'self', and
+    // Vite's 4KB default base64-inlined two Plex Mono subsets that the
+    // policy then blocked (PR #107 review, medium).
+    assetsInlineLimit: 0,
   },
 });
