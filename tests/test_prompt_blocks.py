@@ -162,3 +162,19 @@ def test_rules_block_per_criterion_evidence_contract():
     assert "CRITERION:" in r
     assert "MET | NOT-MET" in r
     assert "never claim MET on inference" in r
+
+
+def test_rules_block_final_report_must_be_self_contained():
+    """v9 drill (ns-5c06afb8): the coder fetched a PR diff, printed it in an
+    EARLIER turn, then finished with 'the full unified diff is shown above' —
+    but only the final message survives as the delivered report, so the human
+    received a summary without the artifact they asked for. The contract must
+    say: the final report is the only thing delivered; re-embed requested
+    output; never point at earlier transcript turns."""
+    r = build_rules_block("uv run pytest -q", "", None)
+    assert "self-contained" in r
+    assert "shown above" in r          # the named anti-pattern
+    assert "only thing delivered" in r
+    # the surviving neighbors this rule must not displace
+    assert "CRITERION:" in r
+    assert "NEVER weaken, skip, or delete a test" in r
