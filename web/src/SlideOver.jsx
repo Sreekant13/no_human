@@ -150,9 +150,12 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
     if (!isAwaiting || busy) return;
     setBusy(true);
     try {
-      await approveTask(taskId);
+      const res = await approveTask(taskId);
       const remaining = reviewQueue.filter((id) => id !== taskId).length;
-      setFlash("Approval recorded. Merge the PR in your git host."
+      // The server's message is authoritative: an already-satisfied approval
+      // completes the task with no PR to merge (PR #101 round-2 review) —
+      // hardcoding the merge instruction here lied on that path.
+      setFlash((res?.message || "Approval recorded. Merge the PR in your git host.")
         + (remaining ? ` ${remaining} more waiting — use Next review.` : ""));
       const updated = await fetchTask(taskId);
       setTask(updated);

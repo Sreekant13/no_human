@@ -551,7 +551,8 @@ class FakeReviewer:
 
     async def review(self, task, *, repo_path, test_output="", held_out_output="",
                      before_ref="HEAD~1", after_ref="HEAD", **kwargs):
-        self.calls.append({"task_id": task.id})
+        self.calls.append({"task_id": task.id, "mode": kwargs.get("mode"),
+                           "claim_report": kwargs.get("claim_report")})
         if self._call_count is not None:
             self._call_count.append(1)
         return self._decision
@@ -2459,8 +2460,9 @@ async def test_a_resumed_attempt_reviews_the_checkpoint_instead_of_failing(
 async def test_zero_diff_preamble_appears_on_retry_and_forbids_fabrication(
     bare_repo, tmp_path, store
 ):
-    """The corrective preamble must name the two valid outcomes without implying
-    an edit has to appear — the agent it addresses may well be right."""
+    """The corrective preamble must name the valid outcomes (edit /
+    already-satisfied report / blocker) without implying an edit has to appear
+    — the agent it addresses may well be right."""
     cfg = _config(tmp_path)
     backend = ZeroDiffBackend()
     orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None))
@@ -2480,6 +2482,195 @@ async def test_zero_diff_preamble_appears_on_retry_and_forbids_fabrication(
         assert "not a silent no-op" in prompt
         # …and it must not become an escape hatch from work the agent can do.
         assert "avoid finishing doable work" in prompt
+
+
+# --------------------------------------------------------------------------- #
+# The already-satisfied zero-diff terminal                                     #
+# --------------------------------------------------------------------------- #
+
+class AlreadySatisfiedBackend:
+    """Zero edits + a fully-cited ALREADY-SATISFIED per-criterion claim."""
+
+    STATEMENT = (
+        "Verified every criterion against the existing code.\n"
+        "ALREADY-SATISFIED\n"
+        "CRITERION: mul(a,b) returns product — MET — evidence: calc.py:4\n"
+    )
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        return AgentResult(final_text=self.STATEMENT, num_turns=3, is_error=False,
+                           tokens_used=120, session_id="s", stop_reason="end_turn")
+
+
+async def test_zero_diff_already_satisfied_claim_reaches_the_human_gate(
+    bare_repo, tmp_path, store
+):
+    """The v6 'answer in hand' park class (ns-b682d728, ns-deb7de00,
+    ns-01c3d46d): a task whose criteria are already true in the code must reach
+    the human gate carrying the evidence-cited claim as its deliverable — via
+    the fresh-context reviewer, never on the coder's word."""
+    passing = ReviewDecision(passed=True, checklist=[
+        ChecklistItem("mul(a,b) returns product", True,
+                      "calc.py:4 defines mul returning a*b")])
+    reviewer = FakeReviewer(passing)
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, AlreadySatisfiedBackend(),
+                        SlackNotifier(None), reviewer=reviewer)
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    # Pin intake: the claim's per-criterion COVERAGE check compares against
+    # task.acceptance_criteria, and live enrichment would nondeterministically
+    # expand it (and burn a real utility call) mid-test.
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert outcome.pr_url is None                       # nothing to merge
+    assert "ALREADY-SATISFIED" in (outcome.report or "")
+    assert reviewer.calls and reviewer.calls[-1]["mode"] == "already_satisfied"
+    assert "calc.py:4" in reviewer.calls[-1]["claim_report"]
+    attempts = await store.list_attempts(t.id)
+    assert attempts[-1]["status"] == "succeeded"
+    assert attempts[-1]["review_passed"] == 1
+    refreshed = await store.find_task(t.id)
+    assert "ALREADY-SATISFIED" in (refreshed.context or {}).get(
+        "already_satisfied_report", "")
+
+
+async def test_refuted_already_satisfied_claim_fails_the_attempt(
+    bare_repo, tmp_path, store
+):
+    """A lazy 'already done' dies on citation verification: the FAIL feeds the
+    bounded loop as review findings and never reaches the human gate."""
+    failing = ReviewDecision(passed=False, checklist=[
+        ChecklistItem("mul(a,b) returns product", False,
+                      "calc.py has no mul() at all — the citation is fiction",
+                      severity="high")])
+    reviewer = FakeReviewer(failing)
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, AlreadySatisfiedBackend(),
+                        SlackNotifier(None), reviewer=reviewer)
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    # Pin intake: the claim's per-criterion COVERAGE check compares against
+    # task.acceptance_criteria, and live enrichment would nondeterministically
+    # expand it (and burn a real utility call) mid-test.
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    # Tightened per PR #101 review: "not awaiting_approval" also passed for
+    # DONE — the refuted claim must end on the failure side of the machine.
+    assert outcome.status in (TaskStatus.FAILED, TaskStatus.ESCALATED)
+    attempts = await store.list_attempts(t.id)
+    assert any("refuted" in (a.get("failure_reason") or "") for a in attempts), \
+        [(a.get("status"), a.get("failure_reason")) for a in attempts]
+
+
+async def test_already_satisfied_with_no_reviewer_fails_closed(
+    bare_repo, tmp_path, store
+):
+    """PR #101 review MEDIUM: the fail-closed branches were untested. No
+    reviewer + no allow_advisory → the claim must NEVER pass unreviewed."""
+    cfg = _config(tmp_path)
+    # _config defaults allow_advisory=True for the fake-backend suite; this
+    # test exercises the PRODUCTION fail-closed default.
+    cfg.data["reviewer"]["allow_advisory"] = False
+    orch = Orchestrator(store, cfg.data, AlreadySatisfiedBackend(),
+                        SlackNotifier(None), reviewer=None)
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    # Pin intake: the claim's per-criterion COVERAGE check compares against
+    # task.acceptance_criteria, and live enrichment would nondeterministically
+    # expand it (and burn a real utility call) mid-test.
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.ESCALATED
+    refreshed = await store.find_task(t.id)
+    assert refreshed.status is not TaskStatus.AWAITING_APPROVAL
+
+
+async def test_already_satisfied_advisory_mode_is_honest_about_no_review(
+    bare_repo, tmp_path, store
+):
+    """allow_advisory passes the claim to the human gate but must SAY the
+    claim was not verified (PR #101 review LOW: false 'review verified' detail)."""
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("reviewer", {})["allow_advisory"] = True
+    orch = Orchestrator(store, cfg.data, AlreadySatisfiedBackend(),
+                        SlackNotifier(None), reviewer=None)
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    # Pin intake: the claim's per-criterion COVERAGE check compares against
+    # task.acceptance_criteria, and live enrichment would nondeterministically
+    # expand it (and burn a real utility call) mid-test.
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert "NOT verified" in outcome.detail
+    assert "verified every cited criterion" not in outcome.detail
+
+
+class _UnavailableReviewer:
+    async def review(self, task, **kwargs):
+        from no_human.review.reviewer import ReviewerUnavailable
+        raise ReviewerUnavailable("no verdict after retries")
+
+
+async def test_already_satisfied_reviewer_unavailable_escalates(
+    bare_repo, tmp_path, store
+):
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, AlreadySatisfiedBackend(),
+                        SlackNotifier(None), reviewer=_UnavailableReviewer())
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    # Pin intake: the claim's per-criterion COVERAGE check compares against
+    # task.acceptance_criteria, and live enrichment would nondeterministically
+    # expand it (and burn a real utility call) mid-test.
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.ESCALATED
+
+
+class _CrashingReviewer:
+    async def review(self, task, **kwargs):
+        raise RuntimeError("reviewer exploded")
+
+
+async def test_already_satisfied_reviewer_crash_fails_the_attempt(
+    bare_repo, tmp_path, store
+):
+    """A crashed reviewer is a failing decision (fail closed), never a pass."""
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, AlreadySatisfiedBackend(),
+                        SlackNotifier(None), reviewer=_CrashingReviewer())
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    # Pin intake: the claim's per-criterion COVERAGE check compares against
+    # task.acceptance_criteria, and live enrichment would nondeterministically
+    # expand it (and burn a real utility call) mid-test.
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status in (TaskStatus.FAILED, TaskStatus.ESCALATED)
+    attempts = await store.list_attempts(t.id)
+    assert any("crashed" in (a.get("failure_reason") or "") for a in attempts)
 
 
 # --------------------------------------------------------------------------- #

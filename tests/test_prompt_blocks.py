@@ -137,3 +137,28 @@ def test_rules_block_ask_vs_act_decision_rule():
     assert "MISSING_ACCESS" in r
     # the anti-tamper rule must survive any rules-block edit
     assert "NEVER weaken, skip, or delete a test" in r
+
+
+def test_rules_block_already_satisfied_is_a_report_terminal_not_a_park():
+    """v6 taxonomy: 'already satisfied' verifications parked as AMBIGUITY
+    blockers with the answer in hand. The rule now routes them to the
+    evidence-cited ALREADY-SATISFIED report (reviewer-verified, human-gated)
+    while keeping the anti-fabrication stance."""
+    r = build_rules_block("uv run pytest -q", "", None)
+    assert "ALREADY-SATISFIED" in r
+    assert "do NOT fabricate an edit" in r
+    assert "Emit a blocker (category AMBIGUITY)" not in r
+    # the human stays the gate for a no-change task
+    assert "not a silent no-op" in r
+    assert "avoid finishing doable work" in r
+
+
+def test_rules_block_per_criterion_evidence_contract():
+    """Rubric-verification pattern (Scale agentic rubrics): the coder's final
+    report must carry one binary, evidence-cited line per acceptance criterion
+    — aligning what the coder claims with what the GoalJudge and the reviewer
+    verify. A criterion without cited evidence is NOT-MET by definition."""
+    r = build_rules_block("uv run pytest -q", "", None)
+    assert "CRITERION:" in r
+    assert "MET | NOT-MET" in r
+    assert "never claim MET on inference" in r

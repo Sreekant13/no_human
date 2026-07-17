@@ -483,6 +483,81 @@ def _build_review_prompt(
     )
 
 
+_VERDICT_FORMAT_CLAIM = (
+    "Output EXACTLY this format (and NOTHING after it):\n\n"
+    "REVIEW_JSON_START\n"
+    '{"passed": true_or_false,\n'
+    ' "stages": {"spec_compliance": {"passed": true_or_false},\n'
+    '            "code_quality": {"passed": true_or_false}},\n'
+    ' "suggested_next": "one-sentence hint for the next attempt" or null,\n'
+    ' "items": [\n'
+    '  {"label": "short label", "passed": true_or_false,\n'
+    '   "severity": "critical|high|medium|low|nit",\n'
+    '   "evidence": "detailed explanation of the finding",\n'
+    '   "file": "path/to/file.py", "line": 42,\n'
+    '   "comment": "written in a natural, human voice"}\n'
+    "]}\n"
+    "REVIEW_JSON_END\n\n"
+    "For each item (there is NO diff — the artifact is the implementer's claim):\n"
+    "  - 'file'/'line' point at the EXISTING repo code that proves your point.\n"
+    "  - When you are refuting a citation that does NOT exist or does not say\n"
+    "    what is claimed, put the CLAIMED path/line in 'file'/'line' and say so\n"
+    "    in 'evidence' — a fabricated citation is a blocking finding, and it is\n"
+    "    never discounted for pointing at something that is not there.\n"
+)
+
+
+def _build_already_satisfied_prompt(
+    task: Task,
+    claim_report: str,
+    *,
+    profile_context: str = "",
+    confirmed_rules: str = "",
+) -> str:
+    """The implementer made ZERO edits and claims every acceptance criterion is
+    already met by the existing code, citing file:line per criterion. The
+    artifact under review is that claim — there is no diff. Same trust chain as
+    a code diff: the fresh-context reviewer verifies, or the claim dies."""
+    criteria = "\n".join(f"  - {c}" for c in task.acceptance_criteria) or "  (none stated)"
+    profile_section = (
+        f"\nProject profile (use these conventions as a baseline):\n{profile_context}\n"
+        if profile_context else ""
+    )
+    rules_section = (
+        f"\nConfirmed rules from past experience (the team learned these the hard way):\n"
+        f"{confirmed_rules}\n"
+        if confirmed_rules else ""
+    )
+    return (
+        "You are a Staff Software Engineer performing an independent verification.\n"
+        "The implementer made NO code changes and claims every acceptance\n"
+        "criterion is ALREADY satisfied by the existing code, with a file:line\n"
+        "citation per criterion. Your ONLY job is to REFUTE that claim.\n\n"
+        "You MAY use read/search tools (Read, Grep, Glob) to inspect any file in\n"
+        "the repository. Do NOT modify any files.\n"
+        "MUST: open EVERY cited file at the cited lines and confirm the code\n"
+        "actually does what the claim says. Never accept a citation unread.\n\n"
+        "For EACH claimed criterion produce one checklist item:\n"
+        "  - passed: true ONLY when the cited code demonstrably satisfies the\n"
+        "    criterion — quote the decisive line(s) in 'evidence'.\n"
+        "  - passed: false when the citation does not exist, does not do what is\n"
+        "    claimed, covers the criterion only partially, or the criterion\n"
+        "    actually requires a change. Grade these critical/high/medium.\n"
+        "Also check what the claim glosses over: a criterion that demands a test,\n"
+        "a doc, or an unhandled case which the existing code lacks is a failing\n"
+        "item with severity high.\n\n"
+        "Severity is a classification, never a score. critical/high/medium block\n"
+        "the claim; low/nit are recorded for the human and do not block.\n\n"
+        + _VERDICT_FORMAT_CLAIM
+        + f"{profile_section}"
+        f"{rules_section}\n"
+        f"Task: {task.title}\n"
+        f"Acceptance criteria:\n{criteria}\n\n"
+        "The implementer's ALREADY-SATISFIED claim (the artifact under review):\n"
+        f"```\n{claim_report[:20000]}\n```\n"
+    )
+
+
 def _build_code_review_prompt(
     task: Task,
     diff: str,
@@ -863,6 +938,7 @@ class AdversarialReviewer:
         prior_rounds: str = "",
         mode: str = "gate",
         pr_comments: str = "",
+        claim_report: str = "",
     ) -> ReviewDecision:
         # Code review mode: higher diff cap, different prompt, multi-turn agent.
         if mode == "code_review":
@@ -882,6 +958,21 @@ class AdversarialReviewer:
                 max_turns=_CODE_REVIEW_TURNS,
                 timeout=_CODE_REVIEW_TIMEOUT,
             )
+
+        # Already-satisfied mode: the artifact is the coder's zero-diff claim.
+        # Multi-turn with read tools — the whole point is opening each cited
+        # file. Citation demotion is OFF: in this mode a finding that names a
+        # NONEXISTENT path is the reviewer refuting a fabricated claim citation
+        # — the true-positive channel — and demoting it passed the fabricated
+        # claim (PR #101 review, critical).
+        if mode == "already_satisfied":
+            prompt = _build_already_satisfied_prompt(
+                task, claim_report,
+                profile_context=profile_context,
+                confirmed_rules=confirmed_rules,
+            )
+            return await self._agent_review(
+                prompt, repo_path, before_ref="HEAD", verify_citations=False)
 
         # Gate mode (default): original adversarial review.
         full_files, omitted_files = "", []
@@ -995,7 +1086,7 @@ class AdversarialReviewer:
     async def _agent_review(
         self, prompt: str, repo_path: Path,
         *, max_turns: int = _REVIEW_TURNS, timeout: int = _REVIEW_TIMEOUT,
-        before_ref: str = "HEAD~1",
+        before_ref: str = "HEAD~1", verify_citations: bool = True,
     ) -> ReviewDecision:
         """Multi-turn review — model can explore the repo with read-only tools.
 
@@ -1016,7 +1107,7 @@ class AdversarialReviewer:
             budget = max_turns * (2 ** round_n)
             decision, reason = await self._review_once(
                 prompt, repo_path, max_turns=budget, timeout=round_timeout,
-                before_ref=before_ref,
+                before_ref=before_ref, verify_citations=verify_citations,
             )
             if decision is not None:
                 return decision
@@ -1043,7 +1134,7 @@ class AdversarialReviewer:
 
     async def _review_once(
         self, prompt: str, repo_path: Path, *, max_turns: int, timeout: int,
-        before_ref: str = "HEAD~1",
+        before_ref: str = "HEAD~1", verify_citations: bool = True,
     ) -> tuple[ReviewDecision | None, str]:
         """One reviewer session.
 
@@ -1073,12 +1164,15 @@ class AdversarialReviewer:
         except asyncio.TimeoutError:
             return None, f"timed out after {timeout}s"
 
-        # Try final_text first, then all captured text.
+        # Try final_text first, then all captured text. `verify_citations`
+        # gates the demotion rule: claim mode must keep a refutation that names
+        # a nonexistent (fabricated) path blocking (PR #101 review, critical).
+        _vc_repo = repo_path if verify_citations else None
         decision = _parse_review_output(result.final_text or "",
-                                        repo_path=repo_path, before_ref=before_ref)
+                                        repo_path=_vc_repo, before_ref=before_ref)
         if _reached_no_verdict(decision):
             decision = _parse_review_output("\n".join(all_text_parts),
-                                            repo_path=repo_path, before_ref=before_ref)
+                                            repo_path=_vc_repo, before_ref=before_ref)
         if _reached_no_verdict(decision):
             reason = result.stop_reason or "no REVIEW_JSON block"
             if getattr(result, "is_error", False):
