@@ -130,3 +130,22 @@ def test_pr_body_no_evidence_when_tests_did_not_run(store, tmp_path):
     t = Task.new("t", repo_path="/r")
     body = orch._pr_body(t, _Commit(), _Result(), test_evidence={"ran": False})
     assert "Test evidence" not in body
+
+
+def test_section_includes_intake_qa(store, tmp_path):
+    """§6 grill: the self-answered Q&A is audited at the human gate."""
+    orch = _orch(store, tmp_path)
+    t = Task.new("grilled task", repo_path="/r")
+    t.context = {"intake_qa": [
+        {"question": "Which file?", "decision_it_changes": "target",
+         "answer": "src/x.py:1", "source": "repo-evidence", "carve_out": "none"},
+        {"question": "Rotate credential?", "decision_it_changes": "auth",
+         "answer": "HUMAN-GATED: not self-answerable", "source": "",
+         "carve_out": "access"},
+    ]}
+    section = orch._assumptions_section(t)
+    assert "Which file?" in section
+    assert "src/x.py:1" in section
+    assert "repo-evidence" in section
+    assert "Rotate credential?" in section
+    assert "HUMAN-GATED" in section

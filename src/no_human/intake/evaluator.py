@@ -208,3 +208,210 @@ async def resolve_assumptions(
     except Exception as exc:  # noqa: BLE001 — advisory, never blocks
         log.warning("assumption resolution failed (proceeding without): %s", exc)
         return None
+
+
+# ------------------------- intake grill (every task) ----------------------- #
+# Operator directive 2026-07-17: every task goes through an intake grill "like
+# with a real user". Questions are generated with an EVPI-style rubric (ask
+# only what changes a decision — SAGE-Agent, ACL 2026); when no human is
+# present they are answered from repo evidence as documented reversible
+# assumptions, and the full Q&A is surfaced at the human gate. Advisory
+# end-to-end: any failure returns what it has and never blocks the pipeline.
+
+_GRILL_JSON = re.compile(r"GRILL_JSON_START\s*(.*?)\s*GRILL_JSON_END", re.DOTALL)
+
+_GRILL_QUESTIONS_PROMPT = (
+    "You are the intake clarifier for an autonomous coding agent. A real "
+    "requester filed this task and has walked away. Generate the clarifying "
+    "questions a careful engineer would ask the requester BEFORE planning.\n\n"
+    "Rules:\n"
+    "- Ask ONLY questions whose answer changes what gets built (target file/"
+    "repo, scope, deliverable artifact, acceptance ambiguity). For each "
+    "question state the decision its answer changes. Output NO question whose "
+    "answer would not change the work.\n"
+    "- Tag carve_out: \"access\" for anything needing credentials/permissions/"
+    "external accounts, \"destructive\" for anything irreversible (deletes, "
+    "rotations, prod mutations), else \"none\". Carve-out questions are for a "
+    "human — never answered autonomously.\n"
+    "- At most 8 questions; fewer is better. A crisp spec deserves zero.\n\n"
+    "Output EXACTLY:\n"
+    "GRILL_JSON_START\n"
+    '{"questions": [{"question": "...", "decision_it_changes": "...", '
+    '"carve_out": "none|access|destructive"}]}\n'
+    "GRILL_JSON_END\n\n"
+    "Task:\n"
+    "Title: {title}\n"
+    "Description: {description}\n"
+    "Acceptance criteria:\n{criteria}\n"
+)
+
+
+@dataclass
+class GrillQA:
+    """One intake question with its (eventual) answer."""
+
+    question: str
+    decision_it_changes: str
+    answer: str = ""
+    source: str = ""  # "human" | "repo-evidence" | "assumption"
+    carve_out: str = "none"  # "none" | "access" | "destructive"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "question": self.question,
+            "decision_it_changes": self.decision_it_changes,
+            "answer": self.answer,
+            "source": self.source,
+            "carve_out": self.carve_out,
+        }
+
+
+async def generate_grill_questions(
+    title: str,
+    description: str,
+    acceptance_criteria: list[str],
+    *,
+    backend: Any | None = None,
+    model: str | None = None,
+) -> list[GrillQA] | None:
+    """Generate the intake grill's questions. None on failure (advisory)."""
+    try:
+        import tempfile
+        from pathlib import Path
+        from ..agent.claude_backend import ClaudeBackend
+        be = backend or ClaudeBackend(
+            model=model or _default_utility_model(), readonly=True,
+        )
+        criteria_text = "\n".join(f"  - {c}" for c in acceptance_criteria) or "  (none)"
+        prompt = _render(
+            _GRILL_QUESTIONS_PROMPT,
+            title=title,
+            description=description or "(none)",
+            criteria=criteria_text,
+        )
+        result = await be.run(prompt, max_turns=1, effort="low",
+                              cwd=Path(tempfile.gettempdir()))
+        m = _GRILL_JSON.search(result.final_text or "")
+        if not m:
+            log.warning("grill produced no parseable GRILL_JSON block")
+            return None
+        data = loads_lenient(m.group(1))
+        items = data.get("questions")
+        if not isinstance(items, list) or not items:
+            return None
+        out: list[GrillQA] = []
+        for item in items[:8]:
+            if not isinstance(item, dict) or not item.get("question"):
+                continue
+            carve = str(item.get("carve_out", "none"))
+            out.append(GrillQA(
+                question=str(item["question"]),
+                decision_it_changes=str(item.get("decision_it_changes", "")),
+                carve_out=carve if carve in ("none", "access", "destructive")
+                else "none",
+            ))
+        return out or None
+    except Exception as exc:  # noqa: BLE001 — advisory, never blocks
+        log.warning("grill question generation failed (proceeding): %s", exc)
+        return None
+
+
+_GRILL_ANSWERS = re.compile(
+    r"GRILL_ANSWERS_START\s*(.*?)\s*GRILL_ANSWERS_END", re.DOTALL)
+
+_GRILL_ANSWERS_PROMPT = (
+    "You are answering intake questions for an autonomous coding agent, using "
+    "ONLY this repository's contents and the task spec below. The requester is "
+    "not available. For each question, give the single most reasonable "
+    "REVERSIBLE answer a senior engineer would proceed under, citing repo "
+    "evidence as path:line where you found it. If the repo holds no evidence, "
+    "answer with the minimal reasonable assumption and source \"assumption\". "
+    "Never invent evidence.\n\n"
+    "Output EXACTLY:\n"
+    "GRILL_ANSWERS_START\n"
+    '{"answers": [{"i": 0, "answer": "...", "source": '
+    '"repo-evidence|assumption"}]}\n'
+    "GRILL_ANSWERS_END\n\n"
+    "Task:\n"
+    "Title: {title}\n"
+    "Description: {description}\n"
+    "Acceptance criteria:\n{criteria}\n\n"
+    "Questions:\n{questions}\n"
+)
+
+
+async def grill_spec(
+    title: str,
+    description: str,
+    acceptance_criteria: list[str],
+    repo_path: Any | None,
+    *,
+    backend: Any | None = None,
+    model: str | None = None,
+    questions: list[GrillQA] | None = None,
+) -> list[GrillQA] | None:
+    """The full unattended grill: generate questions, answer the answerable
+    ones FROM THE REPO (the answering session's cwd is the task's repo — the
+    pre-existing resolve_assumptions path is repo-blind), and hard-gate the
+    carve-outs for a human. Never raises; a failed answering pass returns the
+    questions unanswered rather than fabricating."""
+    try:
+        qs = questions or await generate_grill_questions(
+            title, description, acceptance_criteria,
+            backend=backend, model=model,
+        )
+        if not qs:
+            return None
+        for q in qs:
+            if q.carve_out != "none":
+                q.answer = "HUMAN-GATED: not self-answerable"
+                q.source = ""
+        answerable = [(i, q) for i, q in enumerate(qs) if q.carve_out == "none"]
+        if not answerable:
+            return qs
+        try:
+            import tempfile
+            from pathlib import Path
+            from ..agent.claude_backend import ClaudeBackend
+            be = backend or ClaudeBackend(
+                model=model or _default_utility_model(), readonly=True,
+            )
+            criteria_text = ("\n".join(f"  - {c}" for c in acceptance_criteria)
+                             or "  (none)")
+            q_text = "\n".join(
+                f"  {i}. {q.question} (decides: {q.decision_it_changes})"
+                for i, q in answerable)
+            prompt = _render(
+                _GRILL_ANSWERS_PROMPT,
+                title=title,
+                description=description or "(none)",
+                criteria=criteria_text,
+                questions=q_text,
+            )
+            cwd = Path(repo_path) if repo_path else Path(tempfile.gettempdir())
+            result = await be.run(prompt, max_turns=8, effort="low", cwd=cwd)
+            m = _GRILL_ANSWERS.search(result.final_text or "")
+            if m:
+                data = loads_lenient(m.group(1))
+                answerable_idx = {i for i, _ in answerable}
+                for item in data.get("answers", []) or []:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        i = int(item.get("i"))
+                    except (TypeError, ValueError):
+                        continue
+                    # The model may only answer the questions it was asked —
+                    # a carve-out index in its output is ignored.
+                    if i in answerable_idx and item.get("answer"):
+                        qs[i].answer = str(item["answer"])[:400]
+                        src = str(item.get("source", "assumption"))
+                        qs[i].source = (src if src in
+                                        ("repo-evidence", "assumption")
+                                        else "assumption")
+        except Exception as exc:  # noqa: BLE001 — unanswered beats broken
+            log.warning("grill answering failed (questions unanswered): %s", exc)
+        return qs
+    except Exception as exc:  # noqa: BLE001 — advisory, never blocks
+        log.warning("grill failed entirely (proceeding without): %s", exc)
+        return None

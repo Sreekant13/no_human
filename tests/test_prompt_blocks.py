@@ -178,3 +178,47 @@ def test_rules_block_final_report_must_be_self_contained():
     # the surviving neighbors this rule must not displace
     assert "CRITERION:" in r
     assert "NEVER weaken, skip, or delete a test" in r
+
+
+# ---------------------------- intake Q&A block ----------------------------- #
+
+def test_intake_qa_block_empty():
+    from no_human.core.prompt_blocks import build_intake_qa_block
+    assert build_intake_qa_block([]) == ""
+    assert build_intake_qa_block(None) == ""
+
+
+def test_intake_qa_block_renders_resolved_and_gated_sections():
+    from no_human.core.prompt_blocks import build_intake_qa_block
+    qa = [
+        {"question": "Which file?", "decision_it_changes": "target",
+         "answer": "src/x.py:1 — sole caller", "source": "repo-evidence",
+         "carve_out": "none"},
+        {"question": "Rotate the credential?", "decision_it_changes": "auth",
+         "answer": "HUMAN-GATED: not self-answerable", "source": "",
+         "carve_out": "access"},
+        {"question": "Unanswered one?", "decision_it_changes": "scope",
+         "answer": "", "source": "", "carve_out": "none"},
+    ]
+    out = build_intake_qa_block(qa)
+    assert "RESOLVED AT INTAKE" in out
+    assert "src/x.py:1" in out
+    assert "repo-evidence" in out
+    assert "HUMAN-GATED" in out
+    assert "Rotate the credential?" in out
+    # An unanswered non-carve-out question renders as open, not as resolved.
+    assert "Unanswered one?" in out
+    # Gated items instruct parking, never self-resolution.
+    assert "park" in out.lower()
+
+
+def test_intake_qa_block_caps_items_and_length():
+    from no_human.core.prompt_blocks import build_intake_qa_block
+    qa = [{"question": f"q{i}?", "decision_it_changes": "d",
+           "answer": "a" * 1000, "source": "assumption", "carve_out": "none"}
+          for i in range(12)]
+    out = build_intake_qa_block(qa)
+    # Exactly 8 of the 12 items render (review r1: the earlier disjunct
+    # counted a PR-body-only marker and was vacuously true).
+    assert out.count("  Q: ") == 8
+    assert "a" * 401 not in out

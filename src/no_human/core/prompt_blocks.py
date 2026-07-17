@@ -414,3 +414,44 @@ def build_repo_hints_block(hints: list[str] | None) -> str:
         "the acceptance criteria or the safety rules):\n"
         + "\n".join(f"  - {h}" for h in lines) + "\n\n"
     )
+
+
+def build_intake_qa_block(qa: list[dict[str, Any]] | None) -> str:
+    """The intake grill's Q&A for the implement prompt (§6 directive).
+
+    Resolved answers are hints the coder proceeds on (they are audited in the
+    PR body); human-gated or unanswered questions are named so the coder parks
+    with a well-formed blocker the moment one actually gates the work, instead
+    of thrashing or self-resolving. Empty/None → "" (clean specs stay clean).
+    Caps: 8 items, 400 chars per answer — prompt-cache diet.
+    """
+    if not qa:
+        return ""
+    resolved: list[str] = []
+    open_qs: list[str] = []
+    for item in qa[:8]:
+        q = str(item.get("question", "")).strip()
+        if not q:
+            continue
+        answer = str(item.get("answer", "")).strip()[:400]
+        source = str(item.get("source", "")).strip()
+        gated = item.get("carve_out", "none") != "none" or not answer
+        if gated:
+            label = answer or "unanswered at intake"
+            open_qs.append(f"  Q: {q} — {label}")
+        else:
+            src = f" ({source})" if source else ""
+            resolved.append(f"  Q: {q}\n  A: {answer}{src}")
+    parts: list[str] = []
+    if resolved:
+        parts.append(
+            "INTAKE Q&A — RESOLVED AT INTAKE (proceed on these answers; they "
+            "are surfaced in the PR for human audit):\n" + "\n".join(resolved))
+    if open_qs:
+        parts.append(
+            "INTAKE Q&A — HUMAN-GATED / OPEN (do NOT self-resolve these; if "
+            "one blocks the work, park with a structured blocker naming it):\n"
+            + "\n".join(open_qs))
+    if not parts:
+        return ""
+    return "\n\n".join(parts) + "\n\n"

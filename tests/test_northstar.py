@@ -749,3 +749,37 @@ def test_sandbox_strips_every_ride_along_remote(tmp_path):
                              capture_output=True, text=True).stdout
     assert "upstream" not in remotes and "example.com" not in remotes, remotes
     assert str(tmp_path / "wd" / "remote.git") in remotes
+
+
+@pytest.mark.slow
+@pytest.mark.asyncio
+async def test_bench_grill_runs_in_the_sandbox_not_the_source(tmp_path, monkeypatch):
+    """No-leak property for the §6 intake grill: when the bench replays a
+    spec, the grill's repo evidence comes from the PINNED SANDBOX copy —
+    never the operator's source repo (whose HEAD may already contain the
+    historical solution)."""
+    from no_human.config import load_config
+    from no_human.intake import evaluator as ev
+
+    seen = {}
+
+    async def _fake_grill(title, description, criteria, repo_path, *,
+                          backend=None, model=None, questions=None):
+        seen["repo_path"] = str(repo_path)
+        return None
+    monkeypatch.setattr(ev, "grill_spec", _fake_grill)
+
+    repo = _src_repo(tmp_path)
+    spec = _spec(repo)
+    cfg = load_config(tmp_path / "config.yaml")
+    runner = NorthStarRunner(cfg.data, backend_factory=lambda s: _FixBackend(),
+                             reviewer=_PassReviewer(),
+                             goal_judge=_StubGoalJudge())
+
+    score = await runner.run_one(spec, workdir=tmp_path / "wd")
+
+    assert score.outcome_status == "awaiting_approval"
+    assert seen, "the bench pipeline never ran the intake grill"
+    work = str((tmp_path / "wd" / "work").resolve())
+    assert seen["repo_path"] in (work, str(tmp_path / "wd" / "work"))
+    assert seen["repo_path"] != str(repo)

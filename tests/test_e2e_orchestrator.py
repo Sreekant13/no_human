@@ -3615,3 +3615,26 @@ async def test_clean_code_review_done_carries_the_review_as_report(
 
     assert outcome.status is TaskStatus.DONE
     assert "LGTM" in outcome.report
+
+
+async def test_planner_prompt_carries_intake_qa(bare_repo, tmp_path, store):
+    """§6 grill: the plan is built on the question-answered spec — every
+    base-prompt consumer (single planner + MoA proposers) sees the intake
+    Q&A block (review r1 f1: it previously reached only the coder)."""
+    cfg = _planning_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    t = Task.new("grilled", repo_path=str(bare_repo))
+    t.context = {"intake_qa": [
+        {"question": "Which file carries the fix?", "decision_it_changes":
+         "target", "answer": "src/x.py:1", "source": "repo-evidence",
+         "carve_out": "none"}]}
+    backend = PromptCapturingPlannerBackend(_SAMPLE_PLAN)
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=backend):
+        await orch._generate_plan(t, GitRepo(bare_repo))
+
+    base = _base_prompts(backend)
+    assert base
+    assert all("RESOLVED AT INTAKE" in p for p in base)
+    assert all("src/x.py:1" in p for p in base)
