@@ -516,6 +516,26 @@ class TestBudgetNudge:
         assert out2 == {}
 
     @pytest.mark.asyncio
+    async def test_nudge_reports_through_on_decision(self):
+        """The nudge must be OBSERVABLE: on_decision → orchestrator emits a
+        supervisor_decision event → task_events. Without this, whether the
+        wrap-up nudge fired is unknowable post hoc (the v9 budget-class
+        drill blocker)."""
+        seen = []
+        async def fake_llm(prompt):
+            return "SUPERVISOR_CONTINUE"
+        hook = SupervisorHook(
+            task_title="t", acceptance_criteria=["x"], rules="",
+            llm_call=fake_llm, check_every=100,
+            budget_status=lambda: (3_600_000, 4_000_000),
+            on_decision=seen.append,
+        )
+        out = await hook.hook({"tool_name": "Read", "tool_input": {}}, None, None)
+        assert "additionalContext" in out["hookSpecificOutput"]
+        assert [d.action for d in seen] == ["budget_nudge"]
+        assert "3,600,000" in seen[0].message
+
+    @pytest.mark.asyncio
     async def test_raising_or_absent_budget_status_never_crashes(self):
         def boom():
             raise RuntimeError("unarmed")
@@ -532,3 +552,21 @@ class TestBudgetNudge:
         assert await hook.hook({"tool_name": "R", "tool_input": {}}, None, None) == {}
         hook0 = self._hook(lambda: (100, 0))
         assert await hook0.hook({"tool_name": "R", "tool_input": {}}, None, None) == {}
+
+    @pytest.mark.asyncio
+    async def test_raising_on_decision_never_costs_the_injection(self):
+        """A broken reporting sink must not eat the safety nudge — the latch
+        commits before the report, so a raise would otherwise lose it forever."""
+        async def fake_llm(prompt):
+            return "SUPERVISOR_CONTINUE"
+        def boom(decision):
+            raise RuntimeError("sink down")
+        hook = SupervisorHook(
+            task_title="t", acceptance_criteria=["x"], rules="",
+            llm_call=fake_llm, check_every=100,
+            budget_status=lambda: (3_600_000, 4_000_000),
+            on_decision=boom,
+        )
+        out = await hook.hook({"tool_name": "Read", "tool_input": {}}, None, None)
+        assert "BUDGET" in out["hookSpecificOutput"]["additionalContext"]
+        assert hook._budget_warned is True

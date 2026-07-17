@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..core.db import Store
+from ..core.events import EventPersister
 from ..core.orchestrator import Orchestrator
 from ..core.task import Task, TaskStatus
 from ..notify.slack import SlackNotifier
@@ -275,19 +276,32 @@ class NorthStarRunner:
 
         store = await Store(workdir / "bench.db").connect()
         try:
-            orch = Orchestrator(
-                store, self.config, self.backend_factory(spec),
-                SlackNotifier(None), reviewer=self.reviewer,
-                event_sink=self._event_sink,
-            )
+            # Persist the event stream into the sandbox's own bench.db.
+            # Supervisor/budget events only exist in this stream; dropping it
+            # left the v9 budget-class regression undrillable — whether the
+            # 85% wrap-up nudge fired or was ignored was unknowable post hoc.
             task = _bench_task(spec, work)
-            await store.create_task(task)
+            async with EventPersister(store, task.id) as persister:
+                forward = self._event_sink or (lambda e: None)
 
-            t0 = time.monotonic()
-            outcome = await orch.run_task(task)
-            elapsed = time.monotonic() - t0
+                def sink(event: dict) -> None:
+                    event.setdefault("ts", time.time())
+                    event.setdefault("task_id", task.id)
+                    persister.record(event)
+                    forward(event)
 
-            attempts = await store.list_attempts(task.id)
+                orch = Orchestrator(
+                    store, self.config, self.backend_factory(spec),
+                    SlackNotifier(None), reviewer=self.reviewer,
+                    event_sink=sink,
+                )
+                await store.create_task(task)
+
+                t0 = time.monotonic()
+                outcome = await orch.run_task(task)
+                elapsed = time.monotonic() - t0
+
+                attempts = await store.list_attempts(task.id)
         finally:
             await store.close()
 

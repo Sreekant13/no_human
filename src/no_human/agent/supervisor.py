@@ -442,20 +442,33 @@ class SupervisorHook:
                 spent, ceiling = status
                 if spent >= 0.85 * ceiling:
                     self._budget_warned = True
+                    message = (
+                        f"[SUPERVISOR] BUDGET: you have spent "
+                        f"{spent:,} of this attempt's {ceiling:,}-token "
+                        "budget; the attempt is force-stopped at 100%. "
+                        "STOP exploring NOW and produce your final "
+                        "deliverable immediately with the evidence you "
+                        "already have. Any criterion you cannot cite "
+                        "evidence for is NOT-MET — report it honestly. "
+                        "Do NOT fabricate results or edits to look "
+                        "finished."
+                    )
+                    # Observable firing: on_decision → supervisor_decision
+                    # event → task_events. Whether this nudge fired must be
+                    # drillable post hoc (the v9 budget-class blocker).
+                    # Guarded: a raising sink must never cost the coder the
+                    # wrap-up injection — the latch above already committed us.
+                    if self._on_decision:
+                        try:
+                            self._on_decision(SupervisorDecision(
+                                action="budget_nudge", message=message))
+                        except Exception:  # noqa: BLE001 — advisory, never break the hook
+                            log.warning("budget-nudge on_decision sink raised; "
+                                        "injection still delivered")
                     return {
                         "hookSpecificOutput": {
                             "hookEventName": "PostToolUse",
-                            "additionalContext": (
-                                f"[SUPERVISOR] BUDGET: you have spent "
-                                f"{spent:,} of this attempt's {ceiling:,}-token "
-                                "budget; the attempt is force-stopped at 100%. "
-                                "STOP exploring NOW and produce your final "
-                                "deliverable immediately with the evidence you "
-                                "already have. Any criterion you cannot cite "
-                                "evidence for is NOT-MET — report it honestly. "
-                                "Do NOT fabricate results or edits to look "
-                                "finished."
-                            ),
+                            "additionalContext": message,
                         }
                     }
 

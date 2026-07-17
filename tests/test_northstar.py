@@ -275,6 +275,46 @@ async def test_run_one_end_to_end_push_proof(tmp_path):
     assert _ref_signature(repo) == refs_before
 
 
+@pytest.mark.slow
+@pytest.mark.asyncio
+async def test_run_one_persists_events_to_bench_db(tmp_path):
+    """Bench sandboxes must keep the run's event stream: supervisor/budget
+    events flow through the orchestrator sink, and dropping them made the v9
+    budget-class regression undrillable post hoc (fired-vs-ignored nudges were
+    indistinguishable). run_one persists every event into the per-spec
+    bench.db task_events table — stamped with ts + task_id like the product's
+    _persisting path — while still forwarding to the caller's sink."""
+    import json as _json
+    import sqlite3
+
+    from no_human.config import load_config
+
+    repo = _src_repo(tmp_path)
+    spec = _spec(repo)
+    cfg = load_config(tmp_path / "config.yaml")
+    forwarded: list[dict] = []
+    runner = NorthStarRunner(cfg.data, backend_factory=lambda s: _FixBackend(),
+                             reviewer=_PassReviewer(),
+                             goal_judge=_StubGoalJudge(),
+                             event_sink=forwarded.append)
+
+    score = await runner.run_one(spec, workdir=tmp_path / "wd")
+
+    assert score.outcome_status == "awaiting_approval"
+    db = sqlite3.connect(tmp_path / "wd" / "bench.db")
+    rows = [_json.loads(r[0]) for r in
+            db.execute("SELECT data FROM task_events").fetchall()]
+    db.close()
+    assert rows, "no events persisted to bench.db task_events"
+    # Orchestrator lifecycle events made it in, stamped like the product path.
+    assert any(e.get("source") == "orchestrator" for e in rows)
+    assert all("ts" in e and "task_id" in e for e in rows)
+    # The caller's sink still saw the stream (persistence is additive) —
+    # every sink call both records and forwards, so the counts are EQUAL.
+    assert forwarded, "caller event_sink no longer receives events"
+    assert len(rows) == len(forwarded)
+
+
 # ------------------------------ GoalJudge ---------------------------------- #
 
 def test_goal_judge_parse_fails_closed():
