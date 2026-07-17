@@ -266,7 +266,9 @@ export async function fetchRepos() {
   try {
     const r = await fetch(`${BASE}/api/repos`);
     if (!r.ok) return [];
-    return r.json();
+    // await so a malformed body rejects INSIDE this try (the fetchMetrics
+    // fix, PR #111; its review found these two siblings).
+    return await r.json();
   } catch {
     return [];
   }
@@ -278,7 +280,9 @@ export async function fetchRepoUnderstanding(path) {
   try {
     const r = await fetch(`${BASE}/api/repo?path=${encodeURIComponent(path)}`);
     if (!r.ok) return null;
-    return r.json();
+    // await so a malformed body rejects INSIDE this try (the fetchMetrics
+    // fix, PR #111; its review found these two siblings).
+    return await r.json();
   } catch {
     return null;
   }
