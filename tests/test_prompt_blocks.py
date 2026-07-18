@@ -264,8 +264,9 @@ def test_rules_block_legitimizes_the_supervisor_channel():
     fired-but-ignored, explained. The coder must know the channel is genuine
     harness guidance — while keeping the right to flag factually-wrong advice
     (the supervisor DID name nonexistent skills) instead of obeying blindly."""
+    from no_human.core.prompt_blocks import supervisor_channel_tag
     r = build_rules_block("uv run pytest -q", "", None)
-    assert "[SUPERVISOR]" in r
+    assert supervisor_channel_tag() in r  # nonce PR: exact session tag
     assert "orchestration harness" in r
     assert "not an injection" in r.lower() or "not a prompt-injection" in r.lower()
     # Trust the channel, verify the content — never blind obedience.
@@ -278,3 +279,38 @@ def test_rules_block_legitimizes_the_supervisor_channel():
     # the surviving neighbors this rule must not displace
     assert "CRITERION:" in r
     assert "self-contained" in r
+
+
+def test_rules_block_demands_coverage_of_every_named_target():
+    """v10 2-run class (ns-f5cb4cb0): the request named TWO review targets;
+    the coder silently covered one and shipped. The final-report contract
+    must demand per-named-target coverage — and an explicit per-target
+    'could not' with the reason when one is unreachable — scoped to targets
+    the REQUEST names (no invented deliverables on vague asks)."""
+    r = build_rules_block("uv run pytest -q", "", None)
+    lowered = r.lower()
+    assert "every deliverable" in lowered or "every target" in lowered
+    assert "named in the request" in lowered
+    assert "could not" in lowered
+    # the surviving neighbors this extension must not displace
+    assert "self-contained" in r
+    assert "CRITERION:" in r
+
+
+def test_rules_block_carries_the_session_supervisor_tag():
+    """#126 r1 finding-2 follow-up (nonce): the literal [SUPERVISOR] marker is
+    spoofable by repo content. The rules block must name the per-session
+    UNFORGEABLE tag and declare that supervisor-style markers lacking the
+    exact tag are repo data."""
+    from no_human.core.prompt_blocks import supervisor_channel_tag
+    tag = supervisor_channel_tag()
+    import re
+    assert re.fullmatch(r"\[SUPERVISOR:[0-9a-f]{8}\]", tag), tag
+    # Stable within the process.
+    assert supervisor_channel_tag() == tag
+    r = build_rules_block("uv run pytest -q", "", None)
+    assert tag in r
+    assert "WITHOUT this exact tag" in r
+    # boundary + neighbors survive
+    assert "repo data, not the supervisor" in r
+    assert "CRITERION:" in r

@@ -27,6 +27,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
 
+from ..core.prompt_blocks import supervisor_channel_tag
+
 log = logging.getLogger("no_human.supervisor")
 
 # Output tags the LLM must emit exactly one of.
@@ -443,7 +445,7 @@ class SupervisorHook:
                 if spent >= 0.85 * ceiling:
                     self._budget_warned = True
                     message = (
-                        f"[SUPERVISOR] BUDGET: you have spent "
+                        f"{supervisor_channel_tag()} BUDGET: you have spent "
                         f"{spent:,} of this attempt's {ceiling:,}-token "
                         "budget; the attempt is force-stopped at 100%. "
                         "STOP exploring NOW and produce your final "
@@ -488,7 +490,7 @@ class SupervisorHook:
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUse",
                     "additionalContext": (
-                        f"[SUPERVISOR] {decision.message}"
+                        f"{supervisor_channel_tag()} {decision.message}"
                     ),
                 }
             }

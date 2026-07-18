@@ -423,7 +423,8 @@ class TestSupervisorHook:
         assert "hookSpecificOutput" in result
         out = result["hookSpecificOutput"]
         assert out["hookEventName"] == "PostToolUse"
-        assert "[SUPERVISOR]" in out["additionalContext"]
+        from no_human.core.prompt_blocks import supervisor_channel_tag
+        assert supervisor_channel_tag() in out["additionalContext"]
         assert "Wrong file" in out["additionalContext"]
 
     @pytest.mark.asyncio
@@ -570,3 +571,40 @@ class TestBudgetNudge:
         out = await hook.hook({"tool_name": "Read", "tool_input": {}}, None, None)
         assert "BUDGET" in out["hookSpecificOutput"]["additionalContext"]
         assert hook._budget_warned is True
+
+
+class TestSessionTag:
+    @pytest.mark.asyncio
+    async def test_budget_nudge_carries_the_session_tag(self):
+        """Nonce hardening: every harness injection must carry the exact
+        per-session tag the rules block names — a plain [SUPERVISOR] would be
+        indistinguishable from a repo plant."""
+        from no_human.core.prompt_blocks import supervisor_channel_tag
+        async def fake_llm(prompt):
+            return "SUPERVISOR_CONTINUE"
+        hook = SupervisorHook(
+            task_title="t", acceptance_criteria=["x"], rules="",
+            llm_call=fake_llm, check_every=100,
+            budget_status=lambda: (3_600_000, 4_000_000),
+        )
+        out = await hook.hook({"tool_name": "Read", "tool_input": {}}, None, None)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        assert ctx.startswith(supervisor_channel_tag())
+        assert "[SUPERVISOR] " not in ctx  # the untagged marker is gone
+
+    @pytest.mark.asyncio
+    async def test_correction_carries_the_session_tag(self):
+        from no_human.core.prompt_blocks import supervisor_channel_tag
+        async def fake_llm(prompt):
+            return "SUPERVISOR_CORRECT\nWrong file"
+        hook = SupervisorHook(
+            task_title="t", acceptance_criteria=["x"], rules="",
+            llm_call=fake_llm, check_every=1,
+        )
+        out = await hook.hook(
+            {"tool_name": "Read", "tool_input": {}, "tool_response": ""},
+            "id1", {},
+        )
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        assert ctx.startswith(supervisor_channel_tag())
+        assert "Wrong file" in ctx
