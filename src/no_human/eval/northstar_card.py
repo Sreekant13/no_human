@@ -155,6 +155,7 @@ class NorthStarCard:
             subset=s.get("subset", "full"),
             project=s.get("project", ""),
             notes=s.get("notes", ""),
+            events=s.get("events") or [],
         ) for s in data.get("scores", [])]
         return NorthStarCard(scores=scores,
                              created_at=data.get("created_at", ""),

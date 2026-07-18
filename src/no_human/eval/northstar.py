@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import time
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -44,6 +45,22 @@ _HONEST_STOPS = {TaskStatus.ESCALATED, TaskStatus.AWAITING_INPUT,
                  TaskStatus.BLOCKED}
 
 
+_DIGEST_MAX_EVENTS = 300
+_DIGEST_MAX_TEXT = 200
+
+
+def _digest_events(rows: list[dict]) -> list[dict]:
+    """Compact the persisted event stream for the score record: kind + text
+    (truncated) + ts. Keeps the LAST _DIGEST_MAX_EVENTS — terminal behavior
+    (budget nudges, escalations, wrap-ups) clusters at the end."""
+    out = []
+    for e in rows[-_DIGEST_MAX_EVENTS:]:
+        text = str(e.get("text") or e.get("message") or "")[:_DIGEST_MAX_TEXT]
+        out.append({"kind": str(e.get("kind") or e.get("source") or ""),
+                    "text": text, "ts": e.get("ts")})
+    return out
+
+
 @dataclass
 class BenchScore:
     task_id: str
@@ -66,6 +83,11 @@ class BenchScore:
     subset: str = "full"                # "core" = hand-curated, PR-reviewed
     project: str = ""                   # repo basename — per-project payoff view
     notes: str = ""
+    # Capped digest of the run's event stream. bench.db dies with the
+    # sandbox cleanup; the digest rides the score into progress.json /
+    # latest.json so completed specs stay drillable post hoc (v11 live:
+    # early escalations whose reasons were already deleted).
+    events: list[dict[str, Any]] = dataclasses.field(default_factory=list)
 
     @property
     def token_ratio(self) -> float | None:
@@ -121,6 +143,7 @@ class BenchScore:
             "cost_ratio": (round(self.cost_ratio, 3)
                            if self.cost_ratio is not None else None),
             "notes": self.notes,
+            "events": self.events,
         }
 
 
@@ -302,6 +325,17 @@ class NorthStarRunner:
                 elapsed = time.monotonic() - t0
 
                 attempts = await store.list_attempts(task.id)
+            # OUTSIDE the persister context: its __aexit__ drains the buffer,
+            # so only here is the stream fully flushed to bench.db. The digest
+            # is telemetry, never a verdict — a harvest failure must not
+            # downgrade a completed spec to "crashed" (r1 F2).
+            try:
+                event_digest = _digest_events(
+                    await store.list_events(task.id))
+            except Exception:  # noqa: BLE001 — telemetry only
+                logging.getLogger(__name__).warning(
+                    "event digest harvest failed for %s", spec.id)
+                event_digest = []
         finally:
             await store.close()
 
@@ -311,7 +345,8 @@ class NorthStarRunner:
                 "push-proofing failed; halt the bench")
 
         return await self._score(spec, outcome, work, base_sha,
-                                 attempts, elapsed)
+                                 attempts, elapsed,
+                                 events=event_digest)
 
     def _skipped(self, spec: BenchTask) -> BenchScore:
         orig = spec.original or {}
@@ -335,7 +370,8 @@ class NorthStarRunner:
 
     async def _score(self, spec: BenchTask, outcome, work: Path,
                      base_sha: str, attempts: list[dict],
-                     elapsed: float) -> BenchScore:
+                     elapsed: float,
+                     events: list[dict] | None = None) -> BenchScore:
         status = outcome.status
         # Coder + reviewer buckets (angle-4 finding: coder-only summation
         # rigged the north-star ratio; planner/supervisor columns pending B2).
@@ -359,6 +395,7 @@ class NorthStarRunner:
         toks = orig.get("tokens", {}) or {}
 
         score = BenchScore(
+            events=list(events or []),
             task_id=spec.id, title=spec.title, outcome_status=status.value,
             goal_satisfied=None,
             escalated_honestly=status in _HONEST_STOPS,

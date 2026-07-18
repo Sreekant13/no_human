@@ -315,6 +315,58 @@ async def test_run_one_persists_events_to_bench_db(tmp_path):
     assert len(rows) == len(forwarded)
 
 
+async def test_run_one_carries_an_event_digest_on_the_score(tmp_path):
+    """bench.db dies with the sandbox cleanup, so completed specs were
+    undrillable post hoc (v11 live: three 0/3-SAT early scores whose
+    escalation REASONS were already deleted). The score itself must carry a
+    capped digest of the event stream — it rides progress.json/latest.json
+    and survives forever."""
+    from no_human.config import load_config
+
+    repo = _src_repo(tmp_path)
+    spec = _spec(repo)
+    cfg = load_config(tmp_path / "config.yaml")
+    runner = NorthStarRunner(cfg.data, backend_factory=lambda s: _FixBackend(),
+                             reviewer=_PassReviewer(),
+                             goal_judge=_StubGoalJudge(),
+                             event_sink=None)
+
+    score = await runner.run_one(spec, workdir=tmp_path / "wd")
+
+    assert score.events, "score carries no event digest"
+    # Digest rows are compact: kind + truncated text, nothing unbounded.
+    for e in score.events:
+        assert set(e) <= {"kind", "text", "ts"}
+        assert len(e.get("text") or "") <= 200
+    assert any(e.get("kind") for e in score.events)
+    # And it serializes — the freeze artifact is json.
+    assert "events" in score.as_dict()
+
+
+def test_event_digest_survives_the_card_round_trip(tmp_path):
+    """r1 F1: --resume reloads progress.json via NorthStarCard.load, which
+    rebuilt scores from an explicit keyword list and silently dropped the
+    digest — every already-completed spec's events became [] in the final
+    artifact, on exactly the crash-recovery path the digest exists for."""
+    from no_human.eval.northstar import BenchScore
+    from no_human.eval.northstar_card import NorthStarCard
+
+    score = BenchScore(
+        task_id="t1", title="x", outcome_status="escalated",
+        goal_satisfied=False, escalated_honestly=True, mergeable=None,
+        nh_tokens=1, nh_cache_tokens=0, nh_cache_creation_tokens=0,
+        nh_turns=1, nh_wall_clock_s=1.0,
+        orig_tokens=2, orig_cache_tokens=0, orig_cache_creation_tokens=0,
+        orig_wall_clock_s=2.0, orig_corrections=0,
+        events=[{"kind": "advisory", "text": "answering pass failed",
+                 "ts": 1.0}])
+    card = NorthStarCard(label="t", scores=[score])
+    path = tmp_path / "progress.json"
+    card.save(path)
+    loaded = NorthStarCard.load(path)
+    assert loaded.scores[0].events == score.events
+
+
 # ------------------------------ GoalJudge ---------------------------------- #
 
 def test_goal_judge_parse_fails_closed():
