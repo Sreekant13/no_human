@@ -1,3 +1,5 @@
+import { makeEndpointGate } from "./queueHealthGate.js";
+
 const BASE = import.meta.env.DEV ? "" : "";
 
 /** Guard against the SPA catch-all returning index.html instead of JSON. */
@@ -374,11 +376,8 @@ export async function postReviewComments(taskId, items = null) {
   return r.json();
 }
 
-export async function fetchQueueHealth() {
-  const r = await fetch(`${BASE}/api/queue/health`);
-  if (!r.ok) throw new Error("queue health failed");
-  return r.json();
-}
+export const fetchQueueHealth = makeEndpointGate(
+  () => fetch(`${BASE}/api/queue/health`));
 
 export async function fetchWorkerStatus() {
   const r = await fetch(`${BASE}/api/worker/status`);
