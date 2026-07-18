@@ -519,6 +519,17 @@ export default function App() {
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [showNewTask]);
 
+  // Desktop application menu → the board's own navigation. The Electron shell
+  // (main process) posts "nh:menu"; drive the SAME page state the tab bar does,
+  // so File ▸ New Task and View ▸ Board/Stats/Settings need no parallel UI.
+  useEffect(() => {
+    const off = window.nhDesktop?.onMenu?.((action) => {
+      if (action === "new-task") setShowNewTask(true);
+      else if (action === "board" || action === "stats" || action === "settings") setPage(action);
+    });
+    return off;
+  }, []);
+
   // WebSocket
   useEffect(() => {
     let disposed = false;

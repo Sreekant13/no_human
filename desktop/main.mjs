@@ -8,6 +8,7 @@
 
 import { app, BrowserWindow, Menu, nativeImage, nativeTheme, shell, Tray } from "electron";
 import { parseBadgeCount } from "./badge.mjs";
+import { buildMenuTemplate } from "./menu.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -76,6 +77,25 @@ function showWindow() {
   }
 }
 
+// A native application menu — the operator-facing keyboard surface (view
+// navigation + New Task + reload/zoom + dev-only devtools). Nav items post to
+// the renderer over IPC ("nh:menu"); the preload forwards them to the board's
+// own page state (App.jsx), so the menu drives the SAME UI, not a second one.
+function sendToRenderer(action) {
+  showWindow(); // a menu action on a tray-hidden window should surface it first
+  if (win && !win.isDestroyed()) win.webContents.send("nh:menu", action);
+}
+
+function buildAppMenu() {
+  const template = buildMenuTemplate({
+    isMac: process.platform === "darwin",
+    isDev: !app.isPackaged,
+    onNavigate: (page) => sendToRenderer(page),
+    onNewTask: () => sendToRenderer("new-task"),
+  });
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
 // Defense-in-depth (review finding): only ever hand web schemes to the OS —
 // the board sanitizes its links today, but the shell must not TRUST that.
 function openExternallyIfWeb(url) {
@@ -128,21 +148,33 @@ async function loadBoardOrError(w) {
 }
 
 async function createWindow() {
+  const dark = nativeTheme.shouldUseDarkColors;
+  // Pre-paint color follows the OS theme — a light-mode launch used to flash
+  // dark before first paint (shell audit, 2026-07-17).
+  const bg = dark ? "#0F1117" : "#F4F5F7";
   win = new BrowserWindow({
     width: 1440,
     height: 920,
     minWidth: 720,
     minHeight: 480,
     title: "no_human",
+    // Present only once the first frame is ready (below) — a window shown
+    // eagerly paints a bg-colored rectangle before content, the classic flash.
+    show: false,
+    backgroundColor: bg,
     // Native-Mac chrome (operator: "Claude-desktop-grade look"): content
     // extends under a hidden-inset title bar; traffic lights float over the
-    // sidebar's brand zone, which the web app makes draggable when it
-    // detects the shell. Base color = the board's real --bg token.
-    titleBarStyle: "hiddenInset",
-    trafficLightPosition: { x: 18, y: 18 },
-    // Pre-paint color follows the OS theme — a light-mode launch used to
-    // flash dark before first paint (shell audit, 2026-07-17).
-    backgroundColor: nativeTheme.shouldUseDarkColors ? "#0F1117" : "#F4F5F7",
+    // sidebar's brand zone, which the web app makes draggable when it detects
+    // the shell. On Windows, `hiddenInset` degrades to a frameless window with
+    // NO controls — use `hidden` + a themed titleBarOverlay so the min/max/
+    // close buttons come back (untestable on this Mac; guarded by platform).
+    ...(process.platform === "darwin"
+      ? { titleBarStyle: "hiddenInset", trafficLightPosition: { x: 18, y: 18 } }
+      : {}),
+    ...(process.platform === "win32"
+      ? { titleBarStyle: "hidden",
+          titleBarOverlay: { color: bg, symbolColor: dark ? "#E6E8EC" : "#1A1D23", height: 40 } }
+      : {}),
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -151,6 +183,10 @@ async function createWindow() {
       backgroundThrottling: false,
     },
   });
+  // Reveal on the first paint — with show:false above this kills the flash and
+  // never leaves the window hidden: ready-to-show fires for the board AND for
+  // error.html (loadBoardOrError always loads one of them).
+  win.once("ready-to-show", () => { if (win && !win.isDestroyed()) win.show(); });
   win.on("closed", () => { win = null; });
   // E3 (darwin): closing HIDES to the tray — the board keeps polling and
   // notifications keep coming. Quit is explicit: tray menu or Cmd-Q.
@@ -187,6 +223,7 @@ if (!gotLock) {
     // Tray failure must never abort startup (review: a bad image on some
     // platforms throws here, and this runs BEFORE the window exists).
     try { buildTray(); } catch (err) { console.error("tray failed:", err); }
+    buildAppMenu();
     await createWindow();
   });
   app.on("activate", () => showWindow());

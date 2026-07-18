@@ -32,6 +32,22 @@ try {
   if (!/^http:\/\/127\.0\.0\.1:\d+\/?$/.test(url)) {
     throw new Error(`board did not attach; window url: ${url}`);
   }
+  // A native application menu must be set (a custom menu REPLACES the default,
+  // so this proves setApplicationMenu ran and includes the View navigation).
+  const menu = await app.evaluate(({ Menu }) => {
+    const m = Menu.getApplicationMenu();
+    return m ? m.items.map((i) => i.label || i.role) : null;
+  });
+  console.log(`app menu: ${JSON.stringify(menu)}`);
+  if (!menu) throw new Error("no application menu was set");
+  if (!menu.some((l) => /view/i.test(l))) throw new Error("app menu missing View");
+  // show:false + ready-to-show must reveal the window, never strand it hidden.
+  const visible = await app.evaluate(({ BrowserWindow }) => {
+    const w = BrowserWindow.getAllWindows()[0];
+    return Boolean(w && w.isVisible());
+  });
+  console.log(`window visible=${visible}`);
+  if (!visible) throw new Error("window never became visible after ready-to-show");
   // External link must NOT create a second window.
   const before = app.windows().length;
   await win.evaluate(() => window.open("https://example.com/external"));
