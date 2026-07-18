@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from .base import CIBackend, CIResult, HumanGatedCI, JobResult, PipelineStatus
+from .circleci import CircleCICI
 from .ghe_checkruns import GHECheckRunsCI
 from .github_actions import GitHubActionsCI
 from .gitlab import GitLabCI
@@ -99,12 +100,27 @@ def ci_from_config(config: dict[str, Any]) -> CIBackend | None:
             poll_interval=int(ci_conf.get("poll_interval", 30)),
         )
 
+    if backend == "circleci":
+        # Project-slug "<vcs>/<org>/<repo>" (e.g. "gh/acme/svc"). Watch-first;
+        # trigger mode is opt-in via ci.mode. Token: CIRCLECI_TOKEN in .env.
+        slug = ci_conf.get("project", "")
+        if not slug:
+            return None
+        return CircleCICI(
+            project_slug=slug,
+            mode=ci_conf.get("mode", "watch"),
+            timeout_minutes=int(ci_conf.get("timeout_minutes", 60)),
+            max_infra_retries=int(ci_conf.get("max_infra_retries", 2)),
+            poll_interval=int(ci_conf.get("poll_interval", 30)),
+            result_parser=ci_conf.get("result_parser", "pytest"),
+        )
+
     raise ValueError(f"unknown ci.backend: {backend!r}")
 
 
 __all__ = [
     "CIBackend", "CIResult", "HumanGatedCI", "JobResult", "PipelineStatus",
-    "GitLabCI", "GitHubActionsCI", "JenkinsCI", "GHECheckRunsCI",
+    "GitLabCI", "GitHubActionsCI", "JenkinsCI", "GHECheckRunsCI", "CircleCICI",
     "ci_from_config", "ci_from_layer",
     "parse_results",
 ]
