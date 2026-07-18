@@ -1021,3 +1021,44 @@ async def test_board_websocket_pushes_a_sync_frame_on_change(store, monkeypatch)
     syncs = [m for m in sent if m["type"] == "sync"]
     assert syncs, f"no sync frame pushed; frames: {[m['type'] for m in sent]}"
     assert any(t["title"] == "sync me" for t in syncs[-1]["tasks"])
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/integrations · POST /api/integrations/{name}/test                   #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_integrations_list_endpoint(client):
+    r = await client.get("/api/integrations")
+    assert r.status_code == 200
+    items = r.json()["integrations"]
+    assert [i["name"] for i in items] == ["jira", "github", "gitlab", "jenkins", "circleci", "slack"]
+    assert all(i["configured"] is False for i in items)   # default config
+    assert all(i["healthy"] is None for i in items)       # not tested yet
+
+
+@pytest.mark.asyncio
+async def test_integrations_list_never_leaks_the_slack_webhook(client):
+    from no_human.api.app import app
+    app.state.config.data["notifications"]["slack_webhook_url"] = "https://hooks.slack.com/T/SECRETPART"
+    r = await client.get("/api/integrations")
+    assert "SECRETPART" not in r.text
+    slack = next(i for i in r.json()["integrations"] if i["name"] == "slack")
+    assert slack["configured"] is True
+    assert "SECRETPART" not in slack["detail"]
+
+
+@pytest.mark.asyncio
+async def test_integration_test_endpoint_unconfigured_jira(client):
+    r = await client.post("/api/integrations/jira/test")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["name"] == "jira"
+    assert body["healthy"] is False
+    assert "not configured" in body["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_integration_test_endpoint_unknown_name_404(client):
+    r = await client.post("/api/integrations/mystery/test")
+    assert r.status_code == 404
