@@ -209,11 +209,11 @@ def test_set_auth_profile_edits_only_the_llm_block(tmp_path):
     """A key named auth_profile under another section must not be hijacked."""
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(
-        "tracker:\n  auth_profile: untouched\nllm:\n  auth_mode: subscription\n"
+        "ci_gate:\n  auth_profile: untouched\nllm:\n  auth_mode: subscription\n"
     )
     set_auth_profile("personal", cfg_path)
     data = load_config(cfg_path).data
-    assert data["tracker"]["auth_profile"] == "untouched"
+    assert data["ci_gate"]["auth_profile"] == "untouched"
     assert data["llm"]["auth_profile"] == "personal"
 
 

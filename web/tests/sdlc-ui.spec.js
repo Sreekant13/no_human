@@ -132,9 +132,6 @@ async function mockAPI(page) {
   await page.route("**/api/worker/status", (route) => {
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ running: false, inflight: 0, max_workers: 4 }) });
   });
-  await page.route("**/api/settings/tracker", (route) => {
-    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({}) });
-  });
   await page.route("**/ws", (route) => {
     route.abort();
   });

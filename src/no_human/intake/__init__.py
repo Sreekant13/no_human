@@ -6,7 +6,6 @@ from typing import Any
 
 from ..core.task import Task
 from .base import SourceRef, parse_source
-from .tracker import TrackerAdapter
 from .classify import KindVerdict, TaskKind, classify, classify_kind
 from .grill import GrillQuestion, GrillResult, grill_step
 from .github_issues import GitHubAdapter
@@ -20,8 +19,6 @@ __all__ = [
 
 
 def get_adapter(kind: str, config: dict[str, Any] | None = None):
-    if kind == "tracker":
-        return TrackerAdapter(config)
     if kind == "github":
         return GitHubAdapter()
     if kind == "gitlab":

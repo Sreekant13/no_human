@@ -3,7 +3,7 @@
  *
  * This mirrors the kind `<select>` the modal shipped with. The authoritative enum
  * (`src/no_human/intake/classify.py` TaskKind) also carries `traceability`, a
- * specialised TRACKER/TNTC flow the UI has never offered — it is deliberately absent
+ * specialised TNTC flow the UI has never offered — it is deliberately absent
  * here rather than silently introduced.
  */
 

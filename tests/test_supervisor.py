@@ -29,11 +29,11 @@ class TestDetectInability:
     def test_cant_access_with_skills_corrects_and_names_skill(self):
         d = detect_inability(
             "I can't access the PR link, there's no way for me to view it.",
-            ["tracker-test-cases", "analytics-export-orient"],
+            ["test-linking", "analytics-export-orient"],
         )
         assert d is not None
         assert d.action == "correct"
-        assert "tracker-test-cases" in d.message
+        assert "test-linking" in d.message
         assert "verify" in d.message.lower() or "verifying" in d.message.lower()
 
     def test_inability_without_skills_still_demands_verification(self):
@@ -189,9 +189,9 @@ class TestBuildPrompt:
         prompt = build_evaluation_prompt(
             task_title="t", acceptance_criteria=["x"], rules="r",
             profile_context="", window=[], total_calls=0,
-            skills="  - tracker-test-cases", recent_text="I can't do this",
+            skills="  - test-linking", recent_text="I can't do this",
         )
-        assert "tracker-test-cases" in prompt
+        assert "test-linking" in prompt
         assert "SKILL-EXISTS" in prompt
         assert "UNVERIFIED ASSUMPTION" in prompt
         assert "I can't do this" in prompt
@@ -299,13 +299,13 @@ class TestNoteTextSkillExists:
             return "SUPERVISOR_CONTINUE"
         hook = SupervisorHook(
             task_title="t", acceptance_criteria=["x"], rules="",
-            skills=["tracker-test-cases"], llm_call=fake_llm,
+            skills=["test-linking"], llm_call=fake_llm,
         )
         hook.record("Bash", {"command": "curl ..."}, "403")
         hook.note_text("I can't access the PR, there's no way to see it.")
         d = await hook.evaluate()
         assert d.action == "correct"
-        assert "tracker-test-cases" in d.message
+        assert "test-linking" in d.message
         assert llm_called is False  # deterministic check ran, no LLM spent
 
     @pytest.mark.asyncio

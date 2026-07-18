@@ -420,19 +420,6 @@ export const confirmRules      = (ids)     => _post("/api/onboarding/rules/confi
 export const completeOnboarding = (payload) => _post("/api/onboarding/complete", payload);
 export const generateDocs      = (repo_path) => _post("/api/onboarding/docs/generate", { repo_path });
 
-// ── TRACKER settings (used by Settings page; board import removed) ──────────────
-export async function fetchTrackerSettings() {
-  const r = await fetch(`${BASE}/api/settings/tracker/boards`);
-  if (!r.ok) return { boards: [] };
-  return _jsonSafe(r, { boards: [] });
-}
-export async function fetchTrackerTransport() {
-  const r = await fetch(`${BASE}/api/settings/tracker/transport`);
-  if (!r.ok) return { transport: "unconfigured" };
-  return _jsonSafe(r, { transport: "unconfigured" });
-}
-export const updateTrackerBoards = (boards) => _put("/api/settings/tracker/boards", { boards });
-
 export async function suggestPaths(path) {
   const r = await fetch(`${BASE}/api/fs/suggest?path=${encodeURIComponent(path || "")}`);
   if (!r.ok) return { suggestions: [] };

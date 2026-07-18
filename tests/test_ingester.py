@@ -221,7 +221,7 @@ async def test_ingest_transcripts_with_llm_pass(store):
     async def fake_llm(prompt):
         return (
             'FINDINGS_JSON_START\n{"findings": [{"category": "skill", "rule": '
-            '"use the tracker-test-cases skill for test linking", "importance": '
+            '"use the test-linking skill for test linking", "importance": '
             '"med", "source_message": 1}]}\nFINDINGS_JSON_END'
         )
 
@@ -230,5 +230,5 @@ async def test_ingest_transcripts_with_llm_pass(store):
     # heuristic findings + the one LLM finding
     pending = await LearningQueue(store).pending()
     titles = [p["title"] for p in pending]
-    assert any("tracker-test-cases" in t for t in titles)
+    assert any("test-linking" in t for t in titles)
     assert res.proposed >= 2
