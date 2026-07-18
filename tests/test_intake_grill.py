@@ -72,6 +72,10 @@ async def test_generate_parses_questions_with_carve_outs():
 async def test_generate_unparseable_returns_none_and_never_raises():
     from no_human.intake.evaluator import generate_grill_questions
 
+    # One-element script: the retry pops an exhausted list (IndexError),
+    # exercising the retry-call-raises → None path — the production
+    # backend-error-on-retry case. Both-replies-blockless lives in
+    # test_generate_gives_up_after_one_retry.
     assert await generate_grill_questions(
         "t", "d", [], backend=_ScriptedBackend(["no block here"])) is None
 
@@ -203,3 +207,29 @@ async def test_grill_spec_gives_up_after_one_retry(tmp_path):
                           backend=be, questions=_questions())
     assert len(be.prompts) == 2
     assert qa is not None and qa[0].answer == ""
+
+
+# ------------------ question-gen robustness (v11 live signal) --------------- #
+
+@pytest.mark.asyncio
+async def test_generate_retries_blockless_reply_once():
+    """v11 live occurrence: the 1-shot question-gen pass ended without a
+    GRILL_JSON block (same silent single-emit failure class #125 fixed for
+    the ANSWERS pass — v10 proved that class 6/6 lethal). One retry, same
+    prompt/backend."""
+    from no_human.intake.evaluator import generate_grill_questions
+
+    be = _ScriptedBackend(["rambling, no block", _QUESTIONS_BLOCK])
+    qa = await generate_grill_questions("t", "d", [], backend=be)
+    assert len(be.prompts) == 2
+    assert qa is not None and len(qa) == 2
+
+
+@pytest.mark.asyncio
+async def test_generate_gives_up_after_one_retry():
+    from no_human.intake.evaluator import generate_grill_questions
+
+    be = _ScriptedBackend(["no block", "still no block"])
+    qa = await generate_grill_questions("t", "d", [], backend=be)
+    assert len(be.prompts) == 2
+    assert qa is None

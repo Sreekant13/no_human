@@ -293,6 +293,14 @@ async def generate_grill_questions(
                               cwd=Path(tempfile.gettempdir()))
         m = _GRILL_JSON.search(result.final_text or "")
         if not m:
+            # Same silent single-emit failure class #125 fixed for the
+            # ANSWERS pass (v10: 6/6 lethal there) — retry ONCE.
+            log.warning("grill produced no parseable GRILL_JSON block; "
+                        "retrying once")
+            result = await be.run(prompt, max_turns=1, effort="low",
+                                  cwd=Path(tempfile.gettempdir()))
+            m = _GRILL_JSON.search(result.final_text or "")
+        if not m:
             log.warning("grill produced no parseable GRILL_JSON block")
             return None
         data = loads_lenient(m.group(1))
