@@ -446,3 +446,52 @@ def test_supervisor_budget_status_reads_the_armed_accounting(store, tmp_path):
     # Armed for a DIFFERENT task → None.
     orch._begin_attempt_accounting("other-task", remaining_tokens=1_000)
     assert hook.budget_status() is None
+
+
+def test_supervisor_only_names_skills_the_coder_actually_has(store, tmp_path):
+    """v10 drill (ns-7ef821b2): the supervisor told the coder to use skills
+    that DON'T exist — skill-type memory TITLES leaked into its 'available
+    skills' list while the coder's manifest carries only discovered on-disk
+    skills. A falsifiable recommendation earned the coder's distrust of the
+    whole [SUPERVISOR] channel. The supervisor's list must be exactly the
+    delivered manifest names."""
+    from types import SimpleNamespace
+
+    orch = _orch(store, tmp_path)
+    t = Task.new("investigate", repo_path=str(tmp_path))
+    # Coder manifest: one real on-disk skill.
+    orch._discovered_skills = ["real-deploy-skill"]
+    orch._discovered_skills_info = [
+        SimpleNamespace(name="real-deploy-skill", description="d")]
+    # Skill-type memory: a title that is NOT an invocable skill.
+    orch._active_memories = [
+        {"type": "skill", "title": "how we once fixed the kafka retry"}]
+    hook = orch._build_supervisor(t, str(tmp_path))
+    assert hook is not None
+    assert "real-deploy-skill" in hook.skills
+    assert "how we once fixed the kafka retry" not in hook.skills
+
+
+def test_supervisor_keeps_db_matched_on_disk_skills(store, tmp_path):
+    """r1 finding: the delivered manifest is _discovered_skills_info, which
+    deliberately RESURRECTS on-disk skills whose names match DB skill titles
+    (the _kept union) — relevant_skill_names skips those from
+    _discovered_skills. The supervisor's list must follow the manifest, so a
+    db-matched on-disk skill (invocable under its sanitized on-disk name)
+    stays recommendable when the two sets diverge."""
+    from types import SimpleNamespace
+
+    orch = _orch(store, tmp_path)
+    t = Task.new("investigate", repo_path=str(tmp_path))
+    # Diverge the sets: the db-matched skill is in the manifest info but NOT
+    # in _discovered_skills (exactly what relevant_skill_names produces).
+    orch._discovered_skills = ["plain-skill"]
+    orch._discovered_skills_info = [
+        SimpleNamespace(name="plain-skill", description="d"),
+        SimpleNamespace(name="kafka-retry-helper", description="db-matched")]
+    orch._active_memories = [
+        {"type": "skill", "title": "kafka-retry-helper"}]
+    hook = orch._build_supervisor(t, str(tmp_path))
+    assert hook is not None
+    assert "kafka-retry-helper" in hook.skills
+    assert "plain-skill" in hook.skills
