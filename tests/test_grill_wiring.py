@@ -153,3 +153,24 @@ async def test_malformed_none_intake_section_degrades_advisory(
     await orch._run_intake_grill(t)  # must not raise
     # None-section means "no override" → grill stays on (default True).
     assert called == [1]
+
+
+async def test_all_empty_answers_emit_an_advisory(store, tmp_path, monkeypatch):
+    """v10 drill: the answering failure was silent (log-only) — it must be an
+    advisory event so doctor/task_events see it (the anti-silent-death rule)."""
+    from no_human.intake.evaluator import GrillQA
+
+    async def _fake_grill(*a, **k):
+        return [GrillQA(question="q?", decision_it_changes="d")]  # unanswered
+    monkeypatch.setattr(ev, "grill_spec", _fake_grill)
+
+    t = Task.new("t", repo_path="/r")
+    await store.create_task(t)
+    events = []
+    orch = _orch(store, tmp_path, events)
+    await orch._run_intake_grill(t)
+    adv = [e for e in events if e.get("kind") == "advisory"]
+    assert any("unanswered" in e.get("text", "") for e in adv)
+    # The QA is still persisted (unanswered beats absent).
+    got = await store.get_task(t.id)
+    assert got.context["intake_qa"][0]["question"] == "q?"

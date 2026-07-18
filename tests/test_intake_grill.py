@@ -166,3 +166,40 @@ async def test_grill_spec_generates_when_not_injected(tmp_path):
     qa = await grill_spec("t", "d", [], tmp_path, backend=be)
     assert qa is not None and len(qa) == 2
     assert qa[0].answer.startswith("src/app.py:42")
+
+
+# ---------------------- answering robustness (v10 drill) ------------------- #
+
+@pytest.mark.asyncio
+async def test_answers_prompt_demands_the_block_and_reserves_a_turn():
+    """v10 drill: 2/2 budget burns had EMPTY answers — the 8-turn session
+    spent itself exploring and never emitted GRILL_ANSWERS. The prompt must
+    make the block non-negotiable and reserve the final turn for it."""
+    from no_human.intake.evaluator import _GRILL_ANSWERS_PROMPT
+    p = _GRILL_ANSWERS_PROMPT.lower()
+    assert "final turn" in p
+    assert "required" in p
+    assert "never end" in p
+
+
+@pytest.mark.asyncio
+async def test_grill_spec_retries_empty_answering_once(tmp_path):
+    """One retry on a blockless answering reply — the v10 failure mode."""
+    from no_human.intake.evaluator import grill_spec
+
+    be = _ScriptedBackend(["exploring... ran out of turns", _ANSWERS_BLOCK])
+    qa = await grill_spec("t", "d", [], tmp_path,
+                          backend=be, questions=_questions())
+    assert len(be.prompts) == 2
+    assert qa[0].answer.startswith("src/app.py:42")
+
+
+@pytest.mark.asyncio
+async def test_grill_spec_gives_up_after_one_retry(tmp_path):
+    from no_human.intake.evaluator import grill_spec
+
+    be = _ScriptedBackend(["no block", "still no block"])
+    qa = await grill_spec("t", "d", [], tmp_path,
+                          backend=be, questions=_questions())
+    assert len(be.prompts) == 2
+    assert qa is not None and qa[0].answer == ""

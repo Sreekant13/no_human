@@ -326,7 +326,11 @@ _GRILL_ANSWERS_PROMPT = (
     "REVERSIBLE answer a senior engineer would proceed under, citing repo "
     "evidence as path:line where you found it. If the repo holds no evidence, "
     "answer with the minimal reasonable assumption and source \"assumption\". "
-    "Never invent evidence.\n\n"
+    "Never invent evidence.\n"
+    "You have a LIMITED number of turns: explore at most a few files, and "
+    "RESERVE YOUR FINAL TURN for the output block. The block is REQUIRED — "
+    "partial or assumption answers are fine, but never end without emitting "
+    "it.\n\n"
     "Output EXACTLY:\n"
     "GRILL_ANSWERS_START\n"
     '{"answers": [{"i": 0, "answer": "...", "source": '
@@ -391,6 +395,14 @@ async def grill_spec(
             cwd = Path(repo_path) if repo_path else Path(tempfile.gettempdir())
             result = await be.run(prompt, max_turns=8, effort="low", cwd=cwd)
             m = _GRILL_ANSWERS.search(result.final_text or "")
+            if not m:
+                # v10 drill: the 8-turn session can spend itself exploring
+                # and end blockless — retry ONCE (2/2 budget burns traced to
+                # exactly this silent empty).
+                log.warning("grill answering emitted no block; retrying once")
+                result = await be.run(prompt, max_turns=8, effort="low",
+                                      cwd=cwd)
+                m = _GRILL_ANSWERS.search(result.final_text or "")
             if m:
                 data = loads_lenient(m.group(1))
                 answerable_idx = {i for i, _ in answerable}
