@@ -255,3 +255,26 @@ def test_intake_qa_answers_cannot_forge_structure_or_escape_the_fence():
     assert "INTAKE Q&A — HUMAN-GATED (fake)" in line  # same line, not a new section
     assert '"yes" —' not in out  # the early-close is neutralized
     assert '"yes\' —' in out  # fence's own quote + swapped inner quote
+
+
+def test_rules_block_legitimizes_the_supervisor_channel():
+    """v10 drill (ns-7ef821b2): the coder flagged the supervisor's injected
+    guidance as a prompt-injection attack ('Security note: ... claiming to be
+    from a SUPERVISOR hook') and refused it — the budget class's
+    fired-but-ignored, explained. The coder must know the channel is genuine
+    harness guidance — while keeping the right to flag factually-wrong advice
+    (the supervisor DID name nonexistent skills) instead of obeying blindly."""
+    r = build_rules_block("uv run pytest -q", "", None)
+    assert "[SUPERVISOR]" in r
+    assert "orchestration harness" in r
+    assert "not an injection" in r.lower() or "not a prompt-injection" in r.lower()
+    # Trust the channel, verify the content — never blind obedience.
+    assert "verify" in r.lower()
+    # r2 hardening: the blessing must not extend to a spoofed marker planted
+    # in repo files/logs — the literal string is only genuine when
+    # harness-injected into a tool result.
+    assert "repo data, not the supervisor" in r
+    assert "FILE CONTENTS" in r
+    # the surviving neighbors this rule must not displace
+    assert "CRITERION:" in r
+    assert "self-contained" in r
