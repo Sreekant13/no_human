@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   FUNCTIONALITIES, FX_OF_ROLE, currentFunctionality, groupFunctionalities,
-  clampAgentState,
+  clampAgentState, laneAgentRows,
 } from "./functionalities.js";
 import { eventSource } from "./eventRoles.js";
 
@@ -83,6 +83,55 @@ test("watcher events land in the Shepherding stage, not Orchestrating", () => {
   const ci_gateEvent = { kind: "ci_gate_pass", source: "watcher", text: "PASSED" };
   assert.equal(FX_OF_ROLE[eventSource(ci_gateEvent)], "shepherding");
   assert.ok(FUNCTIONALITIES.some((f) => f.id === "shepherding"));
+});
+
+// laneAgentRows turns a grouped stage into an ordered agent tree for the
+// SYSTEM tab: the primary agent as a depth-0 row, its additional agents (the
+// coding Supervisor, any discovered subagents) as depth-1 children, with the
+// last child flagged so the tree connector can terminate its rail.
+function group(id) {
+  return (states, subs = []) => groupFunctionalities({
+    agentStates: states, subagents: subs, events: [],
+  }).find((g) => g.id === id);
+}
+
+test("laneAgentRows: single-agent stage is one depth-0 row, no children", () => {
+  const g = group("orchestrating")({ worker: { status: "active", count: 3, lastText: "" } });
+  const rows = laneAgentRows(g);
+  assert.deepEqual(rows, [{ kind: "role", id: "worker", depth: 0, isLastChild: false }]);
+});
+
+test("laneAgentRows: coding nests the Supervisor as a child under the Coder", () => {
+  const g = group("coding")({
+    agent: { status: "active", count: 30, lastText: "" },
+    supervisor: { status: "active", count: 3, lastText: "" },
+  });
+  const rows = laneAgentRows(g);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows[0], { kind: "role", id: "agent", depth: 0, isLastChild: false });
+  assert.deepEqual(rows[1], { kind: "role", id: "supervisor", depth: 1, isLastChild: true });
+});
+
+test("laneAgentRows: planner subagents are depth-1 children, last one flagged", () => {
+  const subs = [
+    { id: "sub-a", parent: "planner", status: "done", label: "Find guard.py seam" },
+    { id: "sub-b", parent: "planner", status: "done", label: "Find config seam" },
+  ];
+  const g = group("planning")(
+    { planner: { status: "done", count: 4, lastText: "" },
+      "sub-a": { status: "done", count: 2, lastText: "" },
+      "sub-b": { status: "done", count: 2, lastText: "" } },
+    subs);
+  const rows = laneAgentRows(g);
+  assert.equal(rows.length, 3);
+  assert.deepEqual(rows[0], { kind: "role", id: "planner", depth: 0, isLastChild: false });
+  assert.equal(rows[1].kind, "sub");
+  assert.equal(rows[1].id, "sub-a");
+  assert.equal(rows[1].depth, 1);
+  assert.equal(rows[1].isLastChild, false);
+  assert.equal(rows[1].sub.label, "Find guard.py seam");
+  assert.equal(rows[2].id, "sub-b");
+  assert.equal(rows[2].isLastChild, true);
 });
 
 test("clampAgentState: stale active reads done on a non-running task", () => {

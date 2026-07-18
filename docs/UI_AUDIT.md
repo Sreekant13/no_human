@@ -11,8 +11,12 @@ praise. Findings below are deduplicated, ranked, and each names the file that ca
 **Standing constraint (from the prior persona walk):** the board is *intentional* and was judged
 good. Fix real weaknesses; do **not** reskin for its own sake. The lane model (`boardLanes.js` routes
 by *what the human owes*, not by internal status), the single `isNeedsYou` predicate behind five
-surfaces, the shared burn definition in `cost.js`, and the `AgentLogModal` are all **good and must
-not be broken**.
+surfaces, the shared burn definition in `cost.js`, and the agent log are all **good and must
+not be broken**. *(2026-07-18: the agent log's pop-up `AgentLogModal` was intentionally
+superseded by the inline `AgentLogPanel` — a wide reading pane below the pipeline — as part of
+the operator-requested SYSTEM-tab redesign. The "must not be broken" protection now points at
+`AgentLogPanel`: it preserves the summary card + full event stream + auto-scroll-to-latest of the
+old modal. See the 2026-07-18 SYSTEM-tab entry below.)*
 
 Status key: ✅ fixed · ⬜ open
 
@@ -110,6 +114,26 @@ Design notes for the implementer (verify each before building):
 > target. The audit's "redesign" was already done; the checkbox lagged (again — check
 > the live UI, not the box). **N14 + N15 fixed this pass** (see below). Nothing
 > structural remains open.
+
+## 2026-07-18 — SYSTEM-tab redesign (operator-requested)
+
+Operator feedback on the task drawer's SYSTEM tab drove a redesign (PR #142):
+- **Collision fix:** long subagent names overflowed their ~180px stage column
+  into the neighbour — `.fx-role-name` now truncates (min-width:0 + ellipsis +
+  tooltip). Guarded by `web/e2e/fx-tree-layout.spec.mjs` (RED→GREEN).
+- **Agent tree:** primary agent as a row + its additional agents (Coding
+  Supervisor, planner subagents) nested as depth-1 children with connector rails;
+  ordering is the pure, unit-tested `laneAgentRows` (`functionalities.js`).
+- **Scale:** the whole tab enlarged; the tree is top-anchored (was vertically
+  centred over a void).
+- **Agent log — inline, not modal (operator-approved fork):** clicking an agent
+  opens `AgentLogPanel`, a WIDE reading pane below the pipeline (a stage column
+  is far too narrow for a log), with the deterministic summary card on top, the
+  full event stream, **auto-scroll-to-latest** (sticky-bottom — never yanks a
+  reader who scrolled up), and a close button. This **intentionally supersedes**
+  the pop-up `AgentLogModal` (the operator explicitly chose inline expansion);
+  the standing "must not be broken" protection now points at `AgentLogPanel`
+  (see the constraint note above). No log behavior was lost.
 
 **All closed.** N14 (error-header credit) — removed `white-space: nowrap` from
 `.legion-credit` so it wraps instead of clipping mid-word at ≤360px

@@ -10,7 +10,7 @@ import { ROLE_LABEL, discoverSubagents, eventSource, modelsByNode } from "./even
 import { deriveAgentStatus } from "./pipelineStatus.js";
 import { taskProgress } from "./taskProgress.js";
 import { hasAction, normalizeOption } from "./blockerOptions.js";
-import { clampAgentState, currentFunctionality, groupFunctionalities } from "./functionalities.js";
+import { clampAgentState, currentFunctionality, groupFunctionalities, laneAgentRows } from "./functionalities.js";
 import { agentSummary, taskSummary } from "./summaries.js";
 import { costOf, fmtCost, fmtTokens, totalBurn } from "./cost.js";
 import { formatDuration } from "./formatDuration.js";
@@ -742,61 +742,62 @@ function SummaryCard({ summary }) {
   );
 }
 
-function AgentLogModal({ agent, events, onClose }) {
-  const endRef = useRef(null);
+// The expanded agent's log — a full-width reading pane below the pipeline
+// (replaces the old pop-up modal). Rendered wide because a stage column is far
+// too narrow for a readable log; a header ties it back to the exact agent and
+// stage that is open. Same deterministic digest (summaries.js) + raw event feed.
+function AgentLogPanel({ agent, stage, events, onClose }) {
   const agentEvents = agent.subagentTaskId
     ? events.filter(e => (e.kind === "subagent_start" || e.kind === "subagent_progress" || e.kind === "subagent_done") && e.task_id === agent.subagentTaskId)
     : events.filter(e => eventSource(e) === agent.id);
-
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [agentEvents.length]);
-
-  useEffect(() => {
-    function onKey(e) { if (e.key === "Escape") onClose(); }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
   const elapsed = agentEvents.length > 1 ? agentEvents[agentEvents.length - 1].ts - agentEvents[0].ts : 0;
 
+  // Keep the newest event in view as a live agent streams — the SYSTEM tab's
+  // primary use is watching a running agent (restores the behavior the old
+  // AgentLogModal had via its end-anchor). Sticky-bottom: scroll only the
+  // events list (never the page/drawer), and ONLY when the operator is already
+  // at the bottom — so scrolling up to read history is never yanked back down.
+  const logRef = useRef(null);
+  const stickRef = useRef(true);
+  const onLogScroll = () => {
+    const el = logRef.current;
+    if (el) stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+  };
+  useEffect(() => {
+    const el = logRef.current;
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight;
+  }, [agentEvents.length]);
+
   return (
-    <div className="sys-modal-backdrop" data-nested-modal onClick={onClose}>
-      <div className="sys-modal" style={{ "--node-color": agent.color }} onClick={(e) => e.stopPropagation()}>
-        <div className="sys-modal-header">
-          <div className="sys-modal-icon">{agent.icon}</div>
-          <div className="sys-modal-titles">
-            <div className="sys-modal-type">{agent.type}</div>
-            <div className="sys-modal-name">{agent.label}</div>
-          </div>
-          <button className="sys-modal-close" onClick={onClose} aria-label="Close"><IconX size={16} /></button>
+    <div className="fx-log-panel" style={{ "--node-color": agent.color }}>
+      <div className="fx-log-head">
+        <span className="fx-log-icon">{agent.icon}</span>
+        <div className="fx-log-titles">
+          <div className="fx-log-type">{agent.type}{stage ? ` · ${stage}` : ""}</div>
+          <div className="fx-log-name">{agent.label}</div>
         </div>
-        <div className="sys-modal-stats">
-          <div className="sys-modal-stat">
-            Events: <span className="sys-modal-stat-val">{agentEvents.length}</span>
-          </div>
-          {elapsed > 0 && (
-            <div className="sys-modal-stat">
-              Duration: <span className="sys-modal-stat-val">{fmtDuration(elapsed)}</span>
-            </div>
-          )}
-          <div className="sys-modal-stat">
-            {agent.desc}
-          </div>
+        <div className="fx-log-stats">
+          <span className="fx-log-stat">Events <b>{agentEvents.length}</b></span>
+          {elapsed > 0 && <span className="fx-log-stat">Duration <b>{fmtDuration(elapsed)}</b></span>}
         </div>
-        <SummaryCard summary={agentSummary(events, agent)} />
-        <div className="sys-modal-log">
-          {agentEvents.length === 0 ? (
-            <div className="sys-modal-empty">No events from this agent yet.</div>
-          ) : (
-            agentEvents.map((e, i) => {
-              const prev = i > 0 ? agentEvents[i - 1] : null;
-              const dt = prev ? e.ts - prev.ts : 0;
-              return <RichEvent key={i} event={e} elapsed={dt} role={eventSource(e)} />;
-            })
-          )}
-          <div ref={endRef} />
-        </div>
+        {onClose && (
+          <button className="fx-log-close" onClick={onClose} aria-label="Close agent log">
+            <IconX size={15} />
+          </button>
+        )}
+      </div>
+      {agent.desc && <div className="fx-log-desc">{agent.desc}</div>}
+      <SummaryCard summary={agentSummary(events, agent)} />
+      <div className="fx-log-events" ref={logRef} onScroll={onLogScroll}>
+        {agentEvents.length === 0 ? (
+          <div className="fx-log-empty">No events from this agent yet.</div>
+        ) : (
+          agentEvents.map((e, i) => {
+            const prev = i > 0 ? agentEvents[i - 1] : null;
+            const dt = prev ? e.ts - prev.ts : 0;
+            return <RichEvent key={i} event={e} elapsed={dt} role={eventSource(e)} />;
+          })
+        )}
       </div>
     </div>
   );
@@ -811,20 +812,21 @@ const clipText = (s, n) => {
 // its full agent tree always visible beneath — nothing hidden behind clicks.
 // The arrow out of a header flows when the NEXT stage is the one running.
 
-// M7: one compact row per role — the stage head already carries status/
-// counts/model, so the row only needs identity + a live status dot + the
-// click-through to the full AgentLogModal. Replaces the AgentNode cards
-// that repeated the head's facts at ~150px each.
-function RoleRow({ agent, state, isActive, onClick, laneModel }) {
+// M7 / TS: one compact row per agent — the stage head carries status/counts/
+// model, so the row only needs identity + a live status dot + a chevron that
+// toggles the agent's log (the wide pane below the board). Replaces the
+// AgentNode cards that repeated the head's facts at ~150px each.
+function RoleRow({ agent, state, onClick, laneModel, expanded }) {
   if (!agent) return null;
   const status = (state && state.status) || "idle";
   // The lane head already prints its primary's model in full; repeating it
-  // here truncates to "op…" in a 160px lane — show a row's model only when
+  // here truncates to "op…" in a narrow lane — show a row's model only when
   // it differs from the lane's (e.g. a haiku researcher under the coder).
   const showModel = agent.model && agent.model !== laneModel;
   return (
-    <button type="button" className={`fx-role-row s-${status}`} onClick={onClick}
-            title={`${agent.label} — open full log`}>
+    <button type="button" className={`fx-role-row s-${status}${expanded ? " expanded" : ""}`}
+            onClick={onClick} aria-expanded={expanded}
+            title={`${agent.label} — ${expanded ? "hide" : "show"} log`}>
       <span className="fx-role-icon" aria-hidden="true">{agent.icon}</span>
       <span className="fx-role-name">{agent.label}</span>
       {showModel && <span className="fx-role-model">{agent.model.replace("claude-", "")}</span>}
@@ -834,19 +836,41 @@ function RoleRow({ agent, state, isActive, onClick, laneModel }) {
   );
 }
 
-function FxLane({ g, isCurrent, flowOut, agentStates, node, isActive, onOpen }) {
-  const hasPrimary = g.roles.includes(g.primary);
-  const children = [
-    ...(g.id === "coding" && g.roles.includes("supervisor") ? [node("supervisor")] : []),
-    ...g.subs,
-  ];
+// One agent in the tree: its row. Depth 0 is the stage's primary agent; depth 1
+// is a nested child (the Coding Supervisor, a planner's investigation
+// subagents). The expanded agent's log renders wide below the whole board.
+function AgentRowNode({ agent, depth, isLastChild, state, laneModel, expanded, onToggle }) {
+  if (!agent) return null;
+  return (
+    <div className={`fx-node${depth ? " fx-node--child" : ""}${isLastChild ? " is-last" : ""}`}>
+      <RoleRow agent={agent} state={state} laneModel={laneModel}
+               expanded={expanded} onClick={onToggle} />
+    </div>
+  );
+}
+
+function FxLane({ g, isCurrent, flowOut, agentStates, node, expandedId, onToggle }) {
+  // Resolve the pure row plan (functionalities.js) into agent objects: role ids
+  // get their model binding via node(); discovered subagents carry their own.
+  const nodes = laneAgentRows(g)
+    .map((r) => ({ ...r, agent: r.kind === "role" ? node(r.id) : r.sub }))
+    .filter((r) => r.agent);
+  const primaries = nodes.filter((r) => r.depth === 0);
+  const children  = nodes.filter((r) => r.depth === 1);
+  const hasPrimary = primaries.length > 0;
+  const rowFor = (r) => (
+    <AgentRowNode key={r.agent.id} agent={r.agent} depth={r.depth} isLastChild={r.isLastChild}
+                  state={agentStates[r.agent.id]} laneModel={g.model}
+                  expanded={expandedId === r.agent.id}
+                  onToggle={() => onToggle(r.agent.id)} />
+  );
   return (
     <div className={`fx-lane s-${g.status}${isCurrent ? " current" : ""}`}
          style={{ "--fx-color": g.color }}>
-      <div className={`fx-head${flowOut ? " flow-out" : ""}`} title={g.desc}
-           role="button" tabIndex={0}
-           onClick={() => hasPrimary && onOpen(node(g.primary))}
-           onKeyDown={(e) => { if ((e.key === "Enter" || e.key === " ") && hasPrimary) { e.preventDefault(); onOpen(node(g.primary)); } }}>
+      <div className={`fx-head${flowOut ? " flow-out" : ""}${hasPrimary ? " clickable" : ""}`} title={g.desc}
+           role={hasPrimary ? "button" : undefined} tabIndex={hasPrimary ? 0 : undefined}
+           onClick={() => hasPrimary && onToggle(primaries[0].agent.id)}
+           onKeyDown={(e) => { if ((e.key === "Enter" || e.key === " ") && hasPrimary) { e.preventDefault(); onToggle(primaries[0].agent.id); } }}>
         <div className="fx-head-top">
           <span className="fx-icon" aria-hidden="true">{g.icon}</span>
           <span className="fx-label">{g.label}</span>
@@ -862,18 +886,12 @@ function FxLane({ g, isCurrent, flowOut, agentStates, node, isActive, onOpen }) 
         </div>
         {g.model && <div className="fx-model" title={g.model}>{g.model}</div>}
       </div>
-      {hasPrimary || children.length > 0 ? (
+      {nodes.length > 0 ? (
         <div className="fx-role-list">
-          {hasPrimary && (
-            <RoleRow agent={node(g.primary)} state={agentStates[g.primary]}
-                     isActive={isActive} laneModel={g.model}
-                     onClick={() => onOpen(node(g.primary))} />
+          {primaries.map(rowFor)}
+          {children.length > 0 && (
+            <div className="fx-children">{children.map(rowFor)}</div>
           )}
-          {children.map((c) => (
-            <RoleRow key={c.id} agent={c} state={agentStates[c.id]}
-                     isActive={isActive} laneModel={g.model}
-                     onClick={() => onOpen(c)} />
-          ))}
         </div>
       ) : (
         <div className="fx-lane-empty">not started yet</div>
@@ -884,7 +902,10 @@ function FxLane({ g, isCurrent, flowOut, agentStates, node, isActive, onOpen }) 
 
 function SystemTab({ taskId, task, isActive }) {
   const [events, setEvents] = useState([]);
-  const [modalAgent, setModalAgent] = useState(null);
+  // Single-open accordion: the id of the agent whose inline log is expanded,
+  // or null. Clicking an agent (or its stage head, for the primary) toggles it.
+  const [expandedId, setExpandedId] = useState(null);
+  const toggleAgent = (id) => setExpandedId((cur) => (cur === id ? null : id));
   const currentFx = currentFunctionality(events, isActive);
 
   useEffect(() => {
@@ -963,6 +984,17 @@ function SystemTab({ taskId, task, isActive }) {
   // subagents; clicking one expands that stage's agent tree.
   const groups = groupFunctionalities({ agentStates, subagents, models: nodeModels, events });
 
+  // Resolve the expanded agent (a primary role or a discovered subagent) and the
+  // stage it belongs to, so its log can render in the wide pane below the board.
+  const agentIndex = {};
+  for (const g of groups) {
+    for (const r of laneAgentRows(g)) {
+      const a = r.kind === "role" ? node(r.id) : r.sub;
+      if (a) agentIndex[a.id] = { agent: a, stage: g.label };
+    }
+  }
+  const openAgent = expandedId ? agentIndex[expandedId] : null;
+
   if (events.length === 0) {
     return (
       <div className="sys-view">
@@ -1009,9 +1041,16 @@ function SystemTab({ taskId, task, isActive }) {
                     flowOut={isActive && i + 1 < groups.length
                              && currentFx === groups[i + 1].id}
                     agentStates={agentStates} node={node}
-                    isActive={isActive} onOpen={setModalAgent} />
+                    expandedId={expandedId} onToggle={toggleAgent} />
           ))}
         </div>
+
+        {/* The expanded agent's log — wide, readable, below the pipeline. */}
+        {openAgent && (
+          <AgentLogPanel key={openAgent.agent.id} agent={openAgent.agent}
+                         stage={openAgent.stage} events={events}
+                         onClose={() => setExpandedId(null)} />
+        )}
 
         {/* Summary stats */}
         <div className="sys-summary">
@@ -1038,15 +1077,6 @@ function SystemTab({ taskId, task, isActive }) {
           )}
         </div>
       </div>
-
-      {/* Agent log modal */}
-      {modalAgent && (
-        <AgentLogModal
-          agent={modalAgent}
-          events={events}
-          onClose={() => setModalAgent(null)}
-        />
-      )}
     </div>
   );
 }

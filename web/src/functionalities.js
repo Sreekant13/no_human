@@ -87,6 +87,26 @@ export function groupFunctionalities({ agentStates, subagents, models = {}, even
 }
 
 
+// Order a grouped stage into the SYSTEM tab's agent tree: the stage's primary
+// agent as a depth-0 row, then its ADDITIONAL agents as depth-1 children — the
+// coding Supervisor (a live monitor, not the coder itself) and every discovered
+// subagent (planner proposers' investigators). The last depth-1 child is
+// flagged so the tree connector rail knows where to stop. Kept pure and here
+// (not in the JSX) so the ordering is unit-testable.
+export function laneAgentRows(g) {
+  const out = [];
+  const roles = g.roles || [];
+  if (roles.includes(g.primary)) out.push({ kind: "role", id: g.primary, depth: 0 });
+  // The Supervisor rides the Coding stage but is not the Coder — nest it.
+  if (g.id === "coding" && roles.includes("supervisor")) {
+    out.push({ kind: "role", id: "supervisor", depth: 1 });
+  }
+  for (const s of g.subs || []) out.push({ kind: "sub", id: s.id, sub: s, depth: 1 });
+  let lastChild = -1;
+  out.forEach((r, i) => { if (r.depth === 1) lastChild = i; });
+  return out.map((r, i) => ({ ...r, isLastChild: i === lastChild }));
+}
+
 // A non-running task (parked / escalated / awaiting approval / terminal) has
 // nothing executing: any state still reading "active" is stale, and it must
 // render as done — never as live work. Errors stay errors.
