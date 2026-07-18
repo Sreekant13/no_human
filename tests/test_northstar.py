@@ -783,3 +783,25 @@ async def test_bench_grill_runs_in_the_sandbox_not_the_source(tmp_path, monkeypa
     work = str((tmp_path / "wd" / "work").resolve())
     assert seen["repo_path"] in (work, str(tmp_path / "wd" / "work"))
     assert seen["repo_path"] != str(repo)
+
+
+@pytest.mark.asyncio
+async def test_judge_evidence_notes_keep_2000_chars(tmp_path):
+    """#119 pin (review r1 finding): a silent revert to the old 400-char cap
+    would re-amputate judge rationales (ns-7ef821b2 was cut mid-'BUT …') and
+    only be noticed at the next drill. Feed 3000 chars, expect exactly 2000."""
+    from no_human.core.task import TaskStatus
+    from no_human.eval.judge import GoalVerdict
+
+    class _LongEvidenceJudge:
+        async def judge(self, **kwargs):
+            return GoalVerdict(satisfied=False, evidence="E" * 3000)
+
+    repo = _src_repo(tmp_path)
+    spec = _spec(repo)
+    runner = NorthStarRunner({}, backend_factory=lambda s: None,
+                             goal_judge=_LongEvidenceJudge())
+
+    score = await runner._score(
+        spec, _FakeOutcome(TaskStatus.AWAITING_APPROVAL), repo, "HEAD", [], 1.0)
+    assert len(score.notes) == 2000
