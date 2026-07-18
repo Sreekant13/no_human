@@ -8,12 +8,14 @@ import {
 import { groupLearningsByProject } from "./learningGroups.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 import { pluralize } from "./pluralize.js";
+import IntegrationsPanel from "./Integrations.jsx";
 
 const TABS = [
   { key: "projects",  label: "Projects" },
   { key: "rules",     label: "Rules" },
   { key: "skills",    label: "Skills" },
   { key: "learnings", label: "Learnings" },
+  { key: "integrations", label: "Integrations" },
   { key: "config",    label: "Config" },
 ];
 
@@ -38,6 +40,7 @@ export default function Settings() {
         {tab === "rules"     && <MemoryList kind="rules" fetchFn={fetchRules} addFn={addRule} removeFn={removeRule} />}
         {tab === "skills"    && <MemoryList kind="skills" fetchFn={fetchSkills} addFn={addSkill} removeFn={removeSkill} />}
         {tab === "learnings" && <LearningsPanel />}
+        {tab === "integrations" && <IntegrationsPanel />}
         {tab === "config"    && <ConfigPanel />}
       </div>
     </div>

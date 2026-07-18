@@ -420,6 +420,16 @@ export const confirmRules      = (ids)     => _post("/api/onboarding/rules/confi
 export const completeOnboarding = (payload) => _post("/api/onboarding/complete", payload);
 export const generateDocs      = (repo_path) => _post("/api/onboarding/docs/generate", { repo_path });
 
+// ── Integrations (status registry; secrets never returned) ──────────────────
+export async function fetchIntegrations() {
+  const r = await fetch(`${BASE}/api/integrations`);
+  if (!r.ok) return { integrations: [] };
+  return _jsonSafe(r, { integrations: [] });
+}
+// Run a live health check for one integration; returns the updated status.
+export const testIntegration = (name) =>
+  _post(`/api/integrations/${encodeURIComponent(name)}/test`, {});
+
 export async function suggestPaths(path) {
   const r = await fetch(`${BASE}/api/fs/suggest?path=${encodeURIComponent(path || "")}`);
   if (!r.ok) return { suggestions: [] };
