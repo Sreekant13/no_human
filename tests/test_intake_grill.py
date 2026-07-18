@@ -30,6 +30,8 @@ class _ScriptedBackend:
     async def run(self, prompt, *, cwd=None, **kwargs):
         self.prompts.append(prompt)
         self.cwds.append(cwd)
+        self.kwargs = getattr(self, "kwargs", [])
+        self.kwargs.append(kwargs)
         return _result(self._texts.pop(0))
 
 
@@ -233,3 +235,45 @@ async def test_generate_gives_up_after_one_retry():
     qa = await generate_grill_questions("t", "d", [], backend=be)
     assert len(be.prompts) == 2
     assert qa is None
+
+# ---------------- answering fallback (v11 live root cause) ----------------- #
+
+@pytest.mark.asyncio
+async def test_answering_retry_is_a_toolless_final_attempt(tmp_path):
+    """v11 live root cause: in content-rich repos the 8-turn answering
+    session exhausts ALL turns exploring and the SDK returns an error result
+    ('Reached maximum number of turns') — a blind same-shape resample fails
+    deterministically (0/6 recovery in v11). The retry must change strategy:
+    tool-less, tiny turn budget, emit-now with assumption-grade answers."""
+    from no_human.intake.evaluator import grill_spec
+
+    be = _ScriptedBackend([
+        "Claude Code returned an error result: Reached maximum number of turns (8)",
+        _ANSWERS_BLOCK])
+    qa = await grill_spec("t", "d", [], tmp_path,
+                          backend=be, questions=_questions())
+    assert len(be.prompts) == 2
+    # The fallback is a different strategy, not a resample.
+    assert be.kwargs[1].get("max_turns", 99) <= 2
+    assert "do not use tools" in be.prompts[1].lower()
+    assert "assumption" in be.prompts[1].lower()
+    # r1 blocking finding: the fallback must forbid uncited citations.
+    assert "have not read in this session" in be.prompts[1].lower()
+    # It recovers the answer TEXT (data, fenced downstream)...
+    assert qa[0].answer.startswith("src/app.py:42")
+    # ...but a tool-less session can never stamp repo-evidence: even though
+    # the scripted block claims "repo-evidence", the source is DEMOTED.
+    assert qa[0].source == "assumption"
+
+
+@pytest.mark.asyncio
+async def test_first_pass_answers_keep_their_claimed_source(tmp_path):
+    """The demotion applies ONLY to the fallback path — a first-pass session
+    that actually explored keeps its repo-evidence label."""
+    from no_human.intake.evaluator import grill_spec
+
+    be = _ScriptedBackend([_ANSWERS_BLOCK])
+    qa = await grill_spec("t", "d", [], tmp_path,
+                          backend=be, questions=_questions())
+    assert len(be.prompts) == 1
+    assert qa[0].source == "repo-evidence"

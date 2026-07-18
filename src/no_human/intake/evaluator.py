@@ -401,16 +401,31 @@ async def grill_spec(
                 questions=q_text,
             )
             cwd = Path(repo_path) if repo_path else Path(tempfile.gettempdir())
+            fallback_used = False
             result = await be.run(prompt, max_turns=8, effort="low", cwd=cwd)
             m = _GRILL_ANSWERS.search(result.final_text or "")
             if not m:
-                # v10 drill: the 8-turn session can spend itself exploring
-                # and end blockless — retry ONCE (2/2 budget burns traced to
-                # exactly this silent empty).
-                log.warning("grill answering emitted no block; retrying once")
-                result = await be.run(prompt, max_turns=8, effort="low",
+                # v11 live root cause: in content-rich repos the 8-turn
+                # session exhausts ALL turns exploring and the SDK returns an
+                # error result — a blind resample fails deterministically
+                # (0/6 recovery in v11). The retry changes STRATEGY: no
+                # tools, tiny budget, emit-now; assumption-grade answers
+                # beat empty ones (the grill is advisory by contract).
+                log.warning("grill answering emitted no block; retrying "
+                            "tool-less")
+                fallback = (
+                    prompt
+                    + "\n\nFINAL ATTEMPT — your previous session ran out "
+                    "of turns exploring. Do NOT use tools now. Emit the "
+                    "GRILL_ANSWERS block IMMEDIATELY in your first reply; "
+                    "answers from general knowledge with source "
+                    '"assumption" are fine. Do NOT cite file paths or line '
+                    "numbers you have not read in THIS session; "
+                    "plain-language assumptions only.")
+                result = await be.run(fallback, max_turns=2, effort="low",
                                       cwd=cwd)
                 m = _GRILL_ANSWERS.search(result.final_text or "")
+                fallback_used = True
             if m:
                 data = loads_lenient(m.group(1))
                 answerable_idx = {i for i, _ in answerable}
@@ -425,7 +440,13 @@ async def grill_spec(
                     # a carve-out index in its output is ignored.
                     if i in answerable_idx and item.get("answer"):
                         qs[i].answer = str(item["answer"])[:400]
-                        src = str(item.get("source", "assumption"))
+                        # r1 blocking finding: the tool-less fallback session
+                        # has read NOTHING — it must never stamp
+                        # "repo-evidence" (false verifiability makes the
+                        # human auditor skip exactly the check the PR-body
+                        # section exists to trigger).
+                        src = ("assumption" if fallback_used
+                               else str(item.get("source", "assumption")))
                         qs[i].source = (src if src in
                                         ("repo-evidence", "assumption")
                                         else "assumption")
