@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 KIND_BY_NAME = {
@@ -40,6 +41,69 @@ class IntegrationStatus:
     configured: bool
     healthy: bool | None  # None = never checked
     detail: str          # last check message, NEVER a secret
+
+
+@dataclass
+class FieldSpec:
+    """One configurable field of an integration, for the settings UI's forms.
+
+    Exactly one of ``env_var`` / ``config_path`` is set: secrets (API tokens)
+    live in ``~/.no_human/.env``; everything else is a dotted path into the
+    user's ``config.yaml``. Names/paths here are the ones the corresponding
+    integration module ALREADY reads (see the modules cited per field below) —
+    nothing here is invented.
+    """
+    name: str
+    label: str
+    secret: bool
+    env_var: str | None = None
+    config_path: str | None = None
+
+
+# github/gitlab/jenkins are STATUS VIEWS over the single shared `ci.*` section
+# (see module docstring — one CI backend active at a time). Saving a field for
+# one of them is how the UI selects it as that backend, so a successful save
+# also pins `ci.backend` (+ `ci.enabled`) alongside whatever field was given.
+_CI_BACKEND_BY_NAME = {"github": "github_actions", "gitlab": "gitlab", "jenkins": "jenkins"}
+
+FIELD_SPECS: dict[str, list[FieldSpec]] = {
+    # integrations/jira.py + intake/jira.py read integrations.jira.* / JIRA_API_TOKEN.
+    "jira": [
+        FieldSpec("site", "Site URL", False, config_path="integrations.jira.site"),
+        FieldSpec("project_key", "Project key", False, config_path="integrations.jira.project_key"),
+        FieldSpec("email", "Email", False, config_path="integrations.jira.email"),
+        FieldSpec("jql", "JQL filter", False, config_path="integrations.jira.jql"),
+        FieldSpec("api_token", "API token", True, env_var="JIRA_API_TOKEN"),
+    ],
+    # ci/circleci.py reads CIRCLECI_TOKEN; integrations.circleci.* is the
+    # first-class config section (see _circleci_status above).
+    "circleci": [
+        FieldSpec("org_slug", "Org slug", False, config_path="integrations.circleci.org_slug"),
+        FieldSpec("project", "Project", False, config_path="integrations.circleci.project"),
+        FieldSpec("api_token", "API token", True, env_var="CIRCLECI_TOKEN"),
+    ],
+    # ci/github_actions.py + _ci_view read ci.project as the id_field for this backend.
+    "github": [
+        FieldSpec("project", "Project (owner/repo)", False, config_path="ci.project"),
+    ],
+    # ci/gitlab.py + _ci_view read the SAME ci.project key — one source of
+    # truth, shared with github (only one backend is active at a time).
+    "gitlab": [
+        FieldSpec("project", "Project (namespace/repo)", False, config_path="ci.project"),
+    ],
+    # ci/jenkins.py reads ci.job (id_field) + JENKINS_USER / JENKINS_API_TOKEN.
+    "jenkins": [
+        FieldSpec("job", "Job path", False, config_path="ci.job"),
+        FieldSpec("user", "Jenkins user", True, env_var="JENKINS_USER"),
+        FieldSpec("api_token", "API token", True, env_var="JENKINS_API_TOKEN"),
+    ],
+    # cli/commands.py + api/app.py read notifications.slack_webhook_url. It is
+    # a secret (never echoed back) even though it lives in config.yaml, not
+    # .env — that is the location the existing code already reads it from.
+    "slack": [
+        FieldSpec("webhook_url", "Webhook URL", True, config_path="notifications.slack_webhook_url"),
+    ],
+}
 
 
 def _sect(config: dict, key: str) -> dict:
@@ -102,6 +166,166 @@ _STATUS = {
 def list_integrations(config: dict) -> list[IntegrationStatus]:
     """Every integration's configured/kind status. Pure; ``healthy`` is None."""
     return [_STATUS[name](config) for name in _ORDER]
+
+
+# --------------------------------------------------------------------------- #
+# Write path (settings UI): FIELD_SPECS-validated save + field/set reporting.  #
+#                                                                               #
+# Paths are always resolved from the config module's ENV_PATH/CONFIG_PATH      #
+# ATTRIBUTES (looked up fresh on every call, never captured as a default       #
+# parameter) so that tests can monkeypatch them onto tmp_path and this code    #
+# picks it up — the same discipline api/app.py's _persist_onboarding uses.     #
+# --------------------------------------------------------------------------- #
+
+def _get_dotted(config: dict, dotted: str) -> Any:
+    node: Any = config or {}
+    for part in dotted.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node
+
+
+def _set_dotted(data: dict, dotted: str, value: Any) -> None:
+    parts = dotted.split(".")
+    node = data
+    for part in parts[:-1]:
+        nxt = node.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            node[part] = nxt
+        node = nxt
+    node[parts[-1]] = value
+
+
+def _atomic_write_0600(path: Path, content: str) -> None:
+    """Atomically write *content* to *path*, mode 0600 from the first byte.
+
+    Writes to a sibling temp file that is created with ``O_CREAT`` at 0600
+    (so there is never a window where it exists at the process umask), then
+    ``os.replace``s it onto *path* — atomic on POSIX and immune to a
+    world/group-readable window even on first creation.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.chmod(tmp, 0o600)  # belt-and-suspenders against an inherited umask on some platforms
+    os.replace(tmp, path)
+
+
+def _upsert_env_var(env_path: Path, key: str, value: str) -> None:
+    """Upsert ``KEY=value`` into the .env file: replace the line if the key is
+    already present, append if not, preserving every other line (including
+    comments and blanks) verbatim. The file is created/rewritten atomically at
+    mode 0600 from the first byte (see ``_atomic_write_0600``) — there is
+    never a window where it exists at the process umask. Never logs
+    ``value``."""
+    lines = env_path.read_text().splitlines() if env_path.exists() else []
+    out: list[str] = []
+    replaced = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            existing_key = stripped.split("=", 1)[0].strip()
+            if existing_key == key:
+                out.append(f"{key}={value}")
+                replaced = True
+                continue
+        out.append(line)
+    if not replaced:
+        out.append(f"{key}={value}")
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_0600(env_path, "\n".join(out) + "\n")
+
+
+def _write_config_values(config_path: Path, updates: dict[str, Any]) -> None:
+    """Read-modify-write config.yaml: read the RAW user file (never the
+    defaults-merged view — the deep-merge shadowing trap), set the dotted
+    path(s), and write back preserving every other key untouched."""
+    import yaml
+
+    from .. import config as _config_mod
+
+    try:
+        on_disk = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+    except (yaml.YAMLError, OSError):
+        on_disk = {}
+    on_disk = on_disk or {}
+    for dotted, value in updates.items():
+        _set_dotted(on_disk, dotted, value)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    _config_mod._atomic_write_text(config_path, yaml.safe_dump(on_disk, sort_keys=False))
+
+
+def _field_is_set(spec: FieldSpec, config: dict) -> bool:
+    if spec.env_var:
+        from .. import config as _config_mod
+        status = _config_mod.credential_status([spec.env_var], _config_mod.ENV_PATH)
+        return bool(status.get(spec.env_var, False))
+    return bool(_get_dotted(config, spec.config_path))
+
+
+def integration_fields(name: str, config: dict) -> list[dict[str, Any]]:
+    """The field descriptors for one integration's settings form — never a
+    secret VALUE, only whether each field currently ``set``."""
+    return [
+        {"name": s.name, "label": s.label, "secret": s.secret, "set": _field_is_set(s, config)}
+        for s in FIELD_SPECS.get(name, [])
+    ]
+
+
+def save_integration_config(name: str, fields: dict[str, str]) -> IntegrationStatus:
+    """Validate ``fields`` against ``FIELD_SPECS[name]`` and persist them:
+    secrets to ``~/.no_human/.env``, everything else to ``config.yaml``.
+    Returns the refreshed :class:`IntegrationStatus`. Raises ``ValueError`` for
+    an unknown integration or an unknown field name; never logs or returns a
+    secret value."""
+    specs = FIELD_SPECS.get(name)
+    if specs is None:
+        raise ValueError(f"unknown integration: {name!r}")
+
+    by_field = {s.name: s for s in specs}
+    unknown = sorted(set(fields) - set(by_field))
+    if unknown:
+        raise ValueError(f"unknown field(s) for integration {name!r}: {', '.join(unknown)}")
+
+    # A value containing \n or \r could inject arbitrary extra lines into
+    # .env (e.g. a forged CLAUDE_CODE_OAUTH_TOKEN=... line) — refuse before
+    # any write is dispatched. Never echo the offending value back.
+    bad = sorted(f for f, v in fields.items() if isinstance(v, str) and ("\n" in v or "\r" in v))
+    if bad:
+        raise ValueError(
+            f"field value(s) for integration {name!r} must not contain newlines: "
+            f"{', '.join(bad)}"
+        )
+
+    from .. import config as _config_mod
+
+    env_updates: dict[str, str] = {}
+    config_updates: dict[str, Any] = {}
+    for field_name, value in fields.items():
+        spec = by_field[field_name]
+        if spec.env_var:
+            env_updates[spec.env_var] = value
+        else:
+            config_updates[spec.config_path] = value
+
+    if fields and name in _CI_BACKEND_BY_NAME:
+        config_updates.setdefault("ci.backend", _CI_BACKEND_BY_NAME[name])
+        config_updates.setdefault("ci.enabled", True)
+
+    for key, value in env_updates.items():
+        _upsert_env_var(_config_mod.ENV_PATH, key, value)
+    if config_updates:
+        _write_config_values(_config_mod.CONFIG_PATH, config_updates)
+
+    refreshed = _config_mod.load_config(_config_mod.CONFIG_PATH)
+    return _STATUS[name](refreshed.data)
 
 
 # --------------------------------------------------------------------------- #
@@ -194,4 +418,7 @@ async def test_integration(name: str, config: dict) -> IntegrationStatus:
     return await checker(config)
 
 
-__all__ = ["IntegrationStatus", "KIND_BY_NAME", "list_integrations", "test_integration"]
+__all__ = [
+    "IntegrationStatus", "KIND_BY_NAME", "list_integrations", "test_integration",
+    "FieldSpec", "FIELD_SPECS", "integration_fields", "save_integration_config",
+]
