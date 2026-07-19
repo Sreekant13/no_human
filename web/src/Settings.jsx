@@ -1,6 +1,6 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import {
-  addRule, addSkill, confirmLearning, fetchConfig, fetchLearnings,
+  addRule, addSkill, confirmLearning, fetchLearnings,
   fetchRules, fetchSkills, rejectLearning, removeRule, removeSkill,
   fetchProjects, createProject, updateProject, deleteProject,
   fetchProfiles, detectRepos, onboardRepo, suggestPaths,
@@ -10,40 +10,112 @@ import { useEscapeKey } from "./useEscapeKey.js";
 import { pluralize } from "./pluralize.js";
 import IntegrationsPanel from "./Integrations.jsx";
 
-const TABS = [
+const SECTIONS = [
   { key: "projects",  label: "Projects" },
   { key: "rules",     label: "Rules" },
   { key: "skills",    label: "Skills" },
   { key: "learnings", label: "Learnings" },
   { key: "integrations", label: "Integrations" },
-  { key: "config",    label: "Config" },
 ];
 
-export default function Settings() {
-  const [tab, setTab] = useState("projects");
+// Settings, modeled on the Claude macOS desktop app: an overlay dialog with a
+// left section list and the section's panel content on the right — not a
+// routed page. Mirrors the SlideOver focus/Escape pattern (SlideOver.jsx),
+// so it behaves like the app's other modal surfaces.
+export default function SettingsOverlay({ onClose }) {
+  const [section, setSection] = useState("projects");
+  const dialogRef = useRef(null);
+  const closeRef = useRef(null);
+  const triggerRef = useRef(null);
+
+  // Capture the element that had focus when the overlay opened (the trigger,
+  // e.g. the sidenav "Settings" button) and restore focus to it on close —
+  // whether that's Escape, the × button, or the backdrop, they all tear down
+  // this component the same way, so a single mount/unmount effect covers all
+  // three. Guard against the trigger having been unmounted in the meantime.
+  useEffect(() => {
+    triggerRef.current = document.activeElement;
+    return () => {
+      const trigger = triggerRef.current;
+      if (trigger && trigger !== document.body && document.contains(trigger) && typeof trigger.focus === "function") {
+        trigger.focus();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    closeRef.current?.focus();
+
+    function onKeyDown(e) {
+      if (e.key === "Escape") {
+        // A modal ABOVE the overlay (add-rule/add-skill/add-project) owns the
+        // key — closing both would discard whatever the operator just typed.
+        if (document.querySelector("[data-nested-modal]")) return;
+        onClose();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const el = dialogRef.current;
+      if (!el) return;
+      const focusable = Array.from(
+        el.querySelectorAll('button:not([disabled]), [href], input, textarea, [tabindex]:not([tabindex="-1"])')
+      );
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey) {
+        if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+      } else {
+        if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
+    }
+
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  const activeLabel = SECTIONS.find((s) => s.key === section)?.label || "Settings";
 
   return (
-    <div className="settings-page">
-      <div className="settings-tabs">
-        {TABS.map((t) => (
-          <button
-            key={t.key}
-            className={`settings-tab${tab === t.key ? " active" : ""}`}
-            onClick={() => setTab(t.key)}
-          >
-            {t.label}
-          </button>
-        ))}
+    <>
+      <div className="settings-overlay-backdrop" onClick={onClose} />
+      <div
+        className="settings-overlay"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-overlay-title"
+        ref={dialogRef}
+      >
+        <div className="settings-overlay-left">
+          <div className="settings-overlay-group-header">Settings</div>
+          <nav className="settings-overlay-nav">
+            {SECTIONS.map((s) => (
+              <button
+                key={s.key}
+                className={`settings-overlay-navitem${section === s.key ? " active" : ""}`}
+                aria-current={section === s.key ? "true" : undefined}
+                onClick={() => setSection(s.key)}
+              >
+                {s.label}
+              </button>
+            ))}
+          </nav>
+        </div>
+        <div className="settings-overlay-right">
+          <div className="settings-overlay-header">
+            <h2 className="settings-overlay-title" id="settings-overlay-title">{activeLabel}</h2>
+            <button className="settings-overlay-close" onClick={onClose} ref={closeRef} aria-label="Close settings">✕</button>
+          </div>
+          <div className="settings-overlay-body">
+            {section === "projects"  && <ProjectsPanel />}
+            {section === "rules"     && <MemoryList kind="rules" fetchFn={fetchRules} addFn={addRule} removeFn={removeRule} />}
+            {section === "skills"    && <MemoryList kind="skills" fetchFn={fetchSkills} addFn={addSkill} removeFn={removeSkill} />}
+            {section === "learnings" && <LearningsPanel />}
+            {section === "integrations" && <IntegrationsPanel />}
+          </div>
+        </div>
       </div>
-      <div className="settings-body">
-        {tab === "projects"  && <ProjectsPanel />}
-        {tab === "rules"     && <MemoryList kind="rules" fetchFn={fetchRules} addFn={addRule} removeFn={removeRule} />}
-        {tab === "skills"    && <MemoryList kind="skills" fetchFn={fetchSkills} addFn={addSkill} removeFn={removeSkill} />}
-        {tab === "learnings" && <LearningsPanel />}
-        {tab === "integrations" && <IntegrationsPanel />}
-        {tab === "config"    && <ConfigPanel />}
-      </div>
-    </div>
+    </>
   );
 }
 
@@ -78,8 +150,12 @@ function MemoryList({ kind, fetchFn, addFn, removeFn }) {
   return (
     <div className="memory-panel">
       <div className="memory-header">
+        {/* The overlay header (Settings.jsx) already shows the active section
+            label — this h3's own title text would be a near-duplicate heading,
+            so it's scoped-hidden under .settings-overlay-body (styles.css)
+            while staying intact for any non-overlay reuse of this panel. */}
         <h3 className="memory-title">
-          {kind === "rules" ? "Confirmed Rules" : "Confirmed Skills"}
+          <span className="panel-title-text">{kind === "rules" ? "Confirmed Rules" : "Confirmed Skills"}</span>
           {!loading && <span className="memory-count">{items.length}</span>}
         </h3>
         <button className="btn btn-new-task" onClick={() => setShowAdd(true)}>
@@ -166,7 +242,7 @@ function AddMemoryModal({ kind, onClose, onSaved, addFn }) {
   }
 
   return (
-    <div className="sendback-overlay" onClick={onClose}>
+    <div className="sendback-overlay" data-nested-modal onClick={onClose}>
       <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
         <div className="sendback-label">Add {kind.slice(0, -1)}</div>
         <form onSubmit={handleSubmit}>
@@ -249,8 +325,9 @@ function LearningsPanel() {
   return (
     <div className="memory-panel">
       <div className="memory-header">
+        {/* See MemoryList: redundant with the overlay header's own title. */}
         <h3 className="memory-title">
-          Learning Queue
+          <span className="panel-title-text">Learning Queue</span>
           {!loading && (
             <span className="memory-count">
               {pending.length} pending · {active.length} active
@@ -367,8 +444,9 @@ function ProjectsPanel() {
   return (
     <div className="memory-panel">
       <div className="memory-header">
+        {/* See MemoryList: redundant with the overlay header's own title. */}
         <h3 className="memory-title">
-          Projects
+          <span className="panel-title-text">Projects</span>
           {!loading && <span className="memory-count">{projects.length}</span>}
         </h3>
         <button className="btn btn-new-task" onClick={() => setShowAdd(true)}>
@@ -754,7 +832,7 @@ function AddProjectModal({ onClose, onSaved }) {
   }
 
   return (
-    <div className="sendback-overlay" onClick={onClose}>
+    <div className="sendback-overlay" data-nested-modal onClick={onClose}>
       <div className="new-task-modal" style={{ maxWidth: 520 }} onClick={(e) => e.stopPropagation()}>
         <div className="sendback-label">New Project</div>
         <form onSubmit={handleCreate}>
@@ -802,29 +880,3 @@ function AddProjectModal({ onClose, onSaved }) {
   );
 }
 
-/* ── Config viewer ───────────────────────────────────────────────────────── */
-
-function ConfigPanel() {
-  const [config, setConfig] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-
-  useEffect(() => {
-    fetchConfig()
-      .then((data) => { setConfig(data); setError(null); })
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
-  }, []);
-
-  if (loading) return <div className="settings-empty">Loading…</div>;
-  if (error) return <div className="settings-error">{error}</div>;
-
-  return (
-    <div className="config-panel">
-      <div className="config-hint">
-        Read-only view of <code>~/.no_human/config.yaml</code>. Edit via CLI: <code>nh config edit</code>
-      </div>
-      <pre className="config-json">{JSON.stringify(config, null, 2)}</pre>
-    </div>
-  );
-}

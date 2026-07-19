@@ -1,7 +1,7 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { connectWS, createTask, uploadAttachment, fetchTasks, fetchWorkerStatus, fetchQueueHealth, fetchOnboardingStatus, grillStep, grillStepSSE } from "./api.js";
 import Board from "./Board.jsx";
-import Settings from "./Settings.jsx";
+import SettingsOverlay from "./Settings.jsx";
 import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
 import TaskComposer from "./TaskComposer.jsx";
@@ -404,6 +404,9 @@ export default function App() {
   const [fetchError, setFetchError] = useState(null);
   const [showNewTask, setShowNewTask] = useState(false);
   const [page, setPage] = useState("board");
+  // Settings is an overlay dialog (Claude macOS desktop app model), not a
+  // routed page — it can open on top of whatever page is showing.
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [pendingOpenId, setPendingOpenId] = useState(null);
   const [workerStatus, setWorkerStatus] = useState(null);
   const [queueHealth, setQueueHealth] = useState(null);
@@ -525,7 +528,8 @@ export default function App() {
   useEffect(() => {
     const off = window.nhDesktop?.onMenu?.((action) => {
       if (action === "new-task") setShowNewTask(true);
-      else if (action === "board" || action === "stats" || action === "settings") setPage(action);
+      else if (action === "settings") setSettingsOpen(true);
+      else if (action === "board" || action === "stats") setPage(action);
     });
     return off;
   }, []);
@@ -608,7 +612,7 @@ export default function App() {
       <aside className="nh-sidebar">
         <div className="nh-sidebar-brand"><Brand /></div>
         <nav className="nh-sidenav">
-          {[["board", "Board"], ["stats", "Stats"], ["settings", "Settings"]].map(([k, label]) => (
+          {[["board", "Board"], ["stats", "Stats"]].map(([k, label]) => (
             <button
               key={k}
               className={`nh-sidenav-btn${page === k ? " active" : ""}`}
@@ -620,6 +624,14 @@ export default function App() {
               )}
             </button>
           ))}
+          {/* Settings opens as an overlay dialog, not a routed page. */}
+          <button
+            key="settings"
+            className={`nh-sidenav-btn${settingsOpen ? " active" : ""}`}
+            onClick={() => setSettingsOpen(true)}
+          >
+            Settings
+          </button>
         </nav>
         <NightLedger tasks={tasks} />
         <div className="nh-sidebar-foot">
@@ -709,7 +721,6 @@ export default function App() {
         {page === "done" && <Outcomes tasks={tasks} lane="done" />}
         {page === "failed" && <Outcomes tasks={tasks} lane="failed" />}
         {page === "stats" && <Stats tasks={tasks} />}
-        {page === "settings" && <Settings />}
       </main>
       {showNewTask && (
         <NewTaskModal
@@ -717,6 +728,7 @@ export default function App() {
           onCreated={() => fetchTasks().then((ts) => dispatch({ type: "set", tasks: ts }))}
         />
       )}
+      {settingsOpen && <SettingsOverlay onClose={() => setSettingsOpen(false)} />}
     </div>
   );
 }
