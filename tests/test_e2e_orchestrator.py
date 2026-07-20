@@ -119,6 +119,11 @@ async def test_full_pipeline_opens_local_pr(bare_repo, tmp_path, store):
     assert attempts[-1]["status"] == "succeeded"
     kinds = [e["kind"] for e in events]
     assert "pr_open" in kinds and "commit" in kinds
+    # CI.5: no remote CI configured for this repo -> the pipeline honestly
+    # surfaces that the PR was gated on local tests only (not a remote-CI pass).
+    assert "ci_skipped" in kinds
+    ci_skipped = [e for e in events if e["kind"] == "ci_skipped"]
+    assert ci_skipped and ci_skipped[0].get("remote_ci") is False
 
 
 @pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
