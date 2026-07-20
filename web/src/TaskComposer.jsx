@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from "react";
-import { fetchProjects, fetchConfig } from "./api.js";
+import { fetchProjects, fetchConfig, fetchIntegrations, searchJiraIssues } from "./api.js";
 import { COMPOSER_KINDS, kindByValue, needsPrUrl } from "./composerKinds.js";
 import { splitPrompt } from "./promptSplit.js";
+import { promptFromIssue, jiraStatusChipStyle } from "./jiraImport.js";
 import { greetingName } from "./greeting.js";
 import { hasPrRef } from "./prRefs.js";
 import { formatBytes } from "./formatBytes.js";
@@ -93,8 +94,27 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   const [repoPath, setRepoPath] = useState(initial?.repoPath ?? "");
   const [customRepo, setCustomRepo] = useState(Boolean(initial?.customRepo));
   const [config, setConfig] = useState(null);
+  // Task 1.6 — Import from Jira. `source` rides along invisibly (never a
+  // control the operator sees) so a task created from a picked ticket carries
+  // Task.source = "jira"; everything else runs the SAME grill flow untouched.
+  const [source, setSource] = useState(initial?.source ?? "board");
+  const [jiraConfigured, setJiraConfigured] = useState(false);
+  const [jiraOpen, setJiraOpen] = useState(false);
+  const [jiraQuery, setJiraQuery] = useState("");
+  const [jiraResults, setJiraResults] = useState(undefined); // undefined = no search run yet
+  const [jiraLoading, setJiraLoading] = useState(false);
+  const [jiraError, setJiraError] = useState(null);
+  const [jiraNonce, setJiraNonce] = useState(0); // bumped by "Try again" to re-run the same search
   const fileInputRef = useRef(null);
   const dialogRef = useRef(null);
+  // M2 — picking a ticket unmounts the clicked result button (the panel
+  // closes), dropping focus to <body>. Send it to the prompt textarea
+  // instead: the operator's next move is reading/editing the prefilled
+  // prompt, same as after typing one by hand. The textarea itself never
+  // unmounts when the Jira panel closes, so a direct .focus() call works
+  // immediately — no effect/rAF needed (same imperative idiom as fileInputRef
+  // above; optional chaining guards the pre-mount null case).
+  const promptRef = useRef(null);
 
   // Escape closes the composer — suppressed while a submit is in flight so it
   // cannot discard a task that is already being created.
@@ -103,7 +123,53 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   const repoPathRef = useRef("");
   useEffect(() => { repoPathRef.current = repoPath; });
 
-  useEscapeKey(onClose, !busy);
+  // Escape closes the Jira panel first (progressive disclosure — the same
+  // "narrowest thing first" rule Integrations.jsx's Configure form uses),
+  // and only falls through to closing the whole composer once it's shut.
+  useEscapeKey(() => (jiraOpen ? setJiraOpen(false) : onClose()), !busy);
+
+  // Jira configured? Fetched once — hidden entirely (not just disabled) when
+  // it isn't, so an operator with no Jira integration never sees the affordance.
+  useEffect(() => {
+    fetchIntegrations()
+      .then((r) => {
+        const jira = (r.integrations || []).find((i) => i.name === "jira");
+        setJiraConfigured(Boolean(jira?.configured));
+      })
+      .catch(() => {}); // best-effort, like the greeting's fetchConfig below
+  }, []);
+
+  // Debounced free-text search while the panel is open. 300ms so each
+  // keystroke isn't a request; `ignore` + the cleanup timer discard a stale
+  // response that lands after a newer query has already superseded it.
+  useEffect(() => {
+    if (!jiraOpen) return;
+    const q = jiraQuery.trim();
+    if (!q) {
+      setJiraResults(undefined);
+      setJiraError(null);
+      setJiraLoading(false);
+      return;
+    }
+    let ignore = false;
+    setJiraLoading(true);
+    setJiraError(null);
+    const h = setTimeout(() => {
+      searchJiraIssues(q)
+        .then((issues) => {
+          if (ignore) return;
+          setJiraResults(issues);
+          setJiraLoading(false);
+        })
+        .catch((err) => {
+          if (ignore) return;
+          setJiraError(err.message);
+          setJiraResults(undefined);
+          setJiraLoading(false);
+        });
+    }, 300);
+    return () => { ignore = true; clearTimeout(h); };
+  }, [jiraQuery, jiraOpen, jiraNonce]);
 
   useEffect(() => {
     fetchProjects().then((p) => {
@@ -167,6 +233,18 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   // picker arrives is unavoidable, but the false claim below is).
   const freeTextRepo = customRepo || !loaded || projects.length === 0;
 
+  // Picking an issue prefills the SAME prompt textarea the typed path uses —
+  // the operator proceeds exactly as with a typed task from here on; the
+  // grill flow below never has to know an import happened.
+  function handleJiraPick(issue) {
+    setPrompt(promptFromIssue(issue));
+    setSource("jira");
+    setJiraOpen(false);
+    setJiraQuery("");
+    setJiraResults(undefined);
+    promptRef.current?.focus();
+  }
+
   function handleSubmit(e) {
     if (e) e.preventDefault();
     if (!canSubmit) return;
@@ -186,6 +264,7 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
       prompt,
       prUrl,
       customRepo,
+      source,
     });
   }
 
@@ -214,6 +293,105 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
           ×
         </button>
 
+        {/* Import from Jira — hidden entirely when unconfigured (graceful degrade).
+            An inline disclosure, not a nested modal: it opens in place, right where
+            the affordance sits, and never blocks the rest of the composer. */}
+        {jiraConfigured && (
+          <div className="mb-4 flex justify-center">
+            <button
+              type="button"
+              onClick={() => setJiraOpen((v) => !v)}
+              aria-expanded={jiraOpen}
+              aria-controls="jira-import-panel"
+              className={`${GHOST} gap-2 rounded-full border border-solid border-line px-4 hover:bg-hover hover:text-text`}
+            >
+              <span aria-hidden="true">🎫</span> Import from Jira
+            </button>
+          </div>
+        )}
+
+        {jiraConfigured && jiraOpen && (
+          <div
+            id="jira-import-panel"
+            className="jira-panel-enter mb-4 rounded-2xl border border-solid border-line bg-panel p-4"
+          >
+            <input
+              autoFocus
+              className={TEXT_FIELD}
+              placeholder="Search your Jira project…"
+              value={jiraQuery}
+              onChange={(e) => setJiraQuery(e.target.value)}
+              aria-label="Search Jira tickets"
+            />
+            <div className="mt-3 flex flex-col gap-2" aria-live="polite">
+              {jiraLoading && (
+                <>
+                  <div className="skeleton h-14 w-full rounded-xl" aria-hidden="true" />
+                  <div className="skeleton h-14 w-full rounded-xl" aria-hidden="true" />
+                </>
+              )}
+              {!jiraLoading && jiraError && (
+                <div
+                  role="alert"
+                  className="flex items-center justify-between gap-3 rounded-xl px-4 py-3 font-ui text-sm"
+                  style={{ color: "var(--red)", background: "var(--red-dim)" }}
+                >
+                  <span>{jiraError}</span>
+                  <button
+                    type="button"
+                    onClick={() => setJiraNonce((n) => n + 1)}
+                    className={`${GHOST} shrink-0 px-3`}
+                  >
+                    Try again
+                  </button>
+                </div>
+              )}
+              {!jiraLoading && !jiraError && jiraResults && jiraResults.length === 0 && (
+                <p className="px-2 py-3 text-center font-ui text-sm text-text-muted">
+                  No matching tickets.
+                </p>
+              )}
+              {!jiraLoading && !jiraError && jiraResults && jiraResults.length > 0 && jiraResults.map((issue, i) => {
+                // M1 — colour encodes STATE: the category derived from the
+                // status name (jiraImport.js), never the raw enum. `null`
+                // (unrecognised status) keeps the neutral className below —
+                // no colour claim the normalizer can't back up.
+                const chipStyle = jiraStatusChipStyle(issue.status);
+                return (
+                  <button
+                    key={issue.key}
+                    type="button"
+                    onClick={() => handleJiraPick(issue)}
+                    style={{ animationDelay: `${Math.min(i, 8) * 40}ms` }}
+                    className="jira-result-enter flex cursor-pointer flex-col gap-1 rounded-xl border border-solid border-line bg-card px-4 py-3 text-left transition-colors hover:border-accent hover:bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="font-ui text-sm font-medium text-text">
+                        {issue.key}: {issue.summary}
+                      </span>
+                      {issue.status && (
+                        <span
+                          className={
+                            "shrink-0 rounded-full border border-solid px-2.5 py-0.5 font-ui text-xs " +
+                            (chipStyle ? "font-medium" : "border-line bg-panel text-text-muted")
+                          }
+                          style={chipStyle || undefined}
+                        >
+                          {issue.status}
+                        </span>
+                      )}
+                    </div>
+                    <span className="font-ui text-xs text-text-dim">
+                      {issue.updated ? `Updated ${new Date(issue.updated).toLocaleDateString()}` : "Recently updated"}
+                      {issue.assignee ? ` · ${issue.assignee}` : ""}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         <div className="mb-9 text-center">
           <h2 className="font-display text-4xl font-semibold tracking-tight text-text-hi sm:text-5xl">
             {name ? `Hey there, ${name}` : "Hey there"}
@@ -225,6 +403,7 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
           {/* One large input surface: the prompt and the controls that qualify it. */}
           <div className="rounded-2xl border border-solid border-line bg-panel p-4 transition-colors focus-within:border-accent sm:p-5">
             <textarea
+              ref={promptRef}
               className="min-h-[180px] w-full resize-none border-0 bg-transparent px-2 py-1 font-ui text-lg leading-relaxed text-text outline-none placeholder:text-text-muted sm:min-h-[200px]"
               autoFocus
               placeholder="Describe the task. The first line becomes its title."

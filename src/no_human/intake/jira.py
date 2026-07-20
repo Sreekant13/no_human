@@ -93,18 +93,49 @@ class JiraAdapter:
         return (f'project = "{self.project_key}" AND statusCategory != Done '
                 "ORDER BY updated DESC")
 
-    def search(self) -> list[dict[str, Any]]:
-        """Run the configured JQL and return the matching issues (with fields)."""
+    def _run_search(self, jql: str, max_results: int, fields: str) -> list[dict[str, Any]]:
+        """Shared GET against the successor search endpoint — same auth/URL for
+        both the operator-authored poll (``search``) and the user-driven free
+        text browse (``search_text``)."""
         url = f"{self.site}/rest/api/3/search/jql"
-        params = {
-            "jql": self._search_jql(),
-            "maxResults": 50,
-            "fields": "summary,description,status,labels,issuetype",
-        }
+        params = {"jql": jql, "maxResults": max_results, "fields": fields}
         r = httpx.get(url, params=params, auth=self._auth(), timeout=30.0,
                       headers={"Accept": "application/json"})
         r.raise_for_status()
         return r.json().get("issues", []) or []
+
+    def search(self) -> list[dict[str, Any]]:
+        """Run the configured JQL and return the matching issues (with fields)."""
+        return self._run_search(
+            self._search_jql(), 50, "summary,description,status,labels,issuetype")
+
+    def search_text(self, q: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Free-text issue search for the user-driven browse/pick flow (Import
+        from Jira) — distinct from the operator-authored JQL ``search()`` uses
+        for the background poller. Never built from any task's own text, only
+        from what the operator types into the picker."""
+        escaped = (q or "").replace("\\", "\\\\").replace('"', '\\"')
+        jql = f'text ~ "{escaped}" ORDER BY updated DESC'
+        return self._run_search(
+            jql, limit, "summary,description,status,assignee,updated,issuetype")
+
+    def issue_brief(self, issue: dict[str, Any]) -> dict[str, Any]:
+        """Shape one search hit for the browse/pick list — a short summary,
+        never the full Task shape ``normalize`` builds. Description is
+        truncated (list view, not the detail the created task will carry)."""
+        key = issue.get("key") or ""
+        fields = issue.get("fields") or {}
+        assignee = fields.get("assignee") or {}
+        description = _adf_text(fields.get("description"))
+        return {
+            "key": key,
+            "summary": fields.get("summary") or key or "Jira issue",
+            "status": (fields.get("status") or {}).get("name"),
+            "assignee": assignee.get("displayName"),
+            "updated": fields.get("updated"),
+            "url": f"{self.site}/browse/{key}" if key else self.site,
+            "description": description[:2000],
+        }
 
     def normalize(self, issue: dict[str, Any]) -> Task:
         key = issue.get("key") or ""

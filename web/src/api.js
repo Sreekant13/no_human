@@ -27,11 +27,11 @@ export async function fetchDiff(id) {
   return r.text();
 }
 
-export async function createTask({ title, description, repo_path, project_id, kind, priority, acceptance_criteria, backend }) {
+export async function createTask({ title, description, repo_path, project_id, kind, priority, acceptance_criteria, backend, source }) {
   const r = await fetch(`${BASE}/api/tasks`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title, description, repo_path, project_id, kind, priority, acceptance_criteria, backend }),
+    body: JSON.stringify({ title, description, repo_path, project_id, kind, priority, acceptance_criteria, backend, source }),
   });
   if (!r.ok) {
     const detail = await r.json().catch(() => ({}));
@@ -437,6 +437,19 @@ export const testIntegration = (name) =>
 // never a secret value. Throws with the server's 422/404 `detail` message.
 export const saveIntegrationConfig = (name, fields) =>
   _put(`/api/integrations/${encodeURIComponent(name)}/config`, { fields });
+
+// Task 1.6: browse/pick a configured Jira project's tickets (Import from
+// Jira). Throws with the server's 503 (unconfigured) / 502 (upstream error)
+// `detail` message — the composer surfaces that text as-is.
+export async function searchJiraIssues(q, limit = 20) {
+  const params = new URLSearchParams({ q: q || "", limit: String(limit) });
+  const r = await fetch(`${BASE}/api/integrations/jira/issues?${params}`);
+  if (!r.ok) {
+    const detail = await r.json().catch(() => ({}));
+    throw new Error(detail.detail || `GET jira/issues → ${r.status}`);
+  }
+  return r.json();
+}
 
 export async function suggestPaths(path) {
   const r = await fetch(`${BASE}/api/fs/suggest?path=${encodeURIComponent(path || "")}`);
