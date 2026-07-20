@@ -393,7 +393,10 @@ async function _put(path, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!r.ok) throw new Error(`PUT ${path} → ${r.status}`);
+  if (!r.ok) {
+    const detail = await r.json().catch(() => ({}));
+    throw new Error(detail.detail || `PUT ${path} → ${r.status}`);
+  }
   return r.json();
 }
 
@@ -429,6 +432,11 @@ export async function fetchIntegrations() {
 // Run a live health check for one integration; returns the updated status.
 export const testIntegration = (name) =>
   _post(`/api/integrations/${encodeURIComponent(name)}/test`, {});
+// Save an integration's settings-form fields (dirty fields only — see
+// Integrations.jsx). Returns the refreshed status card + its `fields` array;
+// never a secret value. Throws with the server's 422/404 `detail` message.
+export const saveIntegrationConfig = (name, fields) =>
+  _put(`/api/integrations/${encodeURIComponent(name)}/config`, { fields });
 
 export async function suggestPaths(path) {
   const r = await fetch(`${BASE}/api/fs/suggest?path=${encodeURIComponent(path || "")}`);
