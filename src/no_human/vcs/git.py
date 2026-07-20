@@ -19,7 +19,7 @@ from typing import Iterator
 # Patterns stripped from commit messages to prevent AI attribution leaking
 # into the repo history (the agent identity is set via git config, not trailers).
 _AI_ATTRIBUTION = re.compile(
-    r"\n*Co-authored-by:.*(?:Claude|anthropic|OpenAI|Copilot).*",
+    r"\n*Co-authored-by:.*(?:Claude|anthropic|OpenAI|Copilot).*",  # term-ok: matches real third-party trailers verbatim
     re.IGNORECASE,
 )
 
@@ -135,8 +135,8 @@ class GitRepo:
         ":(exclude,glob)**/node_modules/**",
         ":(exclude,glob)**/.DS_Store",
         ":(exclude,glob)**/.no_human/**",
-        ":(exclude,glob)**/.windsurf/**",
-        ":(exclude,glob)**/.devin/**",
+        ":(exclude,glob)**/.windsurf/**",  # term-ok: real on-disk IDE config dir
+        ":(exclude,glob)**/.devin/**",  # term-ok: real on-disk IDE config dir
         ":(exclude,glob)**/.claude/**",
         ":(exclude,glob)**/HANDOVER.md",
         ":(exclude,glob)**/PLAN.md",
@@ -225,8 +225,8 @@ class GitRepo:
     # coder-created file, favicon.js and the whole *.test.mjs suite, from PR #2).
     # So we filter the curated list here and `git add` it clean.
     _EPHEMERAL_DIRS = frozenset((
-        "__pycache__", ".pytest_cache", "node_modules", ".no_human", ".windsurf",
-        ".devin", ".claude", "venv", ".tox", ".mypy_cache", ".ruff_cache",
+        "__pycache__", ".pytest_cache", "node_modules", ".no_human", ".windsurf",  # term-ok: real on-disk IDE config dir
+        ".devin", ".claude", "venv", ".tox", ".mypy_cache", ".ruff_cache",  # term-ok: real on-disk IDE config dir
         "dist", "build", ".idea", ".vscode",
     ))
     _EPHEMERAL_FILES = frozenset((

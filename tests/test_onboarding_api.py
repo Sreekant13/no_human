@@ -103,7 +103,7 @@ async def test_onboard_rejects_non_repo(client, tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
 async def test_history_extract_returns_valid_shape(client):
-    # Environment-agnostic: whether or not a Windsurf/Devin IDE is running, the
+    # Environment-agnostic: whether or not a Windsurf/Devin IDE is running, the  # term-ok: real IDE names
     # endpoint must return 200 with a well-formed, honest shape (never crash).
     r = await client.post("/api/onboarding/history/extract")
     assert r.status_code == 200

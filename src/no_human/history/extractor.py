@@ -1,9 +1,9 @@
-"""Extract exact conversation transcripts from the Windsurf/Devin language server.
+"""Extract exact conversation transcripts from the Windsurf/Devin language server.  # term-ok: real IDE names
 
 The IDE runs a ConnectRPC server (``exa.language_server_pb.LanguageServerService``)
 inside a Go ``language_server_*`` process. We:
 
-  1. Find the process via ``psutil``, read ``WINDSURF_CSRF_TOKEN`` from its env.
+  1. Find the process via ``psutil``, read ``WINDSURF_CSRF_TOKEN`` from its env.  # term-ok: real third-party env var
   2. Probe its listening ports to find the ConnectRPC endpoint.
   3. Call ``GetAllCascadeTrajectories`` → list of conversations.
   4. Call ``GetCascadeTrajectorySteps`` per conversation → full step data.
@@ -50,13 +50,13 @@ class Transcript:
     ended: str = ""         # ISO 8601 last message timestamp
     cwd: str = ""           # working directory the session ran in
     git_branch: str = ""    # branch checked out at session time
-    source: str = ""        # "cc:enterprise" | "cc:personal" | "windsurf" | ""
+    source: str = ""        # "cc:enterprise" | "cc:personal" | "windsurf" | ""  # term-ok: internal source tag names the real IDE
     corrections: int = 0    # non-noise user messages after the first — the
                             # babysitting signal the benchmark compares against
 
 
 class IDENotRunningError(Exception):
-    """Raised when no Windsurf/Devin language server process is found."""
+    """Raised when no Windsurf/Devin language server process is found."""  # term-ok: real IDE names
 
 
 class LanguageServerClient:
@@ -88,7 +88,7 @@ def _discover_client() -> LanguageServerClient:
     """Auto-discover the language server's ConnectRPC port and CSRF token.
 
     Iterates over all ``language_server_*`` processes, reads the
-    ``WINDSURF_CSRF_TOKEN`` env var, then probes each LISTEN port until
+    ``WINDSURF_CSRF_TOKEN`` env var, then probes each LISTEN port until  # term-ok: real third-party env var
     ``GetAllCascadeTrajectories`` responds.
     """
     try:
@@ -110,7 +110,7 @@ def _discover_client() -> LanguageServerClient:
             env = proc.environ()
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             continue
-        token = env.get("WINDSURF_CSRF_TOKEN")
+        token = env.get("WINDSURF_CSRF_TOKEN")  # term-ok: real third-party env var
         if not token:
             continue
         try:
@@ -123,7 +123,7 @@ def _discover_client() -> LanguageServerClient:
 
     if not candidates:
         raise IDENotRunningError(
-            "No Windsurf/Devin language server found. Is the IDE running?"
+            "No Windsurf/Devin language server found. Is the IDE running?"  # term-ok: real IDE names
         )
 
     for host, port, token in candidates:
@@ -145,7 +145,7 @@ def _discover_client() -> LanguageServerClient:
 def _discover_all_clients() -> list[LanguageServerClient]:
     """Discover ALL responding language servers across all IDE windows.
 
-    Each Devin/Windsurf IDE window runs its own ``language_server_*`` process
+    Each Devin/Windsurf IDE window runs its own ``language_server_*`` process  # term-ok: real IDE names
     with a unique CSRF token. To collect conversations from every window, we
     iterate all language_server processes and return every client that responds
     to ``GetAllCascadeTrajectories``.
@@ -172,7 +172,7 @@ def _discover_all_clients() -> list[LanguageServerClient]:
             env = proc.environ()
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             continue
-        token = env.get("WINDSURF_CSRF_TOKEN")
+        token = env.get("WINDSURF_CSRF_TOKEN")  # term-ok: real third-party env var
         if not token:
             continue
         try:
@@ -186,7 +186,7 @@ def _discover_all_clients() -> list[LanguageServerClient]:
 
     if not pid_candidates:
         raise IDENotRunningError(
-            "No Windsurf/Devin language server found. Is the IDE running?"
+            "No Windsurf/Devin language server found. Is the IDE running?"  # term-ok: real IDE names
         )
 
     clients: list[LanguageServerClient] = []
@@ -306,7 +306,7 @@ def extract_transcripts(
             messages=messages,
             step_count=step_count,
             workspaces=workspaces,
-            source="windsurf",
+            source="windsurf",  # term-ok: internal source tag names the real IDE
             corrections=max(0, len(user_msgs) - 1),
         ))
 

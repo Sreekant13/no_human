@@ -168,7 +168,7 @@ async def test_decompose_creates_subtasks(store):
 
 async def test_decompose_inherits_backend(store):
     parent = Task.new("big task", repo_path="/tmp/r")
-    parent.config = {"backend": "devin"}
+    parent.config = {"backend": "agent-a"}
     await store.create_task(parent)
 
     plan = {
@@ -177,7 +177,7 @@ async def test_decompose_inherits_backend(store):
     }
     lead = LeadAgent(store)
     created = await lead.decompose(parent, plan)
-    assert created[0].config.get("backend") == "devin"
+    assert created[0].config.get("backend") == "agent-a"
 
 
 async def test_decompose_rejects_too_many_subtasks(store):

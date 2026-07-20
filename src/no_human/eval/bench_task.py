@@ -169,7 +169,7 @@ def build_bench_tasks(
         seen_requests.add(req_hash)
 
         tid = f"ns-{hashlib.sha256(t.cascade_id.encode()).hexdigest()[:8]}"
-        # Claude Code carries cwd; Windsurf/Devin carry workspace URIs — the
+        # Claude Code carries cwd; Windsurf/Devin carry workspace URIs — the  # term-ok: real IDE names
         # original 89-conversation corpus is ALL workspaces-shaped.
         cwd = getattr(t, "cwd", "") or ""
         if not cwd:
@@ -211,7 +211,7 @@ def build_bench_tasks(
             title=req_title,
             request=request,
             source={
-                "kind": ("windsurf" if getattr(t, "source", "") == "windsurf"
+                "kind": ("windsurf" if getattr(t, "source", "") == "windsurf"  # term-ok: internal source tag names the real IDE
                          else "claude_code"),
                 "session": t.cascade_id,
                 "label": getattr(t, "source", "") or "",

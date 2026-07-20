@@ -30,7 +30,7 @@ async def test_discovers_and_orders_instruction_files(store, tmp_path):
     repo = tmp_path / "repo"; (repo / ".github").mkdir(parents=True)
     (repo / "CLAUDE.md").write_text("Use tabs, not spaces.")
     (repo / "AGENTS.md").write_text("Run `make check` before committing.")
-    (repo / ".github" / "copilot-instructions.md").write_text("Prefer composition.")
+    (repo / ".github" / "copilot-instructions.md").write_text("Prefer composition.")  # term-ok: real file convention
     orch = _orch(store, tmp_path)
 
     section = orch._repo_instruction_section(repo)

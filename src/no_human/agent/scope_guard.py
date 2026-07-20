@@ -32,7 +32,7 @@ from typing import Any, Callable
 #: reach a commit or a PR.  Two consequences the guards below rely on: an edit
 #: there cannot *be* a scope violation, and rewriting one repeatedly is not an
 #: edit-loop.  no_human itself writes ``.no_human/PLAN.md`` for the agent to read.
-AGENT_OWNED_DIRS = frozenset({".no_human", ".claude", ".devin", ".windsurf"})
+AGENT_OWNED_DIRS = frozenset({".no_human", ".claude", ".devin", ".windsurf"})  # term-ok: real on-disk IDE config dirs
 
 #: Agent-authored files, likewise excluded from every git diff wherever they sit.
 #: The orchestrator's own comment (core/orchestrator.py, plan materialization)

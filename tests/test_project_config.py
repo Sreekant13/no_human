@@ -268,8 +268,8 @@ def test_forbidden_extras_reset_from_baseline_not_accumulated(store, tmp_path):
 
 
 def test_backend_without_forbidden_paths_is_skipped_no_false_emit(store, tmp_path):
-    """A backend that does not enforce forbidden_paths (e.g. Devin) must not get
-    a phantom attribute nor a repo_config event claiming a tightening happened."""
+    """A backend that does not enforce forbidden_paths must not get a phantom
+    attribute nor a repo_config event claiming a tightening happened."""
     events = []
 
     class _NoGuardBackend:

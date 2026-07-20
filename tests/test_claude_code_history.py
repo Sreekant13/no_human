@@ -203,7 +203,7 @@ def test_missing_root_is_skipped_not_fatal(roots, tmp_path):
 def test_mined_rules_scoped_by_cwd_fallback(roots):
     """CC transcripts have no workspaces; the analyzer must scope mined rules
     to the session cwd, or a personal-repo rule goes global (learning-queue
-    flood). Windsurf workspaces still win when present."""
+    flood). Windsurf workspaces still win when present."""  # term-ok: real IDE name
     from no_human.history.analyzer import analyze_transcript
     from no_human.history.extractor import Transcript, Message
 
@@ -230,7 +230,7 @@ def test_mined_rules_scoped_by_cwd_fallback(roots):
 
 def test_cli_json_out_is_pure_json(roots, monkeypatch):
     """`nh history --json-out` stdout must be pipeable JSON — status lines
-    (incl. the windsurf-skipped notice) must not pollute it."""
+    (incl. the windsurf-skipped notice) must not pollute it."""  # term-ok: real IDE name
     from click.testing import CliRunner
     from no_human.cli.commands import cli
     from no_human.history import extractor
@@ -252,7 +252,7 @@ def test_cli_json_out_is_pure_json(roots, monkeypatch):
 
 
 def test_windsurf_transcript_defaults_stay_compatible():
-    """New Transcript fields must default safely for the Windsurf path."""
+    """New Transcript fields must default safely for the Windsurf path."""  # term-ok: real IDE name
     from no_human.history.extractor import Transcript
 
     t = Transcript(cascade_id="w1", title="x", created="2026-07-01")

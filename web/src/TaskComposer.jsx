@@ -83,7 +83,6 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   const [kind, setKind] = useState(initial?.kind ?? "feature");
   const [prUrl, setPrUrl] = useState(initial?.prUrl ?? "");
   const [priority, setPriority] = useState(initial?.priority ?? "medium");
-  const [backend, setBackend] = useState(initial?.backend ?? "claude");
   const [files, setFiles] = useState(initial?.files ?? []);
   // undefined = fetch in flight · [] = genuinely none. The initial-[]
   // ambiguity showed 'No projects yet' during the load window and then
@@ -256,7 +255,6 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
       description: fullDescription,
       kind,
       priority,
-      backend,
       files,
       repoPath: freeTextRepo ? repoPath.trim() || null : repoPath || null,
       projectId: !customRepo && selectedProjectId ? selectedProjectId : null,
@@ -443,34 +441,6 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
                 <option value="medium">medium priority</option>
                 <option value="low">low priority</option>
               </SelectPill>
-
-              {/* Segmented control: one pill, two halves — same height as its siblings. */}
-              <div
-                role="radiogroup"
-                aria-label="Backend"
-                className="flex h-10 shrink-0 overflow-hidden rounded-full border border-solid border-line"
-              >
-                {[
-                  { id: "claude", label: "Claude Code" },
-                  { id: "devin", label: "Devin" },
-                ].map((b) => (
-                  <button
-                    key={b.id}
-                    type="button"
-                    role="radio"
-                    aria-checked={backend === b.id}
-                    onClick={() => setBackend(b.id)}
-                    className={
-                      "cursor-pointer border-0 px-5 font-ui text-sm transition-colors " +
-                      (backend === b.id
-                        ? "bg-accent text-base"
-                        : "bg-card text-text-muted hover:bg-hover hover:text-text")
-                    }
-                  >
-                    {b.label}
-                  </button>
-                ))}
-              </div>
 
               <div className="ml-auto flex items-center gap-2">
                 <button type="button" className={`${GHOST} px-5`} onClick={onClose}>

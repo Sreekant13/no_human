@@ -116,7 +116,7 @@ def _project_from_workspaces(workspaces: list[str]) -> str:
 
 
 def _project_of(transcript: Transcript) -> str:
-    """Project scope for mined rules: workspace URIs (Windsurf) with a
+    """Project scope for mined rules: workspace URIs (Windsurf) with a  # term-ok: real IDE name
     fallback to the session ``cwd`` (Claude Code transcripts carry no
     workspaces — without the fallback every CC-mined rule was global and a
     personal-repo correction could surface in an enterprise task)."""

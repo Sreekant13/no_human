@@ -1,4 +1,4 @@
-"""Extract and analyze Cascade/Windsurf IDE conversation history.
+"""Extract and analyze Cascade/Windsurf IDE conversation history.  # term-ok: real IDE name
 
 Used during onboarding to bootstrap the learning queue from a user's real
 interaction patterns — failure modes, anti-patterns, and successful approaches

@@ -243,7 +243,6 @@ function NewTaskModal({ onClose, onCreated }) {
         kind: fields.kind,
         priority: fields.priority,
         acceptance_criteria: grillResult?.acceptance_criteria || [],
-        backend: fields.backend,
         // Task 1.6: the hidden marker TaskComposer sets when the task came
         // from a picked Jira ticket — "board" for every typed task, unchanged.
         source: fields.source,

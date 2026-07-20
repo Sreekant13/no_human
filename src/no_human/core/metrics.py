@@ -184,7 +184,7 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
     }
 
 async def playbook_outcomes(store) -> list[dict]:
-    """D2 #5 (Devin June-2026): which playbooks actually PAY?
+    """D2 #5 (agent-a June-2026): which playbooks actually PAY?
 
     Joins the playbook_accessed event to each task's outcome and burn. A
     playbook that correlates with escalations and high spend is a liability,

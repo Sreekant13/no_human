@@ -7,7 +7,7 @@
 #   ./scripts/run_tests.sh slow          # slow tests only (~5min)
 #   ./scripts/run_tests.sh full          # all tests, parallel
 #
-# Designed to work with any runner: local, Devin, CI.
+# Designed to work with any runner: local, agent-a, CI.
 # Exit code 0 = all tests passed.
 set -euo pipefail
 

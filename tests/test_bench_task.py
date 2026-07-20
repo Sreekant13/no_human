@@ -199,13 +199,13 @@ def test_resumed_sessions_dedupe_by_first_request(tmp_path):
 # ---------------------------- non-runnable --------------------------------- #
 
 def test_windsurf_workspaces_resolve_repo_path(tmp_path):
-    """Windsurf/Devin transcripts carry `workspaces` (file:// URIs), not cwd —
+    """Windsurf/Devin transcripts carry `workspaces` (file:// URIs), not cwd —  # term-ok: real IDE names
     without the fallback the ENTIRE original 89-conversation corpus builds as
-    non-runnable (found live: all Windsurf specs skipped 'repo missing')."""
+    non-runnable (found live: all Windsurf specs skipped 'repo missing')."""  # term-ok: real IDE name
     repo = _git_repo(tmp_path)
     t = _transcript(cwd="", branch="")
     t.workspaces = [f"file://{repo}/"]
-    t.source = "windsurf"
+    t.source = "windsurf"  # term-ok: internal source tag names the real IDE
     build_bench_tasks([t], out_dir=tmp_path / "specs")
     spec = load_bench_tasks(tmp_path / "specs")[0]
     assert spec.runnable is True

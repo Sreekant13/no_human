@@ -2,14 +2,14 @@
 
 Claude Code stores every session as JSONL under
 ``~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`` — one JSON object per
-line. Unlike the Windsurf extractor (which RPCs a running IDE), this reads files
+line. Unlike the Windsurf extractor (which RPCs a running IDE), this reads files  # term-ok: real IDE name
 directly, so it works with no IDE running and covers the user's real Claude Code
 history (the place they actually give corrections and rules today).
 
 We extract the human's text messages (and assistant text for context), skipping
 sidechains, tool plumbing, and local-command noise. The output is the same
 ``Transcript`` dataclass the analyzer/ingester already consume, so Claude Code
-history flows through the identical learning pipeline as Windsurf.
+history flows through the identical learning pipeline as Windsurf.  # term-ok: real IDE name
 """
 
 from __future__ import annotations

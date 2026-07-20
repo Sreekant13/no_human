@@ -111,8 +111,8 @@ export default function TaskTable({ tasks, onSelect = null, emptyHint = null }) 
                 {t.repo_name || "—"}
               </td>
               <td className="stats-td">
-                <span className={`stats-runner-badge runner-${t.backend || "claude"}`}>
-                  {t.backend === "devin" ? "Devin" : "Claude Code"}
+                <span className="stats-runner-badge runner-claude">
+                  Claude Code
                 </span>
               </td>
               <td className="stats-td stats-td-mono stats-td-right">

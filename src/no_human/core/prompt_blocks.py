@@ -19,7 +19,7 @@ from .task import Task
 
 
 def build_playbook_block(playbook: dict[str, Any] | None) -> str:
-    """1.4: inject a matched Devin-style playbook — the reusable procedure for
+    """1.4: inject a matched agent-a-style playbook — the reusable procedure for
     this task shape. Pure. The Postconditions ('done = these are TRUE') are the
     highest-leverage part; Forbidden reinforces the safety rails. Empty → ''."""
     if not playbook:
@@ -156,7 +156,7 @@ def build_resume_digest(task: Task) -> str:
             "Test plan from the spec — write tests that cover these:\n"
             + test_plan
         )
-    # W3.5 (Devin playbook): the spec's out_of_scope is the FORBIDDEN list.
+    # W3.5 (agent-a playbook): the spec's out_of_scope is the FORBIDDEN list.
     out_of_scope = spec.get("out_of_scope")
     if out_of_scope:
         items = (out_of_scope if isinstance(out_of_scope, list)

@@ -3518,7 +3518,7 @@ async def test_worktree_tasks_resolve_the_primary_repos_profile(bare_repo, tmp_p
 
 
 def test_out_of_scope_becomes_a_forbidden_block_in_the_prompt():
-    """W3.5 (Devin playbook): the spec's out_of_scope is surfaced to the coder
+    """W3.5 (agent-a playbook): the spec's out_of_scope is surfaced to the coder
     as a hard FORBIDDEN constraint, from the first attempt — not discovered
     late by the reviewer as scope creep."""
     from no_human.core.orchestrator import Orchestrator

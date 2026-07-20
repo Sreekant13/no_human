@@ -754,7 +754,7 @@ function TestPlanEditor({ project, onUpdated }) {
                   {CI_BACKEND_OPTIONS.map(b => <option key={b} value={b}>{b}</option>)}
                 </select>
                 <input className="new-task-input" style={{ flex: 1, marginBottom: 0 }}
-                  placeholder={newLayer.ciBackend === "jenkins" ? "Jenkins job path" : "GitLab project (e.g. ci_gate-analytics-export-report-generator)"}
+                  placeholder={newLayer.ciBackend === "jenkins" ? "Jenkins job path" : "GitLab project (e.g. ci_gate-analytics-export)"}
                   value={newLayer.ciProject}
                   onChange={(e) => setNewLayer({ ...newLayer, ciProject: e.target.value })} />
               </div>
