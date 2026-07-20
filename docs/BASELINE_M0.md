@@ -20,7 +20,7 @@ $ sqlite3 -readonly ~/.no_human/no_human.db \
 This is the M0 exit criterion, and it is currently zero. It stays the headline
 number until an authored PR exists.
 
-## The flagship run — task `84251cb2` (CI_GATE integration-test pipeline)
+## The flagship run — task `84251cb2` (INTEGRATION-GATE integration-test pipeline)
 
 Status `blocked`. Stopped by budget, not by a defect: two real reviewer findings
 away from a PR. Work preserved on `scratch/dev/84251cb2-5`
