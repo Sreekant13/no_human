@@ -80,6 +80,44 @@ def test_timed_out_is_failure():
     assert result.status == PipelineStatus.FAILED
 
 
+# --- indeterminate conclusions must NEVER read as green (safety invariant) --- #
+
+@pytest.mark.parametrize("conclusion", ["action_required", "stale",
+                                        "startup_failure", "", None])
+def test_indeterminate_conclusion_is_not_green(conclusion):
+    # action_required (awaiting manual approval), stale, startup_failure (the
+    # workflow never ran the tests), and null/unknown conclusions must map to
+    # UNKNOWN — NOT SUCCESS. Calling any of these green is false confidence.
+    runs = [{"name": "ci", "status": "completed", "conclusion": conclusion,
+             "html_url": ""}]
+    result = check_runs_to_result(runs, ref="abc123")
+    assert result.status == PipelineStatus.UNKNOWN
+    assert not result.passed
+
+
+def test_success_plus_indeterminate_is_not_green():
+    # One green check does not clear an indeterminate sibling.
+    runs = [_run("unit"), {"name": "deploy-gate", "status": "completed",
+                           "conclusion": "action_required", "html_url": ""}]
+    result = check_runs_to_result(runs, ref="abc123")
+    assert result.status == PipelineStatus.UNKNOWN
+    assert not result.passed
+
+
+def test_skipped_only_is_still_success():
+    # SKIPPED = didn't need to run (path filter); it is clean, not indeterminate.
+    runs = [_run("optional", conclusion="skipped")]
+    result = check_runs_to_result(runs, ref="abc123")
+    assert result.status == PipelineStatus.SUCCESS
+
+
+def test_failure_still_wins_over_indeterminate():
+    runs = [{"name": "a", "status": "completed", "conclusion": "action_required",
+             "html_url": ""}, _run("b", conclusion="failure")]
+    result = check_runs_to_result(runs, ref="abc123")
+    assert result.status == PipelineStatus.FAILED
+
+
 def test_jobs_have_web_urls():
     runs = [_run("lint")]
     result = check_runs_to_result(runs, ref="abc123")

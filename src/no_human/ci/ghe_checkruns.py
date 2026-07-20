@@ -88,6 +88,14 @@ def check_runs_to_result(
     jobs: list[JobResult] = []
     any_in_progress = False
     any_failed = False
+    any_indeterminate = False
+
+    # A completed check counts as "clean" ONLY with one of these conclusions.
+    # Anything else that has completed (action_required, stale, startup_failure,
+    # a null/unknown conclusion, ...) is INDETERMINATE — we must not call it
+    # green (a workflow that failed to start or is awaiting manual approval has
+    # NOT run the tests). SKIPPED = didn't need to run; NEUTRAL maps to SUCCESS.
+    _CLEAN = (PipelineStatus.SUCCESS, PipelineStatus.SKIPPED)
 
     for cr in check_runs:
         name = cr.get("name", "?")
@@ -103,6 +111,8 @@ def check_runs_to_result(
         mapped = _CONCLUSION_MAP.get(conclusion, PipelineStatus.UNKNOWN)
         if mapped in (PipelineStatus.FAILED, PipelineStatus.CANCELED):
             any_failed = True
+        elif mapped not in _CLEAN:
+            any_indeterminate = True
         jobs.append(JobResult(
             name=name,
             status=mapped.value,
@@ -114,6 +124,10 @@ def check_runs_to_result(
         overall = PipelineStatus.RUNNING
     elif any_failed:
         overall = PipelineStatus.FAILED
+    elif any_indeterminate:
+        # A completed-but-not-clean check we cannot vouch for -> UNKNOWN, never
+        # green. The caller treats UNKNOWN as "no verdict", not a pass.
+        overall = PipelineStatus.UNKNOWN
     else:
         overall = PipelineStatus.SUCCESS
 
