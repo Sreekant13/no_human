@@ -74,31 +74,34 @@ async function open(task, viewport = { width: 1440, height: 900 }, theme = "dark
   return { ctx, page, errors };
 }
 
-const activeTab = (page) =>
-  page.locator(".so-tab.active, .so-tabs .active").first().innerText().catch(() => "?");
+// 1.4: the tab strip became a lazy accordion (one section open at a time,
+// below a summary-first narrative). The gate-aware "which surface opens
+// first" behavior is unchanged — only the selector for "which one is open".
+const openSectionLabel = (page) =>
+  page.locator(".so-section.open .so-section-title").first().innerText().catch(() => "?");
 
-// B4 — the drawer must open on the surface that can CLEAR the gate.
+// B4 — the drawer must open on the section that can CLEAR the gate.
 {
   const { ctx, page, errors } = await open(PARKED);
-  const t = (await activeTab(page)).toLowerCase();
-  check("[B4] a PARKED task opens on the tab that holds its answer UI", t.includes("detail"), t);
+  const t = (await openSectionLabel(page)).toLowerCase();
+  check("[B4] a PARKED task opens on the section that holds its answer UI", t.includes("detail"), t);
   const optionBtns = page.locator(".slideover .blocker-option-btn");
   const nOptions = await optionBtns.count();
   const questionShown = await page.locator(".slideover").innerText();
-  check("[B4] the blocker's one-click answers are on screen without changing tabs",
+  check("[B4] the blocker's one-click answers are on screen without changing sections",
     nOptions >= 2 && questionShown.includes("Abandon the task"), `${nOptions} option buttons`);
   check("[B4] no page errors", errors.length === 0, errors[0] || "");
   await ctx.close();
 }
 {
   const { ctx, page } = await open(REVIEW);
-  const t = (await activeTab(page)).toLowerCase();
+  const t = (await openSectionLabel(page)).toLowerCase();
   check("[B4] an awaiting-approval task still opens on Review (unchanged)", t.includes("review"), t);
   await ctx.close();
 }
 {
   const { ctx, page } = await open(RUNNING);
-  const t = (await activeTab(page)).toLowerCase();
+  const t = (await openSectionLabel(page)).toLowerCase();
   check("[B4] a running task still opens on System (unchanged)", t.includes("system"), t);
   await ctx.close();
 }
@@ -231,17 +234,24 @@ const activeTab = (page) =>
   await ctx.close();
 }
 
-// MAJOR 4 — every drawer tab must be reachable on a phone.
+// MAJOR 4 — every drawer section (incl. Diff/Attempts) must be reachable on a
+// phone. 1.4 replaced the horizontally-scrolling tab strip with a vertical
+// accordion inside the (vertically scrolling) drawer body — so "reachable"
+// now means every section header is present and the body scrolls vertically,
+// not that a strip scrolls sideways.
 {
   const { ctx, page } = await open(PARKED, { width: 390, height: 844 });
-  const tabs = await page.evaluate(() => {
-    const strip = document.querySelector(".so-tabs");
-    const cs = getComputedStyle(strip);
-    return { overflowX: cs.overflowX, scrollable: strip.scrollWidth > strip.clientWidth,
-             reach: strip.scrollWidth <= strip.clientWidth + strip.scrollWidth };
+  const info = await page.evaluate(() => {
+    const body = document.querySelector(".so-body");
+    const cs = getComputedStyle(body);
+    const titles = [...document.querySelectorAll(".so-section-title")].map((n) => n.textContent.toLowerCase());
+    return { overflowY: cs.overflowY, titles };
   });
-  check("[M4+] the drawer tab strip scrolls on a phone (diff/attempts reachable)",
-    tabs.overflowX === "auto" || !tabs.scrollable, JSON.stringify(tabs));
+  check("[M4+] the drawer body scrolls vertically on a phone", info.overflowY === "auto" || info.overflowY === "scroll",
+    JSON.stringify(info));
+  check("[M4+] Diff and Attempts sections are both present (reachable by scrolling)",
+    info.titles.some((t) => t.includes("diff")) && info.titles.some((t) => t.includes("attempt")),
+    JSON.stringify(info.titles));
   await ctx.close();
 }
 

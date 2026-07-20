@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import {
   approveTask, cancelTask, chooseBlockerOption, fetchDiff, fetchSubtasks,
   fetchTask, fetchTaskEvents, finishReview,
@@ -12,8 +12,10 @@ import { taskProgress } from "./taskProgress.js";
 import { hasAction, normalizeOption } from "./blockerOptions.js";
 import { clampAgentState, currentFunctionality, groupFunctionalities, laneAgentRows } from "./functionalities.js";
 import { agentSummary, taskSummary } from "./summaries.js";
-import { costOf, fmtCost, fmtTokens, totalBurn } from "./cost.js";
-import { formatDuration } from "./formatDuration.js";
+import {
+  PARKED_STATUSES, narrativeFor, chipsFor, milestonesFor, sectionSummary,
+  defaultOpenSection,
+} from "./slideOverSummary.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
 const IconCheck = ({ size = 14, className = "" }) => (
@@ -35,19 +37,6 @@ const IconInfo = ({ size = 14 }) => (
   <svg className="nh-icon" width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="8" cy="8" r="6.5" /><line x1="8" y1="7" x2="8" y2="11" /><circle cx="8" cy="5" r="0.5" fill="currentColor" stroke="none" /></svg>
 );
 
-const STATUS_PILL = {
-  pending:            "pill-pending",
-  context:            "pill-context",
-  planning:           "pill-planning",
-  implementing:       "pill-implementing",
-  reviewing:          "pill-reviewing",
-  testing:            "pill-testing",
-  awaiting_approval:  "pill-awaiting_approval",
-  done:               "pill-done",
-  escalated:          "pill-escalated",
-  failed:             "pill-failed",
-};
-
 export default function SlideOver({ taskId, onClose, refreshKey = 0,
                                     reviewQueue = [], onJump = null }) {
   // W2.5: the review queue — the next awaiting-approval task after this one,
@@ -55,11 +44,15 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   const nextInQueue = reviewQueue.find((id) => id !== taskId) || null;
   const [task, setTask] = useState(null);
   const [diff, setDiff] = useState("");
-  const [tab, setTab] = useState("system");
-  // U3: the drawer opens on the surface that can CLEAR this task's gate — the diff +
+  // 1.4: the tab strip is gone — the drawer is summary-first, with one lazy
+  // accordion section open at a time below it. `openSection` is that section's
+  // key, or null (summary only, all details collapsed).
+  const [openSection, setOpenSection] = useState(null);
+  // U3: the drawer opens on the section that can CLEAR this task's gate — the diff +
   // approve for a review, the question + its canned answers for a parked task. System
   // is one click away.
-  const openedFirstTab = useRef(false);
+  const openedFirstSection = useRef(false);
+  const sectionRefs = useRef({});
   const [busy, setBusy] = useState(false);
   const [sbOpen, setSbOpen] = useState(false);
   const [sbMsg, setSbMsg] = useState("");
@@ -75,7 +68,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
 
   // A NEW task resets the review-first latch; a refreshKey bump must not —
   // it would yank the user back to the review tab on every WS update.
-  useEffect(() => { openedFirstTab.current = false; }, [taskId]);
+  useEffect(() => { openedFirstSection.current = false; }, [taskId]);
 
   // Re-fetch whenever taskId changes OR when Board signals a WS update
   useEffect(() => {
@@ -86,19 +79,22 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
     fetchTask(taskId).then((t) => {
       if (stale) return;
       setTask(t);
-      if (!openedFirstTab.current && t) {
-        // The drawer opens on the surface that explains the gate. Review was already
+      if (!openedFirstSection.current && t) {
+        // The section that explains the gate starts open. Review was already
         // handled; a parked task's blocker — its question, category and evidence — lives in
         // Details, so opening on System buried the question behind a pipeline diagram. (The
-        // Reply button is in the persistent action bar on every tab, and no parked task in
+        // Reply button is in the persistent action bar on every section, and no parked task in
         // the live DB carries one-click `options` — so this surfaces the QUESTION, which is
         // the honest claim.)
-        const dest = t.status === "awaiting_approval" ? "review"
-          : PARKED_STATUSES.has(t.status) ? "details"
-          : null;
+        const dest = defaultOpenSection(t);
         if (dest) {
-          openedFirstTab.current = true;  // once per open; user clicks win after
-          setTab(dest);
+          openedFirstSection.current = true;  // once per open; user clicks win after
+          setOpenSection(dest);
+          // Summary stays visible above; scroll the gate section's header into
+          // view too, so a long drawer doesn't hide the one thing to act on.
+          requestAnimationFrame(() => {
+            sectionRefs.current[dest]?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+          });
         }
       }
     }).catch(() => {});
@@ -144,7 +140,6 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   const isActive = ["pending", "context", "planning", "implementing", "reviewing", "testing"].includes(task?.status);
   const isFailed = task?.status === "failed";
   const isTerminal = task?.status === "done" || task?.status === "failed";
-  const pillClass = STATUS_PILL[task?.status] || "pill-pending";
 
   async function handleApprove() {
     if (!isAwaiting || busy) return;
@@ -235,18 +230,6 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
             <div className="so-id">{task?.id ?? taskId}</div>
             <div className="so-title" id="so-dialog-title">{task?.title ?? "Loading…"}</div>
           </div>
-          {(task?.total_tokens > 0 || task?.total_cache_read > 0) && (
-            <span className="so-cost" title="cost meter: coder + reviewer + planner burn (fresh + cache-read tokens) · indicative $ · wall-time · attempts">
-              {fmtTokens(totalBurn({ used: task.total_tokens, creation: task.total_cache_creation, read: task.total_cache_read }) + totalBurn({ used: task.total_review_tokens, creation: task.total_review_cache_creation, read: task.total_review_cache_read }) + totalBurn({ used: task.total_aux_tokens, creation: task.total_aux_cache_creation, read: task.total_aux_cache_read }))} tok · {fmtCost(costOf({ used: task.total_tokens, creation: task.total_cache_creation, read: task.total_cache_read }) + costOf({ used: task.total_review_tokens, creation: task.total_review_cache_creation, read: task.total_review_cache_read }) + costOf({ used: task.total_aux_tokens, creation: task.total_aux_cache_creation, read: task.total_aux_cache_read }))}
-              {task.wall_seconds != null && ` · ${formatDuration(Math.round(task.wall_seconds))}`}
-              {task.attempt_count > 0 && ` · ${task.attempt_count} attempt${task.attempt_count > 1 ? "s" : ""}`}
-            </span>
-          )}
-          {task && (
-            <span className={`so-status-pill ${pillClass}`}>
-              {String(task.status).replace(/_/g, " ")}
-            </span>
-          )}
           <button className="so-close" onClick={onClose} ref={closeRef} aria-label="Close"><IconX size={16} /></button>
         </div>
         {task && taskProgress(task.status) != null && (
@@ -260,30 +243,39 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
           </div>
         )}
 
-        {/* tabs */}
-        <div className="so-tabs">
-          {["system", "activity", ...(task?.parent_id || task?.status === "compound_parent" ? ["subtasks"] : []), "details", "spec", "review", "diff", "attempts"].map((t) => (
-            <button
-              key={t}
-              className={`so-tab${tab === t ? " active" : ""}`}
-              onClick={() => setTab(t)}
-            >
-              {t}
-            </button>
-          ))}
-        </div>
+        {/* summary — the landing state: a plain-language narrative, live chips,
+            and a small milestone timeline. Replaces the tab strip; the action
+            bar below still leads with Approve/Reply/etc. */}
+        {task && <TaskSummary task={task} isActive={isActive} />}
 
-        {/* body */}
+        {/* body: lazy accordion sections, one open at a time. Each section
+            body is one of the original 8 tab components, unchanged — they
+            still mount (and fetch/SSE) only while their section is open. */}
         <div className="so-body">
           {flash && <FlashBanner msg={flash} onDismiss={() => setFlash(null)} />}
-          {tab === "system"   && <SystemTab taskId={taskId} task={task} isActive={isActive} />}
-          {tab === "activity" && <ActivityTab taskId={taskId} task={task} isActive={isActive} />}
-          {tab === "subtasks" && <SubtasksTab taskId={taskId} />}
-          {tab === "details"  && <DetailsTab task={task} />}
-          {tab === "spec"     && <SpecTab task={task} onRefresh={() => fetchTask(taskId).then(setTask)} />}
-          {tab === "review"   && <ReviewTab task={task} diff={diff} />}
-          {tab === "diff"     && <DiffTab diff={diff} />}
-          {tab === "attempts" && <AttemptsTab task={task} />}
+          <div className="so-accordion">
+            {SECTION_LIST
+              .filter((s) => s.key !== "subtasks" || task?.parent_id || task?.status === "compound_parent")
+              .map((s) => {
+                const isOpen = openSection === s.key;
+                return (
+                  <AccordionSection
+                    key={s.key}
+                    sectionKey={s.key}
+                    label={s.label}
+                    summary={task ? sectionSummary(s.key, { task, diff }) : null}
+                    isOpen={isOpen}
+                    onToggle={() => setOpenSection(isOpen ? null : s.key)}
+                    headerRef={(el) => { sectionRefs.current[s.key] = el; }}
+                  >
+                    {isOpen && sectionBody(s.key, {
+                      taskId, task, diff, isActive,
+                      onSpecRefresh: () => fetchTask(taskId).then(setTask),
+                    })}
+                  </AccordionSection>
+                );
+              })}
+          </div>
         </div>
 
         {/* action bar — contextual based on task status */}
@@ -421,6 +413,122 @@ function FlashBanner({ msg, onDismiss }) {
   );
 }
 
+// ── 1.4: summary-first drawer — narrative + chips + milestones ────────────
+// The one glance that answers "what is this and what happens next" in plain
+// language, before any accordion section is opened. All derivation is pure
+// (slideOverSummary.js) — this component only lays it out.
+function TaskSummary({ task, isActive }) {
+  const n = useMemo(() => narrativeFor(task), [task]);
+  const chips = useMemo(() => chipsFor(task), [task]);
+  const milestones = useMemo(() => milestonesFor(task), [task]);
+  return (
+    <div className="so-summary">
+      <p className="so-summary-narrative">
+        {n.before}{" "}
+        <span className="so-summary-phrase" style={{ color: n.colorVar }}>
+          <span
+            className={`so-summary-dot${isActive ? " pulsing" : ""}`}
+            style={{ background: n.colorVar }}
+            aria-hidden="true"
+          />
+          {n.phrase}
+        </span>
+        {n.after}
+      </p>
+      {chips.length > 0 && (
+        <div className="so-chips">
+          {chips.map((c) => (
+            <div className="so-chip" key={c.key}>
+              {c.href ? (
+                <a href={c.href} target="_blank" rel="noreferrer" className="so-chip-value" key={c.label}>
+                  {c.label} ↗
+                </a>
+              ) : (
+                // key={c.label}: a live SSE-driven update changes the label text, which
+                // remounts this element and replays the crossfade (styles.css) instead of
+                // the number silently snapping to its new value.
+                <span className="so-chip-value" key={c.label}>{c.label}</span>
+              )}
+              <span className="so-chip-sub">{c.sub}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {milestones.length > 0 && (
+        <div className="so-milestones" role="list" aria-label="Task timeline">
+          {milestones.map((m, i) => (
+            <div key={m.key} className={`so-milestone${m.done ? " done" : ""}${m.current ? " current" : ""}`} role="listitem">
+              <span className="so-milestone-dot" aria-hidden="true" />
+              <span className="so-milestone-label">{m.label}</span>
+              {i < milestones.length - 1 && <span className="so-milestone-connector" aria-hidden="true" />}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The ordered accordion sections — one body component each, matching the 8
+// original tabs exactly (Subtasks is filtered in when the task qualifies).
+const SECTION_LIST = [
+  { key: "system",   label: "System" },
+  { key: "activity", label: "Activity" },
+  { key: "subtasks", label: "Sub-tasks" },
+  { key: "details",  label: "Details" },
+  { key: "spec",     label: "Spec" },
+  { key: "review",   label: "Review" },
+  { key: "diff",     label: "Diff" },
+  { key: "attempts", label: "Attempts" },
+];
+
+// Resolves a section key to its (unchanged) tab component. Only called while
+// the section is open — this IS the lazy-render boundary the old tab switch
+// had; a closed section mounts nothing and fetches nothing.
+function sectionBody(key, { taskId, task, diff, isActive, onSpecRefresh }) {
+  switch (key) {
+    case "system":   return <SystemTab taskId={taskId} task={task} isActive={isActive} />;
+    case "activity": return <ActivityTab taskId={taskId} task={task} isActive={isActive} />;
+    case "subtasks": return <SubtasksTab taskId={taskId} />;
+    case "details":  return <DetailsTab task={task} />;
+    case "spec":     return <SpecTab task={task} onRefresh={onSpecRefresh} />;
+    case "review":   return <ReviewTab task={task} diff={diff} />;
+    case "diff":     return <DiffTab diff={diff} />;
+    case "attempts": return <AttemptsTab task={task} />;
+    default: return null;
+  }
+}
+
+// One accordion row: header (label + colored micro-summary + chevron) always
+// visible; body animates open/closed via a grid-template-rows 0fr↔1fr track
+// (styles.css), so it works without knowing the content's height up front.
+function AccordionSection({ sectionKey, label, summary, isOpen, onToggle, headerRef, children }) {
+  return (
+    <div className={`so-section${isOpen ? " open" : ""}`} ref={headerRef}>
+      <button
+        type="button"
+        className="so-section-header"
+        onClick={onToggle}
+        aria-expanded={isOpen}
+        aria-controls={`so-section-body-${sectionKey}`}
+      >
+        <span className="so-section-title">{label}</span>
+        {summary && (
+          <span className="so-section-micro" style={{ color: summary.colorVar }}>
+            {summary.text}
+          </span>
+        )}
+        <span className={`so-section-chev${isOpen ? " open" : ""}`} aria-hidden="true">
+          <IconChevronDown size={14} />
+        </span>
+      </button>
+      <div className="so-section-body-wrap" id={`so-section-body-${sectionKey}`}>
+        <div className="so-section-body-inner">{children}</div>
+      </div>
+    </div>
+  );
+}
+
 
 // ── Agent definitions for the system diagram ───────────────────────────────
 const AGENTS = [
@@ -491,14 +599,13 @@ function useNestedModalKeys(open, onClose) {
   return ref;
 }
 
-// The statuses whose gate is cleared in the Details tab — the blocker question, its
-// evidence, and the one-click canned answers all live there.
-// The statuses whose gate the operator clears IN the drawer (Reply / Resume / the blocker's
-// options). Deliberately NOT paused_quota: the backend parks it without a blocker record
-// (orchestrator._park_quota) and `isParked` gives it no Reply/Resume buttons, so sending it
-// to Details would strand it on a tab emptier than the System one it came from — its gate is
-// a budget raise, not an answer. One definition; `isParked` reads it too.
-const PARKED_STATUSES = new Set(["awaiting_input", "blocked", "escalated"]);
+// PARKED_STATUSES now lives in slideOverSummary.js (imported above) — the statuses
+// whose gate the operator clears IN the drawer (Reply / Resume / the blocker's
+// options). Deliberately NOT paused_quota: the backend parks it without a blocker
+// record (orchestrator._park_quota) and `isParked` gives it no Reply/Resume buttons,
+// so sending it to Details would strand it on a section emptier than System — its
+// gate is a budget raise, not an answer. One definition; `defaultOpenSection` reads
+// it too.
 
 function groupConsecutiveEvents(events) {
   const result = [];
