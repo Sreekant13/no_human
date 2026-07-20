@@ -50,7 +50,7 @@ for (const [label, viewport] of [
 
     const geom = await page.evaluate(() => {
       const vw = window.innerWidth;
-      const btns = [...document.querySelectorAll(".nh-sidenav-btn")].map((b) => {
+      const btns = [...document.querySelectorAll(".nh-navrow")].map((b) => {
         const r = b.getBoundingClientRect();
         return { label: b.textContent.trim().slice(0, 10), left: Math.round(r.left), right: Math.round(r.right), onScreen: r.left >= 0 && r.right <= vw };
       });
@@ -66,6 +66,11 @@ for (const [label, viewport] of [
       };
     });
 
+    // 1.5: nav rows moved from .nh-sidenav-btn to .nh-navrow (grouped nav +
+    // the bottom-pinned Settings row) — a stale selector here would silently
+    // find 0 items and "pass" on an empty array, so require at least Board/
+    // Done/Failed/Stats/Settings (5) to be present.
+    check(`[${label}/${theme}] the nav-row selector actually finds rows (not a stale selector)`, geom.btns.length >= 5, `${geom.btns.length} items`);
     const off = geom.btns.filter((b) => !b.onScreen);
     check(
       `[${label}/${theme}] every nav item is on screen`,

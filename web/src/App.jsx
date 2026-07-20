@@ -33,6 +33,87 @@ function Brand() {
   );
 }
 
+// ── 1.5: sidebar nav icon set — inline SVG only (CSP forbids remote icon
+// fonts/images). Every icon below is paired with a text label by NavRow —
+// never rendered alone. 16px, single stroke weight, no fills except the
+// small "done" check and the tiny alert dot, both currentColor.
+function IconBoard() {
+  return (
+    <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="1.5" y="2.5" width="3.4" height="11" rx="1" />
+      <rect x="6.3" y="2.5" width="3.4" height="7.5" rx="1" />
+      <rect x="11.1" y="2.5" width="3.4" height="9.5" rx="1" />
+    </svg>
+  );
+}
+function IconDone() {
+  return (
+    <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="8" cy="8" r="6.25" />
+      <path d="M5.3 8.2l1.9 1.9 3.5-4.2" />
+    </svg>
+  );
+}
+function IconFailed() {
+  return (
+    <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M8 1.6l6.7 11.6a1 1 0 0 1-.86 1.5H2.16a1 1 0 0 1-.86-1.5L8 1.6z" />
+      <path d="M8 6.2v3.1" />
+      <circle cx="8" cy="11.5" r="0.9" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+function IconStats() {
+  return (
+    <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 13.5h12" />
+      <path d="M4.5 13.5V9" />
+      <path d="M8 13.5V5.5" />
+      <path d="M11.5 13.5V7" />
+    </svg>
+  );
+}
+function IconGear() {
+  return (
+    <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="8" cy="8" r="2.3" />
+      <path d="M8 1.8v1.6M8 12.6v1.6M14.2 8h-1.6M3.4 8H1.8M12.1 3.9l-1.1 1.1M5 11.1l-1.1 1.1M12.1 12.1l-1.1-1.1M5 4.9L3.9 3.9" />
+    </svg>
+  );
+}
+
+// A single sidebar nav row: inline-SVG icon + text label, always both — an
+// icon-only row is never rendered (label is not conditionally hidden). The
+// active row gets a soft filled pill (see .nh-navrow.active in styles.css),
+// animated on --dur-fast/--ease-out and prefers-reduced-motion guarded.
+function NavRow({ icon, label, active, badge, badgeVariant, onClick, title, className = "" }) {
+  return (
+    <button
+      className={`nh-navrow${active ? " active" : ""}${className ? ` ${className}` : ""}`}
+      onClick={onClick}
+      title={title}
+    >
+      <span className="nh-navrow-icon" aria-hidden="true">{icon}</span>
+      <span className="nh-navrow-label">{label}</span>
+      {badge != null && (
+        <span className={`nh-navrow-badge${badgeVariant ? ` nh-navrow-badge-${badgeVariant}` : ""}`}>{badge}</span>
+      )}
+    </button>
+  );
+}
+
+// A muted, uppercase group header over a set of NavRows — the Claude-app
+// "Work" / "Insights" sidebar grouping. Visual grouping only: every row still
+// carries its own original handler, so no nav-model change hides here.
+function NavGroup({ title, children }) {
+  return (
+    <div className="nh-navgroup">
+      <div className="nh-navgroup-title">{title}</div>
+      <div className="nh-navgroup-rows">{children}</div>
+    </div>
+  );
+}
+
 function fmtAge(seconds) {
   if (seconds < 60) return "<1m";
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
@@ -614,48 +695,51 @@ export default function App() {
     <div className="nh-shell nh-shell-cc">
       <aside className="nh-sidebar">
         <div className="nh-sidebar-brand"><Brand /></div>
-        <nav className="nh-sidenav">
-          {[["board", "Board"], ["stats", "Stats"]].map(([k, label]) => (
-            <button
-              key={k}
-              className={`nh-sidenav-btn${page === k ? " active" : ""}`}
-              onClick={() => setPage(k)}
-            >
-              {label}
-              {k === "board" && needYou > 0 && (
-                <span className="nh-sidenav-badge" title={`${needYou} need you`}>{needYou}</span>
-              )}
-            </button>
-          ))}
-          {/* Settings opens as an overlay dialog, not a routed page. */}
-          <button
-            key="settings"
-            className={`nh-sidenav-btn${settingsOpen ? " active" : ""}`}
-            onClick={() => setSettingsOpen(true)}
-          >
-            Settings
-          </button>
+        {/* 1.5: grouped nav, Claude-app style — muted uppercase group headers over
+            icon+label rows. Same destinations/handlers as before (Board/Done/Failed/
+            Stats all still call setPage); this is visual grouping only. Done/Failed
+            move up from the old outlined outcome-pill bar into the Work group. */}
+        <nav className="nh-sidenav" aria-label="Primary">
+          <NavGroup title="Work">
+            <NavRow
+              icon={<IconBoard />}
+              label="Board"
+              active={page === "board"}
+              onClick={() => setPage("board")}
+              badge={needYou > 0 ? needYou : null}
+              badgeVariant="alert"
+              title={needYou > 0 ? `${needYou} need you` : undefined}
+            />
+            <NavRow
+              icon={<IconDone />}
+              label="Done"
+              active={page === "done"}
+              onClick={() => setPage("done")}
+              badge={doneCount}
+              badgeVariant="done"
+              title="Tasks that shipped"
+            />
+            <NavRow
+              icon={<IconFailed />}
+              label="Failed"
+              active={page === "failed"}
+              onClick={() => setPage("failed")}
+              badge={failedCount}
+              badgeVariant={failedCount > 0 ? "failed" : undefined}
+              title={cancelledCount > 0 ? `${failedCount} failed · ${cancelledCount} cancelled` : "Tasks that failed"}
+            />
+          </NavGroup>
+          <NavGroup title="Insights">
+            <NavRow
+              icon={<IconStats />}
+              label="Stats"
+              active={page === "stats"}
+              onClick={() => setPage("stats")}
+            />
+          </NavGroup>
         </nav>
         <NightLedger tasks={tasks} />
         <div className="nh-sidebar-foot">
-          {/* 5D: the outcomes. They are not gates, so they are not lanes — they sit here, above
-              the connection indicator, and open a table of their tasks. */}
-          <div className="nh-outcomes">
-            <button
-              className={`nh-outcome-btn nh-outcome-done${page === "done" ? " active" : ""}`}
-              onClick={() => setPage("done")}
-              title="Tasks that shipped"
-            >
-              Done<span className="nh-outcome-count">{doneCount}</span>
-            </button>
-            <button
-              className={`nh-outcome-btn nh-outcome-failed${page === "failed" ? " active" : ""}`}
-              onClick={() => setPage("failed")}
-              title={cancelledCount > 0 ? `${failedCount} failed · ${cancelledCount} cancelled` : "Tasks that failed"}
-            >
-              Failed<span className="nh-outcome-count">{failedCount}</span>
-            </button>
-          </div>
           {workerStatus?.running && workerStatus.inflight > 0 && (
             <div className="nh-status-indicator" title={`${workerStatus.inflight} of ${workerStatus.max_workers} worker slots in use`}>
               <div className="nh-ws-dot live" style={{ background: 'var(--accent)' }} />
@@ -704,6 +788,15 @@ export default function App() {
             </button>
             <span className="legion-credit">by eyalgolan</span>
           </div>
+          {/* Settings pinned at the very bottom, Claude-app placement — opens the
+              overlay dialog from task 1.1 (page routing is unchanged). */}
+          <NavRow
+            icon={<IconGear />}
+            label="Settings"
+            active={settingsOpen}
+            onClick={() => setSettingsOpen(true)}
+            className="nh-settings-row"
+          />
         </div>
       </aside>
       <main className="nh-main">

@@ -1,4 +1,7 @@
-// 5D — 3-lane board; Done/Failed as outlined buttons above "Connected" opening a TABLE view.
+// 5D — 3-lane board; Done/Failed as nav rows (1.5: grouped under "Work", above the
+// connection indicator) opening a TABLE view. Color still encodes the outcome — as
+// a tinted count badge now, not an outlined border (that pill bar was replaced by
+// the Claude-app-style grouped sidebar nav in task 1.5).
 import { chromium } from "playwright";
 import http from "node:http";
 import fs from "node:fs";
@@ -72,28 +75,39 @@ for (const theme of ["dark", "light"]) {
   check(`[${theme}] R1 no Done or Failed column on the board`,
     !/^(done|failed)$/im.test(boardText), boardText.split("\n")[0]);
 
-  // R2 — two outlined buttons, above the connection indicator.
-  const doneBtn = page.locator(".nh-outcome-done");
-  const failedBtn = page.locator(".nh-outcome-failed");
-  check(`[${theme}] R2 a Done button and a Failed button exist`,
+  // R2 — Done and Failed are nav rows in the sidebar's "Work" group (1.5),
+  // above the connection indicator, with a state-colored count badge.
+  const doneBtn = page.getByRole("button", { name: /^Done/ });
+  const failedBtn = page.getByRole("button", { name: /^Failed/ });
+  check(`[${theme}] R2 a Done row and a Failed row exist`,
     (await doneBtn.count()) === 1 && (await failedBtn.count()) === 1);
   const geom = await page.evaluate(() => {
-    const outcomes = document.querySelector(".nh-outcomes").getBoundingClientRect();
+    const rows = [...document.querySelectorAll(".nh-navrow")];
+    const done = rows.find((b) => b.textContent.trim().startsWith("Done"));
+    const failed = rows.find((b) => b.textContent.trim().startsWith("Failed"));
     const conn = [...document.querySelectorAll(".nh-status-indicator")].pop().getBoundingClientRect();
-    const rgb = (css) => { const c = document.createElement("canvas").getContext("2d"); c.fillStyle = css; return c.fillStyle; };
+    // Badge backgrounds are color-mix(in oklab, ...) — getComputedStyle can report
+    // those back as an oklab() string rather than rgb(), which a plain \d+ regex
+    // mis-parses. Round-trip through a canvas 2D context to normalize to rgb().
+    const toRgb = (css) => { const c = document.createElement("canvas").getContext("2d"); c.fillStyle = css; return c.fillStyle; };
     return {
-      aboveConnected: outcomes.bottom <= conn.top + 1,
-      doneBorder: getComputedStyle(document.querySelector(".nh-outcome-done")).borderTopColor,
-      failedBorder: getComputedStyle(document.querySelector(".nh-outcome-failed")).borderTopColor,
-      doneFill: getComputedStyle(document.querySelector(".nh-outcome-done")).backgroundColor,
+      aboveConnected: done.getBoundingClientRect().bottom <= conn.top + 1
+        && failed.getBoundingClientRect().bottom <= conn.top + 1,
+      doneBadge: toRgb(getComputedStyle(done.querySelector(".nh-navrow-badge")).backgroundColor),
+      failedBadge: toRgb(getComputedStyle(failed.querySelector(".nh-navrow-badge")).backgroundColor),
     };
   });
-  check(`[${theme}] R2 the buttons sit ABOVE the Connected indicator`, geom.aboveConnected);
-  const isGreen = (c) => { const [r, g, b] = c.match(/\d+/g).map(Number); return g > r && g > b; };
-  const isRed = (c) => { const [r, g, b] = c.match(/\d+/g).map(Number); return r > g && r > b; };
-  check(`[${theme}] R2 Done is outlined GREEN`, isGreen(geom.doneBorder), geom.doneBorder);
-  check(`[${theme}] R2 Failed is outlined RED`, isRed(geom.failedBorder), geom.failedBorder);
-  check(`[${theme}] R2 outlined, not filled`, geom.doneFill === "rgba(0, 0, 0, 0)", geom.doneFill);
+  check(`[${theme}] R2 the rows sit ABOVE the Connected indicator`, geom.aboveConnected);
+  // The badges are color-mix(in oklab, --state-done/--state-failed ...), and this
+  // Chromium build's computed-style/canvas serialization keeps oklab() notation
+  // rather than folding it to rgb() — a plain \d+ rgb split mis-reads the decimals.
+  // Read the OKLab `a` axis directly instead: negative a leans green, positive
+  // leans red, which is exactly the green/red state distinction being asserted.
+  const oklabA = (c) => { const m = c.match(/oklab\(\s*[\d.]+\s+(-?[\d.]+)/); return m ? Number(m[1]) : NaN; };
+  const isGreen = (c) => c.startsWith("rgb") ? (() => { const [r, g, b] = c.match(/\d+/g).map(Number); return g > r && g > b; })() : oklabA(c) < -0.02;
+  const isRed   = (c) => c.startsWith("rgb") ? (() => { const [r, g, b] = c.match(/\d+/g).map(Number); return r > g && r > b; })() : oklabA(c) > 0.02;
+  check(`[${theme}] R2 Done's count badge is tinted GREEN`, isGreen(geom.doneBadge), geom.doneBadge);
+  check(`[${theme}] R2 Failed's count badge is tinted RED`, isRed(geom.failedBadge), geom.failedBadge);
 
   // Counts: a cancel is NOT a failure (M2), but it is not hidden either.
   const failedLabel = await failedBtn.innerText();
