@@ -96,7 +96,7 @@ class WakeWatcher:
             (config or {}).get("bounds", {}).get("max_correction_rounds", 2)
         )
         # Cap on autonomous CI-failure → fix cycles on an open PR (Jules /
-        # Copilot pattern: bounded rounds, then hand the specific failure to a
+        # Copilot pattern: bounded rounds, then hand the specific failure to a  # term-ok: real behavior-pattern reference
         # human). Counted per distinct failure signature, so a re-run of the
         # same red check doesn't burn a round.
         self.max_ci_fix_rounds = int(blockers_cfg.get("max_ci_fix_rounds", 3))
