@@ -214,7 +214,12 @@ test("no section micro-summary ever contains a raw status enum", () => {
 test("default-open section maps review-gate/parked/active exactly like the pre-1.4 tab logic", () => {
   assert.equal(defaultOpenSection({ status: "awaiting_approval" }), "review");
   for (const status of PARKED_STATUSES) {
+    // No blocker record -> fall back to opening Details (nothing to build a
+    // DecisionPanel from).
     assert.equal(defaultOpenSection({ status }), "details");
+    // WITH a blocker, the DecisionPanel above the accordion carries the ask, so
+    // the sections stay collapsed instead of dumping the description.
+    assert.equal(defaultOpenSection({ status, blocker: { category: "X" } }), null);
   }
   assert.equal(defaultOpenSection({ status: "implementing" }), "system");
   assert.equal(defaultOpenSection(null), null);

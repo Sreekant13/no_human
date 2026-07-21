@@ -10,6 +10,7 @@ import { ROLE_LABEL, discoverSubagents, eventSource, modelsByNode } from "./even
 import { deriveAgentStatus } from "./pipelineStatus.js";
 import { taskProgress } from "./taskProgress.js";
 import { hasAction, normalizeOption } from "./blockerOptions.js";
+import { decisionFor } from "./blockerDecision.js";
 import { clampAgentState, currentFunctionality, groupFunctionalities, laneAgentRows } from "./functionalities.js";
 import { agentSummary, taskSummary } from "./summaries.js";
 import {
@@ -137,9 +138,25 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
 
   const isAwaiting = task?.status === "awaiting_approval";
   const isParked = PARKED_STATUSES.has(task?.status);
+  // The landing-view decision: what's blocking, in plain language, and what the
+  // human can do about it — surfaced ABOVE the accordion so the ask is never
+  // buried under the description. null unless the task is parked with a blocker.
+  const decision = useMemo(() => decisionFor(task), [task]);
+
   const isActive = ["pending", "context", "planning", "implementing", "reviewing", "testing"].includes(task?.status);
   const isFailed = task?.status === "failed";
   const isTerminal = task?.status === "done" || task?.status === "failed";
+
+  // When the DecisionPanel is showing, it owns the actions (Resume/Reply/Stop),
+  // so the bottom bar suppresses its duplicates. Keyed on whether the panel
+  // actually renders (`!!decision`) — not `isParked`, since decisionFor also
+  // covers paused_quota, which PARKED_STATUSES doesn't. The bar renders only
+  // when it will hold at least one button — no more empty bordered bar on
+  // parked-with-panel or on a terminal `done` task.
+  const hasDecisionPanel = !!decision;
+  const showParkedActions = isParked && !hasDecisionPanel;   // Reply + Resume
+  const showQuietCancel = !isTerminal && !hasDecisionPanel;
+  const showActionBar = isAwaiting || isActive || isFailed || showParkedActions || showQuietCancel;
 
   async function handleApprove() {
     if (!isAwaiting || busy) return;
@@ -248,6 +265,23 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
             bar below still leads with Approve/Reply/etc. */}
         {task && <TaskSummary task={task} isActive={isActive} />}
 
+        {/* Decision panel — the one thing to act on, promoted above the
+            accordion. Only when the task is parked with a blocker; carries the
+            plain-language ask + one-click actions so the operator never has to
+            open Details and scroll past the description to find the question. */}
+        {task && decision && (
+          <DecisionPanel
+            decision={decision}
+            taskId={taskId}
+            taskStatus={task.status}
+            busy={busy}
+            onAction={(id) => {
+              if (id === "reply") setReplyOpen(true);
+              else handleLifecycle(id); // "resume" | "cancel"
+            }}
+          />
+        )}
+
         {/* body: lazy accordion sections, one open at a time. Each section
             body is one of the original 8 tab components, unchanged — they
             still mount (and fetch/SSE) only while their section is open. */}
@@ -278,8 +312,10 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
           </div>
         </div>
 
-        {/* action bar — contextual based on task status */}
-        {task && (
+        {/* action bar — contextual based on task status. Suppressed entirely
+            when the DecisionPanel above owns the actions (parked-with-blocker),
+            and never rendered empty. */}
+        {task && showActionBar && (
           <div className="so-actions">
             {isAwaiting && (
               <button className="btn btn-approve" onClick={handleApprove} disabled={busy}>
@@ -302,12 +338,12 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
                 Next review →
               </button>
             )}
-            {isParked && (
+            {showParkedActions && (
               <button className="btn btn-reply" onClick={() => setReplyOpen(true)} disabled={busy}>
                 Reply
               </button>
             )}
-            {isParked && (
+            {showParkedActions && (
               <button className="btn btn-lifecycle btn-resume" onClick={() => handleLifecycle("resume")} disabled={busy}>
                 Resume
               </button>
@@ -322,12 +358,13 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
                 Retry
               </button>
             )}
-            {!isTerminal && (
+            {showQuietCancel && (
               // Destructive action: spatially separated from the primary CTA
               // (it used to sit as an equal sibling next to Approve — the
               // classic danger-adjacency mistake) and demoted to a quiet
               // text button. Still one click, still confirmable by the
-              // lifecycle handler.
+              // lifecycle handler. Suppressed when the DecisionPanel is
+              // present — it carries its own "Stop this task".
               <button
                 className="btn-cancel-quiet"
                 onClick={() => handleLifecycle("cancel")}
@@ -375,7 +412,14 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
         <div className="sendback-overlay" data-nested-modal onClick={() => setReplyOpen(false)}>
           <div className="sendback-modal" ref={replyRef} role="dialog" aria-modal="true"
                aria-label="Reply to blocker question" onClick={(e) => e.stopPropagation()}>
-            <div className="sendback-label">Reply to blocker question</div>
+            <div className="sendback-label">
+              {decision?.question ? "Answering the task's question" : "Reply to guide the task"}
+            </div>
+            {decision && (decision.question || decision.ask) && (
+              // Context so the box isn't blank: what the human is actually
+              // answering, quoted from the blocker.
+              <p className="reply-context">{decision.question || decision.ask}</p>
+            )}
             <textarea
               className="sendback-textarea"
               placeholder="Your answer…"
@@ -464,6 +508,82 @@ function TaskSummary({ task, isActive }) {
             </div>
           ))}
         </div>
+      )}
+    </div>
+  );
+}
+
+// The action panel for a parked task — rendered above the accordion. It leads
+// with what's blocking in plain language, then the concrete moves: the
+// blocker's own one-click options if it has any, plus resume / reply / stop.
+// The intelligence (category -> copy, which actions apply) lives in the pure,
+// tested `decisionFor`; this component only renders it and owns the one-click
+// option submit (idempotent: disabled after the first click so a double-click
+// can't double-resume).
+function DecisionPanel({ decision, taskId, taskStatus, busy, onAction }) {
+  const [chosen, setChosen] = useState(null);   // option index being submitted
+  const [choiceErr, setChoiceErr] = useState(null);
+  const parked = ["blocked", "awaiting_input", "escalated", "paused_quota"]
+    .includes(taskStatus);
+  async function choose(i) {
+    if (chosen != null || busy) return;
+    setChosen(i);
+    setChoiceErr(null);
+    try {
+      await chooseBlockerOption(taskId, i + 1);   // API is 1-based
+    } catch (e) {
+      setChoiceErr(e?.message || "reply failed");
+      setChosen(null);                            // let the human retry
+    }
+  }
+  const { categoryLabel, headline, ask, question, detail, options, wake, actions } = decision;
+  const frozen = busy || chosen != null;
+  return (
+    <div className="decision-panel" role="region" aria-label="Action needed">
+      <div className="decision-head">
+        <span className="decision-icon" aria-hidden="true"><IconAlertTriangle size={15} /></span>
+        <span className="decision-eyebrow">Needs your decision</span>
+        {categoryLabel && <span className="decision-badge">{categoryLabel}</span>}
+      </div>
+      <p className="decision-headline">{headline}</p>
+      {detail && <p className="decision-detail">{detail}</p>}
+      {question ? (
+        <p className="decision-ask">
+          <span className="decision-ask-label">It’s asking:</span> {question}
+        </p>
+      ) : (
+        <p className="decision-ask">{ask}</p>
+      )}
+      {options.length > 0 && parked && taskId && (
+        <ul className="decision-options">
+          {options.map((opt, i) => (
+            <li key={i}>
+              <button
+                className="decision-option-btn"
+                disabled={frozen}
+                onClick={() => choose(i)}
+              >
+                {chosen === i ? "…" : opt.label}{hasAction(opt) ? " ⚡" : ""}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {choiceErr && <div className="decision-choice-err">{choiceErr}</div>}
+      <div className="decision-actions">
+        {actions.map((a) => (
+          <button
+            key={a.id}
+            className={`decision-btn decision-btn-${a.variant}`}
+            disabled={frozen}
+            onClick={() => onAction(a.id)}
+          >
+            {a.label}
+          </button>
+        ))}
+      </div>
+      {wake && (
+        <p className="decision-wake">Otherwise it resumes on its own when {wake}.</p>
       )}
     </div>
   );
@@ -1546,8 +1666,7 @@ function DetailsTab({ task }) {
           <pre className="so-findings">{findings}</pre>
         </section>
       )}
-      {task.blocker && <BlockerSection blocker={task.blocker} taskId={task.id}
-                                       taskStatus={task.status} />}
+      {task.blocker && <BlockerSection blocker={task.blocker} />}
       {task.repo_path && (
         <section>
           <div className="so-section-label">Repo</div>
@@ -1656,28 +1775,14 @@ function SpecTab({ task, onRefresh }) {
   );
 }
 
-function BlockerSection({ blocker: b, taskId, taskStatus }) {
+function BlockerSection({ blocker: b }) {
   const cat = b.category ? String(b.category).replace(/_/g, " ") : null;
   const pct = b.confidence != null ? `${Math.round(b.confidence * 100)}%` : null;
-  // W2.4: options are buttons — one click answers the blocker (and applies
-  // its action server-side). Disabled after the first click: a double-click
-  // must never double-resume. Parked states only; a non-parked task's
-  // blocker record is history, not a live question.
-  const [chosen, setChosen] = useState(null);   // index being submitted
-  const [choiceErr, setChoiceErr] = useState(null);
-  const parked = ["blocked", "awaiting_input", "escalated", "paused_quota"]
-    .includes(taskStatus);
-  async function choose(i) {
-    if (chosen != null) return;
-    setChosen(i);
-    setChoiceErr(null);
-    try {
-      await chooseBlockerOption(taskId, i + 1);  // API is 1-based
-    } catch (e) {
-      setChoiceErr(e?.message || "reply failed");
-      setChosen(null);                           // let the human retry
-    }
-  }
+  // Read-only record. The live, one-click actions for a parked task now live in
+  // the DecisionPanel above the accordion (a single action surface — buttons in
+  // two places invited a double-submit and split the operator's attention).
+  // This section is the full evidence trail: goal, what happened, the diagnosis,
+  // any question, and the wake condition — for the operator who wants the detail.
   return (
     <section>
       <div className="so-section-label blocker-label">Blocker</div>
@@ -1717,28 +1822,9 @@ function BlockerSection({ blocker: b, taskId, taskStatus }) {
           {b.options?.length > 0 && (
             <ul className="blocker-options">
               {b.options.map(normalizeOption).map((opt, i) => (
-                <li key={i}>
-                  {parked && taskId ? (
-                    <button
-                      className="blocker-option-btn"
-                      disabled={chosen != null}
-                      onClick={() => choose(i)}
-                    >
-                      {chosen === i ? "…" : `[${i + 1}]`} {opt.label}
-                      {hasAction(opt) ? " ⚡" : ""}
-                    </button>
-                  ) : (
-                    <>[{i + 1}] {opt.label}</>
-                  )}
-                </li>
+                <li key={i}>[{i + 1}] {opt.label}{hasAction(opt) ? " ⚡" : ""}</li>
               ))}
             </ul>
-          )}
-          {choiceErr && <div className="blocker-choice-err">{choiceErr}</div>}
-          {parked && (
-            <div className="blocker-reply-hint">
-              …or answer free-form with the Reply button above.
-            </div>
           )}
         </div>
       )}

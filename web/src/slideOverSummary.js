@@ -338,7 +338,14 @@ export function sectionSummary(key, { task, diff } = {}) {
 export function defaultOpenSection(task) {
   if (!task) return null;
   if (task.status === "awaiting_approval") return "review";
-  if (PARKED_STATUSES.has(task.status)) return "details";
+  if (PARKED_STATUSES.has(task.status)) {
+    // A parked task with a blocker now shows the DecisionPanel above the
+    // accordion — it carries the question and the actions, so we leave the
+    // sections collapsed instead of auto-opening Details onto a wall of
+    // description text. Only when there's no blocker to build a panel from do
+    // we fall back to opening Details.
+    return task.blocker ? null : "details";
+  }
   // A compound parent has no pipeline of its own — System renders empty. Open
   // on Sub-tasks when the decomposition actually produced any; otherwise fall
   // back to the pre-existing System default (e.g. mid-decomposition, before
