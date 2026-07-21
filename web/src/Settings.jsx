@@ -57,9 +57,25 @@ export default function SettingsOverlay({ onClose }) {
       if (e.key !== "Tab") return;
       const el = dialogRef.current;
       if (!el) return;
+      // `first`/`last` must be elements that can ACTUALLY take focus. Two ways this trap
+      // has leaked: a focusable type missing from the selector (`summary` — the learnings
+      // group headers), and a listed element that cannot be focused, so activeElement can
+      // never equal it and the wrap branch never fires (a collapsed <details>'s buttons,
+      // or a disabled field). Hence both the wider selector and the visibility filter.
       const focusable = Array.from(
-        el.querySelectorAll('button:not([disabled]), [href], input, textarea, [tabindex]:not([tabindex="-1"])')
-      );
+        el.querySelectorAll(
+          'button, [href], input, select, summary, textarea, [tabindex]:not([tabindex="-1"])',
+        )
+      ).filter((n) => {
+        if (n.disabled || n.getClientRects().length === 0) return false;
+        // Content of a COLLAPSED <details> cannot take focus, but this app's CSS still
+        // lays it out — it keeps its client rects and computes contentVisibility:visible,
+        // so no style-based test sees it. Ask the <details> instead. Without this, the
+        // learnings cards of a collapsed group become `last`, activeElement can never
+        // equal them, the wrap never fires, and Tab leaves the modal.
+        const d = n.closest("details");
+        return !(d && !d.open && n.tagName !== "SUMMARY");
+      });
       if (!focusable.length) return;
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
@@ -334,15 +350,22 @@ function LearningsPanel() {
             </span>
           )}
         </h3>
+        {/* Which of the two is showing was carried only by the `active` class, i.e. by
+            colour — so a screen reader announced two identical "Pending" / "Active"
+            buttons with no way to tell which list was on screen. aria-pressed is the
+            toggle-button state; the nav above uses aria-current because it is navigation,
+            these switch a view in place. */}
         <div className="learnings-toggle">
           <button
             className={`settings-tab sm${view === "pending" ? " active" : ""}`}
+            aria-pressed={view === "pending"}
             onClick={() => setView("pending")}
           >
             Pending
           </button>
           <button
             className={`settings-tab sm${view === "active" ? " active" : ""}`}
+            aria-pressed={view === "active"}
             onClick={() => setView("active")}
           >
             Active
