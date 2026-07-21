@@ -3557,12 +3557,72 @@ def test_pr_url_parts_delegates_to_canonical_parser():
     assert parse_pr_url("not a url") is None
 
 
+class _PlaceholderReportBackend:
+    """Report-only backend that returns a PLACEHOLDER non-answer — the degenerate
+    deliverable C3 must reject (retry, then escalate; never DONE)."""
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        return AgentResult(
+            final_text="Done.", num_turns=1, is_error=False, tokens_used=10,
+            session_id="s", stop_reason="end_turn",
+        )
+
+
+@pytest.mark.slow  # runs the full bounded loop (retries then escalates)
+async def test_investigation_placeholder_report_does_not_complete_as_done(
+    bare_repo, tmp_path, store
+):
+    """C3: a placeholder report ("Done.") is not a deliverable — the attempt
+    fails, the bounded loop retries, and the task escalates honestly instead of
+    marking a non-answer DONE."""
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, _PlaceholderReportBackend(),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("investigate the data drop", repo_path=str(bare_repo),
+                 kind="investigation")
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is not TaskStatus.DONE, (
+        f"a placeholder report must not complete as DONE (got {outcome.status})")
+    # the inadequacy was recorded on the record, not silently dropped
+    assert any(e.get("kind") == "report_inadequate" for e in events)
+    attempts = await store.list_attempts(t.id)
+    assert any(a["status"] == "failed" for a in attempts)
+
+
+class _DesignDocBackend:
+    """Report-only backend that returns a SUBSTANTIVE design document (a real
+    design doc is inherently multi-paragraph; C3's adequacy guard rejects a
+    stub-length one, so this fixture reflects a genuine deliverable)."""
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        doc = (
+            "# Retention pipeline design\n\n"
+            "## Problem\nThe medstarhr instance stopped sending events after a "
+            "retention policy misconfiguration; the pipeline silently drops late "
+            "events instead of surfacing the gap.\n\n"
+            "## Options\n1. Tighten the retention policy and alert on event-gap.\n"
+            "2. Add a dead-letter buffer so late events replay.\n\n"
+            "## Recommendation\nOption 2 plus a gap alert: it removes silent data "
+            "loss and is observable, at the cost of a small replay buffer.\n"
+        )
+        return AgentResult(
+            final_text=doc, num_turns=5, is_error=False, tokens_used=500,
+            session_id="s", stop_reason="end_turn",
+        )
+
+
 async def test_design_doc_report_only_completes_as_done(bare_repo, tmp_path, store):
     """A design_doc task is a READ-ONLY deliverable: findings (the document)
     with no file changes complete as DONE — reusing the investigation rails."""
     cfg = _config(tmp_path)
     events = []
-    orch = Orchestrator(store, cfg.data, ReportOnlyBackend(), SlackNotifier(None),
+    orch = Orchestrator(store, cfg.data, _DesignDocBackend(), SlackNotifier(None),
                         event_sink=events.append)
     t = Task.new("Write a design doc for the retention pipeline",
                  repo_path=str(bare_repo), kind="design_doc")
