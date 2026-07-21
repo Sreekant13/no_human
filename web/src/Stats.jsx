@@ -6,6 +6,7 @@ import TaskTable from "./TaskTable.jsx";
 import { isRealFailure } from "./boardLanes.js";
 import { profileRows, profileStatus } from "./repoView.js";
 import { kindLabel, groupByTask } from "./searchView.js";
+import { pluralize } from "./pluralize.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -350,9 +351,12 @@ function RepoUnderstanding() {
       <div className="stats-section-sub">
         What no_human knows about a repo — profile, structure map, and playbooks
       </div>
+      {/* Chromium's AX tree reported role=combobox name="" — no accessible name at all,
+          so it announced as a bare "combo box". The <h3> above is not a label. */}
       <select
         className="repo-understanding-select"
         data-testid="repo-understanding-select"
+        aria-label="Repository"
         value={selected}
         onChange={(e) => setSelected(e.target.value)}
       >
@@ -435,16 +439,34 @@ function SessionSearch() {
       <div className="stats-section-sub">
         Full-text search across every task's failures, reviews, and blockers
       </div>
+      {/* The placeholder was doing the labelling — Chromium computed the name as
+          nameFrom=["placeholder"]. The name itself persists once you type (the attribute
+          stays), but a placeholder is a hint, not a label: it vanishes VISUALLY the
+          moment anything is typed, so the field's purpose is only discoverable while it
+          is empty, and placeholder-as-name is inconsistently supported across AT. */}
       <input
         type="search"
         className="session-search-input"
         data-testid="session-search-input"
+        aria-label="Search history"
         placeholder="e.g. ImportError, timeout, tamper…"
         value={q}
         onChange={(e) => setQ(e.target.value)}
       />
+      {/* Results swap in silently after the 250ms debounce — sighted users see the list
+          appear, screen readers got nothing. Rendered unconditionally so the live region
+          exists before its content changes, which is what makes it announce. */}
+      <div className="sr-only" role="status">
+        {!searched
+          ? ""
+          : groups.length === 0
+            ? "No matches."
+            : `${groups.length} ${pluralize(groups.length, "task")} matched.`}
+      </div>
+      {/* aria-hidden: the live region above already carries this sentence, and without it
+          "No matches." appears twice in a screen reader's reading order. */}
       {searched && groups.length === 0 && (
-        <div className="stats-section-sub">No matches.</div>
+        <div className="stats-section-sub" aria-hidden="true">No matches.</div>
       )}
       {groups.length > 0 && (
         <ul className="session-search-results">
