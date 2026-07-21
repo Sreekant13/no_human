@@ -33,6 +33,35 @@ _CONCLUSION_MAP: dict[str, PipelineStatus] = {
 }
 
 
+# The env key a human must set to clear an access wall. GitHub's CLI reads this.
+_ACCESS_ENV_KEY = "GH_TOKEN"
+
+# Substrings in a `gh api` error that mean "auth wall" (not a transient blip):
+# retrying will never help — only a human granting a valid token will. Matched
+# as "http 401"/"http 403" (NOT bare "401"/"403", which appear inside byte
+# counts / millisecond timers on unrelated transient errors).
+_AUTH_SIGNALS: tuple[str, ...] = (
+    "http 401", "http 403", "bad credentials", "requires authentication",
+    "must authenticate", "gh auth login", "resource not accessible",
+    "not accessible by",
+)
+
+# Transient conditions that HAPPEN to carry a 403/404 but are NOT auth walls —
+# retrying (with backoff) is correct, so these must fall through to infra_failure.
+_TRANSIENT_SIGNALS: tuple[str, ...] = (
+    "rate limit",        # GitHub emits `HTTP 403: API rate limit exceeded` — clears itself
+    "no commit found",   # a 404 for a not-yet-pushed SHA — a token won't fix it; re-check
+    "no ref found",
+)
+
+
+def _is_auth_error(message: str) -> bool:
+    m = message.lower()
+    if any(sig in m for sig in _TRANSIENT_SIGNALS):
+        return False
+    return any(sig in m for sig in _AUTH_SIGNALS)
+
+
 def _run_gh(args: list[str], *, hostname: str = "") -> dict[str, Any]:
     """Run ``gh api`` and parse the JSON response.
 
@@ -300,19 +329,50 @@ class GHECheckRunsCI(CIBackend):
         self._fetch_runs = fetch_runs or fetch_check_runs
         self._fetch_statuses = fetch_statuses or fetch_commit_statuses
 
+    async def _read_source(
+        self, fetch: Any, to_result: Any, ref: str,
+    ) -> CIResult:
+        """Fetch ONE surface (check-runs or commit-statuses) -> CIResult,
+        classifying read failures.
+
+        An auth wall -> ``access_failure``; any other read error -> a transient
+        ``infra_failure``. Both map to ``UNKNOWN`` (never green) and carry their
+        flag, which ``merge_ci_results`` propagates and never drops.
+        """
+        try:
+            data = await fetch(self.repo, ref, hostname=self.hostname)
+        except Exception as exc:  # noqa: BLE001 — normalize gh/RuntimeError to a CIResult
+            msg = str(exc)
+            if _is_auth_error(msg):
+                log.warning("GHE check-runs read blocked (access) for %s@%s: %s",
+                            self.repo, ref, msg)
+                return CIResult(
+                    pipeline_id=ref, pipeline_url="",
+                    status=PipelineStatus.UNKNOWN,
+                    access_failure=True, access_env_key=_ACCESS_ENV_KEY,
+                    parsed_output=f"cannot read GHE checks: {msg}",
+                )
+            log.warning("GHE check-runs read failed (infra) for %s@%s: %s",
+                        self.repo, ref, msg)
+            return CIResult(
+                pipeline_id=ref, pipeline_url="",
+                status=PipelineStatus.UNKNOWN,
+                infra_failure=True,
+                parsed_output=f"transient error reading GHE checks: {msg}",
+            )
+        return to_result(data, ref=ref)
+
     async def _read(self, ref: str) -> CIResult:
         """Read check-runs AND commit-statuses for ``ref`` and merge them.
 
         External reporters (Jenkins, GitLab, bespoke bots) post to whichever
         surface they choose, so both are read and merged; a green on one surface
-        never hides a failure on the other (``merge_ci_results``).
+        never hides a failure on the other (``merge_ci_results``). Neither read
+        is allowed to raise — a failure on either surface is classified into
+        ``access_failure``/``infra_failure`` by ``_read_source``.
         """
-        runs = await self._fetch_runs(self.repo, ref, hostname=self.hostname)
-        checks = check_runs_to_result(runs, ref=ref)
-        statuses = statuses_to_result(
-            await self._fetch_statuses(self.repo, ref, hostname=self.hostname),
-            ref=ref,
-        )
+        checks = await self._read_source(self._fetch_runs, check_runs_to_result, ref)
+        statuses = await self._read_source(self._fetch_statuses, statuses_to_result, ref)
         return merge_ci_results(checks, statuses, ref=ref)
 
     async def trigger(

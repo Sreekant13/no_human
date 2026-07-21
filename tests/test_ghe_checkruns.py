@@ -288,3 +288,83 @@ def test_ghe_backend_merges_both_surfaces():
     result = asyncio.run(ci.check_status("deadbeef"))
     assert result.failed
     assert not result.passed
+
+
+# --- error classification: a failed read must never raise out of GHECheckRunsCI --- #
+
+def _raise(exc):
+    async def _fetch(repo, ref, *, hostname=""):
+        raise exc
+    return _fetch
+
+
+async def _ok_statuses(repo, ref, *, hostname=""):
+    return _status_payload("success", [])
+
+
+async def _ok_runs(repo, ref, *, hostname=""):
+    return []
+
+
+def test_ghe_auth_error_on_checkruns_is_access_failure():
+    ci = GHECheckRunsCI(
+        "org/repo",
+        fetch_runs=_raise(RuntimeError("gh api failed (1): HTTP 401: Bad credentials")),
+        fetch_statuses=_ok_statuses,
+    )
+    result = asyncio.run(ci.check_status("deadbeef"))
+    assert result.access_failure
+    assert result.access_env_key == "GH_TOKEN"
+    assert result.status == PipelineStatus.UNKNOWN
+    assert not result.passed
+    assert not result.infra_failure
+
+
+def test_ghe_auth_error_on_statuses_is_access_failure():
+    ci = GHECheckRunsCI(
+        "org/repo",
+        fetch_runs=_ok_runs,
+        fetch_statuses=_raise(
+            RuntimeError("gh api failed (1): HTTP 403: Resource not accessible by integration")
+        ),
+    )
+    result = asyncio.run(ci.check_status("deadbeef"))
+    assert result.access_failure
+    assert result.access_env_key == "GH_TOKEN"
+    assert result.status == PipelineStatus.UNKNOWN
+    assert not result.passed
+    assert not result.infra_failure
+
+
+def test_ghe_transient_error_is_infra_failure():
+    ci = GHECheckRunsCI(
+        "org/repo",
+        fetch_runs=_raise(RuntimeError("gh api failed (1): HTTP 502 Bad Gateway")),
+        fetch_statuses=_ok_statuses,
+    )
+    result = asyncio.run(ci.check_status("deadbeef"))
+    assert result.infra_failure
+    assert not result.access_failure
+    assert not result.passed
+    assert result.status == PipelineStatus.UNKNOWN
+
+
+def test_ghe_successful_read_still_merges():
+    async def fake_runs(repo, ref, *, hostname=""):
+        return [_run("build", conclusion="success")]
+
+    async def fake_statuses(repo, ref, *, hostname=""):
+        return _status_payload("success", [_s("ci/jenkins", "success")])
+
+    ci = GHECheckRunsCI("org/repo", fetch_runs=fake_runs, fetch_statuses=fake_statuses)
+    result = asyncio.run(ci.check_status("deadbeef"))
+    assert result.passed
+    assert result.status == PipelineStatus.SUCCESS
+    assert not result.access_failure
+    assert not result.infra_failure
+
+
+def test_ghe_and_gha_share_one_classifier():
+    from no_human.ci.github_actions import _is_auth_error as g
+    from no_human.ci.ghe_checkruns import _is_auth_error as h
+    assert g is h

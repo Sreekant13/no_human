@@ -28,6 +28,8 @@ from typing import Any, Callable
 
 from .base import CIBackend, CIResult, PipelineStatus
 from .ghe_checkruns import (
+    _ACCESS_ENV_KEY,
+    _is_auth_error,
     check_runs_to_result,
     fetch_check_runs,
     fetch_commit_statuses,
@@ -36,34 +38,6 @@ from .ghe_checkruns import (
 )
 
 log = logging.getLogger(__name__)
-
-# The env key a human must set to clear an access wall. GitHub's CLI reads this.
-_ACCESS_ENV_KEY = "GH_TOKEN"
-
-# Substrings in a `gh api` error that mean "auth wall" (not a transient blip):
-# retrying will never help — only a human granting a valid token will. Matched
-# as "http 401"/"http 403" (NOT bare "401"/"403", which appear inside byte
-# counts / millisecond timers on unrelated transient errors).
-_AUTH_SIGNALS: tuple[str, ...] = (
-    "http 401", "http 403", "bad credentials", "requires authentication",
-    "must authenticate", "gh auth login", "resource not accessible",
-    "not accessible by",
-)
-
-# Transient conditions that HAPPEN to carry a 403/404 but are NOT auth walls —
-# retrying (with backoff) is correct, so these must fall through to infra_failure.
-_TRANSIENT_SIGNALS: tuple[str, ...] = (
-    "rate limit",        # GitHub emits `HTTP 403: API rate limit exceeded` — clears itself
-    "no commit found",   # a 404 for a not-yet-pushed SHA — a token won't fix it; re-check
-    "no ref found",
-)
-
-
-def _is_auth_error(message: str) -> bool:
-    m = message.lower()
-    if any(sig in m for sig in _TRANSIENT_SIGNALS):
-        return False
-    return any(sig in m for sig in _AUTH_SIGNALS)
 
 
 class GitHubActionsCI(CIBackend):
