@@ -12,6 +12,7 @@ enriched acceptance criteria. Advisory — never blocks the pipeline.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
@@ -21,6 +22,28 @@ from typing import Any
 from ..core.jsonparse import loads_lenient
 
 log = logging.getLogger("no_human.evaluator")
+
+# Hard wall-clock ceiling on every grill/intake LLM call. A hung SDK subprocess
+# (Stream-closed transport) once wedged the whole bench ~12min at 0% CPU because
+# the raw `be.run()` coroutine on a Stream-closed subprocess never returns and a
+# hang is not an exception (so nothing catches it). wait_for turns a
+# hang into a TimeoutError the callers already treat as "no result" (advisory),
+# so the run proceeds instead of blocking forever. Normal grill calls finish well
+# under this ceiling; it only bounds pathological hangs.
+_LLM_TIMEOUT_S = 300
+
+from types import SimpleNamespace  # noqa: E402
+
+
+async def _bounded_run(be, *args, **kwargs):
+    """be.run() with a hard timeout; on timeout return an empty error-result
+    sentinel so `result.final_text or ""` still works and the grill proceeds."""
+    try:
+        return await asyncio.wait_for(be.run(*args, **kwargs), timeout=_LLM_TIMEOUT_S)
+    except (asyncio.TimeoutError, TimeoutError):
+        log.warning("grill/intake backend.run timed out after %ss — proceeding "
+                    "without it (advisory)", _LLM_TIMEOUT_S)
+        return SimpleNamespace(final_text="", is_error=True)
 
 
 def _render(template: str, **fields: str) -> str:
@@ -129,7 +152,7 @@ async def evaluate_spec(
             description=description or "(none)",
             criteria=criteria_text,
         )
-        result = await be.run(prompt, max_turns=1, effort="low",
+        result = await _bounded_run(be, prompt, max_turns=1, effort="low",
                               cwd=Path(tempfile.gettempdir()))
         text = result.final_text or ""
         m = _EVAL_JSON.search(text)
@@ -195,7 +218,7 @@ async def resolve_assumptions(
             description=description or "(none)",
             criteria=criteria_text,
         )
-        result = await be.run(prompt, max_turns=1, effort="low",
+        result = await _bounded_run(be, prompt, max_turns=1, effort="low",
                               cwd=Path(tempfile.gettempdir()))
         m = _ASSUMPTIONS_JSON.search(result.final_text or "")
         if not m:
@@ -289,7 +312,7 @@ async def generate_grill_questions(
             description=description or "(none)",
             criteria=criteria_text,
         )
-        result = await be.run(prompt, max_turns=1, effort="low",
+        result = await _bounded_run(be, prompt, max_turns=1, effort="low",
                               cwd=Path(tempfile.gettempdir()))
         m = _GRILL_JSON.search(result.final_text or "")
         if not m:
@@ -297,7 +320,7 @@ async def generate_grill_questions(
             # ANSWERS pass (v10: 6/6 lethal there) — retry ONCE.
             log.warning("grill produced no parseable GRILL_JSON block; "
                         "retrying once")
-            result = await be.run(prompt, max_turns=1, effort="low",
+            result = await _bounded_run(be, prompt, max_turns=1, effort="low",
                                   cwd=Path(tempfile.gettempdir()))
             m = _GRILL_JSON.search(result.final_text or "")
         if not m:
@@ -402,7 +425,7 @@ async def grill_spec(
             )
             cwd = Path(repo_path) if repo_path else Path(tempfile.gettempdir())
             fallback_used = False
-            result = await be.run(prompt, max_turns=8, effort="low", cwd=cwd)
+            result = await _bounded_run(be, prompt, max_turns=8, effort="low", cwd=cwd)
             m = _GRILL_ANSWERS.search(result.final_text or "")
             if not m:
                 # v11 live root cause: in content-rich repos the 8-turn
@@ -422,7 +445,7 @@ async def grill_spec(
                     '"assumption" are fine. Do NOT cite file paths or line '
                     "numbers you have not read in THIS session; "
                     "plain-language assumptions only.")
-                result = await be.run(fallback, max_turns=2, effort="low",
+                result = await _bounded_run(be, fallback, max_turns=2, effort="low",
                                       cwd=cwd)
                 m = _GRILL_ANSWERS.search(result.final_text or "")
                 fallback_used = True

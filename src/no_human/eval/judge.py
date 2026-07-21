@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
+from types import SimpleNamespace
 from dataclasses import dataclass
 from typing import Any
 
@@ -128,6 +130,11 @@ _JUDGE_TRANSIENT = ("judge produced no output", "no JUDGE_JSON block found")
 #: infra-retry's 2 min: this is one LLM call inside a multi-hour run, not a pod
 #: reschedule.
 _RETRY_BACKOFF_S = 15.0
+# Hard wall-clock ceiling on a judge LLM call — a hung SDK subprocess
+# (Stream-closed transport) must not wedge the run forever (max_turns=10,
+# effort=high is heavy, so this is generous; it only bounds hangs).
+_JUDGE_TIMEOUT_S = 600.0
+log = logging.getLogger("no_human.judge")
 
 
 def parse_goal_verdict(text: str) -> GoalVerdict:
@@ -182,8 +189,18 @@ class GoalJudge:
         # so that's a format bug, not a transient.
         verdict = None
         for attempt in range(2):
-            result = await backend.run(
-                prompt, cwd=repo_path, max_turns=10, effort="high")
+            try:
+                result = await asyncio.wait_for(
+                    backend.run(prompt, cwd=repo_path, max_turns=10,
+                                effort="high"),
+                    timeout=_JUDGE_TIMEOUT_S)
+            except (asyncio.TimeoutError, TimeoutError):
+                # A hung SDK subprocess (Stream-closed) must not wedge the judge
+                # forever — surface a transient error-result so the existing
+                # retry-once-then-fail-closed path below handles it.
+                log.warning("judge backend.run timed out after %ss (attempt %d)",
+                            _JUDGE_TIMEOUT_S, attempt)
+                result = SimpleNamespace(final_text="", is_error=True)
             verdict = parse_goal_verdict(getattr(result, "final_text", "") or "")
             # Transient = the backend flagged an error (the structured signal) OR
             # the reply was empty / truncated before the JUDGE_JSON block.
@@ -222,8 +239,18 @@ class IntentJudge:
         # reply must not silently fail-close the intent-match eval either.
         verdict = None
         for attempt in range(2):
-            result = await backend.run(
-                prompt, cwd=repo_path, max_turns=10, effort="high")
+            try:
+                result = await asyncio.wait_for(
+                    backend.run(prompt, cwd=repo_path, max_turns=10,
+                                effort="high"),
+                    timeout=_JUDGE_TIMEOUT_S)
+            except (asyncio.TimeoutError, TimeoutError):
+                # A hung SDK subprocess (Stream-closed) must not wedge the judge
+                # forever — surface a transient error-result so the existing
+                # retry-once-then-fail-closed path below handles it.
+                log.warning("judge backend.run timed out after %ss (attempt %d)",
+                            _JUDGE_TIMEOUT_S, attempt)
+                result = SimpleNamespace(final_text="", is_error=True)
             verdict = parse_verdict(getattr(result, "final_text", "") or "")
             transient = (getattr(result, "is_error", False)
                          or verdict.evidence in _JUDGE_TRANSIENT)
