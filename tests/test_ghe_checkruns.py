@@ -4,10 +4,17 @@ Tests the pure conversion logic (check_runs_to_result) with fixture data
 so no ``gh`` CLI or network access is needed.
 """
 
+import asyncio
+
 import pytest
 
-from no_human.ci.ghe_checkruns import check_runs_to_result
-from no_human.ci.base import PipelineStatus
+from no_human.ci.ghe_checkruns import (
+    GHECheckRunsCI,
+    check_runs_to_result,
+    merge_ci_results,
+    statuses_to_result,
+)
+from no_human.ci.base import CIResult, PipelineStatus
 
 
 def _run(name, status="completed", conclusion="success"):
@@ -145,3 +152,139 @@ def test_ci_from_config_ghe_no_repo():
     from no_human.ci import ci_from_config
     cfg = {"ci": {"enabled": True, "backend": "ghe_checkruns"}}
     assert ci_from_config(cfg) is None
+
+
+# --- CI.1b: Commit Status API (statuses_to_result + merge_ci_results) ---------
+
+def _status_payload(state, entries):
+    return {"state": state, "statuses": entries, "total_count": len(entries)}
+
+
+def _s(context, state, url=""):
+    return {"context": context, "state": state, "target_url": url}
+
+
+def test_statuses_all_success():
+    data = _status_payload("success", [_s("ci/jenkins", "success"),
+                                       _s("ci/lint", "success")])
+    result = statuses_to_result(data, ref="abc123")
+    assert result.status == PipelineStatus.SUCCESS
+    assert [j.name for j in result.jobs] == ["ci/jenkins", "ci/lint"]
+
+
+def test_statuses_failure_is_failed():
+    data = _status_payload("failure", [_s("ci/jenkins", "failure")])
+    result = statuses_to_result(data, ref="abc123")
+    assert result.status == PipelineStatus.FAILED
+    assert result.failed
+
+
+def test_statuses_error_state_is_failed_never_green():
+    data = _status_payload("error", [_s("ci/jenkins", "error")])
+    assert statuses_to_result(data).status == PipelineStatus.FAILED
+
+
+def test_statuses_pending_with_entries_is_running():
+    data = _status_payload("pending", [_s("ci/jenkins", "pending")])
+    assert statuses_to_result(data).status == PipelineStatus.RUNNING
+
+
+def test_statuses_empty_is_unknown_no_jobs_not_running():
+    # GitHub reports state="pending" for a commit with ZERO statuses. That is
+    # "no CI reported", NOT running — must be UNKNOWN with no jobs so the merge
+    # treats it as "no opinion" and drops it.
+    data = _status_payload("pending", [])
+    result = statuses_to_result(data)
+    assert result.status == PipelineStatus.UNKNOWN
+    assert result.jobs == []
+
+
+def test_statuses_unmappable_combined_state_with_entries_is_unknown_with_jobs():
+    # An unexpected combined state, but there ARE statuses -> indeterminate, not
+    # empty: UNKNOWN but WITH jobs so it is never silently dropped.
+    data = _status_payload("weird", [_s("ci/jenkins", "success")])
+    result = statuses_to_result(data)
+    assert result.status == PipelineStatus.UNKNOWN
+    assert len(result.jobs) == 1
+
+
+def _empty():
+    return CIResult(pipeline_id="", pipeline_url="", status=PipelineStatus.UNKNOWN)
+
+
+def _ok(name="job"):
+    from no_human.ci.base import JobResult
+    return CIResult(pipeline_id="r", pipeline_url="", status=PipelineStatus.SUCCESS,
+                    jobs=[JobResult(name=name, status="success")])
+
+
+def _fail(name="job"):
+    from no_human.ci.base import JobResult
+    return CIResult(pipeline_id="r", pipeline_url="", status=PipelineStatus.FAILED,
+                    jobs=[JobResult(name=name, status="failed")])
+
+
+def test_merge_both_empty_is_unknown_never_green():
+    m = merge_ci_results(_empty(), _empty(), ref="abc")
+    assert m.status == PipelineStatus.UNKNOWN
+    assert not m.passed
+
+
+def test_merge_green_plus_empty_is_green():
+    assert merge_ci_results(_ok(), _empty()).status == PipelineStatus.SUCCESS
+    assert merge_ci_results(_empty(), _ok()).status == PipelineStatus.SUCCESS
+
+
+def test_merge_failure_wins_over_success():
+    assert merge_ci_results(_ok(), _fail()).status == PipelineStatus.FAILED
+    assert merge_ci_results(_fail(), _ok()).status == PipelineStatus.FAILED
+
+
+def test_merge_running_beats_success_but_not_failure():
+    running = CIResult(pipeline_id="r", pipeline_url="",
+                       status=PipelineStatus.RUNNING,
+                       jobs=[__import__("no_human.ci.base", fromlist=["JobResult"]).JobResult(name="j", status="running")])
+    assert merge_ci_results(_ok(), running).status == PipelineStatus.RUNNING
+    assert merge_ci_results(_fail(), running).status == PipelineStatus.FAILED
+
+
+@pytest.mark.parametrize("state", [PipelineStatus.MANUAL, PipelineStatus.PENDING,
+                                   PipelineStatus.SKIPPED])
+def test_merge_non_success_terminalish_state_never_greens(state):
+    # LOW-1 guard: SUCCESS requires EVERY surviving source to be affirmatively
+    # SUCCESS. A surviving source in any other state (MANUAL awaiting approval,
+    # PENDING, a bare SKIPPED) must merge to UNKNOWN, never green — even paired
+    # with a genuinely-green sibling.
+    from no_human.ci.base import JobResult
+    odd = CIResult(pipeline_id="r", pipeline_url="", status=state,
+                   jobs=[JobResult(name="gate", status=state.value)])
+    assert merge_ci_results(_ok(), odd).status == PipelineStatus.UNKNOWN
+    assert not merge_ci_results(_ok(), odd).passed
+
+
+def test_merge_flagged_unknown_is_not_dropped():
+    # An access wall on one source (UNKNOWN + no jobs but access_failure) is NOT
+    # "empty" — it must keep the merge UNKNOWN and propagate the flag, so a green
+    # sibling never vouches for a commit we couldn't fully read.
+    walled = CIResult(pipeline_id="r", pipeline_url="",
+                      status=PipelineStatus.UNKNOWN,
+                      access_failure=True, access_env_key="GH_TOKEN")
+    m = merge_ci_results(_ok(), walled)
+    assert m.status == PipelineStatus.UNKNOWN
+    assert m.access_failure and m.access_env_key == "GH_TOKEN"
+    assert not m.passed
+
+
+def test_ghe_backend_merges_both_surfaces():
+    # GHECheckRunsCI reads check-runs AND commit-statuses and merges them: a
+    # failing external commit-status sinks green check-runs.
+    async def fake_runs(repo, ref, *, hostname=""):
+        return [_run("build", conclusion="success")]
+
+    async def fake_statuses(repo, ref, *, hostname=""):
+        return _status_payload("failure", [_s("ci/jenkins", "failure")])
+
+    ci = GHECheckRunsCI("org/repo", fetch_runs=fake_runs, fetch_statuses=fake_statuses)
+    result = asyncio.run(ci.check_status("deadbeef"))
+    assert result.failed
+    assert not result.passed

@@ -27,7 +27,13 @@ import logging
 from typing import Any, Callable
 
 from .base import CIBackend, CIResult, PipelineStatus
-from .ghe_checkruns import check_runs_to_result, fetch_check_runs
+from .ghe_checkruns import (
+    check_runs_to_result,
+    fetch_check_runs,
+    fetch_commit_statuses,
+    merge_ci_results,
+    statuses_to_result,
+)
 
 log = logging.getLogger(__name__)
 
@@ -76,9 +82,11 @@ class GitHubActionsCI(CIBackend):
         result_parser: str = "pytest",
         *,
         hostname: str = "",
-        # Injectable so tests never touch the network / the `gh` CLI. Signature
-        # mirrors ``fetch_check_runs(repo, ref, *, hostname) -> list[dict]``.
+        # Injectable so tests never touch the network / the `gh` CLI. Signatures
+        # mirror ``fetch_check_runs(repo, ref, *, hostname) -> list[dict]`` and
+        # ``fetch_commit_statuses(repo, ref, *, hostname) -> dict``.
         fetch_runs: Callable[..., Any] | None = None,
+        fetch_statuses: Callable[..., Any] | None = None,
     ):
         self.repo = repo
         self.workflow = workflow
@@ -88,16 +96,21 @@ class GitHubActionsCI(CIBackend):
         self.result_parser = result_parser
         self.hostname = hostname
         self._fetch_runs = fetch_runs or fetch_check_runs
+        self._fetch_statuses = fetch_statuses or fetch_commit_statuses
 
-    async def _read(self, ref: str) -> CIResult:
-        """One read of ``ref``'s check runs -> CIResult, classifying failures.
+    async def _read_source(
+        self, fetch: Callable[..., Any], to_result: Callable[..., CIResult],
+        ref: str,
+    ) -> CIResult:
+        """Fetch ONE surface (check-runs or commit-statuses) -> CIResult,
+        classifying read failures.
 
         An auth wall -> ``access_failure``; any other read error -> a transient
-        ``infra_failure``. Zero check runs -> ``UNKNOWN`` (handled by
-        ``check_runs_to_result``), which is never green.
+        ``infra_failure``. Both map to ``UNKNOWN`` (never green) and carry their
+        flag, which ``merge_ci_results`` propagates and never drops.
         """
         try:
-            runs = await self._fetch_runs(self.repo, ref, hostname=self.hostname)
+            data = await fetch(self.repo, ref, hostname=self.hostname)
         except Exception as exc:  # noqa: BLE001 — normalize gh/RuntimeError to a CIResult
             msg = str(exc)
             if _is_auth_error(msg):
@@ -117,7 +130,20 @@ class GitHubActionsCI(CIBackend):
                 infra_failure=True,
                 parsed_output=f"transient error reading GitHub checks: {msg}",
             )
-        return check_runs_to_result(runs, ref=ref)
+        return to_result(data, ref=ref)
+
+    async def _read(self, ref: str) -> CIResult:
+        """Read BOTH surfaces for ``ref`` and merge -> a single CIResult.
+
+        Actions results surface as check-runs; external reporters may instead
+        POST to the Commit Status API. Reading only one would miss the other, so
+        both are read and merged such that a green on one surface never hides a
+        failure (or an unread/access wall) on the other. Zero of both -> UNKNOWN,
+        never green.
+        """
+        checks = await self._read_source(self._fetch_runs, check_runs_to_result, ref)
+        statuses = await self._read_source(self._fetch_statuses, statuses_to_result, ref)
+        return merge_ci_results(checks, statuses, ref=ref)
 
     async def trigger(
         self, branch: str, extra_variables: dict[str, str] | None = None
