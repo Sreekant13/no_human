@@ -57,7 +57,6 @@ export default function TaskTable({ tasks, onSelect = null, emptyHint = null }) 
             <th className="stats-th">Status</th>
             <th className="stats-th">Duration</th>
             <th className="stats-th">Project</th>
-            <th className="stats-th">Runner</th>
             <th className="stats-th stats-th-right">Tokens</th>
             <th className="stats-th stats-th-right">Est. Cost</th>
           </tr>
@@ -66,7 +65,10 @@ export default function TaskTable({ tasks, onSelect = null, emptyHint = null }) 
           {rows.map((t) => (
             <tr
               key={t.id}
-              className={`stats-tr${onSelect ? " stats-tr-clickable" : ""}`}
+              // Cancelled tasks end in `failed` status but aren't capability
+              // failures — recede them so the eye lands on real failures. See
+              // Outcomes.jsx, which counts the two apart in the header.
+              className={`stats-tr${onSelect ? " stats-tr-clickable" : ""}${t.cancelled ? " stats-tr-cancelled" : ""}`}
               {...(onSelect
                 ? {
                     role: "button",
@@ -109,11 +111,6 @@ export default function TaskTable({ tasks, onSelect = null, emptyHint = null }) 
               </td>
               <td className="stats-td stats-td-project" title={t.repo_name || undefined}>
                 {t.repo_name || "—"}
-              </td>
-              <td className="stats-td">
-                <span className="stats-runner-badge runner-claude">
-                  Claude Code
-                </span>
               </td>
               <td className="stats-td stats-td-mono stats-td-right">
                 {fmtTokens(
