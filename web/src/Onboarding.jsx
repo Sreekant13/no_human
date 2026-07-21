@@ -124,6 +124,32 @@ export default function Onboarding({ onComplete }) {
   const next = () => setI((n) => Math.min(n + 1, STEPS.length - 1));
   const back = () => setI((n) => Math.max(n - 1, 0));
 
+  // Advancing a step swaps the whole card underneath the user, and nothing moved focus
+  // with it. Measured on the pre-change build, not assumed: the Continue button lives in
+  // .ob-nav, a SIBLING of the card, so it is the same DOM node before and after and it
+  // KEEPS focus — across the eight advances, focus stayed on that button 6 times, sat on
+  // a step's own autofocused input once, and fell to <body> once (entering the repos
+  // step, which is the one that kicks off an async guard() — consistent with the button
+  // being disabled mid-flight, though that cause is inferred, not measured).
+  // So the defect was never "focus is lost". It is that focus stays parked on a control
+  // that sits AFTER the card in DOM order, so the next Tab walks out of the wizard
+  // instead of into the new step's fields — and a screen reader is told nothing at all
+  // while the card's entire contents change. Moving focus into the card, labelled
+  // "Step N of 9: <title>", announces the change once and puts the next Tab inside it.
+  const cardRef = useRef(null);
+  // Compare the previous index rather than a "have we mounted" flag: <StrictMode>
+  // (main.jsx) double-invokes effects on mount with refs preserved, so a boolean reads
+  // as already-mounted on the second pass and steals focus on first paint in dev.
+  const prevStep = useRef(i);
+  useEffect(() => {
+    if (prevStep.current === i) return;
+    prevStep.current = i;
+    const card = cardRef.current;
+    // A step that autoFocuses its own input has already placed focus better than we can;
+    // stealing it back to the container would undo that.
+    if (card && !card.contains(document.activeElement)) card.focus();
+  }, [i]);
+
   async function guard(fn) {
     setBusy(true); setErr(null);
     try { await fn(); } catch (e) { setErr(e.message); } finally { setBusy(false); }
@@ -247,23 +273,57 @@ export default function Onboarding({ onComplete }) {
   return (
     <div className="ob-shell">
       <div className="ob-stage">
-        <div className="ob-stepper">
+        {/* The wizard replaces the whole app shell (App.jsx returns it before the shell's
+            own h1 element), so without this the document had no h1 at all on eight of the nine
+            steps — the step headings are h2. Visually hidden: the visible headline is the
+            step's own. */}
+        <h1 className="sr-only">Set up no_human</h1>
+        <div className="ob-stepper" role="list" aria-label="Setup progress">
           {STEPS.map((s, idx) => (
             <div
               key={s.key}
+              role="listitem"
+              // Position and state were carried only by colour and opacity, which say
+              // nothing to a screen reader. aria-current marks where you are; the
+              // hidden suffix says whether a step is finished or still ahead.
+              aria-current={idx === i ? "step" : undefined}
               className={`ob-step${idx === i ? " current" : ""}${idx < i ? " done" : ""}`}
             >
               <span className="ob-step-dot" />
               <span className="ob-step-label">{s.title}</span>
+              {/* Only the states aria-current does NOT already convey. Saying
+                  "(current step)" here too would make the current item announce its
+                  state twice. */}
+              {idx !== i && (
+                <span className="sr-only">{idx < i ? " (completed)" : " (not started)"}</span>
+              )}
             </div>
           ))}
         </div>
 
-        <div className="ob-card" key={step.key}>
+        <div
+          className="ob-card"
+          key={step.key}
+          ref={cardRef}
+          // Focus target for the step change above. tabIndex -1 keeps it out of the tab
+          // order — it is a landing spot, not a control.
+          tabIndex={-1}
+          role="group"
+          aria-label={`Step ${i + 1} of ${STEPS.length}: ${step.title}`}
+        >
           {step.key === "welcome" && (
             <Stagger>
               <div className="ob-brand"><LegionLogo size={44} /><span>no_human</span></div>
-              <h1 className="ob-h1">Stop hand-holding one chat. Ship 10× in parallel.</h1>
+              {/* h2, not h1: the wizard's h1 is the hidden one on .ob-stage, so every step
+                  now reads h1 → h2 instead of this step alone owning the h1 and the other
+                  eight starting at h2. Renders identically — verified pixel-identical —
+                  but NOT merely because `.ob-h1` is a class-only selector: Tailwind
+                  preflight is off here, so UA margins would otherwise differ (h1 0.67em
+                  vs h2 0.83em). What actually makes the swap safe is the universal
+                  `*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }`
+                  reset near the top of styles.css. If that reset is ever narrowed, this
+                  headline needs an explicit margin-top. */}
+              <h2 className="ob-h1">Stop hand-holding one chat. Ship 10× in parallel.</h2>
               <p className="ob-lede">
                 no_human fields an <em>entire legion of agents at once</em> — many tasks,
                 across many repos, simultaneously. Each one is carried from intake
