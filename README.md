@@ -2,19 +2,34 @@
 
 # no_human
 
-**Autonomous AI software-delivery orchestrator**
+**Give it a ticket. Get back a pull request you can actually review.**
 
-![tests](https://img.shields.io/badge/tests-passing-brightgreen)
 ![python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-Feed it a task from GitHub, GitLab, or plain English —
-it plans, implements, reviews, tests, and opens a PR. You merge.
-
-<!-- TODO: add a screenshot or GIF of the web board here -->
-<!-- ![board screenshot](docs/assets/board.png) -->
-
 </div>
+
+no_human runs the whole delivery loop on its own — intake, plan, implement,
+adversarial review, tests, PR (and remote CI, once you enable it) — on **your
+existing Claude subscription** rather than a metered API key. Then it stops and
+waits for you.
+
+```bash
+nh task add --title "Fix the off-by-one in pagination" --repo ~/my-repo
+```
+
+**It never merges.** Work that reaches a PR stops at `awaiting_approval` with a
+diff and an evidence checklist; work that can't be finished honestly stops at an
+escalation instead. Merging is yours either way — that isn't a setting you can
+flip, it's denied at the tool boundary and covered by tests.
+
+Tasks come from a GitHub or GitLab issue URL, or a plain-English title. (Jira is
+supported as an opt-in server-side poller, not as an argument to `nh task add`.)
+
+**Who it's for:** engineers sitting on well-scoped work — bug fixes, test gaps,
+small features — who would rather review a diff than write it.
+**Who it isn't for:** anyone who wants an agent that ships to production
+unattended. That is deliberately not built here.
 
 ---
 
@@ -36,27 +51,88 @@ it plans, implements, reviews, tests, and opens a PR. You merge.
 
 ## 🌟 Why no_human?
 
-You have a backlog full of well-scoped stories, bug fixes, and test gaps. Each one follows the same loop: read the spec, grep the codebase, write the code, run the tests, open a PR, wait for review. **That loop is now automated.**
+Plenty of tools will write code for you. The hard part is knowing whether to
+trust the result. Three choices here follow from that:
 
-no_human drives the [Claude Agent SDK](https://docs.anthropic.com/en/docs/agents-sdk) on **your existing Claude subscription** — no metered API bills, no new vendor. Point it at a task, and it runs the full delivery pipeline end-to-end. When it's done, it opens a PR and waits for *you* to merge. The agent never merges.
+- **The reviewer is adversarial, and it is not the author.** A fresh-context
+  [Claude Agent SDK](https://docs.anthropic.com/en/docs/agents-sdk) session on a
+  different model is told to *refute* "done" and must cite file:line or command
+  output for every claim. There is no "score yourself 1–10" gate anywhere — a
+  model grading its own work is not evidence.
+- **Giving up honestly is a success.** When a task needs credentials, a missing
+  system, or a decision that is genuinely yours, it parks with a structured
+  blocker instead of inventing a plausible diff. Fabricated confidence costs far
+  more to review than an honest escalation.
+- **Trust only verifiable signals.** A net drop in test count or assertions is
+  blocked *before* a reviewer token is spent, and a Python bugfix must ship a
+  test that provably fails on the unfixed code.
 
-> **Sounds like a lot of moving parts?** It's one command:
-> ```bash
-> nh start
-> ```
-> That boots the web board, a task worker, and the wake watcher. Add a task from the UI or CLI and watch it go.
+Everything runs on your existing Claude subscription — no metered API bills, no
+new vendor. One command boots the whole thing:
+
+```bash
+nh start   # web board + task worker + wake watcher
+```
+
+### Does it work?
+
+There is a benchmark that replays real past tasks through the real pipeline and
+scores the result against what the human actually did. The published run is
+committed at [docs/NORTH_STAR_BENCH.md](docs/NORTH_STAR_BENCH.md): label
+`expanded-core-v8`, 2026-07-17, a 36-spec corpus. It scored the goal satisfied
+unattended on **18/33** runnable tasks (55%), with an honest-escalation rate of
+**73%** on the tasks that were *expected* to escalate.
+
+Everything about that needs qualifying, so here it is:
+
+- **It is not the latest run, and it flatters.** A later run
+  (`expanded-core-v11`, 2026-07-18, a 57-spec corpus) scored **43%** success and
+  **62.5%** honest-escalation — materially below v8 on both. The corpus has since
+  been rebuilt to 55 specs and has not been re-scored, so no published number
+  describes the specs shipping in this repo today. v8 is simply the
+  best-looking published run, which is exactly why it should not stand alone.
+  The run series lives in [docs/NORTH_STAR_PAYOFF.md](docs/NORTH_STAR_PAYOFF.md).
+- **A single run is a point estimate.** Success moves several points between
+  runs on identical specs.
+- **The cost figure is narrower than it looks.** That run's median cost ratio is
+  0.1503, but the median covers only the **8 of 33** tasks where an original
+  human-session cost was recorded at all, and no_human's side excludes planner
+  and supervisor burn. Comparing the run's raw non-cache token totals instead
+  gives **0.394** — and even that is generous to the baseline, since no_human's
+  side spans all 33 runnable tasks while the human side counts only those 8.
+  "Cheaper" is well supported; any precise multiple is not.
+- **It is self-run, not independent**, and you cannot reproduce it: the specs
+  replay the author's own history and pin to local repo paths, so `nh bench run`
+  will skip them on your machine. The harness is reusable; the corpus is not.
+  Note that `nh bench run` **overwrites** `docs/NORTH_STAR_BENCH.md` in your
+  clone — the figures above describe the run committed here.
+
+The number that matters most is not the success rate anyway — it is that the
+failures are mostly *honest* ones that cost you a minute to triage, rather than
+a confident wrong diff that costs you an hour.
 
 ---
 
 ## ⬇️ Getting Started
 
-**Prerequisites:** Python 3.12+, [uv](https://github.com/astral-sh/uv), git, and a Claude subscription (Max or Team).
+**Prerequisites:** Python 3.12+, [uv](https://github.com/astral-sh/uv), git, the
+[Claude CLI](https://claude.com/claude-code) (`npm install -g
+@anthropic-ai/claude-code` — `claude setup-token` is how you mint the token), and a
+Claude OAuth token — from either a paid personal subscription or an enterprise
+profile (whatever `claude setup-token` issues for your plan). Both are
+first-class; `nh auth use <profile>` picks which one pays, and a single run never
+spans two profiles. What you cannot use is a metered `ANTHROPIC_API_KEY`:
+startup aborts if one is set (see [Safety](#-safety-guarantees)).
 
 ```bash
-git clone https://code.example.com/dev/no_human.git && cd no_human
+git clone <your-clone-url>/no_human.git && cd no_human
 uv sync
-nh init
+uv run nh init
 ```
+
+`uv sync` installs the `nh` entry point into the project's `.venv`, so prefix
+commands with `uv run` (or activate the venv) unless you have installed no_human
+onto your `PATH` separately. Every `nh …` below assumes one of those.
 
 `nh init` walks you through token setup, config generation, and first-repo onboarding — about 2 minutes.
 
@@ -75,12 +151,12 @@ The agent will plan, implement, get reviewed, run tests, and open a PR — all o
 | Feature | Description |
 |---|---|
 | **End-to-end delivery** | Plan → implement → adversarial review → test → PR. No manual steps except the final merge. |
-| **Multi-source intake** | GitHub Issues, GitLab Issues, or freeform `--title`. |
+| **Multi-source intake** | GitHub Issues, GitLab Issues, or freeform `--title`; Jira via an opt-in JQL poller. |
 | **Independent reviewer** | A separate model instance told to *refute* "done" — evidence-cited checklist, never a self-score. |
 | **Tamper guard** | Deterministic check: any net reduction in test count / assertions is blocked before review. |
-| **CI integration** | GitLab CI trigger + poll with infra-vs-real failure discrimination and auto-retry. |
-| **Web board** | React operator terminal with 5-lane Kanban (Needs You · Working · Waiting · Failed · Done), Monaco diff viewer, approve / send-back. |
-| **Blocker handling** | 8-category structured blockers with wake conditions, auto-resume, and escalation reports. |
+| **CI integration** | Opt-in trigger + poll for GitLab CI, GitHub Actions, Jenkins or CircleCI, with infra-vs-real failure discrimination and auto-retry. |
+| **Web board** | React operator terminal: a 3-column attention board (Needs Answer · Working · Review PR) with Failed/Done as outcome tables, a native unified diff view, approve / send-back. |
+| **Blocker handling** | 10-category structured blockers with wake conditions, auto-resume, and escalation reports. |
 | **Learning queue** | Mines your IDE sessions for reusable skills and anti-patterns. Nothing activates without your confirm. |
 | **Eval harness** | Golden task replay, held-out tests, intent-match judge, red-team suite, CI regression gate. |
 | **Shadow mode** | Full end-to-end run in a sandbox clone. Never pushes. |
@@ -104,8 +180,8 @@ Task in ──► Context ──► Plan ──► Implement ──► Review �
 
 1. **Intake** — parse a GitHub issue / freeform title into structured acceptance criteria. An interactive grill refines ambiguous specs.
 2. **Context** — read-only, parallel gathering from codebase, comms, and past sessions. Large chunks are distilled through a read-only sub-agent.
-3. **Plan** — generate a plan constrained by confirmed rules. A preflight check validates feasibility before burning agent turns.
-4. **Implement** — Claude Agent SDK session with deterministic guards: scope guard (warns on out-of-plan edits), forbidden-import check, dependency-diff check, per-edit lint feedback.
+3. **Plan** — generate a plan constrained by confirmed rules.
+4. **Implement** — a preflight check reviews the plan before the first edit, then a Claude Agent SDK session runs with deterministic guards: scope guard (warns on out-of-plan edits), forbidden-import check, dependency-diff check, per-edit lint feedback.
 5. **Review** — a fresh-context reviewer on a different model reads the diff, runs tests, and produces an evidence-backed pass/fail checklist. Fails loop back to implement (up to `max_attempts`).
 6. **Test** — local test runner + optional CI trigger. Infra failures auto-retry; real failures loop back.
 7. **PR** — deterministic VCS: branch, commit under a `no_human` identity, push, open PR/MR. Then park for your approval.
@@ -114,8 +190,8 @@ Task in ──► Context ──► Plan ──► Implement ──► Review �
 
 These are **enforced in code**, not advisory:
 
-- **Subscription auth only** — metered API keys are scrubbed from the process env on startup; `ANTHROPIC_API_KEY` aborts the run.
-- **Deterministic VCS** — the orchestrator owns git; the LLM never runs `git merge`, force-push, or `rm -rf`. `never_push_to` blocks pushes to protected branches.
+- **OAuth auth only** — subscription or enterprise profile. Metered API keys are scrubbed from the process env on startup, and a present `ANTHROPIC_API_KEY` aborts the run rather than being silently ignored, so a misconfiguration can never quietly bill the metered API.
+- **Deterministic VCS** — the orchestrator owns branching, committing and pushing. Merging a PR/MR (`gh pr merge`, `glab mr merge`, the REST merge endpoints), force-push and destructive git are denied at the tool boundary, and `never_push_to` blocks pushes to protected branches.
 - **Read-only review** — the reviewer backend blocks all write tools unconditionally.
 - **Tamper guard** — fires before the reviewer; test-gutting agents are escalated immediately.
 - **Reviewer crash → fail-closed** — no silent pass-through.
@@ -143,11 +219,15 @@ nh task add --title "Fix X" --repo ~/repo         # freeform
 nh task list          # board as a table
 nh task show <id>     # requirements, attempts, evidence
 nh status             # portfolio overview: needs-you / working / waiting / done
-nh watch <id>         # live TUI with tool calls and agent reasoning
 nh logs <id>          # attempt log: turns, tokens, failures
 nh diff <id>          # git diff for latest commit
 nh review <id>        # adversarial reviewer's evidence checklist
 ```
+
+> **`nh watch <id>` is not read-only.** It *runs* the task in a live TUI
+> (`cli/tui.py` builds an orchestrator and awaits `run_task`). Use it to drive a
+> task in the foreground — never as a viewer while `nh start` is running, or the
+> same task executes twice.
 
 ### Human actions
 
@@ -191,10 +271,10 @@ Secrets live in `~/.no_human/.env` (chmod 600, never in the repo).
 |---|---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | *(required)* | Subscription auth for the Claude Agent SDK |
 | `llm.primary_model` | `claude-sonnet-5` | The implementer (coder) model |
-| `llm.review_model` | `claude-opus-4-8` | The adversarial reviewer (must differ from implementer) |
+| `llm.review_model` | `claude-opus-4-8` | The adversarial reviewer (kept different from the implementer by convention; not enforced in code) |
 | `server.port` | `8420` | Web board bind port |
-| `bounds.max_attempts` | `3` | Max implement → review cycles per task |
-| `bounds.max_turns_per_attempt` | `60` | Max agent turns per attempt |
+| `bounds.max_attempts` | `3` | Max implement → review cycles in **one** loop. Every resume starts a fresh loop, so this is not a per-task cap — `bounds.lifetime_attempts` is. |
+| `bounds.max_turns_per_attempt` | `500` | Max agent turns per attempt |
 
 <details>
 <summary><b>Advanced settings</b> (CI, concurrency, safety, blockers)</summary>
@@ -202,7 +282,9 @@ Secrets live in `~/.no_human/.env` (chmod 600, never in the repo).
 | Setting | Default | What it does |
 |---|---|---|
 | `concurrency.max_workers` | `2` | Concurrent task workers (each in its own worktree; requires `concurrency.enabled`) |
-| `ci.project` | *(none)* | GitLab project path for CI trigger |
+| `ci.enabled` | `false` | Master switch for remote CI trigger + poll |
+| `ci.backend` | `gitlab` | `gitlab` · `github_actions` · `jenkins` · `circleci` |
+| `ci.project` | *(none)* | Project path for the CI trigger (GitLab-style) |
 | `git.never_push_to` | `[main, master, release/*]` | Protected branch patterns |
 | `safety.forbidden_paths` | `[.env, *.pem, ...]` | Paths the agent cannot write to |
 | `notifications.slack_webhook_url` | `null` | Write-only Slack alerts (null = log only) |
@@ -223,20 +305,24 @@ See [docs/configuration.md](docs/configuration.md) for the full reference.
   config.yaml           # settings
   no_human.db           # SQLite (WAL) — tasks, attempts, profiles, memories
 
-src/no_human/
+src/no_human/         # (abridged — packages only)
   cli/                  # nh commands (Click)
   api/                  # FastAPI + WebSocket + React SPA
   agent/                # Claude Agent SDK backend, guards, hooks
   core/                 # orchestrator, state machine, scheduler, bounds
-  intake/               # GitHub, GitLab adapters
+  intake/               # GitHub, GitLab adapters + Jira poller
   context/              # parallel read-only context gatherers
   review/               # adversarial reviewer
   testing/              # local test runner, test-layer model
+  ci/                   # remote CI trigger + poll (opt-in)
   vcs/                  # deterministic git, PR opening
   learning/             # human-confirmed learning queue
   history/              # IDE transcript extraction + analysis
   eval/                 # golden-set replay + scorecard
-  blockers/             # 8-category blocker taxonomy + wake watcher
+  blockers/             # 10-category blocker taxonomy + wake watcher
+  integrations/         # Jira / CI / notification integrations
+  ci_gate/               # Acme-internal CI adapter (optional)
+  notify/               # Slack webhook notifications
 ```
 
 Design source of truth: [`PLAN.md`](PLAN.md). Implementation brief: [`BUILD.md`](BUILD.md).
@@ -279,10 +365,11 @@ NH_E2E_BASE=http://127.0.0.1:8488 uv run python e2e/board_e2e.py
 
 | Problem | Solution |
 |---|---|
-| **`auth error: ANTHROPIC_API_KEY is set`** | `unset ANTHROPIC_API_KEY` — no_human uses subscription auth, not metered API. |
-| **`auth error: CLAUDE_CODE_OAUTH_TOKEN not found`** | Run `claude setup-token`, then add it to `~/.no_human/.env`. |
+| **`auth error: ANTHROPIC_API_KEY is set`** | `unset ANTHROPIC_API_KEY` — no_human runs on an OAuth token, never the metered API. Startup aborts rather than scrubbing silently, so the misconfiguration reaches you and not your bill. |
+| **`auth error: No subscription token found`** | Run `claude setup-token`, then add the token to `~/.no_human/.env` (chmod 600). `nh auth status` lists configured profiles. |
 | **`no profile to confirm`** | Run `nh onboard <repo>` first, then `nh onboard <repo> --confirm`. |
-| **Task stuck in `implementing`** | Check `nh logs <id>` — likely hit `max_turns`. Increase `bounds.max_turns_per_attempt` or simplify the task. |
+| **Task stuck in `implementing`** | Check `nh logs <id>` — likely hit `max_turns`. Raise `bounds.max_turns_per_attempt` (default 500) or simplify the task. |
+| **`another no_human instance is already running`** | Only one instance may hold `~/.no_human/nh.pid`. There is no `nh stop`: stop the process that holds it (Ctrl-C in its terminal, or signal the PID inside that file). If it died uncleanly, `rm ~/.no_human/nh.pid`. |
 | **Reviewer keeps failing** | Check `nh review <id>` for evidence. Either the code has real issues (fix and retry) or the acceptance criteria are ambiguous (refine with `nh reject`). |
 
 ---
@@ -292,19 +379,19 @@ NH_E2E_BASE=http://127.0.0.1:8488 uv run python e2e/board_e2e.py
 <details>
 <summary><b>Does this use my personal API key?</b></summary>
 
-No. no_human **only** runs on a Claude subscription token (`CLAUDE_CODE_OAUTH_TOKEN`). Metered API keys are scrubbed from the environment on startup — if `ANTHROPIC_API_KEY` is set, the process refuses to start. Your subscription covers the cost.
+No. no_human runs only on an OAuth token (`CLAUDE_CODE_OAUTH_TOKEN`) — from a personal subscription or an enterprise profile. Metered API keys are scrubbed from the environment on startup, and if `ANTHROPIC_API_KEY` is set the process refuses to start (a silent scrub-and-continue would hide a misconfiguration that costs real money). Your subscription covers the cost.
 </details>
 
 <details>
 <summary><b>Can the agent merge a PR?</b></summary>
 
-No. The pipeline stops at `awaiting_approval`. There is no auto-merge anywhere in the codebase. You review the diff, the evidence checklist, and merge in your git host.
+No. The pipeline stops at `awaiting_approval`. There is no auto-merge anywhere in the codebase. You review the diff and the evidence checklist, then merge — in your git host, or with `nh merge-stack run` for a stacked set. Both are operator actions; the agent is denied the merge tools outright.
 </details>
 
 <details>
 <summary><b>What if the agent gets stuck?</b></summary>
 
-The orchestrator has built-in stuck detection: the same error signature twice triggers a context reset. After `max_attempts` (default 3), the task is escalated with a structured report. You can also `nh blocked` to see what's parked and `nh reply` to provide guidance.
+The orchestrator has built-in stuck detection: the same error signature twice triggers a context reset. After `max_attempts` (default 3) the loop escalates with a structured report. A resume starts a fresh loop, so the per-task ceiling is `bounds.lifetime_attempts`, not this. You can also `nh blocked` to see what's parked and `nh reply` to provide guidance.
 </details>
 
 <details>
