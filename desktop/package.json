@@ -9,7 +9,8 @@
     "desktop": "electron .",
     "test": "node --test .",
     "dist": "electron-builder --mac dmg --publish never",
-    "dist:dir": "electron-builder --mac dir --publish never"
+    "dist:dir": "electron-builder --mac dir --publish never",
+    "dist:bundled": "bash ../packaging/build-installer.sh && electron-builder --mac dir --publish never && bash ../packaging/make-dmg.sh"
   },
   "devDependencies": {
     "electron": "38.2.1",
@@ -25,8 +26,25 @@
       "main.mjs",
       "server.mjs",
       "preload.cjs",
+      "tokenStore.mjs",
+      "setupUi.mjs",
+      "navScheduler.mjs",
+      "setupGate.mjs",
+      "serverOwnership.mjs",
+      "serverLifecycle.mjs",
+      "quitPolicy.mjs",
+      "badge.mjs",
+      "menu.mjs",
       "error.html",
+      "token.html",
       "package.json"
+    ],
+    "asar": true,
+    "extraResources": [
+      {
+        "from": "../packaging/dist/nh-server",
+        "to": "nh-server"
+      }
     ],
     "mac": {
       "category": "public.app-category.developer-tools",

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import test from "node:test";
 
-import { isAppOrigin, probe, waitForServer } from "./server.mjs";
+import { configuredPort, isAppOrigin, probe, waitForServer } from "./server.mjs";
 
 function serve(handler) {
   return new Promise((resolve) => {
@@ -60,8 +60,9 @@ test("isAppOrigin: same-origin stays in-window, everything else leaves", () => {
 
 // ------------------------------ E2 tests ---------------------------------- //
 
-import { ensureServer, resolveNhBin, stopServer } from "./server.mjs";
-import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
+import { CLI_HINT_DIRS, bundledNhPath, ensureServer, mergePath, resolveNhBin, stopServer } from "./server.mjs";
+import { mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -75,6 +76,32 @@ test("resolveNhBin: NH_BIN wins when it exists; missing → shell/known-path fal
   const got = await resolveNhBin({ NH_BIN: join(dir, "missing"),
                                    SHELL: "/usr/bin/false" });
   assert.notEqual(got, join(dir, "missing"));
+});
+
+test("bundledNhPath: finds Resources/nh-server/nh, empty when absent or unpackaged", () => {
+  const res = mkdtempSync(join(tmpdir(), "nhres-"));
+  assert.equal(bundledNhPath(res), "", "no bundle yet → empty");
+  mkdirSync(join(res, "nh-server"));
+  writeFileSync(join(res, "nh-server", "nh"), "#!/bin/sh\nexit 0\n");
+  assert.equal(bundledNhPath(res), join(res, "nh-server", "nh"));
+  // Outside Electron process.resourcesPath is undefined — must not throw.
+  assert.equal(bundledNhPath(undefined), "");
+});
+
+test("resolveNhBin: bundled nh wins over PATH, but NH_BIN still wins over bundled", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "nhbin-"));
+  const bundled = join(dir, "bundled-nh");
+  writeFileSync(bundled, "#!/bin/sh\nexit 0\n");
+  chmodSync(bundled, 0o755);
+  // No NH_BIN → the bundle is used instead of the login shell's nh.
+  assert.equal(await resolveNhBin({ SHELL: "/usr/bin/false" }, [], bundled),
+               bundled);
+  // Explicit NH_BIN outranks the bundle (documented escape hatch).
+  const override = join(dir, "override-nh");
+  writeFileSync(override, "#!/bin/sh\nexit 0\n");
+  chmodSync(override, 0o755);
+  assert.equal(await resolveNhBin({ NH_BIN: override, SHELL: "/usr/bin/false" },
+                                  [], bundled), override);
 });
 
 test("ensureServer: attaches without spawning when the server is up", async () => {
@@ -110,6 +137,24 @@ setInterval(() => {}, 1000);
   }
 });
 
+test("ensureServer: onSpawn fires immediately, not when the wait finishes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "nhbin-"));
+  const fake = join(dir, "nh");
+  writeFileSync(fake, "#!/bin/sh\nsleep 30\n");
+  chmodSync(fake, 0o755);
+  const seen = [];
+  const t0 = Date.now();
+  const state = await ensureServer({
+    origin: "http://127.0.0.1:1", spawnTimeoutMs: 900, env: { NH_BIN: fake },
+    nhArgs: [], onSpawn: (c) => seen.push({ pid: c.pid, at: Date.now() - t0 }) });
+  try {
+    assert.equal(seen.length, 1, "the caller must be able to track it at once");
+    assert.ok(seen[0].pid > 0);
+    assert.ok(seen[0].at < 500,
+      `onSpawn must fire at spawn time, fired at ${seen[0].at}ms`);
+  } finally { stopServer(state); }
+});
+
 test("ensureServer: failed resolution reports nh-not-found without spawning", async () => {
   const state = await ensureServer({
     origin: "http://127.0.0.1:1",
@@ -127,8 +172,146 @@ test("stopServer: ONLY kills a spawned child — attached/failed states are neve
   // The gate itself must protect attached — even with a child present
   // (review: without this, only production convention protects attached).
   assert.equal(stopServer({ status: "attached", child }), false);
-  assert.equal(stopServer({ status: "failed", child }), false);
-  assert.equal(killed, false, "attached/failed must never kill");
+  // A "failed" state that still carries a child IS ours: ensureServer leaves a
+  // slow-booting nh running and it may yet bind the port. Refusing to stop it
+  // orphaned the process (reparented to init, still holding the port).
+  assert.equal(stopServer({ status: "failed", reason: "nh-not-found" }), false,
+    "no child -> nothing to stop");
+  assert.equal(killed, false, "attached must never kill");
   assert.equal(stopServer({ status: "spawned", child }), true);
   assert.equal(killed, true);
+
+  // An already-exited child is not "stopped" — reporting true inflated the
+  // drain count and preceded a group kill on a possibly-reused PID.
+  assert.equal(stopServer({ status: "spawned",
+    child: { pid: 999999, exitCode: 0, signalCode: null, kill: () => {} } }), false);
+
+  let killed2 = false;
+  const child2 = { kill: () => { killed2 = true; } };
+  assert.equal(stopServer({ status: "failed", reason: "spawn-timeout", child: child2 }),
+               true, "a spawn-timeout child is ours to stop, not an orphan");
+  assert.equal(killed2, true);
+});
+
+// --- the spawned server must be able to find `claude` ------------------------
+// The Agent SDK resolves its CLI off PATH. A macOS GUI app inherits launchd's
+// PATH, so without this the packaged build serves a healthy board on which
+// EVERY task dies with CLINotFoundError.
+
+test("mergePath: appends missing dirs, never reorders or duplicates", () => {
+  const exists = () => true;
+  assert.equal(mergePath("/usr/bin:/bin", ["/opt/homebrew/bin"], exists),
+    "/usr/bin:/bin:/opt/homebrew/bin", "hint dirs go AFTER the inherited PATH");
+  assert.equal(mergePath("/usr/bin:/opt/homebrew/bin", ["/opt/homebrew/bin"], exists),
+    "/usr/bin:/opt/homebrew/bin", "an entry already present is not duplicated");
+  assert.equal(mergePath("", ["/opt/homebrew/bin"], exists), "/opt/homebrew/bin");
+});
+
+test("mergePath: never appends a directory that does not exist", () => {
+  assert.equal(mergePath("/usr/bin", ["/nope/nowhere"], () => false), "/usr/bin");
+});
+
+test("mergePath: makes a Homebrew claude reachable from launchd's PATH", () => {
+  // The real failure: /opt/homebrew/bin is in NEITHER launchd's default PATH
+  // nor the SDK's hardcoded fallback list, so a Homebrew install is invisible.
+  const launchd = "/usr/bin:/bin:/usr/sbin:/sbin";
+  const onlyBrew = (d) => d === "/opt/homebrew/bin";
+  assert.ok(mergePath(launchd, CLI_HINT_DIRS, onlyBrew).split(":")
+    .includes("/opt/homebrew/bin"),
+    "a Homebrew-installed claude must be reachable by the spawned server");
+});
+
+test("ensureServer: the spawned server inherits the widened PATH", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "nhpath-"));
+  const port = 18400 + (process.pid % 400);
+  const out = join(dir, "path.txt");
+  const fake = join(dir, "nh");
+  // Absolute shebang: the test PATH below is deliberately too narrow to find
+  // `node`, and the shebang must not be what this test is measuring.
+  writeFileSync(fake, `#!${process.execPath}
+require("node:fs").writeFileSync(${JSON.stringify(out)}, process.env.PATH || "");
+const http = require("node:http");
+http.createServer((req, res) => res.end("[]")).listen(${port}, "127.0.0.1");
+setInterval(() => {}, 1000);
+`);
+  chmodSync(fake, 0o755);
+  // LAUNCHD'S PATH. Running under a normal shell the hint dirs are already
+  // inherited, so the widening is invisible and the test proves nothing —
+  // which is exactly the reason this defect shipped.
+  const state = await ensureServer({
+    origin: "http://127.0.0.1:" + port, spawnTimeoutMs: 8000,
+    env: { NH_BIN: fake, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" }, nhArgs: [] });
+  try {
+    assert.equal(state.status, "spawned");
+    const childPath = readFileSync(out, "utf8").split(":");
+    const expected = CLI_HINT_DIRS.filter((d) => existsSync(d));
+    assert.ok(expected.length > 0, "no hint dir exists here; the test proves nothing");
+    for (const d of expected) {
+      assert.ok(childPath.includes(d),
+        `the spawned server cannot see ${d}, so the Agent SDK cannot find claude`);
+    }
+  } finally {
+    stopServer(state);
+  }
+});
+
+// --- configuredPort: a hand-rolled YAML block parser with no tests at all ----
+// docs/INSTALLER.md's verification recipe depends on it, and the shell must
+// find the same port `nh start` binds or a configured install is stranded.
+
+test("configuredPort: reads server.port, and only inside the server block", () => {
+  const dir = mkdtempSync(join(tmpdir(), "nhcfg-"));
+  const write = (body) => {
+    const f = join(dir, `${Math.random().toString(36).slice(2)}.yaml`);
+    writeFileSync(f, body); return f;
+  };
+  assert.equal(configuredPort(write("server:\n  port: 18994\n")), 18994);
+  assert.equal(configuredPort(write("server:\n  host: 127.0.0.1\n  port: 9\n")), 9);
+  // A port under a DIFFERENT top-level key must not be picked up.
+  assert.equal(configuredPort(write("llm:\n  port: 1234\n")), 8420);
+  // The block ends at the next top-level key.
+  assert.equal(configuredPort(write("server:\n  host: x\nllm:\n  port: 1234\n")), 8420);
+});
+
+test("configuredPort: falls back to 8420 rather than throwing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "nhcfg-"));
+  assert.equal(configuredPort(join(dir, "absent.yaml")), 8420, "no config file");
+  const f = join(dir, "junk.yaml");
+  writeFileSync(f, "not: [valid\n  yaml\n");
+  assert.equal(configuredPort(f), 8420, "unparseable config must not crash the shell");
+});
+
+test("stopServer: kills the process GROUP, not just the direct child", async () => {
+  // This is the entire reason for detached:true. Signalling only the direct
+  // child left nh's workers alive at PPID 1, still holding the port.
+  const dir = mkdtempSync(join(tmpdir(), "nhgrp-"));
+  const marker = join(dir, "grandchild.pid");
+  const fake = join(dir, "nh");
+  writeFileSync(fake, `#!${process.execPath}
+const { spawn } = require("node:child_process");
+const kid = spawn(${JSON.stringify(process.execPath)}, ["-e", "setInterval(()=>{},1000)"]);
+require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(kid.pid));
+setInterval(() => {}, 1000);
+`);
+  chmodSync(fake, 0o755);
+  const state = await ensureServer({
+    origin: "http://127.0.0.1:1", spawnTimeoutMs: 700,
+    env: { NH_BIN: fake }, nhArgs: [] });
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  // Poll for the worker's BIRTH as well as its death: a bare read here went
+  // ENOENT under parallel load and produced a random red build.
+  for (let i = 0; i < 60 && !existsSync(marker); i++) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.ok(existsSync(marker), "the fake server never started its worker");
+  const grandchild = Number(readFileSync(marker, "utf8"));
+  assert.ok(alive(grandchild), "the worker should be running before we stop");
+
+  assert.equal(stopServer(state), true);
+  for (let i = 0; i < 40 && (alive(state.child.pid) || alive(grandchild)); i++) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.equal(alive(grandchild), false,
+    "the worker outlived the server it belonged to and still holds the port");
+  assert.equal(alive(state.child.pid), false, "the server itself survived");
 });

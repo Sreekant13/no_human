@@ -25,6 +25,7 @@ nh = "no_human.cli.commands:main"
 
 [dependency-groups]
 dev = [
+    "pyinstaller>=6.21.0",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "pytest-xdist>=3.5",

@@ -78,6 +78,7 @@ export function isAppOrigin(url, origin = DEFAULT_ORIGIN) {
 // ---------------------------- E2: ensure/spawn ---------------------------- //
 
 import { execFile, spawn } from "node:child_process";
+import { canSignal, hasExited, ownsChild } from "./serverOwnership.mjs";
 
 export const DEFAULT_NH_PATHS = [
   path.join(os.homedir(), ".local", "bin", "nh"),
@@ -86,13 +87,33 @@ export const DEFAULT_NH_PATHS = [
 ];
 
 /**
+ * The `nh` frozen by packaging/build-installer.sh and shipped in the app's
+ * Resources (electron-builder extraResources). Present only in a packaged
+ * build: unpackaged, `process.resourcesPath` points inside node_modules/electron
+ * and has no nh-server dir, and under plain `node --test` it is undefined —
+ * both cases return "" so resolution falls through to a developer's own nh.
+ */
+export function bundledNhPath(resourcesPath = process.resourcesPath) {
+  if (!resourcesPath) return "";
+  const p = path.join(resourcesPath, "nh-server", "nh");
+  return fs.existsSync(p) ? p : "";
+}
+
+/**
  * Find the `nh` executable the way the operator's shell would. GUI apps on
- * macOS don't inherit the login shell's PATH, so: $NH_BIN → login-shell
- * `command -v nh` → known install locations. Returns "" when not found.
+ * macOS don't inherit the login shell's PATH, so: $NH_BIN → the bundled server
+ * → login-shell `command -v nh` → known install locations. Returns "" when not
+ * found.
+ *
+ * NH_BIN stays ahead of the bundle: it is the documented escape hatch for
+ * pointing a packaged app at a working tree, and demoting it would silently
+ * pin such installs to the frozen copy.
  */
 export async function resolveNhBin(env = process.env,
-                                   fallbackPaths = DEFAULT_NH_PATHS) {
+                                   fallbackPaths = DEFAULT_NH_PATHS,
+                                   bundled = bundledNhPath()) {
   if (env.NH_BIN && fs.existsSync(env.NH_BIN)) return env.NH_BIN;
+  if (bundled) return bundled;
   const viaShell = await new Promise((resolve) => {
     execFile(env.SHELL || "/bin/zsh", ["-lc", "command -v nh"],
              { timeout: 5000 }, (err, stdout) =>
@@ -103,6 +124,41 @@ export async function resolveNhBin(env = process.env,
     if (fs.existsSync(p)) return p;
   }
   return "";
+}
+
+/**
+ * Where Claude Code actually installs. The Agent SDK resolves its CLI with
+ * `shutil.which("claude")` plus a hardcoded list, and no_human never passes
+ * cli_path — so if `claude` is not on the spawned server's PATH, EVERY task
+ * dies with CLINotFoundError while the board itself looks perfectly healthy.
+ *
+ * That is not hypothetical on macOS: a GUI app inherits launchd's PATH
+ * (/usr/bin:/bin:/usr/sbin:/sbin), not the login shell's, so the operator's own
+ * ~/.local/bin/claude is invisible to a packaged build. /opt/homebrew/bin is
+ * worse still — it is in neither launchd's PATH nor the SDK's fallback list.
+ */
+export const CLI_HINT_DIRS = [
+  "/opt/homebrew/bin",                                   // Homebrew, Apple Silicon
+  "/usr/local/bin",                                      // Homebrew, Intel
+  path.join(os.homedir(), ".local", "bin"),
+  path.join(os.homedir(), ".npm-global", "bin"),
+  path.join(os.homedir(), ".claude", "local"),
+  path.join(os.homedir(), ".yarn", "bin"),
+];
+
+/**
+ * Append missing directories to a PATH. APPEND, never prepend: nh shells out to
+ * git/gh/pytest, and putting user-writable dirs first would let a stray binary
+ * shadow the system one. Non-existent dirs are skipped so PATH stays honest.
+ */
+export function mergePath(basePath, extraDirs = CLI_HINT_DIRS,
+                          exists = fs.existsSync) {
+  const parts = String(basePath || "").split(":").filter(Boolean);
+  const seen = new Set(parts);
+  for (const dir of extraDirs) {
+    if (!seen.has(dir) && exists(dir)) { parts.push(dir); seen.add(dir); }
+  }
+  return parts.join(":");
 }
 
 /**
@@ -118,27 +174,45 @@ export async function ensureServer({
   env = process.env,
   nhArgs = ["start", "--no-open"],
   fallbackPaths = DEFAULT_NH_PATHS,
+  bundled = bundledNhPath(),
+  // Called the instant a child exists. The caller must register it HERE: for
+  // the ~20s until this function returns, a server booted with the old token
+  // was in no registry at all, so nothing could stop it and a token save
+  // reported "Connected" over it.
+  onSpawn = () => {},
 } = {}) {
   if ((await probe(origin)) === "up") return { status: "attached" };
-  const bin = await resolveNhBin(env, fallbackPaths);
+  const bin = await resolveNhBin(env, fallbackPaths, bundled);
   if (!bin) {
     return { status: "failed", reason: "nh-not-found" };
   }
   // Merge over the process env: nh (and a shebang'd test double) needs
   // PATH/HOME; the env param carries only resolution overrides.
+  // detached: its own process GROUP, so stopServer can take the workers down
+  // with it. A plain SIGTERM to the direct child left `nh`'s spawned workers
+  // reparented to init, still holding the port.
+  // PATH is widened AFTER the merge so a caller-supplied env cannot silently
+  // drop it: without this the Agent SDK cannot find `claude` and every task
+  // fails, even though the board serves normally.
+  const spawnEnv = { ...process.env, ...env };
+  spawnEnv.PATH = mergePath(spawnEnv.PATH);
   const child = spawn(bin, nhArgs, {
-    env: { ...process.env, ...env }, detached: false, stdio: "ignore",
+    env: spawnEnv, detached: true, stdio: "ignore",
   });
+  child.unref();
+  // A throwing callback must not reject ensureServer with the child already
+  // spawned and untracked.
+  try { onSpawn(child); } catch { /* tracking must never break the spawn */ }
   const spawnErrored = new Promise((resolve) =>
     child.once("error", () => resolve("spawn-error")));
   const raced = await Promise.race(
     [waitForServer(origin, spawnTimeoutMs), spawnErrored]);
   if (raced === "spawn-error" || (await probe(origin)) !== "up") {
-    // Deliberately NOT killed (review): a slow-booting nh may be about to
-    // win the port bind; killing it races a legitimately-starting server.
-    // It is left to finish; the next launch (or error.html's Retry) probes
-    // and ATTACHES to it. Arbitration against a concurrent operator start
-    // is the OS port bind (nh's pid lock is advisory and check-then-write).
+    // NOT killed here: a slow-booting nh may still be about to win the port,
+    // and killing it from inside ensureServer would race a legitimately
+    // starting server. The child is returned instead, so the CALLER owns the
+    // decision — main.mjs tracks it and stops it before starting a
+    // replacement, which is what keeps Retry from accumulating servers.
     return {
       status: "failed",
       reason: raced === "spawn-error" ? "spawn-error" : "spawn-timeout",
@@ -149,13 +223,43 @@ export async function ensureServer({
 }
 
 /**
+ * SIGKILL the group. Used only after SIGTERM has been given time to work: a
+ * server that ignores SIGTERM otherwise survives quit and keeps the port.
+ */
+export function forceStopServer(state) {
+  return stopServer(state, "SIGKILL");
+}
+
+/**
  * Stop the server ONLY when this shell spawned it. Attached servers belong
  * to the operator — never touched, never pidfile-killed.
+ *
+ * NOTE: a `true` return means the signal was DELIVERED, not that the process
+ * died. Callers must confirm death with hasExited().
  */
-export function stopServer(state) {
-  if (!state || state.status !== "spawned" || !state.child) return false;
+export function stopServer(state, signal = "SIGTERM") {
+  // ownsChild is the single definition of "ours". Gating on status==="spawned"
+  // here contradicted it: ensureServer returns {status:"failed", child} for a
+  // slow-booting nh that may still bind the port, so this refused to stop a
+  // server we started and left it reparented to init, holding the port.
+  if (!ownsChild(state)) return false;
+  const child = state.child;
+  // Already gone: nothing to signal, and saying otherwise inflates the
+  // "stopped" count. Crucially it also stops us reaching the group kill with a
+  // PID the OS may have reused.
+  if (hasExited(child)) return false;
+  // Kill the process GROUP first: `nh` spawns workers, and signalling only the
+  // direct child left them alive at PPID 1 holding the port.
+  // Only signal a group while the child is demonstrably alive: after exit its
+  // PID can be reused, and process.kill(-pid) would hit a stranger's group.
+  if (canSignal(child)) {
+    try {
+      process.kill(-child.pid, signal);
+      return true;
+    } catch { /* no group (or already gone) — fall back to the child */ }
+  }
   try {
-    state.child.kill("SIGTERM");
+    child.kill(signal);
     return true;
   } catch {
     return false;

@@ -56,3 +56,22 @@ test("buildMenuTemplate: macOS gets the app menu; other platforms do not", () =>
   assert.equal(mac[0].role, "appMenu", "macOS app menu first");
   assert.ok(!win.some((t) => t.role === "appMenu"), "no app menu off macOS");
 });
+
+test("File menu exposes Re-enter Claude Token and it routes", () => {
+  let called = 0;
+  const t = buildMenuTemplate({
+    isMac: true, isDev: false, onNavigate() {}, onNewTask() {},
+    onReenterToken: () => { called += 1; },
+  });
+  const file = t.find((m) => m.label === "File");
+  const item = file.submenu.find((i) => i.label === "Re-enter Claude Token…");
+  assert.ok(item, "the only in-app remedy for a bad token must be present");
+  item.click();
+  assert.equal(called, 1, "it must invoke onReenterToken");
+});
+
+test("the token item is omitted when no handler is supplied", () => {
+  const t = buildMenuTemplate({ isMac: true, isDev: false, onNavigate() {}, onNewTask() {} });
+  const file = t.find((m) => m.label === "File");
+  assert.equal(file.submenu.some((i) => i.label === "Re-enter Claude Token…"), false);
+});

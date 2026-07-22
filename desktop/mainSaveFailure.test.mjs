@@ -1,0 +1,54 @@
+// nh:save-token must NEVER report success when the server did not start.
+//
+// This is the branch's signature defect — the app lying about success — and the
+// final failed-status check that prevents it was entirely unpinned. I declined
+// to write this test claiming it needed a >=20s wall-clock path. That was wrong,
+// and a reviewer showed the recipe: NH_BIN outranks every other resolution
+// route, so a NON-EXECUTABLE NH_BIN makes spawn emit EACCES and ensureServer
+// return failed/spawn-error in about 5ms, with nothing ever executed.
+import { register } from "node:module";
+import assert from "node:assert/strict";
+import test from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+register("./testing/electronLoader.mjs", import.meta.url);
+
+const HERE = fileURLToPath(new URL(".", import.meta.url));
+const home = fs.mkdtempSync(path.join(os.tmpdir(), "nh-savefail-"));
+fs.mkdirSync(path.join(home, ".no_human"));
+// A binary that EXISTS (so resolveNhBin returns it) but cannot be executed.
+const fakeNh = path.join(home, "nh");
+fs.writeFileSync(fakeNh, "#!/bin/sh\nexit 0\n");
+fs.chmodSync(fakeNh, 0o644);                 // deliberately not +x -> EACCES
+process.env.HOME = home;
+process.env.NH_BIN = fakeNh;
+process.env.NH_ORIGIN = `http://127.0.0.1:${19800 + (process.pid % 120)}`;  // nothing listening
+
+const stub = await import("./testing/electronStub.mjs");
+await import("./main.mjs");
+stub.fireReady();
+await new Promise((r) => setTimeout(r, 600));
+
+test.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+test("a token saved against a server that cannot start reports the failure", async () => {
+  const handler = stub.calls.ipc.get("nh:save-token");
+  assert.ok(handler, "main.mjs must register nh:save-token");
+  const setupUrl = pathToFileURL(path.join(HERE, "token.html")).href;
+
+  const started = Date.now();
+  const res = await handler({ senderFrame: { url: setupUrl } }, "sk-ant-oat-cannot-start");
+  const elapsed = Date.now() - started;
+
+  assert.equal(res.ok, false,
+    "reporting ok here paints 'Connected. Opening no_human…' over an error page");
+  assert.match(res.error, /did not start/i, "the reason must say the server failed");
+  // The token itself IS saved — only the server failed.
+  assert.match(fs.readFileSync(path.join(home, ".no_human", ".env"), "utf8"),
+    /sk-ant-oat-cannot-start/);
+  assert.ok(elapsed < 8000,
+    `this path must be fast (spawn fails immediately); took ${elapsed}ms`);
+});

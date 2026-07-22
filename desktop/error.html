@@ -1,35 +1,113 @@
 <!doctype html>
+<html lang="en">
 <meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
 <title>no_human — server not reachable</title>
 <style>
-  :root { color-scheme: dark light; }
+  /* Both themes, like token.html: declaring color-scheme while hard-coding dark
+     literals made a light-mode launch flash white -> near-black. */
+  :root {
+    color-scheme: dark light;
+    --bg: #0F1117; --raised: #1A1D27; --border: #2E3241;
+    --border-control: #6E7590;   /* 3:1 for control edges, WCAG 1.4.11 */
+    --text: #C9CDD6; --accent: #4C9AFF;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #F4F5F7; --raised: #FFFFFF; --border: #DFE1E6;
+      --border-control: #7C8391;
+      --text: #172B4D; --accent: #0C66E4;
+    }
+  }
   body {
     margin: 0; min-height: 100vh; display: grid; place-items: center;
-    background: #12141C; color: #E6E8F0;
+    background: var(--bg); color: var(--text);
     font: 15px/1.6 -apple-system, "SF Pro Text", Helvetica, Arial, sans-serif;
   }
   main { max-width: 34rem; padding: 2rem; }
   h1 { font-size: 1.15rem; margin: 0 0 .75rem; }
   code {
-    background: #1A1D27; border: 1px solid #2A2E3D; border-radius: 6px;
+    background: var(--raised); border: 1px solid var(--border); border-radius: 6px;
     padding: .1rem .4rem; font-family: ui-monospace, SFMono-Regular, monospace;
     font-size: .85em;
   }
-  .steps { color: #A8ADC0; margin: 1rem 0; }
+  .steps { color: var(--text); margin: 1rem 0; }
+  .actions { display: flex; gap: .5rem; margin-top: 1rem; flex-wrap: wrap; }
   a.retry {
-    display: inline-block; margin-top: 1rem; padding: .5rem 1.1rem;
-    border: 1px solid #4C6FFF; border-radius: 8px; color: #E6E8F0;
+    display: inline-block; padding: .5rem 1.1rem;
+    border: 1px solid var(--accent); border-radius: 8px; color: var(--text);
     text-decoration: none;
   }
-  a.retry:hover { background: #1A1F35; }
+  a.retry:hover { background: var(--raised); }
+  a.retry:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* Secondary: same shape, quieter border — Retry is the primary action. */
+  a.retry.secondary { border-color: var(--border-control); }
+  /* `display:inline-block` above beats the UA `[hidden]{display:none}` rule, so
+     the attribute alone did NOT hide the link. This restores it. */
+  a.retry[hidden] { display: none; }
+  a.retry[aria-disabled="true"] { opacity: .55; cursor: default; }
 </style>
 <main>
   <h1>The no_human server isn’t reachable</h1>
-  <p class="steps">
+  <!-- Two audiences. A packaged app ships its own server, so telling that user
+       to run `nh start` in a terminal or install from a git checkout is a dead
+       end — there is no checkout and no `nh` on PATH. Developers running the
+       shell from source DO need exactly those commands, so both are kept and
+       main.mjs says which one applies. -->
+  <p class="steps" id="steps-packaged" hidden>
+    The bundled server didn’t start. Retry, or re-enter your Claude subscription
+    token if it may be wrong — no_human can’t start without a valid one.
+  </p>
+  <!-- stop-failed is neither audience's story: a server IS running and would
+       not stop, so "start it in a terminal" and "the bundled server didn't
+       start" are both wrong. -->
+  <p class="steps" id="steps-stopfailed" hidden>
+    A no_human server is already running and didn’t respond to a stop request,
+    so a new one couldn’t take its place. Quit no_human and open it again.
+  </p>
+  <p class="steps" id="steps-dev" hidden>
     The desktop shell attaches to the local server. Start it in a terminal:
     <br /><code>nh start --no-open</code>
     <br />then retry. (If <code>nh</code> isn’t installed:
-    <code>uv tool install --editable ~/git/acme/master/no_human</code>)
+    <code>uv tool install --editable &lt;your no_human checkout&gt;</code>)
   </p>
-  <a class="retry" href="nh://retry">Retry connection</a>
+  <div class="actions">
+    <a class="retry" href="nh://retry">Retry connection</a>
+    <!-- Only when the credential could plausibly be the cause: on
+         reason=nh-not-found the token is not the problem. -->
+    <a class="retry secondary" id="token-link" href="nh://token" hidden>Re-enter Claude token</a>
+  </div>
+  <p class="steps" id="retry-status" role="status"></p>
+  <script>
+    const q = new URLSearchParams(location.search);
+    const reason = q.get("reason") || "";
+    if (reason !== "nh-not-found") document.getElementById("token-link").hidden = false;
+    // Default to the packaged wording: a friend must never be shown build steps.
+    const dev = q.get("packaged") === "0";
+    const which = reason === "stop-failed" ? "steps-stopfailed"
+                                           : (dev ? "steps-dev" : "steps-packaged");
+    document.getElementById(which).hidden = false;
+
+    // Retry can take ~20s (probe + spawn wait) and further clicks are ignored,
+    // so without this it reads as a dead button. aria-disabled + aria-live keeps
+    // it announced rather than just dimmed.
+    const retry = document.querySelector('a[href="nh://retry"]');
+    const status = document.getElementById("retry-status");
+    let retryTimer;
+    retry.addEventListener("click", (e) => {
+      // aria-disabled is advisory: without this guard, Enter on the focused
+      // link still fired while it announced itself as disabled.
+      if (retry.getAttribute("aria-disabled") === "true") { e.preventDefault(); return; }
+      retry.setAttribute("aria-disabled", "true");
+      status.textContent = "Starting the server — this can take about 20 seconds…";
+      // If the attempt is abandoned (nav timeout paints nothing), the page would
+      // otherwise sit here with a permanently unclickable button.
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(() => {
+        retry.removeAttribute("aria-disabled");
+        status.textContent = "Still not reachable — you can try again.";
+      }, 45000);
+    });
+  </script>
 </main>

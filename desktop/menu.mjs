@@ -8,7 +8,8 @@
 // never shadows it. A custom application menu REPLACES the platform default, so
 // the Edit menu (copy/paste/select-all) must be included explicitly or text
 // inputs lose it.
-export function buildMenuTemplate({ isMac, isDev, onNavigate, onNewTask }) {
+export function buildMenuTemplate({ isMac, isDev, onNavigate, onNewTask,
+                                    onReenterToken }) {
   const nav = (label, page, accelerator) => ({
     label, accelerator, click: () => onNavigate(page),
   });
@@ -19,6 +20,14 @@ export function buildMenuTemplate({ isMac, isDev, onNavigate, onNewTask }) {
     submenu: [
       { label: "New Task", accelerator: "CmdOrCtrl+N", click: () => onNewTask() },
       { type: "separator" },
+      // The only way back to the setup screen once a token is on disk. A typo'd
+      // or revoked token otherwise strands the app: hasToken() stays true, so
+      // first-run never re-triggers, and the board either fails to open or
+      // opens and fails every task with no in-app remedy.
+      ...(onReenterToken
+        ? [{ label: "Re-enter Claude Token…", click: () => onReenterToken() },
+           { type: "separator" }]
+        : []),
       isMac ? { role: "close" } : { role: "quit" },
     ],
   });

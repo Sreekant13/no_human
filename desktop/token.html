@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<!-- Local-only page; no remote or inline-eval capability. Defence in depth. -->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'" />
+<title>no_human — connect your Claude subscription</title>
+<style>
+  /* Tokens mirror web/src/styles.css so the shell and the board look like one
+     product. Unlike error.html (dark-only), both themes are defined. */
+  :root {
+    color-scheme: dark light;
+    --bg: #0F1117; --bg-raised: #1A1D27; --border: #2E3241; --border-hi: #3D4255;
+    --text: #C9CDD6; --text-hi: #E8ECF2; --text-muted: #8C92A4;
+    --accent: #4C9AFF; --danger: #EF6B6B;
+    /* Control boundaries need 3:1 (WCAG 1.4.11). --border-hi is 1.90:1
+       against --bg and 1.69:1 against --bg-raised, and the fill does not
+       rescue it (--bg-raised vs --bg is 1.12:1), so the one credential
+       input on this screen had no perceivable edge. 3.69:1 here. */
+    --border-control: #6E7590;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #F4F5F7; --bg-raised: #FFFFFF; --border: #DFE1E6; --border-hi: #C1C7D0;
+      --text: #172B4D; --text-hi: #091E42; --text-muted: #44546F;
+      --accent: #0C66E4; --danger: #C9372C;
+      --border-control: #7C8391;   /* 3.49:1 against both surfaces */
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    background: var(--bg); color: var(--text);
+    font: 15px/1.6 -apple-system, "SF Pro Text", Helvetica, Arial, sans-serif;
+  }
+  main { width: 100%; max-width: 32rem; padding: 2rem; }
+  h1 { font-size: 1.15rem; margin: 0 0 .5rem; color: var(--text-hi); }
+  p { margin: 0 0 1rem; color: var(--text-muted); }
+  ol { margin: 0 0 1.25rem; padding-left: 1.25rem; color: var(--text-muted); }
+  li { margin-bottom: .35rem; }
+  code {
+    background: var(--bg-raised); border: 1px solid var(--border);
+    border-radius: 6px; padding: .1rem .4rem;
+    font-family: ui-monospace, SFMono-Regular, monospace; font-size: .85em;
+    color: var(--text-hi); user-select: all;
+  }
+  label { display: block; font-weight: 500; color: var(--text-hi);
+          margin-bottom: .35rem; }
+  .row { display: flex; gap: .5rem; align-items: stretch; }
+  input {
+    flex: 1; min-width: 0; padding: .6rem .7rem; border-radius: 8px;
+    border: 1px solid var(--border-control); background: var(--bg-raised);
+    color: var(--text-hi); font: inherit;
+    font-family: ui-monospace, SFMono-Regular, monospace; font-size: .9em;
+  }
+  /* 2px visible ring — never remove focus indication (a11y §1). */
+  input:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+  input[aria-invalid="true"] { border-color: var(--danger); }
+  button {
+    padding: .6rem 1.1rem; border-radius: 8px; border: 1px solid var(--border-control);
+    background: var(--bg-raised); color: var(--text-hi); font: inherit;
+    cursor: pointer; min-height: 44px;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  /* Text is --bg on the accent fill, matching .decision-btn-primary in
+     web/src/styles.css. White here measured 2.85:1 (fails AA); --bg gives
+     6.63:1 dark / 4.77:1 light. */
+  button.primary { background: var(--accent); border-color: var(--accent);
+                   color: var(--bg); font-weight: 500; }
+  button:disabled { opacity: .5; cursor: default; }
+  .actions { display: flex; gap: .5rem; margin-top: 1rem; }
+  /* The message text itself carries the meaning; colour only reinforces it
+     (a11y color-not-only), and aria-invalid marks the field independently. */
+  .msg { min-height: 1.5rem; margin-top: .6rem; font-size: .9em; }
+  .msg[data-kind="error"] { color: var(--danger); }
+  .msg[data-kind="ok"] { color: var(--accent); }
+  .hint { font-size: .85em; color: var(--text-muted); margin-top: .75rem; }
+</style>
+<main>
+  <h1>Connect your Claude subscription</h1>
+  <p>
+    no_human runs on your Claude&nbsp;subscription, not a metered API key.
+    It needs a subscription token once — it is stored only on this Mac, in
+    <code>~/.no_human/.env</code>.
+  </p>
+  <ol>
+    <li>In a terminal, run <code>claude setup-token</code></li>
+    <li>Sign in when the browser opens</li>
+    <li>Copy the token it prints, and paste it below</li>
+  </ol>
+
+  <form id="form" novalidate>
+    <label for="token">Subscription token</label>
+    <div class="row">
+      <input id="token" name="token" type="password" autocomplete="off"
+             spellcheck="false" autocapitalize="off"
+             placeholder="sk-ant-oat…"
+             aria-describedby="msg hint" />
+      <button type="button" id="reveal" aria-pressed="false">Show</button>
+    </div>
+    <!-- role=alert announces validation without stealing focus. Deliberately
+         NOT also aria-live=polite: alert implies assertive, and the pair conflicts. -->
+    <div class="msg" id="msg" role="alert"></div>
+    <div class="actions">
+      <button type="submit" class="primary" id="save">Save and start</button>
+      <button type="button" id="secondary">Quit</button>
+    </div>
+  </form>
+  <p class="hint" id="hint">
+    An API key (<code>sk-ant-api…</code>) will not work here — it would bill the
+    metered API instead of your subscription.
+  </p>
+</main>
+<script type="module">
+  import { dismissTarget, labels, parseCanReturn, saveProgress } from "./setupUi.mjs";
+
+  const $ = (id) => document.getElementById(id);
+  const input = $("token"), msg = $("msg"), save = $("save"), reveal = $("reveal");
+
+  function setMsg(text, kind) {
+    msg.textContent = text;
+    if (kind) msg.dataset.kind = kind; else delete msg.dataset.kind;
+    input.setAttribute("aria-invalid", kind === "error" ? "true" : "false");
+  }
+
+  reveal.addEventListener("click", () => {
+    const shown = input.type === "text";
+    input.type = shown ? "password" : "text";
+    reveal.setAttribute("aria-pressed", String(!shown));
+    reveal.textContent = shown ? "Show" : "Hide";
+    input.focus();
+  });
+
+  // Is a working board behind this screen? Set by main.mjs when the screen is
+  // reached from File > Re-enter Claude Token over a live server.
+  const canReturn = parseCanReturn(location.search);
+  const secondary = $("secondary");
+  const copy = labels(canReturn);
+  secondary.textContent = copy.secondary;
+  save.textContent = copy.primary;
+  $("hint").textContent = copy.hint;
+
+  // A save holds the server lifecycle; dismissing mid-flight started a second,
+  // concurrent navigation that could double-spawn.
+  let saving = false;
+
+  function dismiss() {
+    if (saving) return;
+    // Quitting here would kill the app AND stop a shell-spawned server on one
+    // keystroke, so it is only ever the action on genuine first run.
+    const bridge = window.nhSetup;
+    if (!bridge) { setMsg("Desktop bridge unavailable — reopen no_human.", "error"); return; }
+    const action = dismissTarget(canReturn);
+    if (action === "dismiss") {
+      // May queue behind a navigation already running; say so instead of
+      // looking dead, and surface a failure rather than rejecting silently.
+      secondary.disabled = true;
+      setMsg("Returning to the board…", "ok");
+      // It can also resolve TRUE without navigating (a superseded nav paints
+      // nothing), so re-enable unless this page is actually replaced.
+      const reArm = setTimeout(() => {
+        secondary.disabled = false;
+        setMsg("Still here — the board didn’t open. Try again.", "error");
+      }, 25000);
+      Promise.resolve(bridge.dismiss()).then((ok) => {
+        // It RESOLVES false when it declines — handling only rejection left the
+        // button dead.
+        if (ok) return;
+        clearTimeout(reArm);
+        setMsg("Could not return to the board.", "error");
+        secondary.disabled = false;
+      }, (err) => {
+        clearTimeout(reArm);
+        setMsg(`Could not return to the board: ${err && err.message ? err.message : err}`, "error");
+        secondary.disabled = false;
+      });
+      return;
+    }
+    bridge.quit();
+  }
+  secondary.addEventListener("click", dismiss);
+
+  $("form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!window.nhSetup) {
+      setMsg("Desktop bridge unavailable — reopen no_human.", "error");
+      return;
+    }
+    saving = true;
+    save.disabled = true;
+    secondary.disabled = true;      // no concurrent dismiss while we hold the server
+    // Progressive copy: this can legitimately run ~43s, and a single frozen
+    // string with both buttons disabled reads as a crash.
+    const startedAt = Date.now();
+    setMsg(saveProgress(0, canReturn), "ok");
+    let shown = saveProgress(0, canReturn);
+    const ticker = setInterval(() => {
+      const next = saveProgress(Date.now() - startedAt, canReturn);
+      if (next !== shown) { shown = next; setMsg(next, "ok"); }
+    }, 1000);
+    let res;
+    try {
+      res = await window.nhSetup.saveToken(input.value);
+    } catch (err) {
+      // A rejected invoke must not strand the button disabled with the
+      // "Saving…" message and no way forward.
+      res = { ok: false, error: String((err && err.message) || err) };
+    }
+    clearInterval(ticker);
+    saving = false;
+    secondary.disabled = false;
+    if (res && res.ok) {
+      setMsg("Connected. Opening no_human…", "ok");
+      return; // main process swaps this window to the board
+    }
+    if (res && res.needsRestart) {
+      // Saved, but a server already running still holds the old token. Say so
+      // rather than returning to a board that silently keeps failing.
+      setMsg(res.error, "error");
+      save.disabled = false;
+      return;
+    }
+    setMsg((res && res.error) || "Could not save the token.", "error");
+    save.disabled = false;
+    input.focus();          // focus-management: return to the invalid field
+    // Deliberately NOT input.select(): highlighting the whole credential (and
+    // it may be revealed) is needless exposure.
+  });
+
+  // Escape takes the same route as the secondary button: back to the board when
+  // there is one, quit only on genuine first run.
+  document.addEventListener("keydown", (e) => {
+    // Respect the same disabled state as the button: repeated Escape used to
+    // queue navigations that each became a silent no-op.
+    if (e.key === "Escape" && !secondary.disabled) dismiss();
+  });
+
+  // Autofocus the field: this screen exists to collect exactly one value.
+  input.focus();
+</script>

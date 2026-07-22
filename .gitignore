@@ -37,4 +37,8 @@ eval/results/northstar/
 
 # desktop shell
 desktop/node_modules/
+# also match a SYMLINK: a trailing slash only matches a directory, so a
+# symlinked node_modules slipped past and got committed as an absolute path.
+desktop/node_modules
+web/node_modules
 desktop/dist/

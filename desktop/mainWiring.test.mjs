@@ -1,0 +1,137 @@
+// End-to-end wiring tests for main.mjs.
+//
+// WHY THIS EXISTS: every blocking defect in review rounds 8, 9, 10 and 11 lived
+// in this wiring, and a reviewer proved all three round-10 fixes could be
+// reverted with the suite still green:
+//   - dropping event.preventDefault() from the keep-held branch
+//   - reverting stop-failed to a state without the child
+//   - reverting the quit grace from 10s to 2s
+// The decisions are unit-tested elsewhere (quitPolicy, serverLifecycle); this
+// file guards that main.mjs actually WIRES them together.
+import { register } from "node:module";
+import assert from "node:assert/strict";
+import test from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+const HERE = fileURLToPath(new URL(".", import.meta.url));
+
+register("./testing/electronLoader.mjs", import.meta.url);
+
+const PORT = 19700 + (process.pid % 200);
+const MARK = `nhWiring${process.pid}`;
+
+/** A temp HOME with a token, plus a fake `nh` that binds PORT and obeys SIGTERM. */
+function bootstrapEnv() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "nh-wiring-"));
+  fs.mkdirSync(path.join(home, ".no_human"));
+  fs.writeFileSync(path.join(home, ".no_human", ".env"),
+    "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-wiring\n");
+  const bin = path.join(home, "nh");
+  fs.writeFileSync(bin, `#!/usr/bin/env node
+process.title = ${JSON.stringify(MARK)};
+const http = require("node:http");
+http.createServer((q, s) => {
+  if (q.url === "/api/tasks") { s.end("[]"); return; }
+  s.setHeader("content-type", "text/html"); s.end("<h1>BOARD</h1>");
+}).listen(${PORT}, "127.0.0.1");
+setInterval(() => {}, 1000);
+`);
+  fs.chmodSync(bin, 0o755);
+  process.env.HOME = home;                 // BEFORE importing main.mjs
+  process.env.NH_ORIGIN = `http://127.0.0.1:${PORT}`;
+  process.env.NH_BIN = bin;
+  return home;
+}
+
+const liveFakes = () => {
+  const out = execSync(
+    `/bin/ps -eo pid,command | grep ${MARK} | grep -v grep || true`).toString().trim();
+  return out ? out.split("\n").length : 0;
+};
+
+// One module instance is shared: main.mjs has top-level side effects.
+const home = bootstrapEnv();
+const stub = await import("./testing/electronStub.mjs");
+const main = await import("./main.mjs");
+stub.fireReady();
+// Let whenReady -> createWindow -> loadBoardOrError -> ensureServer settle.
+await new Promise((r) => setTimeout(r, 4000));
+
+test.after(() => {
+  try { execSync(`/usr/bin/pkill -9 -f ${MARK}`); } catch { /* already gone */ }
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("the shell actually spawned and attached to a server", () => {
+  assert.equal(liveFakes(), 1, "no server was started; later assertions are void");
+  const win = stub.BrowserWindow.last;
+  assert.ok(win.loaded.some((x) => x.startsWith("url:")),
+    `expected the board to load, got ${JSON.stringify(win.loaded)}`);
+});
+
+test("a probe-up must not relabel a server WE spawned as operator-owned", async () => {
+  // stateOnProbeUp exists because a probe-up overwrote a "spawned" state with
+  // "attached": that discards the only legitimate kill target, so the child is
+  // orphaned at quit and the tray reports it as the operator's. The function is
+  // unit-tested; this pins that main.mjs still routes the probe-up through it.
+  assert.equal(main.serverLabel(), "server: spawned by the app",
+    "the shell should own the server it just started");
+
+  const onNavigate = stub.calls.nav.get("will-navigate");
+  await onNavigate({ preventDefault() {} }, "nh://retry");   // a nav that probes UP
+
+  assert.equal(main.serverLabel(), "server: spawned by the app",
+    "a probe-up relabelled our own child as operator-owned — it would be " +
+    "orphaned at quit and the tray would lie about who owns it");
+});
+
+test("saving a token over OUR OWN live server restarts it and reports success",
+  async () => {
+    // The one state the other IPC fixture cannot reach: a live server we
+    // spawned. Here the correct action is "restart" — stop ours, start it again
+    // on the new credential. Treating it as somebody else's returns
+    // needsRestart and strands the user on the credential screen forever.
+    const save = stub.calls.ipc.get("nh:save-token");
+    assert.ok(save, "main.mjs must register nh:save-token");
+    assert.equal(liveFakes(), 1, "precondition: our server is running");
+
+    const setupUrl = pathToFileURL(path.join(HERE, "token.html")).href;
+    const res = await save({ senderFrame: { url: setupUrl } }, "sk-ant-oat-rotated");
+
+    assert.equal(res.ok, true,
+      `a token save over our own server should succeed; got ${JSON.stringify(res)}`);
+    assert.match(fs.readFileSync(path.join(home, ".no_human", ".env"), "utf8"),
+      /sk-ant-oat-rotated/, "the new token was not persisted");
+    assert.equal(liveFakes(), 1,
+      "the restart should leave exactly one server — not zero, and not a leak");
+  });
+
+test("a SECOND quit during the shutdown hold is HELD, not let through", async () => {
+  const beforeQuit = stub.calls.handlers.get("before-quit");
+  assert.ok(beforeQuit, "main.mjs must register a before-quit handler");
+
+  let prevented = 0;
+  const evt = () => ({ preventDefault: () => { prevented += 1; } });
+
+  beforeQuit(evt());                       // first Cmd-Q -> delay
+  assert.equal(prevented, 1, "the first quit must be held so shutdown can run");
+
+  beforeQuit(evt());                       // second Cmd-Q while shutting down
+  assert.equal(prevented, 2,
+    "the re-entrant quit fell through, abandoning the SIGKILL escalation — " +
+    "the server outlived the app and kept ~/.no_human/nh.pid");
+});
+
+test("the held shutdown stops the server we spawned", async () => {
+  // shutdown() is already running from the test above. Wait for BOTH the
+  // process to die and the quit to be released — asserting on the process
+  // alone raced the async .finally(() => app.quit()).
+  for (let i = 0; i < 80 && (liveFakes() > 0 || stub.calls.quit === 0); i++) {
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  assert.equal(liveFakes(), 0, "the spawned server survived the shutdown");
+  assert.ok(stub.calls.quit >= 1, "the app must actually quit once shutdown finishes");
+});

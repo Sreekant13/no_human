@@ -4,6 +4,15 @@
 // later, notification dedupe in E3).
 const { contextBridge, ipcRenderer } = require("electron");
 
+// First-run credential screen (token.html) only. Deliberately separate from
+// nhDesktop: the board never needs these, and the token never crosses back —
+// saveToken returns {ok} or {error}, never the value.
+contextBridge.exposeInMainWorld("nhSetup", {
+  saveToken: (value) => ipcRenderer.invoke("nh:save-token", value),
+  dismiss: () => ipcRenderer.invoke("nh:dismiss"),
+  quit: () => ipcRenderer.invoke("nh:quit"),
+});
+
 contextBridge.exposeInMainWorld("nhDesktop", {
   shell: true,
   version: process.env.npm_package_version || "dev",
