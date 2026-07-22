@@ -63,12 +63,19 @@ for (const [label, viewport] of [
       const toggle = document.querySelector(".nh-theme-toggle");
       const tr = toggle?.getBoundingClientRect();
       const tag = document.querySelector(".legion-tag");
+      // Dialog-opening controls: read their disclosure attributes from the DOM.
+      const settingsBtn = document.querySelector(".nh-settings-row");
+      const newTaskBtn = document.querySelector(".btn-new-task");
       return {
         vw,
         btns,
         toggleOnScreen: tr ? tr.right <= vw && tr.left >= 0 : null,
         tagVisible: tag ? getComputedStyle(tag).display !== "none" : false,
         pageOverflowX: document.documentElement.scrollWidth > vw + 1,
+        settingsPopup: settingsBtn?.getAttribute("aria-haspopup") || null,
+        settingsExpanded: settingsBtn?.getAttribute("aria-expanded") || null,
+        newTaskPopup: newTaskBtn?.getAttribute("aria-haspopup") || null,
+        newTaskExpanded: newTaskBtn?.getAttribute("aria-expanded") || null,
       };
     });
 
@@ -102,6 +109,19 @@ for (const [label, viewport] of [
       currentRows.length === 1 ? `current="${currentRows[0].label}" active=${currentRows[0].active}` : "",
     );
 
+    // a11y: a control that opens a modal dialog must announce it (aria-haspopup)
+    // and its open state (aria-expanded). Both start collapsed on load.
+    check(
+      `[${label}/${theme}] Settings button announces its dialog (haspopup=dialog, collapsed)`,
+      geom.settingsPopup === "dialog" && geom.settingsExpanded === "false",
+      `haspopup=${geom.settingsPopup} expanded=${geom.settingsExpanded}`,
+    );
+    check(
+      `[${label}/${theme}] New Task button announces its dialog (haspopup=dialog, collapsed)`,
+      geom.newTaskPopup === "dialog" && geom.newTaskExpanded === "false",
+      `haspopup=${geom.newTaskPopup} expanded=${geom.newTaskExpanded}`,
+    );
+
     // The tagline is decorative and may be dropped on a phone — but it must SURVIVE
     // on desktop, where the sidebar is a vertical rail with room for it.
     if (label === "desktop") {
@@ -113,6 +133,13 @@ for (const [label, viewport] of [
     await page.waitForTimeout(600);
     const onSettings = await page.getByRole("button", { name: /NEW PROJECT/i }).isVisible().catch(() => false);
     check(`[${label}/${theme}] Settings page opens`, onSettings);
+    // With the dialog open, the trigger must report aria-expanded="true".
+    const settingsExpandedOpen = await page.locator(".nh-settings-row").getAttribute("aria-expanded").catch(() => null);
+    check(
+      `[${label}/${theme}] Settings button reports expanded while its dialog is open`,
+      settingsExpandedOpen === "true",
+      `expanded=${settingsExpandedOpen}`,
+    );
     check(`[${label}/${theme}] no page errors`, errors.length === 0, errors[0] || "");
 
     await ctx.close();

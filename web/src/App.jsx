@@ -86,7 +86,7 @@ function IconGear() {
 // icon-only row is never rendered (label is not conditionally hidden). The
 // active row gets a soft filled pill (see .nh-navrow.active in styles.css),
 // animated on --dur-fast/--ease-out and prefers-reduced-motion guarded.
-function NavRow({ icon, label, active, current, badge, badgeVariant, onClick, title, className = "" }) {
+function NavRow({ icon, label, active, current, haspopup, expanded, badge, badgeVariant, onClick, title, className = "" }) {
   return (
     <button
       className={`nh-navrow${active ? " active" : ""}${className ? ` ${className}` : ""}`}
@@ -94,6 +94,10 @@ function NavRow({ icon, label, active, current, badge, badgeVariant, onClick, ti
       // rows pass `current`. Settings opens an overlay dialog, not a page, so it is
       // `active` (filled pill) without claiming to be the current page.
       aria-current={current ? "page" : undefined}
+      // A row that opens a dialog announces it (aria-haspopup) and its open state
+      // (aria-expanded) — page-nav rows pass neither, so both stay off for them.
+      aria-haspopup={haspopup || undefined}
+      aria-expanded={expanded === undefined ? undefined : expanded}
       onClick={onClick}
       title={title}
     >
@@ -801,6 +805,8 @@ export default function App() {
             icon={<IconGear />}
             label="Settings"
             active={settingsOpen}
+            haspopup="dialog"
+            expanded={settingsOpen}
             onClick={() => setSettingsOpen(true)}
             className="nh-settings-row"
           />
@@ -817,7 +823,7 @@ export default function App() {
         {page === "board" && (
           <div className="nh-main-bar">
             <OverviewStrip tasks={tasks} />
-            <button className="btn btn-new-task" onClick={() => setShowNewTask(true)}>+ New Task</button>
+            <button className="btn btn-new-task" aria-haspopup="dialog" aria-expanded={showNewTask} onClick={() => setShowNewTask(true)}>+ New Task</button>
           </div>
         )}
         {page === "board" && <Board tasks={tasks} pendingOpenId={pendingOpenId} onPendingOpenHandled={() => setPendingOpenId(null)} />}
