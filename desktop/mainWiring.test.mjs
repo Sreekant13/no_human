@@ -58,8 +58,20 @@ const home = bootstrapEnv();
 const stub = await import("./testing/electronStub.mjs");
 const main = await import("./main.mjs");
 stub.fireReady();
-// Let whenReady -> createWindow -> loadBoardOrError -> ensureServer settle.
-await new Promise((r) => setTimeout(r, 4000));
+// Wait for whenReady -> createWindow -> loadBoardOrError -> ensureServer to
+// settle: the fake server is live AND the board window has loaded. Poll to a
+// generous deadline rather than sleep a fixed 4s — a blind wait flakes red when
+// a loaded CI runner needs longer than 4s to boot the child (gate finding #2).
+// This polls for the exact condition the first test asserts, so it cannot
+// settle early on a broken boot; it just fails faster when idle.
+{
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    const w = stub.BrowserWindow.last;
+    if (liveFakes() === 1 && w && w.loaded.some((x) => x.startsWith("url:"))) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
 
 test.after(() => {
   try { execSync(`/usr/bin/pkill -9 -f ${MARK}`); } catch { /* already gone */ }

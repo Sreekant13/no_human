@@ -128,7 +128,10 @@ setInterval(() => {}, 1000);
   chmodSync(fake, 0o755);
   const origin = "http://127.0.0.1:" + port;
   const state = await ensureServer({
-    origin, spawnTimeoutMs: 8000, env: { NH_BIN: fake }, nhArgs: [] });
+    // Deadline, not a fixed wait: ensureServer returns as soon as the port
+    // answers (~400ms idle). A roomier deadline only affects a genuinely slow
+    // boot under load, which is the flake this widens out (gate finding #2).
+    origin, spawnTimeoutMs: 20000, env: { NH_BIN: fake }, nhArgs: [] });
   try {
     assert.equal(state.status, "spawned");
     assert.ok(state.child.pid > 0);
