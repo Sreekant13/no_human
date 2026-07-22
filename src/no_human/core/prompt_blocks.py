@@ -186,9 +186,17 @@ def supervisor_channel_tag() -> str:
 def build_rules_block(
     test_cmd_str: str, integration_cmd_str: str, ci_name: str | None,
     routing_rules: list[dict] | None = None,
+    repro_mode: str = "advisory",
 ) -> str:
     """The implement-prompt Rules section. ``ci_name`` is the remote CI runner's
     name, or None when there is none (mirrors ``self.ci_runner``).
+
+    ``repro_mode`` is ``repro_gate.mode`` (off | advisory | required). The
+    manifest bullet must say exactly what the gate will DO, because the coder
+    only learns the requirement by being told: under ``required`` a missing
+    manifest FAILS the attempt for every kind, so the bullet states that
+    consequence; under ``off`` the gate never runs, so the bullet is dropped
+    rather than asking for a file nothing reads.
 
     ``routing_rules`` is the profile's change-scoped test routing (the same
     ``test_commands`` globs the orchestrator's gate uses). When present, the
@@ -243,12 +251,17 @@ def build_rules_block(
            f"    after you finish — your job is the scoped evidence, not the marathon.\n"
            if test_cmd_str else
            "  - Run the project's test suite and confirm all tests pass before finishing.\n")
-        + "  - REPRO MANIFEST: if this repo's tests run with pytest, write\n"
-          "    .no_human/repro_tests.json — {\"tests\": [\"<pytest node ids>\"]} — listing\n"
-          "    the test(s) that FAIL on the base code and PASS with your change (for a\n"
-          "    bugfix: the reproduction; for a feature: its acceptance tests). The\n"
-          "    harness runs them in both trees to prove the diff does what it claims.\n"
-          "    The file is metadata: never commit it (.no_human/ is excluded anyway).\n"
+        + ("  - REPRO MANIFEST: if this repo's tests run with pytest, write\n"
+           "    .no_human/repro_tests.json — {\"tests\": [\"<pytest node ids>\"]} — listing\n"
+           "    the test(s) that FAIL on the base code and PASS with your change (for a\n"
+           "    bugfix: the reproduction; for a feature: its acceptance tests). The\n"
+           "    harness runs them in both trees to prove the diff does what it claims.\n"
+           "    The file is metadata: never commit it (.no_human/ is excluded anyway).\n"
+           + ("    WRITE IT IN THIS ATTEMPT: without the manifest the harness FAILS this\n"
+              "    attempt and sends the task back — a missing manifest is treated exactly\n"
+              "    like a failed one, whatever your code does.\n"
+              if repro_mode == "required" else "")
+           if repro_mode != "off" else "")
         + (f"  - Integration tests run on GitLab CI after your branch is pushed. Your\n"
            f"    change must also pass integration tests. If you can run them locally\n"
            f"    with: {integration_cmd_str}\n"
