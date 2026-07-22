@@ -30,6 +30,10 @@ class NorthStarCard:
     scores: list[BenchScore] = field(default_factory=list)
     created_at: str = ""
     label: str = ""            # e.g. "baseline" or the change under test
+    # Refusals a human overrode with `nh bench publish --force`. Carried into
+    # the saved card and rendered at the top of the report: a forced publish is
+    # allowed, but it must never be able to look like a clean one.
+    override_reasons: list[str] = field(default_factory=list)
 
     # ------------------------------ counts --------------------------------- #
 
@@ -66,6 +70,12 @@ class NorthStarCard:
         token ratio is blind to cache-read, which is ~95% of real burn."""
         vals = [s.cost_ratio for s in self.ran if s.cost_ratio is not None]
         return median(vals) if vals else None
+
+    @property
+    def dead_specs(self) -> int:
+        """Specs that ran but burned zero tokens — the SDK died before any model
+        call. A skip is a decision and is excluded; this counts deaths only."""
+        return sum(1 for s in self.ran if not s.nh_tokens)
 
     @property
     def total_nh_tokens(self) -> int:
@@ -112,11 +122,18 @@ class NorthStarCard:
                 "median_cost_ratio": (round(self.median_cost_ratio, 4)
                                       if self.median_cost_ratio is not None
                                       else None),
+                # Specs that RAN but burned zero tokens: the SDK died before any
+                # model call. Published runs are under the refusal threshold by
+                # construction, so this is the number that makes a *sub*-
+                # threshold saturation legible instead of leaving a reader to
+                # scan the per-task table for zeroes.
+                "dead_specs": self.dead_specs,
                 "total_nh_tokens": self.total_nh_tokens,
                 "total_orig_tokens": self.total_orig_tokens,
                 "corrections_avoided": self.corrections_avoided,
                 "honest_escalation_rate": round(self.honest_escalation_rate, 4),
             },
+            "override_reasons": self.override_reasons,
             "scores": [s.as_dict() for s in self.scores],
         }
 
@@ -159,7 +176,71 @@ class NorthStarCard:
         ) for s in data.get("scores", [])]
         return NorthStarCard(scores=scores,
                              created_at=data.get("created_at", ""),
-                             label=data.get("label", ""))
+                             label=data.get("label", ""),
+                             override_reasons=list(
+                                 data.get("override_reasons") or []))
+
+
+# A run must clear these before it may become the published baseline. They are
+# derived from the SCORES rather than from run flags on purpose: a checkpoint
+# written by an older build carries no record of its flags, and the incident
+# these prevent is precisely that such a file overwrote the report.
+MIN_PUBLISHABLE_SPECS = 10
+MAX_DEAD_FRACTION = 0.2
+
+
+def publish_refusals(card: NorthStarCard,
+                     previous: NorthStarCard | None = None) -> list[str]:
+    """Why *card* must not become the published baseline. Empty means it may.
+
+    Three incidents, one root cause — the runner treated every run as
+    authoritative, so a probe and a quota death both overwrote the committed
+    report and the gate baseline:
+
+    - **dead specs.** A spec that burned zero tokens did not run; the SDK died
+      ("Stream closed") before any model call. Those score as failed-and-
+      honestly-escalated, which *inflates* honest-escalation while crushing
+      success — an infrastructure failure wearing a capability result's clothes.
+      Checking a FRACTION rather than "any" is deliberate: the v14 shape was one
+      working spec followed by 96 dead ones, which an any-check waves through.
+      Skipped specs are excluded — a skip is a decision, not a death.
+    - **a slice is not the corpus.** A capped or partial run scored some specs,
+      not the benchmark, and must not replace a baseline built from more.
+    - **regression gates compare against this file.** Publishing a narrower run
+      silently redefines what "no regression" means for every run after it.
+    """
+    reasons: list[str] = []
+    ran = card.ran
+    if not ran:
+        reasons.append(
+            f"nothing ran: {card.total} spec(s), all skipped — a selection "
+            f"problem, not a result")
+        return reasons
+
+    dead = [s for s in ran if not s.nh_tokens]
+    if len(dead) / len(ran) > MAX_DEAD_FRACTION:
+        reasons.append(
+            f"{len(dead)}/{len(ran)} specs burned zero tokens "
+            f"({len(dead) / len(ran):.0%} > {MAX_DEAD_FRACTION:.0%}) — the "
+            f"backend was saturated, so this measures the quota, not no_human")
+
+    if len(ran) < MIN_PUBLISHABLE_SPECS:
+        reasons.append(
+            f"only {len(ran)} spec(s) ran (minimum {MIN_PUBLISHABLE_SPECS}) — "
+            f"a probe or a capped run is a slice, not the corpus")
+
+    # Compared on RAN, not total. Every headline — success_rate,
+    # honest_escalation_rate, median_cost_ratio — is computed over ran, and
+    # skipping is the documented dominant failure mode (the specs pin to local
+    # repo paths). A run that loads 56 specs and skips 40 has the same `total`
+    # as the baseline and would publish "100% success" measured over 16.
+    if previous is not None and len(ran) < len(previous.ran):
+        reasons.append(
+            f"this run ran {len(ran)} spec(s) but the current baseline "
+            f"'{previous.label or 'unlabelled'}' ran {len(previous.ran)} — "
+            f"publishing would narrow what every later regression gate checks")
+
+    return reasons
 
 
 @dataclass
@@ -217,8 +298,18 @@ def render_northstar_md(card: NorthStarCard,
         "# North-star benchmark — no_human vs the operator's real sessions",
         "",
         f"> Run: {card.created_at or 'n/a'}  ·  label: {card.label or 'n/a'}. "
-        "Generated by `nh bench run` — do not edit by hand.",
+        "Generated by `nh bench publish` — do not edit by hand.",
         "",
+    ]
+    if card.override_reasons:
+        lines += [
+            "> [!WARNING]",
+            "> **This run was published with `--force` over the checks below.**",
+            "> Read every number here as unverified until they are addressed:",
+            *(f"> - {r}" for r in card.override_reasons),
+            "",
+        ]
+    lines += [
         "## Headline",
         "",
         f"- **Success (goal satisfied, unattended): {agg['satisfied']}/"
@@ -232,6 +323,14 @@ def render_northstar_md(card: NorthStarCard,
         "nh side includes coder+reviewer, NOT yet planner/supervisor (B2)",
         f"- Total non-cache tokens: nh {agg['total_nh_tokens']:,} vs original "
         f"{agg['total_orig_tokens']:,}",
+        # Always rendered, including the 0 case. A published run is under the
+        # refusal threshold by construction, so the number a reader needs is
+        # confirmation that saturation was checked — not its absence when clean
+        # and a silent omission when not.
+        f"- Specs that ran but burned zero tokens (backend died before any "
+        f"model call): **{agg['dead_specs']}** of {agg['total'] - agg['skipped']}"
+        + ("  ⚠ read every figure here with that in mind"
+           if agg['dead_specs'] else ""),
         f"- **Original-session follow-ups avoided (proxy for corrections): "
         f"{agg['corrections_avoided']}**",
         f"- Honest-escalation rate on gated tasks: "

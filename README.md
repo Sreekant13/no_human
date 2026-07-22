@@ -104,8 +104,11 @@ Everything about that needs qualifying, so here it is:
 - **It is self-run, not independent**, and you cannot reproduce it: the specs
   replay the author's own history and pin to local repo paths, so `nh bench run`
   will skip them on your machine. The harness is reusable; the corpus is not.
-  Note that `nh bench run` **overwrites** `docs/NORTH_STAR_BENCH.md` in your
-  clone — the figures above describe the run committed here.
+  `nh bench run` records its own `eval/results/northstar/<label>-<stamp>.json`
+  and changes nothing else; `docs/NORTH_STAR_BENCH.md` moves only when someone
+  runs `nh bench publish <results-file>`, which refuses a run too small or too
+  quota-starved to mean anything. The figures above describe the run committed
+  here.
 
 The number that matters most is not the success rate anyway — it is that the
 failures are mostly *honest* ones that cost you a minute to triage, rather than

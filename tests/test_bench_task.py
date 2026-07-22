@@ -253,6 +253,18 @@ def test_cli_bench_build_writes_specs(tmp_path, monkeypatch):
     assert len(list(out.glob("ns-*.yaml"))) == 1
 
 
+
+def _results_file(res_dir):
+    """`bench run` records <label>-<stamp>.json and publishes nothing; the
+    baseline is written only by `nh bench publish`."""
+    files = sorted((f for f in res_dir.glob("*.json")
+                    if not f.name.startswith("progress")
+                    and f.name != "latest.json"),
+                   key=lambda f: f.stat().st_mtime)
+    assert files, "the run recorded no results file"
+    import json as _j
+    return _j.loads(files[-1].read_text())
+
 def test_cli_bench_run_wiring_end_to_end(tmp_path, monkeypatch):
     """Exercise bench run PAST the no-specs exit (the live baseline launch
     crashed on a NameError this path would have caught): specs present,
@@ -358,7 +370,7 @@ def test_cli_bench_run_survives_a_crashing_task(tmp_path, monkeypatch):
     assert len(calls) == 2, "the run must continue past the crash"
     assert "crashed" in result.output
     import json as _json
-    saved = _json.loads((tmp_path / "res" / "latest.json").read_text())
+    saved = _results_file(tmp_path / "res")
     crashed = [x for x in saved["scores"] if x["outcome_status"] == "crashed"]
     assert len(crashed) == 1 and crashed[0]["goal_satisfied"] is False
 
@@ -443,7 +455,9 @@ def test_cli_bench_run_checkpoints_and_resumes(tmp_path, monkeypatch):
     # First run: 2 succeed, the 3rd hard-kills the process — the checkpoint
     # must hold the 2 completed specs.
     CliRunner().invoke(cli, ["bench", "run", "--specs-dir", str(d)])
-    ckpt = _json.loads((res_dir / "progress.json").read_text())
+    ckpts = list(res_dir.glob("progress-*.json"))
+    assert len(ckpts) == 1, f"expected one checkpoint, got {ckpts}"
+    ckpt = _json.loads(ckpts[0].read_text())
     assert len({s["task_id"] for s in ckpt["scores"]}) >= 2
 
     # Resume: the 2 already-scored specs are skipped.
@@ -460,12 +474,15 @@ def test_cli_bench_run_checkpoints_and_resumes(tmp_path, monkeypatch):
 
     # The checkpointed specs must survive INTO the final card, not just be
     # skipped-and-dropped — latest.json holds all 3, and the checkpoint is gone.
-    final = _json.loads((res_dir / "latest.json").read_text())
+    final = _results_file(res_dir)
     assert {s["task_id"] for s in final["scores"]} == {"ns-r0", "ns-r1", "ns-r2"}
-    assert not (res_dir / "progress.json").exists(), "clean run left a checkpoint"
+    assert not list(res_dir.glob("progress-*.json")), "clean run left a checkpoint"
 
-    # A checkpoint from a DIFFERENT spec set must not bleed foreign specs into
-    # latest.json (the gate baseline) — resume filters to this run's ids.
+    # A checkpoint from a DIFFERENT run must not bleed foreign specs into this
+    # run's results. Note the MECHANISM, because an earlier version of this
+    # comment named the wrong one: the file is DECLINED at the ownership check
+    # (label "stale" != this run's label), so the resume filter downstream is
+    # never reached. The filter remains as depth, not as what makes this pass.
     (res_dir / "progress.json").write_text(_json.dumps({
         "created_at": "x", "label": "stale",
         "scores": [_score(BenchTask(id="ns-foreign", title="t", request="r",
@@ -473,6 +490,389 @@ def test_cli_bench_run_checkpoints_and_resumes(tmp_path, monkeypatch):
     }))
     seen.clear()
     CliRunner().invoke(cli, ["bench", "run", "--specs-dir", str(d), "--resume"])
-    final2 = _json.loads((res_dir / "latest.json").read_text())
+    final2 = _results_file(res_dir)
     assert "ns-foreign" not in {s["task_id"] for s in final2["scores"]}, \
         "resume leaked a foreign spec into the baseline"
+
+
+def test_a_probe_does_not_delete_another_runs_legacy_checkpoint(tmp_path, monkeypatch):
+    """THE original incident, on the path the legacy fallback exists to serve.
+
+    A `--resume` run whose own keyed checkpoint does not exist used to adopt
+    `progress.json` whatever it held, filter every spec out as foreign — while
+    PRINTING that it was doing so — and then unlink it on "clean completion".
+    So a one-spec probe still erased a 56-spec banked checkpoint. The code can
+    already tell the file is not its own; it must decline it, not inherit and
+    delete it.
+    """
+    import json as _json
+    import yaml as _yaml
+    from click.testing import CliRunner
+    from no_human.cli import commands as cmds
+    from no_human.cli.commands import cli
+    from no_human.eval.bench_task import BenchTask
+    from no_human.eval.northstar import BenchScore
+
+    d = tmp_path / "specs"
+    d.mkdir()
+    (d / "ns-probe.yaml").write_text(_yaml.safe_dump(
+        BenchTask(id="ns-probe", title="t", request="r", subset="core",
+                  runnable=True).to_dict()))
+
+    class _Cfg:
+        data = {"llm": {}}
+        primary_model = review_model = "m"
+        def __getitem__(self, k):
+            return {"safety": {"forbidden_paths": []},
+                    "git": {"never_push_to": []}}[k]
+    monkeypatch.setattr(cmds, "_bootstrap", lambda *a, **kw: (_Cfg(), None))
+    res_dir = tmp_path / "res"
+    res_dir.mkdir()
+    monkeypatch.setattr("no_human.eval.northstar_card.RESULTS_DIR", res_dir)
+    monkeypatch.setattr("no_human.eval.northstar_card.REPORT_MD", tmp_path / "N.md")
+
+    def _sc(task_id):
+        return BenchScore(
+            task_id=task_id, title="t", outcome_status="done",
+            goal_satisfied=True, escalated_honestly=False, mergeable=None,
+            nh_tokens=1000, nh_cache_tokens=0, nh_cache_creation_tokens=0,
+            nh_turns=1, nh_wall_clock_s=0.0, orig_tokens=0, orig_cache_tokens=0,
+            orig_cache_creation_tokens=0, orig_wall_clock_s=0.0,
+            orig_corrections=0,
+        ).as_dict()
+
+    # A long run's banked checkpoint, at the legacy path, from a DIFFERENT set.
+    banked = res_dir / "progress.json"
+    banked.write_text(_json.dumps({
+        "created_at": "x", "label": "expanded-core-v15",
+        "scores": [_sc(f"ns-long-{i}") for i in range(56)],
+    }))
+
+    class _Runner:
+        def __init__(self, *a, **kw): ...
+        async def run_one(self, spec, *, workdir):
+            return BenchScore(
+                task_id=spec.id, title=spec.title, outcome_status="done",
+                goal_satisfied=True, escalated_honestly=False, mergeable=None,
+                nh_tokens=5, nh_cache_tokens=0, nh_cache_creation_tokens=0,
+                nh_turns=1, nh_wall_clock_s=0.0, orig_tokens=0,
+                orig_cache_tokens=0, orig_cache_creation_tokens=0,
+                orig_wall_clock_s=0.0, orig_corrections=0,
+            )
+    monkeypatch.setattr("no_human.eval.northstar.NorthStarRunner", _Runner)
+
+    CliRunner().invoke(cli, ["bench", "run", "--specs-dir", str(d), "--resume"])
+
+    assert banked.exists(), "the probe deleted another run's banked checkpoint"
+    survived = _json.loads(banked.read_text())
+    assert len(survived["scores"]) == 56, "the banked checkpoint was rewritten"
+    assert survived["label"] == "expanded-core-v15"
+
+
+def _bench_env(tmp_path, monkeypatch, spec_ids):
+    """A `bench run` harness: specs on disk, results dir redirected, a runner
+    that scores every spec cheaply."""
+    import yaml as _yaml
+    from no_human.cli import commands as cmds
+    from no_human.eval.bench_task import BenchTask
+    from no_human.eval.northstar import BenchScore
+
+    d = tmp_path / f"specs-{abs(hash(tuple(spec_ids)))}"
+    d.mkdir()
+    for sid in spec_ids:
+        (d / f"{sid}.yaml").write_text(_yaml.safe_dump(
+            BenchTask(id=sid, title="t", request="r", subset="core",
+                      runnable=True).to_dict()))
+
+    class _Cfg:
+        data = {"llm": {}}
+        primary_model = review_model = "m"
+        def __getitem__(self, k):
+            return {"safety": {"forbidden_paths": []},
+                    "git": {"never_push_to": []}}[k]
+    monkeypatch.setattr(cmds, "_bootstrap", lambda *a, **kw: (_Cfg(), None))
+
+    class _Runner:
+        def __init__(self, *a, **kw): ...
+        async def run_one(self, spec, *, workdir):
+            return BenchScore(
+                task_id=spec.id, title=spec.title, outcome_status="done",
+                goal_satisfied=True, escalated_honestly=False, mergeable=None,
+                nh_tokens=5, nh_cache_tokens=0, nh_cache_creation_tokens=0,
+                nh_turns=1, nh_wall_clock_s=0.0, orig_tokens=0,
+                orig_cache_tokens=0, orig_cache_creation_tokens=0,
+                orig_wall_clock_s=0.0, orig_corrections=0,
+            )
+    monkeypatch.setattr("no_human.eval.northstar.NorthStarRunner", _Runner)
+    return d
+
+
+def test_a_run_records_but_publishes_nothing(tmp_path, monkeypatch):
+    """THE invariant this whole change exists for. Publishing as a side effect
+    of finishing is what let a saturated run and a one-spec probe each overwrite
+    the committed report and the gate baseline. Without this test, re-adding
+    either write leaves the suite green."""
+    from click.testing import CliRunner
+    from no_human.cli.commands import cli
+
+    res_dir = tmp_path / "res"
+    res_dir.mkdir()
+    report = tmp_path / "NORTH_STAR_BENCH.md"
+    report.write_text("PUBLISHED BASELINE — MUST NOT MOVE\n")
+    monkeypatch.setattr("no_human.eval.northstar_card.RESULTS_DIR", res_dir)
+    monkeypatch.setattr("no_human.eval.northstar_card.REPORT_MD", report)
+    d = _bench_env(tmp_path, monkeypatch, ["ns-a", "ns-b"])
+
+    CliRunner().invoke(cli, ["bench", "run", "--specs-dir", str(d)])
+
+    assert not (res_dir / "latest.json").exists(), \
+        "a run wrote the gate baseline — publishing must be an explicit act"
+    assert report.read_text() == "PUBLISHED BASELINE — MUST NOT MOVE\n", \
+        "a run overwrote the committed report"
+    assert list(res_dir.glob("run-*.json")), "the run recorded no results file"
+
+
+def test_two_unlabelled_runs_with_different_specs_do_not_share_a_checkpoint(
+    tmp_path, monkeypatch
+):
+    """The collision was at the DEFAULT label: a probe and a `--full` run both
+    slug to "run", so the label alone never separated them and the probe's
+    clean-completion unlink() deleted the corpus run's only resumable state.
+
+    Asserts the checkpoint files a run actually leaves on disk. Rebuilding the
+    expected filename from _slug/_spec_set_key would only prove sha256 is
+    injective — it would pass with the key dropped from the path entirely.
+    Each run is killed partway (KeyboardInterrupt escapes the per-spec `except
+    Exception`) so its checkpoint survives, which is the state being protected.
+    """
+    import json as _json
+    from click.testing import CliRunner
+    from no_human.cli.commands import cli
+    from no_human.eval.northstar import BenchScore
+
+    res_dir = tmp_path / "res"
+    res_dir.mkdir()
+    monkeypatch.setattr("no_human.eval.northstar_card.RESULTS_DIR", res_dir)
+    monkeypatch.setattr("no_human.eval.northstar_card.REPORT_MD", tmp_path / "N.md")
+
+    def _run_dying_on_last(spec_ids):
+        seen = []
+
+        class _DieOnLast:
+            def __init__(self, *a, **kw): ...
+            async def run_one(self, spec, *, workdir):
+                seen.append(spec.id)
+                if len(seen) == len(spec_ids):
+                    raise KeyboardInterrupt("Stream closed (process killed)")
+                return BenchScore(
+                    task_id=spec.id, title=spec.title, outcome_status="done",
+                    goal_satisfied=True, escalated_honestly=False,
+                    mergeable=None, nh_tokens=5, nh_cache_tokens=0,
+                    nh_cache_creation_tokens=0, nh_turns=1,
+                    nh_wall_clock_s=0.0, orig_tokens=0, orig_cache_tokens=0,
+                    orig_cache_creation_tokens=0, orig_wall_clock_s=0.0,
+                    orig_corrections=0,
+                )
+        d = _bench_env(tmp_path, monkeypatch, spec_ids)
+        monkeypatch.setattr("no_human.eval.northstar.NorthStarRunner", _DieOnLast)
+        CliRunner().invoke(cli, ["bench", "run", "--specs-dir", str(d)])
+
+    # A corpus run, then a probe — both unlabelled, as the real runs were.
+    _run_dying_on_last(["ns-full-1", "ns-full-2", "ns-full-3"])
+    after_corpus = sorted(res_dir.glob("progress-*.json"))
+    assert len(after_corpus) == 1, f"expected one checkpoint, got {after_corpus}"
+    corpus_ckpt = after_corpus[0]
+    corpus_scores = {s["task_id"] for s in
+                     _json.loads(corpus_ckpt.read_text())["scores"]}
+    assert corpus_scores == {"ns-full-1", "ns-full-2"}
+
+    _run_dying_on_last(["ns-probe-1", "ns-probe-2"])
+
+    checkpoints = sorted(res_dir.glob("progress-*.json"))
+    assert len(checkpoints) == 2, (
+        f"two unlabelled runs with different spec sets shared one checkpoint "
+        f"({[c.name for c in checkpoints]}) — the probe can destroy the corpus "
+        f"run's resumable state again")
+    assert corpus_ckpt.exists(), "the probe deleted the corpus run's checkpoint"
+    assert {s["task_id"] for s in
+            _json.loads(corpus_ckpt.read_text())["scores"]} == corpus_scores, \
+        "the probe overwrote the corpus run's checkpoint"
+
+
+def test_a_superset_run_does_not_consume_another_runs_legacy_checkpoint(
+    tmp_path, monkeypatch
+):
+    """Round 2's subset test was an ownership test, and a subset relation is not
+    ownership: a run whose spec set CONTAINS the legacy specs passed it, so
+    `--full --resume` would swallow an unrelated core run's scores and then
+    delete its checkpoint. Reachable on the real v15 file."""
+    import json as _json
+    from click.testing import CliRunner
+    from no_human.cli.commands import cli
+
+    res_dir = tmp_path / "res"
+    res_dir.mkdir()
+    monkeypatch.setattr("no_human.eval.northstar_card.RESULTS_DIR", res_dir)
+    monkeypatch.setattr("no_human.eval.northstar_card.REPORT_MD", tmp_path / "N.md")
+
+    banked = res_dir / "progress.json"
+    banked.write_text(_json.dumps({
+        "created_at": "x", "label": "expanded-core-v15",
+        "scores": [{
+            "task_id": "ns-a", "title": "t", "outcome_status": "escalated",
+            "goal_satisfied": False, "escalated_honestly": True,
+            "mergeable": None, "nh_tokens": 0, "nh_cache_tokens": 0,
+            "nh_cache_creation_tokens": 0, "nh_turns": 0, "nh_wall_clock_s": 0.0,
+            "orig_tokens": 0, "orig_cache_tokens": 0,
+            "orig_cache_creation_tokens": 0, "orig_wall_clock_s": 0.0,
+            "orig_corrections": 0,
+        }],
+    }))
+    before = banked.read_bytes()
+
+    # A strict SUPERSET of the banked spec set.
+    d = _bench_env(tmp_path, monkeypatch, ["ns-a", "ns-b", "ns-c"])
+    CliRunner().invoke(cli, ["bench", "run", "--specs-dir", str(d), "--resume"])
+
+    assert banked.exists(), "a superset run deleted another run's checkpoint"
+    assert banked.read_bytes() == before, "another run's checkpoint was rewritten"
+    # ...and its dead spec must not have contaminated this run's card.
+    results = [f for f in res_dir.glob("*.json") if not f.name.startswith("progress")]
+    card = _json.loads(results[0].read_text())
+    assert card["aggregate"]["dead_specs"] == 0, \
+        "adopted a foreign run's zero-token spec into this run's card"
+
+
+def test_an_owned_legacy_checkpoint_is_resumed_from_but_left_in_place(
+    tmp_path, monkeypatch
+):
+    """The migration case the fallback exists for: a run started before per-label
+    checkpoints stays resumable. It must COPY, not consume — a run may only
+    unlink a checkpoint it created, which is the one rule that makes both
+    destruction incidents impossible rather than merely unlikely."""
+    import json as _json
+    from click.testing import CliRunner
+    from no_human.cli.commands import cli
+
+    res_dir = tmp_path / "res"
+    res_dir.mkdir()
+    monkeypatch.setattr("no_human.eval.northstar_card.RESULTS_DIR", res_dir)
+    monkeypatch.setattr("no_human.eval.northstar_card.REPORT_MD", tmp_path / "N.md")
+
+    banked = res_dir / "progress.json"
+    banked.write_text(_json.dumps({
+        "created_at": "x", "label": "mine",
+        "scores": [{
+            "task_id": "ns-a", "title": "t", "outcome_status": "done",
+            "goal_satisfied": True, "escalated_honestly": False,
+            "mergeable": None, "nh_tokens": 999, "nh_cache_tokens": 0,
+            "nh_cache_creation_tokens": 0, "nh_turns": 1,
+            "nh_wall_clock_s": 0.0, "orig_tokens": 0, "orig_cache_tokens": 0,
+            "orig_cache_creation_tokens": 0, "orig_wall_clock_s": 0.0,
+            "orig_corrections": 0,
+        }],
+    }))
+    before = banked.read_bytes()
+
+    d = _bench_env(tmp_path, monkeypatch, ["ns-a", "ns-b"])
+    res = CliRunner().invoke(
+        cli, ["bench", "run", "--specs-dir", str(d), "--label", "mine", "--resume"])
+
+    assert "1 spec(s) already scored" in res.output, res.output
+    assert banked.exists() and banked.read_bytes() == before, \
+        "the legacy checkpoint was consumed instead of copied"
+    results = [f for f in res_dir.glob("*.json") if not f.name.startswith("progress")]
+    card = _json.loads(results[0].read_text())
+    scored = {s["task_id"]: s["nh_tokens"] for s in card["scores"]}
+    assert scored == {"ns-a": 999, "ns-b": 5}, \
+        f"the checkpointed spec was not carried into the final card: {scored}"
+
+
+def _banked(res_dir, label, task_ids, *, nh_tokens=0):
+    """A checkpoint at the LEGACY path, as an older build would have left it."""
+    import json as _json
+    banked = res_dir / "progress.json"
+    banked.write_text(_json.dumps({
+        "created_at": "x", "label": label,
+        "scores": [{
+            "task_id": tid, "title": "t", "outcome_status": "escalated",
+            "goal_satisfied": False, "escalated_honestly": True,
+            "mergeable": None, "nh_tokens": nh_tokens, "nh_cache_tokens": 0,
+            "nh_cache_creation_tokens": 0, "nh_turns": 0,
+            "nh_wall_clock_s": 0.0, "orig_tokens": 0, "orig_cache_tokens": 0,
+            "orig_cache_creation_tokens": 0, "orig_wall_clock_s": 0.0,
+            "orig_corrections": 0,
+        } for tid in task_ids],
+    }))
+    return banked
+
+
+def test_an_unlabelled_legacy_checkpoint_is_declined_not_guessed_at(
+    tmp_path, monkeypatch
+):
+    """The shape BOTH real incidents actually had. An unlabelled checkpoint
+    carries no identity, so a run cannot tell whether it is its own — and the
+    unlabelled default is exactly why the label alone never separated a probe
+    from the corpus. It must be declined, not adopted on a subset match.
+
+    Without this, dropping the non-empty-label clause leaves the suite green
+    while `--full --resume` swallows an unrelated run's dead specs.
+    """
+    import json as _json
+    from click.testing import CliRunner
+    from no_human.cli.commands import cli
+
+    res_dir = tmp_path / "res"
+    res_dir.mkdir()
+    monkeypatch.setattr("no_human.eval.northstar_card.RESULTS_DIR", res_dir)
+    monkeypatch.setattr("no_human.eval.northstar_card.REPORT_MD", tmp_path / "N.md")
+
+    banked = _banked(res_dir, "", ["ns-a"])          # unlabelled, zero-token
+    before = banked.read_bytes()
+
+    d = _bench_env(tmp_path, monkeypatch, ["ns-a", "ns-b"])   # unlabelled run
+    CliRunner().invoke(cli, ["bench", "run", "--specs-dir", str(d), "--resume"])
+
+    assert banked.read_bytes() == before, "an unlabelled checkpoint was consumed"
+    results = [f for f in res_dir.glob("*.json") if not f.name.startswith("progress")]
+    card = _json.loads(results[0].read_text())
+    assert card["aggregate"]["dead_specs"] == 0, \
+        "adopted an unidentifiable checkpoint's zero-token spec into this run"
+    assert {s["task_id"] for s in card["scores"]} == {"ns-a", "ns-b"}
+
+
+def test_a_same_label_checkpoint_from_a_different_spec_set_is_declined(
+    tmp_path, monkeypatch
+):
+    """Label equality alone is not ownership either: two runs can share a label
+    and cover different specs. The subset clause is what closes that, and it was
+    the last clause of the predicate with no test."""
+    import json as _json
+    from click.testing import CliRunner
+    from no_human.cli.commands import cli
+
+    res_dir = tmp_path / "res"
+    res_dir.mkdir()
+    monkeypatch.setattr("no_human.eval.northstar_card.RESULTS_DIR", res_dir)
+    monkeypatch.setattr("no_human.eval.northstar_card.REPORT_MD", tmp_path / "N.md")
+
+    # Holds one spec this run DOES cover, plus one it does not — so the subset
+    # test fails while the downstream foreign-spec filter cannot save us: it
+    # would drop ns-elsewhere but happily keep the stale ns-a score.
+    banked = _banked(res_dir, "mine", ["ns-a", "ns-elsewhere"], nh_tokens=999)
+    before = banked.read_bytes()
+
+    d = _bench_env(tmp_path, monkeypatch, ["ns-a", "ns-b"])
+    CliRunner().invoke(
+        cli, ["bench", "run", "--specs-dir", str(d), "--label", "mine", "--resume"])
+
+    assert banked.read_bytes() == before
+    results = [f for f in res_dir.glob("*.json") if not f.name.startswith("progress")]
+    card = _json.loads(results[0].read_text())
+    assert {s["task_id"] for s in card["scores"]} == {"ns-a", "ns-b"}, \
+        "a same-label checkpoint from a different spec set leaked into this run"
+    scored = {s["task_id"]: s["nh_tokens"] for s in card["scores"]}
+    assert scored["ns-a"] == 5, (
+        f"ns-a carried a score from a differently-scoped run of the same label "
+        f"({scored['ns-a']}) instead of being re-run — the spec sets differ, so "
+        f"the flags differed, so the scores are not interchangeable")
