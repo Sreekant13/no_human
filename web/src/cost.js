@@ -58,6 +58,54 @@ export function fmtCost(dollars) {
 }
 
 /**
+ * One task's token burn across the same nine buckets {@link taskCost} prices — so a surface
+ * showing both cannot show a price for tokens its own count never included. That mismatch is
+ * on the record in this file: "169.87M · est. $73.58", a price for 6M tokens the count never
+ * showed. It recurred twice here: the Stats Token Usage tile and the task table's Tokens
+ * column each counted the coder's buckets beside a whole-run price.
+ */
+export function taskBurn(task) {
+  if (!task) return 0;
+  return (
+    totalBurn({ used: task.total_tokens, creation: task.total_cache_creation, read: task.total_cache_read })
+    + totalBurn({
+      used: task.total_review_tokens,
+      creation: task.total_review_cache_creation,
+      read: task.total_review_cache_read,
+    })
+    + totalBurn({
+      used: task.total_aux_tokens,
+      creation: task.total_aux_cache_creation,
+      read: task.total_aux_cache_read,
+    })
+  );
+}
+
+/**
+ * One task's cost: coder + reviewer + aux (planning/utility) — the per-task twin of
+ * {@link lifetimeCost}, which prices the same nine buckets from the metrics payload. All
+ * nine that TaskSummaryOut sends, because the API sends them so "the task row prices the
+ * WHOLE run, not just coder+review" (models.py). If you add a bucket to one of these, add it
+ * to the other, or a page showing both will contradict itself.
+ */
+export function taskCost(task) {
+  if (!task) return 0;
+  return (
+    costOf({ used: task.total_tokens, creation: task.total_cache_creation, read: task.total_cache_read })
+    + costOf({
+      used: task.total_review_tokens,
+      creation: task.total_review_cache_creation,
+      read: task.total_review_cache_read,
+    })
+    + costOf({
+      used: task.total_aux_tokens,
+      creation: task.total_aux_cache_creation,
+      read: task.total_aux_cache_read,
+    })
+  );
+}
+
+/**
  * The lifetime cost, from /api/metrics — the SINGLE source both the "Cost / merged PR" tile
  * and the "Token Usage" tile read.
  *
@@ -70,15 +118,23 @@ export function lifetimeCost(metrics) {
   const used = metrics?.tokens_used_total;
   if (used == null) return null;
   const ce = metrics.cache_economics || {};
-  // The coder AND the gate. The reviewer's tokens used to be discarded after the verdict, so
-  // every cost surface priced the coder half of the run and called it "spend" — 59 Opus-4-8
-  // review passes over full diffs cost $0 on the page.
+  // The coder AND the gate AND aux. The reviewer's tokens used to be discarded after the
+  // verdict, so every cost surface priced the coder half of the run and called it "spend" —
+  // 59 Opus-4-8 review passes over full diffs cost $0 on the page. Aux was the same story one
+  // bucket later: metrics.py ships aux_*_total, this function ignored them, and the moment
+  // taskCost started pricing aux the per-task rollup on Stats exceeded the lifetime tile
+  // directly above it. Same nine buckets as {@link taskCost}, or the page contradicts itself.
   return (
     costOf({ used, creation: ce.cache_creation_total, read: ce.cache_read_total })
     + costOf({
       used: metrics.review_tokens_used_total,
       creation: metrics.review_cache_creation_total,
       read: metrics.review_cache_read_total,
+    })
+    + costOf({
+      used: metrics.aux_tokens_used_total,
+      creation: metrics.aux_cache_creation_total,
+      read: metrics.aux_cache_read_total,
     })
   );
 }

@@ -6,7 +6,7 @@
 // backend enum. Kept out of SlideOver.jsx so the "what does the operator read
 // at a glance" logic is node-testable without a DOM.
 
-import { costOf, fmtCost, fmtTokens, totalBurn } from "./cost.js";
+import { fmtCost, fmtTokens, taskBurn, taskCost } from "./cost.js";
 import { formatDuration } from "./formatDuration.js";
 
 // The statuses whose gate the operator clears IN the drawer (Reply / Resume / the
@@ -149,12 +149,8 @@ function branchFor(task) {
 export function chipsFor(task) {
   if (!task) return [];
   const chips = [];
-  const burn = totalBurn({ used: task.total_tokens, creation: task.total_cache_creation, read: task.total_cache_read })
-    + totalBurn({ used: task.total_review_tokens, creation: task.total_review_cache_creation, read: task.total_review_cache_read })
-    + totalBurn({ used: task.total_aux_tokens, creation: task.total_aux_cache_creation, read: task.total_aux_cache_read });
-  const cost = costOf({ used: task.total_tokens, creation: task.total_cache_creation, read: task.total_cache_read })
-    + costOf({ used: task.total_review_tokens, creation: task.total_review_cache_creation, read: task.total_review_cache_read })
-    + costOf({ used: task.total_aux_tokens, creation: task.total_aux_cache_creation, read: task.total_aux_cache_read });
+  const burn = taskBurn(task);
+  const cost = taskCost(task);
   if (burn > 0) chips.push({ key: "cost", label: fmtCost(cost), sub: `${fmtTokens(burn)} tok` });
   if (task.wall_seconds != null) chips.push({ key: "time", label: formatDuration(Math.round(task.wall_seconds)), sub: "wall time" });
   if (task.attempt_count > 0) {

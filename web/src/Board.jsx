@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { fmtTokens, totalBurn } from "./cost.js";
+import { fmtTokens, taskBurn } from "./cost.js";
 import SlideOver from "./SlideOver.jsx";
 import { BOARD_LANES, routeTask, isWaiting } from "./boardLanes.js";
 import { taskProgress } from "./taskProgress.js";
@@ -185,11 +185,7 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
   const age = relativeTime(activityTs);
   const isStale = STALE_STATUSES.has(task.status) && ageSec > STALE_THRESHOLD_S;
   const priority = task.priority ?? "medium";
-  const burn = totalBurn({
-    used: task.total_tokens,
-    creation: task.total_cache_creation,
-    read: task.total_cache_read,
-  });
+  const burn = taskBurn(task);
 
   const isActive = ACTIVE_STATUSES.has(task.status);
   const waiting = isWaiting(task);

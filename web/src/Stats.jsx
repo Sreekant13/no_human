@@ -1,12 +1,13 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { fetchMetrics, fetchRepos, fetchRepoUnderstanding, searchEvents } from "./api.js";
-import { costOf, fmtCost, fmtTokens, lifetimeCost, totalBurn } from "./cost.js";
+import { fmtCost, fmtTokens, lifetimeCost, taskBurn } from "./cost.js";
 import { northStarTiles } from "./northStar.js";
 import TaskTable from "./TaskTable.jsx";
 import { isRealFailure } from "./boardLanes.js";
 import { profileRows, profileStatus } from "./repoView.js";
 import { kindLabel, groupByTask } from "./searchView.js";
 import { pluralize } from "./pluralize.js";
+import { costByProject, totalCost } from "./costGroups.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -106,7 +107,8 @@ function computeStats(tasks) {
   // Token tracking across all tasks
   // Burn = fresh + cache-read tokens (the same definition as the drawer and
   // board — tokens_used alone hides 90%+ of real spend, C1).
-  const burnOf = (t) => totalBurn({ used: t.total_tokens, creation: t.total_cache_creation, read: t.total_cache_read });
+  // Nine buckets, same as taskCost — the tile shows this count beside that price.
+  const burnOf = (t) => taskBurn(t);
   const totalTokens = tasks.reduce((s, t) => s + burnOf(t), 0);
   const avgTokensPerTask = doneTasks.length > 0
     ? tasks.filter(t => burnOf(t) > 0).reduce((s, t) => s + burnOf(t), 0)
@@ -277,6 +279,52 @@ const KIND_COLORS = {
   investigation: "var(--cyan)",
   code_review: "var(--green)",
 };
+
+// Per-task cost is a table column and lifetime cost is a tile; nothing sat between them, so
+// "what has this repo cost me" meant adding the column up by hand. Same cost model as both.
+function CostByProject({ tasks }) {
+  const rows = useMemo(() => costByProject(tasks), [tasks]);
+  if (rows.length === 0) return null;
+  const total = totalCost(rows);
+  const max = Math.max(...rows.map((r) => r.cost), 0);
+
+  return (
+    <div className="stats-section" data-testid="cost-by-project">
+      <h3 className="stats-section-title">Cost by Project</h3>
+      <div className="stats-section-sub">
+        {fmtCost(total)} across {rows.length} {pluralize(rows.length, "project")}
+      </div>
+      <div className="cost-project-wrap">
+        <table className="cost-project-table">
+        <thead>
+          <tr>
+            <th className="cost-project-th" scope="col">Project</th>
+            <th className="cost-project-th cost-project-th-right" scope="col">Tasks</th>
+            <th className="cost-project-th cost-project-th-right" scope="col">Est. Cost</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.project} className="cost-project-row">
+              <th className="cost-project-name" scope="row">
+                {/* The bar is decoration on top of the number, not the only way to read it. */}
+                <span
+                  className="cost-project-bar"
+                  style={{ width: max > 0 ? `${(r.cost / max) * 100}%` : 0 }}
+                  aria-hidden="true"
+                />
+                <span className="cost-project-label">{r.project}</span>
+              </th>
+              <td className="cost-project-val">{r.tasks}</td>
+              <td className="cost-project-val cost-project-cost">{fmtCost(r.cost)}</td>
+            </tr>
+          ))}
+        </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
 
 function KindBar({ breakdown, total }) {
   if (breakdown.length === 0) return null;
@@ -648,6 +696,9 @@ export default function Stats({ tasks }) {
           <KindBar breakdown={stats.kindBreakdown} total={stats.totalCompleted} />
         </div>
       )}
+
+      {/* Cost by project — the rollup between the per-task column and the lifetime tile. */}
+      <CostByProject tasks={tasks} />
 
       {/* Repository Understanding (C3-G3) */}
       <RepoUnderstanding />

@@ -27,9 +27,10 @@ export function northStarTiles(metrics) {
   // cache-creation while that share's universe is creation+read, AND it divides by prs_OPENED,
   // so a "per merged PR" label sat on a per-opened-PR number. The lifetime tile on the same
   // page divides this identical cost by nothing, so the two can no longer imply different rates.
-  // Coder + reviewer (+ planner once plan_* columns reach the metrics feed — B2 #5
-  // corrected the false claim that planning ran inside the coder's session; it runs on
-  // separate readonly backends and its burn now lands in attempts.plan_*).
+  // Coder + reviewer + aux (planning/utility). The plan_*/utility_* columns DID reach the
+  // metrics feed (metrics.py aux_*_total) and lifetimeCost prices them as of the
+  // cost-by-project work — the same nine buckets taskCost uses, so this tile and the
+  // per-task surfaces cannot imply different totals.
   const lifetime = lifetimeCost(metrics);
   const costPerPr = merged > 0 && lifetime ? lifetime / merged : null;
 

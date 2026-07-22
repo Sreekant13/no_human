@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fmtTokens, totalBurn, costOf, fmtCost, lifetimeCost } from "./cost.js";
+import { fmtTokens, totalBurn, costOf, fmtCost, lifetimeCost, taskCost, taskBurn } from "./cost.js";
 
 test("totalBurn is every token bucket — cache-read (the hidden 90%) AND cache-creation", () => {
   // Named buckets, like costOf: the burn a card shows and the cost it is priced at must have
@@ -78,4 +78,51 @@ test("lifetimeCost prices the coder AND the reviewer", () => {
   };
   // coder 1M fresh = $3.00 · reviewer 1M fresh = $3.00 + 10M read = $3.00  →  $9.00
   assert.equal(fmtCost(lifetimeCost(metrics)), "$9.00");
+});
+
+// The per-task and lifetime surfaces sit on the SAME page (the Token Usage tile and the
+// north-star "Cost / merged PR" tile above the task table and the per-project rollup), so they
+// must price the same buckets. They did not: taskCost gained the aux bucket while lifetimeCost
+// still priced six of nine, and the rollup came out ABOVE the lifetime tile it sits under.
+test("taskCost and lifetimeCost price the same nine buckets", () => {
+  const B = { fresh: 1_000_000, creation: 2_000_000, read: 30_000_000 };
+  const task = {
+    total_tokens: B.fresh, total_cache_creation: B.creation, total_cache_read: B.read,
+    total_review_tokens: B.fresh, total_review_cache_creation: B.creation, total_review_cache_read: B.read,
+    total_aux_tokens: B.fresh, total_aux_cache_creation: B.creation, total_aux_cache_read: B.read,
+  };
+  // The same nine numbers, in the shape /api/metrics sends them.
+  const metrics = {
+    tokens_used_total: B.fresh,
+    cache_economics: { cache_creation_total: B.creation, cache_read_total: B.read },
+    review_tokens_used_total: B.fresh, review_cache_creation_total: B.creation, review_cache_read_total: B.read,
+    aux_tokens_used_total: B.fresh, aux_cache_creation_total: B.creation, aux_cache_read_total: B.read,
+  };
+  assert.ok(taskCost(task) > 0, "fixture priced at zero — the comparison would be vacuous");
+  assert.equal(
+    taskCost(task),
+    lifetimeCost(metrics),
+    "one of these is pricing a bucket the other ignores; a page showing both now contradicts itself",
+  );
+});
+
+test("taskCost prices aux at the same rate as the other fresh buckets", () => {
+  assert.equal(taskCost({ total_aux_tokens: 1_000_000 }), taskCost({ total_tokens: 1_000_000 }));
+});
+
+test("taskBurn counts every bucket taskCost prices", () => {
+  // A surface showing both must not price tokens its own count omits — the Token Usage tile
+  // read "1.00M · est. $9.00" while the price covered 3M.
+  const only = (field) => ({ [field]: 1_000_000 });
+  for (const field of ["total_tokens", "total_review_tokens", "total_aux_tokens"]) {
+    assert.equal(taskBurn(only(field)), 1_000_000, `${field} missing from taskBurn`);
+    assert.ok(taskCost(only(field)) > 0, `${field} missing from taskCost`);
+  }
+  for (const field of ["total_cache_read", "total_review_cache_read", "total_aux_cache_read"]) {
+    assert.equal(taskBurn(only(field)), 1_000_000, `${field} missing from taskBurn`);
+  }
+  for (const field of ["total_cache_creation", "total_review_cache_creation", "total_aux_cache_creation"]) {
+    assert.equal(taskBurn(only(field)), 1_000_000, `${field} missing from taskBurn`);
+  }
+  assert.equal(taskBurn(null), 0);
 });

@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { costOf, fmtCost, fmtTokens, totalBurn } from "./cost.js";
+import { fmtCost, fmtTokens, taskBurn, taskCost } from "./cost.js";
 
 // The task table, extracted from Stats.jsx so the outcome screens (5D: Done / Failed) show the
 // SAME table instead of a second one that would drift out of step with it.
@@ -113,27 +113,10 @@ export default function TaskTable({ tasks, onSelect = null, emptyHint = null }) 
                 {t.repo_name || "—"}
               </td>
               <td className="stats-td stats-td-mono stats-td-right">
-                {fmtTokens(
-                  totalBurn({
-                    used: t.total_tokens,
-                    creation: t.total_cache_creation,
-                    read: t.total_cache_read,
-                  }) || null,
-                )}
+                {fmtTokens(taskBurn(t) || null)}
               </td>
               <td className="stats-td stats-td-mono stats-td-right">
-                {fmtCost(
-                  costOf({
-                    used: t.total_tokens,
-                    creation: t.total_cache_creation,
-                    read: t.total_cache_read,
-                  })
-                  + costOf({
-                    used: t.total_review_tokens,
-                    creation: t.total_review_cache_creation,
-                    read: t.total_review_cache_read,
-                  }),
-                )}
+                {fmtCost(taskCost(t))}
               </td>
             </tr>
           ))}
