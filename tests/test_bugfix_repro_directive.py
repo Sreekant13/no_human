@@ -16,6 +16,7 @@ from no_human.core.orchestrator import Orchestrator
 from no_human.core.prompt_blocks import build_rules_block
 from no_human.core.task import Task
 from no_human.notify.slack import SlackNotifier
+from no_human.testing.repro_gate import MANIFEST
 
 from .test_e2e_orchestrator import FakeBackend
 
@@ -44,8 +45,9 @@ def _bugfix(tmp_path):
 async def test_bugfix_directive_names_the_manifest_path_schema_and_consequence(
         store, tmp_path):
     d = _orch(store, tmp_path)._kind_directive(_bugfix(tmp_path))
-    # The exact path the gate reads (testing/repro_gate.py: MANIFEST).
-    assert ".no_human/repro_tests.json" in d
+    # The exact path the gate reads — bound to the gate's own constant, so
+    # this test breaks if the manifest path drifts (the drift this file guards).
+    assert MANIFEST in d
     # The schema, so the coder does not have to guess the key.
     assert '{"tests":' in d.replace('{"tests": ', '{"tests":')
     # Both directions the gate proves.
@@ -67,11 +69,29 @@ async def test_bugfix_directive_is_scoped_to_python_changes(store, tmp_path):
     assert "WHEN YOUR FIX CHANGES PYTHON" in d
 
 
+async def test_required_mode_does_not_understate_the_scope(store, tmp_path):
+    """``required`` enforces for EVERY change, so the Python-only clause would
+    be a lie there — a JS-only bugfix is failed for the missing manifest too."""
+    d = _orch(store, tmp_path, mode="required")._kind_directive(_bugfix(tmp_path))
+    assert MANIFEST in d
+    assert "REQUIRED FOR THIS FIX" in d
+    assert "WHEN YOUR FIX CHANGES PYTHON" not in d
+
+
+async def test_unknown_mode_reads_as_advisory(store, tmp_path):
+    """Nothing validates repro_gate.mode, so a config typo is reachable. The
+    gate treats anything that is neither "off" nor "required" as advisory, and
+    the prompt must degrade the same way rather than promising required's
+    wider scope."""
+    d = _orch(store, tmp_path, mode="banana")._kind_directive(_bugfix(tmp_path))
+    assert "WHEN YOUR FIX CHANGES PYTHON" in d
+
+
 async def test_no_manifest_demand_when_the_gate_is_off(store, tmp_path):
     """mode=off never runs the gate, so asking for the file would request
     something nothing reads."""
     d = _orch(store, tmp_path, mode="off")._kind_directive(_bugfix(tmp_path))
-    assert ".no_human/repro_tests.json" not in d
+    assert MANIFEST not in d
     # The rest of the bugfix directive survives.
     assert "root cause" in d.lower()
 
@@ -97,18 +117,34 @@ def test_rules_block_states_the_consequence_only_when_required():
     """Under mode=required the hard-fail applies to EVERY kind, so the shared
     rules block is where that consequence belongs."""
     req = build_rules_block("pytest", "", None, repro_mode="required")
-    assert ".no_human/repro_tests.json" in req
+    assert MANIFEST in req
     assert "FAILS this" in req
 
     adv = build_rules_block("pytest", "", None, repro_mode="advisory")
-    assert ".no_human/repro_tests.json" in adv
+    assert MANIFEST in adv
     # Advisory mode blocks bugfixes only — the bugfix directive carries that;
     # a blanket "fails every attempt" here would be false for other kinds.
     assert "FAILS this" not in adv
 
 
+def test_required_bullet_does_not_excuse_non_pytest_repos():
+    """The bullet opened with "if this repo's tests run with pytest" in every
+    mode — but required fails a non-pytest repo's attempt too, so that clause
+    excused exactly what the gate punishes."""
+    req = build_rules_block("pytest", "", None, repro_mode="required")
+    assert "if this repo's tests run with pytest" not in req
+    assert "required" in req
+    # The conditional is correct for advisory, where the gate only bites a
+    # bugfix that edited Python.
+    adv = build_rules_block("pytest", "", None, repro_mode="advisory")
+    assert "if this repo's tests run with pytest" in adv
+
+
 def test_rules_block_drops_the_manifest_bullet_when_the_gate_is_off():
     off = build_rules_block("pytest", "", None, repro_mode="off")
+    assert MANIFEST not in off
+    # Also reject a bare basename: `MANIFEST not in off` alone would pass on a
+    # mention without the .no_human/ prefix, which is still a manifest demand.
     assert "repro_tests.json" not in off
     # Neighbouring rules are untouched.
     assert "NEVER weaken, skip, or delete a test" in off

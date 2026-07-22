@@ -251,8 +251,11 @@ def build_rules_block(
            f"    after you finish — your job is the scoped evidence, not the marathon.\n"
            if test_cmd_str else
            "  - Run the project's test suite and confirm all tests pass before finishing.\n")
-        + ("  - REPRO MANIFEST: if this repo's tests run with pytest, write\n"
-           "    .no_human/repro_tests.json — {\"tests\": [\"<pytest node ids>\"]} — listing\n"
+        + ("  - REPRO MANIFEST: "
+           + ("this repo's gate is set to required, so write\n"
+              if repro_mode == "required" else
+              "if this repo's tests run with pytest, write\n")
+           + "    .no_human/repro_tests.json — {\"tests\": [\"<pytest node ids>\"]} — listing\n"
            "    the test(s) that FAIL on the base code and PASS with your change (for a\n"
            "    bugfix: the reproduction; for a feature: its acceptance tests). The\n"
            "    harness runs them in both trees to prove the diff does what it claims.\n"
