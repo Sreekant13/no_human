@@ -46,11 +46,12 @@ setInterval(() => {}, 1000);
   return home;
 }
 
-const liveFakes = () => {
+const livePids = () => {
   const out = execSync(
     `/bin/ps -eo pid,command | grep ${MARK} | grep -v grep || true`).toString().trim();
-  return out ? out.split("\n").length : 0;
+  return out ? out.split("\n").map((l) => l.trim().split(/\s+/)[0]) : [];
 };
+const liveFakes = () => livePids().length;
 
 // One module instance is shared: main.mjs has top-level side effects.
 const home = bootstrapEnv();
@@ -97,6 +98,12 @@ test("saving a token over OUR OWN live server restarts it and reports success",
     const save = stub.calls.ipc.get("nh:save-token");
     assert.ok(save, "main.mjs must register nh:save-token");
     assert.equal(liveFakes(), 1, "precondition: our server is running");
+    // The PID of the server BEFORE the save. A genuine restart replaces the
+    // process (old SIGTERM'd, a new one spawned on the new token), so this PID
+    // must NOT survive. Without capturing it, every assertion below is satisfied
+    // whether or not the server was actually cycled — the false guard that let a
+    // mutation disabling the restart pass the whole suite green.
+    const pidBefore = livePids()[0];
 
     const setupUrl = pathToFileURL(path.join(HERE, "token.html")).href;
     const res = await save({ senderFrame: { url: setupUrl } }, "sk-ant-oat-rotated");
@@ -107,6 +114,12 @@ test("saving a token over OUR OWN live server restarts it and reports success",
       /sk-ant-oat-rotated/, "the new token was not persisted");
     assert.equal(liveFakes(), 1,
       "the restart should leave exactly one server — not zero, and not a leak");
+    // The one assertion the old test lacked: the process was actually replaced.
+    // If the restart is skipped, the OLD server keeps the port on the OLD token
+    // while the handler still returns ok — exactly the branch's signature defect.
+    assert.notEqual(livePids()[0], pidBefore,
+      "the server was NOT restarted: the same PID still holds the port, so it is "
+      + "running on the OLD token even though the save reported success");
   });
 
 test("a SECOND quit during the shutdown hold is HELD, not let through", async () => {
