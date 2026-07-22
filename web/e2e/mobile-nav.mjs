@@ -126,6 +126,19 @@ for (const [label, viewport] of [
     // on desktop, where the sidebar is a vertical rail with room for it.
     if (label === "desktop") {
       check(`[${label}/${theme}] brand tagline still shown on desktop`, geom.tagVisible);
+
+      // New Task open/close state — desktop only, where the button is reliably
+      // clickable. The binding (aria-expanded={showNewTask}) is viewport-agnostic,
+      // so one solid round-trip catches a regression the collapsed checks cannot:
+      // opening must flip the trigger to "true", closing (Escape) back to "false".
+      await page.locator(".btn-new-task").click();
+      await page.waitForTimeout(400);
+      const ntOpen = await page.locator(".btn-new-task").getAttribute("aria-expanded").catch(() => null);
+      check(`[${label}/${theme}] New Task reports expanded while its dialog is open`, ntOpen === "true", `expanded=${ntOpen}`);
+      await page.keyboard.press("Escape");
+      await page.waitForTimeout(300);
+      const ntClosed = await page.locator(".btn-new-task").getAttribute("aria-expanded").catch(() => null);
+      check(`[${label}/${theme}] New Task returns to collapsed after Escape`, ntClosed === "false", `expanded=${ntClosed}`);
     }
 
     // And Settings must actually open.
