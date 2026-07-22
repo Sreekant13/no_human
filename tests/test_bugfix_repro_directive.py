@@ -45,8 +45,10 @@ def _bugfix(tmp_path):
 async def test_bugfix_directive_names_the_manifest_path_schema_and_consequence(
         store, tmp_path):
     d = _orch(store, tmp_path)._kind_directive(_bugfix(tmp_path))
-    # The exact path the gate reads — bound to the gate's own constant, so
-    # this test breaks if the manifest path drifts (the drift this file guards).
+    # The exact path the gate reads. Bound to the gate's own constant so the
+    # prompt tracks the gate; note this assertion alone is NOT drift-proof
+    # (both sides derive from MANIFEST) — test_every_prompt_surface_tracks_the
+    # _manifest_constant below is what actually catches a hard-coded literal.
     assert MANIFEST in d
     # The schema, so the coder does not have to guess the key.
     assert '{"tests":' in d.replace('{"tests": ', '{"tests":')
@@ -145,7 +147,7 @@ def test_rules_block_drops_the_manifest_bullet_when_the_gate_is_off():
     assert MANIFEST not in off
     # Also reject a bare basename: `MANIFEST not in off` alone would pass on a
     # mention without the .no_human/ prefix, which is still a manifest demand.
-    assert "repro_tests.json" not in off
+    assert MANIFEST.rsplit("/", 1)[-1] not in off
     # Neighbouring rules are untouched.
     assert "NEVER weaken, skip, or delete a test" in off
 
@@ -155,3 +157,27 @@ def test_rules_block_default_matches_the_orchestrator_default():
     or a caller that omits the argument silently changes the prompt."""
     assert build_rules_block("pytest", "", None) == build_rules_block(
         "pytest", "", None, repro_mode="advisory")
+
+
+def test_every_prompt_surface_tracks_the_manifest_constant(monkeypatch):
+    """Interpolating MANIFEST in one surface and hard-coding the literal in
+    another is exactly the drift this file exists to catch: the #179 review
+    proved the kind-directive assertion could not detect a moved path because
+    prompt_blocks.py still carried the literal. Repoint the constant and every
+    surface must follow."""
+    import no_human.core.orchestrator as orch
+    import no_human.core.prompt_blocks as pb
+
+    moved = ".no_human/repro_tests_v2.json"
+    monkeypatch.setattr(pb, "REPRO_MANIFEST", moved)
+    monkeypatch.setattr(orch, "REPRO_MANIFEST", moved)
+    for mode in ("advisory", "required"):
+        block = pb.build_rules_block("pytest", "", None, repro_mode=mode)
+        assert moved in block, f"{mode} bullet still hard-codes a literal path"
+        assert MANIFEST + " —" not in block
+    # The send-back message is the highest-stakes surface: the coder reads it
+    # AFTER the gate already cost it an attempt, so a stale path here makes an
+    # already-blocked coder write the wrong file on every retry.
+    msg = orch.repro_send_back_message("repro gate waived: no manifest")
+    assert moved in msg, "send-back message still hard-codes a literal path"
+    assert MANIFEST + " " not in msg

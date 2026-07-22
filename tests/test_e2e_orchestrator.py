@@ -19,6 +19,7 @@ from no_human.core.task import Task, TaskStatus
 from no_human.notify.slack import SlackNotifier
 from no_human.review.reviewer import AdversarialReviewer, ReviewDecision
 from no_human.review.selfcheck import ChecklistItem
+from no_human.testing.repro_gate import MANIFEST as REPRO_MANIFEST
 
 
 def _git(cwd, *args):
@@ -140,7 +141,7 @@ async def test_repro_gate_runs_advisory_inside_the_pipeline(bare_repo, tmp_path,
             "def test_mul():\n    assert mul(2, 3) == 6\n"
         )
         (cwd / ".no_human").mkdir(exist_ok=True)
-        (cwd / ".no_human" / "repro_tests.json").write_text(
+        (cwd / REPRO_MANIFEST).write_text(
             '{"tests": ["test_calc.py::test_mul"]}'
         )
 

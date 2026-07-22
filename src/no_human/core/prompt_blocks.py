@@ -6,6 +6,13 @@ their arguments, so they can live here, be unit-tested directly, and keep the
 orchestrator method thin. Extraction is byte-for-byte behaviour-preserving
 (pinned by a golden-prompt test); the still-stateful parts (memories, context
 digest, resume digest, plan) stay in the orchestrator for now.
+
+ONE documented exception to "arguments only": ``REPRO_MANIFEST``, the repro
+gate's own path constant. It is imported rather than injected deliberately —
+an injected path can be passed wrongly or forgotten by a future caller, which
+is precisely the drift that let three PRs each fix one hard-coded copy of this
+string. Importing the constant makes every prompt surface track the gate by
+construction. It is a frozen module-level constant, not state.
 """
 
 from __future__ import annotations
@@ -15,6 +22,7 @@ import secrets
 from typing import Any
 
 from ..blockers import Blocker
+from ..testing.repro_gate import MANIFEST as REPRO_MANIFEST
 from .task import Task
 
 
@@ -255,7 +263,7 @@ def build_rules_block(
            + ("this repo's gate is set to required, so write\n"
               if repro_mode == "required" else
               "if this repo's tests run with pytest, write\n")
-           + "    .no_human/repro_tests.json — {\"tests\": [\"<pytest node ids>\"]} — listing\n"
+           + f"    {REPRO_MANIFEST} — {{\"tests\": [\"<pytest node ids>\"]}} — listing\n"
            "    the test(s) that FAIL on the base code and PASS with your change (for a\n"
            "    bugfix: the reproduction; for a feature: its acceptance tests). The\n"
            "    harness runs them in both trees to prove the diff does what it claims.\n"
