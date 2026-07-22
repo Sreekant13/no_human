@@ -3570,7 +3570,8 @@ class _PlaceholderReportBackend:
         )
 
 
-@pytest.mark.slow  # runs the full bounded loop (retries then escalates)
+# No longer slow: the inadequate-report streak escalates after 2 attempts
+# instead of spending investigation's full 8-attempt bound.
 async def test_investigation_placeholder_report_does_not_complete_as_done(
     bare_repo, tmp_path, store
 ):
@@ -3593,6 +3594,39 @@ async def test_investigation_placeholder_report_does_not_complete_as_done(
     assert any(e.get("kind") == "report_inadequate" for e in events)
     attempts = await store.list_attempts(t.id)
     assert any(a["status"] == "failed" for a in attempts)
+
+
+async def test_repeated_inadequate_reports_escalate_at_two_not_at_the_bound(
+    bare_repo, tmp_path, store
+):
+    """C3 follow-up: rejecting an inadequate report makes the loop RETRY, and
+    `investigation` carries the wider 8-attempt bound — so an agent that cannot
+    produce substance spent six more attempts proving it and then reported
+    BUDGET_EXHAUSTED, a blocker that says nothing about why.
+
+    Same argument as the zero-diff streak: a retry re-runs the same agent
+    against the same request. One retry (which now carries the reason as
+    feedback), then escalate carrying what the agent actually wrote."""
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, _PlaceholderReportBackend(),
+                        SlackNotifier(None))
+    t = Task.new("investigate the data drop", repo_path=str(bare_repo),
+                 kind="investigation")
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.ESCALATED, outcome.detail
+    attempts = await store.list_attempts(t.id)
+    assert len(attempts) == 2, (
+        f"must stop after 2 inadequate reports, not run the full bound "
+        f"(ran {len(attempts)})")
+
+    blocker = outcome.task.blocker
+    assert blocker["category"] == "AMBIGUITY"
+    # The human must see WHAT the agent produced, not just "inadequate" twice.
+    assert "Done." in blocker["evidence"]
+    assert blocker["question"]
 
 
 class _DesignDocBackend:
