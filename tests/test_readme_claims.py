@@ -54,7 +54,16 @@ def _config_rows(readme: str) -> dict[str, str]:
             continue
         key = cells[0].strip("`* ")
         if re.fullmatch(r"[a-z_]+(?:\.[a-z_]+)+", key):
-            rows[key] = cells[1].strip("`* ")
+            value = cells[1].strip()
+            # Drop a trailing annotation BEFORE unwrapping the markup: `3`
+            # (tune per repo) documents the same default as `3`, but stripping
+            # backticks first cannot reach the one hidden behind the ")".
+            # Only when something remains, so a bare "(none)" stays the
+            # none-sentinel the comparison below expects.
+            unannotated = re.sub(r"\s*\([^()]*\)$", "", value).strip()
+            if unannotated:
+                value = unannotated
+            rows[key] = value.strip("`* ")
     return rows
 
 
@@ -77,6 +86,18 @@ REQUIRED_ROWS = {
     "server.port", "llm.primary_model", "llm.review_model",
     "bounds.max_attempts", "bounds.max_turns_per_attempt",
 }
+
+
+def test_required_rows_are_real_config_keys():
+    """REQUIRED_ROWS is hand-kept, so on its own it only proves the README still
+    says what it used to say. Without this, a key renamed or deleted in
+    config.py is caught by neither test: the walk below skips it as _MISSING,
+    and this list happily confirms the now-stale README row is still present."""
+    unreal = sorted(k for k in REQUIRED_ROWS if _resolve(k) is _MISSING)
+    assert not unreal, (
+        f"REQUIRED_ROWS names keys that are not in DEFAULT_CONFIG: {unreal} — "
+        f"the config changed and the README rows for them are now stale"
+    )
 
 
 def test_config_table_documents_the_required_keys(readme):
@@ -118,7 +139,18 @@ def test_prose_default_matches_config(readme):
     """The original defect lived in PROSE — the troubleshooting row told users to
     raise max_turns_per_attempt from a number that was never the default."""
     actual = DEFAULT_CONFIG["bounds"]["max_turns_per_attempt"]
-    for m in re.finditer(r"max_turns_per_attempt`?\s*\(default (\d+)\)", readme):
+    # A bare finditer guards nothing when the prose is reworded past its one
+    # spelling — the loop body never runs and the test passes green. Accept the
+    # spellings a writer would actually use, then require at least one hit.
+    matches = list(re.finditer(
+        r"max_turns_per_attempt`?[^.\n]*?\(defaults?\s*(?:to)?\s*:?\s*(\d+)\)",
+        readme))
+    assert matches, (
+        "no 'max_turns_per_attempt (default N)' prose found in the README. "
+        "Either it was reworded past this pattern — widen the pattern — or the "
+        "claim was dropped, and this guard was about to pass vacuously."
+    )
+    for m in matches:
         assert int(m.group(1)) == actual, (
             f"README prose says default {m.group(1)}, config says {actual}"
         )
@@ -131,15 +163,35 @@ def test_blocker_category_count_matches_the_enum(readme):
         f"README does not say '{n}-category'; the taxonomy has {n} members "
         f"({', '.join(c.name for c in BlockerCategory)})"
     )
+    # Presence at ONE site is not enough. The README states the count twice, so
+    # re-introducing the original "8-category" defect at the other site passed
+    # this test. Every stated count must agree with the enum.
+    wrong = sorted({m.group(1) for m in re.finditer(r"\b(\d+)-category\b", readme)
+                    if int(m.group(1)) != n})
+    assert not wrong, (
+        f"README also claims {wrong}-category; the taxonomy has {n} members"
+    )
 
 
 def test_architecture_tree_lists_every_package(readme):
     """The tree claimed to enumerate src/no_human/ while omitting real packages
     (ci/, integrations/, notify/, ci_gate/). It is now labelled abridged, but it
     must still not omit a package or invent one."""
+    # A package is a directory that actually holds Python, not merely a
+    # directory. Deleting an integration leaves its __pycache__ behind (tracker/
+    # survives that way on any machine that ran TRACKER before it was removed), and
+    # an untracked husk is not a claim the README is failing to make.
+    # `__init__.py` alone is too narrow in the other direction: since PEP 420 a
+    # directory of modules without one is a real, importable, wheel-shipped
+    # package, and forgetting __init__.py on a new package is a common mistake.
+    # The search must RECURSE: a namespace package whose direct children are all
+    # sub-packages has no top-level .py at all, and a non-recursive glob would
+    # wave it through — narrowing coverage below what plain is_dir() caught.
+    # A husk is still excluded either way, since __pycache__ holds only .pyc.
     packages = {
         p.name for p in (REPO / "src" / "no_human").iterdir()
         if p.is_dir() and not p.name.startswith(("_", "."))
+        and ((p / "__init__.py").exists() or any(p.rglob("*.py")))
     }
     # Scoped to the fenced block that contains the tree: an unrelated second
     # tree elsewhere in the README (e.g. web/src) is a legitimate edit and must
