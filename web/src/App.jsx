@@ -86,10 +86,14 @@ function IconGear() {
 // icon-only row is never rendered (label is not conditionally hidden). The
 // active row gets a soft filled pill (see .nh-navrow.active in styles.css),
 // animated on --dur-fast/--ease-out and prefers-reduced-motion guarded.
-function NavRow({ icon, label, active, badge, badgeVariant, onClick, title, className = "" }) {
+function NavRow({ icon, label, active, current, badge, badgeVariant, onClick, title, className = "" }) {
   return (
     <button
       className={`nh-navrow${active ? " active" : ""}${className ? ` ${className}` : ""}`}
+      // aria-current marks the current PAGE for a screen reader — only the page-nav
+      // rows pass `current`. Settings opens an overlay dialog, not a page, so it is
+      // `active` (filled pill) without claiming to be the current page.
+      aria-current={current ? "page" : undefined}
       onClick={onClick}
       title={title}
     >
@@ -704,6 +708,7 @@ export default function App() {
               icon={<IconBoard />}
               label="Board"
               active={page === "board"}
+              current={page === "board"}
               onClick={() => setPage("board")}
               badge={needYou > 0 ? needYou : null}
               badgeVariant="alert"
@@ -713,6 +718,7 @@ export default function App() {
               icon={<IconDone />}
               label="Done"
               active={page === "done"}
+              current={page === "done"}
               onClick={() => setPage("done")}
               badge={doneCount}
               badgeVariant="done"
@@ -722,6 +728,7 @@ export default function App() {
               icon={<IconFailed />}
               label="Failed"
               active={page === "failed"}
+              current={page === "failed"}
               onClick={() => setPage("failed")}
               badge={failedCount}
               badgeVariant={failedCount > 0 ? "failed" : undefined}
@@ -733,6 +740,7 @@ export default function App() {
               icon={<IconStats />}
               label="Stats"
               active={page === "stats"}
+              current={page === "stats"}
               onClick={() => setPage("stats")}
             />
           </NavGroup>

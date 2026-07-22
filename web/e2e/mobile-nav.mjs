@@ -52,7 +52,13 @@ for (const [label, viewport] of [
       const vw = window.innerWidth;
       const btns = [...document.querySelectorAll(".nh-navrow")].map((b) => {
         const r = b.getBoundingClientRect();
-        return { label: b.textContent.trim().slice(0, 10), left: Math.round(r.left), right: Math.round(r.right), onScreen: r.left >= 0 && r.right <= vw };
+        return {
+          label: b.textContent.trim().slice(0, 10),
+          left: Math.round(r.left), right: Math.round(r.right),
+          onScreen: r.left >= 0 && r.right <= vw,
+          current: b.getAttribute("aria-current"),   // measured in the real DOM
+          active: b.classList.contains("active"),
+        };
       });
       const toggle = document.querySelector(".nh-theme-toggle");
       const tr = toggle?.getBoundingClientRect();
@@ -79,6 +85,22 @@ for (const [label, viewport] of [
     );
     check(`[${label}/${theme}] theme toggle is on screen`, geom.toggleOnScreen !== false);
     check(`[${label}/${theme}] no horizontal page overflow`, !geom.pageOverflowX);
+
+    // a11y: the current page must be announced to a screen reader. On load the
+    // board is showing, so exactly one nav row carries aria-current="page" and
+    // it is the active row; no other row falsely claims to be current. (Settings
+    // is an overlay trigger, never a page — it must never carry aria-current.)
+    const currentRows = geom.btns.filter((b) => b.current === "page");
+    check(
+      `[${label}/${theme}] exactly one nav row marks aria-current=page`,
+      currentRows.length === 1,
+      `${currentRows.length} rows: ${currentRows.map((b) => b.label).join(", ") || "none"}`,
+    );
+    check(
+      `[${label}/${theme}] the aria-current row is the active one`,
+      currentRows.length === 1 && currentRows[0].active,
+      currentRows.length === 1 ? `current="${currentRows[0].label}" active=${currentRows[0].active}` : "",
+    );
 
     // The tagline is decorative and may be dropped on a phone — but it must SURVIVE
     // on desktop, where the sidebar is a vertical rail with room for it.
