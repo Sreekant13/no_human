@@ -194,8 +194,30 @@ def redact_local_path(text: str, spec: "BenchTask") -> str:
     # a padded path produced text this function could not match, and an
     # unredacted local path hard-blocks publication with no override.
     stripped = local.strip()
-    for form in {local, str(Path(local)), os.path.normpath(local),
-                 stripped, str(Path(stripped)), os.path.normpath(stripped)}:
+    forms = {local, str(Path(local)), os.path.normpath(local),
+             stripped, str(Path(stripped)), os.path.normpath(stripped)}
+    for form in forms:
+        # Skip forms that are DEGENERATE — nothing but separators, dots and
+        # whitespace. Those are the ones that match EVERYTHING: a
+        # whitespace-only `local` yields "" and ".", and `text.replace("", x)`
+        # splices x between every character (a 30-char note became 765), while
+        # "/" rewrites every separator in the text.
+        #
+        # Keyed on degeneracy, NOT on `os.path.isabs`. Absoluteness looks like
+        # the same rule and is not: it also skips a relative-but-REAL path,
+        # leaving a local path in a note bound for the tracked report. That is
+        # disclosure, not corruption, and it hard-blocks publication.
+        #
+        # `split()` removes whitespace ANYWHERE, using str's own full
+        # definition, so no alternation and no character class can escape.
+        # FOUR earlier versions of this guard named a charset narrower than
+        # this comment claimed — " .\t\n\r" omitted \v and \f; then
+        # `string.whitespace` omitted \xa0 and friends; then
+        # `strip(A).strip()` still let " / "'s unicode mirror "\xa0/\xa0"
+        # through, because chained strips only reach the ENDS. Enumerating
+        # characters kept failing, so this stops enumerating.
+        if not "".join(form.split()).strip(os.sep + "."):
+            continue
         text = text.replace(form, replacement)
     return text
 

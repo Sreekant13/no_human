@@ -553,3 +553,71 @@ async def test_the_SCORED_path_also_uses_the_neutral_project_name(
     assert score.project == "service-a"
     assert "svc-a" not in (score.project or "")
     assert "/local/real" not in (score.notes or "")
+
+
+def test_a_degenerate_local_path_cannot_MANGLE_the_note():
+    """`redact_local_path` builds a set of path FORMS and replaces each. A
+    degenerate `local` puts "" and "." into that set, and
+    `text.replace("", x)` splices x between EVERY character — a 30-char skip
+    note became 765 characters of garbage.
+
+    The direction of harm is corruption, not disclosure (the replacement is the
+    neutral spec path), and the reachable trigger is narrow — a padded path
+    cannot match a repo-map key, so redaction usually short-circuits. But the
+    guard that produced the padded string is the same change that added the
+    stripped forms, so the two shipped together.
+    """
+    from no_human.eval.bench_task import BenchTask, redact_local_path
+
+    def _spec(path: str) -> BenchTask:
+        t = BenchTask(id="x", title="t", request="r", subset="core",
+                      runnable=True, repo={"path": path, "pin": "", "branch": ""})
+        t.spec_repo_path = "/spec/neutral/service-a"
+        return t
+
+    # Whitespace-only: yields "" and "." as forms.
+    note = "skipped: spec has no repo.path"
+    assert redact_local_path(note, _spec("   ")) == note
+    assert redact_local_path("skipped: not absolute", _spec("  .  ")) == \
+        "skipped: not absolute"
+    # Root would rewrite every separator in the text.
+    sep_text = "a/b/c path with /separators/"
+    assert redact_local_path(sep_text, _spec("/")) == sep_text
+
+    # EVERY whitespace character Python strips, not a hand-rolled subset. An
+    # earlier " .\t\n\r" omitted \v and \f, so a vertical-tab-only path still
+    # rewrote the note — the same defect, one character instead of every one.
+    import string
+    # The probe text must CONTAIN the character under test, or replace() is a
+    # no-op and the assertion passes for the wrong reason. A first version used
+    # one fixed string holding only \v and \f, so every unicode case was
+    # vacuous and the mutant survived.
+    for ch in string.whitespace + "\xa0\u2028\u2029\u3000\x85":
+        probe = f"left{ch}right{ch}end"
+        assert ch in probe                     # the trap this guards against
+        assert redact_local_path(probe, _spec(ch)) == probe, repr(ch)
+        assert redact_local_path(probe, _spec(ch * 3)) == probe, repr(ch)
+
+    # MIXED separator/whitespace forms. These need whitespace in the FIRST
+    # strip set: one pass of `.strip("/.")` leaves " / " as "/", and the
+    # trailing bare `.strip()` cannot remove it because it is no longer at an
+    # end. Dropping `string.whitespace` survived every case above precisely
+    # because none of them alternated.
+    # Includes the UNICODE mirrors: chained strips only reach the ENDS, so
+    # "\xa0/\xa0" survived them exactly as " / " survived a single pass.
+    for form in (" / ", " . ", "\t/\t", " /. ", " .. ", "\n/\n",
+                 "\xa0/\xa0", "\u3000.\u3000", "\x85/\x85"):
+        probe = f"left{form}right"
+        assert redact_local_path(probe, _spec(form)) == probe, repr(form)
+
+    # And every REAL path still redacts — including relative ones. The rule is
+    # keyed on DEGENERACY, not on os.path.isabs: absoluteness looks like the
+    # same rule but also skips a relative-but-real path, leaving a local path
+    # in a note bound for the tracked report. That direction is disclosure,
+    # not corruption, and it is the one that hard-blocks publication.
+    for local in ("/Users/me/secret-repo", "Users/me/secret-repo",
+                  "./secret-repo", "/Users/me/secret-repo/"):
+        out = redact_local_path(f"skipped: missing {local}", _spec(local))
+        assert "/Users/me" not in out, f"{local!r} leaked: {out!r}"
+        assert "secret-repo" not in out, f"{local!r} leaked: {out!r}"
+        assert "/spec/neutral/service-a" in out, out
