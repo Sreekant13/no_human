@@ -385,33 +385,28 @@ def _note_card(note: str):
     return _card(scores, label="v13")
 
 
-def test_publish_refuses_a_report_carrying_a_banned_term(bench_env):
+def test_publish_redacts_a_banned_term_in_a_note(bench_env):
     """The per-task notes are judge-authored free text quoting real repo
-    contents, so a publish can drop an internal codename into a TRACKED file
-    that is currently clean. A hand scan is what missed it the first time."""
+    contents. Refusing the whole publish left a real measured card (v13)
+    unpublishable without hand-editing. Instead the renderer redacts the term,
+    so the report publishes clean AND stays reproducible from the raw card —
+    the card keeps the original note, only the tracked markdown is scrubbed."""
     results, report = bench_env
     src = results / "v13.json"
     # The shape that actually slipped through: the term glued to other words.
-    _note_card("ran `ls -la ~/.claude/skills/ci_gate-metrics-core-pipeline/`").save(src)
-
-    # Prove the note actually reaches the rendered report before asserting on
-    # what the guard does about it.
-    from no_human.eval.northstar_card import render_northstar_md
-    assert "metrics-core-pipeline" in render_northstar_md(_note_card(
-        "ran `ls -la ~/.claude/skills/ci_gate-metrics-core-pipeline/`"))
+    card = _note_card("ran `ls -la ~/.claude/skills/ci_gate-metrics-core-pipeline/`")
+    # Redaction is render-only: the raw note still carries the term, proving the
+    # cleaning happens on the way to the tracked file, not by mutating evidence.
+    assert "ci_gate" in card.scores[0].notes
+    card.save(src)
 
     res = CliRunner().invoke(cli, ["bench", "publish", str(src)])
 
-    assert res.exit_code == 1, res.output
-    # Wrap-tolerant: rich wraps the console line, so match on stable fragments
-    # rather than a phrase that a line break can split.
-    assert "refusing to publish" in res.output
-    # The locator is the point: a count alone cannot be grepped for.
-    assert "ns-0" in res.output, res.output
-    assert report.read_text() == "ORIGINAL REPORT\n", "tracked report was written"
-    assert not (results / "latest.json").exists(), (
-        "baseline was promoted despite the refusal — a partial publish leaves "
-        "the gate comparing against a run whose report was rejected")
+    assert res.exit_code == 0, res.output
+    published = report.read_text()
+    assert "ci_gate" not in published.lower(), published   # the codename is gone
+    assert "metrics-core-pipeline" in published, published    # its neighbour stays
+    assert (results / "latest.json").exists()              # baseline promoted
 
 
 def test_publish_allows_english_that_merely_contains_a_term(bench_env):
@@ -427,36 +422,54 @@ def test_publish_allows_english_that_merely_contains_a_term(bench_env):
     assert (results / "latest.json").exists()
 
 
-def test_bench_report_refuses_a_banned_term_too(bench_env):
-    """Round 2's Critical came back half-fixed: only `bench publish` was tested,
-    so reverting the guard on THIS path left the whole suite green while a
-    single command could still write a banned term into the tracked file.
-
-    `bench report` renders straight from latest.json — and the ordering fix in
-    this PR is justified precisely by keeping this command able to regenerate
-    the doc, so the path its rationale depends on cannot be the untested one.
-    """
+def test_bench_report_redacts_a_banned_term_too(bench_env):
+    """`bench report` renders straight from latest.json — a second write path
+    into the tracked doc. Redaction has to fire here too, or regenerating the
+    doc from a banked card would reintroduce the very term `bench publish`
+    scrubbed."""
     results, report = bench_env
     _note_card("ran `ls -la ~/.claude/skills/ci_gate-metrics-core-pipeline/`").save(
         results / "latest.json")
 
     res = CliRunner().invoke(cli, ["bench", "report"])
 
-    assert res.exit_code == 1, res.output
-    assert "refusing to publish" in res.output
-    assert report.read_text() == "ORIGINAL REPORT\n", "tracked report was written"
+    assert res.exit_code == 0, res.output
+    published = report.read_text()
+    assert "ci_gate" not in published.lower(), published
+    assert "metrics-core-pipeline" in published, published
 
 
-def test_publish_refuses_a_home_path_even_with_no_banned_term(bench_env):
-    """The report asserts "labels and repo paths are pseudonymised". The guard
-    checked vendor terms only, so a home path published happily underneath a
-    sentence claiming it had been removed."""
+def test_publish_redacts_a_home_path(bench_env):
+    """The report asserts "labels and repo paths are pseudonymised". A home path
+    in a note is redacted to a placeholder so the published doc keeps that
+    promise while still publishing."""
     results, report = bench_env
     _note_card(f"verified via {Path.home()}/git/thing/file.py").save(
         results / "v13.json")
 
     res = CliRunner().invoke(cli, ["bench", "publish", str(results / "v13.json")])
 
+    assert res.exit_code == 0, res.output
+    published = report.read_text()
+    assert str(Path.home()) not in published and "/Users/" not in published
+    assert (results / "latest.json").exists()
+
+
+def test_the_guard_still_refuses_if_redaction_regresses(bench_env, monkeypatch):
+    """Redaction cleans the report; the CLI guard is the backstop. If a future
+    edit lets a term slip past the redactor (a new BANNED_TERM with no matching
+    branch, say), the guard must still refuse rather than publish the leak — so
+    disabling redaction must bring the refusal back, proving the guard is live
+    and not dead code the redactor has made unreachable."""
+    import no_human.eval.northstar_card as nc
+    monkeypatch.setattr(nc, "redact_for_publish", lambda s: s)  # redaction off
+    results, report = bench_env
+    src = results / "v13.json"
+    _note_card("ran `ls -la ~/.claude/skills/ci_gate-metrics-core-pipeline/`").save(src)
+
+    res = CliRunner().invoke(cli, ["bench", "publish", str(src)])
+
     assert res.exit_code == 1, res.output
+    assert "refusing to publish" in res.output
     assert report.read_text() == "ORIGINAL REPORT\n"
     assert not (results / "latest.json").exists()

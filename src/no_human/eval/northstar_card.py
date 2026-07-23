@@ -12,6 +12,7 @@ is measured, not judged.
 
 from __future__ import annotations
 
+from .vendor_terms import redact_for_publish
 import json
 import os
 from dataclasses import dataclass, field
@@ -630,7 +631,7 @@ def render_northstar_md(card: NorthStarCard,
         lines.append(
             f"| {s.task_id} | {s.outcome_status} | {sat} | {s.nh_tokens:,} | "
             f"{s.orig_tokens:,} | {ratio_s} | {s.orig_corrections} | "
-            f"{(s.notes or '')[:80].replace('|', '/')} |")
+            f"{redact_for_publish(s.notes or '')[:80].replace('|', '/')} |")
     if hidden:
         lines.append(f"\n_{hidden} non-core task(s) included in the aggregates only (privacy: raw corpus rows never enter git)._")
 
@@ -653,7 +654,11 @@ def render_northstar_md(card: NorthStarCard,
         for p in sorted(proj):
             a = proj[p]
             med = f"{median(a['ratios']):.3f}" if a["ratios"] else "—"
-            lines.append(f"| {p} | {a['n']} | {a['ok']}/{a['n']} | {a['esc']} | {med} |")
+            # Redact the DISPLAYED label; the grouping key `p` stays the real
+            # name so counts and medians are unchanged. (v13's project labels
+            # are the real repo names, not the neutral spec basenames.)
+            lines.append(f"| {redact_for_publish(p)} | {a['n']} | "
+                         f"{a['ok']}/{a['n']} | {a['esc']} | {med} |")
 
     if history:
         lines += ["", "## History (key changes)", "",
