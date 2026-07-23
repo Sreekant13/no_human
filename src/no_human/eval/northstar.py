@@ -15,6 +15,8 @@ solution.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import shutil
 import subprocess
@@ -276,6 +278,33 @@ def _bench_task(spec: BenchTask, work: Path) -> Task:
     return task
 
 
+# Watchdog cadence and how long a cancellation gets to unwind before we stop
+# waiting on it — the observed hang was inside subprocess teardown.
+_WATCHDOG_POLL_S = 30.0
+_WATCHDOG_UNWIND_S = 60.0
+
+
+def _make_sink(persister, forward, task_id):
+    """Build the bench event sink AND the last-event clock it feeds.
+
+    Extracted so the WIRING is testable. Left inline, the one line that
+    refreshes the clock could be deleted with every watchdog test still green —
+    and deleting it makes the watchdog fire on a spec that is long but ALIVE,
+    which is the false-kill direction: a slow success recorded as a capability
+    failure.
+    """
+    last_event = [time.monotonic()]
+
+    def sink(event: dict) -> None:
+        event.setdefault("ts", time.time())
+        event.setdefault("task_id", task_id)
+        last_event[0] = time.monotonic()      # proof of life for the watchdog
+        persister.record(event)
+        forward(event)
+
+    return sink, last_event
+
+
 class NorthStarRunner:
     """Mirrors eval.replay.ReplayRunner but for real-repo bench specs."""
 
@@ -287,6 +316,48 @@ class NorthStarRunner:
         self.reviewer = reviewer
         self.goal_judge = goal_judge
         self._event_sink = event_sink
+
+    class SpecStalled(RuntimeError):
+        """A spec emitted no event for longer than the stuck-active threshold."""
+
+    async def _run_with_watchdog(self, orch, task, spec, last_event):
+        """`orch.run_task` under the SAME stuck-active policy the server applies.
+
+        The product already has this watchdog — `blockers.stuck_active_minutes`
+        (added for the 2026-07-11 reviewer hang) — but it lives in
+        `blockers/wake.py`, which only the SERVER runs. `nh bench run` drives
+        the orchestrator directly, so nothing was watching, and one hung
+        Agent-SDK session stopped an entire run silently and indefinitely.
+        Observed live: a spec sat 9 minutes at 0% CPU, no children, no sockets,
+        blocked in `__wait4`, and would have sat there forever.
+
+        Same knob and same semantic as wake.py deliberately — NO EVENT for N
+        minutes, not total wall clock. A spec that is slow but ALIVE keeps
+        emitting, so it is never killed; only silence trips this. Reusing the
+        key means the two cannot drift, and <= 0 disables, exactly as there.
+        """
+        limit_min = float((self.config.get("blockers") or {})
+                          .get("stuck_active_minutes", 40))
+        runner = asyncio.ensure_future(orch.run_task(task))
+        if limit_min <= 0:
+            return await runner                      # watchdog disabled
+        limit_s = limit_min * 60.0
+        while True:
+            done, _ = await asyncio.wait({runner}, timeout=_WATCHDOG_POLL_S)
+            if done:
+                return await runner
+            silent_s = time.monotonic() - last_event[0]
+            if silent_s >= limit_s:
+                runner.cancel()
+                # Give the cancellation a bounded chance to unwind. The hang
+                # observed live was INSIDE subprocess teardown, so waiting on
+                # it forever would reproduce the very defect being fixed.
+                with contextlib.suppress(asyncio.CancelledError,
+                                         asyncio.TimeoutError, Exception):
+                    await asyncio.wait_for(runner, timeout=_WATCHDOG_UNWIND_S)
+                raise NorthStarRunner.SpecStalled(
+                    f"no event for {silent_s / 60:.0f} min "
+                    f"(limit {limit_min:.0f}); the agent session hung")
 
     async def run_one(self, spec: BenchTask, *, workdir: Path) -> BenchScore:
         if not spec.runnable:
@@ -336,11 +407,7 @@ class NorthStarRunner:
             async with EventPersister(store, task.id) as persister:
                 forward = self._event_sink or (lambda e: None)
 
-                def sink(event: dict) -> None:
-                    event.setdefault("ts", time.time())
-                    event.setdefault("task_id", task.id)
-                    persister.record(event)
-                    forward(event)
+                sink, last_event = _make_sink(persister, forward, task.id)
 
                 orch = Orchestrator(
                     store, self.config, self.backend_factory(spec),
@@ -350,7 +417,8 @@ class NorthStarRunner:
                 await store.create_task(task)
 
                 t0 = time.monotonic()
-                outcome = await orch.run_task(task)
+                outcome = await self._run_with_watchdog(
+                    orch, task, spec, last_event)
                 elapsed = time.monotonic() - t0
 
                 attempts = await store.list_attempts(task.id)
