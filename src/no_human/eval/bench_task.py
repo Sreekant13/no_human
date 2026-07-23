@@ -53,12 +53,15 @@ def load_repo_map(path: Path | None = None) -> dict[str, str]:
     run. ``check_repo_map`` reports those instead, and the CLI prints them
     before a run starts.
 
-    Honest note on the safety net: run-time skip-on-missing-repo, the
-    skipped-most-of-the-corpus publish refusal, and the unmeasured-corpus gate
-    are on SEPARATE branches and are not merged yet. Until they land, a target
-    that does not exist still reaches ``_sandbox_copy`` and is booked as a
-    crashed spec — a broken instrument reading as a capability failure, which
-    is the very thing this map exists to prevent.
+    Honest note on the safety net, kept current deliberately: run-time
+    skip-on-missing-repo IS now in place, so a target that does not exist is
+    SKIPPED rather than booked as a crashed spec. Skipping alone would be a
+    FAVOURABLE bias — a skipped spec leaves the success denominator entirely,
+    so a corpus that half fails to resolve scores HIGHER. The counterweight is
+    the unmeasured-corpus rule (``MAX_UNMEASURED_FRACTION`` via
+    ``unmeasured_specs``), which landed first, deliberately, and refuses such a
+    run in BOTH the publish refusal and the regression gate. Both nets are in
+    place; neither is sufficient alone.
 
     ``check_repo_map`` is therefore ADVISORY only: the CLI prints what will not
     resolve and then runs anyway. It buys the operator a chance to abort in the
@@ -95,10 +98,12 @@ def check_repo_map(tasks: list["BenchTask"]) -> list[str]:
     see below — so it is not checked at all).
 
     Non-fatal for a mechanical reason, not because the result is fine to read:
-    an unresolvable repo is currently booked as a CRASHED spec, i.e. it scores
-    as a capability failure. A run started with these warnings UNDER-REPORTS.
-    The right response is to fix the map and start again; the check exists so
-    that decision costs seconds instead of a night of quota.
+    an unresolvable repo is SKIPPED, and a skipped spec leaves the success
+    denominator, so a run started with these warnings OVER-reports — it scores
+    only the specs healthy enough to resolve. That is the dangerous direction:
+    the number looks BETTER the more broken the corpus is. The right response is
+    to fix the map and start again; the check exists so that decision costs
+    seconds instead of a night of quota.
 
     Two failure modes this exists to make loud:
 
@@ -114,13 +119,20 @@ def check_repo_map(tasks: list["BenchTask"]) -> list[str]:
     """
     problems: list[str] = []
     for t in tasks:
-        raw = str(t.repo.get("path") or "")
+        # Strip and absolute-check EXACTLY as the run-time guard does. They
+        # disagreed in both directions: a padded path was reported here and
+        # then ran fine, and a dot-relative path was reported CLEAN here and
+        # then skipped at run time. A silent pre-flight followed by a skip is
+        # precisely the surprise this function exists to prevent.
+        raw = str(t.repo.get("path") or "").strip()
         # A non-runnable spec routes to _skipped and is never cloned, so it can
         # never crash on a bad path; counting it only inflates the headline.
         if not raw or not t.runnable:
             continue
         p = Path(raw)
-        if not p.is_dir():
+        if not p.is_absolute():
+            problems.append(f"{t.id}: repo path is not absolute — {raw}")
+        elif not p.is_dir():
             problems.append(f"{t.id}: repo does not exist here — {raw}")
         elif not (p / ".git").exists():
             problems.append(f"{t.id}: not a git repo — {raw}")
@@ -177,8 +189,13 @@ def redact_local_path(text: str, spec: "BenchTask") -> str:
     replacement = original or "<repo>"
     # Both the literal map value and its normalised form: an exception's argv
     # carries whatever `Path(...)` produced, which is not necessarily the string
-    # the map was written with.
-    for form in {local, str(Path(local)), os.path.normpath(local)}:
+    # the map was written with. The STRIPPED forms are included because the
+    # run-time guard validates `raw.strip()` and emits that into the note — so
+    # a padded path produced text this function could not match, and an
+    # unredacted local path hard-blocks publication with no override.
+    stripped = local.strip()
+    for form in {local, str(Path(local)), os.path.normpath(local),
+                 stripped, str(Path(stripped)), os.path.normpath(stripped)}:
         text = text.replace(form, replacement)
     return text
 

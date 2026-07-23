@@ -292,7 +292,36 @@ class NorthStarRunner:
         if not spec.runnable:
             return self._skipped(spec)
 
-        src_repo = Path(spec.repo.get("path", ""))
+        # `runnable` was decided at spec GENERATION time; nothing re-checked it
+        # here. A spec whose repo path no longer resolves therefore reached
+        # _setup_sandbox, died in `git clone`, and was booked as
+        # outcome_status="crashed", goal_satisfied=False — a broken INSTRUMENT
+        # scored as a capability failure of the agent. An unavailable repo is a
+        # skip, exactly as it is at generation time.
+        #
+        # Resolve BEFORE building the Path: Path("") is PosixPath("."), and so
+        # are "." and "./", all of which would make the .git probe test the
+        # RUNNER's own cwd, pass inside any checkout, and sandbox-copy no_human
+        # itself as the spec's subject. A relative path is meaningless here for
+        # the same reason — the spec records the original session's absolute cwd.
+        raw_path = spec.repo.get("path") or ""
+        if not str(raw_path).strip():
+            return self._skipped(spec, "spec has no repo.path")
+        src_repo = Path(str(raw_path).strip())
+        if not src_repo.is_absolute():
+            return self._skipped(
+                spec, f"repo.path is not absolute: {raw_path!r}")
+        # .exists(), not .is_dir(): a git worktree or submodule has .git as a
+        # FILE, and treating those as missing would skip perfectly good repos.
+        if not (src_repo / ".git").exists():
+            return self._skipped(spec, f"repo missing at run time: {src_repo}")
+        # Hand the VALIDATED path on. _setup_sandbox re-derives
+        # Path(spec.repo["path"]) itself, so validating a stripped copy while it
+        # cloned the raw one meant a whitespace-padded path passed this guard
+        # and then died in `git clone` — this guard's own code producing the
+        # crash it exists to prevent.
+        spec.repo["path"] = str(src_repo)
+
         refs_before = _ref_signature(src_repo)
         work = _setup_sandbox(spec, workdir)
         base_sha = _git(work, "rev-parse", "HEAD")
@@ -348,7 +377,7 @@ class NorthStarRunner:
                                  attempts, elapsed,
                                  events=event_digest)
 
-    def _skipped(self, spec: BenchTask) -> BenchScore:
+    def _skipped(self, spec: BenchTask, reason: str = "") -> BenchScore:
         orig = spec.original or {}
         toks = orig.get("tokens", {}) or {}
         return BenchScore(
@@ -365,7 +394,15 @@ class NorthStarRunner:
             expected_escalation=spec.expect_escalation,
             subset=spec.subset,
             project=spec_project_name(spec),
-            notes=f"skipped: {spec.skip_reason}",
+            # REDACTED. The run-time reasons below name the repo path, which
+            # after the repo-map translation is the operator's real local
+            # checkout — and this note is rendered into the tracked report.
+            # Unredacted it also blocks publication outright: the report
+            # writer refuses any rendered artifact containing a /Users/ path,
+            # with no --force override, so a single run-time skip would kill
+            # an otherwise-clean run at the final write.
+            notes=redact_local_path(
+                f"skipped: {reason or spec.skip_reason}", spec),
         )
 
     async def _score(self, spec: BenchTask, outcome, work: Path,

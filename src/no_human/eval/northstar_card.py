@@ -541,7 +541,13 @@ def render_northstar_md(card: NorthStarCard,
         "",
         f"- **Success (goal satisfied, unattended): {agg['satisfied']}/"
         f"{agg['total'] - agg['skipped']} ran ({agg['success_rate']:.0%})**"
-        f"  ·  skipped (non-runnable): {agg['skipped']}",
+        # "non-runnable" was true when EVERY skip came from spec.runnable=False,
+        # decided at generation time. The dominant skip is now "repo missing at
+        # run time" — the instrument breaking, not a spec that was never
+        # runnable — and a reader of the tracked report would otherwise
+        # conclude the corpus contains N unrunnable specs rather than that N
+        # checkouts vanished. This label is true of both kinds.
+        f"  ·  skipped (not measured): {agg['skipped']}",
         f"  - of which {_delivered} DELIVERED a change and {_gated_ok} correctly "
         f"ESCALATED — 'satisfied' counts an honest refusal as the right outcome, "
         f"which it is, but only the first group shipped anything",
