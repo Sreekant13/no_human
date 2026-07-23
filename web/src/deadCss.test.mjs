@@ -14,8 +14,8 @@ import { dirname, join } from "node:path";
 // cries wolf gets deleted. This family is fully static and hand-written.
 //
 // "Referenced" means referenced by MARKUP (.jsx). An e2e selector naming a class is not
-// usage — web/e2e/drawer.mjs still queries `.blocker-option-btn`, which renders nowhere
-// since the Decision panel landed; that is a stale assertion, not a live style.
+// usage — a class only ever named by a test, and rendered by no component, is a stale
+// assertion rather than a live style, and does not count as a reference here.
 
 const SRC = dirname(fileURLToPath(import.meta.url));
 
