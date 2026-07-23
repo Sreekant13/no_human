@@ -709,3 +709,34 @@ def test_the_diagnostic_renders_an_ODD_mode_readably(tmp_path, monkeypatch):
     # PytestWarning and an undeletable directory into the shared tmp root on
     # every run — noticed because it polluted an UNRELATED worktree's output.
     home.chmod(0o700)
+
+
+def test_a_symlinked_home_logs_the_downgrade_but_a_planted_leaf_is_silent(
+        tmp_path, monkeypatch, caplog):
+    """When NO_HUMAN_HOME itself is a symlink, skipping it leaves the store dir
+    unsecured — a real downgrade (#221 review), so WARN. A planted LEAF symlink
+    is correctly skipped and must stay silent, or every attack attempt spams
+    the log."""
+    import logging
+    import no_human.config as cfg
+
+    # (a) planted leaf symlink under a real home -> skipped, NO warning
+    real_home = tmp_path / "a" / ".no_human"
+    real_home.mkdir(parents=True, mode=0o700)
+    monkeypatch.setattr(cfg, "NO_HUMAN_HOME", real_home)
+    outside = tmp_path / "a" / "victim"; outside.mkdir(mode=0o755)
+    (real_home / "cache").symlink_to(outside)
+    with caplog.at_level(logging.WARNING, logger="no_human.config"):
+        cfg.ensure_private_dir(real_home / "cache")
+    assert not any("symlink" in r.message for r in caplog.records), \
+        "a planted leaf symlink must not warn"
+
+    # (b) NO_HUMAN_HOME itself is a symlink -> WARN
+    caplog.clear()
+    store = tmp_path / "b" / "real_store"; store.mkdir(parents=True, mode=0o755)
+    linked_home = tmp_path / "b" / ".no_human"; linked_home.symlink_to(store)
+    monkeypatch.setattr(cfg, "NO_HUMAN_HOME", linked_home)
+    with caplog.at_level(logging.WARNING, logger="no_human.config"):
+        cfg.ensure_private_dir(linked_home)
+    assert any("symlink" in r.message and "0600" in r.message
+               for r in caplog.records), caplog.text
