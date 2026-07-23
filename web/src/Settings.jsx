@@ -753,11 +753,11 @@ function TestPlanEditor({ project, onUpdated }) {
           <div className="new-task-row">
             <input className="new-task-input" style={{ flex: 1, marginBottom: 0 }} placeholder="Layer name (e.g. unit, integration, ci_gate-e2e)" value={newLayer.name}
               onChange={(e) => setNewLayer({ ...newLayer, name: e.target.value })} autoFocus />
-            <select className="new-task-select" style={{ flex: 'none', width: 80 }} value={newLayer.runner}
+            <select className="new-task-select" style={{ flex: 'none', width: 80 }} aria-label="Test runner" value={newLayer.runner}
               onChange={(e) => setNewLayer({ ...newLayer, runner: e.target.value })}>
               {RUNNER_OPTIONS.map(r => <option key={r} value={r}>{r}</option>)}
             </select>
-            <select className="new-task-select" style={{ flex: 'none', width: 120 }} value={newLayer.gating}
+            <select className="new-task-select" style={{ flex: 'none', width: 120 }} aria-label="Gating" value={newLayer.gating}
               onChange={(e) => setNewLayer({ ...newLayer, gating: e.target.value })}>
               {GATING_OPTIONS.map(g => <option key={g} value={g}>{g}</option>)}
             </select>
@@ -772,7 +772,7 @@ function TestPlanEditor({ project, onUpdated }) {
           ) : (
             <>
               <div className="new-task-row" style={{ marginTop: '6px' }}>
-                <select className="new-task-select" style={{ flex: 'none', width: 100 }} value={newLayer.ciBackend}
+                <select className="new-task-select" style={{ flex: 'none', width: 100 }} aria-label="CI backend" value={newLayer.ciBackend}
                   onChange={(e) => setNewLayer({ ...newLayer, ciBackend: e.target.value })}>
                   {CI_BACKEND_OPTIONS.map(b => <option key={b} value={b}>{b}</option>)}
                 </select>
