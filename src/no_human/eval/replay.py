@@ -145,7 +145,16 @@ class ReplayRunner:
         status = outcome.status
         tamper_free = self._tamper_free(outcome, attempts)
         turns = sum(int(a.get("turns_used") or 0) for a in attempts)
-        tokens = sum(int(a.get("tokens_used") or 0) for a in attempts)
+        # Full burn — all four session groups x three buckets, matching
+        # `_attempt_tokens` (#210) and cost.js taskBurn. `tokens_used` alone
+        # under-reported the golden eval's cost: cache reads dominate, and the
+        # coder group alone omits the plan/utility/review sessions the same way
+        # the tier-up defect did. `list_attempts` is SELECT *, so the aux
+        # columns are in hand (0 when a session did not run).
+        _groups = ("", "review_", "plan_", "utility_")
+        _kinds = ("tokens_used", "cache_read_tokens", "cache_creation_tokens")
+        tokens = sum(int(a.get(f"{g}{k}") or 0)
+                     for a in attempts for g in _groups for k in _kinds)
 
         score = TaskScore(
             task_id=golden.id, title=golden.title,

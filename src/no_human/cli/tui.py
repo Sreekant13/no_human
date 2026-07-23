@@ -17,6 +17,17 @@ from ..core.db import Store
 from ..core.orchestrator import is_agent_session
 
 
+def _event_burn(event: dict) -> int:
+    """Every token a result event reports — non-cache + cache-read +
+    cache-creation. The status line showed `tokens_used` alone (non-cache),
+    which under-reports real cost the same way `nh logs` and `nh agents` did
+    before #210; cache reads are the bulk of the burn. Pure so it is testable
+    without mounting the Textual app."""
+    return (int(event.get("tokens_used") or 0)
+            + int(event.get("cache_read_tokens") or 0)
+            + int(event.get("cache_creation_tokens") or 0))
+
+
 class WatchApp(App):
     CSS = """
     Screen { background: $surface; }
@@ -49,7 +60,7 @@ class WatchApp(App):
         elapsed = int(time.monotonic() - self._start)
         self.query_one("#status", Static).update(
             f"[b]{self.task_id[:8]}[/]  step=[blue]{self._step}[/]  "
-            f"turns={self._turns}  tokens={self._tokens}  elapsed={elapsed}s"
+            f"turns={self._turns}  burn={self._tokens:,}  elapsed={elapsed}s"
         )
 
     def _sink(self, event: dict) -> None:
@@ -68,7 +79,7 @@ class WatchApp(App):
                 log.write(f"    [dim]{text.strip()[:160]}[/]")
             elif kind == "result":
                 self._turns = event.get("num_turns", self._turns)
-                self._tokens = event.get("tokens_used", self._tokens)
+                self._tokens = _event_burn(event) or self._tokens
         else:
             if "status" in event:
                 self._step = event["status"]
