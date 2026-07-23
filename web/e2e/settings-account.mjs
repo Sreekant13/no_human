@@ -158,6 +158,49 @@ function baseStatus(over = {}) {
   await ctx.close();
 }
 
+// ── Scenario 4: an over-long / credential-shaped profile name is CLIPPED ──────
+// Defence-in-depth: the server refuses to store such a name, but a pre-guard or
+// hand-edited value must never be rendered in full. Asserts the *rendered* DOM,
+// so it fails if capName is removed from any display site (not just if the
+// helper is wrong).
+{
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  const LONGNAME = "z".repeat(130);
+  const LONGVAR = "CLAUDE_CODE_OAUTH_TOKEN_" + "Z".repeat(120);
+  await page.route("**/api/**", (route) => {
+    const u = route.request().url();
+    const j = (b, s = 200) => route.fulfill({ status: s, contentType: "application/json", body: JSON.stringify(b) });
+    if (u.includes("/api/auth/status")) return j(baseStatus({
+      restart_required: false, metered_key_present: false,
+      configured_profile: LONGNAME, active_profile: LONGNAME, token_var: LONGVAR,
+      profiles: [{ name: LONGNAME, token_present: true }],
+    }));
+    if (u.includes("/api/onboarding")) return j({ completed: true });
+    if (u.includes("/api/tasks")) return j([]);
+    if (u.includes("/api/projects")) return j([]);
+    return j({});
+  });
+  await openAccount(page);
+
+  const cfgDd = await page.locator('.auth-status dd').nth(0).innerText().catch(() => "");
+  check("[s4] the configured-profile name is clipped to the cap (+ellipsis)",
+    cfgDd.length === 33 && cfgDd.endsWith("…") && !cfgDd.includes("z".repeat(40)),
+    `len=${cfgDd.length}`);
+  const varDd = await page.locator('.auth-status dd code').innerText().catch(() => "");
+  check("[s4] the token variable is clipped to its cap (+ellipsis)",
+    varDd.length === 57 && varDd.endsWith("…") && !varDd.includes("Z".repeat(40)),
+    `len=${varDd.length}`);
+  const optText = await page.locator('.auth-form select option').first().textContent().catch(() => "");
+  check("[s4] the profile <option> label is clipped, so the raw value is not disclosed",
+    optText.length === 33 && optText.endsWith("…") && !optText.includes("z".repeat(40)),
+    `len=${optText.length}`);
+  check("[s4] no page errors", errors.length === 0, errors[0] || "");
+  await ctx.close();
+}
+
 await browser.close();
 srv.close();
 console.log(failures.length ? `\n${failures.length} FAILURE(S)` : "\nALL CHECKS PASSED");

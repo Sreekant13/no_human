@@ -6,6 +6,7 @@ import {
   fetchProfiles, detectRepos, onboardRepo, suggestPaths,
   fetchAuthStatus, setAuthToken,
 } from "./api.js";
+import { capName, PROFILE_CAP, TOKENVAR_CAP } from "./capName.js";
 import { groupLearningsByProject } from "./learningGroups.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 import { pluralize } from "./pluralize.js";
@@ -84,16 +85,16 @@ function AuthPanel() {
       {status.restart_required && (
         <div className="nh-alarm auth-alarm" role="alert">
           Restart required — the running server is still billing
-          {" "}&ldquo;{status.active_profile}&rdquo;, but
-          {" "}&ldquo;{status.configured_profile}&rdquo; is now configured.
+          {" "}&ldquo;{capName(status.active_profile, PROFILE_CAP)}&rdquo;, but
+          {" "}&ldquo;{capName(status.configured_profile, PROFILE_CAP)}&rdquo; is now configured.
           Restart no_human to switch.
         </div>
       )}
 
       <dl className="auth-status">
-        <div><dt>Configured profile</dt><dd>{status.configured_profile}</dd></div>
-        <div><dt>Active (billing) profile</dt><dd>{status.active_profile}</dd></div>
-        <div><dt>Token variable</dt><dd><code>{status.token_var}</code></dd></div>
+        <div><dt>Configured profile</dt><dd>{capName(status.configured_profile, PROFILE_CAP)}</dd></div>
+        <div><dt>Active (billing) profile</dt><dd>{capName(status.active_profile, PROFILE_CAP)}</dd></div>
+        <div><dt>Token variable</dt><dd><code>{capName(status.token_var, TOKENVAR_CAP)}</code></dd></div>
         <div><dt>Token set</dt><dd>{status.token_present ? "yes" : "no"}</dd></div>
       </dl>
 
@@ -101,7 +102,7 @@ function AuthPanel() {
         <label className="auth-label">Profile
           <select className="new-task-select" value={profile} aria-label="Profile"
                   onChange={(e) => setProfile(e.target.value)}>
-            {profiles.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
+            {profiles.map((p) => <option key={p.name} value={p.name}>{capName(p.name, PROFILE_CAP)}</option>)}
           </select>
         </label>
         <label className="auth-label">OAuth token
