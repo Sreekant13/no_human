@@ -6,6 +6,8 @@ doom-looping on an impossible task or stacking corrections on a stale context.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import hashlib
 import re
 from dataclasses import dataclass, field, fields
@@ -236,7 +238,28 @@ class QuotaExhausted(Exception):
     optional ISO timestamp for when quota is expected back.
     """
 
+    # How long to wait before a parked task tries again, when the caller does
+    # not know the real reset time.
+    RETRY_AFTER_S = 3600
+
     def __init__(self, message: str = "subscription quota exhausted",
                  resets_at: str | None = None):
         super().__init__(message)
-        self.resets_at = resets_at
+        # DEFAULTED HERE, not at the call site, so no raise site can produce a
+        # park that never wakes. With `resets_at=None`, TWO mechanisms silently
+        # did nothing: the wake watcher resumes a PAUSED_QUOTA task only when
+        # `wake_check_at` is set AND due, and the scheduler arms its pool-wide
+        # cooldown only when that value parses. So nothing auto-resumed AND the
+        # pool fed the next queued task into the same wall, parking it too —
+        # one at a time. That is the observed incident: 4 tasks, 12 attempts,
+        # one billing wall.
+        #
+        # A fixed hour rather than the reset time parsed out of the message.
+        # The CLI phrases it "resets 2pm (Asia/Jerusalem)" or "resets Jul 24 at
+        # 6pm (...)", and getting that wrong is bad in both directions — too
+        # far ahead stalls the whole pool for days, too near thrashes. An hour
+        # is self-correcting: if the wall is still up the task re-parks, which
+        # is cheap because the CLI rejects it before any model call.
+        self.resets_at = resets_at or (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=self.RETRY_AFTER_S)).isoformat()

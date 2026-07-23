@@ -5,7 +5,6 @@ reported success or zero rather than the truth, and nothing noticed.
 """
 
 import asyncio
-import pathlib
 
 import pytest
 
@@ -25,21 +24,46 @@ async def store(tmp_path):
 # ---- 1. the attempts that burn most reported zero burn ---------------------- #
 
 
-def test_error_result_event_carries_the_cache_counters():
+@pytest.mark.real_backend   # exercise the REAL backend over a mocked SDK
+async def test_error_result_event_carries_the_cache_counters(tmp_path, monkeypatch):
     """`run()` keeps the LAST result event. On max_turns the SDK emits a real
     ResultMessage and THEN raises, so `stream()` yields a corrective error event
     — which used to omit the cache counters. Attempt 11 of task 84251cb2 burned
     3,424,504 cache-read tokens and recorded 0.
 
-    Reverting the `last_cache_read` plumbing leaves these at 0.
+    Asserts the EVENT, not the source. The previous version sliced this file's
+    text between `except Exception as exc:` and the first occurrence of the
+    substring "return" — so adding a comment containing the word "returned"
+    silently truncated the window and failed the test while the plumbing was
+    perfectly correct. A guard that a comment can break is not guarding the
+    behaviour it names.
     """
-    from no_human.agent import claude_backend
+    from claude_agent_sdk import ResultMessage
 
-    src = pathlib.Path(claude_backend.__file__).read_text()
-    error_block = src.split('except Exception as exc:  # noqa: BLE001 — SDK raises')[1]
-    error_block = error_block.split("return")[0]
-    assert '"cache_read_tokens": last_cache_read' in error_block
-    assert '"cache_creation_tokens": last_cache_creation' in error_block
+    from no_human.agent import claude_backend
+    from no_human.agent.claude_backend import ClaudeBackend
+
+    rm = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+        num_turns=11, session_id="s", result="agent done",
+        usage={"input_tokens": 10, "output_tokens": 5,
+               "cache_read_input_tokens": 3_424_504,
+               "cache_creation_input_tokens": 1_111},
+    )
+
+    async def _q(*args, **kwargs):
+        yield rm
+        raise Exception("Claude Code returned an error result: "
+                        "Reached maximum number of turns (11)")
+
+    monkeypatch.setattr(claude_backend, "query", _q)
+    backend = ClaudeBackend(model="claude-opus-4-8")
+
+    events = [e async for e in backend.stream("go", cwd=tmp_path, max_turns=11)]
+    err = [e for e in events if e.kind == "result" and e.meta.get("is_error")][-1]
+
+    assert err.meta["cache_read_tokens"] == 3_424_504
+    assert err.meta["cache_creation_tokens"] == 1_111
 
 
 async def test_agent_result_reports_cache_tokens_from_an_errored_run():

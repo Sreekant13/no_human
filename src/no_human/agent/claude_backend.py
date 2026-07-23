@@ -64,6 +64,13 @@ class AgentResult:
     denials: list[str] = field(default_factory=list)
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    # HTTP status of the failing API call (429/529/500...). The SDK sets it on
+    # the result event precisely when is_error is true and the subtype is
+    # "success" — i.e. THIS incident's shape. It was captured on the event but
+    # never reached here, so `_classify_error`'s 429/529 branch could not fire:
+    # `getattr(result, "api_error_status", None)` was permanently None. The
+    # structured twin of the free-text reason this change surfaces.
+    api_error_status: int | None = None
 
 
 def _make_guard_hook(
@@ -240,6 +247,14 @@ class ClaudeBackend:
         # treats the attempt as failed rather than crashing or committing
         # half-finished work.
         last_turns = last_tokens = 0
+        # The CLI's OWN explanation, carried on the last result event. The
+        # SDK then replaces the trailing ProcessError with
+        # "Claude Code returned an error result: <subtype>" — which for a
+        # quota rejection is the word "success", the least informative
+        # string available — and run() keeps the LAST event, so without
+        # this the real reason is overwritten and lost.
+        last_result_text = ""
+        last_api_error_status: int | None = None
         # Carried onto the corrective error event below. run() keeps the LAST
         # result event, so anything missing there is lost: an attempt that hit
         # max_turns used to record 0 cache-read tokens — the attempts that burn
@@ -327,6 +342,22 @@ class ClaudeBackend:
                     cache_creation = int(usage.get("cache_creation_input_tokens", 0))
                     denials = [str(d) for d in (message.permission_denials or [])]
                     last_turns, last_tokens = message.num_turns, tokens
+                    # ONLY from an ERRORED result. Capturing a SUCCESSFUL
+                    # run's prose here and prepending it below meant a normal
+                    # finish followed by a transport error ("Stream closed")
+                    # inherited the agent's own summary — and a summary that
+                    # happens to mention "rate limit" or "quota" (routine in
+                    # THIS codebase, which is full of quota-handling code) then
+                    # tripped `_quota_signal`, parking a healthy task as
+                    # PAUSED_QUOTA and aborting its bounded loop. It also fed
+                    # variable prose into `stuck.record`, so identical failures
+                    # stopped hashing to the same signature and stuck detection
+                    # broke. The SDK only synthesises the
+                    # "error result: <subtype>" wrapper when the result was
+                    # itself an error, so this gate costs the incident nothing.
+                    if message.is_error:
+                        last_result_text = (message.result or "").strip()
+                        last_api_error_status = message.api_error_status
                     last_cache_read, last_cache_creation = cache_read, cache_creation
                     last_session = message.session_id
                     yield AgentEvent(
@@ -353,6 +384,15 @@ class ClaudeBackend:
             # (task 6cfdb936). max_turns is not an error, so it keeps the clean msg.
             tb = "" if is_max_turns else traceback.format_exc()
             text = msg if is_max_turns else f"{msg}\n\n{tb[-3000:]}".strip()
+            # Lead with what the CLI actually said. A spend-limit rejection
+            # reported only as "returned an error result: success" cost a full
+            # day of debugging: every attempt showed turns=1, tokens=0 and an
+            # error message that named no cause, while the CLI had already
+            # said "You've hit your monthly spend limit".
+            # Capped like the traceback beside it: an unbounded result is
+            # persisted on the event AND fed to `error_signature`.
+            if last_result_text and not is_max_turns:
+                text = f"{last_result_text[:4000]}\n\n{text}"
             yield AgentEvent(
                 "result",
                 text=text,
@@ -363,7 +403,7 @@ class ClaudeBackend:
                     "session_id": last_session,
                     "stop_reason": "max_turns" if is_max_turns else "error",
                     "denials": [],
-                    "api_error_status": None,
+                    "api_error_status": last_api_error_status,
                     "cache_read_tokens": last_cache_read,
                     "cache_creation_tokens": last_cache_creation,
                     "traceback": tb[-4000:] or None,
@@ -412,5 +452,6 @@ class ClaudeBackend:
                     denials=m.get("denials", []),
                     cache_read_tokens=int(m.get("cache_read_tokens", 0)),
                     cache_creation_tokens=int(m.get("cache_creation_tokens", 0)),
+                    api_error_status=m.get("api_error_status"),
                 )
         return final

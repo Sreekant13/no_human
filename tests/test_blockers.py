@@ -637,3 +637,59 @@ def test_parse_pr_url():
     gl = parse_pr_url("https://gitlab.com/grp/sub/repo/-/merge_requests/42")
     assert gl[0] == "gitlab" and gl[3] == 42 and "%2F" in gl[2]
     assert parse_pr_url("https://example.com/not-a-pr") is None
+
+
+@pytest.mark.asyncio
+async def test_the_REAL_quota_park_produces_a_task_the_watcher_can_resume(store):
+    """Parks through `Orchestrator._park_quota` itself, not a hand-built
+    fixture.
+
+    Every other quota-wake test supplies `blocker={"wake_condition":
+    "quota_refreshed", ...}` in its OWN fixture — a shape the real park path
+    never wrote. `_park_quota` set `wake_check_at` and no blocker, and
+    `wake.py` reads the condition off the blocker and short-circuits on a null
+    one (`if not condition: return False`) BEFORE it ever looks at
+    `wake_check_at`. So the task never auto-resumed, and PAUSED_QUOTA is not
+    claimable either — it sat until the 48h park timeout escalated it. The
+    fixtures asserted the contract; nothing asserted the wiring.
+    """
+    from no_human.blockers.wake import WakeWatcher
+    from no_human.core.bounds import QuotaExhausted
+    from no_human.core.orchestrator import Orchestrator
+
+    class _Notifier:
+        def notify(self, *a, **k): pass
+
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.store = store
+    orch.notifier = _Notifier()
+    orch.emit = lambda *a, **k: None
+
+    task = Task.new("t", repo_path="/tmp/x")
+    await store.create_task(task)
+    # pending -> context is the only legal first hop; context can park.
+    await store.set_status(task, TaskStatus.CONTEXT)
+
+    outcome = await orch._park_quota(task, QuotaExhausted("You've hit your weekly limit"))
+    assert outcome.status == TaskStatus.PAUSED_QUOTA
+
+    parked = await store.get_task(task.id)
+    assert parked.blocker, "no blocker => the watcher short-circuits, never resumes"
+    assert parked.wake_check_at, "no wake time => nothing to be due"
+    # The CLI's own reason reaches the parked task, so the board names the
+    # wall instead of saying "quota exhausted".
+    assert "weekly limit" in parked.blocker["root_cause_hypothesis"]
+
+    # Tick the watcher PAST the due time. This is the assertion the fixture
+    # tests could never make.
+    due = datetime.fromisoformat(parked.wake_check_at) + timedelta(minutes=1)
+    actions = await WakeWatcher(store, _cfg()).tick(now=due)
+    assert (task.id, "resumed") in actions, actions
+
+    # And it must NOT resume before it is due, or the pool thrashes.
+    task2 = Task.new("t2", repo_path="/tmp/x")
+    await store.create_task(task2)
+    await store.set_status(task2, TaskStatus.CONTEXT)
+    await orch._park_quota(task2, QuotaExhausted("weekly"))
+    early = datetime.now(timezone.utc)
+    assert (task2.id, "resumed") not in await WakeWatcher(store, _cfg()).tick(now=early)
