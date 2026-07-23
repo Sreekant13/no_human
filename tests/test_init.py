@@ -220,3 +220,66 @@ def test_init_shows_prerequisites(tmp_path, monkeypatch):
     result = runner.invoke(cli, ["init"], input="n\n", catch_exceptions=False)
     # Should show git as found.
     assert "git" in result.output.lower()
+
+
+def test_nh_init_uses_the_HARDENED_writer_not_a_third_implementation(tmp_path):
+    """`nh init` writes the OAuth token. It must go through the one guarded
+    writer, not its own copy.
+
+    This exact hardening shipped DEAD: the fixed `_append_env` was added while
+    the old one was left in place further down the module, and Python binds the
+    last definition — so `nh init` kept writing the token with
+    `write_text` + `chmod`, leaving it world-readable for the window between
+    the two calls, and kept parsing with `splitlines()` while the reader used
+    `split("\\n")`.
+
+    Refusing an embedded separator is the behaviour ONLY the guarded writer
+    has, so it distinguishes the two implementations rather than trusting that
+    the right one is bound.
+    """
+    from no_human.config import AuthError
+
+    env = tmp_path / ".env"
+    nh_home = tmp_path / ".no_human"
+    nh_home.mkdir(mode=0o700)
+    with (
+        patch("no_human.cli.init_cmd.ENV_PATH", env),
+        patch("no_human.cli.init_cmd.NO_HUMAN_HOME", nh_home),
+    ):
+        _append_env("CLAUDE_CODE_OAUTH_TOKEN", "good-token")
+        assert (env.stat().st_mode & 0o777) == 0o600
+
+        # U+2028 is a line break to `splitlines()` but not to `split("\n")`:
+        # the old writer stored it happily and the reader then saw a forged
+        # second line. The guarded writer refuses it.
+        for sep in ("\u2028", "\n", "\x85", "\x00"):
+            with pytest.raises(AuthError):
+                _append_env("CLAUDE_CODE_OAUTH_TOKEN",
+                            f"tok{sep}ANTHROPIC_API_KEY=sk-planted")
+
+    # The refused writes changed nothing.
+    assert env.read_text() == "CLAUDE_CODE_OAUTH_TOKEN=good-token\n"
+
+
+def test_no_module_defines_the_same_top_level_name_twice():
+    """The general form of the bug above, which no test could see.
+
+    A duplicated definition is silent: the file imports, the suite passes, and
+    the LAST definition wins — so a security fix can be present in the source,
+    reviewed, and still dead. Cheap to check across the whole package.
+    """
+    import ast
+    import pathlib
+    from collections import Counter
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "src" / "no_human"
+    offenders = []
+    for py in src.rglob("*.py"):
+        tree = ast.parse(py.read_text())
+        names = Counter(
+            n.name for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        )
+        offenders += [f"{py.relative_to(src)}:{n} defined {c}x"
+                      for n, c in names.items() if c > 1]
+    assert not offenders, offenders

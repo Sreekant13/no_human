@@ -1,0 +1,509 @@
+"""Auth status + token endpoints.
+
+These let Settings show which subscription pays and update its OAuth token.
+Constraint #1 is OAuth-only, so a metered API key must be refused here rather
+than quietly accepted and billed per request. Constraint §8 is that a secret is
+never echoed, so no response may ever carry the token value.
+"""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+
+from no_human.api.app import app
+from no_human.config import AuthError, profile_token_var, set_profile_token
+from no_human.core.db import Store
+
+TOKEN = "sk-ant-oat01-EXAMPLE-not-a-real-token"
+
+
+@pytest_asyncio.fixture
+async def client(tmp_path, monkeypatch):
+    from no_human.config import load_config
+    store = await Store(tmp_path / "test.db").connect()
+    app.state.store = store
+    app.state.config = load_config(tmp_path / "config.yaml")
+    monkeypatch.setattr("no_human.config.ENV_PATH", tmp_path / ".env")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    # HARD GUARD. These tests write real-looking credentials. An earlier draft
+    # of set_profile_token bound `env_path = ENV_PATH` as a DEFAULT ARGUMENT,
+    # captured at import, so this redirect was silently ignored and the test
+    # overwrote a live token in the operator's ~/.no_human/.env. Never let a
+    # broken redirect fall through to the real file again.
+    import no_human.config as _cfg
+    assert _cfg.ENV_PATH == tmp_path / ".env"
+    assert str(_cfg.ENV_PATH).startswith(str(tmp_path))
+    transport = ASGITransport(app=app)
+    # A real browser always sends Origin on these calls; the write route now
+    # requires it, so the fixture mirrors the legitimate UI.
+    async with AsyncClient(transport=transport, base_url="http://test",
+                           headers={"Origin": "http://127.0.0.1:8420"}) as c:
+        yield c
+    await store.close()
+
+
+# ------------------------------ GET status -------------------------------- #
+
+@pytest.mark.asyncio
+async def test_status_reports_names_and_booleans_only(client):
+    r = await client.get("/api/auth/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["token_var"].startswith("CLAUDE_CODE_OAUTH_TOKEN")
+    assert isinstance(body["token_present"], bool)
+    assert isinstance(body["metered_key_present"], bool)
+
+
+@pytest.mark.asyncio
+async def test_status_never_carries_a_token_value(client, tmp_path):
+    """The whole point of the endpoint being safe to render in Settings."""
+    set_profile_token("default", TOKEN, env_path=tmp_path / ".env")
+    r = await client.get("/api/auth/status")
+    assert TOKEN not in r.text
+    assert "oat01" not in r.text
+
+
+@pytest.mark.asyncio
+async def test_status_flags_a_stray_metered_key(client, monkeypatch):
+    """A stray ANTHROPIC_API_KEY silently bills the metered API — a human must
+    be able to see that in the UI, not only by reading their shell profile."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-whatever")
+    r = await client.get("/api/auth/status")
+    assert r.json()["metered_key_present"] is True
+
+
+@pytest.mark.asyncio
+async def test_status_does_not_scrub_the_environment(client, monkeypatch):
+    """A GET must not mutate process state. The scrub belongs to run startup."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-whatever")
+    await client.get("/api/auth/status")
+    assert os.environ.get("ANTHROPIC_API_KEY") == "sk-ant-api03-whatever"
+
+
+# ------------------------------ PUT token ---------------------------------- #
+
+@pytest.mark.asyncio
+async def test_put_token_writes_it_and_reports_presence(client, tmp_path):
+    r = await client.put("/api/auth/token",
+                         json={"profile": "personal", "token": TOKEN})
+    assert r.status_code == 200, r.text
+    env = (tmp_path / ".env").read_text()
+    assert f"CLAUDE_CODE_OAUTH_TOKEN_PERSONAL={TOKEN}" in env
+    assert "personal" in [p["name"] for p in r.json()["profiles"]]
+    # The response must not echo what was just stored.
+    assert TOKEN not in r.text
+
+
+@pytest.mark.asyncio
+async def test_put_token_file_is_owner_only(client, tmp_path):
+    await client.put("/api/auth/token",
+                     json={"profile": "personal", "token": TOKEN})
+    assert oct((tmp_path / ".env").stat().st_mode)[-3:] == "600"
+
+
+@pytest.mark.asyncio
+async def test_put_refuses_a_metered_api_key(client, tmp_path):
+    """Constraint #1: OAuth only. Accepting this would bill per request."""
+    r = await client.put("/api/auth/token",
+                         json={"profile": "personal",
+                               "token": "sk-ant-api03-real-looking-key"})
+    assert r.status_code == 422
+    assert "metered" in r.json()["detail"].lower()
+    assert not (tmp_path / ".env").exists()
+
+
+@pytest.mark.asyncio
+async def test_put_refuses_a_newline_injected_token(client, tmp_path):
+    """A newline would append a forged line to .env — an ANTHROPIC_API_KEY
+    among them, which is the metered-billing escape hatch constraint #1 shuts."""
+    r = await client.put("/api/auth/token", json={
+        "profile": "personal",
+        "token": f"{TOKEN}\nANTHROPIC_API_KEY=sk-ant-api03-forged"})
+    assert r.status_code == 422
+    assert not (tmp_path / ".env").exists()
+
+
+@pytest.mark.asyncio
+async def test_put_refuses_an_injected_profile_name(client, tmp_path):
+    """The profile becomes an .env KEY; a newline there injects a line just as
+    a newline in the value would."""
+    r = await client.put("/api/auth/token", json={
+        "profile": "x\nANTHROPIC_API_KEY=sk-ant-api03-forged",
+        "token": TOKEN})
+    assert r.status_code == 422
+    assert not (tmp_path / ".env").exists()
+
+
+@pytest.mark.asyncio
+async def test_put_refuses_an_empty_token(client):
+    r = await client.put("/api/auth/token",
+                         json={"profile": "personal", "token": "   "})
+    assert r.status_code == 422
+
+
+# --------------------------- unit-level guards ------------------------------ #
+
+def test_profile_token_var_rejects_a_name_that_would_inject():
+    with pytest.raises(AuthError, match="invalid auth profile"):
+        profile_token_var("bad\nANTHROPIC_API_KEY=x")
+
+
+def test_profile_token_var_still_maps_the_normal_cases():
+    assert profile_token_var("default") == "CLAUDE_CODE_OAUTH_TOKEN"
+    assert profile_token_var("Personal") == "CLAUDE_CODE_OAUTH_TOKEN_PERSONAL"
+
+
+def test_set_profile_token_preserves_other_env_lines(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("# a comment\nOTHER=keepme\n")
+    set_profile_token("personal", TOKEN, env_path=env)
+    body = env.read_text()
+    assert "# a comment" in body and "OTHER=keepme" in body
+    assert f"CLAUDE_CODE_OAUTH_TOKEN_PERSONAL={TOKEN}" in body
+
+
+def test_set_profile_token_replaces_rather_than_appends(tmp_path):
+    env = tmp_path / ".env"
+    set_profile_token("personal", "old-token", env_path=env)
+    set_profile_token("personal", TOKEN, env_path=env)
+    body = env.read_text()
+    assert body.count("CLAUDE_CODE_OAUTH_TOKEN_PERSONAL=") == 1
+    assert "old-token" not in body
+
+
+# ---------------------- line-injection, the real alphabet ------------------- #
+
+@pytest.mark.parametrize("sep", [
+    "\n", "\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029",
+])
+@pytest.mark.asyncio
+async def test_put_refuses_every_separator_splitlines_honours(client, tmp_path, sep):
+    """Security review: the guard checked \\n and \\r, but the READER used
+    str.splitlines(), which also breaks on eight more characters. One PUT with
+    U+2028 replaced the operator's real token and planted a physical
+    ANTHROPIC_API_KEY= line — the metered-billing escape constraint #1 exists
+    to prevent. Writer and reader must agree on what a line is."""
+    r = await client.put("/api/auth/token", json={
+        "profile": "personal",
+        "token": f"{TOKEN}{sep}ANTHROPIC_API_KEY=sk-ant-api03-forged"})
+    assert r.status_code == 422, sep
+    assert not (tmp_path / ".env").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_forged_separator_cannot_survive_a_round_trip(client, tmp_path):
+    """Belt and braces: even if something got written, the reader must not
+    invent variables no writer wrote."""
+    from no_human.config import _read_env_file
+    env = tmp_path / ".env"
+    env.write_text(
+        f"CLAUDE_CODE_OAUTH_TOKEN=good\u2028ANTHROPIC_API_KEY=forged\n")
+    assert "ANTHROPIC_API_KEY" not in _read_env_file(env)
+
+
+@pytest.mark.asyncio
+async def test_put_refuses_a_null_byte(client, tmp_path):
+    """A NUL round-trips through .env and then makes os.environ[...] raise
+    'embedded null byte' on EVERY subsequent start — an unauthenticated,
+    persistent brick with an error naming nothing actionable."""
+    r = await client.put("/api/auth/token",
+                         json={"profile": "personal", "token": "x\x00y"})
+    assert r.status_code == 422
+    assert not (tmp_path / ".env").exists()
+
+
+# --------------------- a token pasted into the profile box ------------------ #
+
+@pytest.mark.asyncio
+async def test_a_token_in_the_profile_field_is_refused_not_echoed(client, tmp_path):
+    """The profile regex accepted `sk-ant-oat01-…` (lowercase, digits, hyphens),
+    stored it as a NAME, and GET /api/auth/status echoed it back — in the
+    endpoint that advertises 'names and booleans only'."""
+    r = await client.put("/api/auth/token",
+                         json={"profile": TOKEN.lower(), "token": "whatever"})
+    assert r.status_code == 422
+    assert TOKEN.lower() not in r.text          # never echoed in the error
+    assert not (tmp_path / ".env").exists()
+    status = await client.get("/api/auth/status")
+    assert "oat01" not in status.text
+
+
+@pytest.mark.asyncio
+async def test_an_over_long_profile_is_refused(client):
+    r = await client.put("/api/auth/token",
+                         json={"profile": "a" * 33, "token": TOKEN})
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_an_implausibly_long_token_is_refused(client, tmp_path):
+    r = await client.put("/api/auth/token",
+                         json={"profile": "personal", "token": "x" * 5000})
+    assert r.status_code == 422
+    assert not (tmp_path / ".env").exists()
+
+
+# ------------------------------ drive-by CSRF ------------------------------- #
+
+@pytest.mark.asyncio
+async def test_a_cross_origin_write_is_refused(client, tmp_path):
+    """The server is unauthenticated and sets allow_origins=["*"], so any page
+    the operator visits could otherwise PUT the credential store."""
+    r = await client.put("/api/auth/token",
+                         json={"profile": "personal", "token": TOKEN},
+                         headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403
+    assert not (tmp_path / ".env").exists()
+
+
+@pytest.mark.parametrize("origin", [
+    "http://localhost.evil.com",          # startswith("http://localhost") is True
+    "http://localhost.attacker.io:8080",
+    "http://127.0.0.1.evil.com",
+    "http://localhosting.example.com",
+    "null",                               # sandboxed iframe / file://
+])
+@pytest.mark.asyncio
+async def test_a_lookalike_origin_is_refused(client, tmp_path, origin):
+    """The first version compared with `startswith`, which TRUSTS
+    `http://localhost.evil.com` — a domain an attacker simply registers. A
+    working drive-by was demonstrated against it: preflight 200, PUT 200, token
+    overwritten. The host must be parsed and matched exactly."""
+    r = await client.put("/api/auth/token",
+                         json={"profile": "personal", "token": TOKEN},
+                         headers={"Origin": origin})
+    assert r.status_code == 403, origin
+    assert not (tmp_path / ".env").exists(), origin
+
+
+@pytest.mark.asyncio
+async def test_a_write_with_no_origin_is_refused(tmp_path, monkeypatch):
+    """A browser always sends Origin cross-site, so refusing its ABSENCE costs
+    the real UI nothing and closes the one case a local malicious process or a
+    rebinding proxy would otherwise walk through unchecked."""
+    from no_human.config import load_config
+    store = await Store(tmp_path / "test.db").connect()
+    app.state.store = store
+    app.state.config = load_config(tmp_path / "config.yaml")
+    monkeypatch.setattr("no_human.config.ENV_PATH", tmp_path / ".env")
+    import no_human.config as _cfg
+    assert str(_cfg.ENV_PATH).startswith(str(tmp_path))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        r = await c.put("/api/auth/token",
+                        json={"profile": "personal", "token": TOKEN})
+    await store.close()
+    assert r.status_code == 403
+    assert not (tmp_path / ".env").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_same_origin_write_still_works(client, tmp_path):
+    r = await client.put("/api/auth/token",
+                         json={"profile": "personal", "token": TOKEN},
+                         headers={"Origin": "http://127.0.0.1:8420"})
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_status_sees_a_metered_key_sitting_in_the_env_file(client, tmp_path):
+    """A key in .env is invisible to os.environ until the next start — and
+    'see it without reading your shell profile' is the point of this field."""
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-api03-x\n")
+    r = await client.get("/api/auth/status")
+    assert r.json()["metered_key_present"] is True
+
+
+# ------------- guards that previously survived mutation untested ------------ #
+
+@pytest.mark.asyncio
+async def test_a_SHORT_credential_shaped_profile_is_refused_by_shape(client):
+    """The shape check was untested: the only profile it was tried with was 37
+    chars, so the LENGTH cap caught it and deleting the shape check left the
+    suite green. A short credential-shaped name is the input that separates
+    them."""
+    r = await client.put("/api/auth/token",
+                         json={"profile": "sk-ant-oat01-ab", "token": TOKEN})
+    assert r.status_code == 422
+    assert "looks like a token" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_no_422_ever_echoes_the_submitted_secret(client):
+    """Constraint §8 must hold on the FAILURE paths too. Two routes echoed:
+    the regex branch (where a non-sk-ant enterprise token lands) printed the
+    value, and pydantic returned the whole body when 'profile' was missing."""
+    secret = "EnterpriseTok!9xQz-REAL-LOOKING"
+    r = await client.put("/api/auth/token",
+                         json={"profile": secret, "token": "v"})
+    assert r.status_code == 422
+    assert secret not in r.text and secret.lower() not in r.text
+
+    r2 = await client.put("/api/auth/token", json={"token": TOKEN})
+    assert r2.status_code == 422
+    assert TOKEN not in r2.text
+
+
+def test_upsert_env_var_guards_at_the_choke_point(tmp_path):
+    """The claim was that validation lives in upsert_env_var so EVERY writer is
+    covered — but every test reached it via set_profile_token, which validates
+    separately, so deleting the choke-point guard left the suite green."""
+    from no_human.config import AuthError, upsert_env_var
+    env = tmp_path / ".env"
+    with pytest.raises(AuthError):
+        upsert_env_var(env, "K", "a\u2028ANTHROPIC_API_KEY=forged")
+    assert not env.exists()
+    with pytest.raises(AuthError):
+        upsert_env_var(env, "K\u2028X", "v")
+    assert not env.exists()
+
+
+def test_set_auth_profile_will_not_store_a_credential(tmp_path):
+    """`nh auth use <token>` was blocked only by an UNHANDLED AuthError raised
+    inside an error-message f-string — an accident that produced a traceback,
+    not a refusal. And the stored value is echoed by GET /api/auth/status."""
+    from no_human.config import AuthError, set_auth_profile
+    cfg = tmp_path / "config.yaml"
+    with pytest.raises(AuthError):
+        set_auth_profile("sk-ant-oat01-secret", config_path=cfg)
+    with pytest.raises(AuthError):
+        set_auth_profile("z" * 400, config_path=cfg)
+
+
+def test_repeated_writes_do_not_accumulate_blank_lines(tmp_path):
+    """split("\\n") keeps the trailing empty field, so each append grew the
+    file by a blank line — a regression from the splitlines() version."""
+    from no_human.config import set_profile_token
+    env = tmp_path / ".env"
+    for i in range(3):
+        set_profile_token(f"p{i}", f"tok{i}", env_path=env)
+    assert "\n\n" not in env.read_text()
+
+
+# ---------------- the OTHER writer of the same credential store -------------- #
+
+@pytest.mark.asyncio
+async def test_the_integrations_route_writes_env_and_must_guard_its_origin(
+        client, tmp_path):
+    """`PUT /api/integrations/{name}/config` writes the SAME ~/.no_human/.env
+    the auth route guards. It had no origin check, and with
+    `allow_origins=["*"]` the preflight succeeds for any site — so a page the
+    operator merely visits while `nh serve` is up could plant a credential.
+    Demonstrated end to end before this guard existed: 200, value on disk.
+    """
+    env = tmp_path / ".env"
+    r = await client.put(
+        "/api/integrations/jira/config",
+        json={"fields": {"api_token": "ATTACKER-PLANTED"}},
+        headers={"Origin": "https://evil.example"})
+
+    assert r.status_code == 403, r.text
+    assert not env.exists() or "ATTACKER-PLANTED" not in env.read_text()
+
+
+@pytest.mark.asyncio
+async def test_a_refused_integration_value_leaves_NOTHING_half_written(
+        client, tmp_path):
+    """The values are written one key at a time, so a value refused by the
+    writer's guard used to land AFTER an earlier key had already been
+    committed — a partial write, surfaced as a 500. Every value is validated
+    before the loop now, and the guard is the writer's own, so the two cannot
+    disagree about what a line is.
+    """
+    env = tmp_path / ".env"
+    r = await client.put(
+        "/api/integrations/jenkins/config",
+        json={"fields": {"user": "alice",
+                         "api_token": "tok\u2028ANTHROPIC_API_KEY=sk-planted"}})
+
+    assert r.status_code == 422, r.text          # not a 500
+    body = env.read_text() if env.exists() else ""
+    assert "alice" not in body, body             # the EARLIER key did not land
+    assert "ANTHROPIC_API_KEY" not in body
+    # The refusal names the field but never the value (constraint §8).
+    assert "sk-planted" not in r.text
+
+
+@pytest.mark.asyncio
+async def test_the_status_READ_is_origin_guarded_too(client):
+    """Mutation survived without this: every origin test was a PUT, so the
+    guard on the GET could be deleted by any refactor with the suite green."""
+    r = await client.get("/api/auth/status",
+                         headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403, r.text
+
+
+@pytest.mark.asyncio
+async def test_a_non_http_scheme_is_refused(client):
+    """`file://localhost` has hostname "localhost" and passes the host test.
+    Only the scheme clause rejects it — and nothing covered that clause, so it
+    too survived deletion."""
+    for origin in ("file://localhost", "ftp://127.0.0.1"):
+        r = await client.put("/api/auth/token",
+                             json={"profile": "personal", "token": TOKEN},
+                             headers={"Origin": origin})
+        assert r.status_code == 403, f"{origin}: {r.text}"
+
+
+def test_the_home_dir_is_made_0700_even_when_it_ALREADY_EXISTS(tmp_path):
+    """.env is 0600, but config.yaml, no_human.db and cache/ live beside it in
+    ~/.no_human.
+
+    The first fix here was a NO-OP and the first test could not see it:
+    `mkdir(exist_ok=True, mode=0o700)` applies the mode only when it CREATES
+    the directory, and the DB, config.yaml and the repo-map cache all create
+    ~/.no_human at the process umask FIRST. So in the real ordering the
+    directory is already 0755 by the time a credential is written. Testing
+    against a fresh directory structurally could not catch that — this one
+    creates it world-readable first, exactly as the other call sites do.
+    """
+    from no_human.config import upsert_env_var
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o755)                       # what the OTHER writers leave
+    assert (home.stat().st_mode & 0o777) == 0o755
+
+    upsert_env_var(home / ".env", "K", "v")
+
+    assert (home.stat().st_mode & 0o777) == 0o700
+    assert ((home / ".env").stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.asyncio
+async def test_a_status_read_never_echoes_a_secret_pasted_into_the_profile_field(
+        client, tmp_path):
+    """`llm.auth_profile` is a NAME. A hand-edited or legacy config.yaml can
+    hold anything, and the endpoint returned it verbatim — in the very branch
+    that had already REJECTED it, one rejection reason being "that looks like a
+    token, not a profile name". It would render into the Settings UI and into
+    any screenshot made from it."""
+    leaked = "sk-ant-oat01-LEAKED-SECRET"
+    app.state.config.data.setdefault("llm", {})["auth_profile"] = leaked
+
+    r = await client.get("/api/auth/status")
+    assert r.status_code == 200, r.text
+    assert leaked not in r.text, r.text
+    assert "oat01" not in r.text, r.text
+    # The rejection is still REPORTED — redaction must not hide the problem.
+    assert "invalid" in r.text.lower()
+
+
+def test_a_TRAILING_separator_is_refused_rather_than_silently_truncated(
+        tmp_path):
+    """`splitlines()` DROPS a trailing break, so a length check alone accepted
+    "tok\\u2028": it survived the write and the reader returned a TRUNCATED
+    token — no injection, but a credential that then fails for no visible
+    reason, which is the hardest kind of auth bug to diagnose."""
+    from no_human.config import AuthError, _read_env_file, upsert_env_var
+
+    env = tmp_path / ".env"
+    for sep in ("\n", "\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e",
+                "\x85", "\u2028", "\u2029"):
+        with pytest.raises(AuthError):
+            upsert_env_var(env, "K", f"tok{sep}")
+    upsert_env_var(env, "K", "tok")
+    assert _read_env_file(env)["K"] == "tok"

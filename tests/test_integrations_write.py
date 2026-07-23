@@ -210,7 +210,11 @@ async def client(store, tmp_path):
     app.state.store = store
     app.state.config = nh_config.load_config(nh_config.CONFIG_PATH)
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    # This route writes ~/.no_human/.env, so it requires a local Origin like
+    # the auth route does. Its only caller is the browser (web/src/api.js),
+    # which always sends one — the fixture mirrors that legitimate client.
+    async with AsyncClient(transport=transport, base_url="http://test",
+                           headers={"Origin": "http://127.0.0.1:8420"}) as c:
         yield c
 
 

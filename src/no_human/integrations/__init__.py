@@ -198,49 +198,10 @@ def _set_dotted(data: dict, dotted: str, value: Any) -> None:
     node[parts[-1]] = value
 
 
-def _atomic_write_0600(path: Path, content: str) -> None:
-    """Atomically write *content* to *path*, mode 0600 from the first byte.
-
-    Writes to a sibling temp file that is created with ``O_CREAT`` at 0600
-    (so there is never a window where it exists at the process umask), then
-    ``os.replace``s it onto *path* — atomic on POSIX and immune to a
-    world/group-readable window even on first creation.
-    """
-    tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(content)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-    os.chmod(tmp, 0o600)  # belt-and-suspenders against an inherited umask on some platforms
-    os.replace(tmp, path)
-
-
-def _upsert_env_var(env_path: Path, key: str, value: str) -> None:
-    """Upsert ``KEY=value`` into the .env file: replace the line if the key is
-    already present, append if not, preserving every other line (including
-    comments and blanks) verbatim. The file is created/rewritten atomically at
-    mode 0600 from the first byte (see ``_atomic_write_0600``) — there is
-    never a window where it exists at the process umask. Never logs
-    ``value``."""
-    lines = env_path.read_text().splitlines() if env_path.exists() else []
-    out: list[str] = []
-    replaced = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#") and "=" in stripped:
-            existing_key = stripped.split("=", 1)[0].strip()
-            if existing_key == key:
-                out.append(f"{key}={value}")
-                replaced = True
-                continue
-        out.append(line)
-    if not replaced:
-        out.append(f"{key}={value}")
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_0600(env_path, "\n".join(out) + "\n")
+# Single implementation lives in config, which owns ENV_PATH and every other
+# .env read; aliased here so existing call sites are untouched.
+from ..config import atomic_write_0600 as _atomic_write_0600  # noqa: E402
+from ..config import upsert_env_var as _upsert_env_var  # noqa: E402
 
 
 def _write_config_values(config_path: Path, updates: dict[str, Any]) -> None:
@@ -294,13 +255,30 @@ def save_integration_config(name: str, fields: dict[str, str]) -> IntegrationSta
     if unknown:
         raise ValueError(f"unknown field(s) for integration {name!r}: {', '.join(unknown)}")
 
-    # A value containing \n or \r could inject arbitrary extra lines into
-    # .env (e.g. a forged CLAUDE_CODE_OAUTH_TOKEN=... line) — refuse before
-    # any write is dispatched. Never echo the offending value back.
-    bad = sorted(f for f, v in fields.items() if isinstance(v, str) and ("\n" in v or "\r" in v))
+    # A value that is not exactly ONE .env line could inject arbitrary extra
+    # entries (e.g. a forged CLAUDE_CODE_OAUTH_TOKEN= or ANTHROPIC_API_KEY=
+    # line) — refuse before any write is dispatched. Never echo the offending
+    # value back.
+    #
+    # This checked only \n and \r while the writer's own guard rejects every
+    # separator `splitlines()` honours. The eight it missed therefore reached
+    # the write loop below, which writes ONE KEY AT A TIME: the first key
+    # landed on disk before a later one was refused, leaving .env half-updated
+    # and the caller with a 500. Sharing the writer's guard is what makes the
+    # loop effectively all-or-nothing.
+    from ..config import AuthError, assert_single_env_line
+
+    bad = []
+    for f, v in sorted(fields.items()):
+        if not isinstance(v, str):
+            continue
+        try:
+            assert_single_env_line(v)
+        except AuthError:
+            bad.append(f)
     if bad:
         raise ValueError(
-            f"field value(s) for integration {name!r} must not contain newlines: "
+            f"field value(s) for integration {name!r} must be a single line: "
             f"{', '.join(bad)}"
         )
 

@@ -113,17 +113,13 @@ def ensure_home_dir() -> bool:
 
 
 def _env_has_key(key: str) -> bool:
-    """Check if a key with a value exists in ``~/.no_human/.env``."""
-    if not ENV_PATH.exists():
-        return False
-    for raw in ENV_PATH.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        if k.strip() == key and v.strip().strip('"').strip("'"):
-            return True
-    return False
+    """Check if a key with a value exists in ``~/.no_human/.env``.
+
+    Uses config's parser so this reader cannot disagree with the writer.
+    """
+    from ..config import _read_env_file
+
+    return bool(_read_env_file(ENV_PATH).get(key))
 
 
 def _metered_key_in_env() -> str | None:
@@ -180,35 +176,22 @@ def setup_token() -> bool:
 
 
 def _append_env(key: str, value: str) -> None:
-    """Append a key=value to ``~/.no_human/.env`` (create if absent, chmod 600)."""
-    ensure_home_dir()
-    # Read existing content to avoid duplicates.
-    existing_keys: set[str] = set()
-    lines: list[str] = []
-    if ENV_PATH.exists():
-        for raw in ENV_PATH.read_text().splitlines():
-            line = raw.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, _ = line.partition("=")
-                existing_keys.add(k.strip())
-            lines.append(raw)
-    if key in existing_keys:
-        # Replace the existing line.
-        new_lines = []
-        for raw in lines:
-            line = raw.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, _ = line.partition("=")
-                if k.strip() == key:
-                    new_lines.append(f"{key}={value}")
-                    continue
-            new_lines.append(raw)
-        lines = new_lines
-    else:
-        lines.append(f"{key}={value}")
+    """Upsert a key=value into ``~/.no_human/.env`` (create if absent, 0600).
 
-    ENV_PATH.write_text("\n".join(lines) + "\n")
-    ENV_PATH.chmod(0o600)
+    Delegates to ``config.upsert_env_var`` rather than doing its own
+    read-modify-write. This used to be a THIRD independent writer: it parsed
+    with ``splitlines()`` while validating nothing, so the writer and the
+    reader disagreed about what a line is — the same defect that let a value
+    forge an ``ANTHROPIC_API_KEY=`` entry. It also did ``write_text`` then
+    ``chmod``, which is exactly the umask window ``atomic_write_0600`` exists
+    to close.
+    """
+    from ..config import upsert_env_var
+
+    ensure_home_dir()
+    upsert_env_var(ENV_PATH, key, value)
+
+
 
 
 # --------------------------------------------------------------------------- #
