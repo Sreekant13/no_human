@@ -23,7 +23,7 @@ number until an authored PR exists.
 ## The flagship run — task `84251cb2` (INTEGRATION-GATE integration-test pipeline)
 
 Status `blocked`. Stopped by budget, not by a defect: two real reviewer findings
-away from a PR. Work preserved on `scratch/dev/84251cb2-5`
+away from a PR. Work preserved on `scratch/<user>/84251cb2-5`
 (1 commit ahead of `origin/dev`).
 
 ```
