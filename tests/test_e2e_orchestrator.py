@@ -3629,6 +3629,77 @@ async def test_repeated_inadequate_reports_escalate_at_two_not_at_the_bound(
     assert blocker["question"]
 
 
+class _AlternatingDudBackend:
+    """Delivers nothing, but alternates HOW.
+
+    Odd attempts return a placeholder report (non-empty → the report branch
+    rejects it as inadequate). Even attempts return an EMPTY final_text, which
+    fails the report branch's `final_text.strip()` condition, falls through to
+    the code path, and lands as zero-diff. Both are "this attempt delivered
+    nothing"; only the label differs.
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        self.calls += 1
+        text = "Done." if self.calls % 2 else ""
+        return AgentResult(
+            final_text=text, num_turns=3, is_error=False, tokens_used=400,
+            session_id="s", stop_reason="end_turn",
+        )
+
+
+async def test_alternating_dud_attempts_escalate_instead_of_burning_the_bound(
+    bare_repo, tmp_path, store
+):
+    """Two counters that reset in each OTHER's `else` never trip.
+
+    zero-diff and inadequate-report each escalate after 2 CONSECUTIVE
+    occurrences, but each reset the other's counter. An agent alternating
+    between the two therefore drove both back to 0 every attempt, so neither
+    guard fired and the loop spent its entire bound — precisely the runaway the
+    two guards exist to stop, reachable because the report branch requires a
+    NON-EMPTY final_text, so an empty response falls through to the code path.
+
+    They now share one "delivered nothing" streak; only the escalation message
+    is kind-specific.
+    """
+    cfg = _config(tmp_path)
+    backend = _AlternatingDudBackend()
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None))
+    t = Task.new("investigate the data drop", repo_path=str(bare_repo),
+                 kind="investigation")
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.ESCALATED, outcome.detail
+    attempts = await store.list_attempts(t.id)
+    assert len(attempts) == 2, (
+        f"alternating duds must escalate at 2, not burn the "
+        f"{orch.bounds.max_attempts}-attempt bound (ran {len(attempts)})")
+
+    # PIN THE PREMISE. Without this the test cannot tell alternation from two
+    # identical failures: route an empty final_text into the report branch —
+    # a natural future change — and both attempts become inadequate-report,
+    # this degenerates into a copy of the repeated-inadequate test above, and
+    # it keeps passing while covering nothing.
+    reasons = [a["failure_reason"] for a in attempts]
+    assert reasons[0].startswith("inadequate report"), reasons
+    assert reasons[1] == "agent produced no file changes", reasons
+
+    # A REPORT task must get the report question, not "is this already
+    # implemented?" — the escalation is chosen by task kind, not by which
+    # dud happened to land last.
+    blocker = outcome.task.blocker
+    assert blocker
+    assert "Done." in blocker["evidence"], blocker["evidence"]
+    assert "already implemented" not in (blocker["question"] or "")
+
+
 class _DesignDocBackend:
     """Report-only backend that returns a SUBSTANTIVE design document (a real
     design doc is inherently multi-paragraph; C3's adequacy guard rejects a
@@ -3738,3 +3809,44 @@ async def test_planner_prompt_carries_intake_qa(bare_repo, tmp_path, store):
     assert base
     assert all("RESOLVED AT INTAKE" in p for p in base)
     assert all("src/x.py:1" in p for p in base)
+
+
+class _AlwaysEmptyBackend:
+    """Never produces text — every attempt lands as zero-diff."""
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        return AgentResult(
+            final_text="", num_turns=2, is_error=False, tokens_used=300,
+            session_id="s", stop_reason="end_turn",
+        )
+
+
+async def test_stale_report_text_cannot_hijack_a_zero_diff_escalation(
+    bare_repo, tmp_path, store
+):
+    """`inadequate_report_text` lives on task.context and is NEVER cleared, so
+    keying the escalation off its presence read evidence from an earlier
+    attempt — or from an earlier bounded loop entirely, since context survives
+    escalate -> `nh reply` -> fresh loop.
+
+    A report task whose attempts are BOTH genuine zero-diffs must get the
+    zero-diff escalation, even when a previous run left report text behind.
+    Otherwise the human is told two attempts "returned a report" when neither
+    did, and is shown text from a run that already ended.
+    """
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, _AlwaysEmptyBackend(), SlackNotifier(None))
+    t = Task.new("investigate the data drop", repo_path=str(bare_repo),
+                 kind="investigation")
+    t.context = {"inadequate_report_text": "STALE TEXT FROM A PREVIOUS RUN",
+                 "inadequate_report_reason": "stale reason"}
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.ESCALATED, outcome.detail
+    blocker = outcome.task.blocker
+    assert blocker
+    assert "STALE TEXT FROM A PREVIOUS RUN" not in blocker["evidence"], blocker
+    assert "without editing any file" in blocker["root_cause_hypothesis"], blocker
