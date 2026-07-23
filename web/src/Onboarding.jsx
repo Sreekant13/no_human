@@ -421,7 +421,7 @@ export default function Onboarding({ onComplete }) {
                   <div className="ob-project-head">
                     <strong>{pd.name}</strong>
                     <span className="ob-faint">{pd.repos.size} repo{pd.repos.size !== 1 ? "s" : ""}</span>
-                    <button className="ob-btn-ghost" style={{ marginLeft: 'auto', fontSize: '0.75rem' }} onClick={() => removeProject(pi)}>✕</button>
+                    <button className="ob-btn-ghost" style={{ marginLeft: 'auto', fontSize: '0.75rem' }} aria-label={`Remove project ${pd.name}`} onClick={() => removeProject(pi)}>✕</button>
                   </div>
                   <div className="ob-repolist" style={{ maxHeight: '140px' }}>
                     {[...selectedRepos].map((rp) => (
@@ -635,7 +635,7 @@ function ListEditor({ items, setItems, placeholder }) {
             onChange={(e) => setItems(items.map((x, k) => (k === idx ? e.target.value : x)))}
           />
           {items.length > 1 && (
-            <button className="ob-btn-ghost" onClick={() => setItems(items.filter((_, k) => k !== idx))}>✕</button>
+            <button className="ob-btn-ghost" aria-label={v.trim() ? `Remove ${v.trim()}` : "Remove this entry"} onClick={() => setItems(items.filter((_, k) => k !== idx))}>✕</button>
           )}
         </div>
       ))}

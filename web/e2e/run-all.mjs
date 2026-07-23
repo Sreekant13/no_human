@@ -29,6 +29,7 @@ const SUITES = [
   ["composer", "composer.mjs"],
   ["outcomes (3-lane board)", "outcomes.mjs"],
   ["mobile nav", "mobile-nav.mjs"],
+  ["onboarding a11y", "onboarding-a11y.mjs"],
   ["live flows (needs :8420)", "live-flows.mjs"],
   ["electron shell (needs :8420 + desktop install)", "electron-smoke.mjs"],
 ];
