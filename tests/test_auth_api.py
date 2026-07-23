@@ -595,6 +595,30 @@ def test_the_walk_NEVER_touches_anything_above_the_home_dir(tmp_path, monkeypatc
     assert ((victim / "escaped").stat().st_mode & 0o777) == 0o700
 
 
+def test_a_symlink_leaf_is_NOT_chmod_through(tmp_path, monkeypatch):
+    """`Path.chmod` follows symlinks, so a symlink planted inside ~/.no_human
+    pointing at an OUTSIDE directory had that target narrowed to 0700 (a
+    DoS-shaped hardening bug from #214's review). We only secure the real
+    directories we create in our own subtree — a symlink is skipped, and the
+    file it guards is 0600 regardless."""
+    import no_human.config as cfg
+
+    home = tmp_path / ".no_human"
+    home.mkdir(mode=0o700)
+    monkeypatch.setattr(cfg, "NO_HUMAN_HOME", home)
+
+    outside = tmp_path / "victim"
+    outside.mkdir(mode=0o755)
+    link = home / "cache"
+    link.symlink_to(outside)          # attacker plants a symlink
+
+    cfg.ensure_private_dir(link)
+
+    assert (outside.stat().st_mode & 0o777) == 0o755, "chmod'd through the symlink"
+    # the home dir itself (a real dir) is still secured
+    assert (home.stat().st_mode & 0o777) == 0o700
+
+
 def test_a_path_outside_the_home_dir_secures_only_the_leaf(tmp_path, monkeypatch):
     """A custom path is not ours to restructure — secure the leaf, leave the
     caller's parent alone."""
