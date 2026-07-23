@@ -92,11 +92,79 @@ def test_an_all_skipped_run_is_refused():
 def test_skips_do_not_count_as_dead_specs():
     """A skip is a decision (not a git repo, monorepo too large); a zero-token
     RUN is a death. Counting skips as deaths would refuse valid runs — the real
-    v13 has three of them."""
+    v13 has three of them.
+
+    The fixture is LOAD-BEARING IN BOTH DIRECTIONS and must stay that way:
+      - 7 skipped of 37 loaded = 19%, under the coverage ceiling, so this run
+        is publishable today;
+      - but 7 of the 30 that RAN = 23%, so if a skip were miscounted as a death
+        the dead rule fires and this test fails.
+    An earlier version used 4 skips to duck the coverage rule; that made the
+    mutant it exists to catch survive the entire suite. Do not lower it.
+    """
+    from no_human.eval.northstar_card import (
+        MAX_DEAD_FRACTION,
+        MAX_UNMEASURED_FRACTION,
+    )
+    # Pin the WINDOW, not just the count: moving either constant silently
+    # defuses the mutant this test exists to catch (raising MAX_DEAD_FRACTION
+    # to 0.25 made it survive the whole suite).
+    assert 7 / 37 <= MAX_UNMEASURED_FRACTION, "fixture would trip coverage"
+    assert 7 / 30 > MAX_DEAD_FRACTION, "fixture no longer kills the mutant"
     scores = [_score(f"ns-{i}") for i in range(30)]
     scores += [_score(f"sk-{i}", nh_tokens=0, status="skipped",
-                      satisfied=False) for i in range(10)]
+                      satisfied=False) for i in range(7)]
     assert publish_refusals(_card(scores)) == []
+
+
+def test_a_mostly_unmeasured_run_is_refused_as_the_baseline():
+    """The incident shape, which published CLEAN before coverage was shared.
+
+    36 of 55 specs pinned at a repo that no longer exists are SKIPS, so zero
+    were dead; 19 ran, over the floor; and a fresh clone has no baseline to
+    narrow against. Every existing rule passed and a 65%-unmeasured run became
+    the reference every later run was compared against.
+    """
+    scores = [_score(f"ns-{i}") for i in range(19)]
+    scores += [_score(f"sk-{i}", nh_tokens=0, status="skipped",
+                      satisfied=False) for i in range(36)]
+    refusals = publish_refusals(_card(scores))
+    assert any("went unmeasured" in r for r in refusals), refusals
+    assert any("36/55" in r for r in refusals), refusals
+
+
+def test_gate_and_publish_agree_about_coverage():
+    """They ask different questions elsewhere, but 'did we measure enough of
+    the benchmark' must not get two answers — that disagreement is what let the
+    incident run be rejected by one and published by the other."""
+    from no_human.eval.northstar_card import northstar_gate
+    scores = [_score(f"ns-{i}") for i in range(19)]
+    scores += [_score(f"sk-{i}", nh_tokens=0, status="skipped",
+                      satisfied=False) for i in range(36)]
+    card = _card(scores)
+    # Assert the REASON, not merely that both refuse: otherwise this stays green
+    # if some unrelated publish rule starts firing on this shape.
+    assert any("went unmeasured" in r for r in publish_refusals(card))
+    gate = northstar_gate(card, None)
+    assert not gate.passed
+    assert any("went unmeasured" in r for r in gate.reasons)
+
+
+def test_gate_and_publish_agree_about_the_CORPUS_SHORTFALL_too():
+    """The other half of the shared rule, which had no defender at all: deleting
+    publish's corpus_shortfall check left the whole suite green. The agreement
+    test above cannot cover it, because its card leaves `corpus_available` at 0
+    and the shortfall rule is silent on both sides."""
+    from no_human.eval.northstar_card import northstar_gate
+    # 11 loaded of 55 available, all healthy — coverage is silent (0 unmeasured),
+    # so ONLY the shortfall rule can fire.
+    card = _card([_score(f"ns-{i}") for i in range(11)])
+    card.corpus_available = 55
+    pub = publish_refusals(card)
+    gate = northstar_gate(card, None)
+    assert any("11 of 55" in r for r in pub), pub
+    assert not gate.passed
+    assert any("11 of 55" in r for r in gate.reasons), gate.reasons
 
 
 # ------------------------------ the wiring -------------------------------- #

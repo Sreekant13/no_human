@@ -30,6 +30,11 @@ class NorthStarCard:
     scores: list[BenchScore] = field(default_factory=list)
     created_at: str = ""
     label: str = ""            # e.g. "baseline" or the change under test
+    # How many specs the canonical corpus HAS, independent of what this run
+    # loaded. Without it, coverage is a ratio over the loaded set and therefore
+    # blind to filtering: pointing --specs-dir at the specs that still resolve
+    # makes a broken corpus read as a perfect one. 0 = unknown (older cards).
+    corpus_available: int = 0
     # Refusals a human overrode with `nh bench publish --force`. Carried into
     # the saved card and rendered at the top of the report: a forced publish is
     # allowed, but it must never be able to look like a clean one.
@@ -144,6 +149,7 @@ class NorthStarCard:
                 "dead_specs": self.dead_specs,
                 "total_nh_tokens": self.total_nh_tokens,
                 "total_orig_tokens": self.total_orig_tokens,
+                "corpus_available": self.corpus_available,
                 "corrections_avoided": self.corrections_avoided,
                 "corrections_avoided_delivered": self.corrections_avoided_delivered,
                 "honest_escalation_rate": round(self.honest_escalation_rate, 4),
@@ -190,6 +196,8 @@ class NorthStarCard:
             events=s.get("events") or [],
         ) for s in data.get("scores", [])]
         return NorthStarCard(scores=scores,
+                             corpus_available=int((data.get('aggregate') or {})
+                                                 .get('corpus_available') or 0),
                              created_at=data.get("created_at", ""),
                              label=data.get("label", ""),
                              override_reasons=list(
@@ -202,6 +210,58 @@ class NorthStarCard:
 # these prevent is precisely that such a file overwrote the report.
 MIN_PUBLISHABLE_SPECS = 10
 MAX_DEAD_FRACTION = 0.2
+# How much of the LOADED spec set may go unmeasured before a run stops being a
+# verdict. "Loaded", not "the corpus": `total` counts what this run loaded after
+# the subset filter, --specs-dir and --limit, so deleting specs outright makes
+# coverage look perfect, and BOTH counts shrink together so the shortfall rule
+# cannot see it either. Nothing in the gate catches that on a fresh clone; what
+# does is that deleting corpus files is a visible git commit.
+# Deliberately its own value, NOT an alias of MAX_DEAD_FRACTION: that one is a
+# fraction of the specs that RAN (how saturated was the backend), this is a
+# fraction of the LOADED spec set (how much of what this run picked up did we
+# actually look at). Different numerator, different denominator, different question —
+# aliasing them would mean retuning backend-saturation tolerance silently
+# retunes corpus-coverage tolerance. 20% is chosen so a handful of
+# legitimately-unrunnable specs cannot veto a run, while a corpus that has
+# largely stopped resolving cannot be reported as a result.
+MAX_UNMEASURED_FRACTION = 0.2
+
+
+# How much of the AVAILABLE corpus a run must actually load. Filtering is the
+# documented reaction to a coverage refusal ("just run the ones that work"), and
+# it defeats every ratio computed over the loaded set — 19 surviving specs of 55
+# is a perfect 0/19 unmeasured and clears a 10-spec floor comfortably.
+MIN_CORPUS_LOADED_FRACTION = 0.8
+
+
+def corpus_shortfall(card: NorthStarCard) -> str:
+    """Why this run's spec set is too small a slice of the corpus, or ``""``.
+
+    Compares LOADED against AVAILABLE, which is the only comparison that
+    survives filtering. Silent when the card does not record an available count
+    (older cards, or a run against a corpus of its own).
+    """
+    available = card.corpus_available
+    if not available or card.total >= available * MIN_CORPUS_LOADED_FRACTION:
+        return ""
+    return (
+        f"this run loaded {card.total} of {available} available spec(s) "
+        f"({card.total / available:.0%} < {MIN_CORPUS_LOADED_FRACTION:.0%}) — "
+        f"a filtered slice cannot stand for the corpus, and filtering to the "
+        f"specs that still resolve is exactly how a broken corpus reads as a "
+        f"perfect one")
+
+
+def unmeasured_specs(card: NorthStarCard) -> tuple[int, int]:
+    """``(unmeasured, total)`` — specs that yielded no measurement: *skipped*
+    (never ran) plus *dead* (ran, but burned zero tokens).
+
+    The denominator is the LOADED spec set, not ``ran``. A skipped spec leaves
+    ``ran`` entirely, so a fraction measured against ``ran`` is structurally
+    blind to it — which is exactly how a corpus that mostly failed to resolve
+    reads as a *higher* success rate over the handful that survived.
+    """
+    return card.skipped + card.dead_specs, card.total
 
 
 def publish_refusals(card: NorthStarCard,
@@ -239,6 +299,25 @@ def publish_refusals(card: NorthStarCard,
             f"({len(dead) / len(ran):.0%} > {MAX_DEAD_FRACTION:.0%}) — the "
             f"backend was saturated, so this measures the quota, not no_human")
 
+    # Coverage, the SAME question the gate asks, through the SAME helper. The
+    # dead rule above asks "was the backend saturated" (dead ÷ ran); this asks
+    # "did we look at the benchmark at all" (skipped + dead ÷ loaded). Without
+    # it the incident shape published clean: 36 of 55 specs pinned at a repo
+    # that no longer exists are SKIPS, so zero were dead, 19 ran (over the
+    # floor), and a fresh clone has no baseline to narrow against — every rule
+    # passed and a 65%-unmeasured run became the committed baseline.
+    shortfall = corpus_shortfall(card)
+    if shortfall:
+        reasons.append(shortfall)
+
+    unmeasured, loaded = unmeasured_specs(card)
+    if loaded and unmeasured / loaded > MAX_UNMEASURED_FRACTION:
+        reasons.append(
+            f"{unmeasured}/{loaded} specs went unmeasured "
+            f"({unmeasured / loaded:.0%} > {MAX_UNMEASURED_FRACTION:.0%}) — "
+            f"skipped or dead; too little of the benchmark was measured for "
+            f"this run to be the baseline every later run is compared against")
+
     if len(ran) < MIN_PUBLISHABLE_SPECS:
         reasons.append(
             f"only {len(ran)} spec(s) ran (minimum {MIN_PUBLISHABLE_SPECS}) — "
@@ -274,11 +353,109 @@ def northstar_gate(current: NorthStarCard,
       any drop blocks);
     - median token ratio must not grow by more than ``max_ratio_regression``
       (absolute, e.g. 0.80 → 1.31 blocks at the default 0.5).
-    First run (no previous) always passes — it becomes the baseline.
+
+    A first run has no baseline to compare against, so it skips the regression
+    comparisons — but it must still clear COVERAGE and, because coverage cannot
+    see specs that were never loaded, an absolute floor.
+
+    BEHAVIOUR CHANGES for existing `--gate` users, stated rather than buried:
+
+    - a run NARROWER than the baseline now blocks;
+    - a run that loads well under the AVAILABLE corpus now blocks, with or
+      without a baseline — this is what catches filtering to the specs that
+      still resolve;
+    - `--limit N --gate` blocks well before `MIN_PUBLISHABLE_SPECS`: the
+      loaded-vs-available rule refuses anything under 80% of the corpus, so on
+      a 55-spec corpus the real boundary is N < 44. It also blocks against any
+      baseline it is narrower than;
+    - the FIRST run of any corpus with fewer than `MIN_PUBLISHABLE_SPECS`
+      runnable specs now blocks;
+    - a baseline published from a `--full` run will red a default (core)
+      invocation IF `generated/` is populated. It is empty today, so `--full`
+      currently loads the same specs and changes nothing.
+
+    Every comparison above is computed over ``ran``, so a spec that never ran
+    LEAVES the denominator instead of depressing it. That makes a broken
+    instrument read as an improvement: when most of the corpus fails to resolve
+    (or the backend dies), the survivors are the healthy specs and the headline
+    goes UP, and without the checks below a run measuring a third of the corpus
+    reports a better-than-baseline number and exits 0. ``publish_refusals``
+    applies the SAME coverage rule through the same helper, so the two cannot
+    disagree about whether a run measured enough to mean anything — they did
+    disagree until the incident shape (36 of 55 specs pinned at a repo that no
+    longer exists) was rejected by the gate and published clean.
+
+    Coverage is therefore checked BEFORE the first-run early return. It needs
+    nothing from *previous*, and ``eval/results/northstar/`` is gitignored — so
+    ``previous`` is None in every fresh clone and CI checkout. Gating the check
+    behind a baseline would exempt exactly the configuration where a broken
+    corpus is most likely to be published as one.
+
+    Two limits worth stating rather than implying:
+
+    - **Coverage is counted, membership is not.** A run that measures the same
+      NUMBER of specs drawn from a different (say, easier) population passes
+      these checks. Corpus churn is legitimate and frequent here, so a rule
+      that blocked any change in spec membership would be permanently red;
+      catching a laundered population needs comparing task_ids against the
+      baseline, which is deliberately not attempted here.
+    - **A skip counts against coverage, though ``publish_refusals`` treats a
+      skip as a decision rather than a death.** The two ask different
+      questions and the divergence is intentional: a spec that can never run is
+      still a spec the benchmark did not measure. The consequence is that
+      persistently-unrunnable specs must be REMOVED from the corpus, not left
+      to be skipped forever — otherwise their fixed cost eventually crosses the
+      ceiling and the gate is red for good.
     """
-    if previous is None:
-        return NorthStarGate(True, ["first run — baseline recorded"])
     reasons: list[str] = []
+
+    shortfall = corpus_shortfall(current)
+    if shortfall:
+        reasons.append(shortfall)
+
+    unmeasured, total = unmeasured_specs(current)
+    if total and unmeasured / total > MAX_UNMEASURED_FRACTION:
+        reasons.append(
+            f"{unmeasured}/{total} specs went unmeasured "
+            f"({unmeasured / total:.0%} > {MAX_UNMEASURED_FRACTION:.0%}) — "
+            f"skipped or dead; too little of what this run loaded was "
+            f"measured for it to be a verdict on anything")
+
+    if previous is None:
+        # A floor on `ran` catches a PROBE (--limit 3). It does NOT catch
+        # filtering: 19 surviving specs of 55 clears a 10-spec floor easily,
+        # which is why the corpus_shortfall check above exists and this one is
+        # not load-bearing for that case. Kept because a first run has no
+        # baseline to be narrower than, so nothing else bounds a tiny one.
+        if len(current.ran) < MIN_PUBLISHABLE_SPECS:
+            reasons.append(
+                f"only {len(current.ran)} spec(s) ran and there is no baseline "
+                f"to compare against (minimum {MIN_PUBLISHABLE_SPECS}) — a "
+                f"slice cannot become the reference for every later run")
+        if reasons:
+            return NorthStarGate(False, reasons)
+        return NorthStarGate(True, ["first run — baseline recorded"])
+
+    if not previous.ran:
+        # Reachable via --prev <file>, which accepts any results file. Every
+        # comparison below would silently pass against an empty baseline.
+        #
+        # A reviewer suggested extending this to any baseline under
+        # MIN_PUBLISHABLE_SPECS, which is defensible — a one-spec baseline is
+        # nearly as meaningless. DECLINED here: it blocks four existing tests
+        # whose small fixtures are incidental, and adjusting fixtures so a new
+        # rule fits is exactly the move that neutered a test earlier in this
+        # PR's history. The empty case is the unambiguous one; a wider floor
+        # deserves its own change with its own fixtures.
+        reasons.append(
+            f"the baseline '{previous.label or 'unlabelled'}' measured no "
+            f"specs — there is nothing to compare against")
+    if len(current.ran) < len(previous.ran):
+        reasons.append(
+            f"this run measured {len(current.ran)} spec(s) but the baseline "
+            f"'{previous.label or 'unlabelled'}' measured {len(previous.ran)} "
+            f"— a narrower run cannot establish 'no regression'")
+
     drop = previous.success_rate - current.success_rate
     if drop > max_success_drop + 1e-9:
         reasons.append(

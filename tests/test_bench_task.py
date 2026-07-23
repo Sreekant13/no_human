@@ -316,6 +316,89 @@ def test_cli_bench_run_wiring_end_to_end(tmp_path, monkeypatch):
     assert "success" in result.output
 
 
+def test_cli_bench_run_gate_exits_nonzero_on_an_unmeasured_corpus(
+        tmp_path, monkeypatch):
+    """The predicate being right is worthless if the command ignores it.
+
+    Every spec here skips, so the corpus is 100% unmeasured. There is no
+    baseline (RESULTS_DIR is a fresh tmp dir — the real one is gitignored, so
+    this is the DEFAULT state of a clone), which is precisely the case that
+    used to sail through on `previous is None`. With --gate the command must
+    exit non-zero.
+    """
+    import yaml as _yaml
+    from click.testing import CliRunner
+    from no_human.cli import commands as cmds
+    from no_human.cli.commands import cli
+    from no_human.eval.bench_task import BenchTask
+    from no_human.eval.northstar import BenchScore
+
+    d = tmp_path / "specs"
+    d.mkdir()
+    # 11 that RUN + 5 that skip: `ran` clears the first-run floor, so COVERAGE
+    # (5/16 = 31%) is the sole reason. The earlier fixture skipped all 12, so
+    # ran==0 and the floor fired instead — deleting the coverage check left the
+    # test green, i.e. it did not pin what its name claims.
+    for i in range(11):
+        spec = BenchTask(id=f"ns-ok{i}", title="t", request="r",
+                         subset="core", runnable=True)
+        (d / f"ns-ok{i}.yaml").write_text(_yaml.safe_dump(spec.to_dict()))
+    for i in range(5):
+        spec = BenchTask(id=f"ns-skip{i}", title="t", request="r",
+                         subset="core", runnable=True)
+        (d / f"ns-skip{i}.yaml").write_text(_yaml.safe_dump(spec.to_dict()))
+
+    class _Cfg:
+        data = {"llm": {}}
+        primary_model = "m"
+        review_model = "m"
+        def __getitem__(self, k):
+            return {"safety": {"forbidden_paths": []},
+                    "git": {"never_push_to": []}}[k]
+
+    monkeypatch.setattr(cmds, "_bootstrap", lambda *a, **kw: (_Cfg(), None))
+
+    class _SkippingRunner:
+        def __init__(self, *a, **kw): ...
+        async def run_one(self, spec, *, workdir):
+            skipped = spec.id.startswith("ns-skip")
+            return BenchScore(
+                task_id=spec.id, title=spec.title,
+                outcome_status="skipped" if skipped else "awaiting_approval",
+                goal_satisfied=None if skipped else True,
+                escalated_honestly=False, mergeable=None,
+                nh_tokens=0 if skipped else 500,
+                nh_cache_tokens=0, nh_cache_creation_tokens=0,
+                nh_turns=0 if skipped else 3, nh_wall_clock_s=0.0,
+                orig_tokens=0 if skipped else 1000,
+                orig_cache_tokens=0, orig_cache_creation_tokens=0,
+                orig_wall_clock_s=0.0, orig_corrections=0,
+                subset=spec.subset, notes="repo gone" if skipped else "")
+
+    monkeypatch.setattr("no_human.eval.northstar.NorthStarRunner", _SkippingRunner)
+    monkeypatch.setattr("no_human.eval.northstar_card.RESULTS_DIR",
+                        tmp_path / "results")
+    monkeypatch.setattr("no_human.eval.northstar_card.REPORT_MD",
+                        tmp_path / "NORTH_STAR_BENCH.md")
+    # Point the CANONICAL dir at this same spec set. Without it
+    # `corpus_available` is read from the real 55-spec corpus, the shortfall
+    # rule fires too, and this test passes with the gate's coverage rule
+    # DELETED — satisfied by the publish-refusal section printed above the gate
+    # output. That is exactly the trap the comment below claims to avoid.
+    monkeypatch.setattr("no_human.eval.bench_task.NORTHSTAR_DIR", d)
+
+    result = CliRunner().invoke(
+        cli, ["bench", "run", "--specs-dir", str(d), "--gate"])
+    assert result.exit_code == 1, result.output
+    assert "gate FAILED" in result.output
+    # The gate's OWN reason, in the gate's own section — not merely the exit
+    # code, and not a string the publish refusals happen to print too.
+    gate_section = result.output.split("gate FAILED", 1)[1]
+    assert "went unmeasured" in gate_section, result.output
+    assert "available spec(s)" not in gate_section, (
+        "shortfall fired too — coverage is no longer the sole reason")
+
+
 def test_cli_bench_run_survives_a_crashing_task(tmp_path, monkeypatch):
     """A single task's hard crash (SDK CLI dying on quota saturation killed a
     LIVE baseline at 3/10 and lost every partial result) must be recorded as
@@ -876,3 +959,68 @@ def test_a_same_label_checkpoint_from_a_different_spec_set_is_declined(
         f"ns-a carried a score from a differently-scoped run of the same label "
         f"({scored['ns-a']}) instead of being re-run — the spec sets differ, so "
         f"the flags differed, so the scores are not interchangeable")
+
+
+def test_cli_records_corpus_available_from_the_canonical_dir(tmp_path, monkeypatch):
+    """The loaded-vs-available rule depends on the CLI producing this number,
+    and the ENTIRE plumbing could be severed — CLI, as_dict, and load — with all
+    2021 tests green, because every other test hand-constructs the card.
+
+    Canonical dir has 20 specs; the run loads 11 via --specs-dir. The refusal
+    must name BOTH numbers, which is only possible if the value travelled from
+    the canonical dir through the card to the message.
+    """
+    import yaml as _yaml
+    from click.testing import CliRunner
+    from no_human.cli import commands as cmds
+    from no_human.cli.commands import cli
+    from no_human.eval.bench_task import BenchTask
+    from no_human.eval.northstar import BenchScore
+
+    canon = tmp_path / "canonical"
+    canon.mkdir()
+    for i in range(20):
+        spec = BenchTask(id=f"ns-c{i}", title="t", request="r", subset="core",
+                         runnable=True)
+        (canon / f"ns-c{i}.yaml").write_text(_yaml.safe_dump(spec.to_dict()))
+    run_dir = tmp_path / "subset"
+    run_dir.mkdir()
+    for i in range(11):
+        spec = BenchTask(id=f"ns-c{i}", title="t", request="r", subset="core",
+                         runnable=True)
+        (run_dir / f"ns-c{i}.yaml").write_text(_yaml.safe_dump(spec.to_dict()))
+
+    class _Cfg:
+        data = {"llm": {}}
+        primary_model = "m"
+        review_model = "m"
+        def __getitem__(self, k):
+            return {"safety": {"forbidden_paths": []},
+                    "git": {"never_push_to": []}}[k]
+
+    monkeypatch.setattr(cmds, "_bootstrap", lambda *a, **kw: (_Cfg(), None))
+
+    class _OkRunner:
+        def __init__(self, *a, **kw): ...
+        async def run_one(self, spec, *, workdir):
+            return BenchScore(
+                task_id=spec.id, title=spec.title,
+                outcome_status="awaiting_approval", goal_satisfied=True,
+                escalated_honestly=False, mergeable=None, nh_tokens=500,
+                nh_cache_tokens=0, nh_cache_creation_tokens=0, nh_turns=3,
+                nh_wall_clock_s=1.0, orig_tokens=1000, orig_cache_tokens=0,
+                orig_cache_creation_tokens=0, orig_wall_clock_s=1.0,
+                orig_corrections=0, subset=spec.subset)
+
+    monkeypatch.setattr("no_human.eval.northstar.NorthStarRunner", _OkRunner)
+    monkeypatch.setattr("no_human.eval.northstar_card.RESULTS_DIR",
+                        tmp_path / "results")
+    monkeypatch.setattr("no_human.eval.northstar_card.REPORT_MD",
+                        tmp_path / "NORTH_STAR_BENCH.md")
+    monkeypatch.setattr("no_human.eval.bench_task.NORTHSTAR_DIR", canon)
+
+    result = CliRunner().invoke(
+        cli, ["bench", "run", "--specs-dir", str(run_dir), "--gate"])
+
+    assert "11 of 20" in result.output, result.output
+    assert result.exit_code == 1, result.output
