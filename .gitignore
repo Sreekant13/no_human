@@ -33,6 +33,9 @@ web/node_modules/
 # content (personal + enterprise) — never committed. Curated specs live one
 # level up and ARE tracked.
 eval/northstar_tasks/generated/
+# Machine-local translation from vendor-neutral spec paths to real checkouts.
+# Holds real repo names by definition — never committed.
+eval/repo_map.yaml
 eval/results/northstar/
 
 # desktop shell

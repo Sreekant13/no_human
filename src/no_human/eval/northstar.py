@@ -30,7 +30,7 @@ from ..core.events import EventPersister
 from ..core.orchestrator import Orchestrator
 from ..core.task import Task, TaskStatus
 from ..notify.slack import SlackNotifier
-from .bench_task import BenchTask
+from .bench_task import BenchTask, redact_local_path, spec_project_name
 
 BackendFactory = Callable[[BenchTask], Any]
 
@@ -364,7 +364,7 @@ class NorthStarRunner:
             orig_corrections=int(orig.get("corrections", 0)),
             expected_escalation=spec.expect_escalation,
             subset=spec.subset,
-            project=Path(spec.repo.get("path", "") or "").name,
+            project=spec_project_name(spec),
             notes=f"skipped: {spec.skip_reason}",
         )
 
@@ -411,7 +411,7 @@ class NorthStarRunner:
             orig_corrections=int(orig.get("corrections", 0)),
             expected_escalation=spec.expect_escalation,
             subset=spec.subset,
-            project=Path(spec.repo.get("path", "") or "").name,
+            project=spec_project_name(spec),
         )
 
         if spec.expect_escalation:
@@ -469,7 +469,11 @@ class NorthStarRunner:
             # 2000, not 400: the drill of every done-but-unsatisfied spec
             # starts from this field, and 400 chars cut ns-7ef821b2's verdict
             # off mid-"BUT ..." — the reason it failed was unrecoverable.
-            score.notes = verdict.evidence[:2000]
+            # Defence in depth: the judge only ever sees the tmp sandbox path,
+            # so this is not a known leak channel — but it is the one remaining
+            # free-text field that reaches the tracked report, and "is redaction
+            # applied everywhere notes are written" should have one answer.
+            score.notes = redact_local_path(verdict.evidence, spec)[:2000]
         else:
             score.goal_satisfied = score.mergeable in (True, None)
             score.notes = "no judge injected; holdout-only scoring"

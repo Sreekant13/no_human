@@ -16,6 +16,7 @@ Orchestrator in a push-proof sandbox.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -32,8 +33,201 @@ NORTHSTAR_DIR = Path(__file__).resolve().parents[3] / "eval" / "northstar_tasks"
 # `generated/` is gitignored. Only hand-curated specs (the core subset, moved
 # up into eval/northstar_tasks/ and PR-reviewed like golden tasks) are tracked.
 GENERATED_DIR = NORTHSTAR_DIR / "generated"
+# Local, GITIGNORED translation from the vendor-neutral repo paths carried in
+# tracked specs to the real checkouts on THIS machine. Tracked specs must stay
+# vendor-neutral (commit 496233e scrubbed them), but the scrub rewrote
+# `repo.path` to values that resolve nowhere, so every scrubbed spec died at
+# clone time and scored as a capability failure. This map restores instrument
+# validity WITHOUT putting the real names back into git.
+REPO_MAP_PATH = NORTHSTAR_DIR.parent / "repo_map.yaml"
 
 _WORD = re.compile(r"[a-z0-9_]+")
+
+
+def load_repo_map(path: Path | None = None) -> dict[str, str]:
+    """Load the local spec-path → real-path map. Absent file = ``{}`` (no-op).
+
+    Raises ``ValueError`` for STRUCTURAL problems only (malformed YAML, a
+    non-absolute path on either side). Whether a mapped target actually EXISTS
+    is deliberately not fatal here, so that one stale entry cannot kill a whole
+    run. ``check_repo_map`` reports those instead, and the CLI prints them
+    before a run starts.
+
+    Honest note on the safety net: run-time skip-on-missing-repo, the
+    skipped-most-of-the-corpus publish refusal, and the unmeasured-corpus gate
+    are on SEPARATE branches and are not merged yet. Until they land, a target
+    that does not exist still reaches ``_sandbox_copy`` and is booked as a
+    crashed spec — a broken instrument reading as a capability failure, which
+    is the very thing this map exists to prevent.
+
+    ``check_repo_map`` is therefore ADVISORY only: the CLI prints what will not
+    resolve and then runs anyway. It buys the operator a chance to abort in the
+    first seconds instead of discovering it after a night of quota; it does not
+    stop the run. Do not read it as a guard.
+    """
+    p = Path(path) if path is not None else REPO_MAP_PATH
+    if not p.exists():
+        return {}
+    try:
+        raw = yaml.safe_load(p.read_text()) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{p}: malformed YAML — {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"{p}: expected a mapping of spec-path → real-path")
+    mapping: dict[str, str] = {}
+    for src, dst in raw.items():
+        src, dst = str(src).strip(), str(dst).strip()
+        if not Path(src).is_absolute() or not Path(dst).is_absolute():
+            raise ValueError(
+                f"{p}: both sides must be absolute paths, got {src!r} → {dst!r}")
+        # normpath, not just rstrip: Path() collapses `//` and `/./`
+        # before an argv is built, so an unnormalised target would make
+        # redact_local_path's exact-substring replace a silent no-op.
+        mapping[os.path.normpath(src)] = os.path.normpath(dst)
+    return mapping
+
+
+def check_repo_map(tasks: list["BenchTask"]) -> list[str]:
+    """Pre-flight the corpus: which spec repos will not resolve on this machine.
+
+    Returns one human-readable line per problem; empty when everything it CAN
+    check resolves (a spec with no pin, or `pin: HEAD`, is not discriminable —
+    see below — so it is not checked at all).
+
+    Non-fatal for a mechanical reason, not because the result is fine to read:
+    an unresolvable repo is currently booked as a CRASHED spec, i.e. it scores
+    as a capability failure. A run started with these warnings UNDER-REPORTS.
+    The right response is to fix the map and start again; the check exists so
+    that decision costs seconds instead of a night of quota.
+
+    Two failure modes this exists to make loud:
+
+    - **No map at all.** ``eval/repo_map.yaml`` is gitignored, so it exists only
+      in the checkout where it was written. Bench runs are routinely launched
+      from a ``git worktree``, where it is simply absent — every scrubbed spec
+      then fails to resolve and the run reads as a model regression caused by
+      an operational accident, with no output saying so.
+    - **A target that exists but is the WRONG repo.** A typo'd path that happens
+      to be a real checkout yields confident, meaningless scores. The pin is the
+      cheap discriminator: a repo that does not contain the spec's pinned commit
+      is not the repo the spec was recorded against.
+    """
+    problems: list[str] = []
+    for t in tasks:
+        raw = str(t.repo.get("path") or "")
+        # A non-runnable spec routes to _skipped and is never cloned, so it can
+        # never crash on a bad path; counting it only inflates the headline.
+        if not raw or not t.runnable:
+            continue
+        p = Path(raw)
+        if not p.is_dir():
+            problems.append(f"{t.id}: repo does not exist here — {raw}")
+        elif not (p / ".git").exists():
+            problems.append(f"{t.id}: not a git repo — {raw}")
+        else:
+            pin = str(t.repo.get("pin") or "")
+            # `pin: HEAD` (build_bench_tasks' fallback) and an empty pin are NOT
+            # discriminating — `HEAD^{commit}` resolves in any non-empty repo,
+            # so a wrong-but-real checkout passes. Those specs are unchecked
+            # rather than falsely reassuring.
+            if not pin or pin == "HEAD":
+                continue
+            try:
+                rc = subprocess.run(
+                    ["git", "-C", str(p), "cat-file", "-e", f"{pin}^{{commit}}"],
+                    capture_output=True, timeout=5).returncode
+            except subprocess.TimeoutExpired:
+                # Distinct from the errors below: a timeout means the
+                # wrong-repo discriminator silently did not run, which must not
+                # look like a pass on the cold mount the 5s cap was set for.
+                problems.append(
+                    f"{t.id}: pin probe timed out — repo NOT verified")
+                continue
+            except (OSError, subprocess.SubprocessError):
+                # A pre-flight must never be what breaks the run it protects:
+                # a missing git binary is not a verdict about the spec.
+                continue
+            if rc != 0:
+                problems.append(
+                    f"{t.id}: {raw} does not contain pin {pin[:12]} — "
+                    f"wrong repo, or the commit was garbage-collected")
+    return problems
+
+
+def redact_local_path(text: str, spec: "BenchTask") -> str:
+    """Replace the locally-translated repo path with the spec's own path.
+
+    `project` was not the only route from a translated path into a TRACKED
+    artifact. A crash note is built from ``str(exc)``, and a failed
+    ``_sandbox_copy`` raises ``CalledProcessError`` whose string embeds the full
+    argv — ``git clone --no-hardlinks <REAL LOCAL PATH> …``. That note is
+    rendered into docs/NORTH_STAR_BENCH.md. Truncation is not a guard: whether a
+    real org or repo name survives into git depends only on how long the
+    operator's home directory happens to be.
+
+    Fires only when a spec IS mapped: with no map, ``local == original`` and
+    this returns unchanged. Applied to crash notes and, as defence in depth, to
+    the judge-evidence note on every successfully-scored spec — so the answer
+    to "is redaction applied wherever notes are written" is simply yes.
+    """
+    local = str(spec.repo.get("path") or "")
+    original = spec.spec_repo_path or ""
+    if not text or not local or local == original:
+        return text
+    replacement = original or "<repo>"
+    # Both the literal map value and its normalised form: an exception's argv
+    # carries whatever `Path(...)` produced, which is not necessarily the string
+    # the map was written with.
+    for form in {local, str(Path(local)), os.path.normpath(local)}:
+        text = text.replace(form, replacement)
+    return text
+
+
+def spec_project_name(spec: "BenchTask") -> str:
+    """The project label for REPORTING — always the spec's own path, never the
+    locally-translated one.
+
+    ``project`` is rendered into ``docs/NORTH_STAR_BENCH.md``, which is TRACKED.
+    Deriving it from ``repo["path"]`` after translation would write the real
+    local checkout's name into git and silently undo the vendor-neutral scrub —
+    the exact outcome the repo map exists to avoid.
+
+    SCOPE, so this is not read as a stronger promise than it is: it protects
+    TRACKED specs, whose own paths are the scrubbed ones. Specs under
+    ``generated/`` (loaded by ``--full``) carry the real cwd by construction —
+    they were built from live conversations and were never scrubbed — and the
+    per-project table renders every score, not just the core subset. A
+    ``--full`` publish therefore still writes real basenames. That is
+    pre-existing and out of scope here; it is called out so the next reader
+    does not mistake this helper for a corpus-wide guarantee.
+    """
+    if not spec.spec_repo_path:
+        # Unreachable via load_bench_tasks, which always records it — but
+        # falling back to the TRANSLATED path would emit the real basename,
+        # the exact leak this exists to stop. Match redact_local_path's
+        # placeholder instead of guessing.
+        return "?" if spec.repo.get("path") else ""
+    return Path(spec.spec_repo_path).name
+
+
+def remap_repo_path(repo_path: str, mapping: dict[str, str]) -> str:
+    """Translate *repo_path* through *mapping*, longest prefix wins.
+
+    Matching is path-BOUNDARY aware: ``/x/foo`` maps ``/x/foo`` and
+    ``/x/foo/sub`` but never ``/x/foobar``. Longest-prefix ordering makes
+    the result independent of dict order when one prefix nests inside another
+    (``/a/b`` vs ``/a/b/c``). Translation is ONE hop: a target that is itself
+    a key is not re-translated, so a map cannot chain or loop.
+    """
+    if not repo_path or not mapping:
+        return repo_path
+    candidate = repo_path.rstrip("/")
+    for src in sorted(mapping, key=len, reverse=True):
+        if candidate == src:
+            return mapping[src]
+        if candidate.startswith(src + "/"):
+            return mapping[src] + candidate[len(src):]
+    return repo_path
 
 
 @dataclass
@@ -51,6 +245,14 @@ class BenchTask:
     skip_reason: str = ""
     expect_escalation: bool = False
     path: Path | None = None
+    # The repo path exactly as the SPEC FILE carries it, before any local
+    # translation. Reporting derives the project name from this, never from the
+    # translated path: the translated path names a real local checkout, and the
+    # project name is rendered into docs/NORTH_STAR_BENCH.md, which is TRACKED.
+    # Deliberately a field rather than a key inside ``repo`` — ``to_dict``
+    # serialises ``repo`` wholesale, so a key there could be written back into a
+    # spec file, which is the leak this whole mechanism exists to avoid.
+    spec_repo_path: str = ""
 
     @staticmethod
     def from_dict(data: dict[str, Any], *, path: Path | None = None) -> "BenchTask":
@@ -87,10 +289,22 @@ def load_bench_tasks(directory: Path = NORTHSTAR_DIR, *,
     tasks: list[BenchTask] = []
     if not directory.exists():
         return tasks
+    # Applied at LOAD time so every consumer — the runner's run-time repo
+    # check, the sandbox copy, the scorer — sees the real path. Nothing
+    # re-serialises a LOADED spec (build_bench_tasks constructs fresh specs
+    # from transcripts), so a remapped path can never be written back into a
+    # tracked spec file and undo the vendor-neutral scrub.
+    mapping = load_repo_map()
     for p in sorted(directory.glob("*.yaml")) + sorted(directory.glob("*.yml")):
         data = yaml.safe_load(p.read_text()) or {}
         if data:
-            tasks.append(BenchTask.from_dict(data, path=p))
+            task = BenchTask.from_dict(data, path=p)
+            # Recorded whether or not a map exists, so reporting has one rule.
+            task.spec_repo_path = str(task.repo.get("path") or "")
+            if mapping and task.repo.get("path"):
+                task.repo["path"] = remap_repo_path(
+                    str(task.repo["path"]), mapping)
+            tasks.append(task)
     if subset:
         tasks = [t for t in tasks if t.subset == subset]
     return sorted(tasks, key=lambda t: t.id)

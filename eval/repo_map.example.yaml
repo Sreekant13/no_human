@@ -1,0 +1,35 @@
+# Local bench repo map — copy to `eval/repo_map.yaml` (gitignored) and edit.
+#
+# WHY THIS EXISTS
+# Tracked bench specs carry vendor-neutral repo paths on purpose: the specs are
+# committed, and real project names should not be. But a vendor-neutral path
+# resolves nowhere, and a spec whose repo cannot be cloned dies at setup and
+# scores as a CAPABILITY failure — a broken instrument reading as a model
+# regression. This file translates the neutral paths to the real checkouts on
+# YOUR machine, so the specs stay neutral in git and the benchmark stays valid.
+#
+# FORMAT
+#   <path as written in the spec>: <real path on this machine>
+# Both sides must be ABSOLUTE. Matching is longest-prefix and path-boundary
+# aware, so a directory root maps every spec beneath it, and `/x/foo` never
+# matches `/x/foobar`. Anything not listed is passed through untouched.
+#
+# An absent file is a no-op: specs simply keep their own paths.
+#
+# WHAT HAPPENS IF A PATH DOES NOT RESOLVE — read this before trusting a run.
+# `nh bench run` reports how many spec repos will not resolve on this machine
+# and lists the first ten (missing, not a git repo, or missing the spec's
+# pinned commit — which is how a typo'd entry pointing at a real-but-wrong
+# checkout is caught), and names this file if it is absent. A spec with no pin,
+# or `pin: HEAD`, cannot be discriminated that way and is not checked.
+#
+# That report is ADVISORY: the run then proceeds anyway.
+# An unresolvable repo is currently booked as a CRASHED spec, i.e. it scores as
+# a capability failure rather than a skip — so a run started with warnings will
+# under-report. Abort and fix the map rather than reading the result.
+#
+# NOTE: this file is gitignored, so it does NOT exist in a fresh clone or in any
+# `git worktree`. A bench run launched from a worktree gets no mapping at all.
+
+# /Users/you/git/neutral-name/service-a: /Users/you/git/real-org/real-service-a
+# /Users/you/git/neutral-name/service-b: /Users/you/git/real-org/real-service-b
