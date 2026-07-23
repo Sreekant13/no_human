@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { fetchMetrics, fetchRepos, fetchRepoUnderstanding, searchEvents } from "./api.js";
+import { fetchMetrics, fetchBenchLatest, fetchRepos, fetchRepoUnderstanding, searchEvents } from "./api.js";
 import { fmtCost, fmtTokens, lifetimeCost, taskBurn } from "./cost.js";
 import { northStarTiles } from "./northStar.js";
 import TaskTable from "./TaskTable.jsx";
@@ -538,6 +538,101 @@ function SessionSearch() {
   );
 }
 
+// Bench instrument-trust card (Task 2): makes a REFUSED or UNMEASURED bench run
+// legible, because that is exactly the state that otherwise still looks fine.
+// Fed by GET /api/bench/latest (fetchBenchLatest). A refusal, an under-loaded
+// corpus, or a materially-unmeasured run each gets an ALERT (not a muted chip),
+// and the honest-escalation DENOMINATOR is always shown so "100% (2/2)" cannot
+// be mistaken for "100% (14/14)".
+function BenchTrust({ bench }) {
+  if (bench === undefined || bench === null) return null; // loading / endpoint absent -> hide
+  if (bench.norun) {
+    return (
+      <section className="bench-trust" aria-label="Benchmark">
+        <div className="bench-trust-head"><span className="bench-trust-title">Benchmark</span></div>
+        <div className="stats-empty" style={{ padding: "24px 0" }}>No bench run recorded yet.</div>
+      </section>
+    );
+  }
+  const total = Number(bench.total) || 0;
+  const skipped = Number(bench.skipped) || 0;
+  const dead = Number(bench.dead_specs) || 0;
+  const unmeasured = skipped + dead;
+  const corpus = Number(bench.corpus_available) || 0; // 0 = unknown (older card / pre-#197)
+  const refusals = Array.isArray(bench.refusals) ? bench.refusals : [];
+  const overrides = Array.isArray(bench.override_reasons) ? bench.override_reasons : [];
+  const escN = bench.honest_escalations;
+  const escD = bench.escalation_specs;
+  const haveEsc = Number.isFinite(escN) && Number.isFinite(escD) && escD > 0;
+
+  const refused = refusals.length > 0;
+  const undercorpus = corpus > 0 && total < corpus;
+  const materialUnmeasured = total > 0 && unmeasured / total >= 0.2;
+  const alerting = refused || undercorpus || materialUnmeasured;
+  const pct = (x) => (Number.isFinite(x) ? `${Math.round(x * 100)}%` : "—");
+
+  return (
+    <section className={`bench-trust${alerting ? " bench-trust-alert" : ""}`} aria-label="Benchmark">
+      <div className="bench-trust-head">
+        <span className="bench-trust-title">Benchmark</span>
+        {bench.label && <span className="bench-trust-sub">{bench.label}</span>}
+      </div>
+
+      {refused && (
+        <div className="nh-alarm bench-alarm" role="alert">
+          <strong>This run was refused publication.</strong>
+          <ul className="bench-reasons">{refusals.map((r, i) => <li key={i}>{r}</li>)}</ul>
+        </div>
+      )}
+      {overrides.length > 0 && (
+        <div className="nh-alarm bench-alarm" role="alert">
+          <strong>A human forced past a publish refusal.</strong>
+          <ul className="bench-reasons">{overrides.map((r, i) => <li key={i}>{r}</li>)}</ul>
+        </div>
+      )}
+      {materialUnmeasured && (
+        <div className="nh-alarm bench-alarm" role="alert">
+          <strong>{unmeasured} of {total} specs went unmeasured</strong> ({skipped} skipped, {dead} dead)
+          {" — "}the success rate is over what ran, not the corpus.
+        </div>
+      )}
+      {undercorpus && (
+        <div className="nh-alarm bench-alarm" role="alert">
+          <strong>This run loaded {total} of {corpus} corpus specs.</strong> A run that filters to the
+          specs that resolve reads as perfect coverage — it is not.
+        </div>
+      )}
+
+      <dl className="bench-stats">
+        <div>
+          <dt>Success</dt>
+          <dd>{pct(bench.success_rate)}{Number.isFinite(bench.satisfied) ? ` (${bench.satisfied}/${total})` : ""}</dd>
+        </div>
+        <div>
+          <dt>Honest escalation</dt>
+          <dd>
+            {haveEsc
+              ? <>{Math.round((escN / escD) * 100)}% <span className="bench-denom">({escN}/{escD})</span>
+                  {escD < 5 && <span className="bench-flag"> small sample</span>}</>
+              : <>{pct(bench.honest_escalation_rate)} <span className="bench-flag">denominator unknown</span></>}
+          </dd>
+        </div>
+        <div>
+          <dt>Unmeasured</dt>
+          <dd className={unmeasured > 0 ? "bench-bad" : ""}>{unmeasured} of {total} ({skipped} skipped · {dead} dead)</dd>
+        </div>
+        <div>
+          <dt>Corpus coverage</dt>
+          <dd className={undercorpus ? "bench-bad" : ""}>{corpus > 0 ? `${total} of ${corpus} loaded` : "unknown (older card)"}</dd>
+        </div>
+        {Number.isFinite(bench.median_cost_ratio) && (
+          <div><dt>Median cost</dt><dd>{bench.median_cost_ratio}×</dd></div>
+        )}
+      </dl>
+    </section>
+  );
+}
+
 export default function Stats({ tasks }) {
   const stats = useMemo(() => computeStats(tasks), [tasks]);
   // undefined = fetch in flight (loader) · null = fetch FAILED (honest
@@ -551,6 +646,10 @@ export default function Stats({ tasks }) {
       setMetrics((prev) => (m === null && prev ? prev : m)));
   }, [tasks.length]);
   const northStar = northStarTiles(metrics);
+  // The bench instrument-trust card (Task 2): fetched once, independent of task
+  // metrics. undefined = loading, null = endpoint absent (hide), {norun} = no run.
+  const [bench, setBench] = useState(undefined);
+  useEffect(() => { fetchBenchLatest().then(setBench); }, []);
 
   if (tasks.length === 0) {
     return (
@@ -588,6 +687,9 @@ export default function Stats({ tasks }) {
           ))}
         </div>
       )}
+
+      <BenchTrust bench={bench} />
+
 
       {/* Primary metric cards */}
       <div className="stats-cards">

@@ -337,6 +337,24 @@ export async function fetchMetrics() {
   }
 }
 
+// The latest north-star bench card, for the instrument-trust surface on Stats.
+// Contract: GET /api/bench/latest (a separate endpoint from /api/metrics, which
+// carries TASK metrics only). 404 = the endpoint exists but no run is recorded
+// -> a "no run yet" sentinel so the UI says so instead of showing zeros. Any
+// other non-ok / network error / non-object body -> null, so the section hides
+// gracefully on a build that does not expose the endpoint yet. Never throws.
+export async function fetchBenchLatest() {
+  try {
+    const r = await fetch(`${BASE}/api/bench/latest`);
+    if (r.status === 404) return { norun: true };
+    if (!r.ok) return null;
+    const data = await r.json();
+    return data && typeof data === "object" && !Array.isArray(data) ? data : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function fetchProjects() {
   const r = await fetch(`${BASE}/api/projects`);
   if (!r.ok) return [];
