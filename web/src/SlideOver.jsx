@@ -260,6 +260,18 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
           </div>
         )}
 
+        {/* Why it failed — the orchestrator's own failure_reason, verbatim. A
+            failed task otherwise showed only a Retry button, so a quota stop
+            ("...returned an error result: success") was indistinguishable from a
+            real capability failure. Rendered as text (React-escaped), shown
+            whenever the field is set. */}
+        {task?.failure_reason && (
+          <div className="so-failure" role="alert">
+            <div className="so-failure-label">Why it failed</div>
+            <div className="so-failure-reason">{task.failure_reason}</div>
+          </div>
+        )}
+
         {/* summary — the landing state: a plain-language narrative, live chips,
             and a small milestone timeline. Replaces the tab strip; the action
             bar below still leads with Approve/Reply/etc. */}
