@@ -62,7 +62,7 @@ async def test_a_silent_spec_is_stopped_instead_of_hanging_the_run():
     # useless in CI, and it wedged my own mutation run.
     with pytest.raises(NorthStarRunner.SpecStalled) as exc:
         await asyncio.wait_for(
-            r._run_with_watchdog(orch, object(), object(), last), timeout=10)
+            r._run_with_watchdog(orch, object(), last), timeout=10)
 
     msg = str(exc.value)
     assert "no event" in msg and "hung" in msg, msg
@@ -94,7 +94,7 @@ async def test_a_SLOW_but_ALIVE_spec_is_never_killed():
             done.append(True)
             return "finished"
 
-    out = await r._run_with_watchdog(_Alive(), object(), object(), last)
+    out = await r._run_with_watchdog(_Alive(), object(), last)
 
     assert out == "finished"
     assert done, "the slow-but-alive spec must run to completion"
@@ -118,7 +118,7 @@ async def test_zero_disables_the_watchdog_exactly_as_in_wake_py():
             return "ok"
 
     out = await asyncio.wait_for(
-        r._run_with_watchdog(_SlowAndSilent(), object(), object(),
+        r._run_with_watchdog(_SlowAndSilent(), object(),
                              [time.monotonic()]),
         timeout=10)
     assert out == "ok"
@@ -135,7 +135,7 @@ async def test_the_threshold_comes_from_the_SHARED_config_key():
     with pytest.raises(NorthStarRunner.SpecStalled) as exc:
         await asyncio.wait_for(
             r._run_with_watchdog(_Orch(beats=0, gap=0, sink=lambda: None),
-                                 object(), object(), [time.monotonic()]),
+                                 object(), [time.monotonic()]),
             timeout=10)
     # 0.004 min rounds to 0 in the message, but the limit must be reported.
     assert "limit" in str(exc.value)

@@ -320,7 +320,7 @@ class NorthStarRunner:
     class SpecStalled(RuntimeError):
         """A spec emitted no event for longer than the stuck-active threshold."""
 
-    async def _run_with_watchdog(self, orch, task, spec, last_event):
+    async def _run_with_watchdog(self, orch, task, last_event):
         """`orch.run_task` under the SAME stuck-active policy the server applies.
 
         The product already has this watchdog — `blockers.stuck_active_minutes`
@@ -352,8 +352,11 @@ class NorthStarRunner:
                 # Give the cancellation a bounded chance to unwind. The hang
                 # observed live was INSIDE subprocess teardown, so waiting on
                 # it forever would reproduce the very defect being fixed.
+                # Only the cancel's own CancelledError and the unwind
+                # TimeoutError are expected; anything else is a real teardown
+                # bug and must not be swallowed under the SpecStalled below.
                 with contextlib.suppress(asyncio.CancelledError,
-                                         asyncio.TimeoutError, Exception):
+                                         asyncio.TimeoutError):
                     await asyncio.wait_for(runner, timeout=_WATCHDOG_UNWIND_S)
                 raise NorthStarRunner.SpecStalled(
                     f"no event for {silent_s / 60:.0f} min "
@@ -418,7 +421,7 @@ class NorthStarRunner:
 
                 t0 = time.monotonic()
                 outcome = await self._run_with_watchdog(
-                    orch, task, spec, last_event)
+                    orch, task, last_event)
                 elapsed = time.monotonic() - t0
 
                 attempts = await store.list_attempts(task.id)
