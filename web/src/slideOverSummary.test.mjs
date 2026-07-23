@@ -62,6 +62,18 @@ test("compound_parent narrative reads as coordinating sub-tasks, not a raw enum 
   assert.notEqual(sys.text, "Running");
 });
 
+test("paused_quota reads as a self-resolving quota park, not a task-budget wait", () => {
+  // paused_quota comes from _park_quota (subscription QUOTA exhausted), and it
+  // auto-resumes when quota refreshes — distinct from BUDGET_EXHAUSTED (the
+  // per-task token budget). Neither the narrative nor the badge may call it "budget".
+  const text = narrativeText(narrativeFor({ status: "paused_quota", kind: "task" }));
+  assert.match(text, /quota/i, "narrative names the subscription quota");
+  assert.doesNotMatch(text, /budget/i, "narrative must not conflate quota with the task budget");
+  const badge = sectionSummary("system", { task: { status: "paused_quota" } });
+  assert.match(badge.text, /quota/i, "badge names quota");
+  assert.doesNotMatch(badge.text, /budget/i, "badge must not say budget");
+});
+
 test("reviewing/testing attribution copy — not the coder, not a bare stage word", () => {
   const reviewing = narrativeFor({ status: "reviewing" });
   assert.equal(narrativeText(reviewing).includes("Coder is reviewing"), false);

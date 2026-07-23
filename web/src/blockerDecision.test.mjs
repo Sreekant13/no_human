@@ -97,6 +97,28 @@ test("paused_quota counts as parked", () => {
   assert.ok(d, "paused_quota is a parked state");
 });
 
+test("QUOTA park reads as self-resolving, not a 'waiting for your decision' gate", () => {
+  // The real _park_quota shape (orchestrator.py): status paused_quota, category
+  // QUOTA, wake quota_refreshed, no question/options. It auto-resumes when quota
+  // refreshes, so the copy must NOT be the DEFAULT "waiting for your decision".
+  const d = decisionFor({
+    status: "paused_quota",
+    blocker: {
+      category: "QUOTA",
+      wake_condition: "quota_refreshed",
+      root_cause_hypothesis: "quota exhausted ('personal' subscription)",
+      confidence: 1.0,
+    },
+  });
+  assert.equal(d.category, "QUOTA");
+  assert.equal(d.categoryLabel, "Paused for quota");
+  assert.match(d.headline, /quota refreshes/i);
+  assert.doesNotMatch(d.headline, /waiting for your decision/i); // not the DEFAULT
+  assert.match(d.ask, /resumes on its own/i);
+  assert.equal(d.wake, "quota_refreshed");
+  assert.match(d.actions[0].label, /resume now/i);
+});
+
 test("wake_condition is surfaced when present", () => {
   const d = decisionFor({
     status: "blocked",

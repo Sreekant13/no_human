@@ -47,6 +47,16 @@ const CATEGORY_COPY = {
     ask: "Answer the question below so it can keep going.",
     resumeLabel: "Resume",
   },
+  // A self-resolving park (backend _park_quota, category "QUOTA",
+  // wake_condition "quota_refreshed"): the subscription's quota is exhausted and
+  // the task auto-resumes when it refreshes. Nothing to answer — so the copy must
+  // NOT read as a "waiting for your decision" gate (which the DEFAULT would).
+  QUOTA: {
+    label: "Paused for quota",
+    headline: "This task is paused until its subscription quota refreshes",
+    ask: "It resumes on its own when quota refreshes — you don't need to answer. Resume it now to retry sooner, or stop here.",
+    resumeLabel: "Resume now",
+  },
 };
 
 const DEFAULT_COPY = {

@@ -12,8 +12,10 @@ import { formatDuration } from "./formatDuration.js";
 // The statuses whose gate the operator clears IN the drawer (Reply / Resume / the
 // blocker's options). Single definition — SlideOver's `isParked` and the
 // gate-aware default-open-section both read it. Deliberately NOT paused_quota:
-// the backend parks it without a blocker record, so it has no Reply/Resume
-// affordance and its gate is a budget raise, not an answer.
+// #205 gave it a blocker record and a Resume affordance (rendered via
+// decisionFor / the DecisionPanel), but it is a SELF-RESOLVING park — it
+// auto-resumes once its subscription quota refreshes — so it is not a
+// "waiting on you" gate here.
 export const PARKED_STATUSES = new Set(["awaiting_input", "blocked", "escalated"]);
 
 const ACTIVE_STATUSES = new Set([
@@ -105,7 +107,7 @@ export function narrativeFor(task) {
     return { before: `This ${kind} couldn't make progress on its own —`, phrase: "waiting for your decision", after: "", colorVar: colorForStatus(status) };
   }
   if (status === "paused_quota") {
-    return { before: `This ${kind} ran out of budget —`, phrase: "paused for a budget raise", after: "", colorVar: colorForStatus(status) };
+    return { before: `This ${kind} is paused —`, phrase: "waiting for its subscription quota to refresh", after: "", colorVar: colorForStatus(status) };
   }
   if (ACTIVE_STATUSES.has(status)) {
     const attempt = task.attempt_count > 0 ? ` — attempt ${task.attempt_count}` : "";
@@ -275,7 +277,7 @@ export function sectionSummary(key, { task, diff } = {}) {
       if (task.status === "done") return { text: "Pipeline complete", colorVar: colorForStatus("done") };
       if (task.status === "failed") return { text: "Pipeline stopped — failed", colorVar: colorForStatus("failed") };
       if (PARKED_STATUSES.has(task.status)) return { text: "Paused, waiting on you", colorVar: colorForStatus(task.status) };
-      if (task.status === "paused_quota") return { text: "Paused for budget", colorVar: colorForStatus(task.status) };
+      if (task.status === "paused_quota") return { text: "Paused for quota", colorVar: colorForStatus(task.status) };
       if (task.status === "compound_parent") return { text: "Coordinating sub-tasks", colorVar: colorForStatus(task.status) };
       const stage = STATUS_STAGE_LABEL[task.status];
       return { text: stage ? `Running — ${stage}` : "Running", colorVar: colorForStatus(task.status) };
