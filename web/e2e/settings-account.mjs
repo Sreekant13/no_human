@@ -146,10 +146,14 @@ function baseStatus(over = {}) {
     return j({});
   });
   await openAccount(page);
-  check("[s3] the panel degrades to an 'unavailable' note when the endpoints are absent",
-    (await page.locator('.settings-empty').innerText().catch(() => "")).match(/unavailable/i) != null);
-  check("[s3] no token field is rendered when status is unavailable",
-    (await page.locator('input[aria-label="OAuth token"]').count()) === 0);
+  const noteVisible = (await page.locator('.settings-empty').innerText().catch(() => "")).match(/unavailable/i) != null;
+  check("[s3] the panel degrades to an 'unavailable' note when the endpoints are absent", noteVisible);
+  // Gate the absence check on the note being present: otherwise "no token field"
+  // passes vacuously if the panel CRASHED and rendered nothing (absence of the
+  // field is true either way). Requiring noteVisible makes it fail on a crash.
+  check("[s3] with the unavailable note shown, no token field is rendered",
+    noteVisible && (await page.locator('input[aria-label="OAuth token"]').count()) === 0,
+    `noteVisible=${noteVisible}`);
   check("[s3] no page errors", errors.length === 0, errors[0] || "");
   await ctx.close();
 }
