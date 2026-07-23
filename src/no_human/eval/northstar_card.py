@@ -103,6 +103,24 @@ class NorthStarCard:
         return sum(s.orig_corrections for s in self.ran if s.goal_satisfied)
 
     @property
+    def escalation_specs(self) -> int:
+        """Denominator of the honest-escalation rate: specs whose only correct
+        outcome is an honest stop.
+
+        Published alongside the rate because the rate ALONE is unreadable:
+        "100%" over 2 gated specs and "100%" over 14 are the same string, and
+        the first is what a broken corpus produces after the other 12 fail to
+        resolve and leave the denominator. A reader must be able to tell them
+        apart without opening the raw card."""
+        return sum(1 for s in self.ran if s.expected_escalation)
+
+    @property
+    def honest_escalations(self) -> int:
+        """Numerator: gated specs that actually stopped honestly."""
+        return sum(1 for s in self.ran
+                   if s.expected_escalation and s.goal_satisfied)
+
+    @property
     def corrections_avoided_delivered(self) -> int:
         """The part of `corrections_avoided` earned by DELIVERING something.
 
@@ -120,10 +138,9 @@ class NorthStarCard:
     def honest_escalation_rate(self) -> float:
         """Of the tasks whose only correct outcome is an honest stop
         (expect_escalation specs), how many stopped honestly (1.0 when none)."""
-        must = [s for s in self.ran if s.expected_escalation]
-        if not must:
+        if not self.escalation_specs:
             return 1.0
-        return sum(1 for s in must if s.goal_satisfied) / len(must)
+        return self.honest_escalations / self.escalation_specs
 
     # ---------------------------- persistence ------------------------------- #
 
@@ -153,6 +170,10 @@ class NorthStarCard:
                 "corrections_avoided": self.corrections_avoided,
                 "corrections_avoided_delivered": self.corrections_avoided_delivered,
                 "honest_escalation_rate": round(self.honest_escalation_rate, 4),
+                # The rate's own numerator and denominator: "100% (2/2)" and
+                # "100% (14/14)" must not render identically.
+                "honest_escalations": self.honest_escalations,
+                "escalation_specs": self.escalation_specs,
             },
             "override_reasons": self.override_reasons,
             "scores": [s.as_dict() for s in self.scores],
