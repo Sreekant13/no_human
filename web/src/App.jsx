@@ -227,6 +227,34 @@ function NewTaskModal({ onClose, onCreated }) {
   const showingGrill = grillMode || Boolean(grillResult);
   useEscapeKey(onClose, !busy && showingGrill);
 
+  // The grill/intake modals are dialogs (role/aria set on each modal div below):
+  // pull focus into the current one and trap Tab within it, matching the app's
+  // other modals. Escape is handled above. The effect re-runs on every grill
+  // state transition so that when a step's focused control unmounts (e.g.
+  // loading -> question) focus is pulled back in rather than lost to <body>,
+  // which would let the next Tab escape the trap.
+  const grillRef = useRef(null);
+  useEffect(() => {
+    const el = grillRef.current;
+    if (!el) return undefined;
+    const focusables = () => Array.from(el.querySelectorAll(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    )).filter((n) => !n.disabled && n.getClientRects().length > 0);
+    if (!el.contains(document.activeElement)) (focusables()[0] || el).focus();
+    function onKeyDown(e) {
+      if (e.key !== "Tab") return;
+      const list = focusables();
+      if (!list.length) return;
+      const first = list[0];
+      const last = list[list.length - 1];
+      if (e.shiftKey) {
+        if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+      } else if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [showingGrill, grillResult, grillMode, grillQuestion, busy]);
+
   async function handleSubmit(e) {
     if (e) e.preventDefault();
     if (!fields || busy) return;
@@ -326,7 +354,7 @@ function NewTaskModal({ onClose, onCreated }) {
   if (grillResult) {
     return (
       <div className="sendback-overlay" onClick={onClose}>
-        <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Refined spec" tabIndex={-1} ref={grillRef} onClick={(e) => e.stopPropagation()}>
           <div className="sendback-label">Refined Spec</div>
           <div className="grill-spec">
             <div className="grill-spec-title">{grillResult.title}</div>
@@ -374,7 +402,7 @@ function NewTaskModal({ onClose, onCreated }) {
   if (grillMode && !grillQuestion && busy) {
     return (
       <div className="sendback-overlay" onClick={onClose}>
-        <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Intake grill" tabIndex={-1} ref={grillRef} onClick={(e) => e.stopPropagation()}>
           <div className="sendback-label">Intake Grill</div>
           <div className="grill-loading">
             <Spinner />
@@ -406,7 +434,7 @@ function NewTaskModal({ onClose, onCreated }) {
     if (busy) {
       return (
         <div className="sendback-overlay">
-          <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
+          <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Intake grill" tabIndex={-1} ref={grillRef} onClick={(e) => e.stopPropagation()}>
             <div className="grill-header">
               <div className="sendback-label">Intake Grill</div>
               <span className="grill-round-badge">Round {grillQuestion.round}/{maxRounds}</span>
@@ -429,7 +457,7 @@ function NewTaskModal({ onClose, onCreated }) {
     }
     return (
       <div className="sendback-overlay" onClick={onClose}>
-        <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Intake grill" tabIndex={-1} ref={grillRef} onClick={(e) => e.stopPropagation()}>
           <div className="grill-header">
             <div className="sendback-label">Intake Grill</div>
             <span className="grill-round-badge">Round {grillQuestion.round}/{maxRounds}</span>
