@@ -80,12 +80,16 @@ async function open(task, viewport = { width: 1440, height: 900 }, theme = "dark
 const openSectionLabel = (page) =>
   page.locator(".so-section.open .so-section-title").first().innerText().catch(() => "?");
 
-// B4 — the drawer must open on the section that can CLEAR the gate.
+// B4 — a parked task must surface its blocker answer UI up front. Since the
+// Decision panel landed, a parked task's one-click answers live in the promoted
+// DecisionPanel (`.decision-option-btn`) ABOVE the accordion — not inside a
+// "detail" section — so this asserts the panel, not which section is open.
 {
   const { ctx, page, errors } = await open(PARKED);
-  const t = (await openSectionLabel(page)).toLowerCase();
-  check("[B4] a PARKED task opens on the section that holds its answer UI", t.includes("detail"), t);
-  const optionBtns = page.locator(".slideover .blocker-option-btn");
+  const panel = page.locator(".slideover .decision-panel");
+  check("[B4] a PARKED task surfaces its blocker answer UI (DecisionPanel) up front",
+    await panel.isVisible().catch(() => false));
+  const optionBtns = page.locator(".slideover .decision-option-btn");
   const nOptions = await optionBtns.count();
   const questionShown = await page.locator(".slideover").innerText();
   check("[B4] the blocker's one-click answers are on screen without changing sections",
@@ -109,7 +113,7 @@ const openSectionLabel = (page) =>
 // M3 — Escape must close the nested modal ONLY, preserving the drawer and the typed text.
 {
   const { ctx, page } = await open(PARKED);
-  const replyBtn = page.getByRole("button", { name: /^reply$/i }).first();
+  const replyBtn = page.getByRole("button", { name: /reply/i }).first();
   if (await replyBtn.count()) {
     await replyBtn.click();
     await page.waitForTimeout(400);
