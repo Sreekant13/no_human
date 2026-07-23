@@ -4,6 +4,7 @@ import {
   fetchRules, fetchSkills, rejectLearning, removeRule, removeSkill,
   fetchProjects, createProject, updateProject, deleteProject,
   fetchProfiles, detectRepos, onboardRepo, suggestPaths,
+  fetchAuthStatus, setAuthToken,
 } from "./api.js";
 import { groupLearningsByProject } from "./learningGroups.js";
 import { useEscapeKey } from "./useEscapeKey.js";
@@ -16,7 +17,112 @@ const SECTIONS = [
   { key: "skills",    label: "Skills" },
   { key: "learnings", label: "Learnings" },
   { key: "integrations", label: "Integrations" },
+  { key: "account",   label: "Account" },
 ];
+
+// The Account panel: which OAuth profile pays, whether the running server has
+// drifted from the configured one, and a WRITE-ONLY editor for the token. The
+// API never returns a token, so there is nothing to reveal and no masked echo —
+// the field is cleared the instant it is submitted and never logged.
+function AuthPanel() {
+  const [status, setStatus] = useState(undefined); // undefined = loading, null = unavailable
+  const [profile, setProfile] = useState("");
+  const [token, setToken] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    fetchAuthStatus().then((s) => {
+      setStatus(s);
+      if (s?.configured_profile) setProfile((p) => p || s.configured_profile);
+    });
+  }, []);
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    if (!token.trim() || saving) return;
+    setSaving(true); setError(null); setSaved(false);
+    try {
+      const next = await setAuthToken(profile, token);
+      setToken("");           // write-only — never keep the token after submit
+      setStatus(next);
+      setSaved(true);
+    } catch (err) {
+      setError(err.message);  // the backend's 422 detail, rendered verbatim
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (status === undefined) return <div className="settings-empty">Loading…</div>;
+  if (status === null) {
+    return (
+      <div className="memory-panel">
+        <div className="settings-empty">
+          Account status is unavailable — this server build does not expose the
+          auth endpoints yet.
+        </div>
+      </div>
+    );
+  }
+
+  const profiles = status.profiles || [];
+  return (
+    <div className="memory-panel auth-panel">
+      <div className="memory-header">
+        <h3 className="memory-title"><span className="panel-title-text">Account</span></h3>
+      </div>
+
+      {status.metered_key_present && (
+        <div className="nh-alarm auth-alarm" role="alert">
+          A metered <code>ANTHROPIC_API_KEY</code> is set in no_human&apos;s
+          environment — it bills per request and bypasses your subscription.
+          Unset it where the server runs.
+        </div>
+      )}
+      {status.restart_required && (
+        <div className="nh-alarm auth-alarm" role="alert">
+          Restart required — the running server is still billing
+          {" "}&ldquo;{status.active_profile}&rdquo;, but
+          {" "}&ldquo;{status.configured_profile}&rdquo; is now configured.
+          Restart no_human to switch.
+        </div>
+      )}
+
+      <dl className="auth-status">
+        <div><dt>Configured profile</dt><dd>{status.configured_profile}</dd></div>
+        <div><dt>Active (billing) profile</dt><dd>{status.active_profile}</dd></div>
+        <div><dt>Token variable</dt><dd><code>{status.token_var}</code></dd></div>
+        <div><dt>Token set</dt><dd>{status.token_present ? "yes" : "no"}</dd></div>
+      </dl>
+
+      <form className="auth-form" onSubmit={handleSubmit} autoComplete="off">
+        <label className="auth-label">Profile
+          <select className="new-task-select" value={profile} aria-label="Profile"
+                  onChange={(e) => setProfile(e.target.value)}>
+            {profiles.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
+          </select>
+        </label>
+        <label className="auth-label">OAuth token
+          <input className="new-task-input" type="password" autoComplete="off"
+                 spellCheck={false} value={token} aria-label="OAuth token"
+                 placeholder="CLAUDE_CODE_OAUTH_TOKEN (subscription or enterprise)"
+                 onChange={(e) => { setToken(e.target.value); setSaved(false); setError(null); }} />
+        </label>
+        <p className="auth-hint">
+          A subscription or enterprise OAuth token — not an API key. Stored
+          write-only and never shown again.
+        </p>
+        {error && <div className="settings-error" role="alert">{error}</div>}
+        {saved && <div className="auth-saved" role="status">Saved.</div>}
+        <button className="btn btn-approve" type="submit" disabled={!token.trim() || saving}>
+          {saving ? "Saving…" : "Save token"}
+        </button>
+      </form>
+    </div>
+  );
+}
 
 // Settings, modeled on the Claude macOS desktop app: an overlay dialog with a
 // left section list and the section's panel content on the right — not a
@@ -128,6 +234,7 @@ export default function SettingsOverlay({ onClose }) {
             {section === "skills"    && <MemoryList kind="skills" fetchFn={fetchSkills} addFn={addSkill} removeFn={removeSkill} />}
             {section === "learnings" && <LearningsPanel />}
             {section === "integrations" && <IntegrationsPanel />}
+            {section === "account"     && <AuthPanel />}
           </div>
         </div>
       </div>

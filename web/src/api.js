@@ -263,6 +263,24 @@ export async function fetchProfiles() {
   return r.json();
 }
 
+// Auth status for the Settings Account panel. Returns null when the endpoints
+// are absent (a build without the auth endpoints) so the panel degrades to an
+// "unavailable" note instead of throwing. The payload never contains a token.
+export async function fetchAuthStatus() {
+  try {
+    const r = await fetch(`${BASE}/api/auth/status`);
+    if (!r.ok) return null;
+    return r.json();
+  } catch { return null; }
+}
+
+// Write an OAuth token for a profile. On a 422 refusal (a metered API key, an
+// empty token, or a newline) `_put` throws Error(detail) — a human-facing
+// message written to be shown verbatim. Never returns the token.
+export async function setAuthToken(profile, token) {
+  return _put("/api/auth/token", { profile, token });
+}
+
 // C3-G3: the repos the operator knows (for the repo-understanding picker).
 export async function fetchRepos() {
   try {
