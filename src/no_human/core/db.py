@@ -27,7 +27,10 @@ class Store:
         self._db: aiosqlite.Connection | None = None
 
     async def connect(self) -> "Store":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # no_human.db sits beside the credential store; the directory must be
+        # private even when the DB is what creates it.
+        from ..config import ensure_private_dir
+        ensure_private_dir(self.path.parent)
         self._db = await aiosqlite.connect(self.path)
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode = WAL")

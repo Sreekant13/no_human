@@ -99,16 +99,33 @@ def check_prerequisites() -> tuple[list[str], list[str]]:
 # --------------------------------------------------------------------------- #
 
 def ensure_home_dir() -> bool:
-    """Create ``~/.no_human/`` with 700 permissions. Returns True if created."""
-    created = False
-    if not NO_HUMAN_HOME.exists():
-        NO_HUMAN_HOME.mkdir(parents=True, mode=0o700)
-        created = True
-    else:
-        # Fix permissions if too open (e.g. 755 from a careless mkdir).
-        current = NO_HUMAN_HOME.stat().st_mode & 0o777
-        if current != 0o700:
-            NO_HUMAN_HOME.chmod(0o700)
+    """Ensure ``~/.no_human/`` exists and grants no group or other access.
+
+    Does NOT force 0700: owner bits are left as the operator set them (a 0500
+    lockdown stays 0500). Raises if the result is unusable, rather than
+    widening it. Returns True if the directory was created.
+    """
+    # Delegates to config.ensure_private_dir so ONE implementation governs
+    # every writer. The old `!= 0o700` here re-OPENED a directory the operator
+    # had locked down further (0500 -> 0700), contradicting the invariant the
+    # shared helper documents; it only ever needs to clear group/other bits.
+    from ..config import ensure_private_dir
+
+    created = not NO_HUMAN_HOME.exists()
+    ensure_private_dir(NO_HUMAN_HOME)
+    # The shared helper deliberately does NOT restore owner bits — clearing
+    # group/other is the security goal, and widening a directory the operator
+    # locked down is not ours to do. But `nh init`'s whole contract is "make my
+    # install work", and without owner-write the very next step died with a raw
+    # PermissionError three calls downstream. Say so here instead.
+    if not os.access(NO_HUMAN_HOME, os.W_OK | os.X_OK):
+        mode = format(NO_HUMAN_HOME.stat().st_mode & 0o777, "04o")
+        raise click.ClickException(
+            f"{NO_HUMAN_HOME} is mode {mode}: no_human cannot write into it. "
+            f"Run `chmod u+rwx {NO_HUMAN_HOME}` and re-run `nh init` (if it "
+            f"sits on a read-only mount, move NO_HUMAN_HOME instead). "
+            f"(Permissions are left as you set them — only group/other access "
+            f"is stripped.)")
     return created
 
 

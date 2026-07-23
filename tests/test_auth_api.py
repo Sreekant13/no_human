@@ -507,3 +507,181 @@ def test_a_TRAILING_separator_is_refused_rather_than_silently_truncated(
             upsert_env_var(env, "K", f"tok{sep}")
     upsert_env_var(env, "K", "tok")
     assert _read_env_file(env)["K"] == "tok"
+
+
+@pytest.mark.parametrize("writer", ["db", "config", "pidlock", "cache"])
+def test_every_writer_leaves_the_home_dir_private(tmp_path, monkeypatch, writer):
+    """~/.no_human holds the credential store, config.yaml and the DB. Only
+    .env is chmod'd individually; the DIRECTORY's 0700 protects the rest.
+
+    This drives the REAL writers. The first version called `ensure_private_dir`
+    directly and was still named "every writer" — a claim the test did not
+    make, and all four call sites could be reverted to a bare mkdir with the
+    suite green.
+    """
+    import no_human.config as cfg
+
+    home = tmp_path / ".no_human"
+    monkeypatch.setattr(cfg, "NO_HUMAN_HOME", home)
+    monkeypatch.setattr(cfg, "CONFIG_PATH", home / "config.yaml")
+
+    if writer == "db":
+        import asyncio
+
+        from no_human.core.db import Store
+        async def _go():
+            await (await Store(home / "no_human.db").connect()).close()
+        asyncio.run(_go())
+    elif writer == "config":
+        cfg.load_config(home / "config.yaml")
+    elif writer == "pidlock":
+        import no_human.cli.commands as cmd
+        monkeypatch.setattr("no_human.config.NO_HUMAN_HOME", home)
+        cmd._acquire_pid_lock()
+    else:
+        # The PRODUCTION path: repo_map() is what creates the cache dir.
+        # Calling ensure_private_dir directly here let the real call site be
+        # reverted to a bare mkdir with the suite green.
+        import no_human.context.repo_map as rm
+        monkeypatch.setattr(rm, "_CACHE_DIR", home / "cache")
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        rm.repo_map(repo)
+
+    assert home.exists(), f"{writer} did not create the home dir"
+    assert (home.stat().st_mode & 0o777) == 0o700, (
+        f"{writer} left ~/.no_human at {oct(home.stat().st_mode & 0o777)}")
+
+
+def test_the_walk_NEVER_touches_anything_above_the_home_dir(tmp_path, monkeypatch):
+    """THE safety bound, and the catastrophic case if it is wrong.
+
+    The walk chmods ancestors, so an off-by-one would march to `/`. Nothing
+    asserted that before: replacing the bounded walk with
+    `[path, *path.resolve().parents]` passed both original tests while
+    chmod'ing the pytest basetemp — and, on a real run, everything up to the
+    filesystem root including $HOME.
+    """
+    import no_human.config as cfg
+
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    home = outside / ".no_human"
+    monkeypatch.setattr(cfg, "NO_HUMAN_HOME", home)
+    tmp_path.chmod(0o755)
+
+    cfg.ensure_private_dir(home / "cache" / "deep")
+
+    assert (home.stat().st_mode & 0o777) == 0o700
+    assert ((home / "cache" / "deep").stat().st_mode & 0o777) == 0o700
+    # Everything ABOVE the home dir is untouched.
+    assert (outside.stat().st_mode & 0o777) == 0o755, "walked above NO_HUMAN_HOME"
+    assert (tmp_path.stat().st_mode & 0o777) == 0o755, "walked to the root"
+
+    # A path that LOOKS like it is under the home dir but escapes via "..".
+    # `.resolve()` is what defeats this, and nothing pinned it: dropping it
+    # passed the entire suite while chmod'ing both the root AND an unrelated
+    # sibling. `relative_to` on the UNRESOLVED path happily succeeds, because
+    # the string does start with NO_HUMAN_HOME.
+    # home is outside/.no_human, so home/.. is OUTSIDE, not tmp_path.
+    victim = outside / "victim"
+    victim.mkdir(mode=0o755)
+
+    cfg.ensure_private_dir(home / ".." / "victim" / "escaped")
+
+    assert (victim.stat().st_mode & 0o777) == 0o755, "escaped via .."
+    assert (tmp_path.stat().st_mode & 0o777) == 0o755, "escaped to the root"
+    # The leaf itself is still secured — leaf-only is the correct fallback.
+    assert ((victim / "escaped").stat().st_mode & 0o777) == 0o700
+
+
+def test_a_path_outside_the_home_dir_secures_only_the_leaf(tmp_path, monkeypatch):
+    """A custom path is not ours to restructure — secure the leaf, leave the
+    caller's parent alone."""
+    import no_human.config as cfg
+
+    monkeypatch.setattr(cfg, "NO_HUMAN_HOME", tmp_path / ".no_human")
+    parent = tmp_path / "someone_elses"
+    parent.mkdir(mode=0o755)
+
+    cfg.ensure_private_dir(parent / "leaf")
+
+    assert ((parent / "leaf").stat().st_mode & 0o777) == 0o700
+    assert (parent.stat().st_mode & 0o777) == 0o755, "chmod'd a caller's dir"
+
+
+def test_group_and_other_are_cleared_without_widening_owner_bits(tmp_path,
+                                                                 monkeypatch):
+    """The documented no-churn rule, which `chmod(0o700)` did not implement:
+    it RESTORED owner-write on 0550 and silently dropped setgid on 02750."""
+    import os
+
+    import no_human.config as cfg
+
+    for before, after in ((0o755, 0o700), (0o550, 0o500), (0o2750, 0o2700),
+                          (0o500, 0o500), (0o700, 0o700)):
+        d = tmp_path / f"d{before:o}"
+        d.mkdir()
+        os.chmod(d, before)
+        monkeypatch.setattr(cfg, "NO_HUMAN_HOME", d)
+        cfg.ensure_private_dir(d)
+        got = d.stat().st_mode & 0o7777
+        assert got == after, f"{oct(before)} -> {oct(got)}, expected {oct(after)}"
+        assert not got & 0o077, "group/other access survived"
+
+
+def test_a_tighter_lockdown_is_never_reopened_but_IS_explained(tmp_path,
+                                                                monkeypatch):
+    """Two properties that pull against each other, both required.
+
+    The old `init_cmd` used `!= 0o700`, so an operator who locked the directory
+    down FURTHER (0500) had it silently re-opened. Delegating to the shared
+    helper fixes that — the security goal is "no group or other access", and
+    owner bits are the operator's business.
+
+    But `nh init`'s contract is "make my install work", and without owner-write
+    the NEXT step died with a raw PermissionError three calls downstream. So it
+    must refuse to widen AND say why, in one place, before anything fails.
+    """
+    import click
+    import no_human.config as cfg
+    from no_human.cli import init_cmd
+
+    home = tmp_path / ".no_human"
+    home.mkdir(mode=0o500)
+    monkeypatch.setattr(cfg, "NO_HUMAN_HOME", home)
+    monkeypatch.setattr(init_cmd, "NO_HUMAN_HOME", home)
+
+    with pytest.raises(click.ClickException) as exc:
+        init_cmd.ensure_home_dir()
+
+    assert (home.stat().st_mode & 0o777) == 0o500, "must not widen owner bits"
+    msg = str(exc.value)
+    assert "0500" in msg, msg           # names the actual mode
+    assert "chmod" in msg, msg          # tells them how to fix it
+    assert str(home) in msg, msg        # names the directory
+
+
+def test_the_diagnostic_renders_an_ODD_mode_readably(tmp_path, monkeypatch):
+    """Clearing group/other can leave 0000 (e.g. from 0070), and `oct()`
+    renders that as "0o0" — which reads like a bug, not a permission. Fixed
+    width keeps it recognisable as a mode."""
+    import click
+    import no_human.config as cfg
+    from no_human.cli import init_cmd
+
+    home = tmp_path / ".no_human"
+    home.mkdir(mode=0o070)
+    monkeypatch.setattr(cfg, "NO_HUMAN_HOME", home)
+    monkeypatch.setattr(init_cmd, "NO_HUMAN_HOME", home)
+
+    with pytest.raises(click.ClickException) as exc:
+        init_cmd.ensure_home_dir()
+
+    assert (home.stat().st_mode & 0o777) == 0o000, "group access must be gone"
+    assert "0000" in str(exc.value), str(exc.value)
+    assert "0o0" not in str(exc.value), str(exc.value)
+    # Restore owner access or pytest cannot remove the tmp dir, which leaks a
+    # PytestWarning and an undeletable directory into the shared tmp root on
+    # every run — noticed because it polluted an UNRELATED worktree's output.
+    home.chmod(0o700)

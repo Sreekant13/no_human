@@ -126,7 +126,8 @@ def repo_map(repo_path: Path) -> str:
         pass
     text = build_repo_map(repo_path)
     try:
-        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        from ..config import ensure_private_dir
+        ensure_private_dir(_CACHE_DIR)
         cache.write_text(text, encoding="utf-8")
     except OSError:
         pass  # cache is an optimization, never a dependency
