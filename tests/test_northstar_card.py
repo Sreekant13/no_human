@@ -382,3 +382,110 @@ def test_corpus_available_survives_save_and_load(tmp_path):
     assert reloaded.corpus_available == 55
     # And the rule still fires on the RELOADED card, not just the built one.
     assert "11 of 55" in corpus_shortfall(reloaded)
+
+
+def test_the_report_discloses_that_corpus_resolution_is_MACHINE_LOCAL():
+    """The published report is the artifact a reader trusts, and nothing in it
+    said the spec RESOLUTION depends on a gitignored local file.
+
+    `eval/repo_map.yaml` translates the vendor-neutral tracked paths to real
+    checkouts and is gitignored by design. A fresh clone or `git worktree`
+    LOADS the same specs — the loader globs the directory and only rewrites
+    paths, it never drops one — but RESOLVES far fewer, and the unresolved
+    ones are skipped. So the count that moves is the Headline's
+    `skipped (not measured)`, while loaded-vs-available is invariant.
+
+    The first version of this block got that backwards ("loads FEWER specs";
+    "check the loaded-vs-available count") and would have reassured a reader
+    that a heavily-skipped corpus was healthy.
+    """
+    from no_human.eval.northstar_card import render_northstar_md
+
+    md = render_northstar_md(NorthStarCard(
+        scores=[_score(), _score(status="skipped", satisfied=None,
+                                 task_id="ns-skip")], label="x"))
+    block = [ln for ln in md.split("\n") if "machine-local" in ln]
+    assert block, md[:400]
+    block = block[0]
+
+    assert "repo_map.yaml" in block, "must name the file that does the resolving"
+    assert "repo_map.example.yaml" in block, "must point at the tracked template"
+    assert "gitignored" in block, "must say WHY a clone cannot have it"
+
+    # OBSERVE THE HEADLINE, not the block's own words. The previous version
+    # asserted `"skipped (not measured)" in md`, which the block itself
+    # satisfies — so renaming the Headline label left the test green while the
+    # block pointed at a figure no longer in the report. That label has
+    # already been renamed once (non-runnable -> not measured), so the drift
+    # is real, not hypothetical.
+    # Locate by the LABEL, not the bullet's prose: rewording "Success (goal
+    # satisfied, unattended)" is harmless and must not fail this test.
+    headline = [ln for ln in md.split("\n")
+                if "skipped (" in ln and "ran (" in ln]
+    assert headline, md[:400]
+    assert "skipped (not measured)" in headline[0], headline[0]
+    assert "skipped (not measured)" in block, (
+        "the block must name the same figure the Headline prints")
+
+    # The mechanism, not one literal sentence: it must say the loaded count
+    # does NOT move, and must not repeat the original false claim.
+    assert "LOADS THE SAME SPECS" in block
+    # The one sentence the whole mechanism rests on, and the one
+    # test_the_repo_map_changes_RESOLUTION_not_the_loaded_count proves true —
+    # pinned literally so the prose cannot contradict the behaviour.
+    assert "it never drops a spec" in block
+    # SCOPED: --full/--limit/--specs-dir genuinely do move loaded-vs-available;
+    # only RESOLUTION failures cannot. The unscoped claim was too broad.
+    assert "resolution failures cannot move loaded-vs-available" in block
+    # A trust block that reassures about a big skip count must also say which
+    # way the bias runs: skips leave the denominator, so the score reads HIGHER.
+    assert "HIGHER" in block, "must name the DIRECTION of the bias"
+    assert "loads FEWER specs" not in md
+    assert "loads fewer of them" not in md
+    # Machine-specific counts must not be baked into every future report.
+    for stale in ("53 resolving", "17 without", "55 of 55"):
+        assert stale not in block, f"machine-local figure {stale!r} in the report"
+
+
+def test_the_repo_map_changes_RESOLUTION_not_the_loaded_count(tmp_path, monkeypatch):
+    """The MECHANISM the disclosure block asserts, executed rather than
+    string-matched.
+
+    The block's other assertions pin its own prose, so a paraphrase that adds
+    a falsehood alongside the true sentence slips through. This runs the real
+    loader with and without a repo map and pins the invariant it claims: the
+    LOADED count is identical, and only the RESOLVED count moves. If that ever
+    stops being true, the report is telling readers something false and no
+    amount of phrase-matching would notice.
+    """
+    from pathlib import Path
+
+    import no_human.eval.bench_task as bt
+
+    specs = tmp_path / "specs"
+    specs.mkdir()
+    real = tmp_path / "real_checkout"
+    (real / ".git").mkdir(parents=True)
+    for i in range(3):
+        (specs / f"ns-{i}.yaml").write_text(
+            f"id: ns-{i}\ntitle: t\nrequest: r\nsubset: core\nrunnable: true\n"
+            f"repo:\n  path: /neutral/project-{i}\n  pin: ''\n  branch: ''\n")
+
+    def unresolved(tasks):
+        # The PRODUCTION predicate, not a three-line mirror of it: if
+        # check_repo_map's notion of "resolves" ever diverges from this test's,
+        # the test would keep passing against its own reimplementation.
+        return len(bt.check_repo_map(tasks))
+
+    missing = tmp_path / "absent.yaml"
+    monkeypatch.setattr(bt, "REPO_MAP_PATH", missing)
+    without = bt.load_bench_tasks(specs, subset="core")
+
+    mapped = tmp_path / "repo_map.yaml"
+    mapped.write_text("\n".join(f"/neutral/project-{i}: {real}" for i in range(3)))
+    monkeypatch.setattr(bt, "REPO_MAP_PATH", mapped)
+    with_map = bt.load_bench_tasks(specs, subset="core")
+
+    assert len(without) == len(with_map) == 3, "the map must not change LOADING"
+    assert unresolved(without) == 3, "neutral paths resolve nowhere on their own"
+    assert unresolved(with_map) == 0, "the map is what makes them resolve"

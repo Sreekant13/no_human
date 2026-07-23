@@ -3,10 +3,13 @@
 # WHY THIS EXISTS
 # Tracked bench specs carry vendor-neutral repo paths on purpose: the specs are
 # committed, and real project names should not be. But a vendor-neutral path
-# resolves nowhere, and a spec whose repo cannot be cloned dies at setup and
-# scores as a CAPABILITY failure — a broken instrument reading as a model
-# regression. This file translates the neutral paths to the real checkouts on
-# YOUR machine, so the specs stay neutral in git and the benchmark stays valid.
+# resolves nowhere, and a spec whose repo cannot be found is SKIPPED — which
+# means it leaves the success denominator, so a run with many unresolved repos
+# reads HIGHER than it should. (Historically it died at setup and scored as a
+# CAPABILITY failure instead — a broken instrument reading as a model
+# regression. Both are wrong; the direction of the error is just inverted.)
+# This file translates the neutral paths to the real checkouts on YOUR machine,
+# so the specs stay neutral in git and the benchmark stays valid.
 #
 # FORMAT
 #   <path as written in the spec>: <real path on this machine>
@@ -24,9 +27,12 @@
 # or `pin: HEAD`, cannot be discriminated that way and is not checked.
 #
 # That report is ADVISORY: the run then proceeds anyway.
-# An unresolvable repo is currently booked as a CRASHED spec, i.e. it scores as
-# a capability failure rather than a skip — so a run started with warnings will
-# under-report. Abort and fix the map rather than reading the result.
+# An unresolvable repo is SKIPPED at run time (it used to be booked as a CRASHED
+# spec — a broken instrument scored as the agent failing). Skipping is the right
+# call, but note the direction: skipped specs LEAVE the success denominator, so a
+# run with many unresolved repos OVER-reports, it does not under-report. The
+# unmeasured-corpus rule refuses to publish such a run, but the headline is still
+# computed. Abort and fix the map rather than reading the result.
 #
 # NOTE: this file is gitignored, so it does NOT exist in a fresh clone or in any
 # `git worktree`. A bench run launched from a worktree gets no mapping at all.

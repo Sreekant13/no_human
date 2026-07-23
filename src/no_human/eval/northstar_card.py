@@ -245,6 +245,14 @@ MAX_DEAD_FRACTION = 0.2
 # retunes corpus-coverage tolerance. 20% is chosen so a handful of
 # legitimately-unrunnable specs cannot veto a run, while a corpus that has
 # largely stopped resolving cannot be reported as a result.
+#
+# THE TWO TOLERANCES COMPOUND, and each docstring describes its rule alone.
+# A run may load 80% of the corpus AND leave 20% of that unmeasured, so the
+# combined floor is 0.8 x 0.8 = 64%: measured live, 45 loaded of 55 with 9
+# unmeasured passes the gate with zero refusals while only 36 of 55 (65.5%)
+# were actually measured. That is a deliberate tolerance, not a hole — it is
+# far clear of the ~35% incident these rules exist to catch — but a reader
+# will not derive it from either rule in isolation.
 MAX_UNMEASURED_FRACTION = 0.2
 
 
@@ -259,8 +267,13 @@ def corpus_shortfall(card: NorthStarCard) -> str:
     """Why this run's spec set is too small a slice of the corpus, or ``""``.
 
     Compares LOADED against AVAILABLE, which is the only comparison that
-    survives filtering. Silent when the card does not record an available count
-    (older cards, or a run against a corpus of its own).
+    survives filtering. Returns "" when coverage is adequate — the common
+    case — and DOES NOT APPLY AT ALL only when the card records no available
+    count: an older card, or a checkout with no ``eval/northstar_tasks/``.
+
+    Pointing ``--specs-dir`` at a smaller corpus is NOT an escape hatch — the
+    available count is read from the canonical directory regardless, so an
+    11-spec scratch run against a 55-spec corpus still refuses "11 of 55".
     """
     available = card.corpus_available
     if not available or card.total >= available * MIN_CORPUS_LOADED_FRACTION:
@@ -536,6 +549,23 @@ def render_northstar_md(card: NorthStarCard,
         "_Project labels and repo paths in this report are pseudonymised; every "
         "number is exactly as measured. A run may predate the current corpus — "
         "check the run date above before treating it as reproducible._",
+        "",
+        "> **Corpus resolution is machine-local.** Most tracked specs carry "
+        "vendor-neutral repo paths — the specs are committed and real project "
+        "names should not be — and a vendor-neutral path resolves nowhere on "
+        "its own. `eval/repo_map.yaml` translates those to the checkouts on "
+        "the machine that ran the bench, and it is gitignored (it maps the "
+        "neutral names to private repos, which is exactly what the scrub "
+        "removed). A fresh clone, or a `git worktree`, LOADS THE SAME SPECS "
+        "but RESOLVES far fewer of them: the loader globs the spec directory "
+        "and only rewrites paths, it never drops a spec. Specs that do not "
+        "resolve are SKIPPED, so the figure that moves is "
+        "**skipped (not measured)** in the Headline below — resolution "
+        "failures cannot move loaded-vs-available, so that pair will tell you "
+        "nothing here. Mind the DIRECTION: skipped specs leave the success "
+        "denominator, so a run with many unresolved repos reads HIGHER, not "
+        "lower. See `eval/repo_map.example.yaml` before treating a large skip "
+        "count as a corpus that broke.",
         "",
         "## Headline",
         "",
