@@ -225,7 +225,7 @@ nh task add --title "Fix X" --repo ~/repo         # freeform
 nh task list          # board as a table
 nh task show <id>     # requirements, attempts, evidence
 nh status             # portfolio overview: needs-you / working / waiting / done
-nh logs <id>          # attempt log: turns, tokens, failures
+nh logs <id>          # attempt log: turns, spend vs burn, failures
 nh diff <id>          # git diff for latest commit
 nh review <id>        # adversarial reviewer's evidence checklist
 ```
