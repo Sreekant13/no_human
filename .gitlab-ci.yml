@@ -34,3 +34,21 @@ eval-gate:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH'
+
+# The web board's node unit suite (web/src/*.test.mjs — theme-var, a11y, and
+# pure-helper tests). Until now it ran on no gate, so a frontend regression could
+# merge silently. Only the unit suite runs here; the Playwright e2es need browser
+# binaries and are run locally, so the browser download is skipped on install.
+web-gate:
+  stage: test
+  image: node:20-slim
+  variables:
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+  before_script:
+    - cd web
+    - npm ci
+  script:
+    - npm test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
