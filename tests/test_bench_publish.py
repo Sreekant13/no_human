@@ -14,6 +14,7 @@ the guard left the whole suite green.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -298,3 +299,96 @@ def test_a_forced_publish_survives_re_rendering(bench_env):
     assert res.exit_code == 0, res.output
     assert "WARNING" in report.read_text(), \
         "re-rendering laundered a forced publish into a clean report"
+
+
+# --------------------- the banned-term publish guard ----------------------- #
+# Same convention as the refusals above: the predicate being right is worthless
+# if the command ignores it. Neutering the guard must fail these.
+
+def _note_card(note: str):
+    scores = [_score(f"ns-{i}") for i in range(12)]
+    # subset="core" is LOAD-BEARING: render_northstar_md emits per-task rows
+    # only for core specs, so a "full" fixture puts the note in no rendered
+    # text at all and the guard has nothing to catch. The first draft of this
+    # test did exactly that and passed while proving nothing.
+    for sc in scores:
+        sc.subset = "core"
+    scores[0].notes = note
+    return _card(scores, label="v13")
+
+
+def test_publish_refuses_a_report_carrying_a_banned_term(bench_env):
+    """The per-task notes are judge-authored free text quoting real repo
+    contents, so a publish can drop an internal codename into a TRACKED file
+    that is currently clean. A hand scan is what missed it the first time."""
+    results, report = bench_env
+    src = results / "v13.json"
+    # The shape that actually slipped through: the term glued to other words.
+    _note_card("ran `ls -la ~/.claude/skills/ci_gate-metrics-core-pipeline/`").save(src)
+
+    # Prove the note actually reaches the rendered report before asserting on
+    # what the guard does about it.
+    from no_human.eval.northstar_card import render_northstar_md
+    assert "metrics-core-pipeline" in render_northstar_md(_note_card(
+        "ran `ls -la ~/.claude/skills/ci_gate-metrics-core-pipeline/`"))
+
+    res = CliRunner().invoke(cli, ["bench", "publish", str(src)])
+
+    assert res.exit_code == 1, res.output
+    # Wrap-tolerant: rich wraps the console line, so match on stable fragments
+    # rather than a phrase that a line break can split.
+    assert "refusing to publish" in res.output
+    # The locator is the point: a count alone cannot be grepped for.
+    assert "ns-0" in res.output, res.output
+    assert report.read_text() == "ORIGINAL REPORT\n", "tracked report was written"
+    assert not (results / "latest.json").exists(), (
+        "baseline was promoted despite the refusal — a partial publish leaves "
+        "the gate comparing against a run whose report was rejected")
+
+
+def test_publish_allows_english_that_merely_contains_a_term(bench_env):
+    """A fail-closed guard with no override must not refuse legitimate prose:
+    the only escape would be editing a real measured note to satisfy it."""
+    results, report = bench_env
+    src = results / "v13.json"
+    _note_card("pattern recognition in the report generator script").save(src)
+
+    res = CliRunner().invoke(cli, ["bench", "publish", str(src)])
+
+    assert res.exit_code == 0, res.output
+    assert (results / "latest.json").exists()
+
+
+def test_bench_report_refuses_a_banned_term_too(bench_env):
+    """Round 2's Critical came back half-fixed: only `bench publish` was tested,
+    so reverting the guard on THIS path left the whole suite green while a
+    single command could still write a banned term into the tracked file.
+
+    `bench report` renders straight from latest.json — and the ordering fix in
+    this PR is justified precisely by keeping this command able to regenerate
+    the doc, so the path its rationale depends on cannot be the untested one.
+    """
+    results, report = bench_env
+    _note_card("ran `ls -la ~/.claude/skills/ci_gate-metrics-core-pipeline/`").save(
+        results / "latest.json")
+
+    res = CliRunner().invoke(cli, ["bench", "report"])
+
+    assert res.exit_code == 1, res.output
+    assert "refusing to publish" in res.output
+    assert report.read_text() == "ORIGINAL REPORT\n", "tracked report was written"
+
+
+def test_publish_refuses_a_home_path_even_with_no_banned_term(bench_env):
+    """The report asserts "labels and repo paths are pseudonymised". The guard
+    checked vendor terms only, so a home path published happily underneath a
+    sentence claiming it had been removed."""
+    results, report = bench_env
+    _note_card(f"verified via {Path.home()}/git/thing/file.py").save(
+        results / "v13.json")
+
+    res = CliRunner().invoke(cli, ["bench", "publish", str(results / "v13.json")])
+
+    assert res.exit_code == 1, res.output
+    assert report.read_text() == "ORIGINAL REPORT\n"
+    assert not (results / "latest.json").exists()

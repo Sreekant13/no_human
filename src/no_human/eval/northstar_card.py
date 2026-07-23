@@ -98,6 +98,20 @@ class NorthStarCard:
         return sum(s.orig_corrections for s in self.ran if s.goal_satisfied)
 
     @property
+    def corrections_avoided_delivered(self) -> int:
+        """The part of `corrections_avoided` earned by DELIVERING something.
+
+        `goal_satisfied` is also true for a gated spec that correctly REFUSED
+        and handed the task back — the right outcome, but the human still has
+        to do that work, so those follow-ups were not avoided. On v13, 251 of
+        350 came from refused tasks and one escalated spec alone contributed
+        96 (27% of the headline). Splitting it is the difference between an
+        honest number and one that flatters by construction."""
+        delivered = {"done", "awaiting_approval"}
+        return sum(s.orig_corrections for s in self.ran
+                   if s.goal_satisfied and s.outcome_status in delivered)
+
+    @property
     def honest_escalation_rate(self) -> float:
         """Of the tasks whose only correct outcome is an honest stop
         (expect_escalation specs), how many stopped honestly (1.0 when none)."""
@@ -131,6 +145,7 @@ class NorthStarCard:
                 "total_nh_tokens": self.total_nh_tokens,
                 "total_orig_tokens": self.total_orig_tokens,
                 "corrections_avoided": self.corrections_avoided,
+                "corrections_avoided_delivered": self.corrections_avoided_delivered,
                 "honest_escalation_rate": round(self.honest_escalation_rate, 4),
             },
             "override_reasons": self.override_reasons,
@@ -293,6 +308,16 @@ def render_northstar_md(card: NorthStarCard,
                         history: list[dict[str, Any]] | None = None) -> str:
     """Render docs/NORTH_STAR_BENCH.md content."""
     agg = card.as_dict()["aggregate"]
+    # How many ran specs actually HAVE an original cost to compare against.
+    # The median is over these, not over `ran`, and publishing it without the
+    # denominator overstates its coverage.
+    _priced = sum(1 for s in card.ran if s.cost_ratio is not None)
+    # Numerator/denominator behind the escalation rate. Computed here
+    # rather than added to the aggregate so this does not collide with the
+    # same fields arriving on the bench-endpoint branch.
+    _gated = [s for s in card.ran if s.expected_escalation]
+    _gated_ok = sum(1 for s in _gated if s.goal_satisfied)
+    _delivered = agg['satisfied'] - _gated_ok
     ratio = agg["median_token_ratio"]
     lines = [
         "# North-star benchmark — no_human vs the operator's real sessions",
@@ -310,19 +335,31 @@ def render_northstar_md(card: NorthStarCard,
             "",
         ]
     lines += [
+        "_Project labels and repo paths in this report are pseudonymised; every "
+        "number is exactly as measured. A run may predate the current corpus — "
+        "check the run date above before treating it as reproducible._",
+        "",
         "## Headline",
         "",
         f"- **Success (goal satisfied, unattended): {agg['satisfied']}/"
         f"{agg['total'] - agg['skipped']} ran ({agg['success_rate']:.0%})**"
         f"  ·  skipped (non-runnable): {agg['skipped']}",
+        f"  - of which {_delivered} DELIVERED a change and {_gated_ok} correctly "
+        f"ESCALATED — 'satisfied' counts an honest refusal as the right outcome, "
+        f"which it is, but only the first group shipped anything",
         f"- **Median COST ratio (price-weighted, cache-aware): "
         f"{agg['median_cost_ratio'] if agg['median_cost_ratio'] is not None else 'n/a'}**"
-        " — <1.0 means no_human was cheaper than the babysat session",
+        f" — over the {_priced} of {agg['total'] - agg['skipped']} ran spec(s) "
+        f"with a recorded original cost; <1.0 means no_human was cheaper than "
+        f"the babysat session. The nh side counts coder+reviewer, NOT yet "
+        f"planner/supervisor (B2), so it UNDERSTATES no_human's real burn.",
         f"- Median token ratio (non-cache in/out only): "
         f"{ratio if ratio is not None else 'n/a'} — blind to cache burn; "
         "nh side includes coder+reviewer, NOT yet planner/supervisor (B2)",
-        f"- Total non-cache tokens: nh {agg['total_nh_tokens']:,} vs original "
-        f"{agg['total_orig_tokens']:,}",
+        f"- Total non-cache tokens: nh {agg['total_nh_tokens']:,} over all "
+        f"{agg['total'] - agg['skipped']} ran spec(s), vs original "
+        f"{agg['total_orig_tokens']:,} over the {_priced} that have a baseline "
+        f"at all — NOT a like-for-like pair; use the median cost ratio above",
         # Always rendered, including the 0 case. A published run is under the
         # refusal threshold by construction, so the number a reader needs is
         # confirmation that saturation was checked — not its absence when clean
@@ -331,10 +368,16 @@ def render_northstar_md(card: NorthStarCard,
         f"model call): **{agg['dead_specs']}** of {agg['total'] - agg['skipped']}"
         + ("  ⚠ read every figure here with that in mind"
            if agg['dead_specs'] else ""),
-        f"- **Original-session follow-ups avoided (proxy for corrections): "
-        f"{agg['corrections_avoided']}**",
+        f"- **Original-session follow-ups avoided on DELIVERED tasks: "
+        f"{agg['corrections_avoided_delivered']}** (proxy for corrections)"
+        f"  ·  a further "
+        f"{agg['corrections_avoided'] - agg['corrections_avoided_delivered']} "
+        f"belong to tasks no_human correctly ESCALATED — the human still has "
+        f"to do those, so they are not savings",
         f"- Honest-escalation rate on gated tasks: "
-        f"{agg['honest_escalation_rate']:.0%}",
+        f"{agg['honest_escalation_rate']:.0%} "
+        f"({_gated_ok}/{len(_gated)}) — one flip moves a small "
+        f"denominator several points",
         "",
         "## Per-task",
         "",

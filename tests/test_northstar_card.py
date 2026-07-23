@@ -114,7 +114,41 @@ def test_render_md_has_headline_and_no_numeric_selfscore():
     card.scores[0].subset = "core"   # only curated rows are rendered
     md = render_northstar_md(card)
     assert "Median token ratio" in md
-    assert "follow-ups avoided (proxy for corrections)" in md.lower()
+    # The label changed deliberately: crediting tasks no_human REFUSED as
+    # "avoided" flattered the headline (on v13, 251 of 350 came from escalated
+    # tasks the human still has to do). Assert the SPLIT, not just the phrase.
+    assert "follow-ups avoided on delivered tasks" in md.lower()
+    assert "correctly escalated" in md.lower()
+    # The cost median must carry the denominator it is a median over.
+    assert "with a recorded original cost" in md.lower()
     assert "orig follow-ups (proxy)" in md   # per-task table too (review)
     assert "| ns-1 |" in md
     assert "/10" not in md
+
+
+def test_the_delivered_split_publishes_NUMBERS_not_just_labels():
+    """The split is the whole point, and only its LABELS were asserted — so the
+    report could print 350 under a "DELIVERED" heading, or a delivered count
+    larger than the satisfied count, with the suite green. That is a regression
+    straight back to the flattery this split removed.
+
+    3 satisfied: 2 delivered (done / awaiting_approval) + 1 correct escalation.
+    Follow-ups: 10 + 20 on the delivered pair, 96 on the escalation.
+    """
+    card = NorthStarCard(label="x", scores=[
+        _score(task_id="d1", status="done", satisfied=True, corrections=10),
+        _score(task_id="d2", status="awaiting_approval", satisfied=True,
+               corrections=20),
+        _score(task_id="g1", status="escalated", satisfied=True,
+               corrections=96, expected_escalation=True),
+        _score(task_id="f1", satisfied=False, corrections=5),
+    ])
+    assert card.corrections_avoided == 126           # 10 + 20 + 96
+    assert card.corrections_avoided_delivered == 30  # 10 + 20 only
+
+    md = render_northstar_md(card)
+    assert "avoided on DELIVERED tasks: 30**" in md, md
+    assert "a further 96 belong" in md, md
+    # The success line must name the delivered count, not the satisfied count.
+    assert "of which 2 DELIVERED" in md, md
+    assert "1 correctly ESCALATED" in md, md

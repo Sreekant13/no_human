@@ -274,3 +274,35 @@ def test_local_links_resolve(readme):
     targets = [t.split()[0] for t in re.findall(r"\]\((?!https?:)([^)#]+)", readme) if t.strip()]
     broken = [t for t in targets if not (REPO / t).exists()]
     assert not broken, f"README links to missing files: {broken}"
+
+
+def test_readme_bench_figures_match_the_published_report():
+    """The README hard-codes figures FROM docs/NORTH_STAR_BENCH.md, and nothing
+    tied them together — so the next `bench publish` silently staled every one
+    of them. That is not hypothetical: the README described v8 while linking to
+    a v13 report, and the whole suite stayed green.
+
+    Reads the numbers out of the report rather than restating them, so this
+    cannot drift the way a hard-coded expectation would.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    report = (root / "docs" / "NORTH_STAR_BENCH.md").read_text()
+    readme = (root / "README.md").read_text()
+
+    label = re.search(r"label: (\S+)", report).group(1).rstrip(".")
+    success = re.search(r"Success \(goal satisfied, unattended\): (\d+/\d+)",
+                        report).group(1)
+    pct = re.search(r"Success \(goal satisfied.*?\((\d+)%\)", report).group(1)
+    cost = re.search(r"Median COST ratio[^:]*: ([\d.]+)", report).group(1)
+    esc = re.search(r"Honest-escalation rate on gated tasks: \d+% \((\d+/\d+)\)",
+                    report).group(1)
+
+    for label_, value in (("label", label), ("success", success),
+                          ("success %", pct + "%"), ("cost ratio", cost),
+                          ("escalation n/d", esc)):
+        assert value in readme, (
+            f"README does not carry the published {label_} {value!r} — "
+            f"the report and the front page disagree")

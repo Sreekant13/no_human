@@ -79,28 +79,31 @@ nh start   # web board + task worker + wake watcher
 There is a benchmark that replays real past tasks through the real pipeline and
 scores the result against what the human actually did. The published run is
 committed at [docs/NORTH_STAR_BENCH.md](docs/NORTH_STAR_BENCH.md): label
-`expanded-core-v8`, 2026-07-17, a 36-spec corpus. It scored the goal satisfied
-unattended on **18/33** runnable tasks (55%), with an honest-escalation rate of
-**73%** on the tasks that were *expected* to escalate.
+`expanded-core-v13`, 2026-07-21, a 56-spec run. It scored the goal satisfied
+unattended on **25/53** runnable tasks (47%) — of which **15 delivered a change** and 10 correctly escalated — with an honest-escalation rate of
+**77%** (10/13) on the tasks that were *expected* to escalate.
 
 Everything about that needs qualifying, so here it is:
 
-- **It is not the latest run, and it flatters.** A later run
-  (`expanded-core-v11`, 2026-07-18, a 57-spec corpus) scored **43%** success and
-  **62.5%** honest-escalation — materially below v8 on both. The corpus has since
-  been rebuilt to 55 specs and has not been re-scored, so no published number
-  describes the specs shipping in this repo today. v8 is simply the
-  best-looking published run, which is exactly why it should not stand alone.
-  The run series lives in [docs/NORTH_STAR_PAYOFF.md](docs/NORTH_STAR_PAYOFF.md).
+- **It is not the newest code, and its corpus is gone.** v13 ran BEFORE the
+  vendor-neutral scrub that rewrote every spec's repo path, so it measured real
+  repos — which is exactly why it is the run worth publishing, and also why it
+  cannot be reproduced against the specs shipping here today. Six specs it
+  scored are no longer curated; five current specs it never ran.
 - **A single run is a point estimate.** Success moves several points between
-  runs on identical specs.
-- **The cost figure is narrower than it looks.** That run's median cost ratio is
-  0.1503, but the median covers only the **8 of 33** tasks where an original
-  human-session cost was recorded at all, and no_human's side excludes planner
-  and supervisor burn. Comparing the run's raw non-cache token totals instead
-  gives **0.394** — and even that is generous to the baseline, since no_human's
-  side spans all 33 runnable tasks while the human side counts only those 8.
+  runs on identical specs, because the coder is non-deterministic. Read 47% as
+  a range. The stable signals are cost and honest-escalation.
+- **The cost figure is narrower than it looks.** The median cost ratio is
+  0.1065, but the median covers only the **12 of 53** ran tasks where an
+  original human-session cost was recorded at all, and no_human's side excludes
+  planner and supervisor burn — so it UNDERSTATES what no_human really spent.
   "Cheaper" is well supported; any precise multiple is not.
+- **"Follow-ups avoided" is smaller than the raw number.** 99 of them were
+  earned on tasks no_human actually delivered. A further 251 came from tasks it
+  correctly *escalated* — the right outcome, but the human still has to do that
+  work, so those are not savings.
+- **One spec of 53 burned zero tokens**, meaning it measured nothing; and the
+  run is a 56-of-57 resume checkpoint, so one spec never reported at all.
 - **It is self-run, not independent**, and you cannot reproduce it: the specs
   replay the author's own history and pin to local repo paths, so `nh bench run`
   will skip them on your machine. The harness is reusable; the corpus is not.
