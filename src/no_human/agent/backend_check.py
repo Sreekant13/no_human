@@ -103,18 +103,38 @@ class BackendStatus:
         return self.cli_path is not None and self.token_present
 
 
+def _api_key_on_file() -> bool:
+    """Whether ``ANTHROPIC_API_KEY`` resolves (env or .env), for BYO-API-key mode.
+
+    Read-only (never exports, never echoes the value) — a doctor probe must not
+    mutate the process env. Best-effort: any failure ⇒ "no key".
+    """
+    try:
+        from ..config import API_KEY_VAR, credential_status
+
+        return credential_status([API_KEY_VAR]).get(API_KEY_VAR, False)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def check_backend(*, token_present: bool | None = None,
-                  profile: str | None = None) -> BackendStatus:
+                  profile: str | None = None,
+                  auth_mode: str = "subscription") -> BackendStatus:
     """Probe whether the coding backend can actually run a task.
 
     ``token_present`` may be supplied by a caller that already knows it (the
     board's auth payload, the startup auth assertion); when ``None`` it is read
-    from config. The check is CLI-presence + token-presence — deliberately not a
-    live auth call, which would cost quota and could not run inside ``nh doctor``.
+    from config. The check is CLI-presence + credential-presence — deliberately
+    not a live auth call, which would cost quota and could not run inside
+    ``nh doctor``. In ``auth_mode="api_key"`` (BYO-API-key) the credential is the
+    operator's ``ANTHROPIC_API_KEY`` rather than an OAuth token.
     """
     cli = find_claude_cli()
     if token_present is None:
-        token_present = _token_on_file(profile)
+        token_present = (
+            _api_key_on_file() if auth_mode == "api_key"
+            else _token_on_file(profile)
+        )
     reasons: list[str] = []
     if cli is None:
         reasons.append(
@@ -123,10 +143,16 @@ def check_backend(*, token_present: bool | None = None,
             "launch. Install it with: npm install -g @anthropic-ai/claude-code"
         )
     if not token_present:
-        reasons.append(
-            "no OAuth token on file — expected CLAUDE_CODE_OAUTH_TOKEN in "
-            "~/.no_human/.env or the environment. Create one with: "
-            "claude setup-token"
-        )
+        if auth_mode == "api_key":
+            reasons.append(
+                "no ANTHROPIC_API_KEY on file — auth_mode is 'api_key', so a "
+                "metered key is expected in ~/.no_human/.env or the environment."
+            )
+        else:
+            reasons.append(
+                "no OAuth token on file — expected CLAUDE_CODE_OAUTH_TOKEN in "
+                "~/.no_human/.env or the environment. Create one with: "
+                "claude setup-token"
+            )
     return BackendStatus(cli_path=cli, token_present=bool(token_present),
                          reasons=reasons)

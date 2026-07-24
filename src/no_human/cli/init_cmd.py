@@ -27,6 +27,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from ..config import (
+    API_KEY_VAR,
     CONFIG_PATH,
     DB_PATH,
     ENV_PATH,
@@ -147,7 +148,93 @@ def _metered_key_in_env() -> str | None:
     return None
 
 
-def setup_token() -> bool:
+def setup_token() -> tuple[bool, str]:
+    """Guide the user through billing setup. Returns ``(ready, auth_mode)``.
+
+    Two sanctioned paths: a Claude **subscription** (OAuth token — the default,
+    CLAUDE.md #1) or the user's **own Anthropic API key** (BYO-API-key, metered
+    and billed to them — for friends/commercial installs). The chosen mode is
+    persisted as ``llm.auth_mode`` by :func:`ensure_config`.
+    """
+    # A re-run on a working install must not re-interrogate the operator: if a
+    # mode is already configured and its credential is present, respect it.
+    configured = _configured_auth_mode()
+    if configured == "api_key" and (
+        _env_has_key(API_KEY_VAR) or os.environ.get(API_KEY_VAR)
+    ):
+        console.print(f"  [green]✓[/] {API_KEY_VAR} found (auth_mode: api_key)")
+        return True, "api_key"
+    if configured == "subscription" and (
+        _env_has_key(SUBSCRIPTION_TOKEN_VAR) or os.environ.get(SUBSCRIPTION_TOKEN_VAR)
+    ):
+        console.print(
+            f"  [green]✓[/] {SUBSCRIPTION_TOKEN_VAR} found (auth_mode: subscription)"
+        )
+        return True, "subscription"
+
+    console.print(
+        "  How will this install pay for Claude?\n"
+        "    [bold]1[/] Claude subscription  (OAuth token — recommended)\n"
+        "    [bold]2[/] Your own Anthropic API key  (metered, billed to you)"
+    )
+    choice = click.prompt(
+        "    Choice", type=click.Choice(["1", "2"]), default="1", show_default=True
+    )
+    if choice == "2":
+        return _setup_api_key(), "api_key"
+    return _setup_subscription_token(), "subscription"
+
+
+def _configured_auth_mode() -> str:
+    """Read ``llm.auth_mode`` from config.yaml if it exists, else "subscription".
+
+    Best-effort — a malformed config never crashes setup; it just falls back to
+    the default mode and re-prompts.
+    """
+    try:
+        if CONFIG_PATH.exists():
+            data = yaml.safe_load(CONFIG_PATH.read_text()) or {}
+            mode = (data.get("llm") or {}).get("auth_mode")
+            if mode in ("subscription", "api_key"):
+                return mode
+    except Exception:  # noqa: BLE001
+        pass
+    return "subscription"
+
+
+def _setup_api_key() -> bool:
+    """BYO-API-key path: detect or prompt for ANTHROPIC_API_KEY. True if ready."""
+    if _env_has_key(API_KEY_VAR):
+        console.print(f"  [green]✓[/] {API_KEY_VAR} found in ~/.no_human/.env")
+        return True
+    if os.environ.get(API_KEY_VAR):
+        console.print(f"  [green]✓[/] {API_KEY_VAR} found in environment")
+        if click.confirm("    Persist it to ~/.no_human/.env?", default=True):
+            _append_env(API_KEY_VAR, os.environ[API_KEY_VAR])
+            console.print("    [green]saved[/] to ~/.no_human/.env")
+        return True
+    console.print(
+        "\n  [yellow]✗ no Anthropic API key found.[/]\n"
+        "    Create one at: [bold]https://console.anthropic.com/settings/keys[/]\n"
+        "    This bills your own metered account. Paste it here, or press Enter "
+        "to skip."
+    )
+    key = click.prompt(
+        "    API key", default="", show_default=False, hide_input=True
+    ).strip()
+    if key:
+        _append_env(API_KEY_VAR, key)
+        os.environ[API_KEY_VAR] = key
+        console.print("    [green]saved[/] to ~/.no_human/.env")
+        return True
+    console.print(
+        "    [yellow]skipped[/] — add it later:\n"
+        f"      echo '{API_KEY_VAR}=<your_key>' >> ~/.no_human/.env"
+    )
+    return False
+
+
+def _setup_subscription_token() -> bool:
     """Guide the user through subscription token setup. Returns True if ready."""
     # Check .env file first.
     if _env_has_key(SUBSCRIPTION_TOKEN_VAR):
@@ -215,11 +302,17 @@ def _append_env(key: str, value: str) -> None:
 # Config generation                                                           #
 # --------------------------------------------------------------------------- #
 
-def ensure_config() -> bool:
-    """Generate ``~/.no_human/config.yaml`` with git identity if absent.
+def ensure_config(auth_mode: str = "subscription") -> bool:
+    """Generate ``~/.no_human/config.yaml`` with git identity if absent, and
+    persist the chosen ``llm.auth_mode`` (idempotent even when the file exists).
     Returns True if file was created, False if it already existed."""
     if CONFIG_PATH.exists():
         console.print(f"  [green]✓[/] config.yaml already exists")
+        # Persist a non-default billing mode even into an existing config, so a
+        # re-run of `nh init` that switches to BYO-API-key actually takes effect.
+        if auth_mode != "subscription":
+            _set_auth_mode(auth_mode)
+            console.print(f"    set llm.auth_mode: {auth_mode}")
         return False
 
     # Pre-populate git identity from the user's git config.
@@ -227,22 +320,33 @@ def ensure_config() -> bool:
     git_email = _git_config("user.email")
 
     config = load_config(create_if_missing=True)
+    # Re-read to update git identity and/or billing mode.
+    data = yaml.safe_load(CONFIG_PATH.read_text()) or {}
     if git_name or git_email:
-        # Re-read to update git identity.
-        data = yaml.safe_load(CONFIG_PATH.read_text()) or {}
         git_section = data.setdefault("git", {})
         if git_name:
             git_section.setdefault("agent_identity_name", "no_human")
         if git_email:
             git_section.setdefault("agent_identity_email", "no-human@acme.com")
-        # Also add a comment about the user's identity for reference.
-        CONFIG_PATH.write_text(yaml.safe_dump(data, sort_keys=False))
+    if auth_mode != "subscription":
+        data.setdefault("llm", {})["auth_mode"] = auth_mode
+    CONFIG_PATH.write_text(yaml.safe_dump(data, sort_keys=False))
 
     console.print(f"  [green]✓[/] created config.yaml")
+    if auth_mode != "subscription":
+        console.print(f"    billing mode: {auth_mode}")
     if git_name:
         console.print(f"    your git identity: {git_name} <{git_email or '?'}>")
         console.print(f"    agent identity:    no_human <no-human@acme.com>")
     return True
+
+
+def _set_auth_mode(auth_mode: str) -> None:
+    """Upsert ``llm.auth_mode`` into an existing config.yaml, preserving the
+    rest. Only the mode goes in config; the credential itself lives in .env."""
+    data = yaml.safe_load(CONFIG_PATH.read_text()) or {}
+    data.setdefault("llm", {})["auth_mode"] = auth_mode
+    CONFIG_PATH.write_text(yaml.safe_dump(data, sort_keys=False))
 
 
 def _git_config(key: str) -> str:

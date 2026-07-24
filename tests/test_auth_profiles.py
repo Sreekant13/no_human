@@ -162,7 +162,9 @@ def test_bootstrap_survives_an_llm_block_commented_out(tmp_path, monkeypatch):
         cmd_mod, "assert_subscription_mode", lambda **kw: seen.update(kw)
     )
     cmd_mod._bootstrap()
-    assert seen == {"profile": None}
+    # _bootstrap passes both the profile and the billing mode; a bare/commented
+    # `llm:` block yields the default subscription mode without raising.
+    assert seen == {"profile": None, "auth_mode": "subscription"}
 
 
 # --------------------------- set_auth_profile ------------------------------ #

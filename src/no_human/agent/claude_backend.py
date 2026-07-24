@@ -1,8 +1,11 @@
 """The single coding backend: a thin wrapper over the Claude Agent SDK.
 
 Constraints honoured here:
-  - Subscription auth only (CLAUDE_CODE_OAUTH_TOKEN). The env is scrubbed of
-    metered-API vars by config.assert_subscription_mode() before we ever run.
+  - Auth is set up by config.assert_subscription_mode() before we ever run: the
+    default subscription mode exports CLAUDE_CODE_OAUTH_TOKEN and scrubs every
+    metered var; operator-authorized BYO-API-key mode (llm.auth_mode: "api_key")
+    leaves the operator's own ANTHROPIC_API_KEY in the env and scrubs the rest.
+    Either way the SDK reads exactly one credential from the environment.
   - The SDK ships Read/Edit/Bash/Grep/Glob — we do NOT re-implement tools (§3.6).
   - A PreToolUse hook enforces the safety guard (forbidden paths, protected
     branches, rm -rf, no merge).
