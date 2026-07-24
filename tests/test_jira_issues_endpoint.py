@@ -7,6 +7,8 @@ created here — POST /api/tasks stays the one create path.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
@@ -174,3 +176,29 @@ async def test_upstream_connection_error_surfaces_as_502(client, monkeypatch):
     r = await client.get("/api/integrations/jira/issues", params={"q": "x"})
     assert r.status_code == 502
     assert "SEKRET" not in r.text
+
+
+@pytest.mark.asyncio
+async def test_test_connection_loads_token_from_env_not_only_serve(client, tmp_path, monkeypatch):
+    """Regression (settings 'Test connection' bug): the health check must load
+    JIRA_API_TOKEN from ~/.no_human/.env ITSELF, so it authenticates from a plain
+    `nh start` — not only when `nh serve`'s Jira poll happened to load the token.
+    Here the token lives ONLY in the .env file (never pre-set in os.environ), yet
+    the endpoint must authenticate and never echo the secret back."""
+    (tmp_path / ".env").write_text("JIRA_API_TOKEN=secret-shhh\n")
+    assert "JIRA_API_TOKEN" not in os.environ  # proves it is not pre-loaded
+
+    import no_human.integrations as integ
+
+    async def _fake_get(url, headers=None, auth=None, timeout=10.0):
+        assert auth == ("me@x.com", "secret-shhh")  # token was read from the .env
+        return _Resp({"displayName": "Me"}, status_code=200)
+
+    monkeypatch.setattr(integ, "_http_get", _fake_get)
+
+    r = await client.post("/api/integrations/jira/test")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["healthy"] is True, body
+    assert "authenticated" in body["detail"].lower()
+    assert "secret-shhh" not in body["detail"]  # never leak the token
