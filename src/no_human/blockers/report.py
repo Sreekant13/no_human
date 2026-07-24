@@ -43,6 +43,15 @@ def parse_blocker(text: str) -> Blocker | None:
     # raise the size limit that just blocked it — resolving a blocker by
     # weakening the gate.
     blocker.options = [BlockerOption(label=o.label) for o in blocker.options]
+    # Same boundary for the category: BUDGET_EXHAUSTED is raised by the
+    # HARNESS ledger, never the agent — the harness version carries the true
+    # spend and the raise-budget option; an agent-claimed one is a dead-end
+    # blocker the human cannot answer (live: a coder near its cap
+    # self-declared it, question-less and option-less). What the agent is
+    # actually reporting — "this task is bigger than my budget" — IS
+    # SCOPE_EXPLOSION, which routes to a human with the scope story intact.
+    if blocker.category is BlockerCategory.BUDGET_EXHAUSTED:
+        blocker.category = BlockerCategory.SCOPE_EXPLOSION
     return blocker
 
 

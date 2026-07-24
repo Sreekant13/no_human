@@ -733,3 +733,22 @@ async def test_the_REAL_quota_park_produces_a_task_the_watcher_can_resume(store)
     await orch._park_quota(task2, QuotaExhausted("weekly"))
     early = datetime.now(timezone.utc)
     assert (task2.id, "resumed") not in await WakeWatcher(store, _cfg()).tick(now=early)
+
+
+def test_agent_cannot_claim_the_harness_only_budget_category():
+    """BUDGET_EXHAUSTED is raised by the harness ledger, never the agent
+    (taxonomy comment). An agent that emits it (live: SCRUM-20's coder, near
+    its cap, self-declared BUDGET_EXHAUSTED with no options — a dead-end
+    blocker the human cannot answer) is really reporting that the task is
+    bigger than its budget: SCOPE_EXPLOSION, which routes to a human with the
+    scope story intact."""
+    text = (
+        "cannot finish this within budget\n"
+        "BLOCKER_JSON_START\n"
+        '{"category": "BUDGET_EXHAUSTED", "goal": "g", '
+        '"root_cause_hypothesis": "task needs 5 files", "confidence": 0.8}\n'
+        "BLOCKER_JSON_END"
+    )
+    b = parse_blocker(text)
+    assert b is not None
+    assert b.category is BlockerCategory.SCOPE_EXPLOSION
