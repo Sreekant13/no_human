@@ -394,17 +394,17 @@ def test_publish_redacts_a_banned_term_in_a_note(bench_env):
     results, report = bench_env
     src = results / "v13.json"
     # The shape that actually slipped through: the term glued to other words.
-    card = _note_card("ran `ls -la ~/.claude/skills/ci_gate-metrics-core-pipeline/`")
+    card = _note_card("ran `ls -la ~/.claude/skills/metrics-core-metrics-core-pipeline/`")  # term-ok: redaction fixture needs a banned codename
     # Redaction is render-only: the raw note still carries the term, proving the
     # cleaning happens on the way to the tracked file, not by mutating evidence.
-    assert "ci_gate" in card.scores[0].notes
+    assert "metrics-core" in card.scores[0].notes  # term-ok: redaction fixture needs a banned codename
     card.save(src)
 
     res = CliRunner().invoke(cli, ["bench", "publish", str(src)])
 
     assert res.exit_code == 0, res.output
     published = report.read_text()
-    assert "ci_gate" not in published.lower(), published   # the codename is gone
+    assert "metrics-core" not in published.lower(), published   # the codename is gone  # term-ok: redaction fixture needs a banned codename
     assert "metrics-core-pipeline" in published, published    # its neighbour stays
     assert (results / "latest.json").exists()              # baseline promoted
 
@@ -428,14 +428,14 @@ def test_bench_report_redacts_a_banned_term_too(bench_env):
     doc from a banked card would reintroduce the very term `bench publish`
     scrubbed."""
     results, report = bench_env
-    _note_card("ran `ls -la ~/.claude/skills/ci_gate-metrics-core-pipeline/`").save(
+    _note_card("ran `ls -la ~/.claude/skills/metrics-core-metrics-core-pipeline/`").save(  # term-ok: redaction fixture needs a banned codename
         results / "latest.json")
 
     res = CliRunner().invoke(cli, ["bench", "report"])
 
     assert res.exit_code == 0, res.output
     published = report.read_text()
-    assert "ci_gate" not in published.lower(), published
+    assert "metrics-core" not in published.lower(), published  # term-ok: redaction fixture needs a banned codename
     assert "metrics-core-pipeline" in published, published
 
 
@@ -465,7 +465,7 @@ def test_the_guard_still_refuses_if_redaction_regresses(bench_env, monkeypatch):
     monkeypatch.setattr(nc, "redact_for_publish", lambda s: s)  # redaction off
     results, report = bench_env
     src = results / "v13.json"
-    _note_card("ran `ls -la ~/.claude/skills/ci_gate-metrics-core-pipeline/`").save(src)
+    _note_card("ran `ls -la ~/.claude/skills/metrics-core-metrics-core-pipeline/`").save(src)  # term-ok: redaction fixture needs a banned codename
 
     res = CliRunner().invoke(cli, ["bench", "publish", str(src)])
 

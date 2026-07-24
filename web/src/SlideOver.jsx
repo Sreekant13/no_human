@@ -677,7 +677,7 @@ const AGENTS = [
   // The post-PR watcher (W2.1): without this node its agentState was never
   // derived, so the Shepherding stage could not light up even after the
   // events reached the client (the second half of the same starvation bug).
-  { id: "watcher",    label: "Watcher",      type: "SHEPHERD",     icon: "☂",  desc: "Post-PR: merge watch, feedback injection, CI fixes, CI_GATE gate",
+  { id: "watcher",    label: "Watcher",      type: "SHEPHERD",     icon: "☂",  desc: "Post-PR: merge watch, feedback injection, CI fixes, Enterprise CI gate",
     color: "var(--agent-worker)" },
 ];
 
@@ -1607,7 +1607,7 @@ const EVENT_LABELS = {
   subagent_progress: "Subagent",
   subagent_done: "Subagent done",
   review_posted: "Review posted to PR",
-  // post-PR watcher ladder (blockers/wake.py) — merged/comments/CI/CI_GATE
+  // post-PR watcher ladder (blockers/wake.py) — merged/comments/CI/Enterprise CI
   merged: "PR merged",
   pr_closed: "PR closed",
   pr_feedback: "PR feedback",
@@ -1619,13 +1619,13 @@ const EVENT_LABELS = {
   resumed: "Resumed",
   wake_tick: "Watcher heartbeat",
   state_repaired: "State repaired",
-  // CI_GATE integration gate (M6)
-  ci_gate_trigger: "CI_GATE triggered",
-  ci_gate_poll: "CI_GATE running",
-  ci_gate_pass: "CI_GATE passed",
-  ci_gate_fail: "CI_GATE failed",
-  ci_gate_blocked: "CI_GATE blocked",
-  ci_gate_refused: "CI_GATE refused",
+  // Enterprise CI integration gate (M6)
+  ci_gate_trigger: "Enterprise CI triggered",
+  ci_gate_poll: "Enterprise CI running",
+  ci_gate_pass: "Enterprise CI passed",
+  ci_gate_fail: "Enterprise CI failed",
+  ci_gate_blocked: "Enterprise CI blocked",
+  ci_gate_refused: "Enterprise CI refused",
 };
 
 function eventLabel(kind) {
