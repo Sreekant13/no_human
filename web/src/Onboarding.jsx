@@ -332,17 +332,17 @@ export default function Onboarding({ onComplete }) {
                 hand-held session burns.
               </p>
               <div className="ob-agents">
-                <div className="ob-agent ob-agent-worker">
-                  <div className="ob-agent-role">Coder</div>
-                  <p>Builds the change, writes the tests, and runs them.</p>
+                <div className="ob-agent ob-agent-supervisor">
+                  <div className="ob-agent-role">Supervisor</div>
+                  <p>Watches in real time — enforces your rules, blocks guesses.</p>
                 </div>
                 <div className="ob-agent ob-agent-planner">
                   <div className="ob-agent-role">Planner</div>
                   <p>Turns your task into a plan before it touches code.</p>
                 </div>
-                <div className="ob-agent ob-agent-supervisor">
-                  <div className="ob-agent-role">Supervisor</div>
-                  <p>Watches in real time — enforces your rules, blocks guesses.</p>
+                <div className="ob-agent ob-agent-worker">
+                  <div className="ob-agent-role">Coder</div>
+                  <p>Builds the change, writes the tests, and runs them.</p>
                 </div>
                 <div className="ob-agent ob-agent-reviewer">
                   <div className="ob-agent-role">Reviewer</div>
