@@ -636,3 +636,23 @@ def test_bounded_xdist_workers():
     assert bounded_xdist_workers(20, 12, None) == "1"     # floor at 1
     assert bounded_xdist_workers(1, 12, None) is None     # serial: untouched
     assert bounded_xdist_workers(3, 12, "8") is None      # explicit choice kept
+
+
+@pytest.mark.asyncio
+async def test_resumed_work_claims_before_fresh_pending(store):
+    """WIP-first: a task resumed to IMPLEMENTING (sunk cost, operator waiting)
+    must claim a free slot before a newer PENDING task. Live starvation
+    (2026-07-24): every newly imported ticket jumped the single slot ahead of
+    three budget-raised resumes, which then false-stalled on a 40-min cycle."""
+    fake = FakeOrch(store, hold=asyncio.Event())
+    sched = Scheduler(store, lambda task=None: fake, max_workers=1)
+
+    resumed = Task.new("resumed WIP", repo_path="/tmp/x")
+    await store.create_task(resumed)
+    await store.set_status(resumed, TaskStatus.IMPLEMENTING, validate=False)
+    fresh = Task.new("fresh pending", repo_path="/tmp/x")
+    await store.create_task(fresh)
+
+    started = await sched.tick()
+    assert started == [resumed.id], (
+        f"expected the resumed task to claim the slot, got {started}")

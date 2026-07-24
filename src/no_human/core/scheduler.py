@@ -31,8 +31,11 @@ from .task import TaskStatus
 log = logging.getLogger("no_human.scheduler")
 
 # Tasks the scheduler may pick up: freshly created, or flipped back to
-# IMPLEMENTING by the WakeWatcher / `nh reply` resume.
-_CLAIMABLE = (TaskStatus.PENDING, TaskStatus.IMPLEMENTING)
+# IMPLEMENTING by the WakeWatcher / `nh reply` resume. IMPLEMENTING first —
+# WIP-first: resumed work carries sunk cost and a waiting operator, and
+# pending-first starved three budget-raised resumes behind every newly
+# imported ticket on a one-worker pool (live, 2026-07-24).
+_CLAIMABLE = (TaskStatus.IMPLEMENTING, TaskStatus.PENDING)
 
 
 def resolve_max_workers(
