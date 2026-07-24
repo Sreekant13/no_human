@@ -178,6 +178,32 @@ async def test_empty_query_browses_the_projects_open_tickets(client, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_token_only_in_env_file_is_loaded_on_demand(client, tmp_path, monkeypatch):
+    """Under `nh start` (the board) JIRA_API_TOKEN is NOT in the process env —
+    only `nh serve`'s poller loaded it. The picker endpoint must load it on
+    demand from ~/.no_human/.env (B1 pattern), else a valid, configured Jira
+    integration wrongly 503s "not configured" and the picker looks broken."""
+    (tmp_path / ".env").write_text("JIRA_API_TOKEN=dotenv-secret\n")
+    assert "JIRA_API_TOKEN" not in os.environ  # process env is clean (nh start)
+    captured = {}
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        captured.update(auth=auth)
+        return _Resp({"issues": []})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    try:
+        r = await client.get("/api/integrations/jira/issues", params={"q": ""})
+        assert r.status_code == 200, r.text  # NOT 503 "not configured"
+        # proves the token was loaded from .env into the request's adapter
+        assert captured["auth"] == ("me@x.com", "dotenv-secret")
+    finally:
+        # load_env_var sets os.environ directly (untracked by monkeypatch); pop
+        # it so the token never leaks into a later test.
+        os.environ.pop("JIRA_API_TOKEN", None)
+
+
+@pytest.mark.asyncio
 async def test_upstream_error_surfaces_as_502_never_leaking_token(client, monkeypatch):
     monkeypatch.setenv("JIRA_API_TOKEN", "SEKRET")
 
