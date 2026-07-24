@@ -323,17 +323,22 @@ export default function Onboarding({ onComplete }) {
                   `*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }`
                   reset near the top of styles.css. If that reset is ever narrowed, this
                   headline needs an explicit margin-top. */}
-              <h2 className="ob-h1">Stop hand-holding one chat. Ship 10× in parallel.</h2>
+              <h2 className="ob-h1">Stop hand-holding one chat. Ship 10× in parallel — at a tenth of the cost.</h2>
               <p className="ob-lede">
-                no_human fields an <em>entire legion of agents at once</em> — many tasks,
-                across many repos, simultaneously. Each one is carried from intake
-                to an open PR on its own: no babysitting, no re-explaining, no
-                steering every step. You just review and approve.
+                no_human fields an <em>entire team of specialized agents at once</em> — many
+                tasks, across many repos, in parallel. Each one is carried from intake to an
+                open PR on its own: no babysitting, no re-explaining, no steering every step.
+                You just review and approve — for about <em>a tenth</em> of what one
+                hand-held session burns.
               </p>
               <div className="ob-agents">
                 <div className="ob-agent ob-agent-worker">
-                  <div className="ob-agent-role">Worker</div>
+                  <div className="ob-agent-role">Coder</div>
                   <p>Builds the change, writes the tests, and runs them.</p>
+                </div>
+                <div className="ob-agent ob-agent-planner">
+                  <div className="ob-agent-role">Planner</div>
+                  <p>Turns your task into a plan before it touches code.</p>
                 </div>
                 <div className="ob-agent ob-agent-supervisor">
                   <div className="ob-agent-role">Supervisor</div>
@@ -342,6 +347,14 @@ export default function Onboarding({ onComplete }) {
                 <div className="ob-agent ob-agent-reviewer">
                   <div className="ob-agent-role">Reviewer</div>
                   <p>Fresh eyes, told to refute “done.” Pass/fail with evidence.</p>
+                </div>
+                <div className="ob-agent ob-agent-watcher">
+                  <div className="ob-agent-role">Shepherd</div>
+                  <p>After the PR opens — watches CI, fixes reds, folds in your comments.</p>
+                </div>
+                <div className="ob-agent ob-agent-investigator">
+                  <div className="ob-agent-role">Investigator</div>
+                  <p>Read-only root-cause digs when you want answers, not a diff.</p>
                 </div>
               </div>
               <div className="ob-flow">
@@ -353,7 +366,7 @@ export default function Onboarding({ onComplete }) {
                 <span className="ob-flow-pr">open PR</span>
                 <span className="ob-flow-you">you approve</span>
               </div>
-              <p className="ob-note">Let's teach them how <em>you</em> work — about five minutes.</p>
+              <p className="ob-note">Plus fast utility helpers that summarize, classify, and distill — each agent on the model tier that fits its job. Let's teach them how <em>you</em> work — about five minutes.</p>
             </Stagger>
           )}
 
