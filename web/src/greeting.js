@@ -8,7 +8,7 @@
  * else yields "" and the UI greets a plain "Hey there".
  */
 
-// "dev" / "anne-marie.dubois" / "eyal" — never "user123" or "a.b.c.d".
+// "sam.rivera" / "anne-marie.dubois" / "sam" — never "user123" or "a.b.c.d".
 const HUMAN_LOCAL = /^[a-z]+(?:-[a-z]+)*(?:\.[a-z]+(?:-[a-z]+)*)?$/i;
 
 // A segment from this set means the mailbox is a role, not a person.

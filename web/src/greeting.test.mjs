@@ -8,7 +8,7 @@ import { greetingName } from "./greeting.js";
 // Source: /api/config → notifications.email_to (verified live on the server).
 
 test("derives a first name from a human-looking work address", () => {
-  assert.equal(greetingName({ notifications: { email_to: "dev@example.com" } }), "Eyal");
+  assert.equal(greetingName({ notifications: { email_to: "sam.rivera@example.com" } }), "Sam");
 });
 
 test("handles a single-part local address", () => {
