@@ -80,3 +80,42 @@ export function isNeedsYou(task) {
 export function isRealFailure(task) {
   return Boolean(task) && task.status === "failed" && !task.cancelled;
 }
+
+// SCRUM-15: the scheduler's in-flight set is the ONLY thing that means "the
+// agent is actually working on this right now" — an active-status task the
+// scheduler hasn't picked up yet is queued, not running, no matter how it looks.
+export function isRunning(task) {
+  return task?.claimed === true;
+}
+
+// Queued = routed to Working, but not actually claimed, and not parked on its
+// own signal (that's `waiting`, a distinct, non-active state with its own tag).
+export function isQueued(task) {
+  return routeTask(task) === "working" && !isRunning(task) && !isWaiting(task);
+}
+
+// Card treatment decision, extracted so JSX just consumes it instead of
+// re-deriving "is this active" from raw status (the bug this ticket fixes).
+export function cardActivity(task) {
+  if (isRunning(task)) return { mode: "running", showPulse: true, showQueuedChip: false, mutedProgress: false };
+  if (isQueued(task)) return { mode: "queued", showPulse: false, showQueuedChip: true, mutedProgress: true };
+  if (isWaiting(task)) return { mode: "waiting", showPulse: false, showQueuedChip: false, mutedProgress: true };
+  return { mode: "idle", showPulse: false, showQueuedChip: false, mutedProgress: false };
+}
+
+// SINGLE source of truth for the top strip / lane headers / sidebar counts —
+// they must all read from here so they cannot disagree (the bug this ticket
+// fixes: three surfaces derived "working" from three different vocabularies).
+export function deriveCounts(tasks) {
+  const t = Array.isArray(tasks) ? tasks : [];
+  const running = t.filter(isRunning).length;
+  const queued = t.filter(isQueued).length;
+  const waiting = t.filter(isWaiting).length;
+  return {
+    running,
+    queued,
+    waiting,
+    working: running + queued + waiting, // == Working-lane header, by construction
+    needsYou: t.filter(isNeedsYou).length,
+  };
+}

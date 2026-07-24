@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { LANES, routeTask, isNeedsYou, isWaiting, isRealFailure, BOARD_LANES, OUTCOME_LANES } from "./boardLanes.js";
+import {
+  LANES, routeTask, isNeedsYou, isWaiting, isRealFailure, BOARD_LANES, OUTCOME_LANES,
+  isRunning, isQueued, cardActivity, deriveCounts,
+} from "./boardLanes.js";
 
 test("awaiting_approval routes to its OWN 'Review PR' lane, not a catch-all", () => {
   assert.equal(routeTask({ status: "awaiting_approval" }), "review");
@@ -137,4 +140,83 @@ test("B2 #19: an approved PR stops shouting in 'need you' but keeps its lane", (
   // Routing is UNTOUCHED — LANES is also the routing table (the known trap):
   // the approved task stays visible in the Review lane.
   assert.equal(routeTask(approved), routeTask(unreviewed));
+});
+
+// SCRUM-15: claimed=true from the scheduler's in-flight set is the ONLY signal
+// for "actually running" — an active status alone must never read as running.
+test("isRunning is true only when claimed, regardless of status", () => {
+  assert.equal(isRunning({ status: "implementing", claimed: true }), true);
+  assert.equal(isRunning({ status: "implementing", claimed: false }), false);
+  assert.equal(isRunning({ status: "implementing" }), false);
+  assert.equal(isRunning({ status: "compound_parent", claimed: true }), true);
+});
+
+test("isQueued is a Working-lane task that is not claimed and not waiting", () => {
+  assert.equal(isQueued({ status: "implementing", claimed: false }), true);
+  assert.equal(isQueued({ status: "implementing", claimed: true }), false, "claimed → running, not queued");
+  assert.equal(isQueued({ status: "paused_quota", claimed: false }), false, "waiting has its own state");
+  assert.equal(isQueued({ status: "done", claimed: false }), false, "not routed to working");
+  assert.equal(isQueued({ status: "compound_parent", claimed: false }), true);
+});
+
+test("cardActivity: running gets the pulse; queued/waiting/idle never do", () => {
+  assert.deepEqual(
+    cardActivity({ status: "implementing", claimed: true }),
+    { mode: "running", showPulse: true, showQueuedChip: false, mutedProgress: false },
+  );
+  assert.deepEqual(
+    cardActivity({ status: "implementing", claimed: false }),
+    { mode: "queued", showPulse: false, showQueuedChip: true, mutedProgress: true },
+  );
+  assert.deepEqual(
+    cardActivity({ status: "paused_quota", claimed: false }),
+    { mode: "waiting", showPulse: false, showQueuedChip: false, mutedProgress: true },
+  );
+  // A pending task sits in the Working lane awaiting a slot — that IS queued
+  // (the whole point of this ticket); idle is for terminal/gate states only.
+  assert.deepEqual(
+    cardActivity({ status: "pending", claimed: false }),
+    { mode: "queued", showPulse: false, showQueuedChip: true, mutedProgress: true },
+  );
+  assert.deepEqual(
+    cardActivity({ status: "done", claimed: false }),
+    { mode: "idle", showPulse: false, showQueuedChip: false, mutedProgress: false },
+  );
+  // The exact bug: a queued (unclaimed active) task must never carry the pulse.
+  for (const t of [
+    { status: "implementing", claimed: false },
+    { status: "paused_quota", claimed: false },
+    { status: "pending", claimed: false },
+  ]) {
+    assert.equal(cardActivity(t).showPulse, false);
+  }
+  // compound_parent must never read as running unless actually claimed.
+  assert.equal(cardActivity({ status: "compound_parent", claimed: false }).mode, "queued");
+  assert.equal(cardActivity({ status: "compound_parent", claimed: true }).mode, "running");
+});
+
+test("deriveCounts: one definition — strip/lane/sidebar cannot disagree", () => {
+  const tasks = [
+    { id: "1", status: "implementing", claimed: true },   // running
+    { id: "2", status: "implementing", claimed: false },  // queued
+    { id: "3", status: "pending", claimed: false },        // queued
+    { id: "4", status: "reviewing", claimed: false },      // queued
+    { id: "5", status: "testing", claimed: false },        // queued
+    { id: "6", status: "planning", claimed: false },       // queued
+    { id: "7", status: "context", claimed: false },        // queued
+    { id: "8", status: "compound_parent", claimed: false },// queued
+    { id: "9", status: "awaiting_approval" },              // needs-you
+    { id: "10", status: "escalated" },                     // needs-you
+    { id: "11", status: "paused_quota" },                  // waiting
+  ];
+  const counts = deriveCounts(tasks);
+  assert.deepEqual(counts, { running: 1, queued: 7, waiting: 1, working: 9, needsYou: 2 });
+  assert.equal(counts.running, tasks.filter(isRunning).length);
+  assert.equal(counts.working, tasks.filter((t) => routeTask(t) === "working").length);
+  assert.equal(counts.working, counts.running + counts.queued + counts.waiting);
+});
+
+test("deriveCounts defaults safely on non-array input", () => {
+  assert.deepEqual(deriveCounts(null), { running: 0, queued: 0, waiting: 0, working: 0, needsYou: 0 });
+  assert.deepEqual(deriveCounts(undefined), { running: 0, queued: 0, waiting: 0, working: 0, needsYou: 0 });
 });

@@ -12,14 +12,13 @@ import { setFavicon } from "./favicon.js";
 import { needsPrUrl } from "./composerKinds.js";
 import { hasPrRef } from "./prRefs.js";
 import { shouldTriggerNewTask } from "./keyboardShortcut.js";
-import { isNeedsYou, isRealFailure } from "./boardLanes.js";
+import { isNeedsYou, isRealFailure, deriveCounts } from "./boardLanes.js";
 import { ledgerSummary, LEDGER_WINDOW_MS } from "./nightLedger.js";
 import { fmtCost, taskBurn } from "./cost.js";
 import { deriveSpendDisplay, perShippedCost } from "./ledgerSpend.js";
 import { tasksReducer } from "./tasksReducer.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 
-const PROGRESS_STATUSES  = new Set(["pending", "context", "planning", "implementing", "reviewing", "testing"]);
 
 // Header brand: logo + wordmark + tagline. Used in the main and error headers.
 function Brand() {
@@ -178,7 +177,9 @@ function OverviewStrip({ tasks }) {
   // counts them. Naming them here keeps the strip and the lane from contradicting each
   // other — "1 failed" over a lane badged 11 is worse than either number alone.
   const cancelled  = tasks.filter(t => t.status === "failed" && t.cancelled).length;
-  const inProgress = tasks.filter(t => PROGRESS_STATUSES.has(t.status)).length;
+  // SCRUM-15: one derivation shared with the lane headers and sidebar so the
+  // strip cannot drift from what the board itself shows (running vs queued).
+  const counts = deriveCounts(tasks);
 
   const oldestSec = needsYou.length > 0
     ? Math.max(...needsYou.map(t => (Date.now() - new Date(t.updated_at || t.created_at).getTime()) / 1000))
@@ -212,7 +213,9 @@ function OverviewStrip({ tasks }) {
       )}
       {/* "0 working" is noise on a phone — the Working lane already says so. The gate AGE is not. */}
       <span className="ov-sep ov-hide-narrow">·</span>
-      <span className="ov-hide-narrow">{inProgress} working</span>
+      <span className="ov-hide-narrow">
+        {counts.running} running{counts.queued > 0 ? ` · ${counts.queued} queued` : ""}
+      </span>
     </div>
   );
 }
@@ -755,6 +758,9 @@ export default function App() {
   }
 
   const needYou = tasks.filter(isNeedsYou).length;
+  // SCRUM-15: same derivation as OverviewStrip/lane headers so the sidebar
+  // "Working (N)" figure agrees with the board instead of its own count.
+  const sidebarCounts = deriveCounts(tasks);
   return (
     <div className="nh-shell nh-shell-cc">
       <aside className="nh-sidebar">
@@ -811,7 +817,7 @@ export default function App() {
           {workerStatus?.running && workerStatus.inflight > 0 && (
             <div className="nh-status-indicator" title={`${workerStatus.inflight} of ${workerStatus.max_workers} worker slots in use`}>
               <div className="nh-ws-dot live" style={{ background: 'var(--accent)' }} />
-              <span className="nh-status-label">Working ({workerStatus.inflight})</span>
+              <span className="nh-status-label">Working ({sidebarCounts.running})</span>
             </div>
           )}
           {queueHealth?.stuck && (

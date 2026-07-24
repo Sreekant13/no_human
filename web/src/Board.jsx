@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { fmtTokens, taskBurn } from "./cost.js";
 import SlideOver from "./SlideOver.jsx";
-import { BOARD_LANES, routeTask, isWaiting } from "./boardLanes.js";
+import { BOARD_LANES, routeTask, isWaiting, cardActivity } from "./boardLanes.js";
 import { taskProgress } from "./taskProgress.js";
 import { topPrioritised } from "./laneView.js";
 
@@ -90,6 +90,21 @@ export default function Board({ tasks, pendingOpenId, onPendingOpenHandled }) {
   );
 }
 
+// SCRUM-15: the Working lane header must agree with the card treatment below
+// it — "N live · M queued" only ever comes from cardActivity's own mode, so
+// the header cannot drift from what the cards actually render.
+function workingBreakdown(tasks) {
+  let running = 0;
+  let queued = 0;
+  for (const task of tasks) {
+    const mode = cardActivity(task).mode;
+    if (mode === "running") running += 1;
+    else if (mode === "queued") queued += 1;
+  }
+  if (queued === 0) return String(tasks.length);
+  return `${running} live · ${queued} queued`;
+}
+
 function Lane({ lane, tasks, onSelect }) {
   const [expanded, setExpanded] = useState(false);
   // Human-gate lanes (Needs Answer, Review PR) NEVER collapse — every task there
@@ -123,7 +138,11 @@ function Lane({ lane, tasks, onSelect }) {
       <div className="lane-header">
         <div className="lane-dot" style={{ background: lane.accent }} />
         <div className="lane-title">{lane.label}</div>
-        {tasks.length > 0 && <div className="lane-count">{tasks.length}</div>}
+        {tasks.length > 0 && (
+          <div className="lane-count">
+            {lane.key === "working" ? workingBreakdown(tasks) : tasks.length}
+          </div>
+        )}
       </div>
       <div className="lane-body">
         {tasks.length === 0 ? (
@@ -164,7 +183,6 @@ function Lane({ lane, tasks, onSelect }) {
 
 const STALE_STATUSES = new Set(["context", "planning", "implementing", "reviewing", "testing", "awaiting_approval", "awaiting_input", "blocked"]);
 const STALE_THRESHOLD_S = 16 * 3600;
-const ACTIVE_STATUSES = new Set(["context", "planning", "implementing", "reviewing", "testing"]);
 
 // Human-readable action hint for "Needs You" tasks
 function actionHint(task) {
@@ -187,13 +205,19 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
   const priority = task.priority ?? "medium";
   const burn = taskBurn(task);
 
-  const isActive = ACTIVE_STATUSES.has(task.status);
+  // SCRUM-15: the live pulse/progress must reflect the scheduler's actual claim,
+  // not merely an "active" status — an unclaimed active-status task is queued,
+  // and a queued task must never render as "agent is working on this".
+  const activity = cardActivity(task);
+  const isRunningNow = activity.mode === "running";
+  const isQueuedNow = activity.mode === "queued";
   const waiting = isWaiting(task);
 
   let cardCls = "task-card";
   if (isAwaiting) cardCls += " awaiting";
   if (isStale) cardCls += " stale";
-  if (isActive) cardCls += " active-working";
+  if (isRunningNow) cardCls += " active-working";
+  if (isQueuedNow) cardCls += " card-queued";
   if (waiting) cardCls += " waiting-parked";
 
   return (
@@ -218,7 +242,12 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
         }
       }}
     >
-      {isActive && <div className="card-active-pulse" title="agent is working on this" />}
+      {isRunningNow && <div className="card-active-pulse" title="agent is working on this" />}
+      {isQueuedNow && (
+        <div className="card-queued-tag" title="active but not yet picked up by a worker">
+          queued
+        </div>
+      )}
       {waiting && (
         <div className="card-waiting-tag" title={task.blocker_wake_condition || "will resume on its own"}>
           ◷ {task.status === "paused_quota" ? "waits for quota" : "waits for its own signal"}
@@ -228,16 +257,16 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
         <div className="card-title">{task.title}</div>
         <div className="card-id" title="task id — use it with `nh <id>`">{task.id.slice(0, 8)}</div>
       </div>
-      {task.live_status && isActive && (
+      {task.live_status && isRunningNow && (
         <div className="card-live-status">{task.live_status}</div>
       )}
       {task.subtask_progress && (
         <div className="card-subtask-progress">sub-tasks {task.subtask_progress}</div>
       )}
-      {isActive && taskProgress(task.status) != null && (
+      {(isRunningNow || isQueuedNow) && taskProgress(task.status) != null && (
         <div
-          className="card-progress"
-          title={`~${taskProgress(task.status)}% through the pipeline (${task.status})`}
+          className={`card-progress${activity.mutedProgress ? " is-queued" : ""}`}
+          title={`~${taskProgress(task.status)}% through the pipeline (${task.status}${isQueuedNow ? ", queued" : ""})`}
           role="progressbar"
           aria-valuenow={taskProgress(task.status)}
           aria-valuemin={0}

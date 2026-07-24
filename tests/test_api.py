@@ -1148,3 +1148,67 @@ async def test_reply_park_option_keeps_task_parked(client, store):
     replies = (fresh.context or {}).get("human_replies") or []
     assert replies and "stop" in replies[-1]["answer"]
     assert fresh.config == {}                            # park mutated nothing
+
+
+@pytest.mark.asyncio
+async def test_board_tasks_carry_claimed_from_scheduler(client, store):
+    """SCRUM-15: `claimed` mirrors the scheduler's in-flight set — an
+    active-status task the scheduler has not picked up is queued, not running."""
+    from types import SimpleNamespace
+
+    from no_human.api.app import _board_tasks
+    from no_human.core.task import Task, TaskStatus
+
+    a = Task.new("claimed one", repo_path="/tmp/x")
+    b = Task.new("waiting one", repo_path="/tmp/x")
+    await store.create_task(a)
+    await store.create_task(b)
+    await store.set_status(a, TaskStatus.IMPLEMENTING, validate=False)
+    await store.set_status(b, TaskStatus.IMPLEMENTING, validate=False)
+
+    sched = SimpleNamespace(inflight={a.id}, get_live_status=lambda _id: None)
+    out = {s.id: s for s in await _board_tasks(store, scheduler=sched)}
+    assert out[a.id].claimed is True
+    assert out[b.id].claimed is False
+
+    # No scheduler (CLI/board contexts without one): claimed defaults False.
+    out2 = {s.id: s for s in await _board_tasks(store)}
+    assert out2[a.id].claimed is False
+
+
+@pytest.mark.asyncio
+async def test_mutation_broadcast_payload_carries_claimed(client, store, monkeypatch):
+    """SCRUM-15 regression net: the round-2 internal review caught a mutation
+    broadcast whose tasks payload silently dropped `claimed` (a callsite
+    without scheduler=). Pin the key's presence in a real broadcast payload."""
+    from no_human.api.app import _mgr
+
+    captured: list[dict] = []
+
+    async def fake_broadcast(msg):
+        captured.append(msg)
+
+    monkeypatch.setattr(_mgr, "broadcast", fake_broadcast)
+    r = await client.post("/api/tasks", json={"title": "broadcast probe"})
+    assert r.status_code == 201
+    created_id = r.json()["id"]
+
+    # Value-level pin (fresh-review advisory): a fake scheduler claiming the
+    # task must surface claimed=True in the NEXT mutation broadcast — key
+    # presence alone would still pass if a callsite dropped scheduler=.
+    from types import SimpleNamespace
+
+    from no_human.api.app import app as fastapi_app
+    monkeypatch.setattr(
+        fastapi_app.state, "scheduler",
+        SimpleNamespace(inflight={created_id}, get_live_status=lambda _id: None),
+        raising=False)
+    captured.clear()
+    r2 = await client.post(f"/api/tasks/{created_id}/pause", json={})
+    assert r2.status_code == 200, r2.text
+    tasks_payload = captured[-1].get("tasks") or []
+    assert tasks_payload, "broadcast carries the board tasks"
+    by_id = {t["id"]: t for t in tasks_payload}
+    assert by_id[created_id]["claimed"] is True, (
+        "a scheduler-claimed task must broadcast claimed=True — a dropped "
+        "scheduler= callsite silently flattens it to False")
