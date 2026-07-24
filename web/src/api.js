@@ -487,6 +487,19 @@ export async function searchJiraIssues(q, limit = 20) {
   return r.json();
 }
 
+// SCRUM-9: fetch ONE issue in full when it's picked — the browse list above
+// truncates description to 2000 chars (list payload), so the composer prefill
+// must not be built from that brief alone. Throws with the server's 503/502
+// `detail`, same convention as searchJiraIssues.
+export async function fetchJiraIssue(key) {
+  const r = await fetch(`${BASE}/api/integrations/jira/issues/${encodeURIComponent(key)}`);
+  if (!r.ok) {
+    const detail = await r.json().catch(() => ({}));
+    throw new Error(detail.detail || `GET jira/issues/${key} → ${r.status}`);
+  }
+  return r.json();
+}
+
 export async function suggestPaths(path) {
   const r = await fetch(`${BASE}/api/fs/suggest?path=${encodeURIComponent(path || "")}`);
   if (!r.ok) return { suggestions: [] };

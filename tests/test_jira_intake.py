@@ -89,6 +89,41 @@ def test_normalize_handles_adf_description(monkeypatch):
     assert _adf_text("plain string") == "plain string"
 
 
+def test_issue_brief_truncates_but_issue_detail_carries_full_description(monkeypatch):
+    """SCRUM-9: issue_brief (browse list) truncates to 2000 chars — that's
+    correct for a small list payload. issue_detail (single picked issue) must
+    carry the FULL text so the created task doesn't lose the tail."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    long_desc = "x" * 2000 + "TAIL-AFTER-TRUNCATION-POINT"
+    issue = {"key": "PROJ-9", "fields": {"summary": "Fix", "description": long_desc}}
+    a = JiraAdapter(_cfg())
+    brief = a.issue_brief(issue)
+    assert len(brief["description"]) == 2000
+    assert "TAIL-AFTER-TRUNCATION-POINT" not in brief["description"]
+
+    detail = a.issue_detail(issue)
+    assert detail["description"] == long_desc
+    assert detail["description"].endswith("TAIL-AFTER-TRUNCATION-POINT")
+    # Same shape otherwise.
+    assert detail["key"] == brief["key"] == "PROJ-9"
+    assert detail["summary"] == brief["summary"]
+
+
+def test_get_issue_fetches_by_key_with_basic_auth(monkeypatch):
+    monkeypatch.setenv("JIRA_API_TOKEN", "SEKRET")
+    captured = {}
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        captured.update(url=url, params=params, auth=auth)
+        return _Resp({"key": "PROJ-9", "fields": {"summary": "Fix the thing"}})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    issue = JiraAdapter(_cfg()).get_issue("PROJ-9")
+    assert issue["key"] == "PROJ-9"
+    assert "/rest/api/3/issue/PROJ-9" in captured["url"]
+    assert captured["auth"] == ("me@x.com", "SEKRET")
+
+
 def test_auth_token_never_logged(monkeypatch, caplog):
     monkeypatch.setenv("JIRA_API_TOKEN", "SUPERSECRET")
     monkeypatch.setattr("no_human.intake.jira.httpx.get",

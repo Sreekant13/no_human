@@ -152,6 +152,28 @@ class JiraAdapter:
             "description": description[:2000],
         }
 
+    def issue_detail(self, issue: dict[str, Any]) -> dict[str, Any]:
+        """Same shape as ``issue_brief`` but with the FULL, untruncated
+        description — used only when a single picked issue is fetched for
+        import (SCRUM-9). The browse list keeps ``issue_brief``'s [:2000]
+        truncation; only this detail path carries the whole spec."""
+        brief = self.issue_brief(issue)
+        fields = issue.get("fields") or {}
+        brief["description"] = _adf_text(fields.get("description"))
+        return brief
+
+    def get_issue(self, key: str) -> dict[str, Any]:
+        """Fetch one issue by key with full fields — the detail GET behind
+        the picker's "pick" action (SCRUM-9), so the created task carries the
+        issue's full description instead of ``issue_brief``'s list-view
+        truncation. Same shape as one ``search``/``search_text`` hit."""
+        url = f"{self.site}/rest/api/3/issue/{key}"
+        params = {"fields": "summary,description,status,assignee,updated,issuetype"}
+        r = httpx.get(url, params=params, auth=self._auth(), timeout=30.0,
+                      headers={"Accept": "application/json"})
+        r.raise_for_status()
+        return r.json()
+
     def normalize(self, issue: dict[str, Any]) -> Task:
         key = issue.get("key") or ""
         fields = issue.get("fields") or {}

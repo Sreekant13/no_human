@@ -231,6 +231,66 @@ async def test_upstream_connection_error_surfaces_as_502(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_issue_detail_returns_full_untruncated_description(client, monkeypatch):
+    """SCRUM-9 repro: the browse list truncates description to 2000 chars for
+    a small list payload, but the picker's "pick" action must fetch the FULL
+    text so the created task doesn't silently lose everything past 2000
+    chars. This is the detail GET (a single issue by key), distinct from the
+    list endpoint above."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "SEKRET")
+    long_desc = "x" * 2000 + "TAIL-MARKER-AFTER-2000-CHARS"
+    captured = {}
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        captured.update(url=url, params=params, auth=auth)
+        return _Resp({
+            "key": "PROJ-9",
+            "fields": {
+                "summary": "Fix the thing",
+                "description": long_desc,
+                "status": {"name": "In Progress"},
+                "assignee": {"displayName": "Ada Lovelace"},
+                "updated": "2026-07-18T10:00:00.000+0000",
+            },
+        })
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    r = await client.get("/api/integrations/jira/issues/PROJ-9")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["key"] == "PROJ-9"
+    assert len(body["description"]) == len(long_desc)
+    assert body["description"].endswith("TAIL-MARKER-AFTER-2000-CHARS")
+
+    assert "/rest/api/3/issue/PROJ-9" in captured["url"]
+    assert captured["auth"] == ("me@x.com", "SEKRET")
+    assert "SEKRET" not in r.text
+
+
+@pytest.mark.asyncio
+async def test_issue_detail_unconfigured_returns_503(store, tmp_path):
+    app.state.store = store
+    app.state.config = nh_config.load_config(nh_config.CONFIG_PATH)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        r = await c.get("/api/integrations/jira/issues/PROJ-1")
+    assert r.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_issue_detail_upstream_error_surfaces_as_502(client, monkeypatch):
+    monkeypatch.setenv("JIRA_API_TOKEN", "SEKRET")
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        return _Resp({"errorMessages": ["boom"]}, status_code=500)
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    r = await client.get("/api/integrations/jira/issues/PROJ-9")
+    assert r.status_code == 502
+    assert "SEKRET" not in r.text
+
+
+@pytest.mark.asyncio
 async def test_test_connection_loads_token_from_env_not_only_serve(client, tmp_path, monkeypatch):
     """Regression (settings 'Test connection' bug): the health check must load
     JIRA_API_TOKEN from ~/.no_human/.env ITSELF, so it authenticates from a plain

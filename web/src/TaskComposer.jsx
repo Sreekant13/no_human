@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { fetchProjects, fetchConfig, fetchIntegrations, searchJiraIssues } from "./api.js";
+import { fetchProjects, fetchConfig, fetchIntegrations, searchJiraIssues, fetchJiraIssue } from "./api.js";
 import { COMPOSER_KINDS, kindByValue, needsPrUrl } from "./composerKinds.js";
 import { splitPrompt } from "./promptSplit.js";
 import { promptFromIssue, jiraStatusChipStyle } from "./jiraImport.js";
@@ -233,12 +233,22 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   // Picking an issue prefills the SAME prompt textarea the typed path uses —
   // the operator proceeds exactly as with a typed task from here on; the
   // grill flow below never has to know an import happened.
-  function handleJiraPick(issue) {
-    setPrompt(promptFromIssue(issue));
-    setSource("jira");
+  async function handleJiraPick(issue) {
     setJiraOpen(false);
     setJiraQuery("");
     setJiraResults(undefined);
+    // SCRUM-9: the browse list truncates description to 2000 chars (a list-
+    // payload optimization); prefilling straight from that brief silently cut
+    // off any ticket past 2000 chars. Fetch the single picked issue in full
+    // first — best-effort: a failed lookup falls back to the list brief
+    // already in hand rather than blocking the pick.
+    try {
+      issue = await fetchJiraIssue(issue.key);
+    } catch {
+      // fall back to the truncated brief already in hand
+    }
+    setPrompt(promptFromIssue(issue));
+    setSource("jira");
     promptRef.current?.focus();
   }
 
