@@ -83,6 +83,27 @@ test("reviewing/testing attribution copy — not the coder, not a bare stage wor
   assert.match(narrativeText(testing), /Tests are running/);
 });
 
+test("pre-coding stages are attributed to the real actor, never the Coder", () => {
+  // The Coder is only at the keyboard during `implementing`. Saying "Coder is
+  // planning" while the System view's Coding lane reads "not started yet" is
+  // the contradiction this guards. Each stage must name the actual worker.
+  const planning = narrativeFor({ status: "planning" });
+  assert.equal(narrativeText(planning).includes("Coder is"), false, "planning must not credit the Coder");
+  assert.match(narrativeText(planning), /planner is planning the approach/);
+
+  const context = narrativeFor({ status: "context" });
+  assert.equal(narrativeText(context).includes("Coder is"), false, "context must not credit the Coder");
+  assert.match(narrativeText(context), /orchestrator is gathering context/);
+
+  const pending = narrativeFor({ status: "pending" });
+  assert.equal(narrativeText(pending).includes("Coder is"), false, "pending must not credit the Coder");
+  assert.match(narrativeText(pending), /starting up/);
+
+  // The one stage the Coder IS active must still say so — no over-correction.
+  const implementing = narrativeFor({ status: "implementing" });
+  assert.match(narrativeText(implementing), /Coder is implementing/);
+});
+
 test("narrative colors the status phrase by its semantic token", () => {
   const review = narrativeFor({ status: "awaiting_approval" });
   assert.equal(review.colorVar, "var(--c-review)");

@@ -111,14 +111,24 @@ export function narrativeFor(task) {
   }
   if (ACTIVE_STATUSES.has(status)) {
     const attempt = task.attempt_count > 0 ? ` — attempt ${task.attempt_count}` : "";
-    // Attribution: the reviewer (not "the coder") checks the work, and tests
-    // run themselves — neither should read as if the coder agent is still at
-    // the keyboard during these two stages.
+    // Attribution must match the System view's lanes: the Coder is only at the
+    // keyboard during `implementing`. Every OTHER stage is a different worker —
+    // saying "Coder is planning" while the Coding lane reads "not started yet"
+    // is the contradiction this guards against. Name the actual actor per stage.
     if (status === "reviewing") {
       return { before: "The reviewer is", phrase: `checking the work${attempt}`, after: "", colorVar: colorForStatus(status) };
     }
     if (status === "testing") {
       return { before: "Tests are", phrase: `running${attempt}`, after: "", colorVar: colorForStatus(status) };
+    }
+    if (status === "planning") {
+      return { before: "The planner is", phrase: `planning the approach${attempt}`, after: "", colorVar: colorForStatus(status) };
+    }
+    if (status === "context") {
+      return { before: "The orchestrator is", phrase: `gathering context${attempt}`, after: "", colorVar: colorForStatus(status) };
+    }
+    if (status === "pending") {
+      return { before: `This ${kindLabel(task)} is`, phrase: "starting up", after: "", colorVar: colorForStatus(status) };
     }
     const stage = STATUS_STAGE_LABEL[status] || "working";
     return { before: "Coder is", phrase: `${stage}${attempt}`, after: "", colorVar: colorForStatus(status) };
