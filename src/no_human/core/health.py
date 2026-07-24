@@ -86,11 +86,23 @@ async def queue_health(
     recent_completion = await count(
         f"SELECT COUNT(*) FROM tasks WHERE status IN ({done_q}) "
         "AND updated_at >= ?", *DONE_STATUSES, stuck_cutoff)
-    if recent_completion == 0:
+    # Completions alone false-alarm on a one-worker pool whose tasks each take
+    # longer than the window (live, 2026-07-24: "Queue stuck" while a task had
+    # entered review minutes earlier). A recent STATE event — a pipeline stage
+    # transition — is motion a busy-looping coder cannot fake: loops emit
+    # usage/tool events, never state events, so the original anti-busy-loop
+    # property survives. task_events.ts is epoch seconds, not ISO.
+    epoch_cutoff = (
+        (now or datetime.now(timezone.utc)) - timedelta(minutes=stuck_after_minutes)
+    ).timestamp()
+    recent_transition = await count(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM task_events WHERE ts >= ? "
+        "AND json_extract(data, '$.kind') = 'state' LIMIT 1)", epoch_cutoff)
+    if recent_completion == 0 and recent_transition == 0:
         h.stuck = True
         h.stuck_reason = (
-            f"{h.open_tasks} task(s) open and nothing has completed in "
-            f"{stuck_after_minutes} minutes")
+            f"{h.open_tasks} task(s) open, nothing completed and no task "
+            f"changed stage in {stuck_after_minutes} minutes")
 
     if h.completed_in_window > 0:
         rate_per_min = h.completed_in_window / window_minutes

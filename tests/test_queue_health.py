@@ -41,7 +41,7 @@ async def test_open_work_with_no_completions_is_stuck(store):
     await _task(store, TaskStatus.DONE, updated_min_ago=120)  # stale completion
     h = await queue_health(store, stuck_after_minutes=30)
     assert h.stuck is True
-    assert "nothing has completed in 30 minutes" in h.stuck_reason
+    assert "nothing completed and no task changed stage in 30 minutes" in h.stuck_reason
 
 
 async def test_recent_completion_clears_stuck_and_gives_an_eta(store):
@@ -72,3 +72,29 @@ async def test_eta_is_none_not_zero_when_unknowable(store):
     await _task(store, TaskStatus.PENDING)
     h = await queue_health(store, window_minutes=30)
     assert h.eta_minutes is None, "an unknown ETA must never render as a number"
+
+
+async def test_recent_stage_transition_is_not_stuck(store):
+    """Live false alarm (2026-07-24): 30-60-minute tasks on a ONE-worker pool
+    routinely complete nothing for 30 minutes while the pipeline is visibly
+    moving (a task entered review 5 minutes earlier). A recent STATE event —
+    a stage transition, which a busy-looping coder never emits — is motion,
+    not a stall."""
+    import time
+    await _task(store, TaskStatus.IMPLEMENTING)
+    await _task(store, TaskStatus.DONE, updated_min_ago=120)   # stale completion
+    await store.save_events("sometask", [
+        {"ts": time.time() - 300, "kind": "state", "text": "reviewing"}])
+    h = await queue_health(store, stuck_after_minutes=30)
+    assert h.stuck is False
+
+
+async def test_stale_transitions_and_no_completions_is_still_stuck(store):
+    """The anti-busy-loop property survives: state events OLDER than the
+    window do not count as motion."""
+    import time
+    await _task(store, TaskStatus.IMPLEMENTING)
+    await store.save_events("sometask", [
+        {"ts": time.time() - 3600, "kind": "state", "text": "planning"}])
+    h = await queue_health(store, stuck_after_minutes=30)
+    assert h.stuck is True
