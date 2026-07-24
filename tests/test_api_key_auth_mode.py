@@ -71,6 +71,18 @@ def test_api_key_mode_scrubs_other_metered_redirects(clean_env, monkeypatch):
     assert "ANTHROPIC_VERTEX_PROJECT_ID" not in os.environ  # scrubbed
 
 
+def test_api_key_mode_scrubs_inherited_oauth_token(clean_env, monkeypatch):
+    """A subscription token inherited from the shell must not reach the SDK
+    subprocess alongside the key — "bills exactly one path" must hold by
+    construction, not by the SDK's documented credential precedence."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-friend-key")
+    monkeypatch.setenv(config.SUBSCRIPTION_TOKEN_VAR, "sk-ant-oat-inherited")
+    report = assert_subscription_mode(auth_mode="api_key")
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-friend-key"  # kept
+    assert config.SUBSCRIPTION_TOKEN_VAR not in os.environ  # scrubbed
+    assert config.SUBSCRIPTION_TOKEN_VAR in report.removed
+
+
 def test_api_key_mode_loads_key_from_env_file(clean_env, monkeypatch):
     clean_env.write_text("ANTHROPIC_API_KEY=sk-ant-from-dotenv\n")
     assert_subscription_mode(auth_mode="api_key")
