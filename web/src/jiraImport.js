@@ -58,3 +58,9 @@ const CATEGORY_TOKENS = {
 export function jiraStatusChipStyle(status) {
   return CATEGORY_TOKENS[jiraStatusCategory(status)] || null;
 }
+
+/** The dedup key sent to the backend as external_id, captured when an issue is
+ * picked. Pure so the pick-time capture + grill round-trip stay testable. */
+export function externalIdFromIssue(issue) {
+  return issue?.key ?? null;
+}

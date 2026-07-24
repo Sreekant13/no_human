@@ -299,6 +299,7 @@ function NewTaskModal({ onClose, onCreated }) {
         // Task 1.6: the hidden marker TaskComposer sets when the task came
         // from a picked Jira ticket — "board" for every typed task, unchanged.
         source: fields.source,
+        external_id: fields.externalId,
       });
       // Attach any screenshots/documents to the new task (best-effort — a failed
       // upload must not lose the task that was already created).

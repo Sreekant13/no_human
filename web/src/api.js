@@ -27,11 +27,11 @@ export async function fetchDiff(id) {
   return r.text();
 }
 
-export async function createTask({ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source }) {
+export async function createTask({ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id }) {
   const r = await fetch(`${BASE}/api/tasks`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source }),
+    body: JSON.stringify({ title, description, repo_path, project_id, kind, priority, acceptance_criteria, source, external_id }),
   });
   if (!r.ok) {
     const detail = await r.json().catch(() => ({}));

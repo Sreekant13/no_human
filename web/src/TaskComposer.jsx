@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { fetchProjects, fetchConfig, fetchIntegrations, searchJiraIssues, fetchJiraIssue } from "./api.js";
 import { COMPOSER_KINDS, kindByValue, needsPrUrl } from "./composerKinds.js";
 import { splitPrompt } from "./promptSplit.js";
-import { promptFromIssue, jiraStatusChipStyle } from "./jiraImport.js";
+import { promptFromIssue, jiraStatusChipStyle, externalIdFromIssue } from "./jiraImport.js";
 import { greetingName } from "./greeting.js";
 import { hasPrRef } from "./prRefs.js";
 import { formatBytes } from "./formatBytes.js";
@@ -97,6 +97,10 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   // control the operator sees) so a task created from a picked ticket carries
   // Task.source = "jira"; everything else runs the SAME grill flow untouched.
   const [source, setSource] = useState(initial?.source ?? "board");
+  // SCRUM-33: the dedup key for a picked Jira ticket — seeded from `initial`
+  // (like `source`) so a grill-fail re-seed doesn't drop it; null for every
+  // typed/board task since only handleJiraPick below ever sets it.
+  const [externalId, setExternalId] = useState(initial?.externalId ?? null);
   const [jiraConfigured, setJiraConfigured] = useState(false);
   const [jiraOpen, setJiraOpen] = useState(false);
   const [jiraQuery, setJiraQuery] = useState("");
@@ -249,6 +253,7 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
     }
     setPrompt(promptFromIssue(issue));
     setSource("jira");
+    setExternalId(externalIdFromIssue(issue));
     promptRef.current?.focus();
   }
 
@@ -271,6 +276,7 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
       prUrl,
       customRepo,
       source,
+      externalId,
     });
   }
 
