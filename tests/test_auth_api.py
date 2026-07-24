@@ -84,6 +84,91 @@ async def test_status_does_not_scrub_the_environment(client, monkeypatch):
     assert os.environ.get("ANTHROPIC_API_KEY") == "sk-ant-api03-whatever"
 
 
+# ------------------------- auth_mode-aware fields --------------------------- #
+
+@pytest.mark.asyncio
+async def test_status_carries_auth_mode_and_api_key_present(client):
+    """SCRUM-13: every response — any mode — carries the new contract keys."""
+    r = await client.get("/api/auth/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["auth_mode"] == "subscription"
+    assert isinstance(body["api_key_present"], bool)
+
+
+@pytest.mark.asyncio
+async def test_status_reports_api_key_present_without_leaking_it(client, tmp_path):
+    """api_key_present detects a key sitting in .env, and the value never
+    appears in the response body."""
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-api03-x\n")
+    r = await client.get("/api/auth/status")
+    assert r.json()["api_key_present"] is True
+    assert "sk-ant-api03-x" not in r.text
+    assert "api03" not in r.text
+
+
+@pytest.mark.asyncio
+async def test_api_key_mode_no_restart_when_already_billing_key(
+        client, monkeypatch):
+    """The server is already running under api_key mode and already exported
+    the key ($_ACTIVE_AUTH_PROFILE == "api_key") — a restart would not change
+    what pays, so restart_required must be False."""
+    app.state.config.data.setdefault("llm", {})["auth_mode"] = "api_key"
+    monkeypatch.setattr("no_human.config._ACTIVE_AUTH_PROFILE", "api_key")
+    r = await client.get("/api/auth/status")
+    body = r.json()
+    assert body["auth_mode"] == "api_key"
+    assert body["restart_required"] is False
+
+
+@pytest.mark.asyncio
+async def test_api_key_mode_restart_required_when_billing_path_differs(
+        client, monkeypatch):
+    """Config now says api_key, but the RUNNING process is still exporting an
+    OAuth profile (it started before the switch) — that IS a billing-path
+    change a restart would make, so restart_required must be True."""
+    app.state.config.data.setdefault("llm", {})["auth_mode"] = "api_key"
+    monkeypatch.setattr("no_human.config._ACTIVE_AUTH_PROFILE", "default")
+    r = await client.get("/api/auth/status")
+    assert r.json()["restart_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_api_key_mode_token_present_false_is_not_flagged(
+        client, monkeypatch):
+    """token_present keeps its OAuth-token meaning in api_key mode — no OAuth
+    token on file is normal here, not an error, and must not 500 or flip the
+    field's semantics."""
+    app.state.config.data.setdefault("llm", {})["auth_mode"] = "api_key"
+    monkeypatch.setattr("no_human.config._ACTIVE_AUTH_PROFILE", "api_key")
+    # Defensive: token_present reflects whatever OAuth token is resolvable
+    # for the configured profile, so a real CLAUDE_CODE_OAUTH_TOKEN in the
+    # ambient environment (this is a Claude Code session) must not leak into
+    # the isolated test .env and make the assertion below environment-
+    # dependent.
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    r = await client.get("/api/auth/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert isinstance(body["token_present"], bool)
+    assert body["token_present"] is False
+
+
+@pytest.mark.asyncio
+async def test_subscription_payload_existing_fields_unchanged(client):
+    """Pins that adding the new keys did not alter any existing field's
+    value or semantics in subscription mode (the default, untouched config)."""
+    r = await client.get("/api/auth/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["restart_required"] is False
+    assert body["token_var"].startswith("CLAUDE_CODE_OAUTH_TOKEN")
+    assert body["configured_profile"] == "default"
+    assert "active_profile" in body
+    assert body["metered_key_present"] is False
+    assert body["auth_mode"] == "subscription"
+
+
 # ------------------------------ PUT token ---------------------------------- #
 
 @pytest.mark.asyncio
