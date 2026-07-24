@@ -12,6 +12,7 @@ from no_human.core.db import Store
 from no_human.core.task import Task, TaskStatus
 from no_human.intake.jira import JiraAdapter, _adf_text
 from no_human.intake.jira_poll import JiraPoller
+from no_human.profile import ProjectProfile
 
 
 def _cfg(**over):
@@ -221,6 +222,79 @@ async def test_poller_survives_a_search_error(monkeypatch, tmp_path):
         monkeypatch.setattr(a, "search", boom)
         r = await JiraPoller(a, store, config=_cfg()).poll_once()
         assert r.created == 0                   # error logged, not raised
+    finally:
+        await store.close()
+
+
+# --------------------- SCRUM-26: repo profile default budgets ---------------
+
+
+@pytest.mark.asyncio
+async def test_poller_copies_profile_defaults_into_task_config(monkeypatch, tmp_path):
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        await store.upsert_profile(ProjectProfile(
+            repo_path="/tmp/repo", default_attempt_tokens=6_000_000,
+            default_lifetime_tokens=16_000_000,
+        ))
+        issues = [{"key": "PROJ-1", "fields": {"summary": "A"}}]
+        a = JiraAdapter(_cfg())
+        monkeypatch.setattr(a, "search", lambda: issues)
+        poller = JiraPoller(a, store, config=_cfg(default_repo="/tmp/repo"))
+        r = await poller.poll_once()
+        assert r.created == 1
+        tasks = await store.list_tasks()
+        assert tasks[0].config["attempt_tokens"] == 6_000_000
+        assert tasks[0].config["lifetime_tokens"] == 16_000_000
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_poller_no_profile_defaults_config_unchanged(monkeypatch, tmp_path):
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        issues = [{"key": "PROJ-1", "fields": {"summary": "A"}}]
+        a = JiraAdapter(_cfg())
+        monkeypatch.setattr(a, "search", lambda: issues)
+        poller = JiraPoller(a, store, config=_cfg(default_repo="/tmp/repo"))
+        r = await poller.poll_once()
+        assert r.created == 1
+        tasks = await store.list_tasks()
+        assert "attempt_tokens" not in tasks[0].config
+        assert "lifetime_tokens" not in tasks[0].config
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_poller_explicit_config_overrides_profile_defaults(monkeypatch, tmp_path):
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        await store.upsert_profile(ProjectProfile(
+            repo_path="/tmp/repo", default_attempt_tokens=6_000_000,
+            default_lifetime_tokens=16_000_000,
+        ))
+        issues = [{"key": "PROJ-1", "fields": {"summary": "A"}}]
+        a = JiraAdapter(_cfg())
+        monkeypatch.setattr(a, "search", lambda: issues)
+        orig_normalize = a.normalize
+
+        def _normalize_with_explicit_override(issue):
+            t = orig_normalize(issue)
+            t.config["attempt_tokens"] = 999
+            return t
+
+        monkeypatch.setattr(a, "normalize", _normalize_with_explicit_override)
+        poller = JiraPoller(a, store, config=_cfg(default_repo="/tmp/repo"))
+        r = await poller.poll_once()
+        assert r.created == 1
+        tasks = await store.list_tasks()
+        assert tasks[0].config["attempt_tokens"] == 999          # explicit wins
+        assert tasks[0].config["lifetime_tokens"] == 16_000_000  # untouched key still defaulted
     finally:
         await store.close()
 

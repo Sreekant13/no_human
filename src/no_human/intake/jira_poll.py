@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 from ..core.db import Store
 from ..core.task import Task, TaskStatus
+from ..profile import apply_default_task_config
 
 log = logging.getLogger("no_human.intake.jira_poll")
 
@@ -105,6 +106,9 @@ class JiraPoller:
                 continue
             if self.default_repo:
                 task.repo_path = self.default_repo
+            if task.repo_path:
+                profile = await self.store.get_profile(task.repo_path)
+                task.config = apply_default_task_config(profile, task.config)
             await self.store.create_task(task)
             existing.add(key)
             result.created += 1

@@ -55,6 +55,12 @@ class ProjectProfile:
     notes: str = ""
     wiki_commit: str = ""              # git SHA when wiki was last generated
     default_branch: str = ""           # C3: explicit default branch (e.g. "main", "master")
+    # SCRUM-26: repo-level calibration for task.config's per-task overrides
+    # (attempt_tokens / lifetime_tokens — see blockers/actions.py). 0 = unset;
+    # copied into a new task's config only when the task has no explicit
+    # override, so an operator hand-set task.config always still wins.
+    default_attempt_tokens: int = 0
+    default_lifetime_tokens: int = 0
 
     # --- serialization ---------------------------------------------------- #
 
@@ -78,6 +84,8 @@ class ProjectProfile:
             "notes": self.notes,
             "wiki_commit": self.wiki_commit,
             "default_branch": self.default_branch,
+            "default_attempt_tokens": self.default_attempt_tokens,
+            "default_lifetime_tokens": self.default_lifetime_tokens,
         }
 
     @classmethod
@@ -125,3 +133,22 @@ class ProjectProfile:
         if self.is_usable:
             return True
         return bool(auto_confirm_proven and self.test_cmd and self.proven.get("test_cmd"))
+
+
+def apply_default_task_config(
+    profile: "ProjectProfile | None", task_config: dict[str, Any]
+) -> dict[str, Any]:
+    """Copy a repo profile's default token budgets into a new task's config
+    (SCRUM-26), for exactly the two keys the orchestrator already reads as
+    per-task overrides (``attempt_tokens`` / ``lifetime_tokens`` — see
+    blockers/actions.py's ALLOWED_TASK_CONFIG_KEYS). An explicit key already
+    present on ``task_config`` always wins; no profile / no defaults set on
+    the profile leaves ``task_config`` byte-for-byte unchanged."""
+    if profile is None:
+        return task_config
+    merged = dict(task_config)
+    if profile.default_attempt_tokens and "attempt_tokens" not in merged:
+        merged["attempt_tokens"] = profile.default_attempt_tokens
+    if profile.default_lifetime_tokens and "lifetime_tokens" not in merged:
+        merged["lifetime_tokens"] = profile.default_lifetime_tokens
+    return merged

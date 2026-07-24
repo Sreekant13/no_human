@@ -9,6 +9,7 @@ from httpx import AsyncClient, ASGITransport
 from no_human.core.task import Task, TaskStatus
 from no_human.api.app import app
 from no_human.core.db import Store
+from no_human.profile import ProjectProfile
 
 
 # --------------------------------------------------------------------------- #
@@ -160,6 +161,69 @@ async def test_create_task_absent_external_id_unchanged(client, store):
     assert body["external_id"] is None
     task = await store.get_task(body["id"])
     assert task.external_id is None
+
+
+# --------------------------------------------------------------------------- #
+# POST /api/tasks — SCRUM-26 repo profile default token budgets               #
+# --------------------------------------------------------------------------- #
+
+def _fake_git_repo(tmp_path, name="repo"):
+    """create_task's repo_path branch requires a real dir with a `.git`
+    entry; content doesn't matter, only that the check passes."""
+    repo = tmp_path / name
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    return str(repo.resolve())
+
+
+@pytest.mark.asyncio
+async def test_create_task_copies_profile_defaults_into_config(client, store, tmp_path):
+    repo = _fake_git_repo(tmp_path)
+    await store.upsert_profile(ProjectProfile(
+        repo_path=repo, default_attempt_tokens=6_000_000, default_lifetime_tokens=16_000_000,
+    ))
+    r = await client.post("/api/tasks", json={"title": "Heavy repo task", "repo_path": repo})
+    assert r.status_code == 201
+    task = await store.find_task(r.json()["id"])
+    assert task.config["attempt_tokens"] == 6_000_000
+    assert task.config["lifetime_tokens"] == 16_000_000
+
+
+@pytest.mark.asyncio
+async def test_create_task_no_profile_defaults_config_unchanged(client, store, tmp_path):
+    repo = _fake_git_repo(tmp_path, name="plain_repo")
+    r = await client.post("/api/tasks", json={"title": "Plain task", "repo_path": repo})
+    assert r.status_code == 201
+    task = await store.find_task(r.json()["id"])
+    assert "attempt_tokens" not in task.config
+    assert "lifetime_tokens" not in task.config
+
+
+@pytest.mark.asyncio
+async def test_create_task_explicit_config_overrides_profile_defaults(client, store, tmp_path, monkeypatch):
+    repo = _fake_git_repo(tmp_path, name="override_repo")
+    await store.upsert_profile(ProjectProfile(
+        repo_path=repo, default_attempt_tokens=6_000_000, default_lifetime_tokens=16_000_000,
+    ))
+    # Simulate a task that already carries an explicit attempt_tokens override
+    # by the time create_task's profile-defaults merge runs (e.g. a future
+    # explicit-config field on CreateTaskRequest, or a caller-preset value) —
+    # the merge must leave it alone rather than clobber it with the profile
+    # default, while still filling in the untouched lifetime_tokens key.
+    from no_human.core.task import Task as TaskCls
+    orig_new = TaskCls.new
+
+    def _new_with_explicit_override(*a, **kw):
+        t = orig_new(*a, **kw)
+        t.config["attempt_tokens"] = 999
+        return t
+
+    monkeypatch.setattr(TaskCls, "new", _new_with_explicit_override)
+    r = await client.post("/api/tasks", json={"title": "Override task", "repo_path": repo})
+    assert r.status_code == 201
+    task = await store.find_task(r.json()["id"])
+    assert task.config["attempt_tokens"] == 999            # explicit wins, not clobbered
+    assert task.config["lifetime_tokens"] == 16_000_000    # untouched key still gets the default
 
 
 # --------------------------------------------------------------------------- #
