@@ -7,6 +7,7 @@ import {
   fetchAuthStatus, setAuthToken,
 } from "./api.js";
 import { capName, PROFILE_CAP, TOKENVAR_CAP } from "./capName.js";
+import { authPanelView } from "./authPanelView.js";
 import { groupLearningsByProject } from "./learningGroups.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 import { pluralize } from "./pluralize.js";
@@ -69,20 +70,21 @@ function AuthPanel() {
   }
 
   const profiles = status.profiles || [];
+  const view = authPanelView(status);
   return (
     <div className="memory-panel auth-panel">
       <div className="memory-header">
         <h3 className="memory-title"><span className="panel-title-text">Account</span></h3>
       </div>
 
-      {status.metered_key_present && (
+      {view.showMeteredAlarm && (
         <div className="nh-alarm auth-alarm" role="alert">
           A metered <code>ANTHROPIC_API_KEY</code> is set in no_human&apos;s
           environment — it bills per request and bypasses your subscription.
           Unset it where the server runs.
         </div>
       )}
-      {status.restart_required && (
+      {view.mode === "subscription" && view.showRestartBanner && (
         <div className="nh-alarm auth-alarm" role="alert">
           Restart required — the running server is still billing
           {" "}&ldquo;{capName(status.active_profile, PROFILE_CAP)}&rdquo;, but
@@ -90,37 +92,54 @@ function AuthPanel() {
           Restart no_human to switch.
         </div>
       )}
+      {view.mode === "api_key" && view.showRestartBanner && (
+        <div className="nh-alarm auth-alarm" role="alert">
+          Restart required to switch billing to your API key.
+        </div>
+      )}
 
-      <dl className="auth-status">
-        <div><dt>Configured profile</dt><dd>{capName(status.configured_profile, PROFILE_CAP)}</dd></div>
-        <div><dt>Active (billing) profile</dt><dd>{capName(status.active_profile, PROFILE_CAP)}</dd></div>
-        <div><dt>Token variable</dt><dd><code>{capName(status.token_var, TOKENVAR_CAP)}</code></dd></div>
-        <div><dt>Token set</dt><dd>{status.token_present ? "yes" : "no"}</dd></div>
-      </dl>
+      {view.mode === "api_key" && (
+        <dl className="auth-status">
+          <div><dt>Billing path</dt><dd>Using your personal Anthropic API key</dd></div>
+          <div><dt>Key source</dt><dd><code>~/.no_human/.env</code> (chmod 600)</dd></div>
+          <div><dt>API key set</dt><dd>{view.apiKeyPresent ? "yes" : "no"}</dd></div>
+        </dl>
+      )}
 
-      <form className="auth-form" onSubmit={handleSubmit} autoComplete="off">
-        <label className="auth-label">Profile
-          <select className="new-task-select" value={profile} aria-label="Profile"
-                  onChange={(e) => setProfile(e.target.value)}>
-            {profiles.map((p) => <option key={p.name} value={p.name}>{capName(p.name, PROFILE_CAP)}</option>)}
-          </select>
-        </label>
-        <label className="auth-label">OAuth token
-          <input className="new-task-input" type="password" autoComplete="off"
-                 spellCheck={false} value={token} aria-label="OAuth token"
-                 placeholder="CLAUDE_CODE_OAUTH_TOKEN (subscription or enterprise)"
-                 onChange={(e) => { setToken(e.target.value); setSaved(false); setError(null); }} />
-        </label>
-        <p className="auth-hint">
-          A subscription or enterprise OAuth token — not an API key. Stored
-          write-only and never shown again.
-        </p>
-        {error && <div className="settings-error" role="alert">{error}</div>}
-        {saved && <div className="auth-saved" role="status">Saved.</div>}
-        <button className="btn btn-approve" type="submit" disabled={!token.trim() || saving}>
-          {saving ? "Saving…" : "Save token"}
-        </button>
-      </form>
+      {view.showOAuthForm && (
+        <>
+          <dl className="auth-status">
+            <div><dt>Configured profile</dt><dd>{capName(status.configured_profile, PROFILE_CAP)}</dd></div>
+            <div><dt>Active (billing) profile</dt><dd>{capName(status.active_profile, PROFILE_CAP)}</dd></div>
+            <div><dt>Token variable</dt><dd><code>{capName(status.token_var, TOKENVAR_CAP)}</code></dd></div>
+            <div><dt>Token set</dt><dd>{status.token_present ? "yes" : "no"}</dd></div>
+          </dl>
+
+          <form className="auth-form" onSubmit={handleSubmit} autoComplete="off">
+            <label className="auth-label">Profile
+              <select className="new-task-select" value={profile} aria-label="Profile"
+                      onChange={(e) => setProfile(e.target.value)}>
+                {profiles.map((p) => <option key={p.name} value={p.name}>{capName(p.name, PROFILE_CAP)}</option>)}
+              </select>
+            </label>
+            <label className="auth-label">OAuth token
+              <input className="new-task-input" type="password" autoComplete="off"
+                     spellCheck={false} value={token} aria-label="OAuth token"
+                     placeholder="CLAUDE_CODE_OAUTH_TOKEN (subscription or enterprise)"
+                     onChange={(e) => { setToken(e.target.value); setSaved(false); setError(null); }} />
+            </label>
+            <p className="auth-hint">
+              A subscription or enterprise OAuth token — not an API key. Stored
+              write-only and never shown again.
+            </p>
+            {error && <div className="settings-error" role="alert">{error}</div>}
+            {saved && <div className="auth-saved" role="status">Saved.</div>}
+            <button className="btn btn-approve" type="submit" disabled={!token.trim() || saving}>
+              {saving ? "Saving…" : "Save token"}
+            </button>
+          </form>
+        </>
+      )}
     </div>
   );
 }

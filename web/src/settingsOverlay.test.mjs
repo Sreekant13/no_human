@@ -71,6 +71,27 @@ test("active section nav buttons get aria-current=\"true\"", () => {
 // Review fix #1: the overlay header (Settings.jsx) is the single title; each
 // panel's own in-body heading text is scope-hidden under the overlay
 // container rather than deleted, so panels stay intact if reused elsewhere.
+// SCRUM-14: api_key-mode rendering. The metered-key alarm must no longer be
+// unconditional — it has to be gated by the authPanelView view-model so the
+// api_key path (where the key IS the chosen billing path) can suppress it.
+test("metered alarm is gated by the view-model, not unconditional", () => {
+  assert.match(settingsJsx, /view\.showMeteredAlarm/,
+    "the metered alarm must be gated by view.showMeteredAlarm, not status.metered_key_present directly");
+  assert.doesNotMatch(settingsJsx, /\{status\.metered_key_present\s*&&/,
+    "the metered alarm must not read status.metered_key_present unconditionally anymore");
+  // The OAuth form must still exist in source for the subscription path.
+  assert.match(settingsJsx, /<form className="auth-form"/);
+});
+
+// The api_key mode billing-path panel: driven by auth_mode via the view-model,
+// naming the fixed key source (~/.no_human/.env) per the intake answer.
+test("api_key billing-path panel is rendered", () => {
+  assert.match(settingsJsx, /authPanelView/, "Settings.jsx must import/use the authPanelView view-model");
+  assert.match(settingsJsx, /view\.mode === "api_key"/);
+  assert.match(settingsJsx, /~\/\.no_human\/\.env/, "must name the fixed .env key source");
+  assert.match(settingsJsx, /view\.apiKeyPresent/, "must surface the api_key_present state via the view-model");
+});
+
 test("panel section titles are scoped-hidden inside the overlay, not duplicated", () => {
   const titleTextOccurrences = (settingsJsx.match(/panel-title-text/g) || []).length;
   // ProjectsPanel, MemoryList (rules+skills share one component), LearningsPanel.
