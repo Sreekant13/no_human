@@ -116,3 +116,49 @@ async def test_env_invocation_error_still_proceeds_without_evidence(
     # invocation error on the record — not silently failed
     assert outcome.status is TaskStatus.AWAITING_APPROVAL
     assert outcome.pr_url is not None
+
+
+async def test_node_missing_deps_invocation_error_does_not_fail_attempt(
+    bare_repo, tmp_path, store
+):
+    """SCRUM-35: a node module-resolution failure (the SCRUM-33 "2335 passed,
+    1 failed" shape — missing `node_modules` in the worktree) must ride the
+    SAME boundary as any other invocation error: it does not consume a
+    coder attempt as a code failure, and never reaches the tamper guard —
+    max_attempts=1 here, so if this were fed back as a plain test failure the
+    attempt would end FAILED instead of reaching the human gate."""
+    node_err_cmd = (
+        "printf '# tests 1\\n# pass 0\\n# fail 0\\n'; "
+        "printf 'Error [ERR_MODULE_NOT_FOUND]: Cannot find package "
+        "\"left-pad\"\\n' 1>&2; "
+        "exit 1"
+    )
+    from no_human.profile import ProjectProfile
+    prof = ProjectProfile(
+        repo_path=str(bare_repo), ecosystem="node",
+        test_cmd=node_err_cmd,
+        derived_from=["test"], proven={"test_cmd": True}, confirmed=True,
+    )
+    await store.upsert_profile(prof)
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n"
+        )
+
+    orch = _orch(store, tmp_path, FakeBackend(mutate))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    # reproduces identically on the base tree (a fixed canned command) →
+    # classified environmental → proceeds to the human gate, not FAILED.
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert outcome.pr_url is not None
+    attempts = await store.list_attempts(t.id)
+    assert len(attempts) == 1, "an INFRA failure must not consume a second attempt"
+    assert attempts[-1]["status"] != "failed", (
+        "a dependency-resolution crash must never be recorded as a failed attempt: "
+        + str(attempts[-1])
+    )
