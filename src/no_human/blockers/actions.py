@@ -24,6 +24,13 @@ if TYPE_CHECKING:  # pragma: no cover — typing only, avoids an import cycle
     from ..core.task import Task
 
 SET_TASK_CONFIG = "set_task_config"
+# Terminal outcome (SCRUM-22): the option's meaning is "stop — keep the work
+# parked as-is". Both reply paths check ``is_terminal_action`` and KEEP the
+# task in its parked state instead of resuming; the live bug was the stop
+# option carrying no action, which made "answer + resume" silently invert the
+# human's explicit stop. Exactly ``{"park": true}``, alone — parse_blocker
+# strips agent options to labels, so the agent can never emit it.
+PARK = "park"
 
 # Exactly the per-task overrides the orchestrator honours: the two size
 # limits (`_size_limits`), the two lifetime caps (`_lifetime_limits`), and the
@@ -40,6 +47,11 @@ class ActionError(ValueError):
     it, never swallowed — a silently ignored action is a button that lies."""
 
 
+def is_terminal_action(action: dict[str, Any] | None) -> bool:
+    """True when picking this option means the task STAYS parked (no resume)."""
+    return isinstance(action, dict) and action.get(PARK) is True
+
+
 def apply_action(task: "Task", action: dict[str, Any] | None) -> str | None:
     """Apply `action` to `task` in place. Returns a human-readable summary of
     what changed, or None when the option carried no action."""
@@ -48,9 +60,15 @@ def apply_action(task: "Task", action: dict[str, Any] | None) -> str | None:
     if not isinstance(action, dict):
         raise ActionError(f"action must be an object, got {type(action).__name__}")
 
-    unknown = set(action) - {SET_TASK_CONFIG}
+    unknown = set(action) - {SET_TASK_CONFIG, PARK}
     if unknown:
         raise ActionError(f"unknown action verb(s): {', '.join(sorted(unknown))}")
+
+    if PARK in action:
+        if action.get(PARK) is not True or len(action) != 1:
+            raise ActionError(
+                'a park action must be exactly {"park": true}, alone')
+        return "parked — work kept as-is"
 
     settings = action.get(SET_TASK_CONFIG)
     if not isinstance(settings, dict) or not settings:

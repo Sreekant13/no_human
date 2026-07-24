@@ -1118,3 +1118,33 @@ async def test_integration_test_endpoint_unconfigured_jira(client):
 async def test_integration_test_endpoint_unknown_name_404(client):
     r = await client.post("/api/integrations/mystery/test")
     assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_reply_park_option_keeps_task_parked(client, store):
+    """SCRUM-22: choosing the terminal stop option must keep the task in its
+    parked state — never resume it into the claim queue."""
+    from no_human.core.task import Task, TaskStatus
+
+    t = Task.new("budget-parked", repo_path="/tmp/x")
+    await store.create_task(t)
+    t.blocker = {
+        "category": "BUDGET_EXHAUSTED",
+        "question": "Spend more, or stop here?",
+        "options": [
+            {"label": "raise", "action": {"set_task_config": {"lifetime_tokens": 13_000_000}}},
+            {"label": "stop \u2014 keep the work parked as-is", "action": {"park": True}},
+        ],
+    }
+    await store.update_task_columns(t)
+    await store.set_status(t, TaskStatus.ESCALATED, validate=False)
+
+    r = await client.post(f"/api/tasks/{t.id}/reply", json={"answer": "", "choose": 2})
+    assert r.status_code == 200, r.text
+    assert r.json().get("kept_parked") is True
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.ESCALATED          # NOT implementing
+    replies = (fresh.context or {}).get("human_replies") or []
+    assert replies and "stop" in replies[-1]["answer"]
+    assert fresh.config == {}                            # park mutated nothing

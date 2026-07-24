@@ -752,3 +752,47 @@ def test_agent_cannot_claim_the_harness_only_budget_category():
     b = parse_blocker(text)
     assert b is not None
     assert b.category is BlockerCategory.SCOPE_EXPLOSION
+
+
+def test_park_action_is_terminal_and_mutates_nothing():
+    """SCRUM-22: the BUDGET_EXHAUSTED "stop" option carried no action, so
+    nh reply resumed the task the human explicitly stopped (live: the stop
+    landed the task straight back in the claim queue with an exhausted
+    budget). A park action is a first-class terminal outcome."""
+    from no_human.blockers import apply_action
+    from no_human.blockers.actions import is_terminal_action
+    from no_human.core.task import Task
+
+    t = Task.new("x", repo_path="/tmp/x")
+    t.config = {"lifetime_tokens": 8_000_000}
+    summary = apply_action(t, {"park": True})
+    assert "park" in (summary or "").lower()
+    assert t.config == {"lifetime_tokens": 8_000_000}  # untouched
+
+    assert is_terminal_action({"park": True}) is True
+    assert is_terminal_action({"set_task_config": {"lifetime_tokens": 1}}) is False
+    assert is_terminal_action(None) is False
+
+
+def test_park_action_rejects_malformed_and_combined():
+    from no_human.blockers import ActionError, apply_action
+    from no_human.core.task import Task
+
+    t = Task.new("x", repo_path="/tmp/x")
+    with pytest.raises(ActionError):
+        apply_action(t, {"park": False})
+    with pytest.raises(ActionError):
+        apply_action(t, {"park": True, "set_task_config": {"lifetime_tokens": 9}})
+
+
+def test_budget_blocker_stop_option_carries_park():
+    """The taxonomy-level contract: BUDGET_EXHAUSTED's second option must be
+    an actionable terminal park, not a bare label."""
+    import inspect
+
+    from no_human.core import orchestrator as orch_mod
+
+    src = inspect.getsource(orch_mod)
+    # The stop option now carries the park action (source-level pin; the
+    # behavioral end is covered by the apply/reply tests).
+    assert '"park": True' in src or "'park': True" in src

@@ -9,7 +9,7 @@ from .report import (
     parse_blocker,
     render_report,
 )
-from .actions import ActionError, apply_action
+from .actions import ActionError, apply_action, is_terminal_action
 from .taxonomy import (
     Blocker,
     BlockerCategory,
@@ -24,6 +24,7 @@ from .wake import WakeWatcher, parse_duration
 __all__ = [
     "ActionError",
     "apply_action",
+    "is_terminal_action",
     "Blocker",
     "BlockerCategory",
     "BlockerOption",
