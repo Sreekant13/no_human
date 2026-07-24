@@ -8,6 +8,7 @@ and produces the draft PR locally — without pushing — for human comparison.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tempfile
 from dataclasses import dataclass, field
@@ -133,7 +134,30 @@ async def run_shadow(
         task = Task.new(task_title, repo_path=str(sandbox))
         task.acceptance_criteria = list(acceptance_criteria or [])
         await store.create_task(task)
-        outcome = await orch.run_task(task)
+        # B6: neither run_shadow nor the backend bounds a coder TURN by wall
+        # clock (only max_turns), so a hung Claude SDK subprocess would wedge
+        # the run forever at 0% CPU. Bound the whole task and fail honestly on
+        # timeout. Safe to cancel: the sandbox is a throwaway clone dropped in
+        # the finally below. Generous default so a legitimately long run is not
+        # cut off; override via bounds.shadow_timeout_s.
+        timeout_s = float((config.get("bounds") or {}).get("shadow_timeout_s") or 1800)
+        try:
+            outcome = await asyncio.wait_for(orch.run_task(task), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            if on_event:
+                on_event({"source": "shadow", "kind": "shadow_timeout",
+                          "text": f"shadow aborted after {timeout_s:.0f}s — a hung "
+                                  "backend turn; failed honestly instead of wedging"})
+            diff = subprocess.run(
+                ["git", "diff", base_sha, "HEAD"], cwd=sandbox,
+                capture_output=True, text=True,
+            ).stdout
+            return ShadowResult(
+                task_id=task.id, outcome_status="timed_out",
+                draft_diff=diff, pushed=False,
+                notes=f"shadow run timed out after {timeout_s:.0f}s (no coder-turn "
+                      "watchdog — B6); the backend subprocess hung, no diff forced.",
+            )
         diff = subprocess.run(
             ["git", "diff", base_sha, "HEAD"], cwd=sandbox,
             capture_output=True, text=True,
