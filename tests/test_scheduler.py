@@ -216,7 +216,7 @@ async def test_wake_watcher_ticked_and_implementing_is_claimable(store):
         def __init__(self):
             self.ticked = False
 
-        async def tick(self, *, now=None):
+        async def tick(self, *, now=None, active_ids=None):
             self.ticked = True
 
     wake = FakeWake()

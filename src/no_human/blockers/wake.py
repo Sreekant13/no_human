@@ -241,9 +241,21 @@ class WakeWatcher:
 
     # ------------------------------- tick ---------------------------------- #
 
-    async def tick(self, *, now: datetime | None = None) -> list[tuple[str, str]]:
+    async def tick(
+        self, *, now: datetime | None = None,
+        active_ids: set[str] | None = None,
+    ) -> list[tuple[str, str]]:
         """Re-evaluate all parked tasks once. Returns (task_id, action) tuples
-        where action is 'resumed' or 'escalated_timeout'."""
+        where action is 'resumed' or 'escalated_timeout'.
+
+        ``active_ids`` is the caller's set of worker-CLAIMED task ids; the
+        stuck-active sweep judges only those. A resumed task waiting in an
+        active status for a free worker slot is silent because nothing is
+        running it — parking it as "hung" re-created its escalation every 40
+        minutes behind a deep queue (live, 2026-07-24). ``None`` means the
+        caller cannot know what is claimed (standalone ``nh wake``), so the
+        sweep — whose whole purpose is freeing hung worker slots — is skipped.
+        """
         now = now or datetime.now(timezone.utc)
         actions: list[tuple[str, str]] = []
         for status in (TaskStatus.BLOCKED, TaskStatus.PAUSED_QUOTA,
@@ -259,13 +271,17 @@ class WakeWatcher:
         # 2026-07-11) would otherwise sit in an active state forever, holding a
         # worker slot and never failing honestly. Escalate one with NO event
         # for longer than the threshold (set above the 30-min test timeout, so
-        # a legitimately long test run never trips it).
-        for status in (TaskStatus.IMPLEMENTING, TaskStatus.REVIEWING,
-                       TaskStatus.TESTING, TaskStatus.PLANNING,
-                       TaskStatus.CONTEXT):
-            for task in await self.store.list_tasks(status):
-                if await self._escalate_if_stalled(task, now=now):
-                    actions.append((task.id, "escalated_stalled"))
+        # a legitimately long test run never trips it). Scope: only tasks the
+        # caller actually CLAIMED — see the docstring.
+        if active_ids is not None:
+            for status in (TaskStatus.IMPLEMENTING, TaskStatus.REVIEWING,
+                           TaskStatus.TESTING, TaskStatus.PLANNING,
+                           TaskStatus.CONTEXT):
+                for task in await self.store.list_tasks(status):
+                    if task.id not in active_ids:
+                        continue
+                    if await self._escalate_if_stalled(task, now=now):
+                        actions.append((task.id, "escalated_stalled"))
         return actions
 
     async def _escalate_if_stalled(self, task: Task, *, now: datetime) -> bool:

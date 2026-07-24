@@ -192,7 +192,10 @@ class Scheduler:
         now = now or datetime.now(timezone.utc)
         if self.wake is not None:
             try:
-                await self.wake.tick(now=now)
+                # Pass the claimed set so the stuck-active sweep judges only
+                # tasks a worker is actually running — a resumed task waiting
+                # for a free slot is silent by design, not hung.
+                await self.wake.tick(now=now, active_ids=set(self._inflight))
             except Exception as exc:  # noqa: BLE001 — watcher must not kill the pool
                 log.warning("wake tick failed: %s", exc)
 
