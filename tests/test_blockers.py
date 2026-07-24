@@ -186,6 +186,46 @@ def test_apply_action_writes_only_whitelisted_keys():
     assert t.config == {"max_lines_changed": 700}
 
 
+def test_attempt_tokens_is_settable():
+    from no_human.blockers import apply_action
+    from no_human.blockers.actions import ALLOWED_TASK_CONFIG_KEYS
+    from no_human.core.task import Task
+
+    assert "attempt_tokens" in ALLOWED_TASK_CONFIG_KEYS
+
+    t = Task.new("x", repo_path="/tmp/x")
+    summary = apply_action(t, {"set_task_config": {"attempt_tokens": 6_000_000}})
+    assert summary == "attempt_tokens=6000000"
+    assert t.config["attempt_tokens"] == 6_000_000
+
+
+def test_apply_action_never_lowers_an_existing_cap():
+    from no_human.blockers import apply_action
+    from no_human.core.task import Task
+
+    t = Task.new("x", repo_path="/tmp/x")
+    t.config = {"lifetime_tokens": 16_000_000}
+
+    # A lower request keeps the existing (higher) cap and says so.
+    summary = apply_action(t, {"set_task_config": {"lifetime_tokens": 8_000_000}})
+    assert t.config["lifetime_tokens"] == 16_000_000
+    assert "kept" in summary
+    assert "16000000" in summary
+
+    # A genuinely higher request still raises the cap.
+    summary = apply_action(t, {"set_task_config": {"lifetime_tokens": 24_000_000}})
+    assert t.config["lifetime_tokens"] == 24_000_000
+    assert summary == "lifetime_tokens=24000000"
+
+    # Same behaviour for a second cap key (attempt_tokens), proving it is
+    # uniform across ALLOWED_TASK_CONFIG_KEYS, not special-cased.
+    t.config["attempt_tokens"] = 8_000_000
+    summary = apply_action(t, {"set_task_config": {"attempt_tokens": 5_000_000}})
+    assert t.config["attempt_tokens"] == 8_000_000
+    assert "kept" in summary
+    assert "8000000" in summary
+
+
 # --------------------------------------------------------------------------- #
 # Parsing the agent's structured emission                                     #
 # --------------------------------------------------------------------------- #

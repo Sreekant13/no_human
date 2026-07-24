@@ -26,10 +26,12 @@ if TYPE_CHECKING:  # pragma: no cover — typing only, avoids an import cycle
 SET_TASK_CONFIG = "set_task_config"
 
 # Exactly the per-task overrides the orchestrator honours: the two size
-# limits (`_size_limits`) and the two lifetime caps (`_lifetime_limits`).
+# limits (`_size_limits`), the two lifetime caps (`_lifetime_limits`), and the
+# per-attempt token cap (`_attempt_token_cap`).
 ALLOWED_TASK_CONFIG_KEYS = frozenset({
     "max_lines_changed", "max_files_changed",
     "lifetime_attempts", "lifetime_tokens",
+    "attempt_tokens",
 })
 
 
@@ -54,7 +56,9 @@ def apply_action(task: "Task", action: dict[str, Any] | None) -> str | None:
     if not isinstance(settings, dict) or not settings:
         raise ActionError(f"{SET_TASK_CONFIG} needs a non-empty object of settings")
 
+    existing = task.config or {}
     resolved: dict[str, int] = {}
+    notes: dict[str, str] = {}
     for key, raw in settings.items():
         if key not in ALLOWED_TASK_CONFIG_KEYS:
             raise ActionError(
@@ -67,7 +71,16 @@ def apply_action(task: "Task", action: dict[str, Any] | None) -> str | None:
             raise ActionError(f"{key} must be an integer, got {raw!r}") from None
         if value <= 0:
             raise ActionError(f"{key} must be positive, got {value}")
-        resolved[key] = value
+        # Every allowed key is a resource cap: a "raise the limit" action must
+        # never lower one that is already higher (e.g. BUDGET_EXHAUSTED's
+        # raise option overwriting a bigger stored cap with its fixed value).
+        prior = existing.get(key)
+        if isinstance(prior, int) and not isinstance(prior, bool) and prior > value:
+            resolved[key] = prior
+            notes[key] = f"{key}={prior} (kept; requested {value} would lower it)"
+        else:
+            resolved[key] = value
+            notes[key] = f"{key}={value}"
 
-    task.config = {**(task.config or {}), **resolved}
-    return ", ".join(f"{k}={v}" for k, v in sorted(resolved.items()))
+    task.config = {**existing, **resolved}
+    return ", ".join(notes[k] for k in sorted(notes))
