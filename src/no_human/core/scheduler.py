@@ -65,6 +65,42 @@ def resolve_max_workers(
     return requested, None
 
 
+def resolve_serve_pool(
+    config: dict, *, cli_workers: int | None,
+) -> tuple[int, bool, str | None]:
+    """``nh serve``'s decision: an explicit ``--max-workers`` implies
+    enablement + worktree isolation for THIS invocation only (the config
+    default on disk stays whatever it was). Returns ``(workers, enabled,
+    error)``; ``error is not None`` means: don't serve, print it and exit.
+
+    - ``cli_workers`` given and < 1  -> ``(0, False, "<validation message>")``.
+    - ``cli_workers`` given and >= 1 -> the flag buys isolation: ``(cli_workers,
+      True, None)`` even if ``concurrency.enabled`` is false in config.
+    - ``cli_workers`` is None        -> today's behavior, unchanged: refuse
+      when ``concurrency.enabled`` is false; otherwise use
+      ``concurrency.max_workers`` (default 2, matching serve()'s historical
+      default — NOT ``resolve_max_workers``'s default of 1, which is for
+      the override-clamp case, not "no flag given at all").
+    """
+    conc = config.get("concurrency", {}) or {}
+    enabled = bool(conc.get("enabled", False))
+
+    if cli_workers is not None:
+        if cli_workers < 1:
+            return 0, False, (
+                f"--max-workers must be a positive integer, got {cli_workers}."
+            )
+        return cli_workers, True, None
+
+    if not enabled:
+        return 0, False, (
+            "concurrency.enabled is false — set it in ~/.no_human/config.yaml "
+            "to run the pool, or pass --max-workers N to enable it for this "
+            "run. Refusing to serve without worktree isolation."
+        )
+    return int(conc.get("max_workers", 2) or 2), True, None
+
+
 def bounded_xdist_workers(
     max_workers: int, cpu_count: int, existing: str | None,
 ) -> str | None:

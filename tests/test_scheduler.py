@@ -627,6 +627,63 @@ def test_resolve_max_workers_defaults_are_serial_and_silent():
     assert resolve_max_workers({"concurrency": {"enabled": True, "max_workers": 0}}) == (1, None)
 
 
+def test_explicit_serve_flag_enables_isolated_pool():
+    """SCRUM-10: `nh serve --max-workers N` must run the pool without a
+    config edit — the opposite of resolve_max_workers's clamp, since the
+    flag itself is what turns isolation on for this invocation."""
+    from no_human.core.scheduler import resolve_serve_pool
+
+    workers, enabled, error = resolve_serve_pool(
+        {"concurrency": {"enabled": False, "max_workers": 1}}, cli_workers=3)
+    assert (workers, enabled, error) == (3, True, None)
+
+
+def test_serve_without_flag_and_disabled_refuses():
+    """Absent flag = unchanged: still refuses to serve when concurrency is
+    off in config, exactly like before this feature existed."""
+    from no_human.core.scheduler import resolve_serve_pool
+
+    workers, enabled, error = resolve_serve_pool(
+        {"concurrency": {"enabled": False, "max_workers": 1}}, cli_workers=None)
+    assert enabled is False
+    assert error is not None
+
+
+def test_serve_without_flag_honours_config():
+    """Absent flag = unchanged: an already-enabled config drives the pool
+    width exactly as before."""
+    from no_human.core.scheduler import resolve_serve_pool
+
+    assert resolve_serve_pool(
+        {"concurrency": {"enabled": True, "max_workers": 2}}, cli_workers=None,
+    ) == (2, True, None)
+
+
+def test_serve_without_flag_defaults_to_two_when_enabled_and_unset():
+    """Absent flag = unchanged: serve()'s historical default was 2 workers
+    when concurrency.enabled is true but max_workers isn't set — must not
+    silently drop to resolve_max_workers's 1-worker override default."""
+    from no_human.core.scheduler import resolve_serve_pool
+
+    assert resolve_serve_pool(
+        {"concurrency": {"enabled": True}}, cli_workers=None,
+    ) == (2, True, None)
+
+
+def test_serve_flag_rejects_non_positive():
+    """CLI hygiene: zero/negative --max-workers is rejected with a clear
+    error rather than silently degrading to some other width."""
+    from no_human.core.scheduler import resolve_serve_pool
+
+    workers, enabled, error = resolve_serve_pool({}, cli_workers=0)
+    assert error is not None
+    assert workers == 0
+
+    workers, enabled, error = resolve_serve_pool({}, cli_workers=-1)
+    assert error is not None
+    assert workers == 0
+
+
 def test_bounded_xdist_workers():
     """The CPU-oversubscription guard (2026-07-11): 3 tasks × pytest -n auto
     on 12 cores must not spawn 36 workers."""
