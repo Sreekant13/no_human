@@ -182,6 +182,33 @@ async def test_poller_creates_then_dedupes(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_poller_skips_issue_already_on_board_as_jira_task(monkeypatch, tmp_path):
+    """SCRUM-32 regression: an issue whose key already exists as a board task
+    (source="jira" + external_id, e.g. created via the web import picker)
+    must not be re-created by JiraPoller.tick."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        seeded = Task.new("A", source="jira", external_id="PROJ-1")
+        await store.create_task(seeded)
+
+        a = JiraAdapter(_cfg())
+        monkeypatch.setattr(a, "search", lambda: [{"key": "PROJ-1", "fields": {"summary": "A"}}])
+        monkeypatch.setattr(a, "transition", lambda *a, **k: False)
+        monkeypatch.setattr(a, "comment", lambda *a, **k: False)
+
+        poller = JiraPoller(a, store, config=_cfg())
+        result = await poller.tick()
+
+        assert result.created == 0
+        assert result.skipped == 1
+        matching = [t for t in await store.list_tasks() if t.external_id == "PROJ-1"]
+        assert len(matching) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_poller_survives_a_search_error(monkeypatch, tmp_path):
     monkeypatch.setenv("JIRA_API_TOKEN", "t")
     store = await Store(tmp_path / "t.db").connect()

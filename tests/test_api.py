@@ -107,6 +107,62 @@ async def test_get_task_prefix_lookup(client, store):
 
 
 # --------------------------------------------------------------------------- #
+# POST /api/tasks — external_id (SCRUM-32)                                    #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_create_task_jira_stores_external_id(client, store):
+    r = await client.post("/api/tasks", json={
+        "title": "Import from Jira",
+        "source": "jira",
+        "external_id": "PROJ-9",
+    })
+    assert r.status_code == 201
+    body = r.json()
+    assert body["external_id"] == "PROJ-9"
+    task = await store.get_task(body["id"])
+    assert task.external_id == "PROJ-9"
+
+
+@pytest.mark.asyncio
+async def test_create_task_jira_external_id_trimmed_and_capped(client, store):
+    r = await client.post("/api/tasks", json={
+        "title": "Import from Jira",
+        "source": "jira",
+        "external_id": "  " + ("X" * 100),
+    })
+    assert r.status_code == 201
+    body = r.json()
+    assert body["external_id"] == "X" * 64
+    task = await store.get_task(body["id"])
+    assert task.external_id == "X" * 64
+
+
+@pytest.mark.asyncio
+async def test_create_task_board_ignores_external_id(client, store):
+    r = await client.post("/api/tasks", json={
+        "title": "Typed task",
+        "source": "board",
+        "external_id": "PROJ-9",
+    })
+    assert r.status_code == 201
+    body = r.json()
+    assert body["external_id"] is None
+    task = await store.get_task(body["id"])
+    assert task.external_id is None
+
+
+@pytest.mark.asyncio
+async def test_create_task_absent_external_id_unchanged(client, store):
+    r = await client.post("/api/tasks", json={"title": "Plain task"})
+    assert r.status_code == 201
+    body = r.json()
+    assert body["external_id"] is None
+    task = await store.get_task(body["id"])
+    assert task.external_id is None
+
+
+# --------------------------------------------------------------------------- #
 # GET /api/tasks/{id}/diff                                                     #
 # --------------------------------------------------------------------------- #
 
