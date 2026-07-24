@@ -501,14 +501,14 @@ def test_per_project_label_is_redacted_but_grouping_uses_the_real_name():
     Deleting redact_for_publish from the per-project line leaves the real term
     in the table and fails the first assertion; keying the group on the redacted
     label instead of `p` collapses the two rows and fails the last."""
-    a1 = _score(task_id="a1"); a1.project = "metrics-core"
-    a2 = _score(task_id="a2"); a2.project = "metrics-core"    # same real project
-    b1 = _score(task_id="b1"); b1.project = "METRICSDB"    # distinct key, same redaction
+    a1 = _score(task_id="a1"); a1.project = "metrics-core"  # term-ok: redaction fixture needs a real banned codename
+    a2 = _score(task_id="a2"); a2.project = "metrics-core"    # term-ok: same real project
+    b1 = _score(task_id="b1"); b1.project = "METRICSDB"    # term-ok: distinct key, same redaction
     md = render_northstar_md(NorthStarCard(scores=[a1, a2, b1]))
 
     assert "## Per-project" in md
     section = md.split("## Per-project", 1)[1]
-    assert "metrics-core" not in section.lower(), section      # the codename is gone
+    assert "metrics-core" not in section.lower(), section      # term-ok: the codename is gone
     assert "<redacted>" in section
     # real-name grouping: two keys -> a 2-task row AND a 1-task row, not one of 3
     assert "| 2 |" in section and "| 1 |" in section, section
