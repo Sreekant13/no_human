@@ -177,7 +177,12 @@ class NorthStarCard:
                 "escalation_specs": self.escalation_specs,
             },
             "override_reasons": self.override_reasons,
-            "scores": [s.as_dict() for s in self.scores],
+            # Sorted so a saved card is deterministic regardless of execution
+            # order — `--parallel` completes specs in a nondeterministic order,
+            # and the tracked per-task report renders scores in list order, so
+            # unsorted saves would make baseline-to-baseline diffs noisy.
+            "scores": [s.as_dict()
+                       for s in sorted(self.scores, key=lambda s: s.task_id)],
         }
 
     def save(self, path: Path) -> None:

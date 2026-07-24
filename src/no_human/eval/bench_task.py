@@ -249,6 +249,41 @@ def spec_project_name(spec: "BenchTask") -> str:
     return Path(spec.spec_repo_path).name
 
 
+def quick_cell(spec: "BenchTask") -> tuple[str, bool, bool, str]:
+    """The coverage cell a spec belongs to for the `--quick` iteration tier:
+    project × runnable × expect_escalation × original-size bucket.
+
+    The size bucket uses the ORIGINAL session's wall clock (S <10min,
+    M <1h, L ≥1h) as a complexity proxy — a spec-file constant, so cells never
+    shift between runs and cannot be gamed by our own replay times.
+    """
+    wall = float((spec.original or {}).get("wall_clock_s", 0) or 0)
+    bucket = "S" if wall < 600 else ("M" if wall < 3600 else "L")
+    return (spec_project_name(spec), spec.runnable, spec.expect_escalation, bucket)
+
+
+def select_quick_subset(specs: list["BenchTask"]) -> list["BenchTask"]:
+    """One representative per coverage cell — the stratified `--quick` tier.
+
+    Deterministic and input-order independent (fastest original wall clock in
+    the cell, spec id as tie-break), so quick runs are comparable to EACH
+    OTHER across time. The pick is deliberately fixed rather than rotated:
+    rotation would make consecutive quick runs measure different specs and
+    read as regressions. Guard against overfitting to the fixed picks is the
+    full-core gate, which every publish still has to pass — a quick card is
+    refused as baseline by the existing corpus-coverage machinery.
+    """
+    by_cell: dict[tuple, "BenchTask"] = {}
+    for spec in specs:
+        cell = quick_cell(spec)
+        best = by_cell.get(cell)
+        key = (float((spec.original or {}).get("wall_clock_s", 0) or 0), spec.id)
+        if best is None or key < (
+                float((best.original or {}).get("wall_clock_s", 0) or 0), best.id):
+            by_cell[cell] = spec
+    return sorted(by_cell.values(), key=lambda s: s.id)
+
+
 def remap_repo_path(repo_path: str, mapping: dict[str, str]) -> str:
     """Translate *repo_path* through *mapping*, longest prefix wins.
 

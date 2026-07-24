@@ -12,7 +12,9 @@ SRC = Path(__file__).resolve().parents[1] / "src/no_human/cli/commands.py"
 
 
 def _bench_loop_region(text: str) -> str:
-    start = text.index("for spec in specs:")
+    # The bench loop body now lives in `_run_spec` (the --parallel pool
+    # worker); same prints, same escaping obligations.
+    start = text.index("async def _run_spec(spec):")
     end = text.index("def bench_report", start)
     return text[start:end]
 
@@ -27,6 +29,21 @@ def test_crash_handler_print_is_escaped():
     region = _bench_loop_region(SRC.read_text())
     line = next(l for l in region.splitlines() if "crashed" in l and "console.print" in l)
     assert "escape(" in line, f"unescaped exception print: {line.strip()}"
+
+
+def test_spec_id_prints_are_escaped():
+    """spec.id comes from the spec FILE (`--specs-dir` accepts arbitrary
+    corpora), so a markup-shaped id (`[/x]`) in any console line is the same
+    v11 crash class as the title — and in the completion line it would kill
+    the run AFTER run_one succeeded but BEFORE the checkpoint append."""
+    region = _bench_loop_region(SRC.read_text())
+    printing = [l for l in region.splitlines()
+                if "spec.id" in l and ("console.print" in l or "f\"" in l)]
+    offenders = [l for l in printing
+                 if "{spec.id}" in l and "escape(spec.id)" not in l]
+    assert not offenders, f"unescaped spec.id print(s): {offenders}"
+    # And the id must actually be printed somewhere in the region, escaped.
+    assert any("escape(spec.id)" in l for l in region.splitlines())
 
 
 def test_gate_reason_print_is_escaped():

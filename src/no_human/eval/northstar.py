@@ -396,9 +396,14 @@ class NorthStarRunner:
         # crash it exists to prevent.
         spec.repo["path"] = str(src_repo)
 
-        refs_before = _ref_signature(src_repo)
-        work = _setup_sandbox(spec, workdir)
-        base_sha = _git(work, "rev-parse", "HEAD")
+        # Every subprocess below runs off-loop: under `--parallel` a sandbox
+        # copy (multi-GB cp/clone) or the 300s holdout pytest would otherwise
+        # block EVERY in-flight spec's SDK stream — and, worse, freeze the
+        # stuck-watchdog clock so a quiet-but-alive spec could be booked as a
+        # false SpecStalled crash.
+        refs_before = await asyncio.to_thread(_ref_signature, src_repo)
+        work = await asyncio.to_thread(_setup_sandbox, spec, workdir)
+        base_sha = await asyncio.to_thread(_git, work, "rev-parse", "HEAD")
 
         store = await Store(workdir / "bench.db").connect()
         try:
@@ -439,7 +444,7 @@ class NorthStarRunner:
         finally:
             await store.close()
 
-        if _ref_signature(src_repo) != refs_before:
+        if await asyncio.to_thread(_ref_signature, src_repo) != refs_before:
             raise RuntimeError(
                 f"SOURCE REPO REFS CHANGED during bench run of {spec.id} — "
                 "push-proofing failed; halt the bench")
@@ -545,10 +550,12 @@ class NorthStarRunner:
         # deliverable is COMMITTED on the branch, so uncommitted sandbox cruft that
         # could block a plain checkout is not part of the PR — a silent
         # keep-HEAD-at-base would reintroduce the exact empty-view bug (review D1).
-        diff_ref = self._agent_diff_ref(outcome, work)
+        diff_ref = await asyncio.to_thread(self._agent_diff_ref, outcome, work)
         if diff_ref != "HEAD":
-            r = subprocess.run(["git", "checkout", "-q", "-f", "--detach", diff_ref],
-                               cwd=work, capture_output=True)
+            r = await asyncio.to_thread(
+                subprocess.run,
+                ["git", "checkout", "-q", "-f", "--detach", diff_ref],
+                cwd=work, capture_output=True)
             if r.returncode != 0:
                 logging.getLogger(__name__).warning(
                     "bench: could not checkout %s in %s — judge repo view is stale, "
@@ -562,15 +569,16 @@ class NorthStarRunner:
             # the coder's commits live there regardless). The judge also sees the
             # agent's REPORT (its answer/review/plan), preferred over the terse
             # status `detail`.
-            agent_diff = subprocess.run(
+            agent_diff = (await asyncio.to_thread(
+                subprocess.run,
                 ["git", "diff", base_sha, diff_ref], cwd=work,
-                capture_output=True, text=True).stdout
+                capture_output=True, text=True)).stdout
             verdict = await self.goal_judge.judge(
                 request=spec.request, criteria=spec.acceptance_criteria,
                 agent_diff=agent_diff, outcome_status=status.value,
                 report=(getattr(outcome, "report", "") or getattr(outcome, "detail", "") or ""),
                 repo_path=str(work))
-        score.mergeable = self._holdout_ok(spec, work)
+        score.mergeable = await asyncio.to_thread(self._holdout_ok, spec, work)
         if verdict is not None:
             score.goal_satisfied = bool(verdict.satisfied) and \
                 score.mergeable in (True, None)

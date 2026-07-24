@@ -111,7 +111,11 @@ Everything about that needs qualifying, so here it is:
   and changes nothing else; `docs/NORTH_STAR_BENCH.md` moves only when someone
   runs `nh bench publish <results-file>`, which refuses a run too small or too
   quota-starved to mean anything. The figures above describe the run committed
-  here.
+  here. For faster measurement loops: `--parallel N` runs up to N specs
+  concurrently (each is sandbox-isolated; above ~4 risks quota saturation),
+  and `--quick` runs one deterministic representative per coverage cell
+  (~17 of 54 core specs) — an iteration signal that the publish gate refuses
+  as a baseline, on purpose.
 
 The number that matters most is not the success rate anyway — it is that the
 failures are mostly *honest* ones that cost you a minute to triage, rather than
