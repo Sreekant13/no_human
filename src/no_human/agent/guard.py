@@ -110,6 +110,20 @@ _GIT_DESTRUCTIVE = re.compile(
     r"clean\s+-[a-z]*f|filter-branch|update-ref\s+-d)"
 )
 
+# A live product server/runner launched from an agent session. `nh serve` /
+# `nh start` run against the OPERATOR's ~/.no_human (config, DB, credentials)
+# no matter which checkout they start from — live incident 2026-07-24: a coder
+# verifying serve flags launched a real `nh serve` from its worktree and its
+# Jira poller mass-imported 16 duplicate tasks into the production board.
+# `nh watch` runs a real task; `nh bench run` runs the real pipeline. CLI
+# behavior is tested through the CliRunner suite, never a live process. The
+# command position (start of string or after a separator/path) keeps prose
+# like `echo nh serve …` allowed.
+_LIVE_SERVER = re.compile(
+    r"(?:^|[|;&]\s*|`|\$\(|^\s*|/|\bsudo\s+|\benv\s+[^|;&]*?\s)"
+    r"nh\s+(?:serve|start|watch|bench\s+run)\b"
+)
+
 # Merging the PR — the one action that is always a human's (§3.2). `git merge`
 # is NOT this: a PR is merged through the forge, and that is what must be denied.
 _FORGE_MERGE = re.compile(
@@ -272,6 +286,15 @@ def evaluate(
                 "merging a pull/merge request is blocked — the agent never "
                 "merges. Open the PR, push your fixes to its branch, and stop. "
                 "A human merges it (`nh approve`).",
+            )
+        if _LIVE_SERVER.search(cmd):
+            return GuardDecision(
+                False,
+                "launching a live no_human server/runner (`nh serve`/`start`/"
+                "`watch`/`bench run`) is blocked in agent sessions — it runs "
+                "against the operator's real ~/.no_human config, database, and "
+                "credentials regardless of checkout. Test CLI behavior through "
+                "the test suite (CliRunner), never a live process.",
             )
         if re.search(r"\bgit\s+push\b", cmd) and _push_targets_protected(
             cmd, never_push_to

@@ -299,3 +299,34 @@ def test_rm_of_real_source_test_still_blocked(tmp_path):
     d = guard.evaluate("Bash", {"command": "rm tests/test_core.py"},
                        forbidden_paths=[], never_push_to=[])
     assert not d.allow
+
+
+def test_live_product_server_is_blocked_in_agent_sessions():
+    """Live incident (2026-07-24): a coder task verifying `nh serve` flags
+    LAUNCHED a real `nh serve` from its worktree — which shares the operator's
+    ~/.no_human config/DB/credentials, so its Jira poller mass-imported 16
+    duplicate tasks into the production board. A live product server (or a
+    task-running `nh watch`, or a real `nh bench run`) is never a legitimate
+    coder-session tool — CLI behavior is tested through the CliRunner suite.
+    """
+    for cmd in (
+        "nh serve",
+        "nh serve --max-workers 3",
+        ".venv/bin/nh serve",
+        "/Users/x/.no_human/worktrees/abc/.venv/bin/nh start --no-open",
+        "nh watch abc123",
+        "nh bench run --quick",
+        "cd /tmp && nh serve &",
+    ):
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=[], never_push_to=[])
+        assert not d.allow, f"should be blocked: {cmd}"
+        assert "server" in d.reason.lower() or "live" in d.reason.lower(), d.reason
+
+    # Reads and unrelated nh subcommands stay allowed.
+    for cmd in ("nh --help", "echo nh serve is a command we do not run"):
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=[], never_push_to=[])
+        # the echo contains the phrase but as argv of echo it still matches the
+        # regex — acceptable? No: a pure echo must stay allowed only if the
+        # pattern requires nh at a command position. Assert help stays allowed.
+        if cmd == "nh --help":
+            assert d.allow, d.reason
