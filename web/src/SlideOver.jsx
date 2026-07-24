@@ -144,6 +144,10 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   const decision = useMemo(() => decisionFor(task), [task]);
 
   const isActive = ["pending", "context", "planning", "implementing", "reviewing", "testing"].includes(task?.status);
+  // SCRUM-16: active STATUS gates polling/actions; a live SESSION (the pulse,
+  // ACTIVE agent lanes) additionally requires the scheduler to have CLAIMED
+  // the task — an unclaimed active-status task is queued, nothing is running.
+  const isLive = isActive && task?.claimed === true;
   const isFailed = task?.status === "failed";
   const isTerminal = task?.status === "done" || task?.status === "failed";
 
@@ -275,7 +279,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
         {/* summary — the landing state: a plain-language narrative, live chips,
             and a small milestone timeline. Replaces the tab strip; the action
             bar below still leads with Approve/Reply/etc. */}
-        {task && <TaskSummary task={task} isActive={isActive} />}
+        {task && <TaskSummary task={task} isActive={isLive} />}
 
         {/* Decision panel — the one thing to act on, promoted above the
             accordion. Only when the task is parked with a blocker; carries the
@@ -1192,7 +1196,10 @@ function SystemTab({ taskId, task, isActive }) {
   // showed 5 ACTIVE stages while escalated with zero live sessions).
   const agentStates = {};
   for (const a of AGENTS) {
-    agentStates[a.id] = clampAgentState(deriveAgentStatus(events, a.id), isActive);
+    // SCRUM-16: ACTIVE chips require a live claimed session, not merely an
+    // active status — an unclaimed queued task has zero running agents.
+    agentStates[a.id] = clampAgentState(
+      deriveAgentStatus(events, a.id), isActive && task?.claimed === true);
   }
 
   // Discover dynamically-spawned subagents from events, grouped by the role
@@ -1206,7 +1213,7 @@ function SystemTab({ taskId, task, isActive }) {
     );
     agentStates[sub.id] = clampAgentState(
       { status: sub.status, count: subEvents.length, lastText: subEvents.length > 0 ? subEvents[subEvents.length - 1].text || "" : "" },
-      isActive);
+      isActive && task?.claimed === true);
   }
 
   const totalElapsed = events.length > 1 ? events[events.length - 1].ts - events[0].ts : 0;

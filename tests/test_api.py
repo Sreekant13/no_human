@@ -1276,3 +1276,28 @@ async def test_mutation_broadcast_payload_carries_claimed(client, store, monkeyp
     assert by_id[created_id]["claimed"] is True, (
         "a scheduler-claimed task must broadcast claimed=True — a dropped "
         "scheduler= callsite silently flattens it to False")
+
+
+@pytest.mark.asyncio
+async def test_task_detail_carries_claimed_from_scheduler(client, store):
+    """SCRUM-16: the slide-over's detail payload gets the same claimed
+    contract as the board summaries — live session vs queued."""
+    from types import SimpleNamespace
+
+    from no_human.api.app import app as fastapi_app
+    from no_human.core.task import Task, TaskStatus
+
+    t = Task.new("detail claimed", repo_path="/tmp/x")
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.IMPLEMENTING, validate=False)
+
+    r0 = await client.get(f"/api/tasks/{t.id}")
+    assert r0.json()["claimed"] is False   # no scheduler → default
+
+    fastapi_app.state.scheduler = SimpleNamespace(
+        inflight={t.id}, get_live_status=lambda _id: None)
+    try:
+        r1 = await client.get(f"/api/tasks/{t.id}")
+        assert r1.json()["claimed"] is True
+    finally:
+        del fastapi_app.state.scheduler

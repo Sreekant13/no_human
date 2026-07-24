@@ -111,6 +111,21 @@ export function narrativeFor(task) {
   }
   if (ACTIVE_STATUSES.has(status)) {
     const attempt = task.attempt_count > 0 ? ` — attempt ${task.attempt_count}` : "";
+    // SCRUM-16: an active STATUS is not a live SESSION. `claimed` (the
+    // scheduler's in-flight set, on every board payload since SCRUM-15) is
+    // the only thing that means an agent is actually running right now — an
+    // unclaimed active-status task is queued for a worker slot, and crediting
+    // a live actor ("Coder is implementing") for it is the untruth this
+    // narrative exists to avoid. `pending` keeps its own line below: it has
+    // never claimed an actor.
+    if (status !== "pending" && task.claimed !== true) {
+      return {
+        before: `This ${kind} is`,
+        phrase: `queued — waiting for a worker slot${attempt}`,
+        after: "",
+        colorVar: "var(--c-context)",
+      };
+    }
     // Attribution must match the System view's lanes: the Coder is only at the
     // keyboard during `implementing`. Every OTHER stage is a different worker —
     // saying "Coder is planning" while the Coding lane reads "not started yet"

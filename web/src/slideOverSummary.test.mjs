@@ -75,11 +75,11 @@ test("paused_quota reads as a self-resolving quota park, not a task-budget wait"
 });
 
 test("reviewing/testing attribution copy — not the coder, not a bare stage word", () => {
-  const reviewing = narrativeFor({ status: "reviewing" });
+  const reviewing = narrativeFor({ status: "reviewing", claimed: true });
   assert.equal(narrativeText(reviewing).includes("Coder is reviewing"), false);
   assert.match(narrativeText(reviewing), /reviewer is checking the work/);
 
-  const testing = narrativeFor({ status: "testing" });
+  const testing = narrativeFor({ status: "testing", claimed: true });
   assert.match(narrativeText(testing), /Tests are running/);
 });
 
@@ -87,11 +87,11 @@ test("pre-coding stages are attributed to the real actor, never the Coder", () =
   // The Coder is only at the keyboard during `implementing`. Saying "Coder is
   // planning" while the System view's Coding lane reads "not started yet" is
   // the contradiction this guards. Each stage must name the actual worker.
-  const planning = narrativeFor({ status: "planning" });
+  const planning = narrativeFor({ status: "planning", claimed: true });
   assert.equal(narrativeText(planning).includes("Coder is"), false, "planning must not credit the Coder");
   assert.match(narrativeText(planning), /planner is planning the approach/);
 
-  const context = narrativeFor({ status: "context" });
+  const context = narrativeFor({ status: "context", claimed: true });
   assert.equal(narrativeText(context).includes("Coder is"), false, "context must not credit the Coder");
   assert.match(narrativeText(context), /orchestrator is gathering context/);
 
@@ -100,7 +100,7 @@ test("pre-coding stages are attributed to the real actor, never the Coder", () =
   assert.match(narrativeText(pending), /starting up/);
 
   // The one stage the Coder IS active must still say so — no over-correction.
-  const implementing = narrativeFor({ status: "implementing" });
+  const implementing = narrativeFor({ status: "implementing", claimed: true });
   assert.match(narrativeText(implementing), /Coder is implementing/);
 });
 
@@ -112,7 +112,7 @@ test("narrative colors the status phrase by its semantic token", () => {
   const answer = narrativeFor({ status: "awaiting_input" });
   assert.equal(answer.colorVar, "var(--c-answer)");
 
-  const working = narrativeFor({ status: "implementing", attempt_count: 2 });
+  const working = narrativeFor({ status: "implementing", attempt_count: 2, claimed: true });
   assert.equal(working.colorVar, "var(--c-building)");
   assert.match(working.phrase, /implementing/);
   assert.match(working.phrase, /attempt 2/);
@@ -332,4 +332,31 @@ test("the new motion (accordion + pulse + crossfade) is prefers-reduced-motion g
   const guards = [...stylesCss.matchAll(/@media \(prefers-reduced-motion: reduce\)\s*\{([^]*?)\n\}/g)]
     .map((m) => m[1]).join("\n");
   assert.match(guards, /so-section|so-summary/, "the accordion/summary motion must have a reduced-motion override");
+});
+
+// ── SCRUM-16: ACTIVE means a live claimed session ──────────────────────────
+
+test("unclaimed active task narrates as queued, never as an actor working", () => {
+  for (const status of ["context", "planning", "implementing", "reviewing", "testing"]) {
+    const n = narrativeFor({ status, kind: "feature", attempt_count: 2, claimed: false });
+    const text = `${n.before} ${n.phrase}`;
+    assert.match(text, /queued/i, `${status} unclaimed must read queued`);
+    assert.doesNotMatch(text, /Coder is|reviewer is|planner is|orchestrator is|Tests are/i,
+      `${status} unclaimed must not credit a live actor`);
+    assert.match(n.phrase, /attempt 2/, "attempt number survives");
+  }
+});
+
+test("claimed active task keeps today's actor attribution", () => {
+  const n = narrativeFor({ status: "implementing", kind: "feature", attempt_count: 1, claimed: true });
+  assert.match(`${n.before} ${n.phrase}`, /Coder is implementing/);
+  const r = narrativeFor({ status: "reviewing", kind: "feature", claimed: true });
+  assert.match(`${r.before} ${r.phrase}`, /reviewer is checking/i);
+});
+
+test("parked/terminal narratives are unchanged by the claimed field", () => {
+  const e = narrativeFor({ status: "escalated", kind: "feature", claimed: false });
+  assert.match(`${e.before} ${e.phrase}`, /waiting for your decision/);
+  const d = narrativeFor({ status: "done", kind: "feature", claimed: false });
+  assert.ok(d.phrase.length > 0);
 });

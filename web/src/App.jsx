@@ -814,8 +814,13 @@ export default function App() {
         </nav>
         <NightLedger tasks={tasks} authMode={authMode} />
         <div className="nh-sidebar-foot">
-          {workerStatus?.running && workerStatus.inflight > 0 && (
-            <div className="nh-status-indicator" title={`${workerStatus.inflight} of ${workerStatus.max_workers} worker slots in use`}>
+          {/* SCRUM-16: render-gate and figure share ONE source (deriveCounts
+              over the websocket board payload) — gating on the polled
+              workerStatus while displaying the WS count let a transient
+              drift show "Working (0)". workerStatus stays only as slot
+              capacity in the tooltip. */}
+          {sidebarCounts.running > 0 && (
+            <div className="nh-status-indicator" title={workerStatus?.max_workers ? `${sidebarCounts.running} of ${workerStatus.max_workers} worker slots in use` : `${sidebarCounts.running} running`}>
               <div className="nh-ws-dot live" style={{ background: 'var(--accent)' }} />
               <span className="nh-status-label">Working ({sidebarCounts.running})</span>
             </div>
