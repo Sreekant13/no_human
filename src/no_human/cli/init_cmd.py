@@ -308,9 +308,11 @@ def ensure_config(auth_mode: str = "subscription") -> bool:
     Returns True if file was created, False if it already existed."""
     if CONFIG_PATH.exists():
         console.print(f"  [green]✓[/] config.yaml already exists")
-        # Persist a non-default billing mode even into an existing config, so a
-        # re-run of `nh init` that switches to BYO-API-key actually takes effect.
-        if auth_mode != "subscription":
+        # Persist the chosen billing mode whenever it differs from what is
+        # stored, in BOTH directions (api_key <-> subscription), so a re-run
+        # of `nh init` that switches modes actually takes effect. Leave the
+        # file untouched when the mode is unchanged.
+        if auth_mode != _configured_auth_mode():
             _set_auth_mode(auth_mode)
             console.print(f"    set llm.auth_mode: {auth_mode}")
         return False

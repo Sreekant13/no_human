@@ -162,6 +162,65 @@ def test_ensure_config_persists_api_key_mode(tmp_path, monkeypatch):
     assert data["llm"]["auth_mode"] == "api_key"
 
 
+def test_ensure_config_persists_subscription_mode_over_api_key(tmp_path, monkeypatch):
+    """ensure_config(auth_mode="subscription") must persist the switch back
+    from api_key, not silently no-op it (SCRUM-7)."""
+    import yaml
+
+    import no_human.cli.init_cmd as init_mod
+
+    nh_home = tmp_path / "nh_home"
+    nh_home.mkdir(mode=0o700)
+    config_path = nh_home / "config.yaml"
+    config_path.write_text("llm:\n  auth_mode: api_key\n")
+    monkeypatch.setattr(init_mod, "CONFIG_PATH", config_path)
+
+    init_mod.ensure_config(auth_mode="subscription")
+    data = yaml.safe_load(config_path.read_text())
+    assert data["llm"]["auth_mode"] == "subscription"
+
+
+def test_ensure_config_preserves_other_keys_on_mode_switch(tmp_path, monkeypatch):
+    """A mode switch must not clobber unrelated config keys."""
+    import yaml
+
+    import no_human.cli.init_cmd as init_mod
+
+    nh_home = tmp_path / "nh_home"
+    nh_home.mkdir(mode=0o700)
+    config_path = nh_home / "config.yaml"
+    config_path.write_text(
+        "llm:\n"
+        "  auth_mode: api_key\n"
+        "  implementer_model: claude-sonnet-5\n"
+        "git:\n"
+        "  agent_identity_name: no_human\n"
+    )
+    monkeypatch.setattr(init_mod, "CONFIG_PATH", config_path)
+
+    init_mod.ensure_config(auth_mode="subscription")
+    data = yaml.safe_load(config_path.read_text())
+    assert data["llm"]["auth_mode"] == "subscription"
+    assert data["llm"]["implementer_model"] == "claude-sonnet-5"
+    assert data["git"]["agent_identity_name"] == "no_human"
+
+
+def test_ensure_config_unchanged_mode_does_not_rewrite(tmp_path, monkeypatch):
+    """Calling ensure_config with the already-configured mode must not touch
+    the file at all."""
+    import no_human.cli.init_cmd as init_mod
+
+    nh_home = tmp_path / "nh_home"
+    nh_home.mkdir(mode=0o700)
+    config_path = nh_home / "config.yaml"
+    config_path.write_text("llm:\n  auth_mode: api_key\n")
+    monkeypatch.setattr(init_mod, "CONFIG_PATH", config_path)
+    before = config_path.read_bytes()
+
+    init_mod.ensure_config(auth_mode="api_key")
+    assert config_path.read_bytes() == before
+
+
 def test_setup_token_respects_configured_api_key_without_prompt(tmp_path, monkeypatch):
     """A configured api_key install with its key present must not re-prompt."""
     import no_human.cli.init_cmd as init_mod
