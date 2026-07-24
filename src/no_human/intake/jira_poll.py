@@ -5,8 +5,11 @@ daemon — lean-stack constraint). Two best-effort halves:
 
   - **Poll:** run the operator's JQL, create a ``no_human`` task per NEW issue
     (deduped by ``(source="jira", external_id=<KEY>)``).
-  - **Write-back (opt-in):** on a task's status change, post a work-note comment
-    to its issue. A comment ONLY — never a transition or close (constraint #2).
+  - **Write-back (opt-in, SCRUM-21):** as a task advances, post a work-note
+    comment to its issue AND move it into the workflow's matching status
+    category — In Progress on first claim, Done on completion. Escalated/
+    failed tasks are commented but never transitioned (state must never lie).
+    The agent still never closes or merges (constraint #2).
 
 A Jira transport error logs and is retried next tick; it never crashes the pool.
 """
@@ -34,7 +37,22 @@ _STATUS_NOTE: dict[TaskStatus, str] = {
     TaskStatus.BLOCKED: "no_human is blocked on this issue and parked it with a wake condition.",
     TaskStatus.AWAITING_INPUT: "no_human needs human input to proceed on this issue.",
     TaskStatus.ESCALATED: "no_human escalated this issue — it needs a human to look.",
+    TaskStatus.FAILED: "no_human's attempts on this issue failed — it needs a human to look.",
     TaskStatus.DONE: "no_human completed its work on this issue.",
+}
+
+# Status -> target Jira status-CATEGORY key (never a hardcoded transition id).
+# Only active-work and done statuses get a transition; off-ramps (blocked,
+# awaiting_input, escalated, failed, paused_quota) are deliberately absent —
+# they comment (via _STATUS_NOTE) but never transition (requirement #3).
+_TARGET_CATEGORY: dict[TaskStatus, str] = {
+    TaskStatus.CONTEXT: "indeterminate",
+    TaskStatus.PLANNING: "indeterminate",
+    TaskStatus.IMPLEMENTING: "indeterminate",   # first-attempt claim -> In Progress
+    TaskStatus.REVIEWING: "indeterminate",
+    TaskStatus.TESTING: "indeterminate",
+    TaskStatus.AWAITING_APPROVAL: "indeterminate",
+    TaskStatus.DONE: "done",
 }
 
 
@@ -110,34 +128,56 @@ class JiraPoller:
         return ""
 
     async def sync_statuses(self) -> int:
-        """Opt-in write-back: post a work-note on each jira task's status change,
-        once per change. A comment only — never a transition/close."""
+        """Opt-in write-back: as each jira task advances, transition its issue
+        into the matching status category (SCRUM-21) and post a work-note
+        comment, once per change. These are independent idempotency markers —
+        a transition no-op/failure never suppresses the comment, and vice
+        versa. Escalated/failed/blocked tasks are commented but never
+        transitioned (state must never lie)."""
         if not self.write_back:
             return 0
         written = 0
         for task in await self.store.list_tasks():
             if task.source != "jira" or not task.external_id:
                 continue
-            note = _STATUS_NOTE.get(task.status)
-            if not note:
-                continue
             jira = (task.context or {}).get("jira") or {}
-            if jira.get("nh_synced_status") == task.status.value:
-                continue  # already synced this state
-            if task.status == TaskStatus.AWAITING_APPROVAL:
-                pr = await self._pr_url_for(task)
-                if pr:
-                    note = f"{note}\nPR: {pr}"
-            try:
-                self.adapter.comment(task.external_id, note)
-            except Exception as exc:  # noqa: BLE001 — retried next tick
-                log.warning("Jira comment %s failed: %s", task.external_id, exc)
-                continue
-            jira["nh_synced_status"] = task.status.value
-            task.context = {**(task.context or {}), "jira": jira}
-            await self.store.update_task(task)
-            written += 1
-            self._on_event("jira_status_synced", f"{task.external_id} → {task.status.value}")
+            changed = False
+
+            # --- transition (SCRUM-21): once per category, independent of comment ---
+            done_cats = jira.get("nh_jira_transitions") or []
+            target = _TARGET_CATEGORY.get(task.status)
+            if target and target not in done_cats:
+                try:
+                    self.adapter.transition(task.external_id, target)
+                except Exception as exc:  # noqa: BLE001 — fire-and-forget; unset -> retry next tick
+                    log.warning("Jira transition %s failed: %s", task.external_id, type(exc).__name__)
+                else:
+                    # Marker set on True OR no-match(False) alike — both are a
+                    # handled outcome; only a raised exception should retry.
+                    jira["nh_jira_transitions"] = [*done_cats, target]
+                    changed = True
+                    self._on_event("jira_transitioned", f"{task.external_id} → {target}")
+
+            # --- comment (existing behavior; PR link now also on DONE) ---
+            note = _STATUS_NOTE.get(task.status)
+            if note and jira.get("nh_synced_status") != task.status.value:
+                if task.status in (TaskStatus.AWAITING_APPROVAL, TaskStatus.DONE):
+                    pr = await self._pr_url_for(task)
+                    if pr:
+                        note = f"{note}\nPR: {pr}"
+                try:
+                    self.adapter.comment(task.external_id, note)
+                except Exception as exc:  # noqa: BLE001 — type-name only, no URL/auth/body leak
+                    log.warning("Jira comment %s failed: %s", task.external_id, type(exc).__name__)
+                else:
+                    jira["nh_synced_status"] = task.status.value
+                    changed = True
+                    self._on_event("jira_status_synced", f"{task.external_id} → {task.status.value}")
+
+            if changed:
+                task.context = {**(task.context or {}), "jira": jira}
+                await self.store.update_task(task)
+                written += 1
         return written
 
     async def tick(self) -> PollResult:

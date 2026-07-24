@@ -9,6 +9,7 @@ import logging
 import pytest
 
 from no_human.core.db import Store
+from no_human.core.task import Task, TaskStatus
 from no_human.intake.jira import JiraAdapter, _adf_text
 from no_human.intake.jira_poll import JiraPoller
 
@@ -29,6 +30,17 @@ class _Resp:
 
     def json(self):
         return self._payload
+
+
+def _transitions_payload():
+    """The three status categories a real workflow exposes: To Do (new),
+    In Progress (indeterminate), Done (done) — ids are arbitrary/non-obvious
+    on purpose so a test that hardcoded an id would fail."""
+    return {"transitions": [
+        {"id": "11", "name": "Back to To Do", "to": {"statusCategory": {"key": "new"}}},
+        {"id": "21", "name": "Start Progress", "to": {"statusCategory": {"key": "indeterminate"}}},
+        {"id": "31", "name": "Done", "to": {"statusCategory": {"key": "done"}}},
+    ]}
 
 
 def test_adapter_configured(monkeypatch):
@@ -182,5 +194,242 @@ async def test_poller_survives_a_search_error(monkeypatch, tmp_path):
         monkeypatch.setattr(a, "search", boom)
         r = await JiraPoller(a, store, config=_cfg()).poll_once()
         assert r.created == 0                   # error logged, not raised
+    finally:
+        await store.close()
+
+
+# --------------------------- SCRUM-21: transitions ---------------------------
+
+
+def test_transition_matches_target_category_never_hardcoded_id(monkeypatch):
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    monkeypatch.setattr("no_human.intake.jira.httpx.get",
+                        lambda *a, **k: _Resp(_transitions_payload()))
+    posted = {}
+
+    def fake_post(url, auth=None, json=None, timeout=None, headers=None):
+        posted["url"] = url
+        posted["body"] = json
+        return _Resp({})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.post", fake_post)
+    a = JiraAdapter(_cfg(write_back=True))
+
+    assert a.transition("PROJ-1", "indeterminate") is True
+    assert posted["body"] == {"transition": {"id": "21"}}
+    assert "/issue/PROJ-1/transitions" in posted["url"]
+
+    posted.clear()
+    assert a.transition("PROJ-1", "done") is True
+    assert posted["body"] == {"transition": {"id": "31"}}
+
+
+def test_transition_first_when_multiple_match(monkeypatch):
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    payload = {"transitions": [
+        {"id": "21", "to": {"statusCategory": {"key": "indeterminate"}}},
+        {"id": "22", "to": {"statusCategory": {"key": "indeterminate"}}},
+    ]}
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", lambda *a, **k: _Resp(payload))
+    posted = {}
+
+    def fake_post(url, auth=None, json=None, timeout=None, headers=None):
+        posted["body"] = json
+        return _Resp({})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.post", fake_post)
+    a = JiraAdapter(_cfg(write_back=True))
+    assert a.transition("PROJ-1", "indeterminate") is True
+    assert posted["body"] == {"transition": {"id": "21"}}
+
+
+def test_transition_opt_in_and_no_match_is_noop(monkeypatch, caplog):
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    post_calls = []
+    monkeypatch.setattr("no_human.intake.jira.httpx.post",
+                        lambda *a, **k: post_calls.append(1) or _Resp({}))
+
+    # write_back=False -> zero HTTP at all (transitions() never even called)
+    get_calls = []
+    monkeypatch.setattr("no_human.intake.jira.httpx.get",
+                        lambda *a, **k: get_calls.append(1) or _Resp(_transitions_payload()))
+    assert JiraAdapter(_cfg(write_back=False)).transition("PROJ-1", "indeterminate") is False
+    assert get_calls == []
+    assert post_calls == []
+
+    # write_back=True but no transition targets the requested category
+    no_match = {"transitions": [{"id": "11", "to": {"statusCategory": {"key": "new"}}}]}
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", lambda *a, **k: _Resp(no_match))
+    with caplog.at_level(logging.DEBUG):
+        assert JiraAdapter(_cfg(write_back=True)).transition("PROJ-1", "done") is False
+    assert post_calls == []
+    assert "no transition" in caplog.text.lower()
+
+
+async def _fake_pr_url(_task):
+    return "https://gh/pr/9"
+
+
+def _seeded_jira_task(status: TaskStatus, **context_jira) -> Task:
+    task = Task.new("T", source="jira", external_id="PROJ-1")
+    task.status = status
+    if context_jira:
+        task.context = {"jira": context_jira}
+    return task
+
+
+@pytest.mark.asyncio
+async def test_poller_claim_transitions_in_progress_once(monkeypatch, tmp_path):
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        task = _seeded_jira_task(TaskStatus.IMPLEMENTING)
+        await store.create_task(task)
+
+        a = JiraAdapter(_cfg(write_back=True))
+        transition_calls = []
+        monkeypatch.setattr(a, "transition",
+                            lambda key, cat: transition_calls.append((key, cat)) or True)
+        monkeypatch.setattr(a, "comment", lambda *a_, **k_: True)
+        poller = JiraPoller(a, store, config=_cfg(write_back=True))
+
+        await poller.sync_statuses()
+        await poller.sync_statuses()          # second tick: no re-trigger
+
+        assert transition_calls == [("PROJ-1", "indeterminate")]
+        saved = await store.get_task(task.id)
+        assert saved.context["jira"]["nh_jira_transitions"] == ["indeterminate"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_poller_done_transitions_and_comments_with_pr(monkeypatch, tmp_path):
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        task = _seeded_jira_task(TaskStatus.DONE, nh_jira_transitions=["indeterminate"])
+        await store.create_task(task)
+
+        a = JiraAdapter(_cfg(write_back=True))
+        transition_calls = []
+        comments = []
+        monkeypatch.setattr(a, "transition",
+                            lambda key, cat: transition_calls.append((key, cat)) or True)
+        monkeypatch.setattr(a, "comment",
+                            lambda key, body: comments.append(body) or True)
+        poller = JiraPoller(a, store, config=_cfg(write_back=True))
+        monkeypatch.setattr(poller, "_pr_url_for", _fake_pr_url)
+
+        await poller.sync_statuses()
+
+        assert transition_calls == [("PROJ-1", "done")]
+        assert len(comments) == 1
+        assert "PR: https://gh/pr/9" in comments[0]
+        saved = await store.get_task(task.id)
+        assert saved.context["jira"]["nh_jira_transitions"] == ["indeterminate", "done"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_poller_escalated_comments_without_transition(monkeypatch, tmp_path):
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        get_calls = []
+        post_calls = []
+        monkeypatch.setattr("no_human.intake.jira.httpx.get",
+                            lambda *a, **k: get_calls.append(1) or _Resp({"transitions": []}))
+        monkeypatch.setattr("no_human.intake.jira.httpx.post",
+                            lambda *a, **k: post_calls.append(1) or _Resp({}))
+
+        a = JiraAdapter(_cfg(write_back=True))
+        transition_calls = []
+        comments = []
+        monkeypatch.setattr(a, "transition", lambda *args: transition_calls.append(args))
+        monkeypatch.setattr(a, "comment",
+                            lambda key, body: comments.append((key, body)) or True)
+
+        for status in (TaskStatus.ESCALATED, TaskStatus.FAILED):
+            t = Task.new(f"T-{status.value}", source="jira", external_id=f"PROJ-{status.value}")
+            t.status = status
+            await store.create_task(t)
+
+        poller = JiraPoller(a, store, config=_cfg(write_back=True))
+        await poller.sync_statuses()
+
+        assert transition_calls == []
+        assert len(comments) == 2
+        assert get_calls == []
+        assert post_calls == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_write_back_false_and_non_jira_never_write(monkeypatch, tmp_path):
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+
+    # write_back=False: zero writes even for a DONE jira task.
+    store1 = await Store(tmp_path / "a.db").connect()
+    try:
+        task = _seeded_jira_task(TaskStatus.DONE)
+        await store1.create_task(task)
+        a = JiraAdapter(_cfg(write_back=False))
+        calls = []
+        monkeypatch.setattr(a, "transition", lambda *args: calls.append(("transition", args)))
+        monkeypatch.setattr(a, "comment", lambda *args: calls.append(("comment", args)))
+        written = await JiraPoller(a, store1, config=_cfg(write_back=False)).sync_statuses()
+        assert written == 0
+        assert calls == []
+    finally:
+        await store1.close()
+
+    # write_back=True but a board-typed (non-jira) task is never touched.
+    store2 = await Store(tmp_path / "b.db").connect()
+    try:
+        board_task = Task.new("B", source="board")
+        board_task.status = TaskStatus.DONE
+        await store2.create_task(board_task)
+        a2 = JiraAdapter(_cfg(write_back=True))
+        calls2 = []
+        monkeypatch.setattr(a2, "transition", lambda *args: calls2.append(("transition", args)))
+        monkeypatch.setattr(a2, "comment", lambda *args: calls2.append(("comment", args)))
+        written2 = await JiraPoller(a2, store2, config=_cfg(write_back=True)).sync_statuses()
+        assert written2 == 0
+        assert calls2 == []
+    finally:
+        await store2.close()
+
+
+@pytest.mark.asyncio
+async def test_transition_error_never_breaks_pipeline_or_leaks(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv("JIRA_API_TOKEN", "SEKRET")
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        task = _seeded_jira_task(TaskStatus.IMPLEMENTING)
+        await store.create_task(task)
+
+        a = JiraAdapter(_cfg(write_back=True))
+
+        def boom(key, cat):
+            raise RuntimeError(
+                "https://acme.atlassian.net/rest/api/3/issue/PROJ-1/transitions "
+                "Authorization: Basic dG9rZW46U0VLUkVU")
+
+        monkeypatch.setattr(a, "transition", boom)
+        monkeypatch.setattr(a, "comment", lambda *a_, **k_: True)
+        poller = JiraPoller(a, store, config=_cfg(write_back=True))
+
+        with caplog.at_level(logging.WARNING):
+            await poller.sync_statuses()          # must not raise
+
+        saved = await store.get_task(task.id)
+        assert "nh_jira_transitions" not in saved.context.get("jira", {})   # unset -> retry next tick
+        assert "SEKRET" not in caplog.text
+        assert "acme.atlassian.net" not in caplog.text
+        assert "Authorization" not in caplog.text
+        assert "RuntimeError" in caplog.text
     finally:
         await store.close()

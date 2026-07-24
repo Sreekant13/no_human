@@ -8,9 +8,13 @@ Auth is HTTP Basic ``email:token`` (Atlassian Cloud's API-token scheme). Search
 uses ``/rest/api/3/search/jql`` — the successor endpoint; the older
 ``/rest/api/3/search`` is on Atlassian's deprecation path.
 
-Write-back is a **comment only** and opt-in (``integrations.jira.write_back``,
-default false): the agent never transitions or closes an issue (constraint #2 —
-closing/merging is a human action).
+Write-back is opt-in (``integrations.jira.write_back``, default false) and now
+covers **comments and category-matched transitions** (SCRUM-21): as a task
+advances the agent moves its issue into the workflow's own In Progress / Done
+status *category* (resolved at runtime from the issue's available transitions,
+never a hardcoded transition id). The agent still never closes or merges —
+only advances within the workflow the operator already defined (constraint #2
+— closing/merging is a human action).
 """
 
 from __future__ import annotations
@@ -192,9 +196,9 @@ class JiraAdapter:
         return task
 
     def comment(self, key: str, body: str) -> bool:
-        """Post a work-note comment on an issue. Opt-in (``write_back``); a
-        comment ONLY — never a status transition or close. Returns False when
-        write-back is disabled (a no-op, not an error)."""
+        """Post a work-note comment on an issue. Opt-in (``write_back``).
+        Returns False when write-back is disabled (a no-op, not an error).
+        See ``transition`` for the (separate) category-matched status move."""
         if not self.write_back:
             return False
         url = f"{self.site}/rest/api/3/issue/{key}/comment"
@@ -202,3 +206,32 @@ class JiraAdapter:
                        timeout=30.0, headers={"Accept": "application/json"})
         r.raise_for_status()
         return True
+
+    def transitions(self, key: str) -> list[dict[str, Any]]:
+        """GET the issue's currently-available workflow transitions (only the
+        ones valid from its current status)."""
+        url = f"{self.site}/rest/api/3/issue/{key}/transitions"
+        r = httpx.get(url, auth=self._auth(), timeout=30.0,
+                      headers={"Accept": "application/json"})
+        r.raise_for_status()
+        return r.json().get("transitions", []) or []
+
+    def transition(self, key: str, target_category: str) -> bool:
+        """Opt-in (``write_back``). Move the issue via the FIRST available
+        transition whose target status category key == ``target_category``
+        (``"indeterminate"`` for In Progress, ``"done"`` for Done). Never
+        hardcodes a transition id or name, so custom workflows survive. No
+        matching transition -> debug log + no-op (``False``)."""
+        if not self.write_back:
+            return False
+        for t in self.transitions(key):
+            cat = (((t.get("to") or {}).get("statusCategory") or {}).get("key") or "").lower()
+            if cat == target_category:
+                url = f"{self.site}/rest/api/3/issue/{key}/transitions"
+                r = httpx.post(url, auth=self._auth(),
+                               json={"transition": {"id": t.get("id")}},
+                               timeout=30.0, headers={"Accept": "application/json"})
+                r.raise_for_status()
+                return True
+        log.debug("Jira %s: no transition into category %s", key, target_category)
+        return False
