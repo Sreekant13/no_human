@@ -1,4 +1,4 @@
-"""Extract exact conversation transcripts from the Windsurf/Devin language server.  # term-ok: real IDE names
+"""Extract exact conversation transcripts from the Windsurf language server.  # term-ok: real IDE names
 
 The IDE runs a ConnectRPC server (``exa.language_server_pb.LanguageServerService``)
 inside a Go ``language_server_*`` process. We:
@@ -56,7 +56,7 @@ class Transcript:
 
 
 class IDENotRunningError(Exception):
-    """Raised when no Windsurf/Devin language server process is found."""  # term-ok: real IDE names
+    """Raised when no Windsurf language server process is found."""  # term-ok: real IDE names
 
 
 class LanguageServerClient:
@@ -123,7 +123,7 @@ def _discover_client() -> LanguageServerClient:
 
     if not candidates:
         raise IDENotRunningError(
-            "No Windsurf/Devin language server found. Is the IDE running?"  # term-ok: real IDE names
+            "No Windsurf language server found. Is the IDE running?"  # term-ok: real IDE names
         )
 
     for host, port, token in candidates:
@@ -145,7 +145,7 @@ def _discover_client() -> LanguageServerClient:
 def _discover_all_clients() -> list[LanguageServerClient]:
     """Discover ALL responding language servers across all IDE windows.
 
-    Each Devin/Windsurf IDE window runs its own ``language_server_*`` process  # term-ok: real IDE names
+    Each Windsurf IDE window runs its own ``language_server_*`` process  # term-ok: real IDE names
     with a unique CSRF token. To collect conversations from every window, we
     iterate all language_server processes and return every client that responds
     to ``GetAllCascadeTrajectories``.
@@ -186,7 +186,7 @@ def _discover_all_clients() -> list[LanguageServerClient]:
 
     if not pid_candidates:
         raise IDENotRunningError(
-            "No Windsurf/Devin language server found. Is the IDE running?"  # term-ok: real IDE names
+            "No Windsurf language server found. Is the IDE running?"  # term-ok: real IDE names
         )
 
     clients: list[LanguageServerClient] = []

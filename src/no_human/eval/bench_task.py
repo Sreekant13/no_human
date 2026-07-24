@@ -422,7 +422,7 @@ def build_bench_tasks(
         seen_requests.add(req_hash)
 
         tid = f"ns-{hashlib.sha256(t.cascade_id.encode()).hexdigest()[:8]}"
-        # Claude Code carries cwd; Windsurf/Devin carry workspace URIs — the  # term-ok: real IDE names
+        # Claude Code carries cwd; Windsurf carry workspace URIs — the  # term-ok: real IDE names
         # original 89-conversation corpus is ALL workspaces-shaped.
         cwd = getattr(t, "cwd", "") or ""
         if not cwd:

@@ -1,4 +1,4 @@
--- 1.4 (Devin Playbooks): a reusable, operator-authored playbook for a recurring
+-- 1.4 (Playbooks): a reusable, operator-authored playbook for a recurring
 -- task shape (migration, Stripe integration, data ingestion, …). Injected into
 -- the coder prompt ONLY when its trigger matches the task text (keyword
 -- substring, like knowledge triggers), so it is inert until authored and never

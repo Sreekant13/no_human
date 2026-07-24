@@ -1,4 +1,4 @@
-"""Knowledge triggers (W3.4, Devin-inspired): a confirmed memory/rule is
+"""Knowledge triggers (W3.4): a confirmed memory/rule is
 injected into a task's prompt only when it is RELEVANT, so context spend
 (and noise) happens on-demand instead of always.
 
