@@ -70,20 +70,51 @@ def _test_files(tests: list[str]) -> list[str]:
     return list(seen)
 
 
-def _run_pytest(tests: list[str], cwd: Path, env: dict) -> tuple[bool, bool, str]:
+def _pytest_python(repo_path: Path) -> str | None:
+    """The interpreter to run the repro tests with, or None if none is usable.
+
+    Normally ``sys.executable`` — the interpreter no_human runs under, which has
+    pytest — because a bare ``python`` does not exist in a uv/venv project
+    (the 2026-07-11 bug: every bugfix task escalated on "could not run pytest:
+    No such file or directory: 'python'").
+
+    But in a PyInstaller-frozen build ``sys.executable`` is the frozen ``nh``
+    binary, NOT a Python interpreter. Invoking it with ``-m pytest`` re-runs the
+    click CLI (nh_entry.main), which exits non-zero without running a single
+    test — so the gate read ``ran=True, all_passed=False`` and returned a
+    confident but FALSE ``fail`` for every bugfix. In a frozen build fall back to
+    a real interpreter: the target repo's own venv first (it has the repo's deps
+    and pytest), then ``python3``/``python`` on PATH. None → the caller fails
+    closed to ``error`` (advisory), never a false pass/fail."""
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    from .runner import _venv_bin
+
+    bin_dir = _venv_bin(repo_path)
+    if bin_dir is not None:
+        return str(bin_dir / "python")
+    for name in ("python3", "python"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def _run_pytest(
+    tests: list[str], cwd: Path, env: dict, python: str,
+) -> tuple[bool, bool, str]:
     """(ran, all_passed, tail_of_output). Never raises.
 
     ``ran`` is False when pytest could not be launched or execute at all
-    (missing interpreter, timeout, collection error with 0 tests) — an
-    ENVIRONMENT failure, which the caller must classify as "error" (advisory)
-    rather than "fail" (a real fails-before/passes-after verdict). Uses
-    ``sys.executable`` — the interpreter no_human runs under, which has
-    pytest — because a bare ``python`` does not exist in a uv/venv project
-    (the 2026-07-11 bug: every bugfix task escalated on
-    "could not run pytest: No such file or directory: 'python'")."""
+    (missing interpreter, timeout, pytest not importable, collection error with
+    0 tests) — an ENVIRONMENT failure, which the caller must classify as "error"
+    (advisory) rather than "fail" (a real fails-before/passes-after verdict).
+    ``python`` is resolved by :func:`_pytest_python` — ``sys.executable`` in a
+    normal install, a real interpreter in a frozen build where ``sys.executable``
+    is the nh binary."""
     try:
         proc = subprocess.run(
-            [sys.executable, "-m", "pytest", "-x", "-q", "--no-header", *tests],
+            [python, "-m", "pytest", "-x", "-q", "--no-header", *tests],
             cwd=cwd, env=env, capture_output=True, text=True,
             timeout=_RUN_TIMEOUT,
         )
@@ -92,6 +123,12 @@ def _run_pytest(tests: list[str], cwd: Path, env: dict) -> tuple[bool, bool, str
     except OSError as exc:
         return False, False, f"could not run pytest: {exc}"
     out = (proc.stdout + proc.stderr)[-2000:]
+    # The interpreter can't even load pytest (a bare system python3 fallback,
+    # or the frozen binary re-running the CLI). That is an environment failure,
+    # NOT a test verdict — treat as not-ran so the caller returns "error", never
+    # a false "fail".
+    if "No module named pytest" in out or "No module named 'pytest'" in out:
+        return False, False, out
     # pytest exit 5 = "no tests collected" — an environment/selection problem,
     # not a test verdict. Anything that ran at least one test gives 0-4.
     ran = proc.returncode != 5 and "no tests ran" not in out.lower()
@@ -111,6 +148,16 @@ def run_repro_gate(repo_path: Path, base_ref: str) -> ReproResult:
     if not tests:
         return ReproResult("waived", reasons=[f"no {MANIFEST} manifest"])
 
+    # In a frozen build sys.executable is the nh binary, not a Python
+    # interpreter — resolve a real one, or fail closed to "error" (a false
+    # verdict is worse than an honest "could not verify").
+    python = _pytest_python(repo_path)
+    if python is None:
+        return ReproResult("error", tests=tests, reasons=[
+            "no Python interpreter available to run the repro tests "
+            "(frozen build with no target-repo venv and no python on PATH) "
+            "— the gate fails closed rather than guess a verdict"])
+
     from .runner import _env_for  # venv-aware env (the c0df0da lesson)
     env = _env_for(repo_path)
 
@@ -123,7 +170,7 @@ def run_repro_gate(repo_path: Path, base_ref: str) -> ReproResult:
             "— a listed repro test may not be deleted"])
     after_env = {**env, "PYTHONPATH": os.pathsep.join(
         [str(repo_path), str(repo_path / "src"), env.get("PYTHONPATH", "")])}
-    ran_after, ok_after, out_after = _run_pytest(tests, repo_path, after_env)
+    ran_after, ok_after, out_after = _run_pytest(tests, repo_path, after_env, python)
     if not ran_after:
         # Could not RUN the tests (env/interpreter/collection) — "can't verify"
         # is not "doesn't pass". Advisory error, never blocks the task.
@@ -152,7 +199,7 @@ def run_repro_gate(repo_path: Path, base_ref: str) -> ReproResult:
             shutil.copy2(src, dst)
         before_env = {**env, "PYTHONPATH": os.pathsep.join(
             [str(worktree), str(worktree / "src"), env.get("PYTHONPATH", "")])}
-        ran_before, ok_before, out_before = _run_pytest(tests, worktree, before_env)
+        ran_before, ok_before, out_before = _run_pytest(tests, worktree, before_env, python)
         if not ran_before:
             return ReproResult("error", tests=tests, reasons=[
                 f"base-tree repro run could not execute:\n{out_before}"])
