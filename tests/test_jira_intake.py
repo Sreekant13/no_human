@@ -404,6 +404,90 @@ async def test_write_back_false_and_non_jira_never_write(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_sync_statuses_only_newest_task_per_external_id(monkeypatch, tmp_path):
+    """SCRUM-31: a stale/cancelled duplicate task sharing external_id must
+    never be synced — only the newest (by created_at) task per external_id
+    is eligible for transition/comment."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        older = _seeded_jira_task(TaskStatus.FAILED)
+        older.created_at = "2026-07-01T00:00:00"
+        await store.create_task(older)
+
+        newer = _seeded_jira_task(TaskStatus.IMPLEMENTING)
+        newer.created_at = "2026-07-24T00:00:00"
+        await store.create_task(newer)
+
+        a = JiraAdapter(_cfg(write_back=True))
+        transition_calls = []
+        comments = []
+        monkeypatch.setattr(a, "transition",
+                            lambda key, cat: transition_calls.append((key, cat)) or True)
+        monkeypatch.setattr(a, "comment",
+                            lambda key, body: comments.append((key, body)) or True)
+        poller = JiraPoller(a, store, config=_cfg(write_back=True))
+
+        written = await poller.sync_statuses()
+
+        assert written == 1
+        assert transition_calls == [("PROJ-1", "indeterminate")]
+        assert len(comments) == 1
+        assert "failed" not in comments[0][1].lower()   # the older FAILED note never posted
+
+        saved_older = await store.get_task(older.id)
+        assert "jira" not in saved_older.context or "nh_synced_status" not in saved_older.context.get("jira", {})
+        assert "jira" not in saved_older.context or "nh_jira_transitions" not in saved_older.context.get("jira", {})
+
+        saved_newer = await store.get_task(newer.id)
+        assert saved_newer.context["jira"]["nh_synced_status"] == "implementing"
+        assert saved_newer.context["jira"]["nh_jira_transitions"] == ["indeterminate"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_sync_statuses_identical_created_at_ties_break_on_id(monkeypatch, tmp_path):
+    """When created_at is identical, the higher task id (deterministic
+    tie-breaker) wins — not insertion/iteration order."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        a_task = _seeded_jira_task(TaskStatus.FAILED)
+        a_task.created_at = "2026-07-24T00:00:00"
+        b_task = _seeded_jira_task(TaskStatus.IMPLEMENTING)
+        b_task.created_at = "2026-07-24T00:00:00"
+        # Force a deterministic id ordering regardless of uuid4 randomness:
+        # the LOWER id gets FAILED (loses), the HIGHER id gets IMPLEMENTING (wins).
+        lo, hi = sorted([a_task.id, b_task.id])
+        a_task.id, a_task.status = lo, TaskStatus.FAILED
+        b_task.id, b_task.status = hi, TaskStatus.IMPLEMENTING
+
+        await store.create_task(a_task)
+        await store.create_task(b_task)
+
+        a = JiraAdapter(_cfg(write_back=True))
+        transition_calls = []
+        comments = []
+        monkeypatch.setattr(a, "transition",
+                            lambda key, cat: transition_calls.append((key, cat)) or True)
+        monkeypatch.setattr(a, "comment",
+                            lambda key, body: comments.append((key, body)) or True)
+        poller = JiraPoller(a, store, config=_cfg(write_back=True))
+
+        written = await poller.sync_statuses()
+
+        assert written == 1
+        assert transition_calls == [("PROJ-1", "indeterminate")]  # the higher-id (IMPLEMENTING) task synced
+        saved_b = await store.get_task(b_task.id)
+        assert saved_b.context["jira"]["nh_jira_transitions"] == ["indeterminate"]
+        saved_a = await store.get_task(a_task.id)
+        assert "jira" not in saved_a.context or "nh_jira_transitions" not in saved_a.context.get("jira", {})
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_transition_error_never_breaks_pipeline_or_leaks(monkeypatch, tmp_path, caplog):
     monkeypatch.setenv("JIRA_API_TOKEN", "SEKRET")
     store = await Store(tmp_path / "t.db").connect()

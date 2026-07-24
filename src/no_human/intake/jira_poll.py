@@ -137,9 +137,14 @@ class JiraPoller:
         if not self.write_back:
             return 0
         written = 0
+        newest_by_key: dict[str, Task] = {}
         for task in await self.store.list_tasks():
             if task.source != "jira" or not task.external_id:
                 continue
+            cur = newest_by_key.get(task.external_id)
+            if cur is None or (task.created_at, task.id) > (cur.created_at, cur.id):
+                newest_by_key[task.external_id] = task
+        for task in newest_by_key.values():
             jira = (task.context or {}).get("jira") or {}
             changed = False
 
