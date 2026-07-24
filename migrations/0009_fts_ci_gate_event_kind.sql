@@ -1,5 +1,6 @@
--- 0009 (Phase 2C CI.6): the post-PR gate's failure event was renamed
--- `ci_gate_fail` -> `ci_gate_fail` in the vendor-neutral sweep. Migration 0006
+-- 0009 (Phase 2C CI.6): the post-PR gate's failure event kind was renamed to
+-- `ci_gate_fail` in the vendor-neutral sweep (from the gate's old codename).
+-- Migration 0006
 -- created the FTS insert trigger keyed on the OLD kind, and `CREATE TRIGGER IF
 -- NOT EXISTS` will NOT update the trigger on a database that already has it --
 -- so a pre-existing install would silently stop FTS-indexing gate-failure

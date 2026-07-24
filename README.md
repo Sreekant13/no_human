@@ -327,7 +327,7 @@ src/no_human/         # (abridged — packages only)
   eval/                 # golden-set replay + scorecard
   blockers/             # 10-category blocker taxonomy + wake watcher
   integrations/         # Jira / CI / notification integrations
-  ci_gate/               # Acme-internal CI adapter (optional)
+  ci_gate/               # enterprise CI adapter (optional)
   notify/               # Slack webhook notifications
 ```
 
