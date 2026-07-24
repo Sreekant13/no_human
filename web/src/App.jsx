@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { connectWS, createTask, uploadAttachment, fetchTasks, fetchWorkerStatus, fetchQueueHealth, fetchOnboardingStatus, grillStep, grillStepSSE } from "./api.js";
+import { connectWS, createTask, uploadAttachment, fetchTasks, fetchWorkerStatus, fetchQueueHealth, fetchOnboardingStatus, fetchAuthStatus, grillStep, grillStepSSE } from "./api.js";
 import Board from "./Board.jsx";
 import SettingsOverlay from "./Settings.jsx";
 import Stats from "./Stats.jsx";
@@ -13,8 +13,9 @@ import { needsPrUrl } from "./composerKinds.js";
 import { hasPrRef } from "./prRefs.js";
 import { shouldTriggerNewTask } from "./keyboardShortcut.js";
 import { isNeedsYou, isRealFailure } from "./boardLanes.js";
-import { ledgerSummary } from "./nightLedger.js";
-import { fmtCost } from "./cost.js";
+import { ledgerSummary, LEDGER_WINDOW_MS } from "./nightLedger.js";
+import { fmtCost, taskBurn } from "./cost.js";
+import { deriveSpendDisplay, perShippedCost } from "./ledgerSpend.js";
 import { tasksReducer } from "./tasksReducer.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 
@@ -129,12 +130,24 @@ function fmtAge(seconds) {
   return `${Math.floor(seconds / 86400)}d`;
 }
 
-function NightLedger({ tasks }) {
+function NightLedger({ tasks, authMode }) {
   // The signature module: what no_human did in the last 24h, in the sidebar's
   // dead space. Derived from the same task list as the lanes (one source, one
   // truth) — a quiet board should read "calm instrument", never "dead app".
   const s = ledgerSummary(tasks);
-  const cost = fmtCost(s.cost);
+  // Same 24h window ledgerSummary uses, so the token burn line can never
+  // disagree with the shipped/failed/parked counts beside it.
+  const since = Date.now() - LEDGER_WINDOW_MS;
+  const tokensSpent = (tasks || [])
+    .filter((t) => new Date(t.updated_at || t.created_at || 0).getTime() >= since)
+    .reduce((sum, t) => sum + taskBurn(t), 0);
+  const perPr = perShippedCost(s.done, s.cost);
+  const perPrCost = perPr != null ? fmtCost(perPr) : null;
+  // In subscription/OAuth mode (default/absent) the dollar figure is an
+  // API-rate ESTIMATE, never money that changed hands — only api_key mode
+  // pays Anthropic per token for real (SCRUM-20).
+  const spend = deriveSpendDisplay(tokensSpent, s.cost, s.cost, authMode);
+  const showSpend = s.cost > 0 || tokensSpent > 0;
   return (
     <div className="nh-ledger" aria-label="last 24 hours summary">
       <div className="nh-ledger-title">last 24h</div>
@@ -142,12 +155,16 @@ function NightLedger({ tasks }) {
         ? <div className="nh-ledger-quiet">quiet — nothing shipped, nothing owed</div>
         : (
           <div className="nh-ledger-rows">
-            <div className="nh-ledger-row"><b>{s.done}</b> shipped</div>
+            <div className="nh-ledger-row">
+              <b>{s.done}</b> shipped{perPrCost && ` (~${perPrCost}/PR)`}
+            </div>
             <div className="nh-ledger-row"><b>{s.parked}</b> waiting on you</div>
             {s.failed > 0 && (
               <div className="nh-ledger-row nh-ledger-bad"><b>{s.failed}</b> failed</div>
             )}
-            {cost !== "—" && <div className="nh-ledger-row nh-ledger-cost"><b>{cost}</b> spent</div>}
+            {showSpend && (
+              <div className="nh-ledger-row nh-ledger-cost"><b>{spend.primary}</b> {spend.secondary}</div>
+            )}
           </div>
         )}
     </div>
@@ -529,6 +546,11 @@ export default function App() {
   const [pendingOpenId, setPendingOpenId] = useState(null);
   const [workerStatus, setWorkerStatus] = useState(null);
   const [queueHealth, setQueueHealth] = useState(null);
+  // Mode-aware LAST 24H spend line (SCRUM-20): the same auth-status endpoint
+  // Settings' Account panel already queries. undefined until it resolves —
+  // the sidebar treats that exactly like an absent field (subscription
+  // behavior), never api_key, so it can't flash a false "real dollars" line.
+  const [authMode, setAuthMode] = useState(undefined);
   const doneCount = tasks.filter((t) => t.status === "done").length;
   const failedCount = tasks.filter(isRealFailure).length;
   const cancelledCount = tasks.filter((t) => t.status === "failed" && t.cancelled).length;
@@ -566,6 +588,12 @@ export default function App() {
     fetchTasks()
       .then((ts) => { setFetchError(null); dispatch({ type: "set", tasks: ts }); })
       .catch((err) => setFetchError(err?.message || "Cannot reach the no_human API."));
+  }, []);
+
+  // Auth mode for the sidebar's mode-aware spend line — fetched once, not
+  // polled: it only changes on an operator-driven profile switch + restart.
+  useEffect(() => {
+    fetchAuthStatus().then((s) => setAuthMode(s?.auth_mode)).catch(() => {});
   }, []);
 
   // Worker status poll
@@ -777,7 +805,7 @@ export default function App() {
             />
           </NavGroup>
         </nav>
-        <NightLedger tasks={tasks} />
+        <NightLedger tasks={tasks} authMode={authMode} />
         <div className="nh-sidebar-foot">
           {workerStatus?.running && workerStatus.inflight > 0 && (
             <div className="nh-status-indicator" title={`${workerStatus.inflight} of ${workerStatus.max_workers} worker slots in use`}>
