@@ -110,12 +110,27 @@ class JiraAdapter:
             self._search_jql(), 50, "summary,description,status,labels,issuetype")
 
     def search_text(self, q: str, limit: int = 20) -> list[dict[str, Any]]:
-        """Free-text issue search for the user-driven browse/pick flow (Import
-        from Jira) — distinct from the operator-authored JQL ``search()`` uses
-        for the background poller. Never built from any task's own text, only
-        from what the operator types into the picker."""
-        escaped = (q or "").replace("\\", "\\\\").replace('"', '\\"')
-        jql = f'text ~ "{escaped}" ORDER BY updated DESC'
+        """Issue browse/pick for the user-driven "Import from Jira" flow —
+        distinct from the operator-authored JQL ``search()`` uses for the
+        background poller. Never built from any task's own text, only from what
+        the operator types into the picker.
+
+        Always scoped to the CONFIGURED project so the picker shows the project
+        the integration is wired to. An EMPTY query browses that project's open
+        tickets (so the picker lists everything to choose from without the user
+        guessing a keyword — the project key itself is not ticket text and would
+        match nothing); a non-empty query filters those tickets by free text.
+        """
+        proj = f'project = "{self.project_key}"' if self.project_key else ""
+        q = (q or "").strip()
+        if q:
+            escaped = q.replace("\\", "\\\\").replace('"', '\\"')
+            clause = f'text ~ "{escaped}"'
+        else:
+            # Browse: the project's open tickets, the same set the poller sees.
+            clause = "statusCategory != Done"
+        where = f"{proj} AND {clause}" if proj else clause
+        jql = f"{where} ORDER BY updated DESC"
         return self._run_search(
             jql, limit, "summary,description,status,assignee,updated,issuetype")
 

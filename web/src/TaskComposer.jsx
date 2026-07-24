@@ -144,15 +144,13 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   useEffect(() => {
     if (!jiraOpen) return;
     const q = jiraQuery.trim();
-    if (!q) {
-      setJiraResults(undefined);
-      setJiraError(null);
-      setJiraLoading(false);
-      return;
-    }
     let ignore = false;
     setJiraLoading(true);
     setJiraError(null);
+    // An empty query is valid and is the default: it browses ALL of the
+    // configured project's open tickets so the picker lists everything to
+    // choose from. Only typing needs the 300ms debounce; the initial (empty)
+    // browse loads immediately.
     const h = setTimeout(() => {
       searchJiraIssues(q)
         .then((issues) => {
@@ -166,7 +164,7 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
           setJiraResults(undefined);
           setJiraLoading(false);
         });
-    }, 300);
+    }, q ? 300 : 0);
     return () => { ignore = true; clearTimeout(h); };
   }, [jiraQuery, jiraOpen, jiraNonce]);
 
@@ -316,7 +314,7 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
             <input
               autoFocus
               className={TEXT_FIELD}
-              placeholder="Search your Jira project…"
+              placeholder="Filter your Jira tickets — blank shows all open…"
               value={jiraQuery}
               onChange={(e) => setJiraQuery(e.target.value)}
               aria-label="Search Jira tickets"

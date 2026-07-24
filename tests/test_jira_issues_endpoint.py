@@ -125,6 +125,9 @@ async def test_configured_returns_shaped_issues_and_clamps_description(client, m
     assert captured["auth"] == ("me@x.com", "SEKRET")
     assert 'text ~ "thing"' in captured["params"]["jql"]
     assert "ORDER BY updated DESC" in captured["params"]["jql"]
+    # Scoped to the CONFIGURED project — the picker shows the wired project, not
+    # a cross-project text match (typing the project key used to find nothing).
+    assert 'project = "PROJ"' in captured["params"]["jql"]
 
     # The token never appears anywhere in the response body.
     assert "SEKRET" not in r.text
@@ -149,6 +152,29 @@ async def test_limit_is_clamped_between_1_and_50(client, monkeypatch):
 
     await client.get("/api/integrations/jira/issues")  # default
     assert captured["params"]["maxResults"] == 20
+
+
+@pytest.mark.asyncio
+async def test_empty_query_browses_the_projects_open_tickets(client, monkeypatch):
+    """An empty box must LIST the configured project's open tickets to choose
+    from — not run a text match on nothing. Typing the project key used to find
+    nothing; opening the picker now browses the whole project."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    captured = {}
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        captured.update(params=params)
+        return _Resp({"issues": []})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+
+    r = await client.get("/api/integrations/jira/issues", params={"q": ""})
+    assert r.status_code == 200, r.text
+    jql = captured["params"]["jql"]
+    assert 'project = "PROJ"' in jql, jql
+    assert "statusCategory != Done" in jql, jql
+    assert "text ~" not in jql, "empty query must browse, not text-match"
+    assert "ORDER BY updated DESC" in jql
 
 
 @pytest.mark.asyncio
