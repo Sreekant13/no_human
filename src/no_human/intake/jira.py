@@ -23,6 +23,7 @@ import logging
 import os
 import re
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -171,7 +172,7 @@ class JiraAdapter:
         the picker's "pick" action (SCRUM-9), so the created task carries the
         issue's full description instead of ``issue_brief``'s list-view
         truncation. Same shape as one ``search``/``search_text`` hit."""
-        url = f"{self.site}/rest/api/3/issue/{key}"
+        url = f"{self.site}/rest/api/3/issue/{quote(key, safe='')}"
         params = {"fields": "summary,description,status,assignee,updated,issuetype"}
         r = httpx.get(url, params=params, auth=self._auth(), timeout=30.0,
                       headers={"Accept": "application/json"})
@@ -201,7 +202,7 @@ class JiraAdapter:
         See ``transition`` for the (separate) category-matched status move."""
         if not self.write_back:
             return False
-        url = f"{self.site}/rest/api/3/issue/{key}/comment"
+        url = f"{self.site}/rest/api/3/issue/{quote(key, safe='')}/comment"
         r = httpx.post(url, auth=self._auth(), json={"body": _text_to_adf(body)},
                        timeout=30.0, headers={"Accept": "application/json"})
         r.raise_for_status()
@@ -210,7 +211,7 @@ class JiraAdapter:
     def transitions(self, key: str) -> list[dict[str, Any]]:
         """GET the issue's currently-available workflow transitions (only the
         ones valid from its current status)."""
-        url = f"{self.site}/rest/api/3/issue/{key}/transitions"
+        url = f"{self.site}/rest/api/3/issue/{quote(key, safe='')}/transitions"
         r = httpx.get(url, auth=self._auth(), timeout=30.0,
                       headers={"Accept": "application/json"})
         r.raise_for_status()
@@ -227,7 +228,7 @@ class JiraAdapter:
         for t in self.transitions(key):
             cat = (((t.get("to") or {}).get("statusCategory") or {}).get("key") or "").lower()
             if cat == target_category:
-                url = f"{self.site}/rest/api/3/issue/{key}/transitions"
+                url = f"{self.site}/rest/api/3/issue/{quote(key, safe='')}/transitions"
                 r = httpx.post(url, auth=self._auth(),
                                json={"transition": {"id": t.get("id")}},
                                timeout=30.0, headers={"Accept": "application/json"})

@@ -668,3 +668,25 @@ async def test_transition_error_never_breaks_pipeline_or_leaks(monkeypatch, tmp_
         assert "RuntimeError" in caplog.text
     finally:
         await store.close()
+
+
+def test_issue_urls_quote_the_key(monkeypatch):
+    """Review 2026-07-25 residue: an odd key ('%', '#', '?', space) must be
+    percent-quoted into the URL path — a malformed URL surfaces as an opaque
+    502 instead of Jira's clean 404."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "SEKRET")
+    seen = []
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        seen.append(url)
+        return _Resp({"key": "X", "fields": {}, "transitions": []})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    adapter = JiraAdapter(_cfg())
+    adapter.get_issue("AB#1 %?")
+    adapter.transitions("AB#1 %?")
+
+    assert len(seen) == 2
+    for url in seen:
+        assert "AB%231%20%25%3F" in url, url
+        assert "#" not in url and " " not in url, url

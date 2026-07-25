@@ -313,3 +313,21 @@ async def test_latest_run_is_omitted_when_it_IS_the_published_baseline(
     body = (await client.get("/api/bench/latest")).json()
     assert body["published"] is True
     assert "latest_run" not in body
+
+
+@pytest.mark.asyncio
+async def test_hand_deleted_latest_still_serves_the_published_baseline(client):
+    """Review 2026-07-25 residue: latest.json hand-deleted while
+    published_baseline.json is intact must NOT 404 — the clean baseline is a
+    recorded run and the UI must keep headlining it."""
+    baseline = NorthStarCard(
+        scores=[_score(f"ns-{i}") for i in range(30)], label="v14",
+        created_at="2026-07-20T00:00:00+00:00")
+    baseline.save(client.results / "published_baseline.json")
+
+    r = await client.get("/api/bench/latest")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["label"] == "v14"
+    assert body["published"] is True
+    assert "latest_run" not in body

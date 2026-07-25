@@ -4026,3 +4026,132 @@ async def test_stale_report_text_cannot_hijack_a_zero_diff_escalation(
     assert blocker
     assert "STALE TEXT FROM A PREVIOUS RUN" not in blocker["evidence"], blocker
     assert "without editing any file" in blocker["root_cause_hypothesis"], blocker
+
+
+async def test_layered_failure_stuck_note_precedes_excerpt_block(
+    bare_repo, tmp_path, store,
+):
+    """Review 2026-07-25 residue: the stuck-note is a one-line triage summary
+    and must come BEFORE the (multi-KB) excerpt block in the failure detail,
+    not be buried under it."""
+    from no_human.core.bounds import StuckDetector
+    from no_human.testing.test_layers import Gating, TestLayer, TestPlan
+    from no_human.testing.plan_runner import LayerResult, PlanResult
+    from no_human.testing.runner import TestRunResult
+    import no_human.testing.plan_runner as plan_runner_mod
+
+    plan = TestPlan(layers=[
+        TestLayer(name="unit", command="pytest -q", gating=Gating.BLOCKING),
+    ])
+    tr = TestRunResult(
+        ran=True, ok=False, passed=0, failed=1, errors=0,
+        command="pytest -q", output="1 failed: identical signature",
+        traceback_excerpts={
+            "test_unit.py::test_a": "AssertionError: Root Cause Here",
+        },
+    )
+    lr = LayerResult(layer_name="unit", gating=Gating.BLOCKING, result=tr)
+
+    def fake_run_test_plan(test_plan, task_repo, **kwargs):
+        return PlanResult(layer_results=[lr])
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+    cfg = _config(tmp_path)
+    cfg.data["bounds"] = {"max_attempts": 1}
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("stuck ordering layered", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    async def fake_resolve_test_plan(task):
+        return plan
+
+    def primed_detector():
+        d = StuckDetector()
+        # edit-loop priming: _edit_counts only accumulates (the agent phase
+        # resets consecutive-repeat counts on every distinct tool call).
+        d._edit_counts = {"calc.py": d.edit_threshold}
+        return d
+
+    import no_human.core.orchestrator as orch_mod
+    with _patch.object(orch, "_resolve_test_plan", fake_resolve_test_plan), \
+         _patch.object(plan_runner_mod, "run_test_plan", fake_run_test_plan), \
+         _patch.object(orch_mod, "StuckDetector", primed_detector):
+        await orch.run_task(t)
+
+    failed_events = [e for e in events if e.get("kind") == "attempt_failed"]
+    assert failed_events
+    detail = failed_events[-1]["text"]
+    note = "edit-loop: calc.py edited"
+    assert note in detail, detail[-300:]
+    assert "Root Cause Here" in detail
+    assert detail.index(note) < detail.index("Root Cause Here"), (
+        "stuck note must precede the excerpt block")
+
+
+async def test_single_command_failure_stuck_note_precedes_excerpt_block(
+    bare_repo, tmp_path, store,
+):
+    """Same ordering guarantee for the single-command (non-layered) path."""
+    from no_human.core.bounds import StuckDetector
+    from no_human.testing.runner import TestRunResult
+
+    tr = TestRunResult(
+        ran=True, ok=False, passed=0, failed=1, errors=0,
+        command="pytest -q", output="1 failed: identical signature",
+        traceback_excerpts={
+            "test_unit.py::test_a": "AssertionError: Root Cause Here",
+        },
+    )
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+    cfg = _config(tmp_path)
+    cfg.data["bounds"] = {"max_attempts": 1}
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("stuck ordering single", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    async def fake_run_tests_once(repo, cmd, cwd=None):
+        return tr, False
+
+    async def fake_resolve_test_plan(task):
+        return None
+
+    def primed_detector():
+        d = StuckDetector()
+        # edit-loop priming: _edit_counts only accumulates (the agent phase
+        # resets consecutive-repeat counts on every distinct tool call).
+        d._edit_counts = {"calc.py": d.edit_threshold}
+        return d
+
+    import no_human.core.orchestrator as orch_mod
+    with _patch.object(orch, "_resolve_test_plan", fake_resolve_test_plan), \
+         _patch.object(orch, "_run_tests_once", fake_run_tests_once), \
+         _patch.object(orch_mod, "StuckDetector", primed_detector):
+        await orch.run_task(t)
+
+    failed_events = [e for e in events if e.get("kind") == "attempt_failed"]
+    assert failed_events
+    detail = failed_events[-1]["text"]
+    note = "edit-loop: calc.py edited"
+    assert note in detail, detail[-300:]
+    assert "Root Cause Here" in detail
+    assert detail.index(note) < detail.index("Root Cause Here"), (
+        "stuck note must precede the excerpt block")

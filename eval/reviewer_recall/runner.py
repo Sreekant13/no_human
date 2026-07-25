@@ -6,7 +6,7 @@ Scoring is entirely mechanical (no LLM judge) so the number is stable across
 runs.
 
 CLI entry point: ``nh bench report --reviewer-recall`` (wired in
-``src/no_human/cli/commands.py::_run_reviewer_recall_report``) loads this
+``src/no_human/cli/commands.py::_load_reviewer_recall_runner``) loads this
 module by file path and calls :func:`run_and_report`. That CLI file is the
 ONLY module outside this ``eval/`` tree allowed to reference
 ``eval/reviewer_recall`` — ``tests/test_reviewer_recall_guard.py`` pins this,

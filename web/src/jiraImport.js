@@ -154,7 +154,9 @@ export function importedChip(imported) {
   }
   const style = importedChipStyle(status);
   return {
-    label: `imported — ${status}`,
+    // A payload with no status (older server, partial row) degrades to a
+    // plain "imported" — never the literal "imported — undefined".
+    label: status ? `imported — ${status}` : "imported",
     style,
     className: style ? "font-medium" : "border-line bg-panel text-text-muted",
   };

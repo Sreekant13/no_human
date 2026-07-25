@@ -1323,3 +1323,36 @@ async def test_summary_carries_pr_conflict_rounds_from_context(client, store):
     by_id = {t["id"]: t for t in r.json()}
     assert by_id[a.id]["pr_conflict_rounds"] == 2
     assert by_id[b.id]["pr_conflict_rounds"] == 0
+
+
+@pytest.mark.asyncio
+async def test_corrupt_pr_conflict_rounds_context_never_500s_the_board(client, store):
+    """Review 2026-07-25 residue: a corrupt context value ('two', {}, [1])
+    must coerce to 0, not take down GET /api/tasks for every card."""
+    a = Task.new("corrupt-str", repo_path="/tmp/x")
+    a.context = {"pr_conflict_rounds": "two"}
+    await store.create_task(a)
+    b = Task.new("corrupt-dict", repo_path="/tmp/x")
+    b.context = {"pr_conflict_rounds": {"nested": 1}}
+    await store.create_task(b)
+
+    r = await client.get("/api/tasks")
+    assert r.status_code == 200
+    by_id = {t["id"]: t for t in r.json()}
+    assert by_id[a.id]["pr_conflict_rounds"] == 0
+    assert by_id[b.id]["pr_conflict_rounds"] == 0
+
+
+@pytest.mark.asyncio
+async def test_summary_carries_configured_max_pr_conflict_rounds(client, store):
+    """Review 2026-07-25 residue: the board payload must surface the
+    configured bound so the badge can render 'round N/M' with real data."""
+    t = Task.new("conflicting", repo_path="/tmp/x")
+    t.context = {"pr_conflict_rounds": 2}
+    await store.create_task(t)
+
+    r = await client.get("/api/tasks")
+    assert r.status_code == 200
+    by_id = {x["id"]: x for x in r.json()}
+    # default bound (blockers.max_pr_conflict_rounds) is 3
+    assert by_id[t.id]["max_pr_conflict_rounds"] == 3

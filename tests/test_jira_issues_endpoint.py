@@ -458,14 +458,14 @@ async def test_duplicate_external_ids_set_count(client, store, monkeypatch):
     must surface as a count > 1 so the picker can warn, not silently pick
     one and hide the duplication."""
     monkeypatch.setenv("JIRA_API_TOKEN", "t")
-    # Created FIRST but updated LAST: insertion order (list_tasks sorts by
-    # created_at DESC) and updated-order must diverge, or a `matches[0]`
-    # mutation of the max-by-updated_at pick would pass unnoticed.
+    # Explicit created_at values pin the pick's SEMANTICS (newest created —
+    # the sync's definition; see test_imported_chip_uses_newest_created_task_
+    # like_the_sync for the updated_at-divergence regression case).
     t1 = Task.new("SCRUM-18 v1", source="jira", external_id="SCRUM-18")
-    t1.updated_at = "2026-07-02T00:00:00+00:00"
+    t1.created_at = "2026-07-02T00:00:00+00:00"
     await store.create_task(t1)
     t2 = Task.new("SCRUM-18 v2", source="jira", external_id="SCRUM-18")
-    t2.updated_at = "2026-07-01T00:00:00+00:00"
+    t2.created_at = "2026-07-01T00:00:00+00:00"
     await store.create_task(t2)
 
     def fake_get(url, params=None, auth=None, timeout=None, headers=None):
@@ -476,8 +476,7 @@ async def test_duplicate_external_ids_set_count(client, store, monkeypatch):
     assert r.status_code == 200, r.text
     imported = r.json()[0]["imported"]
     assert imported["count"] == 2
-    # The most-recently-updated match wins for task_id/status — t1, which is
-    # NOT first in store order.
+    # The newest-CREATED match wins for task_id/status (the sync's definition).
     assert imported["task_id"] == t1.id
 
 
@@ -526,3 +525,37 @@ async def test_test_connection_loads_token_from_env_not_only_serve(client, tmp_p
     assert body["healthy"] is True, body
     assert "authenticated" in body["detail"].lower()
     assert "secret-shhh" not in body["detail"]  # never leak the token
+
+
+@pytest.mark.asyncio
+async def test_imported_chip_uses_newest_created_task_like_the_sync(
+        client, store, monkeypatch):
+    """Review 2026-07-25 residue: the sync and the picker chip must share ONE
+    definition of "latest task per external_id" — newest (created_at, id),
+    the sync's key. An older import that was merely touched later
+    (updated_at) must not win the chip."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    older = Task.new("SCRUM-18: first import", source="jira",
+                     external_id="SCRUM-18")
+    older.status = TaskStatus.FAILED
+    older.created_at = "2026-07-20T00:00:00+00:00"
+    older.updated_at = "2026-07-25T09:00:00+00:00"  # touched recently
+    await store.create_task(older)
+    newer = Task.new("SCRUM-18: re-import", source="jira",
+                     external_id="SCRUM-18")
+    newer.status = TaskStatus.DONE
+    newer.created_at = "2026-07-24T00:00:00+00:00"
+    newer.updated_at = "2026-07-24T00:00:00+00:00"
+    await store.create_task(newer)
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        return _Resp({"issues": [_jira_issue_payload()]})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    r = await client.get("/api/integrations/jira/issues", params={"q": "ticket"})
+    assert r.status_code == 200, r.text
+    imported = r.json()[0]["imported"]
+    assert imported["task_id"] == newer.id, \
+        "chip must follow the sync's newest-created definition"
+    assert imported["status"] == "done"
+    assert imported["count"] == 2
