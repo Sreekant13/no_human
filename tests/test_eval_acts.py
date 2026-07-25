@@ -130,6 +130,86 @@ async def test_missing_dimensions_default_to_no_assumptions(store, tmp_path):
     assert "assumptions" not in (got.context or {})
 
 
+async def test_decompose_attaches_split_proposal(store, tmp_path, monkeypatch):
+    """SCRUM-36: a DECOMPOSE verdict attaches a non-binding split proposal
+    to task.context via the same guarded/deduped seam as SCOPE_EXPLOSION —
+    never mutating title/description/acceptance criteria, never creating a
+    task."""
+    calls = []
+
+    async def fake_generate(task, files_to_change=None, surfaces=None, **kw):
+        calls.append(task.id)
+        return "Split proposal:\n\n1. Part one\nDo it.\nContract: c1"
+
+    monkeypatch.setattr(
+        "no_human.core.orchestrator.generate_split_proposal", fake_generate
+    )
+
+    t = Task.new("oversized task", repo_path="/r")
+    t.acceptance_criteria = ["keep me"]
+    before_title, before_criteria = t.title, list(t.acceptance_criteria)
+    before_count = len(await store.list_tasks())
+    await store.create_task(t)
+    orch = _orch(store, tmp_path)
+    eval_out = EvalResult(
+        verdict=EvalVerdict.DECOMPOSE,
+        dimensions={"bounded_scope": False},
+    )
+    await orch._act_on_eval(t, eval_out)
+
+    got = await store.get_task(t.id)
+    assert got.context["split_proposal"].startswith("Split proposal:")
+    assert calls == [t.id]
+    # advisory only: no task mutation, no auto-created task.
+    assert got.title == before_title
+    assert got.acceptance_criteria == before_criteria
+    assert len(await store.list_tasks()) == before_count + 1
+
+
+async def test_decompose_generator_none_skips_silently(store, tmp_path, monkeypatch):
+    async def fake_generate(*a, **k):
+        return None
+
+    monkeypatch.setattr(
+        "no_human.core.orchestrator.generate_split_proposal", fake_generate
+    )
+
+    t = Task.new("oversized task", repo_path="/r")
+    await store.create_task(t)
+    orch = _orch(store, tmp_path)
+    await orch._act_on_eval(t, EvalResult(verdict=EvalVerdict.DECOMPOSE))
+
+    got = await store.get_task(t.id)
+    assert "split_proposal" not in (got.context or {})
+
+
+async def test_decompose_existing_proposal_blocks_regeneration(
+    store, tmp_path, monkeypatch
+):
+    """Dedupe: a task with a split_proposal already in context (e.g. from an
+    earlier SCOPE_EXPLOSION blocker) must not regenerate on a later DECOMPOSE
+    verdict — one proposal per task unless the human clears it."""
+    calls = []
+
+    async def fake_generate(*a, **k):
+        calls.append(True)
+        return "SHOULD NOT BE STORED"
+
+    monkeypatch.setattr(
+        "no_human.core.orchestrator.generate_split_proposal", fake_generate
+    )
+
+    t = Task.new("oversized task", repo_path="/r")
+    t.context = {"split_proposal": "EXISTING PROPOSAL"}
+    await store.create_task(t)
+    orch = _orch(store, tmp_path)
+    await orch._act_on_eval(t, EvalResult(verdict=EvalVerdict.DECOMPOSE))
+
+    got = await store.get_task(t.id)
+    assert got.context["split_proposal"] == "EXISTING PROPOSAL"
+    assert not calls
+
+
 async def test_enrich_with_missing_context_does_both(store, tmp_path, monkeypatch):
     async def _fake_resolve(title, description, criteria, *, backend=None, model=None):
         return ["assume X"]

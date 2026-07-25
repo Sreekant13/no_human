@@ -203,6 +203,38 @@ async def test_generator_none_no_event(store, tmp_path, monkeypatch):
     assert not [e for e in events if e["kind"] == "split_proposal"]
 
 
+async def test_existing_proposal_in_context_blocks_regeneration(
+    store, tmp_path, monkeypatch
+):
+    """SCRUM-36: dedupe is global per task — a scope-explosion blocker must
+    not overwrite a proposal a different trigger already attached."""
+    calls = []
+
+    async def fake_generate(*a, **k):
+        calls.append(True)
+        return "SHOULD NOT BE STORED"
+
+    monkeypatch.setattr(
+        "no_human.core.orchestrator.generate_split_proposal", fake_generate
+    )
+
+    t = await _new_task(store)
+    t.context = {"split_proposal": "EXISTING PROPOSAL"}
+    await store.update_task(t)
+    blocker = _scope_blocker(evidence="orig")
+
+    async with EventPersister(store, t.id, interval=0.01) as persister:
+        orch = _orch(store, tmp_path, sink=persister.record)
+        await orch._raise_blocker(t, blocker)
+
+    got = await store.get_task(t.id)
+    assert got.context["split_proposal"] == "EXISTING PROPOSAL"
+    assert not calls
+    assert blocker.evidence == "orig"
+    events = await store.list_events(t.id)
+    assert not [e for e in events if e["kind"] == "split_proposal"]
+
+
 async def test_generator_exception_skips_and_logs_typename(
     store, tmp_path, monkeypatch, caplog
 ):
