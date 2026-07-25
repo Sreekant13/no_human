@@ -50,3 +50,14 @@ def test_cli_wiring_does_reference_the_runner():
     assert "reviewer_recall" in text and "--reviewer-recall" in text, (
         "the required wiring (flag + runner path) is missing from the CLI file"
     )
+
+
+def test_cli_loader_actually_loads_the_runner():
+    """The stubbed runner tests never exercised the CLI's file-path loader;
+    the first live run died in dataclass processing because the module was
+    never registered in sys.modules before exec. Load it for real."""
+    from no_human.cli.commands import _load_reviewer_recall_runner
+
+    module, repo_root = _load_reviewer_recall_runner()
+    assert callable(module.run_and_report)
+    assert (repo_root / "eval" / "reviewer_recall" / "cases").is_dir()
