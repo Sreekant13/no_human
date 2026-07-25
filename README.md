@@ -38,6 +38,7 @@ unattended. That is deliberately not built here.
 - **Never-merge is enforced at the tool boundary, not a policy** — a `PreToolUse` hook denies `gh pr merge`, `glab mr merge`, and the equivalent REST merge calls before they run.
 - **A deterministic tamper guard runs before a reviewer token is spent** — it fails any attempt that nets a reduction in test count or assertions, no LLM judgment involved.
 - **Every task passes a fresh-context adversarial reviewer told to refute "done"** — it runs on a separate session and must cite file:line or command output for every finding, never a numeric self-score.
+- **Measured reviewer catch-rate: 7/7 seeded defects caught** (logic 2/2, security 1/1, test-tamper 2/2, spec-miss 2/2), specificity 1/2 clean diffs on the first published run — small denominators stated on purpose; corpus is growing. `claude-opus-4-8`, 2026-07-25, method + held-out discipline: [`docs/REVIEWER_RECALL_METHOD.md`](docs/REVIEWER_RECALL_METHOD.md). Regenerate with `nh bench report --reviewer-recall`; the number is never hand-edited.
 - **Honest escalation is a first-class outcome** — a blocker taxonomy routes stuck work to a park-with-wake-condition or a human escalation instead of a faked diff.
 - **Budget caps are enforced per attempt and per task lifetime** — spend against those caps is surfaced per task via `nh logs <id>`.
 - **Your code never leaves your machine; only prompts reach the model API** — the Agent SDK executes every tool against your local working tree, not a remote sandbox or upload.
