@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import time
 
+from no_human.agent.claude_backend import AgentResult
 from no_human.core.orchestrator import Orchestrator
 from no_human.core.task import Task, TaskStatus
 from no_human.notify.slack import SlackNotifier
@@ -160,3 +161,154 @@ async def test_timeout_then_productive_attempt_resets_the_streak(
     fresh = await store.get_task(t.id)
     assert (fresh.blocker or {}).get("category") != "TRANSIENT_INFRA", fresh.blocker
     assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome
+
+
+class _ZeroDiffThenHang:
+    """attempt 1: edits nothing (zero-diff). attempt 2: hangs (timeout).
+    A MIXED streak in that order — SCRUM-46's (zero_diff, timeout) case,
+    which used to be misread as "two consecutive timeouts"."""
+
+    calls = 0
+
+    async def run(self, *a, **k):
+        type(self).calls += 1
+        if type(self).calls == 1:
+            return AgentResult(final_text="already done, nothing to edit",
+                               num_turns=2, is_error=False, tokens_used=100,
+                               session_id="s", stop_reason="end_turn")
+        await asyncio.sleep(30)
+
+
+async def test_zero_diff_then_timeout_escalates_as_mixed_not_pure_timeout(
+    bare_repo, tmp_path, store  # noqa: F811
+):
+    """SCRUM-46: a (zero_diff, timeout) streak must escalate as a mixed,
+    heterogeneous streak — AMBIGUITY, no auto-retry — never the pure-timeout
+    TRANSIENT_INFRA path (which used to fire because it only looked at the
+    LAST attempt's kind)."""
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("bounds", {})["attempt_timeout_s"] = 0.3
+    cfg.data["bounds"]["max_attempts"] = 3
+    _ZeroDiffThenHang.calls = 0
+    orch = Orchestrator(store, cfg.data, _ZeroDiffThenHang(), SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert _ZeroDiffThenHang.calls == 2, (
+        f"expected escalation after 2 attempts, backend ran {_ZeroDiffThenHang.calls}x")
+    assert outcome.status is TaskStatus.ESCALATED, outcome
+    fresh = await store.get_task(t.id)
+    b = fresh.blocker or {}
+    assert b.get("category") == "AMBIGUITY", b
+    assert b.get("category") != "TRANSIENT_INFRA", b
+    blob = ((b.get("question") or "") + (b.get("root_cause_hypothesis") or "")
+            + (b.get("evidence") or "")).lower()
+    assert "mixed" in blob, b
+    assert "two consecutive" not in blob, (
+        "must not be mislabeled as a pure-timeout streak")
+
+
+class _HangThenZeroDiff:
+    """attempt 1: hangs (timeout). attempt 2: edits nothing (zero-diff).
+    The reverse order — SCRUM-46's (timeout, zero_diff) case, which used to
+    ask the misleading zero-diff 'already implemented?' question right after
+    a hang, with the hang itself never mentioned."""
+
+    calls = 0
+
+    async def run(self, *a, **k):
+        type(self).calls += 1
+        if type(self).calls == 1:
+            await asyncio.sleep(30)
+        return AgentResult(final_text="nothing further to add", num_turns=2,
+                           is_error=False, tokens_used=100, session_id="s",
+                           stop_reason="end_turn")
+
+
+async def test_timeout_then_zero_diff_escalates_as_mixed_not_plain_zero_diff(
+    bare_repo, tmp_path, store  # noqa: F811
+):
+    """SCRUM-46: the reverse order — (timeout, zero_diff) — must also
+    escalate as mixed, not the plain zero-diff 'is this already implemented?'
+    question that discards the fact a coder turn also hung."""
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("bounds", {})["attempt_timeout_s"] = 0.3
+    cfg.data["bounds"]["max_attempts"] = 3
+    _HangThenZeroDiff.calls = 0
+    orch = Orchestrator(store, cfg.data, _HangThenZeroDiff(), SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert _HangThenZeroDiff.calls == 2, (
+        f"expected escalation after 2 attempts, backend ran {_HangThenZeroDiff.calls}x")
+    assert outcome.status is TaskStatus.ESCALATED, outcome
+    fresh = await store.get_task(t.id)
+    b = fresh.blocker or {}
+    assert b.get("category") == "AMBIGUITY", b
+    assert b.get("category") != "TRANSIENT_INFRA", b
+    blob = ((b.get("question") or "") + (b.get("root_cause_hypothesis") or "")
+            + (b.get("evidence") or "")).lower()
+    assert "mixed" in blob, b
+    # The mixed question may honestly OFFER "already implemented?" as one
+    # hypothesis among several — what it must not do is present ONLY the
+    # zero-diff framing. The mix and the timeout half must both be named.
+    assert "timeout" in blob, b
+
+
+class _FailThenZeroDiffThenHang:
+    """A 3-attempt sequence: attempt 1 fails for an ORDINARY reason (a
+    terminal agent error, `is_error=True` — not zero-diff, not a timeout),
+    which resets the unproductive streak; attempt 2 is zero-diff; attempt 3
+    hangs. Proves `prev_unproductive` starts clean after a non-streak failure
+    and the trailing (zero_diff, timeout) pair still correctly escalates as
+    mixed — not a stale kind leaking across the reset, and not 3 turns of
+    budget burned before the human hears about the mix."""
+
+    calls = 0
+
+    async def run(self, *a, **k):
+        type(self).calls += 1
+        if type(self).calls == 1:
+            return AgentResult(final_text="unexpected SDK error", num_turns=1,
+                               is_error=True, tokens_used=100, session_id="s",
+                               stop_reason="error")
+        if type(self).calls == 2:
+            return AgentResult(final_text="nothing further to add", num_turns=2,
+                               is_error=False, tokens_used=100, session_id="s",
+                               stop_reason="end_turn")
+        await asyncio.sleep(30)
+
+
+async def test_reset_then_mixed_streak_still_escalates_as_mixed(
+    bare_repo, tmp_path, store  # noqa: F811
+):
+    """SCRUM-46: a longer, 3-attempt run — an ordinary test-failing attempt
+    (resets the streak), then a (zero_diff, timeout) pair — must still
+    escalate as mixed on the trailing pair, proving the reset doesn't leak a
+    stale kind into the next streak."""
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("bounds", {})["attempt_timeout_s"] = 0.3
+    cfg.data["bounds"]["max_attempts"] = 4
+    _FailThenZeroDiffThenHang.calls = 0
+    orch = Orchestrator(store, cfg.data, _FailThenZeroDiffThenHang(),
+                        SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert _FailThenZeroDiffThenHang.calls == 3, (
+        "expected 3 attempts (ordinary failure, then the mixed pair), "
+        f"backend ran {_FailThenZeroDiffThenHang.calls}x")
+    assert outcome.status is TaskStatus.ESCALATED, outcome
+    fresh = await store.get_task(t.id)
+    b = fresh.blocker or {}
+    assert b.get("category") == "AMBIGUITY", b
+    assert b.get("category") != "TRANSIENT_INFRA", b
+    blob = ((b.get("question") or "") + (b.get("root_cause_hypothesis") or "")
+            + (b.get("evidence") or "")).lower()
+    assert "mixed" in blob, b
