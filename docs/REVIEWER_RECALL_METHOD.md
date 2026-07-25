@@ -59,7 +59,7 @@ together. Recall without specificity is inadmissible.
 
 A case counts as **caught** only if:
 1. the review verdict is FAIL (or the defect is cited as a blocking finding), and
-2. at least one finding names the planted file, and
+2. at least one **blocking** finding names the planted file, and
 3. that finding's cited line falls inside `hunk_lines` (±3), and
 4. the finding text matches the defect class (keyword set per case in
    `truth.json`; e.g. the test-tamper case requires the finding to mention
@@ -71,6 +71,39 @@ kept (`runs/<date>/`) so a human can audit any scoring dispute.
 
 A control case counts as a **clean pass** if the verdict is PASS, or FAIL
 with only non-blocking findings.
+
+### Setup failures never score as a miss
+
+If `prepare_case_repo` fails (a broken checkout — the case repo could not be
+built), the case is recorded as `status="ERROR"`, with `caught=None` and
+`clean_pass=None` — it was never measured, so it must never render as a
+miss (`caught=False`) or a false alarm. The headline recall statistic
+**refuses** to display whenever any case has `status="ERROR"`:
+`render_report` raises `HeadlineRefusedError` (and logs the errored case
+IDs) rather than print a number with an unmeasured case silently folded
+into — or dropped from — the denominator. Re-run the tool once the
+underlying setup problem (e.g. a stale `base.ref`) is fixed.
+
+### Run transcripts (`runs/<date>/`)
+
+Every `run_all` invocation writes one JSON transcript per case to
+`eval/reviewer_recall/runs/<YYYY-MM-DD>/<case_id>.json` (the runtime output
+itself is gitignored — only the directory structure is created on disk).
+Schema:
+
+```json
+{
+  "case_name": "logic-stale-renders-fresh",
+  "status": "OK",
+  "caught": true,
+  "score": 1.0,
+  "error_message_if_error": null
+}
+```
+
+For `status="ERROR"` cases, `caught` is **omitted** entirely (not `false`,
+not `null` — an unmeasured case has no caught/missed verdict to report) and
+`score` is `null`; `error_message_if_error` carries the setup failure detail.
 
 ## Reporting
 

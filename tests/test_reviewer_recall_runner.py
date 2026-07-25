@@ -8,6 +8,7 @@ the same way the CLI wiring (`nh bench report --reviewer-recall`) loads it.
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -225,3 +226,86 @@ async def test_run_all_iterates_every_case_with_injected_reviewer():
     assert call_count["n"] == len(all_cases)
     assert len(report.results) == len(all_cases)
     assert report.model == "stub-model"
+
+
+# --- SCRUM-47: ERROR path never scores as a miss ----------------------------
+
+@pytest.mark.asyncio
+async def test_setup_failure_marks_status_error(tmp_path):
+    bad_case = rr.CaseSpec(
+        case_id="broken-checkout", dir=Path("/dev/null"),
+        base_ref="not-a-real-ref-deadbeef", diff_text="",
+        truth=_truth(),
+    )
+
+    async def stub_reviewer(repo_path, diff_text, case_spec):
+        raise AssertionError("reviewer must never be invoked when setup fails")
+
+    result = await rr.run_case(REPO_ROOT, bad_case, stub_reviewer, tmp_path)
+    assert result.status == "ERROR"
+    assert result.caught is None
+    assert result.clean_pass is None
+    assert "case setup failed" in result.reason
+
+
+# --- SCRUM-47: headline refused when any case errored ------------------------
+
+def test_render_report_refuses_on_error():
+    error_result = rr.CaseResult(
+        case_id="broken-checkout", cls="logic", is_control=False,
+        outcome=rr.ReviewOutcome(status="ERROR"), status="ERROR",
+        reason="case setup failed: fatal: bad revision",
+    )
+    report = rr.RecallReport(results=[error_result], model="claude-opus-4-8",
+                             run_date="2026-07-25")
+    with pytest.raises(rr.HeadlineRefusedError):
+        rr.render_report(report)
+
+
+def test_render_report_ok_when_no_errors():
+    seeded_hit = rr.CaseResult(case_id="a", cls="logic", is_control=False,
+                               outcome=rr.ReviewOutcome(status="FAIL"), caught=True)
+    report = rr.RecallReport(results=[seeded_hit], model="claude-opus-4-8",
+                             run_date="2026-07-25")
+    text = rr.render_report(report)
+    assert "reviewer recall: 1/1" in text
+
+
+# --- SCRUM-47: transcripts written on every run_all invocation --------------
+
+@pytest.mark.asyncio
+async def test_run_all_writes_transcripts(tmp_path):
+    async def stub_reviewer(repo_path, diff_text, case_spec):
+        return rr.ReviewOutcome(status="PASS", findings=[])
+
+    report = await rr.run_all(REPO_ROOT, reviewer_fn=stub_reviewer,
+                              model="stub-model", run_date="2026-07-25",
+                              runs_dir=tmp_path)
+    all_cases = rr.load_cases()
+    out_dir = tmp_path / "2026-07-25"
+    assert out_dir.is_dir()
+    for case in all_cases:
+        case_file = out_dir / f"{case.case_id}.json"
+        assert case_file.exists(), f"missing transcript for {case.case_id}"
+    sample = json.loads((out_dir / f"{all_cases[0].case_id}.json").read_text())
+    assert {"case_name", "status", "score"} <= sample.keys()
+    assert sample["case_name"] == all_cases[0].case_id
+    assert sample["status"] == "OK"
+
+
+# --- SCRUM-47: ERROR cases omit `caught` in transcripts (never a miss) ------
+
+def test_error_transcript_omits_caught(tmp_path):
+    error_result = rr.CaseResult(
+        case_id="broken-checkout", cls="logic", is_control=False,
+        outcome=rr.ReviewOutcome(status="ERROR"), status="ERROR",
+        reason="case setup failed: fatal: bad revision",
+    )
+    report = rr.RecallReport(results=[error_result], model="claude-opus-4-8",
+                             run_date="2026-07-25")
+    rr.write_transcripts(report, tmp_path)
+    data = json.loads((tmp_path / "2026-07-25" / "broken-checkout.json").read_text())
+    assert data["status"] == "ERROR"
+    assert "caught" not in data
+    assert data["score"] is None
+    assert "case setup failed" in data["error_message_if_error"]

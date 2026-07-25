@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -27,8 +28,17 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 CASES_DIR = Path(__file__).resolve().parent / "cases"
+RUNS_DIR = Path(__file__).resolve().parent / "runs"
 METHOD_DOC = "docs/REVIEWER_RECALL_METHOD.md"
 DEFAULT_MODEL = "claude-opus-4-8"
+
+logger = logging.getLogger(__name__)
+
+
+class HeadlineRefusedError(RuntimeError):
+    """Raised when the recall headline would be computed with an unmeasured
+    (ERROR) case in the denominator — the runner refuses rather than print a
+    misleading number."""
 
 
 @dataclass
@@ -69,6 +79,7 @@ class CaseResult:
     caught: bool | None = None       # seeded cases only
     clean_pass: bool | None = None   # control cases only
     reason: str = ""
+    status: str = "OK"               # "OK" | "ERROR" (prepare_case_repo failed)
 
 
 @dataclass
@@ -206,8 +217,7 @@ async def run_case(
         return CaseResult(
             case_id=case.case_id, cls=case.truth.get("class", ""),
             is_control=case.is_control, outcome=outcome,
-            caught=None if case.is_control else False,
-            clean_pass=False if case.is_control else None,
+            caught=None, clean_pass=None, status="ERROR",
             reason=f"case setup failed: {stderr or exc}",
         )
     outcome = await reviewer_fn(case_repo, case.diff_text, case)
@@ -246,6 +256,7 @@ async def run_all(
     reviewer_fn: ReviewerFn | None = None,
     model: str = DEFAULT_MODEL,
     run_date: str | None = None,
+    runs_dir: Path = RUNS_DIR,
 ) -> RecallReport:
     fn = reviewer_fn or _default_reviewer_fn(model)
     cases = load_cases(cases_dir)
@@ -254,8 +265,39 @@ async def run_all(
         workdir = Path(tmp)
         for case in cases:
             results.append(await run_case(repo_root, case, fn, workdir))
-    return RecallReport(results=results, model=model,
-                        run_date=run_date or _today())
+    report = RecallReport(results=results, model=model,
+                          run_date=run_date or _today())
+    write_transcripts(report, runs_dir)
+    return report
+
+
+def write_transcripts(report: RecallReport, runs_dir: Path = RUNS_DIR) -> Path:
+    """Persist one ``<case_id>.json`` audit transcript per case under
+    ``runs_dir/<run_date>/`` — called on every :func:`run_all` invocation, per
+    docs/REVIEWER_RECALL_METHOD.md ("Borderline transcripts are kept").
+
+    Schema: ``{case_name, status, caught, score, error_message_if_error}``.
+    ERROR cases omit ``caught`` (never measured — must not read as a miss)
+    and get ``score=None``.
+    """
+    out_dir = runs_dir / report.run_date
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for r in report.results:
+        data: dict[str, Any] = {
+            "case_name": r.case_id,
+            "status": r.status,
+            "error_message_if_error": r.reason if r.status == "ERROR" else None,
+        }
+        if r.status == "ERROR":
+            data["score"] = None
+        elif r.is_control:
+            data["caught"] = r.caught
+            data["score"] = 1.0 if r.clean_pass else 0.0
+        else:
+            data["caught"] = r.caught
+            data["score"] = 1.0 if r.caught else 0.0
+        (out_dir / f"{r.case_id}.json").write_text(json.dumps(data, indent=2))
+    return out_dir
 
 
 def _today() -> str:
@@ -265,7 +307,25 @@ def _today() -> str:
 def render_report(report: RecallReport) -> str:
     """Render exactly the method-doc format — recall + denominator, per-class
     breakdown, specificity ratio, model, run date, method-doc path. Never a
-    bare percentage (the denominator always accompanies it)."""
+    bare percentage (the denominator always accompanies it).
+
+    Refuses (raises :class:`HeadlineRefusedError`) if any case has
+    ``status == "ERROR"``: an unmeasured case (broken checkout) must never be
+    silently folded into the denominator or scored as a miss.
+    """
+    errored = [r for r in report.results if r.status == "ERROR"]
+    if errored:
+        ids = ", ".join(r.case_id for r in errored)
+        logger.error(
+            "reviewer-recall headline refused: %d case(s) errored before "
+            "measurement: %s", len(errored), ids,
+        )
+        raise HeadlineRefusedError(
+            f"{len(errored)} case(s) errored before measurement ({ids}) — "
+            "refusing to compute the headline recall statistic with an "
+            "unmeasured case in the denominator"
+        )
+
     seeded = [r for r in report.results if not r.is_control]
     controls = [r for r in report.results if r.is_control]
 
