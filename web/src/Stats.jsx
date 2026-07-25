@@ -9,6 +9,7 @@ import { profileRows, profileStatus } from "./repoView.js";
 import { kindLabel, groupByTask } from "./searchView.js";
 import { pluralize } from "./pluralize.js";
 import { costByProject, totalCost } from "./costGroups.js";
+import { formatBenchDate } from "./formatBenchDate.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -587,7 +588,7 @@ function BenchTrust({ bench }) {
       <div className="bench-trust-head">
         <span className="bench-trust-title">Benchmark</span>
         {card.label && <span className="bench-trust-sub">{card.label}</span>}
-        {card.created_at && <span className="bench-trust-sub">{card.created_at}</span>}
+        {card.created_at && <span className="bench-trust-sub">{formatBenchDate(card.created_at)}</span>}
       </div>
 
       {refused && (
