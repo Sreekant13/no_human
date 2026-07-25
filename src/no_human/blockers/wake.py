@@ -78,6 +78,7 @@ class WakeWatcher:
         pr_comment: PrCommentChecker | None = None,
         pr_state: Callable[[str], Awaitable[str]] | None = None,
         pr_checks: Callable[[str], Awaitable[list[dict]]] | None = None,
+        pr_mergeable: Callable[[str], Awaitable[dict]] | None = None,
         ci_log: Callable[[str], Awaitable[str]] | None = None,
         on_event: Callable[[str, str], None] | None = None,
         ci_gate_gate: Any = None,
@@ -100,6 +101,14 @@ class WakeWatcher:
         # human). Counted per distinct failure signature, so a re-run of the
         # same red check doesn't burn a round.
         self.max_ci_fix_rounds = int(blockers_cfg.get("max_ci_fix_rounds", 3))
+        # Bounded PR-conflict → rebase cycles (SCRUM-41), same pattern: a PR
+        # that textually conflicts with main is invisible to CI (branch checks
+        # stay green through it) — only `gh pr view --json mergeable` exposes
+        # it. Counted per detected CONFLICTING state; resets only once GitHub
+        # confirms MERGEABLE (a later conflict is then a fresh cycle).
+        self.max_pr_conflict_rounds = int(
+            blockers_cfg.get("max_pr_conflict_rounds", 3)
+        )
         # Stuck-active watchdog threshold (minutes). Default 40 > the 30-min
         # run_tests timeout, so a long test never trips it; a genuinely hung
         # session does. 0 disables.
@@ -126,6 +135,7 @@ class WakeWatcher:
         self._pr_comment = pr_comment
         self._pr_state = pr_state
         self._pr_checks = pr_checks
+        self._pr_mergeable = pr_mergeable
         self._ci_log = ci_log
         self._on_event = on_event or (lambda kind, text: None)
         # The post-PR CI_GATE integration gate (M6). Injectable for tests;
@@ -502,8 +512,17 @@ class WakeWatcher:
            merged PR left its task parked as awaiting_approval forever.)
         2. **Closed unmerged** → ESCALATED with a question (previously polled
            until the end of time).
-        3. **New human comments** → inject + revise (existing B4 path).
-        4. **Red CI on the PR head** → bounded fix loop: fetch the failing
+        3. **Textual conflict with main** (SCRUM-41) → bounded rebase loop:
+           CI stays green through a conflict (it only runs the PR's own
+           branch), so this is the one rung that polls `mergeable` directly.
+           UNKNOWN is GitHub still computing (notably right after the rebase
+           push this rung itself asks for) — never acted on. Definite
+           CONFLICTING sends the rebase instruction back, bounded like the
+           CI-fix rounds; past the cap the conflict is handed to the human.
+           Live occurrence: PR #26 conflicted with #25 and sat invisible
+           until a human tried to merge it.
+        4. **New human comments** → inject + revise (existing B4 path).
+        5. **Red CI on the PR head** → bounded fix loop: fetch the failing
            check's log, feed it back, resume onto the PR branch. Rounds are
            counted per distinct failure *signature* — a re-run of the same red
            check never burns a round — and past the cap the specific failing
@@ -540,19 +559,109 @@ class WakeWatcher:
             await self._emit(task, "pr_closed", f"{task.id[:8]} PR closed unmerged: {url}")
             return "escalated_pr_closed"
 
+        acted = await self._check_pr_conflict(task, url)
+        if acted:
+            return acted
         acted = await self._check_approval_pr_comments(task)
         if acted:
             return acted
         acted = await self._check_pr_ci(task, url)
         if acted:
             return acted
-        # 5. CI_GATE integration gate (M6): PR CI is green (or unknown, which
+        # 6. CI_GATE integration gate (M6): PR CI is green (or unknown, which
         #    the gate re-checks explicitly) — run the integration validation
         #    once per PR head, bounded send-back on failure.
         return await self._check_ci_gate_integration(task, url)
 
+    async def _check_pr_conflict(self, task: Task, url: str) -> str | None:
+        """Rung 3 (SCRUM-41): a textual conflict with main is invisible to CI
+        (branch checks only run the PR's own branch) — this rung is the only
+        one that polls `gh pr view --json mergeable,mergeStateStatus` directly.
+
+        GitHub computes ``mergeable`` asynchronously after every push,
+        including the rebase push this rung itself asks for — so "UNKNOWN" is
+        the normal state for a few seconds after every round, not a real
+        signal. It must never be treated as resolved (would leave a real
+        conflict unhandled) NOR reset the round counter (would let a
+        CONFLICTING → UNKNOWN → CONFLICTING cycle — the normal shape of a
+        rebase-and-repoll — reset every round and never reach the bound). The
+        counter only resets on a *definite* MERGEABLE: that is a genuinely new
+        failure cycle, not a continuation.
+        """
+        if self._pr_mergeable is None:
+            return None
+        try:
+            info = await self._pr_mergeable(url)
+        except Exception as exc:  # noqa: BLE001 — a poll error must not crash the watcher
+            log.warning("failed to poll PR mergeability for %s: %s", task.id[:8], exc)
+            return None
+        mergeable = str((info or {}).get("mergeable") or "").upper()
+
+        if mergeable == "MERGEABLE":
+            ctx = task.context or {}
+            if ctx.get("pr_conflict_rounds"):
+                task.context = await self.store.merge_context(
+                    task.id, {"pr_conflict_rounds": 0})
+            return None
+        if mergeable != "CONFLICTING":
+            # UNKNOWN, "", or anything else GitHub hasn't settled yet: no-op,
+            # no state change — see the docstring above.
+            return None
+
+        merge_state = str((info or {}).get("mergeStateStatus") or "").upper()
+        ctx = task.context or {}
+        rounds = int(ctx.get("pr_conflict_rounds") or 0) + 1
+        task.context = await self.store.merge_context(
+            task.id, {"pr_conflict_rounds": rounds})
+
+        if rounds > self.max_pr_conflict_rounds:
+            data = task.blocker or {}
+            data["category"] = "NOVEL_UNKNOWN"
+            data["question"] = (
+                f"PR {url} is still CONFLICTING with main after {rounds - 1} "
+                f"autonomous rebase round(s) (mergeStateStatus="
+                f"{merge_state or 'UNKNOWN'}). Advise, or take over?"
+            )
+            data["root_cause_hypothesis"] = (
+                f"PR conflicts with main: {url} "
+                f"(mergeable=CONFLICTING, mergeStateStatus={merge_state or 'UNKNOWN'})"
+            )
+            data["evidence"] = (
+                f"gh pr view --json mergeable,mergeStateStatus -> "
+                f"CONFLICTING / {merge_state or 'UNKNOWN'} on "
+                f"{rounds - 1} consecutive detection(s) after send-back rounds"
+            )
+            task.blocker = data
+            await self.store.update_task_columns(task)
+            await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
+            await self._emit(
+                task, "escalated_pr_conflict",
+                f"{task.id[:8]} PR {url} CONFLICTING past "
+                f"{self.max_pr_conflict_rounds} rounds "
+                f"(mergeStateStatus={merge_state or 'UNKNOWN'})",
+            )
+            return "escalated_pr_conflict"
+
+        message = (
+            "The PR has a textual conflict with main (mergeable=CONFLICTING"
+            + (f", mergeStateStatus={merge_state}" if merge_state else "")
+            + ").\nRebase onto origin/main, resolve conflicts, push — the PR "
+              "updates itself."
+        )
+        await self.store.append_context_list(task.id, "send_back_feedback", {
+            "at": now_iso(), "message": message, "author": "pr_conflict",
+            "source": "pr_conflict",
+        })
+        task.context = await self.store.merge_context(task.id, {})
+        await self._emit(
+            task, "pr_conflict",
+            f"{task.id[:8]} PR CONFLICTING — rebase round "
+            f"{rounds}/{self.max_pr_conflict_rounds}",
+        )
+        return await self._resume(task)
+
     async def _check_pr_ci(self, task: Task, url: str) -> str | None:
-        """Rung 4: react to a red check on the open PR's head, bounded."""
+        """Rung 5: react to a red check on the open PR's head, bounded."""
         if self._pr_checks is None:
             return None
         try:
@@ -621,7 +730,7 @@ class WakeWatcher:
         return await self._resume(task)
 
     async def _check_ci_gate_integration(self, task: Task, url: str) -> str | None:
-        """Rung 5 (M6): run the CI_GATE integration validation post-PR, gated.
+        """Rung 6 (M6): run the CI_GATE integration validation post-PR, gated.
 
         The gate object owns eligibility, the once-per-head + in-flight +
         namespace duplicate guards, triggering, polling one status call per

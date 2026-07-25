@@ -504,6 +504,39 @@ async def default_pr_head(ref: str) -> str:
         return ""
 
 
+async def default_pr_mergeable(ref: str) -> dict:
+    """The PR head's mergeability via gh: {"mergeable": ..., "mergeStateStatus": ...}.
+
+    ``mergeable`` is one of "MERGEABLE" | "CONFLICTING" | "UNKNOWN" | "" (gh
+    missing / unparseable ref / network error — treated identically to
+    "UNKNOWN" by callers: never act on it). GitHub computes ``mergeable``
+    asynchronously after every push (including the rebase this rung itself
+    asks for), so "UNKNOWN" is the normal state for a few seconds after a
+    push, not a real signal — callers must never treat it as either resolved
+    or still-conflicting.
+    """
+    if not shutil.which("gh"):
+        return {"mergeable": "", "mergeStateStatus": ""}
+    target = _gh_repo_and_number(ref)
+    if not target:
+        return {"mergeable": "", "mergeStateStatus": ""}
+    repo_arg, num_str = target
+    out = await _run_cli([
+        "gh", "pr", "view", num_str, "--repo", repo_arg,
+        "--json", "mergeable,mergeStateStatus",
+    ])
+    if not out:
+        return {"mergeable": "", "mergeStateStatus": ""}
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return {"mergeable": "", "mergeStateStatus": ""}
+    return {
+        "mergeable": str(data.get("mergeable") or "").upper(),
+        "mergeStateStatus": str(data.get("mergeStateStatus") or "").upper(),
+    }
+
+
 async def default_pr_files(ref: str) -> list[str]:
     """Changed file paths of the PR, or [] (unknown). The CI_GATE gate treats
     an empty list as unclassifiable and refuses latest_dev images for it only
