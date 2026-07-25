@@ -1,10 +1,14 @@
 // Unit tests for the shell's server-discovery helpers (node --test, no
 // electron needed — these run in the standing web gate's node tier).
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import http from "node:http";
 import test from "node:test";
 
-import { configuredPort, isAppOrigin, probe, waitForServer } from "./server.mjs";
+import {
+  classifyBackendFailure, configuredPort, isAppOrigin, makeOutputCapture,
+  probe, tailDetail, waitForServer,
+} from "./server.mjs";
 
 function serve(handler) {
   return new Promise((resolve) => {
@@ -317,4 +321,64 @@ setInterval(() => {}, 1000);
   assert.equal(alive(grandchild), false,
     "the worker outlived the server it belonged to and still holds the port");
   assert.equal(alive(state.child.pid), false, "the server itself survived");
+});
+
+// ── SCRUM-11: launch-failure capture/classification (review finding: the
+//    feature's server half shipped untested; these pin the contract) ──────────
+test("classifyBackendFailure: cli-missing on the _assert_backend_usable text", () => {
+  const out = "coding backend unavailable: the `claude` CLI was not found.\nFix: install";
+  assert.equal(classifyBackendFailure(out), "cli-missing");
+});
+
+test("classifyBackendFailure: not-logged-in on the two missing-token AuthErrors only", () => {
+  assert.equal(classifyBackendFailure(
+    "auth error: No subscription token found. Expected CLAUDE_CODE_OAUTH_TOKEN in ~/.no_human/.env"),
+    "not-logged-in");
+  assert.equal(classifyBackendFailure(
+    "auth error: auth profile 'work' has no token. Expected CLAUDE_CODE_OAUTH_TOKEN_WORK in ~/.no_human/.env"),
+    "not-logged-in");
+  // Other AuthErrors print a "claude setup-token" Fix block too, but
+  // setup-token is the WRONG remediation — they must stay unclassified.
+  assert.equal(classifyBackendFailure(
+    "auth error: ANTHROPIC_API_KEY is set — subscription mode runs on CLAUDE_CODE_OAUTH_TOKEN only.\n" +
+    "Fix: run nh init, or:\n  1. claude setup-token  (creates a subscription token)"),
+    null);
+});
+
+test("classifyBackendFailure: cli-missing wins when both banners appear; unrelated output is null", () => {
+  assert.equal(classifyBackendFailure(
+    "coding backend unavailable: the `claude` CLI was not found.\nNo subscription token found."),
+    "cli-missing");
+  assert.equal(classifyBackendFailure("Address already in use: 8420"), null);
+  assert.equal(classifyBackendFailure(""), null);
+});
+
+test("tailDetail: keeps the last lines, caps chars, empty-safe", () => {
+  assert.equal(tailDetail(""), "");
+  assert.equal(tailDetail("one\ntwo"), "one\ntwo");
+  const many = Array.from({ length: 30 }, (_, i) => `line${i}`).join("\n");
+  const tail = tailDetail(many);
+  assert.ok(tail.startsWith("line20"), tail);
+  assert.ok(!tail.includes("line19"));
+  const long = "x".repeat(2000);
+  const capped = tailDetail(long);
+  assert.ok(capped.length <= 500 + "[truncated…] ".length);
+  assert.ok(capped.startsWith("[truncated…] "));
+});
+
+test("makeOutputCapture: bounded — keeps only the tail past the cap", () => {
+  const cap = makeOutputCapture(10);
+  cap.add("aaaaa"); cap.add("bbbbb"); cap.add("ccccc");
+  assert.equal(cap.text(), "bbbbbccccc");
+});
+
+test("reason strings match error.html's remediation blocks (cross-file contract)", () => {
+  const html = fs.readFileSync(new URL("./error.html", import.meta.url), "utf8");
+  // server.mjs emits backend-cli-missing / backend-not-logged-in; error.html
+  // must route each to a dedicated steps block. A typo on either side breaks
+  // this pin, not just the live behavior.
+  assert.ok(html.includes('"backend-cli-missing"'));
+  assert.ok(html.includes('"backend-not-logged-in"'));
+  assert.ok(html.includes('id="steps-cli-missing"'));
+  assert.ok(html.includes('id="steps-not-logged-in"'));
 });

@@ -184,8 +184,11 @@ const navs = createNavScheduler((w, isCurrent) => _loadBoardOrError(w, isCurrent
 const loadBoardOrError = (w) => navs.schedule(w);
 const supersedeNav = () => navs.supersede();
 
-const showError = (w, reason) => w.loadFile(path.join(__dirname, "error.html"), {
-  query: { origin: ORIGIN, reason, packaged: app.isPackaged ? "1" : "0" },
+const showError = (w, reason, detail) => w.loadFile(path.join(__dirname, "error.html"), {
+  query: {
+    origin: ORIGIN, reason, packaged: app.isPackaged ? "1" : "0",
+    ...(detail ? { detail } : {}),
+  },
 });
 
 /**
@@ -272,7 +275,7 @@ async function _loadBoardOrError(w, current) {
     await showBoard(w);
     return;
   }
-  await showError(w, lifecycle.state.reason);
+  await showError(w, lifecycle.state.reason, lifecycle.state.detail);
 }
 
 const SETUP_FILE = path.join(__dirname, "token.html");

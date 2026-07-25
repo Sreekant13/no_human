@@ -162,11 +162,66 @@ export function mergePath(basePath, extraDirs = CLI_HINT_DIRS,
 }
 
 /**
+ * Bounded accumulator for a child's stdout+stderr. Capped so a chatty/looping
+ * process cannot grow this without bound over a long-lived spawn — only the
+ * TAIL matters for diagnosing a launch failure.
+ */
+export function makeOutputCapture(maxChars = 8000) {
+  let buf = "";
+  return {
+    add(chunk) {
+      buf += String(chunk);
+      if (buf.length > maxChars) buf = buf.slice(buf.length - maxChars);
+    },
+    text() { return buf; },
+  };
+}
+
+/**
+ * Reduce captured output to something small enough for a URL query parameter
+ * (~2KB practical max) while keeping the part most likely to explain a
+ * failure: the last few lines. Mirrors nh start's own console output, which
+ * prints its diagnosis last, right before exiting.
+ */
+export function tailDetail(text, maxLines = 10, maxChars = 500) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return "";
+  const tail = trimmed.split("\n").slice(-maxLines).join("\n");
+  if (tail.length <= maxChars) return tail;
+  return "[truncated…] " + tail.slice(tail.length - maxChars);
+}
+
+/**
+ * Classify captured nh-start output against the two backend-check failures
+ * `agent/backend_check.py` (via `_assert_backend_usable`/`_bootstrap` in
+ * cli/commands.py) diagnoses: a missing `claude` CLI, or no OAuth token on
+ * file. Matched on the exact phrases those code paths print, so a genuine
+ * match is never confused with an unrelated startup failure. Anything else
+ * (network timeouts, version mismatches, ...) returns null and falls through
+ * to the generic retry text — deliberately narrow scope.
+ */
+export function classifyBackendFailure(text) {
+  const t = String(text || "");
+  if (/claude` CLI was not found|coding backend unavailable/i.test(t)) {
+    return "cli-missing";
+  }
+  // Matched on the two genuinely-missing-token AuthError texts only
+  // (config.py: "No subscription token found", "auth profile '<p>' has no
+  // token"). Other AuthErrors (e.g. a stray ANTHROPIC_API_KEY) print a
+  // "claude setup-token" Fix block too, but setup-token is the WRONG
+  // remediation for them — they fall through to generic + verbatim detail.
+  if (/No subscription token found|has no token\. Expected/i.test(t)) {
+    return "not-logged-in";
+  }
+  return null;
+}
+
+/**
  * Attach to a running server, or spawn `nh start --no-open` and wait for it.
  * Returns {status:"attached"} | {status:"spawned", child} | {status:"failed",
- * reason}. The caller must retain `child`: it is the ONLY legitimate kill
- * target — the pidfile belongs to the operator and is never consulted for
- * killing (design rule from the plan; an attached server is not ours).
+ * reason, detail?}. The caller must retain `child`: it is the ONLY legitimate
+ * kill target — the pidfile belongs to the operator and is never consulted
+ * for killing (design rule from the plan; an attached server is not ours).
  */
 export async function ensureServer({
   origin = DEFAULT_ORIGIN,
@@ -196,28 +251,49 @@ export async function ensureServer({
   // fails, even though the board serves normally.
   const spawnEnv = { ...process.env, ...env };
   spawnEnv.PATH = mergePath(spawnEnv.PATH);
+  // stdout/stderr are PIPED (not ignored) so a launch failure's own diagnosis
+  // — e.g. `_assert_backend_usable`'s "claude CLI was not found" — can reach
+  // error.html instead of a generic lifecycle reason. Both streams are
+  // unref'd immediately: this child is detached and may keep running long
+  // after ensureServer returns (or outlive this process entirely under
+  // `node --test`), and a referenced pipe would otherwise keep the event loop
+  // alive waiting on it.
+  const capture = makeOutputCapture();
   const child = spawn(bin, nhArgs, {
-    env: spawnEnv, detached: true, stdio: "ignore",
+    env: spawnEnv, detached: true, stdio: ["ignore", "pipe", "pipe"],
   });
   child.unref();
+  for (const stream of [child.stdout, child.stderr]) {
+    if (!stream) continue;
+    stream.on("data", (chunk) => capture.add(chunk));
+    stream.unref?.();
+  }
   // A throwing callback must not reject ensureServer with the child already
   // spawned and untracked.
   try { onSpawn(child); } catch { /* tracking must never break the spawn */ }
   const spawnErrored = new Promise((resolve) =>
     child.once("error", () => resolve("spawn-error")));
+  // A backend-check refusal (`sys.exit(2)`) exits almost immediately — racing
+  // its exit (not just the port) means Retry doesn't sit for the full
+  // spawnTimeoutMs before showing the real reason.
+  const spawnExited = new Promise((resolve) =>
+    child.once("exit", (code, signal) => {
+      if (code !== 0 || signal) resolve("spawn-exited");
+    }));
   const raced = await Promise.race(
-    [waitForServer(origin, spawnTimeoutMs), spawnErrored]);
+    [waitForServer(origin, spawnTimeoutMs), spawnErrored, spawnExited]);
   if (raced === "spawn-error" || (await probe(origin)) !== "up") {
     // NOT killed here: a slow-booting nh may still be about to win the port,
     // and killing it from inside ensureServer would race a legitimately
     // starting server. The child is returned instead, so the CALLER owns the
     // decision — main.mjs tracks it and stops it before starting a
     // replacement, which is what keeps Retry from accumulating servers.
-    return {
-      status: "failed",
-      reason: raced === "spawn-error" ? "spawn-error" : "spawn-timeout",
-      child,
-    };
+    const text = capture.text();
+    const cause = classifyBackendFailure(text);
+    const reason = cause === "cli-missing" ? "backend-cli-missing"
+      : cause === "not-logged-in" ? "backend-not-logged-in"
+      : raced === "spawn-error" ? "spawn-error" : "spawn-timeout";
+    return { status: "failed", reason, detail: tailDetail(text), child };
   }
   return { status: "spawned", child };
 }

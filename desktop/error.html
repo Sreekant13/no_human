@@ -33,6 +33,9 @@
     font-size: .85em;
   }
   .steps { color: var(--text); margin: 1rem 0; }
+  #detail-body {
+    display: block; margin-top: .35rem; white-space: pre-wrap; word-break: break-word;
+  }
   .actions { display: flex; gap: .5rem; margin-top: 1rem; flex-wrap: wrap; }
   a.retry {
     display: inline-block; padding: .5rem 1.1rem;
@@ -72,6 +75,27 @@
     <br />then retry. (If <code>nh</code> isn’t installed:
     <code>uv tool install --editable &lt;your no_human checkout&gt;</code>)
   </p>
+  <!-- The two backend-check refusals nh start itself diagnoses loudly and
+       exits on (agent/backend_check.py + _assert_backend_usable): a missing
+       claude CLI, or no OAuth token on file. Everything else falls through to
+       the generic text above. -->
+  <p class="steps" id="steps-cli-missing" hidden>
+    no_human can’t run any task: the <code>claude</code> CLI isn’t installed or
+    isn’t on <code>PATH</code>. Install it, then retry:
+    <br /><code>npm install -g @anthropic-ai/claude-code</code>
+  </p>
+  <p class="steps" id="steps-not-logged-in" hidden>
+    no_human found the <code>claude</code> CLI but no subscription token.
+    Create one, then paste it in with “Re-enter Claude token” below:
+    <br /><code>claude setup-token</code>
+  </p>
+  <!-- The actual tail of nh start's own stdout/stderr (server.mjs's
+       tailDetail), when one was captured. Shown verbatim so a failure outside
+       the two classified cases above is not a dead end either. -->
+  <p class="steps" id="detail-text" hidden>
+    <strong>Diagnostic output:</strong>
+    <br /><code id="detail-body"></code>
+  </p>
   <div class="actions">
     <a class="retry" href="nh://retry">Retry connection</a>
     <!-- Only when the credential could plausibly be the cause: on
@@ -82,12 +106,25 @@
   <script>
     const q = new URLSearchParams(location.search);
     const reason = q.get("reason") || "";
+    const detail = q.get("detail") || "";
     if (reason !== "nh-not-found") document.getElementById("token-link").hidden = false;
     // Default to the packaged wording: a friend must never be shown build steps.
     const dev = q.get("packaged") === "0";
-    const which = reason === "stop-failed" ? "steps-stopfailed"
-                                           : (dev ? "steps-dev" : "steps-packaged");
+    // The two backend-check refusals (agent/backend_check.py, via
+    // classifyBackendFailure in server.mjs) get their own remediation ahead of
+    // the generic packaged/dev/stop-failed copy — installing a CLI or minting a
+    // token has nothing to do with either of those stories.
+    const which = reason === "backend-cli-missing" ? "steps-cli-missing"
+      : reason === "backend-not-logged-in" ? "steps-not-logged-in"
+      : reason === "stop-failed" ? "steps-stopfailed"
+      : (dev ? "steps-dev" : "steps-packaged");
     document.getElementById(which).hidden = false;
+    // The actual captured tail of nh start's own output, when there is one —
+    // this is what makes the failure REAL rather than a symbolic reason code.
+    if (detail) {
+      document.getElementById("detail-body").textContent = detail;
+      document.getElementById("detail-text").hidden = false;
+    }
 
     // Retry can take ~20s (probe + spawn wait) and further clicks are ignored,
     // so without this it reads as a dead button. aria-disabled + aria-live keeps

@@ -322,10 +322,12 @@ class Scheduler:
                     self._on_event("quota_pause",
                                    f"pool paused until {resets.isoformat()}")
         except Exception as exc:  # noqa: BLE001 — one task must not kill the pool
-            import sys, traceback
-            print(f"[scheduler] task {task.id[:8]} crashed: {exc}", file=sys.stderr, flush=True)
-            traceback.print_exc(file=sys.stderr)
-            log.warning("task %s crashed in pool: %s", task.id[:8], exc)
+            # logging only — a bare print/traceback to stderr raises
+            # BrokenPipeError inside THIS except when the desktop parent that
+            # piped our stderr has crashed away (SCRUM-11), killing the pool
+            # worker the except exists to protect. logging.handleError swallows.
+            log.warning("task %s crashed in pool: %s", task.id[:8], exc,
+                        exc_info=True)
             self._on_event("task_error", f"{task.id[:8]}: {exc}")
             # Mark the task as FAILED so it doesn't stay stuck.
             try:
