@@ -1,0 +1,35 @@
+// SCRUM-42: while a bounded rebase round (SCRUM-41) is in flight, the Working
+// card's sub-status badge must say so instead of just re-showing the raw
+// pipeline status. Driven entirely by the `pr_conflict_rounds` context field
+// SCRUM-41 attaches to the task (surfaced on TaskSummaryOut) — never by
+// matching text in send_back_feedback entries.
+//
+// SCRUM-41's own default (wake.py's `max_pr_conflict_rounds` fallback) is 3;
+// the backend doesn't currently surface the operator-configured bound on the
+// list payload, so this is a documented fallback, not a guess at the round
+// count itself (which IS real, server-computed data).
+export const DEFAULT_MAX_PR_CONFLICT_ROUNDS = 3;
+
+// Returns null when no conflict cycle is active (rounds falsy — covers both
+// "never conflicted" and the watcher's post-MERGEABLE reset to 0), so callers
+// can cleanly fall back to the plain status badge.
+export function conflictRoundLabel(task) {
+  const rounds = task?.pr_conflict_rounds;
+  if (!rounds) return null;
+  const max = task?.max_pr_conflict_rounds || DEFAULT_MAX_PR_CONFLICT_ROUNDS;
+  return `resolving merge conflict — round ${rounds}/${max}`;
+}
+
+// The badge shows only while the task is actually back IN the pipeline for the
+// rebase. Once the push lands and the task returns to awaiting_approval,
+// `pr_conflict_rounds` stays >0 until the watcher's next tick confirms
+// MERGEABLE and resets it — during that window the card must read normally
+// (operator AC: no sticky badge in Review PR). Escalated/terminal states
+// render through their own lanes untouched.
+const BADGE_STATUSES = new Set([
+  "pending", "context", "planning", "implementing", "reviewing", "testing",
+]);
+
+export function showConflictBadge(task) {
+  return BADGE_STATUSES.has(task?.status) && !!conflictRoundLabel(task);
+}

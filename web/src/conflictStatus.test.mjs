@@ -1,0 +1,35 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  DEFAULT_MAX_PR_CONFLICT_ROUNDS, conflictRoundLabel, showConflictBadge,
+} from "./conflictStatus.js";
+
+// SCRUM-42: the badge is driven by SCRUM-41's pr_conflict_rounds context field
+// (surfaced on the summary payload), never by feedback-text matching.
+
+test("label renders round/max from real server data; falsy rounds -> null", () => {
+  assert.equal(
+    conflictRoundLabel({ pr_conflict_rounds: 2 }),
+    `resolving merge conflict — round 2/${DEFAULT_MAX_PR_CONFLICT_ROUNDS}`,
+  );
+  assert.equal(conflictRoundLabel({ pr_conflict_rounds: 0 }), null);
+  assert.equal(conflictRoundLabel({}), null);
+  assert.equal(conflictRoundLabel(undefined), null);
+});
+
+test("the watcher's post-MERGEABLE reset (rounds -> 0) clears the badge", () => {
+  assert.ok(showConflictBadge({ status: "implementing", pr_conflict_rounds: 1 }));
+  assert.equal(showConflictBadge({ status: "implementing", pr_conflict_rounds: 0 }), false);
+});
+
+test("badge shows only in pipeline statuses — never sticky in Review PR or terminal lanes", () => {
+  for (const status of ["pending", "context", "planning", "implementing", "reviewing", "testing"]) {
+    assert.ok(showConflictBadge({ status, pr_conflict_rounds: 1 }), status);
+  }
+  // The rebase push returns the task to awaiting_approval with rounds still >0
+  // until the watcher confirms MERGEABLE — the card must read normally there.
+  for (const status of ["awaiting_approval", "done", "failed", "escalated", "awaiting_input"]) {
+    assert.equal(showConflictBadge({ status, pr_conflict_rounds: 2 }), false, status);
+  }
+});

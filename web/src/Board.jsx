@@ -5,6 +5,7 @@ import { BOARD_LANES, routeTask, isWaiting, cardActivity } from "./boardLanes.js
 import { taskProgress } from "./taskProgress.js";
 import { topPrioritised } from "./laneView.js";
 import { partitionAnswerLane } from "./answerLane.js";
+import { showConflictBadge, conflictRoundLabel } from "./conflictStatus.js";
 
 // 5B: how many cards a collapsible lane shows before the expand arrow. 4 keeps
 // every lane visible without vertical scroll on a typical viewport; the count
@@ -353,6 +354,11 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClic
         {task.cancelled && <span className="card-cancelled-badge">cancelled</span>}
         {showSubStatus && (
           <span className={`card-substatus substatus-${task.status}`}>{task.status}</span>
+        )}
+        {showConflictBadge(task) && (
+          <span className="card-conflict-badge" title="A sibling PR merged first; the coder is rebasing this branch onto main">
+            {conflictRoundLabel(task)}
+          </span>
         )}
         {task.attempt_count > 0 && (
           <span className="card-attempts">

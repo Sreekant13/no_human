@@ -1301,3 +1301,21 @@ async def test_task_detail_carries_claimed_from_scheduler(client, store):
         assert r1.json()["claimed"] is True
     finally:
         del fastapi_app.state.scheduler
+
+
+@pytest.mark.asyncio
+async def test_summary_carries_pr_conflict_rounds_from_context(client, store):
+    """SCRUM-42: the card's 'resolving merge conflict' badge is driven by the
+    summary's pr_conflict_rounds mirror of SCRUM-41's context key — never by
+    feedback-text matching. Absent key -> 0."""
+    a = Task.new("conflicting", repo_path="/tmp/x")
+    a.context = {"pr_conflict_rounds": 2}
+    await store.create_task(a)
+    b = Task.new("clean", repo_path="/tmp/x")
+    await store.create_task(b)
+
+    r = await client.get("/api/tasks")
+    assert r.status_code == 200
+    by_id = {t["id"]: t for t in r.json()}
+    assert by_id[a.id]["pr_conflict_rounds"] == 2
+    assert by_id[b.id]["pr_conflict_rounds"] == 0
