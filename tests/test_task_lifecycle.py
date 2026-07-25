@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from click.testing import CliRunner
 from no_human.cli.commands import cli
 from no_human.core.db import Store
 from no_human.core.task import Task, TaskStatus
+from no_human.profile import ProjectProfile
 
 
 # --------------------------------------------------------------------------- #
@@ -274,6 +276,85 @@ def test_task_add_rejects_a_linked_repo_that_is_not_a_checkout(tmp_path, monkeyp
     assert result.exit_code == 1
     assert "not a git repo" in result.output
     assert "metrics-core-service" in result.output
+
+
+# --------------------------------------------------------------------------- #
+# nh task add — repo default budgets (SCRUM-48)                                #
+# --------------------------------------------------------------------------- #
+
+def _created_task_id(output: str) -> str:
+    match = re.search(r"created task ([0-9a-f]{8})", output)
+    assert match, f"no 'created task <id>' line in output:\n{output}"
+    return match.group(1)
+
+
+def test_task_add_applies_repo_default_budgets(tmp_path, monkeypatch):
+    """SCRUM-48: `nh task add` must merge repo default budgets in, same as
+    the web create path (api/app.py) and the Jira poller already do."""
+    db = tmp_path / "test.db"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    async def _seed():
+        async with Store(db) as s:
+            await s.upsert_profile(ProjectProfile(
+                repo_path=str(repo.resolve()),
+                default_attempt_tokens=6_000_000,
+                default_lifetime_tokens=16_000_000,
+            ))
+    asyncio.run(_seed())
+
+    runner = _make_runner(db, monkeypatch)
+    result = runner.invoke(cli, [
+        "task", "add", "--title", "Heavy repo task",
+        "--repo", str(repo), "--no-grill", "--no-run",
+    ], catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    task_id = _created_task_id(result.output)
+    task = _get_task(db, task_id)
+    assert task.config["attempt_tokens"] == 6_000_000
+    assert task.config["lifetime_tokens"] == 16_000_000
+
+
+def test_task_add_explicit_config_overrides_repo_defaults(tmp_path, monkeypatch):
+    """An explicit key already on the task's config by the time `task add`
+    creates it (e.g. a future explicit-budget flag) must survive the
+    repo-defaults merge untouched, while an unset key still gets filled in."""
+    db = tmp_path / "test.db"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    async def _seed():
+        async with Store(db) as s:
+            await s.upsert_profile(ProjectProfile(
+                repo_path=str(repo.resolve()),
+                default_attempt_tokens=6_000_000,
+                default_lifetime_tokens=16_000_000,
+            ))
+    asyncio.run(_seed())
+
+    from no_human.core.task import Task as TaskCls
+    orig_new = TaskCls.new
+
+    def _new_with_explicit_override(*a, **kw):
+        t = orig_new(*a, **kw)
+        t.config["attempt_tokens"] = 999
+        return t
+
+    monkeypatch.setattr(TaskCls, "new", _new_with_explicit_override)
+
+    runner = _make_runner(db, monkeypatch)
+    result = runner.invoke(cli, [
+        "task", "add", "--title", "Override task",
+        "--repo", str(repo), "--no-grill", "--no-run",
+    ], catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    task_id = _created_task_id(result.output)
+    task = _get_task(db, task_id)
+    assert task.config["attempt_tokens"] == 999            # explicit wins, not clobbered
+    assert task.config["lifetime_tokens"] == 16_000_000    # untouched key still gets the default
 
 
 # --------------------------------------------------------------------------- #
