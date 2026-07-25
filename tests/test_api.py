@@ -690,6 +690,100 @@ async def test_resume_clears_blocker_and_implements(client, store):
     assert fresh.context.get("survivor") == 1  # context untouched by column write
 
 
+# --------------------------------------------------------------------------- #
+# POST /api/tasks/{id}/shipped (SCRUM-56)                                      #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [
+    TaskStatus.AWAITING_APPROVAL, TaskStatus.ESCALATED, TaskStatus.FAILED,
+])
+async def test_shipped_transitions_from_each_allowed_status(client, store, status):
+    t = await _seed_task(store, status=status)
+    t.blocker = {"category": "AMBIGUITY", "question": "?"}
+    await store.update_task(t)
+
+    r = await client.post(f"/api/tasks/{t.id}/shipped",
+                           json={"sha": "abc1234", "note": "merged by hand"})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["status"] == "done"
+
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.DONE
+    assert fresh.blocker is None
+
+
+@pytest.mark.asyncio
+async def test_shipped_records_human_merged_event_with_sha_and_note_verbatim(client, store):
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    r = await client.post(f"/api/tasks/{t.id}/shipped",
+                           json={"sha": "deadbeef1234", "note": "shipped via PR #531"})
+    assert r.status_code == 200, r.text
+
+    events = await store.list_events(t.id)
+    merged = [e for e in events if e.get("kind") == "human_merged"]
+    assert len(merged) == 1
+    assert merged[0]["sha"] == "deadbeef1234"
+    assert merged[0]["note"] == "shipped via PR #531"
+
+
+@pytest.mark.asyncio
+async def test_shipped_note_is_optional(client, store):
+    t = await _seed_task(store, status=TaskStatus.FAILED)
+    r = await client.post(f"/api/tasks/{t.id}/shipped", json={"sha": "abc1234"})
+    assert r.status_code == 200, r.text
+    events = await store.list_events(t.id)
+    merged = [e for e in events if e.get("kind") == "human_merged"]
+    assert merged[0]["sha"] == "abc1234"
+    assert merged[0]["note"] is None
+
+
+@pytest.mark.asyncio
+async def test_shipped_already_done_is_409(client, store):
+    t = await _seed_task(store, status=TaskStatus.DONE)
+    r = await client.post(f"/api/tasks/{t.id}/shipped", json={"sha": "abc1234"})
+    assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_shipped_cancelled_task_is_409(client, store):
+    t = await _seed_task(store, status=TaskStatus.FAILED)
+    t.context = {"cancel_reason": "Cancelled from board"}
+    await store.update_task(t)
+    r = await client.post(f"/api/tasks/{t.id}/shipped", json={"sha": "abc1234"})
+    assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_shipped_wrong_status_is_409(client, store):
+    t = await _seed_task(store, status=TaskStatus.IMPLEMENTING)
+    r = await client.post(f"/api/tasks/{t.id}/shipped", json={"sha": "abc1234"})
+    assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_shipped_empty_sha_is_400(client, store):
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    r = await client.post(f"/api/tasks/{t.id}/shipped", json={"sha": "   "})
+    assert r.status_code == 400
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.AWAITING_APPROVAL  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_shipped_404(client):
+    r = await client.post("/api/tasks/ghost/shipped", json={"sha": "abc1234"})
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_shipped_missing_sha_422(client, store):
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    r = await client.post(f"/api/tasks/{t.id}/shipped", json={})
+    assert r.status_code == 422
+
+
 def test_task_summary_marks_operator_cancelled_tasks():
     """A cancelled task ends FAILED but carries context.cancel_reason; the API
     surfaces `cancelled` so Stats can keep it out of the success-rate denominator
