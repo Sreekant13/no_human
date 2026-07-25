@@ -16,6 +16,7 @@ Orchestrator in a push-proof sandbox.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import subprocess
@@ -26,6 +27,8 @@ from typing import Any
 import yaml
 
 from ..history.extractor import Transcript
+
+log = logging.getLogger(__name__)
 
 NORTHSTAR_DIR = Path(__file__).resolve().parents[3] / "eval" / "northstar_tasks"
 # The raw built corpus contains VERBATIM operator conversations (titles,
@@ -249,6 +252,26 @@ def spec_project_name(spec: "BenchTask") -> str:
     return Path(spec.spec_repo_path).name
 
 
+def is_resolvable(spec: "BenchTask") -> bool:
+    """Whether *spec*'s repo will actually run HERE: marked ``runnable``, its
+    ``repo.path`` (already translated through the repo map by
+    ``load_bench_tasks``) is absolute, and it is a real git checkout.
+
+    Deliberately the same structural test as the first three checks in
+    ``check_repo_map`` (absolute, exists, has ``.git``) MINUS the pin probe:
+    this answers "can we even attempt this spec", not "is it verified against
+    the exact recorded commit" — the pin check needs a subprocess per spec and
+    exists to catch a wrong-but-real checkout, not to gate selection.
+    """
+    if not spec.runnable:
+        return False
+    raw = str(spec.repo.get("path") or "").strip()
+    if not raw:
+        return False
+    p = Path(raw)
+    return p.is_absolute() and p.is_dir() and (p / ".git").exists()
+
+
 def quick_cell(spec: "BenchTask") -> tuple[str, bool, bool, str]:
     """The coverage cell a spec belongs to for the `--quick` iteration tier:
     project × runnable × expect_escalation × original-size bucket.
@@ -263,7 +286,8 @@ def quick_cell(spec: "BenchTask") -> tuple[str, bool, bool, str]:
 
 
 def select_quick_subset(specs: list["BenchTask"]) -> list["BenchTask"]:
-    """One representative per coverage cell — the stratified `--quick` tier.
+    """One RESOLVABLE representative per coverage cell — the stratified
+    `--quick` tier.
 
     Deterministic and input-order independent (fastest original wall clock in
     the cell, spec id as tie-break), so quick runs are comparable to EACH
@@ -272,16 +296,33 @@ def select_quick_subset(specs: list["BenchTask"]) -> list["BenchTask"]:
     read as regressions. Guard against overfitting to the fixed picks is the
     full-core gate, which every publish still has to pass — a quick card is
     refused as baseline by the existing corpus-coverage machinery.
+
+    Within a cell, only ``is_resolvable`` members are candidates: picking an
+    unresolvable spec would pin the tier's one representative to something
+    that is guaranteed to skip, silently shrinking `ran` while `total` still
+    counts it. A cell whose EVERY member is unresolvable is honestly
+    unmeasurable on this machine — it is dropped from the tier (never
+    silently: a warning names the cell, the reason, and how many specs were
+    dropped) rather than falling back to an unresolvable pick.
     """
-    by_cell: dict[tuple, "BenchTask"] = {}
+    by_cell: dict[tuple, list["BenchTask"]] = {}
     for spec in specs:
-        cell = quick_cell(spec)
-        best = by_cell.get(cell)
-        key = (float((spec.original or {}).get("wall_clock_s", 0) or 0), spec.id)
-        if best is None or key < (
-                float((best.original or {}).get("wall_clock_s", 0) or 0), best.id):
-            by_cell[cell] = spec
-    return sorted(by_cell.values(), key=lambda s: s.id)
+        by_cell.setdefault(quick_cell(spec), []).append(spec)
+
+    def sort_key(s: "BenchTask") -> tuple[float, str]:
+        return (float((s.original or {}).get("wall_clock_s", 0) or 0), s.id)
+
+    selected: list["BenchTask"] = []
+    for cell, members in by_cell.items():
+        resolvable = [s for s in members if is_resolvable(s)]
+        if not resolvable:
+            log.warning(
+                "quick tier: all specs in cell %s are unresolvable — "
+                "dropping %d spec(s): %s",
+                cell, len(members), ", ".join(s.id for s in members))
+            continue
+        selected.append(min(resolvable, key=sort_key))
+    return sorted(selected, key=lambda s: s.id)
 
 
 def remap_repo_path(repo_path: str, mapping: dict[str, str]) -> str:

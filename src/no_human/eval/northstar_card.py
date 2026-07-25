@@ -285,7 +285,7 @@ MAX_UNMEASURED_FRACTION = 0.2
 MIN_CORPUS_LOADED_FRACTION = 0.8
 
 
-def corpus_shortfall(card: NorthStarCard) -> str:
+def corpus_shortfall(card: NorthStarCard, available_override: int = 0) -> str:
     """Why this run's spec set is too small a slice of the corpus, or ``""``.
 
     Compares LOADED against AVAILABLE, which is the only comparison that
@@ -296,8 +296,14 @@ def corpus_shortfall(card: NorthStarCard) -> str:
     Pointing ``--specs-dir`` at a smaller corpus is NOT an escape hatch — the
     available count is read from the canonical directory regardless, so an
     11-spec scratch run against a 55-spec corpus still refuses "11 of 55".
+
+    ``available_override`` is the RUNTIME-ONLY tier denominator for `--quick`
+    (SCRUM-43): the run-time gate grades a quick run against its own expected
+    tier, but the override is never stored on the card — `publish_refusals`
+    always calls this with the card's full-corpus count, which is what keeps
+    a quick card structurally unpublishable as the baseline.
     """
-    available = card.corpus_available
+    available = available_override or card.corpus_available
     if not available or card.total >= available * MIN_CORPUS_LOADED_FRACTION:
         return ""
     return (
@@ -402,7 +408,8 @@ class NorthStarGate:
 def northstar_gate(current: NorthStarCard,
                    previous: NorthStarCard | None, *,
                    max_ratio_regression: float = 0.5,
-                   max_success_drop: float = 0.0) -> NorthStarGate:
+                   max_success_drop: float = 0.0,
+                   tier_expected: int = 0) -> NorthStarGate:
     """Block a key change when the bench regresses vs the previous run.
 
     - success rate must not drop by more than ``max_success_drop`` (default:
@@ -465,7 +472,12 @@ def northstar_gate(current: NorthStarCard,
     """
     reasons: list[str] = []
 
-    shortfall = corpus_shortfall(current)
+    # tier_expected (SCRUM-43): the runtime denominator for a --quick run —
+    # the tier's own expected size, computed from the canonical corpus and
+    # NEVER stored on the card. Publishing still grades the card against the
+    # full corpus (publish_refusals below), so a full-tier quick run passes
+    # THIS gate as iteration signal yet remains unpublishable as baseline.
+    shortfall = corpus_shortfall(current, available_override=tier_expected)
     if shortfall:
         reasons.append(shortfall)
 
