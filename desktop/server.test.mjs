@@ -401,6 +401,24 @@ test("ensureServer: failure-window capture still classifies real spawn output (d
     `expected the captured diagnosis in detail, got: ${state.detail}`);
 });
 
+test("ensureServer: a silent fast non-zero exit is labeled backend-exited, not spawn-timeout", async () => {
+  // No output at all, so classifyBackendFailure(text) returns null and the
+  // reason falls through to the raw race outcome. Uses a LARGE
+  // spawnTimeoutMs: if the race still keyed off the old fallback (or 'close'
+  // never fired), this assertion would fail only after a ~20s hang — so a
+  // fast pass here proves the race resolves on 'close' within milliseconds.
+  const dir = mkdtempSync(join(tmpdir(), "nhexit-"));
+  const fake = join(dir, "nh");
+  writeFileSync(fake, "#!/bin/sh\nexit 3\n");
+  chmodSync(fake, 0o755);
+  const state = await ensureServer({
+    origin: "http://127.0.0.1:1", env: { NH_BIN: fake }, nhArgs: [],
+    spawnTimeoutMs: 20000 });
+  assert.equal(state.status, "failed");
+  assert.equal(state.reason, "backend-exited");
+  assert.equal(state.detail, "", "silent exit must not fabricate a diagnosis");
+});
+
 test("ensureServer: stops capturing once confirmed up, but keeps draining so the running server never EPIPEs", async () => {
   // A shell script, not node: on a broken pipe the shell's default SIGPIPE
   // action TERMINATES it on the very next write — Node silently swallows

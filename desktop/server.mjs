@@ -289,9 +289,13 @@ export async function ensureServer({
     child.once("error", () => resolve("spawn-error")));
   // A backend-check refusal (`sys.exit(2)`) exits almost immediately — racing
   // its exit (not just the port) means Retry doesn't sit for the full
-  // spawnTimeoutMs before showing the real reason.
+  // spawnTimeoutMs before showing the real reason. This races 'close', not
+  // 'exit': 'exit' fires before the stdio pipes finish flushing, so a fast
+  // non-zero exit could resolve the race before capture.text() has the
+  // diagnosis. 'close' fires once both pipes have drained, guaranteeing the
+  // captured output is complete before classifyBackendFailure runs below.
   const spawnExited = new Promise((resolve) =>
-    child.once("exit", (code, signal) => {
+    child.once("close", (code, signal) => {
       if (code !== 0 || signal) resolve("spawn-exited");
     }));
   const raced = await Promise.race(
@@ -306,7 +310,9 @@ export async function ensureServer({
     const cause = classifyBackendFailure(text);
     const reason = cause === "cli-missing" ? "backend-cli-missing"
       : cause === "not-logged-in" ? "backend-not-logged-in"
-      : raced === "spawn-error" ? "spawn-error" : "spawn-timeout";
+      : raced === "spawn-error" ? "spawn-error"
+      : raced === "spawn-exited" ? "backend-exited"
+      : "spawn-timeout";
     return { status: "failed", reason, detail: tailDetail(text), child };
   }
   // Confirmed up (SCRUM-49): capture is only needed for the failure window
