@@ -1,0 +1,20 @@
+{
+  "class": "spec-miss",
+  "file": "src/no_human/cli/commands.py",
+  "hunk_lines": [
+    3283,
+    3289
+  ],
+  "description": "The AC pins 'disabled config keeps nh start byte-identical in behavior'. The 'preload for a faster first tick' moves load_env_var(JIRA_API_TOKEN) OUTSIDE the enabled gate: every nh start now reads the credential file and exports the Jira token into the server process env even with the integration off \u2014 an AC violation with a credential-hygiene smell. The on/off tests mock the poller, not the env, so the suite stays green.",
+  "keywords": [
+    "load_env_var",
+    "enabled",
+    "gate",
+    "credential",
+    "preload",
+    "disabled",
+    "byte-identical"
+  ],
+  "planted_by": "supervising-session",
+  "date": "2026-07-25"
+}

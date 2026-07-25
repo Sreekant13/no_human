@@ -1,0 +1,156 @@
+diff --git a/src/no_human/cli/commands.py b/src/no_human/cli/commands.py
+index 66c7609..e5c1667 100644
+--- a/src/no_human/cli/commands.py
++++ b/src/no_human/cli/commands.py
+@@ -543,6 +543,11 @@ def task_add(source, title, repo, description, criteria, external_id, kind, link
+             t.kind = verdict.kind.value
+             if backend:
+                 t.config["backend"] = backend
++            # SCRUM-48: repo default budgets apply here too, not just web create —
++            # an explicit key already on t.config (e.g. set by grill/intake) wins.
++            from ..profile import ProjectProfile, apply_default_task_config
++            prof = await store.get_profile(t.repo_path) or ProjectProfile.load(t.repo_path)
++            t.config = apply_default_task_config(prof, t.config)
+             await store.create_task(t)
+             console.print(f"[green]created task[/] [bold]{t.id[:8]}[/] — {t.title}")
+             console.print(f"  [magenta]kind:[/] {t.kind}  [dim]({verdict.reason})[/]")
+@@ -556,8 +561,6 @@ def task_add(source, title, repo, description, criteria, external_id, kind, link
+             # active policy — a proven profile with profile.auto_confirm_proven
+             # on IS usable even without a human confirm click, so warning then
+             # would be a lie (it drove ca23ce68 to a clean PR while this warned).
+-            from ..profile import ProjectProfile
+-            prof = await store.get_profile(t.repo_path) or ProjectProfile.load(t.repo_path)
+             auto = bool(config.data.get("profile", {}).get("auto_confirm_proven", False))
+             if not prof or not prof.usable_under_policy(auto_confirm_proven=auto):
+                 console.print(
+@@ -2736,9 +2739,12 @@ def review(target, repo):
+         async with Store(config.db_path) as store:
+             if is_pr_url:
+                 from ..core.task import Task
++                from ..profile import apply_default_task_config
+                 t = Task.new(f"Review {target}",
+                              repo_path=str(Path(repo).resolve()),
+                              description=target, kind="code_review")
++                profile = await store.get_profile(t.repo_path)
++                t.config = apply_default_task_config(profile, t.config)
+                 await store.create_task(t)
+                 console.print(f"[green]queued code review[/] [bold]{t.id[:8]}[/] "
+                               f"— {target}")
+@@ -2803,8 +2809,11 @@ def investigate(question, repo, show_id):
+                               "--show <task_id>[/]")
+                 sys.exit(1)
+             from ..core.task import Task
++            from ..profile import apply_default_task_config
+             t = Task.new(question, repo_path=str(Path(repo).resolve()),
+                          kind="investigation")
++            profile = await store.get_profile(t.repo_path)
++            t.config = apply_default_task_config(profile, t.config)
+             await store.create_task(t)
+             console.print(f"[green]investigating[/] [bold]{t.id[:8]}[/] — {question}")
+             console.print("  read-only; produces a cited report (no PR, no test gate).")
+diff --git a/tests/test_task_lifecycle.py b/tests/test_task_lifecycle.py
+index 748e009..9f79165 100644
+--- a/tests/test_task_lifecycle.py
++++ b/tests/test_task_lifecycle.py
+@@ -6,6 +6,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import json
++import re
+ from pathlib import Path
+ 
+ import pytest
+@@ -15,6 +16,7 @@ from click.testing import CliRunner
+ from no_human.cli.commands import cli
+ from no_human.core.db import Store
+ from no_human.core.task import Task, TaskStatus
++from no_human.profile import ProjectProfile
+ 
+ 
+ # --------------------------------------------------------------------------- #
+@@ -276,6 +278,85 @@ def test_task_add_rejects_a_linked_repo_that_is_not_a_checkout(tmp_path, monkeyp
+     assert "metrics-core-service" in result.output
+ 
+ 
++# --------------------------------------------------------------------------- #
++# nh task add — repo default budgets (SCRUM-48)                                #
++# --------------------------------------------------------------------------- #
++
++def _created_task_id(output: str) -> str:
++    match = re.search(r"created task ([0-9a-f]{8})", output)
++    assert match, f"no 'created task <id>' line in output:\n{output}"
++    return match.group(1)
++
++
++def test_task_add_applies_repo_default_budgets(tmp_path, monkeypatch):
++    """SCRUM-48: `nh task add` must merge repo default budgets in, same as
++    the web create path (api/app.py) and the Jira poller already do."""
++    db = tmp_path / "test.db"
++    repo = tmp_path / "repo"
++    repo.mkdir()
++
++    async def _seed():
++        async with Store(db) as s:
++            await s.upsert_profile(ProjectProfile(
++                repo_path=str(repo.resolve()),
++                default_attempt_tokens=6_000_000,
++                default_lifetime_tokens=16_000_000,
++            ))
++    asyncio.run(_seed())
++
++    runner = _make_runner(db, monkeypatch)
++    result = runner.invoke(cli, [
++        "task", "add", "--title", "Heavy repo task",
++        "--repo", str(repo), "--no-grill", "--no-run",
++    ], catch_exceptions=False)
++
++    assert result.exit_code == 0, result.output
++    task_id = _created_task_id(result.output)
++    task = _get_task(db, task_id)
++    assert task.config["attempt_tokens"] == 6_000_000
++    assert task.config["lifetime_tokens"] == 16_000_000
++
++
++def test_task_add_explicit_config_overrides_repo_defaults(tmp_path, monkeypatch):
++    """An explicit key already on the task's config by the time `task add`
++    creates it (e.g. a future explicit-budget flag) must survive the
++    repo-defaults merge untouched, while an unset key still gets filled in."""
++    db = tmp_path / "test.db"
++    repo = tmp_path / "repo"
++    repo.mkdir()
++
++    async def _seed():
++        async with Store(db) as s:
++            await s.upsert_profile(ProjectProfile(
++                repo_path=str(repo.resolve()),
++                default_attempt_tokens=6_000_000,
++                default_lifetime_tokens=16_000_000,
++            ))
++    asyncio.run(_seed())
++
++    from no_human.core.task import Task as TaskCls
++    orig_new = TaskCls.new
++
++    def _new_with_explicit_override(*a, **kw):
++        t = orig_new(*a, **kw)
++        t.config["attempt_tokens"] = 999
++        return t
++
++    monkeypatch.setattr(TaskCls, "new", _new_with_explicit_override)
++
++    runner = _make_runner(db, monkeypatch)
++    result = runner.invoke(cli, [
++        "task", "add", "--title", "Override task",
++        "--repo", str(repo), "--no-grill", "--no-run",
++    ], catch_exceptions=False)
++
++    assert result.exit_code == 0, result.output
++    task_id = _created_task_id(result.output)
++    task = _get_task(db, task_id)
++    assert task.config["attempt_tokens"] == 999            # explicit wins, not clobbered
++    assert task.config["lifetime_tokens"] == 16_000_000    # untouched key still gets the default
++
++
+ # --------------------------------------------------------------------------- #
+ # Duplicate execution: the server's scheduler already claims the task          #
+ # --------------------------------------------------------------------------- #

@@ -1,0 +1,189 @@
+diff --git a/src/no_human/cli/commands.py b/src/no_human/cli/commands.py
+index 5862cd0..04d9db8 100644
+--- a/src/no_human/cli/commands.py
++++ b/src/no_human/cli/commands.py
+@@ -3267,8 +3267,59 @@ def start(host, port, workers, no_open):
+         "poll_interval": poll_interval,
+     }
+ 
++    # Build the server ourselves (instead of uvicorn.run) so we can run it in
++    # the same event loop as the Jira poll loop below — mirrors `serve`'s
++    # `await asyncio.gather(*coros)` shape without touching `serve` itself.
++    server = uvicorn.Server(uvicorn.Config(_app, host=host, port=port, log_level="warning"))
++
++    async def _go():
++        # Jira intake (SCRUM-21): write-back parity with `nh serve` — same
++        # opt-in flag, cadence parsing, and on_event print as the poller
++        # block there (reused verbatim, not extracted into a shared helper).
++        # A setup failure is caught so a misconfigured Jira integration never
++        # breaks `nh start`: it's opt-in and must degrade gracefully.
++        jira_task = None
++        jira_stop = None
++        jira_store = None
++        jira_cfg = (config.data.get("integrations") or {}).get("jira") or {}
++        # Preload the token so the first enabled tick starts instantly.
++        from ..config import load_env_var
++        load_env_var("JIRA_API_TOKEN")
++        if jira_cfg.get("enabled"):
++            try:
++                from ..intake.jira import JiraAdapter
++                from ..intake.jira_poll import JiraPoller
++                jira_secs = max(60, int((parse_duration(str(jira_cfg.get("poll_interval", "5m")))
++                                         or parse_duration("5m")).total_seconds()))
++                jira_store = await Store(config.db_path).connect()
++                poller = JiraPoller(
++                    JiraAdapter(config.data), jira_store, config=config.data,
++                    on_event=lambda k, t: console.print(f"[cyan]◆ {k}[/] {t}"))
++                console.print(f"[green]Jira intake[/] project={jira_cfg.get('project_key') or '?'} "
++                              f"poll={jira_secs}s")
++                jira_stop = asyncio.Event()
++                jira_task = asyncio.create_task(_jira_poll_loop(poller, jira_stop, jira_secs))
++            except Exception as exc:  # noqa: BLE001 — optional integration, never break `start`
++                console.print(f"[yellow]Jira intake failed to start[/] {exc}")
++                jira_task = jira_stop = None
++                if jira_store is not None:
++                    await jira_store.close()
++                    jira_store = None
++
++        try:
++            await server.serve()
++        finally:
++            if jira_task is not None:
++                jira_stop.set()
++                try:
++                    await asyncio.wait_for(jira_task, timeout=10)
++                except asyncio.TimeoutError:
++                    jira_task.cancel()
++            if jira_store is not None:
++                await jira_store.close()
++
+     try:
+-        uvicorn.run(_app, host=host, port=port, log_level="warning")
++        asyncio.run(_go())
+     finally:
+         _release_pid_lock()
+ 
+diff --git a/tests/test_cli_commands.py b/tests/test_cli_commands.py
+index d5dd336..cefff75 100644
+--- a/tests/test_cli_commands.py
++++ b/tests/test_cli_commands.py
+@@ -9,8 +9,10 @@ from __future__ import annotations
+ import asyncio
+ import json
+ from pathlib import Path
++from unittest.mock import AsyncMock, MagicMock
+ 
+ import pytest
++import uvicorn
+ from click.testing import CliRunner
+ 
+ from no_human.cli.commands import cli
+@@ -812,3 +814,108 @@ def test_burn_includes_the_REVIEWER_session(tmp_path, monkeypatch):
+     assert "spend=2,158,888" in out, result.output
+     # burn is the whole attempt. Drop the review group and this is 2,499,865.
+     assert "burn=2,593,349" in out, result.output
++
++
++# --------------------------------------------------------------------------- #
++# nh start — Jira poller parity with nh serve (SCRUM-21)                      #
++# --------------------------------------------------------------------------- #
++
++class _FakeUvicornServer:
++    """Stands in for uvicorn.Server so `nh start` tests never bind a socket."""
++
++    def __init__(self, config):
++        self.config = config
++
++    async def serve(self):
++        return None
++
++
++def _make_start_cfg(db_path: Path, *, jira_enabled: bool):
++    class _Cfg:
++        primary_model = "claude-sonnet-4-6"
++        review_model = "claude-sonnet-4-6"
++        data = {
++            "server": {"port": 8420},
++            "concurrency": {},
++            "integrations": {"jira": {
++                "enabled": jira_enabled,
++                "project_key": "SCRUM",
++                "poll_interval": "5m",
++            }},
++        }
++
++        def get(self, key, default=None):
++            return self.data.get(key, default)
++
++        def __getitem__(self, key):
++            return self.data[key]
++
++    _Cfg.db_path = db_path
++    return _Cfg()
++
++
++def _patch_start_scaffolding(monkeypatch, cfg):
++    import no_human.cli.commands as cmd_mod
++
++    # Never touch the real ~/.no_human/nh.pid or shell out for auth/CLI
++    # checks — the test only cares about the Jira-poller wiring.
++    monkeypatch.setattr(cmd_mod, "load_config", lambda: cfg)
++    monkeypatch.setattr(cmd_mod, "assert_subscription_mode", lambda **kw: None)
++    monkeypatch.setattr(cmd_mod, "_assert_backend_usable", lambda: None)
++    monkeypatch.setattr(cmd_mod, "_acquire_pid_lock", lambda: True)
++    monkeypatch.setattr(cmd_mod, "_release_pid_lock", lambda: None)
++    # `nh start` builds its own uvicorn.Server (instead of uvicorn.run) so it
++    # can run the Jira poll loop in the same event loop — fake it so the test
++    # never binds a real socket.
++    monkeypatch.setattr(uvicorn, "Server", _FakeUvicornServer)
++    return cmd_mod
++
++
++def test_start_runs_jira_poller_when_enabled(tmp_path, monkeypatch):
++    import no_human.intake.jira as jira_mod
++    import no_human.intake.jira_poll as jira_poll_mod
++
++    cfg = _make_start_cfg(tmp_path / "test.db", jira_enabled=True)
++    cmd_mod = _patch_start_scaffolding(monkeypatch, cfg)
++
++    mock_poller_instance = MagicMock()
++    mock_poller_cls = MagicMock(return_value=mock_poller_instance)
++    monkeypatch.setattr(jira_poll_mod, "JiraPoller", mock_poller_cls)
++    monkeypatch.setattr(jira_mod, "JiraAdapter", MagicMock())
++    # Stands in for the poller's polling loop being started — `nh serve` has
++    # no `JiraPoller.start()` either; both drive `poller.tick()` through this
++    # shared coroutine (verified: src/no_human/intake/jira_poll.py has no
++    # `start` method).
++    mock_poll_loop = AsyncMock(return_value=None)
++    monkeypatch.setattr(cmd_mod, "_jira_poll_loop", mock_poll_loop)
++
++    runner = CliRunner()
++    result = runner.invoke(cli, ["start", "--no-open", "--port", "8420"])
++
++    assert result.exit_code == 0, result.output
++    mock_poller_cls.assert_called_once()
++    mock_poll_loop.assert_called_once()
++    assert mock_poll_loop.call_args.args[0] is mock_poller_instance
++    assert "jira intake" in result.output.lower()
++
++
++def test_start_skips_jira_poller_when_disabled(tmp_path, monkeypatch):
++    import no_human.intake.jira as jira_mod
++    import no_human.intake.jira_poll as jira_poll_mod
++
++    cfg = _make_start_cfg(tmp_path / "test.db", jira_enabled=False)
++    cmd_mod = _patch_start_scaffolding(monkeypatch, cfg)
++
++    mock_poller_cls = MagicMock()
++    monkeypatch.setattr(jira_poll_mod, "JiraPoller", mock_poller_cls)
++    monkeypatch.setattr(jira_mod, "JiraAdapter", MagicMock())
++    mock_poll_loop = AsyncMock(return_value=None)
++    monkeypatch.setattr(cmd_mod, "_jira_poll_loop", mock_poll_loop)
++
++    runner = CliRunner()
++    result = runner.invoke(cli, ["start", "--no-open", "--port", "8420"])
++
++    assert result.exit_code == 0, result.output
++    mock_poller_cls.assert_not_called()
++    mock_poll_loop.assert_not_called()
++    assert "jira" not in result.output.lower()

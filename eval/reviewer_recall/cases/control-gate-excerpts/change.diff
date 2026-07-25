@@ -1,0 +1,352 @@
+diff --git a/src/no_human/core/orchestrator.py b/src/no_human/core/orchestrator.py
+index a2aeb7b..7f1a05a 100644
+--- a/src/no_human/core/orchestrator.py
++++ b/src/no_human/core/orchestrator.py
+@@ -2713,6 +2713,9 @@ class Orchestrator:
+                     detail = f"tests failed: {test_result.summary}"
+                     if failing_tests:
+                         detail += " — " + ", ".join(failing_tests)
++                    excerpt_block = getattr(test_result, "traceback_block", "") or ""
++                    if excerpt_block:
++                        detail += "\n" + excerpt_block
+                     if is_stuck:
+                         self.emit("stuck", "same failure signature repeated; resetting context")
+                     stuck_note = stuck.stuck_reason
+diff --git a/src/no_human/testing/runner.py b/src/no_human/testing/runner.py
+index f8365bd..42046f4 100644
+--- a/src/no_human/testing/runner.py
++++ b/src/no_human/testing/runner.py
+@@ -33,6 +33,7 @@ class TestRunResult:
+     output: str
+     invocation_error: bool = False
+     failing_tests: list[str] = field(default_factory=list)
++    traceback_excerpts: dict[str, str] = field(default_factory=dict)
+ 
+     @property
+     def summary(self) -> str:
+@@ -40,6 +41,11 @@ class TestRunResult:
+             return "no tests run"
+         return f"{'PASS' if self.ok else 'FAIL'}: {self.passed} passed, {self.failed} failed, {self.errors} errors"
+ 
++    @property
++    def traceback_block(self) -> str:
++        """Human-readable, untruncated rendering of ``traceback_excerpts``."""
++        return render_traceback_excerpts(self.traceback_excerpts)
++
+ 
+ def _dir_has_python(d: Path) -> bool:
+     """True if *d* contains at least one .py file (two levels deep)."""
+@@ -141,6 +147,96 @@ def _pytest_failing_tests(output: str) -> list[str]:
+     return seen
+ 
+ 
++# pytest's FAILURES section prints one block per failing test, headed by a
++# rule of underscores around the (short) test name:
++#   _________________________ test_y _________________________
++# and terminated either by the next such header or by a "=" bar line (e.g.
++# the trailing "===== short test summary info =====" / "===== 2 failed in
++# 1.2s ====="). SCRUM-40: the gate previously named only the failing test,
++# with no assertion detail — an escalation could not be triaged without a
++# live reproduction.
++_TRACEBACK_HEADER = re.compile(r"^_{3,}\s+(.+?)\s+_{3,}\s*$", re.M)
++_BAR_LINE = re.compile(r"^={3,}.*$", re.M)
++
++_EXCERPT_MAX_LINES = 40
++_EXCERPT_MAX_BYTES = 2048
++_EXCERPT_MAX_TESTS = 3
++
++
++def _short_test_name(node_id: str) -> str:
++    """``tests/test_x.py::TestC::test_y`` -> ``TestC.test_y``; a node id with
++    no ``::`` (shouldn't happen for a FAILED/ERROR line) is returned as-is."""
++    parts = node_id.split("::")
++    if len(parts) <= 1:
++        return node_id
++    return ".".join(parts[1:])
++
++
++def _cap_excerpt(text: str) -> str:
++    lines = text.strip("\n").splitlines()
++    truncated = len(lines) > _EXCERPT_MAX_LINES
++    capped = "\n".join(lines[:_EXCERPT_MAX_LINES])
++    if len(capped) > _EXCERPT_MAX_BYTES:
++        capped = capped[:_EXCERPT_MAX_BYTES]
++        truncated = True
++    if truncated:
++        capped += "\n… [truncated]"
++    return capped
++
++
++def _pytest_traceback_excerpts(
++    output: str, failing_tests: list[str],
++) -> dict[str, str]:
++    """Map each name in *failing_tests* to a capped excerpt of its FAILURES
++    block in *output*. Unmatched node ids (malformed/absent output) are
++    silently skipped — never raises. When more than ``_EXCERPT_MAX_TESTS``
++    tests match, keeps the ones with the largest (most diagnostic, by
++    uncapped line count) blocks, tiebroken by original failure order."""
++    if not failing_tests:
++        return {}
++    headers = list(_TRACEBACK_HEADER.finditer(output))
++    if not headers:
++        return {}
++    blocks: dict[str, str] = {}
++    for i, m in enumerate(headers):
++        name = m.group(1).strip()
++        start = m.end()
++        next_header_start = headers[i + 1].start() if i + 1 < len(headers) else len(output)
++        bar_match = _BAR_LINE.search(output, start, next_header_start)
++        end = bar_match.start() if bar_match else next_header_start
++        body = output[start:end]
++        if name not in blocks:  # first occurrence wins
++            blocks[name] = body
++
++    matched = [
++        (node_id, blocks[_short_test_name(node_id)])
++        for node_id in failing_tests
++        if _short_test_name(node_id) in blocks
++    ]
++    if not matched:
++        return {}
++
++    indexed = [(node_id, body, idx) for idx, (node_id, body) in enumerate(matched)]
++    if len(indexed) > _EXCERPT_MAX_TESTS:
++        indexed.sort(key=lambda t: (-len(t[1].strip("\n").splitlines()), t[2]))
++        indexed = indexed[:_EXCERPT_MAX_TESTS]
++        indexed.sort(key=lambda t: t[2])  # restore chronological order
++
++    return {node_id: _cap_excerpt(body) for node_id, body, _idx in indexed}
++
++
++def render_traceback_excerpts(excerpts: dict[str, str]) -> str:
++    """Human-readable, non-truncated rendering of *excerpts* for the
++    ``attempt_failed`` event text. Returns "" when empty so callers can
++    append conditionally, exactly like ``failing_tests``."""
++    if not excerpts:
++        return ""
++    parts = ["Traceback excerpts:"]
++    for name, excerpt in excerpts.items():
++        parts.append(f"\n——— {name} ———\n{excerpt}")
++    return "\n".join(parts)
++
++
+ # pytest-xdist's tmp-dir cleanup (TempPathFactory's session-scoped finalizer)
+ # runs at pytest_unconfigure time, AFTER the real summary line already
+ # printed. A worker (`popen-gw*`) racing another worker's rmdir of the shared
+@@ -515,7 +611,8 @@ def run_tests(
+         passed_r, failed_r, errors_r = _parse_test_output(cmd, output_r)
+         failing_tests_r = _pytest_failing_tests(output_r)
+         return TestRunResult(True, rc_r == 0, passed_r, failed_r, errors_r,
+-                             cmd, output_r[-8000:], failing_tests=failing_tests_r)
++                             cmd, output_r[-8000:], failing_tests=failing_tests_r,
++                             traceback_excerpts=_pytest_traceback_excerpts(output_r, failing_tests_r))
+     if not ok and _is_invocation_error(rc, output, passed, failed, errors):
+         retry_cmd = _fix_invocation(cmd, output, repo_path)
+         if retry_cmd and retry_cmd != cmd:
+@@ -532,14 +629,17 @@ def run_tests(
+                 return TestRunResult(True, False, passed2, failed2, errors2,
+                                      retry_cmd, output2[-8000:],
+                                      invocation_error=True)
++            failing_tests2 = _pytest_failing_tests(output2)
+             return TestRunResult(True, ok2, passed2, failed2, errors2,
+                                  retry_cmd, output2[-8000:],
+-                                 failing_tests=_pytest_failing_tests(output2))
++                                 failing_tests=failing_tests2,
++                                 traceback_excerpts=_pytest_traceback_excerpts(output2, failing_tests2))
+         # No fixable retry — mark as invocation error
+         return TestRunResult(True, False, passed, failed, errors,
+                              cmd, output[-8000:], invocation_error=True)
+     return TestRunResult(True, ok, passed, failed, errors, cmd, output[-8000:],
+-                         failing_tests=failing_tests)
++                         failing_tests=failing_tests,
++                         traceback_excerpts=_pytest_traceback_excerpts(output, failing_tests))
+ 
+ 
+ @dataclass
+diff --git a/tests/test_runner.py b/tests/test_runner.py
+index 2641cd2..a23be82 100644
+--- a/tests/test_runner.py
++++ b/tests/test_runner.py
+@@ -12,6 +12,8 @@ from no_human.testing.runner import (
+     _lint_supports_file_args,
+     _parse_pytest,
+     _pytest_failing_tests,
++    _pytest_traceback_excerpts,
++    render_traceback_excerpts,
+     _is_teardown_race,
+     run_tests,
+ )
+@@ -740,3 +742,145 @@ def test_same_tree_run_does_not_inject_src(tmp_path):
+     result = run_tests(repo, str(script), env={"PYTHONPATH": ""})
+ 
+     assert "PP=[]" in result.output
++
++
++# --- SCRUM-40: traceback excerpts ------------------------------------------
++
++def _make_failure_block(name, n_lines, line_text="line"):
++    header = f"_____ {name} _____\n"
++    body = "".join(f"    {line_text} {i}\n" for i in range(n_lines))
++    return header + body
++
++
++def test_traceback_excerpt_single_failure():
++    output = (
++        "=================================== FAILURES ===================================\n"
++        "_________________________________ test_y _________________________________\n"
++        "\n"
++        "    def test_y():\n"
++        ">       assert 1 == 2\n"
++        "E       AssertionError: assert 1 == 2\n"
++        "\n"
++        "tests/test_x.py:5: AssertionError\n"
++        "=========================== short test summary info ============================\n"
++        "FAILED tests/test_x.py::test_y - AssertionError: assert 1 == 2\n"
++        "1 failed in 0.10s\n"
++    )
++    failing_tests = ["tests/test_x.py::test_y"]
++
++    excerpts = _pytest_traceback_excerpts(output, failing_tests)
++
++    assert set(excerpts) == {"tests/test_x.py::test_y"}
++    assert "AssertionError: assert 1 == 2" in excerpts["tests/test_x.py::test_y"]
++
++
++def test_traceback_excerpts_cap_to_three_largest_first():
++    """5 failing tests, differing block sizes: only the 3 largest (by
++    uncapped line count) survive, tiebroken by original failure order, but
++    the RESULT preserves chronological order."""
++    failing_tests = [f"tests/test_x.py::test_{c}" for c in "abcde"]
++    sizes = {"test_a": 3, "test_b": 10, "test_c": 10, "test_d": 6, "test_e": 8}
++    output = (
++        "================================== FAILURES ===================================\n"
++        + "".join(_make_failure_block(name, n) for name, n in sizes.items())
++        + "=========================== short test summary info ============================\n"
++        + "5 failed in 1.0s\n"
++    )
++
++    excerpts = _pytest_traceback_excerpts(output, failing_tests)
++
++    assert list(excerpts.keys()) == [
++        "tests/test_x.py::test_b",
++        "tests/test_x.py::test_c",
++        "tests/test_x.py::test_e",
++    ]
++    assert "tests/test_x.py::test_a" not in excerpts
++    assert "tests/test_x.py::test_d" not in excerpts
++
++
++def test_traceback_excerpt_capped_at_40_lines_and_2kb():
++    output = (
++        _make_failure_block("test_big", 60, line_text="x" * 60)
++        + "=========================== short test summary info ============================\n"
++        + "1 failed in 1.0s\n"
++    )
++    failing_tests = ["tests/test_x.py::test_big"]
++
++    excerpts = _pytest_traceback_excerpts(output, failing_tests)
++    excerpt = excerpts["tests/test_x.py::test_big"]
++
++    assert len(excerpt.splitlines()) <= 41  # 40 lines + truncation marker
++    assert len(excerpt) <= 2048 + len("\n… [truncated]")
++    assert "truncated" in excerpt
++
++
++def test_traceback_excerpts_empty_on_passing_output():
++    assert _pytest_traceback_excerpts("5 passed in 1.0s\n", []) == {}
++
++
++def test_traceback_excerpts_malformed_output_returns_empty():
++    output = "1 failed in 0.1s\nFAILED tests/test_x.py::test_y - boom\n"
++    failing_tests = ["tests/test_x.py::test_y"]
++
++    assert _pytest_traceback_excerpts(output, failing_tests) == {}
++
++
++def test_traceback_excerpt_maps_class_and_param_names():
++    output = (
++        "_____ TestC.test_y _____\n"
++        "    assert False\n"
++        "_____ test_y[p] _____\n"
++        "    assert False\n"
++        "=========================== short test summary info ============================\n"
++        "2 failed in 1.0s\n"
++    )
++    failing_tests = [
++        "tests/test_x.py::TestC::test_y",
++        "tests/test_x.py::test_y[p]",
++    ]
++
++    excerpts = _pytest_traceback_excerpts(output, failing_tests)
++
++    assert set(excerpts) == set(failing_tests)
++
++
++def test_render_traceback_block_is_human_readable_and_untruncated():
++    excerpts = {
++        "tests/test_x.py::test_y": "line1\nline2\nline3",
++    }
++
++    rendered = render_traceback_excerpts(excerpts)
++
++    assert rendered.startswith("Traceback excerpts:")
++    assert "tests/test_x.py::test_y" in rendered
++    assert "line1" in rendered and "line2" in rendered and "line3" in rendered
++    assert render_traceback_excerpts({}) == ""
++
++
++def test_run_tests_populates_traceback_excerpts(tmp_path):
++    script = tmp_path / "fake_pytest.sh"
++    script.write_text(
++        "#!/bin/sh\n"
++        "cat <<'PYEOF'\n"
++        "=================================== FAILURES ===================================\n"
++        "_________________________________ test_y _________________________________\n"
++        "\n"
++        "    def test_y():\n"
++        ">       assert 1 == 2\n"
++        "E       AssertionError: assert 1 == 2\n"
++        "\n"
++        "tests/test_x.py:5: AssertionError\n"
++        "=========================== short test summary info ============================\n"
++        "FAILED tests/test_x.py::test_y - AssertionError: assert 1 == 2\n"
++        "1 failed in 0.10s\n"
++        "PYEOF\n"
++        "exit 1\n"
++    )
++    script.chmod(0o755)
++
++    result = run_tests(tmp_path, str(script))
++
++    assert result.failing_tests == ["tests/test_x.py::test_y"]
++    assert "tests/test_x.py::test_y" in result.traceback_excerpts
++    assert "AssertionError: assert 1 == 2" in result.traceback_excerpts["tests/test_x.py::test_y"]
++    assert "AssertionError: assert 1 == 2" in result.traceback_block
+diff --git a/tests/test_vcs.py b/tests/test_vcs.py
+index 5af4ac6..e2c1659 100644
+--- a/tests/test_vcs.py
++++ b/tests/test_vcs.py
+@@ -1,5 +1,6 @@
+ """Git ops + local PR-open path against a real bare repo. Never merges."""
+ 
++import os
+ import subprocess
+ from pathlib import Path
+ 
+@@ -41,7 +42,15 @@ def test_branch_and_commit_under_agent_identity(repo_with_bare_remote):
+     assert result.branch == "no-human/abc123"
+     author = subprocess.run(["git", "log", "-1", "--format=%an <%ae>"],
+                             cwd=repo.path, capture_output=True, text=True).stdout.strip()
+-    assert author == "no_human <no-human@acme.com>"
++    # This test fails ONLY inside coder/reviewer session environments (3 tasks
++    # burned on it on 2026-07-25) and passes in every local reproduction. If it
++    # fails again, the message must carry enough env context to root-cause
++    # without a live repro (SCRUM-40's excerpt capture surfaces it).
++    git_env = {k: v for k, v in os.environ.items()
++               if k.startswith(("GIT_", "HOME", "XDG_CONFIG"))}
++    assert author == "no_human <no-human@acme.com>", (
++        f"author={author!r}; git-relevant env={git_env!r}"
++    )
+ 
+ 
+ def test_refuses_to_create_protected_branch(repo_with_bare_remote):

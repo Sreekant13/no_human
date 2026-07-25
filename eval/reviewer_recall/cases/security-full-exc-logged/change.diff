@@ -1,0 +1,193 @@
+diff --git a/src/no_human/api/app.py b/src/no_human/api/app.py
+index 8cdd59c..7b8397f 100644
+--- a/src/no_human/api/app.py
++++ b/src/no_human/api/app.py
+@@ -2152,12 +2152,18 @@ async def jira_issues_endpoint(
+         issues = await asyncio.to_thread(adapter.search_text, q, limit)
+     except httpx.HTTPError as exc:
+         # Never surface the raw exception (it can carry the request URL/auth
+-        # object) — a short, tokenless detail only.
+-        log.warning("jira issue search failed: %s", type(exc).__name__)
+-        raise HTTPException(
+-            status_code=502,
+-            detail="Jira search failed — check the site/project configuration.",
+-        )
++        # object) — a short, tokenless detail only, and only the exception's
++        # type name is ever logged.
++        log.warning("jira issue search failed: %r", exc)
++        status = getattr(getattr(exc, "response", None), "status_code", None)
++        if status in (401, 403):
++            detail = (
++                "Jira API token expired or invalid. Verify or rotate the "
++                "token under Settings > Integrations."
++            )
++        else:
++            detail = "Jira search failed — check the site/project configuration."
++        raise HTTPException(status_code=502, detail=detail)
+     # SCRUM-18 — accidental re-import trap: one local-store read (no per-row
+     # Jira calls) building an external_id -> [tasks] index, then attach an
+     # `imported` block to any issue that already has a board task. A deleted
+diff --git a/src/no_human/intake/jira.py b/src/no_human/intake/jira.py
+index b6755c3..3092405 100644
+--- a/src/no_human/intake/jira.py
++++ b/src/no_human/intake/jira.py
+@@ -129,7 +129,7 @@ class JiraAdapter:
+         q = (q or "").strip()
+         if q:
+             escaped = q.replace("\\", "\\\\").replace('"', '\\"')
+-            clause = f'text ~ "{escaped}"'
++            clause = f'statusCategory != Done AND text ~ "{escaped}"'
+         else:
+             # Browse: the project's open tickets, the same set the poller sees.
+             clause = "statusCategory != Done"
+diff --git a/tests/test_jira_intake.py b/tests/test_jira_intake.py
+index b3b07df..0c1c661 100644
+--- a/tests/test_jira_intake.py
++++ b/tests/test_jira_intake.py
+@@ -122,6 +122,56 @@ def test_issue_brief_truncates_but_issue_detail_carries_full_description(monkeyp
+     assert detail["summary"] == brief["summary"]
+ 
+ 
++def test_search_text_nonempty_query_stays_scoped_to_open_tickets(monkeypatch):
++    """SCRUM-5 bug 1: typing into the picker must FILTER the open-tickets set,
++    never expand it — a non-empty query has to keep the same
++    ``statusCategory != Done`` scope the empty-query browse uses."""
++    monkeypatch.setenv("JIRA_API_TOKEN", "t")
++    captured = {}
++
++    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
++        captured.update(params=params)
++        return _Resp({"issues": []})
++
++    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
++    JiraAdapter(_cfg()).search_text("thing")
++    jql = captured["params"]["jql"]
++    assert 'project = "PROJ"' in jql, jql
++    assert "statusCategory != Done" in jql, jql
++    assert 'text ~ "thing"' in jql, jql
++    assert "ORDER BY updated DESC" in jql, jql
++
++
++def test_search_text_empty_query_browses_open_tickets(monkeypatch):
++    monkeypatch.setenv("JIRA_API_TOKEN", "t")
++    captured = {}
++
++    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
++        captured.update(params=params)
++        return _Resp({"issues": []})
++
++    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
++    JiraAdapter(_cfg()).search_text("")
++    jql = captured["params"]["jql"]
++    assert "statusCategory != Done" in jql, jql
++    assert "text ~" not in jql, jql
++
++
++def test_search_text_escapes_quotes_and_backslashes(monkeypatch):
++    monkeypatch.setenv("JIRA_API_TOKEN", "t")
++    captured = {}
++
++    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
++        captured.update(params=params)
++        return _Resp({"issues": []})
++
++    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
++    JiraAdapter(_cfg()).search_text('a"b\\c')
++    jql = captured["params"]["jql"]
++    assert 'a\\"b\\\\c' in jql, jql
++    assert "statusCategory != Done" in jql, jql
++
++
+ def test_get_issue_fetches_by_key_with_basic_auth(monkeypatch):
+     monkeypatch.setenv("JIRA_API_TOKEN", "SEKRET")
+     captured = {}
+diff --git a/tests/test_jira_issues_endpoint.py b/tests/test_jira_issues_endpoint.py
+index 5184bd8..efa7c66 100644
+--- a/tests/test_jira_issues_endpoint.py
++++ b/tests/test_jira_issues_endpoint.py
+@@ -134,6 +134,25 @@ async def test_configured_returns_shaped_issues_and_clamps_description(client, m
+     assert "SEKRET" not in r.text
+ 
+ 
++@pytest.mark.asyncio
++async def test_nonempty_query_endpoint_jql_stays_open_scoped(client, monkeypatch):
++    """SCRUM-5 bug 1: typing a query into the picker must FILTER the open
++    tickets, never expand into Done/closed ones."""
++    monkeypatch.setenv("JIRA_API_TOKEN", "t")
++    captured = {}
++
++    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
++        captured.update(params=params)
++        return _Resp({"issues": []})
++
++    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
++    r = await client.get("/api/integrations/jira/issues", params={"q": "thing"})
++    assert r.status_code == 200, r.text
++    jql = captured["params"]["jql"]
++    assert "statusCategory != Done" in jql, jql
++    assert 'text ~ "thing"' in jql, jql
++
++
+ @pytest.mark.asyncio
+ async def test_limit_is_clamped_between_1_and_50(client, monkeypatch):
+     monkeypatch.setenv("JIRA_API_TOKEN", "t")
+@@ -215,6 +234,7 @@ async def test_upstream_error_surfaces_as_502_never_leaking_token(client, monkey
+     r = await client.get("/api/integrations/jira/issues", params={"q": "x"})
+     assert r.status_code == 502
+     assert "SEKRET" not in r.text
++    assert "Settings > Integrations" not in r.json()["detail"]
+ 
+ 
+ @pytest.mark.asyncio
+@@ -229,6 +249,51 @@ async def test_upstream_connection_error_surfaces_as_502(client, monkeypatch):
+     r = await client.get("/api/integrations/jira/issues", params={"q": "x"})
+     assert r.status_code == 502
+     assert "SEKRET" not in r.text
++    assert "Settings > Integrations" not in r.json()["detail"]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("status_code", [401, 403])
++async def test_credential_error_returns_distinct_message(client, monkeypatch, status_code):
++    """SCRUM-5 bug 2: a token rejection (401/403) must surface a distinct,
++    actionable message — not the generic 'check the site/project
++    configuration' text other failures get — while staying at 502 (resolved
++    intake Q&A: status code unchanged, only the body message differs)."""
++    monkeypatch.setenv("JIRA_API_TOKEN", "SEKRET")
++
++    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
++        return _Resp({"errorMessages": ["Unauthorized"]}, status_code=status_code)
++
++    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
++    r = await client.get("/api/integrations/jira/issues", params={"q": "x"})
++    assert r.status_code == 502
++    detail = r.json()["detail"]
++    assert "Settings > Integrations" in detail
++    assert "token" in detail.lower()
++    assert "rotate" in detail.lower() or "verify" in detail.lower()
++    # never the generic other-failures message
++    assert "check the site/project configuration" not in detail
++    # never leaks the token, the site URL, or the account email
++    assert "SEKRET" not in r.text
++    assert "acme.atlassian.net" not in r.text
++    assert "me@x.com" not in r.text
++
++
++@pytest.mark.asyncio
++async def test_credential_error_never_logs_site_or_token(client, monkeypatch, caplog):
++    import logging
++
++    monkeypatch.setenv("JIRA_API_TOKEN", "SEKRET")
++
++    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
++        return _Resp({"errorMessages": ["Unauthorized"]}, status_code=401)
++
++    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
++    with caplog.at_level(logging.DEBUG):
++        r = await client.get("/api/integrations/jira/issues", params={"q": "x"})
++    assert r.status_code == 502
++    assert "SEKRET" not in caplog.text
++    assert "acme.atlassian.net" not in caplog.text
+ 
+ 
+ @pytest.mark.asyncio
