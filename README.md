@@ -33,6 +33,17 @@ unattended. That is deliberately not built here.
 
 ---
 
+## 🎯 What makes it different
+
+- **Never-merge is enforced at the tool boundary, not a policy** — a `PreToolUse` hook denies `gh pr merge`, `glab mr merge`, and the equivalent REST merge calls before they run.
+- **A deterministic tamper guard runs before a reviewer token is spent** — it fails any attempt that nets a reduction in test count or assertions, no LLM judgment involved.
+- **Every task passes a fresh-context adversarial reviewer told to refute "done"** — it runs on a separate session and must cite file:line or command output for every finding, never a numeric self-score.
+- **Honest escalation is a first-class outcome** — a blocker taxonomy routes stuck work to a park-with-wake-condition or a human escalation instead of a faked diff.
+- **Budget caps are enforced per attempt and per task lifetime** — spend against those caps is surfaced per task via `nh logs <id>`.
+- **Your code never leaves your machine; only prompts reach the model API** — the Agent SDK executes every tool against your local working tree, not a remote sandbox or upload.
+
+---
+
 ## Table of Contents
 
 - [Why no_human?](#-why-no_human)
