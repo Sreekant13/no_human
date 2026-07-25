@@ -165,15 +165,25 @@ export function mergePath(basePath, extraDirs = CLI_HINT_DIRS,
  * Bounded accumulator for a child's stdout+stderr. Capped so a chatty/looping
  * process cannot grow this without bound over a long-lived spawn — only the
  * TAIL matters for diagnosing a launch failure.
+ *
+ * `stop()` ends the capture once startup is confirmed (SCRUM-49): the buffer
+ * is only useful for diagnosing the failure window, so it is dropped and
+ * further chunks are discarded. It deliberately does NOT touch the
+ * underlying stream — see the `stop`-caller in ensureServer for why closing
+ * the pipe's read end here would break the still-running server instead.
  */
 export function makeOutputCapture(maxChars = 8000) {
   let buf = "";
+  let capturing = true;
   return {
     add(chunk) {
+      if (!capturing) return;
       buf += String(chunk);
       if (buf.length > maxChars) buf = buf.slice(buf.length - maxChars);
     },
     text() { return buf; },
+    stop() { capturing = false; buf = ""; },
+    get capturing() { return capturing; },
   };
 }
 
@@ -266,6 +276,10 @@ export async function ensureServer({
   for (const stream of [child.stdout, child.stderr]) {
     if (!stream) continue;
     stream.on("data", (chunk) => capture.add(chunk));
+    // A stray stream-level error must not crash this process — an unhandled
+    // 'error' event throws by default, and these streams now stay attached
+    // for the server's whole lifetime (see capture.stop() below).
+    stream.on("error", () => {});
     stream.unref?.();
   }
   // A throwing callback must not reject ensureServer with the child already
@@ -295,6 +309,19 @@ export async function ensureServer({
       : raced === "spawn-error" ? "spawn-error" : "spawn-timeout";
     return { status: "failed", reason, detail: tailDetail(text), child };
   }
+  // Confirmed up (SCRUM-49): capture is only needed for the failure window
+  // now behind us, so stop retaining it — a long-lived spawned server would
+  // otherwise leak its entire console output into this buffer forever.
+  //
+  // This must NOT stream.destroy() stdout/stderr. Doing so closes OUR read
+  // end, which is the pipe's ONLY reader — the still-running server's very
+  // next stdout/stderr write would then raise EPIPE immediately, which is
+  // exactly the breakage this ticket exists to prevent, just triggered by us
+  // instead of by a later Electron crash. The 'data' listeners registered
+  // above stay attached and keep draining the pipe (so the server's writes
+  // keep succeeding for as long as it runs); capture.stop() only makes them
+  // discard bytes instead of buffering them.
+  capture.stop();
   return { status: "spawned", child };
 }
 

@@ -372,6 +372,69 @@ test("makeOutputCapture: bounded — keeps only the tail past the cap", () => {
   assert.equal(cap.text(), "bbbbbccccc");
 });
 
+// ── SCRUM-49: destroy spawn-capture pipes once the server is confirmed up ──
+test("makeOutputCapture: stop() releases the buffer and ignores further chunks", () => {
+  const cap = makeOutputCapture(100);
+  cap.add("hello");
+  assert.equal(cap.text(), "hello");
+  assert.equal(cap.capturing, true);
+  cap.stop();
+  assert.equal(cap.capturing, false);
+  assert.equal(cap.text(), "", "the buffer must be released once capture stops");
+  cap.add("more, after stop");
+  assert.equal(cap.text(), "", "no bytes retained after stop()");
+});
+
+test("ensureServer: failure-window capture still classifies real spawn output (diagnostics survive)", async () => {
+  // Proves the diagnosis path stays intact for the window this ticket does
+  // NOT touch: a launch that never comes up must still surface why.
+  const dir = mkdtempSync(join(tmpdir(), "nhfail-"));
+  const fake = join(dir, "nh");
+  writeFileSync(fake, "#!/bin/sh\necho 'coding backend unavailable: cli missing'\nexit 2\n");
+  chmodSync(fake, 0o755);
+  const state = await ensureServer({
+    origin: "http://127.0.0.1:1", env: { NH_BIN: fake }, nhArgs: [],
+    spawnTimeoutMs: 2000 });
+  assert.equal(state.status, "failed");
+  assert.equal(state.reason, "backend-cli-missing");
+  assert.ok(state.detail.includes("coding backend unavailable"),
+    `expected the captured diagnosis in detail, got: ${state.detail}`);
+});
+
+test("ensureServer: stops capturing once confirmed up, but keeps draining so the running server never EPIPEs", async () => {
+  // A shell script, not node: on a broken pipe the shell's default SIGPIPE
+  // action TERMINATES it on the very next write — Node silently swallows
+  // EPIPE on stdout/stderr and would not catch a regression to destroy().
+  const dir = mkdtempSync(join(tmpdir(), "nhdrain-"));
+  const port = 19000 + (process.pid % 900);
+  const fake = join(dir, "nh");
+  writeFileSync(fake, `#!/bin/sh
+node -e "require('node:http').createServer(function(q,r){r.end('[]')}).listen(${port},'127.0.0.1')" &
+i=0
+while [ $i -lt 400 ]; do
+  echo "log line $i"
+  i=$((i+1))
+  sleep 0.02
+done
+`);
+  chmodSync(fake, 0o755);
+  const origin = "http://127.0.0.1:" + port;
+  const state = await ensureServer({
+    origin, spawnTimeoutMs: 8000, env: { NH_BIN: fake }, nhArgs: [] });
+  try {
+    assert.equal(state.status, "spawned");
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    assert.ok(alive(state.child.pid), "server just confirmed up must still be running");
+    // Several more write cycles PAST confirmation — exactly the post-startup
+    // window this ticket is about (the server keeps logging long after boot).
+    await new Promise((r) => setTimeout(r, 500));
+    assert.ok(alive(state.child.pid),
+      "the still-running server must not die from EPIPE after its pipes are released");
+  } finally {
+    stopServer(state);
+  }
+});
+
 test("reason strings match error.html's remediation blocks (cross-file contract)", () => {
   const html = fs.readFileSync(new URL("./error.html", import.meta.url), "utf8");
   // server.mjs emits backend-cli-missing / backend-not-logged-in; error.html
