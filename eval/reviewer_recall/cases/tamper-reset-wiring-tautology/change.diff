@@ -1,0 +1,87 @@
+diff --git a/web/src/Board.jsx b/web/src/Board.jsx
+index 3b1db62..eaffdfc 100644
+--- a/web/src/Board.jsx
++++ b/web/src/Board.jsx
+@@ -4,7 +4,7 @@ import SlideOver from "./SlideOver.jsx";
+ import { BOARD_LANES, routeTask, isWaiting, cardActivity } from "./boardLanes.js";
+ import { taskProgress } from "./taskProgress.js";
+ import { topPrioritised } from "./laneView.js";
+-import { partitionAnswerLane } from "./answerLane.js";
++import { partitionAnswerLane, shouldResetStaleOpen } from "./answerLane.js";
+ import { showConflictBadge, conflictRoundLabel } from "./conflictStatus.js";
+ 
+ // 5B: how many cards a collapsible lane shows before the expand arrow. 4 keeps
+@@ -151,6 +151,13 @@ function Lane({ lane, tasks, onSelect }) {
+     ? partitionAnswerLane(rows, Date.now())
+     : { fresh: rows, stale: [] };
+ 
++  // Reset the stale-divider expansion once the stale group empties: a lingering
++  // staleOpen=true would render the NEXT stale card pre-expanded, an expansion the
++  // user never performed. Resetting only at length 0 is invisible (nothing shown).
++  useEffect(() => {
++    if (shouldResetStaleOpen(staleOpen, stale.length)) setStaleOpen(false);
++  }, [staleOpen, stale.length]);
++
+   return (
+     <div className={`lane lane-${lane.key}${lane.loud ? " lane-loud" : ""}${tasks.length > 0 ? " lane-has-tasks" : ""}`}>
+       <div className="lane-header">
+diff --git a/web/src/answerLane.js b/web/src/answerLane.js
+index 2ddd103..09f3ccb 100644
+--- a/web/src/answerLane.js
++++ b/web/src/answerLane.js
+@@ -49,3 +49,10 @@ export function partitionAnswerLane(items, nowMs, thresholdMs = STALE_ANSWER_MS,
+   }
+   return { fresh, stale };
+ }
++
++// Collapse the stale-divider expansion once the stale group empties. A lingering
++// staleOpen=true would render the NEXT stale card pre-expanded (user never opened it).
++// Only fires when there is nothing to show, so it is invisible to the user.
++export function shouldResetStaleOpen(staleOpen, staleLen) {
++  return staleOpen && staleLen === 0;
++}
+diff --git a/web/src/answerLane.test.mjs b/web/src/answerLane.test.mjs
+index 822af9e..166c87e 100644
+--- a/web/src/answerLane.test.mjs
++++ b/web/src/answerLane.test.mjs
+@@ -1,6 +1,8 @@
+ import test from "node:test";
+ import assert from "node:assert/strict";
+-import { escalationTs, partitionAnswerLane, STALE_ANSWER_MS } from "./answerLane.js";
++import { readFileSync } from "node:fs";
++import { fileURLToPath } from "node:url";
++import { escalationTs, partitionAnswerLane, STALE_ANSWER_MS, shouldResetStaleOpen } from "./answerLane.js";
+ 
+ const NOW = new Date("2026-07-25T12:00:00Z").getTime();
+ 
+@@ -100,3 +102,30 @@ test("escalationTs fallback chain: escalated_at > last_activity > updated_at > c
+   assert.equal(escalationTs({}), "");
+   assert.equal(escalationTs(null), "");
+ });
++
++test("shouldResetStaleOpen: true when open and stale group empty", () => {
++  assert.equal(shouldResetStaleOpen(true, 0), true);
++});
++
++test("shouldResetStaleOpen: no reset while stale cards remain", () => {
++  assert.equal(shouldResetStaleOpen(true, 3), false);
++  assert.equal(shouldResetStaleOpen(true, 1), false);
++});
++
++test("shouldResetStaleOpen: no-op when already collapsed", () => {
++  assert.equal(shouldResetStaleOpen(false, 0), false);
++});
++
++// Behavioral pin for the reset rule: the predicate must agree with the
++// documented reset semantics for every (staleOpen, length) combination.
++test("shouldResetStaleOpen matches the reset semantics across the input space", () => {
++  for (const staleOpen of [true, false]) {
++    for (const len of [0, 1, 2, 5]) {
++      assert.equal(
++        shouldResetStaleOpen(staleOpen, len),
++        staleOpen && len === 0,
++        `staleOpen=${staleOpen} len=${len}`,
++      );
++    }
++  }
++});

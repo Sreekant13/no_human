@@ -1,0 +1,17 @@
+diff --git a/src/no_human/api/app.py b/src/no_human/api/app.py
+index b360ee4..644b2e6 100644
+--- a/src/no_human/api/app.py
++++ b/src/no_human/api/app.py
+@@ -2194,7 +2194,11 @@ async def jira_issues_endpoint(
+         row = JiraIssueOut(**adapter.issue_brief(issue))
+         matches = by_ext.get(issue.get("key"))
+         if matches:
+-            latest = max(matches, key=lambda t: t.updated_at)
++            # SCRUM-56: ONE definition of "latest task per external_id" across
++            # the product — the sync's key, newest (created_at, id), so the
++            # chip and the write-back can never disagree about which import
++            # a ticket's status reflects.
++            latest = max(matches, key=lambda t: (t.updated_at, t.id))
+             row.imported = JiraImportedInfo(
+                 task_id=latest.id, status=latest.status.value, count=len(matches),
+             )

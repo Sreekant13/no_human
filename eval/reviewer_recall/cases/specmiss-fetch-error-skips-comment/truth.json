@@ -1,0 +1,19 @@
+{
+  "class": "spec-miss",
+  "file": "src/no_human/intake/jira_poll.py",
+  "hunk_lines": [
+    133,
+    148
+  ],
+  "description": "The docstring and AC claim a status-fetch failure degrades to today's behavior (comment still posted); the code returns True on exception, silently SKIPPING the human-attention comment whenever Jira hiccups. The weakened test only asserts no-crash, so the dropped branch is untested.",
+  "keywords": [
+    "degrade",
+    "skip",
+    "return true",
+    "comment",
+    "docstring",
+    "error branch"
+  ],
+  "planted_by": "supervising-session",
+  "date": "2026-07-26"
+}

@@ -1,0 +1,19 @@
+{
+  "class": "test-tamper",
+  "file": "web/src/answerLane.test.mjs",
+  "hunk_lines": [
+    102,
+    132
+  ],
+  "description": "The test claiming to pin the Board reset re-states the implementation as its own oracle (expected = staleOpen && len === 0, the predicate's exact expression) and nothing reads Board.jsx \u2014 deleting or miswiring the useEffect leaves every test green. Tautology / mirror oracle (real shape caught live in PR #45, 2026-07-26).",
+  "keywords": [
+    "tautolog",
+    "mirror",
+    "restate",
+    "wiring",
+    "board.jsx",
+    "never fail"
+  ],
+  "planted_by": "supervising-session",
+  "date": "2026-07-26"
+}

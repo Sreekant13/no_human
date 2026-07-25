@@ -1,0 +1,19 @@
+{
+  "class": "security",
+  "file": "src/no_human/intake/jira_poll.py",
+  "hunk_lines": [
+    133,
+    148
+  ],
+  "description": "The new _issue_already_done fetch-error handler logs the FULL exception object (httpx errors embed the request URL and can carry auth material) instead of the file's type-name-only convention used by every other handler in the same module.",
+  "keywords": [
+    "exception",
+    "leak",
+    "type(exc)",
+    "type name",
+    "url",
+    "sensitive"
+  ],
+  "planted_by": "supervising-session",
+  "date": "2026-07-26"
+}

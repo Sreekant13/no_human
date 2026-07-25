@@ -1,0 +1,18 @@
+{
+  "class": "logic",
+  "file": "src/no_human/api/app.py",
+  "hunk_lines": [
+    2194,
+    2205
+  ],
+  "description": "The comment claims the picker chip now uses the sync's definition of latest task per external_id \u2014 newest (created_at, id) \u2014 but the code keys on (updated_at, id): an older import merely touched later still wins the chip. Wrong-variable defect behind a parity claim (real bug shape, fixed live 2026-07-25).",
+  "keywords": [
+    "updated_at",
+    "created_at",
+    "wrong key",
+    "does not match",
+    "comment"
+  ],
+  "planted_by": "supervising-session",
+  "date": "2026-07-26"
+}
