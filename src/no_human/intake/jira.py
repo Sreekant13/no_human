@@ -167,6 +167,18 @@ class JiraAdapter:
         brief["description"] = _adf_text(fields.get("description"))
         return brief
 
+    def status_category(self, key: str) -> str:
+        """Lean read of an issue's CURRENT Jira status-category key
+        (``"new"``/``"indeterminate"``/``"done"``), lowercased — only the
+        status field. Used by write-back to avoid posting a "needs a human"
+        note on an issue a human already moved to Done (SCRUM-53)."""
+        url = f"{self.site}/rest/api/3/issue/{quote(key, safe='')}"
+        r = httpx.get(url, params={"fields": "status"}, auth=self._auth(),
+                      timeout=30.0, headers={"Accept": "application/json"})
+        r.raise_for_status()
+        fields = (r.json() or {}).get("fields") or {}
+        return (((fields.get("status") or {}).get("statusCategory") or {}).get("key") or "").lower()
+
     def get_issue(self, key: str) -> dict[str, Any]:
         """Fetch one issue by key with full fields — the detail GET behind
         the picker's "pick" action (SCRUM-9), so the created task carries the

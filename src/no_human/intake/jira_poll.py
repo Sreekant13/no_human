@@ -43,6 +43,14 @@ _STATUS_NOTE: dict[TaskStatus, str] = {
     TaskStatus.DONE: "no_human completed its work on this issue.",
 }
 
+# Off-ramp "needs a human" statuses: commented, never transitioned. Before
+# posting one of these notes, sync_statuses() checks whether a human already
+# moved the issue to Done in Jira — if so, the note would lie (SCRUM-53).
+_HUMAN_ATTENTION: set[TaskStatus] = {
+    TaskStatus.BLOCKED, TaskStatus.AWAITING_INPUT,
+    TaskStatus.ESCALATED, TaskStatus.FAILED,
+}
+
 # Status -> target Jira status-CATEGORY key (never a hardcoded transition id).
 # Only active-work and done statuses get a transition; off-ramps (blocked,
 # awaiting_input, escalated, failed, paused_quota) are deliberately absent —
@@ -122,6 +130,18 @@ class JiraPoller:
             )
         return result
 
+    async def _issue_already_done(self, key: str) -> bool:
+        """True only if the issue's current Jira status category is 'done'.
+        A fetch error degrades to False (proceed to comment — today's
+        behavior) and leaves the marker unset so the next tick retries
+        (SCRUM-53 intake Q&A)."""
+        try:
+            cat = await asyncio.to_thread(self.adapter.status_category, key)
+        except Exception as exc:  # noqa: BLE001 — transient; retry next tick
+            log.warning("Jira status check %s failed: %s", key, type(exc).__name__)
+            return False
+        return cat == "done"
+
     async def _pr_url_for(self, task: Task) -> str:
         try:
             attempts = await self.store.list_attempts(task.id)
@@ -172,19 +192,31 @@ class JiraPoller:
             # --- comment (existing behavior; PR link now also on DONE) ---
             note = _STATUS_NOTE.get(task.status)
             if note and jira.get("nh_synced_status") != task.status.value:
-                if task.status in (TaskStatus.AWAITING_APPROVAL, TaskStatus.DONE):
-                    pr = await self._pr_url_for(task)
-                    if pr:
-                        note = f"{note}\nPR: {pr}"
-                try:
-                    await asyncio.to_thread(
-                        self.adapter.comment, task.external_id, note)
-                except Exception as exc:  # noqa: BLE001 — type-name only, no URL/auth/body leak
-                    log.warning("Jira comment %s failed: %s", task.external_id, type(exc).__name__)
-                else:
+                if (task.status in _HUMAN_ATTENTION
+                        and await self._issue_already_done(task.external_id)):
+                    # A human already closed this issue in Jira; the local
+                    # failed/escalated/blocked row is real but a "needs a
+                    # human" note would lie. Skip + mark so we never re-check
+                    # this state (SCRUM-53).
                     jira["nh_synced_status"] = task.status.value
                     changed = True
-                    self._on_event("jira_status_synced", f"{task.external_id} → {task.status.value}")
+                    self._on_event(
+                        "jira_status_synced",
+                        f"{task.external_id} already Done in Jira → skip note")
+                else:
+                    if task.status in (TaskStatus.AWAITING_APPROVAL, TaskStatus.DONE):
+                        pr = await self._pr_url_for(task)
+                        if pr:
+                            note = f"{note}\nPR: {pr}"
+                    try:
+                        await asyncio.to_thread(
+                            self.adapter.comment, task.external_id, note)
+                    except Exception as exc:  # noqa: BLE001 — type-name only, no URL/auth/body leak
+                        log.warning("Jira comment %s failed: %s", task.external_id, type(exc).__name__)
+                    else:
+                        jira["nh_synced_status"] = task.status.value
+                        changed = True
+                        self._on_event("jira_status_synced", f"{task.external_id} → {task.status.value}")
 
             if changed:
                 task.context = {**(task.context or {}), "jira": jira}

@@ -187,6 +187,22 @@ def test_get_issue_fetches_by_key_with_basic_auth(monkeypatch):
     assert captured["auth"] == ("me@x.com", "SEKRET")
 
 
+def test_status_category_fetches_status_field_only(monkeypatch):
+    monkeypatch.setenv("JIRA_API_TOKEN", "SEKRET")
+    captured = {}
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        captured.update(url=url, params=params)
+        return _Resp({"fields": {"status": {"statusCategory": {"key": "Done"}}}})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    cat = JiraAdapter(_cfg()).status_category("PROJ-9")
+
+    assert cat == "done"
+    assert "/rest/api/3/issue/PROJ-9" in captured["url"]
+    assert captured["params"] == {"fields": "status"}
+
+
 def test_auth_token_never_logged(monkeypatch, caplog):
     monkeypatch.setenv("JIRA_API_TOKEN", "SUPERSECRET")
     monkeypatch.setattr("no_human.intake.jira.httpx.get",
@@ -512,7 +528,10 @@ async def test_poller_escalated_comments_without_transition(monkeypatch, tmp_pat
 
         assert transition_calls == []
         assert len(comments) == 2
-        assert get_calls == []
+        # One status_category GET per off-ramp task (SCRUM-53 done-check);
+        # {"transitions": []} has no "fields", so status_category reads ""
+        # (not done) and the comment still posts.
+        assert get_calls == [1, 1]
         assert post_calls == []
     finally:
         await store.close()
@@ -690,3 +709,125 @@ def test_issue_urls_quote_the_key(monkeypatch):
     for url in seen:
         assert "AB%231%20%25%3F" in url, url
         assert "#" not in url and " " not in url, url
+
+
+@pytest.mark.asyncio
+async def test_poller_skips_needs_human_note_when_issue_done_in_jira(monkeypatch, tmp_path):
+    """SCRUM-53 AC1: a done-in-Jira issue skips the 'needs a human' note and
+    sets the marker so the next tick never re-checks it."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        task = _seeded_jira_task(TaskStatus.FAILED)
+        await store.create_task(task)
+
+        a = JiraAdapter(_cfg(write_back=True))
+        status_calls = []
+        comments = []
+        monkeypatch.setattr(a, "status_category",
+                            lambda key: status_calls.append(key) or "done")
+        monkeypatch.setattr(a, "comment",
+                            lambda key, body: comments.append((key, body)) or True)
+        monkeypatch.setattr(a, "transition", lambda *args: True)
+        poller = JiraPoller(a, store, config=_cfg(write_back=True))
+
+        await poller.sync_statuses()
+        await poller.sync_statuses()          # second tick: marker short-circuits
+
+        assert comments == []
+        assert status_calls == ["PROJ-1"]     # called exactly once
+        saved = await store.get_task(task.id)
+        assert saved.context["jira"]["nh_synced_status"] == "failed"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_poller_comments_when_issue_not_done(monkeypatch, tmp_path):
+    """SCRUM-53 AC4: a non-done issue still gets the 'needs a human' note."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        task = _seeded_jira_task(TaskStatus.ESCALATED)
+        await store.create_task(task)
+
+        a = JiraAdapter(_cfg(write_back=True))
+        comments = []
+        monkeypatch.setattr(a, "status_category", lambda key: "indeterminate")
+        monkeypatch.setattr(a, "comment",
+                            lambda key, body: comments.append((key, body)) or True)
+        monkeypatch.setattr(a, "transition", lambda *args: True)
+        poller = JiraPoller(a, store, config=_cfg(write_back=True))
+
+        await poller.sync_statuses()
+
+        assert len(comments) == 1
+        saved = await store.get_task(task.id)
+        assert saved.context["jira"]["nh_synced_status"] == "escalated"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_poller_comments_when_status_fetch_errors(monkeypatch, tmp_path):
+    """SCRUM-53 AC3: a Jira status fetch failure degrades to today's
+    behavior (comment posted), never a crash of the sync loop."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        task = _seeded_jira_task(TaskStatus.FAILED)
+        await store.create_task(task)
+
+        a = JiraAdapter(_cfg(write_back=True))
+        comments = []
+
+        def boom(key):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(a, "status_category", boom)
+        monkeypatch.setattr(a, "comment",
+                            lambda key, body: comments.append((key, body)) or True)
+        monkeypatch.setattr(a, "transition", lambda *args: True)
+        poller = JiraPoller(a, store, config=_cfg(write_back=True))
+
+        await poller.sync_statuses()          # must not raise
+
+        assert len(comments) == 1
+        saved = await store.get_task(task.id)
+        assert saved.context["jira"]["nh_synced_status"] == "failed"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_poller_done_note_does_not_status_check(monkeypatch, tmp_path):
+    """SCRUM-53 AC2: completion notes are unchanged — the done-check guard
+    only applies to off-ramp (blocked/awaiting_input/escalated/failed)
+    statuses, never the completion path."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        task = _seeded_jira_task(TaskStatus.DONE, nh_jira_transitions=["indeterminate"])
+        await store.create_task(task)
+
+        a = JiraAdapter(_cfg(write_back=True))
+        comments = []
+
+        def must_not_be_called(key):
+            raise AssertionError("status_category must not be called for DONE")
+
+        monkeypatch.setattr(a, "status_category", must_not_be_called)
+        monkeypatch.setattr(a, "comment",
+                            lambda key, body: comments.append((key, body)) or True)
+        monkeypatch.setattr(a, "transition", lambda *args: True)
+        poller = JiraPoller(a, store, config=_cfg(write_back=True))
+        monkeypatch.setattr(poller, "_pr_url_for", _fake_pr_url)
+
+        await poller.sync_statuses()
+
+        assert len(comments) == 1
+        assert "PR: https://gh/pr/9" in comments[0][1]
+        saved = await store.get_task(task.id)
+        assert saved.context["jira"]["nh_synced_status"] == "done"
+    finally:
+        await store.close()
