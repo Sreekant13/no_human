@@ -129,7 +129,7 @@ class JiraAdapter:
         q = (q or "").strip()
         if q:
             escaped = q.replace("\\", "\\\\").replace('"', '\\"')
-            clause = f'text ~ "{escaped}"'
+            clause = f'statusCategory != Done AND text ~ "{escaped}"'
         else:
             # Browse: the project's open tickets, the same set the poller sees.
             clause = "statusCategory != Done"

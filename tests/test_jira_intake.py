@@ -122,6 +122,56 @@ def test_issue_brief_truncates_but_issue_detail_carries_full_description(monkeyp
     assert detail["summary"] == brief["summary"]
 
 
+def test_search_text_nonempty_query_stays_scoped_to_open_tickets(monkeypatch):
+    """SCRUM-5 bug 1: typing into the picker must FILTER the open-tickets set,
+    never expand it — a non-empty query has to keep the same
+    ``statusCategory != Done`` scope the empty-query browse uses."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    captured = {}
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        captured.update(params=params)
+        return _Resp({"issues": []})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    JiraAdapter(_cfg()).search_text("thing")
+    jql = captured["params"]["jql"]
+    assert 'project = "PROJ"' in jql, jql
+    assert "statusCategory != Done" in jql, jql
+    assert 'text ~ "thing"' in jql, jql
+    assert "ORDER BY updated DESC" in jql, jql
+
+
+def test_search_text_empty_query_browses_open_tickets(monkeypatch):
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    captured = {}
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        captured.update(params=params)
+        return _Resp({"issues": []})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    JiraAdapter(_cfg()).search_text("")
+    jql = captured["params"]["jql"]
+    assert "statusCategory != Done" in jql, jql
+    assert "text ~" not in jql, jql
+
+
+def test_search_text_escapes_quotes_and_backslashes(monkeypatch):
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    captured = {}
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        captured.update(params=params)
+        return _Resp({"issues": []})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    JiraAdapter(_cfg()).search_text('a"b\\c')
+    jql = captured["params"]["jql"]
+    assert 'a\\"b\\\\c' in jql, jql
+    assert "statusCategory != Done" in jql, jql
+
+
 def test_get_issue_fetches_by_key_with_basic_auth(monkeypatch):
     monkeypatch.setenv("JIRA_API_TOKEN", "SEKRET")
     captured = {}

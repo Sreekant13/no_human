@@ -135,6 +135,25 @@ async def test_configured_returns_shaped_issues_and_clamps_description(client, m
 
 
 @pytest.mark.asyncio
+async def test_nonempty_query_endpoint_jql_stays_open_scoped(client, monkeypatch):
+    """SCRUM-5 bug 1: typing a query into the picker must FILTER the open
+    tickets, never expand into Done/closed ones."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    captured = {}
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        captured.update(params=params)
+        return _Resp({"issues": []})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    r = await client.get("/api/integrations/jira/issues", params={"q": "thing"})
+    assert r.status_code == 200, r.text
+    jql = captured["params"]["jql"]
+    assert "statusCategory != Done" in jql, jql
+    assert 'text ~ "thing"' in jql, jql
+
+
+@pytest.mark.asyncio
 async def test_limit_is_clamped_between_1_and_50(client, monkeypatch):
     monkeypatch.setenv("JIRA_API_TOKEN", "t")
     captured = {}
@@ -215,6 +234,7 @@ async def test_upstream_error_surfaces_as_502_never_leaking_token(client, monkey
     r = await client.get("/api/integrations/jira/issues", params={"q": "x"})
     assert r.status_code == 502
     assert "SEKRET" not in r.text
+    assert "Settings > Integrations" not in r.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -229,6 +249,51 @@ async def test_upstream_connection_error_surfaces_as_502(client, monkeypatch):
     r = await client.get("/api/integrations/jira/issues", params={"q": "x"})
     assert r.status_code == 502
     assert "SEKRET" not in r.text
+    assert "Settings > Integrations" not in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [401, 403])
+async def test_credential_error_returns_distinct_message(client, monkeypatch, status_code):
+    """SCRUM-5 bug 2: a token rejection (401/403) must surface a distinct,
+    actionable message — not the generic 'check the site/project
+    configuration' text other failures get — while staying at 502 (resolved
+    intake Q&A: status code unchanged, only the body message differs)."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "SEKRET")
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        return _Resp({"errorMessages": ["Unauthorized"]}, status_code=status_code)
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    r = await client.get("/api/integrations/jira/issues", params={"q": "x"})
+    assert r.status_code == 502
+    detail = r.json()["detail"]
+    assert "Settings > Integrations" in detail
+    assert "token" in detail.lower()
+    assert "rotate" in detail.lower() or "verify" in detail.lower()
+    # never the generic other-failures message
+    assert "check the site/project configuration" not in detail
+    # never leaks the token, the site URL, or the account email
+    assert "SEKRET" not in r.text
+    assert "acme.atlassian.net" not in r.text
+    assert "me@x.com" not in r.text
+
+
+@pytest.mark.asyncio
+async def test_credential_error_never_logs_site_or_token(client, monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("JIRA_API_TOKEN", "SEKRET")
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        return _Resp({"errorMessages": ["Unauthorized"]}, status_code=401)
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    with caplog.at_level(logging.DEBUG):
+        r = await client.get("/api/integrations/jira/issues", params={"q": "x"})
+    assert r.status_code == 502
+    assert "SEKRET" not in caplog.text
+    assert "acme.atlassian.net" not in caplog.text
 
 
 @pytest.mark.asyncio
