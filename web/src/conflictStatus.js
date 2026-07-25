@@ -4,20 +4,20 @@
 // SCRUM-41 attaches to the task (surfaced on TaskSummaryOut) — never by
 // matching text in send_back_feedback entries.
 //
-// SCRUM-41's own default (wake.py's `max_pr_conflict_rounds` fallback) is 3;
-// the backend doesn't currently surface the operator-configured bound on the
-// list payload, so this is a documented fallback, not a guess at the round
-// count itself (which IS real, server-computed data).
-export const DEFAULT_MAX_PR_CONFLICT_ROUNDS = 3;
-
 // Returns null when no conflict cycle is active (rounds falsy — covers both
 // "never conflicted" and the watcher's post-MERGEABLE reset to 0), so callers
 // can cleanly fall back to the plain status badge.
+// Review 2026-07-25: no invented denominator — the configured
+// max_pr_conflict_rounds isn't on the payload, and a hardcoded "/3" renders
+// the impossible "round 4/3" when the operator configures 5. If the backend
+// ever surfaces the bound (task.max_pr_conflict_rounds), show it.
 export function conflictRoundLabel(task) {
   const rounds = task?.pr_conflict_rounds;
   if (!rounds) return null;
-  const max = task?.max_pr_conflict_rounds || DEFAULT_MAX_PR_CONFLICT_ROUNDS;
-  return `resolving merge conflict — round ${rounds}/${max}`;
+  const max = task?.max_pr_conflict_rounds;
+  return max
+    ? `resolving merge conflict — round ${rounds}/${max}`
+    : `resolving merge conflict — round ${rounds}`;
 }
 
 // The badge shows only while the task is actually back IN the pipeline for the

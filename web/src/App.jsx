@@ -155,7 +155,12 @@ function NightLedger({ tasks, authMode }) {
         : (
           <div className="nh-ledger-rows">
             <div className="nh-ledger-row">
-              <b>{s.done}</b> shipped{perPrCost && ` (~${perPrCost}/PR)`}
+              {/* Review 2026-07-25: in subscription mode the dollar is an
+                  API-rate estimate — a naked "$X/PR" claimed real spend in the
+                  one mode where it isn't (SCRUM-20's whole point). */}
+              <b>{s.done}</b> shipped
+              {perPrCost && (authMode === "api_key"
+                ? ` (~${perPrCost}/PR)` : ` (~${perPrCost}/PR est.)`)}
             </div>
             <div className="nh-ledger-row"><b>{s.parked}</b> waiting on you</div>
             {s.failed > 0 && (

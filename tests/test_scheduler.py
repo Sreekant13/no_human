@@ -713,3 +713,36 @@ async def test_resumed_work_claims_before_fresh_pending(store):
     started = await sched.tick()
     assert started == [resumed.id], (
         f"expected the resumed task to claim the slot, got {started}")
+
+
+@pytest.mark.asyncio
+async def test_startup_recovers_orphaned_midrun_tasks(tmp_path):
+    """Review 2026-07-25: scoping the stuck sweep to claimed tasks left a
+    task orphaned in a mid-run status (process killed during review/testing)
+    invisible forever — not claimable, not swept. Startup must requeue it."""
+    from no_human.core.db import Store
+    from no_human.core.task import Task, TaskStatus
+
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        orphan = Task.new("killed mid-review", repo_path="/r")
+        await store.create_task(orphan)
+        await store.set_status(orphan, TaskStatus.REVIEWING, validate=False)
+        healthy = Task.new("parked", repo_path="/r")
+        await store.create_task(healthy)
+        await store.set_status(healthy, TaskStatus.ESCALATED, validate=False)
+
+        events = []
+        sched = Scheduler(store, lambda task=None: None,
+                          on_event=lambda k, t: events.append((k, t)))
+        await sched._recover_orphans()
+
+        fresh = await store.get_task(orphan.id)
+        assert fresh.status is TaskStatus.IMPLEMENTING  # claimable again
+        recorded = await store.list_events(orphan.id)
+        assert any(e["kind"] == "orphan_recovered" for e in recorded)
+        assert any(k == "orphan_recovered" for k, _ in events)
+        # Parked/terminal tasks are NOT touched.
+        assert (await store.get_task(healthy.id)).status is TaskStatus.ESCALATED
+    finally:
+        await store.close()

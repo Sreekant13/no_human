@@ -796,3 +796,38 @@ def test_budget_blocker_stop_option_carries_park():
     # The stop option now carries the park action (source-level pin; the
     # behavioral end is covered by the apply/reply tests).
     assert '"park": True' in src or "'park': True" in src
+
+
+@pytest.mark.asyncio
+async def test_wake_sweep_never_touches_a_human_stopped_task(tmp_path):
+    """Review 2026-07-25 (interaction bug): 'stop — keep parked' left the
+    blocker intact, so the watcher's max_park branch re-escalated the task
+    within 48h and any wake_condition resumed it — silently undoing the
+    human's explicit stop. The human_stopped stamp must halt BOTH branches."""
+    from datetime import datetime, timedelta, timezone
+
+    from no_human.blockers.wake import WakeWatcher
+    from no_human.core.db import Store
+    from no_human.core.task import Task, TaskStatus
+
+    store = await Store(tmp_path / "t.db").connect()
+    try:
+        t = Task.new("stopped", repo_path="/r")
+        await store.create_task(t)
+        t.blocker = {
+            "category": "BUDGET_EXHAUSTED",
+            "question": "?",
+            "raised_at": "2026-01-01T00:00:00+00:00",  # far past max_park
+            "wake_condition": "timeout:1s",            # would resume instantly
+            "human_stopped": True,
+        }
+        await store.update_task_columns(t)
+        await store.set_status(t, TaskStatus.ESCALATED, validate=False)
+
+        w = WakeWatcher(store, {"blockers": {}})
+        action = await w._evaluate(t, now=datetime.now(timezone.utc))
+        assert action is None, f"human-stopped task must be untouchable, got {action!r}"
+        fresh = await store.get_task(t.id)
+        assert fresh.status is TaskStatus.ESCALATED
+    finally:
+        await store.close()

@@ -104,7 +104,12 @@ function workingBreakdown(tasks) {
     else if (mode === "queued") queued += 1;
   }
   if (queued === 0) return String(tasks.length);
-  return `${running} live · ${queued} queued`;
+  // Review 2026-07-25: waiting tasks (paused_quota etc.) are neither running
+  // nor queued — omitting them made the header count fewer tasks than the
+  // cards below it whenever a queue formed.
+  const waiting = tasks.length - running - queued;
+  const base = `${running} live · ${queued} queued`;
+  return waiting > 0 ? `${base} · ${waiting} waiting` : base;
 }
 
 function Lane({ lane, tasks, onSelect }) {

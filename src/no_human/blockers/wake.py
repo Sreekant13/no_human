@@ -357,6 +357,14 @@ class WakeWatcher:
         if task.status == TaskStatus.AWAITING_APPROVAL:
             return await self._check_open_pr(task)
 
+        # A human chose "stop — keep the work parked as-is" (SCRUM-22's
+        # terminal park). Review 2026-07-25: without this skip the sweep
+        # undid the stop — max_park re-escalated the task within 48h and any
+        # wake_condition on the blocker resumed it. Human decisions outrank
+        # every automatic branch below; only another human reply changes it.
+        if (task.blocker or {}).get("human_stopped"):
+            return None
+
         blocker = Blocker.from_dict(task.blocker) if task.blocker else None
         raised_at = _parse_iso(blocker.raised_at if blocker else None) \
             or _parse_iso(task.updated_at) or now

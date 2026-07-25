@@ -16,6 +16,7 @@ A Jira transport error logs and is retried next tick; it never crashes the pool.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 
@@ -84,7 +85,7 @@ class JiraPoller:
     async def poll_once(self) -> PollResult:
         result = PollResult()
         try:
-            issues = self.adapter.search()
+            issues = await asyncio.to_thread(self.adapter.search)
         except Exception as exc:  # noqa: BLE001 — transport error retried next tick
             log.warning("Jira poll failed: %s", exc)
             self._on_event("jira_poll_error", str(exc))
@@ -157,7 +158,8 @@ class JiraPoller:
             target = _TARGET_CATEGORY.get(task.status)
             if target and target not in done_cats:
                 try:
-                    self.adapter.transition(task.external_id, target)
+                    await asyncio.to_thread(
+                        self.adapter.transition, task.external_id, target)
                 except Exception as exc:  # noqa: BLE001 — fire-and-forget; unset -> retry next tick
                     log.warning("Jira transition %s failed: %s", task.external_id, type(exc).__name__)
                 else:
@@ -175,7 +177,8 @@ class JiraPoller:
                     if pr:
                         note = f"{note}\nPR: {pr}"
                 try:
-                    self.adapter.comment(task.external_id, note)
+                    await asyncio.to_thread(
+                        self.adapter.comment, task.external_id, note)
                 except Exception as exc:  # noqa: BLE001 — type-name only, no URL/auth/body leak
                     log.warning("Jira comment %s failed: %s", task.external_id, type(exc).__name__)
                 else:

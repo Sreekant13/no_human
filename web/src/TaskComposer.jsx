@@ -259,20 +259,25 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
     setJiraOpen(false);
     setJiraQuery("");
     setJiraResults(undefined);
-    // SCRUM-9: the browse list truncates description to 2000 chars (a list-
-    // payload optimization); prefilling straight from that brief silently cut
-    // off any ticket past 2000 chars. Fetch the single picked issue in full
-    // first — best-effort: a failed lookup falls back to the list brief
-    // already in hand rather than blocking the pick.
-    try {
-      issue = await fetchJiraIssue(issue.key);
-    } catch {
-      // fall back to the truncated brief already in hand
-    }
-    setPrompt(promptFromIssue(issue));
+    // Prefill SYNCHRONOUSLY from the list brief so the operator sees their
+    // pick instantly and can start editing (review 2026-07-25: awaiting the
+    // detail fetch first let a slow Jira clobber typed text seconds later,
+    // and two rapid picks could resolve out of order).
+    const briefPrompt = promptFromIssue(issue);
+    setPrompt(briefPrompt);
     setSource("jira");
     setExternalId(externalIdFromIssue(issue));
     promptRef.current?.focus();
+    // SCRUM-9: the browse list truncates description to 2000 chars; upgrade
+    // to the full issue best-effort — but only if the prompt is still exactly
+    // the brief-derived text (untouched, and not superseded by a later pick).
+    try {
+      const full = await fetchJiraIssue(issue.key);
+      setPrompt((current) =>
+        current === briefPrompt ? promptFromIssue(full) : current);
+    } catch {
+      // the brief already in hand stands
+    }
   }
 
   function handleSubmit(e) {

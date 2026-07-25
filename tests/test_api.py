@@ -1212,6 +1212,10 @@ async def test_reply_park_option_keeps_task_parked(client, store):
     replies = (fresh.context or {}).get("human_replies") or []
     assert replies and "stop" in replies[-1]["answer"]
     assert fresh.config == {}                            # park mutated nothing
+    # Review 2026-07-25: the stop must be durable against the wake watcher's
+    # sweep — the stamp is what _evaluate checks to skip max_park
+    # re-escalation and wake_condition resumes.
+    assert (fresh.blocker or {}).get("human_stopped") is True
 
 
 @pytest.mark.asyncio

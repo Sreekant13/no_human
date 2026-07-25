@@ -1,9 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import {
-  DEFAULT_MAX_PR_CONFLICT_ROUNDS, conflictRoundLabel, showConflictBadge,
-} from "./conflictStatus.js";
+import { conflictRoundLabel, showConflictBadge } from "./conflictStatus.js";
 
 // SCRUM-42: the badge is driven by SCRUM-41's pr_conflict_rounds context field
 // (surfaced on the summary payload), never by feedback-text matching.
@@ -11,7 +9,12 @@ import {
 test("label renders round/max from real server data; falsy rounds -> null", () => {
   assert.equal(
     conflictRoundLabel({ pr_conflict_rounds: 2 }),
-    `resolving merge conflict — round 2/${DEFAULT_MAX_PR_CONFLICT_ROUNDS}`,
+    "resolving merge conflict — round 2",
+  );
+  // With the configured bound on the payload the denominator is REAL data.
+  assert.equal(
+    conflictRoundLabel({ pr_conflict_rounds: 4, max_pr_conflict_rounds: 5 }),
+    "resolving merge conflict — round 4/5",
   );
   assert.equal(conflictRoundLabel({ pr_conflict_rounds: 0 }), null);
   assert.equal(conflictRoundLabel({}), null);

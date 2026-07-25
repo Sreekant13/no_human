@@ -225,6 +225,35 @@ class Scheduler:
                     out.append(t)
         return out
 
+    # Mid-run statuses only a live worker can hold. A task found in one of
+    # these at STARTUP (this process's _inflight is empty by definition) was
+    # orphaned by a crash/kill of the previous process.
+    _ORPHANABLE = (TaskStatus.CONTEXT, TaskStatus.PLANNING,
+                   TaskStatus.REVIEWING, TaskStatus.TESTING)
+
+    async def _recover_orphans(self) -> None:
+        """Startup-only crash recovery (review 2026-07-25): scoping the
+        stuck-active sweep to claimed tasks fixed false parks but left a task
+        orphaned mid-run (server killed during review/testing) INVISIBLE
+        forever — not claimable, not swept, no escalation. At startup nothing
+        is legitimately in-flight yet, so any mid-run status is an orphan:
+        flip it to IMPLEMENTING (claimable) so the pool re-runs it from its
+        checkpoint, and say so in the event stream."""
+        for status in self._ORPHANABLE:
+            for t in await self.store.list_tasks(status):
+                await self.store.set_status(
+                    t, TaskStatus.IMPLEMENTING, validate=False)
+                await self.store.save_events(t.id, [{
+                    "source": "orchestrator", "kind": "orphan_recovered",
+                    "text": (f"found in {status.value} at startup with no "
+                             "worker attached (previous process died mid-run) "
+                             "— requeued from its checkpoint"),
+                    "ts": time.time(),
+                }])
+                self._on_event(
+                    "orphan_recovered",
+                    f"{t.id[:8]} was orphaned in {status.value} — requeued")
+
     async def tick(self, *, now: datetime | None = None) -> list[str]:
         """One scheduling pass: resume parked tasks, then dispatch up to the free
         slots. Returns the task ids started this tick."""
@@ -391,6 +420,7 @@ class Scheduler:
         self, *, stop: asyncio.Event, poll_interval: float = 10.0
     ) -> None:
         """Loop until ``stop`` is set, then drain in-flight tasks."""
+        await self._recover_orphans()
         while not stop.is_set():
             await self.tick()
             try:
