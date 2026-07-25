@@ -1,0 +1,290 @@
+diff --git a/src/no_human/core/orchestrator.py b/src/no_human/core/orchestrator.py
+index a9991d7..bfbc2a7 100644
+--- a/src/no_human/core/orchestrator.py
++++ b/src/no_human/core/orchestrator.py
+@@ -44,6 +44,7 @@ from ..blockers import (
+ )
+ from ..ci.base import CIResult, HumanGatedCI
+ from ..config import active_auth_profile
++from ..intake.surface_advisory import surface_advisory
+ from ..notify.slack import SlackNotifier
+ from ..review import selfcheck
+ from ..review.reviewer import AdversarialReviewer, ReviewDecision, ReviewerUnavailable
+@@ -535,6 +536,19 @@ class Orchestrator:
+                 return out.decode().strip()
+         return "HEAD~1"
+ 
++    def _apply_surface_advisory(self, ctx: dict, spec: TaskSpec) -> None:
++        """SCRUM-24: non-blocking advisory when the plan spans >=2 surfaces
++        (backend/frontend/desktop/docs). Mutates *ctx* in place and emits an
++        event — never gates, blocks, or touches status/criteria. Emitted
++        under its own ``surface_advisory`` kind rather than ``"advisory"``:
++        doctor.py's ``advisory_degradations`` mechanism counts every
++        ``"advisory"`` event as a silently-degraded subsystem, and this
++        informational note is neither."""
++        _adv = surface_advisory(spec.files_to_change)
++        if _adv:
++            ctx["surface_advisory"] = _adv
++            self.emit("surface_advisory", _adv)
++
+     def _advisory(self, text: str) -> None:
+         """A subsystem degraded but the run continues. Logged at warning AND
+         emitted as an event: the silent-swallow log.debug pattern is how whole
+@@ -1072,6 +1086,7 @@ class Orchestrator:
+                     ctx["plan_size_warning"] = True
+                 task.context = ctx
+                 await self.store.update_task(task)
++                self._apply_surface_advisory(ctx, spec)
+ 
+             # Compound task decomposition: if the planner detected complexity
+             # and emitted a DECOMPOSE_PLAN, hand off to the LeadAgent.
+diff --git a/src/no_human/intake/surface_advisory.py b/src/no_human/intake/surface_advisory.py
+new file mode 100644
+index 0000000..4b920be
+--- /dev/null
++++ b/src/no_human/intake/surface_advisory.py
+@@ -0,0 +1,84 @@
++"""SCRUM-24: deterministic surface classification for intake advisories.
++
++Pure, no LLM, no I/O. Dogfooding showed every ticket bundling more than one
++surface (backend + frontend, CLI + board UI, etc.) burned 14-18M tokens across
++truncated attempts and shipped nothing, while single-surface tickets merged in
++1-2 review rounds. This module classifies the surfaces a plan's
++``files_to_change`` touches so the orchestrator can attach a non-blocking
++advisory before the attempt burns its budget.
++"""
++
++from __future__ import annotations
++
++_TEST_DIR_SEGMENTS = {"test", "tests", "__tests__"}
++
++
++def _extract_path_token(item: str) -> str | None:
++    """First path-like token in a raw plan line (mirrors
++    ``scope_guard._extract_path_token`` without importing it, to avoid
++    coupling this pure module to the agent-side scope guard)."""
++    tokens = item.split()
++    for tok in tokens:
++        tok = tok.strip("`'\"(),:|")
++        if not tok:
++            continue
++        if "/" in tok or "." in tok:
++            return tok
++        if len(tokens) == 1:
++            return tok
++    return None
++
++
++def _is_tests_only(path: str) -> bool:
++    segments = path.split("/")
++    if any(seg in _TEST_DIR_SEGMENTS for seg in segments[:-1]):
++        return True
++    basename = segments[-1]
++    if basename == "conftest.py":
++        return True
++    if basename.startswith("test_") and basename.endswith(".py"):
++        return True
++    if basename.endswith("_test.py"):
++        return True
++    return False
++
++
++def _surface_for(path: str) -> str | None:
++    if path.startswith("src/"):
++        return "backend"
++    if path.startswith("web/"):
++        return "frontend"
++    if path.startswith("desktop/"):
++        return "desktop"
++    if path.startswith("docs/") or path.endswith(".md"):
++        return "docs"
++    return None
++
++
++def classify_surfaces(files_to_change: list[str]) -> set[str]:
++    """Distinct surfaces touched by *files_to_change*, tests-only excluded."""
++    surfaces: set[str] = set()
++    for item in files_to_change:
++        path = _extract_path_token(item)
++        if not path:
++            continue
++        path = path.removeprefix("./")
++        if _is_tests_only(path):
++            continue
++        surface = _surface_for(path)
++        if surface:
++            surfaces.add(surface)
++    return surfaces
++
++
++def surface_advisory(files_to_change: list[str]) -> str | None:
++    """A human-facing caution when the plan spans >=2 surfaces, else None."""
++    surfaces = classify_surfaces(files_to_change)
++    if len(surfaces) < 2:
++        return None
++    joined = " + ".join(sorted(surfaces))
++    return (
++        f"This task spans {joined}. Multi-surface tasks fail ~4x more often "
++        "within budget - consider splitting (backend first, frontend "
++        "against its contract)."
++    )
+diff --git a/tests/test_orchestrator_surface_advisory.py b/tests/test_orchestrator_surface_advisory.py
+new file mode 100644
+index 0000000..dcf2ae1
+--- /dev/null
++++ b/tests/test_orchestrator_surface_advisory.py
+@@ -0,0 +1,93 @@
++"""SCRUM-24: the orchestrator attaches a non-blocking multi-surface advisory
++to task.context and a task event when a plan spans >=2 surfaces, and does
++neither for a single-surface plan."""
++
++import pytest
++
++from no_human.config import load_config
++from no_human.core.db import Store
++from no_human.core.events import EventPersister
++from no_human.core.orchestrator import Orchestrator
++from no_human.core.task import Task, TaskSpec
++from no_human.notify.slack import SlackNotifier
++
++TWO_SURFACE_PLAN = """
++## FILES TO CHANGE/CREATE
++
++- src/x.py
++- web/y.js
++"""
++
++ONE_SURFACE_PLAN = """
++## FILES TO CHANGE/CREATE
++
++- src/x.py
++- src/y.py
++"""
++
++
++class _Backend:
++    async def run(self, *a, **k):  # pragma: no cover
++        raise AssertionError("backend should not run here")
++
++
++@pytest.fixture
++async def store(tmp_path):
++    s = await Store(tmp_path / "nh.db").connect()
++    yield s
++    await s.close()
++
++
++def _orch(store, tmp_path, sink=None):
++    cfg = load_config(tmp_path / "config.yaml")
++    return Orchestrator(store, cfg.data, _Backend(), SlackNotifier(None), event_sink=sink)
++
++
++async def test_two_surface_spec_emits_advisory_and_context(store, tmp_path):
++    t = Task.new("multi-surface task", repo_path="/r")
++    t.acceptance_criteria = ["keep me"]
++    await store.create_task(t)
++    status_before = t.status
++
++    async with EventPersister(store, t.id, interval=0.01) as persister:
++        orch = _orch(store, tmp_path, sink=persister.record)
++        spec = TaskSpec.from_plan(TWO_SURFACE_PLAN)
++        ctx = t.context or {}
++        orch._apply_surface_advisory(ctx, spec)
++        t.context = ctx
++        await store.update_task(t)
++
++    got = await store.get_task(t.id)
++    assert "surface_advisory" in got.context
++    assert "backend" in got.context["surface_advisory"]
++    assert "frontend" in got.context["surface_advisory"]
++
++    events = await store.list_events(t.id)
++    surface_events = [e for e in events if e["kind"] == "surface_advisory"]
++    assert len(surface_events) == 1
++    assert "backend" in surface_events[0]["text"]
++
++    # advisory-only: no gating, no status change, no criteria mutation.
++    assert got.status == status_before
++    assert got.acceptance_criteria == ["keep me"]
++    # doctor.py's advisory_degradations mechanism must NOT see this event.
++    assert not [e for e in events if e["kind"] == "advisory"]
++
++
++async def test_one_surface_spec_no_advisory(store, tmp_path):
++    t = Task.new("single-surface task", repo_path="/r")
++    await store.create_task(t)
++
++    async with EventPersister(store, t.id, interval=0.01) as persister:
++        orch = _orch(store, tmp_path, sink=persister.record)
++        spec = TaskSpec.from_plan(ONE_SURFACE_PLAN)
++        ctx = t.context or {}
++        orch._apply_surface_advisory(ctx, spec)
++        t.context = ctx
++        await store.update_task(t)
++
++    got = await store.get_task(t.id)
++    assert "surface_advisory" not in got.context
++
++    events = await store.list_events(t.id)
++    assert not [e for e in events if e["kind"] == "surface_advisory"]
+diff --git a/tests/test_surface_advisory.py b/tests/test_surface_advisory.py
+new file mode 100644
+index 0000000..44189e2
+--- /dev/null
++++ b/tests/test_surface_advisory.py
+@@ -0,0 +1,55 @@
++"""SCRUM-24: pure-function tests for the intake surface classifier."""
++
++from no_human.intake.surface_advisory import classify_surfaces, surface_advisory
++
++
++def test_single_surface_no_advisory():
++    files = ["src/a.py", "src/b.py"]
++    assert classify_surfaces(files) == {"backend"}
++    assert surface_advisory(files) is None
++
++
++def test_backend_plus_frontend():
++    files = ["src/a.py", "web/b.js"]
++    surfaces = classify_surfaces(files)
++    assert surfaces == {"backend", "frontend"}
++    advisory = surface_advisory(files)
++    assert advisory is not None
++    assert "backend" in advisory
++    assert "frontend" in advisory
++
++
++def test_desktop_surface():
++    files = ["desktop/main.ts", "src/x.py"]
++    assert classify_surfaces(files) == {"backend", "desktop"}
++    assert surface_advisory(files) is not None
++
++
++def test_docs_surface_dir_and_md():
++    assert classify_surfaces(["docs/guide.md"]) == {"docs"}
++    files = ["src/a.py", "README.md"]
++    assert classify_surfaces(files) == {"backend", "docs"}
++    assert surface_advisory(files) is not None
++
++
++def test_tests_only_excluded():
++    files = [
++        "src/a.py",
++        "tests/test_a.py",
++        "src/a_test.py",
++        "web/__tests__/x.js",
++        "conftest.py",
++    ]
++    assert classify_surfaces(files) == {"backend"}
++    assert surface_advisory(files) is None
++
++
++def test_markdown_item_with_description():
++    files = ["src/foo.py — add validation", "web/bar.js | tweak"]
++    assert classify_surfaces(files) == {"backend", "frontend"}
++
++
++def test_unknown_paths_contribute_nothing():
++    files = ["Makefile", "pyproject.toml"]
++    assert classify_surfaces(files) == set()
++    assert surface_advisory(files) is None

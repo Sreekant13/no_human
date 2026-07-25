@@ -1,0 +1,19 @@
+{
+  "class": "logic",
+  "file": "src/no_human/profile.py",
+  "hunk_lines": [
+    150,
+    154
+  ],
+  "description": "The lifetime_tokens guard drops the 'not in merged' check, so a repo profile default silently OVERWRITES an explicitly-supplied per-task lifetime cap \u2014 directly contradicting the function's own docstring ('an explicit key already present always wins'). The diff's test only pins explicit-wins for attempt_tokens, so the suite stays green.",
+  "keywords": [
+    "lifetime_tokens",
+    "explicit",
+    "overwrite",
+    "clobber",
+    "not in",
+    "wins"
+  ],
+  "planted_by": "supervising-session",
+  "date": "2026-07-25"
+}

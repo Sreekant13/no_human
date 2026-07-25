@@ -1,0 +1,20 @@
+{
+  "class": "spec-miss",
+  "file": "src/no_human/core/orchestrator.py",
+  "hunk_lines": [
+    1086,
+    1090
+  ],
+  "description": "The production call site runs _apply_surface_advisory AFTER task.context is persisted, so the advisory reaches the in-memory dict and the event stream but never the durable task context \u2014 a restart or any board read from the store loses it. The AC ('advisory attached to task context') is silently unmet; tests only exercise the helper directly and persist manually, so the suite stays green.",
+  "keywords": [
+    "persist",
+    "update_task",
+    "order",
+    "after",
+    "context",
+    "advisory",
+    "durable"
+  ],
+  "planted_by": "supervising-session",
+  "date": "2026-07-25"
+}

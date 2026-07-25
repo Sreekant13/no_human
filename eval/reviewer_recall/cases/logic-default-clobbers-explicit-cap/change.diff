@@ -1,0 +1,617 @@
+diff --git a/src/no_human/api/app.py b/src/no_human/api/app.py
+index 9041b3c..7ae1452 100644
+--- a/src/no_human/api/app.py
++++ b/src/no_human/api/app.py
+@@ -388,6 +388,10 @@ async def create_task(body: CreateTaskRequest, request: Request) -> TaskSummaryO
+     task.linked_repos = linked
+     if body.backend and body.backend == "claude":
+         task.config["backend"] = body.backend
++    if repo_path:
++        from ..profile import apply_default_task_config
++        profile = await store.get_profile(repo_path)
++        task.config = apply_default_task_config(profile, task.config)
+     await store.create_task(task)
+     summary = TaskSummaryOut.from_task(task)
+     tasks = await _board_tasks(store, scheduler=_sched(request))
+diff --git a/src/no_human/cli/commands.py b/src/no_human/cli/commands.py
+index 73bf607..1230a5f 100644
+--- a/src/no_human/cli/commands.py
++++ b/src/no_human/cli/commands.py
+@@ -703,6 +703,74 @@ def task_config(task_id, assignments):
+     asyncio.run(_go())
+ 
+ 
++REPO_CONFIG_KEYS = frozenset({"default_attempt_tokens", "default_lifetime_tokens"})
++
++
++@cli.group("repo")
++def repo_group() -> None:
++    """Manage per-repo profile settings."""
++
++
++@repo_group.command("config")
++@click.argument("repo_path", type=click.Path(exists=True))
++@click.argument("assignments", nargs=-1)
++def repo_config(repo_path, assignments):
++    """Set or inspect human-only repo profile defaults (SCRUM-26).
++
++    nh repo config REPO_PATH                 — inspect current defaults
++    nh repo config REPO_PATH KEY=VALUE ...   — set defaults
++
++    Human-only by construction, like `nh task config` — this is the
++    operator's calibration knob for a repo's default per-task token budgets.
++    They are copied into task.config at task creation whenever the task has
++    no explicit override; an explicit `nh task config` value always wins.
++    Accepts exactly default_attempt_tokens / default_lifetime_tokens.
++    """
++    from ..profile import ProjectProfile
++
++    config, _ = _bootstrap(require_auth=False)
++    repo = str(Path(repo_path).expanduser().resolve())
++
++    resolved: dict[str, int] = {}
++    for assignment in assignments:
++        if "=" not in assignment:
++            console.print(f"[red]malformed assignment (want KEY=VALUE):[/] {assignment}")
++            sys.exit(1)
++        key, _, raw = assignment.partition("=")
++        key = key.strip()
++        if key not in REPO_CONFIG_KEYS:
++            console.print(
++                f"[red]{key!r} is not settable on a repo profile "
++                f"(allowed: {', '.join(sorted(REPO_CONFIG_KEYS))})[/]"
++            )
++            sys.exit(1)
++        try:
++            value = int(raw.strip())
++        except (TypeError, ValueError):
++            console.print(f"[red]{key} must be an integer, got {raw!r}[/]")
++            sys.exit(1)
++        if value <= 0:
++            console.print(f"[red]{key} must be positive, got {value}[/]")
++            sys.exit(1)
++        resolved[key] = value
++
++    async def _go():
++        async with Store(config.db_path) as store:
++            profile = await store.get_profile(repo) or ProjectProfile(repo_path=repo)
++            if not resolved:
++                console.print(f"default_attempt_tokens={profile.default_attempt_tokens or 0}")
++                console.print(f"default_lifetime_tokens={profile.default_lifetime_tokens or 0}")
++                return
++            for key, value in resolved.items():
++                setattr(profile, key, value)
++            await store.upsert_profile(profile)
++            console.print(
++                "[green]applied[/] " + ", ".join(f"{k}={resolved[k]}" for k in sorted(resolved))
++            )
++
++    asyncio.run(_go())
++
++
+ @task.command("list")
+ def task_list():
+     """List all tasks as a board."""
+diff --git a/src/no_human/intake/jira_poll.py b/src/no_human/intake/jira_poll.py
+index 06f1d90..8a8df0c 100644
+--- a/src/no_human/intake/jira_poll.py
++++ b/src/no_human/intake/jira_poll.py
+@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
+ 
+ from ..core.db import Store
+ from ..core.task import Task, TaskStatus
++from ..profile import apply_default_task_config
+ 
+ log = logging.getLogger("no_human.intake.jira_poll")
+ 
+@@ -105,6 +106,9 @@ class JiraPoller:
+                 continue
+             if self.default_repo:
+                 task.repo_path = self.default_repo
++            if task.repo_path:
++                profile = await self.store.get_profile(task.repo_path)
++                task.config = apply_default_task_config(profile, task.config)
+             await self.store.create_task(task)
+             existing.add(key)
+             result.created += 1
+diff --git a/src/no_human/profile.py b/src/no_human/profile.py
+index 57c7588..e652363 100644
+--- a/src/no_human/profile.py
++++ b/src/no_human/profile.py
+@@ -55,6 +55,12 @@ class ProjectProfile:
+     notes: str = ""
+     wiki_commit: str = ""              # git SHA when wiki was last generated
+     default_branch: str = ""           # C3: explicit default branch (e.g. "main", "master")
++    # SCRUM-26: repo-level calibration for task.config's per-task overrides
++    # (attempt_tokens / lifetime_tokens — see blockers/actions.py). 0 = unset;
++    # copied into a new task's config only when the task has no explicit
++    # override, so an operator hand-set task.config always still wins.
++    default_attempt_tokens: int = 0
++    default_lifetime_tokens: int = 0
+ 
+     # --- serialization ---------------------------------------------------- #
+ 
+@@ -78,6 +84,8 @@ class ProjectProfile:
+             "notes": self.notes,
+             "wiki_commit": self.wiki_commit,
+             "default_branch": self.default_branch,
++            "default_attempt_tokens": self.default_attempt_tokens,
++            "default_lifetime_tokens": self.default_lifetime_tokens,
+         }
+ 
+     @classmethod
+@@ -125,3 +133,22 @@ class ProjectProfile:
+         if self.is_usable:
+             return True
+         return bool(auto_confirm_proven and self.test_cmd and self.proven.get("test_cmd"))
++
++
++def apply_default_task_config(
++    profile: "ProjectProfile | None", task_config: dict[str, Any]
++) -> dict[str, Any]:
++    """Copy a repo profile's default token budgets into a new task's config
++    (SCRUM-26), for exactly the two keys the orchestrator already reads as
++    per-task overrides (``attempt_tokens`` / ``lifetime_tokens`` — see
++    blockers/actions.py's ALLOWED_TASK_CONFIG_KEYS). An explicit key already
++    present on ``task_config`` always wins; no profile / no defaults set on
++    the profile leaves ``task_config`` byte-for-byte unchanged."""
++    if profile is None:
++        return task_config
++    merged = dict(task_config)
++    if profile.default_attempt_tokens and "attempt_tokens" not in merged:
++        merged["attempt_tokens"] = profile.default_attempt_tokens
++    if profile.default_lifetime_tokens:
++        merged["lifetime_tokens"] = profile.default_lifetime_tokens
++    return merged
+diff --git a/tests/test_api.py b/tests/test_api.py
+index cd37546..e6e3afe 100644
+--- a/tests/test_api.py
++++ b/tests/test_api.py
+@@ -9,6 +9,7 @@ from httpx import AsyncClient, ASGITransport
+ from no_human.core.task import Task, TaskStatus
+ from no_human.api.app import app
+ from no_human.core.db import Store
++from no_human.profile import ProjectProfile
+ 
+ 
+ # --------------------------------------------------------------------------- #
+@@ -162,6 +163,69 @@ async def test_create_task_absent_external_id_unchanged(client, store):
+     assert task.external_id is None
+ 
+ 
++# --------------------------------------------------------------------------- #
++# POST /api/tasks — SCRUM-26 repo profile default token budgets               #
++# --------------------------------------------------------------------------- #
++
++def _fake_git_repo(tmp_path, name="repo"):
++    """create_task's repo_path branch requires a real dir with a `.git`
++    entry; content doesn't matter, only that the check passes."""
++    repo = tmp_path / name
++    repo.mkdir()
++    (repo / ".git").mkdir()
++    return str(repo.resolve())
++
++
++@pytest.mark.asyncio
++async def test_create_task_copies_profile_defaults_into_config(client, store, tmp_path):
++    repo = _fake_git_repo(tmp_path)
++    await store.upsert_profile(ProjectProfile(
++        repo_path=repo, default_attempt_tokens=6_000_000, default_lifetime_tokens=16_000_000,
++    ))
++    r = await client.post("/api/tasks", json={"title": "Heavy repo task", "repo_path": repo})
++    assert r.status_code == 201
++    task = await store.find_task(r.json()["id"])
++    assert task.config["attempt_tokens"] == 6_000_000
++    assert task.config["lifetime_tokens"] == 16_000_000
++
++
++@pytest.mark.asyncio
++async def test_create_task_no_profile_defaults_config_unchanged(client, store, tmp_path):
++    repo = _fake_git_repo(tmp_path, name="plain_repo")
++    r = await client.post("/api/tasks", json={"title": "Plain task", "repo_path": repo})
++    assert r.status_code == 201
++    task = await store.find_task(r.json()["id"])
++    assert "attempt_tokens" not in task.config
++    assert "lifetime_tokens" not in task.config
++
++
++@pytest.mark.asyncio
++async def test_create_task_explicit_config_overrides_profile_defaults(client, store, tmp_path, monkeypatch):
++    repo = _fake_git_repo(tmp_path, name="override_repo")
++    await store.upsert_profile(ProjectProfile(
++        repo_path=repo, default_attempt_tokens=6_000_000, default_lifetime_tokens=16_000_000,
++    ))
++    # Simulate a task that already carries an explicit attempt_tokens override
++    # by the time create_task's profile-defaults merge runs (e.g. a future
++    # explicit-config field on CreateTaskRequest, or a caller-preset value) —
++    # the merge must leave it alone rather than clobber it with the profile
++    # default, while still filling in the untouched lifetime_tokens key.
++    from no_human.core.task import Task as TaskCls
++    orig_new = TaskCls.new
++
++    def _new_with_explicit_override(*a, **kw):
++        t = orig_new(*a, **kw)
++        t.config["attempt_tokens"] = 999
++        return t
++
++    monkeypatch.setattr(TaskCls, "new", _new_with_explicit_override)
++    r = await client.post("/api/tasks", json={"title": "Override task", "repo_path": repo})
++    assert r.status_code == 201
++    task = await store.find_task(r.json()["id"])
++    assert task.config["attempt_tokens"] == 999            # explicit wins, not clobbered
++    assert task.config["lifetime_tokens"] == 16_000_000    # untouched key still gets the default
++
++
+ # --------------------------------------------------------------------------- #
+ # GET /api/tasks/{id}/diff                                                     #
+ # --------------------------------------------------------------------------- #
+diff --git a/tests/test_jira_intake.py b/tests/test_jira_intake.py
+index ab99c29..b3b07df 100644
+--- a/tests/test_jira_intake.py
++++ b/tests/test_jira_intake.py
+@@ -12,6 +12,7 @@ from no_human.core.db import Store
+ from no_human.core.task import Task, TaskStatus
+ from no_human.intake.jira import JiraAdapter, _adf_text
+ from no_human.intake.jira_poll import JiraPoller
++from no_human.profile import ProjectProfile
+ 
+ 
+ def _cfg(**over):
+@@ -225,6 +226,79 @@ async def test_poller_survives_a_search_error(monkeypatch, tmp_path):
+         await store.close()
+ 
+ 
++# --------------------- SCRUM-26: repo profile default budgets ---------------
++
++
++@pytest.mark.asyncio
++async def test_poller_copies_profile_defaults_into_task_config(monkeypatch, tmp_path):
++    monkeypatch.setenv("JIRA_API_TOKEN", "t")
++    store = await Store(tmp_path / "t.db").connect()
++    try:
++        await store.upsert_profile(ProjectProfile(
++            repo_path="/tmp/repo", default_attempt_tokens=6_000_000,
++            default_lifetime_tokens=16_000_000,
++        ))
++        issues = [{"key": "PROJ-1", "fields": {"summary": "A"}}]
++        a = JiraAdapter(_cfg())
++        monkeypatch.setattr(a, "search", lambda: issues)
++        poller = JiraPoller(a, store, config=_cfg(default_repo="/tmp/repo"))
++        r = await poller.poll_once()
++        assert r.created == 1
++        tasks = await store.list_tasks()
++        assert tasks[0].config["attempt_tokens"] == 6_000_000
++        assert tasks[0].config["lifetime_tokens"] == 16_000_000
++    finally:
++        await store.close()
++
++
++@pytest.mark.asyncio
++async def test_poller_no_profile_defaults_config_unchanged(monkeypatch, tmp_path):
++    monkeypatch.setenv("JIRA_API_TOKEN", "t")
++    store = await Store(tmp_path / "t.db").connect()
++    try:
++        issues = [{"key": "PROJ-1", "fields": {"summary": "A"}}]
++        a = JiraAdapter(_cfg())
++        monkeypatch.setattr(a, "search", lambda: issues)
++        poller = JiraPoller(a, store, config=_cfg(default_repo="/tmp/repo"))
++        r = await poller.poll_once()
++        assert r.created == 1
++        tasks = await store.list_tasks()
++        assert "attempt_tokens" not in tasks[0].config
++        assert "lifetime_tokens" not in tasks[0].config
++    finally:
++        await store.close()
++
++
++@pytest.mark.asyncio
++async def test_poller_explicit_config_overrides_profile_defaults(monkeypatch, tmp_path):
++    monkeypatch.setenv("JIRA_API_TOKEN", "t")
++    store = await Store(tmp_path / "t.db").connect()
++    try:
++        await store.upsert_profile(ProjectProfile(
++            repo_path="/tmp/repo", default_attempt_tokens=6_000_000,
++            default_lifetime_tokens=16_000_000,
++        ))
++        issues = [{"key": "PROJ-1", "fields": {"summary": "A"}}]
++        a = JiraAdapter(_cfg())
++        monkeypatch.setattr(a, "search", lambda: issues)
++        orig_normalize = a.normalize
++
++        def _normalize_with_explicit_override(issue):
++            t = orig_normalize(issue)
++            t.config["attempt_tokens"] = 999
++            return t
++
++        monkeypatch.setattr(a, "normalize", _normalize_with_explicit_override)
++        poller = JiraPoller(a, store, config=_cfg(default_repo="/tmp/repo"))
++        r = await poller.poll_once()
++        assert r.created == 1
++        tasks = await store.list_tasks()
++        assert tasks[0].config["attempt_tokens"] == 999          # explicit wins
++        assert tasks[0].config["lifetime_tokens"] == 16_000_000  # untouched key still defaulted
++    finally:
++        await store.close()
++
++
+ # --------------------------- SCRUM-21: transitions ---------------------------
+ 
+ 
+diff --git a/tests/test_profile.py b/tests/test_profile.py
+index 07f8a77..457ba2a 100644
+--- a/tests/test_profile.py
++++ b/tests/test_profile.py
+@@ -3,7 +3,7 @@
+ import pytest
+ 
+ from no_human.core.db import Store
+-from no_human.profile import PROFILE_RELPATH, ProjectProfile
++from no_human.profile import PROFILE_RELPATH, ProjectProfile, apply_default_task_config
+ 
+ 
+ @pytest.fixture
+@@ -120,4 +120,64 @@ async def test_store_upsert_updates_existing(store, tmp_path):
+     cur = await store.db.execute(
+         "SELECT COUNT(*) c FROM project_profiles WHERE repo_path = ?", (str(tmp_path),)
+     )
+-    assert (await cur.fetchone())["c"] == 1
+\ No newline at end of file
++    assert (await cur.fetchone())["c"] == 1
++
++
++# --------------------------------------------------------------------------- #
++# SCRUM-26: repo-level default token budgets                                  #
++# --------------------------------------------------------------------------- #
++
++def test_default_token_fields_default_to_unset():
++    prof = ProjectProfile(repo_path="/r")
++    assert prof.default_attempt_tokens == 0
++    assert prof.default_lifetime_tokens == 0
++
++
++def test_yaml_round_trip_carries_token_defaults(tmp_path):
++    prof = _sample(tmp_path)
++    prof.default_attempt_tokens = 6_000_000
++    prof.default_lifetime_tokens = 16_000_000
++    prof.save()
++
++    loaded = ProjectProfile.load(tmp_path)
++    assert loaded.default_attempt_tokens == 6_000_000
++    assert loaded.default_lifetime_tokens == 16_000_000
++
++
++async def test_store_round_trip_carries_token_defaults(store, tmp_path):
++    prof = _sample(tmp_path)
++    prof.default_attempt_tokens = 6_000_000
++    prof.default_lifetime_tokens = 16_000_000
++    await store.upsert_profile(prof)
++
++    got = await store.get_profile(str(tmp_path))
++    assert got.default_attempt_tokens == 6_000_000
++    assert got.default_lifetime_tokens == 16_000_000
++
++
++def test_apply_default_task_config_no_profile_is_noop():
++    assert apply_default_task_config(None, {"backend": "claude"}) == {"backend": "claude"}
++
++
++def test_apply_default_task_config_no_defaults_set_is_noop():
++    prof = ProjectProfile(repo_path="/r")  # defaults unset (0)
++    assert apply_default_task_config(prof, {}) == {}
++
++
++def test_apply_default_task_config_copies_when_absent():
++    prof = ProjectProfile(repo_path="/r", default_attempt_tokens=6_000_000,
++                           default_lifetime_tokens=16_000_000)
++    merged = apply_default_task_config(prof, {})
++    assert merged == {"attempt_tokens": 6_000_000, "lifetime_tokens": 16_000_000}
++
++
++def test_apply_default_task_config_explicit_override_wins():
++    prof = ProjectProfile(repo_path="/r", default_attempt_tokens=6_000_000,
++                           default_lifetime_tokens=16_000_000)
++    merged = apply_default_task_config(prof, {"attempt_tokens": 1_234})
++    # explicit attempt_tokens kept; lifetime_tokens still copied from the profile
++    assert merged == {"attempt_tokens": 1_234, "lifetime_tokens": 16_000_000}
++    # the original dict passed in is never mutated in place
++    original = {"attempt_tokens": 1_234}
++    apply_default_task_config(prof, original)
++    assert original == {"attempt_tokens": 1_234}
+\ No newline at end of file
+diff --git a/tests/test_repo_config_cli.py b/tests/test_repo_config_cli.py
+new file mode 100644
+index 0000000..0fd0ae7
+--- /dev/null
++++ b/tests/test_repo_config_cli.py
+@@ -0,0 +1,191 @@
++"""Tests for `nh repo config REPO_PATH KEY=VALUE ...` (SCRUM-26: human-settable
++repo profile default token budgets).
++
++CLI commands drive asyncio.run() internally, so integration tests must be
++synchronous — see tests/test_task_config_cli.py for the established pattern
++this file reuses (_make_runner).
++"""
++from __future__ import annotations
++
++import asyncio
++from pathlib import Path
++
++from click.testing import CliRunner
++
++from no_human.cli.commands import cli
++from no_human.core.db import Store
++from no_human.profile import ProjectProfile
++
++
++# --------------------------------------------------------------------------- #
++# Helpers                                                                      #
++# --------------------------------------------------------------------------- #
++
++def _get_profile(db_path: Path, repo_path: str) -> ProjectProfile | None:
++    async def _go():
++        async with Store(db_path) as s:
++            return await s.get_profile(repo_path)
++    return asyncio.run(_go())
++
++
++def _seed_profile(db_path: Path, repo_path: str, **fields) -> None:
++    async def _go():
++        async with Store(db_path) as s:
++            await s.upsert_profile(ProjectProfile(repo_path=repo_path, **fields))
++    asyncio.run(_go())
++
++
++def _make_runner(path: Path, monkeypatch) -> CliRunner:
++    import no_human.cli.commands as cmd_mod
++
++    class _Cfg:
++        primary_model = "claude-sonnet-4-6"
++        review_model = "claude-sonnet-4-6"
++        data: dict = {}
++
++        def get(self, key, default=None):
++            return self.data.get(key, default)
++
++        def __getitem__(self, key):
++            return self.data[key]
++
++    _Cfg.db_path = path
++
++    monkeypatch.setattr(cmd_mod, "load_config", lambda: _Cfg())
++    monkeypatch.setattr(cmd_mod, "assert_subscription_mode", lambda **kw: None)
++    return CliRunner()
++
++
++# --------------------------------------------------------------------------- #
++# nh repo config — integration                                                #
++# --------------------------------------------------------------------------- #
++
++def test_repo_config_sets_allowed_keys(tmp_path, monkeypatch):
++    db = tmp_path / "test.db"
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    runner = _make_runner(db, monkeypatch)
++
++    result = runner.invoke(cli, [
++        "repo", "config", str(repo),
++        "default_attempt_tokens=6000000", "default_lifetime_tokens=16000000",
++    ])
++
++    assert result.exit_code == 0, result.output
++    prof = _get_profile(db, str(repo.resolve()))
++    assert prof.default_attempt_tokens == 6_000_000
++    assert prof.default_lifetime_tokens == 16_000_000
++
++
++def test_repo_config_round_trip_via_inspect(tmp_path, monkeypatch):
++    db = tmp_path / "test.db"
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    runner = _make_runner(db, monkeypatch)
++
++    set_result = runner.invoke(cli, [
++        "repo", "config", str(repo), "default_attempt_tokens=6000000",
++    ])
++    assert set_result.exit_code == 0, set_result.output
++
++    inspect_result = runner.invoke(cli, ["repo", "config", str(repo)])
++    assert inspect_result.exit_code == 0, inspect_result.output
++    assert "default_attempt_tokens=6000000" in inspect_result.output
++    assert "default_lifetime_tokens=0" in inspect_result.output
++
++
++def test_repo_config_inspect_no_profile_shows_unset(tmp_path, monkeypatch):
++    db = tmp_path / "test.db"
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    runner = _make_runner(db, monkeypatch)
++
++    result = runner.invoke(cli, ["repo", "config", str(repo)])
++
++    assert result.exit_code == 0, result.output
++    assert "default_attempt_tokens=0" in result.output
++    assert "default_lifetime_tokens=0" in result.output
++
++
++def test_repo_config_refuses_unknown_key(tmp_path, monkeypatch):
++    db = tmp_path / "test.db"
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    _seed_profile(db, str(repo.resolve()))
++    runner = _make_runner(db, monkeypatch)
++
++    result = runner.invoke(cli, ["repo", "config", str(repo), "test_cmd=rm -rf /"])
++
++    assert result.exit_code != 0
++    assert "default_attempt_tokens" in result.output  # allowed-keys list surfaced
++    prof = _get_profile(db, str(repo.resolve()))
++    assert prof.default_attempt_tokens == 0
++
++
++def test_repo_config_rejects_non_positive_and_non_integer(tmp_path, monkeypatch):
++    db = tmp_path / "test.db"
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    runner = _make_runner(db, monkeypatch)
++
++    zero = runner.invoke(cli, ["repo", "config", str(repo), "default_attempt_tokens=0"])
++    assert zero.exit_code != 0
++
++    non_int = runner.invoke(cli, ["repo", "config", str(repo), "default_attempt_tokens=lots"])
++    assert non_int.exit_code != 0
++
++    assert _get_profile(db, str(repo.resolve())) is None
++
++
++def test_repo_config_malformed_assignment(tmp_path, monkeypatch):
++    db = tmp_path / "test.db"
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    runner = _make_runner(db, monkeypatch)
++
++    result = runner.invoke(cli, ["repo", "config", str(repo), "default_attempt_tokens"])
++
++    assert result.exit_code != 0
++    assert _get_profile(db, str(repo.resolve())) is None
++
++
++def test_repo_config_allows_values_above_global_caps(tmp_path, monkeypatch):
++    """Buyer-blocking lesson: repo defaults must be able to exceed the global
++    4M attempt / 8M lifetime caps — that's the exact calibration problem this
++    feature solves."""
++    db = tmp_path / "test.db"
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    runner = _make_runner(db, monkeypatch)
++
++    result = runner.invoke(cli, [
++        "repo", "config", str(repo),
++        "default_attempt_tokens=6000000", "default_lifetime_tokens=16000000",
++    ])
++
++    assert result.exit_code == 0, result.output
++    prof = _get_profile(db, str(repo.resolve()))
++    assert prof.default_attempt_tokens == 6_000_000
++    assert prof.default_lifetime_tokens == 16_000_000
++
++
++def test_repo_config_preserves_existing_profile_fields(tmp_path, monkeypatch):
++    """Setting token defaults on an already-onboarded repo must not clobber
++    the rest of its profile (ecosystem/test_cmd/confirmed/etc.)."""
++    db = tmp_path / "test.db"
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    _seed_profile(
++        db, str(repo.resolve()),
++        ecosystem="python-pytest", test_cmd="uv run pytest -q", confirmed=True,
++    )
++    runner = _make_runner(db, monkeypatch)
++
++    result = runner.invoke(cli, ["repo", "config", str(repo), "default_attempt_tokens=6000000"])
++
++    assert result.exit_code == 0, result.output
++    prof = _get_profile(db, str(repo.resolve()))
++    assert prof.default_attempt_tokens == 6_000_000
++    assert prof.ecosystem == "python-pytest"
++    assert prof.test_cmd == "uv run pytest -q"
++    assert prof.confirmed is True
