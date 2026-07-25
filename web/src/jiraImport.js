@@ -95,6 +95,46 @@ export function importedChipStyle(status) {
   return CATEGORY_TOKENS[category] || null;
 }
 
+/**
+ * SCRUM-3 — the picker never told the operator whether it was browsing ALL
+ * open tickets (empty query) or a filtered match, nor whether the list was
+ * truncated at the request limit. `count` is `jiraResults.length`; `limit` is
+ * the request limit passed to searchJiraIssues (must match api.js's default
+ * so "first N" is never a lie). Returns `null` for zero results — the
+ * empty-state message (jiraEmptyMessage) speaks instead, so the header never
+ * says "Showing 0 open tickets".
+ */
+export function jiraResultHeader(query, count, limit) {
+  if (!count) return null;
+  const q = (query || "").trim();
+  if (q) {
+    // At the limit the match set is almost certainly truncated too (review
+    // finding: "50 matching tickets" at exactly 50 was the lie the limit
+    // comment promises to avoid).
+    if (count >= limit) return `First ${limit} matching tickets — type to narrow`;
+    return `${count} matching ticket${count === 1 ? "" : "s"}`;
+  }
+  if (count >= limit) return `Showing first ${limit} open tickets — type to narrow`;
+  return `Showing ${count} open ticket${count === 1 ? "" : "s"} — type to filter`;
+}
+
+/** Zero-results copy: an empty BROWSE (no query — nothing was matched
+ * against) reads differently from a filtered search that matched nothing. */
+export function jiraEmptyMessage(query) {
+  return (query || "").trim() ? "No matching tickets." : "No open tickets in this project.";
+}
+
+/** `issue.updated` is server data — a malformed/missing value must never
+ * render `new Date(x).toLocaleDateString()`'s "Invalid Date" string. Returns
+ * `null` (caller omits the whole date segment) unless `updated` parses to a
+ * real date. */
+export function formatIssueUpdated(updated) {
+  if (!updated) return null;
+  const d = new Date(updated);
+  if (Number.isNaN(d.getTime())) return null;
+  return `Updated ${d.toLocaleDateString()}`;
+}
+
 /** Build the "imported" chip's {label, style, className}, or `null` when the
  * ticket has no board task yet — the caller renders nothing in that case.
  * Import stays clickable either way; this only ever ADDS visible state, it

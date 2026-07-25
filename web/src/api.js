@@ -477,7 +477,7 @@ export const saveIntegrationConfig = (name, fields) =>
 // Task 1.6: browse/pick a configured Jira project's tickets (Import from
 // Jira). Throws with the server's 503 (unconfigured) / 502 (upstream error)
 // `detail` message — the composer surfaces that text as-is.
-export async function searchJiraIssues(q, limit = 20) {
+export async function searchJiraIssues(q, limit = 50) {
   const params = new URLSearchParams({ q: q || "", limit: String(limit) });
   const r = await fetch(`${BASE}/api/integrations/jira/issues?${params}`);
   if (!r.ok) {

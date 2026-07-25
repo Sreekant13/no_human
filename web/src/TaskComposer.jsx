@@ -3,6 +3,7 @@ import { fetchProjects, fetchConfig, fetchIntegrations, searchJiraIssues, fetchJ
 import { COMPOSER_KINDS, kindByValue, needsPrUrl } from "./composerKinds.js";
 import { splitPrompt } from "./promptSplit.js";
 import { promptFromIssue, jiraStatusChipStyle, externalIdFromIssue, importedChip } from "./jiraImport.js";
+import { jiraResultHeader, jiraEmptyMessage, formatIssueUpdated } from "./jiraImport.js";
 import { greetingName } from "./greeting.js";
 import { hasPrRef } from "./prRefs.js";
 import { formatBytes } from "./formatBytes.js";
@@ -18,6 +19,10 @@ import { useEscapeKey } from "./useEscapeKey.js";
 // It owns the composed spec and hands it to the parent, which runs the intake
 // grill exactly as the old form branch did. It never creates the task itself.
 // The parent re-seeds it via `initial` so a failed grill never loses the prompt.
+
+// SCRUM-3: the display limit for the "Showing first N open tickets" header —
+// must match api.js's searchJiraIssues default so truncation is never a lie.
+const JIRA_LIMIT = 50;
 
 // ONE control system. Two Preflight-off hazards are handled here, once:
 //   1. `border` alone sets border-WIDTH. Preflight normally supplies
@@ -105,7 +110,14 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   const [jiraOpen, setJiraOpen] = useState(false);
   const [jiraQuery, setJiraQuery] = useState("");
   const [jiraResults, setJiraResults] = useState(undefined); // undefined = no search run yet
-  const [jiraLoading, setJiraLoading] = useState(false);
+  // The query the MOUNTED results were fetched with (review finding: the
+  // header/empty copy must describe the rows on screen, not the keystrokes
+  // typed since — pairing the live query with stale rows misstates both).
+  const [jiraShownQuery, setJiraShownQuery] = useState("");
+  // SCRUM-3: replaces the old list-teardown-driving flag — a refresh in flight no longer tears
+  // down the visible list, so this now drives only the in-flight hint + the
+  // "nothing to show yet" skeleton gate, not the list's visibility.
+  const [jiraRefreshing, setJiraRefreshing] = useState(false);
   const [jiraError, setJiraError] = useState(null);
   const [jiraNonce, setJiraNonce] = useState(0); // bumped by "Try again" to re-run the same search
   const fileInputRef = useRef(null);
@@ -149,24 +161,30 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
     if (!jiraOpen) return;
     const q = jiraQuery.trim();
     let ignore = false;
-    setJiraLoading(true);
+    // SCRUM-3: do NOT clear jiraResults here — every keystroke used to tear
+    // the visible list down into skeletons before the 300ms debounce even
+    // fired. The previous results stay mounted; jiraRefreshing only drives
+    // the subtle "· Updating…" hint (and the skeleton gate, for the case
+    // where there is nothing to show yet).
+    setJiraRefreshing(true);
     setJiraError(null);
     // An empty query is valid and is the default: it browses ALL of the
     // configured project's open tickets so the picker lists everything to
     // choose from. Only typing needs the 300ms debounce; the initial (empty)
     // browse loads immediately.
     const h = setTimeout(() => {
-      searchJiraIssues(q)
+      searchJiraIssues(q, JIRA_LIMIT)
         .then((issues) => {
           if (ignore) return;
           setJiraResults(issues);
-          setJiraLoading(false);
+          setJiraShownQuery(q);
+          setJiraRefreshing(false);
         })
         .catch((err) => {
           if (ignore) return;
           setJiraError(err.message);
           setJiraResults(undefined);
-          setJiraLoading(false);
+          setJiraRefreshing(false);
         });
     }, q ? 300 : 0);
     return () => { ignore = true; clearTimeout(h); };
@@ -336,13 +354,19 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
               aria-label="Search Jira tickets"
             />
             <div className="mt-3 flex flex-col gap-2" aria-live="polite">
-              {jiraLoading && (
+              {!jiraError && jiraResults && jiraResults.length > 0 && (
+                <p className="mb-2 font-ui text-xs text-text-muted">
+                  {jiraResultHeader(jiraShownQuery, jiraResults.length, JIRA_LIMIT)}
+                  {jiraRefreshing ? " · Updating…" : ""}
+                </p>
+              )}
+              {(!jiraResults || jiraResults.length === 0) && jiraRefreshing && (
                 <>
                   <div className="skeleton h-14 w-full rounded-xl" aria-hidden="true" />
                   <div className="skeleton h-14 w-full rounded-xl" aria-hidden="true" />
                 </>
               )}
-              {!jiraLoading && jiraError && (
+              {!jiraRefreshing && jiraError && (
                 <div
                   role="alert"
                   className="flex items-center justify-between gap-3 rounded-xl px-4 py-3 font-ui text-sm"
@@ -358,12 +382,12 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
                   </button>
                 </div>
               )}
-              {!jiraLoading && !jiraError && jiraResults && jiraResults.length === 0 && (
+              {!jiraRefreshing && !jiraError && jiraResults && jiraResults.length === 0 && (
                 <p className="px-2 py-3 text-center font-ui text-sm text-text-muted">
-                  No matching tickets.
+                  {jiraEmptyMessage(jiraShownQuery)}
                 </p>
               )}
-              {!jiraLoading && !jiraError && jiraResults && jiraResults.length > 0 && jiraResults.map((issue, i) => {
+              {!jiraError && jiraResults && jiraResults.length > 0 && jiraResults.map((issue, i) => {
                 // M1 — colour encodes STATE: the category derived from the
                 // status name (jiraImport.js), never the raw enum. `null`
                 // (unrecognised status) keeps the neutral className below —
@@ -374,6 +398,9 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
                 // The row stays clickable either way — import is always possible,
                 // just no longer accidental.
                 const imp = importedChip(issue.imported);
+                // SCRUM-3: null (missing/malformed updated) omits the date
+                // segment entirely — never renders a JS date-parse-failure string.
+                const updatedText = formatIssueUpdated(issue.updated);
                 return (
                   <button
                     key={issue.key}
@@ -411,8 +438,8 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
                       </span>
                     </div>
                     <span className="font-ui text-xs text-text-dim">
-                      {issue.updated ? `Updated ${new Date(issue.updated).toLocaleDateString()}` : "Recently updated"}
-                      {issue.assignee ? ` · ${issue.assignee}` : ""}
+                      {updatedText}
+                      {issue.assignee ? `${updatedText ? " · " : ""}${issue.assignee}` : ""}
                     </span>
                   </button>
                 );
