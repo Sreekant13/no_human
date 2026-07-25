@@ -329,7 +329,8 @@ export default function Onboarding({ onComplete }) {
                 tasks, across many repos, in parallel. Each one is carried from intake to an
                 open PR on its own: no babysitting, no re-explaining, no steering every step.
                 You just review and approve — for about <em>a tenth</em> of what one
-                hand-held session burns.
+                hand-held session burns. Need answers, not a diff? The same pipeline runs
+                read-only investigations that dig for root cause without touching code.
               </p>
               <div className="ob-agents">
                 <div className="ob-agent ob-agent-supervisor">
@@ -340,7 +341,7 @@ export default function Onboarding({ onComplete }) {
                   <div className="ob-agent-role">Planner</div>
                   <p>Turns your task into a plan before it touches code.</p>
                 </div>
-                <div className="ob-agent ob-agent-worker">
+                <div className="ob-agent ob-agent-agent">
                   <div className="ob-agent-role">Coder</div>
                   <p>Builds the change, writes the tests, and runs them.</p>
                 </div>
@@ -349,12 +350,12 @@ export default function Onboarding({ onComplete }) {
                   <p>Fresh eyes, told to refute “done.” Pass/fail with evidence.</p>
                 </div>
                 <div className="ob-agent ob-agent-watcher">
-                  <div className="ob-agent-role">Shepherd</div>
-                  <p>After the PR opens — watches CI, fixes reds, folds in your comments.</p>
+                  <div className="ob-agent-role">Watcher</div>
+                  <p>After the PR opens — watches CI, fixes reds, folds in your review comments.</p>
                 </div>
-                <div className="ob-agent ob-agent-investigator">
-                  <div className="ob-agent-role">Investigator</div>
-                  <p>Read-only root-cause digs when you want answers, not a diff.</p>
+                <div className="ob-agent ob-agent-worker">
+                  <div className="ob-agent-role">Orchestrator</div>
+                  <p>Schedules each attempt, checkpoints progress, and enforces the bounded retry loop — no runaway sessions.</p>
                 </div>
               </div>
               <div className="ob-flow">
