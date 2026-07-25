@@ -1,0 +1,337 @@
+diff --git a/web/src/Board.jsx b/web/src/Board.jsx
+index 4080d61..2371015 100644
+--- a/web/src/Board.jsx
++++ b/web/src/Board.jsx
+@@ -4,6 +4,7 @@ import SlideOver from "./SlideOver.jsx";
+ import { BOARD_LANES, routeTask, isWaiting, cardActivity } from "./boardLanes.js";
+ import { taskProgress } from "./taskProgress.js";
+ import { topPrioritised } from "./laneView.js";
++import { partitionAnswerLane } from "./answerLane.js";
+ 
+ // 5B: how many cards a collapsible lane shows before the expand arrow. 4 keeps
+ // every lane visible without vertical scroll on a typical viewport; the count
+@@ -107,6 +108,11 @@ function workingBreakdown(tasks) {
+ 
+ function Lane({ lane, tasks, onSelect }) {
+   const [expanded, setExpanded] = useState(false);
++  // SCRUM-19: the Needs-Answer lane's OWN collapse — stale escalations (>24h,
++  // by escalation recency) sink behind an expandable divider instead of
++  // burying tonight's real ones. Independent of `collapsible` below: this
++  // lane still shows every fresh card, never hides one behind a top-N arrow.
++  const [staleOpen, setStaleOpen] = useState(false);
+   // Human-gate lanes (Needs Answer, Review PR) NEVER collapse — every task there
+   // needs action; hiding one behind an arrow defeats the board. Only the
+   // in-flight/outcome lanes (Working, Failed, Done), which grow unbounded, do.
+@@ -133,6 +139,12 @@ function Lane({ lane, tasks, onSelect }) {
+   const showToggle =
+     collapsible && (hiddenCount > 0 || (expanded && rows.length > LANE_TOP_N));
+ 
++  // Never dismisses or filters anything — fresh.length + stale.length === rows.length,
++  // same truthful lane-count badge below (tasks.length, unchanged).
++  const { fresh, stale } = lane.staleCollapse
++    ? partitionAnswerLane(rows, Date.now())
++    : { fresh: rows, stale: [] };
++
+   return (
+     <div className={`lane lane-${lane.key}${lane.loud ? " lane-loud" : ""}${tasks.length > 0 ? " lane-has-tasks" : ""}`}>
+       <div className="lane-header">
+@@ -150,6 +162,44 @@ function Lane({ lane, tasks, onSelect }) {
+             <span className="lane-empty-icon" aria-hidden="true">{lane.emptyIcon || "·"}</span>
+             <span className="lane-empty-text">{lane.emptyHint || ""}</span>
+           </div>
++        ) : lane.staleCollapse ? (
++          <>
++            {fresh.map((task) => (
++              <TaskCard
++                key={task.id}
++                task={task}
++                accent={lane.accent}
++                isAwaiting={!!lane.needsYou}
++                showSubStatus={lane.showSubStatus}
++                onClick={(e) => onSelect(task.id, e.currentTarget)}
++              />
++            ))}
++            {stale.length > 0 && (
++              <button
++                type="button"
++                className={`lane-stale-divider${staleOpen ? " lane-more-open" : ""}`}
++                aria-expanded={staleOpen}
++                aria-label={staleOpen ? `Hide ${stale.length} older need answer${stale.length > 1 ? "s" : ""}` : `Show ${stale.length} older need answer${stale.length > 1 ? "s" : ""}`}
++                onClick={() => setStaleOpen((v) => !v)}
++              >
++                <span className="lane-more-text">
++                  {stale.length} older need answer{stale.length > 1 ? "s" : ""}
++                </span>
++                <span className="lane-more-arrow" aria-hidden="true">▾</span>
++              </button>
++            )}
++            {staleOpen && fresh.map((task) => (
++              <TaskCard
++                key={task.id}
++                task={task}
++                accent={lane.accent}
++                isAwaiting={!!lane.needsYou}
++                showSubStatus={lane.showSubStatus}
++                staleAnswer
++                onClick={(e) => onSelect(task.id, e.currentTarget)}
++              />
++            ))}
++          </>
+         ) : (
+           visible.map((task) => (
+             <TaskCard
+@@ -196,7 +246,7 @@ function actionHint(task) {
+   return null;
+ }
+ 
+-function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
++function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClick }) {
+   const activityTs = task.last_activity || task.updated_at || task.created_at;
+   const ageMs = Date.now() - new Date(activityTs).getTime();
+   const ageSec = ageMs / 1000;
+@@ -219,6 +269,9 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
+   if (isRunningNow) cardCls += " active-working";
+   if (isQueuedNow) cardCls += " card-queued";
+   if (waiting) cardCls += " waiting-parked";
++  // Distinct concern from the in-flight `.stale` treatment above (STALE_STATUSES,
++  // 16h): this is the escalation-age muting for the collapsed Needs-Answer divider.
++  if (staleAnswer) cardCls += " answer-stale";
+ 
+   return (
+     <div
+diff --git a/web/src/answerLane.js b/web/src/answerLane.js
+new file mode 100644
+index 0000000..2ddd103
+--- /dev/null
++++ b/web/src/answerLane.js
+@@ -0,0 +1,51 @@
++// SCRUM-19: the Needs-Answer lane led with day-old escalations while tonight's
++// real ones sat below them. Presentation-only fix: sort by escalation recency
++// (newest first) and split off anything older than 24h into a collapsed,
++// muted group — nothing is dismissed, filtered, or dropped (fresh.length +
++// stale.length === items.length, always).
++
++export const STALE_ANSWER_MS = 24 * 3600 * 1000;
++
++// Prefers a dedicated `escalated_at` (when the schema tracks one); otherwise
++// falls back to the same recency chain the card itself already displays.
++export function escalationTs(task) {
++  return (task && (task.escalated_at || task.last_activity || task.updated_at || task.created_at)) || "";
++}
++
++/**
++ * Split `items` into `{ fresh, stale }`, each newest-escalation-first.
++ * Never mutates `items`; never drops a row — fresh.length + stale.length === items.length.
++ *
++ * @param items      array of tasks
++ * @param nowMs      current time in ms (caller-supplied so this stays pure/testable)
++ * @param thresholdMs age past which a card is "stale" (default 24h)
++ * @param tsOf       timestamp accessor; defaults to escalationTs
++ */
++export function partitionAnswerLane(items, nowMs, thresholdMs = STALE_ANSWER_MS, tsOf = escalationTs) {
++  if (!Array.isArray(items) || items.length === 0) {
++    return { fresh: [], stale: [] };
++  }
++  // Copy-then-sort: never mutate the caller's array. Descending by ts, id
++  // tiebreak for determinism when timestamps collide (or are both missing).
++  const sorted = [...items].sort((a, b) => {
++    const ta = tsOf(a) || "";
++    const tb = tsOf(b) || "";
++    if (ta !== tb) return ta < tb ? 1 : -1;
++    const ida = String(a?.id ?? "");
++    const idb = String(b?.id ?? "");
++    return ida < idb ? -1 : ida > idb ? 1 : 0;
++  });
++
++  const fresh = [];
++  const stale = [];
++  for (const item of sorted) {
++    const ts = tsOf(item);
++    const ageMs = ts ? nowMs - new Date(ts).getTime() : Infinity;
++    // Missing/unparseable timestamp → treated as infinitely old: buried at the
++    // bottom of stale, never throws (new Date(NaN) - anything is NaN, and
++    // NaN > thresholdMs is false, so an explicit Infinity fallback is required).
++    const isStale = Number.isNaN(ageMs) ? true : ageMs > thresholdMs;
++    (isStale ? stale : fresh).push(item);
++  }
++  return { fresh, stale };
++}
+diff --git a/web/src/answerLane.test.mjs b/web/src/answerLane.test.mjs
+new file mode 100644
+index 0000000..822af9e
+--- /dev/null
++++ b/web/src/answerLane.test.mjs
+@@ -0,0 +1,102 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { escalationTs, partitionAnswerLane, STALE_ANSWER_MS } from "./answerLane.js";
++
++const NOW = new Date("2026-07-25T12:00:00Z").getTime();
++
++test("fresh is ordered newest-escalation-first", () => {
++  const items = [
++    { id: "a", created_at: "2026-07-25T09:00:00Z" },
++    { id: "b", created_at: "2026-07-25T11:00:00Z" },
++    { id: "c", created_at: "2026-07-25T10:00:00Z" },
++  ];
++  const { fresh } = partitionAnswerLane(items, NOW);
++  assert.deepEqual(fresh.map((x) => x.id), ["b", "c", "a"]);
++});
++
++test("escalated_at overrides created_at for ordering", () => {
++  const items = [
++    // Newer created_at, but its escalated_at is older than the other's.
++    { id: "recent-create", created_at: "2026-07-25T11:00:00Z", escalated_at: "2026-07-25T08:00:00Z" },
++    { id: "recent-escalate", created_at: "2026-07-25T01:00:00Z", escalated_at: "2026-07-25T09:00:00Z" },
++  ];
++  const { fresh } = partitionAnswerLane(items, NOW);
++  assert.deepEqual(fresh.map((x) => x.id), ["recent-escalate", "recent-create"]);
++});
++
++test("splits on the 24h threshold: recent stays fresh, >24h goes stale", () => {
++  const items = [
++    { id: "recent", created_at: "2026-07-25T11:00:00Z" },   // 1h old
++    { id: "old", created_at: "2026-07-20T12:00:00Z" },       // days old
++  ];
++  const { fresh, stale } = partitionAnswerLane(items, NOW);
++  assert.deepEqual(fresh.map((x) => x.id), ["recent"]);
++  assert.deepEqual(stale.map((x) => x.id), ["old"]);
++});
++
++test("boundary: exactly at the threshold stays fresh (> not >=)", () => {
++  const exactlyThreshold = new Date(NOW - STALE_ANSWER_MS).toISOString();
++  const items = [{ id: "boundary", created_at: exactlyThreshold }];
++  const { fresh, stale } = partitionAnswerLane(items, NOW);
++  assert.deepEqual(fresh.map((x) => x.id), ["boundary"]);
++  assert.equal(stale.length, 0);
++
++  const oneMsOver = new Date(NOW - STALE_ANSWER_MS - 1).toISOString();
++  const overItems = [{ id: "just-over", created_at: oneMsOver }];
++  const over = partitionAnswerLane(overItems, NOW);
++  assert.deepEqual(over.stale.map((x) => x.id), ["just-over"]);
++  assert.equal(over.fresh.length, 0);
++});
++
++test("counts are truthful: fresh.length + stale.length === items.length, nothing dropped or mutated", () => {
++  const items = [
++    { id: "a", created_at: "2026-07-25T11:00:00Z" },
++    { id: "b", created_at: "2026-07-01T00:00:00Z" },
++    { id: "c" }, // no timestamp at all
++    { id: "d", created_at: "2026-07-25T10:59:00Z" },
++  ];
++  const snapshot = JSON.parse(JSON.stringify(items));
++  const { fresh, stale } = partitionAnswerLane(items, NOW);
++  assert.equal(fresh.length + stale.length, items.length);
++  assert.deepEqual(items, snapshot, "input array must not be mutated");
++});
++
++test("ties break deterministically by id", () => {
++  const items = [
++    { id: "c", created_at: "2026-07-25T10:00:00Z" },
++    { id: "a", created_at: "2026-07-25T10:00:00Z" },
++    { id: "b", created_at: "2026-07-25T10:00:00Z" },
++  ];
++  const { fresh } = partitionAnswerLane(items, NOW);
++  assert.deepEqual(fresh.map((x) => x.id), ["a", "b", "c"]);
++});
++
++test("empty/undefined input returns empty lists, never throws", () => {
++  assert.deepEqual(partitionAnswerLane([], NOW), { fresh: [], stale: [] });
++  assert.deepEqual(partitionAnswerLane(undefined, NOW), { fresh: [], stale: [] });
++  assert.deepEqual(partitionAnswerLane(null, NOW), { fresh: [], stale: [] });
++});
++
++test("missing timestamp goes to stale, sorts last, never throws", () => {
++  const items = [
++    { id: "has-ts", created_at: "2026-07-01T00:00:00Z" }, // old, but has a timestamp
++    { id: "no-ts" },
++  ];
++  const { stale } = partitionAnswerLane(items, NOW);
++  assert.deepEqual(stale.map((x) => x.id), ["has-ts", "no-ts"]);
++});
++
++test("escalationTs fallback chain: escalated_at > last_activity > updated_at > created_at", () => {
++  assert.equal(
++    escalationTs({ escalated_at: "E", last_activity: "L", updated_at: "U", created_at: "C" }),
++    "E",
++  );
++  assert.equal(
++    escalationTs({ last_activity: "L", updated_at: "U", created_at: "C" }),
++    "L",
++  );
++  assert.equal(escalationTs({ updated_at: "U", created_at: "C" }), "U");
++  assert.equal(escalationTs({ created_at: "C" }), "C");
++  assert.equal(escalationTs({}), "");
++  assert.equal(escalationTs(null), "");
++});
+diff --git a/web/src/boardLanes.js b/web/src/boardLanes.js
+index fb094ba..709d8dc 100644
+--- a/web/src/boardLanes.js
++++ b/web/src/boardLanes.js
+@@ -17,7 +17,7 @@
+ // so it sits right beside Done and is coloured with the semantic review purple
+ // (--c-review) — NOT the blue of Working.
+ export const LANES = [
+-  { key: "answer",  label: "Needs Answer", accent: "var(--c-answer)",    statuses: ["awaiting_input", "escalated"], loud: true, needsYou: true, emptyIcon: "✓", emptyHint: "All caught up — nothing needs your input" },
++  { key: "answer",  label: "Needs Answer", accent: "var(--c-answer)",    statuses: ["awaiting_input", "escalated"], loud: true, needsYou: true, staleCollapse: true, emptyIcon: "✓", emptyHint: "All caught up — nothing needs your input" },
+   { key: "working", label: "Working",      accent: "var(--c-building)",  statuses: ["pending", "context", "planning", "implementing", "reviewing", "testing", "compound_parent", "paused_quota"], showSubStatus: true, emptyIcon: "○", emptyHint: "No tasks in flight" },
+   { key: "failed",  label: "Failed",       accent: "var(--c-escalated)", statuses: ["failed"], outcome: true, emptyIcon: "○", emptyHint: "No failures" },
+   { key: "review",  label: "Review PR",    accent: "var(--c-review)",    statuses: ["awaiting_approval"], loud: true, needsYou: true, emptyIcon: "○", emptyHint: "No PRs waiting for review" },
+diff --git a/web/src/styles.css b/web/src/styles.css
+index 8983a33..8ee1f13 100644
+--- a/web/src/styles.css
++++ b/web/src/styles.css
+@@ -763,6 +763,36 @@ html, body, #root {
+   .lane-more-arrow { animation: none; }
+ }
+ 
++/* SCRUM-19: Needs-Answer lane's stale-escalation divider. Same ghost/dashed
++   reveal affordance as .lane-more (that ticket's ".lane-more-open" rotates
++   the shared arrow), kept as its own class since it's a distinct concern:
++   a fixed 24h age split, not a top-N count collapse. */
++.lane-stale-divider {
++  position: sticky;
++  bottom: 0;
++  z-index: 1;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  gap: 6px;
++  width: 100%;
++  margin-top: 2px;
++  padding: 6px 8px;
++  background: transparent;
++  border: 1px dashed var(--border);
++  border-radius: var(--r-lg);
++  color: var(--text-dim);
++  font: inherit;
++  font-size: 12px;
++  cursor: pointer;
++  transition: color var(--dur-base) ease, border-color var(--dur-base) ease, background var(--dur-base) ease;
++}
++.lane-stale-divider:hover {
++  color: var(--text);
++  border-color: var(--text-dim);
++  background: var(--bg-panel);
++}
++
+ /* ── TASK CARD ────────────────────────────────────────────────────────────── */
+ 
+ /* A lane is a flex column, and a flex child with overflow:hidden has its automatic minimum
+@@ -3127,6 +3157,16 @@ a.so-chip-value:hover { color: var(--accent-300); }
+ 
+ .task-card.stale .card-age { color: var(--amber); font-weight: 600; }
+ 
++/* SCRUM-19: Needs-Answer lane, collapsed-stale-escalation muting — distinct
++   from `.stale` above (in-flight status age, 16h). Presentation only: the
++   card stays fully clickable, counted, and unchanged underneath. */
++.task-card.answer-stale {
++  opacity: 0.55;
++}
++.task-card.answer-stale:hover {
++  opacity: 0.85;
++}
++
+ /* ── LANE-SPECIFIC TINTING ───────────────────────────────────────────────── */
+ 
+ .lane-answer .lane-header {

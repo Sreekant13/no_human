@@ -23,9 +23,13 @@ eval/reviewer_recall/cases/<case-id>/
 ```
 
 `truth.json`: `{class, file, hunk_lines: [start, end], description,
-planted_by, date}`. The reviewer receives `change.diff` (plus the same repo
-access any review gets) and the standard adversarial review prompt — no
-wording changes, no hints. If the review prompt evolves, the corpus stays
+keywords, planted_by, date}`. The reviewer receives `change.diff` (plus the
+same repo access any review gets) and the standard adversarial review prompt —
+no wording changes, no hints. The review checkout is pinned to `base.ref`
+**without descendant history** (shallow/filtered clone): most cases derive
+from real merged diffs, and a checkout containing the descendant commit would
+let git archaeology diff the case against history and find the plant
+mechanically. If the review prompt evolves, the corpus stays
 valid because it never depended on prompt wording.
 
 **Defect classes** (≥3 cases each, target N=16–20 total):

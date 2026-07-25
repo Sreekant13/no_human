@@ -1,0 +1,609 @@
+diff --git a/src/no_human/core/orchestrator.py b/src/no_human/core/orchestrator.py
+index af2762d..339068d 100644
+--- a/src/no_human/core/orchestrator.py
++++ b/src/no_human/core/orchestrator.py
+@@ -44,6 +44,7 @@ from ..blockers import (
+ )
+ from ..ci.base import CIResult, HumanGatedCI
+ from ..config import active_auth_profile
++from ..intake.split_proposal import generate_split_proposal
+ from ..intake.surface_advisory import surface_advisory
+ from ..notify.slack import SlackNotifier
+ from ..review import selfcheck
+@@ -549,6 +550,41 @@ class Orchestrator:
+             ctx["surface_advisory"] = _adv
+             self.emit("surface_advisory", _adv)
+ 
++    async def _attach_split_proposal(self, task: Task, blocker: Blocker) -> None:
++        """SCRUM-34: on a SCOPE_EXPLOSION blocker, draft a 2-4 sub-task split
++        proposal (utility model, single-turn) and attach it to
++        ``task.context``, append it to the blocker's evidence, and emit it
++        under its own ``split_proposal`` kind — never ``"advisory"`` (doctor.py
++        counts that kind as a degradation, and this is neither).
++
++        Advisory only: never mutates task title/description/acceptance
++        criteria, never creates a task, and any generator failure is
++        swallowed (type-name logged) so it can never affect blocker routing.
++        """
++        if blocker.category != BlockerCategory.SCOPE_EXPLOSION:
++            return
++        try:
++            ctx = task.context or {}
++            files = ctx.get("files_to_change")
++            surfaces = ctx.get("surface_advisory")
++            proposal = await generate_split_proposal(
++                task, files_to_change=files, surfaces=surfaces,
++                model=self._utility_model(),
++            )
++        except Exception as exc:  # noqa: BLE001 — advisory, never blocks routing
++            log.warning("split proposal skipped: %s", type(exc).__name__)
++            return
++        if not proposal:
++            return
++        ctx = task.context or {}
++        ctx["split_proposal"] = proposal
++        task.context = ctx
++        blocker.evidence = (
++            f"{blocker.evidence}\n\n--- Split Proposal ---\n{proposal}"
++            if blocker.evidence else proposal
++        )
++        self.emit("split_proposal", proposal)
++
+     def _advisory(self, text: str) -> None:
+         """A subsystem degraded but the run continues. Logged at warning AND
+         emitted as an event: the silent-swallow log.debug pattern is how whole
+@@ -3202,6 +3238,13 @@ class Orchestrator:
+             if branch:
+                 blocker.resume_branch = branch
+ 
++        # 1b. SCOPE_EXPLOSION (22.2 + SCRUM-34): attach a non-binding split
++        # proposal so the escalation card gives the human a concrete "split
++        # into smaller PRs" starting point. Advisory only — never mutates
++        # scope/criteria, never creates tasks; a failure here must not affect
++        # routing, so it is fully guarded inside the helper.
++        await self._attach_split_proposal(task, blocker)
++
+         # 2. Route (with the low-confidence override from config).
+         if escalate_now:
+             from ..blockers import Route
+diff --git a/src/no_human/intake/split_proposal.py b/src/no_human/intake/split_proposal.py
+new file mode 100644
+index 0000000..a2ae18d
+--- /dev/null
++++ b/src/no_human/intake/split_proposal.py
+@@ -0,0 +1,143 @@
++"""SCRUM-34: split proposal generator.
++
++When a task blows past its safety bounds (SCOPE_EXPLOSION), a human has to
++decide whether to raise the limit or split the task. This module is a single
++utility-model, single-turn call that drafts 2-4 ordered sub-task proposals to
++make that decision easier. It is purely advisory: it never mutates the task,
++never creates tasks, and any parse failure degrades to ``None`` rather than
++blocking or retrying more than once (mirrors ``evaluator.py``'s seam).
++"""
++
++from __future__ import annotations
++
++import logging
++import re
++from typing import Any
++
++from ..core.jsonparse import loads_lenient
++from .evaluator import _bounded_run, _default_utility_model, _render
++
++log = logging.getLogger("no_human.split_proposal")
++
++_SPLIT_JSON = re.compile(r"SPLIT_JSON_START\s*(.*?)\s*SPLIT_JSON_END", re.DOTALL)
++
++_MIN_DRAFTS = 2
++_MAX_DRAFTS = 4
++_MIN_SENTENCES = 3
++_MAX_SENTENCES = 5
++
++_SPLIT_PROMPT = (
++    "A coding task has grown too large for a single agent session/PR and must "
++    "be split. Draft 2-4 ORDERED sub-tasks that together cover the original "
++    "task, each small enough for one focused PR.\n\n"
++    "For each sub-task draft, provide:\n"
++    "  - title: a short imperative title\n"
++    "  - description: a SELF-CONTAINED 3-5 sentence description (someone "
++    "reading only this draft, with no other context, must understand what to "
++    "build)\n"
++    "  - contract: the interface/dependency contract this sub-task exposes to "
++    "or expects from the others (what it produces, what it assumes exists)\n\n"
++    "Output EXACTLY:\n"
++    "SPLIT_JSON_START\n"
++    '[{"title": "...", "description": "...", "contract": "..."}, ...]\n'
++    "SPLIT_JSON_END\n\n"
++    "Task:\n"
++    "Title: {title}\n"
++    "Description: {description}\n"
++    "Acceptance criteria:\n{criteria}\n"
++    "{files_section}"
++    "{surfaces_section}"
++)
++
++
++def _sentence_count(text: str) -> int:
++    parts = [p for p in re.split(r"(?<=[.!?])\s+", (text or "").strip()) if p]
++    return len(parts)
++
++
++def _validate_drafts(data: Any) -> list[dict[str, str]] | None:
++    if not isinstance(data, list) or not (_MIN_DRAFTS <= len(data) <= _MAX_DRAFTS):
++        return None
++    drafts: list[dict[str, str]] = []
++    for item in data:
++        if not isinstance(item, dict):
++            return None
++        title = str(item.get("title") or "").strip()
++        description = str(item.get("description") or "").strip()
++        contract = str(item.get("contract") or "").strip()
++        if not title or not contract:
++            return None
++        n = _sentence_count(description)
++        if not (_MIN_SENTENCES <= n <= _MAX_SENTENCES):
++            return None
++        drafts.append({"title": title, "description": description, "contract": contract})
++    return drafts
++
++
++def _render_proposal(drafts: list[dict[str, str]]) -> str:
++    lines = ["Split proposal:"]
++    for i, d in enumerate(drafts, start=1):
++        lines.append(f"\n{i}. {d['title']}")
++        lines.append(d["description"])
++        lines.append(f"Contract: {d['contract']}")
++    return "\n".join(lines)
++
++
++async def generate_split_proposal(
++    task: Any,
++    files_to_change: list[str] | None = None,
++    surfaces: Any = None,
++    *,
++    backend: Any | None = None,
++    model: str | None = None,
++) -> str | None:
++    """Draft a 2-4 sub-task split proposal for an over-scope task.
++
++    Utility-model, single-turn, strictly-parsed. Returns ``None`` on any
++    failure (missing block, bad JSON, wrong draft count, bad sentence count,
++    missing contract, backend exception) — a missing proposal degrades a
++    hint, it never blocks or retries beyond the single parse retry below.
++    """
++    try:
++        import tempfile
++        from pathlib import Path
++        from ..agent.claude_backend import ClaudeBackend
++
++        be = backend or ClaudeBackend(
++            model=model or _default_utility_model(), readonly=True,
++        )
++        criteria = getattr(task, "acceptance_criteria", None) or []
++        criteria_text = "\n".join(f"  - {c}" for c in criteria) or "  (none)"
++        files_section = (
++            f"Files to change:\n" + "\n".join(f"  - {f}" for f in files_to_change) + "\n"
++            if files_to_change else ""
++        )
++        surfaces_section = f"Surfaces: {surfaces}\n" if surfaces else ""
++        prompt = _render(
++            _SPLIT_PROMPT,
++            title=getattr(task, "title", "") or "",
++            description=getattr(task, "description", None) or "(none)",
++            criteria=criteria_text,
++            files_section=files_section,
++            surfaces_section=surfaces_section,
++        )
++        cwd = Path(tempfile.gettempdir())
++        result = await _bounded_run(be, prompt, max_turns=1, effort="low", cwd=cwd)
++        m = _SPLIT_JSON.search(result.final_text or "")
++        if not m:
++            log.warning("split proposal produced no parseable SPLIT_JSON "
++                        "block; retrying once")
++            result = await _bounded_run(be, prompt, max_turns=1, effort="low", cwd=cwd)
++            m = _SPLIT_JSON.search(result.final_text or "")
++        if not m:
++            log.warning("split proposal produced no parseable SPLIT_JSON block")
++            return None
++        data = loads_lenient(m.group(1))
++        drafts = _validate_drafts(data)
++        if drafts is None:
++            log.warning("split proposal failed strict validation")
++            return None
++        return _render_proposal(drafts)
++    except Exception as exc:  # noqa: BLE001 — advisory, never blocks
++        log.warning("split proposal failed: %s", type(exc).__name__)
++        return None
+diff --git a/tests/test_orchestrator_split_proposal.py b/tests/test_orchestrator_split_proposal.py
+new file mode 100644
+index 0000000..6f75205
+--- /dev/null
++++ b/tests/test_orchestrator_split_proposal.py
+@@ -0,0 +1,229 @@
++"""SCRUM-34: `_raise_blocker` is the single funnel both the orchestrator-raised
++(over-size) and agent-raised (parse_blocker) SCOPE_EXPLOSION paths go through.
++On that category it attaches a non-binding split proposal to task.context,
++appends it to the blocker's evidence, and emits it under its own
++``split_proposal`` event kind — never mutating scope/criteria or creating a
++task, and never doing any of that for other blocker categories."""
++
++import logging
++
++import pytest
++
++from no_human.blockers import Blocker, BlockerCategory, parse_blocker
++from no_human.config import load_config
++from no_human.core.db import Store
++from no_human.core.events import EventPersister
++from no_human.core.orchestrator import Orchestrator
++from no_human.core.task import Task
++from no_human.notify.slack import SlackNotifier
++
++PROPOSAL = "Split proposal:\n\n1. Part one\nDo the first part.\nContract: c1"
++
++AGENT_BLOCKER_TEXT = """
++Ran into trouble.
++
++BLOCKER_JSON_START
++{
++  "category": "SCOPE_EXPLOSION",
++  "transient": false,
++  "confidence": 0.9,
++  "root_cause_hypothesis": "change is too large for one PR",
++  "evidence": "diff touches 40 files",
++  "goal": "implement the feature",
++  "question": "split into smaller PRs?"
++}
++BLOCKER_JSON_END
++"""
++
++
++class _Backend:
++    async def run(self, *a, **k):  # pragma: no cover
++        raise AssertionError("backend should not run here")
++
++
++@pytest.fixture
++async def store(tmp_path):
++    s = await Store(tmp_path / "nh.db").connect()
++    yield s
++    await s.close()
++
++
++def _orch(store, tmp_path, sink=None):
++    cfg = load_config(tmp_path / "config.yaml")
++    return Orchestrator(store, cfg.data, _Backend(), SlackNotifier(None), event_sink=sink)
++
++
++async def _new_task(store, title="oversized task"):
++    t = Task.new(title, repo_path="/r")
++    t.acceptance_criteria = ["keep me"]
++    await store.create_task(t)
++    return t
++
++
++def _scope_blocker(evidence="orig"):
++    return Blocker(
++        category=BlockerCategory.SCOPE_EXPLOSION,
++        transient=False, confidence=0.9, goal="implement the feature",
++        root_cause_hypothesis="too large", evidence=evidence,
++        question="split into smaller PRs?",
++    )
++
++
++async def test_scope_explosion_attaches_context_event_evidence(
++    store, tmp_path, monkeypatch
++):
++    calls = []
++
++    async def fake_generate(task, files_to_change=None, surfaces=None, **kw):
++        calls.append((task.id, files_to_change, surfaces))
++        return PROPOSAL
++
++    monkeypatch.setattr(
++        "no_human.core.orchestrator.generate_split_proposal", fake_generate
++    )
++
++    t = await _new_task(store)
++    blocker = _scope_blocker(evidence="orig")
++
++    async with EventPersister(store, t.id, interval=0.01) as persister:
++        orch = _orch(store, tmp_path, sink=persister.record)
++        await orch._raise_blocker(t, blocker)
++
++    got = await store.get_task(t.id)
++    assert got.context.get("split_proposal") == PROPOSAL
++    assert PROPOSAL in blocker.evidence
++    assert "orig" in blocker.evidence
++
++    events = await store.list_events(t.id)
++    sp_events = [e for e in events if e["kind"] == "split_proposal"]
++    assert len(sp_events) == 1
++    assert sp_events[0]["text"] == PROPOSAL
++    assert calls  # the generator was actually invoked
++
++
++async def test_agent_raised_path_same_hook(store, tmp_path, monkeypatch):
++    async def fake_generate(task, files_to_change=None, surfaces=None, **kw):
++        return PROPOSAL
++
++    monkeypatch.setattr(
++        "no_human.core.orchestrator.generate_split_proposal", fake_generate
++    )
++
++    t = await _new_task(store)
++    blocker = parse_blocker(AGENT_BLOCKER_TEXT)
++    assert blocker is not None
++    assert blocker.category == BlockerCategory.SCOPE_EXPLOSION
++
++    async with EventPersister(store, t.id, interval=0.01) as persister:
++        orch = _orch(store, tmp_path, sink=persister.record)
++        await orch._raise_blocker(t, blocker)
++
++    got = await store.get_task(t.id)
++    assert got.context.get("split_proposal") == PROPOSAL
++    assert PROPOSAL in blocker.evidence
++
++    events = await store.list_events(t.id)
++    assert [e for e in events if e["kind"] == "split_proposal"]
++
++
++async def test_non_scope_category_no_proposal(store, tmp_path, monkeypatch):
++    called = []
++
++    async def fake_generate(*a, **k):
++        called.append(True)
++        return PROPOSAL
++
++    monkeypatch.setattr(
++        "no_human.core.orchestrator.generate_split_proposal", fake_generate
++    )
++
++    t = await _new_task(store)
++    blocker = Blocker(
++        category=BlockerCategory.TRANSIENT_INFRA,
++        transient=True, confidence=0.9, goal="g",
++        root_cause_hypothesis="network blip", evidence="conn refused",
++    )
++
++    async with EventPersister(store, t.id, interval=0.01) as persister:
++        orch = _orch(store, tmp_path, sink=persister.record)
++        await orch._raise_blocker(t, blocker)
++
++    assert not called
++    got = await store.get_task(t.id)
++    assert "split_proposal" not in got.context
++    events = await store.list_events(t.id)
++    assert not [e for e in events if e["kind"] == "split_proposal"]
++
++
++async def test_no_task_mutation(store, tmp_path, monkeypatch):
++    async def fake_generate(task, files_to_change=None, surfaces=None, **kw):
++        return PROPOSAL
++
++    monkeypatch.setattr(
++        "no_human.core.orchestrator.generate_split_proposal", fake_generate
++    )
++
++    t = await _new_task(store, title="do not change me")
++    before_title, before_desc, before_criteria = (
++        t.title, t.description, list(t.acceptance_criteria))
++    before_count = len(await store.list_tasks())
++
++    blocker = _scope_blocker()
++
++    async with EventPersister(store, t.id, interval=0.01) as persister:
++        orch = _orch(store, tmp_path, sink=persister.record)
++        await orch._raise_blocker(t, blocker)
++
++    assert t.title == before_title
++    assert t.description == before_desc
++    assert t.acceptance_criteria == before_criteria
++    after_count = len(await store.list_tasks())
++    assert after_count == before_count
++
++
++async def test_generator_none_no_event(store, tmp_path, monkeypatch):
++    async def fake_generate(*a, **k):
++        return None
++
++    monkeypatch.setattr(
++        "no_human.core.orchestrator.generate_split_proposal", fake_generate
++    )
++
++    t = await _new_task(store)
++    blocker = _scope_blocker(evidence="orig")
++
++    async with EventPersister(store, t.id, interval=0.01) as persister:
++        orch = _orch(store, tmp_path, sink=persister.record)
++        await orch._raise_blocker(t, blocker)
++
++    got = await store.get_task(t.id)
++    assert "split_proposal" not in got.context
++    assert blocker.evidence == "orig"
++    events = await store.list_events(t.id)
++    assert not [e for e in events if e["kind"] == "split_proposal"]
++
++
++async def test_generator_exception_skips_and_logs_typename(
++    store, tmp_path, monkeypatch, caplog
++):
++    async def fake_generate(*a, **k):
++        raise RuntimeError("kaboom")
++
++    monkeypatch.setattr(
++        "no_human.core.orchestrator.generate_split_proposal", fake_generate
++    )
++
++    t = await _new_task(store)
++    blocker = _scope_blocker(evidence="orig")
++
++    async with EventPersister(store, t.id, interval=0.01) as persister:
++        orch = _orch(store, tmp_path, sink=persister.record)
++        with caplog.at_level(logging.WARNING, logger="no_human.orchestrator"):
++            outcome = await orch._raise_blocker(t, blocker)
++
++    assert outcome is not None
++    got = await store.get_task(t.id)
++    assert "split_proposal" not in got.context
++    events = await store.list_events(t.id)
++    assert not [e for e in events if e["kind"] == "split_proposal"]
++    assert "RuntimeError" in caplog.text
+diff --git a/tests/test_split_proposal.py b/tests/test_split_proposal.py
+new file mode 100644
+index 0000000..acb9e0a
+--- /dev/null
++++ b/tests/test_split_proposal.py
+@@ -0,0 +1,151 @@
++"""SCRUM-34: split proposal generator — utility-model, single-turn, strict
++parse. Any failure degrades to None; it never blocks or retries beyond one
++parse retry, and it never touches the task/store."""
++
++import logging
++
++import pytest
++
++from no_human.agent.claude_backend import AgentResult
++from no_human.config import DEFAULT_CONFIG
++from no_human.core.task import Task
++from no_human.intake.split_proposal import generate_split_proposal
++
++VALID_BLOCK = """
++SPLIT_JSON_START
++[
++  {"title": "Extract the parser", "description": "Pull the parsing logic into its own module. It currently lives inline in the orchestrator. This isolates it for reuse.", "contract": "Exposes parse(text) -> Result; no other module changes."},
++  {"title": "Add the validator", "description": "Add strict validation on top of the parser output. It rejects malformed input early. This keeps downstream code simple.", "contract": "Depends on parse() from sub-task 1; exposes validate(result) -> bool."},
++  {"title": "Wire the call site", "description": "Wire the new parser and validator into the existing call site. Replace the old inline logic. Keep behavior identical for valid input.", "contract": "Depends on sub-tasks 1 and 2; no new public interface."}
++]
++SPLIT_JSON_END
++"""
++
++
++def _task(title="Big task", description="A task that grew too large",
++          criteria=None):
++    t = Task.new(title, description=description)
++    t.acceptance_criteria = criteria or ["do the thing"]
++    return t
++
++
++def _result(text: str) -> AgentResult:
++    return AgentResult(final_text=text, num_turns=1, is_error=False,
++                        tokens_used=0, session_id="s", stop_reason="end_turn")
++
++
++class _ScriptedBackend:
++    """Returns each entry of ``script`` in order on successive ``run`` calls."""
++
++    def __init__(self, script):
++        self._script = list(script)
++        self.calls = 0
++
++    async def __call__(self, *a, **k):
++        pass
++
++    async def run(self, prompt, **kwargs):
++        self.calls += 1
++        text = self._script[min(self.calls - 1, len(self._script) - 1)]
++        return _result(text)
++
++
++class _CapturingBackend:
++    """Records the model it was constructed with."""
++
++    seen = []
++
++    def __init__(self, *, model, readonly=False, **_):
++        _CapturingBackend.seen.append(model)
++
++    async def run(self, prompt, **kwargs):
++        return _result(VALID_BLOCK)
++
++
++class _RaisingBackend:
++    async def run(self, prompt, **kwargs):
++        raise ValueError("boom")
++
++
++async def test_valid_2_to_4_drafts_returns_text():
++    be = _ScriptedBackend([VALID_BLOCK])
++    out = await generate_split_proposal(_task(), backend=be)
++    assert out is not None
++    assert "Extract the parser" in out
++    assert "Add the validator" in out
++    assert "Wire the call site" in out
++    assert "Contract" in out
++    assert be.calls == 1
++
++
++async def test_defaults_to_utility_model(monkeypatch):
++    _CapturingBackend.seen = []
++    monkeypatch.setattr(
++        "no_human.agent.claude_backend.ClaudeBackend", _CapturingBackend
++    )
++    await generate_split_proposal(_task())
++    assert _CapturingBackend.seen == [DEFAULT_CONFIG["llm"]["utility_model"]]
++    assert _CapturingBackend.seen[0] != DEFAULT_CONFIG["llm"]["primary_model"]
++    assert _CapturingBackend.seen[0] != DEFAULT_CONFIG["llm"]["review_model"]
++
++
++async def test_no_block_retries_once_then_none():
++    be = _ScriptedBackend(["not a block at all", "still garbage"])
++    out = await generate_split_proposal(_task(), backend=be)
++    assert out is None
++    assert be.calls == 2
++
++
++async def test_wrong_count_returns_none():
++    one_draft = """SPLIT_JSON_START
++[{"title": "Only one", "description": "One sentence only here. Two now. Three now.", "contract": "c"}]
++SPLIT_JSON_END"""
++    five_drafts = "SPLIT_JSON_START\n[" + ", ".join(
++        '{"title": "T%d", "description": "One. Two. Three.", "contract": "c"}' % i
++        for i in range(5)
++    ) + "]\nSPLIT_JSON_END"
++
++    be1 = _ScriptedBackend([one_draft])
++    assert await generate_split_proposal(_task(), backend=be1) is None
++
++    be2 = _ScriptedBackend([five_drafts])
++    assert await generate_split_proposal(_task(), backend=be2) is None
++
++
++async def test_bad_sentence_count_returns_none():
++    too_few = """SPLIT_JSON_START
++[
++  {"title": "A", "description": "Only one sentence.", "contract": "c"},
++  {"title": "B", "description": "One. Two. Three.", "contract": "c"}
++]
++SPLIT_JSON_END"""
++    too_many = """SPLIT_JSON_START
++[
++  {"title": "A", "description": "One. Two. Three. Four. Five. Six. Seven.", "contract": "c"},
++  {"title": "B", "description": "One. Two. Three.", "contract": "c"}
++]
++SPLIT_JSON_END"""
++
++    be1 = _ScriptedBackend([too_few])
++    assert await generate_split_proposal(_task(), backend=be1) is None
++
++    be2 = _ScriptedBackend([too_many])
++    assert await generate_split_proposal(_task(), backend=be2) is None
++
++
++async def test_missing_contract_returns_none():
++    missing = """SPLIT_JSON_START
++[
++  {"title": "A", "description": "One. Two. Three."},
++  {"title": "B", "description": "One. Two. Three.", "contract": "c"}
++]
++SPLIT_JSON_END"""
++    be = _ScriptedBackend([missing])
++    assert await generate_split_proposal(_task(), backend=be) is None
++
++
++async def test_backend_exception_returns_none_and_logs_typename(caplog):
++    with caplog.at_level(logging.WARNING, logger="no_human.split_proposal"):
++        out = await generate_split_proposal(_task(), backend=_RaisingBackend())
++    assert out is None
++    assert "ValueError" in caplog.text

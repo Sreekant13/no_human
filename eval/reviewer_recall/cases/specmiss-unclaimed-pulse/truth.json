@@ -1,0 +1,19 @@
+{
+  "class": "spec-miss",
+  "file": "web/src/Board.jsx",
+  "hunk_lines": [
+    210,
+    214
+  ],
+  "description": "The ticket's whole point is that claimed (scheduler in-flight) is the ONLY signal allowed to render a task as running. The Board.jsx integration ORs status === 'implementing' back in, so every unclaimed implementing task pulses as live again \u2014 the exact lie the AC forbids, reintroduced at the untested JSX seam while the tested helpers stay correct.",
+  "keywords": [
+    "claimed",
+    "implementing",
+    "unclaimed",
+    "queued",
+    "pulse",
+    "status"
+  ],
+  "planted_by": "supervising-session",
+  "date": "2026-07-25"
+}

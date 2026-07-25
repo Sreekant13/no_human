@@ -1,0 +1,554 @@
+diff --git a/src/no_human/api/app.py b/src/no_human/api/app.py
+index ccdcc7e..9041b3c 100644
+--- a/src/no_human/api/app.py
++++ b/src/no_human/api/app.py
+@@ -290,6 +290,9 @@ async def _board_tasks(store: Store, scheduler=None) -> list[TaskSummaryOut]:
+     tasks = await store.list_tasks()
+     # B2 #16: ONE grouped query instead of an N+1 per board tick per socket.
+     by_task = await store.attempts_by_task()
++    # SCRUM-15: `scheduler.inflight` returns a fresh set() copy per call — snapshot
++    # once so every card in this response is judged against the same instant.
++    inflight = scheduler.inflight if scheduler is not None else set()
+     out = []
+     for task in tasks:
+         attempts = by_task.get(task.id, [])
+@@ -297,6 +300,7 @@ async def _board_tasks(store: Store, scheduler=None) -> list[TaskSummaryOut]:
+             task, _latest_pr_url(attempts), attempts=attempts,
+         )
+         if scheduler is not None:
++            summary.claimed = task.id in inflight
+             ls = scheduler.get_live_status(task.id)
+             if ls:
+                 summary.live_status = ls
+@@ -386,7 +390,7 @@ async def create_task(body: CreateTaskRequest, request: Request) -> TaskSummaryO
+         task.config["backend"] = body.backend
+     await store.create_task(task)
+     summary = TaskSummaryOut.from_task(task)
+-    tasks = await _board_tasks(store)
++    tasks = await _board_tasks(store, scheduler=_sched(request))
+     await _mgr.broadcast({
+         "type": "task_created",
+         "task_id": task.id,
+@@ -651,7 +655,7 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
+             await store.set_status(task, TaskStatus.DONE, validate=False)
+             message = ("Already satisfied claim confirmed — no code change was "
+                        "needed. Task done (there is no PR; the agent never merges).")
+-    tasks = await _board_tasks(store)
++    tasks = await _board_tasks(store, scheduler=_sched(request))
+     await _mgr.broadcast({
+         "type": "task_approved",
+         "task_id": task.id,
+@@ -679,7 +683,7 @@ async def finish_review(task_id: str, request: Request) -> dict[str, Any]:
+     drafts = (task.context or {}).get("draft_review_comments") or []
+     posted = sum(1 for d in drafts if d.get("posted"))
+     await store.set_status(task, TaskStatus.DONE, validate=False)
+-    tasks = await _board_tasks(store)
++    tasks = await _board_tasks(store, scheduler=_sched(request))
+     await _mgr.broadcast({
+         "type": "task_updated",
+         "task_id": task.id,
+@@ -735,7 +739,7 @@ async def send_back(
+         task.id, "send_back_feedback", {"at": _now(), "message": body.message})
+     # Reset to IMPLEMENTING so the next `nh watch <id>` retries.
+     await store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
+-    tasks = await _board_tasks(store)
++    tasks = await _board_tasks(store, scheduler=_sched(request))
+     await _mgr.broadcast({
+         "type": "task_updated",
+         "task_id": task.id,
+@@ -775,7 +779,7 @@ async def pause_task(
+                     "root_cause_hypothesis": "Paused by operator via web board"}
+     await store.update_task_columns(task)
+     await store.set_status(task, TaskStatus.BLOCKED, validate=False)
+-    tasks = await _board_tasks(store)
++    tasks = await _board_tasks(store, scheduler=_sched(request))
+     await _mgr.broadcast({"type": "task_updated", "task_id": task.id,
+                           "tasks": [t.model_dump() for t in tasks]})
+     return {"ok": True, "message": f"Paused {task_id[:8]}"}
+@@ -797,7 +801,7 @@ async def resume_task(
+     task.wake_check_at = None
+     await store.update_task_columns(task)
+     await store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
+-    tasks = await _board_tasks(store)
++    tasks = await _board_tasks(store, scheduler=_sched(request))
+     await _mgr.broadcast({"type": "task_updated", "task_id": task.id,
+                           "tasks": [t.model_dump() for t in tasks]})
+     return {"ok": True, "message": f"Resumed {task_id[:8]} → implementing"}
+@@ -824,7 +828,7 @@ async def cancel_task(
+     # The 32-hex task id appears in those command lines, so kill by it. Best-
+     # effort — never let cleanup failure break the cancel response.
+     await _kill_task_processes(task.id)
+-    tasks = await _board_tasks(store)
++    tasks = await _board_tasks(store, scheduler=_sched(request))
+     await _mgr.broadcast({"type": "task_updated", "task_id": task.id,
+                           "tasks": [t.model_dump() for t in tasks]})
+     return {"ok": True, "message": f"Cancelled {task_id[:8]}"}
+@@ -865,7 +869,7 @@ async def retry_task(
+         task.id, {"cancel_reason": None, "retried_at": _now()})
+     await store.update_task_columns(task)
+     await store.set_status(task, TaskStatus.PENDING, validate=False)
+-    tasks = await _board_tasks(store)
++    tasks = await _board_tasks(store, scheduler=_sched(request))
+     await _mgr.broadcast({"type": "task_updated", "task_id": task.id,
+                           "tasks": [t.model_dump() for t in tasks]})
+     return {"ok": True, "message": f"Retried {task_id[:8]} → pending"}
+@@ -1834,7 +1838,7 @@ async def reply_task(
+     task.wake_check_at = None
+     await store.update_task_columns(task)
+     await store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
+-    tasks = await _board_tasks(store)
++    tasks = await _board_tasks(store, scheduler=_sched(request))
+     await _mgr.broadcast({
+         "type": "task_updated",
+         "task_id": task.id,
+diff --git a/src/no_human/api/models.py b/src/no_human/api/models.py
+index 0b5c1ea..03c19d1 100644
+--- a/src/no_human/api/models.py
++++ b/src/no_human/api/models.py
+@@ -222,6 +222,12 @@ class TaskSummaryOut(BaseModel):
+     # identical to an un-reviewed one and kept shouting in "N need you" — a
+     # second operator (or the Electron window) would re-review it.
+     approved_at: str | None = None
++    # SCRUM-15: the scheduler has this task actively in-flight RIGHT NOW —
++    # distinct from `status` being one of the "active" values, which merely
++    # means it's eligible to run. `from_task` has no scheduler access, so this
++    # defaults False; `_board_tasks` (the only path with a scheduler) sets it
++    # from `scheduler.inflight`.
++    claimed: bool = False
+ 
+     @classmethod
+     def from_task(
+diff --git a/tests/test_api.py b/tests/test_api.py
+index 423fddd..cd37546 100644
+--- a/tests/test_api.py
++++ b/tests/test_api.py
+@@ -1148,3 +1148,67 @@ async def test_reply_park_option_keeps_task_parked(client, store):
+     replies = (fresh.context or {}).get("human_replies") or []
+     assert replies and "stop" in replies[-1]["answer"]
+     assert fresh.config == {}                            # park mutated nothing
++
++
++@pytest.mark.asyncio
++async def test_board_tasks_carry_claimed_from_scheduler(client, store):
++    """SCRUM-15: `claimed` mirrors the scheduler's in-flight set — an
++    active-status task the scheduler has not picked up is queued, not running."""
++    from types import SimpleNamespace
++
++    from no_human.api.app import _board_tasks
++    from no_human.core.task import Task, TaskStatus
++
++    a = Task.new("claimed one", repo_path="/tmp/x")
++    b = Task.new("waiting one", repo_path="/tmp/x")
++    await store.create_task(a)
++    await store.create_task(b)
++    await store.set_status(a, TaskStatus.IMPLEMENTING, validate=False)
++    await store.set_status(b, TaskStatus.IMPLEMENTING, validate=False)
++
++    sched = SimpleNamespace(inflight={a.id}, get_live_status=lambda _id: None)
++    out = {s.id: s for s in await _board_tasks(store, scheduler=sched)}
++    assert out[a.id].claimed is True
++    assert out[b.id].claimed is False
++
++    # No scheduler (CLI/board contexts without one): claimed defaults False.
++    out2 = {s.id: s for s in await _board_tasks(store)}
++    assert out2[a.id].claimed is False
++
++
++@pytest.mark.asyncio
++async def test_mutation_broadcast_payload_carries_claimed(client, store, monkeypatch):
++    """SCRUM-15 regression net: the round-2 internal review caught a mutation
++    broadcast whose tasks payload silently dropped `claimed` (a callsite
++    without scheduler=). Pin the key's presence in a real broadcast payload."""
++    from no_human.api.app import _mgr
++
++    captured: list[dict] = []
++
++    async def fake_broadcast(msg):
++        captured.append(msg)
++
++    monkeypatch.setattr(_mgr, "broadcast", fake_broadcast)
++    r = await client.post("/api/tasks", json={"title": "broadcast probe"})
++    assert r.status_code == 201
++    created_id = r.json()["id"]
++
++    # Value-level pin (fresh-review advisory): a fake scheduler claiming the
++    # task must surface claimed=True in the NEXT mutation broadcast — key
++    # presence alone would still pass if a callsite dropped scheduler=.
++    from types import SimpleNamespace
++
++    from no_human.api.app import app as fastapi_app
++    monkeypatch.setattr(
++        fastapi_app.state, "scheduler",
++        SimpleNamespace(inflight={created_id}, get_live_status=lambda _id: None),
++        raising=False)
++    captured.clear()
++    r2 = await client.post(f"/api/tasks/{created_id}/pause", json={})
++    assert r2.status_code == 200, r2.text
++    tasks_payload = captured[-1].get("tasks") or []
++    assert tasks_payload, "broadcast carries the board tasks"
++    by_id = {t["id"]: t for t in tasks_payload}
++    assert by_id[created_id]["claimed"] is True, (
++        "a scheduler-claimed task must broadcast claimed=True — a dropped "
++        "scheduler= callsite silently flattens it to False")
+diff --git a/web/src/App.jsx b/web/src/App.jsx
+index 4e76fa3..44a5640 100644
+--- a/web/src/App.jsx
++++ b/web/src/App.jsx
+@@ -12,14 +12,13 @@ import { setFavicon } from "./favicon.js";
+ import { needsPrUrl } from "./composerKinds.js";
+ import { hasPrRef } from "./prRefs.js";
+ import { shouldTriggerNewTask } from "./keyboardShortcut.js";
+-import { isNeedsYou, isRealFailure } from "./boardLanes.js";
++import { isNeedsYou, isRealFailure, deriveCounts } from "./boardLanes.js";
+ import { ledgerSummary, LEDGER_WINDOW_MS } from "./nightLedger.js";
+ import { fmtCost, taskBurn } from "./cost.js";
+ import { deriveSpendDisplay, perShippedCost } from "./ledgerSpend.js";
+ import { tasksReducer } from "./tasksReducer.js";
+ import { useEscapeKey } from "./useEscapeKey.js";
+ 
+-const PROGRESS_STATUSES  = new Set(["pending", "context", "planning", "implementing", "reviewing", "testing"]);
+ 
+ // Header brand: logo + wordmark + tagline. Used in the main and error headers.
+ function Brand() {
+@@ -178,7 +177,9 @@ function OverviewStrip({ tasks }) {
+   // counts them. Naming them here keeps the strip and the lane from contradicting each
+   // other — "1 failed" over a lane badged 11 is worse than either number alone.
+   const cancelled  = tasks.filter(t => t.status === "failed" && t.cancelled).length;
+-  const inProgress = tasks.filter(t => PROGRESS_STATUSES.has(t.status)).length;
++  // SCRUM-15: one derivation shared with the lane headers and sidebar so the
++  // strip cannot drift from what the board itself shows (running vs queued).
++  const counts = deriveCounts(tasks);
+ 
+   const oldestSec = needsYou.length > 0
+     ? Math.max(...needsYou.map(t => (Date.now() - new Date(t.updated_at || t.created_at).getTime()) / 1000))
+@@ -212,7 +213,9 @@ function OverviewStrip({ tasks }) {
+       )}
+       {/* "0 working" is noise on a phone — the Working lane already says so. The gate AGE is not. */}
+       <span className="ov-sep ov-hide-narrow">·</span>
+-      <span className="ov-hide-narrow">{inProgress} working</span>
++      <span className="ov-hide-narrow">
++        {counts.running} running{counts.queued > 0 ? ` · ${counts.queued} queued` : ""}
++      </span>
+     </div>
+   );
+ }
+@@ -755,6 +758,9 @@ export default function App() {
+   }
+ 
+   const needYou = tasks.filter(isNeedsYou).length;
++  // SCRUM-15: same derivation as OverviewStrip/lane headers so the sidebar
++  // "Working (N)" figure agrees with the board instead of its own count.
++  const sidebarCounts = deriveCounts(tasks);
+   return (
+     <div className="nh-shell nh-shell-cc">
+       <aside className="nh-sidebar">
+@@ -811,7 +817,7 @@ export default function App() {
+           {workerStatus?.running && workerStatus.inflight > 0 && (
+             <div className="nh-status-indicator" title={`${workerStatus.inflight} of ${workerStatus.max_workers} worker slots in use`}>
+               <div className="nh-ws-dot live" style={{ background: 'var(--accent)' }} />
+-              <span className="nh-status-label">Working ({workerStatus.inflight})</span>
++              <span className="nh-status-label">Working ({sidebarCounts.running})</span>
+             </div>
+           )}
+           {queueHealth?.stuck && (
+diff --git a/web/src/Board.jsx b/web/src/Board.jsx
+index fbcf852..4e5f2a2 100644
+--- a/web/src/Board.jsx
++++ b/web/src/Board.jsx
+@@ -1,7 +1,7 @@
+ import { useState, useRef, useEffect } from "react";
+ import { fmtTokens, taskBurn } from "./cost.js";
+ import SlideOver from "./SlideOver.jsx";
+-import { BOARD_LANES, routeTask, isWaiting } from "./boardLanes.js";
++import { BOARD_LANES, routeTask, isWaiting, cardActivity } from "./boardLanes.js";
+ import { taskProgress } from "./taskProgress.js";
+ import { topPrioritised } from "./laneView.js";
+ 
+@@ -90,6 +90,21 @@ export default function Board({ tasks, pendingOpenId, onPendingOpenHandled }) {
+   );
+ }
+ 
++// SCRUM-15: the Working lane header must agree with the card treatment below
++// it — "N live · M queued" only ever comes from cardActivity's own mode, so
++// the header cannot drift from what the cards actually render.
++function workingBreakdown(tasks) {
++  let running = 0;
++  let queued = 0;
++  for (const task of tasks) {
++    const mode = cardActivity(task).mode;
++    if (mode === "running") running += 1;
++    else if (mode === "queued") queued += 1;
++  }
++  if (queued === 0) return String(tasks.length);
++  return `${running} live · ${queued} queued`;
++}
++
+ function Lane({ lane, tasks, onSelect }) {
+   const [expanded, setExpanded] = useState(false);
+   // Human-gate lanes (Needs Answer, Review PR) NEVER collapse — every task there
+@@ -123,7 +138,11 @@ function Lane({ lane, tasks, onSelect }) {
+       <div className="lane-header">
+         <div className="lane-dot" style={{ background: lane.accent }} />
+         <div className="lane-title">{lane.label}</div>
+-        {tasks.length > 0 && <div className="lane-count">{tasks.length}</div>}
++        {tasks.length > 0 && (
++          <div className="lane-count">
++            {lane.key === "working" ? workingBreakdown(tasks) : tasks.length}
++          </div>
++        )}
+       </div>
+       <div className="lane-body">
+         {tasks.length === 0 ? (
+@@ -164,7 +183,6 @@ function Lane({ lane, tasks, onSelect }) {
+ 
+ const STALE_STATUSES = new Set(["context", "planning", "implementing", "reviewing", "testing", "awaiting_approval", "awaiting_input", "blocked"]);
+ const STALE_THRESHOLD_S = 16 * 3600;
+-const ACTIVE_STATUSES = new Set(["context", "planning", "implementing", "reviewing", "testing"]);
+ 
+ // Human-readable action hint for "Needs You" tasks
+ function actionHint(task) {
+@@ -187,13 +205,19 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
+   const priority = task.priority ?? "medium";
+   const burn = taskBurn(task);
+ 
+-  const isActive = ACTIVE_STATUSES.has(task.status);
++  // SCRUM-15: the live pulse/progress must reflect the scheduler's actual claim,
++  // not merely an "active" status — an unclaimed active-status task is queued,
++  // and a queued task must never render as "agent is working on this".
++  const activity = cardActivity(task);
++  const isRunningNow = activity.mode === "running" || task.status === "implementing";
++  const isQueuedNow = activity.mode === "queued" && !isRunningNow;
+   const waiting = isWaiting(task);
+ 
+   let cardCls = "task-card";
+   if (isAwaiting) cardCls += " awaiting";
+   if (isStale) cardCls += " stale";
+-  if (isActive) cardCls += " active-working";
++  if (isRunningNow) cardCls += " active-working";
++  if (isQueuedNow) cardCls += " card-queued";
+   if (waiting) cardCls += " waiting-parked";
+ 
+   return (
+@@ -218,7 +242,12 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
+         }
+       }}
+     >
+-      {isActive && <div className="card-active-pulse" title="agent is working on this" />}
++      {isRunningNow && <div className="card-active-pulse" title="agent is working on this" />}
++      {isQueuedNow && (
++        <div className="card-queued-tag" title="active but not yet picked up by a worker">
++          queued
++        </div>
++      )}
+       {waiting && (
+         <div className="card-waiting-tag" title={task.blocker_wake_condition || "will resume on its own"}>
+           ◷ {task.status === "paused_quota" ? "waits for quota" : "waits for its own signal"}
+@@ -228,16 +257,16 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
+         <div className="card-title">{task.title}</div>
+         <div className="card-id" title="task id — use it with `nh <id>`">{task.id.slice(0, 8)}</div>
+       </div>
+-      {task.live_status && isActive && (
++      {task.live_status && isRunningNow && (
+         <div className="card-live-status">{task.live_status}</div>
+       )}
+       {task.subtask_progress && (
+         <div className="card-subtask-progress">sub-tasks {task.subtask_progress}</div>
+       )}
+-      {isActive && taskProgress(task.status) != null && (
++      {(isRunningNow || isQueuedNow) && taskProgress(task.status) != null && (
+         <div
+-          className="card-progress"
+-          title={`~${taskProgress(task.status)}% through the pipeline (${task.status})`}
++          className={`card-progress${activity.mutedProgress ? " is-queued" : ""}`}
++          title={`~${taskProgress(task.status)}% through the pipeline (${task.status}${isQueuedNow ? ", queued" : ""})`}
+           role="progressbar"
+           aria-valuenow={taskProgress(task.status)}
+           aria-valuemin={0}
+diff --git a/web/src/boardLanes.js b/web/src/boardLanes.js
+index 0dda48b..fb094ba 100644
+--- a/web/src/boardLanes.js
++++ b/web/src/boardLanes.js
+@@ -80,3 +80,42 @@ export function isNeedsYou(task) {
+ export function isRealFailure(task) {
+   return Boolean(task) && task.status === "failed" && !task.cancelled;
+ }
++
++// SCRUM-15: the scheduler's in-flight set is the ONLY thing that means "the
++// agent is actually working on this right now" — an active-status task the
++// scheduler hasn't picked up yet is queued, not running, no matter how it looks.
++export function isRunning(task) {
++  return task?.claimed === true;
++}
++
++// Queued = routed to Working, but not actually claimed, and not parked on its
++// own signal (that's `waiting`, a distinct, non-active state with its own tag).
++export function isQueued(task) {
++  return routeTask(task) === "working" && !isRunning(task) && !isWaiting(task);
++}
++
++// Card treatment decision, extracted so JSX just consumes it instead of
++// re-deriving "is this active" from raw status (the bug this ticket fixes).
++export function cardActivity(task) {
++  if (isRunning(task)) return { mode: "running", showPulse: true, showQueuedChip: false, mutedProgress: false };
++  if (isQueued(task)) return { mode: "queued", showPulse: false, showQueuedChip: true, mutedProgress: true };
++  if (isWaiting(task)) return { mode: "waiting", showPulse: false, showQueuedChip: false, mutedProgress: true };
++  return { mode: "idle", showPulse: false, showQueuedChip: false, mutedProgress: false };
++}
++
++// SINGLE source of truth for the top strip / lane headers / sidebar counts —
++// they must all read from here so they cannot disagree (the bug this ticket
++// fixes: three surfaces derived "working" from three different vocabularies).
++export function deriveCounts(tasks) {
++  const t = Array.isArray(tasks) ? tasks : [];
++  const running = t.filter(isRunning).length;
++  const queued = t.filter(isQueued).length;
++  const waiting = t.filter(isWaiting).length;
++  return {
++    running,
++    queued,
++    waiting,
++    working: running + queued + waiting, // == Working-lane header, by construction
++    needsYou: t.filter(isNeedsYou).length,
++  };
++}
+diff --git a/web/src/boardLanes.test.mjs b/web/src/boardLanes.test.mjs
+index 4016914..2645af5 100644
+--- a/web/src/boardLanes.test.mjs
++++ b/web/src/boardLanes.test.mjs
+@@ -1,6 +1,9 @@
+ import test from "node:test";
+ import assert from "node:assert/strict";
+-import { LANES, routeTask, isNeedsYou, isWaiting, isRealFailure, BOARD_LANES, OUTCOME_LANES } from "./boardLanes.js";
++import {
++  LANES, routeTask, isNeedsYou, isWaiting, isRealFailure, BOARD_LANES, OUTCOME_LANES,
++  isRunning, isQueued, cardActivity, deriveCounts,
++} from "./boardLanes.js";
+ 
+ test("awaiting_approval routes to its OWN 'Review PR' lane, not a catch-all", () => {
+   assert.equal(routeTask({ status: "awaiting_approval" }), "review");
+@@ -138,3 +141,82 @@ test("B2 #19: an approved PR stops shouting in 'need you' but keeps its lane", (
+   // the approved task stays visible in the Review lane.
+   assert.equal(routeTask(approved), routeTask(unreviewed));
+ });
++
++// SCRUM-15: claimed=true from the scheduler's in-flight set is the ONLY signal
++// for "actually running" — an active status alone must never read as running.
++test("isRunning is true only when claimed, regardless of status", () => {
++  assert.equal(isRunning({ status: "implementing", claimed: true }), true);
++  assert.equal(isRunning({ status: "implementing", claimed: false }), false);
++  assert.equal(isRunning({ status: "implementing" }), false);
++  assert.equal(isRunning({ status: "compound_parent", claimed: true }), true);
++});
++
++test("isQueued is a Working-lane task that is not claimed and not waiting", () => {
++  assert.equal(isQueued({ status: "implementing", claimed: false }), true);
++  assert.equal(isQueued({ status: "implementing", claimed: true }), false, "claimed → running, not queued");
++  assert.equal(isQueued({ status: "paused_quota", claimed: false }), false, "waiting has its own state");
++  assert.equal(isQueued({ status: "done", claimed: false }), false, "not routed to working");
++  assert.equal(isQueued({ status: "compound_parent", claimed: false }), true);
++});
++
++test("cardActivity: running gets the pulse; queued/waiting/idle never do", () => {
++  assert.deepEqual(
++    cardActivity({ status: "implementing", claimed: true }),
++    { mode: "running", showPulse: true, showQueuedChip: false, mutedProgress: false },
++  );
++  assert.deepEqual(
++    cardActivity({ status: "implementing", claimed: false }),
++    { mode: "queued", showPulse: false, showQueuedChip: true, mutedProgress: true },
++  );
++  assert.deepEqual(
++    cardActivity({ status: "paused_quota", claimed: false }),
++    { mode: "waiting", showPulse: false, showQueuedChip: false, mutedProgress: true },
++  );
++  // A pending task sits in the Working lane awaiting a slot — that IS queued
++  // (the whole point of this ticket); idle is for terminal/gate states only.
++  assert.deepEqual(
++    cardActivity({ status: "pending", claimed: false }),
++    { mode: "queued", showPulse: false, showQueuedChip: true, mutedProgress: true },
++  );
++  assert.deepEqual(
++    cardActivity({ status: "done", claimed: false }),
++    { mode: "idle", showPulse: false, showQueuedChip: false, mutedProgress: false },
++  );
++  // The exact bug: a queued (unclaimed active) task must never carry the pulse.
++  for (const t of [
++    { status: "implementing", claimed: false },
++    { status: "paused_quota", claimed: false },
++    { status: "pending", claimed: false },
++  ]) {
++    assert.equal(cardActivity(t).showPulse, false);
++  }
++  // compound_parent must never read as running unless actually claimed.
++  assert.equal(cardActivity({ status: "compound_parent", claimed: false }).mode, "queued");
++  assert.equal(cardActivity({ status: "compound_parent", claimed: true }).mode, "running");
++});
++
++test("deriveCounts: one definition — strip/lane/sidebar cannot disagree", () => {
++  const tasks = [
++    { id: "1", status: "implementing", claimed: true },   // running
++    { id: "2", status: "implementing", claimed: false },  // queued
++    { id: "3", status: "pending", claimed: false },        // queued
++    { id: "4", status: "reviewing", claimed: false },      // queued
++    { id: "5", status: "testing", claimed: false },        // queued
++    { id: "6", status: "planning", claimed: false },       // queued
++    { id: "7", status: "context", claimed: false },        // queued
++    { id: "8", status: "compound_parent", claimed: false },// queued
++    { id: "9", status: "awaiting_approval" },              // needs-you
++    { id: "10", status: "escalated" },                     // needs-you
++    { id: "11", status: "paused_quota" },                  // waiting
++  ];
++  const counts = deriveCounts(tasks);
++  assert.deepEqual(counts, { running: 1, queued: 7, waiting: 1, working: 9, needsYou: 2 });
++  assert.equal(counts.running, tasks.filter(isRunning).length);
++  assert.equal(counts.working, tasks.filter((t) => routeTask(t) === "working").length);
++  assert.equal(counts.working, counts.running + counts.queued + counts.waiting);
++});
++
++test("deriveCounts defaults safely on non-array input", () => {
++  assert.deepEqual(deriveCounts(null), { running: 0, queued: 0, waiting: 0, working: 0, needsYou: 0 });
++  assert.deepEqual(deriveCounts(undefined), { running: 0, queued: 0, waiting: 0, working: 0, needsYou: 0 });
++});
+diff --git a/web/src/styles.css b/web/src/styles.css
+index 75a8fc6..459b261 100644
+--- a/web/src/styles.css
++++ b/web/src/styles.css
+@@ -903,6 +903,11 @@ html, body, #root {
+   background: linear-gradient(90deg, var(--accent-500), var(--accent-300));
+   transition: width var(--dur-base) var(--ease-out);
+ }
++/* SCRUM-15: an active-status task the scheduler hasn't claimed yet is queued,
++   not running — mute the same progress bar instead of a second bar shape. */
++.card-progress.is-queued .card-progress-fill {
++  opacity: 0.4;
++}
+ 
+ .card-blocker-q {
+   font-size: 12px;
+@@ -1115,6 +1120,26 @@ html, body, #root {
+ .task-card.waiting-parked { opacity: 0.82; }
+ .task-card.waiting-parked:hover { opacity: 1; }
+ 
++/* SCRUM-15: an active-status card the scheduler has NOT claimed — reuses the
++   waiting-tag's neutral treatment (this is the queued sibling of that tag). */
++.card-queued-tag {
++  display: inline-flex;
++  align-items: center;
++  gap: 5px;
++  font-family: var(--font-ui);
++  font-size: 11px;
++  font-weight: 600;
++  color: var(--c-context, #7a869a);
++  background: color-mix(in srgb, var(--c-context, #7a869a) 12%, transparent);
++  border-radius: 5px;
++  padding: 2px 7px;
++  margin-bottom: 6px;
++  letter-spacing: 0.01em;
++  text-transform: uppercase;
++}
++.task-card.card-queued { opacity: 0.82; }
++.task-card.card-queued:hover { opacity: 1; }
++
+ 
+ /* ── Activity feed — per-role live event stream (worker/supervisor/reviewer) ── */
+ .activity-feed { display: flex; flex-direction: column; gap: 10px; }

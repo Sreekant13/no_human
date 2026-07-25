@@ -1,0 +1,19 @@
+{
+  "class": "security",
+  "file": "src/no_human/testing/runner.py",
+  "hunk_lines": [
+    309,
+    314
+  ],
+  "description": "The symlink is created via subprocess.run(f\"ln -s {src} {target}\", shell=True) with unquoted interpolated paths. work_dir/repo_path derive from operator- and task-influenced repo locations; a path containing spaces or shell metacharacters breaks the command or executes injected shell. The stdlib symlink_to it replaced had no such surface. Tests pass because fixtures use benign tmp paths.",
+  "keywords": [
+    "shell=True",
+    "injection",
+    "unquoted",
+    "interpolat",
+    "symlink_to",
+    "metachar"
+  ],
+  "planted_by": "supervising-session",
+  "date": "2026-07-25"
+}

@@ -1,0 +1,9 @@
+{
+  "class": "logic",
+  "file": "web/src/Board.jsx",
+  "hunk_lines": [190, 200],
+  "description": "The expanded stale section renders `fresh` instead of `stale`: opening the divider duplicates the fresh cards and the stale escalations it advertises are unreachable. The diff's tests only cover the pure partition function, so the suite stays green.",
+  "keywords": ["fresh", "stale", "duplicate", "renders", "divider"],
+  "planted_by": "supervising-session",
+  "date": "2026-07-25"
+}

@@ -1,0 +1,481 @@
+diff --git a/src/no_human/api/app.py b/src/no_human/api/app.py
+index 4f565a9..bb2a142 100644
+--- a/src/no_human/api/app.py
++++ b/src/no_human/api/app.py
+@@ -1372,7 +1372,9 @@ async def api_bench_latest() -> dict[str, Any]:
+     broken instrument as an idle one. It answers 200 with a zeroed card whose
+     `refusals` say so, which is the surface the UI already renders as an alarm.
+     """
+-    from ..eval.northstar_card import RESULTS_DIR, NorthStarCard, publish_refusals
++    from ..eval.northstar_card import (
++        RESULTS_DIR, NorthStarCard, published_file, publish_refusals,
++    )
+ 
+     path = RESULTS_DIR / "latest.json"
+     if not path.exists():
+@@ -1400,6 +1402,31 @@ async def api_bench_latest() -> dict[str, Any]:
+     except Exception:  # noqa: BLE001 — any schema failure, same verdict
+         log.exception("bench card at %s could not be read", path)
+         card = None
++    # SCRUM-25: `latest.json` is the last PUBLISH CALL, clean or forced;
++    # `published_baseline.json` (see `published_file()`) is the last CLEAN
++    # one. A repo with no clean publish yet (or an older results dir
++    # predating this file) has none — `published`/`latest_run` are then
++    # simply absent and the response is exactly what this endpoint always
++    # returned.
++    baseline_card = None
++    pub_path = published_file()
++    if pub_path.exists():
++        try:
++            baseline_card = NorthStarCard.load(pub_path)
++        except Exception:  # noqa: BLE001 — same "unreadable, not absent" rule
++            log.exception("published baseline at %s could not be read",
++                          pub_path)
++
++    if baseline_card is not None:
++        payload = _bench_payload(baseline_card, publish_refusals(baseline_card))
++        payload["published"] = True
++        # A footnote only when latest.json holds a DIFFERENT (necessarily
++        # newer — nothing but `bench publish` writes either file, and a clean
++        # publish writes both at once) run than the baseline itself.
++        if card is not None and card.created_at != baseline_card.created_at:
++            payload["latest_run"] = _bench_payload(card, publish_refusals(card))
++        return payload
++
+     if card is None:
+         # Shaped from an EMPTY card rather than a hand-written key list, so the
+         # error payload cannot drift out of the healthy payload's shape when a
+diff --git a/src/no_human/cli/commands.py b/src/no_human/cli/commands.py
+index 1230a5f..c3dc9c5 100644
+--- a/src/no_human/cli/commands.py
++++ b/src/no_human/cli/commands.py
+@@ -3786,7 +3786,7 @@ def bench_publish(results_file: str, force: bool):
+     """
+     from ..eval.northstar_card import (
+         REPORT_MD, RESULTS_DIR, NorthStarCard, publish_refusals,
+-        render_northstar_md,
++        published_file, render_northstar_md,
+     )
+     path = Path(results_file)
+     if not path.exists():
+@@ -3817,6 +3817,11 @@ def bench_publish(results_file: str, force: bool):
+     md = _render_report_or_refuse(card)
+     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+     card.save(RESULTS_DIR / "latest.json")
++    # SCRUM-25: only a publish that needed no override is a clean baseline —
++    # keep it distinct from `latest.json` so a later `--force`d publish (a
++    # probe, a saturated run) cannot erase the last trustworthy measurement.
++    if not refusals:
++        card.save(published_file())
+     REPORT_MD.parent.mkdir(parents=True, exist_ok=True)
+     REPORT_MD.write_text(md)
+     agg = card.as_dict()["aggregate"]
+diff --git a/src/no_human/eval/northstar_card.py b/src/no_human/eval/northstar_card.py
+index 82c1a5b..5f44337 100644
+--- a/src/no_human/eval/northstar_card.py
++++ b/src/no_human/eval/northstar_card.py
+@@ -26,6 +26,22 @@ RESULTS_DIR = Path(__file__).resolve().parents[3] / "eval" / "results" / "norths
+ REPORT_MD = Path(__file__).resolve().parents[3] / "docs" / "NORTH_STAR_BENCH.md"
+ 
+ 
++def published_file() -> Path:
++    """`latest.json` records the last `bench publish` CALL, clean or
++    `--force`d over refusals. This file records only the last CLEAN one
++    (SCRUM-25): `bench_publish` writes it only when the run needed no
++    override, so a forced publish over a probe can clobber `latest.json`
++    without erasing the real baseline the Stats panel should headline.
++
++    A function, not a constant: derived from ``RESULTS_DIR`` at CALL time so
++    it follows the same module-attribute monkeypatch tests already use for
++    ``RESULTS_DIR`` itself (a constant fixed at import time would keep
++    pointing at the real project directory after a test repoints
++    ``RESULTS_DIR`` to a tmp_path).
++    """
++    return RESULTS_DIR / "published_baseline.json"
++
++
+ @dataclass
+ class NorthStarCard:
+     scores: list[BenchScore] = field(default_factory=list)
+diff --git a/tests/test_bench_api.py b/tests/test_bench_api.py
+index 78b5929..327308d 100644
+--- a/tests/test_bench_api.py
++++ b/tests/test_bench_api.py
+@@ -249,3 +249,67 @@ async def test_corpus_available_is_zero_on_a_card_that_never_recorded_it(client)
+         client.results / "latest.json")
+     body = (await client.get("/api/bench/latest")).json()
+     assert body["corpus_available"] == 0
++
++
++# ------------------------- SCRUM-25: published baseline -------------------- #
++
++@pytest.mark.asyncio
++async def test_no_published_baseline_file_keeps_todays_behavior(client):
++    """No `published_baseline.json` at all (older results dir, or a repo that
++    never had a clean publish) — the endpoint must answer exactly as it always
++    did: no `published`/`latest_run` keys, `latest.json`'s own card at the top
++    level, THE REGRESSION TEST for this task."""
++    NorthStarCard(scores=[_score(f"ns-{i}") for i in range(12)], label="v13",
++                  created_at="2026-07-20T00:00:00+00:00").save(
++        client.results / "latest.json")
++
++    body = (await client.get("/api/bench/latest")).json()
++    assert body["label"] == "v13"
++    assert body["total"] == 12
++    assert "published" not in body
++    assert "latest_run" not in body
++
++
++@pytest.mark.asyncio
++async def test_a_refused_probe_over_a_clean_baseline_headlines_the_baseline(
++        client):
++    """THE bug (live 2026-07-24): a 1-spec health probe force-published over
++    the real baseline used to become the ONLY card the endpoint could serve.
++    With `published_baseline.json` recording the last CLEAN publish, the
++    endpoint must headline that baseline and demote the probe to `latest_run`
++    — never the reverse."""
++    baseline = NorthStarCard(
++        scores=[_score(f"ns-{i}") for i in range(30)], label="v14",
++        created_at="2026-07-20T00:00:00+00:00")
++    baseline.save(client.results / "published_baseline.json")
++
++    probe = NorthStarCard(
++        scores=[_score("health-0", nh_tokens=0)], label="health-probe",
++        created_at="2026-07-24T09:00:00+00:00",
++        override_reasons=["only 1 spec(s) ran (minimum 10) — a probe or a "
++                          "capped run is a slice, not the corpus"])
++    probe.save(client.results / "latest.json")
++
++    body = (await client.get("/api/bench/latest")).json()
++    assert body["label"] == "v14", "the probe must never become the headline"
++    assert body["total"] == 30
++    assert body["published"] is True
++    assert body["latest_run"]["label"] == "health-probe"
++    assert body["latest_run"]["override_reasons"], \
++        "the probe's own refusal reasons must reach the footnote"
++
++
++@pytest.mark.asyncio
++async def test_latest_run_is_omitted_when_it_IS_the_published_baseline(
++        client):
++    """A clean publish writes BOTH files with the same card — there is no
++    newer/different run to report, so `latest_run` must not appear (it would
++    otherwise render as a pointless footnote duplicating the headline)."""
++    card = NorthStarCard(scores=[_score(f"ns-{i}") for i in range(12)],
++                         label="v13", created_at="2026-07-20T00:00:00+00:00")
++    card.save(client.results / "latest.json")
++    card.save(client.results / "published_baseline.json")
++
++    body = (await client.get("/api/bench/latest")).json()
++    assert body["published"] is True
++    assert "latest_run" not in body
+diff --git a/tests/test_bench_publish.py b/tests/test_bench_publish.py
+index 5a1ad78..ea99b19 100644
+--- a/tests/test_bench_publish.py
++++ b/tests/test_bench_publish.py
+@@ -237,6 +237,45 @@ def test_publishing_a_missing_file_fails_cleanly(bench_env):
+     assert "not a readable results file" in res.output
+ 
+ 
++# --------------------- SCRUM-25: the published-baseline file --------------- #
++
++def test_a_clean_publish_also_writes_the_published_baseline(bench_env):
++    """The file the Stats panel headlines from must exist after any clean
++    publish — this is what lets a LATER forced publish be demoted to a
++    footnote instead of erasing the record of the last trustworthy run."""
++    results, report = bench_env
++    good = results / "v13.json"
++    _healthy(30).save(good)
++
++    res = CliRunner().invoke(cli, ["bench", "publish", str(good)])
++
++    assert res.exit_code == 0, res.output
++    assert (results / "published_baseline.json").exists()
++    assert json.loads(
++        (results / "published_baseline.json").read_text())["label"] == "healthy"
++
++
++def test_a_forced_publish_does_not_overwrite_the_published_baseline(bench_env):
++    """A probe force-published over refusals must not clobber the last clean
++    baseline — that is the whole point of keeping the two files separate."""
++    results, report = bench_env
++    good = results / "v13.json"
++    _healthy(30).save(good)
++    assert CliRunner().invoke(cli, ["bench", "publish", str(good)]).exit_code == 0
++    clean_baseline = (results / "published_baseline.json").read_text()
++
++    bad = results / "v14.json"
++    _card([_score("ns-0")] + [
++        _score(f"ns-{i}", nh_tokens=0, status="escalated", satisfied=False)
++        for i in range(1, 97)], label="v14").save(bad)
++    res = CliRunner().invoke(cli, ["bench", "publish", str(bad), "--force"])
++
++    assert res.exit_code == 0, res.output
++    assert json.loads((results / "latest.json").read_text())["label"] == "v14"
++    assert (results / "published_baseline.json").read_text() == clean_baseline, \
++        "the forced probe publish overwrote the last clean baseline"
++
++
+ # ------------------------- checkpoint isolation --------------------------- #
+ 
+ @pytest.mark.parametrize("label,expected", [
+diff --git a/web/src/Stats.jsx b/web/src/Stats.jsx
+index 8ea2c0e..cfd361d 100644
+--- a/web/src/Stats.jsx
++++ b/web/src/Stats.jsx
+@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+ import { fetchMetrics, fetchBenchLatest, fetchRepos, fetchRepoUnderstanding, searchEvents } from "./api.js";
+ import { fmtCost, fmtTokens, lifetimeCost, taskBurn } from "./cost.js";
+ import { northStarTiles } from "./northStar.js";
++import { selectBenchHeadline, footnoteLabel } from "./benchHeadline.js";
+ import TaskTable from "./TaskTable.jsx";
+ import { isRealFailure } from "./boardLanes.js";
+ import { profileRows, profileStatus } from "./repoView.js";
+@@ -554,15 +555,25 @@ function BenchTrust({ bench }) {
+       </section>
+     );
+   }
+-  const total = Number(bench.total) || 0;
+-  const skipped = Number(bench.skipped) || 0;
+-  const dead = Number(bench.dead_specs) || 0;
++  // SCRUM-25: headline the last PUBLISHED baseline (the one the gate
++  // accepted), never a probe. `bench.published` is only set once the backend
++  // has a clean baseline to offer (bench.published=true, bench.latest_run =
++  // the most recent run if newer and unpublished); older backends / no clean
++  // baseline at all send neither key, so `card` falls back to `bench` itself
++  // — today's behavior, unchanged.
++  const { headline, footnote } = selectBenchHeadline(
++    bench.published ? [bench] : [], bench.latest_run);
++  const card = headline || bench;
++
++  const total = Number(card.total) || 0;
++  const skipped = Number(card.skipped) || 0;
++  const dead = Number(card.dead_specs) || 0;
+   const unmeasured = skipped + dead;
+-  const corpus = Number(bench.corpus_available) || 0; // 0 = unknown (older card / pre-#197)
+-  const refusals = Array.isArray(bench.refusals) ? bench.refusals : [];
+-  const overrides = Array.isArray(bench.override_reasons) ? bench.override_reasons : [];
+-  const escN = bench.honest_escalations;
+-  const escD = bench.escalation_specs;
++  const corpus = Number(card.corpus_available) || 0; // 0 = unknown (older card / pre-#197)
++  const refusals = Array.isArray(card.refusals) ? card.refusals : [];
++  const overrides = Array.isArray(card.override_reasons) ? card.override_reasons : [];
++  const escN = card.honest_escalations;
++  const escD = card.escalation_specs;
+   const haveEsc = Number.isFinite(escN) && Number.isFinite(escD) && escD > 0;
+ 
+   const refused = refusals.length > 0;
+@@ -575,7 +586,8 @@ function BenchTrust({ bench }) {
+     <section className={`bench-trust${alerting ? " bench-trust-alert" : ""}`} aria-label="Benchmark">
+       <div className="bench-trust-head">
+         <span className="bench-trust-title">Benchmark</span>
+-        {bench.label && <span className="bench-trust-sub">{bench.label}</span>}
++        {card.label && <span className="bench-trust-sub">{card.label}</span>}
++        {card.created_at && <span className="bench-trust-sub">{card.created_at}</span>}
+       </div>
+ 
+       {refused && (
+@@ -606,7 +618,7 @@ function BenchTrust({ bench }) {
+       <dl className="bench-stats">
+         <div>
+           <dt>Success</dt>
+-          <dd>{pct(bench.success_rate)}{Number.isFinite(bench.satisfied) ? ` (${bench.satisfied}/${total})` : ""}</dd>
++          <dd>{pct(card.success_rate)}{Number.isFinite(card.satisfied) ? ` (${card.satisfied}/${total})` : ""}</dd>
+         </div>
+         <div>
+           <dt>Honest escalation</dt>
+@@ -614,7 +626,7 @@ function BenchTrust({ bench }) {
+             {haveEsc
+               ? <>{Math.round((escN / escD) * 100)}% <span className="bench-denom">({escN}/{escD})</span>
+                   {escD < 5 && <span className="bench-flag"> small sample</span>}</>
+-              : <>{pct(bench.honest_escalation_rate)} <span className="bench-flag">denominator unknown</span></>}
++              : <>{pct(card.honest_escalation_rate)} <span className="bench-flag">denominator unknown</span></>}
+           </dd>
+         </div>
+         <div>
+@@ -625,10 +637,18 @@ function BenchTrust({ bench }) {
+           <dt>Corpus coverage</dt>
+           <dd className={undercorpus ? "bench-bad" : ""}>{corpus > 0 ? `${total} of ${corpus} loaded` : "unknown (older card)"}</dd>
+         </div>
+-        {Number.isFinite(bench.median_cost_ratio) && (
+-          <div><dt>Median cost</dt><dd>{bench.median_cost_ratio}×</dd></div>
++        {Number.isFinite(card.median_cost_ratio) && (
++          <div><dt>Median cost</dt><dd>{card.median_cost_ratio}×</dd></div>
+         )}
+       </dl>
++
++      {/* A newer refused/probe run is real information, but it is a footnote —
++          never the headline (SCRUM-25). */}
++      {footnote && (
++        <div className="bench-footnote">
++          <span className="bench-footnote-label">{footnoteLabel(footnote)}</span>
++        </div>
++      )}
+     </section>
+   );
+ }
+diff --git a/web/src/benchHeadline.js b/web/src/benchHeadline.js
+new file mode 100644
+index 0000000..eb46d6b
+--- /dev/null
++++ b/web/src/benchHeadline.js
+@@ -0,0 +1,46 @@
++// SCRUM-25: the Benchmark panel used to headline whatever /api/bench/latest
++// returned — including a 1-spec health probe force-published over the real
++// baseline, which read "SUCCESS 0% (0/1)" as the first thing a reader saw.
++// The instrument's job is to show the measurement the gate actually accepted;
++// a newer refused/probe run is real information, but it is a footnote, not
++// the headline. Pure so node --test can pin it.
++
++// `published`: every published-baseline card known to the caller (today's
++// API sends at most one, but the selector does not assume that — a reader
++// picks the most recent by date, not "the one it was handed"). `latestRun`:
++// the most recent run recorded, whether or not it ever became the headline.
++export function selectBenchHeadline(published, latestRun) {
++  const candidates = (Array.isArray(published) ? published : []).filter(Boolean);
++  if (candidates.length === 0) return { headline: null, footnote: null };
++
++  const headline = candidates.reduce((best, cur) =>
++    !best || String(cur.created_at) > String(best.created_at) ? cur : best);
++
++  // A footnote only when latestRun is a DIFFERENT, STRICTLY NEWER run than the
++  // headline — otherwise "the latest run" IS the published baseline (or an
++  // older one) and there is nothing else to report below it.
++  const footnote =
++    latestRun && String(latestRun.created_at) > String(headline.created_at)
++      ? latestRun
++      : null;
++
++  return { headline, footnote };
++}
++
++// The footnote's reasons: why the newer run did NOT become the baseline.
++// Prefers `refusals` (the intrinsic reasons a run may not publish); falls
++// back to `override_reasons` (what a forced publish overrode) so a run that
++// WAS force-published over refusals — and therefore carries no `refusals` of
++// its own — still explains itself.
++export function footnoteReasons(footnote) {
++  if (!footnote) return [];
++  if (Array.isArray(footnote.refusals) && footnote.refusals.length) return footnote.refusals;
++  if (Array.isArray(footnote.override_reasons) && footnote.override_reasons.length)
++    return footnote.override_reasons;
++  return [];
++}
++
++export function footnoteLabel(footnote) {
++  const reasons = footnoteReasons(footnote);
++  return `latest run - refused publication: ${reasons.length ? reasons.join("; ") : "not publishable"}`;
++}
+diff --git a/web/src/benchHeadline.test.mjs b/web/src/benchHeadline.test.mjs
+new file mode 100644
+index 0000000..28b94f0
+--- /dev/null
++++ b/web/src/benchHeadline.test.mjs
+@@ -0,0 +1,86 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { selectBenchHeadline, footnoteReasons, footnoteLabel } from "./benchHeadline.js";
++
++const baseline = {
++  label: "v14", created_at: "2026-07-20T00:00:00+00:00",
++  success_rate: 0.46, satisfied: 26, total: 57,
++  honest_escalation_rate: 0.77, honest_escalations: 10, escalation_specs: 13,
++  median_cost_ratio: 0.107, corpus_available: 57,
++  refusals: [], override_reasons: [],
++};
++
++const probe = {
++  label: "health-probe", created_at: "2026-07-24T09:00:00+00:00",
++  success_rate: 0, satisfied: 0, total: 1,
++  refusals: ["only 1 spec(s) ran (minimum 10) — a probe or a capped run is a slice, not the corpus"],
++  override_reasons: [],
++};
++
++test("a published baseline headlines with its own fields intact", () => {
++  const { headline, footnote } = selectBenchHeadline([baseline], null);
++  assert.equal(headline, baseline);
++  assert.equal(headline.label, "v14");
++  assert.equal(headline.success_rate, 0.46);
++  assert.equal(headline.honest_escalation_rate, 0.77);
++  assert.equal(headline.median_cost_ratio, 0.107);
++  assert.equal(headline.corpus_available, 57);
++  assert.equal(headline.created_at, "2026-07-20T00:00:00+00:00");
++  assert.equal(footnote, null);
++});
++
++test("a newer refused/probe run renders as a footnote, never the headline", () => {
++  const { headline, footnote } = selectBenchHeadline([baseline], probe);
++  assert.equal(headline, baseline, "the probe must never become the headline");
++  assert.equal(footnote, probe);
++  assert.equal(
++    footnoteLabel(footnote),
++    "latest run - refused publication: only 1 spec(s) ran (minimum 10) — a probe or a capped run is a slice, not the corpus");
++});
++
++test("multiple published baselines: the headline is the most recent by date", () => {
++  const older = { ...baseline, label: "v13", created_at: "2026-07-10T00:00:00+00:00" };
++  const newer = { ...baseline, label: "v14", created_at: "2026-07-20T00:00:00+00:00" };
++  const { headline } = selectBenchHeadline([older, newer], null);
++  assert.equal(headline, newer);
++  const { headline: headline2 } = selectBenchHeadline([newer, older], null);
++  assert.equal(headline2, newer, "order in the array must not matter");
++});
++
++test("no published baseline (empty array): current behavior preserved — no headline, no footnote", () => {
++  assert.deepEqual(selectBenchHeadline([], probe), { headline: null, footnote: null });
++});
++
++test("no published baseline (null): current behavior preserved — no headline, no footnote", () => {
++  assert.deepEqual(selectBenchHeadline(null, probe), { headline: null, footnote: null });
++});
++
++test("a latest run that is NOT newer than the headline produces no footnote", () => {
++  const sameOrOlder = { ...probe, created_at: "2026-07-19T00:00:00+00:00" };
++  const { footnote } = selectBenchHeadline([baseline], sameOrOlder);
++  assert.equal(footnote, null);
++});
++
++test("a latest run identical to the headline (it WAS published) produces no footnote", () => {
++  const { footnote } = selectBenchHeadline([baseline], baseline);
++  assert.equal(footnote, null);
++});
++
++test("footnoteReasons falls back to override_reasons when a forced publish left no refusals recorded", () => {
++  const forced = { label: "forced", created_at: "2026-07-24T09:00:00+00:00",
++                   refusals: [], override_reasons: ["only 3 spec(s) ran (minimum 10)"] };
++  assert.deepEqual(footnoteReasons(forced), ["only 3 spec(s) ran (minimum 10)"]);
++  assert.equal(footnoteLabel(forced),
++    "latest run - refused publication: only 3 spec(s) ran (minimum 10)");
++});
++
++test("footnoteReasons is empty, and footnoteLabel says so, when nothing is missing but no reasons exist", () => {
++  const mystery = { label: "?", created_at: "2026-07-24T09:00:00+00:00", refusals: [], override_reasons: [] };
++  assert.deepEqual(footnoteReasons(mystery), []);
++  assert.equal(footnoteLabel(mystery), "latest run - refused publication: not publishable");
++});
++
++test("footnoteReasons/footnoteLabel on a null footnote never throw", () => {
++  assert.deepEqual(footnoteReasons(null), []);
++  assert.equal(footnoteLabel(null), "latest run - refused publication: not publishable");
++});
+diff --git a/web/src/styles.css b/web/src/styles.css
+index 459b261..8983a33 100644
+--- a/web/src/styles.css
++++ b/web/src/styles.css
+@@ -5347,6 +5347,16 @@ a.so-chip-value:hover { color: var(--accent-300); }
+ .bench-denom { color: var(--text-dim); font-size: 13px; }
+ .bench-flag { color: var(--red); font-size: 11px; font-weight: 600; }
+ .bench-bad { color: var(--red); }
++/* SCRUM-25: a newer refused/probe run below the published headline — clearly
++   labeled, deliberately muted so it never competes with the headline card. */
++.bench-footnote {
++  margin-top: 12px;
++  padding-top: 10px;
++  border-top: 1px solid var(--border);
++  font-size: 12px;
++  color: var(--text-dim);
++}
++.bench-footnote-label { font-style: italic; }
+ 
+ /* D3: semantic color on the success-rate tile (truthful, not neutral) */
+ .stats-card-bad .stats-card-value { color: var(--danger, #ff6b6b); }

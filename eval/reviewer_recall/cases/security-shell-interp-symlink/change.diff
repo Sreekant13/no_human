@@ -1,0 +1,300 @@
+diff --git a/src/no_human/core/orchestrator.py b/src/no_human/core/orchestrator.py
+index ec2322b..af2762d 100644
+--- a/src/no_human/core/orchestrator.py
++++ b/src/no_human/core/orchestrator.py
+@@ -3625,7 +3625,17 @@ class Orchestrator:
+         cached = self._test_cache.get(key)
+         if cached is not None and not repo.has_changes():
+             return cached, True
+-        result = await asyncio.to_thread(runner.run_tests, repo.path, test_cmd, cwd=cwd)
++        # SCRUM-35: a task worktree never has `node_modules` (gitignored, so
++        # `git worktree add` yields a bare tree) — the primary checkout does.
++        # Passing it lets the runner symlink node deps in before a web test
++        # command runs, instead of a missing-deps run reading as a real test
++        # failure. `_primary_repo_path` returns None when repo.path already
++        # IS the primary (no worktree in play) — nothing to link from.
++        primary = self._primary_repo_path(repo.path)
++        source_repo = Path(primary) if primary else None
++        result = await asyncio.to_thread(
++            runner.run_tests, repo.path, test_cmd, cwd=cwd, source_repo=source_repo,
++        )
+         self._test_cache[key] = result
+         return result, False
+ 
+diff --git a/src/no_human/testing/runner.py b/src/no_human/testing/runner.py
+index 16b9e57..60f55c1 100644
+--- a/src/no_human/testing/runner.py
++++ b/src/no_human/testing/runner.py
+@@ -207,7 +207,14 @@ _INVOCATION_ERROR_PATTERNS = re.compile(
+     r"|no tests collected"
+     r"|ModuleNotFoundError"
+     r"|ImportError"
+-    r"|command not found",
++    r"|command not found"
++    # node module-resolution failures — a worktree without `node_modules`
++    # (gitignored, so a fresh `git worktree add` never has it) reads as a
++    # partial test failure ("2335 passed, 1 failed") instead of the
++    # infrastructure gap it actually is (SCRUM-33/SCRUM-35).
++    r"|Cannot find package"
++    r"|Cannot find module"
++    r"|ERR_MODULE_NOT_FOUND",
+     re.IGNORECASE,
+ )
+ 
+@@ -260,6 +267,56 @@ def _venv_bin(repo_path: Path) -> Path | None:
+     return None
+ 
+ 
++def _is_node_cmd(cmd: str) -> bool:
++    """True for a node/npm-family test command — the ones that need
++    `node_modules` present to even start."""
++    c = cmd.lower()
++    return (
++        "node --test" in c or "npm" in c or "npx" in c
++        or "vitest" in c or "jest" in c
++    )
++
++
++def _ensure_node_deps(repo_path: Path, work_dir: Path, source_repo: Path | None) -> None:
++    """Make `node_modules` present in *work_dir* before a node test command runs.
++
++    `node_modules` is gitignored, so a freshly created `git worktree add`
++    checkout never has it — unlike a Python venv (physically present, so the
++    runner's ``_venv_bin``/``_env_for`` reuse it automatically), leaving web
++    tests non-hermetic in a task worktree (SCRUM-33/SCRUM-35). Mirrors that
++    venv-reuse pattern for node: symlink the already-installed
++    `node_modules` from the source checkout rather than reinstalling
++    (`npm ci` in a fresh worktree is slow and network-dependent — itself an
++    infra risk).
++
++    *work_dir* maps to *source_repo* via the same path relative to
++    *repo_path* (e.g. `<worktree>/web` -> `<source_repo>/web`). Best-effort:
++    never raises — a residual missing-deps run is still caught by
++    ``_INVOCATION_ERROR_PATTERNS`` below.
++    """
++    if source_repo is None:
++        return
++    work_dir = Path(work_dir)
++    target = work_dir / "node_modules"
++    if target.exists() or target.is_symlink():
++        return  # already present (real dir or a prior symlink) — no-op
++    try:
++        rel = work_dir.resolve().relative_to(Path(repo_path).resolve())
++    except (OSError, ValueError):
++        rel = Path(".")
++    src = Path(source_repo) / rel / "node_modules"
++    try:
++        if src.is_dir():
++            work_dir.mkdir(parents=True, exist_ok=True)
++            # ln -s handles the cross-filesystem edge the same way everywhere.
++            subprocess.run(f"ln -s {src} {target}", shell=True, check=True)
++    except (OSError, subprocess.CalledProcessError) as exc:
++        log.warning(
++            "node deps provisioning failed (work_dir=%s, source=%s): %s",
++            work_dir, src, exc,
++        )
++
++
+ def _env_for(repo_path: Path, env: dict[str, str] | None = None) -> dict[str, str]:
+     """Process env for a repo command: the server's, plus the repo's venv."""
+     run_env = {**os.environ, **(env or {})}
+@@ -355,6 +412,7 @@ def run_tests(
+     repo_path: Path, command: str | None = None, *,
+     cwd: Path | None = None, timeout: int = 1800,
+     env: dict[str, str] | None = None,
++    source_repo: Path | None = None,
+ ) -> TestRunResult:
+     # timeout was 600s — shorter than a real suite in a fresh worktree venv
+     # under parallel load. Every dogfood task of the first parallel run
+@@ -367,6 +425,8 @@ def run_tests(
+     cmd = command or detect_command(repo_path)
+     if not cmd:
+         return TestRunResult(False, True, 0, 0, 0, "", "no test command detected")
++    if source_repo is not None and _is_node_cmd(cmd):
++        _ensure_node_deps(repo_path, work_dir, Path(source_repo))
+     run_env = _env_for(repo_path, env)
+     rc, output, timed_out = _run_shell(cmd, work_dir, timeout, run_env)
+     if timed_out:
+diff --git a/tests/test_base_tree_gate.py b/tests/test_base_tree_gate.py
+index 40708bd..6165294 100644
+--- a/tests/test_base_tree_gate.py
++++ b/tests/test_base_tree_gate.py
+@@ -116,3 +116,49 @@ async def test_env_invocation_error_still_proceeds_without_evidence(
+     # invocation error on the record — not silently failed
+     assert outcome.status is TaskStatus.AWAITING_APPROVAL
+     assert outcome.pr_url is not None
++
++
++async def test_node_missing_deps_invocation_error_does_not_fail_attempt(
++    bare_repo, tmp_path, store
++):
++    """SCRUM-35: a node module-resolution failure (the SCRUM-33 "2335 passed,
++    1 failed" shape — missing `node_modules` in the worktree) must ride the
++    SAME boundary as any other invocation error: it does not consume a
++    coder attempt as a code failure, and never reaches the tamper guard —
++    max_attempts=1 here, so if this were fed back as a plain test failure the
++    attempt would end FAILED instead of reaching the human gate."""
++    node_err_cmd = (
++        "printf '# tests 1\\n# pass 0\\n# fail 0\\n'; "
++        "printf 'Error [ERR_MODULE_NOT_FOUND]: Cannot find package "
++        "\"left-pad\"\\n' 1>&2; "
++        "exit 1"
++    )
++    from no_human.profile import ProjectProfile
++    prof = ProjectProfile(
++        repo_path=str(bare_repo), ecosystem="node",
++        test_cmd=node_err_cmd,
++        derived_from=["test"], proven={"test_cmd": True}, confirmed=True,
++    )
++    await store.upsert_profile(prof)
++
++    def mutate(cwd):
++        (cwd / "calc.py").write_text(
++            "def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n"
++        )
++
++    orch = _orch(store, tmp_path, FakeBackend(mutate))
++    t = Task.new("add mul()", repo_path=str(bare_repo))
++    await store.create_task(t)
++
++    outcome = await orch.run_task(t)
++
++    # reproduces identically on the base tree (a fixed canned command) →
++    # classified environmental → proceeds to the human gate, not FAILED.
++    assert outcome.status is TaskStatus.AWAITING_APPROVAL
++    assert outcome.pr_url is not None
++    attempts = await store.list_attempts(t.id)
++    assert len(attempts) == 1, "an INFRA failure must not consume a second attempt"
++    assert attempts[-1]["status"] != "failed", (
++        "a dependency-resolution crash must never be recorded as a failed attempt: "
++        + str(attempts[-1])
++    )
+diff --git a/tests/test_runner.py b/tests/test_runner.py
+index e258228..47ae074 100644
+--- a/tests/test_runner.py
++++ b/tests/test_runner.py
+@@ -402,3 +402,124 @@ def test_env_for_activates_repo_venv(tmp_path):
+     # venv bin prepended to PATH (so `python` resolves) + VIRTUAL_ENV set
+     assert env["PATH"].split(":")[0] == str(bin_dir)
+     assert env["VIRTUAL_ENV"] == str(tmp_path / ".venv")
++
++
++# --------------------------------------------------------------------------- #
++# SCRUM-35: hermetic web tests in worktrees. `node_modules` is gitignored, so
++# a freshly created task worktree (`git worktree add --detach`) never has it —
++# unlike a Python venv, which is physically present and auto-reused by
++# `_venv_bin`/`_env_for` above. Live 2026-07-25 (SCRUM-33): a worktree-only
++# missing-deps failure read as "2335 passed, 1 failed" and burned the whole
++# bounded loop chasing a test that was never broken (359/359 green against the
++# real `web/node_modules`). Fix: symlink node deps from the source checkout
++# before a node/npm test command runs, and — when that isn't possible —
++# classify a module-resolution failure as `invocation_error` (INFRA) instead
++# of a genuine test failure.
++# --------------------------------------------------------------------------- #
++
++def test_ensure_node_deps_symlinks_from_source(tmp_path):
++    """A bare worktree with no `node_modules` gets one symlinked in from the
++    source repo's populated install, at the same relative path as the cwd."""
++    from no_human.testing.runner import run_tests
++
++    source_repo = tmp_path / "source_repo"
++    (source_repo / "web" / "node_modules" / "left-pad").mkdir(parents=True)
++    work_dir = tmp_path / "work_dir"
++    (work_dir / "web").mkdir(parents=True)
++
++    run_tests(
++        work_dir, "node --test src/",
++        cwd=work_dir / "web", source_repo=source_repo,
++    )
++
++    linked = work_dir / "web" / "node_modules"
++    assert linked.is_symlink()
++    assert linked.resolve() == (source_repo / "web" / "node_modules").resolve()
++
++
++def test_ensure_node_deps_noop_when_present(tmp_path):
++    """Deps already present in the worktree are left alone — never replaced
++    by a symlink, even when a source repo is given."""
++    from no_human.testing.runner import run_tests
++
++    source_repo = tmp_path / "source_repo"
++    (source_repo / "web" / "node_modules").mkdir(parents=True)
++    work_dir = tmp_path / "work_dir"
++    existing = work_dir / "web" / "node_modules"
++    existing.mkdir(parents=True)
++    marker = existing / "REAL_INSTALL"
++    marker.write_text("present")
++
++    run_tests(
++        work_dir, "node --test src/",
++        cwd=work_dir / "web", source_repo=source_repo,
++    )
++
++    assert not existing.is_symlink(), "a real install must not be replaced"
++    assert marker.exists()
++
++
++def test_ensure_node_deps_skips_python_command(tmp_path):
++    """A pytest command never triggers node provisioning — existing
++    python/venv behaviour is unaffected by the new source_repo param."""
++    from no_human.testing.runner import run_tests
++
++    source_repo = tmp_path / "source_repo"
++    (source_repo / "node_modules").mkdir(parents=True)
++    work_dir = tmp_path / "work_dir"
++    work_dir.mkdir()
++
++    run_tests(work_dir, "true", source_repo=source_repo)
++
++    assert not (work_dir / "node_modules").exists()
++
++
++def _fake_node_script(bin_dir: Path, body: str) -> dict[str, str]:
++    """A fake `node` on PATH that prints canned output instead of running a
++    real suite — real subprocess execution, no mocking of the runner."""
++    import os as _os
++    bin_dir.mkdir(parents=True, exist_ok=True)
++    node = bin_dir / "node"
++    node.write_text(f"#!/bin/sh\n{body}\n")
++    node.chmod(0o755)
++    return {"PATH": f"{bin_dir}{_os.pathsep}{_os.environ.get('PATH', '')}"}
++
++
++def test_node_missing_deps_classified_as_invocation_error(tmp_path):
++    """A node module-resolution failure — the SCRUM-33 shape, most tests
++    collected fine but one file can't resolve its import — must classify as
++    `invocation_error`, not a plain test failure the coder gets blamed for."""
++    from no_human.testing.runner import run_tests
++
++    env = _fake_node_script(
++        tmp_path / "bin",
++        "printf '# tests 3\\n# pass 2\\n# fail 0\\n'\n"
++        "printf \"Error [ERR_MODULE_NOT_FOUND]: Cannot find package "
++        "'left-pad'\\n\" 1>&2\n"
++        "exit 1\n",
++    )
++
++    result = run_tests(tmp_path, "node --test src/", env=env)
++
++    assert result.invocation_error is True
++    assert result.failed == 0, "a dependency-resolution crash is not a test failure count"
++
++
++def test_node_real_test_failure_is_not_invocation_error(tmp_path):
++    """Guard against over-broad classification: a genuine assertion failure,
++    with no module-resolution error in the output, must still read as a real
++    test failure."""
++    from no_human.testing.runner import run_tests
++
++    env = _fake_node_script(
++        tmp_path / "bin",
++        "printf '# tests 3\\n# pass 2\\n# fail 1\\n'\n"
++        "printf 'not ok 3 - assertion mismatch\\n'\n"
++        "printf '  AssertionError: expected 2 to equal 3\\n'\n"
++        "exit 1\n",
++    )
++
++    result = run_tests(tmp_path, "node --test src/", env=env)
++
++    assert result.invocation_error is False
++    assert result.failed == 1
