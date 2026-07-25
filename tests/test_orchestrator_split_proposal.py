@@ -272,6 +272,90 @@ async def test_repeat_scope_explosion_evidence_includes_existing_proposal(
     assert "SHOULD NOT REGENERATE" not in blocker.evidence
 
 
+async def test_scope_explosion_populates_files_from_spec(store, tmp_path, monkeypatch):
+    """SCRUM-38: the files section must be populated from ctx['spec']
+    ['files_to_change'] — the only key the plan path actually writes."""
+    calls = []
+
+    async def fake_generate(task, files_to_change=None, surfaces=None, **kw):
+        calls.append(files_to_change)
+        return PROPOSAL
+
+    monkeypatch.setattr(
+        "no_human.core.orchestrator.generate_split_proposal", fake_generate
+    )
+
+    t = await _new_task(store)
+    t.context = {
+        "spec": {
+            "files_to_change": [
+                "src/no_human/core/orchestrator.py",
+                "src/no_human/intake/split_proposal.py",
+            ]
+        }
+    }
+    await store.update_task(t)
+    blocker = _scope_blocker(evidence="orig")
+
+    async with EventPersister(store, t.id, interval=0.01) as persister:
+        orch = _orch(store, tmp_path, sink=persister.record)
+        await orch._raise_blocker(t, blocker)
+
+    assert calls
+    assert calls[0] == [
+        "src/no_human/core/orchestrator.py",
+        "src/no_human/intake/split_proposal.py",
+    ]
+
+
+async def test_no_spec_omits_files_section(store, tmp_path, monkeypatch):
+    """No spec in context: files_to_change stays None (current behavior)."""
+    calls = []
+
+    async def fake_generate(task, files_to_change=None, surfaces=None, **kw):
+        calls.append(files_to_change)
+        return PROPOSAL
+
+    monkeypatch.setattr(
+        "no_human.core.orchestrator.generate_split_proposal", fake_generate
+    )
+
+    t = await _new_task(store)
+    blocker = _scope_blocker(evidence="orig")
+
+    async with EventPersister(store, t.id, interval=0.01) as persister:
+        orch = _orch(store, tmp_path, sink=persister.record)
+        await orch._raise_blocker(t, blocker)
+
+    assert calls
+    assert calls[0] is None
+
+
+async def test_spec_with_blank_entries_omits(store, tmp_path, monkeypatch):
+    """Whitespace-only entries don't count as a populated file list."""
+    calls = []
+
+    async def fake_generate(task, files_to_change=None, surfaces=None, **kw):
+        calls.append(files_to_change)
+        return PROPOSAL
+
+    monkeypatch.setattr(
+        "no_human.core.orchestrator.generate_split_proposal", fake_generate
+    )
+
+    t = await _new_task(store)
+    t.context = {"spec": {"files_to_change": ["", "  "]}}
+    await store.update_task(t)
+    blocker = _scope_blocker(evidence="orig")
+
+    async with EventPersister(store, t.id, interval=0.01) as persister:
+        orch = _orch(store, tmp_path, sink=persister.record)
+        await orch._raise_blocker(t, blocker)
+
+    assert calls
+    assert calls[0] is None
+
+
 async def test_generator_exception_skips_and_logs_typename(
     store, tmp_path, monkeypatch, caplog
 ):
