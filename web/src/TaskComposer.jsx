@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { fetchProjects, fetchConfig, fetchIntegrations, searchJiraIssues, fetchJiraIssue } from "./api.js";
 import { COMPOSER_KINDS, kindByValue, needsPrUrl } from "./composerKinds.js";
 import { splitPrompt } from "./promptSplit.js";
-import { promptFromIssue, jiraStatusChipStyle, externalIdFromIssue } from "./jiraImport.js";
+import { promptFromIssue, jiraStatusChipStyle, externalIdFromIssue, importedChip } from "./jiraImport.js";
 import { greetingName } from "./greeting.js";
 import { hasPrRef } from "./prRefs.js";
 import { formatBytes } from "./formatBytes.js";
@@ -369,6 +369,11 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
                 // (unrecognised status) keeps the neutral className below —
                 // no colour claim the normalizer can't back up.
                 const chipStyle = jiraStatusChipStyle(issue.status);
+                // SCRUM-18 — accidental re-import trap: when this ticket already
+                // has a board task, show its status next to the Jira status chip.
+                // The row stays clickable either way — import is always possible,
+                // just no longer accidental.
+                const imp = importedChip(issue.imported);
                 return (
                   <button
                     key={issue.key}
@@ -381,17 +386,29 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
                       <span className="font-ui text-sm font-medium text-text">
                         {issue.key}: {issue.summary}
                       </span>
-                      {issue.status && (
-                        <span
-                          className={
-                            "shrink-0 rounded-full border border-solid px-2.5 py-0.5 font-ui text-xs " +
-                            (chipStyle ? "font-medium" : "border-line bg-panel text-text-muted")
-                          }
-                          style={chipStyle || undefined}
-                        >
-                          {issue.status}
-                        </span>
-                      )}
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        {issue.status && (
+                          <span
+                            className={
+                              "shrink-0 rounded-full border border-solid px-2.5 py-0.5 font-ui text-xs " +
+                              (chipStyle ? "font-medium" : "border-line bg-panel text-text-muted")
+                            }
+                            style={chipStyle || undefined}
+                          >
+                            {issue.status}
+                          </span>
+                        )}
+                        {imp && (
+                          <span
+                            className={
+                              "shrink-0 rounded-full border border-solid px-2.5 py-0.5 font-ui text-xs " + imp.className
+                            }
+                            style={imp.style || undefined}
+                          >
+                            {imp.label}
+                          </span>
+                        )}
+                      </span>
                     </div>
                     <span className="font-ui text-xs text-text-dim">
                       {issue.updated ? `Updated ${new Date(issue.updated).toLocaleDateString()}` : "Recently updated"}

@@ -16,6 +16,7 @@ from httpx import AsyncClient, ASGITransport
 import no_human.config as nh_config
 from no_human.api.app import app
 from no_human.core.db import Store
+from no_human.core.task import Task, TaskStatus
 
 
 def _cfg(**over):
@@ -288,6 +289,152 @@ async def test_issue_detail_upstream_error_surfaces_as_502(client, monkeypatch):
     r = await client.get("/api/integrations/jira/issues/PROJ-9")
     assert r.status_code == 502
     assert "SEKRET" not in r.text
+
+
+# ── SCRUM-18: accidental re-import trap — the `imported` lookup field ──────
+
+def _jira_issue_payload(key="SCRUM-18", status="In Progress"):
+    return {
+        "key": key,
+        "fields": {
+            "summary": "Some ticket",
+            "description": "",
+            "status": {"name": status},
+            "assignee": None,
+            "updated": "2026-07-18T10:00:00.000+0000",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_browse_marks_imported_ticket(client, store, monkeypatch):
+    """A ticket that already has a board task (matched by external_id/key)
+    must carry that task's status in the response's `imported` block."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    task = Task.new("SCRUM-18: Some ticket", source="jira", external_id="SCRUM-18")
+    task.status = TaskStatus.DONE
+    await store.create_task(task)
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        return _Resp({"issues": [_jira_issue_payload()]})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    r = await client.get("/api/integrations/jira/issues", params={"q": "ticket"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body) == 1
+    imported = body[0]["imported"]
+    assert imported is not None
+    assert imported["task_id"] == task.id
+    assert imported["status"] == "done"
+    assert imported["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_no_match_leaves_imported_none(client, store, monkeypatch):
+    """A ticket with no matching board task must leave `imported` unset —
+    it must still be importable (no accidental "already handled" claim)."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    other = Task.new("Unrelated", source="jira", external_id="SCRUM-1")
+    await store.create_task(other)
+    # Same external_id as the browsed key but NOT a jira-sourced task: the
+    # source filter must exclude it (cross-source id collisions never claim
+    # a ticket is imported).
+    collider = Task.new("Colliding id", source="freeform", external_id="SCRUM-18")
+    await store.create_task(collider)
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        return _Resp({"issues": [_jira_issue_payload(key="SCRUM-18")]})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    r = await client.get("/api/integrations/jira/issues", params={"q": "ticket"})
+    assert r.status_code == 200, r.text
+    assert r.json()[0]["imported"] is None
+
+
+@pytest.mark.asyncio
+async def test_imported_lookup_uses_single_store_read(client, store, monkeypatch):
+    """The match against the local store must be ONE read regardless of how
+    many issues come back — never a per-row store or Jira call."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    task = Task.new("SCRUM-18: Some ticket", source="jira", external_id="SCRUM-18")
+    await store.create_task(task)
+
+    calls = {"list_tasks": 0}
+    orig_list_tasks = store.list_tasks
+
+    async def counted_list_tasks(*a, **kw):
+        calls["list_tasks"] += 1
+        return await orig_list_tasks(*a, **kw)
+
+    monkeypatch.setattr(store, "list_tasks", counted_list_tasks)
+
+    search_calls = {"n": 0}
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        search_calls["n"] += 1
+        return _Resp({"issues": [
+            _jira_issue_payload(key="SCRUM-18"),
+            _jira_issue_payload(key="SCRUM-19"),
+            _jira_issue_payload(key="SCRUM-20"),
+        ]})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    r = await client.get("/api/integrations/jira/issues", params={"q": "ticket"})
+    assert r.status_code == 200, r.text
+    assert len(r.json()) == 3
+    assert calls["list_tasks"] == 1, "the tasks store must be read exactly once, not once per issue"
+    assert search_calls["n"] == 1, "the Jira adapter must be called exactly once, not once per issue"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_external_ids_set_count(client, store, monkeypatch):
+    """Two board tasks sharing the same external_id (a data-integrity bug)
+    must surface as a count > 1 so the picker can warn, not silently pick
+    one and hide the duplication."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    # Created FIRST but updated LAST: insertion order (list_tasks sorts by
+    # created_at DESC) and updated-order must diverge, or a `matches[0]`
+    # mutation of the max-by-updated_at pick would pass unnoticed.
+    t1 = Task.new("SCRUM-18 v1", source="jira", external_id="SCRUM-18")
+    t1.updated_at = "2026-07-02T00:00:00+00:00"
+    await store.create_task(t1)
+    t2 = Task.new("SCRUM-18 v2", source="jira", external_id="SCRUM-18")
+    t2.updated_at = "2026-07-01T00:00:00+00:00"
+    await store.create_task(t2)
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        return _Resp({"issues": [_jira_issue_payload()]})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    r = await client.get("/api/integrations/jira/issues", params={"q": "ticket"})
+    assert r.status_code == 200, r.text
+    imported = r.json()[0]["imported"]
+    assert imported["count"] == 2
+    # The most-recently-updated match wins for task_id/status — t1, which is
+    # NOT first in store order.
+    assert imported["task_id"] == t1.id
+
+
+@pytest.mark.asyncio
+async def test_imported_never_leaks_full_task_shape(client, store, monkeypatch):
+    """The lookup is additive-only: task_id + status (+ count), never the
+    full Task shape (description/requirements/context/etc)."""
+    monkeypatch.setenv("JIRA_API_TOKEN", "t")
+    task = Task.new(
+        "SCRUM-18: Some ticket", source="jira", external_id="SCRUM-18",
+        description="secret internal notes",
+    )
+    await store.create_task(task)
+
+    def fake_get(url, params=None, auth=None, timeout=None, headers=None):
+        return _Resp({"issues": [_jira_issue_payload()]})
+
+    monkeypatch.setattr("no_human.intake.jira.httpx.get", fake_get)
+    r = await client.get("/api/integrations/jira/issues", params={"q": "ticket"})
+    imported = r.json()[0]["imported"]
+    assert set(imported.keys()) == {"task_id", "status", "count"}
+    assert "secret internal notes" not in r.text
 
 
 @pytest.mark.asyncio

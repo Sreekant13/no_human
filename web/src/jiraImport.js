@@ -64,3 +64,58 @@ export function jiraStatusChipStyle(status) {
 export function externalIdFromIssue(issue) {
   return issue?.key ?? null;
 }
+
+/**
+ * SCRUM-18 — accidental re-import trap. `issue.imported` (from the browse
+ * endpoint's local-store lookup) says a board task already exists for this
+ * ticket. Map the board TASK status (no_human's own TaskStatus enum values,
+ * NOT a Jira status name) to the same done/active/todo/unknown ramp
+ * jiraStatusCategory uses, plus a "warn" tone for terminal-bad states and
+ * duplicate external_ids — reusing CATEGORY_TOKENS, no new CSS vars.
+ */
+export function importedStatusCategory(status) {
+  const s = (status || "").trim().toLowerCase();
+  if (s === "done") return "done";
+  if (["failed", "blocked", "escalated"].includes(s)) return "warn";
+  if (
+    ["pending", "context", "planning", "implementing", "reviewing", "testing",
+      "awaiting_approval", "compound_parent", "awaiting_input", "paused_quota"].includes(s)
+  ) {
+    return "active";
+  }
+  return "unknown";
+}
+
+const WARN_TOKENS = { color: "var(--red)", background: "var(--red-dim)", borderColor: "var(--red)" };
+
+/** Inline style for the "imported" chip, mirroring jiraStatusChipStyle. */
+export function importedChipStyle(status) {
+  const category = importedStatusCategory(status);
+  if (category === "warn") return WARN_TOKENS;
+  return CATEGORY_TOKENS[category] || null;
+}
+
+/** Build the "imported" chip's {label, style, className}, or `null` when the
+ * ticket has no board task yet — the caller renders nothing in that case.
+ * Import stays clickable either way; this only ever ADDS visible state, it
+ * never disables the row (SCRUM-18: re-imports stay possible, just no
+ * longer accidental). A count > 1 (duplicate external_ids — a data
+ * integrity bug, not something this endpoint cleans up) escalates to a
+ * review warning regardless of the underlying status. */
+export function importedChip(imported) {
+  if (!imported) return null;
+  const { status, count = 1 } = imported;
+  if (count > 1) {
+    return {
+      label: `imported ×${count} — review`,
+      style: WARN_TOKENS,
+      className: "font-medium",
+    };
+  }
+  const style = importedChipStyle(status);
+  return {
+    label: `imported — ${status}`,
+    style,
+    className: style ? "font-medium" : "border-line bg-panel text-text-muted",
+  };
+}
