@@ -249,3 +249,67 @@ async def test_corpus_available_is_zero_on_a_card_that_never_recorded_it(client)
         client.results / "latest.json")
     body = (await client.get("/api/bench/latest")).json()
     assert body["corpus_available"] == 0
+
+
+# ------------------------- SCRUM-25: published baseline -------------------- #
+
+@pytest.mark.asyncio
+async def test_no_published_baseline_file_keeps_todays_behavior(client):
+    """No `published_baseline.json` at all (older results dir, or a repo that
+    never had a clean publish) — the endpoint must answer exactly as it always
+    did: no `published`/`latest_run` keys, `latest.json`'s own card at the top
+    level, THE REGRESSION TEST for this task."""
+    NorthStarCard(scores=[_score(f"ns-{i}") for i in range(12)], label="v13",
+                  created_at="2026-07-20T00:00:00+00:00").save(
+        client.results / "latest.json")
+
+    body = (await client.get("/api/bench/latest")).json()
+    assert body["label"] == "v13"
+    assert body["total"] == 12
+    assert "published" not in body
+    assert "latest_run" not in body
+
+
+@pytest.mark.asyncio
+async def test_a_refused_probe_over_a_clean_baseline_headlines_the_baseline(
+        client):
+    """THE bug (live 2026-07-24): a 1-spec health probe force-published over
+    the real baseline used to become the ONLY card the endpoint could serve.
+    With `published_baseline.json` recording the last CLEAN publish, the
+    endpoint must headline that baseline and demote the probe to `latest_run`
+    — never the reverse."""
+    baseline = NorthStarCard(
+        scores=[_score(f"ns-{i}") for i in range(30)], label="v14",
+        created_at="2026-07-20T00:00:00+00:00")
+    baseline.save(client.results / "published_baseline.json")
+
+    probe = NorthStarCard(
+        scores=[_score("health-0", nh_tokens=0)], label="health-probe",
+        created_at="2026-07-24T09:00:00+00:00",
+        override_reasons=["only 1 spec(s) ran (minimum 10) — a probe or a "
+                          "capped run is a slice, not the corpus"])
+    probe.save(client.results / "latest.json")
+
+    body = (await client.get("/api/bench/latest")).json()
+    assert body["label"] == "v14", "the probe must never become the headline"
+    assert body["total"] == 30
+    assert body["published"] is True
+    assert body["latest_run"]["label"] == "health-probe"
+    assert body["latest_run"]["override_reasons"], \
+        "the probe's own refusal reasons must reach the footnote"
+
+
+@pytest.mark.asyncio
+async def test_latest_run_is_omitted_when_it_IS_the_published_baseline(
+        client):
+    """A clean publish writes BOTH files with the same card — there is no
+    newer/different run to report, so `latest_run` must not appear (it would
+    otherwise render as a pointless footnote duplicating the headline)."""
+    card = NorthStarCard(scores=[_score(f"ns-{i}") for i in range(12)],
+                         label="v13", created_at="2026-07-20T00:00:00+00:00")
+    card.save(client.results / "latest.json")
+    card.save(client.results / "published_baseline.json")
+
+    body = (await client.get("/api/bench/latest")).json()
+    assert body["published"] is True
+    assert "latest_run" not in body

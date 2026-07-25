@@ -26,6 +26,22 @@ RESULTS_DIR = Path(__file__).resolve().parents[3] / "eval" / "results" / "norths
 REPORT_MD = Path(__file__).resolve().parents[3] / "docs" / "NORTH_STAR_BENCH.md"
 
 
+def published_file() -> Path:
+    """`latest.json` records the last `bench publish` CALL, clean or
+    `--force`d over refusals. This file records only the last CLEAN one
+    (SCRUM-25): `bench_publish` writes it only when the run needed no
+    override, so a forced publish over a probe can clobber `latest.json`
+    without erasing the real baseline the Stats panel should headline.
+
+    A function, not a constant: derived from ``RESULTS_DIR`` at CALL time so
+    it follows the same module-attribute monkeypatch tests already use for
+    ``RESULTS_DIR`` itself (a constant fixed at import time would keep
+    pointing at the real project directory after a test repoints
+    ``RESULTS_DIR`` to a tmp_path).
+    """
+    return RESULTS_DIR / "published_baseline.json"
+
+
 @dataclass
 class NorthStarCard:
     scores: list[BenchScore] = field(default_factory=list)

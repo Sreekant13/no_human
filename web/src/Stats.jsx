@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { fetchMetrics, fetchBenchLatest, fetchRepos, fetchRepoUnderstanding, searchEvents } from "./api.js";
 import { fmtCost, fmtTokens, lifetimeCost, taskBurn } from "./cost.js";
 import { northStarTiles } from "./northStar.js";
+import { selectBenchHeadline, footnoteLabel } from "./benchHeadline.js";
 import TaskTable from "./TaskTable.jsx";
 import { isRealFailure } from "./boardLanes.js";
 import { profileRows, profileStatus } from "./repoView.js";
@@ -554,15 +555,25 @@ function BenchTrust({ bench }) {
       </section>
     );
   }
-  const total = Number(bench.total) || 0;
-  const skipped = Number(bench.skipped) || 0;
-  const dead = Number(bench.dead_specs) || 0;
+  // SCRUM-25: headline the last PUBLISHED baseline (the one the gate
+  // accepted), never a probe. `bench.published` is only set once the backend
+  // has a clean baseline to offer (bench.published=true, bench.latest_run =
+  // the most recent run if newer and unpublished); older backends / no clean
+  // baseline at all send neither key, so `card` falls back to `bench` itself
+  // — today's behavior, unchanged.
+  const { headline, footnote } = selectBenchHeadline(
+    bench.published ? [bench] : [], bench.latest_run);
+  const card = headline || bench;
+
+  const total = Number(card.total) || 0;
+  const skipped = Number(card.skipped) || 0;
+  const dead = Number(card.dead_specs) || 0;
   const unmeasured = skipped + dead;
-  const corpus = Number(bench.corpus_available) || 0; // 0 = unknown (older card / pre-#197)
-  const refusals = Array.isArray(bench.refusals) ? bench.refusals : [];
-  const overrides = Array.isArray(bench.override_reasons) ? bench.override_reasons : [];
-  const escN = bench.honest_escalations;
-  const escD = bench.escalation_specs;
+  const corpus = Number(card.corpus_available) || 0; // 0 = unknown (older card / pre-#197)
+  const refusals = Array.isArray(card.refusals) ? card.refusals : [];
+  const overrides = Array.isArray(card.override_reasons) ? card.override_reasons : [];
+  const escN = card.honest_escalations;
+  const escD = card.escalation_specs;
   const haveEsc = Number.isFinite(escN) && Number.isFinite(escD) && escD > 0;
 
   const refused = refusals.length > 0;
@@ -575,7 +586,8 @@ function BenchTrust({ bench }) {
     <section className={`bench-trust${alerting ? " bench-trust-alert" : ""}`} aria-label="Benchmark">
       <div className="bench-trust-head">
         <span className="bench-trust-title">Benchmark</span>
-        {bench.label && <span className="bench-trust-sub">{bench.label}</span>}
+        {card.label && <span className="bench-trust-sub">{card.label}</span>}
+        {card.created_at && <span className="bench-trust-sub">{card.created_at}</span>}
       </div>
 
       {refused && (
@@ -606,7 +618,7 @@ function BenchTrust({ bench }) {
       <dl className="bench-stats">
         <div>
           <dt>Success</dt>
-          <dd>{pct(bench.success_rate)}{Number.isFinite(bench.satisfied) ? ` (${bench.satisfied}/${total})` : ""}</dd>
+          <dd>{pct(card.success_rate)}{Number.isFinite(card.satisfied) ? ` (${card.satisfied}/${total})` : ""}</dd>
         </div>
         <div>
           <dt>Honest escalation</dt>
@@ -614,7 +626,7 @@ function BenchTrust({ bench }) {
             {haveEsc
               ? <>{Math.round((escN / escD) * 100)}% <span className="bench-denom">({escN}/{escD})</span>
                   {escD < 5 && <span className="bench-flag"> small sample</span>}</>
-              : <>{pct(bench.honest_escalation_rate)} <span className="bench-flag">denominator unknown</span></>}
+              : <>{pct(card.honest_escalation_rate)} <span className="bench-flag">denominator unknown</span></>}
           </dd>
         </div>
         <div>
@@ -625,10 +637,18 @@ function BenchTrust({ bench }) {
           <dt>Corpus coverage</dt>
           <dd className={undercorpus ? "bench-bad" : ""}>{corpus > 0 ? `${total} of ${corpus} loaded` : "unknown (older card)"}</dd>
         </div>
-        {Number.isFinite(bench.median_cost_ratio) && (
-          <div><dt>Median cost</dt><dd>{bench.median_cost_ratio}×</dd></div>
+        {Number.isFinite(card.median_cost_ratio) && (
+          <div><dt>Median cost</dt><dd>{card.median_cost_ratio}×</dd></div>
         )}
       </dl>
+
+      {/* A newer refused/probe run is real information, but it is a footnote —
+          never the headline (SCRUM-25). */}
+      {footnote && (
+        <div className="bench-footnote">
+          <span className="bench-footnote-label">{footnoteLabel(footnote)}</span>
+        </div>
+      )}
     </section>
   );
 }
