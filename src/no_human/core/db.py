@@ -6,7 +6,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import aiosqlite
 
@@ -17,6 +17,16 @@ MIGRATIONS_DIR = Path(__file__).resolve().parents[3] / "migrations"
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+class JiraImportedTaskRow(NamedTuple):
+    """One row of the Jira-picker imported-chip projection (SCRUM-54) — only
+    the four columns the chip lookup needs, never a full Task hydration."""
+
+    external_id: str
+    id: str
+    status: str
+    created_at: str
 
 
 class Store:
@@ -189,6 +199,25 @@ class Store:
             )
         rows = await cur.fetchall()
         return [Task.from_row(dict(r)) for r in rows]
+
+    async def list_jira_imported_tasks(self) -> list[JiraImportedTaskRow]:
+        """Narrow projection for the Jira picker's imported-chip lookup
+        (SCRUM-54): only (external_id, id, status, created_at) for
+        jira-sourced tasks with a linked external_id, via one filtered SQL
+        query — never a full `list_tasks()` hydration of every task's every
+        column just to read four fields."""
+        cur = await self.db.execute(
+            "SELECT external_id, id, status, created_at FROM tasks "
+            "WHERE source = 'jira' AND external_id IS NOT NULL"
+        )
+        rows = await cur.fetchall()
+        return [
+            JiraImportedTaskRow(
+                external_id=r["external_id"], id=r["id"],
+                status=r["status"], created_at=r["created_at"],
+            )
+            for r in rows
+        ]
 
     async def set_status(
         self, task: Task, new_status: TaskStatus, *, validate: bool = True

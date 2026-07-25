@@ -57,6 +57,26 @@ async def test_list_by_status(store):
     assert {t.id for t in pend} == {a.id}
 
 
+async def test_list_jira_imported_tasks_filters_source_and_external_id(store):
+    """SCRUM-54: the picker projection returns only (external_id, id, status,
+    created_at) for jira-sourced tasks with a linked external_id — never
+    freeform tasks, never jira tasks still missing an external_id."""
+    jira_task = Task.new("SCRUM-1", source="jira", external_id="SCRUM-1")
+    await store.create_task(jira_task)
+    freeform_task = Task.new("not from jira", source="freeform",
+                              external_id="SCRUM-2")
+    await store.create_task(freeform_task)
+    unlinked_jira_task = Task.new("jira but not yet linked", source="jira")
+    await store.create_task(unlinked_jira_task)
+
+    rows = await store.list_jira_imported_tasks()
+    assert {r.id for r in rows} == {jira_task.id}
+    row = rows[0]
+    assert row.external_id == "SCRUM-1"
+    assert row.status == jira_task.status.value
+    assert row.created_at == jira_task.created_at
+
+
 async def test_list_memories_project_scoped(store):
     """A task on repo A sees A's rules + globals, never repo B's (B3)."""
     await store.add_memory(mem_type="rule", title="ra", content="for A",

@@ -425,14 +425,17 @@ async def test_imported_lookup_uses_single_store_read(client, store, monkeypatch
     task = Task.new("SCRUM-18: Some ticket", source="jira", external_id="SCRUM-18")
     await store.create_task(task)
 
-    calls = {"list_tasks": 0}
-    orig_list_tasks = store.list_tasks
+    # SCRUM-54: the picker's local-store read is the narrow projection, not
+    # list_tasks() — monkeypatch the projection method to verify the same
+    # "exactly once" invariant against the new call site.
+    calls = {"list_jira_imported_tasks": 0}
+    orig_projection = store.list_jira_imported_tasks
 
-    async def counted_list_tasks(*a, **kw):
-        calls["list_tasks"] += 1
-        return await orig_list_tasks(*a, **kw)
+    async def counted_projection(*a, **kw):
+        calls["list_jira_imported_tasks"] += 1
+        return await orig_projection(*a, **kw)
 
-    monkeypatch.setattr(store, "list_tasks", counted_list_tasks)
+    monkeypatch.setattr(store, "list_jira_imported_tasks", counted_projection)
 
     search_calls = {"n": 0}
 
@@ -448,7 +451,7 @@ async def test_imported_lookup_uses_single_store_read(client, store, monkeypatch
     r = await client.get("/api/integrations/jira/issues", params={"q": "ticket"})
     assert r.status_code == 200, r.text
     assert len(r.json()) == 3
-    assert calls["list_tasks"] == 1, "the tasks store must be read exactly once, not once per issue"
+    assert calls["list_jira_imported_tasks"] == 1, "the tasks store must be read exactly once, not once per issue"
     assert search_calls["n"] == 1, "the Jira adapter must be called exactly once, not once per issue"
 
 
