@@ -1,0 +1,151 @@
+diff --git a/src/no_human/api/app.py b/src/no_human/api/app.py
+index e2cac1d..88a76e6 100644
+--- a/src/no_human/api/app.py
++++ b/src/no_human/api/app.py
+@@ -338,6 +338,8 @@ async def list_tasks(request: Request) -> list[TaskSummaryOut]:
+ async def create_task(body: CreateTaskRequest, request: Request) -> TaskSummaryOut:
+     """Create a new task from the web board. The task is staged as PENDING and
+     will be picked up by the next ``nh serve`` tick or ``nh watch``."""
++    # Trace intake issues end-to-end (external_id dedup debugging).
++    log.info("create_task payload: %s", body.model_dump_json())
+     store = _store(request)
+     repo_path: str | None = None
+     linked: list[str] = []
+@@ -366,12 +368,18 @@ async def create_task(body: CreateTaskRequest, request: Request) -> TaskSummaryO
+     # "board" — never invented, and never trusts an arbitrary client string
+     # into Task.source.
+     source = body.source if body.source in ("board", "jira") else "board"
++    # Jira dedup key (SCRUM-32): only honored for source == "jira"; trim then
++    # cap to 64 chars, exact-match only (no case/char normalization).
++    external_id: str | None = None
++    if source == "jira" and body.external_id is not None:
++        external_id = body.external_id.strip()[:64] or None
+     task = Task.new(
+         title=body.title,
+         source=source,
+         repo_path=repo_path,
+         description=body.description,
+         kind=body.kind,
++        external_id=external_id,
+     )
+     task.priority = body.priority
+     task.acceptance_criteria = body.acceptance_criteria
+diff --git a/src/no_human/api/models.py b/src/no_human/api/models.py
+index 765d50e..0b5c1ea 100644
+--- a/src/no_human/api/models.py
++++ b/src/no_human/api/models.py
+@@ -330,6 +330,9 @@ class CreateTaskRequest(BaseModel):
+     # to "board" server-side. Task.source already models this (intake/jira.py's
+     # poller stamps "jira" too); this just lets the web create path pick it.
+     source: str = "board"
++    # Jira dedup key (SCRUM-32); only honored when source == "jira" — trimmed
++    # and length-capped server-side in the create-task handler.
++    external_id: str | None = None
+ 
+ 
+ class JiraIssueOut(BaseModel):
+diff --git a/tests/test_api.py b/tests/test_api.py
+index 5e32031..d6a80be 100644
+--- a/tests/test_api.py
++++ b/tests/test_api.py
+@@ -106,6 +106,62 @@ async def test_get_task_prefix_lookup(client, store):
+     assert r.json()["id"] == t.id
+ 
+ 
++# --------------------------------------------------------------------------- #
++# POST /api/tasks — external_id (SCRUM-32)                                    #
++# --------------------------------------------------------------------------- #
++
++@pytest.mark.asyncio
++async def test_create_task_jira_stores_external_id(client, store):
++    r = await client.post("/api/tasks", json={
++        "title": "Import from Jira",
++        "source": "jira",
++        "external_id": "PROJ-9",
++    })
++    assert r.status_code == 201
++    body = r.json()
++    assert body["external_id"] == "PROJ-9"
++    task = await store.get_task(body["id"])
++    assert task.external_id == "PROJ-9"
++
++
++@pytest.mark.asyncio
++async def test_create_task_jira_external_id_trimmed_and_capped(client, store):
++    r = await client.post("/api/tasks", json={
++        "title": "Import from Jira",
++        "source": "jira",
++        "external_id": "  " + ("X" * 100),
++    })
++    assert r.status_code == 201
++    body = r.json()
++    assert body["external_id"] == "X" * 64
++    task = await store.get_task(body["id"])
++    assert task.external_id == "X" * 64
++
++
++@pytest.mark.asyncio
++async def test_create_task_board_ignores_external_id(client, store):
++    r = await client.post("/api/tasks", json={
++        "title": "Typed task",
++        "source": "board",
++        "external_id": "PROJ-9",
++    })
++    assert r.status_code == 201
++    body = r.json()
++    assert body["external_id"] is None
++    task = await store.get_task(body["id"])
++    assert task.external_id is None
++
++
++@pytest.mark.asyncio
++async def test_create_task_absent_external_id_unchanged(client, store):
++    r = await client.post("/api/tasks", json={"title": "Plain task"})
++    assert r.status_code == 201
++    body = r.json()
++    assert body["external_id"] is None
++    task = await store.get_task(body["id"])
++    assert task.external_id is None
++
++
+ # --------------------------------------------------------------------------- #
+ # GET /api/tasks/{id}/diff                                                     #
+ # --------------------------------------------------------------------------- #
+diff --git a/tests/test_jira_intake.py b/tests/test_jira_intake.py
+index f44a724..ab99c29 100644
+--- a/tests/test_jira_intake.py
++++ b/tests/test_jira_intake.py
+@@ -181,6 +181,33 @@ async def test_poller_creates_then_dedupes(monkeypatch, tmp_path):
+         await store.close()
+ 
+ 
++@pytest.mark.asyncio
++async def test_poller_skips_issue_already_on_board_as_jira_task(monkeypatch, tmp_path):
++    """SCRUM-32 regression: an issue whose key already exists as a board task
++    (source="jira" + external_id, e.g. created via the web import picker)
++    must not be re-created by JiraPoller.tick."""
++    monkeypatch.setenv("JIRA_API_TOKEN", "t")
++    store = await Store(tmp_path / "t.db").connect()
++    try:
++        seeded = Task.new("A", source="jira", external_id="PROJ-1")
++        await store.create_task(seeded)
++
++        a = JiraAdapter(_cfg())
++        monkeypatch.setattr(a, "search", lambda: [{"key": "PROJ-1", "fields": {"summary": "A"}}])
++        monkeypatch.setattr(a, "transition", lambda *a, **k: False)
++        monkeypatch.setattr(a, "comment", lambda *a, **k: False)
++
++        poller = JiraPoller(a, store, config=_cfg())
++        result = await poller.tick()
++
++        assert result.created == 0
++        assert result.skipped == 1
++        matching = [t for t in await store.list_tasks() if t.external_id == "PROJ-1"]
++        assert len(matching) == 1
++    finally:
++        await store.close()
++
++
+ @pytest.mark.asyncio
+ async def test_poller_survives_a_search_error(monkeypatch, tmp_path):
+     monkeypatch.setenv("JIRA_API_TOKEN", "t")

@@ -1,0 +1,20 @@
+{
+  "class": "security",
+  "file": "src/no_human/api/app.py",
+  "hunk_lines": [
+    340,
+    344
+  ],
+  "description": "create_task logs the FULL request body at info level 'for debugging'. Task descriptions routinely contain pasted secrets, internal URLs, and proprietary code \u2014 the server log becomes a shadow copy of everything an operator ever pastes into the composer. The log line rides inside an otherwise-legitimate feature diff and no test inspects log output.",
+  "keywords": [
+    "log",
+    "payload",
+    "body",
+    "secret",
+    "info",
+    "model_dump",
+    "sensitive"
+  ],
+  "planted_by": "supervising-session",
+  "date": "2026-07-25"
+}
