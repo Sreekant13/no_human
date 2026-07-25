@@ -17,7 +17,7 @@
 // so it sits right beside Done and is coloured with the semantic review purple
 // (--c-review) — NOT the blue of Working.
 export const LANES = [
-  { key: "answer",  label: "Needs Answer", accent: "var(--c-answer)",    statuses: ["awaiting_input", "escalated"], loud: true, needsYou: true, emptyIcon: "✓", emptyHint: "All caught up — nothing needs your input" },
+  { key: "answer",  label: "Needs Answer", accent: "var(--c-answer)",    statuses: ["awaiting_input", "escalated"], loud: true, needsYou: true, staleCollapse: true, emptyIcon: "✓", emptyHint: "All caught up — nothing needs your input" },
   { key: "working", label: "Working",      accent: "var(--c-building)",  statuses: ["pending", "context", "planning", "implementing", "reviewing", "testing", "compound_parent", "paused_quota"], showSubStatus: true, emptyIcon: "○", emptyHint: "No tasks in flight" },
   { key: "failed",  label: "Failed",       accent: "var(--c-escalated)", statuses: ["failed"], outcome: true, emptyIcon: "○", emptyHint: "No failures" },
   { key: "review",  label: "Review PR",    accent: "var(--c-review)",    statuses: ["awaiting_approval"], loud: true, needsYou: true, emptyIcon: "○", emptyHint: "No PRs waiting for review" },

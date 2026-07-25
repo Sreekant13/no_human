@@ -4,6 +4,7 @@ import SlideOver from "./SlideOver.jsx";
 import { BOARD_LANES, routeTask, isWaiting, cardActivity } from "./boardLanes.js";
 import { taskProgress } from "./taskProgress.js";
 import { topPrioritised } from "./laneView.js";
+import { partitionAnswerLane } from "./answerLane.js";
 
 // 5B: how many cards a collapsible lane shows before the expand arrow. 4 keeps
 // every lane visible without vertical scroll on a typical viewport; the count
@@ -107,6 +108,11 @@ function workingBreakdown(tasks) {
 
 function Lane({ lane, tasks, onSelect }) {
   const [expanded, setExpanded] = useState(false);
+  // SCRUM-19: the Needs-Answer lane's OWN collapse — stale escalations (>24h,
+  // by escalation recency) sink behind an expandable divider instead of
+  // burying tonight's real ones. Independent of `collapsible` below: this
+  // lane still shows every fresh card, never hides one behind a top-N arrow.
+  const [staleOpen, setStaleOpen] = useState(false);
   // Human-gate lanes (Needs Answer, Review PR) NEVER collapse — every task there
   // needs action; hiding one behind an arrow defeats the board. Only the
   // in-flight/outcome lanes (Working, Failed, Done), which grow unbounded, do.
@@ -133,6 +139,12 @@ function Lane({ lane, tasks, onSelect }) {
   const showToggle =
     collapsible && (hiddenCount > 0 || (expanded && rows.length > LANE_TOP_N));
 
+  // Never dismisses or filters anything — fresh.length + stale.length === rows.length,
+  // same truthful lane-count badge below (tasks.length, unchanged).
+  const { fresh, stale } = lane.staleCollapse
+    ? partitionAnswerLane(rows, Date.now())
+    : { fresh: rows, stale: [] };
+
   return (
     <div className={`lane lane-${lane.key}${lane.loud ? " lane-loud" : ""}${tasks.length > 0 ? " lane-has-tasks" : ""}`}>
       <div className="lane-header">
@@ -150,6 +162,44 @@ function Lane({ lane, tasks, onSelect }) {
             <span className="lane-empty-icon" aria-hidden="true">{lane.emptyIcon || "·"}</span>
             <span className="lane-empty-text">{lane.emptyHint || ""}</span>
           </div>
+        ) : lane.staleCollapse ? (
+          <>
+            {fresh.map((task) => (
+              <TaskCard
+                key={task.id}
+                task={task}
+                accent={lane.accent}
+                isAwaiting={!!lane.needsYou}
+                showSubStatus={lane.showSubStatus}
+                onClick={(e) => onSelect(task.id, e.currentTarget)}
+              />
+            ))}
+            {stale.length > 0 && (
+              <button
+                type="button"
+                className={`lane-stale-divider${staleOpen ? " lane-more-open" : ""}`}
+                aria-expanded={staleOpen}
+                aria-label={staleOpen ? `Hide ${stale.length} older need answer${stale.length > 1 ? "s" : ""}` : `Show ${stale.length} older need answer${stale.length > 1 ? "s" : ""}`}
+                onClick={() => setStaleOpen((v) => !v)}
+              >
+                <span className="lane-more-text">
+                  {stale.length} older need answer{stale.length > 1 ? "s" : ""}
+                </span>
+                <span className="lane-more-arrow" aria-hidden="true">▾</span>
+              </button>
+            )}
+            {staleOpen && stale.map((task) => (
+              <TaskCard
+                key={task.id}
+                task={task}
+                accent={lane.accent}
+                isAwaiting={!!lane.needsYou}
+                showSubStatus={lane.showSubStatus}
+                staleAnswer
+                onClick={(e) => onSelect(task.id, e.currentTarget)}
+              />
+            ))}
+          </>
         ) : (
           visible.map((task) => (
             <TaskCard
@@ -196,7 +246,7 @@ function actionHint(task) {
   return null;
 }
 
-function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
+function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClick }) {
   const activityTs = task.last_activity || task.updated_at || task.created_at;
   const ageMs = Date.now() - new Date(activityTs).getTime();
   const ageSec = ageMs / 1000;
@@ -219,6 +269,9 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, onClick }) {
   if (isRunningNow) cardCls += " active-working";
   if (isQueuedNow) cardCls += " card-queued";
   if (waiting) cardCls += " waiting-parked";
+  // Distinct concern from the in-flight `.stale` treatment above (STALE_STATUSES,
+  // 16h): this is the escalation-age muting for the collapsed Needs-Answer divider.
+  if (staleAnswer) cardCls += " answer-stale";
 
   return (
     <div
