@@ -160,7 +160,10 @@ async def evaluate_spec(
             log.warning("evaluator produced no parseable EVAL_JSON block")
             return None
         data = loads_lenient(m.group(1))
-        verdict = EvalVerdict(data.get("verdict", "accept"))
+        # The prompt teaches the verdicts in UPPERCASE bullets and models echo
+        # that; the enum values are lowercase — live failure 2026-07-25:
+        # "'DECOMPOSE' is not a valid EvalVerdict" silently skipped the eval.
+        verdict = EvalVerdict(str(data.get("verdict", "accept")).strip().lower())
         return EvalResult(
             verdict=verdict,
             dimensions=data.get("dimensions", {}),

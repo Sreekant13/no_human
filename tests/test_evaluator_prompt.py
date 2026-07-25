@@ -98,3 +98,35 @@ async def test_an_explicit_model_wins_over_the_default(capture_backend):
     """Callers holding a resolved config pass model=; the default is only a floor."""
     await evaluate_spec("t", "d", [], model="claude-sonnet-5")
     assert capture_backend.seen == ["claude-sonnet-5"]
+
+
+class _UppercaseVerdictBackend:
+    """The live 2026-07-25 failure shape: models echo the prompt's UPPERCASE
+    verdict bullets, but EvalVerdict values are lowercase — the parse raised
+    and the whole eval was silently skipped ('evaluator failed (proceeding
+    without eval)')."""
+
+    def __init__(self, *, model, readonly=False, **_):
+        pass
+
+    async def run(self, prompt, **kwargs):
+        from no_human.agent.claude_backend import AgentResult
+        return AgentResult(
+            final_text=(
+                'EVAL_JSON_START\n'
+                '{"verdict": "DECOMPOSE", "dimensions": {}, "rationale": "too big"}\n'
+                'EVAL_JSON_END'
+            ),
+            num_turns=1, is_error=False, tokens_used=0,
+            session_id="s", stop_reason="end_turn",
+        )
+
+
+@pytest.mark.asyncio
+async def test_uppercase_verdict_from_the_model_still_parses(monkeypatch):
+    monkeypatch.setattr(
+        "no_human.agent.claude_backend.ClaudeBackend", _UppercaseVerdictBackend
+    )
+    result = await evaluate_spec("t", "d", [])
+    assert result is not None, "an uppercase verdict must not skip the eval"
+    assert result.verdict.value == "decompose"
