@@ -131,7 +131,10 @@ def test_config_malformed_assignment(tmp_path, monkeypatch):
     assert _get_task(db, task_id).config == {}
 
 
-def test_config_never_lowers_existing_cap(tmp_path, monkeypatch):
+def test_config_lowers_lifetime_tokens_exactly(tmp_path, monkeypatch):
+    # SCRUM-44: the human CLI is the gate — it sets the exact requested
+    # value, including lowering a runaway cap. Never-lower is a blocker-
+    # option-only guard (see tests/test_blockers.py).
     db = tmp_path / "test.db"
     task_id = _seed_task(db, config={"lifetime_tokens": 16_000_000})
     runner = _make_runner(db, monkeypatch)
@@ -139,8 +142,20 @@ def test_config_never_lowers_existing_cap(tmp_path, monkeypatch):
     result = runner.invoke(cli, ["task", "config", task_id, "lifetime_tokens=8000000"])
 
     assert result.exit_code == 0, result.output
-    assert "kept" in result.output
-    assert _get_task(db, task_id).config["lifetime_tokens"] == 16_000_000
+    assert "kept" not in result.output
+    assert _get_task(db, task_id).config["lifetime_tokens"] == 8_000_000
+
+
+def test_config_lowers_attempt_tokens_exactly(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, config={"attempt_tokens": 1_000_000})
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["task", "config", task_id, "attempt_tokens=500000"])
+
+    assert result.exit_code == 0, result.output
+    assert "kept" not in result.output
+    assert _get_task(db, task_id).config["attempt_tokens"] == 500_000
 
 
 def test_config_unknown_task_id_exits_nonzero(tmp_path, monkeypatch):

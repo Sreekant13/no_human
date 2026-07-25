@@ -52,9 +52,18 @@ def is_terminal_action(action: dict[str, Any] | None) -> bool:
     return isinstance(action, dict) and action.get(PARK) is True
 
 
-def apply_action(task: "Task", action: dict[str, Any] | None) -> str | None:
+def apply_action(
+    task: "Task", action: dict[str, Any] | None, *, human_override: bool = False
+) -> str | None:
     """Apply `action` to `task` in place. Returns a human-readable summary of
-    what changed, or None when the option carried no action."""
+    what changed, or None when the option carried no action.
+
+    `human_override=False` (the default — every blocker-option path) keeps
+    the never-lower guard: a "raise the limit" option must never lower an
+    already bigger stored cap. `human_override=True` is passed ONLY by the
+    human CLI (`nh task config KEY=VALUE`), which sets the exact value —
+    raising or lowering — because the human is the gate.
+    """
     if not action:
         return None
     if not isinstance(action, dict):
@@ -92,8 +101,12 @@ def apply_action(task: "Task", action: dict[str, Any] | None) -> str | None:
         # Every allowed key is a resource cap: a "raise the limit" action must
         # never lower one that is already higher (e.g. BUDGET_EXHAUSTED's
         # raise option overwriting a bigger stored cap with its fixed value).
+        # The human CLI path (human_override=True) is the explicit gate and sets
+        # the exact requested value instead, raising or lowering.
         prior = existing.get(key)
-        if isinstance(prior, int) and not isinstance(prior, bool) and prior > value:
+        if (not human_override
+                and isinstance(prior, int) and not isinstance(prior, bool)
+                and prior > value):
             resolved[key] = prior
             notes[key] = f"{key}={prior} (kept; requested {value} would lower it)"
         else:

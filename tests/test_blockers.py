@@ -226,6 +226,29 @@ def test_apply_action_never_lowers_an_existing_cap():
     assert "8000000" in summary
 
 
+def test_apply_action_human_override_lowers_exactly():
+    # SCRUM-44: human_override=True (the human CLI path) sets the exact
+    # requested value, including lowering an existing cap. The default
+    # (human_override=False, the blocker-option path) keeps never-lower.
+    from no_human.blockers import apply_action
+    from no_human.core.task import Task
+
+    t = Task.new("x", repo_path="/tmp/x")
+    t.config = {"lifetime_tokens": 16_000_000}
+
+    summary = apply_action(
+        t, {"set_task_config": {"lifetime_tokens": 8_000_000}}, human_override=True
+    )
+    assert t.config["lifetime_tokens"] == 8_000_000
+    assert "kept" not in summary
+    assert summary == "lifetime_tokens=8000000"
+
+    # Without human_override (default), the same lowering request is rejected.
+    summary = apply_action(t, {"set_task_config": {"lifetime_tokens": 4_000_000}})
+    assert t.config["lifetime_tokens"] == 8_000_000
+    assert "kept" in summary
+
+
 # --------------------------------------------------------------------------- #
 # Parsing the agent's structured emission                                     #
 # --------------------------------------------------------------------------- #
