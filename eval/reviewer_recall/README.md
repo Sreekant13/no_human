@@ -20,6 +20,6 @@ Rules that keep the number honest:
 - Controls (`class: control`) are real merged diffs, unmodified; specificity
   over them is reported alongside recall, always.
 
-Current denominator: 8 seeded (2 logic, 2 security, 2 test-tamper,
+Current denominator: 10 seeded (3 logic, 2 security, 3 test-tamper,
 2 spec-miss) + 2 controls. Target per the method doc: 16–20 seeded, ≥4
 controls, ≥3 per class.

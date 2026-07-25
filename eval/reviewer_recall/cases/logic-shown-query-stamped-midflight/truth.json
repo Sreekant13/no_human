@@ -1,0 +1,19 @@
+{
+  "class": "logic",
+  "file": "web/src/TaskComposer.jsx",
+  "hunk_lines": [
+    167,
+    173
+  ],
+  "description": "jiraShownQuery exists precisely to describe the MOUNTED results; stamping it at effect start ('keep in step with typing') pairs the live keystrokes with stale rows for the whole debounce+fetch window \u2014 the exact mid-flight truthfulness bug the field was introduced to fix. The source-regex tests only pin that the call exists somewhere, so the suite stays green.",
+  "keywords": [
+    "jiraShownQuery",
+    "stamp",
+    "mid-flight",
+    "stale",
+    "response",
+    "mounted"
+  ],
+  "planted_by": "supervising-session",
+  "date": "2026-07-25"
+}
