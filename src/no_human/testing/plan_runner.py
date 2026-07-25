@@ -86,12 +86,16 @@ def run_test_plan(
     on_layer_start: Callable[[TestLayer], None] | None = None,
     on_layer_done: Callable[[TestLayer, LayerResult], None] | None = None,
     fallback_cmd: str | None = None,
+    source_repo: Path | None = None,
 ) -> PlanResult:
     """Run all layers in *plan* in dependency order.
 
     *task_repo* is the working directory for layers that don't specify their own
     ``repo``.  *fallback_cmd* is used for layers with empty ``command`` (from
-    profile's test_cmd).
+    profile's test_cmd). *source_repo* is the primary checkout behind a task
+    worktree (SCRUM-35) — passed through to every ``run_tests`` call so a
+    worktree layer's node command can symlink ``node_modules`` in from it,
+    same as the single-command path (``_run_tests_once``).
 
     Called from a thread (``asyncio.to_thread``), so all I/O is synchronous.
     """
@@ -159,6 +163,7 @@ def run_test_plan(
             test_result = run_tests(
                 cwd, cmd, cwd=cwd, timeout=layer.timeout,
                 env=resolved_env or None,
+                source_repo=source_repo,
             )
         except Exception as exc:  # noqa: BLE001
             lr = LayerResult(

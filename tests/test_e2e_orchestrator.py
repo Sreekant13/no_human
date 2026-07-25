@@ -7,6 +7,7 @@ case proves the tamper guard blocks a test-weakening change and escalates.
 
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 from types import SimpleNamespace as _SimpleNamespace
@@ -2767,6 +2768,181 @@ async def test_a_different_command_is_not_a_cache_hit(bare_repo, tmp_path, store
     await orch._run_tests_once(repo, "true")
     _, cached = await orch._run_tests_once(repo, "true -x")
     assert cached is False
+
+
+# --------------------------------------------------------------------------- #
+# SCRUM-45: layered TestPlan path parity — source_repo threading (SCRUM-35)    #
+# and traceback_block aggregation into attempt_failed detail (SCRUM-40)        #
+# --------------------------------------------------------------------------- #
+
+
+async def test_layered_test_plan_threads_source_repo(bare_repo, tmp_path, store):
+    """SCRUM-35 parity: the layered path must pass source_repo to run_test_plan
+    (which threads it to every run_tests call), exactly like the single-command
+    path's ``_run_tests_once`` does — otherwise a worktree layer's node command
+    never gets the node_modules symlink."""
+    from no_human.testing.test_layers import Gating, TestLayer, TestPlan
+    from no_human.testing.plan_runner import LayerResult, PlanResult
+    from no_human.testing.runner import TestRunResult
+    import no_human.testing.plan_runner as plan_runner_mod
+
+    plan = TestPlan(layers=[
+        TestLayer(name="unit", command="true", gating=Gating.BLOCKING),
+    ])
+    captured = {}
+
+    def fake_run_test_plan(test_plan, task_repo, **kwargs):
+        captured["source_repo"] = kwargs.get("source_repo")
+        tr = TestRunResult(ran=True, ok=True, passed=1, failed=0, errors=0,
+                            command="true", output="1 passed")
+        lr = LayerResult(layer_name="unit", gating=Gating.BLOCKING, result=tr)
+        return PlanResult(layer_results=[lr])
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    async def fake_resolve_test_plan(task):
+        return plan
+
+    with _patch.object(orch, "_resolve_test_plan", fake_resolve_test_plan), \
+         _patch.object(orch, "_primary_repo_path", lambda p: "/fake/primary"), \
+         _patch.object(plan_runner_mod, "run_test_plan", fake_run_test_plan):
+        outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert captured["source_repo"] == Path("/fake/primary")
+
+
+async def test_layered_test_plan_source_repo_none_when_not_a_worktree(
+    bare_repo, tmp_path, store,
+):
+    """When the task's repo is not a worktree (_primary_repo_path -> None),
+    source_repo passed to run_test_plan is None — no phantom symlink target."""
+    from no_human.testing.test_layers import Gating, TestLayer, TestPlan
+    from no_human.testing.plan_runner import LayerResult, PlanResult
+    from no_human.testing.runner import TestRunResult
+    import no_human.testing.plan_runner as plan_runner_mod
+
+    plan = TestPlan(layers=[
+        TestLayer(name="unit", command="true", gating=Gating.BLOCKING),
+    ])
+    captured = {}
+
+    def fake_run_test_plan(test_plan, task_repo, **kwargs):
+        captured["source_repo"] = kwargs.get("source_repo")
+        tr = TestRunResult(ran=True, ok=True, passed=1, failed=0, errors=0,
+                            command="true", output="1 passed")
+        lr = LayerResult(layer_name="unit", gating=Gating.BLOCKING, result=tr)
+        return PlanResult(layer_results=[lr])
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+    cfg = _config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    async def fake_resolve_test_plan(task):
+        return plan
+
+    with _patch.object(orch, "_resolve_test_plan", fake_resolve_test_plan), \
+         _patch.object(plan_runner_mod, "run_test_plan", fake_run_test_plan):
+        await orch.run_task(t)
+
+    assert "source_repo" in captured
+    assert captured["source_repo"] is None
+
+
+async def test_layered_test_plan_failure_detail_aggregates_traceback_blocks(
+    bare_repo, tmp_path, store,
+):
+    """SCRUM-40 parity: a layered-plan failure appends every layer's
+    traceback_block into the attempt_failed detail, newline-separated, in
+    execution order, preserving original capitalization — a layer with no
+    excerpt (advisory-only layer, no failure) is skipped silently."""
+    from no_human.testing.test_layers import Gating, TestLayer, TestPlan
+    from no_human.testing.plan_runner import LayerResult, PlanResult
+    from no_human.testing.runner import TestRunResult
+    import no_human.testing.plan_runner as plan_runner_mod
+
+    plan = TestPlan(layers=[
+        TestLayer(name="unit", command="pytest -q", gating=Gating.BLOCKING),
+        TestLayer(name="integration", command="pytest -q", gating=Gating.BLOCKING,
+                  depends_on=["unit"]),
+    ])
+
+    tr_unit = TestRunResult(
+        ran=True, ok=False, passed=0, failed=1, errors=0,
+        command="pytest -q", output="1 failed",
+        traceback_excerpts={
+            "test_unit.py::test_a": "AssertionError: Root Cause Here\n    assert 1 == 2",
+        },
+    )
+    tr_integration = TestRunResult(
+        ran=True, ok=False, passed=0, failed=1, errors=0,
+        command="pytest -q", output="1 failed",
+        traceback_excerpts={
+            "test_integration.py::test_b": "ValueError: Downstream Context\n    raise ValueError",
+        },
+    )
+    lr_unit = LayerResult(layer_name="unit", gating=Gating.BLOCKING, result=tr_unit)
+    lr_integration = LayerResult(
+        layer_name="integration", gating=Gating.BLOCKING, result=tr_integration,
+    )
+
+    def fake_run_test_plan(test_plan, task_repo, **kwargs):
+        return PlanResult(layer_results=[lr_unit, lr_integration])
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+    cfg = _config(tmp_path)
+    cfg.data["bounds"] = {"max_attempts": 1}
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    async def fake_resolve_test_plan(task):
+        return plan
+
+    with _patch.object(orch, "_resolve_test_plan", fake_resolve_test_plan), \
+         _patch.object(plan_runner_mod, "run_test_plan", fake_run_test_plan):
+        outcome = await orch.run_task(t)
+
+    failed_events = [e for e in events if e.get("kind") == "attempt_failed"]
+    assert failed_events, "expected an attempt_failed event"
+    detail = failed_events[0]["text"]
+    # Both layers' excerpts present, capitalization preserved verbatim.
+    assert "AssertionError: Root Cause Here" in detail
+    assert "ValueError: Downstream Context" in detail
+    # Execution order: unit (first layer) precedes integration (second layer).
+    assert detail.index("Root Cause Here") < detail.index("Downstream Context")
+    # outcome.detail is the max_attempts escalation wrapper around the same
+    # attempt text — containment, not equality (the wrapper adds its prefix).
+    assert detail in outcome.detail
 
 
 # --------------------------------------------------------------------------- #
