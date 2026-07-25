@@ -4,7 +4,7 @@ import SlideOver from "./SlideOver.jsx";
 import { BOARD_LANES, routeTask, isWaiting, cardActivity } from "./boardLanes.js";
 import { taskProgress } from "./taskProgress.js";
 import { topPrioritised } from "./laneView.js";
-import { partitionAnswerLane } from "./answerLane.js";
+import { partitionAnswerLane, shouldResetStaleOpen } from "./answerLane.js";
 import { showConflictBadge, conflictRoundLabel } from "./conflictStatus.js";
 
 // 5B: how many cards a collapsible lane shows before the expand arrow. 4 keeps
@@ -150,6 +150,13 @@ function Lane({ lane, tasks, onSelect }) {
   const { fresh, stale } = lane.staleCollapse
     ? partitionAnswerLane(rows, Date.now())
     : { fresh: rows, stale: [] };
+
+  // Reset the stale-divider expansion once the stale group empties: a lingering
+  // staleOpen=true would render the NEXT stale card pre-expanded, an expansion the
+  // user never performed. Resetting only at length 0 is invisible (nothing shown).
+  useEffect(() => {
+    if (shouldResetStaleOpen(staleOpen, stale.length)) setStaleOpen(false);
+  }, [staleOpen, stale.length]);
 
   return (
     <div className={`lane lane-${lane.key}${lane.loud ? " lane-loud" : ""}${tasks.length > 0 ? " lane-has-tasks" : ""}`}>

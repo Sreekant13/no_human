@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { escalationTs, partitionAnswerLane, STALE_ANSWER_MS } from "./answerLane.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { escalationTs, partitionAnswerLane, STALE_ANSWER_MS, shouldResetStaleOpen } from "./answerLane.js";
 
 const NOW = new Date("2026-07-25T12:00:00Z").getTime();
 
@@ -99,4 +101,33 @@ test("escalationTs fallback chain: escalated_at > last_activity > updated_at > c
   assert.equal(escalationTs({ created_at: "C" }), "C");
   assert.equal(escalationTs({}), "");
   assert.equal(escalationTs(null), "");
+});
+
+test("shouldResetStaleOpen: true when open and stale group empty", () => {
+  assert.equal(shouldResetStaleOpen(true, 0), true);
+});
+
+test("shouldResetStaleOpen: no reset while stale cards remain", () => {
+  assert.equal(shouldResetStaleOpen(true, 3), false);
+  assert.equal(shouldResetStaleOpen(true, 1), false);
+});
+
+test("shouldResetStaleOpen: no-op when already collapsed", () => {
+  assert.equal(shouldResetStaleOpen(false, 0), false);
+});
+
+// Static source-shape assertion: no jsdom/React renderer is wired into this
+// project's `node --test` harness (see sidebarNav.test.mjs), so we can't mount
+// Board.jsx and observe staleOpen actually reset. Instead pin the wiring itself —
+// the effect must call the tested predicate with the right args and reset the
+// right state — so deleting/miswiring the useEffect fails this test even though
+// the pure-predicate tests above stay green.
+test("Board.jsx wires the stale-open reset effect to shouldResetStaleOpen(staleOpen, stale.length)", () => {
+  const here = fileURLToPath(new URL(".", import.meta.url));
+  const boardJsx = readFileSync(here + "Board.jsx", "utf8");
+  assert.match(
+    boardJsx,
+    /useEffect\(\(\) => \{\s*if \(shouldResetStaleOpen\(staleOpen, stale\.length\)\) setStaleOpen\(false\);\s*\}, \[staleOpen, stale\.length\]\);/,
+    "expected a useEffect that resets staleOpen via shouldResetStaleOpen(staleOpen, stale.length), deps [staleOpen, stale.length]",
+  );
 });

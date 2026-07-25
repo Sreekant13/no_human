@@ -49,3 +49,10 @@ export function partitionAnswerLane(items, nowMs, thresholdMs = STALE_ANSWER_MS,
   }
   return { fresh, stale };
 }
+
+// Collapse the stale-divider expansion once the stale group empties. A lingering
+// staleOpen=true would render the NEXT stale card pre-expanded (user never opened it).
+// Only fires when there is nothing to show, so it is invisible to the user.
+export function shouldResetStaleOpen(staleOpen, staleLen) {
+  return staleOpen && staleLen === 0;
+}
