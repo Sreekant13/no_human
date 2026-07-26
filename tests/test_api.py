@@ -863,6 +863,7 @@ async def test_resume_still_409s_on_done_and_cancelled(client, store, status):
 @pytest.mark.parametrize("status", [
     TaskStatus.AWAITING_APPROVAL, TaskStatus.ESCALATED, TaskStatus.FAILED,
     TaskStatus.IMPLEMENTING, TaskStatus.REVIEWING,
+    TaskStatus.BLOCKED, TaskStatus.PAUSED_QUOTA,
 ])
 async def test_shipped_transitions_from_each_allowed_status(client, store, status):
     """SCRUM-69: operator-testimony model — shipped is valid from any
