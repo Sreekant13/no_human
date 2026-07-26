@@ -30,15 +30,30 @@
 #
 # Measured: web route ~5s vs ~380s for the default suite.
 
+# Each node command first provisions node_modules. A task runs in a fresh git
+# worktree under ~/.no_human/worktrees/<id>, which has NO node_modules of its
+# own, so `node --test` would fail on any test importing a package (e.g.
+# tableA11y.test.mjs imports postcss) — 458 pass / 1 fail, verified. The
+# worktree finds its primary checkout portably via `git rev-parse
+# --git-common-dir`, so no absolute path is baked in here. node_modules is
+# gitignored (.gitignore:46), so the symlink never dirties the tree, and the
+# `[ -e ]` guard leaves a real directory alone.
+
 test_commands:
   - glob: "web/**"
     command: >-
+      { [ -e web/node_modules ] || ln -sfn
+      "$(dirname "$(git rev-parse --git-common-dir)")/web/node_modules"
+      web/node_modules; } &&
       node --test web/src/*.test.mjs &&
       uv run pytest tests/test_no_banned_terms.py
       tests/test_identity_scrub_guard.py tests/test_readme_claims.py -q
 
   - glob: "desktop/**"
     command: >-
+      { [ -e desktop/node_modules ] || ln -sfn
+      "$(dirname "$(git rev-parse --git-common-dir)")/desktop/node_modules"
+      desktop/node_modules; } &&
       node --test desktop/*.test.mjs &&
       uv run pytest tests/test_no_banned_terms.py
       tests/test_identity_scrub_guard.py tests/test_readme_claims.py -q
