@@ -1,0 +1,17 @@
+# no_human starter config — copied to ~/.no_human/config.yaml by
+# scripts/bootstrap.sh the first time that file is absent. It is never
+# overwritten once it exists.
+#
+# This is a minimal overlay: anything not set here falls back to the full
+# default set in src/no_human/config.py (DEFAULT_CONFIG). See
+# docs/configuration.md for the complete reference.
+#
+# Credentials (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, ...) never go in
+# this file — they live in ~/.no_human/.env (chmod 600).
+
+llm:
+  auth_mode: subscription
+  auth_profile: default
+  primary_model: claude-sonnet-5
+  review_model: claude-opus-4-8
+  planner_model: claude-opus-4-8

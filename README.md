@@ -167,6 +167,8 @@ first-class; `nh auth use <profile>` picks which one pays, and a single run neve
 spans two profiles. What you cannot use is a metered `ANTHROPIC_API_KEY`:
 startup aborts if one is set (see [Safety](#-safety-guarantees)).
 
+One command (checks deps, installs, runs doctor): `git clone <your-clone-url>/no_human.git && cd no_human && ./scripts/bootstrap.sh`
+
 ```bash
 git clone <your-clone-url>/no_human.git && cd no_human
 uv sync
