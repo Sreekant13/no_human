@@ -412,7 +412,7 @@ NH_E2E_BASE=http://127.0.0.1:8488 uv run python e2e/board_e2e.py
 | **`auth error: No subscription token found`** | Run `claude setup-token`, then add the token to `~/.no_human/.env` (chmod 600). `nh auth status` lists configured profiles. |
 | **`no profile to confirm`** | Run `nh onboard <repo>` first, then `nh onboard <repo> --confirm`. |
 | **Task stuck in `implementing`** | Check `nh logs <id>` — likely hit `max_turns`. Raise `bounds.max_turns_per_attempt` (default 500) or simplify the task. |
-| **`another no_human instance is already running`** | Only one instance may hold `~/.no_human/nh.pid`. There is no `nh stop`: stop the process that holds it (Ctrl-C in its terminal, or signal the PID inside that file). If it died uncleanly, `rm ~/.no_human/nh.pid`. |
+| **`another no_human instance is already running`** | Only one instance may hold `~/.no_human/nh.pid`. Run `nh stop` — it SIGTERMs the pidfile's process (SIGKILL after a bounded wait) and removes the pidfile only once the process is confirmed gone. If the pidfile is stale or corrupt, `nh stop` says so and cleans up safely. |
 | **Reviewer keeps failing** | Check `nh review <id>` for evidence. Either the code has real issues (fix and retry) or the acceptance criteria are ambiguous (refine with `nh reject`). |
 
 ---
