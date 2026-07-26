@@ -391,6 +391,46 @@ async def test_send_back_missing_message_422(client, store):
     assert r.status_code == 422
 
 
+@pytest.mark.asyncio
+async def test_send_back_done_task_is_409(client, store):
+    """SCRUM-77: a done row's status write is CAS-blocked (SCRUM-73) — the
+    verb must say so, not claim success."""
+    t = await _seed_task(store, status=TaskStatus.DONE)
+    r = await client.post(f"/api/tasks/{t.id}/send-back", json={"message": "redo"})
+    assert r.status_code == 409
+    refreshed = await store.find_task(t.id)
+    assert refreshed.status == TaskStatus.DONE
+    assert refreshed.context.get("send_back_feedback") in (None, [])
+
+
+@pytest.mark.asyncio
+async def test_send_back_cancelled_task_is_409(client, store):
+    t = await _seed_task(store, status=TaskStatus.FAILED)
+    t.context = {"cancel_reason": "Cancelled from board"}
+    await store.update_task(t)
+    r = await client.post(f"/api/tasks/{t.id}/send-back", json={"message": "redo"})
+    assert r.status_code == 409
+    refreshed = await store.find_task(t.id)
+    assert refreshed.status == TaskStatus.FAILED
+    assert refreshed.context.get("send_back_feedback") in (None, [])
+
+
+@pytest.mark.asyncio
+async def test_send_back_done_task_sends_no_broadcast(client, store, monkeypatch):
+    from no_human.api.app import _mgr
+
+    captured: list[dict] = []
+
+    async def fake_broadcast(msg):
+        captured.append(msg)
+
+    monkeypatch.setattr(_mgr, "broadcast", fake_broadcast)
+    t = await _seed_task(store, status=TaskStatus.DONE)
+    r = await client.post(f"/api/tasks/{t.id}/send-back", json={"message": "redo"})
+    assert r.status_code == 409
+    assert captured == []
+
+
 # --------------------------------------------------------------------------- #
 # POST /api/tasks/{id}/reply                                                   #
 # --------------------------------------------------------------------------- #
