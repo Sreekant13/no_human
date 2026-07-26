@@ -28,6 +28,7 @@ from typing import Any, Callable
 
 from ..agent.claude_backend import AgentResult
 from ..review.selfcheck import ChecklistItem
+from ..review.lint_evidence import collect_lint_evidence, format_lint_evidence
 from ..core.jsonparse import loads_lenient
 from ..core.task import Task
 
@@ -306,6 +307,7 @@ def _build_review_prompt(
     full_files: str = "",
     omitted_files: list[str] | None = None,
     allow_tools: bool = True,
+    lint_evidence: str = "",
 ) -> str:
     criteria = "\n".join(f"  - {c}" for c in task.acceptance_criteria) or "  (none stated)"
     held_section = (
@@ -390,6 +392,11 @@ def _build_review_prompt(
             + ", ".join(omitted_files)
             + " — read them with your tools before making any claim about them.\n\n"
         )
+
+    # Deterministic tool output, clearly labeled so the reviewer can tell it
+    # apart from its own judgment. Only attached when non-empty — a repo with
+    # no ruff config gets no lint section at all (SCRUM-64).
+    lint_section = f"\n{lint_evidence}\n\n" if lint_evidence else ""
 
     next_pass = 4
     rules_pass = ""
@@ -476,6 +483,7 @@ def _build_review_prompt(
         f"Acceptance criteria:\n{criteria}\n\n"
         + diff_section
         + files_section
+        + lint_section
         + _annotated_test_output(test_output)
         + f"{held_section}"
         + rules_pass
@@ -976,6 +984,7 @@ class AdversarialReviewer:
 
         # Gate mode (default): original adversarial review.
         full_files, omitted_files = "", []
+        lint_evidence = ""
         if diff_override:
             # Caller supplied the diff; there are no refs to read files from, and
             # _fast_review runs single-turn with no tools.
@@ -986,6 +995,15 @@ class AdversarialReviewer:
             full_files, omitted_files = _full_file_context(
                 repo_path, before_ref, after_ref,
             )
+            # SCRUM-64: deterministic lint evidence, changed files only. Never
+            # blocks the review — any failure here just means no lint section.
+            try:
+                changed = _changed_paths(repo_path, before_ref, after_ref)
+                lint_evidence = format_lint_evidence(
+                    collect_lint_evidence(repo_path, changed)
+                )
+            except Exception:  # noqa: BLE001 — advisory, never blocks review
+                lint_evidence = ""
         prompt = _build_review_prompt(
             task,
             diff,
@@ -997,6 +1015,7 @@ class AdversarialReviewer:
             prior_rounds=prior_rounds,
             full_files=full_files,
             omitted_files=omitted_files,
+            lint_evidence=lint_evidence,
             allow_tools=not diff_override,
         )
 
