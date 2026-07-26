@@ -35,6 +35,149 @@ async def test_set_status_enforces_transitions(store):
         await store.set_status(t, TaskStatus.DONE)
 
 
+async def test_set_status_cas_guard_blocks_stale_write_over_done_row(store):
+    """SCRUM-73: a worker coroutine holding a stale IMPLEMENTING handle must
+    not resurrect a row a human's `shipped` verb already moved to DONE, even
+    though IMPLEMENTING->REVIEWING passes `assert_transition` against the
+    stale in-memory status. The blocked write is a no-op: it returns the
+    falsy sentinel (None) and the DB row is untouched."""
+    t = Task.new("x", repo_path="/tmp/r")
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.CONTEXT)
+    await store.set_status(t, TaskStatus.PLANNING)
+    await store.set_status(t, TaskStatus.IMPLEMENTING)
+    # A human `shipped` verb elsewhere writes DONE directly to the DB row.
+    await store.set_status(
+        t, TaskStatus.DONE, validate=False, human_override=True)
+
+    stale = Task.new("x", repo_path="/tmp/r")
+    stale.id = t.id
+    stale.status = TaskStatus.IMPLEMENTING  # stale copy, unaware of DONE
+    result = await store.set_status(stale, TaskStatus.REVIEWING)
+
+    assert not result  # falsy sentinel — blocked, not applied
+    assert (await store.get_task(t.id)).status is TaskStatus.DONE
+
+
+async def test_set_status_cas_guard_blocks_stale_write_over_cancelled_row(store):
+    """A FAILED row with a `cancel_reason` in context is an explicit human
+    cancel, not a plain failure — it must be guarded exactly like DONE, so a
+    stale in-flight write can never resurrect a row the human just killed."""
+    t = Task.new("x", repo_path="/tmp/r")
+    await store.create_task(t)
+    # Setup only — jump straight to a mid-run status (the legal ladder is
+    # not what this test pins).
+    await store.set_status(t, TaskStatus.IMPLEMENTING, validate=False)
+    t.context = await store.merge_context(t.id, {"cancel_reason": "nope"})
+    await store.set_status(
+        t, TaskStatus.FAILED, validate=False, human_override=True)
+
+    stale = Task.new("x", repo_path="/tmp/r")
+    stale.id = t.id
+    stale.status = TaskStatus.IMPLEMENTING
+    result = await store.set_status(stale, TaskStatus.REVIEWING)
+
+    assert not result
+    assert (await store.get_task(t.id)).status is TaskStatus.FAILED
+
+
+async def test_set_status_cas_guard_applies_to_validate_false(store):
+    """The guard must not be bypassable via validate=False — several
+    orchestrator writes use it, and terminal is terminal regardless, unless
+    the caller explicitly claims human_override."""
+    t = Task.new("x", repo_path="/tmp/r")
+    await store.create_task(t)
+    await store.set_status(
+        t, TaskStatus.DONE, validate=False, human_override=True)
+
+    result = await store.set_status(t, TaskStatus.PENDING, validate=False)
+
+    assert not result
+    assert (await store.get_task(t.id)).status is TaskStatus.DONE
+
+
+async def test_set_status_failed_to_pending_retry_not_blocked(store):
+    """A plain FAILED row (no cancel_reason) is not terminal for the CAS
+    guard's purposes — writes land without needing human_override, so any
+    caller that reaches this state can still move it."""
+    t = Task.new("x", repo_path="/tmp/r")
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.FAILED, validate=False)
+
+    result = await store.set_status(t, TaskStatus.PENDING, validate=False)
+
+    assert result.status is TaskStatus.PENDING
+    assert (await store.get_task(t.id)).status is TaskStatus.PENDING
+
+
+async def test_set_status_human_override_revives_cancelled_row(store):
+    """`nh task retry` / `POST /api/tasks/{id}/retry` move a row OUT of a
+    cancelled (FAILED + cancel_reason) state via human_override=True — the
+    sanctioned escape hatch the guard must not block."""
+    t = Task.new("x", repo_path="/tmp/r")
+    await store.create_task(t)
+    t.context = await store.merge_context(t.id, {"cancel_reason": "nope"})
+    await store.set_status(
+        t, TaskStatus.FAILED, validate=False, human_override=True)
+
+    result = await store.set_status(
+        t, TaskStatus.PENDING, validate=False, human_override=True)
+
+    assert result.status is TaskStatus.PENDING
+    assert (await store.get_task(t.id)).status is TaskStatus.PENDING
+
+
+async def test_update_task_cas_guard_blocks_stale_status_over_done_row(store):
+    """update_task rewrites the whole row (SCRUM-73) — it must not resurrect
+    a DONE row's status column either, while still writing every other
+    column normally (e.g. the Jira poller's write-back keeps updating
+    context markers on an already-DONE row long after completion)."""
+    t = Task.new("x", repo_path="/tmp/r")
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.DONE, validate=False)
+
+    stale = await store.get_task(t.id)
+    stale.status = TaskStatus.IMPLEMENTING  # stale caller resurrecting it
+    stale.blocker = {"category": "AMBIGUITY", "question": "?"}
+    result = await store.update_task(stale)
+
+    assert result.status is TaskStatus.DONE
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    assert fresh.blocker["category"] == "AMBIGUITY"  # other columns still write
+
+
+async def test_update_task_cas_guard_blocks_stale_status_over_cancelled_row(store):
+    """update_task's guard mirrors set_status's terminal definition — a
+    FAILED row with a cancel_reason is protected too, not just DONE."""
+    t = Task.new("x", repo_path="/tmp/r")
+    await store.create_task(t)
+    t.context = await store.merge_context(t.id, {"cancel_reason": "nope"})
+    await store.set_status(
+        t, TaskStatus.FAILED, validate=False, human_override=True)
+
+    stale = await store.get_task(t.id)
+    stale.status = TaskStatus.PENDING  # stale caller resurrecting it
+    stale.blocker = {"category": "AMBIGUITY", "question": "?"}
+    result = await store.update_task(stale)
+
+    assert result.status is TaskStatus.FAILED
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.FAILED
+    assert fresh.blocker["category"] == "AMBIGUITY"  # other columns still write
+
+
+async def test_update_task_normal_status_write_unaffected(store):
+    """Non-terminal rows must write status through update_task exactly as
+    before the CAS guard was added."""
+    t = Task.new("x", repo_path="/tmp/r")
+    await store.create_task(t)
+    t.status = TaskStatus.CONTEXT
+    result = await store.update_task(t)
+    assert result.status is TaskStatus.CONTEXT
+    assert (await store.get_task(t.id)).status is TaskStatus.CONTEXT
+
+
 async def test_attempts_lifecycle(store):
     t = Task.new("x", repo_path="/tmp/r")
     await store.create_task(t)

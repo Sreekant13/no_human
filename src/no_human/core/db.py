@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,8 @@ from typing import Any, NamedTuple
 import aiosqlite
 
 from .task import Task, TaskStatus, assert_transition
+
+log = logging.getLogger("no_human.db")
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[3] / "migrations"
 
@@ -233,37 +236,119 @@ class Store:
         ]
 
     async def set_status(
-        self, task: Task, new_status: TaskStatus, *, validate: bool = True
-    ) -> Task:
-        """Transition a task, enforcing the legal-transition map by default."""
+        self,
+        task: Task,
+        new_status: TaskStatus,
+        *,
+        validate: bool = True,
+        human_override: bool = False,
+    ) -> Task | None:
+        """Transition a task, enforcing the legal-transition map by default.
+
+        CAS guard (SCRUM-73): the WHERE clause is checked against the live DB
+        row inside this one statement, not the possibly-stale `task.status`
+        this caller is holding — a worker coroutine can hold IMPLEMENTING
+        while a human's `shipped` verb already wrote DONE, and
+        IMPLEMENTING->REVIEWING passes `assert_transition` on the stale
+        value. Terminal here means the row reads DONE, or reads FAILED with a
+        `cancel_reason` recorded in context (an explicit human cancel, not a
+        plain failure) — a plain FAILED row stays writable so `nh task retry`
+        / `POST /api/tasks/{id}/retry` keep working. Once a row is terminal,
+        only a write that keeps its status unchanged may land; every other
+        write (including validate=False ones) is a no-op that returns None.
+
+        `human_override=True` bypasses the guard entirely — reserved for the
+        human verbs that are allowed to move a row OUT of a terminal state
+        (retry, cancel, shipped). Every other call site (watcher,
+        orchestrator, scheduler, pipeline) must leave it at the default so a
+        stale in-process handle can never clobber a human's terminal write.
+        """
         if validate:
             assert_transition(task.status, new_status)
-        task.status = new_status
-        task.updated_at = _now()
-        await self.db.execute(
-            "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-            (new_status.value, task.updated_at, task.id),
-        )
+        now = _now()
+        if human_override:
+            cur = await self.db.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                (new_status.value, now, task.id),
+            )
+        else:
+            cur = await self.db.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? "
+                "WHERE id = ? AND ("
+                "  status = ?"
+                "  OR NOT ("
+                "    status = ?"
+                "    OR (status = ? AND json_extract(context, '$.cancel_reason') IS NOT NULL)"
+                "  )"
+                ")",
+                (
+                    new_status.value, now, task.id,
+                    new_status.value,
+                    TaskStatus.DONE.value, TaskStatus.FAILED.value,
+                ),
+            )
         await self.db.commit()
+        if cur.rowcount == 0:
+            row_cur = await self.db.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task.id,)
+            )
+            row = await row_cur.fetchone()
+            if row is not None:
+                log.warning(
+                    "set_status: blocked %s -> %s on terminal row %s",
+                    row["status"], new_status.value, task.id,
+                )
+                task.status = TaskStatus(row["status"])
+            return None
+        task.status = new_status
+        task.updated_at = now
         return task
 
     async def update_task(self, task: Task) -> Task:
-        """Persist the full mutable surface of a task row."""
+        """Persist the full mutable surface of a task row.
+
+        CAS guard (SCRUM-73): mirrors set_status's terminal definition (done,
+        or failed with a `cancel_reason` in context) — a terminal row's
+        status column is protected from being resurrected by a stale
+        in-memory `task.status`, via a CASE keyed on the row's own
+        pre-update status/context (evaluated atomically inside this one
+        statement, before this call's own :context write applies). Every
+        other column still writes normally, so e.g. the Jira poller can keep
+        updating context write-back markers on an already-DONE row. No
+        override parameter here — callers that must move a row OUT of a
+        terminal state go through set_status(..., human_override=True)
+        instead, since update_task never carries that intent.
+        """
         task.updated_at = _now()
         row = task.to_row()
-        await self.db.execute(
+        cur = await self.db.execute(
             """UPDATE tasks SET
                  external_id=:external_id, source=:source, title=:title,
                  description=:description, requirements=:requirements,
                  acceptance_criteria=:acceptance_criteria, repo_path=:repo_path,
                  kind=:kind, parent_id=:parent_id,
-                 status=:status, blocker=:blocker, wake_check_at=:wake_check_at,
+                 status = CASE
+                            WHEN (
+                              status = 'done'
+                              OR (status = 'failed'
+                                  AND json_extract(context, '$.cancel_reason') IS NOT NULL)
+                            ) AND status != :status
+                            THEN status ELSE :status END,
+                 blocker=:blocker, wake_check_at=:wake_check_at,
                  priority=:priority, context=:context, plan=:plan, config=:config,
                  updated_at=:updated_at
-               WHERE id=:id""",
+               WHERE id=:id
+               RETURNING status""",
             row,
         )
+        result = await cur.fetchone()
         await self.db.commit()
+        if result is not None and result["status"] != row["status"]:
+            log.warning(
+                "update_task: blocked status %s -> %s on terminal row %s",
+                result["status"], row["status"], task.id,
+            )
+            task.status = TaskStatus(result["status"])
         return task
 
     async def merge_context(self, task_id: str, patch: dict) -> dict:
