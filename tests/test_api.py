@@ -170,6 +170,29 @@ async def test_create_task_jira_external_id_trimmed_and_capped(client, store):
 
 
 @pytest.mark.asyncio
+async def test_create_task_mcp_source_persists(client, store):
+    r = await client.post("/api/tasks", json={
+        "title": "Added via MCP bridge",
+        "source": "mcp",
+    })
+    assert r.status_code == 201
+    body = r.json()
+    assert body["source"] == "mcp"
+    task = await store.get_task(body["id"])
+    assert task.source == "mcp"
+
+
+@pytest.mark.asyncio
+async def test_create_task_unknown_source_still_coerced_to_board(client, store):
+    r = await client.post("/api/tasks", json={
+        "title": "Arbitrary client string",
+        "source": "totally-made-up",
+    })
+    assert r.status_code == 201
+    assert r.json()["source"] == "board"
+
+
+@pytest.mark.asyncio
 async def test_create_task_board_ignores_external_id(client, store):
     r = await client.post("/api/tasks", json={
         "title": "Typed task",
