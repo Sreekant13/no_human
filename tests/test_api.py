@@ -77,6 +77,36 @@ async def test_list_tasks_status_values(client, store):
     assert r.json()[0]["status"] == "awaiting_approval"
 
 
+@pytest.mark.asyncio
+async def test_list_tasks_survives_naive_updated_at(client, store):
+    """SCRUM-57: a single row with a naive updated_at (the 2026-07-26 incident
+    shape) must not 500 the whole board — it renders with wall_seconds
+    degraded to a real (naive-treated-as-UTC) value, not a crash."""
+    await _seed_task(store, title="Healthy")
+    corrupt = await _seed_task(store, title="Corrupt")
+    await store._db.execute(
+        "UPDATE tasks SET updated_at = ? WHERE id = ?",
+        ("2026-07-26 06:11:56", corrupt.id),
+    )
+    await store._db.commit()
+
+    r = await client.get("/api/tasks")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data) == 2
+    assert {"Healthy", "Corrupt"} <= {t["title"] for t in data}
+
+    corrupt_card = next(t for t in data if t["title"] == "Corrupt")
+    assert isinstance(corrupt_card["wall_seconds"], (int, float))
+    assert corrupt_card["wall_seconds"] >= 0
+
+
+def test_wall_seconds_naive_treated_as_utc():
+    from no_human.api.models import _wall_seconds
+
+    assert _wall_seconds("2026-07-26T06:00:00+00:00", "2026-07-26 06:11:56") == 716.0
+
+
 # --------------------------------------------------------------------------- #
 # GET /api/tasks/{id}                                                          #
 # --------------------------------------------------------------------------- #
