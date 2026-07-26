@@ -17,6 +17,8 @@ import { ledgerSummary, LEDGER_WINDOW_MS } from "./nightLedger.js";
 import { fmtCost, taskBurn } from "./cost.js";
 import { deriveSpendDisplay, perShippedCost } from "./ledgerSpend.js";
 import { tasksReducer } from "./tasksReducer.js";
+import { drainChip } from "./drainChip.js";
+import { initialDrainReadout, nextDrainReadout, readoutPayload } from "./drainReadout.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 
 
@@ -223,6 +225,17 @@ function OverviewStrip({ tasks }) {
       </span>
     </div>
   );
+}
+
+// SCRUM-67 3/3: header drain readout. `readout` is the poll wiring state
+// (drainReadout.js) — renders nothing until the first successful fetch so it
+// never shows phantom "0/0 workers busy" zeros, and switches to the honest
+// unreachable tone the moment a poll fails after a prior success.
+function DrainReadoutChip({ readout }) {
+  const payload = readoutPayload(readout);
+  if (payload == null) return null;
+  const chip = drainChip(payload);
+  return <span className={`drain-chip tone-${chip.tone}`} title={chip.text}>{chip.text}</span>;
 }
 
 function Spinner() {
@@ -555,6 +568,12 @@ export default function App() {
   const [pendingOpenId, setPendingOpenId] = useState(null);
   const [workerStatus, setWorkerStatus] = useState(null);
   const [queueHealth, setQueueHealth] = useState(null);
+  // SCRUM-67 3/3: the header drain chip's own view of the SAME poll (reuses
+  // fetchQueueHealth below rather than adding a second poller) — kept
+  // separate from queueHealth above so a poll failure can flip the chip to
+  // "unreachable" without disturbing the sidebar's stuck/eta indicators,
+  // which already have their own (independent) staleness tolerance.
+  const [drainReadout, setDrainReadout] = useState(initialDrainReadout);
   // Mode-aware LAST 24H spend line (SCRUM-20): the same auth-status endpoint
   // Settings' Account panel already queries. undefined until it resolves —
   // the sidebar treats that exactly like an absent field (subscription
@@ -609,7 +628,9 @@ export default function App() {
   useEffect(() => {
     function poll() {
       fetchWorkerStatus().then(setWorkerStatus).catch(() => {});
-      fetchQueueHealth().then(setQueueHealth).catch(() => {});
+      fetchQueueHealth()
+        .then((h) => { setQueueHealth(h); setDrainReadout((s) => nextDrainReadout(s, h)); })
+        .catch(() => setDrainReadout((s) => nextDrainReadout(s, "error")));
     }
     poll();
     const id = setInterval(poll, 10000);
@@ -896,6 +917,7 @@ export default function App() {
         {page === "board" && (
           <div className="nh-main-bar">
             <OverviewStrip tasks={tasks} />
+            <DrainReadoutChip readout={drainReadout} />
             <button className="btn btn-new-task" aria-haspopup="dialog" aria-expanded={showNewTask} onClick={() => setShowNewTask(true)}>+ New Task</button>
           </div>
         )}
