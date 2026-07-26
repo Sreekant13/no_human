@@ -18,6 +18,18 @@ import { formatDuration } from "./formatDuration.js";
 // "waiting on you" gate here.
 export const PARKED_STATUSES = new Set(["awaiting_input", "blocked", "escalated"]);
 
+// A parked task whose human explicitly stopped it (blocker.human_stopped,
+// flattened on the board payload as blocker_human_stopped). SINGLE definition
+// so the narrative header and the System pipeline chip read the SAME signal
+// and can never contradict each other. Only meaningful for PARKED_STATUSES —
+// human_stopped is stamped on awaiting_input/blocked/escalated (see
+// _PARKED_STATUSES in app.py); SCRUM-98 settled the narrative, this brings
+// the System chip in line.
+export function isHumanStopped(task) {
+  return !!(task && PARKED_STATUSES.has(task.status)
+    && (task.blocker?.human_stopped || task.blocker_human_stopped));
+}
+
 const ACTIVE_STATUSES = new Set([
   "pending", "context", "planning", "implementing", "reviewing", "testing",
 ]);
@@ -101,7 +113,7 @@ export function narrativeFor(task) {
   // status-specific branch below, not nested inside one — otherwise a
   // human-stopped escalated task would still narrate "waiting for your
   // decision" while the card and count already read it as stopped.
-  if (PARKED_STATUSES.has(status) && (task.blocker?.human_stopped || task.blocker_human_stopped)) {
+  if (isHumanStopped(task)) {
     return { before: `This ${kind} is`, phrase: "parked — you stopped it", after: "", colorVar: colorForStatus(status) };
   }
 
@@ -321,6 +333,7 @@ export function sectionSummary(key, { task, diff } = {}) {
     case "system": {
       if (task.status === "done") return { text: "Pipeline complete", colorVar: colorForStatus("done") };
       if (task.status === "failed") return { text: "Pipeline stopped — failed", colorVar: colorForStatus("failed") };
+      if (isHumanStopped(task)) return { text: "Parked — you stopped it", colorVar: colorForStatus(task.status) };
       if (PARKED_STATUSES.has(task.status)) return { text: "Paused, waiting on you", colorVar: colorForStatus(task.status) };
       if (task.status === "paused_quota") return { text: "Paused for quota", colorVar: colorForStatus(task.status) };
       if (task.status === "compound_parent") return { text: "Coordinating sub-tasks", colorVar: colorForStatus(task.status) };

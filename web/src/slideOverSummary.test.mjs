@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import {
   narrativeFor, chipsFor, milestonesFor, sectionSummary, defaultOpenSection,
   diffStats, colorForStatus, PARKED_STATUSES, STATUS_STAGE_LABEL, isTerminalStatus,
+  isHumanStopped,
 } from "./slideOverSummary.js";
 
 const SRC = dirname(fileURLToPath(import.meta.url));
@@ -151,6 +152,43 @@ test("a human-stopped ESCALATED task also reads as parked, not 'waiting for your
   assert.notEqual(stopped.phrase, waiting.phrase);
   assert.doesNotMatch(narrativeText(stopped), /waiting for your decision/);
   assert.match(narrativeText(stopped), /parked|stopped/);
+});
+
+test("System chip for a human-stopped task says parked, not 'waiting on you' and differs from the non-stopped park", () => {
+  const stopped = sectionSummary("system", { task: { status: "blocked", blocker: { human_stopped: true } } });
+  const parked = sectionSummary("system", { task: { status: "blocked" } });
+  assert.doesNotMatch(stopped.text, /waiting on you/i);
+  assert.match(stopped.text, /parked|stopped/i);
+  assert.equal(stopped.text, "Parked — you stopped it");
+  assert.notEqual(stopped.text, parked.text);
+});
+
+test("System chip reads the flattened blocker_human_stopped field the same as the full blocker", () => {
+  const stopped = sectionSummary("system", { task: { status: "blocked", blocker_human_stopped: true } });
+  assert.equal(stopped.text, "Parked — you stopped it");
+  assert.equal(isHumanStopped({ status: "blocked", blocker: { human_stopped: true } }), true);
+  assert.equal(isHumanStopped({ status: "blocked", blocker_human_stopped: true }), true);
+});
+
+test("a parked task WITHOUT human_stopped still reads 'Paused, waiting on you'", () => {
+  for (const status of ["awaiting_input", "blocked", "escalated"]) {
+    const s = sectionSummary("system", { task: { status } });
+    assert.equal(s.text, "Paused, waiting on you", `${status} without human_stopped must still read the generic park`);
+  }
+});
+
+test("human_stopped changes the System chip for every parked status", () => {
+  for (const status of ["awaiting_input", "blocked", "escalated"]) {
+    const s = sectionSummary("system", { task: { status, blocker: { human_stopped: true } } });
+    assert.doesNotMatch(s.text, /waiting on you/i, `${status} human-stopped must not say waiting on you`);
+    assert.match(s.text, /parked|stopped/i, `${status} human-stopped must read parked/stopped`);
+  }
+});
+
+test("a human-stopped task does NOT auto-open a section (DecisionPanel carries the ask) — defaultOpenSection unchanged", () => {
+  assert.equal(defaultOpenSection({ status: "blocked", blocker: { human_stopped: true } }), null);
+  assert.equal(defaultOpenSection({ status: "escalated", blocker: { human_stopped: true } }), null);
+  assert.equal(defaultOpenSection({ status: "blocked" }), "details");
 });
 
 // ── chips: cost, wall-time, attempts, PR — tabular data only ───────────────
