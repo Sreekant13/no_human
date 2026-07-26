@@ -1,0 +1,44 @@
+# no_human's own repo config — the operator's contract with the agent.
+# Read by src/no_human/project_config.py; the agent is hard-blocked from
+# editing this file (agent/guard.py:250). Only three keys are honored:
+# test_commands, playbook_hints, forbidden_paths_extra.
+#
+# WHY THIS EXISTS (2026-07-26): the stored profile declared no test_commands,
+# so orchestrator._resolve_test_target fell through to the default gate for
+# EVERY change. A three-file, web-only ticket therefore ran the whole
+# 2686-test Python suite (~380s) and could be — and was — failed by a Python
+# test it could not possibly affect. Three funded coder attempts died that way
+# in one day.
+#
+# Routing is change-SCOPED and unanimous: a rule fires only when EVERY file the
+# attempt touched matches that single rule. A change spanning web/ and src/, or
+# web/ and desktop/, matches no single rule and correctly falls back to the
+# full default suite. The default test_cmd stays operator-owned and is NOT set
+# here (project_config only reads the three keys above).
+#
+# Each command deliberately still runs the repo-wide guards that scan the
+# frontend, because a web-only edit CAN break them:
+#   test_no_banned_terms.py     — scans web/src (skips only web/dist)
+#   test_identity_scrub_guard.py— scans everything but docs/ and web/dist/
+#   test_readme_claims.py       — asserts README claims against web/src
+# Dropping those would trade cost for a real safety regression.
+#
+# Note: runner._parse_test_output keys off "node --test" and reports the node
+# TAP counts for these compound commands, so the displayed PASSED count covers
+# the node half only. The VERDICT is unaffected — runner.py:619 takes the
+# verdict from the exit code, and `&&` propagates a pytest failure.
+#
+# Measured: web route ~5s vs ~380s for the default suite.
+
+test_commands:
+  - glob: "web/**"
+    command: >-
+      node --test web/src/*.test.mjs &&
+      uv run pytest tests/test_no_banned_terms.py
+      tests/test_identity_scrub_guard.py tests/test_readme_claims.py -q
+
+  - glob: "desktop/**"
+    command: >-
+      node --test desktop/*.test.mjs &&
+      uv run pytest tests/test_no_banned_terms.py
+      tests/test_identity_scrub_guard.py tests/test_readme_claims.py -q
