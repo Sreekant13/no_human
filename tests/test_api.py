@@ -721,6 +721,118 @@ async def test_resume_clears_blocker_and_implements(client, store):
 
 
 # --------------------------------------------------------------------------- #
+# durable human hold on parked tasks (SCRUM-58)                                #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [TaskStatus.PAUSED_QUOTA, TaskStatus.BLOCKED])
+async def test_pause_on_parked_task_stamps_human_stopped_and_keeps_status(client, store, status):
+    """SCRUM-58: a supervisor reserving the quota window used to hit a 409
+    ('only active tasks can be paused') and had to fall back to a raw DB
+    write of blocker.human_stopped. /pause must accept parked statuses too,
+    stamping the hold without touching status or clobbering the blocker."""
+    t = await _seed_task(store, status=status)
+    t.blocker = {"category": "PAUSED_QUOTA", "question": "no quota", "keep_me": "yes"}
+    await store.update_task_columns(t)
+
+    r = await client.post(f"/api/tasks/{t.id}/pause")
+    assert r.status_code == 200, r.text
+
+    fresh = await store.find_task(t.id)
+    assert fresh.status == status                       # untouched
+    assert fresh.blocker.get("human_stopped") is True
+    assert fresh.blocker.get("keep_me") == "yes"          # existing payload kept
+
+
+@pytest.mark.asyncio
+async def test_pause_on_parked_task_without_blocker_initializes_one(client, store):
+    """Intake Q&A: if a parked task has no blocker yet, pause initializes one
+    with sensible defaults rather than erroring."""
+    t = await _seed_task(store, status=TaskStatus.PAUSED_QUOTA)
+    assert t.blocker is None
+
+    r = await client.post(f"/api/tasks/{t.id}/pause")
+    assert r.status_code == 200, r.text
+
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.PAUSED_QUOTA
+    assert fresh.blocker.get("human_stopped") is True
+    assert fresh.blocker.get("category")                  # default populated
+
+
+@pytest.mark.asyncio
+async def test_pause_on_parked_task_is_idempotent(client, store):
+    """Intake Q&A: pausing an already-held parked task twice succeeds
+    idempotently — no error, human_stopped stays True."""
+    t = await _seed_task(store, status=TaskStatus.PAUSED_QUOTA)
+    t.blocker = {"category": "PAUSED_QUOTA", "question": "no quota"}
+    await store.update_task_columns(t)
+
+    r1 = await client.post(f"/api/tasks/{t.id}/pause")
+    assert r1.status_code == 200, r1.text
+    r2 = await client.post(f"/api/tasks/{t.id}/pause")
+    assert r2.status_code == 200, r2.text
+
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.PAUSED_QUOTA
+    assert fresh.blocker.get("human_stopped") is True
+
+
+@pytest.mark.asyncio
+async def test_hold_and_release_round_trip_on_paused_quota_task(client, store):
+    """Full hold+release round-trip: pause stamps human_stopped on a
+    paused_quota task; resume clears the flag but leaves status/blocker
+    payload otherwise untouched (resume no longer forces a transition)."""
+    t = await _seed_task(store, status=TaskStatus.PAUSED_QUOTA)
+    t.blocker = {"category": "PAUSED_QUOTA", "question": "no quota", "keep_me": "yes"}
+    await store.update_task_columns(t)
+
+    r = await client.post(f"/api/tasks/{t.id}/pause")
+    assert r.status_code == 200, r.text
+    held = await store.find_task(t.id)
+    assert held.status == TaskStatus.PAUSED_QUOTA
+    assert held.blocker.get("human_stopped") is True
+
+    r2 = await client.post(f"/api/tasks/{t.id}/resume")
+    assert r2.status_code == 200, r2.text
+    released = await store.find_task(t.id)
+    assert released.status == TaskStatus.PAUSED_QUOTA     # unchanged by resume
+    assert "human_stopped" not in released.blocker
+    assert released.blocker.get("keep_me") == "yes"        # payload preserved
+
+
+@pytest.mark.asyncio
+async def test_resume_without_human_stopped_keeps_existing_semantics(client, store):
+    """Non-hold path is untouched: resuming a plain blocked task (no
+    human_stopped) still clears the blocker fully and moves to implementing."""
+    t = await _seed_task(store, status=TaskStatus.BLOCKED)
+    t.blocker = {"category": "AMBIGUITY", "question": "?"}
+    await store.update_task_columns(t)
+
+    r = await client.post(f"/api/tasks/{t.id}/resume")
+    assert r.status_code == 200, r.text
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.IMPLEMENTING
+    assert fresh.blocker is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [TaskStatus.DONE, TaskStatus.FAILED])
+async def test_pause_still_409s_on_done_and_cancelled(client, store, status):
+    t = await _seed_task(store, status=status)
+    r = await client.post(f"/api/tasks/{t.id}/pause")
+    assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [TaskStatus.DONE, TaskStatus.FAILED])
+async def test_resume_still_409s_on_done_and_cancelled(client, store, status):
+    t = await _seed_task(store, status=status)
+    r = await client.post(f"/api/tasks/{t.id}/resume")
+    assert r.status_code == 409
+
+
+# --------------------------------------------------------------------------- #
 # POST /api/tasks/{id}/shipped (SCRUM-56)                                      #
 # --------------------------------------------------------------------------- #
 
