@@ -40,6 +40,33 @@ def test_rules_block_core_discipline_always_present():
     assert "EARLY VERIFICATION" not in r
 
 
+def test_rules_block_read_efficiency_guidance_present():
+    r = build_rules_block("", "", None)
+    # New context-efficiency guidance: grep-then-offset/limit for large files.
+    assert "grep -n" in r
+    assert "offset/limit" in r
+    assert "~500 lines" in r
+    # Not an absolute re-read ban — the stale-content carve-out must survive.
+    assert "UNLESS you changed them" in r
+    # Small files remain explicitly fine to read whole.
+    assert "fine to read whole" in r
+    # Reading a different region of an already-seen large file must not be
+    # textually forbidden — only re-reading the SAME lines is discouraged.
+    assert "reading a DIFFERENT region of a large file is not a re-read" in r
+    # Regression guard: the adjacent existing bullets must remain untouched.
+    # Multi-line exact match — the new bullet's own self-reference to this
+    # phrase (without the continuation sentence) must NOT satisfy this assert,
+    # or deleting the real bullet would go undetected.
+    assert (
+        "READ the existing code BEFORE making changes. Understand what is already\n"
+        "    there; do not guess or speculate about the codebase."
+    ) in r
+    assert "read the actual code before changing" in r
+    # Regression guard on the other standing-discipline neighbours.
+    assert "Devil's advocate before acting" in r
+    assert "Review every change as a staff engineer would" in r
+
+
 def test_rules_block_test_cmd_switches_to_early_verification():
     r = build_rules_block("uv run pytest -q", "", None)
     assert "Run unit tests with: uv run pytest -q" in r
