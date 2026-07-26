@@ -242,6 +242,53 @@ test("no section micro-summary ever contains a raw status enum", () => {
   }
 });
 
+// ── details micro: never a phantom "0/N criteria done" ─────────────────────
+
+test("details micro: passed-review task with untracked criteria shows Not tracked, never 0/N", () => {
+  const task = {
+    status: "awaiting_approval",
+    acceptance_criteria: ["a", "b"],
+    // review_passed comes across the wire as an int (0/1), not a boolean —
+    // see api/models.py `review_passed: int | None`.
+    attempts: [{ review_passed: 1 }],
+  };
+  const s = sectionSummary("details", { task });
+  assert.equal(s.text, "Not tracked");
+});
+
+test("details micro: done task with untracked criteria shows Not tracked, never 0/N", () => {
+  const task = { status: "done", acceptance_criteria: ["a", "b", "c"] };
+  const s = sectionSummary("details", { task });
+  assert.equal(s.text, "Not tracked");
+  assert.ok(!s.text.includes("0/"), `must never show a phantom 0/N, got "${s.text}"`);
+});
+
+test("details micro: passed/done task with tracked criteria shows the real count", () => {
+  const task = {
+    status: "done",
+    acceptance_criteria: ["a", "b"],
+    context: { progress: { acceptance_criteria: [{ status: "done" }, { status: "done" }] } },
+  };
+  const s = sectionSummary("details", { task });
+  assert.equal(s.text, "2/2 criteria done");
+});
+
+test("details micro: mid-flight task with untracked criteria shows Not tracked, never a phantom 0/N", () => {
+  const task = { status: "coding", acceptance_criteria: ["a", "b"] };
+  const s = sectionSummary("details", { task });
+  assert.equal(s.text, "Not tracked");
+});
+
+test("details micro: mid-flight task with partially tracked criteria shows the real count", () => {
+  const task = {
+    status: "coding",
+    acceptance_criteria: ["a", "b", "c"],
+    context: { progress: { acceptance_criteria: [{ status: "done" }] } },
+  };
+  const s = sectionSummary("details", { task });
+  assert.equal(s.text, "1/3 criteria done");
+});
+
 // ── gate-aware default section ──────────────────────────────────────────────
 
 test("default-open section maps review-gate/parked/active exactly like the pre-1.4 tab logic", () => {

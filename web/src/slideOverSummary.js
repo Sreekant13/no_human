@@ -321,8 +321,15 @@ export function sectionSummary(key, { task, diff } = {}) {
       if (task.blocker?.question) return { text: "Has a question for you", colorVar: colorForStatus(task.status) };
       const total = task.acceptance_criteria?.length || 0;
       if (total > 0) {
-        const done = (task.context?.progress?.acceptance_criteria || [])
-          .filter((p) => p?.status === "done").length;
+        const progress = task.context?.progress?.acceptance_criteria || [];
+        const tracked = progress.length > 0;
+        // No backend writer populates context.progress.acceptance_criteria
+        // today (grep confirms there is none) — every task is "untracked" in
+        // production. This branch stays correct for if/when a writer lands.
+        if (!tracked) {
+          return { text: "Not tracked", colorVar: "var(--text-muted)" };
+        }
+        const done = progress.filter((p) => p?.status === "done").length;
         return { text: `${done}/${total} criteria done`, colorVar: "var(--text-muted)" };
       }
       return { text: "Description & criteria", colorVar: "var(--text-muted)" };
