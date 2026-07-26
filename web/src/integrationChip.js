@@ -2,11 +2,18 @@
 // integration → labels/brand color. Kept out of the JSX so the state machine is
 // unit-testable with `node --test`.
 
-// The status chip an IntegrationStatus renders. Four states:
-//   unconfigured (neutral) · configured-but-untested (ok) ·
-//   connected after a passing test (ok) · error after a failing test (error).
+// The status chip an IntegrationStatus renders. Five states:
+//   unconfigured (neutral) · ambient — no stored config, but the operator's
+//   own CLI (gh/git) is already authenticated for it (SCRUM-81, `status`
+//   field from GET /api/integrations) (ambient) · configured-but-untested
+//   (ok) · connected after a passing test (ok) · error after a failing test
+//   (error). Ambient is checked before the configured/unconfigured split:
+//   the backend never marks a stored/configured integration "ambient" (see
+//   list_integrations_with_ambient), so this can't shadow a real config.
 export function statusChip(it) {
-  if (!it || !it.configured) return { label: "Unconfigured", tone: "neutral" };
+  if (!it) return { label: "Unconfigured", tone: "neutral" };
+  if (it.status === "ambient") return { label: "Active via CLI auth", tone: "ambient" };
+  if (!it.configured) return { label: "Unconfigured", tone: "neutral" };
   if (it.healthy === false) return { label: "Error", tone: "error" };
   if (it.healthy === true) return { label: "Connected", tone: "ok" };
   return { label: "Configured", tone: "ok" };
