@@ -1175,6 +1175,35 @@ async def test_queue_health_endpoint(client, store):
     assert body["eta_minutes"] is None    # unknowable, not a fake zero
 
 
+async def test_queue_health_endpoint_includes_worker_fields(client, store):
+    """SCRUM-70: queue_health merges workers_busy/max_workers/queue_depth/
+    est_drain_seconds from the scheduler's in-memory state, no nesting."""
+    from types import SimpleNamespace
+
+    from no_human.api.app import app as fastapi_app
+    from no_human.core.task import Task, TaskStatus
+
+    t = Task.new("claimed one", repo_path="/r")
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.IMPLEMENTING, validate=False)
+
+    fastapi_app.state.scheduler = SimpleNamespace(inflight={t.id}, max_workers=2)
+    try:
+        r = await client.get("/api/queue/health")
+    finally:
+        del fastapi_app.state.scheduler
+
+    body = r.json()
+    assert isinstance(body["workers_busy"], int) and body["workers_busy"] == 1
+    assert isinstance(body["max_workers"], int) and body["max_workers"] == 2
+    assert isinstance(body["queue_depth"], int) and body["queue_depth"] == 0
+    assert body["est_drain_seconds"] is None or isinstance(
+        body["est_drain_seconds"], (int, float))
+    # pre-existing keys still present, untouched
+    assert body["open_tasks"] == 1
+    assert "eta_minutes" in body
+
+
 async def test_board_query_is_not_n_plus_1(client, store, monkeypatch):
     """B2 #16: the board issued one attempts query PER TASK, every 2s, per
     socket. It must now use a single grouped query regardless of task count."""

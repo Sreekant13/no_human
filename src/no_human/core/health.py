@@ -13,6 +13,7 @@ actually has, neither of which the board could answer:
 
 from __future__ import annotations
 
+import statistics
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -23,6 +24,8 @@ OPEN_STATUSES = ("pending", "implementing", "reviewing")
 # a board full of these is success, not a stall.
 GATE_STATUSES = ("awaiting_approval", "escalated", "awaiting_input", "blocked")
 DONE_STATUSES = ("done", "failed")
+# Statuses a worker can claim (mirrors scheduler._CLAIMABLE).
+CLAIMABLE_STATUSES = ("implementing", "pending")
 
 
 @dataclass
@@ -34,6 +37,10 @@ class QueueHealth:
     stuck: bool = False
     stuck_reason: str = ""
     eta_minutes: float | None = None   # None = unknowable, not "zero"
+    workers_busy: int = 0
+    max_workers: int = 0
+    queue_depth: int = 0
+    est_drain_seconds: float | None = None   # None = unknowable
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -45,6 +52,11 @@ class QueueHealth:
             "stuck_reason": self.stuck_reason,
             "eta_minutes": (round(self.eta_minutes, 1)
                             if self.eta_minutes is not None else None),
+            "workers_busy": self.workers_busy,
+            "max_workers": self.max_workers,
+            "queue_depth": self.queue_depth,
+            "est_drain_seconds": (round(self.est_drain_seconds, 1)
+                                  if self.est_drain_seconds is not None else None),
         }
 
 
@@ -53,9 +65,23 @@ def _iso_cutoff(minutes: int, *, now: datetime | None = None) -> str:
     return (base - timedelta(minutes=minutes)).isoformat()
 
 
+async def _median_attempt_seconds(db: Any, limit: int) -> float | None:
+    """Median wall-time of recently completed attempts, derived from existing
+    started_at/completed_at timestamps (no schema change: julianday() parses
+    both SQLite datetime('now') and ISO-T forms)."""
+    cur = await db.execute(
+        "SELECT (julianday(completed_at) - julianday(started_at)) * 86400.0 "
+        "FROM attempts WHERE completed_at IS NOT NULL AND started_at IS NOT NULL "
+        "ORDER BY completed_at DESC LIMIT ?", (limit,))
+    rows = await cur.fetchall()
+    secs = [float(r[0]) for r in rows if r[0] is not None and float(r[0]) > 0]
+    return statistics.median(secs) if secs else None
+
+
 async def queue_health(
     store: Any, *, stuck_after_minutes: int = 30, window_minutes: int = 30,
-    now: datetime | None = None,
+    now: datetime | None = None, inflight_ids: Any = None, max_workers: int = 0,
+    attempt_sample: int = 20,
 ) -> QueueHealth:
     db = store.db
 
@@ -67,6 +93,7 @@ async def queue_health(
     open_q = ",".join("?" * len(OPEN_STATUSES))
     gate_q = ",".join("?" * len(GATE_STATUSES))
     done_q = ",".join("?" * len(DONE_STATUSES))
+    claimable_q = ",".join("?" * len(CLAIMABLE_STATUSES))
 
     h = QueueHealth(window_minutes=window_minutes)
     h.open_tasks = await count(
@@ -78,6 +105,27 @@ async def queue_health(
     h.completed_in_window = await count(
         f"SELECT COUNT(*) FROM tasks WHERE status IN ({done_q}) "
         "AND updated_at >= ?", *DONE_STATUSES, cutoff)
+
+    inflight = set(inflight_ids or ())
+    h.workers_busy = len(inflight)
+    h.max_workers = int(max_workers)
+
+    cur = await db.execute(
+        f"SELECT id FROM tasks WHERE status IN ({claimable_q})", CLAIMABLE_STATUSES)
+    rows = await cur.fetchall()
+    h.queue_depth = sum(1 for (tid,) in rows if tid not in inflight)
+
+    median_secs = await _median_attempt_seconds(db, attempt_sample)
+    # Denominator is AVAILABLE workers (max - busy), not max_workers: busy
+    # workers can't claim new tasks, so this is a conservative (slower, not
+    # optimistic) estimate of drain time.
+    available = max(0, h.max_workers - h.workers_busy)
+    if h.queue_depth == 0:
+        h.est_drain_seconds = 0.0            # empty queue drains in 0s — honest
+    elif median_secs is None or available <= 0:
+        h.est_drain_seconds = None           # no history OR no free capacity → unknowable
+    else:
+        h.est_drain_seconds = median_secs * h.queue_depth / available
 
     if h.open_tasks == 0:
         return h  # nothing owed → never stuck, ETA 0 is meaningless

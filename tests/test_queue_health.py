@@ -7,7 +7,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from no_human.core.db import Store
-from no_human.core.health import queue_health
+from no_human.core.health import CLAIMABLE_STATUSES, queue_health
+from no_human.core.scheduler import _CLAIMABLE
 from no_human.core.task import Task, TaskStatus
 
 
@@ -98,3 +99,98 @@ async def test_stale_transitions_and_no_completions_is_still_stuck(store):
         {"ts": time.time() - 3600, "kind": "state", "text": "planning"}])
     h = await queue_health(store, stuck_after_minutes=30)
     assert h.stuck is True
+
+
+async def _attempt(store, task_id: str, *, duration_seconds: float):
+    """Insert a completed attempt row with a known wall-time, via started_at/
+    completed_at (no wall_time column — SCRUM-70 derives duration from these)."""
+    now = datetime.now(timezone.utc)
+    started = now - timedelta(seconds=duration_seconds)
+    aid = await store.create_attempt(task_id, 1)
+    await store.db.execute(
+        "UPDATE attempts SET started_at = ?, completed_at = ?, status = 'succeeded' "
+        "WHERE id = ?",
+        (started.isoformat(), now.isoformat(), aid))
+    await store.db.commit()
+    return aid
+
+
+async def test_queue_health_idle_shape(store):
+    """SCRUM-70 AC: truthful when idle."""
+    h = await queue_health(store, max_workers=2)
+    assert h.workers_busy == 0
+    assert h.max_workers == 2
+    assert h.queue_depth == 0
+    assert h.est_drain_seconds == 0.0
+    d = h.as_dict()
+    for key in ("workers_busy", "max_workers", "queue_depth", "est_drain_seconds"):
+        assert key in d
+    assert isinstance(d["workers_busy"], int)
+    assert isinstance(d["max_workers"], int)
+    assert isinstance(d["queue_depth"], int)
+    assert isinstance(d["est_drain_seconds"], float)
+
+
+async def test_queue_health_busy_shape(store):
+    """SCRUM-70 AC: truthful under load — queue_depth excludes the inflight
+    id, est_drain_seconds = median * depth / available_workers."""
+    claimed = await _task(store, TaskStatus.IMPLEMENTING)
+    await _task(store, TaskStatus.PENDING)
+    await _task(store, TaskStatus.PENDING)
+
+    await _attempt(store, claimed.id, duration_seconds=10)
+    await _attempt(store, claimed.id, duration_seconds=20)
+    await _attempt(store, claimed.id, duration_seconds=30)  # median = 20
+
+    h = await queue_health(store, inflight_ids={claimed.id}, max_workers=2)
+    assert h.workers_busy == 1
+    assert h.max_workers == 2
+    assert h.queue_depth == 2   # 3 claimable - 1 inflight
+    # available = max_workers(2) - busy(1) = 1
+    assert h.est_drain_seconds == pytest.approx(20.0 * 2 / 1, rel=0.01)
+
+
+async def test_queue_health_null_estimate_when_no_attempt_history(store):
+    """SCRUM-70 AC: null estimate path — depth > 0 but no completed attempts."""
+    await _task(store, TaskStatus.PENDING)
+    h = await queue_health(store, max_workers=2)
+    assert h.queue_depth == 1
+    assert h.est_drain_seconds is None
+
+
+async def test_queue_health_null_estimate_when_no_free_capacity(store):
+    """SCRUM-70 AC: honest null, never a fabricated/infinite number, when
+    workers_busy == max_workers (available capacity is zero)."""
+    claimed = await _task(store, TaskStatus.IMPLEMENTING)
+    await _task(store, TaskStatus.PENDING)
+    await _attempt(store, claimed.id, duration_seconds=10)
+
+    h = await queue_health(store, inflight_ids={claimed.id}, max_workers=1)
+    assert h.queue_depth == 1
+    assert h.workers_busy == h.max_workers == 1
+    assert h.est_drain_seconds is None
+
+
+def test_claimable_statuses_match_scheduler():
+    """Drift guard: health.py's CLAIMABLE_STATUSES is a hand-copied mirror of
+    scheduler._CLAIMABLE (comment-only tie). If the scheduler's claim set ever
+    changes without updating health.py, queue_depth silently lies on the
+    board — fail loudly instead."""
+    assert set(CLAIMABLE_STATUSES) == {s.value for s in _CLAIMABLE}
+
+
+async def test_queue_depth_excludes_done_and_blocked(store):
+    """Boundary test: queue_depth counts only CLAIMABLE_STATUSES. A DONE task
+    and a BLOCKED (human_stopped) task must not inflate the count — only the
+    PENDING task is claimable."""
+    await _task(store, TaskStatus.DONE)
+
+    blocked = await _task(store, TaskStatus.IMPLEMENTING)
+    blocked.blocker = {"human_stopped": True}
+    await store.set_status(blocked, TaskStatus.BLOCKED, validate=False)
+    await store.update_task(blocked)
+
+    await _task(store, TaskStatus.PENDING)
+
+    h = await queue_health(store, max_workers=2)
+    assert h.queue_depth == 1
