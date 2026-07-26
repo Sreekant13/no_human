@@ -142,6 +142,30 @@ test("B2 #19: an approved PR stops shouting in 'need you' but keeps its lane", (
   assert.equal(routeTask(approved), routeTask(unreviewed));
 });
 
+test("a human-stopped blocked task stops shouting in 'need you' but keeps its lane", () => {
+  const stopped = { id: "s", status: "blocked", blocker_human_stopped: true };
+  assert.equal(isNeedsYou(stopped), false, "human already gave their answer: stop, keep parked");
+  assert.equal(routeTask(stopped), "answer", "routing is untouched — it stays in Needs Answer");
+});
+
+test("NEGATIVE CONTROL: a blocked task WITHOUT the human-stopped flag still needs you", () => {
+  const blocked = { id: "b", status: "blocked" };
+  assert.equal(isNeedsYou(blocked), true);
+  assert.equal(routeTask(blocked), "answer");
+});
+
+test("deriveCounts.needsYou drops by exactly one when a single task gains blocker_human_stopped", () => {
+  const tasks = [
+    { id: "1", status: "blocked" },
+    { id: "2", status: "awaiting_input" },
+    { id: "3", status: "implementing" },
+  ];
+  const before = deriveCounts(tasks).needsYou;
+  tasks[0] = { ...tasks[0], blocker_human_stopped: true };
+  const after = deriveCounts(tasks).needsYou;
+  assert.equal(after, before - 1);
+});
+
 // SCRUM-15: claimed=true from the scheduler's in-flight set is the ONLY signal
 // for "actually running" — an active status alone must never read as running.
 test("isRunning is true only when claimed, regardless of status", () => {

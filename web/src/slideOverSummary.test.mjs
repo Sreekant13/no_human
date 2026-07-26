@@ -130,6 +130,29 @@ test("approved-but-unmerged reads differently from a fresh PR (B2 #19 parity)", 
   assert.match(approved.phrase, /merge/);
 });
 
+test("a human-stopped blocked task reads as parked by the human, not waiting for an answer", () => {
+  const stopped = narrativeFor({ status: "blocked", blocker: { human_stopped: true } });
+  const waiting = narrativeFor({ status: "blocked" });
+  assert.notEqual(stopped.phrase, waiting.phrase);
+  assert.doesNotMatch(narrativeText(stopped), /waiting for your answer/);
+  assert.match(narrativeText(stopped), /parked|stopped/);
+});
+
+test("the flattened board field (blocker_human_stopped) reads the same as the full blocker object", () => {
+  const stopped = narrativeFor({ status: "blocked", blocker_human_stopped: true });
+  assert.match(narrativeText(stopped), /parked|stopped/);
+  assert.doesNotMatch(narrativeText(stopped), /waiting for your answer/);
+});
+
+test("a human-stopped ESCALATED task also reads as parked, not 'waiting for your decision' "
+  + "(human_stopped is stamped on any parked status, not just blocked/awaiting_input)", () => {
+  const stopped = narrativeFor({ status: "escalated", blocker: { human_stopped: true } });
+  const waiting = narrativeFor({ status: "escalated" });
+  assert.notEqual(stopped.phrase, waiting.phrase);
+  assert.doesNotMatch(narrativeText(stopped), /waiting for your decision/);
+  assert.match(narrativeText(stopped), /parked|stopped/);
+});
+
 // ── chips: cost, wall-time, attempts, PR — tabular data only ───────────────
 
 test("chips include cost+tokens, wall-time, attempts, and a PR link when present", () => {

@@ -39,3 +39,21 @@ def test_last_activity_from_task_output():
     t = _task(updated_at="2026-06-01T10:00:00")
     summary = TaskSummaryOut.from_task(t, attempts=[])
     assert summary.last_activity == "2026-06-01T10:00:00"
+
+
+def test_blocker_human_stopped_true_when_stamped():
+    t = _task(status=TaskStatus.BLOCKED, blocker={"question": "q", "human_stopped": True})
+    summary = TaskSummaryOut.from_task(t, attempts=[])
+    assert summary.blocker_human_stopped is True
+
+
+def test_blocker_human_stopped_false_when_blocker_lacks_the_key():
+    t = _task(status=TaskStatus.BLOCKED, blocker={"question": "q"})
+    summary = TaskSummaryOut.from_task(t, attempts=[])
+    assert summary.blocker_human_stopped is False
+
+
+def test_blocker_human_stopped_false_when_blocker_is_none():
+    t = _task(status=TaskStatus.BLOCKED, blocker=None)
+    summary = TaskSummaryOut.from_task(t, attempts=[])
+    assert summary.blocker_human_stopped is False

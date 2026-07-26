@@ -93,6 +93,18 @@ export function narrativeFor(task) {
   const kind = kindLabel(task);
   const status = task.status;
 
+  // A human who explicitly stopped a parked task (blocker.human_stopped,
+  // flattened on the board payload as blocker_human_stopped) already gave
+  // their answer: "stop, keep parked". This is stamped on ANY parked status
+  // (/reply terminal:true hits awaiting_input, blocked, AND escalated — see
+  // _PARKED_STATUSES in app.py), so it must be checked before any
+  // status-specific branch below, not nested inside one — otherwise a
+  // human-stopped escalated task would still narrate "waiting for your
+  // decision" while the card and count already read it as stopped.
+  if (PARKED_STATUSES.has(status) && (task.blocker?.human_stopped || task.blocker_human_stopped)) {
+    return { before: `This ${kind} is`, phrase: "parked — you stopped it", after: "", colorVar: colorForStatus(status) };
+  }
+
   if (status === "done") {
     return { before: `This ${kind} is`, phrase: "done", after: " — its pull request was merged.", colorVar: colorForStatus(status) };
   }

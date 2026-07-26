@@ -69,6 +69,11 @@ export function isNeedsYou(task) {
   // "N need you". It STAYS in the Review lane (routing is untouched: LANES is
   // also the routing table) but renders as "approved — merge pending".
   if (task?.approved_at) return false;
+  // A human who explicitly stopped a parked task already gave their answer
+  // (blocker.human_stopped, flattened as blocker_human_stopped). Stop it
+  // shouting in "N need you", but keep its lane — routing untouched, exactly
+  // like the approved_at guard above.
+  if (task?.blocker_human_stopped) return false;
   return NEEDS_YOU_LANES.has(routeTask(task));
 }
 

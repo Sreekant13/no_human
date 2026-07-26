@@ -252,6 +252,10 @@ function actionHint(task) {
   // B2 #19: approved-but-unmerged is no longer YOUR move — say so instead of
   // asking for a review that already happened.
   if (task.approved_at) return "approved — merge pending";
+  // A human who explicitly stopped this parked task already gave their
+  // answer — checked before the status branches so it wins regardless of
+  // which parked status (awaiting_input/blocked/escalated) the task is in.
+  if (task.blocker_human_stopped) return "stopped by you — parked";
   if (task.status === "awaiting_approval") return "review & approve PR";
   if (task.status === "awaiting_input") return "answer question";
   if (task.status === "escalated") return "advise or split task";
