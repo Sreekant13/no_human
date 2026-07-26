@@ -307,6 +307,11 @@ class WakeWatcher:
         age_min = (now.timestamp() - last_ts) / 60.0
         if age_min < self.stuck_active_minutes:
             return False
+        # Load-bearing terminal guard (SCRUM-68) — a task shipped/cancelled
+        # between the caller's list fetch and this write must not be flipped
+        # to ESCALATED by the stall watchdog.
+        if await self._is_terminal(task):
+            return False
         data = task.blocker or {}
         data["category"] = "NOVEL_UNKNOWN"
         data["question"] = (
@@ -349,7 +354,28 @@ class WakeWatcher:
         except Exception:  # noqa: BLE001 — a heartbeat must never break the tick
             log.warning("wake heartbeat failed for %s", task.id[:8], exc_info=True)
 
+    async def _is_terminal(self, task: Task) -> bool:
+        """True once only an explicit human verb (never this watcher) may
+        revive the task: done, or cancelled (FAILED + a cancel_reason —
+        there is no separate 'cancelled' status; see api/app.py's cancel
+        endpoint). Re-reads the store instead of trusting the possibly-stale
+        `task` object: a concurrent POST /shipped or /cancel can land mid-tick,
+        between a rung's own network poll (PR state/comments/checks/mergeable)
+        and its write — live incident SCRUM-68, where a done task's PR got a
+        post-merge comment and the pr_feedback rung resumed it to implementing."""
+        current = await self.store.get_task(task.id)
+        if current is None:
+            return False
+        if current.status == TaskStatus.DONE:
+            return True
+        return current.status == TaskStatus.FAILED and bool(
+            (current.context or {}).get("cancel_reason"))
+
     async def _evaluate(self, task: Task, *, now: datetime) -> str | None:
+        # Terminal is terminal — checked first, before any rung does any work.
+        if await self._is_terminal(task):
+            return None
+
         # An open PR: shepherd it. Merged → done; closed-unmerged → escalate;
         # new human comments → revise (B4); red CI on the PR head → bounded fix
         # loop (M1). It NEVER times out — a PR may wait for human approval
@@ -378,6 +404,11 @@ class WakeWatcher:
                 condition, raised_at=raised_at, now=now, wake_check_at=wake_check_at,
             )
             if satisfied:
+                # condition_satisfied may have awaited a live checker (network);
+                # re-verify terminal-ness right before acting on it (wake_condition
+                # rung, and the pr_feedback rung it can trigger below).
+                if await self._is_terminal(task):
+                    return None
                 # If the condition is pr_comment_on, inject the comments as feedback.
                 if condition and condition.strip().lower().startswith("pr_comment_on:"):
                     rounds = await self._inject_pr_feedback(task, condition)
@@ -388,8 +419,11 @@ class WakeWatcher:
                         return "escalated_revisions"
                 return await self._resume(task)
 
-        # Timeout → escalate (never silently abandon).
+        # Timeout → escalate (never silently abandon). Re-verify: max_park
+        # re-escalation must not revive a task a human already closed out.
         if now - raised_at >= self.max_park:
+            if await self._is_terminal(task):
+                return None
             await self._escalate_timeout(task, blocker)
             return "escalated_timeout"
         return None
@@ -400,6 +434,12 @@ class WakeWatcher:
         Resume re-enters the loop in a fresh session seeded with the report
         (22.5) — the orchestrator picks it up from the [WIP-BLOCKED] checkpoint.
         """
+        # LOAD-BEARING terminal guard (SCRUM-68). The rung-level rechecks above
+        # this call are cheap early-outs; THIS one is the invariant — every
+        # resume path, present or future, funnels through here, and any await
+        # a rung did since its own recheck reopens the race this closes.
+        if await self._is_terminal(task):
+            return "skipped_terminal"
         patch = {
             "resumed_at": now_iso(),
             "resume_reason": "wake_condition_satisfied",
@@ -433,6 +473,12 @@ class WakeWatcher:
             return None
         comments = [c for c in comments if not self._is_self_or_bot(c)]
         if not comments:
+            return None
+        # The comment fetch above is a network await — a POST /shipped landing
+        # during it must not have its own merge-notice comment injected as
+        # feedback into a finished task (the SCRUM-68 incident, one await
+        # deeper than the rung's own recheck).
+        if await self._is_terminal(task):
             return None
         rounds = await self._append_comments_as_feedback(task, comments)
         if not (task.context or {}).get("pr_comment_ref"):
@@ -549,6 +595,11 @@ class WakeWatcher:
                 state = (await self._pr_state(url)) or ""
             except Exception as exc:  # noqa: BLE001 — a poll error must not crash the watcher
                 log.warning("failed to poll PR state for %s: %s", task.id[:8], exc)
+        # The poll above just awaited a network call; re-verify terminal-ness
+        # before acting on MERGED/CLOSED (state rung, SCRUM-68) — a concurrent
+        # POST /cancel landing mid-poll must not still write DONE/ESCALATED.
+        if await self._is_terminal(task):
+            return None
         if state == "MERGED":
             await self.store.set_status(task, TaskStatus.DONE, validate=False)
             await self._emit(task, "merged", f"{task.id[:8]} PR merged by a human: {url}")
@@ -602,6 +653,10 @@ class WakeWatcher:
             info = await self._pr_mergeable(url)
         except Exception as exc:  # noqa: BLE001 — a poll error must not crash the watcher
             log.warning("failed to poll PR mergeability for %s: %s", task.id[:8], exc)
+            return None
+        # The poll above just awaited a network call; re-verify terminal-ness
+        # before writing anything (conflict rung, SCRUM-68).
+        if await self._is_terminal(task):
             return None
         mergeable = str((info or {}).get("mergeable") or "").upper()
 
@@ -677,6 +732,10 @@ class WakeWatcher:
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to poll PR checks for %s: %s", task.id[:8], exc)
             return None
+        # The poll above just awaited a network call; re-verify terminal-ness
+        # before writing anything (CI-rounds rung, SCRUM-68).
+        if await self._is_terminal(task):
+            return None
         failing = [c for c in checks if c.get("status") == "fail"]
         if not failing:
             return None
@@ -697,6 +756,11 @@ class WakeWatcher:
                 excerpt = await self._ci_log(failing[0]["link"])
             except Exception:  # noqa: BLE001 — the log is a bonus, not a dependency
                 excerpt = ""
+        # The log fetch above is a network await — re-verify terminal-ness
+        # before ANY write in this rung (SCRUM-68; the round counter, the
+        # escalation, and the resume below all mutate the task).
+        if await self._is_terminal(task):
+            return None
         names = ", ".join(c.get("name", "?") for c in failing)
         rounds = int(ctx.get("pr_ci_rounds") or 0) + 1
         task.context = await self.store.merge_context(
@@ -760,6 +824,11 @@ class WakeWatcher:
             outcome = await self._ci_gate_gate.step(task, url)
         except Exception as exc:  # noqa: BLE001 — the gate must never kill the watcher
             log.warning("CI_GATE gate step failed for %s: %s", task.id[:8], exc)
+            return None, None
+        # gate.step just triggered pipelines / posted PR comments over the
+        # network; re-verify terminal-ness before acting on the outcome
+        # (CI_GATE rung 6, SCRUM-68) — same race window as the other rungs.
+        if await self._is_terminal(task):
             return None, None
         # The gate mutates task.context["ci_gate"] in memory (its state
         # machine) — persist that subtree atomically. RFC 7396: an empty dict
@@ -866,6 +935,12 @@ class WakeWatcher:
         except Exception as exc:  # noqa: BLE001 — a poll error must not crash the watcher
             log.warning("failed to poll PR comments for %s: %s", task.id[:8], exc)
             return None
+        # The poll above just awaited a network call; re-verify terminal-ness
+        # before writing anything (pr_feedback rung — the exact live incident,
+        # SCRUM-68: a done task's PR got a post-merge comment and this rung
+        # counted it as new human feedback and resumed the task).
+        if await self._is_terminal(task):
+            return None
 
         since = ctx.get("pr_comment_since")
         fresh = [c for c in comments
@@ -901,6 +976,9 @@ class WakeWatcher:
 
     async def _escalate_revisions(self, task: Task, rounds: int) -> None:
         """Stop the comment→revise loop after the cap and hand back to a human."""
+        # Load-bearing terminal guard (SCRUM-68) — see _resume.
+        if await self._is_terminal(task):
+            return
         data = task.blocker or {}
         data["category"] = "AMBIGUITY"
         data["root_cause_hypothesis"] = (
@@ -918,6 +996,9 @@ class WakeWatcher:
         )
 
     async def _escalate_timeout(self, task: Task, blocker: Blocker | None) -> None:
+        # Load-bearing terminal guard (SCRUM-68) — see _resume.
+        if await self._is_terminal(task):
+            return
         data = task.blocker or {}
         data["timed_out"] = True
         data["category"] = "NOVEL_UNKNOWN" if blocker is None else data.get("category")

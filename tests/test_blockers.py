@@ -854,3 +854,309 @@ async def test_wake_sweep_never_touches_a_human_stopped_task(tmp_path):
         assert fresh.status is TaskStatus.ESCALATED
     finally:
         await store.close()
+
+
+# --------------------------------------------------------------------------- #
+# SCRUM-68: a terminal task (done/cancelled) must never be resumed             #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_done_task_with_human_merged_event_ignores_new_pr_comment(store):
+    """Live incident 2026-07-26: task ad7f5a41 (SCRUM-63) was marked done via
+    POST /shipped (human_merged event recorded), then the supervising session
+    posted a merge-notice comment on its PR. The pr_feedback rung counted
+    that as '1 new PR comment(s)' and resumed the done task to implementing.
+    Terminal is terminal — the sweep must do nothing."""
+    t = Task.new("done-task", repo_path="/tmp/r")
+    t.context = {"pr_watch": "https://code.example.com/o/r/pull/9"}
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+    await store.set_status(t, TaskStatus.DONE, validate=False)
+    await store.save_events(t.id, [{
+        "source": "human", "kind": "human_merged",
+        "sha": "deadbeef", "note": "merged by hand", "ts": 0,
+    }])
+    before = len(await store.list_events(t.id))
+
+    async def pr_comment(url):
+        return [PrComment(author="human", body="thanks for merging!",
+                          created_at="2026-07-26T12:00:00+00:00")]
+
+    w = WakeWatcher(store, _cfg(), pr_comment=pr_comment)
+    actions = await w.tick(now=datetime.now(timezone.utc))
+    assert actions == []
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    assert not (fresh.context or {}).get("send_back_feedback")
+    assert len(await store.list_events(t.id)) == before
+
+
+@pytest.mark.asyncio
+async def test_cancelled_task_ignores_new_pr_comment(store):
+    """A cancelled task (FAILED + cancel_reason — there is no separate
+    'cancelled' status) must be treated exactly like done: untouchable."""
+    t = Task.new("cancelled-task", repo_path="/tmp/r")
+    t.context = {"pr_watch": "https://code.example.com/o/r/pull/9",
+                 "cancel_reason": "superseded by a fresh run"}
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+    await store.set_status(t, TaskStatus.FAILED, validate=False)
+    before = len(await store.list_events(t.id))
+
+    async def pr_comment(url):
+        return [PrComment(author="human", body="please revive this",
+                          created_at="2026-07-26T12:00:00+00:00")]
+
+    w = WakeWatcher(store, _cfg(), pr_comment=pr_comment)
+    actions = await w.tick(now=datetime.now(timezone.utc))
+    assert actions == []
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.FAILED
+    assert not (fresh.context or {}).get("send_back_feedback")
+    assert len(await store.list_events(t.id)) == before
+
+
+@pytest.mark.asyncio
+async def test_evaluate_rechecks_current_db_status_not_the_stale_arg(store):
+    """The exact race behind the live incident: the sweep tick fetched the
+    task while it was AWAITING_APPROVAL (the in-memory `task` object handed
+    to _evaluate), but a concurrent POST /shipped flipped it to done before
+    this rung acted on it. The guard must re-read the STORE, not trust the
+    caller's possibly-stale object."""
+    t = Task.new("stale-arg", repo_path="/tmp/r")
+    t.context = {"pr_watch": "https://code.example.com/o/r/pull/9"}
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+    # `t` (held by the test, simulating the sweep's loop variable) still says
+    # AWAITING_APPROVAL in memory — only the DB row is flipped to done, via a
+    # second Task handle, exactly as a concurrent request would.
+    t2 = await store.get_task(t.id)
+    await store.set_status(t2, TaskStatus.DONE, validate=False)
+    await store.save_events(t.id, [{
+        "source": "human", "kind": "human_merged", "sha": "abc", "ts": 0,
+    }])
+    assert t.status is TaskStatus.AWAITING_APPROVAL  # confirms the staleness
+
+    w = WakeWatcher(store, _cfg())
+    action = await w._evaluate(t, now=datetime.now(timezone.utc))
+    assert action is None
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+
+
+@pytest.mark.asyncio
+async def test_pr_feedback_rung_rechecks_terminal_after_the_network_poll(store):
+    """Pins the mid-poll race directly: the comment poll itself is where a
+    concurrent /shipped can land (it's the network await), so the recheck
+    must happen AFTER the poll returns, using the comments it already
+    fetched, not before."""
+    t = Task.new("mid-poll", repo_path="/tmp/r")
+    t.context = {"pr_watch": "https://code.example.com/o/r/pull/9"}
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+
+    async def pr_comment(url):
+        # Simulate a concurrent POST /shipped landing while this network call
+        # is in flight.
+        current = await store.get_task(t.id)
+        await store.set_status(current, TaskStatus.DONE, validate=False)
+        await store.save_events(t.id, [{
+            "source": "human", "kind": "human_merged", "sha": "abc", "ts": 0,
+        }])
+        return [PrComment(author="human", body="great, thanks!",
+                          created_at="2026-07-26T12:00:00+00:00")]
+
+    w = WakeWatcher(store, _cfg(), pr_comment=pr_comment)
+    out = await w._check_open_pr(t)
+    assert out is None
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    assert not (fresh.context or {}).get("send_back_feedback")
+
+
+@pytest.mark.asyncio
+async def test_state_rung_rechecks_terminal_after_the_pr_state_poll(store):
+    """Reviewer finding: _check_open_pr's MERGED/CLOSED branch polled
+    _pr_state and wrote DONE/ESCALATED with no post-poll terminal recheck. A
+    concurrent POST /cancel landing during that poll must not be overwritten
+    by a stale-read 'merged' verdict."""
+    t = Task.new("state-race", repo_path="/tmp/r")
+    t.context = {"pr_watch": "https://code.example.com/o/r/pull/9"}
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+
+    async def pr_state(url):
+        current = await store.get_task(t.id)
+        # merge_context, not update_task_columns — the latter deliberately
+        # never persists context (multi-writer discipline, db.py).
+        await store.merge_context(t.id, {"cancel_reason": "cancelled mid-poll"})
+        await store.set_status(current, TaskStatus.FAILED, validate=False)
+        return "MERGED"
+
+    events = []
+    w = WakeWatcher(store, _cfg(), pr_state=pr_state,
+                     on_event=lambda k, task: events.append(k))
+    out = await w._check_open_pr(t)
+    assert out is None
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.FAILED
+    assert fresh.context.get("cancel_reason") == "cancelled mid-poll"
+    assert "merged" not in events
+
+
+@pytest.mark.asyncio
+async def test_ci_gate_rung_rechecks_terminal_after_gate_step(store):
+    """Reviewer finding: _ci_gate_step awaited gate.step (triggers pipelines,
+    posts PR comments) and branched on the outcome with no post-step
+    terminal recheck. A concurrent cancel landing during that step must not
+    still act on a stale 'passed'/'triggered' outcome."""
+    t = Task.new("gate-race", repo_path="/tmp/r")
+    t.context = {"pr_watch": "https://code.example.com/o/r/pull/9"}
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+
+    from no_human.ci_gate.gate import Ci_gateOutcome
+
+    class _StubGate:
+        async def step(self, task, url):
+            current = await store.get_task(task.id)
+            await store.set_status(current, TaskStatus.DONE, validate=False)
+            return Ci_gateOutcome(action="passed", web_url="https://ci/1")
+
+    events = []
+    w = WakeWatcher(store, _cfg(), ci_gate_gate=_StubGate(),
+                     on_event=lambda k, task: events.append(k))
+    outcome, action = await w._ci_gate_step(t, "https://code.example.com/o/r/pull/9")
+    assert outcome is None
+    assert action is None
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    assert "ci_gate_pass" not in events
+
+
+# --------------------------------------------------------------------------- #
+# SCRUM-68 load-bearing guards: the WRITE HELPERS re-read the DB and refuse   #
+# terminal tasks. The rung-level rechecks are early-outs; these direct-call   #
+# tests pin the invariant every rung path funnels through.                    #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_resume_refuses_a_terminal_task(store):
+    """Removing _resume's internal guard must fail this test: a stale handle
+    (status blocked) whose DB row went done mid-race must not be resumed."""
+    t = Task.new("resume-guard", repo_path="/tmp/r")
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.BLOCKED, validate=False)
+    stale = await store.get_task(t.id)
+    await store.set_status(t, TaskStatus.DONE, validate=False)
+    events = []
+    w = WakeWatcher(store, _cfg(), on_event=lambda k, task: events.append(k))
+    out = await w._resume(stale)
+    assert out == "skipped_terminal"
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    assert "resumed" not in events
+
+
+@pytest.mark.asyncio
+async def test_escalate_revisions_refuses_a_terminal_task(store):
+    t = Task.new("rev-guard", repo_path="/tmp/r")
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+    stale = await store.get_task(t.id)
+    await store.set_status(t, TaskStatus.DONE, validate=False)
+    events = []
+    w = WakeWatcher(store, _cfg(), on_event=lambda k, task: events.append(k))
+    await w._escalate_revisions(stale, rounds=99)
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    assert "escalated_revisions" not in events
+
+
+@pytest.mark.asyncio
+async def test_escalate_timeout_refuses_a_terminal_task(store):
+    t = Task.new("timeout-guard", repo_path="/tmp/r")
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.BLOCKED, validate=False)
+    stale = await store.get_task(t.id)
+    # cancelled shape: FAILED + cancel_reason
+    await store.merge_context(t.id, {"cancel_reason": "operator superseded"})
+    await store.set_status(t, TaskStatus.FAILED, validate=False)
+    events = []
+    w = WakeWatcher(store, _cfg(), on_event=lambda k, task: events.append(k))
+    await w._escalate_timeout(stale, None)
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.FAILED
+    assert "escalated_timeout" not in events
+
+
+@pytest.mark.asyncio
+async def test_stall_watchdog_refuses_a_terminal_task(store):
+    """A task shipped between the sweep's list fetch and the stall write must
+    not be flipped to ESCALATED by the watchdog."""
+    import time as _time
+    t = Task.new("stall-guard", repo_path="/tmp/r")
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.IMPLEMENTING, validate=False)
+    await store.save_events(t.id, [{
+        "source": "agent", "kind": "tool_use", "text": "old",
+        "ts": _time.time() - 7200,
+    }])
+    stale = await store.get_task(t.id)
+    await store.set_status(t, TaskStatus.DONE, validate=False)
+    events = []
+    w = WakeWatcher(store, _cfg(stuck_active_minutes=30),
+                    on_event=lambda k, task: events.append(k))
+    out = await w._escalate_if_stalled(stale, now=datetime.now(timezone.utc))
+    assert out is False
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    assert "escalated_stalled" not in events
+
+
+@pytest.mark.asyncio
+async def test_ci_rung_rechecks_terminal_after_the_log_fetch(store):
+    """The CI rung's _ci_log fetch is a network await; a task shipped during
+    it must see NO writes (no round counter, no escalation, no resume)."""
+    t = Task.new("ci-log-race", repo_path="/tmp/r")
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+
+    async def pr_checks(url):
+        return [{"name": "unit", "status": "fail", "link": "http://ci/1"}]
+
+    async def ci_log(link):
+        await store.set_status(t, TaskStatus.DONE, validate=False)
+        return "boom log"
+
+    events = []
+    w = WakeWatcher(store, _cfg(), pr_checks=pr_checks, ci_log=ci_log,
+                    on_event=lambda k, task: events.append(k))
+    out = await w._check_pr_ci(t, "https://code.example.com/o/r/pull/7")
+    assert out is None
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    assert (fresh.context or {}).get("pr_ci_rounds") is None
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_inject_pr_feedback_refuses_a_terminal_task(store):
+    """A merge-notice comment fetched mid-race for a shipped task must not be
+    injected as feedback (the exact SCRUM-68 incident shape)."""
+    t = Task.new("feedback-race", repo_path="/tmp/r")
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+
+    async def pr_comment(ref):
+        await store.set_status(t, TaskStatus.DONE, validate=False)
+        return [{"author": "human", "body": "merged this by hand, thanks"}]
+
+    events = []
+    w = WakeWatcher(store, _cfg(), pr_comment=pr_comment,
+                    on_event=lambda k, task: events.append(k))
+    out = await w._inject_pr_feedback(t, "pr_comment_on:https://x/pull/7")
+    assert out is None
+    fresh = await store.get_task(t.id)
+    assert (fresh.context or {}).get("send_back_feedback") is None
+    assert "pr_feedback" not in events
