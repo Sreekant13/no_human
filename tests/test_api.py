@@ -1516,7 +1516,7 @@ async def test_board_websocket_pushes_a_sync_frame_on_change(store, monkeypatch)
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
-async def test_integrations_list_endpoint(client):
+async def test_integrations_list_endpoint(client, mock_ambient_probes):
     r = await client.get("/api/integrations")
     assert r.status_code == 200
     items = r.json()["integrations"]
@@ -1526,7 +1526,23 @@ async def test_integrations_list_endpoint(client):
 
 
 @pytest.mark.asyncio
-async def test_integrations_list_never_leaks_the_slack_webhook(client):
+async def test_integrations_list_includes_status_field(client, mock_ambient_probes):
+    # SCRUM-81: the payload carries a tri-state `status` per provider —
+    # 'configured' | 'ambient' | 'unconfigured' — not just the boolean
+    # `configured` flag. Force a deterministic ambient result so this doesn't
+    # depend on whether `gh`/`git` happen to be authenticated on the runner.
+    mock_ambient_probes._AMBIENT_PROBES["github"] = lambda: True
+    r = await client.get("/api/integrations")
+    assert r.status_code == 200
+    items = {i["name"]: i for i in r.json()["integrations"]}
+    assert items["github"]["status"] == "ambient"
+    assert items["gitlab"]["status"] == "unconfigured"
+    for name in ("jira", "jenkins", "circleci", "slack"):
+        assert items[name]["status"] == "unconfigured"
+
+
+@pytest.mark.asyncio
+async def test_integrations_list_never_leaks_the_slack_webhook(client, mock_ambient_probes):
     from no_human.api.app import app
     app.state.config.data["notifications"]["slack_webhook_url"] = "https://hooks.slack.com/T/SECRETPART"
     r = await client.get("/api/integrations")
@@ -1724,3 +1740,165 @@ async def test_summary_carries_configured_max_pr_conflict_rounds(client, store):
     by_id = {x["id"]: x for x in r.json()}
     # default bound (blockers.max_pr_conflict_rounds) is 3
     assert by_id[t.id]["max_pr_conflict_rounds"] == 3
+
+
+@pytest.mark.asyncio
+async def test_integrations_list_does_not_block_the_event_loop(client, mock_ambient_probes, monkeypatch):
+    """SCRUM-81 regression guard: the ambient overlay shells out to `gh`/`git`
+    (subprocess.run, up to 2s per provider). If the handler calls it INLINE
+    instead of offloading with asyncio.to_thread, the single-threaded loop
+    freezes for the probe's whole duration — SSE, the task list and every other
+    request stall with it (measured: 1.52s typical, 15.01s worst case).
+
+    This fails if `await asyncio.to_thread(...)` is ever reverted to a direct
+    call, which nothing else in the suite notices.
+    """
+    import asyncio as _asyncio
+    import time as _time
+
+    from no_human import integrations as _reg
+
+    block_s = 0.30
+    real = _reg.list_integrations_with_ambient
+
+    def slow(data):
+        _time.sleep(block_s)          # blocking, exactly like a real CLI probe
+        return real(data)
+
+    monkeypatch.setattr(_reg, "list_integrations_with_ambient", slow)
+    ticks = 0
+
+    async def _ticker():
+        nonlocal ticks
+        while True:
+            await _asyncio.sleep(0.01)
+            ticks += 1
+
+    t = _asyncio.create_task(_ticker())
+    try:
+        r = await client.get("/api/integrations")
+    finally:
+        t.cancel()
+        await _asyncio.gather(t, return_exceptions=True)
+
+    assert r.status_code == 200
+    # Offloaded: the loop keeps servicing other work (~30 ticks in 0.30s).
+    # Inline: the loop is frozen for the whole probe and ticks stays ~0.
+    assert ticks >= 10, (
+        f"event loop stalled during GET /api/integrations (ticks={ticks}); "
+        "the blocking ambient probe is not offloaded via asyncio.to_thread"
+    )
+
+
+@pytest.mark.asyncio
+async def test_integrations_save_does_not_block_the_event_loop(
+    client, mock_ambient_probes, monkeypatch, tmp_path
+):
+    """Same guarantee as the list endpoint, for the SAVE path.
+
+    save_integration_config overlays an ambient probe that shells out, and the
+    endpoint calls it from an `async def`. Without asyncio.to_thread a settings
+    save freezes the single-threaded loop for the probe's whole duration
+    (measured 1.52s). Nothing else in the suite notices that revert — this is
+    the only guard for it.
+    """
+    # This route writes ~/.no_human/.env and reads ~/.no_human/config.yaml.
+    # Redirect BOTH module-level constants off the real store, exactly like
+    # tests/test_integrations_write.py::_isolated_paths — without this the
+    # assertions below depend on the operator's own config (they pass only on a
+    # host where github happens to be unconfigured) and the route is one
+    # non-empty payload away from writing the real credential store.
+    from no_human import config as nh_config
+
+    monkeypatch.setattr(nh_config, "CONFIG_PATH", tmp_path / "config.yaml")
+    monkeypatch.setattr(nh_config, "ENV_PATH", tmp_path / ".env")
+
+    import asyncio as _asyncio
+    import time as _time
+
+    from no_human import integrations as _reg
+
+    real = _reg.save_integration_config
+
+    def slow(name, fields):
+        _time.sleep(0.30)          # blocking, exactly like a real CLI probe
+        return real(name, fields)
+
+    monkeypatch.setattr(_reg, "save_integration_config", slow)
+    ticks = 0
+
+    async def _ticker():
+        nonlocal ticks
+        while True:
+            await _asyncio.sleep(0.01)
+            ticks += 1
+
+    t = _asyncio.create_task(_ticker())
+    try:
+        # This route is CSRF-guarded (_require_local_origin, writing=True):
+        # without a local Origin it 403s BEFORE reaching the function under
+        # test, which would make this guard vacuous.
+        r = await client.put(
+            "/api/integrations/github/config",
+            json={"fields": {}},
+            headers={"Origin": "http://127.0.0.1:8420"},
+        )
+    finally:
+        t.cancel()
+        await _asyncio.gather(t, return_exceptions=True)
+
+    assert r.status_code == 200, r.text
+    assert ticks >= 10, (
+        f"event loop stalled during the settings save (ticks={ticks}); "
+        "the blocking ambient probe is not offloaded via asyncio.to_thread"
+    )
+
+
+@pytest.mark.asyncio
+async def test_integration_test_endpoint_reports_ambient_not_unconfigured(
+    client, mock_ambient_probes, monkeypatch
+):
+    """The /test endpoint must AGREE with the list endpoint, not contradict it.
+
+    _check_view previously returned a flat "not configured" for any provider
+    without stored credentials, so an ambiently-authenticated github reported
+    unconfigured on one surface while the list reported ambient on another —
+    the exact "whichever chip you trust, one surface is lying" problem this
+    ticket exists to remove.
+    """
+    monkeypatch.setitem(mock_ambient_probes._AMBIENT_PROBES, "github", lambda: True)
+    r = await client.post("/api/integrations/github/test")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "ambient", body
+    assert body["healthy"] is None, body
+    assert body["detail"] != "not configured", body
+
+
+@pytest.mark.asyncio
+async def test_saving_config_keeps_an_ambient_provider_ambient(
+    client, mock_ambient_probes, monkeypatch, tmp_path
+):
+    """Saving (or clearing) fields must not make an ambiently-authenticated
+    provider look worse than the list endpoint already reports it. Without the
+    overlay the save response says 'unconfigured', and the client merges that
+    into its copy — so the chip silently regresses on save."""
+    # This route writes ~/.no_human/.env and reads ~/.no_human/config.yaml.
+    # Redirect BOTH module-level constants off the real store, exactly like
+    # tests/test_integrations_write.py::_isolated_paths — without this the
+    # assertions below depend on the operator's own config (they pass only on a
+    # host where github happens to be unconfigured) and the route is one
+    # non-empty payload away from writing the real credential store.
+    from no_human import config as nh_config
+
+    monkeypatch.setattr(nh_config, "CONFIG_PATH", tmp_path / "config.yaml")
+    monkeypatch.setattr(nh_config, "ENV_PATH", tmp_path / ".env")
+
+    monkeypatch.setitem(mock_ambient_probes._AMBIENT_PROBES, "github", lambda: True)
+    r = await client.put(
+        "/api/integrations/github/config",
+        json={"fields": {}},
+        headers={"Origin": "http://127.0.0.1:8420"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "ambient", r.text

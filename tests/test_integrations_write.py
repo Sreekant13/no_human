@@ -257,7 +257,7 @@ async def test_put_success_returns_refreshed_status_and_fields_no_secret(client)
 
 
 @pytest.mark.asyncio
-async def test_get_integrations_includes_fields_with_set_booleans(client):
+async def test_get_integrations_includes_fields_with_set_booleans(client, mock_ambient_probes):
     r = await client.get("/api/integrations")
     assert r.status_code == 200
     body = r.json()

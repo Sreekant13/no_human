@@ -23,6 +23,29 @@ def _no_real_backoffs(monkeypatch):
     monkeypatch.setattr(_jk, "_INFRA_BACKOFF_SECONDS", 0)
 
 
+@pytest.fixture
+def mock_ambient_probes(monkeypatch):
+    """Opt-in hermetic seam for the SCRUM-81 ambient-auth probes
+    (no_human/integrations/__init__.py). NOT autouse — the tamper guard
+    correctly rejects an autouse conftest fixture that monkeypatches, since a
+    conftest that does so is the single highest-leverage way to make a whole
+    suite lie and no reviewer can easily tell hermetic mocking from faking the
+    system-under-test green. Request this BY NAME in any test that reaches
+    `list_integrations_with_ambient` / `GET /api/integrations` /
+    `POST /api/integrations/{name}/test`, so it never transitively shells out
+    to a real `gh`/`git credential fill` — proven live: an instrumented PATH
+    shim recorded 5 real `gh auth status` invocations from tests that didn't
+    mock this. Defaults both probes to False (mirrors "CLI not
+    authenticated"/never-ambient) and gives the test a fresh cache; override
+    `reg._AMBIENT_PROBES[name]` afterward (via the same `monkeypatch`
+    fixture) for the ambient=True path."""
+    from no_human import integrations as reg
+    monkeypatch.setitem(reg._AMBIENT_PROBES, "github", lambda: False)
+    monkeypatch.setitem(reg._AMBIENT_PROBES, "gitlab", lambda: False)
+    monkeypatch.setattr(reg, "_AMBIENT_CACHE", {})
+    return reg
+
+
 class _HermeticUtilityBackend:
     """Stands in for every ClaudeBackend the ORCHESTRATOR constructs itself
     (utility eval, distillation, supervisor LLM, planners). Those calls are

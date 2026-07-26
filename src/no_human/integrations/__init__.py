@@ -16,10 +16,13 @@ echoed back.
 
 from __future__ import annotations
 
+import asyncio
 import os
+import subprocess
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 KIND_BY_NAME = {
     "jira": "issue_tracker",
@@ -41,6 +44,12 @@ class IntegrationStatus:
     configured: bool
     healthy: bool | None  # None = never checked
     detail: str          # last check message, NEVER a secret
+    # 'configured' (stored token/settings present) | 'ambient' (no stored
+    # config, but the CLI the operator already uses — gh/git — is itself
+    # authenticated, e.g. 36 PRs shipped via ambient `gh` auth with no
+    # integration ever configured) | 'unconfigured'. Only github/gitlab are
+    # ever 'ambient' — see `_AMBIENT_PROBES` below.
+    status: str = "unconfigured"
 
 
 @dataclass
@@ -115,18 +124,24 @@ def _sect(config: dict, key: str) -> dict:
 # Pure status derivation (one function per integration)                        #
 # --------------------------------------------------------------------------- #
 
+def _status_str(configured: bool) -> str:
+    return "configured" if configured else "unconfigured"
+
+
 def _jira_status(config: dict) -> IntegrationStatus:
     j = _sect(config, "integrations").get("jira") or {}
     configured = bool(j.get("site") and j.get("project_key") and j.get("email"))
     detail = f"{j['site']} · {j['project_key']}" if configured else "not configured"
-    return IntegrationStatus("jira", "issue_tracker", configured, None, detail)
+    return IntegrationStatus("jira", "issue_tracker", configured, None, detail,
+                              status=_status_str(configured))
 
 
 def _circleci_status(config: dict) -> IntegrationStatus:
     c = _sect(config, "integrations").get("circleci") or {}
     configured = bool(c.get("org_slug") and c.get("project"))
     detail = f"{c['org_slug']} · {c['project']}" if configured else "not configured"
-    return IntegrationStatus("circleci", "ci", configured, None, detail)
+    return IntegrationStatus("circleci", "ci", configured, None, detail,
+                              status=_status_str(configured))
 
 
 def _ci_view(config: dict, name: str, backend: str, kind: str,
@@ -135,7 +150,8 @@ def _ci_view(config: dict, name: str, backend: str, kind: str,
     ci = _sect(config, "ci")
     configured = bool(ci.get("enabled") and ci.get("backend") == backend and ci.get(id_field))
     detail = f"{label} · {ci[id_field]}" if configured else "not configured"
-    return IntegrationStatus(name, kind, configured, None, detail)
+    return IntegrationStatus(name, kind, configured, None, detail,
+                              status=_status_str(configured))
 
 
 def _github_status(config: dict) -> IntegrationStatus:
@@ -154,7 +170,8 @@ def _slack_status(config: dict) -> IntegrationStatus:
     # The webhook is a secret — report only that one is set, never the URL.
     configured = bool(_sect(config, "notifications").get("slack_webhook_url"))
     detail = "webhook configured" if configured else "not configured"
-    return IntegrationStatus("slack", "notifications", configured, None, detail)
+    return IntegrationStatus("slack", "notifications", configured, None, detail,
+                              status=_status_str(configured))
 
 
 _STATUS = {
@@ -166,6 +183,113 @@ _STATUS = {
 def list_integrations(config: dict) -> list[IntegrationStatus]:
     """Every integration's configured/kind status. Pure; ``healthy`` is None."""
     return [_STATUS[name](config) for name in _ORDER]
+
+
+# --------------------------------------------------------------------------- #
+# Ambient CLI-auth detection (SCRUM-81).                                       #
+#                                                                               #
+# Some providers work with no integration ever configured here because the    #
+# operator's own CLI is already authenticated (e.g. `gh`) — this install has   #
+# shipped merged GitHub PRs entirely via ambient `gh`/git auth while the panel #
+# still said "Unconfigured". These probes are read-only: they never write a    #
+# credential anywhere, and never surface a token/secret value.                 #
+# --------------------------------------------------------------------------- #
+
+def _run_probe(
+    cmd: list[str], *, timeout: float = 2.0, input_text: str | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, input=input_text, env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _probe_github_ambient() -> bool:
+    """`gh auth status` exits 0 iff at least one host is logged in."""
+    proc = _run_probe(["gh", "auth", "status"])
+    return proc is not None and proc.returncode == 0
+
+
+def _probe_gitlab_ambient() -> bool:
+    """Ask git's OWN credential subsystem whether it can produce a credential
+    for gitlab.com, without prompting and without a network round-trip:
+    `git credential fill` consults whatever helper is configured (netrc,
+    credential store, manager, ...) and returns immediately if none has
+    anything — GIT_TERMINAL_PROMPT=0 + a no-op GIT_ASKPASS guarantee it never
+    blocks waiting on input. Only WHETHER a non-empty `password=` line came
+    back is inspected — never its value — so this can never leak a secret.
+    A username alone (e.g. a bare `credential.gitlab.com.username` config
+    entry with no stored password) is a preference, not proof of an
+    authenticated session, and must not read as ambient."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/usr/bin/true"}
+    proc = _run_probe(
+        ["git", "credential", "fill"],
+        input_text="protocol=https\nhost=gitlab.com\n\n", env=env,
+    )
+    if proc is None or proc.returncode != 0:
+        return False
+    return any(
+        line.startswith("password=") and line != "password="
+        for line in proc.stdout.splitlines()
+    )
+
+
+# Only github/gitlab have an ambient path — jira/circleci/jenkins/slack have no
+# equivalent "already authenticated CLI" concept.
+_AMBIENT_PROBES: dict[str, Callable[[], bool]] = {
+    "github": _probe_github_ambient,
+    "gitlab": _probe_gitlab_ambient,
+}
+
+_AMBIENT_TTL_SECONDS = 60.0
+
+# Process-lifetime cache, keyed by provider name → (checked_at, result). This
+# app has no multi-user/session concept (single-operator local tool — see
+# `_require_local_origin`), so the running server process IS the "session";
+# the cache never stores a credential, only a bool + timestamp, and evaporates
+# on restart. Tests inject their own `cache=` dict to isolate state.
+_AMBIENT_CACHE: dict[str, tuple[float, bool]] = {}
+
+
+def ambient_available(
+    name: str, *, cache: dict[str, tuple[float, bool]] | None = None, now: float | None = None,
+) -> bool:
+    """Is ``name`` reachable via ambient CLI auth right now? Cached for
+    ``_AMBIENT_TTL_SECONDS`` so a burst of requests within the window doesn't
+    repeatedly shell out to `gh`/`git`."""
+    probe = _AMBIENT_PROBES.get(name)
+    if probe is None:
+        return False
+    if cache is None:
+        cache = _AMBIENT_CACHE
+    ts = time.monotonic() if now is None else now
+    cached = cache.get(name)
+    if cached is not None and (ts - cached[0]) < _AMBIENT_TTL_SECONDS:
+        return cached[1]
+    result = probe()
+    cache[name] = (ts, result)
+    return result
+
+
+_AMBIENT_DETAIL = "available via ambient CLI auth"
+
+
+def list_integrations_with_ambient(
+    config: dict, *, cache: dict[str, tuple[float, bool]] | None = None, now: float | None = None,
+) -> list[IntegrationStatus]:
+    """``list_integrations`` plus the ambient-auth overlay: an unconfigured
+    github/gitlab whose CLI is already authenticated is reported as
+    ``status="ambient"`` instead of ``"unconfigured"`` (``configured`` stays
+    False — no stored settings exist)."""
+    out = []
+    for s in list_integrations(config):
+        if not s.configured and ambient_available(s.name, cache=cache, now=now):
+            s = replace(s, status="ambient", detail=_AMBIENT_DETAIL)
+        out.append(s)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -303,7 +427,13 @@ def save_integration_config(name: str, fields: dict[str, str]) -> IntegrationSta
         _write_config_values(_config_mod.CONFIG_PATH, config_updates)
 
     refreshed = _config_mod.load_config(_config_mod.CONFIG_PATH)
-    return _STATUS[name](refreshed.data)
+    status = _STATUS[name](refreshed.data)
+    # Saving (or clearing) a field must not make an ambiently-authenticated
+    # github/gitlab look worse than the list endpoint already reports it —
+    # overlay the same ambient check here (see list_integrations_with_ambient).
+    if not status.configured and ambient_available(name):
+        status = replace(status, status="ambient", detail=_AMBIENT_DETAIL)
+    return status
 
 
 # --------------------------------------------------------------------------- #
@@ -366,12 +496,21 @@ async def _check_circleci(config: dict) -> IntegrationStatus:
     return replace(base, healthy=False, detail=f"HTTP {r.status_code}")
 
 
-async def _check_view(status_fn, config: dict) -> IntegrationStatus:
+async def _check_view(status_fn, name: str, config: dict) -> IntegrationStatus:
     """github/gitlab/jenkins/slack are status views — 'healthy' mirrors
     'configured'; the live connection is exercised by the CI backend / webhook
-    at run time, so a separate ping here would be a second, weaker truth."""
+    at run time, so a separate ping here would be a second, weaker truth. An
+    unconfigured github/gitlab that is nonetheless ambiently authenticated
+    (SCRUM-81) reports ``status="ambient"``/``healthy=None`` instead of a flat
+    'not configured' — this endpoint must agree with `list_integrations_with_
+    ambient`, not contradict it."""
     base = status_fn(config)
     if not base.configured:
+        # ambient_available() can shell out (subprocess.run) — never block
+        # this coroutine's event loop; offload it exactly like every other
+        # blocking call in this codebase.
+        if await asyncio.to_thread(ambient_available, name):
+            return replace(base, healthy=None, detail=_AMBIENT_DETAIL, status="ambient")
         return replace(base, healthy=False, detail="not configured")
     return replace(base, healthy=True,
                    detail=f"{base.detail} — verified by the backend at run time")
@@ -380,10 +519,10 @@ async def _check_view(status_fn, config: dict) -> IntegrationStatus:
 _CHECKERS = {
     "jira": _check_jira,
     "circleci": _check_circleci,
-    "github": lambda c: _check_view(_github_status, c),
-    "gitlab": lambda c: _check_view(_gitlab_status, c),
-    "jenkins": lambda c: _check_view(_jenkins_status, c),
-    "slack": lambda c: _check_view(_slack_status, c),
+    "github": lambda c: _check_view(_github_status, "github", c),
+    "gitlab": lambda c: _check_view(_gitlab_status, "gitlab", c),
+    "jenkins": lambda c: _check_view(_jenkins_status, "jenkins", c),
+    "slack": lambda c: _check_view(_slack_status, "slack", c),
 }
 
 
@@ -399,4 +538,5 @@ async def test_integration(name: str, config: dict) -> IntegrationStatus:
 __all__ = [
     "IntegrationStatus", "KIND_BY_NAME", "list_integrations", "test_integration",
     "FieldSpec", "FIELD_SPECS", "integration_fields", "save_integration_config",
+    "ambient_available", "list_integrations_with_ambient",
 ]
