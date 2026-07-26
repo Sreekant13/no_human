@@ -25,12 +25,17 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..profile import ProjectProfile
 
 MANIFEST = ".no_human/repro_tests.json"
 _RUN_TIMEOUT = 600
@@ -135,7 +140,108 @@ def _run_pytest(
     return ran, proc.returncode == 0, out
 
 
-def run_repro_gate(repo_path: Path, base_ref: str) -> ReproResult:
+def _is_python_profile(profile: "ProjectProfile | None") -> bool:
+    """True when the repro run should go through pytest — the default when no
+    profile is given (unchanged pre-SCRUM-65 behaviour), or when the profile's
+    declared ecosystem is unset or python-flavoured ("python-pytest" etc.).
+    Any other declared ecosystem ("node", "maven", "go", ...) routes through
+    the profile's own ``test_cmd`` instead — pytest cannot run JS/Go/Java
+    tests, so keeping this pytest-only silently no-ops the repro guarantee for
+    every non-Python repo (SCRUM-65)."""
+    if profile is None:
+        return True
+    eco = (profile.ecosystem or "").strip().lower()
+    return not eco or eco.startswith("python")
+
+
+def _parse_test_cmd(test_cmd: str | None) -> list[str] | None:
+    """The profile's ``test_cmd`` split into argv, or None if missing, blank,
+    unparseable (e.g. mismatched quotes), or containing an un-interpolated
+    template placeholder — the caller fails closed to 'error' rather than
+    guess an invocation or forward a literal ``{token}`` to a foreign runner
+    (SCRUM-65 review item 4)."""
+    if not test_cmd or not test_cmd.strip():
+        return None
+    try:
+        argv = shlex.split(test_cmd)
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    if any("{" in tok or "}" in tok for tok in argv):
+        return None
+    return argv
+
+
+def _test_cmd_targets(tests: list[str]) -> list[str]:
+    """Test-target arguments for a non-Python ``test_cmd``.
+
+    pytest node ids (``path::case``) mean nothing to jest/mocha/go test — a
+    raw ``::`` would reach a foreign runner verbatim (SCRUM-65 review item 4).
+    Strip to the deduplicated file part, same convention as ``_test_files``."""
+    return _test_files(tests)
+
+
+def _runner_sanity_check(argv: list[str], cwd: Path, env: dict) -> tuple[bool, str]:
+    """Prove ``argv`` itself runs cleanly in ``cwd`` with no test-file
+    arguments, before trusting any exit code from a test-targeted invocation
+    there as a genuine fails-before verdict.
+
+    A ``git worktree add`` checkout of ``base_ref`` contains only tracked
+    files — installed deps (node_modules, a vendored module cache, ...) are
+    not — so an otherwise-working test_cmd can exit non-zero in that isolated
+    worktree for an ENVIRONMENT reason that has nothing to do with the bug
+    under test (SCRUM-65 review: a JS repro's fails-before step exited
+    127/1 from a missing runner/dependency, and any non-zero exit was being
+    read as "bug reproduced" — a vacuous, always-true repro). We never
+    provision deps here (no npm install — slow and out of scope); an honest
+    refusal is the correct outcome."""
+    try:
+        proc = subprocess.run(
+            argv, cwd=cwd, env=env, capture_output=True, text=True,
+            timeout=_RUN_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {_RUN_TIMEOUT}s"
+    except OSError as exc:
+        return False, f"could not run test_cmd: {exc}"
+    out = (proc.stdout + proc.stderr)[-2000:]
+    return proc.returncode == 0, out
+
+
+def _run_test_cmd(
+    argv: list[str], tests: list[str], cwd: Path, env: dict,
+) -> tuple[bool, bool, str]:
+    """(ran, all_passed, tail_of_output) for a non-Python ``profile.test_cmd``.
+
+    Mirrors ``_run_pytest``'s contract but stays language-agnostic: the
+    touched test files are appended as positional arguments (works across
+    jest, mocha, go test, etc. without special syntax), and ``ran`` is False
+    when the command itself could not be launched, OR when it exits 126/127
+    ("command not found" / "not executable" — the shell's own signal that
+    nothing ran, not a test verdict). pytest's exit-code-5 / 'no tests ran'
+    conventions don't generalize across test runners, so we don't try to
+    guess collection state generically beyond that."""
+    try:
+        proc = subprocess.run(
+            [*argv, *tests], cwd=cwd, env=env, capture_output=True, text=True,
+            timeout=_RUN_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return False, False, f"timed out after {_RUN_TIMEOUT}s"
+    except OSError as exc:
+        return False, False, f"could not run test_cmd: {exc}"
+    out = (proc.stdout + proc.stderr)[-2000:]
+    if proc.returncode in (126, 127):
+        return False, False, (
+            f"test runner exited {proc.returncode} (not found / not "
+            f"executable — environment failure, not a test verdict):\n{out}")
+    return True, proc.returncode == 0, out
+
+
+def run_repro_gate(
+    repo_path: Path, base_ref: str, profile: "ProjectProfile | None" = None,
+) -> ReproResult:
     """Prove fails-before / passes-after for the declared repro tests.
 
     ``base_ref`` is the code before this task's changes (the merge base of the
@@ -143,20 +249,46 @@ def run_repro_gate(repo_path: Path, base_ref: str) -> ReproResult:
     files into a temporary worktree at ``base_ref`` and runs them with the
     primary repo's venv on PYTHONPATH-priority, so worktree code shadows any
     editable install of the primary checkout.
+
+    ``profile`` is the repo's confirmed :class:`ProjectProfile` (or None). A
+    Python profile (or no profile — the historical default) runs the repro
+    tests with pytest, unchanged. Any other declared ecosystem routes the same
+    fails-before/passes-after proof through the profile's own ``test_cmd``
+    instead (SCRUM-65), so the guarantee is not pytest-only.
     """
     tests = read_manifest(repo_path)
     if not tests:
         return ReproResult("waived", reasons=[f"no {MANIFEST} manifest"])
 
-    # In a frozen build sys.executable is the nh binary, not a Python
-    # interpreter — resolve a real one, or fail closed to "error" (a false
-    # verdict is worse than an honest "could not verify").
-    python = _pytest_python(repo_path)
-    if python is None:
-        return ReproResult("error", tests=tests, reasons=[
-            "no Python interpreter available to run the repro tests "
-            "(frozen build with no target-repo venv and no python on PATH) "
-            "— the gate fails closed rather than guess a verdict"])
+    python: str | None = None
+    test_argv: list[str] | None = None
+    if _is_python_profile(profile):
+        # In a frozen build sys.executable is the nh binary, not a Python
+        # interpreter — resolve a real one, or fail closed to "error" (a
+        # false verdict is worse than an honest "could not verify").
+        python = _pytest_python(repo_path)
+        if python is None:
+            return ReproResult("error", tests=tests, reasons=[
+                "no Python interpreter available to run the repro tests "
+                "(frozen build with no target-repo venv and no python on "
+                "PATH) — the gate fails closed rather than guess a verdict"])
+    else:
+        test_argv = _parse_test_cmd(profile.test_cmd if profile else None)
+        if test_argv is None:
+            return ReproResult("error", tests=tests, reasons=[
+                "no usable profile.test_cmd to run the repro tests for "
+                f"ecosystem {(profile.ecosystem if profile else '')!r} "
+                "(missing or unparseable) — the gate fails closed rather "
+                "than guess a verdict"])
+
+    def _run(tests_: list[str], cwd: Path, env: dict) -> tuple[bool, bool, str]:
+        if python is not None:
+            return _run_pytest(tests_, cwd, env, python)
+        return _run_test_cmd(test_argv, tests_, cwd, env)
+
+    # pytest keeps its node ids (``path::case``); a foreign runner only gets
+    # file paths — a raw "::" would reach jest/mocha/go test verbatim.
+    target_files = tests if python is not None else _test_cmd_targets(tests)
 
     from .runner import _env_for  # venv-aware env (the c0df0da lesson)
     env = _env_for(repo_path)
@@ -168,9 +300,12 @@ def run_repro_gate(repo_path: Path, base_ref: str) -> ReproResult:
         return ReproResult("fail", tests=tests, reasons=[
             f"declared test file(s) missing from the attempt tree: {missing} "
             "— a listed repro test may not be deleted"])
-    after_env = {**env, "PYTHONPATH": os.pathsep.join(
-        [str(repo_path), str(repo_path / "src"), env.get("PYTHONPATH", "")])}
-    ran_after, ok_after, out_after = _run_pytest(tests, repo_path, after_env, python)
+    if python is not None:
+        after_env = {**env, "PYTHONPATH": os.pathsep.join(
+            [str(repo_path), str(repo_path / "src"), env.get("PYTHONPATH", "")])}
+    else:
+        after_env = env
+    ran_after, ok_after, out_after = _run(target_files, repo_path, after_env)
     if not ran_after:
         # Could not RUN the tests (env/interpreter/collection) — "can't verify"
         # is not "doesn't pass". Advisory error, never blocks the task.
@@ -193,13 +328,29 @@ def run_repro_gate(repo_path: Path, base_ref: str) -> ReproResult:
             return ReproResult("error", tests=tests, reasons=[
                 f"could not build the base worktree at {base_ref}: "
                 f"{added.stderr.strip()[:300]}"])
+        if test_argv is not None:
+            # The worktree has only tracked files — no installed deps. Prove
+            # the runner itself works there BEFORE trusting any exit code
+            # from the real (test-targeted) invocation as a fails-before
+            # verdict; a broken/dep-less runner must never read as "the bug
+            # reproduced" (SCRUM-65 review).
+            sane, sane_out = _runner_sanity_check(test_argv, worktree, env)
+            if not sane:
+                return ReproResult("error", tests=tests, reasons=[
+                    "repro runner unavailable in the isolated base worktree "
+                    "(missing dependencies? a fresh git worktree has no "
+                    f"installed deps) — never provisioned, fails closed:\n"
+                    f"{sane_out}"])
         for f in _test_files(tests):
             src, dst = repo_path / f, worktree / f
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
-        before_env = {**env, "PYTHONPATH": os.pathsep.join(
-            [str(worktree), str(worktree / "src"), env.get("PYTHONPATH", "")])}
-        ran_before, ok_before, out_before = _run_pytest(tests, worktree, before_env, python)
+        if python is not None:
+            before_env = {**env, "PYTHONPATH": os.pathsep.join(
+                [str(worktree), str(worktree / "src"), env.get("PYTHONPATH", "")])}
+        else:
+            before_env = env
+        ran_before, ok_before, out_before = _run(target_files, worktree, before_env)
         if not ran_before:
             return ReproResult("error", tests=tests, reasons=[
                 f"base-tree repro run could not execute:\n{out_before}"])
