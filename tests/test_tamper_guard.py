@@ -28,6 +28,57 @@ def test_is_test_file():
     assert not tamper_guard.is_test_file("src/foo.py")
 
 
+def test_is_test_file_table():
+    """Table-driven: guarded vs unguarded paths, incl. .mjs/.cjs test files."""
+    guarded = [
+        "web/src/boardLanes.test.mjs",
+        "desktop/main.test.mjs",
+        "foo.spec.mjs",
+        "foo.test.cjs",
+        "foo.spec.cjs",
+        "tests/test_x.py",
+        "src/foo_test.py",
+        "conftest.py",
+        "src/pkg/conftest.py",
+        "web/Button.test.js",
+        "web/Button.test.ts",
+        "web/Button.test.jsx",
+        "web/Button.spec.tsx",
+        "com/acme/FooTest.java",
+        "com/acme/FooIT.java",
+        "pkg/__tests__/x.js",
+    ]
+    unguarded = [
+        "web/src/App.jsx",
+        "web/src/overviewStrip.js",
+        "web/e2e/board.mjs",
+        "src/foo.py",
+    ]
+    for path in guarded:
+        assert tamper_guard.is_test_file(path), f"expected guarded: {path}"
+    for path in unguarded:
+        assert not tamper_guard.is_test_file(path), f"expected unguarded: {path}"
+
+
+def test_detects_mjs_test_gutting():
+    """Gutting assertions out of a .test.mjs file must be caught (was a bug)."""
+    before = {
+        "web/src/boardLanes.test.mjs":
+            "it('lanes render', () => {\n"
+            "    expect(lanes.length).toBe(4);\n"
+            "    expect(lanes[0].name).toBe('backlog');\n"
+            "});\n"
+    }
+    after = {
+        "web/src/boardLanes.test.mjs":
+            "it('lanes render', () => {\n"
+            "});\n"
+    }
+    report = tamper_guard.check(before, after)
+    assert report.tampered is True
+    assert any("assertions" in r for r in report.reasons)
+
+
 def test_clean_when_assertions_added():
     before = {"tests/test_x.py": PY_TESTS}
     after = {"tests/test_x.py": PY_TESTS + "\n    assert extra()\n"}
