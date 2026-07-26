@@ -13,6 +13,7 @@ import { needsPrUrl } from "./composerKinds.js";
 import { hasPrRef } from "./prRefs.js";
 import { shouldTriggerNewTask } from "./keyboardShortcut.js";
 import { isNeedsYou, isRealFailure, deriveCounts } from "./boardLanes.js";
+import { overviewState } from "./overviewStrip.js";
 import { ledgerSummary, LEDGER_WINDOW_MS } from "./nightLedger.js";
 import { fmtCost, taskBurn } from "./cost.js";
 import { deriveSpendDisplay, perShippedCost } from "./ledgerSpend.js";
@@ -178,50 +179,31 @@ function NightLedger({ tasks, authMode }) {
 }
 
 function OverviewStrip({ tasks }) {
-  const needsYou   = tasks.filter(isNeedsYou);
-  const failed     = tasks.filter(isRealFailure).length;
-  // Cancels also end in `failed` status and sit in the Failed lane, so the lane's badge
-  // counts them. Naming them here keeps the strip and the lane from contradicting each
-  // other — "1 failed" over a lane badged 11 is worse than either number alone.
-  const cancelled  = tasks.filter(t => t.status === "failed" && t.cancelled).length;
-  // SCRUM-15: one derivation shared with the lane headers and sidebar so the
-  // strip cannot drift from what the board itself shows (running vs queued).
-  const counts = deriveCounts(tasks);
-
-  const oldestSec = needsYou.length > 0
-    ? Math.max(...needsYou.map(t => (Date.now() - new Date(t.updated_at || t.created_at).getTime()) / 1000))
-    : null;
-
-  const allClear = needsYou.length === 0 && failed === 0;
+  // SCRUM-84: this strip is live-state only (overviewStrip.js) — all-time
+  // outcome tallies (failed/cancelled) are dropped here; they already live in
+  // the Failed nav badge and Stats page, and mixing an unlabeled all-time
+  // count in with now-metrics put a second, differently-scoped "failed"
+  // number on screen next to the sidebar's 24h ledger figure.
+  const s = overviewState(tasks);
 
   return (
     <div className="nh-overview">
-      {allClear
-        ? <span className="ov-clear">all clear</span>
-        : <>
-            <span className={needsYou.length > 0 ? "ov-awaiting" : ""}>{needsYou.length} need you</span>
-            {failed > 0 && <>
-              <span className="ov-sep">·</span>
-              <span className="ov-escalated">{failed} failed</span>
-            </>}
-            {cancelled > 0 && <>
-              <span className="ov-sep">·</span>
-              <span>{cancelled} cancelled</span>
-            </>}
-          </>
+      {s.allClear
+        ? <span className="ov-clear">nothing needs you</span>
+        : <span className="ov-awaiting">{s.needsYouCount} need you</span>
       }
-      {oldestSec !== null && (
+      {s.oldestWaitingSec !== null && (
         <>
           <span className="ov-sep">·</span>
-          <span className={`ov-oldest${oldestSec > 24 * 3600 ? " ov-oldest-stale" : ""}`}>
-            oldest {fmtAge(oldestSec)}
+          <span className={`ov-oldest${s.oldestWaitingSec > 24 * 3600 ? " ov-oldest-stale" : ""}`}>
+            oldest waiting {fmtAge(s.oldestWaitingSec)}
           </span>
         </>
       )}
       {/* "0 working" is noise on a phone — the Working lane already says so. The gate AGE is not. */}
       <span className="ov-sep ov-hide-narrow">·</span>
       <span className="ov-hide-narrow">
-        {counts.running} running{counts.queued > 0 ? ` · ${counts.queued} queued` : ""}
+        {s.running} running{s.queued > 0 ? ` · ${s.queued} queued` : ""}
       </span>
     </div>
   );

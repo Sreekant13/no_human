@@ -104,9 +104,12 @@ for (const theme of ["dark", "light"]) {
   check(`[${theme}] M5 no card text overflows its box horizontally`, clipped.length === 0,
     clipped.length ? JSON.stringify(clipped.slice(0, 2)) : "");
 
-  // M2 — the overview strip must not call a cancelled task a failure.
-  const strip = await page.locator(".nh-overview").innerText();
-  check(`[${theme}] M2 cancelled tasks are not counted as failures`, /\b1 failed\b/.test(strip) && /11 cancelled/.test(strip), strip.replace(/\n/g, " "));
+  // M2 — a cancelled task must not be counted as a failure. SCRUM-84 moved this
+  // all-time failed/cancelled tally off the always-on overview strip; it now
+  // lives only in the Failed nav row's tooltip (App.jsx `title={...}`).
+  const failedTitle = await page.locator("button.nh-navrow", { hasText: "Failed" }).getAttribute("title");
+  check(`[${theme}] M2 cancelled tasks are not counted as failures`,
+    /\b1 failed\b/.test(failedTitle) && /11 cancelled/.test(failedTitle), failedTitle);
 
   // (M2b and the failed-lane pill checks moved to drive-5d.mjs — 5D took Failed off the board.)
 
