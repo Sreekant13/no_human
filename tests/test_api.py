@@ -628,11 +628,11 @@ def test_format_events_carries_the_per_role_model_map():
 
     out = _format_events([
         {"ts": 1, "source": "orchestrator", "kind": "models",
-         "text": "coder=claude-sonnet-5 · reviewer=claude-opus-4-8",
-         "models": {"coder": "claude-sonnet-5", "reviewer": "claude-opus-4-8"}},
+         "text": "coder=claude-sonnet-5 · reviewer=claude-opus-5",
+         "models": {"coder": "claude-sonnet-5", "reviewer": "claude-opus-5"}},
         {"ts": 2, "source": "orchestrator", "kind": "state", "text": "implementing"},
     ])
-    assert out[0]["models"] == {"coder": "claude-sonnet-5", "reviewer": "claude-opus-4-8"}
+    assert out[0]["models"] == {"coder": "claude-sonnet-5", "reviewer": "claude-opus-5"}
     assert "models" not in out[1], "only the models event carries the map"
 
 

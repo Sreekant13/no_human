@@ -13,5 +13,5 @@ llm:
   auth_mode: subscription
   auth_profile: default
   primary_model: claude-sonnet-5
-  review_model: claude-opus-4-8
-  planner_model: claude-opus-4-8
+  review_model: claude-opus-5
+  planner_model: claude-opus-5

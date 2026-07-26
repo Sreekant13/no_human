@@ -1,7 +1,7 @@
 """Independent adversarial reviewer (PLAN.md Part 4.4, §3.3).
 
 A fresh-context Agent SDK session told to *find faults and refute "done."*
-Runs as ``claude-opus-4-8`` (different model from the implementer) with a
+Runs as ``claude-opus-5`` (different model from the implementer) with a
 read-only guard so it can inspect the repo but cannot modify it.
 
 Contract:
@@ -914,7 +914,7 @@ class AdversarialReviewer:
     def __init__(
         self,
         *,
-        model: str = "claude-opus-4-8",
+        model: str = "claude-opus-5",
         backend: Any | None = None,
         on_event: Callable | None = None,
     ):

@@ -40,7 +40,7 @@ async def test_max_turns_exception_becomes_error_result(tmp_path, monkeypatch):
         claude_backend, "query",
         _fake_query("Claude Code returned an error result: Reached maximum number of turns (40)"),
     )
-    backend = ClaudeBackend(model="claude-opus-4-8")
+    backend = ClaudeBackend(model="claude-opus-5")
 
     result = await backend.run("do it", cwd=tmp_path, max_turns=40)
 
@@ -54,7 +54,7 @@ async def test_other_sdk_error_becomes_error_result(tmp_path, monkeypatch):
     monkeypatch.setattr(
         claude_backend, "query", _fake_query("transport blew up"),
     )
-    backend = ClaudeBackend(model="claude-opus-4-8")
+    backend = ClaudeBackend(model="claude-opus-5")
 
     result = await backend.run("do it", cwd=tmp_path, max_turns=40)
 
@@ -77,7 +77,7 @@ async def test_result_message_then_raise_is_corrected_to_error(tmp_path, monkeyp
         claude_backend, "query",
         _result_then_raise(rm, "Claude Code returned an error result: Reached maximum number of turns (12)"),
     )
-    backend = ClaudeBackend(model="claude-opus-4-8")
+    backend = ClaudeBackend(model="claude-opus-5")
 
     result = await backend.run("do it", cwd=tmp_path, max_turns=12)
 
@@ -92,7 +92,7 @@ async def test_stream_yields_a_result_event_on_error(tmp_path, monkeypatch):
     monkeypatch.setattr(
         claude_backend, "query", _fake_query("Reached maximum number of turns (40)"),
     )
-    backend = ClaudeBackend(model="claude-opus-4-8")
+    backend = ClaudeBackend(model="claude-opus-5")
 
     events = [e async for e in backend.stream("go", cwd=tmp_path, max_turns=40)]
 
@@ -109,7 +109,7 @@ async def test_genuine_error_preserves_traceback_for_diagnosis(tmp_path, monkeyp
     monkeypatch.setattr(
         claude_backend, "query", _fake_query("'bool' object is not subscriptable"),
     )
-    result = await ClaudeBackend(model="claude-opus-4-8").run(
+    result = await ClaudeBackend(model="claude-opus-5").run(
         "do it", cwd=tmp_path, max_turns=40)
     assert result.is_error is True
     assert "'bool' object is not subscriptable" in result.final_text
@@ -122,7 +122,7 @@ async def test_max_turns_stays_clean_without_a_traceback(tmp_path, monkeypatch):
         claude_backend, "query",
         _fake_query("Claude Code returned an error result: Reached maximum number of turns (40)"),
     )
-    result = await ClaudeBackend(model="claude-opus-4-8").run(
+    result = await ClaudeBackend(model="claude-opus-5").run(
         "x", cwd=tmp_path, max_turns=40)
     assert "Traceback" not in result.final_text
 
@@ -131,7 +131,7 @@ def test_thinking_is_a_dict_not_a_bool(tmp_path):
     """The SDK's `thinking` is a ThinkingConfig dict; passing True crashed every
     complex (thinking-enabled) task with 'bool' object is not subscriptable
     (task 6cfdb936)."""
-    b = ClaudeBackend(model="claude-opus-4-8")
+    b = ClaudeBackend(model="claude-opus-5")
     opts = b._options(tmp_path, 40, thinking=True)
     assert isinstance(opts.thinking, dict) and opts.thinking["type"] == "adaptive"
 
@@ -147,7 +147,7 @@ def test_precompact_hook_registered_when_on_compact_set(tmp_path):
     the SDK options must carry a PreCompact hook — the only way to KNOW whether
     the CLI's auto-compaction ever fires for coder sessions (it never has been
     observed; sessions end ~160k tokens, under the ~92% threshold)."""
-    b = ClaudeBackend(model="claude-opus-4-8")
+    b = ClaudeBackend(model="claude-opus-5")
     opts = b._options(tmp_path, 40, on_compact=lambda trigger: None)
     assert "PreCompact" in opts.hooks
 
@@ -170,7 +170,7 @@ def test_coder_sessions_are_project_scoped(tmp_path):
     (superpowers et al.), personal settings, and EVERY user skill into every
     coder session's context. Relevant user skills are delivered by copying
     them into the working tree instead (see _materialize_skills)."""
-    b = ClaudeBackend(model="claude-opus-4-8")
+    b = ClaudeBackend(model="claude-opus-5")
     opts = b._options(tmp_path, 40, skills=["a", "b"])
     assert opts.setting_sources == ["project"]
 
@@ -181,7 +181,7 @@ def test_coder_sessions_are_project_scoped(tmp_path):
     assert opts_bare.setting_sources == ["project"]
 
     # Read-only sessions (reviewer/planner/supervisor) stay hermetic.
-    r = ClaudeBackend(model="claude-opus-4-8", readonly=True)
+    r = ClaudeBackend(model="claude-opus-5", readonly=True)
     opts_ro = r._options(tmp_path, 40)
     assert opts_ro.setting_sources is None
 
@@ -207,7 +207,7 @@ async def test_the_clis_own_reason_survives_the_sdk_wrapper(tmp_path, monkeypatc
         claude_backend, "query",
         _result_then_raise(rm, "Claude Code returned an error result: success"),
     )
-    backend = ClaudeBackend(model="claude-opus-4-8")
+    backend = ClaudeBackend(model="claude-opus-5")
 
     result = await backend.run("do it", cwd=tmp_path, max_turns=12)
 
@@ -241,7 +241,7 @@ async def test_a_SUCCESSFUL_run_does_not_donate_its_prose_to_a_later_error(
     )
     monkeypatch.setattr(claude_backend, "query",
                         _result_then_raise(rm, "Stream closed unexpectedly"))
-    backend = ClaudeBackend(model="claude-opus-4-8")
+    backend = ClaudeBackend(model="claude-opus-5")
 
     result = await backend.run("do it", cwd=tmp_path, max_turns=12)
 
@@ -286,7 +286,7 @@ async def test_the_api_error_status_reaches_the_classifier(tmp_path, monkeypatch
     monkeypatch.setattr(
         claude_backend, "query",
         _result_then_raise(rm, "Claude Code returned an error result: success"))
-    backend = ClaudeBackend(model="claude-opus-4-8")
+    backend = ClaudeBackend(model="claude-opus-5")
 
     result = await backend.run("do it", cwd=tmp_path, max_turns=12)
 
@@ -309,7 +309,7 @@ async def test_the_prepended_reason_is_capped_like_everything_beside_it(
     monkeypatch.setattr(
         claude_backend, "query",
         _result_then_raise(rm, "Claude Code returned an error result: success"))
-    backend = ClaudeBackend(model="claude-opus-4-8")
+    backend = ClaudeBackend(model="claude-opus-5")
 
     result = await backend.run("do it", cwd=tmp_path, max_turns=12)
 

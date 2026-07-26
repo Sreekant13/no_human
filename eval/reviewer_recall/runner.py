@@ -30,7 +30,7 @@ from typing import Any, Awaitable, Callable
 CASES_DIR = Path(__file__).resolve().parent / "cases"
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
 METHOD_DOC = "docs/REVIEWER_RECALL_METHOD.md"
-DEFAULT_MODEL = "claude-opus-4-8"
+DEFAULT_MODEL = "claude-opus-5"
 
 logger = logging.getLogger(__name__)
 

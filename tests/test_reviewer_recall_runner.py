@@ -151,13 +151,13 @@ def test_render_report_format():
                                outcome=rr.ReviewOutcome(status="PASS"), clean_pass=True)
     report = rr.RecallReport(
         results=[seeded_hit, seeded_miss, control_ok],
-        model="claude-opus-4-8", run_date="2026-07-25",
+        model="claude-opus-5", run_date="2026-07-25",
     )
     text = rr.render_report(report)
     assert "reviewer recall: 1/2" in text
     assert "logic 1/1" in text and "security 0/1" in text
     assert "specificity:     1/1 clean diffs passed" in text
-    assert "model: claude-opus-4-8" in text
+    assert "model: claude-opus-5" in text
     assert "run date: 2026-07-25" in text
     assert "docs/REVIEWER_RECALL_METHOD.md" in text
     # never a bare percentage: the "(NN%)" always follows an "x/y" denominator
@@ -256,7 +256,7 @@ def test_render_report_refuses_on_error():
         outcome=rr.ReviewOutcome(status="ERROR"), status="ERROR",
         reason="case setup failed: fatal: bad revision",
     )
-    report = rr.RecallReport(results=[error_result], model="claude-opus-4-8",
+    report = rr.RecallReport(results=[error_result], model="claude-opus-5",
                              run_date="2026-07-25")
     with pytest.raises(rr.HeadlineRefusedError):
         rr.render_report(report)
@@ -265,7 +265,7 @@ def test_render_report_refuses_on_error():
 def test_render_report_ok_when_no_errors():
     seeded_hit = rr.CaseResult(case_id="a", cls="logic", is_control=False,
                                outcome=rr.ReviewOutcome(status="FAIL"), caught=True)
-    report = rr.RecallReport(results=[seeded_hit], model="claude-opus-4-8",
+    report = rr.RecallReport(results=[seeded_hit], model="claude-opus-5",
                              run_date="2026-07-25")
     text = rr.render_report(report)
     assert "reviewer recall: 1/1" in text
@@ -301,7 +301,7 @@ def test_error_transcript_omits_caught(tmp_path):
         outcome=rr.ReviewOutcome(status="ERROR"), status="ERROR",
         reason="case setup failed: fatal: bad revision",
     )
-    report = rr.RecallReport(results=[error_result], model="claude-opus-4-8",
+    report = rr.RecallReport(results=[error_result], model="claude-opus-5",
                              run_date="2026-07-25")
     rr.write_transcripts(report, tmp_path)
     data = json.loads((tmp_path / "2026-07-25" / "broken-checkout.json").read_text())

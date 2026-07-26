@@ -235,7 +235,7 @@ async def test_run_review_does_not_convert_no_verdict_into_a_coder_finding(
     from no_human.core.orchestrator import Orchestrator
 
     class _DeadReviewer:
-        model = "claude-opus-4-8"
+        model = "claude-opus-5"
         _on_event = None
         async def review(self, *a, **kw):
             raise ReviewerUnavailable("reviewer reached no verdict")

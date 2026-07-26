@@ -112,7 +112,7 @@ not `null` — an unmeasured case has no caught/missed verdict to report) and
 ```
 reviewer recall: 13/16 (81%)  [logic 4/4, security 3/4, test-tamper 3/4, spec-miss 3/4]
 specificity:     4/4 clean diffs passed
-model: claude-opus-4-8 · run date: YYYY-MM-DD · method: docs/REVIEWER_RECALL_METHOD.md
+model: claude-opus-5 · run date: YYYY-MM-DD · method: docs/REVIEWER_RECALL_METHOD.md
 ```
 
 README publishes exactly this line with denominator, date, and a link here.

@@ -22,7 +22,7 @@ nh task add --title "Fix the off-by-one in pagination" --repo ~/my-repo
 
 ## 🔒 Trust, in numbers
 
-- **Measured reviewer catch-rate: 15/16 seeded defects caught (94%)** — logic 4/4, security 4/4, spec-miss 4/4, test-tamper 3/4 — specificity 2/4 clean diffs, on the expanded 20-case corpus (prior runs: 11/12 + 3/4 on 16 cases; 7/7 + 1/2 on 9). The recurring miss is the corpus's hardest plant class (a load-bearing assert "de-flaked" into a tautology); specificity flips run-to-run on borderline nits — that variance is why gating is moving parser-side. `claude-opus-4-8`, 2026-07-26, method + held-out discipline: [`docs/REVIEWER_RECALL_METHOD.md`](docs/REVIEWER_RECALL_METHOD.md). Regenerate with `nh bench report --reviewer-recall`; the number is never hand-edited. (A same-day A/B rejected `claude-opus-5` as reviewer: 14/16 recall, 0/4 specificity under the current prompt.)
+- **Measured reviewer catch-rate: 15/16 seeded defects caught (94%)** — logic 4/4, security 4/4, spec-miss 4/4, test-tamper 3/4 — specificity 2/4 clean diffs, on the expanded 20-case corpus (prior runs: 11/12 + 3/4 on 16 cases; 7/7 + 1/2 on 9). The recurring miss is the corpus's hardest plant class (a load-bearing assert "de-flaked" into a tautology); specificity flips run-to-run on borderline nits — that variance is why gating is moving parser-side. `claude-opus-4-8`, 2026-07-26, method + held-out discipline: [`docs/REVIEWER_RECALL_METHOD.md`](docs/REVIEWER_RECALL_METHOD.md). Regenerate with `nh bench report --reviewer-recall`; the number is never hand-edited. **This number was measured on `claude-opus-4-8`. As of 2026-07-26 the shipping reviewer is `claude-opus-5` (operator decision, CLAUDE.md #7) and this catch-rate has NOT yet been re-measured on it** — the one A/B that did run scored Opus 5 lower (14/16 recall, 0/4 specificity under the current prompt), so treat 15/16 as the 4.8 record, not a claim about what ships today, until a fresh `--reviewer-recall` run replaces it.
 - **Never merges — enforced at the tool boundary, not a policy.** A `PreToolUse` hook denies `gh pr merge`, `glab mr merge`, and the equivalent REST merge calls before they run. Merging is always yours.
 - **A deterministic tamper guard runs before a reviewer token is spent** — it fails any attempt that nets a reduction in test count or assertions, no LLM judgment involved.
 - **Honest escalation is a first-class outcome** — a blocker taxonomy routes stuck work to a park-with-wake-condition or a human escalation instead of a faked diff.
@@ -316,7 +316,7 @@ Secrets live in `~/.no_human/.env` (chmod 600, never in the repo).
 |---|---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | *(required)* | Subscription auth for the Claude Agent SDK |
 | `llm.primary_model` | `claude-sonnet-5` | The implementer (coder) model |
-| `llm.review_model` | `claude-opus-4-8` | The adversarial reviewer (kept different from the implementer by convention; not enforced in code) |
+| `llm.review_model` | `claude-opus-5` | The adversarial reviewer (kept different from the implementer by convention; not enforced in code) |
 | `server.port` | `8420` | Web board bind port |
 | `bounds.max_attempts` | `3` | Max implement → review cycles in **one** loop. Every resume starts a fresh loop, so this is not a per-task cap — `bounds.lifetime_attempts` is. |
 | `bounds.max_turns_per_attempt` | `500` | Max agent turns per attempt |

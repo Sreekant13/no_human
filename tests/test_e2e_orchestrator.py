@@ -3385,7 +3385,7 @@ async def test_supervisor_model_is_recorded_and_is_not_the_reviewers(tmp_path, s
 
     models = orch._active_models()
     assert models["supervisor"] == "claude-sonnet-5"
-    assert models["reviewer"] == "claude-opus-4-8"
+    assert models["reviewer"] == "claude-opus-5"
     assert models["supervisor"] != models["reviewer"], (
         "the supervisor must no longer inherit the reviewer's tier"
     )

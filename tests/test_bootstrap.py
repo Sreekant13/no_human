@@ -151,3 +151,46 @@ def test_idempotent_rerun(fake_env):
     assert second.returncode == 0, second.stderr
     assert "leaving untouched" in second.stdout
     assert config_path.read_bytes() == first_bytes
+
+
+# --------------------------------------------------------------------------- #
+# The template is an OVERLAY, not a copy of the defaults.                       #
+#                                                                              #
+# bootstrap.sh copies scripts/config.yaml.template to ~/.no_human/config.yaml   #
+# and then NEVER overwrites it ("config.yaml exists — leaving untouched"), and  #
+# load_config deep-merges that file OVER DEFAULT_CONFIG. So any model pinned in #
+# the template WINS on every bootstrapped install, permanently.                 #
+#                                                                              #
+# That makes a stale model id in the template invisible here (this repo has no  #
+# ~/.no_human/config.yaml checked in) while silently pinning every NEW install  #
+# to the old model. An independent review caught exactly that: the Opus tier    #
+# was moved to claude-opus-5 everywhere except the template, so bootstrapped    #
+# installs would have kept running the previous reviewer forever.               #
+#                                                                              #
+# test_template_created_when_absent asserts only `copy == template`, which is   #
+# tautological with respect to CONTENT — it passes no matter what the template  #
+# says. This test is the content guard it lacks.                                #
+# --------------------------------------------------------------------------- #
+def test_template_model_ids_match_the_shipped_defaults():
+    """Every llm.*_model the template pins must equal DEFAULT_CONFIG's value."""
+    import yaml
+
+    from no_human.config import DEFAULT_CONFIG
+
+    template = yaml.safe_load(TEMPLATE.read_text()) or {}
+    pinned = {k: v for k, v in (template.get("llm") or {}).items()
+              if k.endswith("_model")}
+    # Guard the guard: if the template stops pinning models entirely this test
+    # would vacuously pass, so require that it still pins the two that matter.
+    assert {"primary_model", "review_model"} <= set(pinned), (
+        f"template no longer pins the core model tiers: {sorted(pinned)} — "
+        f"this test would silently stop protecting anything"
+    )
+    defaults = DEFAULT_CONFIG["llm"]
+    drifted = {k: (v, defaults.get(k)) for k, v in pinned.items()
+               if v != defaults.get(k)}
+    assert not drifted, (
+        "scripts/config.yaml.template pins model ids that no longer match "
+        f"DEFAULT_CONFIG (template, default): {drifted} — every bootstrapped "
+        "install would keep running the stale model, permanently"
+    )

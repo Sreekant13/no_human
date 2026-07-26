@@ -7,7 +7,7 @@ a fenced JUDGE_JSON block and **failing closed** (no block → not a match), the
 same discipline as the adversarial reviewer.
 
 The judge is injectable so the eval harness runs offline in tests; the default
-uses the review model (claude-opus-4-8) — deliberately a *different* model
+uses the review model (claude-opus-5) — deliberately a *different* model
 from the implementer (claude-sonnet-5).
 """
 
@@ -163,7 +163,7 @@ class GoalJudge:
     invariant). Same fail-closed JUDGE_JSON discipline as IntentJudge; runs on
     the review model (different from the implementer)."""
 
-    def __init__(self, *, model: str = "claude-opus-4-8", backend: Any | None = None):
+    def __init__(self, *, model: str = "claude-opus-5", backend: Any | None = None):
         self.model = model
         self._backend = backend
 
@@ -216,7 +216,7 @@ class GoalJudge:
 class IntentJudge:
     """Runs the different-model judge over (agent_diff, known_good_diff)."""
 
-    def __init__(self, *, model: str = "claude-opus-4-8", backend: Any | None = None):
+    def __init__(self, *, model: str = "claude-opus-5", backend: Any | None = None):
         self.model = model
         self._backend = backend  # lazily constructed to avoid SDK import at module load
 

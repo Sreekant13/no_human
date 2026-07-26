@@ -185,7 +185,7 @@ async def test_angle_passes_skipped_after_a_decided_fail(monkeypatch, tmp_path):
     FAIL is pure reviewer-model cost. They must not run."""
     from no_human.review.reviewer import AdversarialReviewer, ReviewDecision
 
-    r = AdversarialReviewer(model="claude-opus-4-8")
+    r = AdversarialReviewer(model="claude-opus-5")
     calls = {"fast": 0}
 
     async def fake_fast(prompt, repo_path, before_ref="HEAD~1"):

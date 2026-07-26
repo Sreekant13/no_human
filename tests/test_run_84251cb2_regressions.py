@@ -57,7 +57,7 @@ async def test_error_result_event_carries_the_cache_counters(tmp_path, monkeypat
                         "Reached maximum number of turns (11)")
 
     monkeypatch.setattr(claude_backend, "query", _q)
-    backend = ClaudeBackend(model="claude-opus-4-8")
+    backend = ClaudeBackend(model="claude-opus-5")
 
     events = [e async for e in backend.stream("go", cwd=tmp_path, max_turns=11)]
     err = [e for e in events if e.kind == "result" and e.meta.get("is_error")][-1]
@@ -234,7 +234,7 @@ def _orch_for_guards(store, tmp_path):
         never_push_to = ["main"]
 
     class _Reviewer:
-        model = "claude-opus-4-8"
+        model = "claude-opus-5"
         _on_event = None
 
     cfg = load_config(tmp_path / "config.yaml")
