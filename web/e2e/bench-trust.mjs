@@ -83,6 +83,16 @@ const HEALTHY = {
   honest_escalation_rate: 1.0, honest_escalations: 14, escalation_specs: 14,
   refusals: [], override_reasons: [],
 };
+// SCRUM-82: a clean, PUBLISHED baseline — the only shape the headline row
+// (.bench-published) is allowed to source figures from.
+const PUBLISHED = {
+  published: true,
+  label: "expanded-core-v14", created_at: "2026-07-23T10:00:00Z",
+  total: 24, skipped: 0, dead_specs: 0, corpus_available: 24,
+  success_rate: 0.58, satisfied: 14, median_cost_ratio: 0.10,
+  honest_escalation_rate: 1.0, honest_escalations: 14, escalation_specs: 14,
+  refusals: [], override_reasons: [],
+};
 
 // ── Scenario A: a REFUSED, unmeasured, small-sample run — must ALARM ─────────
 {
@@ -101,6 +111,10 @@ const HEALTHY = {
     "");
   check("[A] the unmeasured count is surfaced (7 of 10)", (await card.innerText().catch(() => "")).includes("7 of 10"));
   check("[A] the under-corpus coverage is surfaced (10 of 24)", (await card.innerText().catch(() => "")).includes("10 of 24"));
+  // Regression: success is over RAN specs (total - skipped = 10 - 3 = 7), never
+  // the loaded total — the exact fabricated-denominator bug this feature fixed
+  // (BenchTrust at Stats.jsx:623 shares formatSuccessFraction with the new row).
+  check("[A] success is over RAN specs (3/7)", (await card.innerText()).includes("(3/7)"));
   // The crux: the denominator is shown AND flagged small.
   check("[A] honest-escalation shows its denominator (2/2)", (await card.innerText().catch(() => "")).includes("(2/2)"));
   check("[A] a 2-sample escalation rate is flagged small", (await card.innerText().catch(() => "")).toLowerCase().includes("small sample"));
@@ -140,6 +154,44 @@ const HEALTHY = {
   check("[D] the Stats page rendered (positive gate)", await page.locator(".stats-northstar, .stats-cards").first().isVisible().catch(() => false));
   check("[D] the bench card is hidden when the endpoint is absent", (await page.locator(".bench-trust").count()) === 0);
   check("[D] no page errors", errors.length === 0, errors[0] || "");
+  await ctx.close();
+}
+
+// ── Scenario P1: a PUBLISHED baseline — the headline row shows trusted figures ──
+{
+  const { ctx, page, errors } = await openStats(PUBLISHED);
+  const row = page.locator(".bench-published");
+  check("[P1] the published row renders", await row.count() >= 1);
+  const text = await row.innerText().catch(() => "");
+  check("[P1] shows the run label verbatim", text.includes("expanded-core-v14"), text);
+  check("[P1] shows the run date", text.includes("2026"), text);
+  check("[P1] shows success over RAN specs, with denominator (14/24)", text.includes("58%") && text.includes("(14/24)"), text);
+  check("[P1] shows honest escalation with its denominator (14/14)", text.includes("100%") && text.includes("(14/14)"), text);
+  check("[P1] shows the cost ratio", text.includes("0.1×"), text);
+  check("[P1] the refusal card below is unaffected and still renders", await page.locator(".bench-trust").count() >= 1);
+  check("[P1] no page errors", errors.length === 0, errors[0] || "");
+  await ctx.close();
+}
+
+// ── Scenario P2: a refused/probe run never sources the headline row ─────────
+{
+  const { ctx, page, errors } = await openStats(REFUSED);
+  const row = page.locator(".bench-published");
+  check("[P2] the row renders (honest empty, not hidden)", await row.count() >= 1);
+  const text = await row.innerText().catch(() => "");
+  check("[P2] shows the honest empty state", text.includes("No published baseline yet."), text);
+  check("[P2] fabricates NO digits from the refused run", !/\d/.test(text), text);
+  check("[P2] the refusal card below is unaffected and still alarms", await page.locator(".bench-trust-alert").count() >= 1);
+  check("[P2] no page errors", errors.length === 0, errors[0] || "");
+  await ctx.close();
+}
+
+// ── Scenario P3: endpoint ABSENT (older build) — the row hides entirely ─────
+{
+  const { ctx, page, errors } = await openStats("absent");
+  check("[P3] the Stats page rendered (positive gate)", await page.locator(".stats-northstar, .stats-cards").first().isVisible().catch(() => false));
+  check("[P3] the published row is hidden when the endpoint is absent", (await page.locator(".bench-published").count()) === 0);
+  check("[P3] no page errors", errors.length === 0, errors[0] || "");
   await ctx.close();
 }
 

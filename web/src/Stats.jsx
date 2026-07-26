@@ -3,6 +3,7 @@ import { fetchMetrics, fetchBenchLatest, fetchRepos, fetchRepoUnderstanding, sea
 import { fmtCost, fmtTokens, lifetimeCost, taskBurn } from "./cost.js";
 import { northStarTiles } from "./northStar.js";
 import { selectBenchHeadline, footnoteLabel } from "./benchHeadline.js";
+import { selectPublishedRun, publishedEscalationPct, formatSuccessFraction } from "./benchPublished.js";
 import TaskTable from "./TaskTable.jsx";
 import { isRealFailure } from "./boardLanes.js";
 import { profileRows, profileStatus } from "./repoView.js";
@@ -619,7 +620,7 @@ function BenchTrust({ bench }) {
       <dl className="bench-stats">
         <div>
           <dt>Success</dt>
-          <dd>{pct(card.success_rate)}{Number.isFinite(card.satisfied) ? ` (${card.satisfied}/${total})` : ""}</dd>
+          <dd>{pct(card.success_rate)}{formatSuccessFraction(card.satisfied, total, skipped)}</dd>
         </div>
         <div>
           <dt>Honest escalation</dt>
@@ -649,6 +650,49 @@ function BenchTrust({ bench }) {
         <div className="bench-footnote">
           <span className="bench-footnote-label">{footnoteLabel(footnote)}</span>
         </div>
+      )}
+    </section>
+  );
+}
+
+// SCRUM-82: the panel above answers "was the last run refused / does it
+// trust its own numbers" — but never "what is the last trusted number".
+// This row headlines the last PUBLISHED baseline (never a refused/quick
+// run — selectPublishedRun guards on `bench.published === true`) so the
+// product's proof point is not invisible on its own stats page. BenchTrust
+// (above) is untouched; this only ADDS a row rendered directly above it.
+function BenchPublishedRow({ bench }) {
+  if (bench === undefined || bench === null) return null; // loading / endpoint absent -> hide, same as BenchTrust
+  const row = selectPublishedRun(bench);
+  const pct = (x) => (Number.isFinite(x) ? `${Math.round(x * 100)}%` : "—");
+
+  if (!row) {
+    return (
+      <section className="bench-published" aria-label="Last published run">
+        <span className="bench-published-title">Last published run</span>
+        <span className="bench-published-empty">No published baseline yet.</span>
+      </section>
+    );
+  }
+
+  return (
+    <section className="bench-published" aria-label="Last published run">
+      <span className="bench-published-title">Last published run</span>
+      {row.label && <span className="bench-published-item">{row.label}</span>}
+      {row.created_at && <span className="bench-published-item">{formatBenchDate(row.created_at)}</span>}
+      <span className="bench-published-item">
+        <span className="bench-published-dt">Success</span>{" "}
+        {pct(row.success_rate)}
+        {formatSuccessFraction(row.satisfied, row.total, row.skipped)}
+      </span>
+      <span className="bench-published-item">
+        <span className="bench-published-dt">Honest escalation</span>{" "}
+        {publishedEscalationPct(row)}
+      </span>
+      {Number.isFinite(row.median_cost_ratio) && (
+        <span className="bench-published-item">
+          <span className="bench-published-dt">Cost</span> {row.median_cost_ratio}×
+        </span>
       )}
     </section>
   );
@@ -709,6 +753,7 @@ export default function Stats({ tasks }) {
         </div>
       )}
 
+      <BenchPublishedRow bench={bench} />
       <BenchTrust bench={bench} />
 
 
