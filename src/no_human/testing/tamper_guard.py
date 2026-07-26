@@ -39,9 +39,12 @@ _TEST_FILE_PATTERNS = (
 )
 _TEST_FILE_RE = re.compile("|".join(_TEST_FILE_PATTERNS))
 
-# Test-function declarations.
+# Test-function declarations. The bare `test(` alternative uses a negative
+# lookbehind (not just \b) to exclude `.test(` / `foo.test(` — RegExp.prototype
+# .test() calls, not test declarations — while still matching a standalone
+# `test(...)` at the start of a line/expression.
 _TEST_DECL = re.compile(
-    r"\bdef\s+test\w*\s*\(|\bit\s*\(|\btest\s*\(|@Test\b|\bdescribe\s*\(",
+    r"\bdef\s+test\w*\s*\(|\bit\s*\(|(?<![.\w])test\s*\(|@Test\b|\bdescribe\s*\(",
 )
 
 # Assertion-ish calls across python/js/java.

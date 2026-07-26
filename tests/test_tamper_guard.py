@@ -118,6 +118,64 @@ def test_counts_across_languages():
     assert tamper_guard.count_assertions("assertThat(x).isEqualTo(1)") >= 1
 
 
+def test_regexp_test_call_is_not_a_declaration():
+    """RegExp.prototype.test() calls must not be counted as test declarations."""
+    assert tamper_guard.count_tests("re.test(x)") == 0
+    assert tamper_guard.count_tests("/re/.test(x)") == 0
+    assert tamper_guard.count_tests("foo.test(bar)") == 0
+    assert tamper_guard.count_tests("assert.ok(!/transparent/.test(body));") == 0
+
+
+def test_word_ending_in_test_is_not_a_declaration():
+    """A variable/word ending in 'test' followed by '(' must not count."""
+    assert tamper_guard.count_tests("latest(1)") == 0
+    assert tamper_guard.count_tests("var x = latest(y);") == 0
+
+
+def test_bare_test_call_still_counts():
+    """A genuine standalone test(...) declaration must still be counted."""
+    assert tamper_guard.count_tests("test('does a thing', () => {})") == 1
+    assert tamper_guard.count_tests("  test(`templated ${x}`, () => {})") == 1
+
+
+def test_mixed_declarations_and_regexp_calls_count_only_declarations():
+    src = (
+        "test('a', () => {\n"
+        "  assert.ok(!/transparent/.test(body));\n"
+        "});\n"
+        "test('b', () => {\n"
+        "  if (/x/.test(y)) { return; }\n"
+        "});\n"
+    )
+    assert tamper_guard.count_tests(src) == 2
+
+
+def test_check_honest_regexp_refactor_is_not_tampered():
+    """Swapping a `.test(` regex helper for an equivalent one must not trip the guard.
+
+    Reproduces the reported bug: before, `_TEST_DECL` counted `.test(` calls as
+    test declarations, so replacing them with an equivalent non-`.test()` check
+    dropped the apparent count and produced a false TAMPERED verdict.
+    """
+    before = {
+        "web/src/x.test.mjs":
+            "test('renders without a transparent background', () => {\n"
+            "  const body = getBody();\n"
+            "  assert.ok(!/background:\\s*transparent/.test(body));\n"
+            "});\n"
+    }
+    after = {
+        "web/src/x.test.mjs":
+            "test('renders without a transparent background', () => {\n"
+            "  const body = getBody();\n"
+            "  assert.ok(!includesTransparentBackground(body));\n"
+            "});\n"
+    }
+    report = tamper_guard.check(before, after)
+    assert report.tampered is False
+    assert report.tests_before == report.tests_after == 1
+
+
 # --------------------------------------------------------------------------- #
 # Isolation-corpus attacks: cheats that keep test/assertion counts unchanged   #
 # --------------------------------------------------------------------------- #
