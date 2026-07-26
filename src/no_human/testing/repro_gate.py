@@ -39,6 +39,16 @@ if TYPE_CHECKING:
 
 MANIFEST = ".no_human/repro_tests.json"
 _RUN_TIMEOUT = 600
+# The sanity pre-run's own bound (SCRUM-78) — independent of _RUN_TIMEOUT so a
+# broken/hung runner never costs a full fails-before/passes-after budget just
+# to prove it can launch at all. A bare invocation may legitimately run a
+# runner's whole default suite (jest/go test/etc. with no path given), so a
+# large healthy suite can still time out here; that reads as an honest
+# advisory "error" (never a false pass/fail), which is the fail-closed
+# contract this gate promises — this ticket trades precision/cost, not safety.
+# Kept well under _RUN_TIMEOUT (pinned by a test) so it can't silently
+# drift back toward the old 600s cost.
+_SANITY_TIMEOUT = 60
 
 
 @dataclass
@@ -183,30 +193,70 @@ def _test_cmd_targets(tests: list[str]) -> list[str]:
 
 
 def _runner_sanity_check(argv: list[str], cwd: Path, env: dict) -> tuple[bool, str]:
-    """Prove ``argv`` itself runs cleanly in ``cwd`` with no test-file
-    arguments, before trusting any exit code from a test-targeted invocation
-    there as a genuine fails-before verdict.
+    """Prove the runner behind ``argv`` is actually AVAILABLE in ``cwd`` —
+    before trusting any exit code from a test-targeted invocation there as a
+    genuine fails-before verdict.
 
     A ``git worktree add`` checkout of ``base_ref`` contains only tracked
     files — installed deps (node_modules, a vendored module cache, ...) are
-    not — so an otherwise-working test_cmd can exit non-zero in that isolated
-    worktree for an ENVIRONMENT reason that has nothing to do with the bug
-    under test (SCRUM-65 review: a JS repro's fails-before step exited
-    127/1 from a missing runner/dependency, and any non-zero exit was being
-    read as "bug reproduced" — a vacuous, always-true repro). We never
+    not — so an otherwise-working test_cmd can fail to even launch in that
+    isolated worktree for an ENVIRONMENT reason that has nothing to do with
+    the bug under test (SCRUM-65 review: a JS repro's fails-before step
+    exited 127/1 from a missing runner/dependency, and any non-zero exit was
+    being read as "bug reproduced" — a vacuous, always-true repro). We never
     provision deps here (no npm install — slow and out of scope); an honest
-    refusal is the correct outcome."""
+    refusal is the correct outcome.
+
+    SCRUM-78 tried to let a runner that RAN but found no tests / reported
+    real failures ("ran, exit != 0") through, distinguishing it from "never
+    started", using elapsed wall-clock as the discriminator. Review rejected
+    that: a slow environment failure (e.g. a missing-dependency import that
+    takes over a second to raise) is indistinguishable from a slow real
+    failure by timing alone, and misclassifying it as "ran" resurrects the
+    exact vacuous-repro bug SCRUM-65 fixed (proven by
+    ``test_non_python_slow_missing_dep_is_advisory_error_not_pass`` in
+    tests/test_repro_gate.py, which fails a pure-timing discriminator). A
+    generic probe (``--version``/``--help``) doesn't generalize either —
+    ``test_cmd`` is an arbitrary profile-supplied string across every
+    ecosystem, and a probe a healthy runner fails is a new false-refusal
+    class. There is no reliable way to tell "ran, found failures" apart from
+    "never really started" without provisioning the worktree's dependencies,
+    which is out of scope here — so this refuses on ANY non-zero exit,
+    matching the pre-SCRUM-78 contract. What SCRUM-78 keeps: a short,
+    independent timeout (``_SANITY_TIMEOUT`` vs the old ``_RUN_TIMEOUT``) and
+    a distinct, honest reason string per launch-failure mode, including a
+    process killed by a signal (crash/OOM) — which "ran to completion" never
+    covers, timing or not."""
+    if not argv:
+        return False, "no test runner command configured"
     try:
         proc = subprocess.run(
             argv, cwd=cwd, env=env, capture_output=True, text=True,
-            timeout=_RUN_TIMEOUT,
+            timeout=_SANITY_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        return False, f"timed out after {_RUN_TIMEOUT}s"
+        return False, (
+            f"sanity check timed out after {_SANITY_TIMEOUT}s (runner hung "
+            "or stalled)")
     except OSError as exc:
-        return False, f"could not run test_cmd: {exc}"
+        return False, f"test runner could not be launched (system error): {exc}"
     out = (proc.stdout + proc.stderr)[-2000:]
-    return proc.returncode == 0, out
+    if proc.returncode < 0:
+        return False, (
+            f"test runner was killed by signal {-proc.returncode} "
+            f"(crash/OOM) — not a test verdict:\n{out}")
+    if proc.returncode == 127:
+        return False, f"test runner not found (command not found):\n{out}"
+    if proc.returncode == 126:
+        return False, f"test runner is not executable (exit 126):\n{out}"
+    if proc.returncode == 0:
+        return True, out
+    return False, (
+        f"test runner exited {proc.returncode} when launched bare with no "
+        "test-file arguments in the isolated base worktree — a dependency "
+        "failure and a real test failure are indistinguishable here without "
+        f"provisioning deps, so this refuses rather than risk a fabricated "
+        f"fails-before verdict:\n{out}")
 
 
 def _run_test_cmd(
@@ -334,13 +384,12 @@ def run_repro_gate(
             # from the real (test-targeted) invocation as a fails-before
             # verdict; a broken/dep-less runner must never read as "the bug
             # reproduced" (SCRUM-65 review).
-            sane, sane_out = _runner_sanity_check(test_argv, worktree, env)
+            sane, sane_reason = _runner_sanity_check(test_argv, worktree, env)
             if not sane:
                 return ReproResult("error", tests=tests, reasons=[
                     "repro runner unavailable in the isolated base worktree "
-                    "(missing dependencies? a fresh git worktree has no "
-                    f"installed deps) — never provisioned, fails closed:\n"
-                    f"{sane_out}"])
+                    "— the gate fails closed rather than read an environment "
+                    f"failure as a fails-before verdict: {sane_reason}"])
         for f in _test_files(tests):
             src, dst = repo_path / f, worktree / f
             dst.parent.mkdir(parents=True, exist_ok=True)

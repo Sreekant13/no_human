@@ -397,6 +397,184 @@ def test_unsubstituted_placeholder_in_test_cmd_is_advisory_error_e2e(js_repo):
     assert "test_cmd" in r.reasons[0]
 
 
+# --------------------------------------------------------------------------- #
+# SCRUM-78: the bare-runner sanity pre-run classifies "runner unavailable" vs #
+# "runner ran" (exit code alone is not enough — mirrors _run_test_cmd's own   #
+# allowlist: only 126/127 are launch failures), gets its own short timeout    #
+# independent of _RUN_TIMEOUT, and keeps the fail-closed contract: any        #
+# ambiguity is still an advisory error, never a false pass/fail.              #
+# --------------------------------------------------------------------------- #
+
+def _py(code: str) -> list[str]:
+    return [sys.executable, "-c", code]
+
+
+def test_sanity_exit_0_runner_ran(tmp_path):
+    ok, _ = repro_gate._runner_sanity_check(
+        _py("import sys; sys.exit(0)"), tmp_path, {})
+    assert ok is True
+
+
+def test_sanity_exit_127_refuses(tmp_path):
+    ok, reason = repro_gate._runner_sanity_check(
+        _py("import sys; sys.exit(127)"), tmp_path, {})
+    assert ok is False
+    assert "command not found" in reason
+
+
+def test_sanity_exit_126_refuses(tmp_path):
+    ok, reason = repro_gate._runner_sanity_check(
+        _py("import sys; sys.exit(126)"), tmp_path, {})
+    assert ok is False
+    assert "not executable" in reason or "shell error" in reason
+
+
+def test_sanity_oserror_refuses(tmp_path):
+    ok, reason = repro_gate._runner_sanity_check(
+        ["/no/such/binary-xyz"], tmp_path, {})
+    assert ok is False
+    assert "system error" in reason
+
+
+@pytest.mark.parametrize("exit_code", [1, 2, 5])
+def test_sanity_nonzero_exit_refuses(tmp_path, exit_code):
+    """SCRUM-78 re-review: precision (letting a healthy-but-noisy runner
+    through) proved unsafe — a slow environment failure is indistinguishable
+    from a slow real failure by any signal we can read without provisioning
+    deps. Any nonzero bare exit refuses, matching the pre-SCRUM-78 contract,
+    at the SHIPPED default (no monkeypatching)."""
+    ok, reason = repro_gate._runner_sanity_check(
+        _py(f"import sys; sys.exit({exit_code})"), tmp_path, {})
+    assert ok is False
+    assert str(exit_code) in reason
+
+
+def test_sanity_killed_by_signal_refuses(tmp_path):
+    """A process killed by a signal (SIGKILL/OOM, SIGSEGV, ...) reports a
+    negative returncode — it did not complete a run and must never read as
+    'ran', regardless of how long it survived first."""
+    ok, reason = repro_gate._runner_sanity_check(
+        _py("import os, signal; os.kill(os.getpid(), signal.SIGKILL)"),
+        tmp_path, {})
+    assert ok is False
+    assert "signal" in reason.lower()
+
+
+def test_sanity_timeout_refuses(tmp_path, monkeypatch):
+    monkeypatch.setattr(repro_gate, "_SANITY_TIMEOUT", 0.3)
+    ok, reason = repro_gate._runner_sanity_check(
+        _py("import time; time.sleep(5)"), tmp_path, {})
+    assert ok is False
+    assert "timed out" in reason
+
+
+def test_sanity_timeout_bounded_well_under_run_timeout():
+    """MINOR 5: pin the constant so it cannot silently drift back toward the
+    old 600s cost."""
+    assert repro_gate._SANITY_TIMEOUT < repro_gate._RUN_TIMEOUT
+    assert repro_gate._SANITY_TIMEOUT <= 120
+
+
+def test_sanity_reason_strings_are_distinct(tmp_path, monkeypatch):
+    monkeypatch.setattr(repro_gate, "_SANITY_TIMEOUT", 0.3)
+    _, r127 = repro_gate._runner_sanity_check(
+        _py("import sys; sys.exit(127)"), tmp_path, {})
+    _, r126 = repro_gate._runner_sanity_check(
+        _py("import sys; sys.exit(126)"), tmp_path, {})
+    _, r_os = repro_gate._runner_sanity_check(
+        ["/no/such/binary-xyz"], tmp_path, {})
+    _, r_nonzero = repro_gate._runner_sanity_check(
+        _py("import sys; sys.exit(1)"), tmp_path, {})
+    _, r_signal = repro_gate._runner_sanity_check(
+        _py("import os, signal; os.kill(os.getpid(), signal.SIGKILL)"),
+        tmp_path, {})
+    _, r_timeout = repro_gate._runner_sanity_check(
+        _py("import time; time.sleep(5)"), tmp_path, {})
+    assert len({r127, r126, r_os, r_nonzero, r_signal, r_timeout}) == 6
+
+
+def test_non_python_slow_missing_dep_is_advisory_error_not_pass(tmp_path):
+    """HELD-NEGATIVE regression (review BLOCKER 1): the previous SCRUM-78
+    attempt used elapsed wall-clock (<=1s ⇒ 'startup crash') to decide 'ran'.
+    A dependency failure that takes ~1.3s to raise defeated that guard and
+    produced a false 'pass'. This is the SAME fixture as
+    test_non_python_missing_uncommitted_dep_is_advisory_error_not_pass, with
+    a sleep added before the failing import so it is provably NOT fast. It
+    must still be an advisory error, not a fabricated 'pass', regardless of
+    how long the environment failure takes."""
+    def git(*args):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+    git("init", "-b", "main")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (tmp_path / "run_tests.py").write_text(
+        "import time\n"
+        "time.sleep(1.3)\n"  # slow dependency resolution before it fails
+        "import helper\n"  # uncommitted dependency — stands in for node_modules
+        "import sys\n"
+        "sys.exit(0 if helper.check(sys.argv[1:]) else 1)\n"
+    )
+    (tmp_path / "lib.js").write_text("module.exports = 'buggy';\n")
+    (tmp_path / "lib.test.js").write_text("'fixed' in open('lib.js').read()\n")
+    git("add", "-A")
+    git("commit", "-m", "base (buggy)")
+    (tmp_path / "lib.js").write_text("module.exports = 'fixed';\n")
+    (tmp_path / "helper.py").write_text(  # NEVER committed
+        "import pathlib\n"
+        "def check(files):\n"
+        "    return all(eval(pathlib.Path(f).read_text().strip()) for f in files)\n"
+    )
+    (tmp_path / ".no_human").mkdir()
+    (tmp_path / MANIFEST).write_text(json.dumps({"tests": ["lib.test.js"]}))
+    profile = _node_profile(tmp_path, f"{sys.executable} run_tests.py")
+    r = run_repro_gate(tmp_path, "HEAD", profile)
+    assert r.verdict != "pass", r.reasons
+    assert r.verdict == "error", r.reasons
+
+
+def test_non_python_healthy_nonzero_bare_runner_now_refuses_safely_e2e(tmp_path):
+    """Documents the precision/safety trade-off (review BLOCKER 1): a runner
+    that exits nonzero when invoked bare (no test-file args) but correctly
+    evaluates tests when given them CANNOT be told apart, from the sanity
+    pre-run alone, from an environment failure that also exits nonzero bare —
+    so the gate now safely refuses (advisory error) rather than risk a
+    fabricated fails-before verdict. A slower/more conservative gate that
+    refuses honestly is preferred over one that fabricates evidence."""
+    def git(*args):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+
+    runner = (
+        "import os, pathlib, sys\n"
+        "if len(sys.argv) == 1:\n"
+        "    sys.exit(1)\n"  # bare invocation: no test-file args ⇒ usage error
+        "def ok(test_file):\n"
+        "    p = pathlib.Path(test_file).resolve()\n"
+        "    expr = p.read_text().strip()\n"
+        "    old = os.getcwd()\n"
+        "    os.chdir(p.parent)\n"
+        "    try:\n"
+        "        return bool(eval(expr))\n"
+        "    finally:\n"
+        "        os.chdir(old)\n"
+        "sys.exit(0 if all(ok(f) for f in sys.argv[1:]) else 1)\n"
+    )
+    git("init", "-b", "main")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (tmp_path / "run_tests.py").write_text(runner)
+    (tmp_path / "lib.js").write_text("module.exports = 'buggy';\n")
+    (tmp_path / "lib.test.js").write_text("'fixed' in open('lib.js').read()\n")
+    git("add", "-A")
+    git("commit", "-m", "base (buggy)")
+    (tmp_path / "lib.js").write_text("module.exports = 'fixed';\n")
+    (tmp_path / ".no_human").mkdir()
+    (tmp_path / MANIFEST).write_text(json.dumps({"tests": ["lib.test.js"]}))
+
+    profile = _node_profile(tmp_path, f"{sys.executable} run_tests.py")
+    r = run_repro_gate(tmp_path, "HEAD", profile)
+    assert r.verdict == "error", r.reasons
+
+
 def test_is_python_profile_routing():
     assert repro_gate._is_python_profile(None) is True
     assert repro_gate._is_python_profile(
