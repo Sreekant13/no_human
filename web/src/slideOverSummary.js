@@ -56,6 +56,14 @@ export function colorForStatus(status) {
   return STATUS_COLOR_VAR[status] || "var(--text-muted)";
 }
 
+// A task in a terminal state (done/failed — cancelled is failed + a flag,
+// see boardLanes.js) has nothing left to decide: any blocker it carries is
+// history, not a live ask. Single definition so the milestone timeline, the
+// details micro, and SlideOver's own inline check never drift from each other.
+export function isTerminalStatus(status) {
+  return status === "done" || status === "failed";
+}
+
 // User-facing label for a task kind — never the raw backend value verbatim
 // for kinds that read as code (e.g. "ci_fix" → "CI fix").
 const KIND_LABEL = {
@@ -215,7 +223,7 @@ export function milestonesFor(task) {
 
   // The latest milestone reached "pulses" while the task is still active —
   // terminal tasks (done/failed) show a settled trail, nothing pulsing.
-  const isTerminal = task.status === "done" || task.status === "failed";
+  const isTerminal = isTerminalStatus(task.status);
   let lastDoneIdx = -1;
   items.forEach((it, i) => { if (it.done) lastDoneIdx = i; });
   return items.map((it, i) => ({ ...it, current: !isTerminal && i === lastDoneIdx }));
@@ -318,7 +326,12 @@ export function sectionSummary(key, { task, diff } = {}) {
       // An open question is the more actionable fact — it wins over the
       // criteria count when both are present (the criteria are still one
       // click away inside the section either way).
-      if (task.blocker?.question) return { text: "Has a question for you", colorVar: colorForStatus(task.status) };
+      if (task.blocker?.question) {
+        if (isTerminalStatus(task.status)) {
+          return { text: "Asked before it ended", colorVar: "var(--text-muted)" };
+        }
+        return { text: "Has a question for you", colorVar: colorForStatus(task.status) };
+      }
       const total = task.acceptance_criteria?.length || 0;
       if (total > 0) {
         const progress = task.context?.progress?.acceptance_criteria || [];

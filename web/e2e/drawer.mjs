@@ -259,6 +259,77 @@ const openSectionLabel = (page) =>
   await ctx.close();
 }
 
+// ── SCRUM-80: a terminal task's blocker renders as neutral history, never a
+// live ask; a parked task keeps the live ask unchanged. The blocker's full
+// evidence trail lives in the Details accordion section, so open it first.
+{
+  const openDetails = async (page) => {
+    await page.locator(".so-section-header", { hasText: "Details" }).first().click();
+    await page.waitForTimeout(300);
+  };
+
+  // Control: the existing PARKED task (awaiting_input, a live decision) must
+  // keep the live "Question for you" ask, with no blocker-history modifier.
+  const { ctx: ctxLive, page: pageLive } = await open(PARKED);
+  await openDetails(pageLive);
+  const liveHistoryCount = await pageLive.locator(".slideover .blocker-history").count();
+  check("[SCRUM-80 control] a parked task's blocker section is NOT blocker-history", liveHistoryCount === 0);
+  const liveLabel = pageLive.locator(".slideover .blocker-question .blocker-field-label").first();
+  // .blocker-field-label is CSS text-transform: uppercase — innerText reflects
+  // the painted case in a real browser, so compare case-insensitively.
+  const liveLabelText = (await liveLabel.innerText()).trim().toLowerCase();
+  check("[SCRUM-80 control] the label reads 'Question for you' on a parked task", liveLabelText === "question for you", liveLabelText);
+  const liveColor = await liveLabel.evaluate((el) => getComputedStyle(el).color);
+  await ctxLive.close();
+
+  // Terminal: a failed task carrying the same blocker shape renders it as
+  // settled history — neutral label, no blocker-history-less styling, and no
+  // stale "live choice" affordances (numbered options / "Wake when").
+  // Done/Failed are OUTCOMES (Board.jsx 5D) — they are NOT board lanes with
+  // `.task-card`s; they live behind the "Failed" nav row as a TaskTable
+  // (`.stats-tr`), per Outcomes.jsx / TaskTable.jsx. Open it that way.
+  const FAILED_WITH_BLOCKER = mkTask("failed00aaaabbbbcccc", "failed", {
+    blocker: {
+      question: "The PR was closed without merging. Abandon the task, or rework and reopen?",
+      category: "ambiguity",
+      confidence: 0.8,
+      options: ["Abandon the task", "Rework and reopen the PR"],
+      wake_condition: "the PR reopens",
+    },
+  });
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on("console", (m) => { if (m.type() === "error" && !m.text().includes("WebSocket")) errors.push(m.text()); });
+  page.on("pageerror", (e) => errors.push("pageerror: " + e.message));
+  await page.addInitScript((t) => localStorage.setItem("nh-theme", t), "dark");
+  await page.route("**/api/**", api(FAILED_WITH_BLOCKER));
+  await page.goto("http://127.0.0.1:4640/", { waitUntil: "networkidle" });
+  await page.waitForTimeout(500);
+  await page.locator(".nh-navrow", { hasText: "Failed" }).click();
+  await page.waitForTimeout(300);
+  await page.locator(".stats-tr").first().click();
+  await page.locator(".slideover").waitFor({ state: "visible", timeout: 5000 });
+  await page.waitForTimeout(700);
+  await openDetails(page);
+  const historyCount = await page.locator(".slideover .blocker-history").count();
+  check("[SCRUM-80] a failed task's blocker section gets the blocker-history modifier", historyCount > 0);
+  const label = page.locator(".slideover .blocker-question .blocker-field-label").first();
+  const labelText = (await label.innerText()).trim().toLowerCase();
+  check("[SCRUM-80] label reads 'Asked before it ended' on a failed task", labelText === "asked before it ended", labelText);
+  const color = await label.evaluate((el) => getComputedStyle(el).color);
+  check("[SCRUM-80] the neutralized label's computed colour is not the live accent",
+    color !== liveColor, `${color} vs live ${liveColor}`);
+  const wakeLabel = page.locator(".slideover .blocker-field-label", { hasText: "Was waiting for" });
+  check("[SCRUM-80] the wake-condition field is past-tense on a terminal task", await wakeLabel.count() > 0);
+  const staleWakeLabel = page.locator(".slideover .blocker-field-label", { hasText: "Wake when" });
+  check("[SCRUM-80] the live 'Wake when' wording is gone on a terminal task", await staleWakeLabel.count() === 0);
+  const liveOptionsCount = await page.locator(".slideover .blocker-options").count();
+  check("[SCRUM-80] the numbered options list is not rendered as a live choice on a terminal task", liveOptionsCount === 0);
+  check("[SCRUM-80] no page errors", errors.length === 0, errors[0] || "");
+  await ctx.close();
+}
+
 await browser.close();
 srv.close();
 console.log(failures.length ? `\n${failures.length} FAILURE(S)` : "\nALL CHECKS PASSED");

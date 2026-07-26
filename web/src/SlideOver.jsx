@@ -15,7 +15,7 @@ import { clampAgentState, currentFunctionality, groupFunctionalities, laneAgentR
 import { agentSummary, taskSummary } from "./summaries.js";
 import {
   PARKED_STATUSES, narrativeFor, chipsFor, milestonesFor, sectionSummary,
-  defaultOpenSection,
+  defaultOpenSection, isTerminalStatus,
 } from "./slideOverSummary.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
@@ -149,7 +149,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   // the task — an unclaimed active-status task is queued, nothing is running.
   const isLive = isActive && task?.claimed === true;
   const isFailed = task?.status === "failed";
-  const isTerminal = task?.status === "done" || task?.status === "failed";
+  const isTerminal = isTerminalStatus(task?.status);
 
   // When the DecisionPanel is showing, it owns the actions (Resume/Reply/Stop),
   // so the bottom bar suppresses its duplicates. Keyed on whether the panel
@@ -1685,7 +1685,7 @@ function DetailsTab({ task }) {
           <pre className="so-findings">{findings}</pre>
         </section>
       )}
-      {task.blocker && <BlockerSection blocker={task.blocker} />}
+      {task.blocker && <BlockerSection blocker={task.blocker} terminal={isTerminalStatus(task.status)} />}
       {task.repo_path && (
         <section>
           <div className="so-section-label">Repo</div>
@@ -1794,7 +1794,7 @@ function SpecTab({ task, onRefresh }) {
   );
 }
 
-function BlockerSection({ blocker: b }) {
+function BlockerSection({ blocker: b, terminal }) {
   const cat = b.category ? String(b.category).replace(/_/g, " ") : null;
   const pct = b.confidence != null ? `${Math.round(b.confidence * 100)}%` : null;
   // Read-only record. The live, one-click actions for a parked task now live in
@@ -1802,8 +1802,11 @@ function BlockerSection({ blocker: b }) {
   // two places invited a double-submit and split the operator's attention).
   // This section is the full evidence trail: goal, what happened, the diagnosis,
   // any question, and the wake condition — for the operator who wants the detail.
+  // Once the task is terminal there's no decision left to make: the section
+  // stays in the DOM (SCRUM-80 — it's still the evidence trail) but renders as
+  // settled history, not a live ask.
   return (
-    <section>
+    <section className={terminal ? "blocker-history" : undefined}>
       <div className="so-section-label blocker-label">Blocker</div>
       {cat && (
         <div className="blocker-meta">
@@ -1836,9 +1839,9 @@ function BlockerSection({ blocker: b }) {
       )}
       {b.question && (
         <div className="blocker-field blocker-question">
-          <div className="blocker-field-label">Question for you</div>
+          <div className="blocker-field-label">{terminal ? "Asked before it ended" : "Question for you"}</div>
           <div className="blocker-field-body">{b.question}</div>
-          {b.options?.length > 0 && (
+          {!terminal && b.options?.length > 0 && (
             <ul className="blocker-options">
               {b.options.map(normalizeOption).map((opt, i) => (
                 <li key={i}>[{i + 1}] {opt.label}{hasAction(opt) ? " ⚡" : ""}</li>
@@ -1849,7 +1852,7 @@ function BlockerSection({ blocker: b }) {
       )}
       {b.wake_condition && (
         <div className="blocker-field">
-          <div className="blocker-field-label">Wake when</div>
+          <div className="blocker-field-label">{terminal ? "Was waiting for" : "Wake when"}</div>
           <div className="blocker-field-body blocker-wake">{b.wake_condition}</div>
         </div>
       )}

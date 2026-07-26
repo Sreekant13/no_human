@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   narrativeFor, chipsFor, milestonesFor, sectionSummary, defaultOpenSection,
-  diffStats, colorForStatus, PARKED_STATUSES, STATUS_STAGE_LABEL,
+  diffStats, colorForStatus, PARKED_STATUSES, STATUS_STAGE_LABEL, isTerminalStatus,
 } from "./slideOverSummary.js";
 
 const SRC = dirname(fileURLToPath(import.meta.url));
@@ -289,6 +289,34 @@ test("details micro: mid-flight task with partially tracked criteria shows the r
   assert.equal(s.text, "1/3 criteria done");
 });
 
+// ── SCRUM-80: terminal tasks neutralize a live blocker ask ─────────────────
+
+test("isTerminalStatus is true only for done/failed", () => {
+  assert.equal(isTerminalStatus("done"), true);
+  assert.equal(isTerminalStatus("failed"), true);
+  assert.equal(isTerminalStatus("blocked"), false);
+  assert.equal(isTerminalStatus("awaiting_input"), false);
+  assert.equal(isTerminalStatus("implementing"), false);
+});
+
+test("details micro neutralizes a blocker question once the task is terminal (failed)", () => {
+  const s = sectionSummary("details", { task: { status: "failed", blocker: { question: "why?" } } });
+  assert.equal(s.text, "Asked before it ended");
+  assert.equal(s.colorVar, "var(--text-muted)");
+});
+
+test("details micro neutralizes a blocker question once the task is terminal (done)", () => {
+  const s = sectionSummary("details", { task: { status: "done", blocker: { question: "why?" } } });
+  assert.equal(s.text, "Asked before it ended");
+  assert.equal(s.colorVar, "var(--text-muted)");
+});
+
+test("details micro keeps the live ask for a non-terminal (parked) blocker", () => {
+  const s = sectionSummary("details", { task: { status: "blocked", blocker: { question: "why?" } } });
+  assert.equal(s.text, "Has a question for you");
+  assert.equal(s.colorVar, colorForStatus("blocked"));
+});
+
 // ── gate-aware default section ──────────────────────────────────────────────
 
 test("default-open section maps review-gate/parked/active exactly like the pre-1.4 tab logic", () => {
@@ -373,6 +401,29 @@ test("accordion expand/collapse animates grid-template-rows with the shared timi
   assert.match(stylesCss, /var\(--ease-out\)/);
   // exit ~65% of enter duration
   assert.match(stylesCss, /0\.65/);
+});
+
+test("SCRUM-80: blocker-history modifier is wired in both the component and the stylesheet", () => {
+  assert.match(slideOverSrc, /blocker-history/, "SlideOver.jsx must apply the blocker-history class for terminal tasks");
+  const rulesMatch = stylesCss.match(/\.blocker-history[^{]*\{[^}]*\}/g);
+  assert.ok(rulesMatch && rulesMatch.length > 0, "styles.css must define .blocker-history rules");
+  const rulesText = rulesMatch.join("\n");
+  // No new/invented tokens and no hardcoded hex — only the existing neutral
+  // tokens already defined in both :root and [data-theme="light"] (checked
+  // directly below, against both theme blocks parsed from stylesCss).
+  assert.doesNotMatch(rulesText, /#[0-9a-fA-F]{3,8}\b/, ".blocker-history must not hardcode a hex color");
+  const usedVars = [...rulesText.matchAll(/var\((--[a-z-]+)\)/g)].map((m) => m[1]);
+  assert.ok(usedVars.length > 0, ".blocker-history must reference at least one CSS var");
+  const allowed = new Set(["--text-dim", "--text-muted", "--border", "--border-hi", "--text"]);
+  for (const v of usedVars) {
+    assert.ok(allowed.has(v), `.blocker-history uses an unexpected token ${v} — must reuse an existing neutral token`);
+  }
+  const rootBlock = stylesCss.match(/:root\s*\{([^}]*)\}/)?.[1] || "";
+  const lightBlock = stylesCss.match(/\[data-theme="light"\]\s*\{([^}]*)\}/)?.[1] || "";
+  for (const v of allowed) {
+    assert.match(rootBlock, new RegExp(`${v}\\s*:`), `${v} must be defined in :root`);
+    assert.match(lightBlock, new RegExp(`${v}\\s*:`), `${v} must be defined in [data-theme="light"]`);
+  }
 });
 
 test("the new motion (accordion + pulse + crossfade) is prefers-reduced-motion guarded", () => {
