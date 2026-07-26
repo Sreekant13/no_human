@@ -862,8 +862,11 @@ async def test_resume_still_409s_on_done_and_cancelled(client, store, status):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [
     TaskStatus.AWAITING_APPROVAL, TaskStatus.ESCALATED, TaskStatus.FAILED,
+    TaskStatus.IMPLEMENTING, TaskStatus.REVIEWING,
 ])
 async def test_shipped_transitions_from_each_allowed_status(client, store, status):
+    """SCRUM-69: operator-testimony model — shipped is valid from any
+    non-terminal status, including mid-run statuses a live worker holds."""
     t = await _seed_task(store, status=status)
     t.blocker = {"category": "AMBIGUITY", "question": "?"}
     await store.update_task(t)
@@ -877,6 +880,11 @@ async def test_shipped_transitions_from_each_allowed_status(client, store, statu
     fresh = await store.find_task(t.id)
     assert fresh.status == TaskStatus.DONE
     assert fresh.blocker is None
+
+    events = await store.list_events(t.id)
+    merged = [e for e in events if e.get("kind") == "human_merged"]
+    assert len(merged) == 1, f"expected human_merged event for {status.value}"
+    assert merged[0]["sha"] == "abc1234"
 
 
 @pytest.mark.asyncio
@@ -921,10 +929,41 @@ async def test_shipped_cancelled_task_is_409(client, store):
 
 
 @pytest.mark.asyncio
-async def test_shipped_wrong_status_is_409(client, store):
+async def test_shipped_from_mid_run_status_succeeds(client, store):
+    """SCRUM-69: a task a live worker is mid-run on (e.g. resurrected after a
+    wrongly-resumed-then-paused watcher incident) is no longer 409'd — the
+    operator's human_merged testimony is trusted regardless of run status."""
     t = await _seed_task(store, status=TaskStatus.IMPLEMENTING)
     r = await client.post(f"/api/tasks/{t.id}/shipped", json={"sha": "abc1234"})
-    assert r.status_code == 409
+    assert r.status_code == 200, r.text
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.DONE
+
+
+@pytest.mark.asyncio
+async def test_shipped_from_implementing_declaims_and_is_not_claimable(client, store):
+    """De-claim + scheduler guard: shipping a mid-run task clears its blocker
+    and wake_check_at, and once DONE it falls outside the scheduler's
+    _CLAIMABLE statuses (IMPLEMENTING, PENDING) so a live pool cannot
+    re-claim it."""
+    from no_human.core.scheduler import Scheduler
+
+    t = await _seed_task(store, status=TaskStatus.IMPLEMENTING)
+    t.blocker = {"category": "AMBIGUITY", "question": "?"}
+    t.wake_check_at = "2026-07-27T00:00:00+00:00"
+    await store.update_task(t)
+
+    r = await client.post(f"/api/tasks/{t.id}/shipped", json={"sha": "abc1234"})
+    assert r.status_code == 200, r.text
+
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.DONE
+    assert fresh.blocker is None
+    assert fresh.wake_check_at is None
+
+    sched = Scheduler(store, lambda task=None: None, max_workers=1)
+    claimable_ids = {ct.id for ct in await sched._claimable()}
+    assert t.id not in claimable_ids
 
 
 @pytest.mark.asyncio
