@@ -150,6 +150,62 @@ def test_mixed_declarations_and_regexp_calls_count_only_declarations():
     assert tamper_guard.count_tests(src) == 2
 
 
+def test_bare_it_and_describe_still_count():
+    """Genuine it()/describe() declarations must still be counted."""
+    assert tamper_guard.count_tests("it('x', () => {})") == 1
+    assert tamper_guard.count_tests("  it('indented', () => {})") == 1
+    assert tamper_guard.count_tests("describe('suite', () => {})") == 1
+    assert tamper_guard.count_tests("  describe('nested', () => {})") == 1
+
+
+def test_playwright_test_describe_prefix_still_counts():
+    """`test.describe(` (Playwright's suite form) is an allowlisted genuine declaration."""
+    assert tamper_guard.count_tests('test.describe("suite", () => {})') == 1
+    src = (
+        "test.describe('outer', () => {\n"
+        "  it('does a thing', () => {});\n"
+        "});\n"
+    )
+    assert tamper_guard.count_tests(src) == 2
+
+
+def test_describe_to_test_describe_refactor_is_not_tampered():
+    """Renaming `describe(` to `test.describe(` is an honest refactor, not tampering.
+
+    Reproduces the reported regression: the dot-prefix guard on `describe` alone
+    would drop `test.describe(` to zero, making an honest Playwright-style suite
+    rename look like a test-count decrease.
+    """
+    before = {
+        "web/tests/x.spec.js":
+            "describe('suite', () => {\n"
+            "  it('does a thing', () => {});\n"
+            "});\n"
+    }
+    after = {
+        "web/tests/x.spec.js":
+            "test.describe('suite', () => {\n"
+            "  it('does a thing', () => {});\n"
+            "});\n"
+    }
+    report = tamper_guard.check(before, after)
+    assert report.tampered is False
+    assert report.tests_before == report.tests_after == 2
+
+
+def test_method_it_and_describe_are_not_declarations():
+    """foo.it(...) / obj.describe(...) are method calls, not declarations."""
+    assert tamper_guard.count_tests("foo.it(bar)") == 0
+    assert tamper_guard.count_tests("obj.describe(x)") == 0
+    assert tamper_guard.count_tests("suite.it(y)") == 0
+
+
+def test_word_ending_in_it_or_describe_is_not_a_declaration():
+    """A variable/word ending in 'it'/'describe' followed by '(' must not count."""
+    assert tamper_guard.count_tests("edit(x)") == 0
+    assert tamper_guard.count_tests("audit(y)") == 0
+
+
 def test_check_honest_regexp_refactor_is_not_tampered():
     """Swapping a `.test(` regex helper for an equivalent one must not trip the guard.
 

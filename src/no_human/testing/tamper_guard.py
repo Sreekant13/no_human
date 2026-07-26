@@ -39,12 +39,24 @@ _TEST_FILE_PATTERNS = (
 )
 _TEST_FILE_RE = re.compile("|".join(_TEST_FILE_PATTERNS))
 
-# Test-function declarations. The bare `test(` alternative uses a negative
-# lookbehind (not just \b) to exclude `.test(` / `foo.test(` — RegExp.prototype
-# .test() calls, not test declarations — while still matching a standalone
-# `test(...)` at the start of a line/expression.
+# Test-function declarations. The `test`, `it`, and `describe` alternatives
+# use a negative lookbehind (not just \b) to exclude `.test(` / `foo.test(` —
+# RegExp.prototype.test() calls, not test declarations — and likewise
+# `foo.it(` / `obj.describe(`, while still matching a standalone
+# `test(...)` / `it(...)` / `describe(...)` at the start of a line/expression.
+# Known tradeoff: the lookbehind cannot distinguish `t.test('sub', fn)` (a
+# genuine node:test SUBTEST declaration) from `foo.test(bar)` (a regex call),
+# so `t.test(` / `foo.it(` style subtests are deliberately left uncounted.
+# One exception is allowlisted explicitly: Playwright's `test.describe(` suite
+# form is a genuine declaration and DOES occur live (web/tests/sdlc-ui.spec.js:142),
+# so it is matched via a closed-class prefix alternative below rather than the
+# dot-guarded `describe` alternative (which would otherwise miscount an honest
+# `describe(` -> `test.describe(` refactor as tampering). A repo-wide
+# `git grep -nE '(^|[^.\w])[A-Za-z_$][\w$]*\.(test|it|describe)\('` found no other
+# live dot-prefixed `it`/`describe` declarations to allowlist.
 _TEST_DECL = re.compile(
-    r"\bdef\s+test\w*\s*\(|\bit\s*\(|(?<![.\w])test\s*\(|@Test\b|\bdescribe\s*\(",
+    r"\bdef\s+test\w*\s*\(|(?<![.\w])it\s*\(|(?<![.\w])test\s*\(|@Test\b"
+    r"|(?<![.\w])describe\s*\(|(?<![.\w])test\.describe\s*\(",
 )
 
 # Assertion-ish calls across python/js/java.
