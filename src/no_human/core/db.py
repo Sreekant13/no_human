@@ -200,6 +200,19 @@ class Store:
         rows = await cur.fetchall()
         return [Task.from_row(dict(r)) for r in rows]
 
+    async def get_task_by_source_external_id(
+        self, source: str, external_id: str
+    ) -> Task | None:
+        """Filtered dedupe lookup for any external-source intake (Slack, and
+        usable by Jira too) — one indexed-shape query instead of hydrating
+        every task via `list_tasks()` just to scan for a match."""
+        cur = await self.db.execute(
+            "SELECT * FROM tasks WHERE source = ? AND external_id = ? LIMIT 1",
+            (source, external_id),
+        )
+        row = await cur.fetchone()
+        return Task.from_row(dict(row)) if row else None
+
     async def list_jira_imported_tasks(self) -> list[JiraImportedTaskRow]:
         """Narrow projection for the Jira picker's imported-chip lookup
         (SCRUM-54): only (external_id, id, status, created_at) for
