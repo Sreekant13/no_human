@@ -10,9 +10,11 @@ dependencies = [
     "click>=8.4.1",
     "fastapi>=0.138.0",
     "httpx>=0.28.1",
+    "mcp>=1.28.0",
     "psutil>=7.0.0",
     "pyyaml>=6.0.3",
     "rich>=15.0.0",
+    "slack-sdk>=3.43.0",
     "textual>=8.2.7",
     # [standard] pulls in the `websockets` impl uvicorn needs for the board's
     # live-update WS. Plain uvicorn can't do the WS handshake — the upgrade then
