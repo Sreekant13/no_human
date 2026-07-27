@@ -87,10 +87,25 @@ class NorthStarCard:
         return median(vals) if vals else None
 
     @property
+    def priced_scores(self) -> list[BenchScore]:
+        """Ran specs with a real, non-zero priced cost — the population
+        ``median_cost_ratio`` (and its published denominator) is taken over.
+
+        Gates on ``cost_ratio`` itself, not on ``nh_tokens`` alone: cost_ratio
+        is price-weighted (nh_tokens + 0.1*cache_read + 1.25*cache_creation),
+        so a spec can have nh_tokens == 0 yet real cache-read spend and a real
+        non-zero cost_ratio — gating on raw nh_tokens would wrongly drop that
+        spec too. ``cost_ratio`` is falsy for both None (no baseline) and 0.0
+        (no_human spent nothing — crashed/skipped/escalated before any model
+        call), and a 0.0 is a non-result, not a cost win, so both are
+        excluded here."""
+        return [s for s in self.ran if s.cost_ratio]
+
+    @property
     def median_cost_ratio(self) -> float | None:
         """Price-weighted (cache-aware) ratio — the honest headline; the plain
         token ratio is blind to cache-read, which is ~95% of real burn."""
-        vals = [s.cost_ratio for s in self.ran if s.cost_ratio is not None]
+        vals = [s.cost_ratio for s in self.priced_scores]
         return median(vals) if vals else None
 
     @property
@@ -553,10 +568,21 @@ def render_northstar_md(card: NorthStarCard,
                         history: list[dict[str, Any]] | None = None) -> str:
     """Render docs/NORTH_STAR_BENCH.md content."""
     agg = card.as_dict()["aggregate"]
-    # How many ran specs actually HAVE an original cost to compare against.
-    # The median is over these, not over `ran`, and publishing it without the
-    # denominator overstates its coverage.
-    _priced = sum(1 for s in card.ran if s.cost_ratio is not None)
+    # How many ran specs actually count toward the cost median — the same
+    # `priced_scores` predicate the median itself is computed over. Using a
+    # different predicate here (e.g. counting every spec with a cost_ratio,
+    # zero-spend ones included) would publish a denominator larger than the
+    # population the median was actually taken over.
+    _priced = len(card.priced_scores)
+    # Specs with ANY recorded original baseline (cost_ratio is not None),
+    # independent of whether no_human spent anything on them. This is a
+    # DIFFERENT, larger population than `_priced`: a zero-spend spec still
+    # HAS a baseline and still contributes its orig_tokens to
+    # `total_orig_tokens`, even though `priced_scores` (and therefore the
+    # median) excludes it for having spent nothing. Reusing `_priced` as the
+    # denominator for the orig-tokens total would understate how many specs
+    # that total is actually summed over.
+    _baselined = sum(1 for s in card.ran if s.cost_ratio is not None)
     # Numerator/denominator behind the escalation rate. Computed here
     # rather than added to the aggregate so this does not collide with the
     # same fields arriving on the bench-endpoint branch.
@@ -626,7 +652,7 @@ def render_northstar_md(card: NorthStarCard,
         "nh side includes coder+reviewer, NOT yet planner/supervisor (B2)",
         f"- Total non-cache tokens: nh {agg['total_nh_tokens']:,} over all "
         f"{agg['total'] - agg['skipped']} ran spec(s), vs original "
-        f"{agg['total_orig_tokens']:,} over the {_priced} that have a baseline "
+        f"{agg['total_orig_tokens']:,} over the {_baselined} that have a baseline "
         f"at all — NOT a like-for-like pair; use the median cost ratio above",
         # Always rendered, including the 0 case. A published run is under the
         # refusal threshold by construction, so the number a reader needs is
