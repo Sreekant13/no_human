@@ -377,7 +377,7 @@ export default function Onboarding({ onComplete }) {
               <p className="ob-sub">Used to scope rules to your team.</p>
               <label className="ob-field">
                 <span>Team</span>
-                <input className="ob-input" value={team} placeholder="e.g. METRICSDB, ANALYTICS-EXPORT"
+                <input className="ob-input" value={team} placeholder="e.g. PLATFORM, PAYMENTS"
                        onChange={(e) => setTeam(e.target.value)} autoFocus />
               </label>
             </Stagger>
@@ -426,7 +426,7 @@ export default function Onboarding({ onComplete }) {
               <h2 className="ob-h2">Group repos into projects</h2>
               <p className="ob-sub">A project is a named unit of work — it can span multiple repos. When you create a task, you pick a project.</p>
               <div className="ob-row" style={{ marginBottom: '0.75rem' }}>
-                <input className="ob-input" value={newProjName} placeholder="Project name, e.g. metrics-core" onChange={(e) => setNewProjName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addProject()} />
+                <input className="ob-input" value={newProjName} placeholder="Project name, e.g. checkout-api" onChange={(e) => setNewProjName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addProject()} />
                 <button className="ob-btn-ghost" onClick={addProject} disabled={!newProjName.trim()}>+ Add project</button>
               </div>
               {projectDefs.length === 0 && <div className="ob-empty">No projects defined yet. Add at least one to continue.</div>}
