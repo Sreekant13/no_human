@@ -704,15 +704,21 @@ def render_northstar_md(card: NorthStarCard,
         proj[p]["n"] += 1
         proj[p]["ok"] += 1 if s.goal_satisfied else 0
         proj[p]["esc"] += 1 if s.escalated_honestly else 0
-        if s.cost_ratio is not None:
-            proj[p]["ratios"].append(s.cost_ratio)
+    # The median MUST be taken over exactly `card.priced_scores` — the same
+    # population as the headline `median_cost_ratio`. Re-deriving the predicate
+    # here is what let the two drift apart (a zero-spend spec is a non-result,
+    # not a cost win, and counting it makes a project look 8x cheaper than the
+    # headline). Do not reintroduce a local `if s.cost_ratio ...` test.
+    for s in card.priced_scores:
+        proj[s.project or "?"]["ratios"].append(s.cost_ratio)
     if len(proj) > 1:
         lines += ["", "## Per-project", "",
-                  "| project | tasks | satisfied | honest-escalations | median cost |",
+                  "| project | tasks | satisfied | honest-escalations | median cost (priced n) |",
                   "|---|---|---|---|---|"]
         for p in sorted(proj):
             a = proj[p]
-            med = f"{median(a['ratios']):.3f}" if a["ratios"] else "—"
+            med = (f"{median(a['ratios']):.3f} ({len(a['ratios'])})"
+                   if a["ratios"] else "—")
             # Redact the DISPLAYED label; the grouping key `p` stays the real
             # name so counts and medians are unchanged. (v13's project labels
             # are the real repo names, not the neutral spec basenames.)
