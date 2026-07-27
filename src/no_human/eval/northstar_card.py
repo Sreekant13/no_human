@@ -644,7 +644,7 @@ def render_northstar_md(card: NorthStarCard,
         f"- **Median COST ratio (price-weighted, cache-aware): "
         f"{agg['median_cost_ratio'] if agg['median_cost_ratio'] is not None else 'n/a'}**"
         f" — over the {_priced} of {agg['total'] - agg['skipped']} ran spec(s) "
-        f"with a recorded original cost; <1.0 means no_human was cheaper than "
+        f"with a recorded original cost AND non-zero no_human spend; <1.0 means no_human was cheaper than "
         f"the babysat session. The nh side counts coder+reviewer, NOT yet "
         f"planner/supervisor (B2), so it UNDERSTATES no_human's real burn.",
         f"- Median token ratio (non-cache in/out only): "
@@ -685,7 +685,7 @@ def render_northstar_md(card: NorthStarCard,
     core_scores = [s for s in card.scores if s.subset == "core"]
     hidden = len(card.scores) - len(core_scores)
     for s in core_scores:
-        ratio_s = (f"{s.cost_ratio:.2f}" if s.cost_ratio is not None else "—")
+        ratio_s = (f"{s.cost_ratio:.2f}" if s.cost_ratio else "—")
         sat = {True: "✅", False: "❌", None: "—"}[s.goal_satisfied]
         lines.append(
             f"| {s.task_id} | {s.outcome_status} | {sat} | {s.nh_tokens:,} | "
