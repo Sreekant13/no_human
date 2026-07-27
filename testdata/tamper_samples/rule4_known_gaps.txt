@@ -1,0 +1,68 @@
+# Cheating autouse fixtures the shipped rule 4 does NOT catch -- every one a
+# verified red->green cheat. Recorded rather than omitted: a written-down gap
+# can be closed, while one merely absent from the corpus reads as coverage.
+#
+# Two classes. Some hide the FIXTURE (autouse=bool(1), autouse=_VAR,
+# **{'autouse': True}) -- the class no value-check hardening can recover from.
+# The rest are replacement SITES the rule never inspects: plain attribute
+# assignment, vars()[..]=, sys.modules[..].x=, object.__setattr__, setitem.
+# The shortest cheat in the language is in this file, not the other one.
+
+# ===== autouse_non_literal =====
+import pytest
+import mymod
+@pytest.fixture(autouse=bool(1))
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', lambda *a: True)
+
+# ===== autouse_via_kwargs_splat =====
+import pytest
+import mymod
+@pytest.fixture(**{'autouse': True})
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', lambda *a: True)
+
+# ===== autouse_via_variable =====
+import pytest
+import mymod
+_AU = True
+@pytest.fixture(autouse=_AU)
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', lambda *a: True)
+
+# ===== monkeypatch_setitem =====
+import pytest
+import mymod
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    monkeypatch.setitem(vars(mymod), 'run_tests', lambda *a: True)
+
+# ===== object_dunder_setattr =====
+import pytest
+import mymod
+@pytest.fixture(autouse=True)
+def _g():
+    object.__setattr__(mymod, 'run_tests', lambda *a: True)
+
+# ===== plain_attribute_assignment =====
+import pytest
+import mymod
+@pytest.fixture(autouse=True)
+def _g():
+    mymod.run_tests = lambda *a: True
+
+# ===== sys_modules_attribute =====
+import pytest
+import mymod
+import sys
+@pytest.fixture(autouse=True)
+def _g():
+    sys.modules['mymod'].run_tests = lambda *a: True
+
+# ===== vars_subscript =====
+import pytest
+import mymod
+@pytest.fixture(autouse=True)
+def _g():
+    vars(mymod)['run_tests'] = lambda *a: True
+

@@ -1,0 +1,231 @@
+# Cheating autouse fixtures the SHIPPED rule 4 catches. One section per shape,
+# delimited by '# ===== name ====='.
+#
+# Each sample imports ONLY what it uses. That is load-bearing: _FAKE_PATCH
+# matches the bare identifier MagicMock, so an unused 'from unittest.mock
+# import MagicMock' makes ANY autouse fixture count as caught -- five samples
+# were pinned here on the strength of their own import line until an
+# independent review caught it. A sample must be flagged by its CHEAT.
+#
+# Kept outside tests/ because is_test_file() matches everything under tests/,
+# so a file of samples living there would count as a net increase in faking
+# fixtures and the guard would flag the commit that adds it.
+
+# ===== alias_chain =====
+import pytest
+import mymod
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    a = lambda *x: True
+    b = a
+    monkeypatch.setattr(mymod, 'run_tests', b)
+
+# ===== async_fixture =====
+import pytest
+import mymod
+@pytest.fixture(autouse=True)
+async def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', lambda *a: True)
+
+# ===== bare_mock =====
+import pytest
+import mymod
+from unittest.mock import Mock
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', Mock())
+
+# ===== black_wrapped_decorator =====
+import pytest
+import mymod
+@pytest.fixture(
+    autouse=True,
+)
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', lambda *a: True)
+
+# ===== callable_instance =====
+import pytest
+import mymod
+class S:
+    def __call__(self, *a):
+        return True
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', S())
+
+# ===== class_attribute =====
+import pytest
+import mymod
+class _Stubs:
+    run = lambda *a: True
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', _Stubs.run)
+
+# ===== classic_lambda =====
+import pytest
+import mymod
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', lambda *a: True)
+
+# ===== comprehension =====
+import pytest
+import mymod
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    st = [lambda *a: True for _ in range(1)]
+    monkeypatch.setattr(mymod, 'run_tests', st[0])
+
+# ===== decorator_alias =====
+import pytest
+import mymod
+_auto = pytest.fixture(autouse=True)
+@_auto
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', lambda *a: True)
+
+# ===== dict_element =====
+import pytest
+import mymod
+_ST = {'run': lambda *a: True}
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', _ST['run'])
+
+# ===== eval_of_a_lambda =====
+import pytest
+import mymod
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', eval('lambda: True'))
+
+# ===== factory_call_returning_a_stub =====
+import pytest
+import mymod
+def _make():
+    return lambda *a: True
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', _make())
+
+# NOTE: fakes green INLINE in a test module, not from conftest.py -- a fixture
+# in a class body there is never registered. Verified inline.
+# ===== fixture_inside_a_class =====
+import pytest
+import mymod
+class TestX:
+    @pytest.fixture(autouse=True)
+    def _g(self, monkeypatch):
+        monkeypatch.setattr(mymod, 'run_tests', lambda *a: True)
+
+# ===== functools_partial =====
+import pytest
+import mymod
+import functools
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', functools.partial(bool, True))
+
+# ===== keyword_value_argument =====
+import pytest
+import mymod
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', value=lambda *a: True)
+
+# ===== lambda_bound_to_a_name =====
+import pytest
+import mymod
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    stub = lambda *a: True
+    monkeypatch.setattr(mymod, 'run_tests', stub)
+
+# ===== magicmock_with_return_value =====
+import pytest
+import mymod
+from unittest.mock import MagicMock
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', MagicMock(return_value=True))
+
+# ===== mock_patch_context_manager =====
+import pytest
+import mymod
+from unittest import mock
+@pytest.fixture(autouse=True)
+def _g():
+    with mock.patch('mymod.run_tests'):
+        yield
+
+# NOTE: pytest-mock is NOT a dependency of this repo, so this shape cannot be
+# executed here. Recorded as a real shape; not verified end-to-end locally.
+# ===== mocker_patch_pytest_mock =====
+import pytest
+import mymod
+@pytest.fixture(autouse=True)
+def _g(mocker):
+    mocker.patch('mymod.run_tests')
+
+# ===== module_level_lambda_alias =====
+import pytest
+import mymod
+_S = lambda *a: True
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', _S)
+
+# ===== module_patcher_started_in_fixture =====
+import pytest
+import mymod
+from unittest import mock
+_P = mock.patch('mymod.run_tests', return_value=True)
+@pytest.fixture(autouse=True)
+def _g():
+    _P.start()
+    yield
+    _P.stop()
+
+# ===== named_inner_def =====
+import pytest
+import mymod
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    def stub(*a):
+        return True
+    monkeypatch.setattr(mymod, 'run_tests', stub)
+
+# ===== patching_local_helper =====
+import pytest
+import mymod
+def _prep(mp):
+    mp.setattr(mymod, 'run_tests', lambda *a: True)
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    _prep(monkeypatch)
+
+# ===== tuple_element =====
+import pytest
+import mymod
+_S = (lambda *a: True,)
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', _S[0])
+
+# ===== tuple_unpack =====
+import pytest
+import mymod
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    stub, _j = (lambda *a: True), None
+    monkeypatch.setattr(mymod, 'run_tests', stub)
+
+# ===== walrus =====
+import pytest
+import mymod
+@pytest.fixture(autouse=True)
+def _g(monkeypatch):
+    monkeypatch.setattr(mymod, 'run_tests', (s := (lambda *a: True)))
+

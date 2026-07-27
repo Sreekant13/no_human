@@ -1,0 +1,17 @@
+# Positive control for the import-artifact defect an independent review found.
+#
+# _FAKE_PATCH matches the bare identifier MagicMock, so this fixture is flagged
+# by its UNUSED import rather than by its cheat. Five corpus samples were pinned
+# as "caught" on exactly this basis; the cheat itself (plain attribute
+# assignment) is a known gap and lives in rule4_known_gaps.txt.
+#
+# It sits in testdata/ for the same reason as every other sample: inline in a
+# test module, the literal text alone counts as a faking fixture and the guard
+# flags the commit that adds it.
+
+# ===== unused_mock_import_alone_flags =====
+import pytest, mymod
+from unittest.mock import MagicMock
+@pytest.fixture(autouse=True)
+def _g():
+    mymod.run_tests = lambda *a: True
