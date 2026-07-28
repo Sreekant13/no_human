@@ -465,8 +465,138 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
         </div>
 
         <form onSubmit={handleSubmit} className={busy ? "pointer-events-none opacity-60" : ""}>
+          {/* What shape of work this is. One choice out of many → radios, not toggles.
+              N5: the two most consequential groups (kind, repo) sat unlabeled
+              outside the card while priority (least consequential) sat inside —
+              visible eyebrows give the hierarchy back without moving anything. */}
+          <p className="mt-0 px-1 font-ui text-xs uppercase tracking-wide text-text-dim" id="kind-eyebrow">Kind</p>
+          <div role="radiogroup" aria-labelledby="kind-eyebrow" className="mt-1.5 flex flex-wrap gap-2">
+            {COMPOSER_KINDS.map((chip) => {
+              const selected = chip.kind === kind;
+              return (
+                <button
+                  key={chip.kind}
+                  type="button"
+                  role="radio"
+                  aria-checked={selected}
+                  onClick={() => setKind(chip.kind)}
+                  className={`${selected ? ACCENT : ON_CARD} px-5`}
+                >
+                  {chip.label}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* The hint lived only in a `title` tooltip — invisible to keyboard and
+              touch users. Show the selected kind's meaning instead. */}
+          {selectedChip && (
+            <p className="mt-2 px-5 font-ui text-sm text-text-muted">{selectedChip.hint}</p>
+          )}
+
+          {needsPrUrl(kind) && (
+            <div className="mt-3">
+              <input
+                className={TEXT_FIELD}
+                placeholder="https://github.com/owner/repo/pull/123"
+                value={prUrl}
+                onChange={(e) => setPrUrl(e.target.value)}
+                aria-label="PR or MR URL"
+                aria-describedby="pr-url-hint"
+              />
+              <p
+                id="pr-url-hint"
+                role={prRefMissing ? "alert" : undefined}
+                className={`mt-2 px-5 font-ui text-sm ${prRefMissing ? "" : "text-text-muted"}`}
+                style={prRefMissing ? { color: "var(--red)" } : undefined}
+              >
+                {prRefMissing
+                  ? "Paste the PR/MR to review — a full URL, or a “host/owner/repo PR #123” reference."
+                  : "The agent fetches this diff, reviews it, and drafts comments for your approval."}
+              </p>
+            </div>
+          )}
+
+          {/* Where the work happens. */}
+          <p className="mt-3 px-1 font-ui text-xs uppercase tracking-wide text-text-dim" id="repo-eyebrow">Repository</p>
+          <div className="mt-1.5 flex flex-wrap items-center gap-2">
+            {!freeTextRepo ? (
+              <SelectPill
+                grow
+                value={selectedProjectId}
+                onChange={(e) => {
+                  setSelectedProjectId(e.target.value);
+                  // Otherwise a repo picked inside the OLD project rides along.
+                  setRepoPath("");
+                }}
+                aria-label="Project"
+              >
+                {(projects ?? []).map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} ({p.repo_paths.length} {pluralize(p.repo_paths.length, "repo")})
+                  </option>
+                ))}
+              </SelectPill>
+            ) : (
+              <input
+                className={`${TEXT_FIELD} min-w-0 flex-1`}
+                placeholder="~/git/my-project"
+                value={repoPath}
+                onChange={(e) => setRepoPath(e.target.value)}
+                aria-label="Repository path"
+                aria-describedby="repo-path-hint"
+              />
+            )}
+
+            {!freeTextRepo && project && project.repo_paths.length > 1 && (
+              <SelectPill
+                value={repoPath || project.primary_repo || project.repo_paths[0]}
+                onChange={(e) => setRepoPath(e.target.value)}
+                aria-label="Repository"
+              >
+                {project.repo_paths.map((rp) => (
+                  <option key={rp} value={rp}>
+                    {rp.split("/").pop()}
+                    {rp === project.primary_repo ? " (primary)" : ""}
+                  </option>
+                ))}
+              </SelectPill>
+            )}
+
+            {showRepoToggle && (
+              <button
+                type="button"
+                className={`${ON_CARD} px-5`}
+                onClick={() => {
+                  const next = !customRepo;
+                  setCustomRepo(next);
+                  // Leaving custom mode clears the free text and restores a project;
+                  // ENTERING it keeps whatever was already typed.
+                  if (!next) {
+                    setRepoPath("");
+                    setSelectedProjectId(projects[0]?.id || "");
+                  }
+                }}
+              >
+                {customRepo ? "use a saved project" : "use another repo"}
+              </button>
+            )}
+          </div>
+
+          {freeTextRepo && (
+            <p id="repo-path-hint" className="mt-2 px-5 font-ui text-sm text-text-muted">
+              Must be a path to a git repository — e.g. ~/git/my-project.
+            </p>
+          )}
+
+          {loaded && projects.length === 0 && (
+            <p className="mt-2 px-5 font-ui text-sm text-text-muted">
+              No projects yet — give the path of the repo to work in.
+            </p>
+          )}
+
           {/* One large input surface: the prompt and the controls that qualify it. */}
-          <div className="rounded-2xl border border-solid border-line bg-panel p-4 transition-colors focus-within:border-accent sm:p-5">
+          <div className="mt-4 rounded-2xl border border-solid border-line bg-panel p-4 transition-colors focus-within:border-accent sm:p-5">
             <textarea
               ref={promptRef}
               className="min-h-[180px] w-full resize-none border-0 bg-transparent px-2 py-1 font-ui text-lg leading-relaxed text-text outline-none placeholder:text-text-muted sm:min-h-[200px]"
@@ -523,129 +653,6 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
               </div>
             </div>
           </div>
-
-          {/* What shape of work this is. One choice out of many → radios, not toggles.
-              N5: the two most consequential groups (kind, repo) sat unlabeled
-              outside the card while priority (least consequential) sat inside —
-              visible eyebrows give the hierarchy back without moving anything. */}
-          <p className="mt-4 px-1 font-ui text-xs uppercase tracking-wide text-text-dim" id="kind-eyebrow">Kind</p>
-          <div role="radiogroup" aria-labelledby="kind-eyebrow" className="mt-1.5 flex flex-wrap gap-2">
-            {COMPOSER_KINDS.map((chip) => {
-              const selected = chip.kind === kind;
-              return (
-                <button
-                  key={chip.kind}
-                  type="button"
-                  role="radio"
-                  aria-checked={selected}
-                  onClick={() => setKind(chip.kind)}
-                  className={`${selected ? ACCENT : ON_CARD} px-5`}
-                >
-                  {chip.label}
-                </button>
-              );
-            })}
-          </div>
-
-          {/* The hint lived only in a `title` tooltip — invisible to keyboard and
-              touch users. Show the selected kind's meaning instead. */}
-          {selectedChip && (
-            <p className="mt-2 px-5 font-ui text-sm text-text-muted">{selectedChip.hint}</p>
-          )}
-
-          {needsPrUrl(kind) && (
-            <div className="mt-3">
-              <input
-                className={TEXT_FIELD}
-                placeholder="https://github.com/owner/repo/pull/123"
-                value={prUrl}
-                onChange={(e) => setPrUrl(e.target.value)}
-                aria-label="PR or MR URL"
-                aria-describedby="pr-url-hint"
-              />
-              <p
-                id="pr-url-hint"
-                role={prRefMissing ? "alert" : undefined}
-                className={`mt-2 px-5 font-ui text-sm ${prRefMissing ? "" : "text-text-muted"}`}
-                style={prRefMissing ? { color: "var(--red)" } : undefined}
-              >
-                {prRefMissing
-                  ? "Paste the PR/MR to review — a full URL, or a “host/owner/repo PR #123” reference."
-                  : "The agent fetches this diff, reviews it, and drafts comments for your approval."}
-              </p>
-            </div>
-          )}
-
-          {/* Where the work happens. */}
-          <p className="mt-3 px-1 font-ui text-xs uppercase tracking-wide text-text-dim">Repository</p>
-          <div className="mt-1.5 flex flex-wrap items-center gap-2">
-            {!freeTextRepo ? (
-              <SelectPill
-                grow
-                value={selectedProjectId}
-                onChange={(e) => {
-                  setSelectedProjectId(e.target.value);
-                  // Otherwise a repo picked inside the OLD project rides along.
-                  setRepoPath("");
-                }}
-                aria-label="Project"
-              >
-                {(projects ?? []).map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name} ({p.repo_paths.length} {pluralize(p.repo_paths.length, "repo")})
-                  </option>
-                ))}
-              </SelectPill>
-            ) : (
-              <input
-                className={`${TEXT_FIELD} min-w-0 flex-1`}
-                placeholder="~/git/my-project"
-                value={repoPath}
-                onChange={(e) => setRepoPath(e.target.value)}
-                aria-label="Repository path"
-              />
-            )}
-
-            {!freeTextRepo && project && project.repo_paths.length > 1 && (
-              <SelectPill
-                value={repoPath || project.primary_repo || project.repo_paths[0]}
-                onChange={(e) => setRepoPath(e.target.value)}
-                aria-label="Repository"
-              >
-                {project.repo_paths.map((rp) => (
-                  <option key={rp} value={rp}>
-                    {rp.split("/").pop()}
-                    {rp === project.primary_repo ? " (primary)" : ""}
-                  </option>
-                ))}
-              </SelectPill>
-            )}
-
-            {showRepoToggle && (
-              <button
-                type="button"
-                className={`${ON_CARD} px-5`}
-                onClick={() => {
-                  const next = !customRepo;
-                  setCustomRepo(next);
-                  // Leaving custom mode clears the free text and restores a project;
-                  // ENTERING it keeps whatever was already typed.
-                  if (!next) {
-                    setRepoPath("");
-                    setSelectedProjectId(projects[0]?.id || "");
-                  }
-                }}
-              >
-                {customRepo ? "back to projects" : "custom path"}
-              </button>
-            )}
-          </div>
-
-          {loaded && projects.length === 0 && (
-            <p className="mt-2 px-5 font-ui text-sm text-text-muted">
-              No projects yet — give the path of the repo to work in.
-            </p>
-          )}
 
           {files.length > 0 && (
             <div className="mt-3 px-5 font-ui text-sm text-text-muted">
