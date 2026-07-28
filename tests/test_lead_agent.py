@@ -540,3 +540,86 @@ async def test_quality_gate_skipped_when_disabled(store):
     refreshed = await store.get_task(parent.id)
     assert refreshed.status is TaskStatus.DONE
     assert "quality_gate" not in events
+
+
+async def test_unblock_ready_clears_a_checkpoint_it_never_chose(store):
+    """🔴 A MACHINE re-entry must not inherit another actor's provenance.
+
+    `_unblock_ready` moves a sub-task BLOCKED→PENDING when its dependencies are
+    done. That is the loop deciding, not a human. If a stale `resume_from`
+    survives it, the zero-diff honesty gate reads that pair and — when it says
+    `by: "human"` — believes a human gated this run. An attempt that edits
+    nothing is then credited and a PR opens on work no attempt produced.
+
+    This test exists because an architecture audit caught the fix for it
+    shipping with a LABEL and no demonstrated RED: the new AST registry test
+    pins the ENUMERATION of re-entry paths, not their behaviour, so
+    `("core/lead_agent.py", "_unblock_ready"): CLEARS` passed whether or not the
+    clearing line existed. An enumeration guard and a behaviour guard are not
+    substitutes for each other.
+    """
+    parent = Task.new("parent", repo_path="/tmp/repo")
+    await store.create_task(parent)
+    dep = Task.new("dep", repo_path="/tmp/repo")
+    dep.parent_id = parent.id
+    await store.create_task(dep)
+    await store.set_status(dep, TaskStatus.DONE, validate=False)
+
+    blocked = Task.new("blocked on dep", repo_path="/tmp/repo")
+    blocked.parent_id = parent.id
+    # The real gate is the wake condition plus `depends_on_ids` in context —
+    # NOT a `depends_on` attribute. My first version of this fixture set the
+    # latter, `_unblock_ready` returned 0, and the test "failed" for a reason
+    # that had nothing to do with the claim. Instrument, not product.
+    blocked.blocker = {"category": "DEPENDENCY_WAIT",
+                       "question": "waiting on dep",
+                       "wake_condition": "subtask_deps_met"}
+    await store.create_task(blocked)
+    await store.set_status(blocked, TaskStatus.BLOCKED, validate=False)
+    # Residue of an earlier human resume. Nothing clears it on its own.
+    await store.merge_context(blocked.id, {
+        "depends_on_ids": [dep.id],
+        "resume_from": {"sha": "75c68e08", "branch": "old", "by": "human"}})
+
+    lead = LeadAgent(store)
+    unblocked = await lead._unblock_ready(parent.id)
+
+    assert unblocked == 1, unblocked
+    ctx = (await store.get_task(blocked.id)).context or {}
+    assert ctx.get("resume_from") is None, (
+        "a dependency-met unblock inherited a checkpoint no actor chose for it, "
+        f"still labelled human: {ctx.get('resume_from')}")
+
+
+async def test_check_completion_retry_clears_a_checkpoint_it_never_chose(store):
+    """The TWIN of `_unblock_ready`, and it shipped unpinned.
+
+    Audit 4 said two `LeadAgent` CLEARS fixes had a label and no demonstrated
+    RED. Audit 5 checked BOTH and found only one had been closed: deleting
+    `check_completion`'s clearing line still left 2826 tests green. So the fix
+    for "a fix landed on one half of a pair" landed on one half of a pair —
+    the fifth occurrence of that shape in this branch.
+
+    The auto-retry of a FAILED sub-task is a MACHINE decision. A stale
+    `by:"human"` surviving it tells the zero-diff honesty gate a human gated
+    this run, and an attempt that edits nothing is credited.
+    """
+    parent = Task.new("parent", repo_path="/tmp/repo")
+    await store.create_task(parent)
+    await store.set_status(parent, TaskStatus.COMPOUND_PARENT, validate=False)
+
+    sub = Task.new("failed sub-task", repo_path="/tmp/repo")
+    sub.parent_id = parent.id
+    await store.create_task(sub)
+    await store.set_status(sub, TaskStatus.FAILED, validate=False)
+    await store.merge_context(sub.id, {
+        "resume_from": {"sha": "75c68e08", "branch": "old", "by": "human"}})
+
+    lead = LeadAgent(store)
+    await lead.check_completion(await store.get_task(parent.id))
+
+    refreshed = await store.get_task(sub.id)
+    assert refreshed.status is TaskStatus.PENDING, refreshed.status
+    assert (refreshed.context or {}).get("resume_from") is None, (
+        "the machine retry inherited a checkpoint no actor chose for it, still "
+        f"labelled human: {(refreshed.context or {}).get('resume_from')}")

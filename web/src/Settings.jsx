@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from "react";
+import keepFocusInDialog from "./keepFocusInDialog.js";
 import {
   addRule, addSkill, confirmLearning, fetchLearnings,
   fetchRules, fetchSkills, rejectLearning, removeRule, removeSkill,
@@ -169,9 +170,53 @@ export default function SettingsOverlay({ onClose }) {
     };
   }, []);
 
-  useEffect(() => {
-    closeRef.current?.focus();
+  // Move focus into the overlay when it OPENS — mount-only, for the same reason
+  // SlideOver's is: App renders <SettingsOverlay onClose={() => ...} /> with a new
+  // arrow every render, so sharing this call with the [onClose] effect below made
+  // every background re-render (the 10s worker-status poll) steal focus out of the
+  // field the operator was typing into — a token or repo path — and park it on the
+  // close button.
+  useEffect(() => { closeRef.current?.focus(); }, []);
 
+  // Self-heal ONLY when the focused control was REMOVED — see SlideOver.jsx for
+  // why "focus is on <body>" is the wrong question: the operator clicking a
+  // heading inside this overlay lands focus on <body> legitimately, and healing
+  // from there is the focus theft this whole change exists to remove.
+  useEffect(() => {
+    const el = dialogRef.current;
+    if (!el) return undefined;
+    // See SlideOver.jsx: `focusin` fires reliably, the blur on a REMOVED node
+    // does not, and a DOM mutation is the only trigger that means "something
+    // disappeared" rather than "the component re-rendered".
+    //
+    // Unlike the drawer, THIS panel contains its nested modals (add rule / add
+    // skill / new project) as descendants — measured: 45 nodes under the panel
+    // against 167 under its parent. So the scope is the panel itself. An earlier
+    // version copied the drawer's comment and its `el.parentNode` verbatim, which
+    // watched the whole app shell and matched `[data-nested-modal]`
+    // DOCUMENT-WIDE — including the drawer's own overlays and the composer,
+    // none of which belong to Settings.
+    const scope = el;
+    const ours = (n) => Boolean(n && el.contains(n));
+    let last = null;
+    const onFocusIn = (e) => { if (ours(e.target)) last = e.target; };
+    scope.addEventListener("focusin", onFocusIn);
+    const obs = new MutationObserver(() => {
+      if (!last || document.contains(last)) return;
+      // Whatever we remembered is gone. Forget it FIRST, whichever way this
+      // goes: leaving it set kept the heal armed against a detached node for the
+      // rest of the dialog's life, so an unrelated mutation minutes later stole
+      // focus — and retained the detached subtree too.
+      last = null;
+      const active = document.activeElement;
+      if (active && active !== document.body && !el.contains(active)) return;
+      closeRef.current?.focus();
+    });
+    obs.observe(scope, { childList: true, subtree: true });
+    return () => { scope.removeEventListener("focusin", onFocusIn); obs.disconnect(); };
+  }, []);
+
+  useEffect(() => {
     function onKeyDown(e) {
       if (e.key === "Escape") {
         // A modal ABOVE the overlay (add-rule/add-skill/add-project) owns the
@@ -220,13 +265,20 @@ export default function SettingsOverlay({ onClose }) {
 
   return (
     <>
-      <div className="settings-overlay-backdrop" onClick={onClose} />
+      {/* No backdrop close: a stray click here used to discard the whole
+          overlay AND any nested modal under it, with everything typed in them. */}
+      <div className="settings-overlay-backdrop" onMouseDown={keepFocusInDialog} />
       <div
         className="settings-overlay"
         role="dialog"
         aria-modal="true"
         aria-labelledby="settings-overlay-title"
         ref={dialogRef}
+        // The backdrop above is a SIBLING of this panel, so it never sees a
+        // mousedown inside the panel — and most of the panel is headings,
+        // labels and padding. Without this, clicking any of them while typing
+        // a token or a repo path strands the caret and drops every keystroke.
+        onMouseDown={keepFocusInDialog}
       >
         <div className="settings-overlay-left">
           <div className="settings-overlay-group-header">Settings</div>
@@ -385,8 +437,9 @@ function AddMemoryModal({ kind, onClose, onSaved, addFn }) {
   }
 
   return (
-    <div className="sendback-overlay" data-nested-modal onClick={onClose}>
-      <div className="new-task-modal" onClick={(e) => e.stopPropagation()}>
+    <div className="sendback-overlay" data-nested-modal
+         onMouseDown={keepFocusInDialog}>
+      <div className="new-task-modal">
         <div className="sendback-label">Add {kind.slice(0, -1)}</div>
         <form onSubmit={handleSubmit}>
           <div className="ntm-field">
@@ -939,6 +992,12 @@ function AddProjectModal({ onClose, onSaved }) {
   const [scanRoot, setScanRoot] = useState("~/git");
   const [detected, setDetected] = useState([]);
   const [selectedRepos, setSelectedRepos] = useState(new Set());
+  // Escape was DEAD here while its sibling AddMemoryModal had it: this modal
+  // carries `data-nested-modal`, which makes the overlay's own Escape handler
+  // stand down for it, and nothing took over. With backdrop-close removed,
+  // Cancel was the only way out — while the code and the composer's spec both
+  // state "Escape and Cancel stay as the deliberate exits".
+  useEscapeKey(onClose, !busy);
   const [scanning, setScanning] = useState(false);
 
   async function handleScan() {
@@ -982,8 +1041,9 @@ function AddProjectModal({ onClose, onSaved }) {
   }
 
   return (
-    <div className="sendback-overlay" data-nested-modal onClick={onClose}>
-      <div className="new-task-modal" style={{ maxWidth: 520 }} onClick={(e) => e.stopPropagation()}>
+    <div className="sendback-overlay" data-nested-modal
+         onMouseDown={keepFocusInDialog}>
+      <div className="new-task-modal" style={{ maxWidth: 520 }}>
         <div className="sendback-label">New Project</div>
         <form onSubmit={handleCreate}>
           <div className="ntm-field">

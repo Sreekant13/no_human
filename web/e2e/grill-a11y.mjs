@@ -109,6 +109,38 @@ const afterShift = await page.evaluate(() => {
 check("Shift+Tab at the start wraps to the end (trap holds)",
   afterShift.inDialog && afterShift.isLast, JSON.stringify(afterShift));
 
+// H3: the grill overlays had ZERO coverage — restoring `onClick={onClose}` on
+// them left this suite green.
+// ⚠️ SCOPE: this suite drives the three `aria-label="Intake grill"` branches.
+// The fourth overlay — `aria-label="Refined spec"`, the one the operator sees
+// when the grill finishes — is reached by NO suite, so its backdrop and caret
+// behaviour are still unpinned. Covering it needs a harness that drives the
+// grill to completion; recorded rather than silently left as "H3 closed". A stray click mid-grill would discard every
+// answer the operator had already given, which is the same class of loss the
+// composer and reply modal were fixed for.
+{
+  const dialog = page.locator('.new-task-modal[role="dialog"]');
+  await page.mouse.click(6, 6);                 // the backdrop, well outside
+  await page.waitForTimeout(300);
+  check("[backdrop] a stray click does not discard the intake grill",
+    await dialog.isVisible().catch(() => false));
+  // …and it must not strand the caret either: most of this dialog is static
+  // spec text, and a mousedown on it used to drop every following keystroke.
+  const focusable = await page.evaluate(() => {
+    const el = document.querySelector('.new-task-modal[role="dialog"]');
+    const t = el && el.querySelector("input, textarea");
+    if (t) { t.focus(); return true; }
+    return false;
+  });
+  if (focusable) {
+    await page.locator('.new-task-modal .sendback-label').first().click();
+    await page.waitForTimeout(150);
+    const held = await page.evaluate(() => document.activeElement?.tagName || "none");
+    check("[caret] clicking the spec text does not strand the caret",
+      held === "INPUT" || held === "TEXTAREA", held);
+  }
+}
+
 check("no page errors", errors.length === 0, errors[0] || "");
 
 await ctx.close();

@@ -1946,3 +1946,180 @@ async def test_saving_config_keeps_an_ambient_provider_ambient(
     )
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "ambient", r.text
+
+
+async def test_reply_stamps_HUMAN_provenance_on_the_resume_checkpoint(client, store):
+    """The zero-diff honesty gate credits work already ahead of base only when a
+    HUMAN gated it, and it reads `resume_from.by`. This endpoint is one of the
+    three human writers, so if it does not stamp itself the gate cannot tell this
+    answer from a timer-driven wake resume — and, worse, a stale `by: "wake"` from
+    an earlier machine resume SURVIVES a write that omits the key, because
+    `merge_context` is RFC 7396 and nested dicts merge.
+
+    That latch failed every human resume after any machine resume as fabrication:
+    two burnt attempts and a human paged. A review found the whole stamp could be
+    deleted from the real writers with the entire suite staying green.
+    """
+    t = await _seed_task(store, status=TaskStatus.ESCALATED)
+    t.blocker = {
+        "category": "AMBIGUITY", "question": "which store?",
+        "resume_branch": "scratch/x/abc-2", "resume_commit": "75c68e08",
+    }
+    await store.update_task(t)
+    # The residue of an earlier machine resume, which nothing ever clears.
+    await store.merge_context(t.id, {
+        "resume_reason": "wake_condition_satisfied",
+        "resume_from": {"sha": "75c68e08", "branch": "scratch/x/abc-2",
+                        "by": "wake"},
+    })
+
+    r = await client.post(f"/api/tasks/{t.id}/reply", json={"answer": "SQLite only"})
+    assert r.status_code == 200, r.text
+
+    resume_from = (await store.find_task(t.id)).context["resume_from"]
+    assert resume_from.get("by") == "human", (
+        "the reply endpoint did not stamp HUMAN provenance, so a stale machine "
+        f"marker survived its write: {resume_from}")
+
+
+async def test_reply_stamps_provenance_even_with_NO_checkpoint(client, store):
+    """The stamp must not be gated on the blocker carrying a `resume_commit`.
+
+    Five review rounds traded one direction of a ONE-WAY LATCH for the other
+    before naming the cause: every writer stamped `by` inside `if checkpoint:`,
+    so a resume whose own blocker recorded no sha wrote nothing at all, and
+    because `merge_context` is RFC 7396 the PREVIOUS actor's `by` survived to
+    describe THIS resume. Here a human answers a blocker that has no checkpoint
+    while a machine marker is on the row: the honesty gate must see "human".
+    """
+    t = await _seed_task(store, status=TaskStatus.ESCALATED)
+    # A blocker with NO resume_commit — the shape that skipped the write.
+    t.blocker = {"category": "AMBIGUITY", "question": "which store?"}
+    await store.update_task(t)
+    await store.merge_context(t.id, {
+        "resume_reason": "wake_condition_satisfied",
+        "resume_from": {"sha": "75c68e08", "branch": "scratch/x/abc-2",
+                        "by": "wake"},
+    })
+
+    r = await client.post(f"/api/tasks/{t.id}/reply", json={"answer": "SQLite only"})
+    assert r.status_code == 200, r.text
+
+    resume_from = (await store.find_task(t.id)).context["resume_from"]
+    assert resume_from.get("by") == "human", (
+        "a blocker without a resume_commit skipped the provenance write, so an "
+        f"earlier machine resume still describes this human answer: {resume_from}")
+    # A review mutated this endpoint back to the round-6 shape and the suite
+    # stayed GREEN, because every test here asserted `by` and none asserted
+    # `sha`. Relabelling the machine's sha is the fail-OPEN direction.
+    assert resume_from.get("sha") is None, (
+        f"/reply inherited a sha it never chose and relabelled it: {resume_from}")
+
+
+async def test_the_drawer_RESUME_button_stamps_human_provenance(client, store):
+    """`POST /api/tasks/{id}/resume` is the Resume button in the drawer, and it
+    was a resume path that wrote NO provenance at all — found independently by
+    a staff review and an architecture audit on the same day.
+
+    Two consequences, both live: a stale `by: "wake"` from any earlier machine
+    resume described the human's click, so the zero-diff honesty gate failed the
+    next attempt as fabrication (the D15 regression, on the surface friends
+    actually use); and the endpoint cleared `task.blocker` without ever reading
+    its checkpoint, so the next attempt branched from a stale sha and discarded
+    everything the parked attempt had committed. Its CLI twin, `nh task resume`,
+    has read the checkpoint since D15.
+    """
+    t = await _seed_task(store, status=TaskStatus.BLOCKED)
+    t.blocker = {"category": "AMBIGUITY", "question": "which store?",
+                 "resume_branch": "scratch/x/abc-2", "resume_commit": "75c68e08"}
+    await store.update_task(t)
+    await store.merge_context(t.id, {
+        "resume_reason": "wake_condition_satisfied",
+        "resume_from": {"sha": "0e22fe3d", "branch": "old", "by": "wake"},
+    })
+
+    r = await client.post(f"/api/tasks/{t.id}/resume")
+    assert r.status_code == 200, r.text
+
+    resume_from = (await store.find_task(t.id)).context["resume_from"]
+    assert resume_from.get("by") == "human", (
+        "the drawer's Resume button wrote no provenance, so an earlier machine "
+        f"resume still describes this human's click: {resume_from}")
+    assert resume_from.get("sha") == "75c68e08", (
+        "the endpoint cleared the blocker without reading its checkpoint, so the "
+        f"next attempt branches from a stale sha and loses committed work: {resume_from}")
+
+
+async def test_the_drawer_RESUME_button_with_no_checkpoint_clears_the_sha(client, store):
+    """The Resume button on a blocker that recorded no sha. It must not keep the
+    sha a MACHINE resume chose — a review reverted this endpoint to the round-6
+    shape and every test still passed, because they all asserted `by` and never
+    `sha`."""
+    t = await _seed_task(store, status=TaskStatus.BLOCKED)
+    t.blocker = {"category": "AMBIGUITY", "question": "which store?"}
+    await store.update_task(t)
+    await store.merge_context(t.id, {
+        "resume_from": {"sha": "0e22fe3d", "branch": "old", "by": "wake"}})
+
+    r = await client.post(f"/api/tasks/{t.id}/resume")
+    assert r.status_code == 200, r.text
+
+    resume_from = (await store.find_task(t.id)).context["resume_from"]
+    assert resume_from.get("by") == "human", resume_from
+    assert resume_from.get("sha") is None, (
+        f"the Resume button inherited a sha it never chose: {resume_from}")
+
+
+async def test_the_drawer_SEND_BACK_button_stamps_human_provenance(client, store):
+    """Sending a PR back for revision is a human gate, and the honesty gate has
+    to see it as one. This endpoint wrote no provenance either, so on a revision
+    branch whose HEAD is a [WIP-PARTIAL] a stale machine marker made the correct
+    "nothing more to change" verdict read as fabrication — two burnt attempts.
+
+    No checkpoint is involved here, so the write CLEARS any recorded sha rather
+    than relabelling one it never chose — see `resume_provenance`.
+    """
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    await store.merge_context(t.id, {
+        "resume_from": {"sha": "75c68e08", "branch": "scratch/x/abc-2",
+                        "by": "wake"},
+    })
+
+    r = await client.post(f"/api/tasks/{t.id}/send-back", json={"message": "redo"})
+    assert r.status_code == 200, r.text
+
+    resume_from = (await store.find_task(t.id)).context["resume_from"]
+    assert resume_from.get("by") == "human", (
+        f"send-back left a machine marker describing a human's decision: {resume_from}")
+    # 🔴 And it must NOT inherit the sha a MACHINE resume chose. An earlier
+    # version of this test asserted the opposite — that the sha survives — and
+    # pinned the fail-OPEN regression as correct: `by` said "human" over a sha
+    # no human picked, which disarms the zero-diff honesty gate and credits the
+    # loop's own abandoned [WIP-PARTIAL]. An independent review reproduced a PR
+    # being opened on work no attempt produced. Provenance is a property OF a
+    # sha; a write that names no checkpoint clears it.
+    assert resume_from.get("sha") is None, (
+        "send-back inherited a sha it never chose and relabelled it human — "
+        f"this is the fail-OPEN direction: {resume_from}")
+
+
+async def test_retry_clears_the_resume_checkpoint_so_a_fresh_run_is_fresh(client, store):
+    """`POST /retry` promises "a fresh run". It kept `resume_from`, so the retry
+    silently branched from a checkpoint some EARLIER actor chose — and if that
+    stale pair carried `by: "human"`, the zero-diff honesty gate was disarmed
+    for a run no human had gated. An eleventh resume path, found by review.
+
+    Retry means from base. A human who wants to continue from a checkpoint has
+    Resume for that.
+    """
+    t = await _seed_task(store, status=TaskStatus.FAILED)
+    await store.merge_context(t.id, {
+        "resume_from": {"sha": "75c68e08", "branch": "old", "by": "human"}})
+
+    r = await client.post(f"/api/tasks/{t.id}/retry")
+    assert r.status_code == 200, r.text
+
+    ctx = (await store.find_task(t.id)).context or {}
+    assert ctx.get("resume_from") is None, (
+        "retry inherited a checkpoint it never chose, so a 'fresh run' branches "
+        f"from a stale sha: {ctx.get('resume_from')}")

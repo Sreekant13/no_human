@@ -16,6 +16,7 @@ from .taxonomy import (
     BlockerOption,
     Route,
     resume_checkpoint,
+    resume_provenance,
     route_for,
     triage,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "BlockerOption",
     "Route",
     "resume_checkpoint",
+    "resume_provenance",
     "route_for",
     "triage",
     "parse_blocker",

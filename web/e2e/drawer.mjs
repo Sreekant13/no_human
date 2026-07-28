@@ -330,6 +330,287 @@ const openSectionLabel = (page) =>
   await ctx.close();
 }
 
+// FOCUS-STEAL — reported by a friend testing the app: "every time they tried typing
+// in the text box, after a few seconds the text stopped getting typed". The drawer's
+// focus trap called closeRef.focus() from an effect keyed on [onClose], and Board
+// passes a NEW onClose identity on every render — so every re-render (the 10s worker
+// poll, and every WS task frame) yanked focus out of whatever the operator was typing
+// into and parked it on the drawer's close button. Typing into a <button> goes nowhere.
+//
+// This drives the REAL re-render (the poll), not a simulated one: a test that called
+// the effect directly would pass with the bug present.
+{
+  const { ctx, page, errors } = await open(PARKED);
+  const replyBtn = page.getByRole("button", { name: /reply/i }).first();
+  await replyBtn.click();
+  await page.waitForTimeout(400);
+  const ta = page.locator(".sendback-modal textarea").first();
+  await ta.click();
+  await page.keyboard.type("an answer the operator is still typing");
+  const focusedBefore = await page.evaluate(() => document.activeElement?.tagName || "none");
+  check("[focus] the reply box has focus once clicked", focusedBefore === "TEXTAREA", focusedBefore);
+
+  // Span a full worker-status poll (App.jsx polls every 10s) so a real re-render lands
+  // while the operator is "typing". Nothing here touches focus.
+  await page.waitForTimeout(11000);
+
+  const after = await page.evaluate(() => ({
+    tag: document.activeElement?.tagName || "none",
+    cls: String(document.activeElement?.className || ""),
+  }));
+  check("[focus] a background re-render does NOT steal focus from the reply box",
+    after.tag === "TEXTAREA", `focus landed on ${after.tag}.${after.cls}`);
+
+  // The operator must be able to keep typing where they left off. Note the SPACE:
+  // with focus parked on the close button, a space keystroke ACTIVATES it, closing
+  // the drawer and discarding the answer — so this also pins that the reply survives.
+  await page.keyboard.type(" and this arrives after the re-render");
+  const stillOpen = await page.locator(".sendback-modal textarea").count() > 0;
+  check("[focus] typing a space does not activate the close button and discard the reply",
+    stillOpen, stillOpen ? "" : "the reply modal was closed by a keystroke");
+  const value = stillOpen ? await ta.inputValue() : "(modal gone)";
+  check("[focus] keystrokes after the re-render still reach the reply box",
+    value.endsWith("after the re-render"), JSON.stringify(value.slice(-40)));
+  check("[focus] no page errors", errors.length === 0, errors[0] || "");
+  await ctx.close();
+}
+
+// The reply/send-back modals inside the drawer had backdrop-click close, so a
+// stray click discarded a typed blocker answer — the exact box the reported
+// symptom describes. And a backdrop that no longer closes must not STEAL FOCUS
+// either, or the dialog stays open silently swallowing keystrokes, which is the
+// same symptom by a different trigger.
+{
+  const { ctx, page, errors } = await open(PARKED);
+  await page.getByRole("button", { name: /reply/i }).first().click();
+  await page.waitForTimeout(400);
+  const ta = page.locator(".sendback-modal textarea").first();
+  await ta.click();
+  await page.keyboard.type("a blocker answer worth keeping");
+
+  // Click the backdrop, away from the modal box.
+  await page.mouse.click(12, 12);
+  await page.waitForTimeout(400);
+  check("[reply-backdrop] a click outside does NOT close the reply modal",
+    await page.locator(".sendback-modal").count() > 0);
+  const focus = await page.evaluate(() => ({
+    tag: document.activeElement?.tagName || "none",
+    cls: String(document.activeElement?.className || ""),
+  }));
+  check("[reply-backdrop] the backdrop click does not steal focus from the box",
+    focus.cls.includes("sendback-textarea"), `${focus.tag}.${focus.cls}`);
+  await page.keyboard.type(" and this still lands");
+  const val = await ta.inputValue().catch(() => "(gone)");
+  check("[reply-backdrop] keystrokes after the stray click still reach the box",
+    val.endsWith("still lands"), JSON.stringify(val.slice(-30)));
+  check("[reply-backdrop] no page errors", errors.length === 0, errors[0] || "");
+  await ctx.close();
+}
+
+// The drawer is aria-modal, so focus must not be left ORPHANED outside it.
+// Clicking the reply modal's own Cancel unmounts the focused control; focus
+// falls to <body> with nothing to return to, and one Tab then walks into the
+// page behind the dialog. THAT is what the trap heals.
+{
+  const { ctx, page } = await open(PARKED);
+  await page.getByRole("button", { name: /reply/i }).first().click();
+  await page.waitForTimeout(400);
+  // Put focus INSIDE the modal first — the operator is typing their answer.
+  // Without this the spec never reaches the state it describes: on macOS
+  // Chromium a mouse click does not focus a <button>, so focus would still be
+  // on the drawer's own close button and nothing would be orphaned.
+  await page.locator(".sendback-modal textarea").first().click();
+  await page.waitForTimeout(150);
+  await page.locator(".sendback-modal").getByRole("button", { name: /^cancel$/i }).click();
+  await page.waitForTimeout(600);
+  const healed = await page.evaluate(() => {
+    const so = document.querySelector(".slideover");
+    return Boolean(so && so.contains(document.activeElement));
+  });
+  check("[focus-trap] focus returns inside the drawer when the focused control unmounts",
+    healed);
+  await ctx.close();
+}
+
+// …and it must NOT heal in any other case. An earlier version of this suite
+// asserted the OPPOSITE — it required focus to be dragged back inside after the
+// user Tabbed away — which pinned a focus THEFT as correct and would have
+// blocked its own fix.
+//
+// 🔴 These specs must do two things an earlier version did not, or they pass
+// while testing nothing: (1) put focus INSIDE the drawer first, so the observer
+// has a remembered element at all — otherwise it early-returns and every guard
+// below it is unreachable; and (2) cause a mutation UNDER THE OBSERVED SCOPE.
+// Waiting 11s for "a real background poll" does neither: the worker-status poll
+// mutates the sidebar, not the drawer's subtree, so the observer never runs.
+const forceMutationInDrawer = (page) => page.evaluate(() => {
+  const host = document.querySelector(".slideover");
+  const probe = document.createElement("span");
+  host.appendChild(probe);
+  probe.remove();
+});
+
+// THE REPORTED BUG, by the route a user actually hits it: typing an answer, then
+// clicking a heading inside the dialog. Most of a dialog is not focusable, so a
+// mousedown there used to move focus to <body> and silently drop every keystroke
+// after it — with the dialog still on screen looking focused.
+{
+  const { ctx, page } = await open(PARKED);
+  await page.getByRole("button", { name: /reply/i }).first().click();
+  await page.waitForTimeout(400);
+  const ta = page.locator(".sendback-modal textarea").first();
+  await ta.click();
+  await page.keyboard.type("my blocker answer");
+  await page.locator(".sendback-modal .sendback-label").first().click();
+  await page.waitForTimeout(200);
+  const held = await page.evaluate(() => document.activeElement?.tagName || "none");
+  check("[caret] clicking a heading inside the dialog does not strand the caret",
+    held === "TEXTAREA", held);
+  await page.keyboard.type(" AND MORE");
+  const val = await ta.inputValue().catch(() => "(gone)");
+  check("[caret] …so the keystrokes after it still land",
+    val.endsWith(" AND MORE"), JSON.stringify(val.slice(-24)));
+  await ctx.close();
+}
+
+// The heal must NOT fire while the element it remembers is still on the page —
+// otherwise every mutation under the drawer re-grabs focus from wherever the
+// user put it, which is the theft this whole change exists to remove.
+{
+  const { ctx, page } = await open(PARKED);
+  await page.getByRole("button", { name: /reply/i }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".sendback-modal textarea").first().click();
+  // Drop focus WITHOUT removing anything — the state a stray click used to make.
+  await page.evaluate(() => document.activeElement?.blur());
+  await forceMutationInDrawer(page);
+  await page.waitForTimeout(200);
+  const after = await page.evaluate(() => ({
+    tag: document.activeElement?.tagName || "none",
+    cls: String(document.activeElement?.className || ""),
+  }));
+  check("[focus-trap] a mutation does not heal while the remembered box still exists",
+    !after.cls.includes("so-close"), `${after.tag}.${after.cls}`);
+  await ctx.close();
+}
+
+// …and it must not reclaim focus from a live control the user moved to.
+{
+  const { ctx, page } = await open(PARKED);
+  await page.getByRole("button", { name: /reply/i }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".sendback-modal textarea").first().click();
+  await page.evaluate(() => {
+    const outside = document.querySelector(".nh-navrow");
+    if (outside) outside.focus();          // a deliberate move, as by Tab
+    // now remove what the drawer remembered, so the heal is armed
+    document.querySelector(".sendback-modal textarea")?.remove();
+  });
+  await page.waitForTimeout(300);
+  const after = await page.evaluate(() => String(document.activeElement?.className || ""));
+  check("[focus-trap] a live control outside the drawer keeps focus",
+    !after.includes("so-close"), after);
+  await ctx.close();
+}
+
+// A DISABLED control must not swallow the click and strand the caret.
+//
+// This is the reported bug's last route and the one that survived six review
+// rounds, because the guard for it was written in the wrong LAYER: Chrome does
+// not dispatch mouse events on a disabled form control at all, so
+// `keepFocusInDialog` is never called and cannot cancel anything — the browser
+// moves focus to <body> regardless. Only a BROWSER test can see this. The unit
+// spec "covering" it builds an event with a disabled `closest()` target, which
+// the browser never produces, so the fake passed while the product broke.
+//
+// The sequence is the friend's: the reply modal opens with the textarea focused
+// and "Send reply" already greyed out (it is disabled until you type). Click the
+// greyed button — the natural thing to do when a dialog seems stuck — and every
+// keystroke after it is silently discarded.
+{
+  const { ctx, page, errors } = await open(PARKED);
+  await page.getByRole("button", { name: /reply/i }).first().click();
+  await page.waitForTimeout(400);
+  const ta = page.locator(".sendback-modal textarea").first();
+
+  const greyed = await page.evaluate(() => {
+    const b = [...document.querySelectorAll(".sendback-modal button")]
+      .find((x) => x.disabled);
+    return b ? { text: b.textContent.trim(), disabled: b.disabled } : null;
+  });
+  check("[disabled-strand] the reply modal opens with its primary action disabled",
+    greyed !== null && greyed.disabled === true, JSON.stringify(greyed));
+  check("[disabled-strand] the caret starts in the reply box (autofocus)",
+    (await page.evaluate(() => document.activeElement?.tagName)) === "TEXTAREA");
+
+  // Click the greyed button by coordinates — `.click()` on a disabled control is
+  // refused by the driver, but a real mouse press at that point is not, and that
+  // is exactly what a person does.
+  const box = await page.evaluate(() => {
+    const b = [...document.querySelectorAll(".sendback-modal button")]
+      .find((x) => x.disabled);
+    const r = b.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+  await page.mouse.click(box.x, box.y);
+  await page.waitForTimeout(200);
+
+  const landed = await page.evaluate(() => document.activeElement?.tagName || "none");
+  check("[disabled-strand] clicking the greyed primary action does NOT strand the caret on <body>",
+    landed === "TEXTAREA", `focus landed on ${landed}`);
+
+  await page.keyboard.type("the answer typed after clicking the greyed button");
+  const value = await ta.inputValue();
+  check("[disabled-strand] keystrokes after that click still reach the reply box",
+    value === "the answer typed after clicking the greyed button", JSON.stringify(value));
+
+  // POSITIVE CONTROL. 🔴 It has to be able to FAIL against the failure mode it
+  // names. An earlier version only checked that Cancel still closed the modal,
+  // and a review proved that was not enough: gutting `keepFocusInDialog` into
+  // the naive "preventDefault on EVERY mousedown" — the exact fix its own
+  // header warns against — left this whole suite GREEN. Only the unit tests
+  // noticed.
+  //
+  // What the naive fix actually breaks is CARET PLACEMENT: cancelling mousedown
+  // on a real text control stops the browser moving the caret to where you
+  // clicked. So the control now clicks at a known offset inside the textarea
+  // and asserts the caret MOVED there, which no blanket-preventDefault build
+  // can satisfy.
+  await page.keyboard.press("Home");
+  const caret = await page.evaluate(() => {
+    const ta = document.querySelector(".sendback-modal textarea");
+    ta.setSelectionRange(0, 0);
+    const r = ta.getBoundingClientRect();
+    // y must clear the textarea's top PADDING (14px) or the click lands above
+    // the first text line and the browser correctly reports caret 0 — which
+    // reads as a failure of the product when it is a failure of the coordinate.
+    return { x: r.x + 60, y: r.y + 26, before: ta.selectionStart };
+  });
+  await page.mouse.click(caret.x, caret.y);
+  await page.waitForTimeout(150);
+  const caretAfter = await page.evaluate(
+    () => document.querySelector(".sendback-modal textarea").selectionStart);
+  check("[disabled-strand CONTROL] clicking INSIDE the reply box still places the caret",
+    caretAfter > caret.before,
+    `caret stayed at ${caret.before} — a blanket preventDefault() would do this`);
+
+  // …and an ENABLED control in the same dialog must still activate.
+  const cancelBox = await page.evaluate(() => {
+    const b = [...document.querySelectorAll(".sendback-modal button")]
+      .find((x) => !x.disabled && /cancel/i.test(x.textContent));
+    const r = b.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+  await page.mouse.click(cancelBox.x, cancelBox.y);
+  await page.waitForTimeout(300);
+  check("[disabled-strand CONTROL] an ENABLED button in the same dialog still activates",
+    (await page.locator(".sendback-modal").count()) === 0,
+    (await page.locator(".sendback-modal").count()) === 0 ? ""
+      : "Cancel did not close the reply modal — the fix made live controls inert");
+  check("[disabled-strand] no page errors", errors.length === 0, errors[0] || "");
+  await ctx.close();
+}
+
 await browser.close();
 srv.close();
 console.log(failures.length ? `\n${failures.length} FAILURE(S)` : "\nALL CHECKS PASSED");

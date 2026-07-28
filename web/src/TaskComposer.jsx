@@ -6,6 +6,7 @@ import { promptFromIssue, jiraStatusChipStyle, externalIdFromIssue, importedChip
 import { jiraResultHeader, jiraEmptyMessage, formatIssueUpdated } from "./jiraImport.js";
 import { greetingName } from "./greeting.js";
 import { hasPrRef } from "./prRefs.js";
+import { keepFocusInDialog } from "./keepFocusInDialog.js";
 import { formatBytes } from "./formatBytes.js";
 import { pluralize } from "./pluralize.js";
 import { useEscapeKey } from "./useEscapeKey.js";
@@ -308,8 +309,11 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
       // data-nested-modal: any dialog that can sit above the task drawer must claim Escape,
       // or the drawer's own handler closes IT too and the typed prompt is gone.
       data-nested-modal
+      // No backdrop-click close: a friend testing the app lost a long typed
+      // prompt to a stray click outside the box. Escape, the × above and Cancel
+      // are the deliberate ways out; none of them is reachable by accident.
       className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/70 p-4 backdrop-blur-sm sm:items-center sm:p-8"
-      onClick={onClose}
+      onMouseDown={keepFocusInDialog}
     >
       <div
         ref={dialogRef}
@@ -317,7 +321,7 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
         aria-modal="true"
         aria-label="New task"
         className="relative max-h-[90vh] w-full max-w-5xl overflow-y-auto rounded-3xl border border-solid border-line bg-card px-6 py-10 shadow-2xl sm:px-14 sm:py-12"
-        onClick={(e) => e.stopPropagation()}
+       
       >
         <button
           type="button"

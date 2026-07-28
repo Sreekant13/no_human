@@ -156,6 +156,52 @@ def resume_checkpoint(blocker: dict[str, Any] | None) -> dict[str, str] | None:
     return {"sha": sha, "branch": blocker.get("resume_branch") or ""}
 
 
+def resume_provenance(checkpoint: dict[str, str] | None, by: str) -> dict[str, Any]:
+    """The COMPLETE ``resume_from`` value for one resume, by one actor.
+
+    Every resume path writes this and nothing else, because the zero-diff
+    honesty gate reads ``sha`` and ``by`` TOGETHER — it credits work already
+    ahead of base only when the branch point is the checkpoint a HUMAN gated —
+    and seven review rounds were spent on the two ways those halves came apart.
+
+    ``resume_from`` is stored with RFC 7396 (``merge_context``), where nested
+    dicts MERGE and a ``None`` value DELETES the key. That is the whole trap:
+
+    * A write that omitted ``by`` inherited the PREVIOUS actor's — so a resume
+      with no checkpoint of its own was described by whoever resumed last. That
+      latched in whichever direction the reader preferred: a stale ``"wake"``
+      failed a human's answer as fabrication, a stale ``"human"`` credited a
+      timer's re-entry.
+    * Writing ``by`` alone fixed that and broke the other half — the sha a
+      MACHINE resume had chosen survived and was relabelled ``human``, so
+      `nh unblock` on a task the wake watcher had resumed disarmed the gate and
+      an attempt that edited nothing was credited with the loop's own abandoned
+      [WIP-PARTIAL]. **That direction opens a PR on work no attempt produced**,
+      which is the failure this gate exists to prevent; an independent review
+      reproduced it end to end through `run_task`.
+
+    So provenance is never a separate write. Every key is stated every time:
+    with no checkpoint, ``sha`` and ``branch`` are explicitly ``None``, which
+    DELETES any inherited value, and ``by`` can only ever describe a sha the
+    same actor chose. A human re-entry that names no checkpoint therefore
+    branches from BASE and the gate stays ARMED.
+
+    🔴 Be honest about what that costs. An earlier version of this docstring
+    said "or from this run's own handoff… costing one attempt asked to redo
+    work". Both halves were false: `_resume_branch_point` takes
+    `handoff.wip_sha` only when ``attempt_n > 1``, and a resume starts a FRESH
+    bounded loop at attempt 1, so there is no handoff to fall back to on the
+    path that matters. The real cost is **redo everything committed since
+    base**. That is still the right side to fail on — the alternative is a PR
+    opened on work nobody did — but a caller that HAS a checkpoint must pass it
+    rather than None, or it pays that price for nothing.
+    """
+    cp = checkpoint or {}
+    return {"sha": cp.get("sha") or None,
+            "branch": cp.get("branch") or None,
+            "by": by}
+
+
 @dataclass
 class Blocker:
     """Structured blocker report (PLAN.md 22.1). Never prose — a human acts on

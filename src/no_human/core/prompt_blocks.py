@@ -123,11 +123,22 @@ def build_resume_digest(task: Task) -> str:
     if handoff:
         summary = handoff.get("summary", "")
         files = handoff.get("changed_files", [])
-        turns = handoff.get("turns_used", "?")
+        turns = handoff.get("turns_used")
         wip = handoff.get("wip_sha", "")
+        # Say what ACTUALLY stopped the previous attempt. The budget / stuck /
+        # timeout aborts have no turn count at all, and this line used to assert
+        # "ran out of turns (? used)" for all three — a false statement, with a
+        # literal "?", injected straight into the coder's prompt.
+        stopped = handoff.get("stopped_because") or ""
+        if stopped:
+            why = f"The previous attempt stopped ({stopped})"
+        elif turns is not None:
+            why = f"The previous attempt ran out of turns ({turns} used)"
+        else:
+            why = "The previous attempt stopped early"
         resume_lines = [
-            f"The previous attempt ran out of turns ({turns} used) and left "
-            f"partial work{' (committed as WIP-PARTIAL ' + wip[:8] + ')' if wip else ''}."
+            f"{why} and left partial work"
+            f"{' (committed as WIP-PARTIAL ' + wip[:8] + ')' if wip else ''}."
         ]
         if files:
             resume_lines.append(
@@ -135,9 +146,13 @@ def build_resume_digest(task: Task) -> str:
             )
         if summary and not summary.startswith("Claude Code returned"):
             resume_lines.append(f"  Last status: {summary[:600]}")
+        # Only tell the agent to read a list when there IS one.
+        read_step = ("  1. READ the files listed above to understand what is already done.\n"
+                     if files else
+                     "  1. Inspect the working tree to see what is already done.\n")
         resume_lines.append(
             "CRITICAL: Your working tree ALREADY CONTAINS the partial implementation.\n"
-            "  1. READ the files listed above to understand what is already done.\n"
+            + read_step +
             "  2. Do NOT redo work that is already complete.\n"
             "  3. Pick up where the previous attempt left off.\n"
             "  4. Focus remaining turns on completing unfinished acceptance criteria\n"

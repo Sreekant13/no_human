@@ -225,6 +225,12 @@ class LeadAgent:
                 await self.store.update_task(parent)
                 log.info("retrying failed sub-task %s", t.id[:8])
                 self._emit("retry", f"retrying sub-task: {t.title}")
+                # A MACHINE decided this retry, so it must not inherit whatever
+                # `resume_from` the previous actor left — a stale `by:"human"`
+                # would tell the zero-diff honesty gate a human gated this run.
+                # Same rule as `POST /retry` and `nh task retry`: a fresh run
+                # branches from base.
+                await self.store.merge_context(t.id, {"resume_from": None})
                 await self.store.set_status(
                     t, TaskStatus.PENDING, validate=False,
                 )
@@ -299,6 +305,10 @@ class LeadAgent:
 
                 t.blocker = None
                 await self.store.update_task(t)
+                # Dependencies being met is a MACHINE decision — see the retry
+                # path above. Nothing here chose a checkpoint, so nothing may
+                # inherit one.
+                await self.store.merge_context(t.id, {"resume_from": None})
                 await self.store.set_status(t, TaskStatus.PENDING)
                 unblocked += 1
                 log.info("unblocked sub-task %s (deps met)", t.id[:8])

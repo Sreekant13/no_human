@@ -6,6 +6,7 @@ import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
 import TaskComposer from "./TaskComposer.jsx";
 import Outcomes from "./Outcomes.jsx";
+import { keepFocusInDialog } from "./keepFocusInDialog.js";
 import { LegionLogo } from "./Logo.jsx";
 import { newlyNeedsYou, notificationBody, titleWithBadge } from "./notifications.js";
 import { setFavicon } from "./favicon.js";
@@ -373,9 +374,14 @@ function NewTaskModal({ onClose, onCreated }) {
   }
 
   if (grillResult) {
+    // No backdrop-click close: a stray click mid-intake discarded the whole
+    // refined spec. Escape and the explicit Cancel button are the ways out.
+    // (The grill's question-while-busy branch further below never had one, for
+    // this same reason; the other three, including the loading branch, did and
+    // no longer do.)
     return (
-      <div className="sendback-overlay" onClick={onClose}>
-        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Refined spec" tabIndex={-1} ref={grillRef} onClick={(e) => e.stopPropagation()}>
+      <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
+        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Refined spec" tabIndex={-1} ref={grillRef}>
           <div className="sendback-label">Refined Spec</div>
           <div className="grill-spec">
             <div className="grill-spec-title">{grillResult.title}</div>
@@ -422,8 +428,9 @@ function NewTaskModal({ onClose, onCreated }) {
   // Loading overlay while grill is exploring (no question yet)
   if (grillMode && !grillQuestion && busy) {
     return (
-      <div className="sendback-overlay" onClick={onClose}>
-        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Intake grill" tabIndex={-1} ref={grillRef} onClick={(e) => e.stopPropagation()}>
+      // No backdrop-click close — see the Refined Spec branch above.
+      <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
+        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Intake grill" tabIndex={-1} ref={grillRef}>
           <div className="sendback-label">Intake Grill</div>
           <div className="grill-loading">
             <Spinner />
@@ -454,8 +461,8 @@ function NewTaskModal({ onClose, onCreated }) {
     const progressPct = Math.min(100, (grillQuestion.round / maxRounds) * 100);
     if (busy) {
       return (
-        <div className="sendback-overlay">
-          <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Intake grill" tabIndex={-1} ref={grillRef} onClick={(e) => e.stopPropagation()}>
+        <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
+          <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Intake grill" tabIndex={-1} ref={grillRef}>
             <div className="grill-header">
               <div className="sendback-label">Intake Grill</div>
               <span className="grill-round-badge">Round {grillQuestion.round}/{maxRounds}</span>
@@ -477,8 +484,10 @@ function NewTaskModal({ onClose, onCreated }) {
       );
     }
     return (
-      <div className="sendback-overlay" onClick={onClose}>
-        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Intake grill" tabIndex={-1} ref={grillRef} onClick={(e) => e.stopPropagation()}>
+      // No backdrop-click close — a stray click mid-grill discarded every answer
+      // the operator had already given. See the Refined Spec branch above.
+      <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
+        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Intake grill" tabIndex={-1} ref={grillRef}>
           <div className="grill-header">
             <div className="sendback-label">Intake Grill</div>
             <span className="grill-round-badge">Round {grillQuestion.round}/{maxRounds}</span>

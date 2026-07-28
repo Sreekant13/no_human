@@ -6,6 +6,7 @@ import {
   connectTaskSSE,
 } from "./api.js";
 import Markdown from "./Markdown.jsx";
+import { keepFocusInDialog } from "./keepFocusInDialog.js";
 import { ROLE_LABEL, discoverSubagents, eventSource, modelsByNode } from "./eventRoles.js";
 import { deriveAgentStatus } from "./pipelineStatus.js";
 import { taskProgress } from "./taskProgress.js";
@@ -103,10 +104,64 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
     return () => { stale = true; };
   }, [taskId, refreshKey]);
 
+  // Move focus into the drawer when it OPENS — mount-only, and deliberately so.
+  // This call used to live in the [onClose] effect below, and Board passes a NEW
+  // onClose identity on every render, so EVERY background re-render (the 10s
+  // worker-status poll, and every WS task frame) yanked focus out of whatever the
+  // operator was typing into and parked it on this button — where the next SPACE
+  // keystroke activated it, closing the drawer and discarding the answer.
+  // Board keys the drawer on selectedId, so a task switch still remounts it and
+  // re-runs this; the "Next review →" jump goes through that same key change.
+  useEffect(() => { closeRef.current?.focus(); }, []);
+
+  // Self-heal the focus trap — but ONLY when the focused control was REMOVED
+  // from the DOM, which is the one case that actually drops focus out of an
+  // aria-modal dialog against the operator's wishes.
+  //
+  // Two earlier forms of this ran from a RENDER effect and asked where focus IS,
+  // which cannot answer the question that matters — WHY it is there:
+  //   `activeElement === document.body`  fires when the operator clicks plain
+  //       text (a heading, a label). Focus legitimately sits on <body>, the heal
+  //       yanks it to the close button, and the next SPACE closes the drawer and
+  //       discards the typed answer. That is the originally reported bug, intact.
+  //   `not inside any dialog`            additionally yanks focus back from a
+  //       control the operator deliberately Tabbed to outside the drawer.
+  // Remembering WHICH control had focus supplies the missing signal: if that
+  // element is still in the document, the operator moved focus on purpose —
+  // leave them be. Only if it has been removed is focus genuinely orphaned.
+  useEffect(() => {
+    const el = dialogRef.current;
+    if (!el) return undefined;
+    // Remember the last control focus was in. `focusin` fires reliably; the
+    // `focusout`/`blur` that a REMOVAL would raise does not — Chromium does not
+    // fire it when the focused node is detached, which is exactly our case.
+    // The nested modals (reply / send-back) are SIBLINGS of this dialog, not
+    // descendants — so both the listener and the observer must sit one level up,
+    // or the one unmount that actually orphans focus is invisible here.
+    const scope = el.parentNode || el;
+    const ours = (n) => Boolean(
+      n && (el.contains(n) || (n.closest && n.closest("[data-nested-modal]"))));
+    let last = null;
+    const onFocusIn = (e) => { if (ours(e.target)) last = e.target; };
+    scope.addEventListener("focusin", onFocusIn);
+    // A DOM mutation is the only honest trigger: it fires when something is
+    // removed, and never merely because the component re-rendered.
+    const obs = new MutationObserver(() => {
+      if (!last || document.contains(last)) return;   // nothing was orphaned
+      // Forget it FIRST, whichever way this goes: leaving it set kept the heal
+      // armed against a detached node for the rest of the drawer's life, so an
+      // unrelated mutation later stole focus (and retained the dead subtree).
+      last = null;
+      const active = document.activeElement;
+      if (active && active !== document.body && !el.contains(active)) return;
+      closeRef.current?.focus();
+    });
+    obs.observe(scope, { childList: true, subtree: true });
+    return () => { scope.removeEventListener("focusin", onFocusIn); obs.disconnect(); };
+  }, []);
+
   // Escape-to-close + focus trap
   useEffect(() => {
-    closeRef.current?.focus();
-
     function onKeyDown(e) {
       if (e.key === "Escape") {
         // A modal ABOVE the drawer owns the key: closing both would also destroy the
@@ -237,13 +292,23 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
 
   return (
     <>
-      <div className="slideover-backdrop" onClick={onClose} />
+      {/* No backdrop close. This was kept as a deliberate decision on the
+          grounds that closing the drawer is "non-destructive" — a review
+          disproved it: a stray click here destroyed a typed spec
+          change-request with no confirm, the same loss that motivated
+          removing backdrop-close from the other five overlays. */}
+      <div className="slideover-backdrop" onMouseDown={keepFocusInDialog} />
       <div
         className="slideover"
         role="dialog"
         aria-modal="true"
         aria-labelledby="so-dialog-title"
         ref={dialogRef}
+        // Most of this panel is headings, summaries and labels. A mousedown on
+        // any of them while the operator is typing an answer strands the caret
+        // and drops every keystroke after it — the reported bug, reached by a
+        // click rather than by a re-render.
+        onMouseDown={keepFocusInDialog}
       >
         {/* header */}
         <div className="so-header">
@@ -396,9 +461,15 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
 
       {/* send-back modal */}
       {sbOpen && (
-        <div className="sendback-overlay" data-nested-modal onClick={() => setSbOpen(false)}>
+        <div
+          // No backdrop-click close: this discarded typed feedback on a stray
+          // click. Escape and the Cancel button below are the deliberate exits.
+          // onMouseDown keeps the caret in the textarea when the backdrop is
+          // clicked — otherwise the modal stays open but silently stops typing.
+          className="sendback-overlay" data-nested-modal
+          onMouseDown={keepFocusInDialog}>
           <div className="sendback-modal" ref={sbRef} role="dialog" aria-modal="true"
-               aria-label="Send back with feedback" onClick={(e) => e.stopPropagation()}>
+               aria-label="Send back with feedback">
             <div className="sendback-label">Send back with feedback</div>
             <textarea
               className="sendback-textarea"
@@ -425,9 +496,14 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
 
       {/* reply modal */}
       {replyOpen && (
-        <div className="sendback-overlay" data-nested-modal onClick={() => setReplyOpen(false)}>
+        <div
+          // No backdrop-click close — see the send-back modal above. This is the
+          // box a friend was typing a blocker answer into when a stray click
+          // discarded it.
+          className="sendback-overlay" data-nested-modal
+          onMouseDown={keepFocusInDialog}>
           <div className="sendback-modal" ref={replyRef} role="dialog" aria-modal="true"
-               aria-label="Reply to blocker question" onClick={(e) => e.stopPropagation()}>
+               aria-label="Reply to blocker question">
             <div className="sendback-label">
               {decision?.question ? "Answering the task's question" : "Reply to guide the task"}
             </div>

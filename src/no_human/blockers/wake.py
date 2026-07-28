@@ -25,7 +25,7 @@ from typing import Any, Awaitable, Callable
 
 from ..core.db import Store
 from ..core.task import Task, TaskStatus
-from .taxonomy import Blocker, resume_checkpoint
+from .taxonomy import Blocker, resume_checkpoint, resume_provenance
 
 log = logging.getLogger("no_human.wake")
 
@@ -448,8 +448,23 @@ class WakeWatcher:
         # checkpoint the blocker recorded, or the next attempt branches from a
         # stale sha and discards the parked attempt's committed work.
         checkpoint = resume_checkpoint(task.blocker)
-        if checkpoint:
-            patch["resume_from"] = checkpoint
+        # Stamp the provenance UNCONDITIONALLY: the zero-diff honesty gate must
+        # be able to tell a MACHINE resume (a timer, a CI rung, an auto-rebase)
+        # from a human answering a blocker, and crediting a machine resume opens
+        # a PR on work no attempt produced.
+        #
+        # 🔴 This is deliberately NOT inside `if checkpoint:`. Gating the stamp
+        # on the checkpoint is what made `by` a ONE-WAY LATCH through five review
+        # rounds: `resume_from` is merged with RFC 7396, so when this resume had
+        # no checkpoint of its own the write was skipped entirely and a `by`
+        # written by the PREVIOUS actor survived to describe THIS one. Whichever
+        # order the reader then used, it was wrong in one direction — a stale
+        # "human" credited a timer's re-entry, a stale "wake" failed a human's
+        # answer as fabrication. `by` must always describe the resume that is
+        # actually happening, so it is written every time, checkpoint or not.
+        # `resume_reason` beside it says the same thing and is kept for rows
+        # written before provenance existed.
+        patch["resume_from"] = resume_provenance(checkpoint, "wake")
         task.context = await self.store.merge_context(task.id, patch)
         task.wake_check_at = None
         await self.store.update_task_columns(task)
