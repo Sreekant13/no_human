@@ -1194,6 +1194,50 @@ async def test_summary_carries_review_totals(client, store):
     assert row["total_review_cache_creation"] == 4
 
 
+async def test_detail_carries_aux_totals_matching_list(client, store):
+    """The drawer (GET /api/tasks/{id}) priced only 6 of the 9 buckets
+    web/src/cost.js reads: total_aux_* were absent → undefined → 0, so the
+    drawer under-reported the run vs the board card for the same task."""
+    from no_human.core.task import Task
+
+    t = Task.new("priced aux", repo_path="/r")
+    await store.create_task(t)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(
+        aid,
+        tokens_used=100, cache_read_tokens=1000, cache_creation_tokens=10,
+        review_tokens_used=40, review_cache_read_tokens=400, review_cache_creation_tokens=4,
+        plan_tokens_used=7, plan_cache_read_tokens=70, plan_cache_creation_tokens=3,
+        utility_tokens_used=5, utility_cache_read_tokens=50, utility_cache_creation_tokens=2,
+    )
+
+    detail = (await client.get(f"/api/tasks/{t.id}")).json()
+    row = [x for x in (await client.get("/api/tasks")).json() if x["id"] == t.id][0]
+
+    for key, expected in (
+        ("total_aux_tokens", 12),
+        ("total_aux_cache_read", 120),
+        ("total_aux_cache_creation", 5),
+    ):
+        assert key in detail
+        assert detail[key] is not None
+        assert isinstance(detail[key], int)
+        assert detail[key] == expected
+        assert detail[key] == row[key]
+
+    # Same nine-bucket sum web/src/cost.js's taskBurn/taskCost compute, checked
+    # identical between the drawer and the board card for the same task.
+    def _nine_bucket_sum(payload):
+        keys = (
+            "total_tokens", "total_cache_creation", "total_cache_read",
+            "total_review_tokens", "total_review_cache_creation", "total_review_cache_read",
+            "total_aux_tokens", "total_aux_cache_creation", "total_aux_cache_read",
+        )
+        return sum(payload.get(k) or 0 for k in keys)
+
+    assert _nine_bucket_sum(detail) == _nine_bucket_sum(row)
+
+
 async def test_worker_status_surfaces_watcher_error(client):
     """B2 #13: a dead WakeWatcher used to be swallowed silently while parked
     tasks (notify-silent by design) depended on it entirely to wake."""
