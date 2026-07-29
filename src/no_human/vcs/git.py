@@ -91,15 +91,25 @@ class GitRepo:
     def head_sha(self) -> str:
         return self._run("rev-parse", "HEAD")
 
-    def default_branch(self) -> str:
+    def default_branch(self, *, local_only: bool = False) -> str:
         """Best-effort: resolve the remote's actual default branch (origin/HEAD).
 
         C3: a local checkout's current branch can lag the remote's real default
         (e.g. an old clone still on "master" after the remote moved to "main").
-        Returns "" if it can't be determined (no origin, detached, offline)."""
+        Returns "" if it can't be determined (no origin, detached, offline).
+
+        ``local_only`` skips the ``git remote show origin`` fallback, which does
+        NETWORK I/O. Callers serving an HTTP request must pass it: PR-001's GUI
+        half needs this value while a person is typing in the composer, and a
+        request handler that can block on a slow or unreachable remote would
+        hang the board — offline, that fallback is a timeout, not an answer.
+        The symbolic-ref path below is a local ref read and always cheap.
+        """
         ref = self._run("symbolic-ref", "-q", "refs/remotes/origin/HEAD", check=False)
         if ref:
             return ref.rsplit("/", 1)[-1]
+        if local_only:
+            return ""
         out = self._run("remote", "show", "origin", check=False)
         for line in out.splitlines():
             line = line.strip()

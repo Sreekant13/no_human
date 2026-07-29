@@ -645,3 +645,196 @@ def test_result_size_flags_non_text_blocks_and_never_raises():
     assert _result_size([{"type": "text", "text": None}])["result_chars"] == 0
     assert _result_size(None)["result_chars"] == 0
     assert _result_size("12345")["result_chars"] == 5
+def test_budget_abort_records_the_SHAPE_of_the_spend_not_just_its_size(store, tmp_path):
+    """S1.2. `attempts.turns_used` is NULL on every budget-aborted attempt — it comes
+    from ResultMessage.num_turns and an abort has no result — so a 4M attempt was
+    indistinguishable from any other. An agent spinning through hundreds of small
+    turns and an agent taking a handful of enormous ones look identical in the
+    ledger and need OPPOSITE fixes.
+
+    This pins the live counter. It is deliberately NOT written to turns_used: a
+    "usage" event is emitted per assistant message and only when that message
+    carries a usage block, so it is a LOWER BOUND, and a lower bound in a column
+    that elsewhere holds an exact count corrupts every aggregate over it.
+    """
+    orch = _orch(store, tmp_path)
+    orch._active_task_id = "task-1"
+    orch._begin_attempt_accounting("task-1", remaining_tokens=1_000)
+    ev = AgentEvent("usage", meta={"tokens_used": 100, "cache_read_tokens": 0,
+                                   "cache_creation_tokens": 0})
+    for _ in range(7):
+        orch._agent_sink(ev, role=CODER_ROLE)
+
+    assert orch._attempt_usage["assistant_messages"] == 7, (
+        "the sink must count assistant messages, or a budget-aborted attempt cannot "
+        "be told apart from any other"
+    )
+    # And the counter must be scoped to the attempt, like the token totals beside it:
+    # re-arming resets it, or attempt N+1 inherits attempt N's shape.
+    orch._begin_attempt_accounting("task-1", remaining_tokens=1_000)
+    assert orch._attempt_usage["assistant_messages"] == 0
+
+
+class _BudgetBurnBackend:
+    """A coder turn that spends past the ceiling, driving the REAL sink.
+
+    The sink raises BudgetAbort out of `run`, so the orchestrator's own
+    `except BudgetAbort` handler runs — which is the code under test.
+    """
+
+    def __init__(self, per_message: int, messages: int = 50):
+        self.per_message, self.messages = per_message, messages
+
+    async def run(self, *a, on_event=None, **k):
+        for _ in range(self.messages):
+            # PRODUCTION-SHAPED, deliberately. A review showed the first fixture used
+            # tokens_used=100_000 / cache_read=0 — the INVERSE of production, where
+            # cache reads are 99.98% of spend (real row: tokens_used=709,
+            # cache_read=4,033,914). Under that fixture, deleting the cache-read term
+            # from `spent` was undetectable, and the shipped diagnostic would have read
+            # ~17 tokens/message instead of ~69,562: a wrong number read as truth, which
+            # is the exact harm this change refuses to inflict on `turns_used`.
+            on_event(AgentEvent("usage", meta={
+                "tokens_used": self.per_message // 100,
+                "cache_read_tokens": self.per_message - (self.per_message // 100),
+                "cache_creation_tokens": 0,
+            }))
+        raise AssertionError("the sink should have aborted before this")
+
+
+async def test_the_budget_abort_EVENT_carries_the_spend_shape(
+    bare_repo, tmp_path, store  # noqa: F811
+):
+    """Observes the ARTIFACT, not a private attribute.
+
+    A review deleted both meta keys from the emit and the full suite stayed
+    green (2867 passed): the only test asserted on `orch._attempt_usage`, never
+    on the emitted `agent_error` event, which is the entire deliverable. That is
+    this repo's own recorded lesson — a test that recomputes the expected value
+    from the code under test proves nothing; break the WIRING and it must fail.
+    """
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("bounds", {})["attempt_tokens"] = 500_000
+    events: list = []
+    orch = Orchestrator(store, cfg.data, _BudgetBurnBackend(per_message=100_000),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("burn the budget", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    budget = [e for e in events
+              if e.get("kind") == "agent_error" and e.get("error_class") == "budget"]
+    assert budget, f"no budget agent_error was emitted; kinds={sorted({e.get('kind') for e in events})}"
+    ev = budget[0]
+    # The COUNT must be exact, not merely truthy. A review replaced the emitted count
+    # with a constant 1 — the precise opposite of the diagnostic's purpose, which is
+    # telling "hundreds of small turns" from "a handful of enormous ones" — and the
+    # whole suite stayed green. 5 messages are driven below the 500k ceiling at 100k
+    # each, so the 5TH is what crosses it: the sink increments BEFORE the ceiling check, so spent==500_000 >= 500_000 fires on message 5. The assertion was right and this comment was wrong.
+    assert ev.get("assistant_messages") == 5, (
+        "the budget-abort event must carry the EXACT message count, or a constant "
+        f"passes and the diagnostic is a lie; got {ev!r}"
+    )
+    # And the numerator must include cache reads, which are ~99.98% of real spend.
+    assert ev["tokens_per_message"] == 100_000, ev
+
+
+async def test_the_message_counter_is_scoped_to_the_running_task(store, tmp_path):
+    """Task B's messages must never be charged to task A — the same scoping bug
+    the token ceiling already had. A review moved the increment outside the
+    `ceiling[0] == self._active_task_id` guard and all 2867 tests stayed green.
+    """
+    orch = _orch(store, tmp_path)
+    orch._begin_attempt_accounting("task-A", remaining_tokens=10_000)
+    orch._active_task_id = "task-B"          # a DIFFERENT task is running
+    ev = AgentEvent("usage", meta={"tokens_used": 100, "cache_read_tokens": 0,
+                                   "cache_creation_tokens": 0})
+    for _ in range(5):
+        orch._agent_sink(ev, role=CODER_ROLE)
+
+    assert orch._attempt_usage["assistant_messages"] == 0, (
+        "task B's assistant messages were charged to task A's accounting"
+    )
+
+
+async def test_the_parked_task_evidence_actually_SHOWS_the_spend_shape(store, tmp_path):
+    """The visibility claim, made true instead of retracted.
+
+    A review found the emit's justification — that it put the shape "where a human
+    reading a parked task can see it" — was an unchecked claim about a consumer:
+    `web/src` has zero references to the keys, the CLI prints kind+text only, and
+    this blocker's evidence carried attempts and tokens with no SHAPE. The
+    BUDGET_EXHAUSTED blocker is what a human actually reads when a task parks, so
+    the shape belongs there.
+    """
+    orch = _orch(store, tmp_path)
+    orch._active_task_id = "task-1"
+    orch._begin_attempt_accounting("task-1", remaining_tokens=10_000_000)
+    ev = AgentEvent("usage", meta={"tokens_used": 100, "cache_read_tokens": 9_900,
+                                   "cache_creation_tokens": 0})
+    for _ in range(4):
+        orch._agent_sink(ev, role=CODER_ROLE)
+
+    t = Task.new("x", repo_path=str(tmp_path))
+    t.id = "task-1"
+    # Assert on the BLOCKER a human reads, not on the helper. Testing the helper
+    # directly left the WIRING unpinned: deleting `+ self._spend_shape_note(task)`
+    # from the evidence kept all 23 tests green — the same "test the artifact, not
+    # the function" defect this branch was already corrected for once.
+    # Force the cap with a REAL attempt row: lifetime_usage sums attempts from the DB,
+    # and _lifetime_limits rejects a 0 override (`value if value > 0 else default`), so
+    # neither a zero cap nor an attempt-less task can produce the blocker.
+    await store.create_task(t)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, status="failed", tokens_used=5_000_000,
+                               cache_read_tokens=0, cache_creation_tokens=0)
+    t.config = {"lifetime_tokens": 1_000_000}
+    blocker = await orch._check_lifetime_budget(t)
+    assert blocker is not None, "the lifetime cap should have produced a blocker"
+    assert "4 assistant messages" in blocker.evidence, blocker.evidence
+    assert "10,000 tokens/message" in blocker.evidence, blocker.evidence
+    # The causal clause must be EVIDENCED, not asserted. This fixture is 99%
+    # cache-read (100 fresh / 9,900 cached), so the clause is true and appears —
+    # and the percentage that justifies it is printed beside it.
+    assert "99% cache-read" in blocker.evidence, blocker.evidence
+    assert "scales with TURNS" in blocker.evidence, blocker.evidence
+
+    # Scoped to THIS task: the pool reuses one Orchestrator, so another task's
+    # counters must never describe this one.
+    other = Task.new("y", repo_path=str(tmp_path))
+    other.id = "task-2"
+    assert orch._spend_shape_note(other) == "", (
+        "task-2's evidence was built from task-1's counters"
+    )
+
+
+def test_the_causal_clause_is_WITHHELD_when_the_numbers_do_not_support_it(store, tmp_path):
+    """A review drove a SPINNER shape — many messages, cache-read only ~3% of spend —
+    and the note still asserted "cost is dominated by re-reading the conversation each
+    turn". That was false for those inputs: ~97% was fresh input/output. The split was
+    in hand and only the sum was printed, so a claim was ASSERTED where it could be
+    EVIDENCED.
+
+    PR-024 measured 99% cache-read over 1,896 messages, but that is ONE repo and ONE
+    prompt shape, while this string ships to every install. It must describe the
+    attempt in front of it.
+    """
+    orch = _orch(store, tmp_path)
+    orch._active_task_id = "task-1"
+    orch._begin_attempt_accounting("task-1", remaining_tokens=10_000_000)
+    # Spinner: fresh dominates, cache-read is a small minority.
+    ev = AgentEvent("usage", meta={"tokens_used": 2_900, "cache_read_tokens": 100,
+                                   "cache_creation_tokens": 0})
+    for _ in range(200):
+        orch._agent_sink(ev, role=CODER_ROLE)
+
+    t = Task.new("spinner", repo_path=str(tmp_path))
+    t.id = "task-1"
+    note = orch._spend_shape_note(t)
+
+    assert "200 assistant messages" in note, note          # the numbers still ship
+    assert "3% cache-read" in note, note                   # and so does the split
+    assert "scales with TURNS" not in note, (
+        f"the causal clause was asserted for a shape that contradicts it: {note}"
+    )
