@@ -196,7 +196,20 @@ def test_architecture_tree_lists_every_package(readme):
     # Scoped to the fenced block that contains the tree: an unrelated second
     # tree elsewhere in the README (e.g. web/src) is a legitimate edit and must
     # not be read as a claim about src/no_human packages.
-    fences = [b for b in readme.split("```") if "src/no_human/" in b]
+    #
+    # 🔴 ODD INDICES ONLY, AND THAT IS THE WHOLE POINT. `split("```")` alternates
+    # prose, fence, prose, fence… so code blocks are the ODD segments. This filter
+    # used to accept ANY segment containing "src/no_human/", so the moment a PROSE
+    # sentence cited a real path — e.g. "(`src/no_human/cli/tui.py` builds an
+    # orchestrator)" — that prose segment sorted ahead of the real tree, `listed`
+    # came back EMPTY, and the test reported all 17 packages missing. It failed on
+    # a correct README while passing on a less accurate one, which is the worst
+    # possible direction for a guard: it punished making a citation resolvable.
+    # This is a STRENGTHENING, not a relaxation — the test now reads the artifact
+    # it was always meant to read (a code block) instead of whichever segment
+    # happened to match first.
+    segs = readme.split("```")
+    fences = [b for i, b in enumerate(segs) if i % 2 == 1 and "src/no_human/" in b]
     assert fences, "architecture tree fence not found in README"
     listed = set(re.findall(r"^\s{2}(\w+)/\s+#", fences[0], re.M))
     missing = packages - listed

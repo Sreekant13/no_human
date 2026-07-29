@@ -9,10 +9,38 @@
 
 </div>
 
-no_human runs the whole delivery loop on its own — intake, plan, implement,
-adversarial review, tests, PR (and remote CI, once you enable it) — on **your
-existing Claude subscription** rather than a metered API key. Then it stops and
-waits for you.
+### Stop hand-holding one chat. Ship 10× in parallel — at a tenth of the cost.
+
+no_human carries a task from intake to an open PR on its own: no babysitting, no
+re-explaining, no steering every step. You just review and approve. Need answers, not
+a diff? The same pipeline runs investigations that dig for root cause and return a
+cited findings report rather than a feature, when no code change turns out to be needed.
+It never merges — that stays yours.
+
+Running several tasks at once is **opt-in and bounded**: concurrency ships *off*
+(`concurrency.enabled: false`) and defaults to `max_workers: 2` when you turn it on
+(`src/no_human/config.py`). A default install runs one task at a time. There is no
+enforced ceiling — `max_workers` is a default you can raise, not a cap.
+
+**The output is a pull request a competent developer merges as-is** — that is the
+bar, and it is the only one that counts. What makes that output trustworthy is
+that no_human refuses to grade its own work: a fresh-context reviewer that never
+saw the code being written is told to refute "done", cites `file:line`, and can
+only return pass or fail — never a score. A deterministic tamper guard blocks any
+net reduction in tests or assertions *before* a reviewer token is spent. And every
+task carries an enforced spend cap and a per-task ledger that counts cache-read —
+~96% of the *tokens* an agent burns and, at cache-read's 1/10th price, still roughly
+two-thirds of the bill on that measurement (`docs/COST_LEVERS.md`). Most tooling omits
+the term entirely.
+
+Every number here is measured and sourced — including the ones that make us look worse.
+The **bench card** is additionally published through a fail-closed gate; the other figures
+are sourced to the code or to a recorded measurement, and say which. The headline "10x in
+parallel" is a **design ambition, not a measured result** — nothing here measures delivery
+volume yet, and the parallelism it refers to ships off by default.
+"At a tenth of the cost" is likewise not a precise multiple: the recorded median cost ratio
+is 0.1065 over 12 of 53 specs (see ["Does it work?"](#does-it-work)) — cheaper is well
+supported, an exact 10× is not.
 
 ```bash
 nh task add --title "Fix the off-by-one in pagination" --repo ~/my-repo
@@ -22,11 +50,14 @@ nh task add --title "Fix the off-by-one in pagination" --repo ~/my-repo
 
 ## 🔒 Trust, in numbers
 
-- **Measured reviewer catch-rate: 15/16 seeded defects caught (94%)** — logic 4/4, security 4/4, spec-miss 4/4, test-tamper 3/4 — specificity 2/4 clean diffs, on the expanded 20-case corpus (prior runs: 11/12 + 3/4 on 16 cases; 7/7 + 1/2 on 9). The recurring miss is the corpus's hardest plant class (a load-bearing assert "de-flaked" into a tautology); specificity flips run-to-run on borderline nits — that variance is why gating is moving parser-side. `claude-opus-4-8`, 2026-07-26, method + held-out discipline: [`docs/REVIEWER_RECALL_METHOD.md`](docs/REVIEWER_RECALL_METHOD.md). Regenerate with `nh bench report --reviewer-recall`; the number is never hand-edited. **This number was measured on `claude-opus-4-8`. As of 2026-07-26 the shipping reviewer is `claude-opus-5` (operator decision, CLAUDE.md #7) and this catch-rate has NOT yet been re-measured on it** — the one A/B that did run scored Opus 5 lower (14/16 recall, 0/4 specificity under the current prompt), so treat 15/16 as the 4.8 record, not a claim about what ships today, until a fresh `--reviewer-recall` run replaces it.
+- **The reviewer is measured against a seeded-defect corpus, and the number is never hand-edited** — regenerate with `nh bench report --reviewer-recall`. 🔴 **No catch-rate is quoted here, deliberately.** The last full measurement ran on `claude-opus-4-8`; the shipping reviewer has been `claude-opus-5` since 2026-07-26 with **no re-measurement**, and the one A/B that did run scored Opus 5 lower. Quoting the old figure as if it described what ships is the re-attribution this project forbids, so **no catch-rate is published on any user-facing surface** until the shipping reviewer is re-measured. `docs/REVIEWER_RECALL_METHOD.md` holds the method, not a number. The retired 4.8 figure is named only in `.agents/product-marketing.md` and `CLAUDE.md`, in both cases in order to **forbid** its reuse.
 - **Never merges — enforced at the tool boundary, not a policy.** A `PreToolUse` hook denies `gh pr merge`, `glab mr merge`, and the equivalent REST merge calls before they run. Merging is always yours.
 - **A deterministic tamper guard runs before a reviewer token is spent** — it fails any attempt that nets a reduction in test count or assertions, no LLM judgment involved.
+- **Runs against your own checkout; only prompts reach the model API.** Stated as a
+  property, not a pitch — the Agent SDK executes every tool against your local working
+  tree, not a remote sandbox or an upload.
 - **Honest escalation is a first-class outcome** — a blocker taxonomy routes stuck work to a park-with-wake-condition or a human escalation instead of a faked diff.
-- **Local-only — your code never leaves your machine; only prompts reach the model API.** The Agent SDK executes every tool against your local working tree, not a remote sandbox or upload.
+- **Cost is measured per task, and cache-read is counted.** The spend caps and the metrics path enforce on `tokens_used + cache_read` (`src/no_human/core/orchestrator.py:713`, `src/no_human/core/metrics.py:162`) — cache-read alone is ~96% of the *tokens* an agent burns — and, priced at 1/10th, still roughly two-thirds of the bill on that measurement (`docs/COST_LEVERS.md`; the token share and the dollar share are different numbers and the mix varies by run) — and it is the term most tooling omits. The canonical ACCOUNTING figure adds `cache_creation` on top; the two differ, and this README does not pretend they are one number. In a recorded measurement over 61 Claude Code sub-agent transcripts from this project's own development sessions — *not* no_human product runs — the per-agent figure those runs' own completion notifications reported understated true spend by **86.6x in aggregate** (median 78.4x, worst 221x). That record lives in a private research repo, so treat the multiples as illustrative of the omission, not as a published product metric. Each task carries an enforced spend cap and a per-task ledger, so a run cannot quietly become expensive.
 
 **It never merges.** Work that reaches a PR stops at `awaiting_approval` with a
 diff and an evidence checklist; work that can't be finished honestly stops at an
@@ -52,7 +83,7 @@ uv run nh init     # token setup + config + first repo (~2 min)
 uv run nh task add --title "Add greet(name)" --repo ~/my-repo
 ```
 
-Needs Python 3.12+, [uv](https://github.com/astral-sh/uv), git, and a Claude OAuth token (`claude setup-token`) — full prerequisites: [Getting Started](#%EF%B8%8F-getting-started); full walkthrough: [docs/quickstart.md](docs/quickstart.md).
+Needs Python 3.12+, [uv](https://github.com/astral-sh/uv), git, and a Claude credential — an OAuth token from `claude setup-token` by default, or your own `ANTHROPIC_API_KEY` under `llm.auth_mode: "api_key"` — full prerequisites: [Getting Started](#%EF%B8%8F-getting-started); full walkthrough: [docs/quickstart.md](docs/quickstart.md).
 
 ---
 
@@ -100,8 +131,8 @@ trust the result. Three choices here follow from that:
   blocked *before* a reviewer token is spent, and a Python bugfix must ship a
   test that provably fails on the unfixed code.
 
-Everything runs on your existing Claude subscription — no metered API bills, no
-new vendor. One command boots the whole thing:
+Runs against your own Claude credential, on your own checkout. One command boots
+the whole thing:
 
 ```bash
 nh start   # web board + task worker + wake watcher
@@ -164,8 +195,10 @@ a confident wrong diff that costs you an hour.
 Claude OAuth token — from either a paid personal subscription or an enterprise
 profile (whatever `claude setup-token` issues for your plan). Both are
 first-class; `nh auth use <profile>` picks which one pays, and a single run never
-spans two profiles. What you cannot use is a metered `ANTHROPIC_API_KEY`:
-startup aborts if one is set (see [Safety](#-safety-guarantees)).
+spans two profiles. In the default `subscription` mode a metered `ANTHROPIC_API_KEY`
+is rejected: startup aborts if one is set (see [Safety](#-safety-guarantees)).
+If you would rather pay Anthropic directly, set `llm.auth_mode: "api_key"` and supply
+your own `ANTHROPIC_API_KEY` in `~/.no_human/.env` instead of an OAuth token.
 
 One command (checks deps, installs, runs doctor): `git clone <your-clone-url>/no_human.git && cd no_human && ./scripts/bootstrap.sh`
 
@@ -187,7 +220,7 @@ Then add your first task:
 nh task add --title "Add greet(name)" --repo ~/my-repo
 ```
 
-The agent will plan, implement, get reviewed, run tests, and open a PR — all on your subscription token. See [docs/quickstart.md](docs/quickstart.md) for the full 5-minute walkthrough.
+The agent will plan, implement, get reviewed, run tests, and open a PR. See [docs/quickstart.md](docs/quickstart.md) for the full 5-minute walkthrough.
 
 ---
 
@@ -215,7 +248,7 @@ Task in ──► Context ──► Plan ──► Implement ──► Review �
               │                     │            │          │
               │                     │            │          └── local + CI
               │                     │            └── fresh-context adversarial reviewer
-              │                     └── Claude Agent SDK (your subscription)
+              │                     └── Claude Agent SDK (your Claude credential)
               └── codebase grep, git log, Teams, Outlook, session memory
 ```
 
@@ -235,7 +268,7 @@ Task in ──► Context ──► Plan ──► Implement ──► Review �
 
 These are **enforced in code**, not advisory:
 
-- **OAuth auth only** — subscription or enterprise profile. Metered API keys are scrubbed from the process env on startup, and a present `ANTHROPIC_API_KEY` aborts the run rather than being silently ignored, so a misconfiguration can never quietly bill the metered API.
+- **One credential per run, and the run says which** — in the default `subscription` mode, metered keys are scrubbed and a present `ANTHROPIC_API_KEY` aborts the run rather than being silently ignored, so a misconfiguration can never quietly bill the metered API.
 - **Deterministic VCS** — the orchestrator owns branching, committing and pushing. Merging a PR/MR (`gh pr merge`, `glab mr merge`, the REST merge endpoints), force-push and destructive git are denied at the tool boundary, and `never_push_to` blocks pushes to protected branches.
 - **Read-only review** — the reviewer backend blocks all write tools unconditionally.
 - **Tamper guard** — fires before the reviewer; test-gutting agents are escalated immediately.
@@ -270,7 +303,7 @@ nh review <id>        # adversarial reviewer's evidence checklist
 ```
 
 > **`nh watch <id>` is not read-only.** It *runs* the task in a live TUI
-> (`cli/tui.py` builds an orchestrator and awaits `run_task`). Use it to drive a
+> (`src/no_human/cli/tui.py` builds an orchestrator and awaits `run_task`). Use it to drive a
 > task in the foreground — never as a viewer while `nh start` is running, or the
 > same task executes twice.
 
@@ -314,7 +347,7 @@ Secrets live in `~/.no_human/.env` (chmod 600, never in the repo).
 
 | Setting | Default | What it does |
 |---|---|---|
-| `CLAUDE_CODE_OAUTH_TOKEN` | *(required)* | Subscription auth for the Claude Agent SDK |
+| `CLAUDE_CODE_OAUTH_TOKEN` | *(required in `subscription` mode)* | Subscription auth for the Claude Agent SDK |
 | `llm.primary_model` | `claude-sonnet-5` | The implementer (coder) model |
 | `llm.review_model` | `claude-opus-5` | The adversarial reviewer (kept different from the implementer by convention; not enforced in code) |
 | `server.port` | `8420` | Web board bind port |
@@ -410,7 +443,7 @@ NH_E2E_BASE=http://127.0.0.1:8488 uv run python e2e/board_e2e.py
 
 | Problem | Solution |
 |---|---|
-| **`auth error: ANTHROPIC_API_KEY is set`** | `unset ANTHROPIC_API_KEY` — no_human runs on an OAuth token, never the metered API. Startup aborts rather than scrubbing silently, so the misconfiguration reaches you and not your bill. |
+| **`auth error: ANTHROPIC_API_KEY is set`** | `unset ANTHROPIC_API_KEY` **if you are in the default `subscription` mode** — that mode bills OAuth only. If you intend to use your own key, set `llm.auth_mode: "api_key"`, where the key is REQUIRED rather than rejected. Startup aborts rather than scrubbing silently, so the misconfiguration reaches you and not your bill. |
 | **`auth error: No subscription token found`** | Run `claude setup-token`, then add the token to `~/.no_human/.env` (chmod 600). `nh auth status` lists configured profiles. |
 | **`no profile to confirm`** | Run `nh onboard <repo>` first, then `nh onboard <repo> --confirm`. |
 | **Task stuck in `implementing`** | Check `nh logs <id>` — likely hit `max_turns`. Raise `bounds.max_turns_per_attempt` (default 500) or simplify the task. |
@@ -424,7 +457,14 @@ NH_E2E_BASE=http://127.0.0.1:8488 uv run python e2e/board_e2e.py
 <details>
 <summary><b>Does this use my personal API key?</b></summary>
 
-No. no_human runs only on an OAuth token (`CLAUDE_CODE_OAUTH_TOKEN`) — from a personal subscription or an enterprise profile. Metered API keys are scrubbed from the environment on startup, and if `ANTHROPIC_API_KEY` is set the process refuses to start (a silent scrub-and-continue would hide a misconfiguration that costs real money). Your subscription covers the cost.
+no_human runs on **exactly one** credential per run, and says which. Two modes ship:
+`llm.auth_mode: "subscription"` (the default) uses `CLAUDE_CODE_OAUTH_TOKEN` from a personal
+or enterprise profile, and **aborts** if `ANTHROPIC_API_KEY` is present — a silent
+scrub-and-continue would hide a misconfiguration that costs real money.
+`llm.auth_mode: "api_key"` is the sanctioned BYO-key mode: your own `ANTHROPIC_API_KEY` is
+the chosen billing path, and every *other* metered route (`ANTHROPIC_AUTH_TOKEN`, Bedrock,
+Vertex) is scrubbed instead — so a run still bills exactly one path. The key lives in
+`~/.no_human/.env`, never in config.
 </details>
 
 <details>

@@ -110,13 +110,26 @@ not `null` — an unmeasured case has no caught/missed verdict to report) and
 `nh bench report --reviewer-recall` prints:
 
 ```
-reviewer recall: 13/16 (81%)  [logic 4/4, security 3/4, test-tamper 3/4, spec-miss 3/4]
-specificity:     4/4 clean diffs passed
-model: claude-opus-5 · run date: YYYY-MM-DD · method: docs/REVIEWER_RECALL_METHOD.md
+reviewer recall: NN/16 (NN%)  [logic N/4, security N/4, test-tamper N/4, spec-miss N/4]
+specificity:     N/4 clean diffs passed
+model: <model-id> · run date: YYYY-MM-DD · method: docs/REVIEWER_RECALL_METHOD.md
 ```
 
-README publishes exactly this line with denominator, date, and a link here.
-Never a bare percentage.
+🔴 **The block above is a FORMAT TEMPLATE, not a result.** Every field is a placeholder
+on purpose. An earlier version filled it with illustrative numbers next to a real model
+id, which reads as a measurement of that model — exactly the re-attribution this document
+exists to prevent.
+
+**No catch-rate is currently published on any user-facing surface.** The retired 4.8 figure
+is named only in `.agents/product-marketing.md` and `CLAUDE.md`, in both cases in order to
+**forbid** its reuse — which is the opposite of publishing it. (An earlier draft of this
+line said "anywhere in this repo", the same false absolute that was caught and rescoped in
+`README.md`; it was fixed there and left standing here, one file away, in the very document
+the README points at.) The last full measurement
+ran on `claude-opus-4-8`; the shipping reviewer has been `claude-opus-5` since 2026-07-26
+and has not been re-measured, and the one A/B that did run scored Opus 5 lower. Until a
+real run exists, this file holds the METHOD and no number. When one does, publish it with
+denominator, date and model id — never a bare percentage.
 
 ## Instrument discipline (non-negotiable)
 

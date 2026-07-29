@@ -330,7 +330,8 @@ export default function Onboarding({ onComplete }) {
                 open PR on its own: no babysitting, no re-explaining, no steering every step.
                 You just review and approve — for about <em>a tenth</em> of what one
                 hand-held session burns. Need answers, not a diff? The same pipeline runs
-                read-only investigations that dig for root cause without touching code.
+                investigations that dig for root cause and hand back a cited findings
+                report when no code change is needed.
               </p>
               <div className="ob-agents">
                 <div className="ob-agent ob-agent-supervisor">

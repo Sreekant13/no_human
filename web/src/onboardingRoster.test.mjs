@@ -8,7 +8,7 @@ import { ROLE_LABEL } from "./eventRoles.js";
 
 // Guards the WELCOME step's agent roster grid (.ob-agents in Onboarding.jsx): the
 // six cards must name the six live roles (ROLE_LABEL is the source of truth), use
-// truthful colour tokens, still advertise the read-only investigation capability,
+// truthful colour tokens, still advertise the investigation capability (NOT as read-only),
 // and stay legible on narrow viewports.
 
 const SRC = dirname(fileURLToPath(import.meta.url));
@@ -52,12 +52,26 @@ test("no card claims a nonexistent agent (Shepherd / Investigator are gone)", ()
   assert.doesNotMatch(jsx, /Investigator/, "Orchestrator card must not still read 'Investigator'");
 });
 
-test("the intro paragraph still advertises the read-only investigation capability", () => {
+test("the intro paragraph still advertises the investigation capability, and does NOT call it read-only", () => {
   const lede = jsx.match(/<p className="ob-lede">([\s\S]*?)<\/p>/)?.[1] ?? "";
   assert.match(
     lede,
-    /investigation|root cause|read-only/i,
-    "the .ob-lede intro must keep advertising read-only investigations after the capability moved out of a card",
+    /investigation|root cause/i,
+    "the .ob-lede intro must keep advertising investigations after the capability moved out of a card",
+  );
+  // 🔴 THE GUARD USED TO DEMAND THE FALSEHOOD. Its name, its comment and its failure
+  // message all said "read-only investigations", and `read-only` sat in the alternation
+  // above — so a reviewer reading this file was told the retracted claim was REQUIRED.
+  // The `investigation` kind is not read-only at runtime: the coder is instructed to
+  // propose a fix and run the tests, and the report-only path is gated on
+  // `if not repo.has_changes()`. The alternation made it pass either way, so the copy fix
+  // swept README, Onboarding.jsx and the positioning doc while this test still pointed at
+  // the old claim. A guard that can be satisfied by the thing it should forbid is worse
+  // than no guard: it launders the falsehood as verified.
+  assert.doesNotMatch(
+    lede,
+    /read-only/i,
+    "the .ob-lede must NOT call investigations read-only — they are not, and this claim was retracted 2026-07-29",
   );
   // The thesis line itself is explicitly out of scope for this task.
   assert.match(jsx, /Stop hand-holding one chat\. Ship 10× in parallel — at a tenth of the cost\./);
