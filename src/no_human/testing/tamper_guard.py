@@ -36,6 +36,13 @@ _TEST_FILE_PATTERNS = (
     r"[^/]+Test\.java$",
     r"[^/]+IT\.java$",
     r"(^|/)__tests__/",
+    # web/e2e/*.mjs — the UI gate. It was invisible here, so all 14 suites could be
+    # deleted or gutted with `tampered=False`: they match none of the patterns above
+    # (not `tests/`, not `*.test.*`, not `*.spec.*`). An execution audit proved it —
+    # 417 lines of e2e counted as ZERO. This is the gate that catches what the unit
+    # suites structurally cannot: a blank page from a ReferenceError, a `border` that
+    # paints nothing because Tailwind preflight is off, a light-theme regression.
+    r"(^|/)e2e/",
 )
 _TEST_FILE_RE = re.compile("|".join(_TEST_FILE_PATTERNS))
 
@@ -60,9 +67,33 @@ _TEST_DECL = re.compile(
 )
 
 # Assertion-ish calls across python/js/java.
+#
+# `check(` is this repo's own e2e assertion form: every suite under web/e2e/ defines
+# `const check = (name, ok, detail) => { … if (!ok) failures.push(name) }` and asserts
+# through it. Adding `(^|/)e2e/` to the path patterns above WITHOUT this would have been
+# a VACUOUS fix — the files would be counted as test files with zero tests and zero
+# assertions, so deleting one would still show no reduction and still report
+# `tampered=False`. A guard that looks like protection and cannot fail is the exact
+# defect this session spent the night removing from its own tooling.
+#
+# Safe to add because `is_test_file()` gates the counting, so this never sees product
+# code. `\bcheck\s*\(` also cannot match `check=True` (a kwarg, no paren follows the
+# name) or `checkVisibility(` (the paren does not follow `check`).
 _ASSERT = re.compile(
     r"\bassert\b|\bself\.assert\w+\s*\(|\bexpect\s*\(|\bassert\w*\s*\("
-    r"|\bAssert\.|\bassertThat\s*\(|pytest\.raises|\.should\b",
+    r"|\bAssert\.|\bassertThat\s*\(|pytest\.raises|\.should\b"
+    # Dot-guarded, exactly like the `it`/`test`/`describe` alternatives above and for
+    # the same reason. A bare `check(` is this repo's e2e assertion helper; a DOTTED
+    # `tamper_guard.check(` or `self.check(` is a call to a product function. An audit
+    # found 24 of those miscounted as assertions across three test files — 19 in
+    # tests/test_tamper_guard.py, i.e. calls to the very function under test, so an
+    # honest refactor there would have read as TAMPERING.
+    #
+    # 🖐️ My negative controls tested `check=True` and `checkVisibility(` — both real,
+    # both beside the point. The live false positive was in TEST code, and the
+    # `is_test_file()` gating I cited as the safety argument does nothing about it.
+    # A control that refutes a satellite is not a control.
+    r"|(?<![.\w])check\s*\(",
 )
 
 # Skip / xfail / disable markers — neuter a test without touching its body.
@@ -208,7 +239,21 @@ def check(
                 f"{p}: autouse monkeypatch fixture {b_ff}->{a_ff} "
                 f"(forces green without fixing product code)")
 
-    tampered = ta < tb or aa < ab or sa > sb or auta > autb or ffa > ffb
+    # A DELETED test file is tampering on its own, regardless of the totals. This used
+    # to be computed from aggregate counts alone while `reasons` recorded the deletion
+    # independently, so the report could NAME a deleted test file and still return
+    # `tampered=False` — verified by an audit against real suites whose assertions
+    # count zero (electron-smoke.mjs, live-flows.mjs): delete either and the totals do
+    # not move. Silence and cleanliness looked the same, again.
+    #
+    # An honest deletion (removing tests for a removed feature) moves the counts and
+    # would already fire; the case this catches is precisely the one where it does
+    # NOT — a file disappearing without a trace in the numbers. The guard fires and a
+    # human justifies it, which is how it is meant to work.
+    deleted = [p for p in before if p not in after]
+    tampered = (
+        bool(deleted) or ta < tb or aa < ab or sa > sb or auta > autb or ffa > ffb
+    )
     return TamperReport(
         tampered=tampered,
         tests_before=tb,

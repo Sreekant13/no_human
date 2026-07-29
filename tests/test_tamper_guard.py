@@ -47,11 +47,26 @@ def test_is_test_file_table():
         "com/acme/FooTest.java",
         "com/acme/FooIT.java",
         "pkg/__tests__/x.js",
+        # The UI gate. This ASSERTION MOVED from `unguarded` to `guarded` on
+        # 2026-07-29, deliberately and with justification — it is not a test being
+        # weakened to clear a path. It sat in the unguarded list with NO comment,
+        # grouped with product code (App.jsx, foo.py), which reads as a snapshot of
+        # what the patterns happened to match rather than a designed exclusion.
+        # An execution audit then proved the consequence: all 14 e2e suites could be
+        # deleted or gutted with `tampered=False`, and 417 lines of e2e counted as
+        # ZERO. That is the gate catching what the unit suites structurally cannot —
+        # a blank page from a ReferenceError, a `border` painting nothing because
+        # Tailwind preflight is off, a light-theme regression.
+        # KNOWN TRADEOFF: e2e suites are large and refactored often, so an honest
+        # rewrite that nets fewer `check(` calls will now trip the guard and need a
+        # human to justify it. That is the intended direction — the guard fires on a
+        # net reduction and a person decides — and it is strictly better than a gate
+        # that cannot be defended at all.
+        "web/e2e/board.mjs",
     ]
     unguarded = [
         "web/src/App.jsx",
         "web/src/overviewStrip.js",
-        "web/e2e/board.mjs",
         "src/foo.py",
     ]
     for path in guarded:
@@ -378,3 +393,77 @@ def test_tamper_check_between_clean_linked_repo(tmp_path):
 
     report = tamper_check_between(repo)
     assert report.tampered is False
+
+
+def test_the_e2e_gate_is_visible_to_the_guard_and_its_assertions_are_counted():
+    """The UI gate was invisible: 14 suites deletable with `tampered=False`.
+
+    `web/e2e/*.mjs` matched none of the path patterns — not `tests/`, not
+    `*.test.*`, not `*.spec.*` — so an execution audit measured 417 lines of e2e
+    counted as ZERO. That is the gate catching what the unit suites structurally
+    cannot: a blank page from a ReferenceError, a `border` that paints nothing
+    because Tailwind preflight is off, a light-theme regression.
+
+    Both halves are required, and the path alone would have been a VACUOUS fix:
+    these suites assert through a local `check(name, ok, detail)` helper, so
+    without teaching `_ASSERT` about `check(` they would be counted as test files
+    with zero assertions — deleting one would still show no reduction.
+    """
+    assert tamper_guard.is_test_file("web/e2e/form-order.mjs")
+    assert tamper_guard.is_test_file("web/e2e/board.mjs")
+    # Product code must stay OUT — the counting is gated on is_test_file().
+    assert not tamper_guard.is_test_file("src/no_human/core/orchestrator.py")
+    assert not tamper_guard.is_test_file("web/src/cost.js")
+
+    suite = (
+        'const check = (n, ok, d = "") => { if (!ok) failures.push(n); };\n'
+        'check("a", x === 1);\ncheck("b", y === 2);\ncheck("c", z === 3);\n'
+    )
+    # 3 CALLS. The definition `const check = (n, ok, d) =>` is `check =`, not
+    # `check(`, so it is correctly not counted as an assertion.
+    assert tamper_guard.count_assertions(suite) == 3, (
+        "the e2e assertion form must be counted, or the path pattern protects nothing"
+    )
+    # A gutted suite must show a REAL drop, which is what makes the guard fire.
+    gutted = 'const check = (n, ok, d = "") => {};\n'
+    assert tamper_guard.count_assertions(gutted) < tamper_guard.count_assertions(suite)
+
+    # False positives that would make honest edits look like tampering.
+    assert tamper_guard.count_assertions("subprocess.run(x, check=True)") == 0
+    assert tamper_guard.count_assertions("el.checkVisibility({a: 1})") == 0
+
+
+def test_deleting_a_test_file_is_tampering_even_when_the_counts_do_not_move():
+    # `tampered` was computed from AGGREGATE counts while `reasons` recorded per-file
+    # deletions independently, so the report could NAME a deleted test file and still
+    # return tampered=False. An audit proved it against real suites whose assertions
+    # count zero — delete electron-smoke.mjs or live-flows.mjs and no total moves.
+    before = {"web/e2e/zero.mjs": "// a suite with no counted assertions\n"}
+    after: dict[str, str] = {}
+    r = tamper_guard.check(before, after)
+    assert r.tests_before == r.tests_after, "the counts genuinely do not move"
+    assert r.assertions_before == r.assertions_after
+    assert any("deleted" in x for x in r.reasons), r.reasons
+    assert r.tampered, (
+        f"a deleted test file must be tampering even when totals are flat: {r.reasons}"
+    )
+
+    # Control: an untouched file is not tampering.
+    same = tamper_guard.check(before, dict(before))
+    assert not same.tampered, same.reasons
+
+
+def test_check_is_dot_guarded_so_product_calls_in_tests_are_not_assertions():
+    # A bare `check(` is this repo's e2e assertion helper. A DOTTED
+    # `tamper_guard.check(` or `self.check(` is a call to a product function, and an
+    # audit found 24 miscounted across three test files — 19 in this very file, i.e.
+    # calls to the function under test, so an honest refactor here read as tampering.
+    #
+    # This exists because removing the dot guard left the whole suite green: the fix
+    # had two halves and only one was pinned.
+    assert tamper_guard.count_assertions('check("a", ok);') == 1
+    assert tamper_guard.count_assertions("tamper_guard.check(before, after)") == 0
+    assert tamper_guard.count_assertions("self.check(x)") == 0
+    # And the controls that were NOT the live false positive, kept for completeness.
+    assert tamper_guard.count_assertions("run(x, check=True)") == 0
+    assert tamper_guard.count_assertions("el.checkVisibility({})") == 0
