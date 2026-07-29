@@ -495,3 +495,153 @@ def test_supervisor_keeps_db_matched_on_disk_skills(store, tmp_path):
     assert hook is not None
     assert "kafka-retry-helper" in hook.skills
     assert "plain-skill" in hook.skills
+
+
+@pytest.mark.real_backend  # exercises the REAL ClaudeBackend.stream
+async def test_stream_reports_tool_result_SIZE_from_the_user_message(tmp_path, monkeypatch):
+    """PR-024 lever 1's prerequisite.
+
+    Tool RESULTS arrive in a UserMessage — an AssistantMessage carries the
+    ToolUseBlock (the call). A ToolResultBlock branch used to sit inside the
+    AssistantMessage loop, so it was UNREACHABLE: 0 tool_result events across 35
+    attempts against 1,497 tool_use, and the `_TOOL_RESULT_CAP` truncation a
+    previous author wrote never executed once.
+
+    The SIZE is emitted, never the text: 72% of an attempt's cost is the
+    conversation re-read every turn and tool results are the payload, so the size
+    distribution is what a truncation threshold must be chosen from — while
+    persisting the text would bloat the DB and could capture whatever a command
+    printed, including credentials.
+    """
+    from claude_agent_sdk import UserMessage
+    from claude_agent_sdk.types import ToolResultBlock
+
+    from no_human.agent import claude_backend
+    from no_human.agent.claude_backend import ClaudeBackend, _TOOL_RESULT_CAP
+
+    big = "x" * (_TOOL_RESULT_CAP + 500)
+    small = "ok"
+
+    async def _q(*args, **kwargs):
+        yield UserMessage(content=[ToolResultBlock(tool_use_id="t1", content=big)])
+        yield UserMessage(content=[ToolResultBlock(tool_use_id="t2", content=small)])
+
+    monkeypatch.setattr(claude_backend, "query", lambda *a, **kw: _q())
+    backend = ClaudeBackend(model="claude-sonnet-5")
+    events = [e async for e in backend.stream("go", cwd=tmp_path, max_turns=5)]
+
+    results = [e for e in events if e.kind == "tool_result"]
+    assert len(results) == 2, f"tool results were not observed at all; got {events!r}"
+    assert results[0].meta["result_chars"] == len(big)
+    assert results[0].meta["over_cap"] is True
+    assert results[1].meta["result_chars"] == len(small)
+    assert results[1].meta["over_cap"] is False
+    # JOIN KEY — without it the distribution cannot be sliced by tool, which is the
+    # whole point (Bash is 62% of calls and is the unbounded one).
+    assert results[0].meta["tool_use_id"] == "t1"
+    assert results[1].meta["tool_use_id"] == "t2"
+    # The TEXT must never be carried — DB bloat and secret capture.
+    assert not results[0].text, f"tool_result must not carry the text; got {results[0].text!r}"
+
+
+
+@pytest.mark.real_backend  # exercises the REAL ClaudeBackend.stream
+async def test_stream_handles_PARALLEL_tool_results_and_measures_model_visible_text(
+    tmp_path, monkeypatch
+):
+    """Three gaps a review found in the first version, each with its own mutation.
+
+    * PARALLEL CALLS: the CLI batches several results into ONE UserMessage. The first
+      test fed two messages of one block each, so a `break`-after-first-block mutation
+      SURVIVED. This feeds one message with three blocks.
+    * REPR vs TEXT: `str(content)` measured `[{'type': 'text', 'text': 'hello world'}]`
+      as 41 chars for 11 of payload, and `None` as 4 rather than 0.
+    * SUBAGENT SPLIT: a subagent's results are re-read in the SUBAGENT's context, not
+      the main conversation, so they must be excludable from the distribution.
+    """
+    from claude_agent_sdk import UserMessage
+    from claude_agent_sdk.types import ToolResultBlock
+
+    from no_human.agent import claude_backend
+    from no_human.agent.claude_backend import ClaudeBackend
+
+    async def _q(*args, **kwargs):
+        yield UserMessage(content=[
+            ToolResultBlock(tool_use_id="a", content="12345"),
+            ToolResultBlock(tool_use_id="b", content=[{"type": "text", "text": "hello world"}]),
+            ToolResultBlock(tool_use_id="c", content=None),
+        ])
+        yield UserMessage(
+            content=[ToolResultBlock(tool_use_id="d", content="sub")],
+            parent_tool_use_id="toolu_parent",
+        )
+
+    monkeypatch.setattr(claude_backend, "query", lambda *a, **kw: _q())
+    backend = ClaudeBackend(model="claude-sonnet-5")
+    events = [e async for e in backend.stream("go", cwd=tmp_path, max_turns=5)]
+    r = [e for e in events if e.kind == "tool_result"]
+
+    assert len(r) == 4, f"parallel blocks in ONE message must each be counted; got {len(r)}"
+    assert [e.meta["tool_use_id"] for e in r] == ["a", "b", "c", "d"]
+    assert r[0].meta["result_chars"] == 5
+    # 11 chars of payload, NOT the 41-char repr of the wrapper list.
+    assert r[1].meta["result_chars"] == 11, f"repr length leaked in: {r[1].meta!r}"
+    # None is 0 chars, not 4 ("None").
+    assert r[2].meta["result_chars"] == 0, f"None recorded as text: {r[2].meta!r}"
+    # Main-thread results are distinguishable from subagent results.
+    assert r[0].meta["parent_tool_use_id"] is None
+    assert r[3].meta["parent_tool_use_id"] == "toolu_parent"
+
+
+@pytest.mark.real_backend  # exercises the REAL ClaudeBackend.stream
+async def test_tool_use_emits_the_join_key_so_the_per_tool_slice_is_computable(
+    tmp_path, monkeypatch
+):
+    # A review deleted `meta={"tool_use_id": block.id}` from the tool_use emit and the
+    # ENTIRE suite stayed green. The commit message claimed both ends of the join key
+    # were proved when only the RESULT end was. A join key with one end is not a join
+    # key — and the CALL side is the half carrying `tool_name`, which is what makes the
+    # per-tool slice ("Bash is 62% of calls and is the unbounded one") computable.
+    from claude_agent_sdk import AssistantMessage
+    from claude_agent_sdk.types import ToolUseBlock
+
+    from no_human.agent import claude_backend
+    from no_human.agent.claude_backend import ClaudeBackend
+
+    async def _q(*args, **kwargs):
+        yield AssistantMessage(
+            content=[ToolUseBlock(id="toolu_x", name="Bash", input={"command": "ls"})],
+            model="claude-sonnet-5",
+        )
+
+    monkeypatch.setattr(claude_backend, "query", lambda *a, **kw: _q())
+    backend = ClaudeBackend(model="claude-sonnet-5")
+    events = [e async for e in backend.stream("go", cwd=tmp_path, max_turns=5)]
+    tu = [e for e in events if e.kind == "tool_use"]
+    assert len(tu) == 1
+    assert tu[0].tool_name == "Bash"
+    assert tu[0].meta["tool_use_id"] == "toolu_x", (
+        "without the CALL-side id the size distribution cannot be sliced BY TOOL, "
+        "which is the entire purpose of collecting it"
+    )
+
+
+def test_result_size_flags_non_text_blocks_and_never_raises():
+    # Two review findings, both in the size helper.
+    # 1. An image tool result carries a large base64 payload and ZERO text, so joining
+    #    only `text` recorded it as 0 chars — the SAME defect class as the repr
+    #    inflation this helper replaced, opposite direction, an order of magnitude
+    #    larger (11->41 vs ~1.2M->0). Now FLAGGED so it can be excluded, the way
+    #    is_error and parent_tool_use_id are.
+    # 2. `{"type":"text","text":null}` made it RAISE. That does not merely lose
+    #    telemetry: the nearest handler terminates the stream, so the whole attempt
+    #    fails as an SDK error. Telemetry must never break the session.
+    from no_human.agent.claude_backend import _result_size
+
+    assert _result_size([{"type": "text", "text": "hello world"}]) == {
+        "result_chars": 11, "over_cap": False, "non_text_blocks": 0}
+    img = _result_size([{"type": "image", "source": {"data": "x" * 100}}])
+    assert img["result_chars"] == 0 and img["non_text_blocks"] == 1, img
+    assert _result_size([{"type": "text", "text": None}])["result_chars"] == 0
+    assert _result_size(None)["result_chars"] == 0
+    assert _result_size("12345")["result_chars"] == 5

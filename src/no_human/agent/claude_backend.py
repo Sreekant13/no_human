@@ -32,6 +32,7 @@ from claude_agent_sdk import (
     ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
     query,
 )
 
@@ -41,6 +42,54 @@ from .supervisor import SupervisorHook
 # Phase 7c: explicit cap for tool-result display. Silent truncation makes the
 # model treat a partial as complete; the marker + retrieval hint prevent that.
 _TOOL_RESULT_CAP = 2000
+
+
+def _result_size(content: Any) -> dict[str, Any]:
+    """Size of a tool result as the MODEL sees it, not as Python reprs it.
+
+    `ToolResultBlock.content` is `str | list[dict] | None`. The first version used
+    `str(content)`, so `[{'type': 'text', 'text': 'hello world'}]` recorded 41 chars
+    for 11 of payload (~30 chars of fixed dict-repr overhead, and `\n` counted as two),
+    and `content=None` recorded 4 ("None") rather than 0 — planting phantom mass at the
+    low end of the very distribution this exists to produce. The threshold is read off
+    the HIGH end where that overhead is proportionally small, so the headline survives,
+    but any median or percentile taken from repr lengths is wrong.
+    """
+    non_text = 0
+    if content is None:
+        text = ""
+    elif isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict):
+                # `or ""` guards a malformed `{"type":"text","text":null}`: a raise
+                # here does NOT just lose telemetry — the nearest handler terminates
+                # the stream and fails the whole attempt as an SDK error. This file
+                # already states the principle at the guard-hook: telemetry must
+                # never break the session.
+                if b.get("type") == "text" or "text" in b:
+                    parts.append(str(b.get("text") or ""))
+                else:
+                    # An image block carries a large base64 payload and ZERO text.
+                    # Counting it as 0 chars is the SAME defect class as the repr
+                    # inflation this helper replaced, in the opposite direction and
+                    # an order of magnitude larger (11->41 vs ~1.2M->0). Flagged so
+                    # it can be EXCLUDED, the way is_error and parent_tool_use_id are.
+                    non_text += 1
+            else:
+                parts.append(str(b))
+        text = "".join(parts)
+    else:
+        text = str(content)
+    return {
+        "result_chars": len(text),
+        "over_cap": len(text) > _TOOL_RESULT_CAP,
+        # A threshold read off the GLOBAL distribution must exclude these; a
+        # threshold read off the Bash slice is unaffected, since Bash is text-only.
+        "non_text_blocks": non_text,
+    }
 
 
 @dataclass
@@ -266,6 +315,44 @@ class ClaudeBackend:
         last_session: str | None = None
         try:
             async for message in query(prompt=prompt, options=options):
+                # Tool RESULTS arrive in a UserMessage, not an AssistantMessage:
+                # an assistant message carries the ToolUseBlock (the call), and the
+                # result comes back as a user turn. A `ToolResultBlock` branch used to
+                # sit inside the AssistantMessage loop below, so it was UNREACHABLE —
+                # 0 tool_result events across 35 attempts against 1,497 tool_use — and
+                # the `_TOOL_RESULT_CAP` truncation a previous author wrote has never
+                # executed once. Verified against the SDK types: UserMessage carries
+                # `content: str | list[ContentBlock]` and `tool_use_result`.
+                #
+                # We emit the SIZE, never the text. PR-024 measured that 72% of an
+                # attempt's cost is the conversation re-read every turn, and tool
+                # results are the payload — but persisting that text would bloat the DB
+                # by ~1,500 results per session AND risk capturing whatever a command
+                # printed, including credentials. The size is what the truncation
+                # threshold must be chosen from; the text is not needed for it.
+                if isinstance(message, UserMessage):
+                    blocks = message.content
+                    if isinstance(blocks, list):
+                        for block in blocks:
+                            if isinstance(block, ToolResultBlock):
+                                yield AgentEvent(
+                                    "tool_result",
+                                    meta={
+                                        # JOIN KEY — pairs this size with its tool.
+                                        "tool_use_id": block.tool_use_id,
+                                        # A SUBAGENT's results are re-read in the
+                                        # SUBAGENT's context, not the main conversation
+                                        # whose 72% re-read cost is the target. Counting
+                                        # them undifferentiated inflates the population
+                                        # the threshold is chosen from.
+                                        "parent_tool_use_id": message.parent_tool_use_id,
+                                        # Error results are short and a different
+                                        # population; they must be excludable.
+                                        "is_error": bool(getattr(block, "is_error", False)),
+                                        **_result_size(block.content),
+                                    },
+                                )
+                    continue
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
                         if isinstance(block, ThinkingBlock):
@@ -273,21 +360,18 @@ class ClaudeBackend:
                         elif isinstance(block, TextBlock):
                             yield AgentEvent("text", text=block.text)
                         elif isinstance(block, ToolUseBlock):
+                            # `id` is the JOIN KEY. Without it the tool_result size
+                            # distribution cannot be sliced BY TOOL — and the whole
+                            # point (PR-024) is that Bash is 62% of calls and is the
+                            # unbounded one, so the truncation threshold must be
+                            # per-tool. Index-pairing is unsound: one assistant turn
+                            # can carry several ToolUseBlocks.
                             yield AgentEvent(
                                 "tool_use",
                                 tool_name=block.name,
                                 tool_input=block.input,
+                                meta={"tool_use_id": block.id},
                             )
-                        elif isinstance(block, ToolResultBlock):
-                            content = block.content
-                            text = content if isinstance(content, str) else str(content)
-                            if len(text) > _TOOL_RESULT_CAP:
-                                text = (
-                                    text[:_TOOL_RESULT_CAP]
-                                    + f"\n[TRUNCATED: showing {_TOOL_RESULT_CAP} of "
-                                    f"{len(text)} chars — use Grep or offset to see more]"
-                                )
-                            yield AgentEvent("tool_result", text=text)
                     # Per-message usage → a running mid-attempt total in the
                     # orchestrator's sink (B2 #2). Summing these per-call
                     # numbers reproduces the ResultMessage's cumulative
