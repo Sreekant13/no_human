@@ -470,6 +470,17 @@ export async function fetchOnboardingStatus() {
   return r.json();
 }
 export const detectRepos       = (root)    => _post("/api/onboarding/repos/detect", { root });
+
+// Auto-discovery over the conventional clone roots. No body and no root
+// parameter by design (see the endpoint's docstring): the scan is bound to the
+// user's home, so a plain GET is the whole request.
+export const discoverRepos = async (limit) => {
+  const qs = limit ? `?limit=${encodeURIComponent(limit)}` : "";
+  const r = await fetch(`${BASE}/api/repos/discover${qs}`);
+  if (!r.ok) throw new Error(`GET repos/discover → ${r.status}`);
+  return r.json();
+};
+
 export const onboardRepo       = (repo_path) => _post("/api/onboarding/repos/onboard", { repo_path });
 export const extractHistory    = ()        => _post("/api/onboarding/history/extract", {});
 export const analyzeHistory    = (days = 30) => _post("/api/onboarding/history/analyze", { days });

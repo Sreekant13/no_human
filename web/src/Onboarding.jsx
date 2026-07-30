@@ -1,9 +1,10 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
-  detectRepos, onboardRepo, extractHistory, analyzeHistory,
+  detectRepos, discoverRepos, onboardRepo, extractHistory, analyzeHistory,
   confirmRules, completeOnboarding, suggestPaths, createProject,
   generateDocs, fetchIntegrations,
 } from "./api.js";
+import { repoBadges, discoveryMessage, fromDetectedRepo } from "./discoveredRepos.js";
 import { LegionLogo } from "./Logo.jsx";
 import { statusChip, KIND_LABEL, NAME_LABEL } from "./integrationChip.js";
 import { IntegrationIcon } from "./integrationIcons.jsx";
@@ -104,8 +105,12 @@ const STEPS = [
 export default function Onboarding({ onComplete }) {
   const [i, setI] = useState(0);
   const [team, setTeam] = useState("");
-  const [root, setRoot] = useState("~/git");
+  const [root, setRoot] = useState("");
   const [detected, setDetected] = useState([]);
+  // The auto-discovery response, kept whole so the roots it searched, the cap
+  // note and the refused roots can all be reported (discoveryMessage).
+  const [discovery, setDiscovery] = useState(null);
+  const [manualScan, setManualScan] = useState(false);
   const [selectedRepos, setSelectedRepos] = useState(new Set());
   const [onboarded, setOnboarded] = useState({});   // path -> {ecosystem,test_cmd,...} | "busy"
   const [projectDefs, setProjectDefs] = useState([]);   // [{name, repos: Set}]
@@ -162,11 +167,14 @@ export default function Onboarding({ onComplete }) {
     historyPromiseRef.current = extractHistory().catch(() => null);
   }, []);
 
-  // Auto-detect repos when entering the repos step the first time.
+  // Entering the repos step discovers the user's repositories across every
+  // conventional clone root, so the first thing they see is their own list -
+  // not an empty box asking for a path they have to remember.
   useEffect(() => {
-    if (step.key === "repos" && detected.length === 0) {
+    if (step.key === "repos" && discovery === null) {
       guard(async () => {
-        const res = await detectRepos(root);
+        const res = await discoverRepos();
+        setDiscovery(res);
         setDetected(res.repos || []);
       });
     }
@@ -387,22 +395,61 @@ export default function Onboarding({ onComplete }) {
           {step.key === "repos" && (
             <Stagger>
               <h2 className="ob-h2">Which repositories do you work on?</h2>
+              <p className="ob-sub">
+                {discovery?.roots_scanned?.length
+                  ? `Found by searching ${discovery.roots_scanned.length} ${discovery.roots_scanned.length === 1 ? "folder" : "folders"} under your home directory.`
+                  : "Searching the usual places people keep their clones."}
+              </p>
               <div className="ob-row">
-                <PathInput value={root} onChange={setRoot} placeholder="scan root, e.g. ~/git" />
                 <button className="ob-btn-ghost" disabled={busy}
-                        onClick={() => guard(async () => setDetected((await detectRepos(root)).repos || []))}>
+                        onClick={() => guard(async () => {
+                          const res = await discoverRepos();
+                          setDiscovery(res);
+                          setDetected(res.repos || []);
+                        })}>
                   Re-scan
                 </button>
+                <button className="ob-btn-ghost" type="button"
+                        aria-expanded={manualScan}
+                        onClick={() => setManualScan((v) => !v)}>
+                  {manualScan ? "Hide folder search" : "Search another folder"}
+                </button>
               </div>
+              {manualScan && (
+                <div className="ob-row">
+                  <PathInput value={root} onChange={setRoot} placeholder="folder to search, e.g. ~/work" />
+                  <button className="ob-btn-ghost" disabled={busy || !root.trim()}
+                          onClick={() => guard(async () => {
+                            // The older bounded scan: one caller-named root,
+                            // kept as the escape hatch for clones that live
+                            // outside the conventional locations.
+                            const res = await detectRepos(root);
+                            const rows = (res.repos || []).map(fromDetectedRepo);
+                            setDetected(rows);
+                            setDiscovery({
+                              ...(discovery || {}), roots_scanned: [res.root],
+                              roots_missing: [], roots_refused: [],
+                              repos: rows, capped: false, note: "",
+                            });
+                          })}>
+                    Search
+                  </button>
+                </div>
+              )}
               <div className="ob-repolist">
-                {detected.length === 0 && <div className="ob-empty">{busy ? <><span className="grill-spinner" style={{ width: 16, height: 16, verticalAlign: 'middle', marginRight: 8 }} />Scanning for git repos…</> : "No git repos found under that path."}</div>}
+                {detected.length === 0 && <div className="ob-empty">{busy ? <><span className="grill-spinner" style={{ width: 16, height: 16, verticalAlign: 'middle', marginRight: 8 }} />Looking for your repositories…</> : "No repositories found. Search another folder above."}</div>}
                 {detected.map((r) => {
                   const st = onboarded[r.path];
                   return (
                     <label key={r.path} className={`ob-repo${selectedRepos.has(r.path) ? " sel" : ""}`}>
                       <input type="checkbox" checked={selectedRepos.has(r.path)} onChange={() => toggleRepo(r.path)} />
                       <span className="ob-repo-name">{r.name}</span>
-                      {r.ecosystem && <span className="ob-tag">{r.ecosystem}</span>}
+                      {repoBadges(r).map((b) => (
+                        <span key={b.key}
+                              className={b.tone === "warn" ? "ob-tag ob-tag-warn" : "ob-tag"}>
+                          {b.text}
+                        </span>
+                      ))}
                       {st === "busy" && <span className="ob-repo-status"><span className="grill-spinner" style={{ width: 12, height: 12, verticalAlign: 'middle', marginRight: 4 }} />profiling…</span>}
                       {st && st !== "busy" && (
                         <span className="ob-repo-status ok">
@@ -413,6 +460,9 @@ export default function Onboarding({ onComplete }) {
                   );
                 })}
               </div>
+              {discoveryMessage(discovery) && (
+                <p className="ob-note">{discoveryMessage(discovery)}</p>
+              )}
               {selectedRepos.size > 0 && (
                 <button className="ob-btn" disabled={busy} onClick={onboardSelected}>
                   {busy ? "Profiling…" : `Profile ${selectedRepos.size} repo${selectedRepos.size > 1 ? "s" : ""}`}

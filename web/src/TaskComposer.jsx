@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
-import { fetchProjects, fetchConfig, fetchIntegrations, searchJiraIssues, fetchJiraIssue, scaffoldRepo } from "./api.js";
+import { fetchProjects, fetchConfig, fetchIntegrations, searchJiraIssues, fetchJiraIssue, scaffoldRepo, discoverRepos } from "./api.js";
+import { repoBadges, discoveryMessage, filterRepos } from "./discoveredRepos.js";
 import { COMPOSER_KINDS, kindByValue, needsPrUrl } from "./composerKinds.js";
 import { splitPrompt } from "./promptSplit.js";
 import { promptFromIssue, jiraStatusChipStyle, externalIdFromIssue, importedChip } from "./jiraImport.js";
@@ -110,6 +111,12 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   // returned to the repository input exactly once (see focusedAfterCreateRef
   // below) rather than on every unrelated re-render.
   const [repoCreated, setRepoCreated] = useState(false);
+  // Auto-discovered repositories (GET /api/repos/discover). `null` until the
+  // fetch settles, so an empty list is never shown as "nothing found" while it
+  // is still in flight - the same loading≠empty rule as `projects` above.
+  const [discovered, setDiscovered] = useState(null);
+  const [discoveredOpen, setDiscoveredOpen] = useState(false);
+  const [discoveredQuery, setDiscoveredQuery] = useState("");
   const [config, setConfig] = useState(null);
   // Task 1.6 — Import from Jira. `source` rides along invisibly (never a
   // control the operator sees) so a task created from a picked ticket carries
@@ -173,6 +180,32 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
     focusedAfterCreateRef.current = true;
     repoInputRef.current?.focus();
   }, [repoCreated]);
+
+  // Discovery runs once per composer, in the background. It is a convenience
+  // over the typed path, so a failure is swallowed: the field, its autocomplete
+  // and the create-repo panel all still work with no discovered list at all.
+  useEffect(() => {
+    let live = true;
+    discoverRepos()
+      .then((res) => { if (live) setDiscovered(res); })
+      .catch(() => { if (live) setDiscovered({ repos: [], failed: true }); });
+    return () => { live = false; };
+  }, []);
+
+  // Open the list unprompted in exactly one case: there is no saved project to
+  // pick, so the alternative is an empty path field typed from memory - the
+  // problem discovery exists to solve. Whenever a project IS selectable the
+  // list stays collapsed, so it never pushes the rest of the form down for a
+  // user who did not ask for it. One-shot: reopening after a manual close
+  // would fight the user.
+  const autoOpenedRef = useRef(false);
+  useEffect(() => {
+    if (autoOpenedRef.current || !Array.isArray(projects) || !discovered) return;
+    autoOpenedRef.current = true;
+    if (projects.length === 0 && (discovered.repos || []).length > 0) {
+      setDiscoveredOpen(true);
+    }
+  }, [projects, discovered]);
 
   // Escape closes the Jira panel first (progressive disclosure — the same
   // "narrowest thing first" rule Integrations.jsx's Configure form uses),
@@ -270,6 +303,8 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   }, []);
 
   const { title, description } = splitPrompt(prompt);
+  const discoveredRepos = discovered?.repos ?? [];
+  const discoveryNote = discoveryMessage(discovered);
   const name = greetingName(config);
   const project = (projects ?? []).find((p) => p.id === selectedProjectId);
   const selectedChip = kindByValue(kind);
@@ -730,7 +765,74 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
           {freeTextRepo && (
             <p id="repo-path-hint" className="mt-2 px-5 font-ui text-sm text-text-muted">
               Must be a path to a git repository — e.g. ~/git/my-project.
+              {discoveredRepos.length > 0 && (
+                <>
+                  {" "}
+                  <button
+                    type="button"
+                    className="underline underline-offset-2 hover:text-text"
+                    aria-expanded={discoveredOpen}
+                    aria-controls="discovered-repos-panel"
+                    onClick={() => setDiscoveredOpen((v) => !v)}
+                  >
+                    {discoveredOpen
+                      ? "hide the repositories found on this machine"
+                      : `or pick one of ${discoveredRepos.length} ${pluralize(discoveredRepos.length, "repository", "repositories")} found on this machine`}
+                  </button>
+                </>
+              )}
             </p>
+          )}
+
+          {freeTextRepo && discoveredOpen && (
+            <div
+              id="discovered-repos-panel"
+              className="mt-2 rounded-2xl border border-solid border-line bg-panel p-4"
+            >
+              {discoveredRepos.length > 8 && (
+                <input
+                  className={`${TEXT_FIELD} mb-2 w-full`}
+                  placeholder="Filter by name or path"
+                  value={discoveredQuery}
+                  onChange={(e) => setDiscoveredQuery(e.target.value)}
+                  spellCheck={false}
+                  aria-label="Filter discovered repositories"
+                  // Enter must filter, never submit the composer.
+                  onKeyDown={(e) => { if (e.key === "Enter") e.preventDefault(); }}
+                />
+              )}
+              <ul className="max-h-64 list-none overflow-y-auto">
+                {filterRepos(discoveredRepos, discoveredQuery).map((r) => (
+                  <li key={r.path}>
+                    <button
+                      type="button"
+                      data-discovered-repo={r.path}
+                      aria-current={repoPath === r.path ? "true" : undefined}
+                      className={`flex w-full flex-wrap items-baseline gap-x-2 gap-y-0.5 rounded-xl px-3 py-2 text-left hover:bg-hover ${repoPath === r.path ? "bg-hover" : ""}`}
+                      onClick={() => {
+                        setRepoPath(r.path);
+                        setDiscoveredOpen(false);
+                      }}
+                    >
+                      <span className="font-ui text-base text-text">{r.name}</span>
+                      {repoBadges(r).map((b) => (
+                        <span
+                          key={b.key}
+                          className="font-ui text-xs"
+                          style={{ color: b.tone === "warn" ? "var(--amber)" : "var(--text-dim)" }}
+                        >
+                          {b.text}
+                        </span>
+                      ))}
+                      <span className="w-full font-mono text-xs text-text-dim">{r.path}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {discoveryNote && (
+                <p className="mt-2 px-3 font-ui text-sm text-text-muted">{discoveryNote}</p>
+              )}
+            </div>
           )}
 
           {/* The create-repo panel that would normally carry this message

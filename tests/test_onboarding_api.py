@@ -158,3 +158,83 @@ async def test_complete_persists_and_status_reflects(client, tmp_path):
     assert body["completed"] is True
     assert body["team"] == "METRICSDB"
     assert (tmp_path / "config.yaml").exists()
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/repos/discover — the typed-path replacement. The endpoint is bound  #
+# to the process's home, so these tests relocate HOME onto tmp_path rather     #
+# than accepting a caller-supplied root (which would be an unbounded scan      #
+# surface on a localhost service).                                             #
+# --------------------------------------------------------------------------- #
+
+def _seed_repo(path):
+    (path / ".git").mkdir(parents=True)
+    (path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    return path
+
+
+@pytest.mark.asyncio
+async def test_discover_lists_repos_from_the_conventional_roots(client, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _seed_repo(home / "git" / "svc-a")
+    _seed_repo(home / "Projects" / "svc-b")
+    monkeypatch.setenv("HOME", str(home))
+
+    r = await client.get("/api/repos/discover")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    names = {x["name"] for x in body["repos"]}
+    assert names == {"svc-a", "svc-b"}
+    row = next(x for x in body["repos"] if x["name"] == "svc-a")
+    assert row["path"] == str(home / "git" / "svc-a")
+    assert row["is_git"] is True
+    assert row["branch"] == "main"
+    assert row["dirty"] is False
+    assert body["capped"] is False
+    assert isinstance(body["elapsed_ms"], int)
+
+
+@pytest.mark.asyncio
+async def test_discover_honours_operator_configured_extra_roots(client, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _seed_repo(home / "work" / "acme")
+    monkeypatch.setenv("HOME", str(home))
+    app.state.config.data["onboarding"] = {"extra_scan_roots": ["~/work"]}
+    try:
+        r = await client.get("/api/repos/discover")
+        assert {x["name"] for x in r.json()["repos"]} == {"acme"}
+    finally:
+        app.state.config.data.pop("onboarding", None)
+
+
+@pytest.mark.asyncio
+async def test_discover_caps_and_says_so_rather_than_truncating_silently(client, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    for i in range(6):
+        _seed_repo(home / "git" / f"r{i}")
+    monkeypatch.setenv("HOME", str(home))
+
+    r = await client.get("/api/repos/discover", params={"limit": 2})
+    body = r.json()
+    assert len(body["repos"]) == 2
+    assert body["capped"] is True
+    assert body["total_found"] == 6
+    assert body["note"]
+
+
+@pytest.mark.asyncio
+async def test_discover_clamps_an_absurd_limit(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    r = await client.get("/api/repos/discover", params={"limit": 10 ** 6})
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_discover_on_a_bare_home_is_an_empty_list_not_an_error(client, tmp_path, monkeypatch):
+    home = tmp_path / "empty-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    r = await client.get("/api/repos/discover")
+    assert r.status_code == 200
+    assert r.json()["repos"] == []
+    assert r.json()["roots_scanned"] == []
