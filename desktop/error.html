@@ -59,8 +59,9 @@
        shell from source DO need exactly those commands, so both are kept and
        main.mjs says which one applies. -->
   <p class="steps" id="steps-packaged" hidden>
-    The bundled server didn’t start. Retry, or re-enter your Claude subscription
-    token if it may be wrong — no_human can’t start without a valid one.
+    The bundled server didn’t start. Retry, or use “Re-enter Claude token”
+    below to replace your saved credential if it may be wrong — the server
+    refuses to start without a working Claude credential.
   </p>
   <!-- stop-failed is neither audience's story: a server IS running and would
        not stop, so "start it in a terminal" and "the bundled server didn't
@@ -85,8 +86,9 @@
     <br /><code>npm install -g @anthropic-ai/claude-code</code>
   </p>
   <p class="steps" id="steps-not-logged-in" hidden>
-    no_human found the <code>claude</code> CLI but no subscription token.
-    Create one, then paste it in with “Re-enter Claude token” below:
+    no_human found the <code>claude</code> CLI but no Claude credential on
+    file. Create a subscription token, then paste it in with “Re-enter Claude
+    token” below (or choose the API-key option on that screen):
     <br /><code>claude setup-token</code>
   </p>
   <!-- The actual tail of nh start's own stdout/stderr (server.mjs's

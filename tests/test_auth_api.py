@@ -192,12 +192,15 @@ async def test_put_token_file_is_owner_only(client, tmp_path):
 
 @pytest.mark.asyncio
 async def test_put_refuses_a_metered_api_key(client, tmp_path):
-    """Constraint #1: OAuth only. Accepting this would bill per request."""
+    """Constraint #1: this endpoint stores OAuth tokens only. An API key pasted
+    here is refused and pointed at llm.auth_mode: api_key instead."""
     r = await client.put("/api/auth/token",
                          json={"profile": "personal",
                                "token": "sk-ant-api03-real-looking-key"})
     assert r.status_code == 422
-    assert "metered" in r.json()["detail"].lower()
+    detail = r.json()["detail"]
+    assert "ANTHROPIC_API_KEY" in detail
+    assert "not an OAuth token" in detail
     assert not (tmp_path / ".env").exists()
 
 

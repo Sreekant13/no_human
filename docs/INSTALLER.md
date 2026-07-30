@@ -43,11 +43,15 @@ with `CLINotFoundError`. The app widens the server's `PATH` to cover the usual
 install locations — including `/opt/homebrew/bin`, which is in neither launchd's
 `PATH` nor the SDK's own fallback list — but the CLI has to exist somewhere.
 
-On first launch the app asks for a Claude **subscription token** — no_human runs
-on a subscription, never a metered API key. Create one with `claude setup-token`
-and paste it in; it is written to `~/.no_human/.env` (mode 600) on that machine
-only. An API key (`sk-ant-api…`) is rejected, because it would bill the metered
-API instead of the subscription.
+On first launch the app asks to connect Claude and offers two credential
+types. The default is a **subscription token** (personal or enterprise):
+create one with `claude setup-token` and paste it in. The alternative is an
+**Anthropic API key**, which bills the operator's own Anthropic account —
+select "Anthropic API key" on that screen and paste an `sk-ant-api…` key.
+Either credential is written to `~/.no_human/.env` (mode 600) on that machine
+only, and a run bills exactly the one configured path: a key pasted into the
+subscription field is rejected, and stray billing variables are scrubbed at
+startup.
 
 ## Why the packaging looks the way it does
 

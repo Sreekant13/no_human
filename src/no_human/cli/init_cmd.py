@@ -254,9 +254,11 @@ def _setup_subscription_token() -> bool:
     if metered:
         console.print(
             f"\n  [bold red]⚠ {metered} is set in your environment.[/]\n"
-            f"    no_human runs on subscription auth ONLY — metered keys cause\n"
-            f"    silent API billing. Please unset it:\n"
-            f"      [bold]unset {metered}[/]"
+            f"    In the default subscription mode, startup scrubs this variable\n"
+            f"    so a run bills exactly one path. Please unset it:\n"
+            f"      [bold]unset {metered}[/]\n"
+            f"    (To bill your own Anthropic account with an API key, set\n"
+            f"    llm.auth_mode: api_key in config.yaml.)"
         )
 
     # Guide through setup.

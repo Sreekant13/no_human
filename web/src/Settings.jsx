@@ -81,9 +81,11 @@ function AuthPanel() {
 
       {view.showMeteredAlarm && (
         <div className="nh-alarm auth-alarm" role="alert">
-          A metered <code>ANTHROPIC_API_KEY</code> is set in no_human&apos;s
-          environment — it bills per request and bypasses your subscription.
-          Unset it where the server runs.
+          An <code>ANTHROPIC_API_KEY</code> is set in no_human&apos;s
+          environment while the configured mode is subscription — startup
+          scrubs the key so a run bills exactly one path. Unset it where the
+          server runs, or switch billing to the key with{" "}
+          <code>llm.auth_mode: api_key</code>.
         </div>
       )}
       {view.mode === "subscription" && view.showRestartBanner && (

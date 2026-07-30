@@ -4,23 +4,31 @@ no_human is designed for **unattended** runs, so its safety properties are
 correctness requirements, not preferences. They are enforced in code and covered
 by tests.
 
-## 1. Subscription auth only — never the metered API
+## 1. One billing path per run
 
+Two sanctioned auth modes exist. The default, `llm.auth_mode: "subscription"`,
+runs on a Claude OAuth token (personal or enterprise, from
+`claude setup-token`); `llm.auth_mode: "api_key"` is an operator opt-in that
+bills the operator's own Anthropic account with their own `ANTHROPIC_API_KEY`.
 The Claude Agent SDK honours `ANTHROPIC_API_KEY` **over**
-`CLAUDE_CODE_OAUTH_TOKEN` when both are present, so a stray key would silently
-bill the pay-per-token API. On startup (`config.assert_subscription_mode`):
+`CLAUDE_CODE_OAUTH_TOKEN` when both are present, so in either mode startup
+(`config.assert_subscription_mode`) guarantees a run bills exactly the one
+configured path:
 
-1. Every metered-auth variable is **scrubbed** from the process environment:
-   `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, the
-   Bedrock/Vertex set, `GOOGLE_APPLICATION_CREDENTIALS`, `AWS_BEARER_TOKEN_BEDROCK`.
-2. If `ANTHROPIC_API_KEY` was present, the process **refuses to start** (exit 2)
-   — the scrub already protected this run, but startup aborts so you fix the
-   source rather than masking a misconfiguration.
-3. The subscription token is loaded from `~/.no_human/.env`
+1. Every auth variable that could redirect billing elsewhere is **scrubbed**
+   from the process environment: `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
+   the Bedrock/Vertex set, `GOOGLE_APPLICATION_CREDENTIALS`,
+   `AWS_BEARER_TOKEN_BEDROCK` — and, in the default mode, `ANTHROPIC_API_KEY`.
+2. In the default mode, if `ANTHROPIC_API_KEY` was present the process
+   **refuses to start** (exit 2) — the scrub already protected this run, but
+   startup aborts so you fix the source rather than masking a misconfiguration.
+3. The credential for the configured mode (OAuth token, or API key in
+   `api_key` mode) is loaded from `~/.no_human/.env`
    (`chmod 600`, gitignored, **never** in the repo) with a process-env fallback.
 
-The token is never read from or written to anywhere in the repo, and
-`ANTHROPIC_API_KEY` is rejected if it appears in `config.yaml`.
+Credentials are never read from or written to anywhere in the repo, and
+`ANTHROPIC_API_KEY` is rejected if it appears in `config.yaml` — the *mode*
+may live in config; the key never does.
 
 ## 2. The agent never merges
 
@@ -42,7 +50,7 @@ blocked unconditionally.
 
 - **Tamper guard**: any net reduction in test count / assertions between the base
   and the change is blocked *before* the reviewer runs (cheap, deterministic).
-- **Independent reviewer**: a fresh-context `claude-sonnet-4-6` subagent told to
+- **Independent reviewer**: a fresh-context `claude-opus-5` subagent told to
   refute "done", producing an evidence-cited pass/fail checklist — **never a
   numeric self-score**. Reviewer crash → fail-closed.
 - **Held-out tests**: `tests/held_out/` are run by the orchestrator and given to
@@ -59,7 +67,9 @@ or escalates with a structured report (see [blockers.md](blockers.md)).
 
 ## 6. What to review before trusting an unattended run
 
-- `~/.no_human/.env` is `chmod 600` and contains only `CLAUDE_CODE_OAUTH_TOKEN`.
+- `~/.no_human/.env` is `chmod 600` and holds the credential for the
+  configured mode (`CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY` in
+  `api_key` mode), alongside any integration secrets (Jira, CircleCI...).
 - `nh eval --gate` is green and the red-team suite shows zero tamper / faked-done
   incidents.
 - `never_push_to` and `forbidden_paths` match your repo's protected surface.
