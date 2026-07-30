@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Awaitable, Callable, NamedTuple, TypeVar
 
 import aiosqlite
 
@@ -17,9 +19,52 @@ log = logging.getLogger("no_human.db")
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[3] / "migrations"
 
+_T = TypeVar("_T")
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def serialized_write(
+    fn: Callable[..., Awaitable[_T]],
+) -> Callable[..., Awaitable[_T]]:
+    """Run one Store write — every statement of it plus its COMMIT — as a
+    single critical section on the shared connection.
+
+    ONE `aiosqlite.Connection` is shared by every coroutine (the pool runs
+    `concurrency.max_workers` tasks against one Store). aiosqlite serialises
+    *individual* operations on its worker thread, but never a *sequence* of
+    them: each `await` is a scheduling point where another coroutine's write —
+    and, fatally, its `commit()` — runs in the middle of ours. Two consequences,
+    both of which this decorator fixes:
+
+    1. `commit()` ends the connection's implicit transaction, so a foreign
+       commit lands halfway through any multi-statement write here
+       (`create_attempt`'s UPDATE+INSERT, `_migrate`, `update_attempt`'s
+       read-modify-write, `add_memory`'s dedupe-then-insert). The atomicity
+       those writes assume was never real once two tasks ran at once.
+    2. If the statement the foreign commit interrupts is a *writer that has
+       produced a row* — `UPDATE … RETURNING`, whose VDBE stays live between
+       `execute()` and the fetch — SQLite refuses the COMMIT outright:
+       ``OperationalError: cannot commit transaction - SQL statements in
+       progress``. That crash killed real attempts (see
+       `tests/test_db_concurrency.py`).
+
+    Reads are deliberately NOT serialised: they never COMMIT, so they cannot
+    split someone else's transaction, and a live SELECT cursor does not block
+    COMMIT (SQLite only refuses on `db->nVdbeWrite > 0`). The lock is per-Store,
+    i.e. per-connection, which is the right scope — cross-connection and
+    cross-process serialisation is SQLite's own job and is unchanged.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(self: "Store", *args: Any, **kwargs: Any) -> _T:
+        async with self._write_lock:
+            return await fn(self, *args, **kwargs)
+
+    wrapper.__nh_serialized_write__ = True  # type: ignore[attr-defined]
+    return wrapper
 
 
 class JiraImportedTaskRow(NamedTuple):
@@ -38,6 +83,9 @@ class Store:
     def __init__(self, path: Path):
         self.path = Path(path).expanduser()
         self._db: aiosqlite.Connection | None = None
+        # Guards every write critical section on this connection — see
+        # `serialized_write` for why one connection + N coroutines needs it.
+        self._write_lock = asyncio.Lock()
 
     async def connect(self) -> "Store":
         # no_human.db sits beside the credential store; the directory must be
@@ -68,6 +116,7 @@ class Store:
             raise RuntimeError("Store not connected; call connect() first")
         return self._db
 
+    @serialized_write
     async def _migrate(self) -> None:
         for sql_file in sorted(MIGRATIONS_DIR.glob("*.sql")):
             await self.db.executescript(sql_file.read_text())
@@ -164,6 +213,7 @@ class Store:
 
     # ----------------------------- tasks ---------------------------------- #
 
+    @serialized_write
     async def create_task(self, task: Task) -> Task:
         row = task.to_row()
         cols = ", ".join(row.keys())
@@ -235,6 +285,7 @@ class Store:
             for r in rows
         ]
 
+    @serialized_write
     async def set_status(
         self,
         task: Task,
@@ -304,6 +355,7 @@ class Store:
         task.updated_at = now
         return task
 
+    @serialized_write
     async def update_task(self, task: Task) -> Task:
         """Persist the full mutable surface of a task row.
 
@@ -321,7 +373,7 @@ class Store:
         """
         task.updated_at = _now()
         row = task.to_row()
-        cur = await self.db.execute(
+        await self.db.execute(
             """UPDATE tasks SET
                  external_id=:external_id, source=:source, title=:title,
                  description=:description, requirements=:requirements,
@@ -337,9 +389,24 @@ class Store:
                  blocker=:blocker, wake_check_at=:wake_check_at,
                  priority=:priority, context=:context, plan=:plan, config=:config,
                  updated_at=:updated_at
-               WHERE id=:id
-               RETURNING status""",
+               WHERE id=:id""",
             row,
+        )
+        # Deliberately NOT `UPDATE … RETURNING status`. A writer that has
+        # produced a row leaves its VDBE live between `execute()` and the fetch,
+        # and every `await` in that gap is a scheduling point: SQLite refuses any
+        # COMMIT while a write statement is in progress ("cannot commit
+        # transaction - SQL statements in progress"). That was this method's
+        # half of KI-1. The write lock alone would close it, but only while the
+        # ONLY thing that can reach this connection is a lock-taking Store
+        # method, and only because CPython's refcounting happens to finalize the
+        # abandoned cursor if this frame unwinds (a cancellation, an exception) —
+        # measured, not assumed, but an implementation detail no invariant should
+        # rest on. A plain UPDATE parks nothing. The read-back below is inside
+        # the same uncommitted transaction and the same critical section, so it
+        # observes exactly what RETURNING did.
+        cur = await self.db.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task.id,)
         )
         result = await cur.fetchone()
         await self.db.commit()
@@ -351,6 +418,7 @@ class Store:
             task.status = TaskStatus(result["status"])
         return task
 
+    @serialized_write
     async def merge_context(self, task_id: str, patch: dict) -> dict:
         """Atomically merge *patch* into the task's context (RFC 7396).
 
@@ -378,6 +446,7 @@ class Store:
         row = await cur.fetchone()
         return json.loads(row[0]) if row and row[0] else {}
 
+    @serialized_write
     async def append_context_list(self, task_id: str, key: str, item: dict) -> None:
         """Atomically append *item* to the context list at *key* (created if
         absent). List appends cannot be expressed as a merge patch (RFC 7396
@@ -399,6 +468,7 @@ class Store:
         )
         await self.db.commit()
 
+    @serialized_write
     async def update_task_columns(self, task: Task) -> Task:
         """Persist the task's mutable columns EXCEPT context. Multi-writer
         zones (watcher, CLI, gate) must write context only via merge_context/
@@ -421,6 +491,7 @@ class Store:
         await self.db.commit()
         return task
 
+    @serialized_write
     async def request_cancel(self, task_id: str, reason: str) -> None:
         """Ask a running task to stop at its next cooperative checkpoint.
 
@@ -440,6 +511,7 @@ class Store:
         row = await cur.fetchone()
         return row["cancel_requested"] if row else None
 
+    @serialized_write
     async def clear_cancel_request(self, task_id: str) -> None:
         """Drop a pending cancellation, once honoured or withdrawn."""
         await self.db.execute(
@@ -465,6 +537,7 @@ class Store:
 
     # ---------------------------- attempts --------------------------------- #
 
+    @serialized_write
     async def create_attempt(self, task_id: str, attempt_number: int) -> str:
         # An earlier attempt of this task still 'in_progress' cannot be running:
         # attempts are serial, so a new one starting means the old process died
@@ -487,6 +560,7 @@ class Store:
         await self.db.commit()
         return attempt_id
 
+    @serialized_write
     async def update_attempt(self, attempt_id: str, **fields: Any) -> None:
         if not fields:
             return
@@ -591,6 +665,7 @@ class Store:
     # with confirmed=0 and never enter the active rule set until a human
     # confirms them (avoids leniency-biased lessons accumulating silently).
 
+    @serialized_write
     async def add_memory(
         self, *, mem_type: str, title: str, content: str,
         tags: list[str] | None = None, project: str | None = None,
@@ -655,6 +730,7 @@ class Store:
 
     # ----------------------------- playbooks ------------------------------ #
 
+    @serialized_write
     async def add_playbook(
         self, *, title: str, trigger_keywords: list[str] | None = None,
         procedure: str = "", postconditions: list[str] | None = None,
@@ -694,6 +770,7 @@ class Store:
         )
         return [dict(r) for r in await cur.fetchall()]
 
+    @serialized_write
     async def delete_playbook(self, prefix: str) -> bool:
         cur = await self.db.execute(
             "DELETE FROM playbooks WHERE id = ? OR id LIKE ?",
@@ -703,6 +780,7 @@ class Store:
 
     # --------------------------- PR merge order (2.2) --------------------- #
 
+    @serialized_write
     async def add_pr_edge(self, *, child_pr: str, parent_pr: str,
                           project: str | None = None) -> None:
         """Record that child_pr must merge AFTER parent_pr (2.2)."""
@@ -723,6 +801,7 @@ class Store:
             cur = await self.db.execute("SELECT child_pr, parent_pr FROM pr_edges")
         return [(r["child_pr"], r["parent_pr"]) for r in await cur.fetchall()]
 
+    @serialized_write
     async def delete_pr_edges_for(self, pr: str) -> int:
         """Remove every edge touching a PR (e.g. once it merges or closes)."""
         cur = await self.db.execute(
@@ -738,6 +817,7 @@ class Store:
         rows = await cur.fetchall()
         return dict(rows[0]) if len(rows) == 1 else None
 
+    @serialized_write
     async def archive_memory(self, mem_id: str, reason: str = "") -> bool:
         """Recoverable archive (curator action — never a delete). The reason
         is appended to content so recovery keeps the audit trail."""
@@ -748,6 +828,7 @@ class Store:
         await self.db.commit()
         return cur.rowcount > 0
 
+    @serialized_write
     async def confirm_memory(self, mem_id: str) -> bool:
         """Promote a proposed memory into the active set (one-click confirm)."""
         cur = await self.db.execute(
@@ -758,6 +839,7 @@ class Store:
         await self.db.commit()
         return cur.rowcount > 0
 
+    @serialized_write
     async def delete_memory(self, mem_id: str) -> bool:
         cur = await self.db.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
         await self.db.commit()
@@ -765,6 +847,7 @@ class Store:
 
     # ----------------------- task events (persisted) ----------------------- #
 
+    @serialized_write
     async def save_events(self, task_id: str, events: list[dict[str, Any]]) -> None:
         """Persist a batch of task events so they survive a server restart."""
         if not events:
@@ -794,6 +877,7 @@ class Store:
 
     # ----------------------- project profiles ----------------------------- #
 
+    @serialized_write
     async def upsert_profile(self, profile: "ProjectProfile") -> None:
         d = profile.to_dict()
         await self.db.execute(
@@ -835,6 +919,7 @@ class Store:
 
     # ----------------------------- projects --------------------------------- #
 
+    @serialized_write
     async def create_project(self, project: "Project") -> "Project":
         from ..project_model import Project
         row = project.to_row()
@@ -877,6 +962,7 @@ class Store:
                 return proj
         return None
 
+    @serialized_write
     async def update_project(self, project: "Project") -> None:
         row = project.to_row()
         await self.db.execute(
@@ -887,6 +973,7 @@ class Store:
         )
         await self.db.commit()
 
+    @serialized_write
     async def delete_project(self, project_id: str) -> bool:
         cur = await self.db.execute(
             "DELETE FROM projects WHERE id = ?", (project_id,)
@@ -904,6 +991,7 @@ class Store:
         row = await cur.fetchone()
         return dict(row) if row else None
 
+    @serialized_write
     async def history_cache_put(
         self, content_sig: str, cascade_id: str, title: str, findings_json: str,
     ) -> None:
@@ -915,6 +1003,7 @@ class Store:
         )
         await self.db.commit()
 
+    @serialized_write
     async def history_cache_clear(self) -> int:
         """Clear the entire history cache (Re-scan). Returns rows deleted."""
         cur = await self.db.execute("DELETE FROM history_cache")
