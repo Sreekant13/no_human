@@ -27,6 +27,7 @@ const SUITES = [
   ["board", "board.mjs"],
   ["drawer", "drawer.mjs"],
   ["composer", "composer.mjs"],
+  ["form order", "form-order.mjs"],
   ["outcomes (3-lane board)", "outcomes.mjs"],
   ["mobile nav", "mobile-nav.mjs"],
   ["onboarding a11y", "onboarding-a11y.mjs"],
