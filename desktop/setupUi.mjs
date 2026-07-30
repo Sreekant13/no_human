@@ -18,21 +18,27 @@ export function dismissTarget(canReturn) {
   return canReturn ? "dismiss" : "quit";
 }
 
-/** Copy that has to change with context, so the buttons never lie. */
-export function labels(canReturn) {
-  return canReturn
-    ? {
-        primary: "Save and restart",
-        secondary: "Back to board",
-        hint: "Saving restarts the no_human server so it picks up the new " +
-              "token — a task running right now will be interrupted.",
-      }
-    : {
-        primary: "Save and start",
-        secondary: "Quit",
-        hint: "An API key (sk-ant-api…) will not work here — it would bill " +
-              "the metered API instead of your subscription.",
-      };
+/** Copy that has to change with context, so the buttons never lie. `mode` is
+ *  the credential type the operator has selected on the screen:
+ *  "subscription" (default) or "api_key" (the sanctioned BYO-key opt-in). */
+export function labels(canReturn, mode = "subscription") {
+  if (canReturn) {
+    return {
+      primary: "Save and restart",
+      secondary: "Back to board",
+      hint: "Saving restarts the no_human server so it picks up the new " +
+            "credential — a task running right now will be interrupted.",
+    };
+  }
+  return {
+    primary: "Save and start",
+    secondary: "Quit",
+    hint: mode === "api_key"
+      ? "The key is stored only on this Mac, in ~/.no_human/.env, and " +
+        "bills your Anthropic account directly."
+      : "Use the token from `claude setup-token`. Have your own Anthropic " +
+        "API key instead? Switch the credential type above.",
+  };
 }
 
 /**

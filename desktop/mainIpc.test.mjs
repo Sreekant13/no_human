@@ -203,3 +203,25 @@ test("the renderer stays sandboxed from node", () => {
   assert.ok(String(opts.webPreferences.preload || "").endsWith("preload.cjs"),
     "the bridge must come from the preload, not the page");
 });
+
+test("nh:save-token in api_key mode writes the key and flips config.yaml", async () => {
+  const handler = stub.calls.ipc.get("nh:save-token");
+  // Disk effects are the contract here; the returned action (ok / needsRestart)
+  // depends on server state the other tests already pin.
+  await handler(from(SETUP_URL), "sk-ant-api03-e2test", "api_key");
+  assert.match(envText(), /ANTHROPIC_API_KEY=sk-ant-api03-e2test/,
+    "the key must land in .env under ANTHROPIC_API_KEY");
+  const cfg = fs.readFileSync(path.join(home, ".no_human", "config.yaml"), "utf8");
+  assert.match(cfg, /auth_mode: api_key/, "the MODE must land in config.yaml");
+
+  // A subscription token pasted while api_key is selected is refused pre-disk.
+  const bad = await handler(from(SETUP_URL), "sk-ant-oat-wrong", "api_key");
+  assert.equal(bad.ok, false);
+  assert.doesNotMatch(envText(), /ANTHROPIC_API_KEY=sk-ant-oat-wrong/);
+
+  // An omitted mode (stale renderer) keeps today's subscription behaviour.
+  await handler(from(SETUP_URL), "sk-ant-oat-back-to-sub");
+  assert.match(envText(), /CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-back-to-sub/);
+  assert.match(fs.readFileSync(path.join(home, ".no_human", "config.yaml"), "utf8"),
+    /auth_mode: subscription/, "saving a token must configure subscription mode");
+});

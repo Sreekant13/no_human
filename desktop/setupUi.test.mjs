@@ -33,6 +33,28 @@ test("labels: the buttons describe what will actually happen", () => {
   assert.match(first.hint, /API key/);
 });
 
+test("labels: api_key mode states where the key lives and who it bills", () => {
+  const first = labels(false, "api_key");
+  assert.equal(first.secondary, "Quit");
+  assert.equal(first.primary, "Save and start");
+  assert.match(first.hint, /\.env/, "storage location is stated");
+  assert.match(first.hint, /Anthropic account/i, "billing destination is stated");
+
+  const over = labels(true, "api_key");
+  assert.match(over.hint, /interrupted/,
+    "re-entry over a live board still warns about the restart in every mode");
+});
+
+test("labels: no mode's copy disparages the other (claims discipline, D4)", () => {
+  for (const canReturn of [true, false]) {
+    for (const mode of ["subscription", "api_key"]) {
+      const { hint } = labels(canReturn, mode);
+      assert.doesNotMatch(hint, /will not work|would bill the metered/i,
+        `labels(${canReturn}, ${mode}) must describe, not disparage`);
+    }
+  }
+});
+
 test("saveProgress: never claims to stop an old server on first run", () => {
   // labels(false) already says "Save and START" — there is nothing to stop.
   for (const ms of [0, 5000, 20000, 40000]) {

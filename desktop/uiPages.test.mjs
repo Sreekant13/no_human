@@ -46,7 +46,8 @@ test("a rejected save marks the field invalid and announces it", () => {
   assert.equal(probe.token.msgRole, "alert", "the message must be announced");
   assert.ok(probe.token.msgText.length > 0, "the alert region was left empty");
   assert.equal(probe.token.labelFor, "token", "the field has no programmatic label");
-  assert.deepEqual(probe.token.tabOrder, ["token", "reveal", "save", "secondary"],
+  assert.deepEqual(probe.token.tabOrder,
+    ["mode-subscription", "mode-api-key", "token", "reveal", "save", "secondary"],
     "tab order no longer follows reading order");
   assert.ok(probe.token.saveMinHeight >= 44,
     `primary action is ${probe.token.saveMinHeight}px; below a 44px touch target`);

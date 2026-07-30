@@ -7,7 +7,7 @@
 // a blank window is the one unacceptable failure mode.
 
 import { app, BrowserWindow, ipcMain, Menu, nativeImage, nativeTheme, shell, Tray } from "electron";
-import { hasToken, writeToken } from "./tokenStore.mjs";
+import { hasCredential, setAuthMode, writeCredential } from "./tokenStore.mjs";
 import { isSetupUrl } from "./setupGate.mjs";
 import { restartFailedMessage } from "./setupUi.mjs";
 import {
@@ -235,7 +235,7 @@ async function _loadBoardOrError(w, current) {
   // without one — so the board (and its web onboarding) is unreachable until a
   // token exists. Ask for it natively: pointing the operator at a terminal, as
   // error.html does, is a dead end in a packaged app.
-  if (!hasToken()) {
+  if (!hasCredential()) {
     if (!current()) return;
     await showSetup(w);
     return;
@@ -339,11 +339,17 @@ function fromSetupScreen(event) {
 }
 
 // token.html -> main. Returns {ok} or {error}; the value is never echoed back
-// and never logged.
-ipcMain.handle("nh:save-token", async (event, value) => {
+// and never logged. `mode` is the credential type the operator selected —
+// anything but the explicit "api_key" opt-in is treated as the default, so a
+// stale renderer that omits it keeps today's behaviour.
+ipcMain.handle("nh:save-token", async (event, value, mode) => {
   if (!fromSetupScreen(event)) return { ok: false, error: "not permitted" };
+  const m = mode === "api_key" ? "api_key" : "subscription";
   try {
-    writeToken(value);
+    // Credential first: if it fails validation, the configured mode is
+    // untouched and the screen still matches config.yaml.
+    writeCredential(value, m);
+    setAuthMode(m);
   } catch (err) {
     return { ok: false, error: err.message };
   }

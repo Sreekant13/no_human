@@ -4,7 +4,7 @@
 <!-- Local-only page; no remote or inline-eval capability. Defence in depth. -->
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'" />
-<title>no_human — connect your Claude subscription</title>
+<title>no_human — connect Claude</title>
 <style>
   /* Tokens mirror web/src/styles.css so the shell and the board look like one
      product. Unlike error.html (dark-only), both themes are defined. */
@@ -77,22 +77,52 @@
   .msg[data-kind="error"] { color: var(--danger); }
   .msg[data-kind="ok"] { color: var(--accent); }
   .hint { font-size: .85em; color: var(--text-muted); margin-top: .75rem; }
+  /* The credential-type choice. A fieldset so the group carries its own
+     accessible name; radios keep native chrome (biggest, most familiar hit
+     targets on this one-shot screen). */
+  fieldset {
+    border: 1px solid var(--border); border-radius: 8px;
+    margin: 0 0 1rem; padding: .5rem .75rem .65rem;
+  }
+  legend { font-size: .85em; color: var(--text-muted); padding: 0 .3rem; }
+  .mode-option { display: flex; gap: .5rem; align-items: baseline; margin: .25rem 0; }
+  .mode-option input { flex: none; }
+  .mode-option label { font-weight: 500; color: var(--text-hi); margin: 0; }
+  .mode-option .mode-sub { font-size: .85em; color: var(--text-muted); }
 </style>
 <main>
-  <h1>Connect your Claude subscription</h1>
+  <h1>Connect Claude</h1>
   <p>
-    no_human runs on your Claude&nbsp;subscription, not a metered API key.
-    It needs a subscription token once — it is stored only on this Mac, in
-    <code>~/.no_human/.env</code>.
+    no_human codes with Claude. Connect it once — with your Claude
+    subscription, or with your own Anthropic API key. The credential is
+    stored only on this Mac, in <code>~/.no_human/.env</code>.
   </p>
-  <ol>
-    <li>In a terminal, run <code>claude setup-token</code></li>
-    <li>Sign in when the browser opens</li>
-    <li>Copy the token it prints, and paste it below</li>
-  </ol>
 
   <form id="form" novalidate>
-    <label for="token">Subscription token</label>
+    <fieldset>
+      <legend>Credential type</legend>
+      <div class="mode-option">
+        <input type="radio" id="mode-subscription" name="mode"
+               value="subscription" checked />
+        <label for="mode-subscription">Claude subscription
+          <span class="mode-sub">— a token from <code>claude setup-token</code></span>
+        </label>
+      </div>
+      <div class="mode-option">
+        <input type="radio" id="mode-api-key" name="mode" value="api_key" />
+        <label for="mode-api-key">Anthropic API key
+          <span class="mode-sub">— from console.anthropic.com, bills your Anthropic account</span>
+        </label>
+      </div>
+    </fieldset>
+
+    <ol id="steps">
+      <li>In a terminal, run <code>claude setup-token</code></li>
+      <li>Sign in when the browser opens</li>
+      <li>Copy the token it prints, and paste it below</li>
+    </ol>
+
+    <label for="token" id="cred-label">Subscription token</label>
     <div class="row">
       <input id="token" name="token" type="password" autocomplete="off"
              spellcheck="false" autocapitalize="off"
@@ -109,8 +139,8 @@
     </div>
   </form>
   <p class="hint" id="hint">
-    An API key (<code>sk-ant-api…</code>) will not work here — it would bill the
-    metered API instead of your subscription.
+    Use the token from <code>claude setup-token</code>. Have your own Anthropic
+    API key instead? Switch the credential type above.
   </p>
 </main>
 <script type="module">
@@ -137,10 +167,26 @@
   // reached from File > Re-enter Claude Token over a live server.
   const canReturn = parseCanReturn(location.search);
   const secondary = $("secondary");
-  const copy = labels(canReturn);
-  secondary.textContent = copy.secondary;
-  save.textContent = copy.primary;
-  $("hint").textContent = copy.hint;
+
+  // The credential type. Everything mode-dependent renders through ONE
+  // function so the label, placeholder, steps and hint can never disagree.
+  const mode = () => document.querySelector('input[name="mode"]:checked').value;
+  function renderMode() {
+    const m = mode();
+    const copy = labels(canReturn, m);
+    secondary.textContent = copy.secondary;
+    save.textContent = copy.primary;
+    $("hint").textContent = copy.hint;
+    $("cred-label").textContent = m === "api_key" ? "Anthropic API key" : "Subscription token";
+    input.placeholder = m === "api_key" ? "sk-ant-api…" : "sk-ant-oat…";
+    // The 3 setup-token steps only apply to the subscription flow.
+    $("steps").style.display = m === "api_key" ? "none" : "";
+    setMsg("", null);   // a validation message for the OTHER mode would mislead
+  }
+  for (const r of document.querySelectorAll('input[name="mode"]')) {
+    r.addEventListener("change", renderMode);
+  }
+  renderMode();
 
   // A save holds the server lifecycle; dismissing mid-flight started a second,
   // concurrent navigation that could double-spawn.
@@ -202,7 +248,7 @@
     }, 1000);
     let res;
     try {
-      res = await window.nhSetup.saveToken(input.value);
+      res = await window.nhSetup.saveToken(input.value, mode());
     } catch (err) {
       // A rejected invoke must not strand the button disabled with the
       // "Saving…" message and no way forward.

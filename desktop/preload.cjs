@@ -5,10 +5,11 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 // First-run credential screen (token.html) only. Deliberately separate from
-// nhDesktop: the board never needs these, and the token never crosses back —
-// saveToken returns {ok} or {error}, never the value.
+// nhDesktop: the board never needs these, and the credential never crosses
+// back — saveToken returns {ok} or {error}, never the value. `mode` selects
+// the billing path: "subscription" (default) or "api_key" (BYO Anthropic key).
 contextBridge.exposeInMainWorld("nhSetup", {
-  saveToken: (value) => ipcRenderer.invoke("nh:save-token", value),
+  saveToken: (value, mode) => ipcRenderer.invoke("nh:save-token", value, mode),
   dismiss: () => ipcRenderer.invoke("nh:dismiss"),
   quit: () => ipcRenderer.invoke("nh:quit"),
 });
