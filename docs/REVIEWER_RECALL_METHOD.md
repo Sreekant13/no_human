@@ -17,7 +17,8 @@ runner references the path).
 
 ```
 eval/reviewer_recall/cases/<case-id>/
-  base.ref        # git SHA in THIS repo the diff applies to
+  base.ref        # PROVENANCE ONLY — the SHA the case was cut from
+  base/           # the base file content the diff applies to, materialised
   change.diff     # the diff the reviewer sees (defect planted, unmarked)
   truth.json      # ground truth — NEVER shown to the reviewer
 ```
@@ -25,11 +26,17 @@ eval/reviewer_recall/cases/<case-id>/
 `truth.json`: `{class, file, hunk_lines: [start, end], description,
 keywords, planted_by, date}`. The reviewer receives `change.diff` (plus the
 same repo access any review gets) and the standard adversarial review prompt —
-no wording changes, no hints. The review checkout is pinned to `base.ref`
-**without descendant history** (shallow/filtered clone): most cases derive
-from real merged diffs, and a checkout containing the descendant commit would
-let git archaeology diff the case against history and find the plant
-mechanically. If the review prompt evolves, the corpus stays
+no wording changes, no hints. The review checkout is built **without any
+history at all**: `prepare_case_repo` seeds a scratch repo from `base/` and
+makes one commit, then applies `change.diff`. Most cases derive from real
+merged diffs, and a checkout containing the descendant commit would let git
+archaeology diff the case against history and find the plant mechanically —
+here there is no ref, remote, ancestor or descendant commit to find. `base.ref`
+is **never resolved**; it records where the case came from, so the corpus keeps
+working in the published repo (a fresh `git init`, one commit, no inherited
+objects). Regenerate a case's `base/` with
+`python eval/reviewer_recall/materialize_base.py <case-id>` from a checkout
+that still has the commit. If the review prompt evolves, the corpus stays
 valid because it never depended on prompt wording.
 
 **Defect classes** (≥3 cases each, target N=16–20 total):
@@ -82,7 +89,7 @@ miss (`caught=False`) or a false alarm. The headline recall statistic
 `render_report` raises `HeadlineRefusedError` (and logs the errored case
 IDs) rather than print a number with an unmeasured case silently folded
 into — or dropped from — the denominator. Re-run the tool once the
-underlying setup problem (e.g. a stale `base.ref`) is fixed.
+underlying setup problem (e.g. a missing `base/` directory) is fixed.
 
 ### Run transcripts (`runs/<date>/`)
 

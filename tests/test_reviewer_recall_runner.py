@@ -189,6 +189,67 @@ def test_prepare_case_repo_has_no_descendant_history(tmp_path):
     assert diff_status.stdout.strip() != ""
 
 
+def test_every_case_prepares_with_no_repo_history_at_all(tmp_path):
+    """The corpus must survive the open-source export: a fresh `git init` with
+    one commit and none of the objects `base.ref` names.
+
+    This does not simulate that with a flag — it points `repo_root` at a
+    directory that is not a git repository at all, so any surviving read of
+    repo history (git archive / rev-parse / cat-file) fails loudly.
+    """
+    not_a_repo = tmp_path / "no-git-here"
+    not_a_repo.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    prepared, errors = [], []
+    for case in rr.load_cases():
+        try:
+            case_repo = rr.prepare_case_repo(not_a_repo, case, work)
+        except Exception as exc:  # noqa: BLE001 — the point is to report all
+            errors.append(f"{case.case_id}: {type(exc).__name__}: {exc}")
+            continue
+        prepared.append(case.case_id)
+        shas = subprocess.run(["git", "rev-list", "--all"], cwd=case_repo,
+                              check=True, capture_output=True, text=True)
+        assert len(shas.stdout.split()) == 1, case.case_id
+        planted = case.truth.get("file")
+        if planted:
+            assert (case_repo / planted).is_file(), case.case_id
+    assert errors == [], errors
+    assert len(prepared) == len(rr.load_cases())
+
+
+def test_prepared_case_repo_matches_the_pinned_base_content(tmp_path):
+    """Materialising must not have altered what the case measures: the base
+    blob of every file the diff touches has to equal the blob at `base.ref`.
+
+    Skipped when the history is gone (that is the whole point of the change),
+    so this is a provenance check for THIS repo, not a runtime dependency.
+    """
+    have_history = subprocess.run(
+        ["git", "cat-file", "-e", "58e3c7d18644306d0dc11da47e2aae7accdae892"],
+        cwd=REPO_ROOT, capture_output=True,
+    ).returncode == 0
+    if not have_history:
+        pytest.skip("base.ref commits are not in this repo — corpus is self-contained")
+    checked = 0
+    for case in rr.load_cases():
+        base_dir = case.dir / rr.BASE_DIR_NAME
+        for path in sorted(base_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(base_dir).as_posix()
+            blob = subprocess.run(
+                ["git", "cat-file", "blob", f"{case.base_ref}:{rel}"],
+                cwd=REPO_ROOT, capture_output=True,
+            )
+            assert blob.returncode == 0, f"{case.case_id}:{rel} not at base.ref"
+            assert blob.stdout == path.read_bytes(), (
+                f"{case.case_id}:{rel} differs from the blob at {case.base_ref}")
+            checked += 1
+    assert checked == 70, checked
+
+
 @pytest.mark.asyncio
 async def test_run_case_invokes_injected_reviewer_with_checked_out_repo(tmp_path):
     case = next(c for c in rr.load_cases() if c.case_id == "logic-stale-renders-fresh")

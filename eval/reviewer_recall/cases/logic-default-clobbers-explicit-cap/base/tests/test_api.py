@@ -1,0 +1,1214 @@
+"""FastAPI board endpoint tests (Phase 4 DoD)."""
+from __future__ import annotations
+
+import json
+import pytest
+import pytest_asyncio
+from httpx import AsyncClient, ASGITransport
+
+from no_human.core.task import Task, TaskStatus
+from no_human.api.app import app
+from no_human.core.db import Store
+
+
+# --------------------------------------------------------------------------- #
+# Fixtures                                                                     #
+# --------------------------------------------------------------------------- #
+
+@pytest_asyncio.fixture
+async def store(tmp_path):
+    s = await Store(tmp_path / "test.db").connect()
+    yield s
+    await s.close()
+
+
+@pytest_asyncio.fixture
+async def client(store, tmp_path):
+    from no_human.config import load_config
+    app.state.store = store
+    app.state.config = load_config(tmp_path / "config.yaml")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+
+
+async def _seed_task(store: Store, *, status=TaskStatus.PENDING, title="Fix thing") -> Task:
+    t = Task.new(title, repo_path="/tmp/repo")
+    t.acceptance_criteria = ["Should work"]
+    await store.create_task(t)
+    if status != TaskStatus.PENDING:
+        await store.set_status(t, status, validate=False)
+    return t
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/tasks                                                               #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_list_tasks_empty(client):
+    r = await client.get("/api/tasks")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_returns_summary(client, store):
+    await _seed_task(store, title="Alpha")
+    await _seed_task(store, title="Beta", status=TaskStatus.IMPLEMENTING)
+    r = await client.get("/api/tasks")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data) == 2
+    titles = {t["title"] for t in data}
+    assert titles == {"Alpha", "Beta"}
+    # summary shape — no attempts field
+    for item in data:
+        assert "id" in item
+        assert "status" in item
+        assert "attempts" not in item
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_status_values(client, store):
+    await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    r = await client.get("/api/tasks")
+    assert r.json()[0]["status"] == "awaiting_approval"
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/tasks/{id}                                                          #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_get_task_detail(client, store):
+    t = await _seed_task(store)
+    r = await client.get(f"/api/tasks/{t.id}")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["id"] == t.id
+    assert data["title"] == t.title
+    assert data["acceptance_criteria"] == ["Should work"]
+    assert "attempts" in data
+
+
+@pytest.mark.asyncio
+async def test_get_task_404(client):
+    r = await client.get("/api/tasks/does-not-exist")
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_task_prefix_lookup(client, store):
+    t = await _seed_task(store)
+    r = await client.get(f"/api/tasks/{t.id[:8]}")
+    assert r.status_code == 200
+    assert r.json()["id"] == t.id
+
+
+# --------------------------------------------------------------------------- #
+# POST /api/tasks — external_id (SCRUM-32)                                    #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_create_task_jira_stores_external_id(client, store):
+    r = await client.post("/api/tasks", json={
+        "title": "Import from Jira",
+        "source": "jira",
+        "external_id": "PROJ-9",
+    })
+    assert r.status_code == 201
+    body = r.json()
+    assert body["external_id"] == "PROJ-9"
+    task = await store.get_task(body["id"])
+    assert task.external_id == "PROJ-9"
+
+
+@pytest.mark.asyncio
+async def test_create_task_jira_external_id_trimmed_and_capped(client, store):
+    r = await client.post("/api/tasks", json={
+        "title": "Import from Jira",
+        "source": "jira",
+        "external_id": "  " + ("X" * 100),
+    })
+    assert r.status_code == 201
+    body = r.json()
+    assert body["external_id"] == "X" * 64
+    task = await store.get_task(body["id"])
+    assert task.external_id == "X" * 64
+
+
+@pytest.mark.asyncio
+async def test_create_task_board_ignores_external_id(client, store):
+    r = await client.post("/api/tasks", json={
+        "title": "Typed task",
+        "source": "board",
+        "external_id": "PROJ-9",
+    })
+    assert r.status_code == 201
+    body = r.json()
+    assert body["external_id"] is None
+    task = await store.get_task(body["id"])
+    assert task.external_id is None
+
+
+@pytest.mark.asyncio
+async def test_create_task_absent_external_id_unchanged(client, store):
+    r = await client.post("/api/tasks", json={"title": "Plain task"})
+    assert r.status_code == 201
+    body = r.json()
+    assert body["external_id"] is None
+    task = await store.get_task(body["id"])
+    assert task.external_id is None
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/tasks/{id}/diff                                                     #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_get_diff_no_repo(client, store):
+    t = Task.new("No repo", repo_path=None)
+    await store.create_task(t)
+    r = await client.get(f"/api/tasks/{t.id}/diff")
+    assert r.status_code == 200
+    assert r.text == ""
+
+
+@pytest.mark.asyncio
+async def test_get_diff_no_attempts(client, store):
+    t = await _seed_task(store)
+    r = await client.get(f"/api/tasks/{t.id}/diff")
+    assert r.status_code == 200
+    assert r.text == ""
+
+
+# --------------------------------------------------------------------------- #
+# POST /api/tasks/{id}/approve                                                 #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_approve_awaiting(client, store):
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    r = await client.post(f"/api/tasks/{t.id}/approve")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    # "never merges" language must be present
+    assert "never merges" in data["message"].lower() or "agent never merges" in data["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_approve_wrong_status_409(client, store):
+    t = await _seed_task(store, status=TaskStatus.IMPLEMENTING)
+    r = await client.post(f"/api/tasks/{t.id}/approve")
+    assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_approve_records_timestamp(client, store):
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    await client.post(f"/api/tasks/{t.id}/approve")
+    refreshed = await store.find_task(t.id)
+    assert refreshed.context.get("approved_at") is not None
+
+
+@pytest.mark.asyncio
+async def test_approve_404(client):
+    r = await client.post("/api/tasks/no-such-task/approve")
+    assert r.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# POST /api/tasks/{id}/send-back                                               #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_send_back_stores_feedback(client, store):
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    r = await client.post(
+        f"/api/tasks/{t.id}/send-back",
+        json={"message": "Handle the edge case with empty input."},
+    )
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    refreshed = await store.find_task(t.id)
+    feedback = refreshed.context.get("send_back_feedback", [])
+    assert len(feedback) == 1
+    assert "edge case" in feedback[0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_send_back_resets_to_implementing(client, store):
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    await client.post(
+        f"/api/tasks/{t.id}/send-back",
+        json={"message": "Please redo."},
+    )
+    refreshed = await store.find_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING
+
+
+@pytest.mark.asyncio
+async def test_send_back_accumulates_feedback(client, store):
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    await client.post(f"/api/tasks/{t.id}/send-back", json={"message": "First."})
+    # reset back to awaiting to send again
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+    await client.post(f"/api/tasks/{t.id}/send-back", json={"message": "Second."})
+    refreshed = await store.find_task(t.id)
+    feedback = refreshed.context.get("send_back_feedback", [])
+    assert len(feedback) == 2
+
+
+@pytest.mark.asyncio
+async def test_send_back_404(client):
+    r = await client.post("/api/tasks/ghost/send-back", json={"message": "x"})
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_send_back_missing_message_422(client, store):
+    t = await _seed_task(store)
+    r = await client.post(f"/api/tasks/{t.id}/send-back", json={})
+    assert r.status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# POST /api/tasks/{id}/reply                                                   #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_reply_stores_answer_and_resets(client, store):
+    t = await _seed_task(store, status=TaskStatus.BLOCKED)
+    t.blocker = {"question": "Which DB?", "category": "need_clarification"}
+    await store.update_task(t)
+
+    r = await client.post(f"/api/tasks/{t.id}/reply", json={"answer": "SQLite only"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+
+    refreshed = await store.find_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING
+    replies = refreshed.context.get("human_replies", [])
+    assert len(replies) == 1
+    assert replies[0]["answer"] == "SQLite only"
+    assert replies[0]["question"] == "Which DB?"
+
+
+@pytest.mark.asyncio
+async def test_reply_choose_applies_the_action_and_resumes_from_checkpoint(client, store):
+    """D14/D15: the board's option button must apply the option's action, and the
+    reply must resume from the [WIP-BLOCKED] checkpoint, not from base."""
+    t = await _seed_task(store, status=TaskStatus.ESCALATED)
+    t.blocker = {
+        "category": "SCOPE_EXPLOSION",
+        "question": "This change exceeds the safety size limits.",
+        "options": [
+            "split into smaller tasks",
+            {"label": "raise the limit for this task",
+             "action": {"set_task_config": {"max_lines_changed": 700}}},
+        ],
+        "resume_branch": "scratch/x/abc-2",
+        "resume_commit": "75c68e08",
+    }
+    await store.update_task(t)
+
+    r = await client.post(f"/api/tasks/{t.id}/reply", json={"answer": "", "choose": 2})
+    assert r.status_code == 200, r.text
+
+    refreshed = await store.find_task(t.id)
+    assert refreshed.config["max_lines_changed"] == 700
+    reply = refreshed.context["human_replies"][-1]
+    assert reply["answer"] == "raise the limit for this task"
+    assert reply["applied"] == "max_lines_changed=700"
+    assert refreshed.context["resume_from"]["sha"] == "75c68e08"
+
+
+@pytest.mark.asyncio
+async def test_reply_choose_out_of_range_is_400_and_changes_nothing(client, store):
+    t = await _seed_task(store, status=TaskStatus.ESCALATED)
+    t.blocker = {"category": "SCOPE_EXPLOSION", "options": ["only one"]}
+    await store.update_task(t)
+
+    r = await client.post(f"/api/tasks/{t.id}/reply", json={"answer": "", "choose": 7})
+    assert r.status_code == 400
+    assert "between 1 and 1" in r.json()["detail"]
+
+    refreshed = await store.find_task(t.id)
+    assert refreshed.config == {}
+    assert refreshed.status is TaskStatus.ESCALATED  # not resumed
+
+
+@pytest.mark.asyncio
+async def test_reply_all_parked_statuses_accepted(client, store):
+    for status in (TaskStatus.BLOCKED, TaskStatus.AWAITING_INPUT,
+                   TaskStatus.PAUSED_QUOTA, TaskStatus.ESCALATED):
+        t = await _seed_task(store, status=status, title=f"parked-{status.value}")
+        r = await client.post(f"/api/tasks/{t.id}/reply", json={"answer": "go ahead"})
+        assert r.status_code == 200, f"expected 200 for {status.value}, got {r.status_code}"
+
+
+@pytest.mark.asyncio
+async def test_reply_wrong_status_409(client, store):
+    t = await _seed_task(store, status=TaskStatus.IMPLEMENTING)
+    r = await client.post(f"/api/tasks/{t.id}/reply", json={"answer": "irrelevant"})
+    assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_reply_404(client):
+    r = await client.post("/api/tasks/ghost/reply", json={"answer": "x"})
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_reply_missing_answer_422(client, store):
+    t = await _seed_task(store, status=TaskStatus.BLOCKED)
+    r = await client.post(f"/api/tasks/{t.id}/reply", json={})
+    assert r.status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# Static SPA path resolution                                                   #
+# --------------------------------------------------------------------------- #
+
+def test_web_dist_path_points_at_repo_web_dir():
+    """_WEB_DIST must resolve to <repo>/web/dist — not above the repo. A wrong
+    parents[] index silently breaks SPA serving (the API just 404s on /)."""
+    from pathlib import Path
+
+    from no_human.api.app import _WEB_DIST
+
+    repo_root = Path(__file__).resolve().parents[1]  # tests/ -> repo root
+    assert _WEB_DIST == repo_root / "web" / "dist"
+
+
+async def test_spa_catchall_does_not_intercept_api(client):
+    """The SPA catch-all must never return index.html for /api/ paths.
+    If the SPA handler intercepts an API path, the frontend gets HTML
+    instead of JSON → the 'Unexpected token <' error."""
+    r = await client.get("/api/onboarding/status")
+    assert r.status_code == 200
+    assert "application/json" in r.headers.get("content-type", "")
+    data = r.json()
+    assert "completed" in data
+
+
+def test_board_lanes_cover_every_task_status():
+    """Every TaskStatus must map to a board lane — otherwise a task in that state
+    silently vanishes from the UI (regression: parked states were dropped)."""
+    import re
+    from pathlib import Path
+
+    from no_human.core.task import TaskStatus
+
+    # LANES moved out of Board.jsx into boardLanes.js (the 2026-07-11 lane split
+    # into Review-PR / Needs-Answer). Read wherever the statuses arrays live.
+    board = (Path(__file__).resolve().parents[1] / "web" / "src" / "boardLanes.js").read_text()
+    # Collect every status string listed in a `statuses: [...]` array.
+    listed: set[str] = set()
+    for arr in re.findall(r"statuses:\s*\[([^\]]*)\]", board):
+        listed |= set(re.findall(r'"([a-z_]+)"', arr))
+    # Some statuses are routed dynamically in routeTask (e.g. "blocked" splits on
+    # wake_condition into Working vs Needs-Answer) rather than via a statuses
+    # array — they're still covered, so count those explicit comparisons too.
+    listed |= set(re.findall(r'status === "([a-z_]+)"', board))
+    missing = {s.value for s in TaskStatus} - listed
+    assert not missing, f"task statuses with no board lane: {sorted(missing)}"
+
+
+# --------------------------------------------------------------------------- #
+# Role attribution survives the events formatter                               #
+# --------------------------------------------------------------------------- #
+
+def test_format_events_keeps_planner_and_aggregator_events():
+    """The formatter used to drop every source it didn't recognise, so stamping
+    planner events with their own role would have made them vanish from the
+    board entirely — the opposite of the point."""
+    from no_human.api.app import _format_events
+
+    out = _format_events([
+        {"ts": 1, "source": "orchestrator", "kind": "planning", "text": "start"},
+        {"ts": 2, "source": "planner:test-first", "kind": "tool_use",
+         "tool_name": "Read", "tool_input": {"file_path": "Jenkinsfile"}},
+        {"ts": 3, "source": "planner:risk-first", "kind": "subagent_start",
+         "text": "Investigate Jenkinsfile", "task_id": "sdk-1", "status": "active"},
+        {"ts": 4, "source": "aggregator", "kind": "text", "text": "synthesizing"},
+        {"ts": 5, "source": "agent", "kind": "tool_use",
+         "tool_name": "Edit", "tool_input": {"file_path": "Jenkinsfile"}},
+    ])
+
+    by_ts = {e["ts"]: e for e in out}
+    assert set(by_ts) == {1, 2, 3, 4, 5}, "no event may be dropped"
+    # The raw role is preserved, not flattened back onto "agent".
+    assert by_ts[2]["source"] == "planner:test-first"
+    assert by_ts[3]["source"] == "planner:risk-first"
+    assert by_ts[3]["task_id"] == "sdk-1"
+    assert by_ts[4]["source"] == "aggregator"
+    assert by_ts[4]["kind"] == "agent_text"
+    assert by_ts[5]["source"] == "agent"
+
+
+def test_is_agent_session_classifies_every_role():
+    from no_human.core.orchestrator import is_agent_session
+
+    assert is_agent_session("agent")
+    assert is_agent_session("planner")
+    assert is_agent_session("planner:minimal-first")
+    assert is_agent_session("aggregator")
+    assert not is_agent_session("orchestrator")
+    assert not is_agent_session("reviewer")
+    assert not is_agent_session("")
+    assert not is_agent_session(None)
+
+
+def test_format_events_carries_the_per_role_model_map():
+    """The formatter keeps only ts/kind/text/source for orchestrator events, so
+    the models dict would be stripped before the System view ever saw it."""
+    from no_human.api.app import _format_events
+
+    out = _format_events([
+        {"ts": 1, "source": "orchestrator", "kind": "models",
+         "text": "coder=claude-sonnet-5 · reviewer=claude-opus-4-8",
+         "models": {"coder": "claude-sonnet-5", "reviewer": "claude-opus-4-8"}},
+        {"ts": 2, "source": "orchestrator", "kind": "state", "text": "implementing"},
+    ])
+    assert out[0]["models"] == {"coder": "claude-sonnet-5", "reviewer": "claude-opus-4-8"}
+    assert "models" not in out[1], "only the models event carries the map"
+
+
+async def test_task_events_are_not_truncated_by_the_in_memory_buffer(store):
+    """The scheduler buffer is a deque(maxlen=200). Serving it alone dropped the
+    Planner's events from a 321-event run and the Planner vanished from the
+    System view mid-run."""
+    from types import SimpleNamespace
+    from no_human.api.app import task_events
+    from no_human.core.task import Task
+
+    t = Task.new("long run", repo_path="/tmp/x")
+    await store.create_task(t)
+    persisted = [{"ts": float(i), "source": "planner", "kind": "tool_use",
+                  "tool_name": f"R{i}"} for i in range(300)]
+    await store.save_events(t.id, persisted)
+
+    # The buffer holds only the tail, plus two events not yet flushed.
+    class FakeSched:
+        _event_log = {t.id: None}
+
+        def task_events(self, tid):
+            return persisted[-50:] + [
+                {"ts": 1000.0, "source": "agent", "kind": "tool_use", "tool_name": "live1"},
+                {"ts": 1001.0, "source": "agent", "kind": "tool_use", "tool_name": "live2"},
+            ]
+
+    req = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        scheduler=FakeSched(), store=store)))
+    out = await task_events(t.id, req)
+
+    assert len(out) == 302, "every persisted event plus the unflushed tail"
+    assert out[0]["source"] == "planner", "the earliest events must survive"
+    assert [e["tool_name"] for e in out[-2:]] == ["live1", "live2"]
+    # The overlapping window must not be duplicated.
+    assert sum(1 for e in out if e["tool_name"] == "R299") == 1
+
+
+def test_format_events_carries_the_supervisor_message():
+    """`text` is just "continue"/"correct"; the substance lives in `message`.
+    Dropping it made the Supervisor look like it only ever said one word —
+    while its corrections carried real guidance (live run 84251cb2: 33
+    corrections, all invisible on the board)."""
+    from no_human.api.app import _format_events
+
+    out = _format_events([
+        {"ts": 1, "source": "orchestrator", "kind": "supervisor_decision",
+         "text": "correct", "message": "Use the no_human_verify skill instead"},
+        {"ts": 2, "source": "orchestrator", "kind": "supervisor_decision",
+         "text": "continue"},
+    ])
+    assert out[0]["message"] == "Use the no_human_verify skill instead"
+    assert "message" not in out[1]
+
+
+async def test_sse_replays_from_last_event_id(store):
+    """W2.3: the browser's native EventSource reconnect sends Last-Event-ID;
+    the stream must resume AFTER that cursor, not replay from zero (duplicate
+    events) or force the client to give up (frozen UI)."""
+    from types import SimpleNamespace
+    from no_human.api.app import task_events_stream
+    from no_human.core.task import Task
+
+    t = Task.new("sse replay", repo_path="/tmp/x")
+    await store.create_task(t)
+    events = [
+        {"ts": 10.0, "kind": "state", "source": "orchestrator", "text": "implementing"},
+        {"ts": 20.0, "kind": "state", "source": "orchestrator", "text": "reviewing"},
+    ]
+
+    class FakeSched:
+        inflight = set()            # not running → the stream ends after idle ticks
+        _event_log = {t.id: None}   # _resolve_task_id reads the keys
+        _event_notify = {}
+        def task_events(self, tid):
+            return events
+
+    req = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(scheduler=FakeSched(), store=store)),
+        headers={"last-event-id": "10.0"},
+    )
+    resp = await task_events_stream(t.id, req)
+    body = ""
+    async for chunk in resp.body_iterator:
+        body += chunk if isinstance(chunk, str) else chunk.decode()
+        if '"done"' in body:
+            break
+    assert "reviewing" in body, "events after the cursor must arrive"
+    assert "implementing" not in body, "events at/before the cursor must not replay"
+    assert "id: 20.0" in body, "frames must carry the ts as the SSE id"
+
+
+def test_format_events_passes_watcher_events_through():
+    """The persona walk found the post-PR ladder invisible: 2015 events
+    served, 0 from the watcher — _format_events dropped source:'watcher'
+    entirely, so the Shepherding stage could never light up."""
+    from no_human.api.app import _format_events
+
+    out = _format_events([
+        {"ts": 1, "source": "watcher", "kind": "ci_gate_pass",
+         "text": "CI_GATE integration PASSED"},
+        {"ts": 2, "source": "watcher", "kind": "pr_ci_red",
+         "text": "CI failing — fix round 1/3"},
+        {"ts": 3, "source": "human", "kind": "state_repaired",
+         "text": "escalated → awaiting_approval"},
+    ])
+    assert [e["kind"] for e in out] == ["ci_gate_pass", "pr_ci_red", "state_repaired"]
+    assert out[0]["source"] == "watcher"
+
+
+@pytest.mark.asyncio
+async def test_retry_clears_cancel_reason_atomically(client, store):
+    """W1.1 API migration: retry clears cancel_reason (None-delete via
+    merge_context) and stamps retried_at, without a stale-blob clobber."""
+    t = await _seed_task(store, status=TaskStatus.FAILED)
+    t.context = {"cancel_reason": "was cancelled", "keep_me": "yes"}
+    await store.update_task(t)
+    r = await client.post(f"/api/tasks/{t.id}/retry")
+    assert r.status_code == 200
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.PENDING
+    assert "cancel_reason" not in fresh.context   # None-deleted
+    assert fresh.context.get("keep_me") == "yes"  # sibling survived
+    assert "retried_at" in fresh.context
+
+
+@pytest.mark.asyncio
+async def test_cancel_sets_reason_and_fails(client, store):
+    t = await _seed_task(store, status=TaskStatus.IMPLEMENTING)
+    r = await client.post(f"/api/tasks/{t.id}/cancel")
+    assert r.status_code == 200
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.FAILED
+    assert fresh.context.get("cancel_reason")
+
+
+@pytest.mark.asyncio
+async def test_resume_clears_blocker_and_implements(client, store):
+    t = await _seed_task(store, status=TaskStatus.BLOCKED)
+    t.blocker = {"category": "AMBIGUITY", "question": "?"}
+    t.context = {"survivor": 1}
+    await store.update_task(t)
+    r = await client.post(f"/api/tasks/{t.id}/resume")
+    assert r.status_code == 200
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.IMPLEMENTING
+    assert fresh.blocker is None
+    assert fresh.context.get("survivor") == 1  # context untouched by column write
+
+
+def test_task_summary_marks_operator_cancelled_tasks():
+    """A cancelled task ends FAILED but carries context.cancel_reason; the API
+    surfaces `cancelled` so Stats can keep it out of the success-rate denominator
+    (it's an operator decision, not a capability failure)."""
+    from no_human.api.models import TaskSummaryOut
+    from no_human.core.task import Task, TaskStatus
+    cancelled = Task.new("superseded task", repo_path="/tmp/x")
+    cancelled.status = TaskStatus.FAILED
+    cancelled.context = {"cancel_reason": "superseded by a fresh run"}
+    assert TaskSummaryOut.from_task(cancelled).cancelled is True
+
+    genuine = Task.new("real failure", repo_path="/tmp/x")
+    genuine.status = TaskStatus.FAILED
+    assert TaskSummaryOut.from_task(genuine).cancelled is False
+
+
+@pytest.mark.asyncio
+async def test_attachment_upload_stores_file_and_records_path(
+    client, store, tmp_path, monkeypatch,
+):
+    """Phase 3 (user-requested): a screenshot/document uploaded to a task is
+    stored on disk and its path recorded on task.context for the coder to read."""
+    monkeypatch.setattr("no_human.config.NO_HUMAN_HOME", tmp_path / "nh_home")
+    t = await _seed_task(store, title="bug with a screenshot")
+    files = {"file": ("shot.png", b"\x89PNG-fake-bytes", "image/png")}
+    r = await client.post(f"/api/tasks/{t.id}/attachments", files=files)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["name"] == "shot.png" and body["count"] == 1
+    from pathlib import Path
+    assert Path(body["path"]).read_bytes() == b"\x89PNG-fake-bytes"
+    got = await store.get_task(t.id)
+    assert got.context["attachments"][0]["name"] == "shot.png"
+
+
+def test_task_out_reports_cache_read_burn():
+    """The cost meter must include cache-read (90%+ of real burn) — summing
+    tokens_used alone under-reported a 33M-token task as '121.5k tok'."""
+    from no_human.api.models import TaskOut, TaskSummaryOut
+    from no_human.core.task import Task
+    t = Task.new("x", repo_path="/tmp/r")
+    attempts = [
+        {"id": "a1", "tokens_used": 4_000, "cache_read_tokens": 500_000,
+         "attempt_number": 1, "status": "succeeded"},
+        {"id": "a2", "tokens_used": 6_000, "cache_read_tokens": 700_000,
+         "attempt_number": 2, "status": "failed"},
+    ]
+    out = TaskOut.from_task(t, attempts)
+    assert out.total_tokens == 10_000
+    assert out.total_cache_read == 1_200_000
+    s = TaskSummaryOut.from_task(t, attempts=attempts)
+    assert s.total_cache_read == 1_200_000
+
+
+def test_task_out_reports_cache_creation_burn():
+    """Cache-CREATION is full-price fresh work, and it was invisible to every cost surface.
+
+    The task rollup exposed tokens_used + cache_read only, so a per-task cost priced two of
+    the three buckets — and the task rows summed to LESS than the lifetime figure on the same
+    page (which does include creation). One model, three buckets, everywhere.
+    """
+    from no_human.api.models import TaskOut, TaskSummaryOut
+    from no_human.core.task import Task
+    t = Task.new("x", repo_path="/tmp/r")
+    attempts = [
+        {"id": "a1", "tokens_used": 4_000, "cache_read_tokens": 500_000,
+         "cache_creation_tokens": 30_000, "attempt_number": 1, "status": "succeeded"},
+        {"id": "a2", "tokens_used": 6_000, "cache_read_tokens": 700_000,
+         "cache_creation_tokens": 20_000, "attempt_number": 2, "status": "failed"},
+    ]
+    out = TaskOut.from_task(t, attempts)
+    assert out.total_cache_creation == 50_000
+    s = TaskSummaryOut.from_task(t, attempts=attempts)
+    assert s.total_cache_creation == 50_000
+    # A task with no creation recorded reports None, not a misleading 0.
+    bare = TaskOut.from_task(t, [{"id": "a", "tokens_used": 1, "attempt_number": 1}])
+    assert bare.total_cache_creation is None
+
+
+async def test_spa_index_is_no_cache(client):
+    """index.html must carry Cache-Control: no-cache — without it Chromium's
+    heuristic freshness serves a stale app shell after every deploy (found
+    live: the desktop shell ran a bundle two deploys old). Hashed /assets
+    stay long-cacheable; only the entry document revalidates."""
+    r = await client.get("/")
+    if r.status_code == 404:  # dist not built in this env — header rule moot
+        return
+    assert r.headers.get("cache-control") == "no-cache"
+
+
+# --------------------- B2 #9/#10 board-truthfulness ------------------------ #
+
+async def test_task_fingerprint_sees_every_card_field(store):
+    """B2 #10: the old (status, updated_at, live_status) tuple missed
+    subtask_progress/pr_url/attempt_count — a stale card the snapshot pushes
+    could never repair. The hash must move when ANY summary field moves."""
+    from types import SimpleNamespace
+
+    from no_human.api.app import _task_fingerprint
+
+    def T(**over):
+        base = dict(id="t1", status="implementing", updated_at="x",
+                    live_status="running", pr_url=None, attempt_count=1,
+                    subtask_progress=None, cancelled=False)
+        base.update(over)
+        return SimpleNamespace(model_dump=lambda b=base: dict(b), id=base["id"])
+
+    fp0 = _task_fingerprint([T()])
+    assert _task_fingerprint([T(pr_url="https://x/pr/1")]) != fp0
+    assert _task_fingerprint([T(attempt_count=2)]) != fp0
+    assert _task_fingerprint([T(subtask_progress="2/3")]) != fp0
+    assert _task_fingerprint([T(cancelled=True)]) != fp0
+    assert _task_fingerprint([T()]) == fp0   # stable when nothing moved
+
+
+async def test_connmgr_serializes_sends_and_survives_concurrency():
+    """B2 #9: two writers per socket corrupted frames → silent death behind
+    a green "Connected". All sends go through one per-socket lock."""
+    import asyncio as aio
+
+    from no_human.api.app import _ConnMgr
+
+    class FakeWS:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.sent = []
+        async def accept(self): ...
+        async def send_text(self, text):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await aio.sleep(0.005)
+            self.sent.append(text)
+            self.active -= 1
+
+    mgr = _ConnMgr()
+    ws = FakeWS()
+    await mgr.connect(ws)
+    await aio.gather(*[mgr.send(ws, f"m{i}") for i in range(8)],
+                     mgr.broadcast({"type": "sync"}))
+    assert ws.max_active == 1, "sends interleaved — the lock is not held"
+    assert len(ws.sent) == 9
+    mgr.remove(ws)
+    assert id(ws) not in mgr._locks
+
+
+async def test_summary_carries_review_totals(client, store):
+    """B2 #12: TaskTable priced review fields the list endpoint never sent
+    (undefined→0 dropped the review gate from every row)."""
+    from no_human.core.task import Task
+
+    t = Task.new("priced", repo_path="/r")
+    await store.create_task(t)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, tokens_used=100, cache_read_tokens=1000,
+                               review_tokens_used=40,
+                               review_cache_read_tokens=400,
+                               review_cache_creation_tokens=4)
+    r = await client.get("/api/tasks")
+    row = [x for x in r.json() if x["id"] == t.id][0]
+    assert row["total_review_tokens"] == 40
+    assert row["total_review_cache_read"] == 400
+    assert row["total_review_cache_creation"] == 4
+
+
+async def test_worker_status_surfaces_watcher_error(client):
+    """B2 #13: a dead WakeWatcher used to be swallowed silently while parked
+    tasks (notify-silent by design) depended on it entirely to wake."""
+    from no_human.api.app import app as _app
+    _app.state.watcher_error = "boom: config"
+    r = await client.get("/api/worker/status")
+    assert r.json().get("watcher_error") == "boom: config"
+
+
+async def test_queue_health_endpoint(client, store):
+    from no_human.core.task import Task, TaskStatus
+    t = Task.new("open one", repo_path="/r")
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.IMPLEMENTING, validate=False)
+    r = await client.get("/api/queue/health")
+    body = r.json()
+    assert body["open_tasks"] == 1
+    assert body["stuck"] is True          # nothing completed in the window
+    assert body["eta_minutes"] is None    # unknowable, not a fake zero
+
+
+async def test_board_query_is_not_n_plus_1(client, store, monkeypatch):
+    """B2 #16: the board issued one attempts query PER TASK, every 2s, per
+    socket. It must now use a single grouped query regardless of task count."""
+    from no_human.core.task import Task
+
+    for i in range(5):
+        t = Task.new(f"t{i}", repo_path="/r")
+        await store.create_task(t)
+        await store.create_attempt(t.id, 1)
+
+    calls = {"per_task": 0, "grouped": 0}
+    real_list = store.list_attempts
+    real_grouped = store.attempts_by_task
+
+    async def counted_list(task_id):
+        calls["per_task"] += 1
+        return await real_list(task_id)
+
+    async def counted_grouped():
+        calls["grouped"] += 1
+        return await real_grouped()
+
+    monkeypatch.setattr(store, "list_attempts", counted_list)
+    monkeypatch.setattr(store, "attempts_by_task", counted_grouped)
+
+    r = await client.get("/api/tasks")
+    assert r.status_code == 200
+    assert len(r.json()) == 5
+    assert calls["grouped"] == 1
+    assert calls["per_task"] == 0, "the board still issues a query per task"
+
+
+# --------------------------------------------------------------------------- #
+# Approve completes an already-satisfied claim (no PR exists to merge)         #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_approve_completes_an_already_satisfied_task(client, store):
+    """PR #101 review HIGH: with no PR, 'merge it yourself' is a dead end —
+    approval IS the human confirmation the terminal promised, so it completes
+    the task."""
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    await store.merge_context(t.id, {"already_satisfied_report":
+        "ALREADY-SATISFIED\nCRITERION: Should work — MET — evidence: x.py:1"})
+    r = await client.post(f"/api/tasks/{t.id}/approve")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    assert "already satisfied" in data["message"].lower()
+    refreshed = await store.find_task(t.id)
+    assert refreshed.status is TaskStatus.DONE
+    assert refreshed.context.get("approved_at") is not None
+
+
+@pytest.mark.asyncio
+async def test_approve_with_a_pr_still_leaves_the_merge_to_the_human(client, store):
+    """The PR path is unchanged: approval recorded, status stays
+    awaiting_approval, the human merges."""
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    r = await client.post(f"/api/tasks/{t.id}/approve")
+    assert r.status_code == 200
+    refreshed = await store.find_task(t.id)
+    assert refreshed.status is TaskStatus.AWAITING_APPROVAL
+
+
+@pytest.mark.asyncio
+async def test_approve_with_a_stale_claim_and_a_real_pr_does_not_auto_done(client, store):
+    """PR #101 round-2 MEDIUM: a stale already_satisfied_report + a later real
+    PR must keep the normal merge flow, never a false DONE."""
+    t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
+    await store.merge_context(t.id, {"already_satisfied_report":
+        "ALREADY-SATISFIED\nCRITERION: Should work — MET — evidence: x.py:1"})
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, pr_url="https://github.com/o/r/pull/7")
+    r = await client.post(f"/api/tasks/{t.id}/approve")
+    assert r.status_code == 200
+    assert "merge the pr" in r.json()["message"].lower()
+    refreshed = await store.find_task(t.id)
+    assert refreshed.status is TaskStatus.AWAITING_APPROVAL
+
+
+# --------------------------------------------------------------------------- #
+# Content-Security-Policy (fonts+CSP increment)                                #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_responses_carry_a_strict_csp(client):
+    """The board is self-contained (self-hosted fonts, data: favicon, ws
+    socket) — every response declares it, so an injected external script or
+    style can never load (electron-pro checklist gap #1)."""
+    r = await client.get("/api/tasks")
+    csp = r.headers.get("content-security-policy", "")
+    assert "default-src 'self'" in csp
+    assert "script-src 'self'" in csp and "unsafe-eval" not in csp
+    assert "img-src 'self' data:" in csp
+    assert "font-src 'self'" in csp
+    assert "connect-src 'self' ws: wss:" in csp
+    assert "object-src 'none'" in csp
+    assert "frame-ancestors 'none'" in csp
+
+# The board WebSocket actually routes (PR #107 review found it dead)           #
+# --------------------------------------------------------------------------- #
+
+def _ws_shim(store):
+    """A bare app exposing the PRODUCTION ws_board coroutine over the fixture
+    store — NO lifespan. PR #109's reviewer proved the first draft's
+    TestClient(app) booted the real lifespan: the operator's config/DB and a
+    live Scheduler ticking against their queue. Never again."""
+    from fastapi import FastAPI
+    from no_human.api.app import ws_board
+    shim = FastAPI()
+    shim.state.store = store
+    shim.websocket("/ws")(ws_board)
+    return shim
+
+
+@pytest.mark.asyncio
+async def test_board_websocket_routes_and_sends_the_init_snapshot(store):
+    """Since PR #75 the @app.websocket('/ws') decorator sat on the
+    _task_fingerprint HELPER, so FastAPI routed the helper (rejecting every
+    connection with 'missing query tlist') and ws_board never ran. On the
+    production app the route must be ws_board; the shim proves the coroutine
+    serves the init snapshot from the wired store."""
+    from starlette.testclient import TestClient
+    from no_human.api.app import app as prod_app, ws_board
+    # 1. The production route table binds /ws to ws_board (the regression).
+    ws_routes = [r for r in prod_app.routes if getattr(r, "path", "") == "/ws"]
+    assert ws_routes and ws_routes[0].endpoint is ws_board
+    # 2. The coroutine itself, over the fixture store, no lifespan.
+    t = await _seed_task(store, status=TaskStatus.PENDING, title="ws smoke")
+    with TestClient(_ws_shim(store)) as tc:
+        with tc.websocket_connect("/ws") as ws:
+            msg = ws.receive_json()
+            assert msg["type"] == "init"
+            assert any(x["title"] == "ws smoke" for x in msg["tasks"])
+
+
+@pytest.mark.asyncio
+async def test_board_websocket_disconnect_ends_the_poll_loop(store, monkeypatch):
+    """PR #109 review (medium): ws_board never received, so a disconnect on an
+    IDLE board (nothing to send, nothing to raise) leaked the loop polling the
+    store every 2s per closed tab, forever. This drives the PRODUCTION
+    coroutine directly (a TestClient portal freezes the server coroutine
+    outside the ws context, which made the first draft of this test pass on
+    the UNFIXED loop — vacuous): a fake socket whose receive() resolves when
+    the client closes; after that, the store must not be polled again."""
+    import asyncio
+    from types import SimpleNamespace
+    from no_human.api.app import ws_board
+
+    polls = {"n": 0}
+    real_list = store.list_tasks
+
+    async def counting(*a, **kw):
+        polls["n"] += 1
+        return await real_list(*a, **kw)
+    monkeypatch.setattr(store, "list_tasks", counting, raising=False)
+
+    closed = asyncio.Event()
+
+    class _FakeWS:
+        app = SimpleNamespace(state=SimpleNamespace(store=store, scheduler=None))
+
+        async def accept(self):
+            return None
+
+        async def send_text(self, _):
+            return None
+
+        async def receive(self):
+            await closed.wait()
+            return {"type": "websocket.disconnect", "code": 1000}
+
+        async def close(self):
+            return None
+
+    # Speed the poll clock up 20x so the test observes multiple windows fast.
+    real_wait = asyncio.wait
+
+    async def fast_wait(fs, timeout=None, **kw):
+        return await real_wait(fs, timeout=(0.1 if timeout == 2 else timeout), **kw)
+    from importlib import import_module
+    # `import no_human.api.app as m` binds the parent package's `app`
+    # ATTRIBUTE (the FastAPI instance) — import_module gets the module.
+    app_mod = import_module("no_human.api.app")
+    monkeypatch.setattr(app_mod.asyncio, "wait", fast_wait)
+
+    task = asyncio.create_task(ws_board(_FakeWS()))
+    await asyncio.sleep(0.35)          # a few poll windows while connected
+    assert polls["n"] >= 2, "harness sanity: the loop must be polling"
+    closed.set()                        # client disconnects
+    await asyncio.wait_for(task, timeout=2)  # the coroutine must END
+    baseline = polls["n"]
+    await asyncio.sleep(0.5)            # five would-be windows
+    assert polls["n"] == baseline, (
+        f"poll loop kept running after disconnect: {polls['n'] - baseline} extra")
+
+
+@pytest.mark.asyncio
+async def test_board_websocket_disconnect_deregisters_the_socket(store, monkeypatch):
+    """PR #109 round-2 (low): the normal-disconnect return path skipped
+    _mgr.remove, so closed tabs accumulated inert socket+lock entries until
+    the next broadcast pruned them."""
+    import asyncio
+    from types import SimpleNamespace
+    from importlib import import_module
+    app_mod = import_module("no_human.api.app")
+
+    closed = asyncio.Event()
+
+    class _FakeWS:
+        app = SimpleNamespace(state=SimpleNamespace(store=store, scheduler=None))
+        async def accept(self): return None
+        async def send_text(self, _): return None
+        async def receive(self):
+            await closed.wait()
+            return {"type": "websocket.disconnect", "code": 1000}
+        async def close(self): return None
+
+    ws = _FakeWS()
+    task = asyncio.create_task(app_mod.ws_board(ws))
+    await asyncio.sleep(0.1)
+    assert ws in app_mod._mgr._sockets   # registered while connected
+    closed.set()
+    await asyncio.wait_for(task, timeout=3)
+    assert ws not in app_mod._mgr._sockets
+    assert id(ws) not in app_mod._mgr._locks
+
+
+@pytest.mark.asyncio
+async def test_board_websocket_pushes_a_sync_frame_on_change(store, monkeypatch):
+    """No sync-frame coverage existed anywhere (#109 round-2, info): mutate
+    the store mid-connection and the loop must push a type:'sync' frame."""
+    import asyncio, json as _json
+    from types import SimpleNamespace
+    from importlib import import_module
+    app_mod = import_module("no_human.api.app")
+
+    sent = []
+    closed = asyncio.Event()
+
+    class _FakeWS:
+        app = SimpleNamespace(state=SimpleNamespace(store=store, scheduler=None))
+        async def accept(self): return None
+        async def send_text(self, text): sent.append(_json.loads(text))
+        async def receive(self):
+            await closed.wait()
+            return {"type": "websocket.disconnect", "code": 1000}
+        async def close(self): return None
+
+    real_wait = asyncio.wait
+    async def fast_wait(fs, timeout=None, **kw):
+        return await real_wait(fs, timeout=(0.1 if timeout == 2 else timeout), **kw)
+    monkeypatch.setattr(app_mod.asyncio, "wait", fast_wait)
+
+    task = asyncio.create_task(app_mod.ws_board(_FakeWS()))
+    await asyncio.sleep(0.15)
+    assert sent and sent[0]["type"] == "init"
+    await _seed_task(store, status=TaskStatus.PENDING, title="sync me")
+    await asyncio.sleep(0.4)
+    closed.set()
+    await asyncio.wait_for(task, timeout=3)
+    syncs = [m for m in sent if m["type"] == "sync"]
+    assert syncs, f"no sync frame pushed; frames: {[m['type'] for m in sent]}"
+    assert any(t["title"] == "sync me" for t in syncs[-1]["tasks"])
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/integrations · POST /api/integrations/{name}/test                   #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_integrations_list_endpoint(client):
+    r = await client.get("/api/integrations")
+    assert r.status_code == 200
+    items = r.json()["integrations"]
+    assert [i["name"] for i in items] == ["jira", "github", "gitlab", "jenkins", "circleci", "slack"]
+    assert all(i["configured"] is False for i in items)   # default config
+    assert all(i["healthy"] is None for i in items)       # not tested yet
+
+
+@pytest.mark.asyncio
+async def test_integrations_list_never_leaks_the_slack_webhook(client):
+    from no_human.api.app import app
+    app.state.config.data["notifications"]["slack_webhook_url"] = "https://hooks.slack.com/T/SECRETPART"
+    r = await client.get("/api/integrations")
+    assert "SECRETPART" not in r.text
+    slack = next(i for i in r.json()["integrations"] if i["name"] == "slack")
+    assert slack["configured"] is True
+    assert "SECRETPART" not in slack["detail"]
+
+
+@pytest.mark.asyncio
+async def test_integration_test_endpoint_unconfigured_jira(client):
+    r = await client.post("/api/integrations/jira/test")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["name"] == "jira"
+    assert body["healthy"] is False
+    assert "not configured" in body["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_integration_test_endpoint_unknown_name_404(client):
+    r = await client.post("/api/integrations/mystery/test")
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_reply_park_option_keeps_task_parked(client, store):
+    """SCRUM-22: choosing the terminal stop option must keep the task in its
+    parked state — never resume it into the claim queue."""
+    from no_human.core.task import Task, TaskStatus
+
+    t = Task.new("budget-parked", repo_path="/tmp/x")
+    await store.create_task(t)
+    t.blocker = {
+        "category": "BUDGET_EXHAUSTED",
+        "question": "Spend more, or stop here?",
+        "options": [
+            {"label": "raise", "action": {"set_task_config": {"lifetime_tokens": 13_000_000}}},
+            {"label": "stop \u2014 keep the work parked as-is", "action": {"park": True}},
+        ],
+    }
+    await store.update_task_columns(t)
+    await store.set_status(t, TaskStatus.ESCALATED, validate=False)
+
+    r = await client.post(f"/api/tasks/{t.id}/reply", json={"answer": "", "choose": 2})
+    assert r.status_code == 200, r.text
+    assert r.json().get("kept_parked") is True
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.ESCALATED          # NOT implementing
+    replies = (fresh.context or {}).get("human_replies") or []
+    assert replies and "stop" in replies[-1]["answer"]
+    assert fresh.config == {}                            # park mutated nothing
+
+
+@pytest.mark.asyncio
+async def test_board_tasks_carry_claimed_from_scheduler(client, store):
+    """SCRUM-15: `claimed` mirrors the scheduler's in-flight set — an
+    active-status task the scheduler has not picked up is queued, not running."""
+    from types import SimpleNamespace
+
+    from no_human.api.app import _board_tasks
+    from no_human.core.task import Task, TaskStatus
+
+    a = Task.new("claimed one", repo_path="/tmp/x")
+    b = Task.new("waiting one", repo_path="/tmp/x")
+    await store.create_task(a)
+    await store.create_task(b)
+    await store.set_status(a, TaskStatus.IMPLEMENTING, validate=False)
+    await store.set_status(b, TaskStatus.IMPLEMENTING, validate=False)
+
+    sched = SimpleNamespace(inflight={a.id}, get_live_status=lambda _id: None)
+    out = {s.id: s for s in await _board_tasks(store, scheduler=sched)}
+    assert out[a.id].claimed is True
+    assert out[b.id].claimed is False
+
+    # No scheduler (CLI/board contexts without one): claimed defaults False.
+    out2 = {s.id: s for s in await _board_tasks(store)}
+    assert out2[a.id].claimed is False
+
+
+@pytest.mark.asyncio
+async def test_mutation_broadcast_payload_carries_claimed(client, store, monkeypatch):
+    """SCRUM-15 regression net: the round-2 internal review caught a mutation
+    broadcast whose tasks payload silently dropped `claimed` (a callsite
+    without scheduler=). Pin the key's presence in a real broadcast payload."""
+    from no_human.api.app import _mgr
+
+    captured: list[dict] = []
+
+    async def fake_broadcast(msg):
+        captured.append(msg)
+
+    monkeypatch.setattr(_mgr, "broadcast", fake_broadcast)
+    r = await client.post("/api/tasks", json={"title": "broadcast probe"})
+    assert r.status_code == 201
+    created_id = r.json()["id"]
+
+    # Value-level pin (fresh-review advisory): a fake scheduler claiming the
+    # task must surface claimed=True in the NEXT mutation broadcast — key
+    # presence alone would still pass if a callsite dropped scheduler=.
+    from types import SimpleNamespace
+
+    from no_human.api.app import app as fastapi_app
+    monkeypatch.setattr(
+        fastapi_app.state, "scheduler",
+        SimpleNamespace(inflight={created_id}, get_live_status=lambda _id: None),
+        raising=False)
+    captured.clear()
+    r2 = await client.post(f"/api/tasks/{created_id}/pause", json={})
+    assert r2.status_code == 200, r2.text
+    tasks_payload = captured[-1].get("tasks") or []
+    assert tasks_payload, "broadcast carries the board tasks"
+    by_id = {t["id"]: t for t in tasks_payload}
+    assert by_id[created_id]["claimed"] is True, (
+        "a scheduler-claimed task must broadcast claimed=True — a dropped "
+        "scheduler= callsite silently flattens it to False")

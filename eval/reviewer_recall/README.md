@@ -2,9 +2,39 @@
 
 Method: `docs/REVIEWER_RECALL_METHOD.md`. Read it before touching anything here.
 
-Each `cases/<id>/` holds `base.ref` (SHA in this repo), `change.diff` (what the
-reviewer sees — for seeded cases the defect is planted, unmarked), and
-`truth.json` (ground truth — never shown to the reviewer).
+Each `cases/<id>/` holds `base.ref` (provenance only — the SHA the case was cut
+from), `base/` (the base file content the diff applies to, materialised inside
+the case), `change.diff` (what the reviewer sees — for seeded cases the defect
+is planted, unmarked), and `truth.json` (ground truth — never shown to the
+reviewer).
+
+## The corpus is self-contained (2026-07-30)
+
+`prepare_case_repo` used to rebuild each case with `git archive <base.ref>`.
+That pinned the corpus to this repo's history — and no_human ships as a fresh
+`git init` with a single commit, so every case would have ERRORed at
+`git archive` in the published repo. The base content now lives in
+`cases/<id>/base/` and **`base.ref` is never resolved**. Regenerate it for a new
+case with `python eval/reviewer_recall/materialize_base.py <case-id>`, run from
+a checkout that still has the commit.
+
+Only the files a case's `change.diff` touches are materialised (70 files,
+~4.7 MB across all 20 cases). That is the full set the scratch repo is read
+for: the runner invokes the reviewer with `diff_override`, which puts it on the
+single-turn, no-tools path (`review/reviewer.py`, gate mode) — it never
+explores the tree, it only gets the diff. The one place the tree is read is
+`_verify_citations`, which demotes a blocking finding whose cited `file:line`
+does not exist.
+
+**Behavioural delta, stated plainly:** under `git archive` the whole base tree
+was present, so a blocking finding citing a file *outside* the diff still
+verified and stayed blocking. It now demotes to advisory, because that file is
+not materialised. This can only affect a finding that names a file the reviewer
+was never shown — with only the diff in its prompt, such a citation is a
+hallucinated location. It cannot change a seeded case's `caught` (the planted
+file is always in the diff); it can only make a control *more* likely to score
+a clean pass. If a run shows a control passing on demoted off-diff citations,
+say so rather than banking the number.
 
 Rules that keep the number honest:
 

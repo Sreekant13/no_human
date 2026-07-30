@@ -1,0 +1,127 @@
+"""ProjectProfile — per-repo, human-confirmed build/test/CI recipe.
+
+The mechanism that keeps no_human general: how to install / unit-test / lint a
+repo, which CI to trigger and how to read it, and which steps are human-gated —
+all *config derived from the repo's own declarations and proven by running*,
+never hardcoded per repo (no ``if repo == "metrics-core"`` anywhere).
+
+The YAML at ``<repo>/.no_human/project.yml`` is the human-confirmable source of
+truth; ``Store`` mirrors it (with the confirmation flag) for the daemon. A
+profile is only trusted once ``confirmed`` is true — `nh onboard` proposes it,
+a human confirms via the same gate as `nh learnings`.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+PROFILE_RELPATH = Path(".no_human") / "project.yml"
+
+
+@dataclass
+class ProjectProfile:
+    repo_path: str
+    ecosystem: str = ""                 # e.g. "python-pytest", "node", "maven"
+    install_cmd: str = ""               # e.g. "uv sync"
+    test_cmd: str = ""                  # unit tests, e.g. "uv run pytest -q"
+    integration_test_cmd: str = ""       # integration tests, e.g. "uv run pytest tests/integration -q"
+    lint_cmd: str = ""                  # e.g. "uv run ruff check"
+    # Change-scoped test commands (2026-07-11): ordered glob rules so a
+    # change touching only one area runs the tests for THAT area, not the
+    # repo-wide default. Each: {"glob": "web/**", "command": "node --test
+    # src/", "cwd": "web"}. Matched against the attempt's edited files
+    # (fnmatch, * spans dirs); used only when EVERY edited file matches one
+    # rule, else the default test_cmd runs. Empty = today's behaviour exactly.
+    test_commands: list[dict[str, Any]] = field(default_factory=list)
+    ci: dict[str, Any] = field(default_factory=dict)        # mirrors config "ci" block
+    human_gated_steps: list[str] = field(default_factory=list)
+    # VCS topology (derived from the repo's `origin` remote), so no_human knows
+    # which host to open the PR against without anything hardcoded.
+    vcs_host: str = ""                  # e.g. "github.com", "code.example.com", "gitlab.acme.net"
+    vcs_remote: str = ""                # origin URL, credentials stripped
+    # The ~/.no_human/.env keys this repo needs to be driven end-to-end (derived
+    # from the CI backend + VCS host). On a missing one, the engine escalates a
+    # MISSING_ACCESS blocker naming the exact key — never the value.
+    required_credentials: list[str] = field(default_factory=list)
+    # Provenance: which repo declarations each command was derived from, and
+    # whether `nh onboard` proved it by running it. Trust requires proof.
+    derived_from: list[str] = field(default_factory=list)
+    proven: dict[str, bool] = field(default_factory=dict)   # cmd-key -> ran-clean
+    confirmed: bool = False
+    notes: str = ""
+    wiki_commit: str = ""              # git SHA when wiki was last generated
+    default_branch: str = ""           # C3: explicit default branch (e.g. "main", "master")
+
+    # --- serialization ---------------------------------------------------- #
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "repo_path": self.repo_path,
+            "ecosystem": self.ecosystem,
+            "install_cmd": self.install_cmd,
+            "test_cmd": self.test_cmd,
+            "integration_test_cmd": self.integration_test_cmd,
+            "lint_cmd": self.lint_cmd,
+            "test_commands": self.test_commands,
+            "ci": self.ci,
+            "human_gated_steps": self.human_gated_steps,
+            "vcs_host": self.vcs_host,
+            "vcs_remote": self.vcs_remote,
+            "required_credentials": self.required_credentials,
+            "derived_from": self.derived_from,
+            "proven": self.proven,
+            "confirmed": self.confirmed,
+            "notes": self.notes,
+            "wiki_commit": self.wiki_commit,
+            "default_branch": self.default_branch,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ProjectProfile":
+        known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
+        return cls(**{k: v for k, v in (data or {}).items() if k in known})
+
+    # --- YAML in the repo ------------------------------------------------- #
+
+    def yaml_path(self) -> Path:
+        return Path(self.repo_path).expanduser() / PROFILE_RELPATH
+
+    def save(self) -> Path:
+        """Write the profile to ``<repo>/.no_human/project.yml``."""
+        path = self.yaml_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # repo_path is implied by location; keep it out of the on-disk file.
+        body = {k: v for k, v in self.to_dict().items() if k != "repo_path"}
+        path.write_text(yaml.safe_dump(body, sort_keys=False))
+        return path
+
+    @classmethod
+    def load(cls, repo_path: str | Path) -> "ProjectProfile | None":
+        path = Path(repo_path).expanduser() / PROFILE_RELPATH
+        if not path.exists():
+            return None
+        data = yaml.safe_load(path.read_text()) or {}
+        data["repo_path"] = str(Path(repo_path).expanduser())
+        return cls.from_dict(data)
+
+    # --- readiness -------------------------------------------------------- #
+
+    @property
+    def is_usable(self) -> bool:
+        """A profile may drive a task only if a human confirmed it and its test
+        command was proven to run."""
+        return bool(self.confirmed and self.test_cmd and self.proven.get("test_cmd"))
+
+    def usable_under_policy(self, *, auto_confirm_proven: bool) -> bool:
+        """Whether this profile may drive a task under the active policy: a
+        human confirmed it (``is_usable``), OR ``auto_confirm_proven`` is opted
+        in and its test command was PROVEN to run clean. Single source of truth
+        for both the orchestrator (which gates test-command resolution on it)
+        and the CLI (which warns when it does NOT hold) — they must not drift."""
+        if self.is_usable:
+            return True
+        return bool(auto_confirm_proven and self.test_cmd and self.proven.get("test_cmd"))

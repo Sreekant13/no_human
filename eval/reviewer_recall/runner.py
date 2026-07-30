@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -31,8 +32,16 @@ CASES_DIR = Path(__file__).resolve().parent / "cases"
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
 METHOD_DOC = "docs/REVIEWER_RECALL_METHOD.md"
 DEFAULT_MODEL = "claude-opus-5"
+# Per-case directory holding the base content the case's diff applies to.
+BASE_DIR_NAME = "base"
 
 logger = logging.getLogger(__name__)
+
+
+class CasePrepError(RuntimeError):
+    """A case could not be materialised into a scratch repo — e.g. its
+    ``base/`` directory is missing. Caught by :func:`run_case` and reported as
+    ``status="ERROR"`` (never scored as a miss)."""
 
 
 class HeadlineRefusedError(RuntimeError):
@@ -99,6 +108,11 @@ def load_cases(cases_dir: Path = CASES_DIR) -> list[CaseSpec]:
     for entry in sorted(cases_dir.iterdir()):
         if not entry.is_dir():
             continue
+        # A case is a directory holding truth.json. Anything else living under
+        # cases/ — __pycache__, editor scratch — is not a case and must not be
+        # loaded as one (a stray __pycache__ once crashed load_cases outright).
+        if not (entry / "truth.json").is_file():
+            continue
         base_ref = (entry / "base.ref").read_text().strip()
         diff_text = (entry / "change.diff").read_text()
         truth = json.loads((entry / "truth.json").read_text())
@@ -114,25 +128,40 @@ def _run(cmd: list[str], *, cwd: Path, input_bytes: bytes | None = None) -> None
 
 
 def prepare_case_repo(repo_root: Path, case: CaseSpec, workdir: Path) -> Path:
-    """Check out ``case.base_ref`` with NO descendant history, then apply
-    ``case.diff_text``.
+    """Seed a single-commit scratch repo from the case's own materialised base
+    content, then apply ``case.diff_text``.
 
-    Per the method doc: most cases derive from real merged diffs, and a
-    checkout that still carries the descendant commit would let the reviewer
-    do git archaeology (``git log --all``, diffing against the later "real"
-    fix) and find the plant mechanically. ``git archive`` exports the tree at
-    ``base_ref`` with zero history, then we seed a brand-new single-commit
-    repo from it — a stricter filter than a shallow clone: there is no other
-    ref, remote, or ancestor/descendant commit to discover at all.
+    HISTORY-INDEPENDENT (2026-07-30). This used to run
+    ``git archive <case.base_ref>`` against ``repo_root``, which pinned the
+    corpus to this repo's history. no_human ships as a fresh ``git init`` with
+    a single commit and no other objects, so every case would have ERRORed at
+    ``git archive`` in the published repo. The base content each diff needs now
+    lives in ``cases/<id>/base/`` (regenerate with
+    ``eval/reviewer_recall/materialize_base.py``); ``base.ref`` is kept as
+    provenance only and is never resolved. ``repo_root`` is likewise unused —
+    kept in the signature because it is part of the runner's public shape.
+
+    The no-descendant-history property the method doc requires is unchanged and
+    in fact stricter: the scratch repo is seeded from plain files, so there is
+    no ref, remote, ancestor or descendant commit to do archaeology against —
+    only the single ``base`` commit this function creates.
+
+    Only the files the diff touches are materialised. That is the whole set the
+    scratch repo is ever read for: the recall runner calls the reviewer with
+    ``diff_override``, which puts it on the single-turn no-tools path
+    (``reviewer.py``, gate mode), so the tree is consulted only by
+    ``_verify_citations``. See the README for the one behavioural delta this
+    implies.
     """
+    base_src = case.dir / BASE_DIR_NAME
+    if not base_src.is_dir():
+        raise CasePrepError(
+            f"{case.case_id}: no materialised base content at {base_src} — "
+            f"run eval/reviewer_recall/materialize_base.py {case.case_id} from "
+            f"a checkout that still resolves base.ref ({case.base_ref})"
+        )
     target = workdir / case.case_id
-    target.mkdir(parents=True, exist_ok=True)
-    archive = subprocess.run(
-        ["git", "archive", case.base_ref], cwd=repo_root,
-        check=True, capture_output=True,
-    ).stdout
-    subprocess.run(["tar", "-x"], cwd=target, input=archive, check=True,
-                   capture_output=True)
+    shutil.copytree(base_src, target, dirs_exist_ok=True)
     _run(["git", "init", "-q"], cwd=target)
     _run(["git", "add", "-A"], cwd=target)
     _run([
@@ -211,8 +240,8 @@ async def run_case(
     """Checkout + apply + invoke + score a single case."""
     try:
         case_repo = prepare_case_repo(repo_root, case, workdir)
-    except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or b"").decode(errors="ignore")[:400]
+    except (subprocess.CalledProcessError, CasePrepError, OSError) as exc:
+        stderr = (getattr(exc, "stderr", None) or b"").decode(errors="ignore")[:400]
         outcome = ReviewOutcome(status="ERROR", findings=[])
         return CaseResult(
             case_id=case.case_id, cls=case.truth.get("class", ""),
