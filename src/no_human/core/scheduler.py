@@ -28,6 +28,7 @@ from typing import Awaitable, Callable
 
 from ..config import parallelism_enabled, worktree_isolation_enabled
 from .db import Store
+from . import plan_gate
 from .events import EventPersister
 from .task import TaskStatus
 
@@ -255,6 +256,14 @@ class Scheduler:
             for t in await self.store.list_tasks(status):
                 if t.id not in self._inflight:
                     out.append(t)
+        # A plan-approval correction resumes into PLANNING, not IMPLEMENTING —
+        # it must be re-planned before a token is spent implementing it. That
+        # status is otherwise mid-run-only, so it is claimed here on the one
+        # marker a live planning worker can never carry: a correction a human
+        # left on a parked task (`plan_gate.pending_correction`).
+        for t in await self.store.list_tasks(TaskStatus.PLANNING):
+            if t.id not in self._inflight and plan_gate.pending_correction(t):
+                out.append(t)
         return out
 
     # Mid-run statuses only a live worker can hold. A task found in one of
@@ -273,6 +282,12 @@ class Scheduler:
         checkpoint, and say so in the event stream."""
         for status in self._ORPHANABLE:
             for t in await self.store.list_tasks(status):
+                # Not an orphan: a task sitting in PLANNING with a human's
+                # plan correction on it is WAITING to be re-planned, and
+                # requeueing it as IMPLEMENTING would spend the run on the
+                # very plan they rejected. `_claimable` picks it up instead.
+                if plan_gate.pending_correction(t):
+                    continue
                 await self.store.set_status(
                     t, TaskStatus.IMPLEMENTING, validate=False)
                 await self.store.save_events(t.id, [{

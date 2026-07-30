@@ -91,6 +91,7 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   const [kind, setKind] = useState(initial?.kind ?? "feature");
   const [prUrl, setPrUrl] = useState(initial?.prUrl ?? "");
   const [priority, setPriority] = useState(initial?.priority ?? "medium");
+  const [planApproval, setPlanApproval] = useState(initial?.planApproval ?? false);
   const [files, setFiles] = useState(initial?.files ?? []);
   // undefined = fetch in flight · [] = genuinely none. The initial-[]
   // ambiguity showed 'No projects yet' during the load window and then
@@ -387,6 +388,7 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
       description: fullDescription,
       kind,
       priority,
+      planApproval,
       files,
       repoPath: freeTextRepo ? repoPath.trim() || null : repoPath || null,
       projectId: !customRepo && selectedProjectId ? selectedProjectId : null,
@@ -897,6 +899,21 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
                 <option value="medium">medium priority</option>
                 <option value="low">low priority</option>
               </SelectPill>
+
+              {/* GAP 1: the one toggle that answers "I am not letting an agent
+                  burn millions of tokens on its own reading of my ticket".
+                  Off by default - an unattended run stays unattended. */}
+              <label
+                className={`${ON_PANEL} flex cursor-pointer items-center gap-2 px-3`}
+                title="Stop after planning and show me the plan before any implementation token is spent"
+              >
+                <input
+                  type="checkbox"
+                  checked={planApproval}
+                  onChange={(e) => setPlanApproval(e.target.checked)}
+                />
+                <span>review plan first</span>
+              </label>
 
               <div className="ml-auto flex items-center gap-2">
                 <button type="button" className={`${GHOST} px-5`} onClick={onClose}>

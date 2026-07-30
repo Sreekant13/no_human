@@ -304,6 +304,9 @@ function NewTaskModal({ onClose, onCreated }) {
         // from a picked Jira ticket — "board" for every typed task, unchanged.
         source: fields.source,
         external_id: fields.externalId,
+        // GAP 1: the composer's "review plan first" toggle. Omitted-as-false
+        // keeps every other caller on the unattended path.
+        plan_approval: !!fields.planApproval,
       });
       // Attach any screenshots/documents to the new task (best-effort — a failed
       // upload must not lose the task that was already created).

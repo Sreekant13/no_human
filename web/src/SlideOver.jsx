@@ -11,6 +11,7 @@ import { ROLE_LABEL, discoverSubagents, eventSource, modelsByNode } from "./even
 import { deriveAgentStatus } from "./pipelineStatus.js";
 import { taskProgress } from "./taskProgress.js";
 import { hasAction, normalizeOption } from "./blockerOptions.js";
+import { planApproveIndex } from "./planGate.js";
 import { decisionFor } from "./blockerDecision.js";
 import { clampAgentState, currentFunctionality, groupFunctionalities, laneAgentRows } from "./functionalities.js";
 import { agentSummary, taskSummary } from "./summaries.js";
@@ -1889,10 +1890,17 @@ function SpecTab({ task, onRefresh }) {
             <div className="spec-approval-actions">
               <button className="btn-approve" disabled={specBusy} onClick={async () => {
                 setSpecBusy(true);
-                try { await replyTask(task.id, "spec approved"); if (onRefresh) onRefresh(); }
+                // At the plan-approval gate the approval is the option, not the
+                // words: a free-text reply there is a correction and re-plans.
+                const approveIdx = planApproveIndex(task);
+                try {
+                  if (approveIdx) await chooseBlockerOption(task.id, approveIdx);
+                  else await replyTask(task.id, "spec approved");
+                  if (onRefresh) onRefresh();
+                }
                 catch { /* handled by parent */ }
                 finally { setSpecBusy(false); }
-              }}>Approve Spec</button>
+              }}>{planApproveIndex(task) ? "Approve Plan" : "Approve Spec"}</button>
               <button className="btn-request-changes" disabled={specBusy}
                 onClick={() => setRequestingChanges(true)}>Request Changes</button>
             </div>

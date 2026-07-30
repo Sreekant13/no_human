@@ -31,6 +31,13 @@ SET_TASK_CONFIG = "set_task_config"
 # human's explicit stop. Exactly ``{"park": true}``, alone — parse_blocker
 # strips agent options to labels, so the agent can never emit it.
 PARK = "park"
+# Plan-approval gate (GAP 1): the option's meaning is "the plan is good — start
+# implementing". Structural, not a string match on the answer text, so the
+# board's one-click option and `nh reply --choose` mean the same thing and a
+# free-text reply is unambiguously a correction. Exactly
+# ``{"approve_plan": true}``, alone — parse_blocker strips agent options to
+# labels, so the agent can never approve its own plan.
+APPROVE_PLAN = "approve_plan"
 
 # Exactly the per-task overrides the orchestrator honours: the two size
 # limits (`_size_limits`), the two lifetime caps (`_lifetime_limits`), and the
@@ -52,6 +59,11 @@ def is_terminal_action(action: dict[str, Any] | None) -> bool:
     return isinstance(action, dict) and action.get(PARK) is True
 
 
+def is_plan_approval_action(action: dict[str, Any] | None) -> bool:
+    """True when picking this option APPROVES the parked plan (GAP 1)."""
+    return isinstance(action, dict) and action.get(APPROVE_PLAN) is True
+
+
 def apply_action(
     task: "Task", action: dict[str, Any] | None, *, human_override: bool = False
 ) -> str | None:
@@ -69,9 +81,15 @@ def apply_action(
     if not isinstance(action, dict):
         raise ActionError(f"action must be an object, got {type(action).__name__}")
 
-    unknown = set(action) - {SET_TASK_CONFIG, PARK}
+    unknown = set(action) - {SET_TASK_CONFIG, PARK, APPROVE_PLAN}
     if unknown:
         raise ActionError(f"unknown action verb(s): {', '.join(sorted(unknown))}")
+
+    if APPROVE_PLAN in action:
+        if action.get(APPROVE_PLAN) is not True or len(action) != 1:
+            raise ActionError(
+                'a plan-approval action must be exactly {"approve_plan": true}, alone')
+        return "plan approved - implementation may start"
 
     if PARK in action:
         if action.get(PARK) is not True or len(action) != 1:
