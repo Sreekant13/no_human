@@ -36,6 +36,10 @@ CiGreenChecker = Callable[[str], Awaitable[bool]]
 CiTerminalChecker = Callable[[str], Awaitable[tuple[bool, bool]]]
 # Returns list of new PrComment objects for a PR ref.
 PrCommentChecker = Callable[[str], Awaitable[list[Any]]]
+# (repo_path, branch, base) -> whether branch's content already landed on base
+# (a local, content-based check — see default_branch_shipped for why a
+# squash merge makes ancestry the wrong test).
+PrShippedChecker = Callable[[str, str, str], Awaitable[bool]]
 
 _DURATION = re.compile(r"(\d+)\s*([smhd])", re.IGNORECASE)
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -80,6 +84,7 @@ class WakeWatcher:
         pr_checks: Callable[[str], Awaitable[list[dict]]] | None = None,
         pr_mergeable: Callable[[str], Awaitable[dict]] | None = None,
         ci_log: Callable[[str], Awaitable[str]] | None = None,
+        pr_shipped: PrShippedChecker | None = None,
         on_event: Callable[[str, str], None] | None = None,
         ci_gate_gate: Any = None,
     ):
@@ -137,6 +142,7 @@ class WakeWatcher:
         self._pr_checks = pr_checks
         self._pr_mergeable = pr_mergeable
         self._ci_log = ci_log
+        self._pr_shipped = pr_shipped
         self._on_event = on_event or (lambda kind, text: None)
         # The post-PR CI_GATE integration gate (M6). Injectable for tests;
         # by default built here (the single wiring point for all three hosts)
@@ -620,6 +626,39 @@ class WakeWatcher:
             await self._emit(task, "merged", f"{task.id[:8]} PR merged by a human: {url}")
             return "merged"
         if state == "CLOSED":
+            # GitHub's merged flag is never true for our PRs: the operator's
+            # hard rule is a LOCAL, identity-normalized squash merge (never
+            # `gh pr merge`), so a squash commit lands on base with a fresh
+            # SHA that has no commit-graph lineage back to the branch — every
+            # shipped PR still reports CLOSED here. Trusting that flag alone
+            # escalated every successful task (SCRUM-68 follow-up). Before
+            # escalating, ask git (not GitHub) whether the branch's content is
+            # actually present on its base — that's true regardless of how
+            # the commit graph got there.
+            if self._pr_shipped is not None:
+                ctx = task.context or {}
+                branch = ctx.get("pr_branch")
+                base = ctx.get("base_branch") or "main"
+                if task.repo_path and branch:
+                    try:
+                        shipped = await self._pr_shipped(task.repo_path, branch, base)
+                    except Exception as exc:  # noqa: BLE001 — a checker error must not crash the watcher
+                        log.warning("pr_shipped check failed for %s: %s", task.id[:8], exc)
+                        shipped = False
+                    # The shipped check just ran several local git subprocesses
+                    # (merge-base, diff --name-only, diff --quiet) — easily a
+                    # few seconds on a large repo — so re-verify terminal-ness
+                    # before writing, same SCRUM-68 guard as every other rung.
+                    if await self._is_terminal(task):
+                        return None
+                    if shipped:
+                        await self.store.set_status(task, TaskStatus.DONE, validate=False)
+                        await self._emit(
+                            task, "shipped",
+                            f"{task.id[:8]} PR closed but its content is already on "
+                            f"{base} (squash-merged): {url}",
+                        )
+                        return "shipped_pr_closed"
             data = task.blocker or {}
             data["category"] = "AMBIGUITY"
             data["question"] = (

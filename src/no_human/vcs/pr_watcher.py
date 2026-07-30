@@ -597,3 +597,74 @@ async def default_ci_log_excerpt(link: str) -> str:
         if "error" in low or "exception" in low or "failure" in low:
             return "\n".join(lines[max(0, i - 2): i + 18])[:2000]
     return "\n".join(lines[-15:])[:2000]
+
+
+async def _git_rc(repo_path: str, *args: str) -> tuple[int, str]:
+    """Run a local git command; return (returncode, stripped stdout)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", repo_path, *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await proc.communicate()
+    except OSError:
+        # FileNotFoundError (git absent) and E2BIG (argv too long on a very
+        # large touched set) both land here. The caller's contract is "never
+        # a false shipped", so any failure must read as a non-zero rc.
+        return 1, ""
+    return proc.returncode, out.decode("utf-8", "replace").strip()
+
+
+async def default_branch_shipped(repo_path: str, branch: str, base: str = "main") -> bool:
+    """Whether ``branch``'s changes are actually present in ``base``, checked
+    by tree CONTENT rather than commit ancestry.
+
+    The operator's hard rule (CLAUDE.md) is that what lands on ``main`` is a
+    local, identity-normalized squash merge -- never `gh pr merge`. A squash
+    merge writes a brand-new commit onto ``base`` with its own SHA, so
+    `git merge-base --is-ancestor <branch> <base>` is FALSE for every one of
+    our merges even when the change is fully landed: ancestry tracks commit
+    lineage, and a squash commit has no lineage back to the branch it came
+    from. It is therefore not a valid "did this ship" test here.
+
+    Instead: find the files ``branch`` touched relative to its merge-base with
+    ``base``, then diff those same paths between ``branch`` and ``base``'s
+    current tip. No remaining differences means the content already landed,
+    regardless of how the commit graph got there.
+
+    Returns False (never a false "shipped") on any git failure: missing repo,
+    missing/deleted branch, unrelated histories, etc. -- callers must treat
+    False as "can't tell", same as GitHub's PR state going unknown.
+    """
+    if not repo_path or not branch:
+        return False
+    rc, merge_base = await _git_rc(repo_path, "merge-base", branch, base)
+    if rc != 0 or not merge_base:
+        return False
+    # --no-renames: rename detection reports a `git mv` as the DESTINATION
+    # path only, so the source path never enters the touched set and its
+    # deletion is never compared against base. A branch that moves a file
+    # would then report "shipped" while the removal half had not landed, and
+    # the task would be marked DONE with half its deliverable missing.
+    # Trailing `--`: without it, a branch whose name is also a path in the
+    # tree makes git bail with "ambiguous argument".
+    # `-z`: git C-QUOTES any path containing a non-ASCII byte, a quote, a
+    # backslash or a control character (core.quotePath, on by default), e.g.
+    # `café.py` comes back as `"caf\303\251.py"`. Feeding that literal string
+    # back as a pathspec matches NOTHING, so `--quiet` reports "no
+    # differences" and a branch that never landed is reported as shipped.
+    # `-z` emits raw NUL-separated names, so what we pass back is what git
+    # gave us.
+    rc, touched = await _git_rc(
+        repo_path, "diff", "--name-only", "-z", "--no-renames",
+        merge_base, branch, "--",
+    )
+    if rc != 0:
+        return False
+    files = [f for f in touched.split("\0") if f.strip()]
+    if not files:
+        return True  # branch never diverged in content from base — trivially shipped
+    rc, _ = await _git_rc(repo_path, "diff", "--quiet", branch, base, "--", *files)
+    if rc not in (0, 1):  # anything other than "clean"/"differs" is an error
+        return False
+    return rc == 0
