@@ -258,13 +258,27 @@ def test_task_add_rejects_a_linked_repo_that_is_not_a_checkout(tmp_path, monkeyp
     """D19: click already rejects a *missing* --linked-repo (Path(exists=True)).
     A path that exists but is not a git checkout used to sail through intake and
     then be dropped by a bare `continue` mid-attempt, after the planner had
-    already written a plan naming its files."""
+    already written a plan naming its files.
+
+    The console width is pinned because it decides whether this test is testing
+    anything. Rich falls back to 80 columns whenever stdout is not a terminal —
+    a pipe, a log file, every CI runner — and its default rendering folds a
+    token longer than the line, so the reported path came back with a newline
+    inside it. Unpinned, tmp_path's length alone decides where that fold lands
+    and therefore whether the assertion below notices: this test passed on
+    macOS and failed on Linux for no reason other than that.
+    """
+    monkeypatch.setenv("COLUMNS", "80")
     db = tmp_path / "test.db"
     runner = _make_runner(db, monkeypatch)
     primary = tmp_path / "primary"
     (primary / ".git").mkdir(parents=True)
     not_a_checkout = tmp_path / "metrics-core-service"
     not_a_checkout.mkdir()
+    # pytest's tmp_path is always well past 80 characters, so the rendered
+    # message cannot fit on one 80-column line — the path has to survive being
+    # wrapped, which is the point.
+    assert len(str(not_a_checkout)) > 80
 
     result = runner.invoke(cli, [
         "task", "add", "--title", "multi-repo task",
@@ -276,6 +290,9 @@ def test_task_add_rejects_a_linked_repo_that_is_not_a_checkout(tmp_path, monkeyp
     assert result.exit_code == 1
     assert "not a git repo" in result.output
     assert "metrics-core-service" in result.output
+    # The whole path, verbatim and unbroken — a path the user cannot copy out
+    # of the error is not a usable error message.
+    assert str(not_a_checkout) in result.output
 
 
 # --------------------------------------------------------------------------- #

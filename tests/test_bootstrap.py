@@ -28,8 +28,50 @@ def _write_stub(bin_dir: Path, name: str, output: str = "") -> None:
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
+# The tools these tests stub, add, and delete. Whether one of them is on PATH
+# is the entire subject of the missing-tool tests, so the host's copies must
+# never be reachable — see system_bin.
+STUBBED_TOOLS = ("python3", "uv", "claude", "nh")
+
+
+@pytest.fixture(scope="session")
+def system_bin(tmp_path_factory):
+    """A stand-in for /usr/bin:/bin that cannot leak a stubbed tool.
+
+    bootstrap.sh needs ordinary system utilities (dirname, awk, cut, cp,
+    basename, git...), so the fake PATH cannot be the stub bin/ alone. But
+    putting the real /usr/bin on it broke what these tests mean by "missing":
+    deleting the stub stopped implying the tool was absent, because the host
+    still had one. Ubuntu ships /usr/bin/python3 at 3.12, which quietly
+    satisfied the very check test_missing_python_without_uv_* exists to
+    exercise; that test passed on macOS only because /usr/bin/python3 there is
+    3.9, too old to satisfy it. Nothing about the script was wrong — the
+    precondition was never established on Linux.
+
+    So mirror the system directories one symlink at a time and drop every name
+    the fixture stubs. Absence is then absence on any host. Symlinking rather
+    than listing an allowlist keeps this working when the script (or the real
+    `nh doctor` it runs at step 5) reaches for another utility.
+    """
+    mirror = tmp_path_factory.mktemp("system-bin")
+    for src_dir in (Path("/usr/bin"), Path("/bin")):
+        if not src_dir.is_dir():
+            continue
+        for entry in src_dir.iterdir():
+            # python3.12, python3.13, ... would satisfy nothing here (the
+            # script only calls `python3`), but drop the whole family so the
+            # rule is "no interpreter the fixture did not put there".
+            if entry.name in STUBBED_TOOLS or entry.name.startswith("python"):
+                continue
+            link = mirror / entry.name
+            if link.exists() or link.is_symlink():
+                continue  # /bin is a symlink to /usr/bin on merged-usr Linux
+            link.symlink_to(entry)
+    return mirror
+
+
 @pytest.fixture
-def fake_env(tmp_path):
+def fake_env(tmp_path, system_bin):
     """A temp bin/ with stub python3/uv/claude/nh, plus isolated HOME."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -43,11 +85,20 @@ def fake_env(tmp_path):
     nh_home = home / ".no_human"
 
     env = {
-        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "PATH": f"{bin_dir}:{system_bin}",
         "HOME": str(home),
         "NO_HUMAN_HOME": str(nh_home),
     }
     return {"env": env, "bin_dir": bin_dir, "home": home, "nh_home": nh_home}
+
+
+def _which(fake_env, tool: str) -> str | None:
+    """Resolve `tool` exactly the way bootstrap.sh's `command -v` does."""
+    result = subprocess.run(
+        ["/bin/sh", "-c", f"command -v {tool}"],
+        capture_output=True, text=True, timeout=30, env=fake_env["env"],
+    )
+    return result.stdout.strip() or None
 
 
 def _run(fake_env, extra_args=None):
@@ -103,8 +154,26 @@ def test_template_created_when_absent(fake_env):
     assert config_path.read_text() == TEMPLATE.read_text()
 
 
+def test_fake_path_resolves_tools_only_from_the_stub_bin(fake_env):
+    """Deleting a stub has to mean the tool is gone. It did not: the fake PATH
+    ended in /usr/bin:/bin, so the host's python3/uv/git-shipped claude were
+    still one lookup away, and a missing-tool test silently tested nothing on
+    any machine that had the real thing. This is the guard for that."""
+    for tool in STUBBED_TOOLS:
+        assert _which(fake_env, tool) == str(fake_env["bin_dir"] / tool)
+        (fake_env["bin_dir"] / tool).unlink()
+        assert _which(fake_env, tool) is None, (
+            f"{tool} is still on PATH after its stub was deleted — the host's "
+            f"copy leaked through, so 'missing {tool}' tests prove nothing"
+        )
+    # ...and the utilities the script genuinely needs are still reachable.
+    for util in ("dirname", "awk", "cut", "cp", "mkdir", "cat", "basename"):
+        assert _which(fake_env, util) is not None, util
+
+
 def test_missing_uv_prints_instructions_and_exits_nonzero(fake_env):
     (fake_env["bin_dir"] / "uv").unlink()
+    assert _which(fake_env, "uv") is None, "precondition: uv must be off PATH"
     result = _run(fake_env)
     assert result.returncode == 1, result.stdout + result.stderr
     assert "astral.sh/uv/install.sh" in result.stdout
@@ -114,8 +183,16 @@ def test_missing_uv_prints_instructions_and_exits_nonzero(fake_env):
 def test_missing_python_without_uv_prints_instructions_and_exits_nonzero(fake_env):
     (fake_env["bin_dir"] / "python3").unlink()
     (fake_env["bin_dir"] / "uv").unlink()
+    # Assert the precondition, don't assume it. Without this the test passed on
+    # macOS and failed on Linux purely because of which python3 the host had in
+    # /usr/bin, and the failure looked like a bug in the script's messaging.
+    assert _which(fake_env, "python3") is None, "precondition: no python3 on PATH"
+    assert _which(fake_env, "uv") is None, "precondition: no uv on PATH"
     result = _run(fake_env)
     assert result.returncode == 1, result.stdout + result.stderr
+    # The uv guidance is not a substitute: with no interpreter and no uv to
+    # provision one, the script has to say where Python itself comes from.
+    assert "Install Python 3.12+" in result.stdout
     assert "python.org" in result.stdout or "brew install python@3.12" in result.stdout
     assert "[2/5]" not in result.stdout
 

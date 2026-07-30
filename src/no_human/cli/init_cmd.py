@@ -26,6 +26,7 @@ import yaml
 from rich.console import Console
 from rich.panel import Panel
 
+from . import print_path_error
 from ..config import (
     API_KEY_VAR,
     CONFIG_PATH,
@@ -377,10 +378,10 @@ def offer_onboard() -> str | None:
     repo = click.prompt("  Repo path", default=".", show_default=True).strip()
     repo_path = str(Path(repo).expanduser().resolve())
     if not Path(repo_path).is_dir():
-        console.print(f"  [red]not a directory:[/] {repo_path}")
+        print_path_error(console, "  [red]not a directory:[/]", repo_path)
         return None
     if not (Path(repo_path) / ".git").exists():
-        console.print(f"  [red]not a git repo:[/] {repo_path}")
+        print_path_error(console, "  [red]not a git repo:[/]", repo_path)
         return None
     return repo_path
 
