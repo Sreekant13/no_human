@@ -14,11 +14,14 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import re
+import sys
 
 import pytest
 from click.testing import CliRunner
 
+from no_human.cli import shell as shell_mod
 from no_human.cli.api_client import NhApiError, NhServerUnreachable
 from no_human.cli.commands import cli
 from no_human.cli.shell import ShellApp, run_shell
@@ -48,6 +51,7 @@ class FakeClient:
         self._grill_frames = list(grill_frames or [])
         self._event_frames = list(event_frames or [])
         self.calls: list[tuple] = []
+        self.stream_cursors: list[str] = []
         self.grill_payloads: list[dict] = []
         self.created: list[dict] = []
         self.raise_on: dict[str, Exception] = {}
@@ -98,8 +102,9 @@ class FakeClient:
         for f in batch:
             yield f
 
-    async def stream_events(self, task_id):
+    async def stream_events(self, task_id, *, last_event_id=""):
         self.calls.append(("stream_events", task_id))
+        self.stream_cursors.append(last_event_id)
         for f in self._event_frames:
             yield f
 
@@ -115,7 +120,8 @@ async def type_line(pilot, text):
 
 
 def make_app(client, **kw):
-    kw.setdefault("poll_interval", 0)  # 0 = no background polling in tests
+    kw.setdefault("poll_interval", 0)   # 0 = no background polling in tests
+    kw.setdefault("follow_reconnect", 0)  # 0 = one pass over the fake's frames
     return ShellApp(client, **kw)
 
 
@@ -245,6 +251,30 @@ async def test_the_detail_pane_tails_the_selected_tasks_event_stream():
     assert "Edit shell.py" in text
 
 
+async def test_the_detail_pane_reopens_the_stream_the_server_closed():
+    """The server ends this stream five idle ticks after the task leaves the
+    inflight set - about six seconds for anything parked, queued or awaiting
+    approval, which is most of what this surface shows. Running it once left
+    the pane permanently silent, and re-selecting the task was the only cure.
+
+    The reconnect carries the `last-event-id` cursor, so it resumes rather than
+    replaying the server's 200-event deque."""
+    client = FakeClient(
+        [_t(id="tailme000001", status="implementing")],
+        event_frames=[{"kind": "tool_use", "text": "Edit shell.py", "ts": 1712.5}],
+    )
+    app = make_app(client, follow_reconnect=0.01)
+    async with app.run_test(size=SIZE) as pilot:
+        for _ in range(20):
+            await pilot.pause()
+            await asyncio.sleep(0.01)
+        opened = [c for c in client.calls if c[0] == "stream_events"]
+        cursors = list(client.stream_cursors)
+    assert len(opened) > 1, "one pass and the pane goes dead for good"
+    assert cursors[0] == ""
+    assert cursors[1] == "1712.5", "a reconnect resumes, it does not replay"
+
+
 async def test_moving_the_selection_switches_which_stream_is_followed():
     client = FakeClient([_t(id="aaaaaaaa1111", status="escalated"),
                          _t(id="bbbbbbbb2222", status="implementing")])
@@ -319,6 +349,92 @@ async def test_accepting_the_refined_spec_creates_the_task():
         "repo_path": "/repo",
         "acceptance_criteria": ["ac one"],
     }]
+
+
+async def test_saying_yes_creates_a_task_a_REAL_SERVER_MODEL_would_accept():
+    """The one test the whole feature rests on, and the one the suite did not
+    have: `FakeClient.create_task` accepts any keywords and `MockTransport`
+    returned 201 for any body, so 115 tests passed while the shipped client put
+    `kind: null, priority: null` on the wire and every single create 422'd.
+
+    Here the transport runs the server's OWN `CreateTaskRequest` over the bytes
+    the real `NhClient` sends, and answers 422 in FastAPI's shape when it does
+    not validate - so a body the server would refuse fails HERE."""
+    import httpx
+    from pydantic import ValidationError
+
+    from no_human.api.models import CreateTaskRequest
+    from no_human.cli.api_client import NhClient
+
+    sse = "".join(f"data: {json.dumps(f)}\n\n" for f in RESULT)
+    posted: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/grill/stream":
+            return httpx.Response(200, text=sse)
+        if path == "/api/tasks" and request.method == "POST":
+            body = json.loads(request.content)
+            posted["body"] = body
+            try:
+                parsed = CreateTaskRequest(**body)
+            except ValidationError as exc:
+                return httpx.Response(422, json={"detail": exc.errors(
+                    include_url=False, include_context=False, include_input=False)})
+            posted["parsed"] = parsed
+            return httpx.Response(201, json={"id": "newtask0001",
+                                             "title": parsed.title,
+                                             "status": "pending"})
+        return httpx.Response(200, json=[])
+
+    client = NhClient(transport=httpx.MockTransport(handler))
+    app = make_app(client, repo_path="/repo")
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        await type_line(pilot, "add a retry button")
+        await type_line(pilot, "yes")
+        text = frame(app)
+    await client.aclose()
+
+    assert "parsed" in posted, (
+        f"the server model refused the client's body: {posted.get('body')}")
+    assert posted["parsed"].title == "Add a retry action"
+    assert posted["parsed"].acceptance_criteria == ["ac one"]
+    assert posted["parsed"].kind == "feature"
+    assert posted["parsed"].priority == "medium"
+    assert "created newtask" in text
+
+
+async def test_a_rejected_create_tells_the_operator_which_fields_were_rejected():
+    """A bare `POST /api/tasks -> 422` in the conversation pane is what let a
+    broken body ship. The field names have to reach the screen."""
+    import httpx
+
+    from no_human.cli.api_client import NhClient
+
+    sse = "".join(f"data: {json.dumps(f)}\n\n" for f in RESULT)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/grill/stream":
+            return httpx.Response(200, text=sse)
+        if request.url.path == "/api/tasks" and request.method == "POST":
+            return httpx.Response(422, json={"detail": [
+                {"type": "string_type", "loc": ["body", "kind"],
+                 "msg": "Input should be a valid string"}]})
+        return httpx.Response(200, json=[])
+
+    client = NhClient(transport=httpx.MockTransport(handler))
+    app = make_app(client, repo_path="/repo")
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        await type_line(pilot, "add a retry button")
+        await type_line(pilot, "yes")
+        text = frame(app)
+        still_up = app.is_running
+    await client.aclose()
+    assert "kind" in text
+    assert "valid string" in text
+    assert still_up
 
 
 async def test_declining_the_refined_spec_creates_nothing():
@@ -448,6 +564,36 @@ async def test_slash_quit_exits_the_shell():
     assert not app.is_running
 
 
+async def test_ctrl_c_leaves_the_shell():
+    """Textual 8 does not quit on ctrl+c. `App` binds it to `help_quit`, whose
+    own docstring says it "no longer quits", and a focused `Input` binds it to
+    `copy` - and #prompt holds focus for the app's whole life. So the reflex
+    every terminal user has did nothing here. Only a PRIORITY binding is
+    checked ahead of the focused widget, which is why this is not a plain
+    tuple in BINDINGS.
+
+    Read INSIDE the context: `run_test`'s exit stops the app either way, so an
+    assertion after the block passes whether or not the key did anything."""
+    app = make_app(FakeClient([_t()]))
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        assert app.query_one("#prompt").has_focus, "the reflex fires while typing"
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        left = not app.is_running
+    assert left
+
+
+async def test_ctrl_q_still_leaves_the_shell():
+    app = make_app(FakeClient([_t()]))
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        await pilot.press("ctrl+q")
+        await pilot.pause()
+        left = not app.is_running
+    assert left
+
+
 # --------------------------------------------------------------------------- #
 # The server going away                                                        #
 # --------------------------------------------------------------------------- #
@@ -470,14 +616,75 @@ async def test_the_server_dropping_mid_session_says_how_to_start_it():
     assert still_up
 
 
-def test_run_shell_refuses_plainly_when_nothing_is_listening(capsys):
+def test_run_shell_refuses_plainly_when_nothing_is_listening(capsys, monkeypatch):
     """A real connect to a port nothing is bound to - no live server, no mock,
-    and no traceback."""
+    and no traceback.
+
+    The tty guard is forced open: pytest's captured stdio is not a terminal, so
+    without this the run would stop at the guard and never reach the probe this
+    test is about."""
+    monkeypatch.setattr(shell_mod, "stdio_is_interactive", lambda: True)
     code = run_shell(base_url="http://127.0.0.1:1")
     out = capsys.readouterr().out
     assert code == 1
     assert "nh start" in out
     assert "Traceback" not in out
+
+
+# --------------------------------------------------------------------------- #
+# No terminal, no full-screen app                                              #
+# --------------------------------------------------------------------------- #
+
+class _FakeStdio:
+    """Only the one method the guard asks about."""
+
+    def __init__(self, tty: bool) -> None:
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+@pytest.mark.parametrize("stdin_tty,stdout_tty", [(False, True), (True, False),
+                                                  (False, False)])
+def test_the_shell_will_not_take_a_terminal_it_does_not_have(
+        monkeypatch, stdin_tty, stdout_tty):
+    """`nh </dev/null` used to hang forever: the probe passed, Textual took a
+    screen nobody was watching, and the process never exited - 0 bytes on
+    stdout and a full-screen paint on stderr. In a CI job or an agent's shell
+    that is a wedge, and the SIGINT that eventually kills it exits 0, so the
+    wedge reads as success.
+
+    Port 1 is refused, so reaching the probe at all would return 1. Getting 2
+    proves the guard runs BEFORE any network call, not after a 15 s connect
+    timeout."""
+    monkeypatch.setattr(sys, "stdin", _FakeStdio(stdin_tty))
+    monkeypatch.setattr(sys, "stdout", _FakeStdio(stdout_tty))
+    said: list[str] = []
+    code = run_shell(base_url="http://127.0.0.1:1", _echo=said.append)
+    assert code == 2
+    out = "\n".join(said)
+    assert "terminal" in out.lower()
+    for verb in ("start", "approve", "watch", "status"):
+        assert verb in out, "the fallback is the help it used to print"
+
+
+def test_stdio_is_interactive_is_true_only_when_both_ends_are_a_terminal(monkeypatch):
+    monkeypatch.setattr(sys, "stdin", _FakeStdio(True))
+    monkeypatch.setattr(sys, "stdout", _FakeStdio(True))
+    assert shell_mod.stdio_is_interactive() is True
+
+
+def test_a_detached_stream_is_not_interactive(monkeypatch):
+    """A closed or replaced stream raises rather than answering. Guessing
+    `interactive` there is how the hang comes back."""
+    class _Closed:
+        def isatty(self):
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr(sys, "stdin", _Closed())
+    monkeypatch.setattr(sys, "stdout", _FakeStdio(True))
+    assert shell_mod.stdio_is_interactive() is False
 
 
 # --------------------------------------------------------------------------- #
@@ -527,6 +734,27 @@ def test_nh_shell_is_also_an_explicit_verb(monkeypatch):
     monkeypatch.setattr(shell_mod, "run_shell", lambda **kw: 0)
     result = CliRunner().invoke(cli, ["shell"])
     assert result.exit_code == 0
+
+
+def test_nh_repo_before_the_shell_verb_is_not_dropped(monkeypatch):
+    """`--repo` is declared at both levels so both orders read naturally. The
+    group-level one used to be parsed and then silently discarded the moment a
+    subcommand followed it, so `nh --repo /x shell` filed against the cwd."""
+    import no_human.cli.shell as shell_mod
+    seen = {}
+    monkeypatch.setattr(shell_mod, "run_shell",
+                        lambda **kw: (seen.update(kw), 0)[1])
+
+    assert CliRunner().invoke(cli, ["--repo", "/x", "shell"]).exit_code == 0
+    assert seen["repo_path"] == "/x"
+
+    seen.clear()
+    assert CliRunner().invoke(cli, ["shell", "--repo", "/y"]).exit_code == 0
+    assert seen["repo_path"] == "/y"
+
+    seen.clear()
+    assert CliRunner().invoke(cli, ["--repo", "/x", "shell", "--repo", "/y"]).exit_code == 0
+    assert seen["repo_path"] == "/y", "the nearer option wins"
 
 
 def test_a_subcommand_still_runs_instead_of_the_shell(monkeypatch):

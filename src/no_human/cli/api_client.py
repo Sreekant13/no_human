@@ -26,6 +26,12 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8420"
 # for the life of a run, so they read with no timeout at all.
 GRILL_READ_TIMEOUT = 140.0
 
+# A single SSE line the server would ever send is a JSON frame of a few KB.
+# The decoder holds the trailing partial line until its newline arrives, so a
+# stream that sends no newline at all would otherwise grow that buffer without
+# limit for the whole life of a long-running TUI.
+MAX_SSE_LINE = 1_000_000
+
 
 class NhServerUnreachable(Exception):
     """No server answered. Carries the message a human should see."""
@@ -65,6 +71,12 @@ class SSEDecoder:
         self._buffer += chunk
         lines = self._buffer.split("\n")
         self._buffer = lines.pop()
+        if len(self._buffer) > MAX_SSE_LINE:
+            # Nothing this protocol emits is this long without a newline, so
+            # the partial line is not a frame in progress. Drop it rather than
+            # hold it forever; the tail simply fails to parse and is skipped
+            # like any other malformed line.
+            self._buffer = ""
         frames: list[dict[str, Any]] = []
         for raw in lines:
             line = raw.rstrip("\r")
@@ -72,7 +84,10 @@ class SSEDecoder:
                 continue
             try:
                 data = json.loads(line[6:])
-            except ValueError:
+            except (ValueError, RecursionError):
+                # RecursionError is NOT a ValueError: json.loads raises it on
+                # deeply nested input, and catching only ValueError lets one
+                # hostile frame kill the whole stream.
                 continue
             if isinstance(data, dict):
                 frames.append(data)
@@ -99,6 +114,41 @@ def classify_grill_frame(frame: dict[str, Any]) -> str:
     if kind == "error":
         return "error"
     return "event"
+
+
+def _render_validation_errors(detail: Any) -> str:
+    """FastAPI's 422 ``detail`` is a LIST of ``{loc, msg, ...}``, never a str.
+
+    Rendering only the status code for it is how a client body the server
+    refuses reaches an operator undiagnosed: `POST /api/tasks -> 422` names no
+    field, so there is nothing to go and look at. Returns "" for any other
+    shape, so the caller falls back to the plain line.
+    """
+    if not isinstance(detail, list) or not detail:
+        return ""
+    lines = []
+    for item in detail:
+        if not isinstance(item, dict):
+            lines.append(f"  {item}")
+            continue
+        loc = item.get("loc")
+        parts = [str(p) for p in loc if p != "body"] if isinstance(loc, list) else []
+        field = ".".join(parts) or "(body)"
+        lines.append(f"  {field}: {item.get('msg') or 'was rejected'}")
+    return "\n".join(lines)
+
+
+def _without_nulls(**fields: Any) -> dict[str, Any]:
+    """Only the fields that have a value.
+
+    A key set to None is NOT the same as an absent key. The server declares
+    ``kind: str = "feature"`` and ``priority: str = "medium"`` — non-optional
+    with a default — and Pydantic refuses an explicit null for a non-optional
+    ``str``. Sending every optional key unconditionally therefore 422'd every
+    create the shell ever attempted. Omitting lets the server's own defaults
+    stand, which is what a client that has no opinion should do.
+    """
+    return {name: value for name, value in fields.items() if value is not None}
 
 
 # --------------------------------------------------------------------------- #
@@ -137,9 +187,16 @@ class NhClient:
             body = response.json()
         except ValueError:
             body = None
-        if isinstance(body, dict) and isinstance(body.get("detail"), str):
-            return body["detail"]
-        return f"{response.request.method} {response.request.url.path} -> {response.status_code}"
+        call = (f"{response.request.method} {response.request.url.path} "
+                f"-> {response.status_code}")
+        if isinstance(body, dict):
+            detail = body.get("detail")
+            if isinstance(detail, str):
+                return detail
+            fields = _render_validation_errors(detail)
+            if fields:
+                return f"{call}\n{fields}"
+        return call
 
     async def _request(self, method: str, path: str, **kw: Any) -> httpx.Response:
         try:
@@ -200,16 +257,18 @@ class NhClient:
     ) -> dict[str, Any]:
         body = {
             "title": title,
-            "description": description,
-            "repo_path": repo_path,
-            "project_id": project_id,
-            "kind": kind,
-            "priority": priority,
             "acceptance_criteria": list(acceptance_criteria or []),
             # The server's allowlist maps anything outside board/jira/mcp to
             # "board" — sending "cli" is honest about the surface and lands as
             # "board" server-side either way.
             "source": "cli",
+            **_without_nulls(
+                description=description,
+                repo_path=repo_path,
+                project_id=project_id,
+                kind=kind,
+                priority=priority,
+            ),
         }
         return await self._json("POST", "/api/tasks", json=body)
 
@@ -239,18 +298,35 @@ class NhClient:
         project_id: str | None = None,
         qa_history: Iterable[dict[str, str]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """POST /api/grill/stream — the SAME intake the web composer runs."""
+        """POST /api/grill/stream — the SAME intake the web composer runs.
+
+        `GrillStepRequest` does declare its optionals as ``| None``, so a null
+        here would be accepted — the omission is deliberate anyway: one rule
+        for every body this client builds is what stops the create-task bug
+        from growing a second instance.
+        """
         body = {
             "title": title,
-            "description": description,
-            "repo_path": repo_path,
-            "project_id": project_id,
             "qa_history": list(qa_history or []),
+            **_without_nulls(
+                description=description,
+                repo_path=repo_path,
+                project_id=project_id,
+            ),
         }
         return self._stream("POST", "/api/grill/stream", json=body,
                             timeout=httpx.Timeout(15.0, read=GRILL_READ_TIMEOUT))
 
-    def stream_events(self, task_id: str) -> AsyncIterator[dict[str, Any]]:
-        """GET /api/tasks/{id}/events/stream — the live tool-call tail."""
+    def stream_events(
+        self, task_id: str, *, last_event_id: str = "",
+    ) -> AsyncIterator[dict[str, Any]]:
+        """GET /api/tasks/{id}/events/stream — the live tool-call tail.
+
+        ``last_event_id`` is the resume cursor the server reads out of the
+        `last-event-id` header (the same one a browser's EventSource sends).
+        Reconnecting without it replays the whole 200-event deque.
+        """
+        headers = {"last-event-id": last_event_id} if last_event_id else None
         return self._stream("GET", f"/api/tasks/{task_id}/events/stream",
+                            headers=headers,
                             timeout=httpx.Timeout(15.0, read=None))

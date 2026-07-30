@@ -20,10 +20,12 @@ Two things this deliberately does NOT do:
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 from typing import Any
 
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Footer, Input, RichLog, Static
 
@@ -78,7 +80,15 @@ class ShellApp(App):
     # decoy.
     ENABLE_COMMAND_PALETTE = False
 
+    # ctrl+c is the reflex every terminal user has for "get me out", and in
+    # Textual 8 it does NOT quit: App binds it to `help_quit`, whose own
+    # docstring says so, and a focused Input binds it to `copy` — and #prompt
+    # holds focus for this app's whole life, so the reflex reached the copy
+    # binding and looked like nothing happened. Only a PRIORITY binding is
+    # checked ahead of the focused widget, hence Binding() rather than a tuple.
+    # show=False keeps the footer showing one way out, not two.
     BINDINGS = [
+        Binding("ctrl+c", "quit", "Quit", priority=True, show=False),
         ("ctrl+q", "quit", "Quit"),
         ("ctrl+n", "next_task", "Next task"),
         ("ctrl+p", "prev_task", "Prev task"),
@@ -91,11 +101,15 @@ class ShellApp(App):
         *,
         repo_path: str | None = None,
         poll_interval: float = 3.0,
+        follow_reconnect: float = 3.0,
     ) -> None:
         super().__init__()
         self.client = client
         self.repo_path = repo_path
         self.poll_interval = poll_interval
+        #: Seconds to wait before re-opening an event stream the server closed.
+        #: 0 disables reconnection (tests that assert on one pass of a fake).
+        self.follow_reconnect = follow_reconnect
         self.tasks: list[dict[str, Any]] = []
         self.selected_id: str | None = None
         self.intake: IntakeSession | None = None
@@ -180,14 +194,37 @@ class ShellApp(App):
             render_lanes(self.tasks, selected_id=self.selected_id))
 
     async def _follow(self, task_id: str) -> None:
-        """GET /api/tasks/{id}/events/stream, rendered like `nh watch`."""
-        try:
-            async for event in self.client.stream_events(task_id):
-                if event.get("kind") == "done":
-                    continue
-                self._detail(self._format_event(event))
-        except (NhServerUnreachable, NhApiError) as exc:
-            self._say_error(exc)
+        """GET /api/tasks/{id}/events/stream, rendered like `nh watch`.
+
+        The server ENDS this stream whenever the task is not in flight for five
+        ticks (app.py `task_events_stream`), which for anything parked, queued
+        or awaiting approval is about six seconds after you select it. Running
+        the stream once therefore left the detail pane permanently silent for
+        the tasks this surface exists to show you, and the only way back was to
+        select the task again.
+
+        So it reconnects, carrying the `last-event-id` cursor the server reads
+        so a reconnect resumes instead of replaying the deque. The worker is
+        `exclusive=True` in its group: selecting another task cancels this
+        loop, and app exit cancels it too.
+        """
+        cursor = ""
+        while True:
+            try:
+                async for event in self.client.stream_events(
+                        task_id, last_event_id=cursor):
+                    ts = event.get("ts")
+                    if ts is not None:
+                        cursor = str(ts)
+                    if event.get("kind") == "done":
+                        continue
+                    self._detail(self._format_event(event))
+            except (NhServerUnreachable, NhApiError) as exc:
+                self._say_error(exc)
+                return
+            if not self.follow_reconnect:
+                return
+            await asyncio.sleep(self.follow_reconnect)
 
     @staticmethod
     def _format_event(event: dict[str, Any]) -> str:
@@ -389,6 +426,44 @@ def _repo_from_cwd() -> str | None:
     return None
 
 
+def stdio_is_interactive() -> bool:
+    """Is there a human at a terminal on BOTH ends?
+
+    Textual takes the screen and does not give it back until a key says so, so
+    without a terminal there is no key and no exit: `nh </dev/null` ran
+    forever, wrote nothing to stdout, and painted a full screen of escapes to
+    stderr. That wedges a CI job, a wrapper script, and — since no_human's own
+    coder agents run shell commands — an agent's run. Worse, the SIGINT that
+    eventually kills it exits 0, so the wedge reads as success.
+
+    A stream that has been closed or replaced raises instead of answering;
+    guessing "interactive" there is how the hang comes back.
+    """
+    for stream in (sys.stdin, sys.stdout):
+        try:
+            if not stream.isatty():
+                return False
+        except (AttributeError, ValueError, OSError):
+            return False
+    return True
+
+
+def non_interactive_message() -> str:
+    """What a non-tty caller gets instead of a full-screen app: one line of
+    reason, then the verb list bare `nh` used to print."""
+    head = ("nh's conversational shell needs an interactive terminal, and "
+            "stdin/stdout here are not one.\n"
+            "Run `nh` from a terminal for the shell, or use a verb:\n")
+    try:
+        import click
+
+        from .commands import cli
+
+        return head + "\n" + cli.get_help(click.Context(cli, info_name="nh"))
+    except Exception:  # noqa: BLE001 — the reason must survive a help failure
+        return head
+
+
 def base_url_from_config(config: Any = None) -> str:
     if config is None:
         return DEFAULT_BASE_URL
@@ -413,9 +488,17 @@ def run_shell(
     The reachability probe happens BEFORE Textual takes the terminal: a
     full-screen app that then paints "cannot connect" is a worse way to learn
     the server is down than one plain line on stdout.
+
+    The tty guard happens before even that. A caller with no terminal must not
+    pay a connect timeout — up to 15s against a blackholed host — to be told
+    something that was knowable with no network at all.
     """
     echo = _echo or print
     url = base_url or base_url_from_config(config)
+
+    if not stdio_is_interactive():
+        echo(non_interactive_message())
+        return 2
 
     async def _probe() -> bool:
         async with NhClient(url) as client:
@@ -434,4 +517,10 @@ def run_shell(
     return 0
 
 
-__all__ = ["ShellApp", "run_shell", "base_url_from_config"]
+__all__ = [
+    "ShellApp",
+    "base_url_from_config",
+    "non_interactive_message",
+    "run_shell",
+    "stdio_is_interactive",
+]

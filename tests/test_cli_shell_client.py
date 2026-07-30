@@ -14,6 +14,7 @@ import pytest
 
 from no_human.cli.api_client import (
     DEFAULT_BASE_URL,
+    MAX_SSE_LINE,
     NhApiError,
     NhClient,
     NhServerUnreachable,
@@ -276,3 +277,177 @@ async def test_stream_events_yields_task_events():
         async for f in c.stream_events("abc"):
             got.append(f)
     assert [f["kind"] for f in got] == ["tool_use", "done"]
+
+
+async def test_stream_events_resumes_from_the_cursor_it_is_given():
+    """The server reads `last-event-id` and replays only what came after it
+    (app.py `task_events_stream`). Reconnecting without it re-sends the whole
+    deque, and the detail pane would print every event twice."""
+    seen = {}
+
+    def handler(request):
+        seen["last_event_id"] = request.headers.get("last-event-id")
+        return httpx.Response(200, text='data: {"kind": "done"}\n\n')
+
+    async with _client(handler) as c:
+        async for _ in c.stream_events("abc", last_event_id="1712.5"):
+            pass
+    assert seen["last_event_id"] == "1712.5"
+
+
+# --------------------------------------------------------------------------- #
+# The bodies the client sends, checked against the SERVER'S OWN models         #
+#                                                                              #
+# Every test above answers through a MockTransport that returns 2xx for any    #
+# input, so none of them can catch a body the real server refuses — and one    #
+# shipped exactly that way: `create_task` put `kind: None, priority: None` in  #
+# the body unconditionally, the server declares them `str` with defaults, and  #
+# Pydantic rejects an explicit null for a non-optional str. Every create was a #
+# 422 and the shell's headline feature could not file a single task.           #
+#                                                                              #
+# So these validate the bytes the client actually puts on the wire against the #
+# request model `no_human.api.app` binds for that route. A permissive mock     #
+# proves nothing; the server's own model is the contract.                      #
+# --------------------------------------------------------------------------- #
+
+async def _body_of(call) -> dict:
+    """Run one client call against a mock that accepts anything, and hand back
+    the JSON body it sent."""
+    seen: dict = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "x"}, headers={"content-type": "application/json"})
+
+    async with _client(handler) as c:
+        out = call(c)
+        if hasattr(out, "__aiter__"):
+            async for _ in out:
+                pass
+        else:
+            await out
+    return seen["body"]
+
+
+#: (name, the call, the model the route declares). Every POST the shell makes
+#: that builds a body is here — the two verb POSTs (`act`) send no body at all.
+BODY_CONTRACTS = [
+    ("create_task as the shell calls it",
+     lambda c: c.create_task(title="Refined", description="desc", repo_path="/repo",
+                             acceptance_criteria=["ac1", "ac2"]),
+     "CreateTaskRequest"),
+    ("create_task with nothing but a title",
+     lambda c: c.create_task(title="Just a title"),
+     "CreateTaskRequest"),
+    ("create_task with every optional field set",
+     lambda c: c.create_task(title="T", description="d", repo_path="/repo",
+                             project_id="p1", kind="bugfix", priority="high",
+                             acceptance_criteria=["ac"]),
+     "CreateTaskRequest"),
+    ("reply",
+     lambda c: c.reply("abc123", "use the second option"),
+     "ReplyRequest"),
+    ("grill_stream as the shell calls it",
+     lambda c: c.grill_stream(title="t", description="d", repo_path="/repo",
+                              qa_history=[{"question": "q", "answer": "a"}]),
+     "GrillStepRequest"),
+    ("grill_stream with nothing but a title",
+     lambda c: c.grill_stream(title="t"),
+     "GrillStepRequest"),
+]
+
+
+@pytest.mark.parametrize("name,call,model_name", BODY_CONTRACTS,
+                         ids=[c[0] for c in BODY_CONTRACTS])
+async def test_the_body_the_client_sends_validates_against_the_server_model(
+        name, call, model_name):
+    from no_human.api import models as api_models
+
+    model = getattr(api_models, model_name)
+    body = await _body_of(call)
+    model(**body)  # raises ValidationError if the server would have said 422
+
+
+async def test_create_task_omits_the_fields_it_was_not_given_rather_than_nulling_them():
+    """`kind` and `priority` are `str` with server-side defaults. An absent key
+    takes the default; an explicit null is a type error. This is the exact bug,
+    named: the body must not carry a key it has no value for."""
+    body = await _body_of(lambda c: c.create_task(title="T", description="d"))
+    assert [k for k, v in body.items() if v is None] == []
+    assert "kind" not in body
+    assert "priority" not in body
+    assert "project_id" not in body
+
+
+async def test_create_task_still_sends_a_kind_and_priority_when_it_has_them():
+    body = await _body_of(
+        lambda c: c.create_task(title="T", kind="bugfix", priority="high"))
+    assert body["kind"] == "bugfix"
+    assert body["priority"] == "high"
+
+
+async def test_the_server_defaults_survive_the_omission():
+    """Omitting is only correct if the server fills the same values in. Read
+    them off the model rather than restating them here."""
+    from no_human.api.models import CreateTaskRequest
+
+    body = await _body_of(lambda c: c.create_task(title="T"))
+    parsed = CreateTaskRequest(**body)
+    assert parsed.kind == "feature"
+    assert parsed.priority == "medium"
+    assert parsed.title == "T"
+
+
+async def test_a_422_names_the_fields_the_server_rejected():
+    """FastAPI's 422 `detail` is a LIST of {loc, msg}, not a str, so the old
+    fallback printed `POST /api/tasks -> 422` and nothing else — which is
+    precisely how a broken client body reached an operator undiagnosed."""
+    def handler(request):
+        return httpx.Response(422, json={"detail": [
+            {"type": "string_type", "loc": ["body", "kind"],
+             "msg": "Input should be a valid string"},
+            {"type": "string_type", "loc": ["body", "priority"],
+             "msg": "Input should be a valid string"},
+        ]})
+
+    async with _client(handler) as c:
+        with pytest.raises(NhApiError) as ei:
+            await c.create_task(title="t")
+    msg = str(ei.value)
+    assert "kind" in msg
+    assert "priority" in msg
+    assert "Input should be a valid string" in msg
+    assert "422" in msg
+
+
+async def test_a_422_whose_detail_is_neither_string_nor_list_still_reports_the_call():
+    def handler(request):
+        return httpx.Response(422, json={"detail": {"unexpected": "shape"}})
+
+    async with _client(handler) as c:
+        with pytest.raises(NhApiError) as ei:
+            await c.create_task(title="t")
+    assert "/api/tasks" in str(ei.value)
+    assert "422" in str(ei.value)
+
+
+# --------------------------------------------------------------------------- #
+# Hostile streams                                                              #
+# --------------------------------------------------------------------------- #
+
+def test_the_decoder_does_not_retain_an_unbounded_line():
+    """A stream that never sends a newline must not turn into a memory leak in
+    a long-lived TUI: the buffer is capped, not grown forever."""
+    dec = SSEDecoder()
+    for _ in range(200):
+        dec.feed("x" * 100_000)
+    assert len(dec._buffer) <= MAX_SSE_LINE + 100_000
+
+
+def test_the_decoder_survives_json_nested_past_the_recursion_limit():
+    """`json.loads` raises RecursionError — NOT a ValueError — on deep nesting,
+    so catching only ValueError lets a hostile frame kill the stream."""
+    dec = SSEDecoder()
+    frames = dec.feed("data: " + "[" * 200_000 + "\n"
+                      'data: {"kind": "done"}\n')
+    assert frames == [{"kind": "done"}]
