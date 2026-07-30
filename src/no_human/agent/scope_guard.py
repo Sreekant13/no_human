@@ -61,8 +61,9 @@ def is_agent_owned(path: str | Path, repo_root: str | Path = "") -> bool:
 
     Pass *repo_root* whenever it is known.  Without it the check runs against the
     absolute path, and a checkout that lives *inside* an agent-owned directory —
-    a concurrency worktree under ``~/.no_human/worktrees/`` is exactly that —
-    reads as wholly agent-owned, switching both guards off.
+    a per-task worktree under ``~/.no_human/worktrees/`` is exactly that, and
+    since ``isolation.enabled`` defaults on it is the normal case, not an
+    opt-in one — reads as wholly agent-owned, switching both guards off.
     """
     rel = _relative(path, repo_root)
     if any(part in AGENT_OWNED_DIRS for part in rel.parts):

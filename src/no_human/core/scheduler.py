@@ -4,7 +4,9 @@ A single-event-loop pool that drains the SQLite queue into at most
 ``max_workers`` concurrent ``run_task`` coroutines. Concurrency is real because
 the two long phases yield: the Agent SDK session is async, and the orchestrator
 offloads the blocking test subprocess to a thread. Each task runs in its own git
-worktree (see ``Orchestrator`` worktree mode), so same-repo tasks don't collide.
+worktree (``isolation.enabled``, on by default), so same-repo tasks don't
+collide. Isolation and parallelism are separate switches: isolation is the
+default for a single task, and a hard requirement for a pool of more than one.
 
 Two coordination rules:
   - **No double-dispatch.** A task id is reserved in ``_inflight`` synchronously
@@ -24,6 +26,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
+from ..config import parallelism_enabled, worktree_isolation_enabled
 from .db import Store
 from .events import EventPersister
 from .task import TaskStatus
@@ -43,62 +46,91 @@ def resolve_max_workers(
 ) -> tuple[int, str | None]:
     """Effective pool size, plus a warning when a request for >1 is refused.
 
-    Worktree isolation is gated on ``concurrency.enabled``
-    (``Orchestrator._concurrency_enabled``), but the pool used to be sized from
-    ``concurrency.max_workers`` alone. With ``enabled: false, max_workers: 2``
-    the server announced "2 worker(s) · concurrent" and two tasks could run in
-    the SAME checkout with no isolation, stomping each other's branch and index.
+    Two independent switches (see ``config.worktree_isolation_enabled`` /
+    ``config.parallelism_enabled``):
 
-    The pool must never be wider than the isolation allows. The CLI and the
-    server lifespan both resolve it here; they used to compute it separately,
-    which is how the announcement and the real pool were free to disagree.
+    - ``isolation.enabled`` — each task gets its own worktree. On by default,
+      so the width below is normally allowed.
+    - ``concurrency.enabled`` — more than one task at a time. Off by default.
+
+    The pool must never be wider than the isolation allows. With ``enabled:
+    false, max_workers: 2`` the server once announced "2 worker(s) · concurrent"
+    while two tasks ran in the SAME checkout, stomping each other's branch and
+    index. The CLI and the server lifespan both resolve the width here; they
+    used to compute it separately, which is how the announcement and the real
+    pool were free to disagree.
     """
     conc = config.get("concurrency", {}) or {}
-    enabled = bool(conc.get("enabled", False))
     requested = max(1, int(override or conc.get("max_workers", 1) or 1))
-    if not enabled and requested > 1:
-        return 1, (
-            f"concurrency.enabled is false — running 1 worker, not {requested}. "
-            "Parallel tasks would share one checkout with no worktree isolation. "
-            "Set concurrency.enabled: true to run them in parallel."
-        )
+    if requested > 1:
+        if not worktree_isolation_enabled(config):
+            return 1, (
+                f"isolation.enabled is false - running 1 worker, not {requested}. "
+                "Parallel tasks would share one checkout, stomping each other's "
+                "branch and index. Re-enable isolation.enabled to run them in "
+                "parallel."
+            )
+        if not parallelism_enabled(config):
+            return 1, (
+                f"concurrency.enabled is false - running 1 worker, not {requested}. "
+                "Set concurrency.enabled: true to run them in parallel."
+            )
     return requested, None
 
 
 def resolve_serve_pool(
     config: dict, *, cli_workers: int | None,
 ) -> tuple[int, bool, str | None]:
-    """``nh serve``'s decision: an explicit ``--max-workers`` implies
-    enablement + worktree isolation for THIS invocation only (the config
-    default on disk stays whatever it was). Returns ``(workers, enabled,
-    error)``; ``error is not None`` means: don't serve, print it and exit.
+    """``nh serve``'s decision: an explicit ``--max-workers`` enables the pool
+    for THIS invocation only (the config default on disk stays whatever it was).
+    Returns ``(workers, enabled, error)``; ``error is not None`` means: don't
+    serve, print it and exit.
 
     - ``cli_workers`` given and < 1  -> ``(0, False, "<validation message>")``.
-    - ``cli_workers`` given and >= 1 -> the flag buys isolation: ``(cli_workers,
-      True, None)`` even if ``concurrency.enabled`` is false in config.
-    - ``cli_workers`` is None        -> today's behavior, unchanged: refuse
-      when ``concurrency.enabled`` is false; otherwise use
-      ``concurrency.max_workers`` (default 2, matching serve()'s historical
-      default — NOT ``resolve_max_workers``'s default of 1, which is for
-      the override-clamp case, not "no flag given at all").
+    - ``cli_workers`` given and >= 1 -> the flag buys parallelism:
+      ``(cli_workers, True, None)`` even if ``concurrency.enabled`` is false in
+      config. It does NOT buy isolation — that is a separate switch, and a flag
+      must not override an operator who explicitly turned isolation off.
+    - ``cli_workers`` is None        -> refuse when ``concurrency.enabled`` is
+      false; otherwise use ``concurrency.max_workers`` (default 2, matching
+      serve()'s historical default — NOT ``resolve_max_workers``'s default of 1,
+      which is for the override-clamp case, not "no flag given at all").
+
+    Isolation is a DEFAULT for one task and a REQUIREMENT for many: any pool
+    wider than one worker is refused outright when ``isolation.enabled`` is
+    false, rather than quietly downgraded, because N workers in one checkout
+    is the exact collision the isolation exists to prevent.
     """
     conc = config.get("concurrency", {}) or {}
-    enabled = bool(conc.get("enabled", False))
+    isolated = worktree_isolation_enabled(config)
+
+    def _no_isolation(width: int) -> str:
+        return (
+            f"isolation.enabled is false - refusing to serve {width} workers. "
+            "They would share one checkout and stomp each other's branch and "
+            "index. Set isolation.enabled: true in ~/.no_human/config.yaml, or "
+            "serve a single worker."
+        )
 
     if cli_workers is not None:
         if cli_workers < 1:
             return 0, False, (
                 f"--max-workers must be a positive integer, got {cli_workers}."
             )
+        if cli_workers > 1 and not isolated:
+            return 0, False, _no_isolation(cli_workers)
         return cli_workers, True, None
 
-    if not enabled:
+    if not parallelism_enabled(config):
         return 0, False, (
-            "concurrency.enabled is false — set it in ~/.no_human/config.yaml "
+            "concurrency.enabled is false - set it in ~/.no_human/config.yaml "
             "to run the pool, or pass --max-workers N to enable it for this "
-            "run. Refusing to serve without worktree isolation."
+            "run. Refusing to serve a pool that was not asked for."
         )
-    return int(conc.get("max_workers", 2) or 2), True, None
+    workers = int(conc.get("max_workers", 2) or 2)
+    if workers > 1 and not isolated:
+        return 0, False, _no_isolation(workers)
+    return workers, True, None
 
 
 def bounded_xdist_workers(

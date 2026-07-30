@@ -187,18 +187,29 @@ async def test_pause_stops_the_session_and_checkpoints_the_work(
     assert outcome.pr_url is None
     assert "user paused" in outcome.detail
 
-    # the work survived, as a [WIP-BLOCKED] commit
-    head_msg = subprocess.run(
-        ["git", "log", "-1", "--pretty=%s"], cwd=bare_repo,
-        capture_output=True, text=True, check=True,
-    ).stdout
-    assert "[WIP-BLOCKED]" in head_msg
-    assert "def mul" in (bare_repo / "calc.py").read_text()
-
     # the task is parked, not failed, and the flag was consumed
     reloaded = await store.find_task(task.id)
     assert reloaded.status is TaskStatus.BLOCKED
     assert reloaded.blocker["category"] == "USER_PAUSED"
+
+    # The work survived, as a [WIP-BLOCKED] commit on the task's branch. Read
+    # the BRANCH, not the checkout: the run happens in its own worktree
+    # (isolation.enabled), so the operator's checkout is deliberately still on
+    # main at the commit they left it on. The branch is the surviving artifact.
+    resume_branch = reloaded.blocker["resume_branch"]
+    assert resume_branch, "nothing recorded to resume from"
+    head_msg = subprocess.run(
+        ["git", "log", "-1", "--pretty=%s", resume_branch], cwd=bare_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "[WIP-BLOCKED]" in head_msg
+    committed = subprocess.run(
+        ["git", "show", f"{resume_branch}:calc.py"], cwd=bare_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "def mul" in committed
+    # ...and the operator's own working tree was never written to.
+    assert "def mul" not in (bare_repo / "calc.py").read_text()
     assert await store.get_cancel_request(task.id) is None
     assert [e for e in events if e["kind"] == "cancelled"]
 

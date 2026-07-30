@@ -589,8 +589,8 @@ async def test_flushed_events_are_not_duplicated_by_the_final_flush(store):
 
 def test_pool_is_clamped_to_one_when_concurrency_is_disabled():
     """The live config was exactly this, and the server announced
-    '2 worker(s) · concurrent' while Orchestrator._concurrency_enabled() was
-    False — so two tasks would share one checkout with no worktree."""
+    '2 worker(s) · concurrent' while parallelism was off — so two tasks would
+    be dispatched into a pool the operator never asked for."""
     from no_human.core.scheduler import resolve_max_workers
 
     workers, warning = resolve_max_workers(

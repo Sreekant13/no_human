@@ -2150,7 +2150,11 @@ async def test_plan_file_is_scoped_to_no_human_dir_and_cleaned_up(
 async def test_stale_plan_file_is_removed_when_this_run_has_no_plan(
     bare_repo, tmp_path, store,
 ):
-    """A plan left behind by a crashed run is never inherited by the next one."""
+    """A plan left behind by a crashed run is never inherited by the next one.
+
+    Scoped to `isolation.enabled: false`, because that is the only mode that
+    writes the plan into the operator's checkout and so the only mode with
+    anything to clean up. The default mode is covered by the test below."""
     stale = bare_repo / ".no_human" / "PLAN.md"
     stale.parent.mkdir(parents=True, exist_ok=True)
     stale.write_text("# a previous run's plan — must not leak into this one\n")
@@ -2160,6 +2164,7 @@ async def test_stale_plan_file_is_removed_when_this_run_has_no_plan(
         (cwd / "calc.py").write_text("def add(a, b):\n    return a + b\n")
 
     cfg = _config(tmp_path)  # planning disabled → no plan for this task
+    cfg.data["isolation"]["enabled"] = False
     orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None))
     t = Task.new("tweak add()", repo_path=str(bare_repo))
     await store.create_task(t)
@@ -2167,6 +2172,37 @@ async def test_stale_plan_file_is_removed_when_this_run_has_no_plan(
     await orch.run_task(t)
 
     assert not stale.exists()
+
+
+@pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
+async def test_a_stale_plan_in_the_checkout_is_invisible_to_an_isolated_run(
+    bare_repo, tmp_path, store,
+):
+    """Same guarantee, default config: the run happens in its own worktree,
+    which is built from a commit — so a `.no_human/PLAN.md` sitting untracked
+    in the operator's checkout cannot reach the agent at all, and the run does
+    not reach into that checkout to delete it either."""
+    stale = bare_repo / ".no_human" / "PLAN.md"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("# a previous run's plan — must not leak into this one\n")
+
+    seen: dict[str, bool] = {}
+
+    def mutate(cwd):
+        seen["plan_visible"] = (cwd / ".no_human" / "PLAN.md").exists()
+        seen["isolated"] = cwd != bare_repo
+        (cwd / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+
+    cfg = _config(tmp_path)  # planning disabled → no plan for this task
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None))
+    t = Task.new("tweak add()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    assert seen.get("isolated"), "the run used the operator's checkout"
+    assert seen.get("plan_visible") is False, "stale plan visible to agent"
+    assert stale.read_text().startswith("# a previous run's plan")
 
 
 # --------------------------------------------------------------------------- #
@@ -3033,7 +3069,11 @@ async def test_layered_test_plan_source_repo_none_when_not_a_worktree(
     bare_repo, tmp_path, store,
 ):
     """When the task's repo is not a worktree (_primary_repo_path -> None),
-    source_repo passed to run_test_plan is None — no phantom symlink target."""
+    source_repo passed to run_test_plan is None — no phantom symlink target.
+
+    Worktree isolation is on by default, so this mode has to be asked for
+    explicitly (`isolation.enabled: false`) — that is the whole point of the
+    path under test."""
     from no_human.testing.test_layers import Gating, TestLayer, TestPlan
     from no_human.testing.plan_runner import LayerResult, PlanResult
     from no_human.testing.runner import TestRunResult
@@ -3060,6 +3100,7 @@ async def test_layered_test_plan_source_repo_none_when_not_a_worktree(
             "def test_mul():\n    assert mul(2, 3) == 6\n")
 
     cfg = _config(tmp_path)
+    cfg.data["isolation"]["enabled"] = False   # the not-a-worktree mode
     orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None))
     t = Task.new("add mul()", repo_path=str(bare_repo))
     await store.create_task(t)
@@ -3261,10 +3302,15 @@ async def test_subagents_materialized_before_agent_run(bare_repo, tmp_path, stor
     class CheckingBackend:
         async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
                       on_event=None, supervisor_hook=None, **kwargs):
-            # Check that subagent files exist DURING the agent run.
+            # Check that subagent files exist DURING the agent run, in the tree
+            # the agent was actually handed — by default an isolated worktree,
+            # not the operator's checkout.
             agents_dir = cwd / ".claude" / "agents"
             agents_dir_existed["exists"] = agents_dir.exists()
             agents_dir_existed["researcher"] = (agents_dir / "no_human_researcher.md").exists()
+            agents_dir_existed["md"] = (
+                (agents_dir / "no_human_researcher.md").read_text()
+                if agents_dir_existed["researcher"] else "")
             # Produce file changes so the task completes.
             (cwd / "calc.py").write_text(
                 "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
@@ -3287,9 +3333,11 @@ async def test_subagents_materialized_before_agent_run(bare_repo, tmp_path, stor
     assert agents_dir_existed.get("researcher"), "no_human_researcher.md not materialized"
 
     # Verify the file content is valid YAML frontmatter + instructions.
-    researcher_md = (bare_repo / ".claude" / "agents" / "no_human_researcher.md").read_text()
+    researcher_md = agents_dir_existed["md"]
     assert "name: no_human_researcher" in researcher_md
     assert "NEVER edit files" in researcher_md
+    # The operator's checkout is not where agent tooling gets dropped.
+    assert not (bare_repo / ".claude" / "agents").exists()
 
 
 # --------------------------------------------------------------------------- #

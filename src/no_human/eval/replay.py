@@ -18,6 +18,7 @@ in tests without spending quota.
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
@@ -34,6 +35,8 @@ from ..notify.slack import SlackNotifier
 from .golden import GoldenTask
 
 BackendFactory = Callable[[GoldenTask], Any]
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -180,6 +183,9 @@ class ReplayRunner:
             return score
 
         # Normal golden task: mergeable + tamper-free + intent match.
+        # Both read the sandbox checkout, so it has to be showing the agent's
+        # work first — see _checkout_agent_result.
+        self._checkout_agent_result(outcome, work)
         score.mergeable = self._mergeable(golden, outcome, work)
         score.intent_match = await self._intent_match(golden, work, base_sha)
         intent_ok = score.intent_match in (True, None)
@@ -198,6 +204,47 @@ class ReplayRunner:
             if isinstance(tr, str) and '"tamper_flag": true' in tr.lower():
                 return False
         return True
+
+    @staticmethod
+    def _agent_ref(outcome, work: Path) -> str:
+        """The ref carrying the agent's commits, or ``HEAD``.
+
+        A run works in its own git worktree (``isolation.enabled``) and that
+        worktree is removed before ``run_task`` returns, so the sandbox
+        checkout's HEAD is still pinned at base — the deliverable exists only
+        on the branch, in the shared object store. ``ctx["pr_branch"]`` is
+        where the orchestrator records it; the ``origin/`` fallback covers a
+        branch that was pushed but not left behind locally.
+        """
+        ctx = getattr(getattr(outcome, "task", None), "context", None) or {}
+        branch = ctx.get("pr_branch")
+        if branch:
+            for cand in (branch, f"origin/{branch}"):
+                if subprocess.run(["git", "rev-parse", "--verify", cand],
+                                  cwd=work, capture_output=True).returncode == 0:
+                    return cand
+            # Recorded but unresolvable: say so rather than quietly scoring the
+            # base tree, which reads as "the agent changed nothing".
+            log.warning(
+                "eval: pr_branch %r not resolvable in %s — scoring HEAD, which "
+                "may under-score the deliverable", branch, work)
+        return "HEAD"
+
+    def _checkout_agent_result(self, outcome, work: Path) -> None:
+        """Point the sandbox checkout at the agent's branch before scoring.
+
+        Forced: the deliverable is COMMITTED on the branch, so uncommitted
+        sandbox cruft is not part of it and must not be allowed to block the
+        checkout into a silent base-tree score.
+        """
+        ref = self._agent_ref(outcome, work)
+        if ref == "HEAD":
+            return
+        r = subprocess.run(["git", "checkout", "-q", "-f", "--detach", ref],
+                           cwd=work, capture_output=True)
+        if r.returncode != 0:
+            log.warning("eval: could not check out %s in %s — scoring a stale "
+                        "tree: %s", ref, work, r.stderr.decode()[:200])
 
     def _mergeable(self, golden: GoldenTask, outcome, work: Path) -> bool:
         # Must have reached a reviewable PR.
