@@ -19,8 +19,10 @@ Advisory only: any failure — no config, missing binary, timeout, bad output �
 returns an empty result. This must never block or slow the review gate.
 
 Whose ruff runs: the `ruff` binary resolved from no_human's OWN PATH/
-environment — deliberately never the target repo's venv (we never execute
-code sourced from the repo under review). If that ruff's version disagrees
+environment — deliberately never the target repo's venv. The goal is that
+nothing this module runs is chosen by the repo under review; that is enforced
+vector by vector, not by assertion — see `changed_line_numbers` for the git
+flags that pin it and for what remains unproven. If that ruff's version disagrees
 with the target repo's pinned ruff (e.g. an unsupported `--output-format` or
 a rejected config option), ruff exits 2 and `collect_lint_evidence` treats it
 as untrusted output -> empty result, by design.
@@ -156,13 +158,29 @@ def changed_line_numbers(
     """{repo-relative path: line numbers the diff added or modified, in the
     AFTER state}. Returns {} on ANY failure — advisory, never raises.
 
-    `--no-ext-diff` matters: a repo-configured external diff driver is code
-    sourced from the repo under review, and this module never runs that.
+    Every flag below neutralises something the repo under review controls. The
+    repo owns `.gitattributes` (a tracked file that can arrive in the very diff
+    being reviewed) and `.git/config` (writable by the coder agent), so git's
+    own defaults are attacker-influenced here:
+
+    * `--no-ext-diff` — ignore a `diff.<driver>.command` external diff program.
+    * `--no-textconv` — ignore a `diff.<driver>.textconv` filter. This is NOT
+      covered by `--no-ext-diff`; verified by observation — with only
+      `--no-ext-diff`, a textconv of `sh -c 'touch PWNED; cat'` selected via
+      `*.py diff=evil` in `.gitattributes` still executed.
+    * `--src-prefix=a/ --dst-prefix=b/` — pin the header prefixes this parser
+      strips. `diff.dstPrefix=dst/` would otherwise make every key `dst/…`, no
+      key would match a ruff finding, and ALL evidence would vanish silently.
+
+    This does not amount to a proof that git executes nothing: it pins the two
+    execution vectors that are known and reachable here. (`core.fsmonitor` was
+    also tested and does not fire for a commit-to-commit diff.)
     """
     try:
         proc = subprocess.run(
-            ["git", "--no-pager", "diff", "--no-ext-diff", "--no-color",
-             "--unified=0", "-M", f"{before_ref}..{after_ref}"],
+            ["git", "--no-pager", "diff", "--no-ext-diff", "--no-textconv",
+             "--no-color", "--unified=0", "-M",
+             "--src-prefix=a/", "--dst-prefix=b/", f"{before_ref}..{after_ref}"],
             cwd=repo_path, capture_output=True, text=True,
             errors="replace", timeout=timeout,
         )
@@ -226,11 +244,22 @@ def _filter_to_changed_lines(
 ) -> list[LintFinding]:
     """Drop findings on lines the diff did not touch.
 
-    Fail-open contract: an EMPTY map means we learned nothing about which lines
-    changed, so every finding is kept (today's whole-file behaviour). A map that
-    is present but has no entry for a path means that path genuinely gained no
-    after-state lines (deletion-only, mode change, pure rename) — its findings
-    are pre-existing and are dropped.
+    Three distinct cases, all verified by observation:
+
+    * The map is EMPTY — we learned nothing about which lines changed (no git,
+      a bad ref, a timeout). Fail OPEN: every finding is kept, which is the
+      whole-file behaviour this scoping replaced.
+    * The map has an entry for the path whose set is EMPTY — the file appeared
+      in the diff with a header but gained no after-state lines, i.e. lines
+      were deleted from a file that still exists. Its remaining violations are
+      pre-existing, so they are dropped.
+    * The map is non-empty but has NO entry for the path — a pure rename or a
+      mode-only change emits no `+++` header at all, so no key is created.
+      These are dropped too, by the `.get(path, ())` default.
+
+    Note the asymmetry: "no entry" only fails open when it makes the WHOLE map
+    empty, i.e. when the diff contains nothing but such changes. In a mixed
+    diff another file supplies the entries, and a rename-only path is dropped.
     """
     if not changed_lines:
         return findings

@@ -504,19 +504,39 @@ def test_collect_lint_evidence_end_to_end_with_real_ruff(tmp_path):
 
 
 def test_changed_line_numbers_ignores_content_masquerading_as_a_header(tmp_path):
-    """An ADDED line whose content starts with `++ ` renders as `+++ ...` at
-    column 0. Treated as a file header it would redirect the line map to a path
-    the diff never touched — i.e. the diff's own content steering the evidence.
+    """An ADDED line whose content is literally `++ b/victim.py` is rendered by
+    git as `+++ b/victim.py` at column 0 — indistinguishable from a file header
+    unless the parser tracks the header region.
+
+    The payload must be the bare text: a commented `# ++ b/victim.py` renders as
+    `+# ++ ...`, never matches, and makes this test vacuous.
+
+    Read as a header it retargets `current`, so the NEXT hunk's lines are
+    credited to victim.py: calc.py silently loses coverage (its real violations
+    stop being reported) and victim.py gains lines the diff never touched.
     """
     repo = _git_repo_with_diff(tmp_path)
     (repo / "victim.py").write_text("safe = 1\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "victim")
-    (repo / "calc.py").write_text(_CALC_V2 + "# ++ b/victim.py\n# @@ -1 +900,3 @@\n")
+    # Payload on line 1, a genuine change at the end -> two hunks, so a
+    # retargeted `current` visibly steals the second one.
+    (repo / "calc.py").write_text("++ b/victim.py\n" + _CALC_V2 + "z = 1\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "sneaky content")
+
+    raw = subprocess.run(
+        ["git", "--no-pager", "diff", "--no-color", "--unified=0",
+         "HEAD~1..HEAD", "--", "calc.py"],
+        cwd=repo, env=_GIT_ENV, capture_output=True, text=True, check=True,
+    ).stdout
+    # Guard the guard: if git ever stops rendering this at column 0 the attack
+    # is gone and this test would silently stop testing anything.
+    assert "\n+++ b/victim.py\n" in raw, raw
+
     got = changed_line_numbers(repo, "HEAD~1", "HEAD")
-    assert got == {"calc.py": {7, 8}}, got
+    assert got == {"calc.py": {1, 8}}, got
+    assert "victim.py" not in got
 
 
 def test_parse_changed_lines_handles_hand_written_hunk_forms():
@@ -533,3 +553,81 @@ def test_parse_changed_lines_handles_hand_written_hunk_forms():
         "@@ -1,2 +0,0 @@\n-a\n-b\n"
     )
     assert parse_changed_lines(diff) == {"a.py": {3, 11, 12, 13}}
+
+
+def test_changed_line_numbers_never_runs_repo_configured_diff_programs(tmp_path):
+    """`.gitattributes` is a TRACKED file that can arrive in the diff under
+    review, and `.git/config` is writable by the coder agent — so both diff
+    driver hooks are attacker-controlled here.
+
+    Observes the side effect (did the program run?), not the command line.
+    `--no-ext-diff` alone is NOT enough: it leaves `textconv` live.
+    """
+    repo = _git_repo_with_diff(tmp_path)
+    ext_sentinel = tmp_path / "RAN_EXT_DIFF"
+    conv_sentinel = tmp_path / "RAN_TEXTCONV"
+    (repo / ".gitattributes").write_text("*.py diff=conv\n*.txt diff=ext\n")
+    (repo / "notes.txt").write_text("before\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "arm the drivers")
+    (repo / "calc.py").write_text(_CALC_V2 + "tail = 1\n")
+    (repo / "notes.txt").write_text("after\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "payload")
+    _git(repo, "config", "diff.conv.textconv", f"sh -c 'touch {conv_sentinel}; cat'")
+    _git(repo, "config", "diff.ext.command", f"sh -c 'touch {ext_sentinel}'")
+
+    got = changed_line_numbers(repo, "HEAD~1", "HEAD")
+
+    assert not conv_sentinel.exists(), "diff.<driver>.textconv executed"
+    assert not ext_sentinel.exists(), "diff.<driver>.command executed"
+    assert got["calc.py"] == {7}, got
+
+
+def test_changed_line_numbers_pins_header_prefixes(tmp_path):
+    """`diff.dstPrefix` is repo-controlled. Unpinned it renames every key in
+    the map, nothing matches a ruff finding, and the evidence disappears with
+    no error anywhere — the silent-no-op failure mode this module must not have.
+    """
+    repo = _git_repo_with_diff(tmp_path)
+    _git(repo, "config", "diff.dstPrefix", "dst/")
+    _git(repo, "config", "diff.srcPrefix", "src/")
+    assert changed_line_numbers(repo, "HEAD~1", "HEAD") == {"calc.py": {_TOUCHED_LINE}}
+
+
+def test_collect_lint_evidence_survives_repo_controlled_diff_prefix(tmp_path):
+    """The end the user feels: with a hostile `diff.dstPrefix`, real evidence
+    on a touched line must still reach the reviewer."""
+    repo = _git_repo_with_diff(tmp_path)
+    _git(repo, "config", "diff.dstPrefix", "dst/")
+    payload = _abs_ruff_payload(repo, [
+        (1, "F401", "`os` imported but unused"),
+        (_TOUCHED_LINE, "F401", "`sys` imported but unused"),
+    ])
+    with patch("no_human.review.lint_evidence.subprocess.run",
+               side_effect=_fake_ruff_only(payload)):
+        findings = collect_lint_evidence(
+            repo, ["calc.py"], before_ref="HEAD~1", after_ref="HEAD")
+    assert [(f.path, f.line_number) for f in findings] == [("calc.py", _TOUCHED_LINE)]
+
+
+def test_filter_drops_findings_for_a_pure_rename_in_a_mixed_diff(tmp_path):
+    """Pins the measured mechanism the docstring describes: a pure rename emits
+    NO `+++` header, so it gets no map entry — and with another file supplying
+    entries the map is non-empty, so those findings are DROPPED, not kept."""
+    from no_human.review.lint_evidence import _filter_to_changed_lines
+
+    repo = _git_repo_with_diff(tmp_path)
+    _git(repo, "mv", "calc.py", "renamed.py")
+    (repo / "other.py").write_text("k = 2\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "rename plus an unrelated edit")
+
+    got = changed_line_numbers(repo, "HEAD~1", "HEAD")
+    assert got == {"other.py": {1}}, got  # no entry at all for renamed.py
+
+    stale = [LintFinding(path="renamed.py", line_number=1,
+                         error_code="F401", message="`os` imported but unused")]
+    assert _filter_to_changed_lines(stale, got) == []
+    # ... but the same finding survives when the map is empty (fail open).
+    assert _filter_to_changed_lines(stale, {}) == stale
