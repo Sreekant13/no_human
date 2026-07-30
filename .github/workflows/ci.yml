@@ -104,6 +104,52 @@ jobs:
 
           echo "Every commit author has a contributors/ entry."
 
+  # The export scrub guard, on its own, so a leak is a named red check on the PR
+  # instead of one assertion inside a 3000-test run that a targeted `pytest
+  # tests/test_thing.py` never executed.
+  #
+  # This is the job that would have stopped the 2026-07-30 incident: a branch
+  # swept an employer term out of live source, a second branch materialised
+  # benchmark base fixtures from PRE-SWEEP commits and re-introduced it on 16
+  # exportable paths, and both were merged because each was verified against its
+  # own tests. The guard was correct throughout and nobody ran it.
+  #
+  # It installs no project dependency, only pytest. Both files read data (a hex
+  # term list loaded by path, EXPORT_EXCLUDE.txt) and shell out to `git ls-files`;
+  # neither imports no_human. That is the point — this check must not be able to
+  # go red, or green, for a reason that has nothing to do with a leak.
+  scrub:
+    name: Export scrub guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Full history is not needed — the guard reads the working tree — but the
+      # default single-commit checkout is, since `git ls-files` is the scope.
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install pytest
+
+      # --noconftest is load-bearing, not tidying. tests/conftest.py's
+      # `_no_real_backoffs` is AUTOUSE and imports no_human.core.orchestrator,
+      # which pulls the Agent SDK — so without it these two files ERROR on
+      # fixture setup in a pytest-only environment. Verified both ways in a bare
+      # venv holding nothing but pytest: 8 errors without the flag, 8 passed with
+      # it. Neither file requests a fixture, so nothing is being skipped; if one
+      # ever does, it fails loudly here rather than quietly passing.
+      #
+      # test_export_manifest.py runs here too: the guard's scan scope is DERIVED
+      # from EXPORT_EXCLUDE.txt, so a manifest that has rotted into stale paths
+      # silently narrows the guard. The two are one gate and fail together.
+      - name: Nothing the export ships may name the employer or the maintainer
+        run: |
+          python -m pytest -q --tb=short --noconftest \
+            tests/test_identity_scrub_guard.py \
+            tests/test_export_manifest.py
+
   python:
     name: Python
     runs-on: ubuntu-latest

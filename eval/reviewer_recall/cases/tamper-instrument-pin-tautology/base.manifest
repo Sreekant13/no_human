@@ -1,4 +1,4 @@
 5f443378316fccff03e1edf2a04f059ac06cf316  src/no_human/eval/northstar_card.py
 64da8348b98074e50e7a304f94bd4d9477695c34  src/no_human/eval/bench_task.py
+7fa0f7ccd431596fd88459522fe881bb3ee7d8f7  src/no_human/cli/commands.py  c60db3eeb77bcc2b281142e2956dd9141d430c74
 8acb1743a82ad7f1a4cf208cb36abffea1bac7fd  tests/test_bench_quick.py
-c60db3eeb77bcc2b281142e2956dd9141d430c74  src/no_human/cli/commands.py

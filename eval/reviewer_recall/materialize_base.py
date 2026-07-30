@@ -20,11 +20,21 @@ repo is only ever read for citation verification (the reviewer runs single-turn
 with no tools when the runner passes ``diff_override``, so it never explores the
 tree). Files the diff CREATES (``--- /dev/null``) have no base blob and are
 skipped.
+
+DE-IDENTIFICATION. A base blob comes from a PRE-SWEEP commit, so it can carry
+terms that the tree-wide de-identification sweep has since removed from live
+source — and ``eval/reviewer_recall/`` is published, so those are a public leak.
+Every blob is therefore passed through ``scrub()`` on the way to disk, using the
+substitution list in the private supplement (absent in the export, where this
+script cannot run anyway because it needs history). A file whose bytes the scrub
+changed records its ORIGIN blob id as a third manifest column, so provenance
+stays pinned to ``base.ref`` even though the bytes deliberately differ from it.
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -34,6 +44,44 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 BASE_DIR_NAME = "base"
 MANIFEST_NAME = "base.manifest"
+
+PRIVATE_TERMS_PATH = (
+    REPO_ROOT / "src" / "no_human" / "eval" / "_vendor_terms_private.py"
+)
+
+
+def _load_scrub() -> list[tuple[bytes, bytes]]:
+    """``(term, replacement)`` byte pairs, longest term first.
+
+    Loaded BY PATH, not by importing ``no_human.eval`` — that package's
+    ``__init__`` pulls the orchestrator and the Agent SDK, which is a great deal
+    of machinery for a script whose job is ``git cat-file``. Absent supplement
+    (the public export) means an empty list: nothing to scrub, because the
+    export cannot run this script at all.
+    """
+    if not PRIVATE_TERMS_PATH.exists():
+        return []
+    spec = importlib.util.spec_from_file_location(
+        "_rr_vendor_terms_private", PRIVATE_TERMS_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    pairs = [(bytes.fromhex(h), r.encode()) for h, r in
+             getattr(mod, "BASE_FIXTURE_SCRUB", [])]
+    return sorted(pairs, key=lambda p: len(p[0]), reverse=True)
+
+
+SCRUB = _load_scrub()
+
+
+def scrub(data: bytes) -> bytes:
+    """Apply the de-identification substitutions to one blob's bytes.
+
+    Longest term first so a term that is a prefix of another (a name and its
+    truncation) cannot be half-replaced by the shorter rule.
+    """
+    for term, replacement in SCRUB:
+        data = data.replace(term, replacement)
+    return data
 
 
 def blob_sha1(data: bytes) -> str:
@@ -74,10 +122,19 @@ def diff_base_paths(diff_text: str) -> list[str]:
 def materialise(case_dir: Path, repo_root: Path = REPO_ROOT) -> list[str]:
     """Extract the case's base blobs and write ``base.manifest`` beside them.
 
-    The manifest is ``<git blob sha1>  <repo-relative path>`` per line, sorted.
-    It is the provenance record: each SHA is the object id of the blob at
-    ``base.ref``, so it pins the materialised bytes to the commit the case was
-    cut from even in a repo that no longer has that commit.
+    The manifest is ``<git blob sha1>  <repo-relative path>`` per line, sorted,
+    with an optional third column ``<origin blob sha1>``.
+
+    Column 1 is always the blob id of the bytes ON DISK, so it is a byte-identity
+    pin that keeps working after the export, when ``base.ref`` resolves nothing
+    and ``git cat-file`` can no longer be the reference.
+
+    Column 3 appears only when :func:`scrub` changed the blob, and holds the
+    object id of the blob at ``base.ref``. Provenance is then still pinned — the
+    source blob must hash to that id — while column 1 says what the fixture
+    actually is. The two columns being equal would be a lie once a file is
+    de-identified, and one manifest that quietly means two different things is
+    how a scrubbed fixture silently reverts.
     """
     base_ref = (case_dir / "base.ref").read_text().strip()
     diff_text = (case_dir / "change.diff").read_text()
@@ -89,11 +146,15 @@ def materialise(case_dir: Path, repo_root: Path = REPO_ROOT) -> list[str]:
             ["git", "cat-file", "blob", f"{base_ref}:{rel}"],
             cwd=repo_root, check=True, capture_output=True,
         ).stdout
+        clean = scrub(blob)
         dest = out_root / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(blob)
+        dest.write_bytes(clean)
         written.append(rel)
-        manifest.append(f"{blob_sha1(blob)}  {rel}")
+        line = f"{blob_sha1(clean)}  {rel}"
+        if clean != blob:
+            line += f"  {blob_sha1(blob)}"
+        manifest.append(line)
     (case_dir / MANIFEST_NAME).write_text("\n".join(sorted(manifest)) + "\n")
     return written
 
@@ -101,6 +162,7 @@ def materialise(case_dir: Path, repo_root: Path = REPO_ROOT) -> list[str]:
 def main(argv: list[str]) -> int:
     wanted = set(argv[1:])
     total = 0
+    print(f"scrub rules loaded: {len(SCRUB)}")
     for case_dir in sorted(CASES_DIR.iterdir()):
         if not case_dir.is_dir():
             continue

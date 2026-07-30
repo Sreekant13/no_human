@@ -19,7 +19,9 @@
 # Each command deliberately still runs the repo-wide guards that scan the
 # frontend, because a web-only edit CAN break them:
 #   test_no_banned_terms.py     — scans web/src (skips only web/dist)
-#   test_identity_scrub_guard.py— scans everything but docs/ and web/dist/
+#   test_identity_scrub_guard.py— scans every tracked file the export ships
+#                                 (i.e. minus EXPORT_EXCLUDE.txt, and nothing
+#                                 else — it has no skip list of its own)
 #   test_readme_claims.py       — asserts README claims against web/src
 # Dropping those would trade cost for a real safety regression.
 #

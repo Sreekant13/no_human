@@ -6,8 +6,14 @@ Each `cases/<id>/` holds `base.ref` (provenance only — the SHA the case was cu
 from), `base/` (the base file content the diff applies to, materialised inside
 the case), `change.diff` (what the reviewer sees — for seeded cases the defect
 is planted, unmarked), `truth.json` (ground truth — never shown to the
-reviewer), and `base.manifest` (the git blob id of each `base/` file at
-`base.ref` — provenance that outlives the history).
+reviewer), and `base.manifest` (the git blob id of each `base/` file — a
+byte-identity pin that outlives the history).
+
+`base.manifest` lines are `<blob id>  <path>`, with an optional third column
+`<origin blob id>`. Column 1 always hashes the bytes **on disk**. The third
+column appears only on a file the materialiser de-identified after extracting
+it, and holds the blob id at `base.ref`, so provenance stays pinned while the
+fixture's bytes deliberately differ from it. See "De-identification" below.
 
 A case directory must hold all of `base.ref`, `change.diff` and `truth.json`.
 `load_cases` skips a directory with **none** of them (`__pycache__` and the
@@ -53,6 +59,34 @@ listing each one, and every `runs/<date>/<case>.json` transcript carries both
 fields. With 4 controls one flip is 25 points and published specificity has sat
 at 2/4 and 0/4, so a caveat nobody can act on is not good enough: read those
 lines before quoting a specificity number.
+
+## De-identification (2026-07-31)
+
+A base fixture is cut from a **pre-sweep** commit — that is what makes it a base
+— so it can carry vendor/employer terms that the tree-wide de-identification
+sweep has since removed from live source. `eval/reviewer_recall/` is **not** in
+`EXPORT_EXCLUDE.txt`: this corpus is published, so such a term is a public leak.
+
+That happened. On 2026-07-30 one branch swept a term out of live source and
+another materialised base fixtures from pre-sweep commits; merged in that order,
+`main` went red with 16 hits on exportable paths, plus 6 more that an inherited
+`# term-ok` comment had been hiding. Twelve files across eleven cases.
+
+The fix is in the materialiser, not in anyone's memory: `materialize_base.py`
+pipes every blob through `scrub()` on the way to disk, using the substitution
+list in the private supplement (absent in the export, where this script cannot
+run anyway). Re-running it is therefore safe and idempotent. The replacements
+are the ones the live sweep chose for the same identifiers, so a fixture still
+reads as a realistic file.
+
+**What this must never do is change what the corpus measures.** Verified for
+this pass: 22 lines rewritten, every one of them a vendor term inside a comment
+or a string, and every one outside every pre-image hunk range in that case's
+`change.diff` — so no context line moved and all 20 diffs still apply.
+`truth.json` and `change.diff` are untouched in all 20 cases.
+`test_prepared_case_repo_matches_the_pinned_base_content` asserts both
+directions of the manifest's third column, so neither an undeclared edit to a
+fixture nor a stale `scrubbed-from` declaration can pass.
 
 Rules that keep the number honest:
 

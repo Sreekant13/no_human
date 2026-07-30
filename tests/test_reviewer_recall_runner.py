@@ -228,48 +228,120 @@ def _blob_sha1(data: bytes) -> str:
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
+def _load_materialize_base():
+    """`materialize_base.py`, loaded by path exactly as `rr` is above.
+
+    Its `scrub` IS imported rather than reimplemented, and the difference from
+    `_blob_sha1` is the point. A hash has a published definition, so a second
+    implementation is an independent witness. The substitution list does not:
+    its whole content is "what the operator decided to replace", and a copy here
+    would be one more hand-maintained list, free to drift from the materialiser
+    and let a fixture pass against rules the materialiser no longer has. The
+    claim under test is that the fixtures on disk are what the materialiser
+    produces, so the materialiser has to be the reference.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "test_rr_materialize_base",
+        REPO_ROOT / "eval" / "reviewer_recall" / "materialize_base.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_scrub = _load_materialize_base().scrub
+
+
 def test_prepared_case_repo_matches_the_pinned_base_content():
     """Materialising must not have altered what the case measures: every file
-    under `base/` has to still be the blob it was extracted from.
+    under `base/` has to still be the bytes the manifest pins, and those bytes
+    have to still trace to `base.ref`.
 
-    This runs ALWAYS, including after the export. `base.manifest` records the
-    git blob id of each file at `base.ref`, so the pin survives a repo where
-    `base.ref` resolves nothing — which is the environment this whole change
-    exists to serve, and exactly where a skip would have switched it off.
-    Where the history IS still present, the manifest is additionally re-derived
-    from git so the recorded ids cannot drift from their source.
+    This runs ALWAYS, including after the export. Column 1 of `base.manifest` is
+    the git blob id of the file ON DISK, so the byte-identity pin survives a repo
+    where `base.ref` resolves nothing — which is the environment this whole
+    change exists to serve, and exactly where a skip would have switched it off.
+
+    Where the history IS still present, provenance is re-derived from git so the
+    recorded ids cannot drift from their source. A file with no third column must
+    equal its blob at `base.ref` byte for byte, as before. A file WITH a third
+    column was de-identified after extraction (see
+    `materialize_base.py::scrub`), so it must NOT equal that blob — and the blob
+    must hash to the recorded origin id. Both directions are asserted: an
+    undeclared edit to a fixture fails, and so does a stale `scrubbed-from`
+    column on a file that is no longer scrubbed. The scrub itself only ever
+    rewrites a vendor term inside a comment or a string, never a line the case's
+    `change.diff` quotes as context — `test_every_case_prepares_with_no_repo_history_at_all`
+    is what proves that, by applying all 20 diffs.
     """
     have_history = subprocess.run(
         ["git", "cat-file", "-e", "58e3c7d18644306d0dc11da47e2aae7accdae892"],
         cwd=REPO_ROOT, capture_output=True,
     ).returncode == 0
-    checked = 0
+    checked = scrubbed = 0
     for case in rr.load_cases():
         base_dir = case.dir / rr.BASE_DIR_NAME
         manifest = {}
         for line in (case.dir / "base.manifest").read_text().splitlines():
-            sha, rel = line.split("  ", 1)
-            manifest[rel] = sha
+            fields = line.split("  ")
+            assert len(fields) in (2, 3), f"{case.case_id}: bad manifest line: {line!r}"
+            sha, rel = fields[0], fields[1]
+            manifest[rel] = (sha, fields[2] if len(fields) == 3 else None)
         on_disk = sorted(
             p.relative_to(base_dir).as_posix()
             for p in base_dir.rglob("*") if p.is_file()
         )
         assert on_disk == sorted(manifest), (
             f"{case.case_id}: base/ and base.manifest disagree on which files exist")
-        for rel, sha in manifest.items():
+        for rel, (sha, origin) in manifest.items():
             data = (base_dir / rel).read_bytes()
             assert _blob_sha1(data) == sha, (
                 f"{case.case_id}:{rel} no longer matches its manifest blob id")
+            if origin is not None:
+                scrubbed += 1
             if have_history:
                 blob = subprocess.run(
                     ["git", "cat-file", "blob", f"{case.base_ref}:{rel}"],
                     cwd=REPO_ROOT, capture_output=True,
                 )
                 assert blob.returncode == 0, f"{case.case_id}:{rel} not at base.ref"
-                assert blob.stdout == data, (
-                    f"{case.case_id}:{rel} differs from the blob at {case.base_ref}")
+                if origin is None:
+                    assert blob.stdout == data, (
+                        f"{case.case_id}:{rel} differs from the blob at "
+                        f"{case.base_ref} with no 'scrubbed-from' column to say so")
+                else:
+                    assert _blob_sha1(blob.stdout) == origin, (
+                        f"{case.case_id}:{rel} does not descend from manifest "
+                        f"origin {origin} at {case.base_ref}")
+                    assert blob.stdout != data, (
+                        f"{case.case_id}:{rel} carries a 'scrubbed-from' column "
+                        "but is byte-identical to base.ref — stale declaration")
+                    # …and the difference is EXACTLY the scrub, nothing else.
+                    #
+                    # Without this line the three assertions above are
+                    # self-referential on the scrubbed files: column 1 is
+                    # recomputed from disk, column 3 from the origin blob, and
+                    # "they differ" is satisfied by ANY difference. An
+                    # independent review demonstrated it on 2026-07-31 — append
+                    # a payload line to a scrubbed fixture, recompute column 1,
+                    # leave column 3 alone, and this test passed. The pin said
+                    # where the bytes came from and that they had been changed;
+                    # it never said HOW, so it permitted any change at all.
+                    #
+                    # Only reachable where history is present. In the export
+                    # `have_history` is False and `scrub` has no rules anyway —
+                    # column 1 is the pin that survives out there.
+                    assert _scrub(blob.stdout) == data, (
+                        f"{case.case_id}:{rel} is not its origin blob put "
+                        "through scrub() — the fixture carries an edit that "
+                        "the de-identification substitutions do not account "
+                        "for. Re-run materialize_base.py.")
             checked += 1
     assert checked == 70, checked
+    # 12 -> 17 on 2026-07-31: five more fixtures now carry a scrub, four of them
+    # for the two employer ticket ids that a term list could never have seen.
+    # Deliberately a literal and not a count derived from the manifests, which
+    # is where `scrubbed` already comes from and would agree by construction.
+    assert scrubbed == 17, scrubbed
 
 
 @pytest.mark.asyncio
