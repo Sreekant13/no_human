@@ -1,0 +1,4 @@
+5184bd8c659aa0c0b7a44d854a4000000e54ecad  tests/test_jira_issues_endpoint.py
+8cdd59cbd81babc9332c876aa297534a537af8f6  src/no_human/api/app.py
+b3b07dfb95394ed820f146e5aa87fc125b0daa3d  tests/test_jira_intake.py
+b6755c3ecf7150ae91a4418c23a2a072360bcbad  src/no_human/intake/jira.py

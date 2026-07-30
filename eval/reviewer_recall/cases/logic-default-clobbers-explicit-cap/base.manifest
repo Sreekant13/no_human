@@ -1,0 +1,7 @@
+06f1d9029d2b19921cafc8e49f0c62a56159baad  src/no_human/intake/jira_poll.py
+07f8a77b5d9f9d6288c332d26961c0e9c95c22c2  tests/test_profile.py
+57c75883bec81bf0924feb7a95d304df89c04461  src/no_human/profile.py
+73bf6076504ca8eb4536bdf23b6ab1cbd0dab39a  src/no_human/cli/commands.py
+9041b3c38dbccae4f0f8f3a3423097995272da8d  src/no_human/api/app.py
+ab99c29c6cc2c4a15937b3bb53f9ec8c04331b25  tests/test_jira_intake.py
+cd3754606387f98afb9424d1fdd8c291be24b81d  tests/test_api.py

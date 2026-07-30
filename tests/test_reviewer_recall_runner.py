@@ -7,8 +7,10 @@ the same way the CLI wiring (`nh bench report --reviewer-recall`) loads it.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -219,33 +221,53 @@ def test_every_case_prepares_with_no_repo_history_at_all(tmp_path):
     assert len(prepared) == len(rr.load_cases())
 
 
-def test_prepared_case_repo_matches_the_pinned_base_content(tmp_path):
-    """Materialising must not have altered what the case measures: the base
-    blob of every file the diff touches has to equal the blob at `base.ref`.
+def _blob_sha1(data: bytes) -> str:
+    """git's blob object id, computed here rather than imported from
+    `materialize_base` — a check that calls the extractor's own helper would
+    agree with it by construction."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
-    Skipped when the history is gone (that is the whole point of the change),
-    so this is a provenance check for THIS repo, not a runtime dependency.
+
+def test_prepared_case_repo_matches_the_pinned_base_content():
+    """Materialising must not have altered what the case measures: every file
+    under `base/` has to still be the blob it was extracted from.
+
+    This runs ALWAYS, including after the export. `base.manifest` records the
+    git blob id of each file at `base.ref`, so the pin survives a repo where
+    `base.ref` resolves nothing — which is the environment this whole change
+    exists to serve, and exactly where a skip would have switched it off.
+    Where the history IS still present, the manifest is additionally re-derived
+    from git so the recorded ids cannot drift from their source.
     """
     have_history = subprocess.run(
         ["git", "cat-file", "-e", "58e3c7d18644306d0dc11da47e2aae7accdae892"],
         cwd=REPO_ROOT, capture_output=True,
     ).returncode == 0
-    if not have_history:
-        pytest.skip("base.ref commits are not in this repo — corpus is self-contained")
     checked = 0
     for case in rr.load_cases():
         base_dir = case.dir / rr.BASE_DIR_NAME
-        for path in sorted(base_dir.rglob("*")):
-            if not path.is_file():
-                continue
-            rel = path.relative_to(base_dir).as_posix()
-            blob = subprocess.run(
-                ["git", "cat-file", "blob", f"{case.base_ref}:{rel}"],
-                cwd=REPO_ROOT, capture_output=True,
-            )
-            assert blob.returncode == 0, f"{case.case_id}:{rel} not at base.ref"
-            assert blob.stdout == path.read_bytes(), (
-                f"{case.case_id}:{rel} differs from the blob at {case.base_ref}")
+        manifest = {}
+        for line in (case.dir / "base.manifest").read_text().splitlines():
+            sha, rel = line.split("  ", 1)
+            manifest[rel] = sha
+        on_disk = sorted(
+            p.relative_to(base_dir).as_posix()
+            for p in base_dir.rglob("*") if p.is_file()
+        )
+        assert on_disk == sorted(manifest), (
+            f"{case.case_id}: base/ and base.manifest disagree on which files exist")
+        for rel, sha in manifest.items():
+            data = (base_dir / rel).read_bytes()
+            assert _blob_sha1(data) == sha, (
+                f"{case.case_id}:{rel} no longer matches its manifest blob id")
+            if have_history:
+                blob = subprocess.run(
+                    ["git", "cat-file", "blob", f"{case.base_ref}:{rel}"],
+                    cwd=REPO_ROOT, capture_output=True,
+                )
+                assert blob.returncode == 0, f"{case.case_id}:{rel} not at base.ref"
+                assert blob.stdout == data, (
+                    f"{case.case_id}:{rel} differs from the blob at {case.base_ref}")
             checked += 1
     assert checked == 70, checked
 
@@ -287,6 +309,112 @@ async def test_run_all_iterates_every_case_with_injected_reviewer():
     assert call_count["n"] == len(all_cases)
     assert len(report.results) == len(all_cases)
     assert report.model == "stub-model"
+
+
+# --- load_cases must never quietly shrink the denominator -------------------
+
+def _copy_corpus(tmp_path):
+    dest = tmp_path / "cases"
+    shutil.copytree(rr.CASES_DIR, dest)
+    return dest
+
+
+def test_load_cases_ignores_a_directory_that_is_not_a_case(tmp_path):
+    cases_dir = _copy_corpus(tmp_path)
+    (cases_dir / "__pycache__").mkdir()
+    (cases_dir / "__pycache__" / "runner.cpython-312.pyc").write_bytes(b"\x00")
+    assert len(rr.load_cases(cases_dir)) == 20
+
+
+def test_load_cases_raises_on_a_partial_case_instead_of_dropping_it(tmp_path):
+    """A case missing one of its three files used to vanish from the run.
+
+    That routes around HeadlineRefusedError: a dropped case never becomes a
+    CaseResult, so the refusal guard cannot see it, and the denominator moves
+    with nothing to say so (`security 0/3` where it should read 0/4).
+    """
+    for missing in rr.CASE_FILE_NAMES:
+        cases_dir = _copy_corpus(tmp_path / missing)
+        (cases_dir / "security-payload-logged" / missing).unlink()
+        with pytest.raises(rr.CasePrepError) as exc:
+            rr.load_cases(cases_dir)
+        assert "security-payload-logged" in str(exc.value)
+        assert missing in str(exc.value)
+
+
+# --- a control's clean pass must be auditable for citation demotions --------
+
+def _demoted_control(demoted):
+    """A control where the reviewer raised a blocking finding that the
+    citation rule then demoted — so `blocking` is empty and it scores clean."""
+    return rr.ReviewOutcome(status="FAIL", findings=[
+        rr.Finding(file="off-diff.py", line=7, text="looks wrong", blocking=False),
+    ], demoted_citations=demoted)
+
+
+def test_demoted_clean_pass_is_flagged_not_silently_banked():
+    case = _control_case()
+    result = rr.score_case(case, _demoted_control(["hardcoded path: off-diff.py not found"]))
+    assert result.clean_pass is True          # scoring is unchanged...
+    assert result.clean_pass_relied_on_demotion is True   # ...but it is marked
+    assert "demoted" in result.reason
+    assert "off-diff.py" in result.reason
+
+
+def test_genuine_clean_pass_is_not_flagged():
+    result = rr.score_case(_control_case(), rr.ReviewOutcome(status="PASS", findings=[]))
+    assert result.clean_pass is True
+    assert result.clean_pass_relied_on_demotion is False
+    assert result.reason == "clean pass"
+
+
+def test_render_report_warns_when_specificity_rests_on_demotions():
+    suspect = rr.score_case(_control_case(), _demoted_control(["x: off-diff.py not found"]))
+    report = rr.RecallReport(results=[suspect], model="claude-opus-5",
+                             run_date="2026-07-30")
+    text = rr.render_report(report)
+    assert "specificity:     1/1 clean diffs passed" in text
+    assert "demoted by the citation rule" in text
+    assert "off-diff.py" in text
+
+
+def test_transcript_records_demotions_so_a_score_can_be_audited(tmp_path):
+    suspect = rr.score_case(_control_case(), _demoted_control(["x: off-diff.py not found"]))
+    report = rr.RecallReport(results=[suspect], model="claude-opus-5",
+                             run_date="2026-07-30")
+    rr.write_transcripts(report, tmp_path)
+    data = json.loads((tmp_path / "2026-07-30" / "synthetic-control.json").read_text())
+    assert data["score"] == 1.0
+    assert data["clean_pass_relied_on_demotion"] is True
+    assert data["demoted_citations"] == ["x: off-diff.py not found"]
+
+
+def test_default_reviewer_fn_carries_demoted_citations_off_the_decision():
+    """The runner's own adapter used to drop `decision.demoted_citations`, so
+    the signal never reached a transcript no matter what the reviewer found."""
+    import asyncio
+    from no_human.review.selfcheck import ChecklistItem
+
+    class _Decision:
+        passed = True
+        checklist: list = []
+        demoted_citations = ["style: nowhere.py not found in the worktree"]
+        failed_items: list = []
+        blocking_items: list = []
+
+    class _Reviewer:
+        def __init__(self, model): pass
+        async def review(self, *a, **k): return _Decision()
+
+    import no_human.review.reviewer as rev
+    real, rev.AdversarialReviewer = rev.AdversarialReviewer, _Reviewer
+    try:
+        fn = rr._default_reviewer_fn("stub")
+        outcome = asyncio.run(fn(Path("."), "diff", _control_case()))
+    finally:
+        rev.AdversarialReviewer = real
+    assert outcome.demoted_citations == ["style: nowhere.py not found in the worktree"]
+    assert ChecklistItem is not None  # import pinned: the adapter builds from these
 
 
 # --- SCRUM-47: ERROR path never scores as a miss ----------------------------

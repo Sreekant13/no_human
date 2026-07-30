@@ -1,0 +1,4 @@
+483a0d228438ad0e21cd1dcf56ab0cb7c668e0ef  web/src/api.js
+95ce486c8d6558eefd4bc01045ad8d12fb83d8b3  web/src/taskComposerJira.test.mjs
+a5cc023b13238569f8972f619fc06fb5ed98aed7  web/src/jiraImport.js
+fef4aa14bff4840c1c2a157d99f68a9d67381152  web/src/TaskComposer.jsx

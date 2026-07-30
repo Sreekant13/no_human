@@ -64,6 +64,18 @@ class ReviewOutcome:
 
     status: str  # "PASS" | "FAIL"
     findings: list[Finding] = field(default_factory=list)
+    # Blocking findings the reviewer's citation rule demoted to advisory
+    # ("label: reason" strings, from ``ReviewDecision.demoted_citations``).
+    #
+    # Recorded because a demotion can decide a control. The scratch repo holds
+    # only the files the diff touches, so a blocking finding citing a file
+    # OUTSIDE the diff demotes and the control then scores a clean pass. With 4
+    # controls one flip is 25 points, and published specificity has sat at 2/4
+    # and 0/4 — the range where one flip is the whole signal. Without this
+    # field, a demoted-citation clean pass is indistinguishable from a genuine
+    # one in every recorded artifact, and the README's "say so rather than
+    # banking the number" is unperformable.
+    demoted_citations: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -90,6 +102,21 @@ class CaseResult:
     reason: str = ""
     status: str = "OK"               # "OK" | "ERROR" (prepare_case_repo failed)
 
+    @property
+    def demoted_citations(self) -> list[str]:
+        return self.outcome.demoted_citations
+
+    @property
+    def clean_pass_relied_on_demotion(self) -> bool:
+        """This control passed, but the reviewer DID raise blocking findings
+        that the citation rule demoted — so the pass may be an artifact of the
+        scratch repo holding only the diff's files, not reviewer specificity.
+
+        Never bank such a control silently: report it.
+        """
+        return bool(self.is_control and self.clean_pass
+                    and self.outcome.demoted_citations)
+
 
 @dataclass
 class RecallReport:
@@ -102,17 +129,33 @@ class RecallReport:
 ReviewerFn = Callable[[Path, str, CaseSpec], Awaitable[ReviewOutcome]]
 
 
+CASE_FILE_NAMES = ("base.ref", "change.diff", "truth.json")
+
+
 def load_cases(cases_dir: Path = CASES_DIR) -> list[CaseSpec]:
-    """Iterate ``cases_dir`` and parse each ``<id>/{base.ref,change.diff,truth.json}``."""
+    """Iterate ``cases_dir`` and parse each ``<id>/{base.ref,change.diff,truth.json}``.
+
+    A directory with NONE of those files is not a case at all (``__pycache__``,
+    editor scratch) and is skipped. A directory with SOME of them is a broken
+    case and raises: silently dropping it would move the denominator with
+    nothing to say so, and it would route around
+    :class:`HeadlineRefusedError` — a dropped case never becomes a
+    :class:`CaseResult`, so the refusal guard never sees it. Loud beats short.
+    """
     cases: list[CaseSpec] = []
     for entry in sorted(cases_dir.iterdir()):
         if not entry.is_dir():
             continue
-        # A case is a directory holding truth.json. Anything else living under
-        # cases/ — __pycache__, editor scratch — is not a case and must not be
-        # loaded as one (a stray __pycache__ once crashed load_cases outright).
-        if not (entry / "truth.json").is_file():
+        present = [n for n in CASE_FILE_NAMES if (entry / n).is_file()]
+        if not present:
             continue
+        if len(present) != len(CASE_FILE_NAMES):
+            missing = [n for n in CASE_FILE_NAMES if n not in present]
+            raise CasePrepError(
+                f"{entry.name}: incomplete case directory — missing {missing} "
+                f"(has {present}). Fix or remove the directory; the runner will "
+                "not quietly shrink the denominator around it."
+            )
         base_ref = (entry / "base.ref").read_text().strip()
         diff_text = (entry / "change.diff").read_text()
         truth = json.loads((entry / "truth.json").read_text())
@@ -187,8 +230,18 @@ def score_case(case: CaseSpec, outcome: ReviewOutcome) -> CaseResult:
 
     if case.is_control:
         clean = outcome.status == "PASS" or not blocking
-        reason = ("clean pass" if clean else
-                  f"false alarm: blocking finding on a clean diff ({blocking[0].file}:{blocking[0].line})")
+        if not clean:
+            reason = (f"false alarm: blocking finding on a clean diff "
+                      f"({blocking[0].file}:{blocking[0].line})")
+        elif outcome.demoted_citations:
+            # Do not let this read as plain specificity — the reviewer DID
+            # raise blocking findings and the citation rule dropped them.
+            reason = ("clean pass — BUT "
+                      f"{len(outcome.demoted_citations)} blocking finding(s) "
+                      "were demoted by the citation rule: "
+                      f"{'; '.join(outcome.demoted_citations)}")
+        else:
+            reason = "clean pass"
         return CaseResult(case_id=case.case_id, cls=cls, is_control=True,
                           outcome=outcome, clean_pass=clean, reason=reason)
 
@@ -272,8 +325,14 @@ def _default_reviewer_fn(model: str) -> ReviewerFn:
                     blocking=id(item) in blocking_ids)
             for item in decision.failed_items
         ]
-        return ReviewOutcome(status="PASS" if decision.passed else "FAIL",
-                             findings=findings)
+        return ReviewOutcome(
+            status="PASS" if decision.passed else "FAIL",
+            findings=findings,
+            # Kept, not discarded: with only the diff's files in the scratch
+            # repo, a demotion here is what turns a control's false alarm into
+            # a "clean pass".
+            demoted_citations=list(decision.demoted_citations),
+        )
 
     return _fn
 
@@ -305,9 +364,16 @@ def write_transcripts(report: RecallReport, runs_dir: Path = RUNS_DIR) -> Path:
     ``runs_dir/<run_date>/`` — called on every :func:`run_all` invocation, per
     docs/REVIEWER_RECALL_METHOD.md ("Borderline transcripts are kept").
 
-    Schema: ``{case_name, status, caught, score, error_message_if_error}``.
+    Schema: ``{case_name, status, caught, score, error_message_if_error,
+    demoted_citations, clean_pass_relied_on_demotion}``.
     ERROR cases omit ``caught`` (never measured — must not read as a miss)
     and get ``score=None``.
+
+    ``demoted_citations`` is recorded on every case so a score of 1.0 can be
+    audited after the fact. It is the difference between "the reviewer found
+    nothing wrong with this clean diff" and "the reviewer flagged something and
+    the citation rule threw it away because the cited file is not in the
+    scratch repo" — which, with 4 controls, is worth 25 specificity points.
     """
     out_dir = runs_dir / report.run_date
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -325,6 +391,8 @@ def write_transcripts(report: RecallReport, runs_dir: Path = RUNS_DIR) -> Path:
         else:
             data["caught"] = r.caught
             data["score"] = 1.0 if r.caught else 0.0
+        data["demoted_citations"] = list(r.demoted_citations)
+        data["clean_pass_relied_on_demotion"] = r.clean_pass_relied_on_demotion
         (out_dir / f"{r.case_id}.json").write_text(json.dumps(data, indent=2))
     return out_dir
 
@@ -376,9 +444,28 @@ def render_report(report: RecallReport) -> str:
     lines = [
         f"reviewer recall: {caught}/{total}{pct}{class_suffix}",
         f"specificity:     {clean}/{len(controls)} clean diffs passed",
-        f"model: {report.model} · run date: {report.run_date} · "
-        f"method: {report.method_doc}",
     ]
+
+    # A control that passed only because the citation rule demoted the
+    # reviewer's blocking findings is not evidence of specificity. The scratch
+    # repo holds only the diff's files, so a finding citing anything else is
+    # demoted by construction. Print it next to the number — a caveat that
+    # lives only in a doc cannot be acted on.
+    suspect = [r for r in controls if r.clean_pass_relied_on_demotion]
+    if suspect:
+        lines.append(
+            f"  ⚠ {len(suspect)} of those {clean} clean passes had blocking "
+            "findings demoted by the citation rule — do not bank this "
+            "specificity number without reading them:"
+        )
+        for r in suspect:
+            for d in r.demoted_citations:
+                lines.append(f"      {r.case_id}: {d}")
+
+    lines.append(
+        f"model: {report.model} · run date: {report.run_date} · "
+        f"method: {report.method_doc}"
+    )
     return "\n".join(lines)
 
 

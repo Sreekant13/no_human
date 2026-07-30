@@ -1,0 +1,3 @@
+10e7d03091c6dbaac433ac86ea2caf92742cadc1  tests/test_jira_intake.py
+5cc992fe9b16cdab9acfab2cdcd53d4b92a4da2a  src/no_human/intake/jira.py
+9801ad4826b1a375f03287de8c8f270b1002e7ab  src/no_human/intake/jira_poll.py

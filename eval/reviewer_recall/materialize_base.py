@@ -24,6 +24,7 @@ skipped.
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +33,18 @@ CASES_DIR = Path(__file__).resolve().parent / "cases"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 BASE_DIR_NAME = "base"
+MANIFEST_NAME = "base.manifest"
+
+
+def blob_sha1(data: bytes) -> str:
+    """git's blob object id for ``data``, computed without git.
+
+    The manifest records these so the byte-identity pin on ``base/`` keeps
+    running after the export, when ``base.ref`` resolves nothing and
+    ``git cat-file`` can no longer be the reference. Computed here rather than
+    shelled out so the test that checks it shares no code with the extractor.
+    """
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
 def diff_base_paths(diff_text: str) -> list[str]:
@@ -59,10 +72,18 @@ def diff_base_paths(diff_text: str) -> list[str]:
 
 
 def materialise(case_dir: Path, repo_root: Path = REPO_ROOT) -> list[str]:
+    """Extract the case's base blobs and write ``base.manifest`` beside them.
+
+    The manifest is ``<git blob sha1>  <repo-relative path>`` per line, sorted.
+    It is the provenance record: each SHA is the object id of the blob at
+    ``base.ref``, so it pins the materialised bytes to the commit the case was
+    cut from even in a repo that no longer has that commit.
+    """
     base_ref = (case_dir / "base.ref").read_text().strip()
     diff_text = (case_dir / "change.diff").read_text()
     out_root = case_dir / BASE_DIR_NAME
     written: list[str] = []
+    manifest: list[str] = []
     for rel in diff_base_paths(diff_text):
         blob = subprocess.run(
             ["git", "cat-file", "blob", f"{base_ref}:{rel}"],
@@ -72,6 +93,8 @@ def materialise(case_dir: Path, repo_root: Path = REPO_ROOT) -> list[str]:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(blob)
         written.append(rel)
+        manifest.append(f"{blob_sha1(blob)}  {rel}")
+    (case_dir / MANIFEST_NAME).write_text("\n".join(sorted(manifest)) + "\n")
     return written
 
 
