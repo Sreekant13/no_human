@@ -25,10 +25,9 @@ equivalent REST calls are denied before they execute
 It runs on your machine, against your checkout, on your Claude credential.
 Nothing is uploaded to a hosted sandbox. Only prompts reach the model API.
 
-> **TODO (demo):** getnohuman.com has a section headed "Watch it work a ticket",
-> but the page currently exposes no video or embed URL, and no file in this repo
-> references one. Link it here once the hosted video URL is confirmed. Not
-> guessing a link.
+**[Watch it work a ticket](https://getnohuman.com/#demo)** - filing the task, the
+review evidence that comes back with the diff, and the approve step, which is
+yours.
 
 ## Quickstart
 
