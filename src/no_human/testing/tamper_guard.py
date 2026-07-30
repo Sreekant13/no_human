@@ -127,7 +127,63 @@ _FAKE_PATCH = re.compile(
 _AUTOUSE = re.compile(r"autouse\s*=\s*True")
 
 
+# Benchmark fixture CONTENT that merely looks like a test file, by path shape.
+#
+# `eval/<corpus>/cases/<case-id>/base/**` is a benchmark case's materialised base
+# tree: a frozen snapshot of product source — including real `tests/test_*.py`
+# files copied verbatim — so a case can be replayed against a known starting
+# point without depending on git history. Those copies are INPUT to a benchmark,
+# not the project's own tests, and they never execute: `pyproject.toml` pins
+# `testpaths = ["tests"]` and `eval/conftest.py` sets `collect_ignore_glob =
+# ["*"]`, so neither `pytest` nor `pytest .` nor `pytest eval` collects one
+# (verified: `pytest eval --collect-only` exits 5; a whole-repo collect with
+# `--override-ini=testpaths=` yields 0 nodes under `eval/`). This guard exists to
+# stop an agent faking a GREEN SUITE, and a file the suite never runs cannot make
+# it green — so the guard's own premise does not reach these paths.
+#
+# Counting them was not merely noisy, it was EXPLOITABLE. `tamper_check_between`
+# compares merge-base..HEAD, so a branch that ADDS cases carries their whole
+# count (+735 tests / +2004 assertions for the corpus as it stands) into the
+# aggregate. `check()` decides `tampered` from the AGGREGATE while `reasons`
+# records per-file drops independently — so a branch that added 68 snapshot files
+# and quietly deleted 3 tests from a real `tests/test_vcs.py` reported
+# `[clean] tests 141->813` with `tests/test_vcs.py: tests 42->39` sitting in its
+# own reasons list. The guard named the tamper and passed it. Same shape as the
+# deleted-file bug two comment blocks below: silence and cleanliness looked the
+# same. Excluding these paths restores the aggregate to the no-fixture control
+# exactly (141->138), so the dilution is closed rather than moved.
+#
+# Deliberately a PATH SHAPE, not an opt-out. There is no magic comment, no config
+# key, no `# tamper: ignore` marker an agent could write INTO a file to escape
+# counting — the only way in is to physically move a test to this path, which
+# removes it from its old one and trips the unconditional "test file deleted"
+# rule (`deleted` is computed from the raw `before` mapping, so the move is
+# caught by the disappearance, not the arrival). Verified verbatim and gutted.
+#
+# All four segments are load-bearing: a top-level `eval/`, one corpus directory,
+# the literal `cases/`, one case id, the literal `base/`. A blanket `eval/` rule
+# would be an escape hatch — `eval/` is an ordinary directory an agent may write
+# to, and excluding it wholesale would let a real suite be parked under `eval/`
+# and gutted there. `eval/x/tests/`, `eval/x/cases/y/tests/` and
+# `eval/x/cases/y/z/base/` all stay guarded.
+#
+# Generic on purpose, and NOT named after this repo's own corpus. This module is
+# repo-agnostic — it classifies Java, JS and Go paths and runs against linked and
+# user repos where one project's corpus name means nothing — and `docs/` pins
+# that no module under `src/` may reference that corpus by name (a grep-level
+# guard test enforces it). That guard is not weakened, allowlisted, or touched
+# here.
+_FIXTURE_CONTENT_RE = re.compile(r"^eval/[^/]+/cases/[^/]+/base/")
+
+
+def is_fixture_content(path: str) -> bool:
+    """True for benchmark fixture snapshots that only LOOK like test files."""
+    return bool(_FIXTURE_CONTENT_RE.search(path))
+
+
 def is_test_file(path: str) -> bool:
+    if is_fixture_content(path):
+        return False
     return bool(_TEST_FILE_RE.search(path))
 
 

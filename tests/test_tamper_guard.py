@@ -467,3 +467,230 @@ def test_check_is_dot_guarded_so_product_calls_in_tests_are_not_assertions():
     # And the controls that were NOT the live false positive, kept for completeness.
     assert tamper_guard.count_assertions("run(x, check=True)") == 0
     assert tamper_guard.count_assertions("el.checkVisibility({})") == 0
+
+
+# --- fixture snapshots are not the project's own tests -----------------------
+#
+# `eval/reviewer_recall/cases/<id>/base/**` materialises frozen copies of product
+# source so a reviewer can be replayed against a known base. Some of those copies
+# ARE real `tests/test_*.py` files, verbatim. They never execute (`testpaths =
+# ["tests"]` plus `eval/conftest.py`'s `collect_ignore_glob = ["*"]`), so they
+# cannot fake a green suite — and counting them was actively exploitable.
+
+_FIXTURE_DIR = "eval/reviewer_recall/cases/control-gate-excerpts/base"
+
+
+def test_fixture_snapshots_are_excluded_by_path_shape_only():
+    """The exclusion is a path shape an agent cannot invoke from inside a file.
+
+    All five segments are load-bearing: a top-level ``eval/``, one corpus
+    directory, the literal ``cases/``, one case id, the literal ``base/``.
+    """
+    assert not tamper_guard.is_test_file(f"{_FIXTURE_DIR}/tests/test_vcs.py")
+    assert not tamper_guard.is_test_file(f"{_FIXTURE_DIR}/tests/conftest.py")
+    assert not tamper_guard.is_test_file(
+        "eval/reviewer_recall/cases/x/base/web/src/boardLanes.test.mjs"
+    )
+    assert tamper_guard.is_fixture_content(f"{_FIXTURE_DIR}/tests/test_vcs.py")
+    # ACKNOWLEDGED BREADTH: the rule is a shape, not this repo's corpus name, so a
+    # second benchmark corpus under eval/ gets the same treatment. That is
+    # deliberate — this module is repo-agnostic and also runs against linked and
+    # user repos — and it costs nothing an attacker can use, because arriving at
+    # this path requires leaving another one (see the relocation test below).
+    assert not tamper_guard.is_test_file("eval/other_corpus/cases/x/base/tests/test_a.py")
+
+    # Everything one step off the shape stays GUARDED. Each of these is a place an
+    # agent could try to park a real suite if the rule were any looser.
+    still_guarded = [
+        # `eval/` at large is an ordinary directory — never blanket-excluded.
+        "eval/tests/test_x.py",
+        "eval/reviewer_recall/tests/test_x.py",
+        "eval/reviewer_recall/cases/tests/test_x.py",
+        # ...outside a case's `base/` subtree.
+        "eval/reviewer_recall/cases/x/tests/test_x.py",
+        "eval/reviewer_recall/cases/x/base_extra/tests/test_x.py",
+        "eval/reviewer_recall/cases/x/notbase/tests/test_x.py",
+        # ...nested two case-id levels deep (the shape is exactly one).
+        "eval/reviewer_recall/cases/x/y/base/tests/test_x.py",
+        # ...a lookalike prefix.
+        "evaluation/reviewer_recall/cases/x/base/tests/test_x.py",
+        "other_eval/reviewer_recall/cases/x/base/tests/test_x.py",
+        # ...the same shape buried under another directory: the rule is anchored at
+        # the repo root, so a nested copy is NOT a free pass.
+        "vendor/eval/reviewer_recall/cases/x/base/tests/test_x.py",
+        "src/eval/reviewer_recall/cases/x/base/tests/test_x.py",
+        # The project's own tests, unchanged.
+        "tests/test_vcs.py",
+        "web/e2e/board.mjs",
+        "conftest.py",
+    ]
+    for path in still_guarded:
+        assert tamper_guard.is_test_file(path), f"expected still guarded: {path}"
+        assert not tamper_guard.is_fixture_content(path), path
+
+
+def test_no_in_file_marker_can_opt_a_real_test_out_of_the_guard():
+    """There is no magic comment. Only the path decides."""
+    for marker in (
+        "# tamper: ignore\n",
+        "# fixture content, not a test\n",
+        "# noqa: tamper\n",
+        '"""base fixture snapshot"""\n',
+        "# eval/reviewer_recall/cases/x/base/tests/test_x.py\n",
+    ):
+        before = {"tests/test_x.py": marker + "def test_a():\n    assert f()\n"}
+        after = {"tests/test_x.py": marker + "def test_a():\n    pass\n"}
+        r = tamper_guard.check(before, after)
+        assert r.tampered, f"a comment must not buy an exemption: {marker!r}"
+
+
+def test_fixture_snapshots_do_not_dilute_a_real_reduction():
+    """The dilution hazard, closed rather than moved.
+
+    `tamper_check_between` compares merge-base..HEAD, so a branch that ADDS corpus
+    cases used to carry their whole count (+735 tests / +2004 assertions) into the
+    aggregate. `check()` decides `tampered` from the aggregate while `reasons`
+    records per-file drops independently — so the report NAMED the reduction and
+    still returned clean. Reproduced end-to-end against the real corpus: a branch
+    that added 68 snapshot files and deleted 3 tests from a real `tests/test_vcs.py`
+    read `[clean] tests 141->813` with `tests/test_vcs.py: tests 42->39` in reasons.
+    """
+    real_before = "def test_a():\n    assert f()\n\ndef test_b():\n    assert g()\n"
+    real_after = "def test_a():\n    assert f()\n"          # one test, one assert gone
+    bulk = "".join(f"def test_s{i}():\n    assert h({i})\n" for i in range(200))
+
+    before = {"tests/test_x.py": real_before}
+    after = {
+        "tests/test_x.py": real_after,
+        f"{_FIXTURE_DIR}/tests/test_snapshot.py": bulk,
+    }
+    r = tamper_guard.check(before, after)
+    assert r.tampered, f"a real reduction must survive 200 added fixture tests: {r}"
+    assert any("tests/test_x.py" in x for x in r.reasons), r.reasons
+
+    # Closed, not moved: the aggregate must equal the no-fixture control exactly.
+    control = tamper_guard.check(before, {"tests/test_x.py": real_after})
+    assert (r.tests_before, r.tests_after) == (control.tests_before, control.tests_after)
+    assert (r.assertions_before, r.assertions_after) == (
+        control.assertions_before, control.assertions_after
+    )
+    assert r.tests_after < r.tests_before, r.summary
+
+
+def test_relocating_a_real_test_into_a_fixture_path_is_still_tampering():
+    """Excluding a path must not make it a laundry for real suites.
+
+    A move removes the file from its old path, and the deleted-file rule is
+    unconditional, so the smuggle is caught by the DISAPPEARANCE — verbatim or
+    gutted, it makes no difference.
+    """
+    real = "def test_a():\n    assert f()\n\ndef test_b():\n    assert g()\n"
+    before = {"tests/test_x.py": real}
+
+    verbatim = tamper_guard.check(before, {f"{_FIXTURE_DIR}/tests/test_x.py": real})
+    assert verbatim.tampered, verbatim
+    assert any("deleted: tests/test_x.py" in x for x in verbatim.reasons), verbatim.reasons
+    # And the counts drop too, so it fires twice over rather than on one rule.
+    assert verbatim.tests_after < verbatim.tests_before, verbatim.summary
+
+    gutted = tamper_guard.check(
+        before, {f"{_FIXTURE_DIR}/tests/test_x.py": "def test_a():\n    pass\n"}
+    )
+    assert gutted.tampered, gutted
+    assert any("deleted: tests/test_x.py" in x for x in gutted.reasons), gutted.reasons
+
+
+def test_fixture_snapshots_do_not_raise_false_cheat_signals():
+    """Verbatim copies of signals already live and accepted in `tests/`.
+
+    `tests/test_vcs.py` seeds a fixture repo with the literal string
+    `"assert True\\n"`, and `tests/test_jira_issues_endpoint.py` has a legitimate
+    `@pytest.fixture(autouse=True)` that monkeypatches config PATHS. Snapshotting
+    either registered `tautological assertions 0->1` / `autouse monkeypatch fixture
+    0->1` on a branch that touched no test at all.
+    """
+    snapshot = (
+        'def test_seed(repo):\n'
+        '    (repo.path / "test_thing.py").write_text("assert True\\n")\n'
+        '\n'
+        '@pytest.fixture(autouse=True)\n'
+        'def _isolated_paths(tmp_path, monkeypatch):\n'
+        '    monkeypatch.setattr(nh_config, "ENV_PATH", tmp_path / ".env")\n'
+    )
+    # The content really does carry both signals — this is a live false positive,
+    # not a hypothetical one.
+    assert tamper_guard.count_tautologies(snapshot) == 1
+    assert tamper_guard.count_faking_fixtures(snapshot) == 1
+
+    r = tamper_guard.check(
+        {"tests/test_x.py": "def test_a():\n    assert f()\n"},
+        {
+            "tests/test_x.py": "def test_a():\n    assert f()\n",
+            f"{_FIXTURE_DIR}/tests/test_snapshot.py": snapshot,
+        },
+    )
+    assert not r.tampered, r.reasons
+    assert r.reasons == [], r.reasons
+
+    # Control: the SAME content under a real test path still fires, on both rules.
+    live = tamper_guard.check(
+        {"tests/test_x.py": "def test_a():\n    assert f()\n"},
+        {
+            "tests/test_x.py": "def test_a():\n    assert f()\n",
+            "tests/test_snapshot.py": snapshot,
+        },
+    )
+    assert live.tampered, live
+    assert any("tautological" in x for x in live.reasons), live.reasons
+    assert any("autouse" in x for x in live.reasons), live.reasons
+
+
+def test_known_cost_deleting_a_fixture_snapshot_is_no_longer_flagged():
+    """The one case where this exclusion is strictly WEAKER. Named, not hidden.
+
+    Before the exclusion, deleting a materialised snapshot tripped the
+    unconditional deleted-test-file rule. It no longer does — the path is not a
+    test file, so it never enters `before`. That is the unavoidable price of not
+    counting them: you cannot both ignore a path and police deletions in it.
+
+    Why it is an acceptable price:
+      * these files never execute, so deleting one cannot turn a red suite green
+        — which is the only thing this guard exists to prevent;
+      * corpus integrity has its own signal in the LIVE suite
+        (`tests/test_reviewer_recall_runner.py::test_load_cases_real_corpus`
+        pins the case count, and the recall runner raises on a case whose `base/`
+        is missing), and that live test is itself still guarded here, so it
+        cannot be deleted to cover the tracks;
+      * the diff is still in front of the human reviewer, which is the gate.
+    """
+    snapshot = "def test_a():\n    assert f()\n"
+
+    def snapshot_repo(files):
+        """What `runner.tamper_check_between` hands to `check()`: git's file list
+        run through `is_test_file` first. Model it, don't shortcut it."""
+        return {p: s for p, s in files.items() if tamper_guard.is_test_file(p)}
+
+    live = {"tests/test_x.py": "def test_a():\n    assert f()\n"}
+    r = tamper_guard.check(
+        snapshot_repo({**live, f"{_FIXTURE_DIR}/tests/test_snapshot.py": snapshot}),
+        snapshot_repo(live),
+    )
+    assert not r.tampered, r.reasons
+
+    # FAIL-CLOSED at the `check()` boundary: the deleted-file rule reads the raw
+    # `before` mapping and does NOT consult `is_test_file`, so a caller that hands
+    # `check()` a fixture path directly still gets a tamper verdict. The exclusion
+    # is not a hole punched through `check()` itself — it lives entirely in which
+    # paths the caller collects.
+    direct = tamper_guard.check(
+        {f"{_FIXTURE_DIR}/tests/test_snapshot.py": snapshot}, {}
+    )
+    assert direct.tampered, "check() must stay fail-closed on any path it is given"
+
+    # The compensating control: the LIVE test that pins corpus integrity is an
+    # ordinary guarded test file, so it cannot be removed quietly.
+    assert tamper_guard.is_test_file("tests/test_reviewer_recall_runner.py")
+    gone = tamper_guard.check(
+        {"tests/test_reviewer_recall_runner.py": snapshot}, {}
+    )
+    assert gone.tampered, gone.reasons
