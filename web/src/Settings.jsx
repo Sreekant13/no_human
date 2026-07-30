@@ -1,10 +1,11 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import keepFocusInDialog from "./keepFocusInDialog.js";
+import PathInput from "./PathInput.jsx";
 import {
   addRule, addSkill, confirmLearning, fetchLearnings,
   fetchRules, fetchSkills, rejectLearning, removeRule, removeSkill,
   fetchProjects, createProject, updateProject, deleteProject,
-  fetchProfiles, detectRepos, onboardRepo, suggestPaths,
+  fetchProfiles, detectRepos, onboardRepo,
   fetchAuthStatus, setAuthToken,
 } from "./api.js";
 import { capName, PROFILE_CAP, TOKENVAR_CAP } from "./capName.js";
@@ -784,7 +785,7 @@ function ProjectCard({ project, onDelete, onUpdated }) {
           {error && <div className="new-task-error">{error}</div>}
           {addingRepo ? (
             <div className="project-add-repo">
-              <PathInputSettings value={newRepoPath} onChange={setNewRepoPath} placeholder="Repo path, e.g. ~/git/my-repo" />
+              <PathInput className="new-task-input" style={{ flex: 1 }} autoFocus listId="settings-addrepo-pathlist" value={newRepoPath} onChange={setNewRepoPath} placeholder="Repo path, e.g. ~/git/my-repo" />
               <button className="btn btn-approve btn-sm" disabled={!newRepoPath.trim() || profiling} onClick={handleAddRepo}>
                 {profiling ? <><span className="grill-spinner" /> Profiling…</> : 'Add'}
               </button>
@@ -800,33 +801,6 @@ function ProjectCard({ project, onDelete, onUpdated }) {
   );
 }
 
-function PathInputSettings({ value, onChange, placeholder }) {
-  const [opts, setOpts] = useState([]);
-  const listId = "settings-pathlist";
-  useEffect(() => {
-    let live = true;
-    const t = setTimeout(async () => {
-      const res = await suggestPaths(value);
-      if (live) setOpts(res.suggestions || []);
-    }, 150);
-    return () => { live = false; clearTimeout(t); };
-  }, [value]);
-  return (
-    <>
-      <input
-        className="new-task-input" list={listId} value={value}
-        placeholder={placeholder} spellCheck={false} autoFocus
-        onChange={(e) => onChange(e.target.value)}
-        style={{ flex: 1 }}
-      />
-      <datalist id={listId}>
-        {opts.map((o) => (
-          <option key={o.path} value={o.path}>{o.is_repo ? "git repo" : "folder"}</option>
-        ))}
-      </datalist>
-    </>
-  );
-}
 
 /* ── Test-plan editor (PR5) ─────────────────────────────────────────────── */
 
@@ -1060,7 +1034,7 @@ function AddProjectModal({ onClose, onSaved }) {
           <div className="ntm-field">
             <label className="ntm-label">Scan for repos</label>
             <div className="new-task-row">
-              <PathInputSettings value={scanRoot} onChange={setScanRoot} placeholder="Scan root, e.g. ~/git" />
+              <PathInput className="new-task-input" style={{ flex: 1 }} autoFocus listId="settings-scanroot-pathlist" value={scanRoot} onChange={setScanRoot} placeholder="Scan root, e.g. ~/git" />
               <button type="button" className="btn btn-sendback btn-sm" disabled={scanning} onClick={handleScan}>
                 {scanning ? <><span className="grill-spinner" /> Scanning…</> : 'Scan'}
               </button>

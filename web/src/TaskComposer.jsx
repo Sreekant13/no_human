@@ -10,6 +10,7 @@ import { keepFocusInDialog } from "./keepFocusInDialog.js";
 import { formatBytes } from "./formatBytes.js";
 import { pluralize } from "./pluralize.js";
 import { useEscapeKey } from "./useEscapeKey.js";
+import PathInput from "./PathInput.jsx";
 
 // The new-task composer (Task 5A) — one prompt, kind chips, inline controls.
 //
@@ -538,11 +539,12 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
                 ))}
               </SelectPill>
             ) : (
-              <input
+              <PathInput
                 className={`${TEXT_FIELD} min-w-0 flex-1`}
                 placeholder="~/git/my-project"
                 value={repoPath}
-                onChange={(e) => setRepoPath(e.target.value)}
+                onChange={setRepoPath}
+                listId="composer-pathlist"
                 aria-label="Repository path"
                 aria-describedby="repo-path-hint"
               />
