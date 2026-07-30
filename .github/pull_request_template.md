@@ -22,7 +22,9 @@ Example:
 - [ ] Lockfiles committed if a dependency changed.
 - [ ] Nothing in the diff reads or writes a credential inside the repo.
 - [ ] This does not conflict with the constraints in `CLAUDE.md`.
-- [ ] First PR only: I have read `CLA.md` and I agree to it.
+- [ ] First PR only: I have read `CLA.md` and added my `contributors/<handle>.md`
+      entry to this PR. (Ticking this box is not the record — the file is. CI
+      checks for the file.)
 
 <!--
 `main` is protected. The maintainer reviews and merges by hand. There is no

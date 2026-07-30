@@ -65,6 +65,23 @@ uv run pytest -q -n 4
 Do not use `-n auto`. It has wedged repeatedly on this repo. Pick an explicit
 worker count.
 
+Run it through `uv run`, or with the virtualenv activated — not with a bare
+`pytest` from an unactivated shell. Four tests shell out to `pytest` as a
+subprocess, because that is the test command the product itself infers for a
+plain Python repo, and a subprocess resolves it from `PATH`:
+
+```
+tests/test_base_tree_gate.py::test_coder_introduced_import_breakage_fails_the_attempt
+tests/test_holdout_gate.py::test_passing_held_out_does_not_block
+tests/test_onboard.py::test_onboard_python_pytest_end_to_end
+tests/test_onboard.py::test_onboard_writes_yaml_and_round_trips
+```
+
+With `pytest` missing from `PATH` they fail on `/bin/sh: pytest: command not
+found`, and the assertion you see is about a task that escalated, which does not
+point at the cause. `uv run pytest` puts the virtualenv's `bin` on `PATH`, which
+is why CI uses it. This is recorded because nothing else in the repo says so.
+
 Two markers are declared in `pyproject.toml`:
 
 - `slow` for tests over 10 seconds. Skip them with `-m "not slow"`.
@@ -83,6 +100,19 @@ tests/test_scheduler.py::test_reanalysis_dedup_across_runs
 They read local IDE transcripts through `no_human.history.extractor`, which
 scans running processes for a language server. CI deselects both. If you see
 `IDENotRunningError` locally, that is why.
+
+CI deselects a third test for a different reason — a real, open defect:
+
+```
+tests/test_scheduler.py::test_two_repos_run_concurrently_in_worktrees
+```
+
+It is the only test that drives two orchestrators against one `Store` at once,
+and about a third of runs die on `cannot commit transaction - SQL statements in
+progress`. It is not an xdist flake: it reproduces serially and on its own.
+[`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) has the repro data, the
+hypothesis already ruled out, and what a fix has to prove. Run it locally,
+several times, if you touch `core/db.py` or the scheduler.
 
 There is also [`scripts/run_tests.sh`](scripts/run_tests.sh) with `fast`,
 `slow`, and `full` modes. It uses `-n auto`, so prefer the direct `pytest`
@@ -103,9 +133,37 @@ npm test
 538 tests. These are `node --test` unit tests over the board's pure helpers,
 theme variables, and accessibility logic.
 
-`npm run lint` is currently failing on a missing `react-hooks/exhaustive-deps`
-rule definition in `web/eslint.config.mjs`. It is not wired into CI. Fixing the
-ESLint config is a welcome PR on its own.
+`npm run lint` is broken, and it is broken twice over. It is not wired into CI,
+so neither failure blocks anything today.
+
+On **Node 20** — the version CI pins for this job, and therefore the version you
+are most likely to have installed for it — eslint 10.7.0 dies before it lints
+anything:
+
+```
+ESLint: 10.7.0
+TypeError: util.styleText is not a function
+    at .../eslint/lib/cli-engine/formatters/stylish.js:22:9
+```
+
+`util.styleText` arrived in Node 22. The `stylish` formatter calls it
+unconditionally, so on Node 20 the run crashes while formatting its own output.
+
+On **Node 22** eslint gets far enough to lint, and then reports the config
+problem underneath:
+
+```
+web/src/Integrations.jsx
+  283:5  error  Definition for rule 'react-hooks/exhaustive-deps' was not found
+```
+
+`eslint-plugin-react-hooks` is not in `web/package.json`, so
+`web/eslint.config.mjs` names a rule nothing provides.
+
+Fixing this is a welcome PR, but it is two fixes: pin or configure eslint so it
+runs on the Node version this job uses, *and* add the missing plugin (or drop
+the rule). A PR that only does the second still leaves `npm run lint` unusable
+on Node 20.
 
 ### Desktop shell
 
@@ -122,14 +180,19 @@ platform binary of about 100 MB. The suite does not need it: Electron is
 stubbed through `desktop/testing/electronLoader.mjs`.
 
 The one exception is `desktop/uiPages.test.mjs`, which spawns the real Electron
-binary to measure computed styles in a renderer. Run it locally with a full
-install:
+binary to measure computed styles in a renderer. It needs a full install, so run
+it on its own:
 
 ```bash
 cd desktop
 npm ci
-npm test          # Node 20 only; on Node 22 use the explicit file list above
+node --test uiPages.test.mjs
 ```
+
+Do not use `npm test` here. The script is `node --test .`, and a directory
+argument stopped being walked in Node 22 — the same change described under the
+web board above. It works only on Node 20, which is below this package's own
+`engines.node` floor of `>=22.12`. Stay on Node 22 and name the files.
 
 ### Playwright end-to-end
 
@@ -192,14 +255,40 @@ repository.
 
 ## Contributor licence agreement
 
-Your first PR needs you to agree to [`CLA.md`](CLA.md). Say so in the PR body:
+Your first PR needs you to agree to [`CLA.md`](CLA.md). It matters because the
+project may be relicensed later and may be offered as a hosted service. Read it
+before you agree — that is the whole point of it.
+
+Agreement is **recorded in git**, not in a signing service and not as a
+tick-box. In your first pull request, add one file named after your GitHub
+handle, in lower case:
 
 ```
-I have read CLA.md and I agree to it.
+contributors/<your-github-handle>.md
 ```
 
-It matters because the project may be relicensed later and may be offered as a
-hosted service. Read it before you agree.
+containing the version of `CLA.md` you agree to and the date. The template is in
+[`contributors/README.md`](contributors/README.md). You do it once, ever.
+
+The `CLA ledger` job in CI asks GitHub who authored the commits in your PR and
+fails if any of them has no such file. It checks only that the file exists — it
+cannot verify a signature and does not try to. The maintainer's own commits and
+bot accounts are skipped.
+
+## Trademark
+
+The licence covers the code, not the name. [`TRADEMARK.md`](TRADEMARK.md) says
+what you may do with "no_human" and the logo. In short: describe accurately what
+your thing is or works with, and do not imply this project endorses it. Forks
+are welcome; give yours its own name.
+
+## Third-party notices
+
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) records attribution and the
+obligations a *packaged binary* carries — Electron, Chromium, and the
+PyInstaller bootloader exception. The source tree vendors no third-party code,
+so it matters only if you build and hand someone an installer. If you touch
+`packaging/`, read it first.
 
 ## Security issues
 

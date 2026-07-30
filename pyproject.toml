@@ -4,6 +4,12 @@ version = "0.1.0"
 description = "Autonomous AI software-delivery orchestrator driving the Claude Agent SDK on your own Claude credentials"
 readme = "README.md"
 requires-python = ">=3.12"
+# PEP 639. hatchling >= 1.27 reads the SPDX string and `license-files`, and
+# emits `License-Expression` / `License-File` metadata; without these two the
+# built wheel declares no licence at all and dependency scanners read it as
+# unlicensed. The file itself is LICENSE at the repo root and does not change.
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "aiosqlite>=0.22.1",
     "claude-agent-sdk>=0.2.120",

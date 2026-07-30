@@ -8,6 +8,7 @@
 | [adapters.md](adapters.md) | Intake (TRACKER/GitHub/GitLab), context, VCS, CI backends |
 | [eval.md](eval.md) | Golden set, replay scoring, scorecard/CI gate, shadow mode |
 | [blockers.md](blockers.md) | Part 22 taxonomy, escalation, wake watcher, `nh reply` |
+| [KNOWN_ISSUES.md](KNOWN_ISSUES.md) | Reproduced defects that are not fixed yet, and what a fix must prove |
 
 Design source of truth: [`../PLAN.md`](../PLAN.md). Implementation brief:
 [`../BUILD.md`](../BUILD.md).

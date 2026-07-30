@@ -246,3 +246,10 @@ Issues and pull requests are welcome. Run `uv run pytest -q` before submitting.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+The licence covers the code, not the name. [TRADEMARK.md](TRADEMARK.md) is the
+policy on using "no_human" and the logo: describing what your project works
+with or forks from is fine, implying this project endorses it is not.
+
+Packaging a binary carries obligations the source tree does not —
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) lists them.
