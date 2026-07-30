@@ -1,0 +1,116 @@
+name: CI
+
+# Nothing here may reach a model API, spend a token, or push to a repository.
+# The Python suite is hermetic by construction: tests/conftest.py installs an
+# autouse fixture that swaps ClaudeBackend for a stub everywhere the
+# orchestrator builds one, and it only steps aside when NH_TESTS_LIVE_SDK=1,
+# which is never set in CI. The `real_backend` marker exempts a handful of
+# tests from that stub, but those drive the real class over a mocked SDK
+# client and still make no network call.
+#
+# The live `nh eval` / `nh bench` runs spend subscription tokens through the
+# Agent SDK. They are run locally, on demand, and are not part of any job here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # uv reads .python-version (3.12), so the toolchain cannot drift away
+      # from the file that declares it.
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # -n auto has wedged on this repo, so the worker count is explicit.
+      # The two deselected tests read local IDE transcripts through
+      # no_human.history.extractor, which scans running processes for a
+      # language server. They raise IDENotRunningError on any machine without
+      # that IDE open, which includes every CI runner.
+      - name: Run tests
+        run: |
+          uv run pytest -q --tb=short -n 4 \
+            --deselect tests/test_scheduler.py::test_reanalysis_maybe_run_produces_result \
+            --deselect tests/test_scheduler.py::test_reanalysis_dedup_across_runs
+
+  web:
+    name: Web board
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    env:
+      # This job runs the node unit suite only. The Playwright suites in
+      # web/e2e need a browser and, for some of them, a running server.
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 20 on purpose. `npm test` is `node --test src/`, and from Node 22
+      # a directory argument to --test is resolved as a module instead of
+      # being walked, so the script fails there. .gitlab-ci.yml pins
+      # node:20-slim for the same job.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci
+
+      - run: npm test
+
+  desktop:
+    name: Desktop shell
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      # --ignore-scripts skips Electron's postinstall, which fetches a ~100 MB
+      # platform binary. The suite does not need it: Electron is stubbed
+      # through desktop/testing/electronLoader.mjs.
+      - run: npm ci --ignore-scripts
+
+      # `npm test` is `node --test .`, which Node 22 rejects, so the files are
+      # listed explicitly. uiPages.test.mjs is the one suite that does need the
+      # real Electron binary: it spawns a renderer to read computed styles.
+      # Run it locally with a full `npm ci`.
+      - name: Run tests
+        run: |
+          files=()
+          for f in ./*.test.mjs; do
+            [ "$f" = "./uiPages.test.mjs" ] && continue
+            files+=("$f")
+          done
+          node --test "${files[@]}"

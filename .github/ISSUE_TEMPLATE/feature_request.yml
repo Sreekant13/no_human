@@ -1,0 +1,35 @@
+name: Feature request
+description: Propose a change in behaviour
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that you cannot do today.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you want instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you already tried
+      description: Workarounds, other tools, or why the existing options fall short.
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      description: >
+        CLAUDE.md lists constraints this project treats as correctness
+        requirements. A proposal that breaks one of them will be declined.
+      options:
+        - label: I have read CLAUDE.md and this proposal does not conflict with it.
+          required: true

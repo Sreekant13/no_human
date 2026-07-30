@@ -1,0 +1,53 @@
+name: Bug report
+description: Something behaves differently from what it should
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. nh task add --title "..." --repo ~/some-repo
+        2. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output
+      description: >
+        The command and its output. Redact tokens before pasting.
+      render: text
+
+  - type: input
+    id: version
+    attributes:
+      label: Commit SHA
+      placeholder: git rev-parse --short HEAD
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: OS and Python version
+      placeholder: macOS 15.2, Python 3.12.8
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: nosecrets
+    attributes:
+      label: Before you submit
+      options:
+        - label: This report contains no credentials or private repository content.
+          required: true
