@@ -16,8 +16,10 @@ test("api.js scaffoldRepo POSTs parent+name to /api/repos/scaffold", () => {
   assert.match(src, /export async function scaffoldRepo\(parent, name\)/);
   assert.match(src, /\/api\/repos\/scaffold/);
   // Backend errors carry WHICH check failed in `detail` - the composer must
-  // be able to surface it verbatim, so the helper must throw it.
-  assert.match(src, /scaffoldRepo[\s\S]{0,400}d\.detail/);
+  // be able to surface it verbatim, so the helper must throw it. It goes
+  // through detailMessage() because FastAPI's `detail` is a LIST on a 422 and
+  // `new Error(d.detail)` rendered that as "[object Object]" (apiError.js).
+  assert.match(src, /scaffoldRepo[\s\S]{0,400}detailMessage\(d,/);
 });
 
 test("the composer imports and calls scaffoldRepo", () => {

@@ -43,25 +43,41 @@ const PARKED = mkTask("parked00aaaabbbbcccc", "awaiting_input", {
 const REVIEW = mkTask("review00aaaabbbbcccc", "awaiting_approval", { pr_url: "https://example.com/pull/1" });
 const RUNNING = mkTask("running0aaaabbbbcccc", "implementing");
 
-const api = (task, opts = {}) => (route) => {
-  const u = route.request().url();
-  const j = (b) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(b) });
-  if (route.request().method() !== "GET") {
-    if (opts.approveFails && u.includes("/approve")) {
-      return route.fulfill({
-        status: 409, contentType: "application/json",
-        body: JSON.stringify({ detail: "task is 'done', not awaiting_approval" }),
-      });
+const api = (task, opts = {}) => {
+  // The real /approve stamps context.approved_at and leaves the task in
+  // awaiting_approval (api/app.py) — it does NOT change the status. `opts.stateful`
+  // reproduces that, so a later GET sees the approval the way a reopened drawer does.
+  let approvedAt = null;
+  return (route) => {
+    const u = route.request().url();
+    const j = (b) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(b) });
+    if (route.request().method() !== "GET") {
+      if (opts.approveFails && u.includes("/approve")) {
+        return route.fulfill({
+          status: 409, contentType: "application/json",
+          body: JSON.stringify({ detail: "task is 'done', not awaiting_approval" }),
+        });
+      }
+      if (opts.stateful && u.includes("/approve")) {
+        approvedAt = new Date().toISOString();
+        return route.fulfill({
+          status: 200, contentType: "application/json",
+          body: JSON.stringify({ ok: true, message: "Approval recorded. Merge the PR in your git host — the agent never merges." }),
+        });
+      }
+      return route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
     }
-    return route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
-  }
-  if (u.includes("/api/onboarding")) return j({ completed: true });
-  if (u.includes("/api/projects")) return j([]);
-  if (u.match(/\/api\/tasks\/[^/]+\/diff/)) return j({ diff: "" });
-  if (u.match(/\/api\/tasks\/[^/]+\/events/)) return j([]);
-  if (u.match(/\/api\/tasks\/[^/]+$/)) return j(task);
-  if (u.includes("/api/tasks")) return j([task]);
-  return j({});
+    const t = approvedAt
+      ? { ...task, context: { ...(task.context || {}), approved_at: approvedAt } }
+      : task;
+    if (u.includes("/api/onboarding")) return j({ completed: true });
+    if (u.includes("/api/projects")) return j([]);
+    if (u.match(/\/api\/tasks\/[^/]+\/diff/)) return j({ diff: "" });
+    if (u.match(/\/api\/tasks\/[^/]+\/events/)) return j([]);
+    if (u.match(/\/api\/tasks\/[^/]+$/)) return j(t);
+    if (u.includes("/api/tasks")) return j([t]);
+    return j({});
+  };
 };
 
 const browser = await chromium.launch();
@@ -678,8 +694,17 @@ const UNGRADED_REVIEW = mkTask("oldrev00aaaabbbbcccc", "awaiting_approval", {
   const header = await page.locator(".slideover .so-section.open .so-section-label-row").first().innerText();
   check("[D1] a FAILED review keeps today's failure-first header", /FAILED/.test(header), header);
   const chips = await page.locator(".slideover .so-checklist .cr-sev").allInnerTexts();
-  check("[D1] an item with no severity key omits the chip rather than crashing",
-    chips.length === 1 && /nit/i.test(chips[0]), JSON.stringify(chips));
+  // An item with no severity key must not crash, and must not silently vanish
+  // either: the section header counts it in an "unrated" bucket, and an
+  // ungraded finding BLOCKS, so the row says so with the same word.
+  check("[D1] an item with no severity key is chipped 'unrated', matching the header's bucket",
+    chips.length === 2 && /unrated/i.test(chips[0]) && /nit/i.test(chips[1]), JSON.stringify(chips));
+  const unratedPainted = await page.evaluate(() => {
+    const el = document.querySelector(".slideover .cr-sev-unrated");
+    return el ? getComputedStyle(el).color : null;
+  });
+  check("[D1] …and .cr-sev-unrated is finally a reachable rule, not dead paint",
+    !!unratedPainted, String(unratedPainted));
   const colors = await page.evaluate(() => {
     const q = (s) => document.querySelector(s);
     const c = (s) => { const el = q(s); return el ? getComputedStyle(el).borderLeftColor : null; };
@@ -703,7 +728,8 @@ const UNGRADED_REVIEW = mkTask("oldrev00aaaabbbbcccc", "awaiting_approval", {
   await page.waitForTimeout(600);
   const after = (await btn.innerText()).trim();
   const disabled = await btn.isDisabled();
-  check("[D2] the button label changes once the approval lands", /^approved$/i.test(after), `"${before}" → "${after}"`);
+  check("[D2] the button label changes once the approval lands",
+    /^approved — merge pending$/i.test(after), `"${before}" → "${after}"`);
   check("[D2] …and it is disabled so it cannot be double-approved", disabled);
   const status = page.locator('.slideover [role="status"]').first();
   const statusText = (await status.count()) ? await status.innerText() : "";
@@ -731,6 +757,130 @@ const UNGRADED_REVIEW = mkTask("oldrev00aaaabbbbcccc", "awaiting_approval", {
   // The 409 is the point of this block; any OTHER console error is a real bug.
   const unexpected = errors.filter((e) => !e.includes("409"));
   check("[D2] no unexpected page errors", unexpected.length === 0, unexpected[0] || "");
+  await ctx.close();
+}
+
+// ── DEFECT 2a: the confirmation must be where the operator is looking ──────
+// The REPORTED symptom was not a missing banner — it was an unseen one. The
+// banner used to render at the TOP of the scrolling .so-body, so on a long
+// drawer, clicking Approve at the bottom painted the confirmation off-screen.
+// The whole suite passed with the defect reintroduced, because nothing here
+// asserted the banner's POSITION and every fixture was short enough that
+// .so-body never scrolled. This block fixes both halves.
+const LONG_PARA =
+  "The lane counts are currently only rendered by the TUI, which means any "
+  + "script that wants them has to scrape ANSI output and guess at column "
+  + "widths. A --json flag should emit the same numbers the board renders, "
+  + "keyed by lane, with no decoration and a stable schema. ";
+const SCROLLING_REVIEW = mkTask("longrev0aaaabbbbcccc", "awaiting_approval", {
+  pr_url: "https://example.com/pull/9",
+  // Long enough that .so-body genuinely overflows — asserted below, never assumed.
+  description: LONG_PARA.repeat(24),
+  acceptance_criteria: Array.from({ length: 12 }, (_, i) => `Criterion ${i + 1}: ${LONG_PARA}`),
+});
+{
+  const { ctx, page, errors } = await open(SCROLLING_REVIEW);
+  // Open Details so the long description is actually laid out inside .so-body.
+  await page.locator('.slideover .so-section-header:has(.so-section-title:text-is("Details"))').click();
+  await page.waitForTimeout(600);
+  const body = page.locator(".slideover .so-body");
+  const overflow = await body.evaluate((el) => ({ scroll: el.scrollHeight, client: el.clientHeight }));
+  check("[D2a] the fixture's body genuinely overflows — the defect can manifest here",
+    overflow.scroll > overflow.client,
+    `scrollHeight=${overflow.scroll} clientHeight=${overflow.client}`);
+
+  const btn = page.locator(".slideover .so-actions .btn-approve").first();
+  await btn.click();
+  await page.waitForTimeout(600);
+  // Scroll the body to the very bottom — where an operator on a long drawer is
+  // when they reach for Approve.
+  await body.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await page.waitForTimeout(300);
+  const scrolledTo = await body.evaluate((el) => el.scrollTop);
+  check("[D2a] …and it really did scroll", scrolledTo > 0, `scrollTop=${scrolledTo}`);
+
+  const banner = page.locator(".slideover .flash-banner").first();
+  const inBody = await banner.evaluate((el) => !!el.closest(".so-body"));
+  check("[D2a] the confirmation is NOT inside the scrolling body", !inBody);
+  const box = await banner.boundingBox();
+  const vp = page.viewportSize();
+  const visible = !!box && box.y >= 0 && box.y + box.height <= vp.height
+    && box.x >= 0 && box.x + box.width <= vp.width && box.height > 0;
+  check("[D2a] …so after scrolling to the bottom it is still on screen",
+    visible, JSON.stringify({ box, vp }));
+  // It must also stay next to the button that caused it, not merely on screen.
+  const btnBox = await btn.boundingBox();
+  check("[D2a] …and directly above the action bar it belongs to",
+    !!box && !!btnBox && box.y + box.height <= btnBox.y + 1
+      && btnBox.y - (box.y + box.height) < 40,
+    JSON.stringify({ bannerBottom: box && box.y + box.height, btnTop: btnBox && btnBox.y }));
+  check("[D2a] no page errors", errors.length === 0, errors[0] || "");
+  await ctx.close();
+}
+
+// ── DEFECT 2b: the confirmation must survive closing the drawer ────────────
+// approveOutcome is session state and /approve leaves the task in
+// awaiting_approval, so reopening the drawer on an approved task showed a
+// plain enabled "Approve" — the same "did that do anything?" reading — and a
+// second click silently re-stamped approved_at over the operator's real one.
+{
+  const { ctx, page, errors } = await open(REVIEW, { width: 1440, height: 900 }, "dark", { stateful: true });
+  const btn = () => page.locator(".slideover .so-actions .btn-approve").first();
+  await btn().click();
+  await page.waitForTimeout(600);
+  check("[D2b] the approval lands", /merge pending/i.test((await btn().innerText()).trim()));
+  // Close the drawer and reopen the same task — a fresh SlideOver mount.
+  await page.locator(".slideover .so-close").click();
+  await page.waitForTimeout(400);
+  check("[D2b] the drawer closed", (await page.locator(".slideover").count()) === 0);
+  await page.locator(".task-card").first().click();
+  await page.locator(".slideover").waitFor({ state: "visible", timeout: 5000 });
+  await page.waitForTimeout(800);
+  const label = (await btn().innerText()).trim();
+  check("[D2b] a REOPENED drawer still shows the approval, not a bare Approve",
+    /^approved — merge pending$/i.test(label), label);
+  check("[D2b] …and will not silently re-stamp approved_at", await btn().isDisabled());
+  const narrative = await page.locator(".slideover").innerText();
+  check("[D2b] the summary says the same thing the button does",
+    /approved and is/i.test(narrative) && /waiting for the PR to merge/i.test(narrative),
+    (narrative.match(/This \w+[^\n]*/) || [""])[0]);
+  check("[D2b] no page errors", errors.length === 0, errors[0] || "");
+  await ctx.close();
+}
+
+// …and a task approved in an EARLIER session (nothing in this drawer's state,
+// only context.approved_at in the payload) reads the same way on a cold open.
+const PREAPPROVED = mkTask("apprvd00aaaabbbbcccc", "awaiting_approval", {
+  pr_url: "https://example.com/pull/10",
+  context: { approved_at: "2026-07-30T09:00:00+00:00" },
+});
+{
+  const { ctx, page, errors } = await open(PREAPPROVED);
+  const btn = page.locator(".slideover .so-actions .btn-approve").first();
+  const label = (await btn.innerText()).trim();
+  check("[D2b] a cold open on an already-approved task shows the approved state",
+    /^approved — merge pending$/i.test(label) && (await btn.isDisabled()), label);
+  check("[D2b] no page errors", errors.length === 0, errors[0] || "");
+  await ctx.close();
+}
+
+// A send-back after the approval spends it: approved_at is never cleared
+// server-side, so a stale stamp must not lock the operator out of approving
+// the PR that replaced the one they rejected.
+const SENT_BACK_AFTER_APPROVAL = mkTask("resent00aaaabbbbcccc", "awaiting_approval", {
+  pr_url: "https://example.com/pull/11",
+  context: {
+    approved_at: "2026-07-30T09:00:00+00:00",
+    send_back_feedback: [{ at: "2026-07-30T10:00:00+00:00", message: "not this" }],
+  },
+});
+{
+  const { ctx, page, errors } = await open(SENT_BACK_AFTER_APPROVAL);
+  const btn = page.locator(".slideover .so-actions .btn-approve").first();
+  const label = (await btn.innerText()).trim();
+  check("[D2b] an approval predating a send-back does not gate the NEW PR",
+    /^approve$/i.test(label) && !(await btn.isDisabled()), label);
+  check("[D2b] no page errors", errors.length === 0, errors[0] || "");
   await ctx.close();
 }
 

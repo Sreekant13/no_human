@@ -18,7 +18,7 @@ import {
   PARKED_STATUSES, narrativeFor, chipsFor, milestonesFor, sectionSummary,
   defaultOpenSection, isTerminalStatus,
   reviewVerdict, severityChip, checklistRowClass, isBlockingFinding,
-  approveButtonState, approvalFeedback,
+  approveButtonState, approvalFeedback, taskApprovedAt,
 } from "./slideOverSummary.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
@@ -227,8 +227,13 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   const showQuietCancel = !isTerminal && !hasDecisionPanel;
   const showActionBar = isAwaiting || isActive || isFailed || showParkedActions || showQuietCancel;
 
+  // Already approved according to the SERVER, not merely according to this
+  // drawer session — survives closing and reopening the drawer, which
+  // `approveOutcome` (reset on every taskId change) does not.
+  const approvedAt = taskApprovedAt(task);
+
   async function handleApprove() {
-    if (!isAwaiting || busy || approveOutcome === "ok") return;
+    if (!isAwaiting || busy || approveOutcome === "ok" || approvedAt) return;
     setBusy(true);
     setApproveOutcome(null);
     try {
@@ -420,7 +425,11 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
               // The click has to change something on the control itself: an
               // approval that recorded server-side but left the button reading
               // "Approve" was read as a dead button.
-              const ab = approveButtonState({ busy, outcome: approveOutcome });
+              // `approvedAt` is the payload's own record, so reopening the
+              // drawer on an approved task still reads "Approved — merge
+              // pending" instead of offering a bare Approve that would
+              // silently re-stamp approved_at.
+              const ab = approveButtonState({ busy, outcome: approveOutcome, approvedAt });
               return (
                 <button
                   className={`btn btn-approve btn-approve-${ab.tone}`}

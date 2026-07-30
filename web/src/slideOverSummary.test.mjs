@@ -8,7 +8,7 @@ import {
   diffStats, colorForStatus, PARKED_STATUSES, STATUS_STAGE_LABEL, isTerminalStatus,
   isHumanStopped,
   ADVISORY_SEVERITIES, isBlockingFinding, reviewVerdict, severityChip,
-  checklistRowClass, approveButtonState, approvalFeedback,
+  checklistRowClass, approveButtonState, approvalFeedback, taskApprovedAt,
 } from "./slideOverSummary.js";
 
 const SRC = dirname(fileURLToPath(import.meta.url));
@@ -619,17 +619,86 @@ test("a FAILED review keeps today's failure-first presentation (verdict word, no
   assert.equal(v.blocking, 1);
 });
 
-test("severity chips render the reviewer's grade, and older attempts without one omit the chip", () => {
+test("severity chips render the reviewer's grade, and a PASSING row without one omits the chip", () => {
   assert.equal(severityChip({ passed: false, severity: "Low" }), "low");
   assert.equal(severityChip({ passed: false, severity: "nit" }), "nit");
   assert.equal(severityChip({ passed: false, severity: "high" }), "high");
-  // Older attempts stored severity as "" or not at all — omit, never crash.
-  assert.equal(severityChip({ passed: false, severity: "" }), null);
-  assert.equal(severityChip({ passed: false, severity: "   " }), null);
-  assert.equal(severityChip({ passed: false }), null);
-  assert.equal(severityChip({}), null);
+  // A passing criterion carries no grade and needs none.
+  assert.equal(severityChip({ passed: true }), null);
+  assert.equal(severityChip({ passed: true, severity: "" }), null);
   assert.equal(severityChip(undefined), null);
   assert.equal(severityChip(null), null);
+});
+
+// The section header counted an "unrated" bucket for a failing finding the
+// reviewer never graded, while the ROW rendered no chip at all — the header
+// said "1 unrated" next to a row that showed nothing, and the `.cr-sev-unrated`
+// rule in styles.css was reachable from no code path. An ungraded failing
+// finding BLOCKS (reviewer.py's degrade-safe rule), so the honest fix is to
+// show it, not to stop counting it.
+test("an UNGRADED failing finding gets the same 'unrated' chip the header counts", () => {
+  assert.equal(severityChip({ passed: false, severity: "" }), "unrated");
+  assert.equal(severityChip({ passed: false, severity: "   " }), "unrated");
+  assert.equal(severityChip({ passed: false }), "unrated");
+  assert.equal(severityChip({}), "unrated");
+  // …and the header's bucket name is the SAME token, so the chip class and the
+  // count can never drift apart.
+  const v = reviewVerdict({
+    passed: true,
+    items: [{ passed: true }, { passed: false }, { passed: false, severity: "nit" }],
+  });
+  assert.match(v.detail, /1 nit/);
+  assert.match(v.detail, /1 unrated/);
+  const buckets = v.detail.match(/\(([^)]*)\)/)[1].split(", ");
+  assert.equal(
+    buckets.reduce((n, b) => n + Number(b.split(" ")[0]), 0), 2,
+    `every failing finding must appear in the breakdown: "${v.detail}"`,
+  );
+});
+
+// styles.css carried `.cr-sev-med` and `.cr-sev-major` plus a comment claiming
+// the reviewer emits "med". It does not: reviewer.py's schema is
+// critical|high|medium|low|nit ("med" is history/analyzer.py's unrelated
+// importance label). Both selectors were dead paint.
+test("the .cr-sev-* rules cover exactly the severities that can reach the chip", () => {
+  const css = readFileSync(join(SRC, "styles.css"), "utf8");
+  const styled = new Set(
+    [...css.matchAll(/\.cr-sev-([a-z0-9-]+)/g)].map((m) => m[1]),
+  );
+  const reviewerPy = readFileSync(
+    join(SRC, "..", "..", "src", "no_human", "review", "reviewer.py"), "utf8",
+  );
+  // Read the schema line the reviewer actually sends to the model rather than
+  // hand-copying the values here.
+  const schema = reviewerPy.match(/"severity":\s*"([a-z|]+)"/);
+  assert.ok(schema, "reviewer.py's severity schema line not found — retarget this test");
+  const emitted = schema[1].split("|");
+  assert.deepEqual(
+    emitted, ["critical", "high", "medium", "low", "nit"],
+    "reviewer.py's severity vocabulary changed — update styles.css to match",
+  );
+  const expected = new Set([...emitted, "unrated"]);
+  assert.deepEqual(
+    [...styled].filter((c) => !expected.has(c)), [],
+    "dead severity paint: a .cr-sev-* rule no severity can produce",
+  );
+  assert.deepEqual(
+    [...expected].filter((c) => !styled.has(c)), [],
+    "an emittable severity with no chip style",
+  );
+  // Same vocabulary, same source of truth, for the header's sort order.
+  const js = readFileSync(join(SRC, "slideOverSummary.js"), "utf8");
+  const order = js.match(/SEVERITY_ORDER\s*=\s*\[([^\]]*)\]/);
+  assert.ok(order, "SEVERITY_ORDER not found — retarget this test");
+  const ranked = [...order[1].matchAll(/"([a-z]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(
+    ranked.filter((c) => !expected.has(c)), [],
+    "SEVERITY_ORDER ranks a value the reviewer cannot emit",
+  );
+  assert.deepEqual(
+    emitted.filter((c) => !ranked.includes(c)), [],
+    "an emittable severity the header cannot rank",
+  );
 });
 
 test("a non-blocking finding row is visually distinct from a blocking failure", () => {
@@ -693,12 +762,101 @@ test("the Approve button changes state the moment it is clicked and once it land
 
   const ok = approveButtonState({ outcome: "ok" });
   assert.equal(ok.disabled, true);
-  assert.equal(ok.label, "Approved");
+  // The label also names what is left to do — the same words the board uses,
+  // and the same words a REOPENED drawer shows (see the derivation tests below).
+  assert.equal(ok.label, "Approved — merge pending");
   assert.notEqual(ok.label, idle.label);
 
   const err = approveButtonState({ outcome: "error" });
   assert.equal(err.disabled, false, "a failed approval must be retryable");
   assert.match(err.label, /retry/i);
+});
+
+// ── DEFECT 2, second half: the confirmation must survive a drawer close ─────
+// `approveOutcome` is session state, reset on every taskId change, and the
+// approve endpoint leaves the task in awaiting_approval on the normal PR path
+// (api/app.py stamps context.approved_at and stops there). So reopening the
+// drawer on an already-approved task showed a plain, enabled "Approve" — the
+// exact "did that do anything?" reading this defect was filed for — and a
+// second click silently re-stamped approved_at over the real one.
+
+test("an approval is derived from the task payload, not only from session state", () => {
+  assert.equal(taskApprovedAt(null), null);
+  assert.equal(taskApprovedAt({}), null);
+  assert.equal(taskApprovedAt({ context: {} }), null);
+  // TaskOut (the drawer's detail payload) carries it under context…
+  assert.equal(
+    taskApprovedAt({ context: { approved_at: "2026-07-30T10:00:00+00:00" } }),
+    "2026-07-30T10:00:00+00:00",
+  );
+  // …TaskSummaryOut (the board's payload) hoists it to the top level. Both are
+  // the same fact; the drawer must not care which shape it was handed.
+  assert.equal(taskApprovedAt({ approved_at: "2026-07-30T10:00:00+00:00" }),
+    "2026-07-30T10:00:00+00:00");
+});
+
+test("a send-back AFTER the approval spends it — the next PR is unapproved", () => {
+  // send-back never clears context.approved_at (api/app.py's send_back only
+  // appends feedback and resets the status), so a stale stamp would lock the
+  // operator out of approving the NEXT attempt's PR.
+  const stale = {
+    context: {
+      approved_at: "2026-07-30T10:00:00+00:00",
+      send_back_feedback: [{ at: "2026-07-30T11:00:00+00:00", message: "redo it" }],
+    },
+  };
+  assert.equal(taskApprovedAt(stale), null, "an approval predating a send-back is spent");
+  const live = {
+    context: {
+      approved_at: "2026-07-30T12:00:00+00:00",
+      send_back_feedback: [{ at: "2026-07-30T11:00:00+00:00", message: "redo it" }],
+    },
+  };
+  assert.equal(taskApprovedAt(live), "2026-07-30T12:00:00+00:00",
+    "an approval AFTER the last send-back still stands");
+  // Unparseable timestamps must not silently discard a real approval.
+  assert.equal(
+    taskApprovedAt({ context: { approved_at: "2026-07-30T12:00:00+00:00", send_back_feedback: [{ at: "??" }] } }),
+    "2026-07-30T12:00:00+00:00",
+  );
+});
+
+test("reopening the drawer on an approved task shows the approved state, not a bare Approve", () => {
+  const reopened = approveButtonState({ approvedAt: "2026-07-30T10:00:00+00:00" });
+  assert.equal(reopened.disabled, true,
+    "a second click would re-stamp approved_at over the operator's real approval");
+  assert.equal(reopened.tone, "ok");
+  assert.notEqual(reopened.label, "Approve", "a bare 'Approve' reads as nothing having happened");
+  // Same words the board already uses for this state (Board.jsx actionHint).
+  assert.match(reopened.label, /approved/i);
+  assert.match(reopened.label, /merge pending/i);
+  // The just-clicked path and the reopened path must not disagree about what
+  // an approved task looks like.
+  assert.deepEqual(approveButtonState({ outcome: "ok" }), reopened);
+  // A task with no approval is untouched.
+  assert.equal(approveButtonState({ approvedAt: null }).label, "Approve");
+  // An in-flight click still wins over the stale payload it is about to update.
+  assert.match(approveButtonState({ busy: true, approvedAt: null }).label, /ing/i);
+});
+
+test("the board's wording for an approved task is the wording the drawer reuses", () => {
+  const board = readFileSync(join(SRC, "Board.jsx"), "utf8");
+  const hint = board.match(/approved_at\)\s*return\s*"([^"]+)"/);
+  assert.ok(hint, "Board.jsx's approved-task action hint not found — retarget this test");
+  const { label } = approveButtonState({ approvedAt: "2026-07-30T10:00:00+00:00" });
+  assert.equal(label.toLowerCase(), hint[1].toLowerCase(),
+    "the drawer must not invent new copy for a state the board already names");
+});
+
+test("SlideOver.jsx derives the Approve button from the task, not only from session state", () => {
+  const src = readFileSync(join(SRC, "SlideOver.jsx"), "utf8");
+  assert.match(src, /approveButtonState\(\{[^}]*approvedAt/,
+    "the button must be handed the derived approval");
+  assert.match(src, /taskApprovedAt\(/, "the derivation must come from the shared helper");
+  // The click guard has to honour the same derivation, or the disabled button's
+  // handler would still fire on a keyboard/programmatic activation.
+  assert.doesNotMatch(src, /if \(!isAwaiting \|\| busy \|\| approveOutcome === "ok"\) return;/,
+    "the re-approval guard cannot read session state alone");
 });
 
 test("a recorded approval says so and says who merges - never the agent", () => {

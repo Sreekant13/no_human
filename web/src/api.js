@@ -1,4 +1,5 @@
 import { makeEndpointGate } from "./queueHealthGate.js";
+import { detailMessage } from "./apiError.js";
 
 const BASE = import.meta.env.DEV ? "" : "";
 
@@ -35,7 +36,7 @@ export async function createTask({ title, description, repo_path, project_id, ki
   });
   if (!r.ok) {
     const detail = await r.json().catch(() => ({}));
-    throw new Error(detail.detail || `POST /api/tasks → ${r.status}`);
+    throw new Error(detailMessage(detail, `POST /api/tasks → ${r.status}`));
   }
   return r.json();
 }
@@ -57,7 +58,7 @@ export async function approveTask(id) {
     // A bare status code left the operator with no way to tell a rejected
     // approval from a network blip.
     const detail = await r.json().catch(() => ({}));
-    throw new Error(detail.detail || `POST approve → ${r.status}`);
+    throw new Error(detailMessage(detail, `POST approve → ${r.status}`));
   }
   return r.json();
 }
@@ -111,7 +112,7 @@ export async function grillStep({ title, description, repo_path, project_id, qa_
   });
   if (!r.ok) {
     const detail = await r.json().catch(() => ({}));
-    throw new Error(detail.detail || `POST /api/grill → ${r.status}`);
+    throw new Error(detailMessage(detail, `POST /api/grill → ${r.status}`));
   }
   return r.json();
 }
@@ -131,7 +132,7 @@ export function grillStepSSE({ title, description, repo_path, project_id, qa_his
       });
       if (!r.ok) {
         const d = await r.json().catch(() => ({}));
-        if (onError) onError(new Error(d.detail || `POST /api/grill/stream → ${r.status}`));
+        if (onError) onError(new Error(detailMessage(d, `POST /api/grill/stream → ${r.status}`)));
         return;
       }
       const reader = r.body.getReader();
@@ -171,25 +172,25 @@ export function grillStepSSE({ title, description, repo_path, project_id, qa_his
 
 export async function pauseTask(id) {
   const r = await fetch(`${BASE}/api/tasks/${id}/pause`, { method: "POST" });
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `POST pause → ${r.status}`); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST pause → ${r.status}`)); }
   return r.json();
 }
 
 export async function resumeTask(id) {
   const r = await fetch(`${BASE}/api/tasks/${id}/resume`, { method: "POST" });
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `POST resume → ${r.status}`); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST resume → ${r.status}`)); }
   return r.json();
 }
 
 export async function cancelTask(id) {
   const r = await fetch(`${BASE}/api/tasks/${id}/cancel`, { method: "POST" });
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `POST cancel → ${r.status}`); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST cancel → ${r.status}`)); }
   return r.json();
 }
 
 export async function retryTask(id) {
   const r = await fetch(`${BASE}/api/tasks/${id}/retry`, { method: "POST" });
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `POST retry → ${r.status}`); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST retry → ${r.status}`)); }
   return r.json();
 }
 
@@ -207,13 +208,13 @@ export async function addRule({ title, content, tags, project }) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ title, content, tags: tags || [], project }),
   });
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `POST rules → ${r.status}`); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST rules → ${r.status}`)); }
   return r.json();
 }
 
 export async function removeRule(id) {
   const r = await fetch(`${BASE}/api/rules/${id}`, { method: "DELETE" });
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `DELETE rules → ${r.status}`); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `DELETE rules → ${r.status}`)); }
   return r.json();
 }
 
@@ -229,13 +230,13 @@ export async function addSkill({ title, content, tags, project }) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ title, content, tags: tags || [], project }),
   });
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `POST skills → ${r.status}`); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST skills → ${r.status}`)); }
   return r.json();
 }
 
 export async function removeSkill(id) {
   const r = await fetch(`${BASE}/api/skills/${id}`, { method: "DELETE" });
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `DELETE skills → ${r.status}`); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `DELETE skills → ${r.status}`)); }
   return r.json();
 }
 
@@ -247,13 +248,13 @@ export async function fetchLearnings({ active = false } = {}) {
 
 export async function confirmLearning(id) {
   const r = await fetch(`${BASE}/api/learnings/${id}/confirm`, { method: "POST" });
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `POST confirm → ${r.status}`); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST confirm → ${r.status}`)); }
   return r.json();
 }
 
 export async function rejectLearning(id) {
   const r = await fetch(`${BASE}/api/learnings/${id}/reject`, { method: "POST" });
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `POST reject → ${r.status}`); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST reject → ${r.status}`)); }
   return r.json();
 }
 
@@ -373,7 +374,7 @@ export async function createProject({ name, repo_paths, primary_repo }) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name, repo_paths, primary_repo }),
   });
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `POST projects → ${r.status}`); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST projects → ${r.status}`)); }
   return r.json();
 }
 
@@ -384,7 +385,7 @@ export async function scaffoldRepo(parent, name) {
     body: JSON.stringify({ parent, name }),
   });
   // The backend's `detail` names WHICH validation failed - surface it verbatim.
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `POST repos/scaffold → ${r.status}`); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST repos/scaffold → ${r.status}`)); }
   return r.json();
 }
 
@@ -394,13 +395,13 @@ export async function updateProject(id, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `PUT projects → ${r.status}`); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `PUT projects → ${r.status}`)); }
   return r.json();
 }
 
 export async function deleteProject(id) {
   const r = await fetch(`${BASE}/api/projects/${id}`, { method: "DELETE" });
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `DELETE projects → ${r.status}`); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `DELETE projects → ${r.status}`)); }
   return r.json();
 }
 
@@ -424,7 +425,7 @@ export async function postReviewComments(taskId, items = null) {
   });
   if (!r.ok) {
     const d = await r.json().catch(() => ({}));
-    throw new Error(d.detail || `POST post-review-comments → ${r.status}`);
+    throw new Error(detailMessage(d, `POST post-review-comments → ${r.status}`));
   }
   return r.json();
 }
@@ -448,7 +449,7 @@ async function _put(path, body) {
   });
   if (!r.ok) {
     const detail = await r.json().catch(() => ({}));
-    throw new Error(detail.detail || `PUT ${path} → ${r.status}`);
+    throw new Error(detailMessage(detail, `PUT ${path} → ${r.status}`));
   }
   return r.json();
 }
@@ -459,7 +460,7 @@ async function _post(path, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {}),
   });
-  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `POST ${path} → ${r.status}`); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST ${path} → ${r.status}`)); }
   return r.json();
 }
 
@@ -499,7 +500,7 @@ export async function searchJiraIssues(q, limit = 50) {
   const r = await fetch(`${BASE}/api/integrations/jira/issues?${params}`);
   if (!r.ok) {
     const detail = await r.json().catch(() => ({}));
-    throw new Error(detail.detail || `GET jira/issues → ${r.status}`);
+    throw new Error(detailMessage(detail, `GET jira/issues → ${r.status}`));
   }
   return r.json();
 }
@@ -512,7 +513,7 @@ export async function fetchJiraIssue(key) {
   const r = await fetch(`${BASE}/api/integrations/jira/issues/${encodeURIComponent(key)}`);
   if (!r.ok) {
     const detail = await r.json().catch(() => ({}));
-    throw new Error(detail.detail || `GET jira/issues/${key} → ${r.status}`);
+    throw new Error(detailMessage(detail, `GET jira/issues/${key} → ${r.status}`));
   }
   return r.json();
 }

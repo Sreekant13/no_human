@@ -125,7 +125,10 @@ export function narrativeFor(task) {
     return { before: `This ${kind}`, phrase: "failed", after: " — retry it, or take a closer look at what went wrong.", colorVar: colorForStatus(status) };
   }
   if (status === "awaiting_approval") {
-    if (task.approved_at) {
+    // `task.approved_at` alone was dead in the drawer: TaskSummaryOut hoists the
+    // field, TaskOut (what the drawer fetches) only carries context.approved_at,
+    // so this branch never fired where it mattered most.
+    if (taskApprovedAt(task)) {
       return { before: `This ${kind} was approved and is`, phrase: "waiting for the PR to merge", after: "", colorVar: colorForStatus(status) };
     }
     return { before: `This ${kind} opened a pull request and is`, phrase: "waiting for your review", after: "", colorVar: colorForStatus(status) };
@@ -319,11 +322,16 @@ export function isBlockingFinding(item) {
   return !ADVISORY_SEVERITIES.has(normSeverity(item));
 }
 
-// The chip text for one checklist row, or null when the attempt carries no
-// grade (older attempts stored severity as "" or omitted the key) — the caller
-// renders no chip rather than an empty one.
+// The chip text for one checklist row. A PASSING criterion carries no grade and
+// needs no chip. A FAILING finding the reviewer never graded is "unrated" — the
+// same token severityBreakdown() counts in the section header below, so the row
+// and the header can no longer disagree (the header said "1 unrated" beside a
+// row that rendered nothing at all, and `.cr-sev-unrated` was reachable from no
+// code path). An ungraded finding also BLOCKS, per reviewer.py's degrade-safe
+// rule — silently showing no chip understated it.
 export function severityChip(item) {
-  return normSeverity(item) || null;
+  if (!item) return null;
+  return normSeverity(item) || (item.passed ? null : UNRATED);
 }
 
 // Row modifier: a passing row, an advisory (non-blocking) finding, or a
@@ -334,12 +342,22 @@ export function checklistRowClass(item) {
   return isBlockingFinding(item) ? "fail" : "advisory";
 }
 
-const SEVERITY_ORDER = ["critical", "high", "major", "med", "medium", "low", "nit"];
+// The bucket for a failing finding the reviewer left ungraded. Not a severity —
+// the absence of one — so it sorts after the real grades.
+const UNRATED = "unrated";
+
+// reviewer.py's schema is critical|high|medium|low|nit and nothing else;
+// slideOverSummary.test.mjs reads that vocabulary out of the Python source and
+// asserts this list and the .cr-sev-* rules in styles.css both match it. ("med"
+// and "major" used to sit here and in the stylesheet: "med" is
+// history/analyzer.py's unrelated importance label and "major" was never
+// emitted by anything.)
+const SEVERITY_ORDER = ["critical", "high", "medium", "low", "nit", UNRATED];
 
 function severityBreakdown(failed) {
   const counts = new Map();
   for (const it of failed) {
-    const key = normSeverity(it) || "unrated";
+    const key = normSeverity(it) || UNRATED;
     counts.set(key, (counts.get(key) || 0) + 1);
   }
   const rank = (k) => {
@@ -377,10 +395,46 @@ export function reviewVerdict(checklist) {
 // read a successful approval as a dead button. These two pure helpers give the
 // click an immediate state change and a live-region message.
 
+// When this task was approved, or null. Derived from the PAYLOAD, not from the
+// session: `approveOutcome` is reset on every taskId change, and the approve
+// endpoint leaves a normal PR task in awaiting_approval (it stamps
+// context.approved_at and stops — the human still merges). Reading session
+// state alone meant reopening the drawer on an approved task showed a plain,
+// enabled "Approve", and a second click silently re-stamped approved_at.
+//
+// TaskOut (the drawer's detail payload) carries it under `context`;
+// TaskSummaryOut (the board's) hoists it to the top level. Same fact.
+export function taskApprovedAt(task) {
+  const at = task?.approved_at || task?.context?.approved_at;
+  if (!at) return null;
+  // "Send back" returns the task to the queue for a NEW attempt with a NEW PR,
+  // and it never clears approved_at server-side. An approval recorded before
+  // the latest send-back is SPENT — treating it as live would lock the operator
+  // out of approving the PR that replaced the one they rejected.
+  const t = Date.parse(at);
+  const backs = task?.context?.send_back_feedback;
+  if (Number.isFinite(t) && Array.isArray(backs)) {
+    for (const b of backs) {
+      const bt = Date.parse(b?.at);
+      if (Number.isFinite(bt) && bt > t) return null;
+    }
+  }
+  return at;
+}
+
 // `outcome` is null before the click resolves, "ok" once the server recorded
-// the approval, "error" if it did not.
-export function approveButtonState({ busy = false, outcome = null } = {}) {
-  if (outcome === "ok") return { label: "Approved", disabled: true, tone: "ok" };
+// the approval, "error" if it did not. `approvedAt` is taskApprovedAt(task) —
+// the same state, but one that survives closing and reopening the drawer.
+//
+// Re-approval is BLOCKED, not merely labelled: a second POST cannot produce a
+// merge (only the human's git host can) and its only effect is to overwrite the
+// timestamp of when the human actually approved.
+export function approveButtonState({ busy = false, outcome = null, approvedAt = null } = {}) {
+  // Wording matched to Board.jsx's action hint for the same state, so the card
+  // and the drawer never describe one task two ways.
+  if (outcome === "ok" || (approvedAt && outcome !== "error")) {
+    return { label: "Approved — merge pending", disabled: true, tone: "ok" };
+  }
   if (busy) return { label: "Approving…", disabled: true, tone: "busy" };
   if (outcome === "error") return { label: "Retry approve", disabled: false, tone: "error" };
   return { label: "Approve", disabled: false, tone: "idle" };
