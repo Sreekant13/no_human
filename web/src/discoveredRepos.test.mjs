@@ -29,6 +29,7 @@ const result = (over = {}) => ({
   total_found: 0,
   limit: 200,
   capped: false,
+  walk_truncated: false,
   note: "",
   elapsed_ms: 3,
   ...over,
@@ -137,6 +138,23 @@ test("refused out-of-home roots are reported, never silently dropped", () => {
     repos: [repo()], roots_scanned: ["/Users/x/git"], roots_refused: ["/etc"],
   }));
   assert.match(m, /outside your home/i);
+});
+
+test("a truncated search is admitted, never passed off as a complete list", () => {
+  // The dangerous shape: rows came back, so the list LOOKS authoritative and
+  // the user concludes their repo is not there.
+  const m = discoveryMessage(result({
+    repos: [repo()], roots_scanned: ["/Users/x/git"], walk_truncated: true,
+  }));
+  assert.match(m, /stopped early/i);
+  assert.match(m, /type a repository path/i);
+});
+
+test("a complete search adds no truncation warning", () => {
+  assert.equal(
+    discoveryMessage(result({ repos: [repo()], roots_scanned: ["/Users/x/git"] })),
+    "",
+  );
 });
 
 test("a missing result object does not throw", () => {

@@ -429,6 +429,11 @@ export default function Onboarding({ onComplete }) {
                             setDiscovery({
                               ...(discovery || {}), roots_scanned: [res.root],
                               roots_missing: [], roots_refused: [],
+                              // A manual single-root scan is its own complete
+                              // answer; carrying the auto-scan's truncation
+                              // flag over would warn about a search that is
+                              // no longer on screen.
+                              walk_truncated: false,
                               repos: rows, capped: false, note: "",
                             });
                           })}>

@@ -11,12 +11,26 @@ Three properties matter more than coverage:
   is a leaf (we do not descend into one), and the result count is capped. When
   the cap bites, the response says so — a silently truncated list is a list
   the user cannot trust.
-* **Contained.** The walk never leaves ``home``. Operator-configured extra
-  roots outside home are refused and reported; a symlink pointing out of home
-  is not followed.
-* **Fast.** The walk is pure ``os.scandir``. The only subprocess is one
-  ``git status`` per *returned* repo (after the cap), run on a small thread
-  pool, so a wide tree costs one status per row shown and nothing more.
+* **Contained.** Every scan root — the conventional ones as much as the
+  operator-configured extras — is resolved and must land inside the resolved
+  ``home``; one that does not is refused and reported. Every directory entered
+  below a root is likewise checked, so a symlink pointing out of home is never
+  followed. The rule is containment after resolution, not "no symlinks":
+  ``~/Code -> ~/actual-clones`` is scanned, ``~/Code -> /Volumes/BigDisk`` is
+  refused.
+* **Fast.** The walk is pure ``os.scandir`` under its own wall-clock budget
+  (:data:`WALK_BUDGET_S`) — a network-mounted root cannot stall the request, it
+  can only truncate the answer, and a truncated answer says so. The only
+  subprocess is one ``git status`` per *returned* repo (after the cap), run on
+  a small thread pool, so a wide tree costs one status per row shown and
+  nothing more.
+
+Nothing in here may raise on a filesystem it merely cannot read. A single
+``chmod 000`` directory used to take the whole response down with a
+``PermissionError`` — ``Path.exists()`` swallows ENOENT but not EACCES — and
+this endpoint is on the first-run onboarding path, where a 500 is the user's
+first impression of the product. Unreadable entries are skipped; the rest of
+the list still comes back.
 
 ``dirty`` is the reason the git probe is worth its cost: pointing an agent at
 a repository the user is mid-edit in is how uncommitted work gets lost, and
@@ -26,6 +40,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -90,17 +105,53 @@ UNTRACKED_TIMEOUT_S = 0.75
 #: never budgeted away - the list itself is always complete.
 DIRTY_BUDGET_S = 2.0
 
+#: Wall clock for the DIRECTORY WALK, shared across every root. Separate from
+#: (and spent before) `DIRTY_BUDGET_S`, which only ever covered git probing:
+#: measured on a real home the split was walk 0.002s / total 2.34s, so the walk
+#: looked free and went unbudgeted. It is free on local disk. It is not free on
+#: an SMB or sshfs mount, where a single `scandir` can block for seconds, and
+#: nothing in the old code could stop it. A blown budget truncates the search
+#: and says so (`walk_truncated` plus a note) rather than holding the request.
+WALK_BUDGET_S = 1.5
+
 _GIT_WORKERS = 8
 
 
+def _exists(p: Path) -> bool:
+    """``p.exists()`` that reads an unreadable parent as "no", not as a crash.
+
+    ``Path.exists`` deliberately swallows ENOENT/ENOTDIR but re-raises
+    everything else, EACCES included. One ``chmod 000`` directory anywhere
+    under a scan root would otherwise abort the entire scan.
+    """
+    try:
+        return p.exists()
+    except OSError:
+        return False
+
+
+def _is_dir(p: Path) -> bool:
+    """``p.is_dir()``, same EACCES treatment as :func:`_exists`."""
+    try:
+        return p.is_dir()
+    except OSError:
+        return False
+
+
+def _scandir(d: Path) -> list[os.DirEntry[str]]:
+    """One directory listing. Indirected through the module so a test can make
+    it slow and pin the walk budget without patching ``os``."""
+    return list(os.scandir(d))
+
+
 def _quick_ecosystem(repo: Path) -> str:
-    if (repo / "package.json").exists():
+    if _exists(repo / "package.json"):
         return "node"
-    if (repo / "uv.lock").exists() or (repo / "pyproject.toml").exists():
+    if _exists(repo / "uv.lock") or _exists(repo / "pyproject.toml"):
         return "python"
-    if (repo / "pom.xml").exists():
+    if _exists(repo / "pom.xml"):
         return "maven"
-    if (repo / "go.mod").exists():
+    if _exists(repo / "go.mod"):
         return "go"
     return ""
 
@@ -113,12 +164,29 @@ def _is_within(child: Path, parent: Path) -> bool:
     return True
 
 
+def _resolved(p: Path) -> Path:
+    try:
+        return p.resolve()
+    except OSError:
+        return p
+
+
 def _git_dir(repo: Path) -> Path | None:
-    """Resolve ``.git`` whether it is a directory or a worktree pointer file."""
+    """Resolve ``.git`` whether it is a directory or a worktree pointer file.
+
+    One ``stat`` decides both cases. This is the hottest probe in the walk —
+    it runs on every directory visited, almost all of which have no ``.git`` at
+    all — so asking twice (``is_dir`` then ``is_file``) would double the
+    syscalls of the common miss.
+    """
     dot = repo / ".git"
-    if dot.is_dir():
+    try:
+        mode = dot.stat().st_mode
+    except OSError:
+        return None
+    if stat.S_ISDIR(mode):
         return dot
-    if dot.is_file():
+    if stat.S_ISREG(mode):
         try:
             line = dot.read_text(errors="replace").strip()
         except OSError:
@@ -126,9 +194,39 @@ def _git_dir(repo: Path) -> Path | None:
         if line.startswith("gitdir:"):
             target = Path(line.split(":", 1)[1].strip()).expanduser()
             if not target.is_absolute():
-                target = (repo / target).resolve()
-            return target if target.is_dir() else None
+                target = _resolved(repo / target)
+            return target if _is_dir(target) else None
     return None
+
+
+def _is_repo(d: Path) -> bool:
+    """True only for a directory that is really a git working tree.
+
+    A *name* ``.git`` is not evidence: unpacked archives, backup folders and
+    half-deleted clones all carry one. Accepting the name alone did two kinds
+    of damage — it offered a directory the agent cannot work in, and, because a
+    repo is a leaf, it hid every genuine repository nested beneath it. The
+    cheapest real evidence is ``HEAD``, which is also the file the branch
+    readout needs anyway, so this costs nothing extra.
+    """
+    gd = _git_dir(d)
+    return gd is not None and _exists(gd / "HEAD")
+
+
+def _is_bare_repo(d: Path) -> bool:
+    """A bare repository: git metadata at the top level, no working tree.
+
+    Not offered — there is no checkout to point a task at — and, more to the
+    point, not descended into: walking one means enumerating ``objects/``,
+    ``refs/`` and ``hooks/`` for nothing. The ``HEAD`` probe comes first so the
+    ordinary directory pays one stat, not four.
+    """
+    return (
+        _exists(d / "HEAD")
+        and _is_dir(d / "objects")
+        and _is_dir(d / "refs")
+        and _exists(d / "config")
+    )
 
 
 def _head_info(repo: Path) -> tuple[str, bool]:
@@ -189,7 +287,7 @@ _PENDING = "pending"
 
 def _describe_cheap(repo: Path, deadline: float) -> dict[str, Any]:
     """Everything a row needs except the expensive untracked verdict."""
-    is_git = (repo / ".git").exists()
+    is_git = _is_repo(repo)
     branch, detached = _head_info(repo) if is_git else ("", False)
     row: dict[str, Any] = {
         "path": str(repo),
@@ -244,31 +342,51 @@ def _untracked_pass(rows: list[dict[str, Any]], deadline: float) -> None:
 
 
 def _walk(root: Path, home: Path, max_depth: int, ceiling: int,
-          found: list[Path]) -> None:
-    """Collect candidate project directories under ``root``, depth-bounded."""
+          found: list[Path], deadline: float) -> bool:
+    """Collect candidate project directories under ``root``, depth-bounded.
+
+    Returns True if the wall-clock ``deadline`` cut the walk short — the caller
+    reports that rather than passing a truncated list off as a complete one.
+    Whatever was found before the cut is kept.
+    """
+    truncated = False
+
     def visit(d: Path, depth: int) -> None:
+        nonlocal truncated
         if len(found) >= ceiling:
             return
-        if (d / ".git").exists() or any((d / m).exists() for m in _MANIFESTS):
+        if time.monotonic() >= deadline:
+            truncated = True
+            return
+        if _is_repo(d):
             found.append(d)
             return  # a project is a leaf - never descend into one
+        if _is_bare_repo(d):
+            return  # no working tree to offer, and nothing inside worth walking
+        if any(_exists(d / m) for m in _MANIFESTS):
+            found.append(d)
+            return
         if depth >= max_depth:
             return
         try:
-            entries = list(os.scandir(d))
+            entries = _scandir(d)
         except OSError:
             return
         for e in sorted(entries, key=lambda x: x.name):
-            if not e.is_dir(follow_symlinks=True):
+            try:
+                if not e.is_dir(follow_symlinks=True):
+                    continue
+                is_link = e.is_symlink()
+            except OSError:
                 continue
             if e.name.startswith(".") or e.name in EXCLUDED_DIRS:
                 continue
             child = Path(e.path)
-            if e.is_symlink():
+            if is_link:
                 try:
                     target = child.resolve()
                 except OSError:
-                    continue
+                    continue  # a cycle or a dead link: refuse, do not guess
                 # A link out of home is exactly the escape hatch this walk
                 # must not take.
                 if not _is_within(target, home):
@@ -276,6 +394,7 @@ def _walk(root: Path, home: Path, max_depth: int, ceiling: int,
             visit(child, depth + 1)
 
     visit(root, 0)
+    return truncated
 
 
 def discover_repos(
@@ -289,20 +408,36 @@ def discover_repos(
 
     Returns a JSON-ready dict: ``repos`` (path/name/is_git/branch/dirty/
     detached/ecosystem), the roots actually scanned, missing and refused, the
-    cap state with a human-readable ``note``, and ``elapsed_ms``.
+    cap state, ``walk_truncated`` (the walk ran out of wall clock, so some
+    folders were never reached), a human-readable ``note`` covering both of
+    those, and ``elapsed_ms``.
+
+    It does not raise on anything it merely cannot read. An unreadable
+    directory, a dead symlink or a root that vanished mid-scan is skipped and
+    the rest of the list still comes back.
     """
     t0 = time.perf_counter()
     home_path = Path(home).expanduser() if home is not None else Path.home()
-    try:
-        home_path = home_path.resolve()
-    except OSError:
-        pass
+    home_path = _resolved(home_path)
 
     scanned: list[str] = []
     missing: list[str] = []
     refused: list[str] = []
 
-    candidate_roots: list[Path] = [home_path / name for name in CONVENTIONAL_ROOTS]
+    candidate_roots: list[Path] = []
+    for name in CONVENTIONAL_ROOTS:
+        root = home_path / name
+        # The conventional roots were the ONE path built without this check,
+        # and `~/Code -> /Volumes/BigDisk/code` is an ordinary setup - so the
+        # walk left home through the front door while refusing every side
+        # entrance. Report the link, not just its target: "/Volumes/BigDisk"
+        # on its own does not tell the user which of their folders did it.
+        target = _resolved(root)
+        if target != root and not _is_within(target, home_path):
+            refused.append(f"{root} -> {target}")
+            continue
+        candidate_roots.append(root)
+
     for raw in extra_roots or []:
         if not str(raw).strip():
             continue
@@ -316,10 +451,7 @@ def discover_repos(
             p = home_path / text[2:]
         else:
             p = Path(text)
-        try:
-            p = p.resolve()
-        except OSError:
-            pass
+        p = _resolved(p)
         if not _is_within(p, home_path):
             refused.append(str(p))
             continue
@@ -328,14 +460,29 @@ def discover_repos(
 
     ceiling = max(max_results * 5, 1000)
     found: list[Path] = []
+    walk_deadline = time.monotonic() + WALK_BUDGET_S
+    walk_truncated = False
     for root in candidate_roots:
-        if not root.is_dir():
+        if time.monotonic() >= walk_deadline:
+            walk_truncated = True
+            break
+        if not _is_dir(root):
             missing.append(str(root))
             continue
         scanned.append(str(root))
-        _walk(root, home_path, max_depth, ceiling, found)
+        if _walk(root, home_path, max_depth, ceiling, found, walk_deadline):
+            walk_truncated = True
 
-    unique = sorted(set(found), key=lambda p: (p.name.lower(), str(p)))
+    # Dedupe on the RESOLVED path: `Projects/alias -> Projects/plain` is one
+    # checkout, and two rows for it is two identical tasks waiting to happen.
+    # Where both spellings were found, keep the real one.
+    by_real: dict[Path, Path] = {}
+    for p in found:
+        key = _resolved(p)
+        prev = by_real.get(key)
+        if prev is None or (prev != key and p == key):
+            by_real[key] = p
+    unique = sorted(by_real.values(), key=lambda p: (p.name.lower(), str(p)))
     total = len(unique)
     capped = total > max_results
     shown = unique[:max_results]
@@ -345,12 +492,18 @@ def discover_repos(
         rows = list(pool.map(lambda p: _describe_cheap(p, deadline), shown))
     _untracked_pass(rows, deadline)
 
-    note = ""
+    notes: list[str] = []
     if capped:
-        note = (
+        notes.append(
             f"Showing the first {max_results} of {total} repositories found - "
             "narrow the scan roots in Settings, or type the path directly, "
             "to reach the rest."
+        )
+    if walk_truncated:
+        notes.append(
+            "The search stopped early to keep this page responsive, so some "
+            "folders were not reached - type a repository path directly to "
+            "use one of them."
         )
 
     return {
@@ -361,7 +514,8 @@ def discover_repos(
         "total_found": total,
         "limit": max_results,
         "capped": capped,
-        "note": note,
+        "walk_truncated": walk_truncated,
+        "note": " ".join(notes),
         "elapsed_ms": int((time.perf_counter() - t0) * 1000),
     }
 

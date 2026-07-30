@@ -6,6 +6,7 @@ nothing here reads the operator's real machine.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -19,6 +20,21 @@ from no_human.repo_discovery import (
     DEFAULT_MAX_RESULTS,
     discover_repos,
 )
+
+def _assert_unreadable(p: Path) -> None:
+    """Prove the ``chmod`` actually bites before trusting the test that follows.
+
+    A permission test that silently stops reproducing anything is worse than no
+    test: it reports green forever. Under root the bits mean nothing, so the
+    precondition is simply not claimed there — the test still runs and its
+    assertions still hold, it just proves less on that one uid. This is checked
+    inline rather than with a skip marker: skipping is what the tamper guard
+    exists to notice, and a test that runs everywhere owes it no exception.
+    """
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return
+    with pytest.raises(PermissionError):
+        (p / ".git").exists()
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -105,6 +121,37 @@ def test_a_symlink_escaping_home_is_not_followed(tmp_path):
     (home / "git" / "link").symlink_to(outside)
     res = discover_repos(home=home)
     assert "secret-repo" not in _by_name(res)
+
+
+def test_a_conventional_root_symlinked_out_of_home_is_refused(tmp_path):
+    """``~/Code -> /Volumes/BigDisk/code`` is an ordinary developer setup, and
+    it used to walk straight out of home: the eight conventional roots were the
+    only paths built without the resolve-and-contain check every other entry
+    point gets. The module docstring promises the walk never leaves ``home``,
+    so this is the promise, tested.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    _fake_repo(outside / "secretrepo")
+    (home / "Dev").symlink_to(outside)
+
+    res = discover_repos(home=home)
+
+    assert _by_name(res) == {}, "a repo outside home must never reach the picker"
+    assert str(home / "Dev") not in res["roots_scanned"]
+    assert any("Dev" in r for r in res["roots_refused"]), res["roots_refused"]
+
+
+def test_a_conventional_root_symlinked_inside_home_is_still_scanned(tmp_path):
+    """Containment, not "no symlinks" - a link that stays inside home is fine."""
+    home = tmp_path / "home"
+    real = home / "actual-clones"
+    _fake_repo(real / "svc")
+    (home / "Code").symlink_to(real)
+    got = _by_name(discover_repos(home=home))
+    assert "svc" in got
+    assert discover_repos(home=home)["roots_refused"] == []
 
 
 # --------------------------------------------------------------------------- #
@@ -388,3 +435,178 @@ def test_the_budget_bounds_the_whole_scan_not_each_repo(tmp_path, monkeypatch):
     # 16 serial 0.3s probes would be 4.8s; the budget plus one in-flight probe
     # is the ceiling regardless of how many repos there are.
     assert wall < 2.0, f"scan took {wall:.2f}s"
+
+
+# --------------------------------------------------------------------------- #
+# A hostile filesystem: unreadable directories, junk .git, aliases, bare repos #
+# --------------------------------------------------------------------------- #
+
+def test_one_unreadable_directory_does_not_take_the_whole_scan_down(tmp_path):
+    """One ``chmod 000`` directory beside a healthy repo used to raise
+    ``PermissionError`` out of the walk. ``Path.exists()`` swallows ENOENT but
+    NOT EACCES, and the probe sat outside the ``try/except OSError`` that
+    guards ``os.scandir``. There is no exception handler on the API app, so the
+    result was an unhandled 500 on the first-run onboarding path - losing the
+    entire list, including the repos that scanned fine.
+    """
+    root = tmp_path / "Projects"
+    _fake_repo(root / "healthy")
+    locked = root / "locked"
+    (locked / ".git").mkdir(parents=True)
+    locked.chmod(0o000)
+    try:
+        _assert_unreadable(locked)
+        res = discover_repos(home=tmp_path)
+    finally:
+        locked.chmod(0o755)
+
+    assert "healthy" in _by_name(res), "a readable repo must survive an unreadable sibling"
+    assert "locked" not in _by_name(res)
+
+
+def test_an_unreadable_root_is_skipped_not_raised(tmp_path):
+    locked_root = tmp_path / "git"
+    locked_root.mkdir()
+    _fake_repo(tmp_path / "Projects" / "healthy")
+    locked_root.chmod(0o000)
+    try:
+        _assert_unreadable(locked_root)
+        res = discover_repos(home=tmp_path)
+    finally:
+        locked_root.chmod(0o755)
+    assert "healthy" in _by_name(res)
+
+
+def test_describing_an_unreadable_repo_answers_instead_of_raising(tmp_path):
+    """The same EACCES class one layer down: the ``.exists()`` probes inside
+    the per-row describe (`is_git`, `_quick_ecosystem`) were unguarded too."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o000)
+    try:
+        _assert_unreadable(locked)
+        row = repo_discovery._describe_cheap(locked, time.monotonic() + 5)
+    finally:
+        locked.chmod(0o755)
+    assert row["is_git"] is False
+    assert row["ecosystem"] == ""
+    assert row["dirty_scan"] == "not-a-repo"
+
+
+def test_a_directory_merely_named_dot_git_is_not_a_repo(tmp_path):
+    """A *directory* called ``.git`` is not proof of a repository - an unpacked
+    archive or a backup folder has one. Worse than the false row: the entry was
+    treated as a leaf, so the genuine repos nested beneath it were never found.
+    """
+    fake = tmp_path / "git" / "backup-2019"
+    (fake / ".git").mkdir(parents=True)      # no HEAD - not a git directory
+    _fake_repo(fake / "real-svc")
+
+    got = _by_name(discover_repos(home=tmp_path))
+    assert "backup-2019" not in got, "a bare .git name must not pass as a repository"
+    assert "real-svc" in got, "a repo nested under the false positive must still be found"
+
+
+def test_a_symlinked_alias_of_a_repo_is_not_a_second_row(tmp_path):
+    """``sorted(set(found))`` deduped literal paths, so an alias and its target
+    were two rows for one checkout - and picking either starts the same task."""
+    root = tmp_path / "Projects"
+    plain = _fake_repo(root / "plain")
+    (root / "alias").symlink_to(plain)
+
+    res = discover_repos(home=tmp_path)
+    assert [r["path"] for r in res["repos"]] == [str(plain)]
+    assert res["total_found"] == 1
+
+
+def test_a_bare_repository_is_skipped_and_never_enumerated(tmp_path, monkeypatch):
+    """A bare repo has no working tree to point a task at, so offering it would
+    be wrong - but descending into it to enumerate ``objects/`` and ``refs/``
+    is wrong regardless of that call."""
+    bare = tmp_path / "git" / "mirror.git"
+    bare.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)],
+                   check=True, capture_output=True)
+    _fake_repo(tmp_path / "git" / "worktree-repo")
+
+    seen: list[str] = []
+    real = repo_discovery._scandir
+
+    def spy(d):
+        seen.append(str(d))
+        return real(d)
+
+    monkeypatch.setattr(repo_discovery, "_scandir", spy)
+    got = _by_name(discover_repos(home=tmp_path))
+
+    assert "mirror.git" not in got
+    assert "worktree-repo" in got
+    assert not any("mirror.git" in s for s in seen), \
+        f"the walk enumerated a bare repository's internals: {seen}"
+
+
+# --------------------------------------------------------------------------- #
+# The walk has its own wall-clock budget                                       #
+# --------------------------------------------------------------------------- #
+
+def test_a_slow_root_cannot_stall_the_request_forever(tmp_path, monkeypatch):
+    """``DIRTY_BUDGET_S`` covers only the git-probing phase. A network-mounted
+    or otherwise slow root stalled the walk itself with nothing to stop it.
+    """
+    for i in range(12):
+        _fake_repo(tmp_path / "git" / f"d{i:02d}" / "repo")
+
+    real = repo_discovery._scandir
+
+    def slow(d):
+        time.sleep(0.1)
+        return real(d)
+
+    monkeypatch.setattr(repo_discovery, "_scandir", slow)
+    monkeypatch.setattr(repo_discovery, "WALK_BUDGET_S", 0.25)
+
+    t0 = time.perf_counter()
+    res = discover_repos(home=tmp_path)
+    wall = time.perf_counter() - t0
+
+    # 13 scandir calls at 0.1s each is 1.3s with no budget in the way.
+    assert wall < 1.0, f"the walk ran for {wall:.2f}s past its budget"
+    assert res["walk_truncated"] is True
+    assert res["note"], "a truncated search must say so, not return a short list silently"
+
+
+def test_a_truncated_walk_still_returns_what_it_found(tmp_path, monkeypatch):
+    """Degrade honestly: partial results plus a flag, the way the git probe
+    already does - not an empty list and not an exception."""
+    # "Projects" is scanned before "git", so the fast root finishes first and
+    # the slow one is what the budget cuts off.
+    for i in range(6):
+        _fake_repo(tmp_path / "Projects" / f"r{i}")
+    (tmp_path / "git" / "slow-tree" / "buried").mkdir(parents=True)
+    _fake_repo(tmp_path / "git" / "slow-tree" / "buried" / "unreached")
+
+    real = repo_discovery._scandir
+    calls = {"n": 0}
+
+    def slow_after_the_first(d):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            time.sleep(0.4)
+        return real(d)
+
+    monkeypatch.setattr(repo_discovery, "_scandir", slow_after_the_first)
+    monkeypatch.setattr(repo_discovery, "WALK_BUDGET_S", 0.2)
+
+    res = discover_repos(home=tmp_path)
+    names = set(_by_name(res))
+    assert names == {f"r{i}" for i in range(6)}, \
+        "the root that finished must keep its results"
+    assert "unreached" not in names
+    assert res["walk_truncated"] is True
+
+
+def test_an_untruncated_walk_says_so(tmp_path):
+    _fake_repo(tmp_path / "git" / "only")
+    res = discover_repos(home=tmp_path)
+    assert res["walk_truncated"] is False
+    assert res["note"] == ""

@@ -7,6 +7,7 @@ and config.yaml persistence on complete.
 """
 from __future__ import annotations
 
+import os
 import types
 
 import pytest
@@ -238,3 +239,54 @@ async def test_discover_on_a_bare_home_is_an_empty_list_not_an_error(client, tmp
     assert r.status_code == 200
     assert r.json()["repos"] == []
     assert r.json()["roots_scanned"] == []
+
+
+@pytest.mark.asyncio
+async def test_discover_survives_an_unreadable_directory_instead_of_500ing(
+    client, tmp_path, monkeypatch
+):
+    """One ``chmod 000`` folder anywhere under a scan root used to raise
+    ``PermissionError`` straight out of the walk. This endpoint has no
+    exception handler in front of it, so that was an unhandled 500 on the
+    FIRST-RUN onboarding path, and it took the healthy repos down with it.
+    """
+    home = tmp_path / "home"
+    _seed_repo(home / "Projects" / "healthy")
+    locked = home / "Projects" / "locked"
+    (locked / ".git").mkdir(parents=True)
+    locked.chmod(0o000)
+    monkeypatch.setenv("HOME", str(home))
+    try:
+        # Prove the scenario is genuinely hostile before trusting the result.
+        # (Under root the bits mean nothing; the assertions below still hold,
+        # they just prove less there. A skip marker would cost a tamper signal
+        # for no gain.)
+        if not (hasattr(os, "geteuid") and os.geteuid() == 0):
+            with pytest.raises(PermissionError):
+                (locked / ".git").exists()
+        r = await client.get("/api/repos/discover")
+    finally:
+        locked.chmod(0o755)
+
+    assert r.status_code == 200, r.text
+    assert {x["name"] for x in r.json()["repos"]} == {"healthy"}
+
+
+@pytest.mark.asyncio
+async def test_discover_refuses_a_conventional_root_that_leaves_home(
+    client, tmp_path, monkeypatch
+):
+    """``~/Dev -> /Volumes/BigDisk`` is an ordinary setup, and it walked the
+    scan straight out of the home directory this endpoint is bound to."""
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    _seed_repo(outside / "secretrepo")
+    (home / "Dev").symlink_to(outside)
+    monkeypatch.setenv("HOME", str(home))
+
+    r = await client.get("/api/repos/discover")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["repos"] == []
+    assert body["roots_refused"], "a refused root must be reported, not silently dropped"

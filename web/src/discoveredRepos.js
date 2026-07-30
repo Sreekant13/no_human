@@ -41,8 +41,9 @@ export function repoBadges(repo) {
   return out;
 }
 
-// One line under the list: the cap note, an empty-state, or a warning about
-// configured roots that were refused. "" means there is nothing to say.
+// One line under the list: the cap note, an empty-state, a warning about scan
+// roots that were refused, or the fact that the search ran out of time.
+// "" means there is nothing to say.
 export function discoveryMessage(res) {
   if (!res) return "";
   const scanned = res.roots_scanned || [];
@@ -59,9 +60,18 @@ export function discoveryMessage(res) {
         : `Searched ${scanned.length} ${scanned.length === 1 ? "folder" : "folders"} and found no repositories - type a repository path instead.`,
     );
   }
-  if (refused.length) {
+  if (res.walk_truncated) {
+    // A short list that LOOKS complete is the failure mode here: the user
+    // concludes the repo is not there and stops looking.
     parts.push(
-      `Skipped ${refused.length} configured ${refused.length === 1 ? "root" : "roots"} outside your home directory.`,
+      "The search stopped early, so some folders were not reached - type a repository path to use one of them.",
+    );
+  }
+  if (refused.length) {
+    // Not always operator-configured: a conventional root can be a symlink out
+    // of home (`~/Code -> /Volumes/BigDisk`), and the wording has to cover it.
+    parts.push(
+      `Skipped ${refused.length} scan ${refused.length === 1 ? "root" : "roots"} pointing outside your home directory.`,
     );
   }
   return parts.join(" ");
