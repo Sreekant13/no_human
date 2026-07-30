@@ -106,9 +106,9 @@ async def seed() -> int:
                  "pr_url": "local-pr://remote.git/no-human/aabbccdd", "status": "succeeded",
                  "review_passed": 1, "turns_used": 7,
                  "review_checklist": {"passed": True, "items": [
-                     {"criterion": "mul(a,b) returns a*b", "passed": True,
+                     {"label": "mul(a,b) returns a*b", "passed": True,
                       "evidence": "calc.py:5 returns a*b; verified by test_mul"},
-                     {"criterion": "a test covers mul()", "passed": True,
+                     {"label": "a test covers mul()", "passed": True,
                       "evidence": "test_calc.py:9 asserts mul(2,3)==6"},
                  ]},
                  "test_results": {"ran": True, "ok": True, "passed": 3, "failed": 0,
