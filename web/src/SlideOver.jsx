@@ -232,26 +232,45 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   // drawer session — survives closing and reopening the drawer, which
   // `approveOutcome` (reset on every taskId change) does not.
   const approvedAt = taskApprovedAt(task);
+  // ONE derivation, read by both the button and its click guard. Computing the
+  // state at the render site and the guard separately is what let an enabled
+  // "Retry approve" sit on top of a handler that returns immediately; sharing
+  // the object makes that class of divergence unrepresentable.
+  const approveBtn = approveButtonState({ busy, outcome: approveOutcome, approvedAt });
 
   async function handleApprove() {
-    if (!isAwaiting || busy || approveOutcome === "ok" || approvedAt) return;
+    if (!isAwaiting || approveBtn.disabled) return;
     setBusy(true);
     setApproveOutcome(null);
+    let posted = false;
     try {
       const res = await approveTask(taskId);
+      posted = true;
       const remaining = reviewQueue.filter((id) => id !== taskId).length;
       // The server's message is authoritative: an already-satisfied approval
       // completes the task with no PR to merge (PR #101 round-2 review) —
       // hardcoding the merge instruction here lied on that path.
       setApproveOutcome("ok");
       setFlash(approvalFeedback({ ok: true, message: res?.message, remaining }));
-      const updated = await fetchTask(taskId);
-      setTask(updated);
     } catch (e) {
       setApproveOutcome("error");
       setFlash(approvalFeedback({ ok: false, error: e.message }));
     } finally {
       setBusy(false);
+    }
+    // The refresh is OUTSIDE the approval's try on purpose. It used to sit
+    // inside it, so a transient GET failure AFTER the POST had already landed
+    // ran the catch: the operator was told "Approval NOT recorded" about an
+    // approval the server had recorded, and the button offered a retry. The
+    // POST's own result is the only thing that can decide the outcome; failing
+    // to re-read the task is a display problem, and the WS-driven refresh
+    // delivers the updated task anyway.
+    if (posted) {
+      try {
+        setTask(await fetchTask(taskId));
+      } catch {
+        /* the socket's own refresh will bring it — the approval stands either way */
+      }
     }
   }
 
@@ -422,7 +441,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
             and never rendered empty. */}
         {task && showActionBar && (
           <div className="so-actions">
-            {isAwaiting && (() => {
+            {isAwaiting && (
               // The click has to change something on the control itself: an
               // approval that recorded server-side but left the button reading
               // "Approve" was read as a dead button.
@@ -430,17 +449,16 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
               // drawer on an approved task still reads "Approved — merge
               // pending" instead of offering a bare Approve that would
               // silently re-stamp approved_at.
-              const ab = approveButtonState({ busy, outcome: approveOutcome, approvedAt });
-              return (
-                <button
-                  className={`btn btn-approve btn-approve-${ab.tone}`}
-                  onClick={handleApprove}
-                  disabled={ab.disabled || busy}
-                >
-                  {ab.label}
-                </button>
-              );
-            })()}
+              // `approveBtn` is the SAME object handleApprove guards on, so an
+              // enabled label can never outlive the handler that backs it.
+              <button
+                className={`btn btn-approve btn-approve-${approveBtn.tone}`}
+                onClick={handleApprove}
+                disabled={approveBtn.disabled || busy}
+              >
+                {approveBtn.label}
+              </button>
+            )}
             {isAwaiting && (
               <button className="btn btn-sendback" onClick={() => setSbOpen(true)} disabled={busy}>
                 Send back

@@ -670,13 +670,26 @@ test("the .cr-sev-* rules cover exactly the severities that can reach the chip",
   );
   // Read the schema line the reviewer actually sends to the model rather than
   // hand-copying the values here.
-  const schema = reviewerPy.match(/"severity":\s*"([a-z|]+)"/);
-  assert.ok(schema, "reviewer.py's severity schema line not found — retarget this test");
-  const emitted = schema[1].split("|");
-  assert.deepEqual(
-    emitted, ["critical", "high", "medium", "low", "nit"],
-    "reviewer.py's severity vocabulary changed — update styles.css to match",
-  );
+  //
+  // ALL of them: reviewer.py carries THREE copies of this line (three prompts),
+  // and a non-global `.match` reads only the first — so the other two could
+  // drift to a vocabulary styles.css has no chip for, silently, with this test
+  // green. Every copy is checked, and the count is asserted so deleting a
+  // prompt (or adding a fourth) is a deliberate edit rather than a quiet loss
+  // of coverage.
+  const schemas = [...reviewerPy.matchAll(/"severity":\s*"([a-z|]+)"/g)];
+  assert.ok(schemas.length > 0, "reviewer.py's severity schema line not found — retarget this test");
+  assert.equal(schemas.length, 3,
+    `reviewer.py now has ${schemas.length} severity schema lines, not 3 — retarget this test`);
+  const vocabularies = schemas.map((m) => m[1].split("|"));
+  for (const [i, emitted] of vocabularies.entries()) {
+    assert.deepEqual(
+      emitted, ["critical", "high", "medium", "low", "nit"],
+      `reviewer.py's severity vocabulary changed in schema copy #${i + 1} — ` +
+      "the three prompts must agree with each other and with styles.css",
+    );
+  }
+  const emitted = vocabularies[0];
   const expected = new Set([...emitted, "unrated"]);
   assert.deepEqual(
     [...styled].filter((c) => !expected.has(c)), [],
@@ -837,6 +850,50 @@ test("reopening the drawer on an approved task shows the approved state, not a b
   assert.equal(approveButtonState({ approvedAt: null }).label, "Approve");
   // An in-flight click still wins over the stale payload it is about to update.
   assert.match(approveButtonState({ busy: true, approvedAt: null }).label, /ing/i);
+});
+
+// ── DEAD CONTROL: an enabled "Retry approve" whose handler returns early ────
+// `approveButtonState` used to exclude `outcome === "error"` from the approved
+// state, while SlideOver's handleApprove returns immediately on `approvedAt`.
+// Both conditions hold at once on a path with no server fault in it: the POST
+// lands, `outcome` becomes "ok", the refetch in the same `try` fails, the catch
+// rewrites `outcome` to "error", and the refresh then delivers `approved_at`.
+// The operator is left with an enabled button that does nothing on click —
+// the exact class of defect this drawer work exists to remove.
+//
+// The rule: `approvedAt` is the SERVER's record, `outcome` is this session's
+// guess at it, and the server wins.
+
+test("a server-recorded approval outranks a stale client error — no enabled control that cannot fire", () => {
+  const stuck = approveButtonState({ outcome: "error", approvedAt: "2026-07-30T10:00:00+00:00" });
+  assert.equal(stuck.disabled, true,
+    "an enabled button whose handler returns early on approvedAt is a dead control");
+  assert.doesNotMatch(stuck.label, /retry/i,
+    "offering a retry for an approval the server already recorded is a lie about the state");
+  // It is the SAME state a reopened drawer shows, by every field — the local
+  // error must not leave a third, half-approved appearance behind.
+  assert.deepEqual(stuck, approveButtonState({ approvedAt: "2026-07-30T10:00:00+00:00" }));
+});
+
+test("an approval error with NO server record is still fully retryable", () => {
+  // The case the old exclusion was aimed at, unchanged: a genuinely refused or
+  // dropped POST leaves no approved_at, and the operator must be able to click
+  // again. Narrowing this is how the fix above would go wrong.
+  const retry = approveButtonState({ outcome: "error", approvedAt: null });
+  assert.equal(retry.disabled, false);
+  assert.match(retry.label, /retry/i);
+  assert.equal(retry.tone, "error");
+
+  // And an approval SPENT by a later send-back is not a record either:
+  // taskApprovedAt returns null for it, so the retry survives that path too.
+  const spent = taskApprovedAt({
+    context: {
+      approved_at: "2026-07-30T10:00:00+00:00",
+      send_back_feedback: [{ at: "2026-07-30T11:00:00+00:00", message: "redo" }],
+    },
+  });
+  assert.equal(spent, null);
+  assert.deepEqual(approveButtonState({ outcome: "error", approvedAt: spent }), retry);
 });
 
 test("the board's wording for an approved task is the wording the drawer reuses", () => {

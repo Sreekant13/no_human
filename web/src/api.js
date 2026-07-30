@@ -1,7 +1,14 @@
 import { makeEndpointGate } from "./queueHealthGate.js";
 import { detailMessage } from "./apiError.js";
 
-const BASE = import.meta.env.DEV ? "" : "";
+// Both arms of the old `import.meta.env.DEV ? "" : ""` were the empty string —
+// vite folded it to "" in every build, so this is byte-identical at runtime.
+// Written literally because `import.meta.env` is undefined outside vite, and
+// that one expression made this whole module unimportable under `node --test`:
+// api.test.mjs can now exercise these functions for real instead of asserting
+// over their source text. (connectWS still reads import.meta.env, but only when
+// called, and it needs a browser anyway.)
+const BASE = "";
 
 /** Guard against the SPA catch-all returning index.html instead of JSON. */
 function _jsonSafe(r, fallback) {
@@ -47,7 +54,14 @@ export async function uploadAttachment(taskId, file) {
   const r = await fetch(`${BASE}/api/tasks/${taskId}/attachments`, {
     method: "POST", body: fd,
   });
-  if (!r.ok) throw new Error(`upload ${file.name} → ${r.status}`);
+  // detailMessage, like every other mutating call here: the server explains WHY
+  // (a 409 reason, a 422 naming the offending field) and a bare status code
+  // threw that away, leaving the operator unable to tell a REFUSED action from
+  // a network blip. This one also has a 413/415 the operator can act on.
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    throw new Error(detailMessage(d, `upload ${file.name} → ${r.status}`));
+  }
   return r.json();
 }
 
@@ -65,7 +79,10 @@ export async function approveTask(id) {
 
 export async function finishReview(id) {
   const r = await fetch(`${BASE}/api/tasks/${id}/finish-review`, { method: "POST" });
-  if (!r.ok) throw new Error(`POST finish-review → ${r.status}`);
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    throw new Error(detailMessage(d, `POST finish-review → ${r.status}`));
+  }
   return r.json();
 }
 
@@ -75,7 +92,10 @@ export async function replyTask(id, answer) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ answer }),
   });
-  if (!r.ok) throw new Error(`POST reply → ${r.status}`);
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    throw new Error(detailMessage(d, `POST reply → ${r.status}`));
+  }
   return r.json();
 }
 
@@ -88,7 +108,10 @@ export async function chooseBlockerOption(id, choose) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ choose }),
   });
-  if (!r.ok) throw new Error(`POST reply(choose) → ${r.status}`);
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    throw new Error(detailMessage(d, `POST reply(choose) → ${r.status}`));
+  }
   return r.json();
 }
 
@@ -98,7 +121,12 @@ export async function sendBack(id, message) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message }),
   });
-  if (!r.ok) throw new Error(`POST send-back → ${r.status}`);
+  if (!r.ok) {
+    // The 409s here say "task is already done" / "task is cancelled"
+    // (api/app.py send_back) - the reason the send-back did not take.
+    const d = await r.json().catch(() => ({}));
+    throw new Error(detailMessage(d, `POST send-back → ${r.status}`));
+  }
   return r.json();
 }
 

@@ -165,9 +165,27 @@ def _is_within(child: Path, parent: Path) -> bool:
 
 
 def _resolved(p: Path) -> Path:
+    """``p.resolve()`` that degrades to the unresolved path instead of raising.
+
+    ``ValueError`` as well as ``OSError``: an embedded NUL byte makes the
+    underlying ``lstat`` raise ``ValueError``, not ``OSError``, and this is the
+    one probe that operator-supplied text reaches BEFORE any filesystem check
+    could reject it (``discover_repos`` resolves each ``extra_roots`` entry, and
+    ``home``, before ``_is_within`` gets a chance to refuse them). Catching only
+    ``OSError`` therefore let a single configured root abort the whole scan with
+    a traceback, which contradicts this module's stated contract that it "does
+    not raise on anything it merely cannot read".
+
+    A path this cannot resolve is returned unchanged, so it fails the
+    ``_is_within`` boundary check and lands in ``roots_refused`` - reported, not
+    silently dropped.
+
+    ``_exists``/``_is_dir`` need no such widening: ``pathlib`` already converts
+    the NUL ``ValueError`` into ``False`` for those two (verified on 3.12).
+    """
     try:
         return p.resolve()
-    except OSError:
+    except (OSError, ValueError):
         return p
 
 
@@ -208,6 +226,24 @@ def _is_repo(d: Path) -> bool:
     repo is a leaf, it hid every genuine repository nested beneath it. The
     cheapest real evidence is ``HEAD``, which is also the file the branch
     readout needs anyway, so this costs nothing extra.
+
+    Absence of evidence is treated as absence, with NO note - a deliberate
+    choice, so it is recorded here rather than re-litigated. A repo whose
+    ``.git`` this process cannot stat (``chmod 000 .git``) reads as False and,
+    measured on a synthetic home:
+
+      * with a manifest alongside it, the directory is still OFFERED, as
+        ``is_git: false`` / ``dirty_scan: "not-a-repo"``;
+      * without one, it is dropped and the walk descends into it.
+
+    So the two outcomes differ, and a note in the truncation note's style ("some
+    repositories were skipped") would be FALSE for the first of them - the
+    walk-truncation note is truthful precisely because the walk really did stop.
+    Producing a truthful one instead needs the EACCES/ENOENT split threaded out
+    of this function, through ``_walk``'s recursion and a ``ThreadPoolExecutor``
+    that has no collector. That is a real change, and the case it buys is one no
+    scan has hit: a ``.git`` unreadable to this uid is unusable by the agent's
+    git calls too, so there is nothing to offer even once it is named.
     """
     gd = _git_dir(d)
     return gd is not None and _exists(gd / "HEAD")

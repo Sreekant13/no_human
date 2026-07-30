@@ -432,7 +432,21 @@ export function taskApprovedAt(task) {
 export function approveButtonState({ busy = false, outcome = null, approvedAt = null } = {}) {
   // Wording matched to Board.jsx's action hint for the same state, so the card
   // and the drawer never describe one task two ways.
-  if (outcome === "ok" || (approvedAt && outcome !== "error")) {
+  //
+  // `approvedAt` outranks a client-side "error", and the exclusion that used to
+  // be here (`outcome !== "error"`) is why: it produced an ENABLED "Retry
+  // approve" whose handler is a no-op, because SlideOver's handleApprove
+  // returns early on `approvedAt`. Reachable without any server fault - the
+  // POST lands, `outcome` is set to "ok", and a transient failure of the
+  // refetch in the same try flips it to "error"; the next refresh then delivers
+  // `approved_at`. A concurrent `nh approve` reaches the same state.
+  //
+  // `approvedAt` is the SERVER's record and `outcome` is this session's guess
+  // at it, so when they disagree the server wins. An error with no server
+  // record is still retryable, which is the case that exclusion was aimed at
+  // and is unaffected. `taskApprovedAt` has already discarded an approval spent
+  // by a later send-back, so this cannot latch on a stale stamp.
+  if (outcome === "ok" || approvedAt) {
     return { label: "Approved — merge pending", disabled: true, tone: "ok" };
   }
   if (busy) return { label: "Approving…", disabled: true, tone: "busy" };

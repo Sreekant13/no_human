@@ -55,6 +55,41 @@ FIXTURE_FLOOR = 28
 # pins, one per status that can reach it.
 PRESERVED_DEFECT_PINS = 3
 
+# ``node --test`` exits 0 on a file that declares no tests, on a file where every
+# test is ``test.skip``, and on any file that reaches ``process.exit(0)`` - so
+# the exit code alone cannot tell "the JS agrees" apart from "the JS never ran".
+# Demonstrated: dropping ``escalated`` from boardLanes.js's answer lane makes the
+# node file fail 7 subtests, and ONE inserted ``process.exit(0)`` line then puts
+# the Python suite back to green with the drift still in place.
+#
+# The TAP epilogue is the signal that does tell them apart: all three vacuous
+# exits report ``# pass 0`` or ``# pass 1``, against 92 on a real run. Requiring
+# ``# fail 0`` AND a pass floor closes it.
+#
+# The floor is derived from the shared fixture rather than hardcoded, so it
+# cannot rot as cases are added. It is deliberately ONE subtest per shared case,
+# not the three the node file runs today (computeLane, isWaiting, routeTask -
+# 3x28 plus 8 standalone tests = 92): the margin means restructuring the node
+# file cannot turn this into a false failure, while a floor of 28 still leaves
+# every vacuous exit (pass=0 or pass=1) far below it.
+NODE_PASS_FLOOR = len(_FIXTURES)
+
+
+def _tap_counter(stdout: str, name: str) -> int | None:
+    """One counter from ``node --test``'s TAP epilogue, e.g. ``# pass 92``.
+
+    ``None`` when the line is absent or unparseable, which the caller treats as
+    a FAILURE: a reporter that stopped emitting the counters would otherwise
+    silently reopen the hole this parsing exists to close.
+    """
+    for line in stdout.splitlines():
+        if line.startswith(f"# {name} "):
+            try:
+                return int(line.split()[-1])
+            except ValueError:
+                return None
+    return None
+
 
 def _ids() -> list[str]:
     return [c["name"] for c in _FIXTURES]
@@ -152,7 +187,10 @@ def test_the_js_implementation_agrees_on_every_shared_case():
         text=True,
         timeout=180,
     )
-    if proc.returncode == 0:
+    # The exit code is necessary but NOT sufficient - see NODE_PASS_FLOOR.
+    npass = _tap_counter(proc.stdout, "pass")
+    nfail = _tap_counter(proc.stdout, "fail")
+    if proc.returncode == 0 and nfail == 0 and npass is not None and npass >= NODE_PASS_FLOOR:
         return
     # Report the failing subtests and the TAP counts, not the whole passing
     # dump: a full TAP body is ~600 lines and pytest spends ~15s rewriting it
@@ -162,12 +200,21 @@ def test_the_js_implementation_agrees_on_every_shared_case():
         if line.startswith("not ok ") or line.startswith("# fail") or line.startswith("# pass")
     ]
     detail = "\n".join(interesting) or proc.stdout[-2000:]
-    raise AssertionError(
-        "web/src/boardLanes.js disagrees with no_human/core/lanes.py - the two "
-        "implementations of the lane decision have drifted.\n"
-        f"node --test src/laneConformance.test.mjs exited {proc.returncode}\n"
-        f"{detail}\n{proc.stderr[-2000:]}"
-    )
+    if proc.returncode == 0:
+        why = (
+            f"node --test exited 0 but reported pass={npass} fail={nfail}, and the "
+            f"floor is {NODE_PASS_FLOOR} passing subtests (one per shared fixture "
+            "case). That is the signature of a node file that did not actually run "
+            "its assertions - no tests declared, every test skipped, or an early "
+            "process.exit(0) - so this run proves nothing about JS/Python agreement."
+        )
+    else:
+        why = (
+            "web/src/boardLanes.js disagrees with no_human/core/lanes.py - the two "
+            "implementations of the lane decision have drifted.\n"
+            f"node --test src/laneConformance.test.mjs exited {proc.returncode}"
+        )
+    raise AssertionError(f"{why}\n{detail}\n{proc.stderr[-2000:]}")
 
 
 # --------------------------------------------------------------------------- #

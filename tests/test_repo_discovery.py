@@ -113,6 +113,27 @@ def test_extra_roots_outside_home_are_refused(tmp_path):
     assert str(outside) in res["roots_refused"]
 
 
+def test_an_unresolvable_extra_root_is_refused_rather_than_crashing_the_scan(tmp_path):
+    """A NUL byte in a configured root aborted the ENTIRE scan with a traceback.
+
+    ``_resolved`` guarded ``p.resolve()`` against ``OSError`` only, but an
+    embedded NUL makes the underlying ``lstat`` raise ``ValueError`` - and
+    ``extra_roots`` is operator config, so this reaches ``resolve()`` before any
+    containment check can reject it. ``discover_repos`` documents that it "does
+    not raise on anything it merely cannot read", and every OTHER bad root
+    (missing, outside home, symlinked away) is reported in a list.
+
+    The behaviour tested is the one the picker sees: the good root still
+    produces its repo, and the bad one is NAMED in ``roots_refused``.
+    """
+    _fake_repo(tmp_path / "work" / "acme-api")
+
+    res = discover_repos(home=tmp_path, extra_roots=["~/work", "bad\0root"])
+
+    assert "acme-api" in _by_name(res), "one bad root must not cost the good ones"
+    assert any("\0" in r for r in res["roots_refused"]), res["roots_refused"]
+
+
 def test_a_symlink_escaping_home_is_not_followed(tmp_path):
     home = tmp_path / "home"
     (home / "git").mkdir(parents=True)
