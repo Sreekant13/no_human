@@ -22,19 +22,27 @@ module pins all five:
    value (parent streamed out=9 vs ResultMessage out=1,281). Cache reads,
    cache creation and input_tokens ARE final.
 5. ``TaskNotificationMessage.usage.total_tokens`` is NOT a bill. It is
-   ``(LAST request's input + cache_creation + cache_read) + SUM(output)`` — a
-   context-size gauge whose cache buckets are a final-message snapshot rather
-   than a sum. On a real 6-response subagent it reports 13,087 against 76,704
-   actually billed (17%); across 2,962 real subagent transcripts it runs 7-12%.
-   It coincides with the true total only when the subagent made exactly ONE
-   request — 50 of 2,962 real transcripts (1.7%), the degenerate shape the
-   single-subagent recording happens to have. So the totals come from the
-   deduped stream; the scalar is trusted only in that one-request case, plus as
-   an explicit floor when nothing streamed at all.
+   ``(LAST request's input + cache_creation + cache_read) + SUM(output over
+   every streamed occurrence, duplicates included)`` — a context-size gauge
+   whose cache buckets are a final-message snapshot rather than a sum, and
+   whose output term double-counts the stream's repeats. On a real 6-response
+   subagent it reports 13,087 against 76,704 actually billed (17%); across
+   2,962 real subagent transcripts it runs 7-12%. It never coincides with the
+   true total, not even on a ONE-request subagent: there the output term is
+   still an early snapshot summed over the duplicates. On the single-response
+   recording it carries output=8 (4 streamed twice) where the subagent's own
+   transcript records output=45. So the totals come from the deduped stream;
+   the scalar is used ONLY as a labelled floor when nothing streamed at all.
 
 ``testdata/subagent_usage_stream_multi.json`` is a second live recording — a
 6-response subagent — that exists specifically to cover the ~98% branch the
 single-response recording cannot reach.
+
+KNOWN RESIDUAL, pinned by ``test_the_known_residual_is_the_streamed_output``:
+because streamed ``output_tokens`` is an early snapshot, subagent output is
+under-recorded by roughly 0.8% of that subagent's bill. It is not recoverable
+from the SDK stream — the parent transcript's Task ``toolUseResult`` has no
+usage block — so these tests assert the residual rather than pretend it away.
 """
 
 import json
@@ -106,10 +114,10 @@ def _replay(messages):
 # ----------------------------------------------------------------------------
 # Independently derived expectations.
 #
-# These are read STRAIGHT OFF the recorded artifact by two sources that are not
-# the code under test: the SDK's own ResultMessage.usage (for the parent) and
-# the CLI's own TaskUsage.total_tokens scalar (for the subagent). Nothing here
-# is recomputed from the accounting logic being tested.
+# These are read STRAIGHT OFF the recorded artifact by sources that are not the
+# code under test: the SDK's own ResultMessage.usage (for the parent) and the
+# deduped subagent assistant messages (for the subagent). Nothing here is
+# recomputed from the accounting logic being tested.
 # ----------------------------------------------------------------------------
 _RECORDS = json.loads(FIXTURE.read_text())
 _RESULTS = [r["usage"] for r in _RECORDS if r["type"] == "result"]
@@ -117,15 +125,28 @@ PARENT_IN = sum(u["input_tokens"] for u in _RESULTS)                    # 35
 PARENT_OUT = sum(u["output_tokens"] for u in _RESULTS)                  # 1281
 PARENT_CACHE_READ = sum(u["cache_read_input_tokens"] for u in _RESULTS)      # 74002
 PARENT_CACHE_CREATE = sum(u["cache_creation_input_tokens"] for u in _RESULTS)  # 7149
-# The CLI's scalar for the one subagent. This recording's subagent made exactly
-# ONE request (tool_uses: 0), the only shape in which the scalar's
-# last-request-snapshot formula collapses to in+out+cache_read+cache_creation
-# and is therefore the true total. Do NOT generalise this identity — see the
-# multi-response fixture, where the same scalar is 17% of what was billed.
-SUBAGENT_TOTAL = sum(r["usage"]["total_tokens"]
-                     for r in _RECORDS if r["type"] == "task_notification")  # 11067
+# The subagent's spend, deduplicated by message_id — the billing record. This
+# recording's subagent made exactly ONE request (tool_uses: 0) that the stream
+# repeats twice.
+_SUB = {r["message_id"]: r["usage"] for r in _RECORDS
+        if r["type"] == "assistant" and r["parent_tool_use_id"]}
+SUBAGENT_TOTAL = sum(u["input_tokens"] + u["output_tokens"]
+                     + u["cache_read_input_tokens"]
+                     + u["cache_creation_input_tokens"]
+                     for u in _SUB.values())                                 # 11063
+# The CLI's gauge for the same subagent, for contrast only. It is NOT a bill
+# and NOT the true total even at one request: 11,067 = (10 + 2,852 + 8,197)
+# + SUM(output over both streamed occurrences) = 11,059 + 8, where the true
+# output_tokens is 45. Never derive an expectation from this.
+SUBAGENT_SCALAR = sum(r["usage"]["total_tokens"]
+                      for r in _RECORDS if r["type"] == "task_notification")  # 11067
+# The subagent's own transcript (agent-a483262a49fffc186.jsonl, probe session
+# 6a403c36) records in=10 out=45 cr=8,197 cc=2,852 for msg_011CdYRgNms2TE7e9oW.
+# That file is NOT reachable from the parent's SDK stream; it is quoted here so
+# the residual below is a measured number rather than an estimate.
+SUBAGENT_TRUE_BILL = 10 + 45 + 8_197 + 2_852                                 # 11104
 GRAND_TOTAL = (PARENT_IN + PARENT_OUT + PARENT_CACHE_READ
-               + PARENT_CACHE_CREATE + SUBAGENT_TOTAL)                       # 93534
+               + PARENT_CACHE_CREATE + SUBAGENT_TOTAL)                       # 93530
 
 
 async def test_the_recording_really_does_hide_subagent_spend(tmp_path, monkeypatch):
@@ -151,7 +172,7 @@ async def test_ledger_totals_match_the_independently_derived_grand_total(
     tmp_path, monkeypatch,
 ):
     """The headline: what lands in the attempt ledger must equal
-    (sum of every ResultMessage) + (the CLI's own subagent rollup)."""
+    (sum of every ResultMessage) + (the deduped subagent stream)."""
     monkeypatch.setattr(claude_backend, "query", _replay(_load_recorded_stream()))
     backend = ClaudeBackend(model="claude-sonnet-5")
 
@@ -159,11 +180,11 @@ async def test_ledger_totals_match_the_independently_derived_grand_total(
 
     ledger = (result.tokens_used + result.cache_read_tokens
               + result.cache_creation_tokens)
-    assert ledger == GRAND_TOTAL == 93_534
+    assert ledger == GRAND_TOTAL == 93_530
     # And the split is exact, not merely the total.
     assert result.cache_read_tokens == PARENT_CACHE_READ + 8_197
     assert result.cache_creation_tokens == PARENT_CACHE_CREATE + 2_852
-    assert result.tokens_used == PARENT_IN + PARENT_OUT + 18
+    assert result.tokens_used == PARENT_IN + PARENT_OUT + 14
 
 
 async def test_subagent_spend_is_reported_separately_too(tmp_path, monkeypatch):
@@ -176,8 +197,10 @@ async def test_subagent_spend_is_reported_separately_too(tmp_path, monkeypatch):
 
     sub = (result.subagent_tokens_used + result.subagent_cache_read_tokens
            + result.subagent_cache_creation_tokens)
-    assert sub == SUBAGENT_TOTAL == 11_067
+    assert sub == SUBAGENT_TOTAL == 11_063
     assert result.subagent_count == 1
+    # Measured, not floored: the stream showed this subagent.
+    assert result.subagent_floored_count == 0
 
 
 async def test_every_result_message_counts_not_just_the_last(tmp_path, monkeypatch):
@@ -205,8 +228,10 @@ def _synthetic_duplicates():
 
     Hand-computed expectation, independent of the implementation:
       parent  : ResultMessage says in 100 + out 900 + cr 5,000 + cc 300 = 6,300
-      subagent: TaskUsage.total_tokens = 2,222
-      grand   : 8,522
+      subagent: deduped stream says in 20 + out 2 + cr 2,000 + cc 150 = 2,172
+      grand   : 8,472
+    The 2,222 gauge on the notification is deliberately NOT 2,172: it is there
+    so a test can prove the accounting ignores it.
     A naive sum would report the parent stream 3x and the subagent 2x.
     """
     usage_p = {"input_tokens": 100, "output_tokens": 7,
@@ -249,10 +274,11 @@ async def test_duplicate_message_ids_are_counted_once(tmp_path, monkeypatch):
 
     total = (result.tokens_used + result.cache_read_tokens
              + result.cache_creation_tokens)
-    assert total == 8_522, f"expected 6300 parent + 2222 subagent, got {total}"
+    assert total == 8_472, f"expected 6300 parent + 2172 subagent, got {total}"
     assert result.subagent_cache_read_tokens == 2_000, "counted the subagent twice"
     assert result.subagent_cache_creation_tokens == 150
-    assert result.subagent_tokens_used == 2_222 - 2_000 - 150
+    # From the deduped stream (20 + 2), NOT from the 2,222 gauge.
+    assert result.subagent_tokens_used == 22
 
 
 async def test_a_run_with_no_subagents_is_unchanged(tmp_path, monkeypatch):
@@ -375,16 +401,18 @@ async def test_a_multi_response_subagent_ignores_the_scalar_even_when_it_fits(
 ):
     """The mutant-killer the negative guard was hiding.
 
-    On most real subagents `total - Sum(cr) - Sum(cc)` goes negative, so the
-    guard rejects it and the wrong branch is indistinguishable from the right
-    one. That is precisely how the false premise survived review the first
-    time. A high-output subagent breaks the tie: two responses, each
+    On most real subagents `total - Sum(cr) - Sum(cc)` goes negative, so a
+    guard rejecting negatives makes the wrong branch indistinguishable from the
+    right one. That is precisely how the false premise survived review the
+    first time. A high-output subagent breaks the tie: two responses, each
     in=10 out=5,000 cr=100 cc=50, so the CLI's gauge is
     (10+50+100) + 10,000 = 10,160 — comfortably ABOVE Sum(cr)+Sum(cc)=300.
 
     Correct answer, from the stream: 20 + 10,000 = 10,020.
     Scalar answer: 10,160 - 300 = 9,860.
-    Only the `len(msgs) == 1` restriction separates them.
+    The scalar is no longer consulted for spend at all, so any reintroduction
+    of that arithmetic — guarded or not, restricted to one response or not —
+    dies here.
     """
     usage = {"input_tokens": 10, "output_tokens": 5_000,
              "cache_read_input_tokens": 100, "cache_creation_input_tokens": 50}
@@ -418,27 +446,113 @@ async def test_a_multi_response_subagent_ignores_the_scalar_even_when_it_fits(
     assert result.subagent_cache_creation_tokens == 100
 
 
-async def test_a_single_response_subagent_still_uses_the_scalar(
+async def test_a_single_response_subagent_ignores_the_scalar_too(
     tmp_path, monkeypatch,
 ):
-    """The one shape where the scalar IS exact: with a single request, "last
-    request" and "the only request" coincide and the CLI's formula collapses to
-    in+out+cache_read+cache_creation. It recovers the true output_tokens, which
-    the stream understates (8 actual vs 4 streamed)."""
+    """The 1.7% shape the deleted branch existed for.
+
+    A single-request subagent was believed to be the one case where the gauge
+    is exact — "last request" and "the only request" coincide. It is not. The
+    output term is SUM(output) over every streamed occurrence of an EARLY
+    snapshot, so here it is 4+4=8 against a true output_tokens of 45. The
+    branch traded a false claim in source for 4 tokens (11,067 vs 11,063,
+    0.036% of the bill), and neither number is the truth (11,104).
+    """
+    assert SUBAGENT_SCALAR == 11_067
+    only = next(iter(_SUB.values()))
+    # The gauge decomposes exactly as documented — last request's
+    # in+cc+cr, plus output summed over BOTH streamed occurrences.
+    snapshot = (only["input_tokens"] + only["cache_creation_input_tokens"]
+                + only["cache_read_input_tokens"])
+    dup_output = sum(r["usage"]["output_tokens"] for r in _RECORDS
+                     if r["type"] == "assistant" and r["parent_tool_use_id"])
+    assert snapshot == 11_059 and dup_output == 8
+    assert SUBAGENT_SCALAR == snapshot + dup_output
+
     monkeypatch.setattr(claude_backend, "query", _replay(_load_recorded_stream()))
     backend = ClaudeBackend(model="claude-sonnet-5")
     result = await backend.run("go", cwd=tmp_path, max_turns=10)
 
-    streamed_io = 10 + 4
-    assert result.subagent_tokens_used == 18 > streamed_io
+    assert result.subagent_tokens_used == 10 + 4, "rebuilt in/out from the gauge"
 
 
-async def test_a_single_response_scalar_below_its_own_cache_is_refused(
+async def test_an_absurd_scalar_cannot_become_the_bill(tmp_path, monkeypatch):
+    """The unbounded-from-above hole the deleted branch left open.
+
+    The old code guarded the scalar from BELOW (reject if it would go negative)
+    and not at all from above, so `total - cr - cc` became the in/out column
+    whatever its size: a gauge of 10,000,000 against a subagent that streamed
+    in=10 out=4 cr=8,197 cc=2,852 yielded 9,988,951 in/out, a 900x
+    over-report that would trip any budget gate. Latent only because the CLI's
+    formula bounds the real value to single digits. Nothing reads the scalar
+    for spend now, so size cannot matter.
+    """
+    usage_s = {"input_tokens": 10, "output_tokens": 4,
+               "cache_read_input_tokens": 8_197, "cache_creation_input_tokens": 2_852}
+    msgs = [
+        TaskStartedMessage(subtype="task_started", data={}, task_id="t1",
+                           description="d", uuid="u", session_id="sess",
+                           tool_use_id="toolu_sub"),
+        AssistantMessage(content=[TextBlock(text="")], model="m",
+                         parent_tool_use_id="toolu_sub", usage=usage_s,
+                         message_id="msg_sub_1", session_id="sess"),
+        TaskNotificationMessage(
+            subtype="task_notification", data={}, task_id="t1",
+            status="completed", output_file="/dev/null", summary="s", uuid="u",
+            session_id="sess", tool_use_id="toolu_sub",
+            usage={"total_tokens": 10_000_000, "tool_uses": 0, "duration_ms": 5}),
+        ResultMessage(subtype="success", duration_ms=0, duration_api_ms=0,
+                      is_error=False, num_turns=1, session_id="sess", result="k",
+                      usage={"input_tokens": 1, "output_tokens": 1,
+                             "cache_read_input_tokens": 10,
+                             "cache_creation_input_tokens": 0}),
+    ]
+    monkeypatch.setattr(claude_backend, "query", _replay(msgs))
+    backend = ClaudeBackend(model="claude-sonnet-5")
+    result = await backend.run("go", cwd=tmp_path, max_turns=10)
+
+    assert result.subagent_tokens_used == 14, "the gauge became the bill"
+    assert result.subagent_cache_read_tokens == 8_197
+    assert result.subagent_cache_creation_tokens == 2_852
+    assert result.subagent_floored_count == 0
+
+
+async def test_the_known_residual_is_the_streamed_output(tmp_path, monkeypatch):
+    """Pin the undercount rather than pretend it away.
+
+    Streamed ``output_tokens`` is an early snapshot the stream never revises,
+    and the true value is not in the parent's stream anywhere: the Task
+    ``toolUseResult`` carries {agentId, description, outputFile, prompt,
+    resolvedModel, status} and no usage block, and the gauge is not a bill.
+    The subagent's own transcript records out=45 where the stream showed 4, so
+    the ledger under-records this subagent by 41 tokens — 0.37% of its bill.
+    On the 6-response fixture the same effect is 633 of 77,337 (0.82%).
+
+    If a future SDK exposes the final figures, this test fails and should be
+    replaced by one asserting the true bill. Until then it documents the gap.
+    """
+    monkeypatch.setattr(claude_backend, "query", _replay(_load_recorded_stream()))
+    backend = ClaudeBackend(model="claude-sonnet-5")
+    result = await backend.run("go", cwd=tmp_path, max_turns=10)
+
+    recorded = (result.subagent_tokens_used + result.subagent_cache_read_tokens
+                + result.subagent_cache_creation_tokens)
+    assert recorded == 11_063
+    assert SUBAGENT_TRUE_BILL == 11_104
+    residual = SUBAGENT_TRUE_BILL - recorded
+    assert residual == 41
+    assert residual / SUBAGENT_TRUE_BILL < 0.01
+    # The gap is entirely output, never the cache buckets — those are final.
+    assert result.subagent_cache_read_tokens == 8_197
+    assert result.subagent_cache_creation_tokens == 2_852
+
+
+async def test_a_scalar_below_the_streamed_cache_cannot_shrink_the_bill(
     tmp_path, monkeypatch,
 ):
-    """Kills the mutant that removes the negative guard. A scalar smaller than
-    the cache figures of the one request it describes is incoherent; the
-    subtraction would go negative and UNDERSTATE the bill."""
+    """A gauge smaller than the cache figures of the request it describes is
+    incoherent; any arithmetic built on it would go negative and UNDERSTATE the
+    bill. The stream is the only input, so the gauge cannot reach the total."""
     usage_s = {"input_tokens": 20, "output_tokens": 2,
                "cache_read_input_tokens": 9_000, "cache_creation_input_tokens": 500}
     msgs = [
@@ -463,7 +577,7 @@ async def test_a_single_response_scalar_below_its_own_cache_is_refused(
     backend = ClaudeBackend(model="claude-sonnet-5")
     result = await backend.run("go", cwd=tmp_path, max_turns=10)
 
-    # 300 - 9000 - 500 would be -9,200. Fall back to the streamed in/out.
+    # 300 - 9000 - 500 would be -9,200. The streamed in/out is the answer.
     assert result.subagent_tokens_used == 22
     assert result.subagent_cache_read_tokens == 9_000
 
@@ -538,11 +652,18 @@ async def test_an_all_zero_repeat_never_erases_a_measurement(tmp_path, monkeypat
 
 async def test_a_subagent_the_stream_never_showed_still_counts(tmp_path, monkeypatch):
     """The SDK warns that some tasks report only a terminal TaskUpdatedMessage
-    and may emit no assistant messages we can see. When only the scalar arrives
-    it is the sole signal, so bank it — but as a FLOOR, not as truth: the
-    scalar runs 7-17% of real spend, so this case is still a large undercount.
-    It is banked as non-cache tokens (the dearest bucket) so a gate whose job is
-    to stop runaway spend errs toward flagging on a number known to be too low.
+    and may emit no assistant messages we can see. When only the gauge arrives
+    it is the sole signal, so bank it — but as a FLOOR, not as truth: the gauge
+    runs 7-17% of real spend, so this case is still a large undercount. It is
+    banked as non-cache tokens (the dearest bucket) so a gate whose job is to
+    stop runaway spend errs toward flagging on a number known to be too low.
+
+    The alternative — dropping it with the single-response branch — would
+    record ZERO for such a subagent, which is the "subagents are free" bug this
+    module exists to end. So it survives, and the word FLOOR is carried by a
+    DATUM (`subagent_floored_count`), not by a comment: a surface reporting
+    subagent spend can say "1 of 1 is a floor" instead of presenting a known
+    undercount as a total.
     """
     msgs = [
         TaskStartedMessage(subtype="task_started", data={}, task_id="t9",
@@ -568,6 +689,53 @@ async def test_a_subagent_the_stream_never_showed_still_counts(tmp_path, monkeyp
     assert result.subagent_cache_read_tokens == 0
     assert (result.tokens_used + result.cache_read_tokens
             + result.cache_creation_tokens) == 2 + 10 + 4_444
+    # The label, on a datum a surface can read.
+    assert result.subagent_count == 1
+    assert result.subagent_floored_count == 1
+
+
+async def test_the_floor_label_rides_the_result_event_not_just_the_result(
+    tmp_path, monkeypatch,
+):
+    """`subagent_floored_count` must reach the orchestrator's event stream —
+    that stream is the audit trail (no DB column reads these back), so a field
+    only on AgentResult would be invisible to every surface."""
+    msgs = [
+        TaskStartedMessage(subtype="task_started", data={}, task_id="t9",
+                           description="d", uuid="u", session_id="sess",
+                           tool_use_id="toolu_ghost"),
+        TaskNotificationMessage(
+            subtype="task_notification", data={}, task_id="t9",
+            status="completed", output_file="/dev/null", summary="s", uuid="u",
+            session_id="sess", tool_use_id="toolu_ghost",
+            usage={"total_tokens": 4_444, "tool_uses": 1, "duration_ms": 5}),
+        # A second subagent that DID stream, so the count is a ratio, not a flag.
+        TaskStartedMessage(subtype="task_started", data={}, task_id="t8",
+                           description="d", uuid="u", session_id="sess",
+                           tool_use_id="toolu_seen"),
+        AssistantMessage(content=[TextBlock(text="")], model="m",
+                         parent_tool_use_id="toolu_seen",
+                         usage={"input_tokens": 5, "output_tokens": 3,
+                                "cache_read_input_tokens": 90,
+                                "cache_creation_input_tokens": 7},
+                         message_id="msg_seen", session_id="sess"),
+        ResultMessage(subtype="success", duration_ms=0, duration_api_ms=0,
+                      is_error=False, num_turns=1, session_id="sess", result="k",
+                      usage={"input_tokens": 1, "output_tokens": 1,
+                             "cache_read_input_tokens": 10,
+                             "cache_creation_input_tokens": 0}),
+    ]
+    monkeypatch.setattr(claude_backend, "query", _replay(msgs))
+    backend = ClaudeBackend(model="claude-sonnet-5")
+
+    results = [ev async for ev in backend.stream("go", cwd=tmp_path, max_turns=10)
+               if ev.kind == "result"]
+
+    assert len(results) == 1
+    meta = results[0].meta
+    assert meta["subagent_count"] == 2
+    assert meta["subagent_floored_count"] == 1
+    assert meta["subagent_tokens_used"] == 4_444 + 8
 
 
 async def test_the_mid_attempt_usage_events_are_deduped_too(tmp_path, monkeypatch):
