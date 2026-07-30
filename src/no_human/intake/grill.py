@@ -34,6 +34,13 @@ class GrillQuestion:
     question: str
     suggestions: list[str]
     round: int
+    # What THIS round cost. Each grill_step is one billed backend call and the
+    # caller loops, so the per-step figures are the only honest unit; neither
+    # return type carried them before, so the whole interactive intake billed
+    # as free.
+    tokens_used: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
 
 
 @dataclass
@@ -44,6 +51,9 @@ class GrillResult:
     description: str
     acceptance_criteria: list[str]
     qa_log: list[dict] = field(default_factory=list)
+    tokens_used: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
 
 
 MAX_ROUNDS_DEFAULT = 5
@@ -159,6 +169,14 @@ async def grill_step(
 
     The backend should be a read-only :class:`ClaudeBackend` instance so the
     agent can explore the codebase (Read/Grep/Glob) but cannot modify it.
+
+    Exactly one billed backend call happens per step, and BOTH return types
+    carry its three token figures — so unlike the evaluator (whose returns are
+    a bare ``list``/``str`` and which bills up to four calls per invocation, and
+    therefore needs a ``usage_sink``), the return value is a sufficient
+    accounting channel here. Callers own the booking: interactive intake runs
+    before any task exists, so there is no attempt row and the GUI/CLI write
+    these figures to ``unattributed_usage`` instead.
     """
     round_n = len(qa_history) + 1
     force = round_n >= max_rounds
@@ -189,6 +207,12 @@ async def grill_step(
             timeout=120,
         )
     except asyncio.TimeoutError:
+        # KNOWN UNDER-REPORT: wait_for cancelled the call, so no result object
+        # exists and the fields below stay 0 — the round IS billed by the
+        # provider and is recorded as free. Booking an explicit zero would be a
+        # lie of a different shape; the incremental AgentEvent("usage") stream
+        # could give a lower bound, but reading it means passing on_event, which
+        # changes what the call does. See _bounded_run in evaluator.py.
         return GrillQuestion(
             question="The codebase exploration took too long. Can you describe the scope more narrowly?",
             suggestions=[
@@ -197,6 +221,13 @@ async def grill_step(
             ],
             round=round_n,
         )
+
+    usage = {
+        "tokens_used": int(getattr(result, "tokens_used", 0) or 0),
+        "cache_read_tokens": int(getattr(result, "cache_read_tokens", 0) or 0),
+        "cache_creation_tokens": int(
+            getattr(result, "cache_creation_tokens", 0) or 0),
+    }
 
     parsed = parse_grill_response(result.final_text, round_n, qa_history)
 
@@ -208,6 +239,9 @@ async def grill_step(
             description=description or "",
             acceptance_criteria=[f"Implement: {title}"],
             qa_log=list(qa_history),
+            **usage,
         )
 
+    for k, v in usage.items():
+        setattr(parsed, k, v)
     return parsed

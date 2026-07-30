@@ -46,7 +46,8 @@ async def test_enrich_adopts_criteria_and_preserves_original(store, tmp_path):
 
 
 async def test_clarify_records_assumptions(store, tmp_path, monkeypatch):
-    async def _fake_resolve(title, description, criteria, *, backend=None, model=None):
+    async def _fake_resolve(title, description, criteria, *, backend=None, model=None,
+                            usage_sink=None):
         return ["assume the header is X-Instance-Id"]
     monkeypatch.setattr(ev, "resolve_assumptions", _fake_resolve)
 
@@ -103,7 +104,8 @@ async def test_missing_context_resolves_assumptions_even_on_accept(
     An explicit no_missing_context=false is the evaluator saying 'the agent
     will hit an information gap' — resolve assumptions up front regardless of
     the headline verdict."""
-    async def _fake_resolve(title, description, criteria, *, backend=None, model=None):
+    async def _fake_resolve(title, description, criteria, *, backend=None, model=None,
+                            usage_sink=None):
         return ["assume the export endpoint means /api/data/export"]
     monkeypatch.setattr(ev, "resolve_assumptions", _fake_resolve)
 
@@ -211,7 +213,8 @@ async def test_decompose_existing_proposal_blocks_regeneration(
 
 
 async def test_enrich_with_missing_context_does_both(store, tmp_path, monkeypatch):
-    async def _fake_resolve(title, description, criteria, *, backend=None, model=None):
+    async def _fake_resolve(title, description, criteria, *, backend=None, model=None,
+                            usage_sink=None):
         return ["assume X"]
     monkeypatch.setattr(ev, "resolve_assumptions", _fake_resolve)
 

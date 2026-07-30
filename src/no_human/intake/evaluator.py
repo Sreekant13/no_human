@@ -34,16 +34,75 @@ _LLM_TIMEOUT_S = 300
 
 from types import SimpleNamespace  # noqa: E402
 
+# Every intake call in this module is utility-tier spend that used to be
+# discarded at the type boundary: the functions return verdicts, assumptions and
+# Q&A, never an ``AgentResult``, so ``tokens_used``/``cache_read_tokens``/
+# ``cache_creation_tokens`` had nowhere to go. Rather than widen four different
+# return types (two of which are plain ``list``/``str``), each entry point takes
+# a ``usage_sink`` and every backend call is handed to it. The sink is the
+# orchestrator's ``_note_utility_usage`` in-process — the SAME sink the
+# supervisor hook, context distillation and stuck-hypothesis calls already use,
+# so intake lands in ``attempts.utility_*`` alongside them and nothing needs a
+# second mechanism.
+#
+# The sink is called with the raw backend result, so it reads usage exactly the
+# way ``claude_backend.AgentResult`` reports it (parent + subagent rollup).
+UsageSink = Any  # Callable[[AgentResult], None]
 
-async def _bounded_run(be, *args, **kwargs):
-    """be.run() with a hard timeout; on timeout return an empty error-result
-    sentinel so `result.final_text or ""` still works and the grill proceeds."""
+
+def _record_usage(usage_sink: UsageSink | None, result: Any) -> None:
+    """Hand one backend result to the caller's usage sink, never raising.
+
+    Accounting must not be able to change what an advisory call DOES: a broken
+    sink degrades the ledger, it may not degrade a verdict.
+    """
+    if usage_sink is None or result is None:
+        return
     try:
-        return await asyncio.wait_for(be.run(*args, **kwargs), timeout=_LLM_TIMEOUT_S)
+        usage_sink(result)
+    except Exception as exc:  # noqa: BLE001 — accounting never blocks intake
+        log.warning("utility usage sink failed (spend unrecorded): %s", exc)
+
+
+async def _bounded_run(be, *args, usage_sink: UsageSink | None = None, **kwargs):
+    """be.run() with a hard timeout; on timeout return an empty error-result
+    sentinel so `result.final_text or ""` still works and the grill proceeds.
+
+    Recording lives HERE rather than at each call site so no branch (the parse
+    retries, the tool-less answer fallback) can forget to book its own spend.
+
+    KNOWN UNDER-REPORT — the timeout path books nothing. ``wait_for`` cancels
+    the coroutine, so no ``AgentResult`` is ever returned and the sentinel below
+    carries no figures; passing it to the sink would book a false zero, which is
+    worse than a gap you can name. But "no usage figure exists" would be wrong:
+    ``ClaudeBackend.stream`` yields an incremental ``AgentEvent("usage", ...)``
+    per assistant message (claude_backend.py, the same channel ``_agent_sink``
+    meters the coder with), and this function simply never passes ``on_event``.
+    A lower bound IS obtainable, and providers do bill tokens generated before a
+    disconnect — so a timed-out grill-answers call (``max_turns=8``, the most
+    expensive intake call there is) is recorded as zero when it was not free.
+    Wiring ``on_event`` through is the fix; it is deliberately not done here
+    because it changes what the call does, and this change is accounting only.
+    """
+    try:
+        result = await asyncio.wait_for(be.run(*args, **kwargs),
+                                        timeout=_LLM_TIMEOUT_S)
     except (asyncio.TimeoutError, TimeoutError):
         log.warning("grill/intake backend.run timed out after %ss — proceeding "
-                    "without it (advisory)", _LLM_TIMEOUT_S)
+                    "without it (advisory); its spend is unrecoverable",
+                    _LLM_TIMEOUT_S)
         return SimpleNamespace(final_text="", is_error=True)
+    _record_usage(usage_sink, result)
+    return result
+
+
+def usage_of(result: Any) -> tuple[int, int, int]:
+    """(tokens_used, cache_read, cache_creation) off any backend result."""
+    return (
+        int(getattr(result, "tokens_used", 0) or 0),
+        int(getattr(result, "cache_read_tokens", 0) or 0),
+        int(getattr(result, "cache_creation_tokens", 0) or 0),
+    )
 
 
 def _render(template: str, **fields: str) -> str:
@@ -74,6 +133,15 @@ class EvalResult:
     dimensions: dict[str, bool] = field(default_factory=dict)
     enriched_criteria: list[str] | None = None
     rationale: str = ""
+    # What this evaluation COST. The three utility-tier token figures used to
+    # stop at the ``AgentResult`` inside ``evaluate_spec`` — this type had no
+    # token fields at all, so the spend was dropped at the return boundary
+    # before any ledger could see it. Callers with an attempt row route it
+    # through ``usage_sink``; callers without one (the GUI/CLI intake, which
+    # runs before a task exists) read it off the result they already hold.
+    tokens_used: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -83,6 +151,14 @@ class EvalResult:
         }
         if self.enriched_criteria:
             d["enriched_criteria"] = self.enriched_criteria
+        # Only when there is spend to report: a hand-built EvalResult (tests,
+        # the board's own annotations) keeps the exact shape it always had.
+        if self.tokens_used or self.cache_read_tokens or self.cache_creation_tokens:
+            d["usage"] = {
+                "tokens_used": self.tokens_used,
+                "cache_read_tokens": self.cache_read_tokens,
+                "cache_creation_tokens": self.cache_creation_tokens,
+            }
         return d
 
 
@@ -136,6 +212,7 @@ async def evaluate_spec(
     *,
     backend: Any | None = None,
     model: str | None = None,
+    usage_sink: UsageSink | None = None,
 ) -> EvalResult | None:
     """Run the intake quality evaluator. Returns None on failure (advisory)."""
     try:
@@ -153,13 +230,15 @@ async def evaluate_spec(
             criteria=criteria_text,
         )
         result = await _bounded_run(be, prompt, max_turns=1, effort="low",
-                              cwd=Path(tempfile.gettempdir()))
+                              cwd=Path(tempfile.gettempdir()),
+                              usage_sink=usage_sink)
         text = result.final_text or ""
         m = _EVAL_JSON.search(text)
         if not m:
             log.warning("evaluator produced no parseable EVAL_JSON block")
             return None
         data = loads_lenient(m.group(1))
+        tok, cr, cc = usage_of(result)
         # The prompt teaches the verdicts in UPPERCASE bullets and models echo
         # that; the enum values are lowercase — live failure 2026-07-25:
         # "'DECOMPOSE' is not a valid EvalVerdict" silently skipped the eval.
@@ -169,6 +248,9 @@ async def evaluate_spec(
             dimensions=data.get("dimensions", {}),
             enriched_criteria=data.get("enriched_criteria"),
             rationale=data.get("rationale", ""),
+            tokens_used=tok,
+            cache_read_tokens=cr,
+            cache_creation_tokens=cc,
         )
     except Exception as exc:  # noqa: BLE001 — advisory, never blocks
         log.warning("evaluator failed (proceeding without eval): %s", exc)
@@ -203,6 +285,7 @@ async def resolve_assumptions(
     *,
     backend: Any | None = None,
     model: str | None = None,
+    usage_sink: UsageSink | None = None,
 ) -> list[str] | None:
     """For an ambiguous spec, return the assumptions the agent will proceed
     under so it never has to stop and ask a human (megaplan P2 / decision #1).
@@ -222,7 +305,8 @@ async def resolve_assumptions(
             criteria=criteria_text,
         )
         result = await _bounded_run(be, prompt, max_turns=1, effort="low",
-                              cwd=Path(tempfile.gettempdir()))
+                              cwd=Path(tempfile.gettempdir()),
+                              usage_sink=usage_sink)
         m = _ASSUMPTIONS_JSON.search(result.final_text or "")
         if not m:
             return None
@@ -299,6 +383,7 @@ async def generate_grill_questions(
     *,
     backend: Any | None = None,
     model: str | None = None,
+    usage_sink: UsageSink | None = None,
 ) -> list[GrillQA] | None:
     """Generate the intake grill's questions. None on failure (advisory)."""
     try:
@@ -316,15 +401,18 @@ async def generate_grill_questions(
             criteria=criteria_text,
         )
         result = await _bounded_run(be, prompt, max_turns=1, effort="low",
-                              cwd=Path(tempfile.gettempdir()))
+                              cwd=Path(tempfile.gettempdir()),
+                              usage_sink=usage_sink)
         m = _GRILL_JSON.search(result.final_text or "")
         if not m:
             # Same silent single-emit failure class #125 fixed for the
-            # ANSWERS pass (v10: 6/6 lethal there) — retry ONCE.
+            # ANSWERS pass (v10: 6/6 lethal there) — retry ONCE. The retry is
+            # a SECOND billed call; _bounded_run books it too.
             log.warning("grill produced no parseable GRILL_JSON block; "
                         "retrying once")
             result = await _bounded_run(be, prompt, max_turns=1, effort="low",
-                                  cwd=Path(tempfile.gettempdir()))
+                                  cwd=Path(tempfile.gettempdir()),
+                                  usage_sink=usage_sink)
             m = _GRILL_JSON.search(result.final_text or "")
         if not m:
             log.warning("grill produced no parseable GRILL_JSON block")
@@ -387,6 +475,7 @@ async def grill_spec(
     backend: Any | None = None,
     model: str | None = None,
     questions: list[GrillQA] | None = None,
+    usage_sink: UsageSink | None = None,
 ) -> list[GrillQA] | None:
     """The full unattended grill: generate questions, answer the answerable
     ones FROM THE REPO (the answering session's cwd is the task's repo — the
@@ -396,7 +485,7 @@ async def grill_spec(
     try:
         qs = questions or await generate_grill_questions(
             title, description, acceptance_criteria,
-            backend=backend, model=model,
+            backend=backend, model=model, usage_sink=usage_sink,
         )
         if not qs:
             return None
@@ -428,7 +517,9 @@ async def grill_spec(
             )
             cwd = Path(repo_path) if repo_path else Path(tempfile.gettempdir())
             fallback_used = False
-            result = await _bounded_run(be, prompt, max_turns=8, effort="low", cwd=cwd)
+            # The expensive one: max_turns=8, and it explores a real repo.
+            result = await _bounded_run(be, prompt, max_turns=8, effort="low",
+                                        cwd=cwd, usage_sink=usage_sink)
             m = _GRILL_ANSWERS.search(result.final_text or "")
             if not m:
                 # v11 live root cause: in content-rich repos the 8-turn
@@ -449,7 +540,7 @@ async def grill_spec(
                     "numbers you have not read in THIS session; "
                     "plain-language assumptions only.")
                 result = await _bounded_run(be, fallback, max_turns=2, effort="low",
-                                      cwd=cwd)
+                                      cwd=cwd, usage_sink=usage_sink)
                 m = _GRILL_ANSWERS.search(result.final_text or "")
                 fallback_used = True
             if m:

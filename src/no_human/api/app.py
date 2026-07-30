@@ -441,6 +441,27 @@ async def create_task(body: CreateTaskRequest, request: Request) -> TaskSummaryO
     return summary
 
 
+async def _record_intake_spend(store, site: str, model: str | None, obj) -> None:
+    """Book one intake call's tokens to the unattributed ledger, never raising.
+
+    *obj* is any intake result carrying the three token fields (``GrillQuestion``
+    / ``GrillResult`` / ``EvalResult``). Accounting is not allowed to break a
+    request: a ledger write that fails degrades the record, not the intake.
+    """
+    if obj is None:
+        return
+    try:
+        await store.record_unattributed_usage(
+            site=site,
+            model=model,
+            tokens_used=getattr(obj, "tokens_used", 0),
+            cache_read_tokens=getattr(obj, "cache_read_tokens", 0),
+            cache_creation_tokens=getattr(obj, "cache_creation_tokens", 0),
+        )
+    except Exception as exc:  # noqa: BLE001 — accounting never blocks intake
+        log.warning("intake usage not recorded for %s: %s", site, exc)
+
+
 @app.post("/api/grill")
 async def grill_step_endpoint(body: GrillStepRequest, request: Request):
     """B2: Run one step of the intake grill interrogation.
@@ -497,6 +518,11 @@ async def grill_step_endpoint(body: GrillStepRequest, request: Request):
     step = await grill_step(
         body.title, body.description, repo_path, body.qa_history, backend,
     )
+    # This round's utility-tier spend. It cannot go on an attempt row: the
+    # wizard runs before any task exists (and the operator may never finish
+    # it), so it is booked to the unattributed intake ledger instead of being
+    # forced onto some later task that did not ask for it.
+    await _record_intake_spend(store, "api.grill", config.review_model, step)
     if isinstance(step, GrillResult):
         return GrillResultOut(
             title=step.title, description=step.description,
@@ -582,6 +608,9 @@ async def grill_stream_endpoint(body: GrillStepRequest, request: Request):
                 body.title, body.description, repo_path,
                 body.qa_history or [], backend, on_event=_on_event,
             )
+            # Same unattributed-ledger booking as the sync endpoint above.
+            await _record_intake_spend(
+                store, "api.grill_stream", config.review_model, step)
             if isinstance(step, GrillResult):
                 # D1/D9: run evaluator and emit verdict before grill_result.
                 try:
@@ -590,6 +619,9 @@ async def grill_stream_endpoint(body: GrillStepRequest, request: Request):
                         step.title, step.description, step.acceptance_criteria,
                         model=config.utility_model,
                     )
+                    await _record_intake_spend(
+                        store, "api.grill_stream.evaluate_spec",
+                        config.utility_model, eval_result)
                     if eval_result:
                         queue.put_nowait({
                             "kind": "eval_verdict", "source": "grill",

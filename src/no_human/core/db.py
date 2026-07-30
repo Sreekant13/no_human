@@ -210,6 +210,43 @@ class Store:
                 ingested_at TEXT DEFAULT (datetime('now'))
             )
         """)
+        # Real spend that NO ATTEMPT ROW can own. Two sources, both intake:
+        #
+        #  * The interactive grill (`nh task add --grill`, the board's
+        #    /api/grill endpoints) runs BEFORE a task exists, so
+        #    `attempts.utility_*` is not merely the wrong column — there is no
+        #    row, and often no task ever (the operator can walk away mid-
+        #    wizard). Those rows carry task_id NULL.
+        #  * Pre-attempt intake on a task that never reached an attempt (parked
+        #    at the plan gate, escalated on an unavailable input, decomposed).
+        #    The task id IS known, so those rows carry it — but no attempt
+        #    spent it, and inventing an attribution is how a cost surface
+        #    starts lying.
+        #
+        # `site` says which, per row, so the residual stays diagnosable instead
+        # of being one anonymous number.
+        #
+        # DELIBERATELY NOT summed into per-task cost (`lifetime_usage`,
+        # `eval/northstar`): those answer "what did THIS task cost", and this
+        # table is by construction the spend no attempt owns. It is the
+        # whole-cost residual — read it for the true total, not the per-task
+        # one. `nh status` prints it whenever it is non-zero.
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS unattributed_usage (
+                id TEXT PRIMARY KEY,
+                ts TEXT NOT NULL,
+                site TEXT NOT NULL,
+                model TEXT,
+                task_id TEXT,
+                tokens_used INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_creation_tokens INTEGER DEFAULT 0
+            )
+        """)
+        await self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_unattributed_usage_task "
+            "ON unattributed_usage(task_id)"
+        )
 
     # ----------------------------- tasks ---------------------------------- #
 
@@ -659,6 +696,75 @@ class Store:
         )
         row = await cur.fetchone()
         return (int(row["n"]), int(row["toks"])) if row else (0, 0)
+
+    # ---------------------- unattributed usage ledger ----------------------- #
+
+    @serialized_write
+    async def record_unattributed_usage(
+        self, *, site: str, tokens_used: int = 0, cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0, model: str | None = None,
+        task_id: str | None = None,
+    ) -> str | None:
+        """Book utility-tier spend that no attempt row can own.
+
+        ``site`` names WHERE it was spent — the live values are ``"api.grill"``,
+        ``"api.grill_stream"``, ``"api.grill_stream.evaluate_spec"``,
+        ``"cli.task_add.grill"``, ``"orphaned_utility_usage"`` and
+        ``"orphaned_plan_usage"`` — so the residual stays diagnosable rather
+        than being one anonymous number.
+        Returns the row id, or None when there was nothing to record — a call
+        that reports zero across all three figures writes no row, so the table
+        holds spend and never padding.
+
+        NOT YET BOOKED ANYWHERE, and this ledger is their natural home — five
+        further LLM sites still record nothing, verified present as of this
+        commit: the GUI transcript analyzer (`api/app.py:2925`, review tier),
+        the WikiGenerator (`api/app.py:3008` + `docs_gen.py:118`,
+        ``max_turns=12``), and three CLI backends (`cli/commands.py:1776`,
+        `:2310`, `:3138`). Deliberately left out of this change, which is
+        scoped to the six intake sites.
+        """
+        tokens_used = int(tokens_used or 0)
+        cache_read_tokens = int(cache_read_tokens or 0)
+        cache_creation_tokens = int(cache_creation_tokens or 0)
+        if not (tokens_used or cache_read_tokens or cache_creation_tokens):
+            return None
+        row_id = uuid.uuid4().hex
+        await self.db.execute(
+            "INSERT INTO unattributed_usage (id, ts, site, model, task_id, "
+            "tokens_used, cache_read_tokens, cache_creation_tokens) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (row_id, _now(), site, model, task_id, tokens_used,
+             cache_read_tokens, cache_creation_tokens),
+        )
+        await self.db.commit()
+        return row_id
+
+    async def unattributed_usage_totals(
+        self, task_id: str | None = None
+    ) -> dict[str, int]:
+        """Totals over the unattributed ledger: ``{calls, tokens_used,
+        cache_read_tokens, cache_creation_tokens, total}``.
+
+        ``task_id=None`` totals the WHOLE ledger (the default question — "how
+        much intake spend does no task own"); pass an id to scope it.
+        """
+        sql = ("SELECT COUNT(*) AS calls, "
+               "COALESCE(SUM(tokens_used), 0) AS tokens_used, "
+               "COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, "
+               "COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens "
+               "FROM unattributed_usage")
+        args: tuple[Any, ...] = ()
+        if task_id is not None:
+            sql += " WHERE task_id = ?"
+            args = (task_id,)
+        cur = await self.db.execute(sql, args)
+        row = await cur.fetchone()
+        out = {k: int(row[k] if row else 0) for k in (
+            "calls", "tokens_used", "cache_read_tokens", "cache_creation_tokens")}
+        out["total"] = (out["tokens_used"] + out["cache_read_tokens"]
+                        + out["cache_creation_tokens"])
+        return out
 
     # --------------------------- memories ---------------------------------- #
     # The human-confirmed learning queue (PLAN.md 4.5): proposals land here

@@ -15,7 +15,7 @@ import re
 from typing import Any
 
 from ..core.jsonparse import loads_lenient
-from .evaluator import _bounded_run, _default_utility_model, _render
+from .evaluator import UsageSink, _bounded_run, _default_utility_model, _render
 
 log = logging.getLogger("no_human.split_proposal")
 
@@ -90,6 +90,7 @@ async def generate_split_proposal(
     *,
     backend: Any | None = None,
     model: str | None = None,
+    usage_sink: UsageSink | None = None,
 ) -> str | None:
     """Draft a 2-4 sub-task split proposal for an over-scope task.
 
@@ -122,12 +123,15 @@ async def generate_split_proposal(
             surfaces_section=surfaces_section,
         )
         cwd = Path(tempfile.gettempdir())
-        result = await _bounded_run(be, prompt, max_turns=1, effort="low", cwd=cwd)
+        result = await _bounded_run(be, prompt, max_turns=1, effort="low", cwd=cwd,
+                                    usage_sink=usage_sink)
         m = _SPLIT_JSON.search(result.final_text or "")
         if not m:
             log.warning("split proposal produced no parseable SPLIT_JSON "
                         "block; retrying once")
-            result = await _bounded_run(be, prompt, max_turns=1, effort="low", cwd=cwd)
+            # The retry is billed too — _bounded_run books both calls.
+            result = await _bounded_run(be, prompt, max_turns=1, effort="low", cwd=cwd,
+                                        usage_sink=usage_sink)
             m = _SPLIT_JSON.search(result.final_text or "")
         if not m:
             log.warning("split proposal produced no parseable SPLIT_JSON block")

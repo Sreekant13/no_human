@@ -3444,7 +3444,8 @@ async def test_intake_evaluator_runs_for_non_grill_tasks(
 
     eval_called = {}
 
-    async def fake_evaluate_spec(title, desc, criteria, *, backend=None, model=None):
+    async def fake_evaluate_spec(title, desc, criteria, *, backend=None, model=None,
+                                 usage_sink=None):
         eval_called["yes"] = True
         return EvalResult(
             verdict=EvalVerdict.DECOMPOSE,
@@ -3492,7 +3493,8 @@ async def test_intake_evaluator_skipped_when_already_evaluated(
     """Tasks that already have eval_result (grill path) skip re-evaluation."""
     eval_called = {}
 
-    async def fake_evaluate_spec(title, desc, criteria, *, backend=None, model=None):
+    async def fake_evaluate_spec(title, desc, criteria, *, backend=None, model=None,
+                                 usage_sink=None):
         eval_called["yes"] = True
 
     monkeypatch.setattr(
@@ -3526,7 +3528,8 @@ async def test_intake_evaluator_failure_does_not_block_pipeline(
     bare_repo, tmp_path, store, monkeypatch,
 ):
     """Evaluator failure is advisory — task proceeds normally."""
-    async def failing_evaluate_spec(title, desc, criteria, *, backend=None, model=None):
+    async def failing_evaluate_spec(title, desc, criteria, *, backend=None, model=None,
+                                    usage_sink=None):
         raise RuntimeError("evaluator crashed")
 
     monkeypatch.setattr(
