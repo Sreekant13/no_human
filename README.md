@@ -2,513 +2,242 @@
 
 # no_human
 
-**Give it a ticket. Get back a pull request you can actually review.**
+**Give it a ticket. Get back a pull request, with the evidence that it works.**
 
-![python](https://img.shields.io/badge/python-3.12%2B-blue)
-![license](https://img.shields.io/badge/license-MIT-green)
+[![python](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+[getnohuman.com](https://getnohuman.com)
 
 </div>
 
-### Stop hand-holding one chat. Ship 10× in parallel — at a tenth of the cost.
+no_human takes a software ticket and works it to an open pull request without
+supervision. It reads the codebase, plans, writes the change, gets the change
+reviewed by a second model that never saw it being written, runs your tests, and
+opens the PR. Then it stops.
 
-no_human carries a task from intake to an open PR on its own: no babysitting, no
-re-explaining, no steering every step. You just review and approve. Need answers, not
-a diff? The same pipeline runs investigations that dig for root cause and return a
-cited findings report rather than a feature, when no code change turns out to be needed.
-It never merges — that stays yours.
+It never merges. That is not a setting. `gh pr merge`, `glab mr merge` and the
+equivalent REST calls are denied before they execute
+([`src/no_human/agent/guard.py:130`](src/no_human/agent/guard.py)), and pushes to
+`main`, `master` and `release/*` are denied too
+([`src/no_human/config.py:676`](src/no_human/config.py)).
 
-Running several tasks at once is **opt-in and bounded**: concurrency ships *off*
-(`concurrency.enabled: false`) and defaults to `max_workers: 2` when you turn it on
-(`src/no_human/config.py`). A default install runs one task at a time. There is no
-enforced ceiling — `max_workers` is a default you can raise, not a cap.
+It runs on your machine, against your checkout, on your Claude credential.
+Nothing is uploaded to a hosted sandbox. Only prompts reach the model API.
 
-**The output is a pull request a competent developer merges as-is** — that is the
-bar, and it is the only one that counts. What makes that output trustworthy is
-that no_human refuses to grade its own work: a fresh-context reviewer that never
-saw the code being written is told to refute "done", cites `file:line`, and can
-only return pass or fail — never a score. A deterministic tamper guard blocks any
-net reduction in tests or assertions *before* a reviewer token is spent. And every
-task carries an enforced spend cap and a per-task ledger that counts cache-read —
-~96% of the *tokens* an agent burns and, at cache-read's 1/10th price, still roughly
-two-thirds of the bill on that measurement (`docs/COST_LEVERS.md`). Most tooling omits
-the term entirely.
+> **TODO (demo):** getnohuman.com has a section headed "Watch it work a ticket",
+> but the page currently exposes no video or embed URL, and no file in this repo
+> references one. Link it here once the hosted video URL is confirmed. Not
+> guessing a link.
 
-Every number here is measured and sourced — including the ones that make us look worse.
-The **bench card** is additionally published through a fail-closed gate; the other figures
-are sourced to the code or to a recorded measurement, and say which. The headline "10x in
-parallel" is a **design ambition, not a measured result** — nothing here measures delivery
-volume yet, and the parallelism it refers to ships off by default.
-"At a tenth of the cost" is likewise not a precise multiple: the recorded median cost ratio
-is 0.1065 over 12 of 53 specs (see ["Does it work?"](#does-it-work)) — cheaper is well
-supported, an exact 10× is not.
-
-```bash
-nh task add --title "Fix the off-by-one in pagination" --repo ~/my-repo
-```
-
----
-
-## 🔒 Trust, in numbers
-
-- **The reviewer is measured against a seeded-defect corpus, and the number is never hand-edited** — regenerate with `nh bench report --reviewer-recall`. 🔴 **No catch-rate is quoted here, deliberately.** The last full measurement ran on `claude-opus-4-8`; the shipping reviewer has been `claude-opus-5` since 2026-07-26 with **no re-measurement**, and the one A/B that did run scored Opus 5 lower. Quoting the old figure as if it described what ships is the re-attribution this project forbids, so **no catch-rate is published on any user-facing surface** until the shipping reviewer is re-measured. `docs/REVIEWER_RECALL_METHOD.md` holds the method, not a number. The retired 4.8 figure is named only in `.agents/product-marketing.md` and `CLAUDE.md`, in both cases in order to **forbid** its reuse.
-- **Never merges — enforced at the tool boundary, not a policy.** A `PreToolUse` hook denies `gh pr merge`, `glab mr merge`, and the equivalent REST merge calls before they run. Merging is always yours.
-- **A deterministic tamper guard runs before a reviewer token is spent** — it fails any attempt that nets a reduction in test count or assertions, no LLM judgment involved.
-- **Runs against your own checkout; only prompts reach the model API.** Stated as a
-  property, not a pitch — the Agent SDK executes every tool against your local working
-  tree, not a remote sandbox or an upload.
-- **Honest escalation is a first-class outcome** — a blocker taxonomy routes stuck work to a park-with-wake-condition or a human escalation instead of a faked diff.
-- **Cost is measured per task, and cache-read is counted.** The spend caps and the metrics path enforce on `tokens_used + cache_read` (`src/no_human/core/orchestrator.py:713`, `src/no_human/core/metrics.py:162`) — cache-read alone is ~96% of the *tokens* an agent burns — and, priced at 1/10th, still roughly two-thirds of the bill on that measurement (`docs/COST_LEVERS.md`; the token share and the dollar share are different numbers and the mix varies by run) — and it is the term most tooling omits. The canonical ACCOUNTING figure adds `cache_creation` on top; the two differ, and this README does not pretend they are one number. In a recorded measurement over 61 Claude Code sub-agent transcripts from this project's own development sessions — *not* no_human product runs — the per-agent figure those runs' own completion notifications reported understated true spend by **86.6x in aggregate** (median 78.4x, worst 221x). That record lives in a private research repo, so treat the multiples as illustrative of the omission, not as a published product metric. Each task carries an enforced spend cap and a per-task ledger, so a run cannot quietly become expensive.
-
-**It never merges.** Work that reaches a PR stops at `awaiting_approval` with a
-diff and an evidence checklist; work that can't be finished honestly stops at an
-escalation instead. Merging is yours either way — that isn't a setting you can
-flip, it's denied at the tool boundary and covered by tests.
-
-Tasks come from a GitHub or GitLab issue URL, or a plain-English title. (Jira is
-supported as an opt-in server-side poller, not as an argument to `nh task add`.)
-
-**Who it's for:** engineers sitting on well-scoped work — bug fixes, test gaps,
-small features — who would rather review a diff than write it.
-**Who it isn't for:** anyone who wants an agent that ships to production
-unattended. That is deliberately not built here.
-
----
-
-## ⚡ Quickstart
+## Quickstart
 
 ```bash
 git clone <your-clone-url>/no_human.git && cd no_human
-uv sync            # installs the nh entry point into .venv (prefix cmds with `uv run`)
-uv run nh init     # token setup + config + first repo (~2 min)
-uv run nh task add --title "Add greet(name)" --repo ~/my-repo
+uv sync                                             # installs the `nh` entry point into .venv
+uv run nh init                                      # token, config, first repo (about 2 minutes)
+uv run nh task add --title "Fix the off-by-one in pagination" --repo ~/my-repo
 ```
 
-Needs Python 3.12+, [uv](https://github.com/astral-sh/uv), git, and a Claude credential — an OAuth token from `claude setup-token` by default, or your own `ANTHROPIC_API_KEY` under `llm.auth_mode: "api_key"` — full prerequisites: [Getting Started](#%EF%B8%8F-getting-started); full walkthrough: [docs/quickstart.md](docs/quickstart.md).
+Requires Python 3.12+, [uv](https://github.com/astral-sh/uv), git, and a Claude
+credential. By default that is an OAuth token from `claude setup-token`
+(personal subscription or enterprise, both first-class). If you would rather pay
+Anthropic directly, set `llm.auth_mode: "api_key"` and put your own
+`ANTHROPIC_API_KEY` in `~/.no_human/.env`.
 
----
+`nh start` runs the web board, the task worker and the wake watcher together on
+`127.0.0.1:8420`. Full walkthrough: [docs/quickstart.md](docs/quickstart.md).
 
-## 💰 Honest cost
+## What stops it from shipping something broken
 
-Real-work attempts measure **12k–32k output tokens each** ([`docs/NORTH_STAR_PAYOFF.md:351`](docs/NORTH_STAR_PAYOFF.md)); a one-surface PR runs **1–3 attempts** (`bounds.max_attempts` default 3) before it reaches review — call it **~13K–75K output tokens** end-to-end. Budget caps are enforced per attempt and per task lifetime, and spend against those caps is surfaced per task via `nh logs <id>`.
+Four gates. All four are code, not prompt instructions, and three of them run
+before a reviewer token is spent.
 
-Any dollar figure here is **est.** (estimated), computed the only honest way — output-token price ÷ 1k × token count — never a billed number: lifetime burn is actually dominated by cache **reads**, priced at 1/10th the output rate ([`docs/COST_LEVERS.md`](docs/COST_LEVERS.md)), so a single-PR total is always an estimate, not an invoice. See [docs/COST_LEVERS.md](docs/COST_LEVERS.md) for the full breakdown, and ["Does it work?"](#does-it-work) below for how bench cost ratios are qualified — a noisy range, not a guarantee.
+**An adversarial reviewer that is not the author.**
+[`src/no_human/review/reviewer.py`](src/no_human/review/reviewer.py) opens a
+fresh Agent SDK session with read-only tools, on a different model from the
+implementer by default (`claude-opus-5` reviewing `claude-sonnet-5`,
+[`config.py:624-626`](src/no_human/config.py)), and tells it to refute "done".
+It returns a checklist of findings with `file`, `line` and severity - a boolean
+verdict, never a score. Three things make that verdict hard to game: every cited
+location is checked against the actual tree, and a finding citing a location
+that does not exist is demoted to advisory (`reviewer.py:904`); the pass/fail is
+recomputed deterministically from the checklist rather than taken on the model's
+word (`_gate_verdict`, `reviewer.py:917`); and a reviewer that crashes, times
+out, or emits no parseable verdict fails closed (`reviewer.py:880`, `:1136`).
 
----
+**Deterministic lint evidence, so the reviewer is not guessing.**
+[`src/no_human/review/lint_evidence.py`](src/no_human/review/lint_evidence.py)
+runs ruff over the changed Python files and attaches the findings to the review
+context. It uses the target repo's own ruff config and attaches nothing if the
+repo has none, so no_human never imposes its style on yours. It is advisory: any
+failure returns empty rather than blocking the gate.
 
-## Table of Contents
+**A tamper guard against a self-gutted test suite.**
+[`src/no_human/testing/tamper_guard.py`](src/no_human/testing/tamper_guard.py)
+diffs test files separately from product code and fails on a net drop in test or
+assertion count, a net increase in skip/xfail markers, a real assertion replaced
+by a tautology, or a behaviour-faking `autouse` fixture appearing in a
+`conftest.py`. No model judgement is involved. It covers Python, JS/TS, Java and
+the `e2e/` tree.
 
-- [Why no_human?](#-why-no_human)
-- [Quickstart](#-quickstart)
-- [Honest cost](#-honest-cost)
-- [Getting Started](#%EF%B8%8F-getting-started)
-- [What You Get](#-what-you-get)
-- [How It Works](#%EF%B8%8F-how-it-works)
-- [CLI Reference](#-cli-reference)
-- [Configuration](#-configuration)
-- [Architecture](#%EF%B8%8F-architecture)
-- [Development](#%EF%B8%8F-development)
-- [Troubleshooting](#-troubleshooting)
-- [FAQ](#-faq)
-- [License](#-license)
+**A reproduction gate that proves the fix fixes something.**
+[`src/no_human/testing/repro_gate.py`](src/no_human/testing/repro_gate.py) takes
+the tests the coder says demonstrate its change, copies them into a worktree at
+the merge base, and requires them to **fail there** and **pass on the new tree**.
+A bugfix whose test also passes on the unfixed code has proved nothing. Default
+mode is `advisory`, which still enforces for a Python bugfix
+([`config.py:739-758`](src/no_human/config.py)).
 
----
+## When it cannot finish
 
-## 🌟 Why no_human?
+The loop is bounded and it is allowed to give up. `bounds.max_attempts` is 3 per
+loop, `bounds.max_turns_per_attempt` is 500, and `bounds.lifetime_attempts` is 9
+across resumes ([`config.py:713-726`](src/no_human/config.py)). A repeated
+identical tool call or a repeated error signature trips stuck detection, which
+resets context instead of stacking more corrections on a confused session
+(`orchestrator.py:737-795`).
 
-Plenty of tools will write code for you. The hard part is knowing whether to
-trust the result. Three choices here follow from that:
+When it runs out, it does not invent a plausible diff. It classifies the
+blocker into one of ten categories - `MISSING_ACCESS`, `AMBIGUITY`,
+`SCOPE_EXPLOSION`, `IMPOSSIBLE`, `QUOTA`, `BUDGET_EXHAUSTED` and four more
+([`src/no_human/blockers/taxonomy.py`](src/no_human/blockers/taxonomy.py)) - and
+either parks with a wake condition or escalates with a structured report and one
+specific question. `nh blocked` lists what is parked; `nh reply <id> "answer"`
+resumes it.
 
-- **The reviewer is adversarial, and it is not the author.** A fresh-context
-  [Claude Agent SDK](https://docs.anthropic.com/en/docs/agents-sdk) session on a
-  different model is told to *refute* "done" and must cite file:line or command
-  output for every claim. There is no "score yourself 1–10" gate anywhere — a
-  model grading its own work is not evidence.
-- **Giving up honestly is a success.** When a task needs credentials, a missing
-  system, or a decision that is genuinely yours, it parks with a structured
-  blocker instead of inventing a plausible diff. Fabricated confidence costs far
-  more to review than an honest escalation.
-- **Trust only verifiable signals.** A net drop in test count or assertions is
-  blocked *before* a reviewer token is spent, and a Python bugfix must ship a
-  test that provably fails on the unfixed code.
+An honest escalation costs a minute to triage. A confident wrong diff costs an
+hour to review.
 
-Runs against your own Claude credential, on your own checkout. One command boots
-the whole thing:
+## How it works
 
-```bash
-nh start   # web board + task worker + wake watcher
+```
+ticket ──► context ──► plan ──► implement ──► review ──► test ──► PR ──► you merge
+              │                      │           │         │
+              │                      │           │         └── local runner + optional CI
+              │                      │           └── fresh-context reviewer, read-only
+              │                      └── Claude Agent SDK, your credential, your checkout
+              └── grep, git log, past sessions
 ```
 
-### Does it work?
+Tickets come from a GitHub or GitLab issue URL, or a plain-English `--title`.
+Jira is supported as an opt-in server-side poller, not as an argument to
+`nh task add`.
 
-There is a benchmark that replays real past tasks through the real pipeline and
-scores the result against what the human actually did. The published run is
-committed at [docs/NORTH_STAR_BENCH.md](docs/NORTH_STAR_BENCH.md): label
-`expanded-core-v13`, 2026-07-21, a 56-spec run. It scored the goal satisfied
-unattended on **25/53** runnable tasks (47%) — of which **15 delivered a change** and 10 correctly escalated — with an honest-escalation rate of
-**77%** (10/13) on the tasks that were *expected* to escalate.
+Implementation runs behind a `PreToolUse` hook
+([`claude_backend.py:143`](src/no_human/agent/claude_backend.py)) that enforces
+forbidden paths, protected branches, the merge ban and a destructive-shell
+circuit breaker. A failed review loops back to implement. Branching, committing
+and pushing are done by no_human's own git code, not by the model. The PR lands
+in `awaiting_approval` and waits.
 
-Everything about that needs qualifying, so here it is:
-
-- **It is not the newest code, and its corpus is gone.** v13 ran BEFORE the
-  vendor-neutral scrub that rewrote every spec's repo path, so it measured real
-  repos — which is exactly why it is the run worth publishing, and also why it
-  cannot be reproduced against the specs shipping here today. Six specs it
-  scored are no longer curated; five current specs it never ran.
-- **A single run is a point estimate.** Success moves several points between
-  runs on identical specs, because the coder is non-deterministic. Read 47% as
-  a range. The stable signals are cost and honest-escalation.
-- **The cost figure is narrower than it looks.** The median cost ratio is
-  0.1065, but the median covers only the **12 of 53** ran tasks where an
-  original human-session cost was recorded at all, and no_human's side excludes
-  planner and supervisor burn — so it UNDERSTATES what no_human really spent.
-  "Cheaper" is well supported; any precise multiple is not.
-- **"Follow-ups avoided" is smaller than the raw number.** 99 of them were
-  earned on tasks no_human actually delivered. A further 251 came from tasks it
-  correctly *escalated* — the right outcome, but the human still has to do that
-  work, so those are not savings.
-- **One spec of 53 burned zero tokens**, meaning it measured nothing; and the
-  run is a 56-of-57 resume checkpoint, so one spec never reported at all.
-- **It is self-run, not independent**, and you cannot reproduce it: the specs
-  replay the author's own history and pin to local repo paths, so `nh bench run`
-  will skip them on your machine. The harness is reusable; the corpus is not.
-  `nh bench run` records its own `eval/results/northstar/<label>-<stamp>.json`
-  and changes nothing else; `docs/NORTH_STAR_BENCH.md` moves only when someone
-  runs `nh bench publish <results-file>`, which refuses a run too small or too
-  quota-starved to mean anything. The figures above describe the run committed
-  here. For faster measurement loops: `--parallel N` runs up to N specs
-  concurrently (each is sandbox-isolated; above ~4 risks quota saturation),
-  and `--quick` runs one deterministic representative per coverage cell
-  (~17 of 54 core specs) — an iteration signal that the publish gate refuses
-  as a baseline, on purpose.
-
-The number that matters most is not the success rate anyway — it is that the
-failures are mostly *honest* ones that cost you a minute to triage, rather than
-a confident wrong diff that costs you an hour.
-
----
-
-## ⬇️ Getting Started
-
-**Prerequisites:** Python 3.12+, [uv](https://github.com/astral-sh/uv), git, the
-[Claude CLI](https://claude.com/claude-code) (`npm install -g
-@anthropic-ai/claude-code` — `claude setup-token` is how you mint the token), and a
-Claude OAuth token — from either a paid personal subscription or an enterprise
-profile (whatever `claude setup-token` issues for your plan). Both are
-first-class; `nh auth use <profile>` picks which one pays, and a single run never
-spans two profiles. In the default `subscription` mode a metered `ANTHROPIC_API_KEY`
-is rejected: startup aborts if one is set (see [Safety](#-safety-guarantees)).
-If you would rather pay Anthropic directly, set `llm.auth_mode: "api_key"` and supply
-your own `ANTHROPIC_API_KEY` in `~/.no_human/.env` instead of an OAuth token.
-
-One command (checks deps, installs, runs doctor): `git clone <your-clone-url>/no_human.git && cd no_human && ./scripts/bootstrap.sh`
+## Daily commands
 
 ```bash
-git clone <your-clone-url>/no_human.git && cd no_human
+nh start                             # board + worker + wake watcher
+nh task add <issue-url> --repo ~/repo
+nh status                            # needs-you / working / waiting / done
+nh review <id>                       # the reviewer's evidence checklist
+nh diff <id>                         # the diff it wants to ship
+nh logs <id>                         # turns, spend against the cap, failures
+nh approve <id>                      # records approval - you merge the PR
+nh reject <id> --reason "..."        # send it back with feedback
+```
+
+`nh --help` lists the rest (onboarding, rules, skills, shadow runs, the eval
+harness, the benchmark). Note that `nh watch <id>` *runs* a task in a
+foreground TUI - it is not a read-only viewer, so do not point it at a task
+`nh start` is already working.
+
+## Configuration
+
+`~/.no_human/config.yaml`, generated by `nh init`. Secrets go in
+`~/.no_human/.env` (chmod 600, never in the repo, never in config).
+
+| Setting | Default | What it does |
+|---|---|---|
+| `llm.auth_mode` | `subscription` | `subscription` (OAuth) or `api_key` (your own key) |
+| `llm.primary_model` | `claude-sonnet-5` | The implementer |
+| `llm.review_model` | `claude-opus-5` | The reviewer |
+| `bounds.max_attempts` | `3` | Implement/review cycles in one loop |
+| `concurrency.enabled` | `false` | Parallel task workers, each in its own worktree |
+| `ci.enabled` | `false` | Trigger and poll GitLab CI, GitHub Actions, Jenkins or CircleCI |
+
+Concurrency ships off, and `max_workers` defaults to 2 when you turn it on
+([`config.py:830-835`](src/no_human/config.py)). Full reference:
+[docs/configuration.md](docs/configuration.md).
+
+In the default `subscription` mode, a present `ANTHROPIC_API_KEY` aborts startup
+rather than being silently ignored (`config.assert_subscription_mode`,
+[`config.py:546`](src/no_human/config.py)). Silently scrubbing it would hide a
+misconfiguration that costs real money. In `api_key` mode the reverse holds: your
+key is the billing path and every *other* metered route is scrubbed, so a run
+bills exactly one thing and records which.
+
+## Limits
+
+Things this does not do, and numbers this does not have.
+
+- **Ambitious tasks are not the target.** It is aimed at well-scoped work:
+  bugfixes, test gaps, small features, investigations. A vague ticket produces
+  an escalation, which is the intended behaviour, not a workaround.
+- **No published catch-rate for the reviewer.** The last full measurement
+  against the seeded-defect corpus ran on `claude-opus-4-8`. The shipping
+  reviewer has been `claude-opus-5` since 2026-07-26 and has **not** been
+  re-measured, and the one A/B that did run scored Opus 5 lower on that corpus.
+  Quoting the old number would be attributing it to a model it does not
+  describe, so no number is published anywhere here. The method is in
+  [docs/REVIEWER_RECALL_METHOD.md](docs/REVIEWER_RECALL_METHOD.md); regenerate
+  with `nh bench report --reviewer-recall`.
+- **The benchmark is self-run and you cannot reproduce it.** There is a harness
+  that replays real past tasks through the real pipeline and scores against what
+  the human actually did; the committed run is
+  [docs/NORTH_STAR_BENCH.md](docs/NORTH_STAR_BENCH.md). Its specs pin to the
+  author's local repo paths, so `nh bench run` skips them on your machine. The
+  harness is reusable, the corpus is not. Success rate also moves several points
+  between runs on identical specs because the coder is non-deterministic, so
+  treat any single figure as a point estimate rather than a score.
+- **No dollar figure is a billed number.** See below.
+- **The reviewer and implementer being different models is a default, not an
+  enforced invariant.** You can configure them to the same model. Nothing stops
+  you.
+- **There is no deploy step.** The pipeline ends at an open PR. Shipping is a
+  separate problem and not one this solves.
+- **Language coverage is uneven.** `nh onboard` auto-derives a test command for
+  pytest, `npm test` and `mvn` ([`onboard.py:220-260`](src/no_human/onboard.py));
+  anything else you configure by hand. The tamper guard reads Python, JS/TS and
+  Java test files. The reproduction gate is pytest-only.
+
+## Cost
+
+Every task carries an enforced spend cap, and the cap counts cache reads, not
+just input and output tokens (`orchestrator.py:713-717`,
+`metrics.py:38`). That matters more than it sounds. In this project's own
+lifetime measurement over 100 attempts, cache reads were **95.6%** of all tokens
+burned ([docs/COST_LEVERS.md](docs/COST_LEVERS.md)); priced at a tenth of the
+output rate, they still dominated the bill. Tooling that reports "tokens used"
+without them is reporting roughly 1% of the traffic.
+
+Real-work attempts in that record measure 12k-32k output tokens each
+([docs/NORTH_STAR_PAYOFF.md](docs/NORTH_STAR_PAYOFF.md)), and a one-surface PR
+takes one to three attempts. Any dollar figure derived from that is an estimate,
+not an invoice. `nh logs <id>` shows spend against the cap per task.
+
+## Development
+
+```bash
 uv sync
-uv run nh init
+uv run pytest -q
+uv run nh --help
 ```
 
-`uv sync` installs the `nh` entry point into the project's `.venv`, so prefix
-commands with `uv run` (or activate the venv) unless you have installed no_human
-onto your `PATH` separately. Every `nh …` below assumes one of those.
+Design source of truth: [PLAN.md](PLAN.md). Implementation brief:
+[BUILD.md](BUILD.md). Safety model: [docs/security.md](docs/security.md).
+Evaluation harness: [docs/eval.md](docs/eval.md). Intake adapter setup:
+[docs/adapters.md](docs/adapters.md).
 
-`nh init` walks you through token setup, config generation, and first-repo onboarding — about 2 minutes.
+Issues and pull requests are welcome. Run `uv run pytest -q` before submitting.
 
-Then add your first task:
+## License
 
-```bash
-nh task add --title "Add greet(name)" --repo ~/my-repo
-```
-
-The agent will plan, implement, get reviewed, run tests, and open a PR. See [docs/quickstart.md](docs/quickstart.md) for the full 5-minute walkthrough.
-
----
-
-## 🎁 What You Get
-
-| Feature | Description |
-|---|---|
-| **End-to-end delivery** | Plan → implement → adversarial review → test → PR. No manual steps except the final merge. |
-| **Multi-source intake** | GitHub Issues, GitLab Issues, or freeform `--title`; Jira via an opt-in JQL poller. |
-| **Independent reviewer** | A separate model instance told to *refute* "done" — evidence-cited checklist, never a self-score. |
-| **Tamper guard** | Deterministic check: any net reduction in test count / assertions is blocked before review. |
-| **CI integration** | Opt-in trigger + poll for GitLab CI, GitHub Actions, Jenkins or CircleCI, with infra-vs-real failure discrimination and auto-retry. |
-| **Web board** | React operator terminal: a 3-column attention board (Needs Answer · Working · Review PR) with Failed/Done as outcome tables, a native unified diff view, approve / send-back. |
-| **Blocker handling** | 10-category structured blockers with wake conditions, auto-resume, and escalation reports. |
-| **Learning queue** | Mines your IDE sessions for reusable skills and anti-patterns. Nothing activates without your confirm. |
-| **Eval harness** | Golden task replay, held-out tests, intent-match judge, red-team suite, CI regression gate. |
-| **Shadow mode** | Full end-to-end run in a sandbox clone. Never pushes. |
-
----
-
-## ⚙️ How It Works
-
-```
-Task in ──► Context ──► Plan ──► Implement ──► Review ──► Test ──► PR ──► You merge
-              │                     │            │          │
-              │                     │            │          └── local + CI
-              │                     │            └── fresh-context adversarial reviewer
-              │                     └── Claude Agent SDK (your Claude credential)
-              └── codebase grep, git log, Teams, Outlook, session memory
-```
-
-**The agent never merges.** Every PR stops at `awaiting_approval` for your decision.
-
-### Pipeline stages
-
-1. **Intake** — parse a GitHub issue / freeform title into structured acceptance criteria. An interactive grill refines ambiguous specs.
-2. **Context** — read-only, parallel gathering from codebase, comms, and past sessions. Large chunks are distilled through a read-only sub-agent.
-3. **Plan** — generate a plan constrained by confirmed rules.
-4. **Implement** — a preflight check reviews the plan before the first edit, then a Claude Agent SDK session runs with deterministic guards: scope guard (warns on out-of-plan edits), forbidden-import check, dependency-diff check, per-edit lint feedback.
-5. **Review** — a fresh-context reviewer on a different model reads the diff, runs tests, and produces an evidence-backed pass/fail checklist. Fails loop back to implement (up to `max_attempts`).
-6. **Test** — local test runner + optional CI trigger. Infra failures auto-retry; real failures loop back.
-7. **PR** — deterministic VCS: branch, commit under a `no_human` identity, push, open PR/MR. Then park for your approval.
-
-### 🔒 Safety guarantees
-
-These are **enforced in code**, not advisory:
-
-- **One credential per run, and the run says which** — in the default `subscription` mode, metered keys are scrubbed and a present `ANTHROPIC_API_KEY` aborts the run rather than being silently ignored, so a misconfiguration can never quietly bill the metered API.
-- **Deterministic VCS** — the orchestrator owns branching, committing and pushing. Merging a PR/MR (`gh pr merge`, `glab mr merge`, the REST merge endpoints), force-push and destructive git are denied at the tool boundary, and `never_push_to` blocks pushes to protected branches.
-- **Read-only review** — the reviewer backend blocks all write tools unconditionally.
-- **Tamper guard** — fires before the reviewer; test-gutting agents are escalated immediately.
-- **Reviewer crash → fail-closed** — no silent pass-through.
-
-See [docs/security.md](docs/security.md) for the full model.
-
----
-
-## 🚀 CLI Reference
-
-The daily workflow is just two commands: `nh start` and `nh task add`. Everything below is there when you need it.
-
-### Core workflow
-
-```bash
-nh init                                           # first-time setup wizard
-nh start                                          # board + worker (the only command you need)
-nh task add https://github.com/org/repo/issues/42 --repo ~/repo
-nh task add --title "Fix X" --repo ~/repo         # freeform
-```
-
-### Observability
-
-```bash
-nh task list          # board as a table
-nh task show <id>     # requirements, attempts, evidence
-nh status             # portfolio overview: needs-you / working / waiting / done
-nh logs <id>          # attempt log: turns, spend vs burn, failures
-nh diff <id>          # git diff for latest commit
-nh review <id>        # adversarial reviewer's evidence checklist
-```
-
-> **`nh watch <id>` is not read-only.** It *runs* the task in a live TUI
-> (`src/no_human/cli/tui.py` builds an orchestrator and awaits `run_task`). Use it to drive a
-> task in the foreground — never as a viewer while `nh start` is running, or the
-> same task executes twice.
-
-### Human actions
-
-```bash
-nh approve <id>                     # record approval — YOU merge the PR
-nh reject <id> --reason "..."       # send back with feedback
-nh blocked                          # parked tasks + the one question each needs
-nh reply <id> "the answer"          # answer + resume from checkpoint
-nh unblock <id>                     # manually resume (or --fail to abandon)
-```
-
-### Learning & evaluation
-
-```bash
-nh learnings                        # review pending proposals
-nh learnings --confirm <id>         # activate a rule (one-click gate)
-nh rules list                       # confirmed rules
-nh skills list                      # confirmed skills
-nh eval --gate                      # golden-set replay + CI gate
-nh shadow "title" --repo ~/repo     # sandbox run, never pushes
-```
-
-### Repo management
-
-```bash
-nh onboard ~/repo                   # derive + prove install/test/lint commands
-nh onboard ~/repo --confirm         # confirm the proven profile
-nh history                          # extract IDE conversation history
-nh history --analyze                # mine corrections → propose learnings
-nh config show                      # pretty-print config
-```
-
----
-
-## 🔧 Configuration
-
-All config lives at `~/.no_human/config.yaml` (auto-generated by `nh init`).  
-Secrets live in `~/.no_human/.env` (chmod 600, never in the repo).
-
-| Setting | Default | What it does |
-|---|---|---|
-| `CLAUDE_CODE_OAUTH_TOKEN` | *(required in `subscription` mode)* | Subscription auth for the Claude Agent SDK |
-| `llm.primary_model` | `claude-sonnet-5` | The implementer (coder) model |
-| `llm.review_model` | `claude-opus-5` | The adversarial reviewer (kept different from the implementer by convention; not enforced in code) |
-| `server.port` | `8420` | Web board bind port |
-| `bounds.max_attempts` | `3` | Max implement → review cycles in **one** loop. Every resume starts a fresh loop, so this is not a per-task cap — `bounds.lifetime_attempts` is. |
-| `bounds.max_turns_per_attempt` | `500` | Max agent turns per attempt |
-
-<details>
-<summary><b>Advanced settings</b> (CI, concurrency, safety, blockers)</summary>
-
-| Setting | Default | What it does |
-|---|---|---|
-| `concurrency.max_workers` | `2` | Concurrent task workers (each in its own worktree; requires `concurrency.enabled`) |
-| `ci.enabled` | `false` | Master switch for remote CI trigger + poll |
-| `ci.backend` | `gitlab` | `gitlab` · `github_actions` · `jenkins` · `circleci` |
-| `ci.project` | *(none)* | Project path for the CI trigger (GitLab-style) |
-| `git.never_push_to` | `[main, master, release/*]` | Protected branch patterns |
-| `safety.forbidden_paths` | `[.env, *.pem, ...]` | Paths the agent cannot write to |
-| `notifications.slack_webhook_url` | `null` | Write-only Slack alerts (null = log only) |
-| `blockers.max_park_duration` | `48h` | Auto-escalate parked tasks after this |
-| `blockers.wake_poll_interval` | `10m` | How often the watcher checks wake conditions |
-
-See [docs/configuration.md](docs/configuration.md) for the full reference.
-
-</details>
-
----
-
-## 🏗️ Architecture
-
-```
-~/.no_human/
-  .env                  # secrets (chmod 600)
-  config.yaml           # settings
-  no_human.db           # SQLite (WAL) — tasks, attempts, profiles, memories
-
-src/no_human/         # (abridged — packages only)
-  cli/                  # nh commands (Click)
-  api/                  # FastAPI + WebSocket + React SPA
-  agent/                # Claude Agent SDK backend, guards, hooks
-  core/                 # orchestrator, state machine, scheduler, bounds
-  intake/               # GitHub, GitLab adapters + Jira poller
-  context/              # parallel read-only context gatherers
-  review/               # adversarial reviewer
-  testing/              # local test runner, test-layer model
-  ci/                   # remote CI trigger + poll (opt-in)
-  vcs/                  # deterministic git, PR opening
-  learning/             # human-confirmed learning queue
-  history/              # IDE transcript extraction + analysis
-  eval/                 # golden-set replay + scorecard
-  blockers/             # 10-category blocker taxonomy + wake watcher
-  integrations/         # Jira / CI / notification integrations
-  ci_gate/               # enterprise CI adapter (optional)
-  notify/               # Slack webhook notifications
-```
-
-Design source of truth: [`PLAN.md`](PLAN.md). Implementation brief: [`BUILD.md`](BUILD.md).
-
----
-
-## 🛠️ Development
-
-```bash
-uv sync                     # install dependencies
-uv run pytest -q            # run all tests
-uv run nh --help            # CLI reference
-```
-
-### E2E tests (web board)
-
-```bash
-uv sync --group e2e
-uv run playwright install chromium
-cd web && npm install && npm run build && cd ..
-uv run python e2e/serve_demo.py 8488 &
-NH_E2E_BASE=http://127.0.0.1:8488 uv run python e2e/board_e2e.py
-```
-
-### 📖 Key design documents
-
-| Document | Purpose |
-|---|---|
-| [`PLAN.md`](PLAN.md) | Architectural spec and constraints |
-| [`BUILD.md`](BUILD.md) | Implementation brief |
-| [`EVOLUTION_PLAN.md`](EVOLUTION_PLAN.md) | Evolution roadmap |
-| [`docs/security.md`](docs/security.md) | Safety model |
-| [`docs/configuration.md`](docs/configuration.md) | Full config reference |
-| [`docs/adapters.md`](docs/adapters.md) | Intake adapter setup (GitHub, GitLab) |
-| [`docs/eval.md`](docs/eval.md) | Evaluation harness and golden tasks |
-
----
-
-## ❓ Troubleshooting
-
-| Problem | Solution |
-|---|---|
-| **`auth error: ANTHROPIC_API_KEY is set`** | `unset ANTHROPIC_API_KEY` **if you are in the default `subscription` mode** — that mode bills OAuth only. If you intend to use your own key, set `llm.auth_mode: "api_key"`, where the key is REQUIRED rather than rejected. Startup aborts rather than scrubbing silently, so the misconfiguration reaches you and not your bill. |
-| **`auth error: No subscription token found`** | Run `claude setup-token`, then add the token to `~/.no_human/.env` (chmod 600). `nh auth status` lists configured profiles. |
-| **`no profile to confirm`** | Run `nh onboard <repo>` first, then `nh onboard <repo> --confirm`. |
-| **Task stuck in `implementing`** | Check `nh logs <id>` — likely hit `max_turns`. Raise `bounds.max_turns_per_attempt` (default 500) or simplify the task. |
-| **`another no_human instance is already running`** | Only one instance may hold `~/.no_human/nh.pid`. Run `nh stop` — it SIGTERMs the pidfile's process (SIGKILL after a bounded wait) and removes the pidfile only once the process is confirmed gone. If the pidfile is stale or corrupt, `nh stop` says so and cleans up safely. |
-| **Reviewer keeps failing** | Check `nh review <id>` for evidence. Either the code has real issues (fix and retry) or the acceptance criteria are ambiguous (refine with `nh reject`). |
-
----
-
-## 💬 FAQ
-
-<details>
-<summary><b>Does this use my personal API key?</b></summary>
-
-no_human runs on **exactly one** credential per run, and says which. Two modes ship:
-`llm.auth_mode: "subscription"` (the default) uses `CLAUDE_CODE_OAUTH_TOKEN` from a personal
-or enterprise profile, and **aborts** if `ANTHROPIC_API_KEY` is present — a silent
-scrub-and-continue would hide a misconfiguration that costs real money.
-`llm.auth_mode: "api_key"` is the sanctioned BYO-key mode: your own `ANTHROPIC_API_KEY` is
-the chosen billing path, and every *other* metered route (`ANTHROPIC_AUTH_TOKEN`, Bedrock,
-Vertex) is scrubbed instead — so a run still bills exactly one path. The key lives in
-`~/.no_human/.env`, never in config.
-</details>
-
-<details>
-<summary><b>Can the agent merge a PR?</b></summary>
-
-No. The pipeline stops at `awaiting_approval`. There is no auto-merge anywhere in the codebase. You review the diff and the evidence checklist, then merge — in your git host, or with `nh merge-stack run` for a stacked set. Both are operator actions; the agent is denied the merge tools outright.
-</details>
-
-<details>
-<summary><b>What if the agent gets stuck?</b></summary>
-
-The orchestrator has built-in stuck detection: the same error signature twice triggers a context reset. After `max_attempts` (default 3) the loop escalates with a structured report. A resume starts a fresh loop, so the per-task ceiling is `bounds.lifetime_attempts`, not this. You can also `nh blocked` to see what's parked and `nh reply` to provide guidance.
-</details>
-
-<details>
-<summary><b>Can I use this for multiple repos?</b></summary>
-
-Yes. Create a project with multiple repo paths. The test-plan model supports cross-repo test execution — e.g. unit tests in the primary repo, integration tests in a separate test repo. The write path covers all repos: each linked repo gets its own branch, commit, and PR (linked back to the primary). A single `nh approve` covers all PRs. The tamper guard runs on every repo — test-gutting in a linked repo is caught and escalated.
-</details>
-
-<details>
-<summary><b>How does learning work?</b></summary>
-
-Success → proposed skill. Structural blocker → proposed anti-pattern. The agent mines your IDE conversations for correction patterns. **Nothing enters the active rule set without your explicit confirm** (`nh learnings --confirm`). This prevents one-off context from calcifying into permanent rules.
-</details>
-
----
-
-## 📄 License
-
-MIT — see [LICENSE](LICENSE) for details.
-
----
-
-## ✍️ Author
-
-Created by **eyalgolan** — exploring what autonomous software delivery looks like when you refuse to compromise on trust, safety, or human oversight.
-
-## 💭 Feedback & contributions
-
-Found a bug? Have an idea? Open an issue or start a discussion. PRs are welcome — run the test suite (`uv run pytest -q`) before submitting.
-
----
-
-<div align="center">
-<sub>Built for engineers who'd rather review code than write boilerplate.</sub>
-</div>
+MIT. See [LICENSE](LICENSE).
