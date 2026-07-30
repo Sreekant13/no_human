@@ -1033,12 +1033,17 @@ class AdversarialReviewer:
             full_files, omitted_files = _full_file_context(
                 repo_path, before_ref, after_ref,
             )
-            # SCRUM-64: deterministic lint evidence, changed files only. Never
-            # blocks the review — any failure here just means no lint section.
+            # SCRUM-64: deterministic lint evidence, scoped to the lines this
+            # diff changed — a pre-existing violation on an untouched line is
+            # not evidence about the agent's work. Never blocks the review —
+            # any failure here just means no lint section.
             try:
                 changed = _changed_paths(repo_path, before_ref, after_ref)
                 lint_evidence = format_lint_evidence(
-                    collect_lint_evidence(repo_path, changed)
+                    collect_lint_evidence(
+                        repo_path, changed,
+                        before_ref=before_ref, after_ref=after_ref,
+                    )
                 )
             except Exception:  # noqa: BLE001 — advisory, never blocks review
                 lint_evidence = ""

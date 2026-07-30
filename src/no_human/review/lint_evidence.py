@@ -6,6 +6,15 @@ style), runs ruff on the diff's changed Python files ONLY, and returns
 structured findings the reviewer context builder can attach as machine-parsed
 evidence.
 
+Scoped to the diff's changed LINES, not merely its changed files. A violation
+that already existed on a line the agent never touched is not evidence about
+the agent's diff — it is noise that grows with file size and can push an
+adversarial reviewer toward a false FAIL. When the caller supplies the two
+refs, findings are filtered to lines the diff added or modified in the AFTER
+state; a newly added file counts as all-lines-changed. If the changed-line map
+cannot be computed (no git, unparseable diff, timeout) we fail OPEN to the
+previous whole-file behaviour rather than to silence.
+
 Advisory only: any failure — no config, missing binary, timeout, bad output —
 returns an empty result. This must never block or slow the review gate.
 
@@ -21,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -62,6 +72,135 @@ def has_ruff_config(repo_path: Path) -> bool:
     return False
 
 
+# `@@ -a,b +c,d @@` — we only care about the AFTER side. `d` defaults to 1 when
+# omitted; `d == 0` is a pure deletion and contributes no after-state lines.
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_NEW_PATH_RE = re.compile(r"^\+\+\+ (.*)$")
+
+# The changed-line map is a small git read; it must never outlast the lint step.
+DIFF_TIMEOUT = 20
+
+
+def _unquote_git_path(path: str) -> str:
+    """git wraps a path in double quotes and C-escapes it when it contains
+    non-ASCII, backslashes or control characters (`"b/caf\\303\\251.py"`).
+    Plain paths — including ones with spaces — are emitted verbatim."""
+    if len(path) >= 2 and path.startswith('"') and path.endswith('"'):
+        try:
+            return (
+                path[1:-1]
+                .encode("latin-1", "backslashreplace")
+                .decode("unicode_escape")
+                .encode("latin-1")
+                .decode("utf-8", "replace")
+            )
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            return path[1:-1]
+    return path
+
+
+def parse_changed_lines(diff_text: str) -> dict[str, set[int]]:
+    """Parse `git diff --unified=0` output into {repo-relative path: after-state
+    line numbers added or modified}.
+
+    A path that appears in the diff but gains no after-state lines (a pure
+    deletion) maps to an EMPTY set — deliberately present, so a caller can tell
+    "this file changed but no line was added" apart from "we learned nothing".
+
+    `+++ ` is only honoured inside a file's header region (after `diff --git`,
+    before its first `@@`). An ADDED line whose own content begins with `++ `
+    renders as `+++ ...` at column 0 and would otherwise be misread as a header,
+    letting the diff's own content redirect the line map to another path.
+    """
+    out: dict[str, set[int]] = {}
+    current: str | None = None
+    in_header = False
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            in_header, current = True, None
+            continue
+        if in_header and line.startswith("+++ "):
+            m = _NEW_PATH_RE.match(line)
+            # The quoting wraps the WHOLE header token including git's `b/`
+            # prefix (`+++ "b/caf\303\251.py"`), so unquote before stripping it.
+            raw = _unquote_git_path((m.group(1) if m else "").rstrip("\t"))
+            if not raw or raw == "/dev/null":
+                current = None
+                continue
+            current = raw[2:] if raw.startswith("b/") else raw
+            out.setdefault(current, set())
+            continue
+        if not line.startswith("@@"):
+            continue
+        # With --unified=0 every content line carries a +/- prefix, so a bare
+        # `@@` at column 0 is always a real hunk header.
+        in_header = False
+        m = _HUNK_RE.match(line)
+        if current is None or not m:
+            continue
+        start = int(m.group(1))
+        count = 1 if m.group(2) is None else int(m.group(2))
+        if count <= 0:  # deletion-only hunk: no after-state lines
+            continue
+        out[current].update(range(start, start + count))
+    return out
+
+
+def changed_line_numbers(
+    repo_path: Path,
+    before_ref: str,
+    after_ref: str,
+    *,
+    timeout: int = DIFF_TIMEOUT,
+) -> dict[str, set[int]]:
+    """{repo-relative path: line numbers the diff added or modified, in the
+    AFTER state}. Returns {} on ANY failure — advisory, never raises.
+
+    `--no-ext-diff` matters: a repo-configured external diff driver is code
+    sourced from the repo under review, and this module never runs that.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "--no-pager", "diff", "--no-ext-diff", "--no-color",
+             "--unified=0", "-M", f"{before_ref}..{after_ref}"],
+            cwd=repo_path, capture_output=True, text=True,
+            errors="replace", timeout=timeout,
+        )
+        if proc.returncode != 0:
+            log.warning("git diff for changed lines exited %d: %s",
+                        proc.returncode, (proc.stderr or "")[:300])
+            return {}
+        return parse_changed_lines(proc.stdout or "")
+    except subprocess.TimeoutExpired:
+        log.warning("git diff for changed lines timed out after %ds", timeout)
+        return {}
+    except Exception:  # noqa: BLE001 — advisory evidence, never blocks the review
+        log.warning("changed-line map failed", exc_info=True)
+        return {}
+
+
+def _repo_relative(raw: str, repo_path: Path) -> str:
+    """ruff's JSON `filename` is ABSOLUTE and symlink-resolved even when it was
+    handed a relative path (verified against ruff 0.14.0). Left as-is it both
+    defeats the changed-line filter — whose keys are git's repo-relative paths
+    — and leaks the operator's home directory into the reviewer prompt.
+
+    Returns the path unchanged if it cannot be placed inside the repo, so an
+    unexpected shape degrades to today's rendering rather than vanishing.
+    """
+    if not raw:
+        return raw
+    try:
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = repo_path / candidate
+        root = Path(os.path.realpath(str(repo_path)))
+        resolved = Path(os.path.realpath(str(candidate)))
+        return resolved.relative_to(root).as_posix()
+    except (ValueError, OSError):
+        return raw
+
+
 def _changed_python_files(repo_path: Path, changed_files: list[str]) -> list[str]:
     """Changed `.py` paths that actually exist inside `repo_path`. Never scans
     the repo — only ever considers paths the caller says are in the diff, and
@@ -82,16 +221,42 @@ def _changed_python_files(repo_path: Path, changed_files: list[str]) -> list[str
     return out
 
 
+def _filter_to_changed_lines(
+    findings: list[LintFinding], changed_lines: dict[str, set[int]],
+) -> list[LintFinding]:
+    """Drop findings on lines the diff did not touch.
+
+    Fail-open contract: an EMPTY map means we learned nothing about which lines
+    changed, so every finding is kept (today's whole-file behaviour). A map that
+    is present but has no entry for a path means that path genuinely gained no
+    after-state lines (deletion-only, mode change, pure rename) — its findings
+    are pre-existing and are dropped.
+    """
+    if not changed_lines:
+        return findings
+    return [
+        f for f in findings
+        if f.line_number in changed_lines.get(f.path, ())
+    ]
+
+
 def collect_lint_evidence(
     repo_path: Path,
     changed_files: list[str],
     *,
+    before_ref: str | None = None,
+    after_ref: str | None = None,
     timeout: int = LINT_TIMEOUT,
 ) -> list[LintFinding]:
     """Run ruff on the diff's changed Python files, if the repo configures
     ruff. Returns [] on: no config, no changed .py files, a missing/failing
     ruff binary, a timeout, or unparseable output — this is advisory evidence
-    and must never raise into the review gate."""
+    and must never raise into the review gate.
+
+    When both `before_ref` and `after_ref` are given, findings are further
+    scoped to the lines that diff touched; without them the whole changed file
+    is reported, as before.
+    """
     try:
         if not has_ruff_config(repo_path):
             return []
@@ -117,11 +282,15 @@ def collect_lint_evidence(
                 continue
             loc = item.get("location") or {}
             findings.append(LintFinding(
-                path=str(item.get("filename") or ""),
+                path=_repo_relative(str(item.get("filename") or ""), repo_path),
                 line_number=int(loc.get("row") or 0),
                 error_code=str(item.get("code") or ""),
                 message=str(item.get("message") or ""),
             ))
+        if before_ref is not None and after_ref is not None:
+            findings = _filter_to_changed_lines(
+                findings, changed_line_numbers(repo_path, before_ref, after_ref),
+            )
         # Determinism is enforced here, not inherited from ruff's (unordered
         # across files) output order.
         findings.sort(key=lambda f: (f.path, f.line_number, f.error_code))
@@ -154,7 +323,12 @@ def format_lint_evidence(findings: list[LintFinding]) -> str:
     """
     if not findings:
         return ""
-    header = "Evidence: ruff (deterministic static analysis of the changed files)"
+    # The scope is stated so the reviewer does not read "no finding for foo.py"
+    # as "foo.py is clean" — untouched lines were never in scope.
+    header = (
+        "Evidence: ruff (deterministic static analysis, scoped to the lines "
+        "this diff changed)"
+    )
     lines = [header]
     shown = 0
     size = len(header)

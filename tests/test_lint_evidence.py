@@ -8,11 +8,17 @@ on a real ruff binary.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
+from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from no_human.review.lint_evidence import (
     LintFinding,
+    changed_line_numbers,
     collect_lint_evidence,
     format_lint_evidence,
     has_ruff_config,
@@ -292,7 +298,238 @@ def test_review_prompt_byte_identical_with_empty_lint_evidence():
 
 def test_review_prompt_includes_lint_block_when_present():
     t = Task.new("Fix bug")
-    lint_block = "Evidence: ruff (deterministic static analysis of the changed files)\n  calc.py:3 F401 unused import"
+    lint_block = "Evidence: ruff (deterministic static analysis, scoped to the lines this diff changed)\n  calc.py:3 F401 unused import"
     prompt = _build_review_prompt(t, "diff", "tests", "", lint_evidence=lint_block)
     assert "Evidence: ruff" in prompt
     assert "calc.py:3 F401 unused import" in prompt
+
+
+# --------------------------------------------------------------------------- #
+# Changed-LINES scoping (real git repos, real diffs)                           #
+# --------------------------------------------------------------------------- #
+#
+# These tests build a real git repo and run real `git diff` — the hunk parsing
+# is exercised against git's actual output, not a hand-written fixture of what
+# we imagine git prints.
+
+_GIT_ENV = {
+    **os.environ,
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_SYSTEM": os.devnull,
+    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+}
+
+
+def _git(repo, *args):
+    return subprocess.run(
+        ["git", *args], cwd=repo, env=_GIT_ENV,
+        capture_output=True, text=True, check=True,
+    )
+
+
+# A file whose line 1 violation (unused `import os`) is PRE-EXISTING and whose
+# appended last line carries the violation the diff actually introduced.
+_CALC_V1 = "import os\n\n\ndef total(values):\n    return sum(values)\n"
+_CALC_V2 = _CALC_V1 + "import sys\n"
+_TOUCHED_LINE = 6  # the appended `import sys`
+
+
+def _git_repo_with_diff(tmp_path):
+    """A committed repo whose HEAD~1..HEAD diff touches ONLY line 6 of calc.py."""
+    _git(tmp_path, "init", "-q", ".")
+    (tmp_path / "ruff.toml").write_text("line-length = 100\n")
+    (tmp_path / "calc.py").write_text(_CALC_V1)
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "base")
+    (tmp_path / "calc.py").write_text(_CALC_V2)
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "append an unused import")
+    return tmp_path
+
+
+def _fake_ruff_only(payload, returncode=1):
+    """Intercept the `ruff` subprocess ONLY — git calls still run for real."""
+    real_run = subprocess.run
+
+    def _run(cmd, **kwargs):
+        if cmd and cmd[0] == "ruff":
+            return subprocess.CompletedProcess(cmd, returncode, stdout=payload, stderr="")
+        return real_run(cmd, **kwargs)
+
+    return _run
+
+
+def _abs_ruff_payload(repo, rows):
+    """What ruff really emits: an ABSOLUTE, symlink-resolved `filename`.
+    Verified against ruff 0.14.0 — a relative path argument still produces an
+    absolute filename in the JSON."""
+    return json.dumps([
+        {
+            "filename": os.path.realpath(str(Path(repo) / "calc.py")),
+            "code": code,
+            "message": msg,
+            "location": {"row": row, "column": 1},
+        }
+        for row, code, msg in rows
+    ])
+
+
+def test_changed_line_numbers_maps_added_lines(tmp_path):
+    repo = _git_repo_with_diff(tmp_path)
+    assert changed_line_numbers(repo, "HEAD~1", "HEAD") == {"calc.py": {_TOUCHED_LINE}}
+
+
+def test_changed_line_numbers_new_file_is_all_lines(tmp_path):
+    repo = _git_repo_with_diff(tmp_path)
+    (repo / "brand_new.py").write_text("a = 1\nb = 2\nc = 3\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add file")
+    assert changed_line_numbers(repo, "HEAD~1", "HEAD") == {"brand_new.py": {1, 2, 3}}
+
+
+def test_changed_line_numbers_pure_deletion_contributes_no_after_lines(tmp_path):
+    """`@@ -4,2 +3,0 @@` — a deletion-only hunk adds no after-state lines. The
+    path is still reported (with an empty set) so callers can tell 'this file
+    changed but no line was added' apart from 'git told us nothing'."""
+    repo = _git_repo_with_diff(tmp_path)
+    (repo / "calc.py").write_text("import os\n\n\ndef total(values):\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "delete lines")
+    assert changed_line_numbers(repo, "HEAD~1", "HEAD") == {"calc.py": set()}
+
+
+def test_changed_line_numbers_multiline_and_multifile(tmp_path):
+    repo = _git_repo_with_diff(tmp_path)
+    (repo / "calc.py").write_text("import os\n\n\ndef total(values):\n    x = 1\n    y = 2\n    return x + y\n")
+    (repo / "other.py").write_text("z = 0\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "edit both")
+    got = changed_line_numbers(repo, "HEAD~1", "HEAD")
+    assert got["other.py"] == {1}
+    # lines 5-7 replaced the old lines 5-6
+    assert got["calc.py"] == {5, 6, 7}
+
+
+def test_changed_line_numbers_handles_quoted_paths(tmp_path):
+    """git quotes paths with backslashes/non-ASCII in `+++ b/...` headers."""
+    repo = _git_repo_with_diff(tmp_path)
+    (repo / "café naïve.py").write_text("q = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "unicode path")
+    assert changed_line_numbers(repo, "HEAD~1", "HEAD") == {"café naïve.py": {1}}
+
+
+def test_changed_line_numbers_bad_ref_fails_open_to_empty(tmp_path):
+    """Never raises into the review gate; an unusable ref yields {}."""
+    repo = _git_repo_with_diff(tmp_path)
+    assert changed_line_numbers(repo, "no-such-ref", "HEAD") == {}
+
+
+def test_changed_line_numbers_not_a_repo_fails_open_to_empty(tmp_path):
+    assert changed_line_numbers(tmp_path, "HEAD~1", "HEAD") == {}
+
+
+def test_collect_lint_evidence_drops_findings_on_untouched_lines(tmp_path):
+    """THE point of this module's scoping: a pre-existing violation on a line
+    the diff never touched must not be presented to the reviewer as evidence
+    about the agent's diff."""
+    repo = _git_repo_with_diff(tmp_path)
+    payload = _abs_ruff_payload(repo, [
+        (1, "F401", "`os` imported but unused"),          # pre-existing, untouched
+        (_TOUCHED_LINE, "F401", "`sys` imported but unused"),  # introduced here
+    ])
+    with patch("no_human.review.lint_evidence.subprocess.run",
+               side_effect=_fake_ruff_only(payload)):
+        findings = collect_lint_evidence(
+            repo, ["calc.py"], before_ref="HEAD~1", after_ref="HEAD")
+    assert [(f.path, f.line_number) for f in findings] == [("calc.py", _TOUCHED_LINE)]
+
+
+def test_collect_lint_evidence_normalizes_absolute_ruff_paths(tmp_path):
+    """ruff reports an ABSOLUTE filename. Rendering it verbatim leaks the
+    operator's home directory into the reviewer prompt — and makes the
+    changed-line filter silently drop everything."""
+    repo = _git_repo_with_diff(tmp_path)
+    payload = _abs_ruff_payload(repo, [(_TOUCHED_LINE, "F401", "`sys` imported but unused")])
+    with patch("no_human.review.lint_evidence.subprocess.run",
+               side_effect=_fake_ruff_only(payload)):
+        findings = collect_lint_evidence(
+            repo, ["calc.py"], before_ref="HEAD~1", after_ref="HEAD")
+    assert [f.path for f in findings] == ["calc.py"]
+    block = format_lint_evidence(findings)
+    assert str(repo) not in block
+    assert os.path.realpath(str(repo)) not in block
+    assert "calc.py:6" in block
+
+
+def test_collect_lint_evidence_without_refs_keeps_all_findings(tmp_path):
+    """Back-compatible: no refs supplied -> whole-file behaviour, unchanged."""
+    repo = _git_repo_with_diff(tmp_path)
+    payload = _abs_ruff_payload(repo, [
+        (1, "F401", "`os` imported but unused"),
+        (_TOUCHED_LINE, "F401", "`sys` imported but unused"),
+    ])
+    with patch("no_human.review.lint_evidence.subprocess.run",
+               side_effect=_fake_ruff_only(payload)):
+        findings = collect_lint_evidence(repo, ["calc.py"])
+    assert [f.line_number for f in findings] == [1, _TOUCHED_LINE]
+
+
+def test_collect_lint_evidence_git_failure_fails_open_to_whole_file(tmp_path):
+    """Fail OPEN: if the changed-line map can't be computed we degrade to the
+    previous behaviour (all findings for changed files), never to silence."""
+    repo = _git_repo_with_diff(tmp_path)
+    payload = _abs_ruff_payload(repo, [
+        (1, "F401", "`os` imported but unused"),
+        (_TOUCHED_LINE, "F401", "`sys` imported but unused"),
+    ])
+    with patch("no_human.review.lint_evidence.subprocess.run",
+               side_effect=_fake_ruff_only(payload)):
+        findings = collect_lint_evidence(
+            repo, ["calc.py"], before_ref="bogus-ref", after_ref="HEAD")
+    assert [f.line_number for f in findings] == [1, _TOUCHED_LINE]
+
+
+@pytest.mark.skipif(shutil.which("ruff") is None, reason="ruff not on PATH")
+def test_collect_lint_evidence_end_to_end_with_real_ruff(tmp_path):
+    """No mocks at all: real git, real ruff. Only runs where ruff is installed
+    (it is deliberately not a dependency of this project)."""
+    repo = _git_repo_with_diff(tmp_path)
+    findings = collect_lint_evidence(
+        repo, ["calc.py"], before_ref="HEAD~1", after_ref="HEAD")
+    assert findings, "real ruff should flag the appended unused import"
+    assert {f.path for f in findings} == {"calc.py"}
+    assert {f.line_number for f in findings} == {_TOUCHED_LINE}
+
+
+def test_changed_line_numbers_ignores_content_masquerading_as_a_header(tmp_path):
+    """An ADDED line whose content starts with `++ ` renders as `+++ ...` at
+    column 0. Treated as a file header it would redirect the line map to a path
+    the diff never touched — i.e. the diff's own content steering the evidence.
+    """
+    repo = _git_repo_with_diff(tmp_path)
+    (repo / "victim.py").write_text("safe = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "victim")
+    (repo / "calc.py").write_text(_CALC_V2 + "# ++ b/victim.py\n# @@ -1 +900,3 @@\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "sneaky content")
+    got = changed_line_numbers(repo, "HEAD~1", "HEAD")
+    assert got == {"calc.py": {7, 8}}, got
+
+
+def test_parse_changed_lines_handles_hand_written_hunk_forms():
+    """The three `@@` shapes, straight from the format: omitted count (1 line),
+    explicit count, and a zero count (deletion) that adds nothing."""
+    from no_human.review.lint_evidence import parse_changed_lines
+
+    diff = (
+        "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+        "@@ -3 +3 @@\n-old\n+new\n"
+        "@@ -10,0 +11,3 @@\n+x\n+y\n+z\n"
+        "@@ -20,2 +22,0 @@\n-gone\n-gone\n"
+        "diff --git a/b.py b/b.py\n--- a/b.py\n+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n-a\n-b\n"
+    )
+    assert parse_changed_lines(diff) == {"a.py": {3, 11, 12, 13}}
