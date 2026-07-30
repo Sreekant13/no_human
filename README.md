@@ -19,8 +19,9 @@ opens the PR. Then it stops.
 It never merges. That is not a setting. `gh pr merge`, `glab mr merge` and the
 equivalent REST calls are denied before they execute
 ([`src/no_human/agent/guard.py:130`](src/no_human/agent/guard.py)), and pushes to
-`main`, `master` and `release/*` are denied too
-([`src/no_human/config.py:676`](src/no_human/config.py)).
+`main`, `master` and `release/*` are denied too - the denial is at
+[`guard.py:300`](src/no_human/agent/guard.py), the default patterns at
+[`config.py:676`](src/no_human/config.py).
 
 It runs on your machine, against your checkout, on your Claude credential.
 Nothing is uploaded to a hosted sandbox. Only prompts reach the model API.
@@ -49,8 +50,9 @@ Anthropic directly, set `llm.auth_mode: "api_key"` and put your own
 
 ## What stops it from shipping something broken
 
-Four gates. All four are code, not prompt instructions, and three of them run
-before a reviewer token is spent.
+Three gates, and one input they run on. All of it is code, not prompt
+instructions, and the two deterministic gates run before a reviewer token is
+spent.
 
 **An adversarial reviewer that is not the author.**
 [`src/no_human/review/reviewer.py`](src/no_human/review/reviewer.py) opens a
@@ -65,12 +67,13 @@ recomputed deterministically from the checklist rather than taken on the model's
 word (`_gate_verdict`, `reviewer.py:917`); and a reviewer that crashes, times
 out, or emits no parseable verdict fails closed (`reviewer.py:880`, `:1136`).
 
-**Deterministic lint evidence, so the reviewer is not guessing.**
+**Deterministic lint evidence. Not a gate, an input.**
 [`src/no_human/review/lint_evidence.py`](src/no_human/review/lint_evidence.py)
 runs ruff over the changed Python files and attaches the findings to the review
-context. It uses the target repo's own ruff config and attaches nothing if the
-repo has none, so no_human never imposes its style on yours. It is advisory: any
-failure returns empty rather than blocking the gate.
+context, so the reviewer judges against machine output instead of reading the
+diff cold. It uses the target repo's own ruff config and attaches nothing if the
+repo has none, so no_human never imposes its style on yours. It cannot block on
+its own: any failure returns empty rather than stalling the review.
 
 **A tamper guard against a self-gutted test suite.**
 [`src/no_human/testing/tamper_guard.py`](src/no_human/testing/tamper_guard.py)
@@ -205,15 +208,16 @@ Things this does not do, and numbers this does not have.
 - **There is no deploy step.** The pipeline ends at an open PR. Shipping is a
   separate problem and not one this solves.
 - **Language coverage is uneven.** `nh onboard` auto-derives a test command for
-  pytest, `npm test` and `mvn` ([`onboard.py:220-260`](src/no_human/onboard.py));
+  pytest, `npm test` and `mvn` ([`onboard.py:220-261`](src/no_human/onboard.py));
   anything else you configure by hand. The tamper guard reads Python, JS/TS and
   Java test files. The reproduction gate is pytest-only.
 
 ## Cost
 
 Every task carries an enforced spend cap, and the cap counts cache reads, not
-just input and output tokens (`orchestrator.py:713-717`,
-`metrics.py:38`). That matters more than it sounds. In this project's own
+just input and output tokens (`orchestrator.py:713-717`; the per-task ledger
+sums the same term for reporting at `metrics.py:38`). That matters more than it
+sounds. In this project's own
 lifetime measurement over 100 attempts, cache reads were **95.6%** of all tokens
 burned ([docs/COST_LEVERS.md](docs/COST_LEVERS.md)); priced at a tenth of the
 output rate, they still dominated the bill. Tooling that reports "tokens used"

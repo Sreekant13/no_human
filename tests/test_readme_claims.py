@@ -236,8 +236,17 @@ def test_readme_source_citations_resolve(readme):
 
     Coverage traded, stated plainly: the completeness half is gone (no listing
     claims to be exhaustive any more, so there is nothing to be incomplete
-    about). The invention half is now checked far more tightly than before —
-    per file AND per line number, not per directory.
+    about). The invention half is checked per FILE and per LINE BOUND — not per
+    directory as before, but not semantically either.
+
+    🔴 What this does NOT check, so nobody over-reads a green run: that the cited
+    line says what the README says it says. `config.py:676` -> `config.py:1`
+    passes here, and review demonstrated exactly that. Only a citation past the
+    end of the file is caught. Binding a line number to its content would mean
+    restating the code in the test, which rots faster than the citation does; the
+    residual risk is a citation that drifts by a few lines after an edit above
+    it, and that is left to the human. An earlier draft of this docstring said
+    "per file AND per line number", which overstated it.
 
     A bare basename must resolve to exactly ONE file under src/no_human. An
     ambiguous citation fails rather than being skipped: a citation the reader
@@ -270,58 +279,29 @@ def test_readme_source_citations_resolve(readme):
     assert not bad, "README cites source that does not resolve:\n  " + "\n  ".join(bad)
 
 
-@pytest.mark.skipif(
-    not re.search(r"^\s{2}\w+/\s+#", (REPO / "README.md").read_text(encoding="utf-8"), re.M),
-    reason="README carries no architecture tree; test_readme_source_citations_resolve "
-           "covers source-layout claims instead. Unskips automatically if a tree returns.",
-)
-def test_architecture_tree_lists_every_package(readme):
-    """The tree claimed to enumerate src/no_human/ while omitting real packages
-    (ci/, integrations/, notify/, ci_gate/). It is now labelled abridged, but it
-    must still not omit a package or invent one.
-
-    Kept, not deleted, and kept ARMED: the skip condition is computed from the
-    README itself, so the day anyone puts a package tree back on the front page
-    this guard starts enforcing again with no one having to remember it."""
-    # A package is a directory that actually holds Python, not merely a
-    # directory. Deleting an integration leaves its __pycache__ behind (tracker/
-    # survives that way on any machine that ran TRACKER before it was removed), and
-    # an untracked husk is not a claim the README is failing to make.
-    # `__init__.py` alone is too narrow in the other direction: since PEP 420 a
-    # directory of modules without one is a real, importable, wheel-shipped
-    # package, and forgetting __init__.py on a new package is a common mistake.
-    # The search must RECURSE: a namespace package whose direct children are all
-    # sub-packages has no top-level .py at all, and a non-recursive glob would
-    # wave it through — narrowing coverage below what plain is_dir() caught.
-    # A husk is still excluded either way, since __pycache__ holds only .pyc.
-    packages = {
-        p.name for p in (REPO / "src" / "no_human").iterdir()
-        if p.is_dir() and not p.name.startswith(("_", "."))
-        and ((p / "__init__.py").exists() or any(p.rglob("*.py")))
-    }
-    # Scoped to the fenced block that contains the tree: an unrelated second
-    # tree elsewhere in the README (e.g. web/src) is a legitimate edit and must
-    # not be read as a claim about src/no_human packages.
-    #
-    # 🔴 ODD INDICES ONLY, AND THAT IS THE WHOLE POINT. `split("```")` alternates
-    # prose, fence, prose, fence… so code blocks are the ODD segments. This filter
-    # used to accept ANY segment containing "src/no_human/", so the moment a PROSE
-    # sentence cited a real path — e.g. "(`src/no_human/cli/tui.py` builds an
-    # orchestrator)" — that prose segment sorted ahead of the real tree, `listed`
-    # came back EMPTY, and the test reported all 17 packages missing. It failed on
-    # a correct README while passing on a less accurate one, which is the worst
-    # possible direction for a guard: it punished making a citation resolvable.
-    # This is a STRENGTHENING, not a relaxation — the test now reads the artifact
-    # it was always meant to read (a code block) instead of whichever segment
-    # happened to match first.
-    segs = readme.split("```")
-    fences = [b for i, b in enumerate(segs) if i % 2 == 1 and "src/no_human/" in b]
-    assert fences, "architecture tree fence not found in README"
-    listed = set(re.findall(r"^\s{2}(\w+)/\s+#", fences[0], re.M))
-    missing = packages - listed
-    invented = listed - packages
-    assert not missing, f"architecture tree omits real packages: {sorted(missing)}"
-    assert not invented, f"architecture tree lists non-existent packages: {sorted(invented)}"
+# REMOVED (2026-07-30): test_architecture_tree_lists_every_package.
+#
+# It pinned the README's `src/no_human/` package tree to the filesystem. The
+# rewrite deleted that tree (PLAN.md is the architecture surface; the front page
+# duplicated it), so the guard's subject exists on no surface in this repo and
+# there is nowhere to re-point it.
+#
+# It was first kept behind a `skipif` that re-armed if a tree ever returned.
+# That was wrong twice over and review caught both:
+#   1. the skip marker itself trips no_human's tamper guard (skip/xfail 0->1
+#      reads as a neutered test), and README.md advertises that exact rule -
+#      shipping it would have meant a front page describing a gate the commit
+#      trips;
+#   2. the arming regex was byte-identical to the extractor, so it only armed
+#      for the ONE tree format the old README happened to use. Six realistic
+#      tree formats were tried against it, each omitting a real package: it
+#      caught two and silently skipped four, including the output of `tree(1)`.
+#      An unarmed guard that reports "skipped" is worse than a deleted one,
+#      because the skip reads as coverage.
+#
+# Coverage is not lost: `test_readme_source_citations_resolve` above checks the
+# claims that replaced the tree. What is genuinely gone is the completeness
+# check, and only because nothing on any surface claims to enumerate any more.
 
 
 # Claims proven false by review and fixed. A regression here is not a typo — it
