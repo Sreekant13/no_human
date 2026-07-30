@@ -34,6 +34,7 @@ def open_pr(
     base: str = "main",
     github_hosts: list[str] | None = None,
     labels: list[str] | None = None,
+    update_existing_body: bool = False,
 ) -> PrResult:
     """Push the branch and open a PR/MR against the detected remote.
 
@@ -65,7 +66,8 @@ def open_pr(
     repo.push(branch)
     if is_github:
         return PrResult(github.open_pr(repo.path, branch, title, body, base=base,
-                                       labels=labels),
+                                       labels=labels,
+                                       update_existing_body=update_existing_body),
                         "github", branch)
     if is_gitlab:
         return PrResult(gitlab.open_mr(repo.path, branch, title, body, base=base,

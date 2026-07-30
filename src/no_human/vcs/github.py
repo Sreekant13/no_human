@@ -25,7 +25,7 @@ def is_github_remote(url: str, extra_hosts: tuple[str, ...] | list[str] = ()) ->
 
 def open_pr(
     repo_path: Path, branch: str, title: str, body: str, *, base: str = "main",
-    labels: list[str] | None = None,
+    labels: list[str] | None = None, update_existing_body: bool = False,
 ) -> str:
     """Create a draft PR and return its URL. Requires `gh` auth.
 
@@ -70,6 +70,34 @@ def open_pr(
     if "already exists" in stderr.lower():
         existing = _existing_pr_url(repo_path, branch)
         if existing:
+            # 🔴 APPLY THE NEW BODY. This path used to return the URL and silently drop
+            # it, which was harmless while the only caller was `_finalize` — but 0a opens
+            # a DRAFT before the review gate, so the first body is the pre-review one
+            # (no test evidence, no review evidence) and `_finalize`'s richer body was
+            # being discarded. A review caught it: the human-visible PR permanently lost
+            # its "## Review evidence" and "## Test evidence" sections, which regresses
+            # W1.6/M-B and defeats 0a's own purpose. The comment claiming "_finalize's
+            # later call UPDATES the same PR" was simply false — nothing in src/ ran
+            # `gh pr edit` at all.
+            #
+            # 🔴 OPT-IN ONLY. My first version edited unconditionally, which also hit the
+            # REVISION flow (a task resuming onto an existing PR branch) and would have
+            # OVERWRITTEN a description a human had edited — behaviour main never had. A
+            # review caught it. Only the run that opened the draft itself may rewrite the
+            # body, so `_finalize` passes True and nothing else does.
+            #
+            # Best-effort: a failed body update must not fail a PR that exists. The URL is
+            # the delivery; the body is evidence, and losing it loudly beats escalating a
+            # delivered change.
+            if not update_existing_body:
+                return existing
+            edit = subprocess.run(
+                ["gh", "pr", "edit", existing, "--body", body],
+                cwd=repo_path, capture_output=True, text=True,
+            )
+            if edit.returncode != 0:
+                log.warning("gh pr edit failed for %s (%s); PR keeps its earlier body",
+                            existing, edit.stderr.strip())
             return existing
     raise RuntimeError(f"gh pr create failed: {stderr}")
 

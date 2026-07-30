@@ -308,8 +308,43 @@ def _build_review_prompt(
     omitted_files: list[str] | None = None,
     allow_tools: bool = True,
     lint_evidence: str = "",
+    draft_pr: str = "",
+    draft_pr_absent: str = "",
 ) -> str:
     criteria = "\n".join(f"  - {c}" for c in task.acceptance_criteria) or "  (none stated)"
+    # 0a / PR-021: the gate used to run BEFORE the PR existed, so a criterion of the
+    # form "the PR body contains X" was unsatisfiable — the reviewer said so and then
+    # asked the coder to open a PR, which only the loop can do. A draft PR is now opened
+    # first. Stating its absence explicitly matters as much as stating its presence: a
+    # forge outage must read as "the artifact is genuinely missing", not as a rule the
+    # coder failed to follow.
+    pr_section = (
+        f"\nThe draft pull request for this change is already open: {draft_pr}\n"
+        f"Its body is product-generated from a template — the implementer cannot author\n"
+        f"its headings. If a criterion refers to the PR or its body, judge it against\n"
+        f"that PR, and use your tools to read it if you need to.\n"
+        if draft_pr else ""
+    )
+    # 🔴 SILENT WHEN NO OPEN WAS ATTEMPTED. My first version emitted "the forge was
+    # unreachable when one was attempted" whenever draft_pr was empty — which is FALSE for
+    # every GitLab remote, every local bare-repo remote (the whole bench/eval corpus and
+    # the e2e fixtures), and `_gate_already_satisfied`, none of which attempt an open at
+    # all. So a false causal claim went into the one component whose entire value is
+    # evidence-based judgement, on the majority of runs. Worse, it said "do not treat the
+    # absence as an implementer failure", which soft-excused PR-body criteria on GitLab
+    # where they ARE satisfiable at delivery — the opposite of what the helper's own
+    # docstring claims.
+    #
+    # It also made this diff NOT BENCH-NEUTRAL: every bench spec's reviewer prompt would
+    # have gained a paragraph, unmeasured. Empty string here means byte-identical to main
+    # for those runs, which is the only defensible default.
+    if not draft_pr and draft_pr_absent == "open failed":
+        pr_section = (
+            "\nAn attempt to open the pull request for this change FAILED, so no PR "
+            "exists.\nIf a criterion refers to the PR body, say plainly that the artifact "
+            "is absent —\ndo NOT ask the implementer to open a PR, which it cannot do, and "
+            "do not treat\nthe absence as an implementer failure.\n"
+        )
     held_section = (
         f"\nHeld-out test results (tests the implementer never saw):\n{held_out_output}\n"
         if held_out_output else ""
@@ -479,6 +514,7 @@ def _build_review_prompt(
         f"{rules_section}"
         f"{continuity_section}\n"
         # ── volatile task-specific content ──
+        f"{pr_section}"
         f"Task: {task.title}\n"
         f"Acceptance criteria:\n{criteria}\n\n"
         + diff_section
@@ -947,6 +983,8 @@ class AdversarialReviewer:
         mode: str = "gate",
         pr_comments: str = "",
         claim_report: str = "",
+        draft_pr: str = "",
+        draft_pr_absent: str = "",
     ) -> ReviewDecision:
         # Code review mode: higher diff cap, different prompt, multi-turn agent.
         if mode == "code_review":
@@ -1017,6 +1055,8 @@ class AdversarialReviewer:
             omitted_files=omitted_files,
             lint_evidence=lint_evidence,
             allow_tools=not diff_override,
+            draft_pr=draft_pr,
+            draft_pr_absent=draft_pr_absent,
         )
 
         # When the diff is already provided, use a single-turn call (no tools).

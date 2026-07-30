@@ -18,6 +18,7 @@ from no_human.core.db import Store
 from no_human.core.orchestrator import Orchestrator
 from no_human.core.task import Task, TaskStatus
 from no_human.notify.slack import SlackNotifier
+from no_human.vcs import PrResult
 from no_human.review.reviewer import AdversarialReviewer, ReviewDecision
 from no_human.review.selfcheck import ChecklistItem
 from no_human.testing.repro_gate import MANIFEST as REPRO_MANIFEST
@@ -605,6 +606,211 @@ async def test_reviewer_passes_proceeds_to_pr(bare_repo, tmp_path, store):
     assert last["review_passed"] == 1
     assert last["review_checklist"] is not None
     assert [e["kind"] for e in events].count("review") >= 1
+
+
+async def test_the_draft_pr_url_REACHES_the_reviewer_end_to_end_0a(
+        bare_repo, tmp_path, store, monkeypatch):
+    """0a: the PR must exist BEFORE the gate runs, and its url must ARRIVE there.
+
+    This is the seam two review rounds asked for. It is not a tautology: the url is
+    handed to the FORGE stub (orch_mod.open_pr), never to reviewer.review. Every hop
+    between them is the real thing — _open_draft_pr_for_review -> _run_review ->
+    reviewer.review. Dropping `draft_pr=` at that last hop makes the entire 0a change
+    inert (the gate is told no PR exists while one is open) and, before this test, the
+    whole suite stayed green.
+
+    The ordering assertion is 0a itself: open_pr is called, THEN the reviewer runs.
+    On main the only open_pr call comes after the gate has already decided.
+
+    Why github_hosts: a pre-gate draft is opened for GitHub remotes only (GitLab's
+    open_mr is neither draft-by-default nor already-exists-idempotent). The bare
+    fixture remote is a local path, so it is classified via the documented GHE
+    `git.github_hosts` mechanism rather than by rewriting git plumbing —
+    `remote.origin.pushurl` would NOT work, `git remote get-url` ignores it.
+    """
+    from no_human.core import orchestrator as orch_mod
+
+    FORGE_URL = "https://github.com/o/r/pull/4242"
+    order: list[str] = []
+    opens: list[dict] = []
+
+    def fake_open_pr(repo, branch, title, body, **kwargs):
+        order.append("open_pr")
+        opens.append({"body": body, "refresh": kwargs.get("update_existing_body")})
+        return PrResult(url=FORGE_URL, kind="github", branch=branch)
+
+    monkeypatch.setattr(orch_mod, "open_pr", fake_open_pr)
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+
+    seen_draft_pr: list = []
+
+    class SpyReviewer(FakeReviewer):
+        async def review(self, task, **kwargs):
+            order.append("review")
+            seen_draft_pr.append(kwargs.get("draft_pr"))
+            return await super().review(task, **kwargs)
+
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("git", {})["github_hosts"] = ["remote.git"]
+    reviewer = SpyReviewer(ReviewDecision(passed=True, checklist=[
+        ChecklistItem("mul(a,b) implemented", True, "calc.py:4 returns a*b"),
+    ]))
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=[].append, reviewer=reviewer)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    assert reviewer.calls, "reviewer never ran — the test proves nothing"
+    # 0a ordering: the artifact exists before the gate judges it.
+    assert order[:2] == ["open_pr", "review"], order
+    # 0a wiring: the url the forge returned is the url the gate was given.
+    assert seen_draft_pr[0] == FORGE_URL, seen_draft_pr
+
+    # CRITICAL-2, and the mutant that survived a whole extra round: opening the draft
+    # early means `gh pr create` will find the PR already there at finalize time, so the
+    # FINAL body — the one carrying the evidence sections — is written only if _finalize
+    # asks for a refresh. Forcing update_existing_body=False there loses the evidence
+    # permanently and every other test in the suite still passes. Assert the ORCHESTRATOR
+    # sets it, not merely that github.open_pr honours it.
+    assert len(opens) >= 2, f"expected a pre-gate open and a finalize open, got {opens}"
+    assert opens[0]["refresh"] is not True, "the FIRST open creates the draft; nothing to refresh"
+    assert opens[-1]["refresh"] is True, opens
+    # and the refresh must actually carry the evidence the draft body could not have had
+    assert "Review evidence" in opens[-1]["body"], opens[-1]["body"][:400]
+
+
+async def test_a_run_that_did_NOT_open_the_draft_never_rewrites_the_body_0a(
+        bare_repo, tmp_path, store, monkeypatch):
+    """HIGH-2 (review round 3, DRIVEN): `update_existing_body` meant "a url came back".
+
+    The revision flow (`nh reject`, a PR comment) resumes onto a branch whose PR already
+    exists. open_pr returned that url, the flag went True, and _finalize ran
+    `gh pr edit --body <template>` over a description a HUMAN may have edited — behaviour
+    main never had. vcs/github.py asserted in prose that "only the run that opened the
+    draft may rewrite the body"; that sentence was false, and a review proved it by
+    driving the pipeline.
+
+    The right question is "did I CREATE this PR", which is now answered by asking the forge
+    BEFORE opening, and persisted in task.context so a resume can still answer it.
+    """
+    from no_human.core import orchestrator as orch_mod
+    from no_human.vcs import github as gh_mod
+
+    URL = "https://github.com/o/r/pull/77"
+    opens: list[dict] = []
+
+    def fake_open_pr(repo, branch, title, body, **kwargs):
+        opens.append({"refresh": kwargs.get("update_existing_body")})
+        return PrResult(url=URL, kind="github", branch=branch)
+
+    monkeypatch.setattr(orch_mod, "open_pr", fake_open_pr)
+    # the PR is ALREADY open on this branch — this run is not its author
+    monkeypatch.setattr(gh_mod, "_existing_pr_url", lambda repo_path, branch: URL)
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("git", {})["github_hosts"] = ["remote.git"]
+    reviewer = FakeReviewer(ReviewDecision(passed=True, checklist=[
+        ChecklistItem("mul(a,b) implemented", True, "calc.py:4 returns a*b"),
+    ]))
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=[].append, reviewer=reviewer)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    assert opens, "open_pr never ran — the test proves nothing"
+    assert not any(o["refresh"] for o in opens), (
+        "REGRESSION: a run that did not create the PR asked the forge to REWRITE its "
+        f"body — a human's edited description would be lost. calls={opens}")
+    # and the durable claim must not have been staked either
+    assert not (t.context or {}).get("pr_draft_created"), t.context
+
+
+async def test_the_finalize_RETRY_still_refreshes_the_body_0a(
+        bare_repo, tmp_path, store, monkeypatch):
+    """HIGH-3 (review round 3, DRIVEN): the retry omitted `update_existing_body`.
+
+    0a makes _finalize's `gh pr create` ALWAYS hit already-exists (the pre-gate draft is
+    open), so if the first create fails transiently, the retry is the ONLY call that can
+    write the final body. It was passing the kwarg on the first call and not the retry —
+    measured flags [None, True, None] — so any task that hit one transient forge error
+    kept the pre-review draft body permanently, with no evidence sections.
+    """
+    from no_human.core import orchestrator as orch_mod
+    from no_human.vcs import github as gh_mod
+
+    URL = "https://github.com/o/r/pull/78"
+    opens: list[dict] = []
+    calls = {"n": 0}
+
+    def fake_open_pr(repo, branch, title, body, **kwargs):
+        calls["n"] += 1
+        opens.append({"n": calls["n"], "refresh": kwargs.get("update_existing_body"),
+                      "body": body})
+        if calls["n"] == 2:          # _finalize's first create fails transiently
+            raise RuntimeError("gh pr create failed: unexpected EOF")
+        return PrResult(url=URL, kind="github", branch=branch)
+
+    async def no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(orch_mod, "open_pr", fake_open_pr)
+    monkeypatch.setattr(orch_mod.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(gh_mod, "_existing_pr_url", lambda repo_path, branch: None)
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+
+    cfg = _config(tmp_path)
+    cfg.data.setdefault("git", {})["github_hosts"] = ["remote.git"]
+    reviewer = FakeReviewer(ReviewDecision(passed=True, checklist=[
+        ChecklistItem("mul(a,b) implemented", True, "calc.py:4 returns a*b"),
+    ]))
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=[].append, reviewer=reviewer)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    assert len(opens) >= 3, f"expected draft + failed create + retry, got {opens}"
+    retry = opens[-1]
+    assert retry["refresh"] is True, (
+        "REGRESSION: _finalize's transient retry dropped update_existing_body, so the PR "
+        f"keeps the pre-review draft body forever. flags={[o['refresh'] for o in opens]}")
+    assert "Review evidence" in retry["body"], retry["body"][:300]
 
 
 async def test_reviewer_fails_blocks_pr_and_loops(bare_repo, tmp_path, store):
