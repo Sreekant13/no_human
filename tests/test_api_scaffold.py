@@ -325,6 +325,123 @@ async def test_scaffold_ignores_git_dir_env(client, monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_scaffold_ignores_git_object_directory_env(
+        client, monkeypatch, tmp_path):
+    """GIT_OBJECT_DIRECTORY redirects where git writes loose objects. Pointed
+    outside home it silently drains the new repo's objects there while the
+    endpoint still answers 201 - the child env must not carry it."""
+    decoy = tmp_path / "objdir-decoy"
+    monkeypatch.setenv("GIT_OBJECT_DIRECTORY", str(decoy))
+    home = Path.home()
+    (home / "git").mkdir()
+    r = await client.post("/api/repos/scaffold",
+                          json={"parent": str(home / "git"), "name": "objdirproof"})
+    assert r.status_code == 201, r.text
+    assert not decoy.exists()
+    target = Path(r.json()["repo_path"])
+    monkeypatch.delenv("GIT_OBJECT_DIRECTORY")
+    # The objects are in the repo, not the decoy: a commit that can be read
+    # back with the decoy gone proves nothing was written outside home.
+    assert _git(target, "rev-list", "--count", "HEAD") == "1"
+    assert _git(target, "cat-file", "-p", "HEAD:README.md") == "# objdirproof"
+    assert not decoy.exists()
+
+
+@pytest.mark.asyncio
+async def test_scaffold_ignores_git_common_dir_env(client, monkeypatch, tmp_path):
+    """GIT_COMMON_DIR relocates the shared part of the git dir (refs, config,
+    objects). Pointed outside home it makes git materialise that directory
+    there and the scaffold fails - the child env must not carry it."""
+    decoy = tmp_path / "commondir-decoy"
+    monkeypatch.setenv("GIT_COMMON_DIR", str(decoy))
+    home = Path.home()
+    (home / "git").mkdir()
+    r = await client.post("/api/repos/scaffold",
+                          json={"parent": str(home / "git"), "name": "commonproof"})
+    assert r.status_code == 201, r.text
+    assert not decoy.exists()
+    target = Path(r.json()["repo_path"])
+    assert (target / ".git").is_dir()
+    monkeypatch.delenv("GIT_COMMON_DIR")
+    assert _git(target, "rev-list", "--count", "HEAD") == "1"
+    assert not decoy.exists()
+
+
+@pytest.mark.asyncio
+async def test_scaffold_child_env_carries_only_the_allowlist(client, monkeypatch):
+    """Any GIT_* the operator's shell exports is a potential redirect, so the
+    child env is built from an allowlist rather than by subtracting known-bad
+    names. A GIT_* nobody enumerated must not reach the child."""
+    monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", "/nope/alt")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", "/nope/ceiling")
+    seen: dict[str, str] = {}
+    real_run = subprocess.run
+
+    def _capture(argv, *args, **kwargs):
+        seen.update(kwargs.get("env") or {})
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _capture)
+    home = Path.home()
+    (home / "git").mkdir()
+    r = await client.post("/api/repos/scaffold",
+                          json={"parent": str(home / "git"), "name": "allowlist"})
+    assert r.status_code == 201, r.text
+    leaked = {k for k in seen if k.startswith("GIT_")} - {"GIT_CONFIG_NOSYSTEM"}
+    assert leaked == set(), f"unexpected GIT_* reached the child: {sorted(leaked)}"
+
+
+# ---------------------------- project-name clash ---------------------------- #
+
+@pytest.mark.asyncio
+async def test_scaffold_name_clash_409s_before_touching_the_disk(client):
+    """Two parents, one name: ~/a/dup registers project 'dup', so ~/b/dup
+    cannot. The clash must be refused BEFORE anything is created, or the
+    second directory exists on disk with no project - unregisterable through
+    this endpoint (a retry 409s on the path check) and the operator is stuck."""
+    home = Path.home()
+    (home / "a").mkdir()
+    (home / "b").mkdir()
+    first = await client.post("/api/repos/scaffold",
+                              json={"parent": str(home / "a"), "name": "dup"})
+    assert first.status_code == 201, first.text
+
+    r = await client.post("/api/repos/scaffold",
+                          json={"parent": str(home / "b"), "name": "dup"})
+    assert r.status_code == 409, r.text
+    # No orphan: nothing was created under the second parent.
+    assert not (home / "b" / "dup").exists()
+    assert list((home / "b").iterdir()) == []
+    # The message says what to do about it, not just that it happened.
+    detail = r.json()["detail"]
+    assert "dup" in detail
+    assert "different name" in detail
+    # The first repo is untouched.
+    assert (home / "a" / "dup" / ".git").is_dir()
+
+
+@pytest.mark.asyncio
+async def test_scaffold_name_clash_race_leaves_no_orphan(client, monkeypatch):
+    """The pre-check cannot close the window entirely: another writer can
+    register the name between the check and our INSERT. That path still 409s,
+    and must still leave no directory behind."""
+    home = Path.home()
+    (home / "b").mkdir()
+    store = app.state.store
+    real_create = store.create_project
+
+    async def _clash(project):
+        raise RuntimeError("UNIQUE constraint failed: projects.name")
+
+    monkeypatch.setattr(store, "create_project", _clash)
+    r = await client.post("/api/repos/scaffold",
+                          json={"parent": str(home / "b"), "name": "raced"})
+    assert real_create is not None
+    assert r.status_code == 409, r.text
+    assert not (home / "b" / "raced").exists()
+
+
+@pytest.mark.asyncio
 async def test_scaffold_refuses_cross_origin(client):
     """Filesystem-mutating write: same posture as the credential routes - a
     drive-by page on another origin must not be able to litter $HOME."""
