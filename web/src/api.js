@@ -371,6 +371,17 @@ export async function createProject({ name, repo_paths, primary_repo }) {
   return r.json();
 }
 
+export async function scaffoldRepo(parent, name) {
+  const r = await fetch(`${BASE}/api/repos/scaffold`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ parent, name }),
+  });
+  // The backend's `detail` names WHICH validation failed - surface it verbatim.
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `POST repos/scaffold → ${r.status}`); }
+  return r.json();
+}
+
 export async function updateProject(id, body) {
   const r = await fetch(`${BASE}/api/projects/${id}`, {
     method: "PUT",

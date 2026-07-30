@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { fetchProjects, fetchConfig, fetchIntegrations, searchJiraIssues, fetchJiraIssue } from "./api.js";
+import { fetchProjects, fetchConfig, fetchIntegrations, searchJiraIssues, fetchJiraIssue, scaffoldRepo } from "./api.js";
 import { COMPOSER_KINDS, kindByValue, needsPrUrl } from "./composerKinds.js";
 import { splitPrompt } from "./promptSplit.js";
 import { promptFromIssue, jiraStatusChipStyle, externalIdFromIssue, importedChip } from "./jiraImport.js";
@@ -99,6 +99,13 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   const [selectedProjectId, setSelectedProjectId] = useState(initial?.projectId ?? "");
   const [repoPath, setRepoPath] = useState(initial?.repoPath ?? "");
   const [customRepo, setCustomRepo] = useState(Boolean(initial?.customRepo));
+  // "Create a new repo" (plan Task 5) - an inline disclosure inside free-text
+  // repo mode, same progressive-disclosure idiom as the Jira panel above.
+  const [createRepoOpen, setCreateRepoOpen] = useState(false);
+  const [newRepoParent, setNewRepoParent] = useState("");
+  const [newRepoName, setNewRepoName] = useState("");
+  const [newRepoBusy, setNewRepoBusy] = useState(false);
+  const [newRepoError, setNewRepoError] = useState(null);
   const [config, setConfig] = useState(null);
   // Task 1.6 — Import from Jira. `source` rides along invisibly (never a
   // control the operator sees) so a task created from a picked ticket carries
@@ -279,6 +286,26 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
         current === briefPrompt ? promptFromIssue(full) : current);
     } catch {
       // the brief already in hand stands
+    }
+  }
+
+  async function handleCreateRepo() {
+    if (newRepoBusy) return;
+    setNewRepoBusy(true);
+    setNewRepoError(null);
+    try {
+      const res = await scaffoldRepo(newRepoParent.trim(), newRepoName.trim());
+      // Success: the new path becomes THE repo for this task and the normal
+      // free-text flow resumes - the composer never re-asks for it.
+      setRepoPath(res.repo_path);
+      setCreateRepoOpen(false);
+      setNewRepoParent("");
+      setNewRepoName("");
+    } catch (err) {
+      // The backend's `detail` says WHICH check failed - show it verbatim.
+      setNewRepoError(err.message);
+    } finally {
+      setNewRepoBusy(false);
     }
   }
 
@@ -565,6 +592,21 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
               </SelectPill>
             )}
 
+            {freeTextRepo && (
+              <button
+                type="button"
+                className={`${ON_CARD} px-5`}
+                aria-expanded={createRepoOpen}
+                aria-controls="create-repo-panel"
+                onClick={() => {
+                  setCreateRepoOpen((v) => !v);
+                  setNewRepoError(null);
+                }}
+              >
+                create a new repo
+              </button>
+            )}
+
             {showRepoToggle && (
               <button
                 type="button"
@@ -577,6 +619,9 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
                   if (!next) {
                     setRepoPath("");
                     setSelectedProjectId(projects[0]?.id || "");
+                    // The create-repo disclosure only exists in free-text mode.
+                    setCreateRepoOpen(false);
+                    setNewRepoError(null);
                   }
                 }}
               >
@@ -584,6 +629,68 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
               </button>
             )}
           </div>
+
+          {freeTextRepo && createRepoOpen && (
+            <div
+              id="create-repo-panel"
+              className="mt-2 rounded-2xl border border-solid border-line bg-panel p-4"
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                <PathInput
+                  className={`${TEXT_FIELD} min-w-0 flex-1`}
+                  placeholder="~/git"
+                  value={newRepoParent}
+                  onChange={setNewRepoParent}
+                  listId="composer-newrepo-parent"
+                  aria-label="Parent directory"
+                  // Enter here must never implicitly submit the composer form
+                  // (PathInput spreads this onto its <input>). With both
+                  // fields filled it creates the repo, like the name field;
+                  // otherwise it is a no-op.
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      if (newRepoParent.trim() && newRepoName.trim()) handleCreateRepo();
+                    }
+                  }}
+                />
+                <input
+                  className={`${TEXT_FIELD} w-full sm:w-56`}
+                  placeholder="my-new-repo"
+                  value={newRepoName}
+                  onChange={(e) => setNewRepoName(e.target.value)}
+                  // Enter here must create the repo, not implicitly submit the
+                  // whole composer form through the "Next" button.
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") { e.preventDefault(); handleCreateRepo(); }
+                  }}
+                  spellCheck={false}
+                  aria-label="New repository name"
+                />
+                <button
+                  type="button"
+                  className={`${ON_PANEL} px-5`}
+                  disabled={newRepoBusy || !newRepoParent.trim() || !newRepoName.trim()}
+                  onClick={handleCreateRepo}
+                >
+                  {newRepoBusy ? "Creating…" : "Create repo"}
+                </button>
+              </div>
+              <p className="mt-2 px-5 font-ui text-sm text-text-muted">
+                Makes parent/name, runs git init, commits a README, and saves it
+                as a project - then the task continues in it.
+              </p>
+              {newRepoError && (
+                <p
+                  role="alert"
+                  className="mt-2 rounded-xl px-4 py-2 font-ui text-sm"
+                  style={{ color: "var(--red)", background: "var(--red-dim)" }}
+                >
+                  {newRepoError}
+                </p>
+              )}
+            </div>
+          )}
 
           {freeTextRepo && (
             <p id="repo-path-hint" className="mt-2 px-5 font-ui text-sm text-text-muted">
