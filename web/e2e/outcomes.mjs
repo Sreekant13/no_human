@@ -34,8 +34,20 @@ const TASKS = [
   mk("gate1aaaabbbbccccdddd", "awaiting_input", { blocker_question: "Which one?" }),
   mk("work1aaaabbbbccccdddd", "implementing"),
   mk("rev01aaaabbbbccccdddd", "awaiting_approval"),
-  mk("done1aaaabbbbccccdddd", "done"),
-  mk("done2aaaabbbbccccdddd", "done"),
+  // Open-PR (operator demo finding): a DONE ticket must still link to its PR —
+  // done1 has a real https PR, done2 the demo DB's local-pr:// (text-only badge).
+  // The titles are REAL-length (~90 chars, mean production title is ~80): the
+  // badge sat after the title inside a 260px overflow:hidden cell, so a real
+  // title clipped it invisible while it stayed in the tab order (review D1) —
+  // short fixture titles ("Task done1…") could never reproduce that.
+  mk("done1aaaabbbbccccdddd", "done", {
+    pr_url: "https://example.com/repo/pull/13",
+    title: "done1 — Per-PR CI_GATE integration test pipeline for metrics-core-query-service PR #531 triage",
+  }),
+  mk("done2aaaabbbbccccdddd", "done", {
+    pr_url: "local-pr://tasks/14",
+    title: "done2 — Per-PR CI_GATE integration test pipeline for metrics-core-query-service PR #532 triage",
+  }),
   mk("fail1aaaabbbbccccdddd", "failed", { cancelled: false }),
   mk("canc1aaaabbbbccccdddd", "failed", { cancelled: true }),
   mk("canc2aaaabbbbccccdddd", "failed", { cancelled: true }),
@@ -139,6 +151,59 @@ for (const theme of ["dark", "light"]) {
   await doneBtn.click();
   await page.waitForTimeout(400);
   check(`[${theme}] R3 Done opens its own table`, (await page.locator(".stats-table tbody tr").count()) === 2);
+
+  // Open-PR — a DONE row links straight to its PR without opening the drawer.
+  const doneRow = page.locator(".stats-table tbody tr", { hasText: "done1" });
+  const prLink = doneRow.locator("a.card-pr-badge");
+  check(`[${theme}] a DONE row carries the Open PR anchor with the right href/target`,
+    (await prLink.count()) === 1
+      && (await prLink.getAttribute("href")) === "https://example.com/repo/pull/13"
+      && (await prLink.getAttribute("target")) === "_blank",
+    `count=${await prLink.count()}`);
+  check(`[${theme}] the anchor is labelled (Open PR), not a cryptic pill`,
+    /Open PR/.test((await prLink.textContent().catch(() => "")) || ""));
+  // D1 — presence is not enough: the seeded title is REAL-length (~90 chars),
+  // and the anchor must have an on-screen box INSIDE its cell and WIN the
+  // hit-test at its own center. Under the old 260px ellipsis cell the badge
+  // laid out past the clip: focusable, count()===1, and invisible at every
+  // viewport (WCAG 2.4.7 focus-visible / 2.4.11 focus-not-obscured).
+  // NO scrollIntoView first: an overflow:hidden cell is still programmatically
+  // scrollable, so scrolling would "reveal" the clipped anchor and fake a pass —
+  // the assertion is about the DEFAULT state a user actually sees.
+  const rowHit = await prLink.evaluate((a) => {
+    const r = a.getBoundingClientRect();
+    const cell = a.closest("td").getBoundingClientRect();
+    const el = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return { w: Math.round(r.width), h: Math.round(r.height),
+      insideCell: r.width > 0 && r.right <= cell.right + 1 && r.left >= cell.left - 1,
+      hit: !!el && (el === a || a.contains(el)) };
+  });
+  check(`[${theme}] the anchor has a real box inside its (overflow:hidden) cell`,
+    rowHit.w > 10 && rowHit.h > 8 && rowHit.insideCell, JSON.stringify(rowHit));
+  check(`[${theme}] elementFromPoint at the anchor's center resolves to the anchor`,
+    rowHit.hit, JSON.stringify(rowHit));
+  const localRow = page.locator(".stats-table tbody tr", { hasText: "done2" });
+  check(`[${theme}] a non-http pr_url (local-pr://) renders text-only, never a dead link`,
+    (await localRow.locator("a.card-pr-badge").count()) === 0
+      && (await localRow.locator("span.card-pr-badge").count()) === 1);
+  check(`[${theme}] the text-only badge is also visible inside its cell (not clipped)`,
+    await localRow.locator("span.card-pr-badge").evaluate((s) => {
+      const r = s.getBoundingClientRect();
+      const cell = s.closest("td").getBoundingClientRect();
+      return r.width > 5 && r.right <= cell.right + 1;
+    }).catch(() => false));
+  // Block navigation only (capture-phase preventDefault; target="_blank" is
+  // asserted above) - propagation is untouched, so the row would still see the
+  // click and open the drawer if stopPropagation were missing.
+  await page.evaluate(() => {
+    document.addEventListener("click", (e) => {
+      if (e.target.closest && e.target.closest("a.card-pr-badge")) e.preventDefault();
+    }, true);
+  });
+  await prLink.click();
+  await page.waitForTimeout(400);
+  check(`[${theme}] clicking Open PR does NOT open the row's drawer`,
+    !(await page.locator(".slideover").isVisible().catch(() => false)));
   if (theme === "dark") await page.screenshot({ path: `${OUT}/outcomes-done-dark.png` });
 
   // Back to the board.

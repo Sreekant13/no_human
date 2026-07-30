@@ -212,6 +212,35 @@ test("chips omit zero/absent fields rather than showing a false 0", () => {
   assert.deepEqual(chips, []);
 });
 
+// Operator finding (demo walk): the PR affordance must survive the ticket
+// finishing - a DONE task with a pr_url still gets the open-pull-request chip.
+test("the PR chip renders for DONE tasks too, not only awaiting ones", () => {
+  const task = {
+    status: "done",
+    attempts: [{ branch_name: "nh/task-7", pr_url: "https://example.com/pr/7" }],
+  };
+  const chips = chipsFor(task);
+  const pr = chips.find((c) => c.key === "pr");
+  assert.ok(pr, "done task with a pr_url must still carry the PR chip");
+  assert.equal(pr.href, "https://example.com/pr/7");
+  // Truthful copy for any status: it names the artifact/action, never claims
+  // the PR is "waiting for your review".
+  assert.match(pr.sub, /pull request/);
+  assert.doesNotMatch(pr.sub, /waiting/i);
+});
+
+test("a non-http pr_url (demo local-pr://) yields a text chip with NO href", () => {
+  const task = {
+    status: "done",
+    attempts: [{ branch_name: "nh/task-8", pr_url: "local-pr://tasks/8" }],
+  };
+  const chips = chipsFor(task);
+  const pr = chips.find((c) => c.key === "pr");
+  assert.ok(pr, "the PR chip still appears (the branch/PR exists)");
+  assert.equal(pr.href, undefined, "a local-pr:// href would be a dead link");
+  assert.equal(pr.sub, "pull request");
+});
+
 // ── milestones ──────────────────────────────────────────────────────────────
 
 test("milestones mark created→planned→attempt→review→pr→done in order", () => {

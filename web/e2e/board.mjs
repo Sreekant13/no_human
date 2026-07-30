@@ -55,7 +55,23 @@ const failedReal = [
   { id: "cancelnewaaaabbbbcc", title: "Per-PR CI_GATE Pipeline", status: "failed", cancelled: true,
     kind: "bugfix", created_at: now, updated_at: now },
 ];
-const TASKS = [...answer, ...failedCancelled, ...failedReal];
+// Open-PR affordance (operator demo finding): a card whose payload carries a
+// pr_url must link straight to the PR. The demo DB's local-pr:// URLs must
+// degrade to a text badge, never a dead link. (DONE tasks left the board in 5D;
+// their Open PR link lives in the Outcomes table - covered by e2e/outcomes.mjs.)
+// Titles are REAL-length (~90 chars; production mean is ~80): a short fixture
+// title let a clipped-invisible badge pass the presence checks (review D1).
+const prTasks = [
+  { id: "prawaitaaaabbbbcccc1",
+    title: "Awaiting task with PR — per-PR CI_GATE integration test pipeline for metrics-core-query #12",
+    status: "awaiting_approval",
+    kind: "feature", pr_url: "https://example.com/repo/pull/12", created_at: now, updated_at: now },
+  { id: "prlocalaaaabbbbccc33",
+    title: "Awaiting task with local PR — per-PR CI_GATE integration pipeline for metrics-core-qs #14",
+    status: "awaiting_approval",
+    kind: "feature", pr_url: "local-pr://tasks/14", created_at: now, updated_at: now },
+];
+const TASKS = [...answer, ...failedCancelled, ...failedReal, ...prTasks];
 
 const browser = await chromium.launch();
 
@@ -151,6 +167,51 @@ for (const theme of ["dark", "light"]) {
     await page.keyboard.press("Escape");
     await page.waitForTimeout(300);
   }
+
+  // Open-PR — the card links straight to the PR, without opening the drawer.
+  const prCard = page.locator(".task-card", { hasText: "Awaiting task with PR" }).first();
+  const prLink = prCard.locator("a.card-pr-badge");
+  check(`[${theme}] the card carries the Open PR anchor with the right href/target`,
+    await prLink.count() === 1
+      && (await prLink.getAttribute("href")) === "https://example.com/repo/pull/12"
+      && (await prLink.getAttribute("target")) === "_blank",
+    `count=${await prLink.count()}`);
+  check(`[${theme}] the anchor is labelled (Open PR), not a cryptic pill`,
+    /Open PR/.test((await prLink.textContent().catch(() => "")) || ""));
+  check(`[${theme}] the anchor is keyboard-reachable (tabbable)`,
+    await prLink.evaluate((el) => el.tabIndex >= 0).catch(() => false));
+  // D1 — presence is not enough: with a REAL-length title the anchor must have
+  // an on-screen box and WIN the hit-test at its own center. A clipped anchor
+  // stays in the tab order but can never be seen or clicked (WCAG 2.4.7/2.4.11).
+  // No scrollIntoView first: it can scroll an overflow:hidden ancestor and
+  // "reveal" a clipped badge — measure the DEFAULT state the user sees.
+  const cardHit = await prLink.evaluate((a) => {
+    const r = a.getBoundingClientRect();
+    const el = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return { w: Math.round(r.width), h: Math.round(r.height),
+      hit: !!el && (el === a || a.contains(el)) };
+  });
+  check(`[${theme}] the anchor has a real on-screen box (not clipped away)`,
+    cardHit.w > 10 && cardHit.h > 8, JSON.stringify(cardHit));
+  check(`[${theme}] elementFromPoint at the anchor's center resolves to the anchor`,
+    cardHit.hit, JSON.stringify(cardHit));
+  const localCard = page.locator(".task-card", { hasText: "Awaiting task with local PR" });
+  check(`[${theme}] non-http pr_url (local-pr://) renders text-only, never a dead link`,
+    (await localCard.locator("a.card-pr-badge").count()) === 0
+      && (await localCard.locator("span.card-pr-badge").count()) === 1);
+  // Clicking the anchor must NOT open the drawer. Block navigation via a
+  // capture-phase preventDefault (the target="_blank" contract is asserted
+  // above) - propagation is left alone so the card would still see the click
+  // if stopPropagation were missing.
+  await page.evaluate(() => {
+    document.addEventListener("click", (e) => {
+      if (e.target.closest && e.target.closest("a.card-pr-badge")) e.preventDefault();
+    }, true);
+  });
+  await prLink.click();
+  await page.waitForTimeout(400);
+  const drawerAfterPr = await page.locator(".slideover").isVisible().catch(() => false);
+  check(`[${theme}] clicking Open PR does NOT open the drawer`, !drawerAfterPr);
 
   if (theme === "dark") await page.screenshot({ path: `${OUT}/board-fixed-dark.png` });
   if (theme === "light") await page.screenshot({ path: `${OUT}/board-fixed-light.png` });

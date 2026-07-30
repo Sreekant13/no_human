@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { fmtCost, fmtTokens, taskBurn, taskCost } from "./cost.js";
+import { httpPrUrl } from "./prUrl.js";
 
 // The task table, extracted from Stats.jsx so the outcome screens (5D: Done / Failed) show the
 // SAME table instead of a second one that would drift out of step with it.
@@ -89,7 +90,15 @@ export default function TaskTable({ tasks, onSelect = null, emptyHint = null }) 
                 : {})}
             >
               <td className="stats-td stats-td-name" title={t.title}>
-                {t.title}
+                {/* The title lives in its OWN ellipsis span inside a flex row:
+                    when the cell was the ellipsis container, a real-length
+                    title (~80 chars mean) pushed the Open PR anchor past the
+                    260px clip — focusable but invisible at every viewport
+                    (review D1). The badge is a flex:0 0 auto sibling that can
+                    never be clipped away. The flex row is an inner div, not
+                    the td — see styles.css .stats-td-name-row for why. */}
+                <div className="stats-td-name-row">
+                <span className="stats-td-name-title">{t.title}</span>
                 {t._collapsed > 0 && (
                   <span
                     className="stats-collapsed-note"
@@ -98,6 +107,27 @@ export default function TaskTable({ tasks, onSelect = null, emptyHint = null }) 
                     +{t._collapsed} older
                   </span>
                 )}
+                {/* The way BACK to a shipped ticket's PR (operator demo finding):
+                    same affordance as the board card - a real anchor for http(s),
+                    a text-only badge for demo-DB local-pr:// URLs. stopPropagation
+                    so the link never also opens the row's drawer; the row's
+                    keydown guard already bails on descendant events, so Enter on
+                    the focused link activates the link, not the row. */}
+                {t.pr_url && (
+                  httpPrUrl(t.pr_url) ? (
+                    <a
+                      className="card-pr-badge stats-pr-link"
+                      href={t.pr_url}
+                      target="_blank"
+                      rel="noreferrer noopener"
+                      title="open the pull request in a new tab"
+                      onClick={(e) => e.stopPropagation()}
+                    >Open PR ↗</a>
+                  ) : (
+                    <span className="card-pr-badge stats-pr-link">PR</span>
+                  )
+                )}
+                </div>
               </td>
               <td className="stats-td stats-td-status">
                 <span

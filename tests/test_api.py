@@ -71,6 +71,20 @@ async def test_list_tasks_returns_summary(client, store):
 
 
 @pytest.mark.asyncio
+async def test_list_tasks_carries_pr_url_for_done_tasks(client, store):
+    """Operator finding (demo walk): the board card is the way BACK to a
+    finished ticket's PR — the list payload must carry pr_url (latest
+    attempt's) for DONE tasks, or the card has nothing to link."""
+    t = await _seed_task(store, status=TaskStatus.DONE)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(aid, pr_url="https://github.com/o/r/pull/42")
+    r = await client.get("/api/tasks")
+    assert r.status_code == 200
+    (item,) = r.json()
+    assert item["pr_url"] == "https://github.com/o/r/pull/42"
+
+
+@pytest.mark.asyncio
 async def test_list_tasks_status_values(client, store):
     await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
     r = await client.get("/api/tasks")

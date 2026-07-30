@@ -8,6 +8,7 @@
 
 import { fmtCost, fmtTokens, taskBurn, taskCost } from "./cost.js";
 import { formatDuration } from "./formatDuration.js";
+import { httpPrUrl } from "./prUrl.js";
 
 // The statuses whose gate the operator clears IN the drawer (Reply / Resume / the
 // blocker's options). Single definition — SlideOver's `isParked` and the
@@ -217,7 +218,14 @@ export function chipsFor(task) {
   }
   const pr = prUrlFor(task);
   if (pr) {
-    chips.push({ key: "pr", label: branchFor(task) || "PR", sub: "open pull request", href: pr });
+    // Only http(s) URLs get an href - a demo-DB local-pr:// anchor would be a
+    // dead link, so it degrades to a text chip (same rule as the board card,
+    // via the ONE shared guard in prUrl.js).
+    if (httpPrUrl(pr)) {
+      chips.push({ key: "pr", label: branchFor(task) || "PR", sub: "open pull request", href: pr });
+    } else {
+      chips.push({ key: "pr", label: branchFor(task) || "PR", sub: "pull request" });
+    }
   }
   return chips;
 }

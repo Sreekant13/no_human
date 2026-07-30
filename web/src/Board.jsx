@@ -6,6 +6,7 @@ import { taskProgress } from "./taskProgress.js";
 import { topPrioritised } from "./laneView.js";
 import { partitionAnswerLane, shouldResetStaleOpen } from "./answerLane.js";
 import { showConflictBadge, conflictRoundLabel } from "./conflictStatus.js";
+import { httpPrUrl } from "./prUrl.js";
 
 // 5B: how many cards a collapsible lane shows before the expand arrow. 4 keeps
 // every lane visible without vertical scroll on a typical viewport; the count
@@ -384,14 +385,15 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClic
         {priority === "high" && <span className="card-priority card-priority-high">HI</span>}
         {priority === "low"  && <span className="card-priority card-priority-low">LO</span>}
         {task.pr_url && (
-          task.pr_url.startsWith("http") ? (
+          httpPrUrl(task.pr_url) ? (
             <a
               className="card-pr-badge"
               href={task.pr_url}
               target="_blank"
-              rel="noreferrer"
+              rel="noreferrer noopener"
+              title="open the pull request in a new tab"
               onClick={(e) => e.stopPropagation()}
-            >PR</a>
+            >Open PR ↗</a>
           ) : (
             <span className="card-pr-badge">PR</span>
           )
