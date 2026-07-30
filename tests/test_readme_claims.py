@@ -142,41 +142,147 @@ def test_prose_default_matches_config(readme):
     # A bare finditer guards nothing when the prose is reworded past its one
     # spelling — the loop body never runs and the test passes green. Accept the
     # spellings a writer would actually use, then require at least one hit.
+    #
+    # The 2026-07-30 rewrite dropped the troubleshooting table that carried the
+    # only "(default 500)" spelling and stated the same number as a plain "is
+    # 500" instead. The claim did not move surface and it did not go away — only
+    # its phrasing changed — so the fix is to widen the pattern, exactly as the
+    # paragraph above anticipated, NOT to dictate one wording back into the
+    # prose. `is N` and `defaults to N` are added; the mandatory-hit assertion
+    # below is unchanged, so this cannot start passing vacuously.
     matches = list(re.finditer(
-        r"max_turns_per_attempt`?[^.\n]*?\(defaults?\s*(?:to)?\s*:?\s*(\d+)\)",
+        r"max_turns_per_attempt`?[^.\n]*?"
+        r"(?:\(defaults?\s*(?:to)?\s*:?\s*(\d+)\)|\bis\s+(\d+)\b|\bdefaults?\s+to\s+(\d+)\b)",
         readme))
     assert matches, (
-        "no 'max_turns_per_attempt (default N)' prose found in the README. "
-        "Either it was reworded past this pattern — widen the pattern — or the "
-        "claim was dropped, and this guard was about to pass vacuously."
+        "no 'max_turns_per_attempt (default N)' / 'is N' prose found in the "
+        "README. Either it was reworded past this pattern — widen the pattern — "
+        "or the claim was dropped, and this guard was about to pass vacuously."
     )
     for m in matches:
-        assert int(m.group(1)) == actual, (
-            f"README prose says default {m.group(1)}, config says {actual}"
+        stated = next(g for g in m.groups() if g is not None)
+        assert int(stated) == actual, (
+            f"README prose says default {stated}, config says {actual}"
         )
 
 
+# Counts get written as words as often as digits. Keeping only the digit
+# spelling let "ten categories" read as *no claim at all*, so a README that had
+# quietly gone stale in words would have passed.
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+}
+_CATEGORY_COUNT_RE = re.compile(
+    r"\b(\d+|" + "|".join(_NUMBER_WORDS) + r")[- ]categor(?:y|ies)\b",
+    re.IGNORECASE,
+)
+
+
+def _stated_category_counts(text: str) -> list[int]:
+    out = []
+    for m in _CATEGORY_COUNT_RE.finditer(text):
+        tok = m.group(1).lower()
+        out.append(int(tok) if tok.isdigit() else _NUMBER_WORDS[tok])
+    return out
+
+
 def test_blocker_category_count_matches_the_enum(readme):
-    """The README said "8-category" for a 10-member enum."""
+    """The README said "8-category" for a 10-member enum.
+
+    The 2026-07-30 rewrite restated the same claim in words ("one of ten
+    categories"). The claim stayed on this surface, so the guard stays pointed
+    here — it now reads both spellings. That is a STRENGTHENING: the old digit-
+    only pattern would have waved through "eight categories" without a word.
+    """
     n = len(BlockerCategory)
-    assert f"{n}-category" in readme, (
-        f"README does not say '{n}-category'; the taxonomy has {n} members "
-        f"({', '.join(c.name for c in BlockerCategory)})"
+    stated = _stated_category_counts(readme)
+    assert stated, (
+        f"README states no blocker-category count at all; the taxonomy has {n} "
+        f"members ({', '.join(c.name for c in BlockerCategory)}). A count that "
+        f"is not stated cannot be checked — restate it or this guard is blind."
     )
     # Presence at ONE site is not enough. The README states the count twice, so
     # re-introducing the original "8-category" defect at the other site passed
     # this test. Every stated count must agree with the enum.
-    wrong = sorted({m.group(1) for m in re.finditer(r"\b(\d+)-category\b", readme)
-                    if int(m.group(1)) != n})
+    wrong = sorted({c for c in stated if c != n})
     assert not wrong, (
-        f"README also claims {wrong}-category; the taxonomy has {n} members"
+        f"README claims {wrong} blocker categories; the taxonomy has {n} members"
     )
 
 
+_SOURCE_CITATION_RE = re.compile(r"`([\w/]+\.py):(\d+)(?:-(\d+))?`")
+
+
+def test_readme_source_citations_resolve(readme):
+    """Every ``file.py:LINE`` the README cites must exist and have that line.
+
+    RETARGET (2026-07-30). This guard was ``test_architecture_tree_lists_every_
+    package``: it pinned the README's ``src/no_human/`` tree to the filesystem so
+    the tree could not omit or invent a package. The rewrite deleted that tree
+    (PLAN.md is the architecture surface; the front page duplicated it), so the
+    enumeration it checked exists on no surface at all and cannot be pointed
+    somewhere else.
+
+    What replaces it is not a deletion. The rewrite swapped one kind of claim
+    about the source layout for another: instead of one tree, the README now
+    makes 15 individually checkable claims of the form ``config.py:676``. Those
+    are the same defect class this file exists for — "a claim about a component
+    that nobody verified" — and NOTHING checked them: ``test_local_links_resolve``
+    only sees markdown link targets, and most of these citations are bare code
+    spans with no link. Line numbers were never checked by anything at all.
+
+    Coverage traded, stated plainly: the completeness half is gone (no listing
+    claims to be exhaustive any more, so there is nothing to be incomplete
+    about). The invention half is now checked far more tightly than before —
+    per file AND per line number, not per directory.
+
+    A bare basename must resolve to exactly ONE file under src/no_human. An
+    ambiguous citation fails rather than being skipped: a citation the reader
+    cannot follow is the defect, not an exemption.
+    """
+    cites = _SOURCE_CITATION_RE.findall(readme)
+    assert len(cites) >= 10, (
+        f"only {len(cites)} source citations found in the README; this guard is "
+        f"the only thing checking them and it must not pass vacuously"
+    )
+    bad: list[str] = []
+    for path, start, end in cites:
+        if "/" in path:
+            hits = [REPO / path] if (REPO / path).exists() else []
+        else:
+            hits = sorted((REPO / "src" / "no_human").rglob(path))
+        if len(hits) != 1:
+            bad.append(
+                f"{path}:{start} resolves to {len(hits)} files"
+                f"{' — disambiguate with a path prefix' if len(hits) > 1 else ''}"
+            )
+            continue
+        total = len(hits[0].read_text(encoding="utf-8").splitlines())
+        last = int(end or start)
+        if last > total:
+            bad.append(
+                f"{path}:{start}-{last} cites past end of file "
+                f"({hits[0].relative_to(REPO)} has {total} lines)"
+            )
+    assert not bad, "README cites source that does not resolve:\n  " + "\n  ".join(bad)
+
+
+@pytest.mark.skipif(
+    not re.search(r"^\s{2}\w+/\s+#", (REPO / "README.md").read_text(encoding="utf-8"), re.M),
+    reason="README carries no architecture tree; test_readme_source_citations_resolve "
+           "covers source-layout claims instead. Unskips automatically if a tree returns.",
+)
 def test_architecture_tree_lists_every_package(readme):
     """The tree claimed to enumerate src/no_human/ while omitting real packages
     (ci/, integrations/, notify/, ci_gate/). It is now labelled abridged, but it
-    must still not omit a package or invent one."""
+    must still not omit a package or invent one.
+
+    Kept, not deleted, and kept ARMED: the skip condition is computed from the
+    README itself, so the day anyone puts a package tree back on the front page
+    this guard starts enforcing again with no one having to remember it."""
     # A package is a directory that actually holds Python, not merely a
     # directory. Deleting an integration leaves its __pycache__ behind (tracker/
     # survives that way on any machine that ran TRACKER before it was removed), and
@@ -289,33 +395,78 @@ def test_local_links_resolve(readme):
     assert not broken, f"README links to missing files: {broken}"
 
 
-def test_readme_bench_figures_match_the_published_report():
-    """The README hard-codes figures FROM docs/NORTH_STAR_BENCH.md, and nothing
-    tied them together — so the next `bench publish` silently staled every one
-    of them. That is not hypothetical: the README described v8 while linking to
-    a v13 report, and the whole suite stayed green.
+BENCH_REPORT = REPO / "docs" / "NORTH_STAR_BENCH.md"
 
-    Reads the numbers out of the report rather than restating them, so this
-    cannot drift the way a hard-coded expectation would.
+
+@pytest.fixture(scope="module")
+def bench_report() -> str:
+    return BENCH_REPORT.read_text(encoding="utf-8")
+
+
+def test_published_bench_report_is_internally_consistent(bench_report):
+    """The published figures must agree with each other.
+
+    RETARGET (2026-07-30). This was ``test_readme_bench_figures_match_the_
+    published_report``: it required the README to restate the report's label,
+    success fraction, percentage, cost ratio and escalation ratio, so a
+    ``bench publish`` could not silently stale the front page. The rewrite
+    removed those figures from the README on purpose — the run is self-run and
+    its corpus does not resolve on anyone else's machine, so republishing a
+    47% headline was the claim least defensible on a public page.
+
+    Asserting that the report contains its own numbers would be vacuous, so the
+    coupling is re-pointed at the one thing about the report that IS checkable
+    without the README: the headline figures are derived quantities and must
+    reconcile. ``docs/NORTH_STAR_BENCH.md`` is machine-written and says "do not
+    edit by hand" — and until now NOTHING enforced that. A hand-edited success
+    percentage, or a delivered/escalated split that does not sum to the
+    satisfied count, now fails here. That is coverage the old test did not have
+    at all: it would have happily confirmed the README faithfully echoed a
+    doctored report.
     """
-    import re
-    from pathlib import Path
+    satisfied, ran = (int(x) for x in re.search(
+        r"Success \(goal satisfied, unattended\): (\d+)/(\d+)",
+        bench_report).groups())
+    pct = int(re.search(r"Success \(goal satisfied.*?\((\d+)%\)", bench_report).group(1))
+    delivered, escalated = (int(x) for x in re.search(
+        r"of which (\d+) DELIVERED a change and (\d+) correctly ESCALATED",
+        bench_report).groups())
+    esc_pct, esc_n, esc_d = (int(x) for x in re.search(
+        r"Honest-escalation rate on gated tasks: (\d+)% \((\d+)/(\d+)\)",
+        bench_report).groups())
 
-    root = Path(__file__).resolve().parents[1]
-    report = (root / "docs" / "NORTH_STAR_BENCH.md").read_text()
-    readme = (root / "README.md").read_text()
+    assert round(satisfied / ran * 100) == pct, (
+        f"published success {satisfied}/{ran} rounds to "
+        f"{round(satisfied / ran * 100)}%, but the report states {pct}%"
+    )
+    assert delivered + escalated == satisfied, (
+        f"published split {delivered} delivered + {escalated} escalated = "
+        f"{delivered + escalated}, but the report states {satisfied} satisfied"
+    )
+    assert round(esc_n / esc_d * 100) == esc_pct, (
+        f"published honest-escalation {esc_n}/{esc_d} rounds to "
+        f"{round(esc_n / esc_d * 100)}%, but the report states {esc_pct}%"
+    )
 
-    label = re.search(r"label: (\S+)", report).group(1).rstrip(".")
-    success = re.search(r"Success \(goal satisfied, unattended\): (\d+/\d+)",
-                        report).group(1)
-    pct = re.search(r"Success \(goal satisfied.*?\((\d+)%\)", report).group(1)
-    cost = re.search(r"Median COST ratio[^:]*: ([\d.]+)", report).group(1)
-    esc = re.search(r"Honest-escalation rate on gated tasks: \d+% \((\d+/\d+)\)",
-                    report).group(1)
 
-    for label_, value in (("label", label), ("success", success),
-                          ("success %", pct + "%"), ("cost ratio", cost),
-                          ("escalation n/d", esc)):
-        assert value in readme, (
-            f"README does not carry the published {label_} {value!r} — "
-            f"the report and the front page disagree")
+def test_readme_does_not_carry_a_stale_bench_label(readme, bench_report):
+    """The front page must not name a bench run other than the published one.
+
+    The original defect was the README describing v8 while linking a v13 report,
+    with the suite green throughout. The README no longer quotes figures, but it
+    still LINKS the report, so that exact rot is still reachable and this half of
+    the old coupling is kept pointed at the README.
+
+    The link assertion is deliberately positive: it fails if someone drops the
+    reference entirely, which would end the coupling silently.
+    """
+    label = re.search(r"label: (\S+)", bench_report).group(1).rstrip(".")
+    named = set(re.findall(r"\b(expanded-core-v\d+)\b", readme))
+    assert not (named - {label}), (
+        f"README names bench run(s) {sorted(named - {label})}; the published "
+        f"report is {label!r} — the front page and the report disagree"
+    )
+    assert "docs/NORTH_STAR_BENCH.md" in readme, (
+        "README no longer links docs/NORTH_STAR_BENCH.md; the benchmark claim "
+        "and its evidence are no longer connected from the front page"
+    )

@@ -159,6 +159,8 @@ foreground TUI - it is not a read-only viewer, so do not point it at a task
 | `llm.primary_model` | `claude-sonnet-5` | The implementer |
 | `llm.review_model` | `claude-opus-5` | The reviewer |
 | `bounds.max_attempts` | `3` | Implement/review cycles in one loop |
+| `bounds.max_turns_per_attempt` | `500` | Agent turns before an attempt is cut off |
+| `server.port` | `8420` | Web board bind port |
 | `concurrency.enabled` | `false` | Parallel task workers, each in its own worktree |
 | `ci.enabled` | `false` | Trigger and poll GitLab CI, GitHub Actions, Jenkins or CircleCI |
 
