@@ -106,6 +106,10 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   const [newRepoName, setNewRepoName] = useState("");
   const [newRepoBusy, setNewRepoBusy] = useState(false);
   const [newRepoError, setNewRepoError] = useState(null);
+  // Tracks the false->true create-repo success transition so focus can be
+  // returned to the repository input exactly once (see focusedAfterCreateRef
+  // below) rather than on every unrelated re-render.
+  const [repoCreated, setRepoCreated] = useState(false);
   const [config, setConfig] = useState(null);
   // Task 1.6 — Import from Jira. `source` rides along invisibly (never a
   // control the operator sees) so a task created from a picked ticket carries
@@ -139,6 +143,16 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   // immediately — no effect/rAF needed (same imperative idiom as fileInputRef
   // above; optional chaining guards the pre-mount null case).
   const promptRef = useRef(null);
+  // Captured up front, like Board.jsx closeTask captures e.currentTarget
+  // before its target unmounts: the "Create repo" button and its whole panel
+  // unmount on success, so the focus target must be a ref to the surviving
+  // free-text repository PathInput, never something read off the click event.
+  const repoInputRef = useRef(null);
+  // One-shot guard for the success-transition focus effect below — without
+  // it, a StrictMode double-invoke or an unrelated re-render while
+  // repoCreated is still true would steal focus back from wherever the
+  // operator has since moved it.
+  const focusedAfterCreateRef = useRef(false);
 
   // Escape closes the composer — suppressed while a submit is in flight so it
   // cannot discard a task that is already being created.
@@ -146,6 +160,19 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
   // captured at mount would be stale by resolve time).
   const repoPathRef = useRef("");
   useEffect(() => { repoPathRef.current = repoPath; });
+
+  // Create-repo success moves focus to the repository input exactly once, on
+  // the false->true transition. Deps are `[repoCreated]` only, so unrelated
+  // state updates (typing in the prompt, Jira polling, projects loading)
+  // never re-run this and can't steal focus back from wherever the operator
+  // has since moved it; the ref flag additionally absorbs a StrictMode
+  // double-invoke of the same transition.
+  useEffect(() => {
+    if (!repoCreated) { focusedAfterCreateRef.current = false; return; }
+    if (focusedAfterCreateRef.current) return;
+    focusedAfterCreateRef.current = true;
+    repoInputRef.current?.focus();
+  }, [repoCreated]);
 
   // Escape closes the Jira panel first (progressive disclosure — the same
   // "narrowest thing first" rule Integrations.jsx's Configure form uses),
@@ -293,6 +320,10 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
     if (newRepoBusy) return;
     setNewRepoBusy(true);
     setNewRepoError(null);
+    // Re-arm the one-shot focus effect for this attempt — scaffolding is
+    // non-idempotent server-side, so a second create must announce/focus
+    // again rather than silently no-op on an already-true flag.
+    setRepoCreated(false);
     try {
       const res = await scaffoldRepo(newRepoParent.trim(), newRepoName.trim());
       // Success: the new path becomes THE repo for this task and the normal
@@ -301,6 +332,7 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
       setCreateRepoOpen(false);
       setNewRepoParent("");
       setNewRepoName("");
+      setRepoCreated(true);
     } catch (err) {
       // The backend's `detail` says WHICH check failed - show it verbatim.
       setNewRepoError(err.message);
@@ -567,6 +599,7 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
               </SelectPill>
             ) : (
               <PathInput
+                ref={repoInputRef}
                 className={`${TEXT_FIELD} min-w-0 flex-1`}
                 placeholder="~/git/my-project"
                 value={repoPath}
@@ -601,6 +634,7 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
                 onClick={() => {
                   setCreateRepoOpen((v) => !v);
                   setNewRepoError(null);
+                  setRepoCreated(false);
                 }}
               >
                 create a new repo
@@ -622,6 +656,7 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
                     // The create-repo disclosure only exists in free-text mode.
                     setCreateRepoOpen(false);
                     setNewRepoError(null);
+                    setRepoCreated(false);
                   }
                 }}
               >
@@ -695,6 +730,19 @@ export default function TaskComposer({ busy, error, initial, onStart, onClose })
           {freeTextRepo && (
             <p id="repo-path-hint" className="mt-2 px-5 font-ui text-sm text-text-muted">
               Must be a path to a git repository — e.g. ~/git/my-project.
+            </p>
+          )}
+
+          {/* The create-repo panel that would normally carry this message
+              unmounts on success, so the announcement renders here — outside
+              it — reusing the same role="alert" pattern as newRepoError. */}
+          {repoCreated && (
+            <p
+              role="alert"
+              className="mt-2 rounded-xl px-4 py-2 font-ui text-sm"
+              style={{ color: "var(--green)", background: "var(--green-dim)" }}
+            >
+              Repository created
             </p>
           )}
 
