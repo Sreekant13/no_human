@@ -140,10 +140,20 @@ SUBAGENT_TOTAL = sum(u["input_tokens"] + u["output_tokens"]
 # output_tokens is 45. Never derive an expectation from this.
 SUBAGENT_SCALAR = sum(r["usage"]["total_tokens"]
                       for r in _RECORDS if r["type"] == "task_notification")  # 11067
-# The subagent's own transcript (agent-a483262a49fffc186.jsonl, probe session
-# 6a403c36) records in=10 out=45 cr=8,197 cc=2,852 for msg_011CdYRgNms2TE7e9oW.
-# That file is NOT reachable from the parent's SDK stream; it is quoted here so
-# the residual below is a measured number rather than an estimate.
+# The subagent's own transcript records in=10 out=45 cr=8,197 cc=2,852 for
+# msg_011CdYRgNms2TE7e9oWdhMHE. That file is NOT reachable from the parent's
+# SDK stream, and it is NOT in this repo: it lives in a machine-local CLI
+# transcript directory (~/.claude-personal/projects/-private-tmp-wt-tokens-probe/
+# 6a403c36-.../subagents/agent-a483262a49fffc186.jsonl — note ".claude-personal",
+# not ".claude"). So this constant is TRANSCRIBED, not derived from the fixture,
+# and a reader on another machine cannot re-derive it. Treat the residual test
+# below as documentation of a measurement taken once, not as a live check.
+#
+# What IS checkable from the fixture alone, and enough on its own to establish
+# the DIRECTION of the error: streamed output_tokens is an early snapshot the
+# stream never revises downward, so the recorded 4 is a hard lower bound on the
+# true output. The ledger therefore under-records; only the exact size of the
+# gap depends on the transcribed 45.
 SUBAGENT_TRUE_BILL = 10 + 45 + 8_197 + 2_852                                 # 11104
 GRAND_TOTAL = (PARENT_IN + PARENT_OUT + PARENT_CACHE_READ
                + PARENT_CACHE_CREATE + SUBAGENT_TOTAL)                       # 93530
@@ -379,14 +389,16 @@ async def test_a_multi_response_subagent_ignores_the_reported_scalar(
 async def test_the_scalar_never_shrinks_a_multi_response_subagent(
     tmp_path, monkeypatch,
 ):
-    """Kills the mutant that drops the `len(msgs) == 1` restriction.
+    """Kills any mutant that lets the gauge reduce a measured subagent.
 
-    With the restriction removed, a multi-response subagent takes the
-    `total - cache_read - cache_creation` path. Here that is
-    13,087 - 60,681 - 15,966 — deeply negative — and the old code's
-    `total >= cr + cc` guard is what hid it, on 98.3% of real subagents.
-    Whatever the arithmetic, the answer must not fall below the streamed
-    in/out, which is a hard floor on what the subagent billed.
+    Historically the guard was a `len(msgs) == 1` restriction on a
+    `total - cache_read - cache_creation` branch; that branch is gone, and
+    nothing in the current code names such a restriction. The PROPERTY it was
+    protecting is what this pins. On this fixture the arithmetic would be
+    13,087 - 60,681 - 15,966 — deeply negative — and the old `total >= cr + cc`
+    guard is what hid that, on 98.3% of real subagents. Whatever the
+    arithmetic, the answer must not fall below the streamed in/out, which is a
+    hard lower bound on what the subagent billed.
     """
     monkeypatch.setattr(claude_backend, "query", _replay(_load_multi_stream()))
     backend = ClaudeBackend(model="claude-sonnet-5")
@@ -476,16 +488,25 @@ async def test_a_single_response_subagent_ignores_the_scalar_too(
     assert result.subagent_tokens_used == 10 + 4, "rebuilt in/out from the gauge"
 
 
-async def test_an_absurd_scalar_cannot_become_the_bill(tmp_path, monkeypatch):
-    """The unbounded-from-above hole the deleted branch left open.
+async def test_an_absurd_scalar_cannot_displace_a_measurement(tmp_path, monkeypatch):
+    """The unbounded-from-above hole, closed on the path that had a measurement.
 
     The old code guarded the scalar from BELOW (reject if it would go negative)
     and not at all from above, so `total - cr - cc` became the in/out column
     whatever its size: a gauge of 10,000,000 against a subagent that streamed
     in=10 out=4 cr=8,197 cc=2,852 yielded 9,988,951 in/out, a 900x
     over-report that would trip any budget gate. Latent only because the CLI's
-    formula bounds the real value to single digits. Nothing reads the scalar
-    for spend now, so size cannot matter.
+    formula bounds the real value to single digits.
+
+    SCOPE, precisely: this is fixed for a subagent the stream SHOWED, which is
+    where the bug was — the gauge displaced a real measurement. It is NOT a
+    claim that the scalar is unread. It is still read on the streamed-nothing
+    floor path (`test_a_subagent_the_stream_never_showed_still_counts`), and
+    that path is still unbounded above: a gauge of 10,000,000,000 there lands
+    10,000,000,000 in `subagent_tokens_used` verbatim, because a floor with no
+    measurement to check it against has nothing to be bounded by. Capping it
+    (say, at the model's context window) is a separate decision, deliberately
+    not taken here.
     """
     usage_s = {"input_tokens": 10, "output_tokens": 4,
                "cache_read_input_tokens": 8_197, "cache_creation_input_tokens": 2_852}
@@ -528,6 +549,16 @@ async def test_the_known_residual_is_the_streamed_output(tmp_path, monkeypatch):
     the ledger under-records this subagent by 41 tokens — 0.37% of its bill.
     On the 6-response fixture the same effect is 633 of 77,337 (0.82%).
 
+    TWO CLASSES OF ASSERTION BELOW, and the difference matters:
+      - the DIRECTION of the error is checked against the fixture alone. The
+        stream never revises output downward, so the recorded figure is a lower
+        bound on the true bill, and the cache buckets — which ARE final — must
+        come through untouched. This holds on any machine.
+      - the SIZE of the error rests on `SUBAGENT_TRUE_BILL`, transcribed from a
+        machine-local CLI transcript that is not in this repo (see its
+        definition). That number cannot be re-derived here, so treat it as
+        documentation of a measurement taken once, not as a live check.
+
     If a future SDK exposes the final figures, this test fails and should be
     replaced by one asserting the true bill. Until then it documents the gap.
     """
@@ -538,13 +569,18 @@ async def test_the_known_residual_is_the_streamed_output(tmp_path, monkeypatch):
     recorded = (result.subagent_tokens_used + result.subagent_cache_read_tokens
                 + result.subagent_cache_creation_tokens)
     assert recorded == 11_063
+    # -- direction, from the fixture alone --------------------------------
+    streamed_out = next(iter(_SUB.values()))["output_tokens"]
+    assert streamed_out == 4
+    assert result.subagent_tokens_used == 10 + streamed_out
+    # The gap is entirely output, never the cache buckets — those are final.
+    assert result.subagent_cache_read_tokens == 8_197
+    assert result.subagent_cache_creation_tokens == 2_852
+    # -- size, from the transcribed constant ------------------------------
     assert SUBAGENT_TRUE_BILL == 11_104
     residual = SUBAGENT_TRUE_BILL - recorded
     assert residual == 41
     assert residual / SUBAGENT_TRUE_BILL < 0.01
-    # The gap is entirely output, never the cache buckets — those are final.
-    assert result.subagent_cache_read_tokens == 8_197
-    assert result.subagent_cache_creation_tokens == 2_852
 
 
 async def test_a_scalar_below_the_streamed_cache_cannot_shrink_the_bill(
@@ -694,6 +730,51 @@ async def test_a_subagent_the_stream_never_showed_still_counts(tmp_path, monkeyp
     assert result.subagent_floored_count == 1
 
 
+async def test_the_floor_path_is_unbounded_above_and_that_is_recorded(
+    tmp_path, monkeypatch,
+):
+    """The honest counterpart to `test_an_absurd_scalar_cannot_displace_a_
+    measurement`, kept executable so the caveat cannot rot into prose.
+
+    The scalar IS still read for spend — on this one path — and here it has no
+    upper bound: with no streamed measurement to check it against, there is
+    nothing to bound it BY. A gauge of 10,000,000,000 lands verbatim in
+    `subagent_tokens_used` and in the ledger. That is deliberate, not an
+    oversight: the alternative on this path is recording zero.
+
+    A sanity cap (reject a gauge above the model's context window, record zero
+    plus the flag) is a real option and a SEPARATE decision. If it is taken,
+    this test is what must change, and `subagent_floored_count` is already the
+    channel for saying which subagents it fired on.
+    """
+    absurd = 10_000_000_000
+    msgs = [
+        TaskStartedMessage(subtype="task_started", data={}, task_id="t9",
+                           description="d", uuid="u", session_id="sess",
+                           tool_use_id="toolu_ghost"),
+        TaskNotificationMessage(
+            subtype="task_notification", data={}, task_id="t9",
+            status="completed", output_file="/dev/null", summary="s", uuid="u",
+            session_id="sess", tool_use_id="toolu_ghost",
+            usage={"total_tokens": absurd, "tool_uses": 1, "duration_ms": 5}),
+        ResultMessage(subtype="success", duration_ms=0, duration_api_ms=0,
+                      is_error=False, num_turns=1, session_id="sess", result="k",
+                      usage={"input_tokens": 1, "output_tokens": 1,
+                             "cache_read_input_tokens": 10,
+                             "cache_creation_input_tokens": 0}),
+    ]
+    monkeypatch.setattr(claude_backend, "query", _replay(msgs))
+    backend = ClaudeBackend(model="claude-sonnet-5")
+    result = await backend.run("go", cwd=tmp_path, max_turns=10)
+
+    assert result.subagent_tokens_used == absurd, "the floor is NOT capped"
+    assert (result.tokens_used + result.cache_read_tokens
+            + result.cache_creation_tokens) == absurd + 12
+    # And it is labelled, which is what makes the unbounded number readable
+    # rather than silently authoritative.
+    assert result.subagent_floored_count == 1
+
+
 async def test_the_floor_label_rides_the_result_event_not_just_the_result(
     tmp_path, monkeypatch,
 ):
@@ -736,6 +817,54 @@ async def test_the_floor_label_rides_the_result_event_not_just_the_result(
     assert meta["subagent_count"] == 2
     assert meta["subagent_floored_count"] == 1
     assert meta["subagent_tokens_used"] == 4_444 + 8
+
+
+async def test_the_floor_label_survives_a_mid_stream_failure(tmp_path, monkeypatch):
+    """The ERROR result path carries the label too, and nothing else pinned it.
+
+    `stream()` builds the result meta twice: once on ResultMessage and once in
+    the `except` handler, which is the ONLY event a run that dies mid-flight
+    keeps. Deleting `subagent_floored_count` from the error meta alone left the
+    whole module green, so the label was mutation-survivable exactly where it
+    matters most: an aborted attempt is the case where spend is least certain,
+    and a floored subagent would have reported zero floors there.
+    """
+    def _raising_replay(messages):
+        async def _q(*args, **kwargs):
+            for m in messages:
+                yield m
+            raise RuntimeError("Stream closed unexpectedly")
+        return _q
+
+    msgs = [
+        TaskStartedMessage(subtype="task_started", data={}, task_id="t9",
+                           description="d", uuid="u", session_id="sess",
+                           tool_use_id="toolu_ghost"),
+        TaskNotificationMessage(
+            subtype="task_notification", data={}, task_id="t9",
+            status="completed", output_file="/dev/null", summary="s", uuid="u",
+            session_id="sess", tool_use_id="toolu_ghost",
+            usage={"total_tokens": 4_444, "tool_uses": 1, "duration_ms": 5}),
+    ]
+    monkeypatch.setattr(claude_backend, "query", _raising_replay(msgs))
+    backend = ClaudeBackend(model="claude-sonnet-5")
+
+    results = [ev async for ev in backend.stream("go", cwd=tmp_path, max_turns=10)
+               if ev.kind == "result"]
+
+    assert len(results) == 1, "the except handler must still emit a result"
+    meta = results[0].meta
+    assert meta["is_error"] is True
+    assert meta["subagent_count"] == 1
+    assert meta["subagent_floored_count"] == 1, "error meta dropped the label"
+    assert meta["subagent_tokens_used"] == 4_444
+
+    # And it reaches AgentResult through run(), not only the raw event.
+    monkeypatch.setattr(claude_backend, "query", _raising_replay(msgs))
+    result = await ClaudeBackend(model="claude-sonnet-5").run(
+        "go", cwd=tmp_path, max_turns=10)
+    assert result.is_error is True
+    assert result.subagent_floored_count == 1
 
 
 async def test_the_mid_attempt_usage_events_are_deduped_too(tmp_path, monkeypatch):
