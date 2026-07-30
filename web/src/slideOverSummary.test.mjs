@@ -7,6 +7,8 @@ import {
   narrativeFor, chipsFor, milestonesFor, sectionSummary, defaultOpenSection,
   diffStats, colorForStatus, PARKED_STATUSES, STATUS_STAGE_LABEL, isTerminalStatus,
   isHumanStopped,
+  ADVISORY_SEVERITIES, isBlockingFinding, reviewVerdict, severityChip,
+  checklistRowClass, approveButtonState, approvalFeedback,
 } from "./slideOverSummary.js";
 
 const SRC = dirname(fileURLToPath(import.meta.url));
@@ -547,4 +549,210 @@ test("parked/terminal narratives are unchanged by the claimed field", () => {
   assert.match(`${e.before} ${e.phrase}`, /waiting for your decision/);
   const d = narrativeFor({ status: "done", kind: "feature", claimed: false });
   assert.ok(d.phrase.length > 0);
+});
+
+// ── DEFECT 1: a PASSED review must not read as a failure ───────────────────
+// Operator report: a review that PASSED under the severity-class rule (only
+// blocking findings fail the gate) with 4 non-blocking findings and 1 passing
+// criterion rendered "4 findings · 1/5 passed" — an 80% failure to read, on a
+// legitimate PASS. The verdict word comes first and the findings are counted
+// as advisory, never as a pass ratio.
+
+test("blocking classification mirrors the backend's ADVISORY_SEVERITIES exactly", () => {
+  const REVIEWER_PY = readFileSync(join(SRC, "../../src/no_human/review/reviewer.py"), "utf8");
+  const m = REVIEWER_PY.match(/ADVISORY_SEVERITIES\s*=\s*frozenset\(\{([^}]*)\}\)/);
+  assert.ok(m, "could not find ADVISORY_SEVERITIES in reviewer.py");
+  const backend = new Set(m[1].match(/"([^"]+)"/g).map((s) => s.replace(/"/g, "")));
+  assert.deepEqual([...ADVISORY_SEVERITIES].sort(), [...backend].sort());
+
+  assert.equal(isBlockingFinding({ passed: true, severity: "high" }), false, "a PASSING item never blocks");
+  for (const sev of backend) {
+    assert.equal(isBlockingFinding({ passed: false, severity: sev }), false, `${sev} is advisory`);
+    assert.equal(isBlockingFinding({ passed: false, severity: sev.toUpperCase() }), false, "case-insensitive");
+  }
+  // Unclassified degrades SAFE — blocking, same as the backend.
+  assert.equal(isBlockingFinding({ passed: false, severity: "" }), true);
+  assert.equal(isBlockingFinding({ passed: false }), true);
+  assert.equal(isBlockingFinding({ passed: false, severity: "med" }), true);
+  assert.equal(isBlockingFinding({ passed: false, severity: "high" }), true);
+});
+
+test("a PASSED review states PASSED first and counts its findings as non-blocking", () => {
+  const checklist = {
+    passed: true,
+    items: [
+      { label: "criterion met", passed: true },
+      { label: "a", passed: false, severity: "low" },
+      { label: "b", passed: false, severity: "low" },
+      { label: "c", passed: false, severity: "nit" },
+      { label: "d", passed: false, severity: "nit" },
+    ],
+  };
+  const v = reviewVerdict(checklist);
+  assert.equal(v.verdict, "PASSED");
+  assert.equal(v.tone, "pass");
+  assert.equal(v.detail, "4 non-blocking findings (2 low, 2 nit)");
+  assert.equal(v.advisory, 4);
+  assert.equal(v.blocking, 0);
+  // The reported defect, pinned: no pass RATIO anywhere on a passed review.
+  const line = `${v.verdict} ${v.detail}`;
+  assert.doesNotMatch(line, /\d+\s*\/\s*\d+/, `a passed review must never render a ratio: "${line}"`);
+  assert.doesNotMatch(v.detail, /passed/i, "a pass COUNT in the detail would re-create the 1/5 reading");
+});
+
+test("a PASSED review with a single finding is singular, and a clean one has no detail", () => {
+  const one = reviewVerdict({ passed: true, items: [{ passed: false, severity: "nit" }] });
+  assert.equal(one.detail, "1 non-blocking finding (1 nit)");
+  const clean = reviewVerdict({ passed: true, items: [{ passed: true }, { passed: true }] });
+  assert.equal(clean.verdict, "PASSED");
+  assert.equal(clean.detail, null);
+});
+
+test("a FAILED review keeps today's failure-first presentation (verdict word, no detail)", () => {
+  const v = reviewVerdict({
+    passed: false,
+    items: [{ passed: false, severity: "high" }, { passed: false, severity: "low" }],
+  });
+  assert.equal(v.verdict, "FAILED");
+  assert.equal(v.tone, "fail");
+  assert.equal(v.detail, null, "the failed header is unchanged");
+  assert.equal(v.blocking, 1);
+});
+
+test("severity chips render the reviewer's grade, and older attempts without one omit the chip", () => {
+  assert.equal(severityChip({ passed: false, severity: "Low" }), "low");
+  assert.equal(severityChip({ passed: false, severity: "nit" }), "nit");
+  assert.equal(severityChip({ passed: false, severity: "high" }), "high");
+  // Older attempts stored severity as "" or not at all — omit, never crash.
+  assert.equal(severityChip({ passed: false, severity: "" }), null);
+  assert.equal(severityChip({ passed: false, severity: "   " }), null);
+  assert.equal(severityChip({ passed: false }), null);
+  assert.equal(severityChip({}), null);
+  assert.equal(severityChip(undefined), null);
+  assert.equal(severityChip(null), null);
+});
+
+test("a non-blocking finding row is visually distinct from a blocking failure", () => {
+  assert.equal(checklistRowClass({ passed: true }), "pass");
+  assert.equal(checklistRowClass({ passed: false, severity: "low" }), "advisory");
+  assert.equal(checklistRowClass({ passed: false, severity: "nit" }), "advisory");
+  assert.equal(checklistRowClass({ passed: false, severity: "high" }), "fail");
+  assert.equal(checklistRowClass({ passed: false }), "fail");
+  assert.notEqual(checklistRowClass({ passed: false, severity: "low" }),
+    checklistRowClass({ passed: false, severity: "high" }),
+    "an advisory row must not reuse the blocking red class");
+});
+
+test("the review micro-summary of a PASSED review with findings is not a failure ratio", () => {
+  const task = {
+    attempts: [{
+      review_checklist: {
+        passed: true,
+        items: [
+          { passed: true },
+          { passed: false, severity: "low" }, { passed: false, severity: "low" },
+          { passed: false, severity: "nit" }, { passed: false, severity: "nit" },
+        ],
+      },
+    }],
+  };
+  const s = sectionSummary("review", { task });
+  assert.doesNotMatch(s.text, /1\/5 passed/, "the reported string must be gone");
+  assert.doesNotMatch(s.text, /\d+\s*\/\s*\d+/, `no ratio on a passed review: "${s.text}"`);
+  assert.match(s.text, /^Passed/, `verdict first: "${s.text}"`);
+  assert.match(s.text, /4 non-blocking findings/);
+  assert.equal(s.colorVar, "var(--green)", "a pass is not painted as a failure");
+});
+
+test("the micro-summary still leads with the failure when the review FAILED", () => {
+  const task = {
+    attempts: [{
+      review_checklist: {
+        passed: false,
+        items: [{ passed: true }, { passed: false, severity: "high" }],
+      },
+    }],
+  };
+  const s = sectionSummary("review", { task });
+  assert.equal(s.colorVar, "var(--red)");
+  assert.match(s.text, /1 finding/);
+});
+
+// ── DEFECT 2: clicking Approve must be observably confirmed ────────────────
+// Operator report: Approve recorded server-side (context.approved_at was set)
+// but the UI said nothing, so they believed it had failed.
+
+test("the Approve button changes state the moment it is clicked and once it lands", () => {
+  const idle = approveButtonState({});
+  assert.equal(idle.label, "Approve");
+  assert.equal(idle.disabled, false);
+
+  const busy = approveButtonState({ busy: true });
+  assert.equal(busy.disabled, true, "an in-flight approval must not be re-clickable");
+  assert.notEqual(busy.label, idle.label, "the label must change while it is in flight");
+
+  const ok = approveButtonState({ outcome: "ok" });
+  assert.equal(ok.disabled, true);
+  assert.equal(ok.label, "Approved");
+  assert.notEqual(ok.label, idle.label);
+
+  const err = approveButtonState({ outcome: "error" });
+  assert.equal(err.disabled, false, "a failed approval must be retryable");
+  assert.match(err.label, /retry/i);
+});
+
+test("a recorded approval says so and says who merges - never the agent", () => {
+  const f = approvalFeedback({ ok: true });
+  assert.equal(f.role, "status");
+  assert.equal(f.tone, "ok");
+  assert.match(f.text, /approval recorded/i);
+  assert.match(f.text, /merge/i);
+  assert.match(f.text, /agent never merges/i, "constraint #2 must be visible on the confirmation");
+  assert.doesNotMatch(f.text, /—/, "hyphens, not em-dashes, in user-facing strings");
+});
+
+test("the server's own message stays authoritative, with the queue remainder appended", () => {
+  const msg = "Already satisfied claim confirmed - no code change was needed.";
+  const f = approvalFeedback({ ok: true, message: msg, remaining: 2 });
+  assert.ok(f.text.startsWith(msg), `server message must lead: "${f.text}"`);
+  assert.match(f.text, /2 more waiting/);
+  const alone = approvalFeedback({ ok: true, message: msg, remaining: 0 });
+  assert.equal(alone.text, msg, "no queue suffix when nothing is waiting");
+});
+
+test("a failed approval is equally visible, and never claims it was recorded", () => {
+  const f = approvalFeedback({ ok: false, error: "task is 'done', not awaiting_approval" });
+  assert.equal(f.role, "alert");
+  assert.equal(f.tone, "error");
+  assert.match(f.text, /not (recorded|approved)/i);
+  assert.match(f.text, /task is 'done'/, "the server's reason must reach the operator");
+  assert.doesNotMatch(f.text, /approval recorded/i);
+});
+
+// ── wiring: the drawer must actually render these (behaviour is in e2e/drawer.mjs)
+
+test("SlideOver.jsx renders the review header and the checklist rows from these helpers", () => {
+  const src = readFileSync(join(SRC, "SlideOver.jsx"), "utf8");
+  assert.match(src, /reviewVerdict/, "the review header must come from reviewVerdict");
+  assert.match(src, /checklistRowClass\(/, "row styling must come from checklistRowClass");
+  assert.match(src, /severityChip\(/, "each row's chip must come from severityChip");
+  assert.match(src, /cr-sev cr-sev-/, "the chip must reuse the existing cr-sev styling");
+  assert.doesNotMatch(src, /item\.passed \? "pass" : "fail"/,
+    "the hardcoded pass/fail row class cannot survive - advisory rows need their own");
+});
+
+test("SlideOver.jsx drives the Approve button and its confirmation from these helpers", () => {
+  const src = readFileSync(join(SRC, "SlideOver.jsx"), "utf8");
+  assert.match(src, /approveButtonState\(/);
+  assert.match(src, /approvalFeedback\(/);
+  assert.doesNotMatch(src, /\{busy \? "…" : "Approve"\}/,
+    "the bare busy-ellipsis label gave no post-click confirmation");
+});
+
+test("the flash banner is a live region so the confirmation is announced, not just painted", () => {
+  const src = readFileSync(join(SRC, "SlideOver.jsx"), "utf8");
+  const banner = src.match(/function FlashBanner\([\s\S]*?\n\}/);
+  assert.ok(banner, "FlashBanner not found");
+  assert.match(banner[0], /aria-live/);
+  assert.match(banner[0], /role=/);
 });

@@ -17,6 +17,8 @@ import { agentSummary, taskSummary } from "./summaries.js";
 import {
   PARKED_STATUSES, narrativeFor, chipsFor, milestonesFor, sectionSummary,
   defaultOpenSection, isTerminalStatus,
+  reviewVerdict, severityChip, checklistRowClass, isBlockingFinding,
+  approveButtonState, approvalFeedback,
 } from "./slideOverSummary.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
@@ -65,12 +67,20 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   const sbRef = useNestedModalKeys(sbOpen, closeSb);
   const replyRef = useNestedModalKeys(replyOpen, closeReply);
   const [flash, setFlash] = useState(null);
+  // null before the operator clicks Approve, "ok" once the server recorded it,
+  // "error" if it did not. Drives the button's label + disabled state so the
+  // click is confirmed on the control itself, not only in the banner.
+  const [approveOutcome, setApproveOutcome] = useState(null);
   const dialogRef = useRef(null);
   const closeRef = useRef(null);
 
   // A NEW task resets the review-first latch; a refreshKey bump must not —
   // it would yank the user back to the review tab on every WS update.
   useEffect(() => { openedFirstSection.current = false; }, [taskId]);
+
+  // "Next review →" swaps taskId in place; the previous task's Approved state
+  // must not carry over onto the new one's button.
+  useEffect(() => { setApproveOutcome(null); setFlash(null); }, [taskId]);
 
   // Re-fetch whenever taskId changes OR when Board signals a WS update
   useEffect(() => {
@@ -218,20 +228,22 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   const showActionBar = isAwaiting || isActive || isFailed || showParkedActions || showQuietCancel;
 
   async function handleApprove() {
-    if (!isAwaiting || busy) return;
+    if (!isAwaiting || busy || approveOutcome === "ok") return;
     setBusy(true);
+    setApproveOutcome(null);
     try {
       const res = await approveTask(taskId);
       const remaining = reviewQueue.filter((id) => id !== taskId).length;
       // The server's message is authoritative: an already-satisfied approval
       // completes the task with no PR to merge (PR #101 round-2 review) —
       // hardcoding the merge instruction here lied on that path.
-      setFlash((res?.message || "Approval recorded. Merge the PR in your git host.")
-        + (remaining ? ` ${remaining} more waiting — use Next review.` : ""));
+      setApproveOutcome("ok");
+      setFlash(approvalFeedback({ ok: true, message: res?.message, remaining }));
       const updated = await fetchTask(taskId);
       setTask(updated);
     } catch (e) {
-      setFlash(`Error: ${e.message}`);
+      setApproveOutcome("error");
+      setFlash(approvalFeedback({ ok: false, error: e.message }));
     } finally {
       setBusy(false);
     }
@@ -367,7 +379,6 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
             body is one of the original 8 tab components, unchanged — they
             still mount (and fetch/SSE) only while their section is open. */}
         <div className="so-body">
-          {flash && <FlashBanner msg={flash} onDismiss={() => setFlash(null)} />}
           <div className="so-accordion">
             {SECTION_LIST
               .filter((s) => s.key !== "subtasks" || task?.parent_id || task?.status === "compound_parent")
@@ -393,16 +404,33 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
           </div>
         </div>
 
+        {/* The result of the last action, pinned OUTSIDE the scrolling body and
+            directly above the buttons that cause it. Inside .so-body it scrolled
+            away from the action bar, so clicking Approve at the bottom of a long
+            drawer showed its confirmation off-screen — the operator saw nothing
+            happen. */}
+        {flash && <FlashBanner msg={flash} onDismiss={() => setFlash(null)} />}
+
         {/* action bar — contextual based on task status. Suppressed entirely
             when the DecisionPanel above owns the actions (parked-with-blocker),
             and never rendered empty. */}
         {task && showActionBar && (
           <div className="so-actions">
-            {isAwaiting && (
-              <button className="btn btn-approve" onClick={handleApprove} disabled={busy}>
-                {busy ? "…" : "Approve"}
-              </button>
-            )}
+            {isAwaiting && (() => {
+              // The click has to change something on the control itself: an
+              // approval that recorded server-side but left the button reading
+              // "Approve" was read as a dead button.
+              const ab = approveButtonState({ busy, outcome: approveOutcome });
+              return (
+                <button
+                  className={`btn btn-approve btn-approve-${ab.tone}`}
+                  onClick={handleApprove}
+                  disabled={ab.disabled || busy}
+                >
+                  {ab.label}
+                </button>
+              );
+            })()}
             {isAwaiting && (
               <button className="btn btn-sendback" onClick={() => setSbOpen(true)} disabled={busy}>
                 Send back
@@ -540,10 +568,21 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
 
 /* ── sub-components ───────────────────────────────────────────────────────── */
 
+// `msg` is either a plain string (the lifecycle/reply flows) or the
+// { text, role, tone } shape approvalFeedback returns. The role makes it a live
+// region: an approval that only PAINTS a confirmation is invisible to a
+// screen reader and easy to miss on a long drawer.
 function FlashBanner({ msg, onDismiss }) {
+  const { text, role, tone } = typeof msg === "string"
+    ? { text: msg, role: "status", tone: "info" }
+    : { text: msg?.text ?? "", role: msg?.role || "status", tone: msg?.tone || "info" };
   return (
-    <div className="flash-banner">
-      <span>{msg}</span>
+    <div
+      className={`flash-banner flash-banner-${tone}`}
+      role={role}
+      aria-live={role === "alert" ? "assertive" : "polite"}
+    >
+      <span>{text}</span>
       <button className="flash-banner-dismiss" onClick={onDismiss} aria-label="Dismiss"><IconX size={14} /></button>
     </div>
   );
@@ -2036,7 +2075,7 @@ function ReviewTab({ task, diff }) {
     );
   }
 
-  const allPassed = checklist.passed;
+  const verdict = reviewVerdict(checklist);
   const testResults = lastAttempt?.test_results;
   const tamperFlag = testResults?.tamper_flag;
   const ciUrl = lastAttempt?.ci_pipeline_url;
@@ -2191,10 +2230,16 @@ function ReviewTab({ task, diff }) {
       <section>
         <div className="so-section-label so-section-label-row">
           <span>Reviewer verdict —{" "}
-            {allPassed
-              ? <span className="verdict-pass">PASSED</span>
-              : <span className="verdict-fail">FAILED</span>
+            {verdict.tone === "pass"
+              ? <span className="verdict-pass">{verdict.verdict}</span>
+              : <span className="verdict-fail">{verdict.verdict}</span>
             }
+            {/* On a PASS the findings are counted as findings with their
+                severities. The old "N/M passed" ratio read as an 80% failure
+                on a review that passed with 4 advisory findings. */}
+            {verdict.detail && (
+              <span className="verdict-detail" data-testid="verdict-detail"> - {verdict.detail}</span>
+            )}
           </span>
           {checklist.items.length >= 5 && (
             <span className="review-cap-indicator" data-testid="review-cap">(capped at 5 items)</span>
@@ -2243,12 +2288,22 @@ function ReviewTab({ task, diff }) {
           </div>
         )}
         <div className="so-checklist">
-          {checklist.items.map((item, i) => (
-            <div key={i} className={`checklist-item ${item.passed ? "pass" : "fail"}`}>
-              {/* header row: icon + title + file chip */}
+          {checklist.items.map((item, i) => {
+            // A low/nit finding is advisory: it did not fail the gate, so it
+            // gets its own row modifier and icon instead of the blocking red.
+            const rowClass = checklistRowClass(item);
+            const sev = severityChip(item);
+            const blocking = isBlockingFinding(item);
+            return (
+            <div key={i} className={`checklist-item ${rowClass}`}>
+              {/* header row: icon + title + severity chip + file chip */}
               <div className="ci-header">
-                <span className="ci-icon">{item.passed ? <IconCheck size={14} /> : <IconX size={14} />}</span>
+                <span className="ci-icon">
+                  {item.passed ? <IconCheck size={14} /> : blocking ? <IconX size={14} /> : <IconInfo size={14} />}
+                </span>
                 <span className="ci-title">{item.label}</span>
+                {/* Older attempts carry no severity — omit the chip. */}
+                {sev && <span className={`cr-sev cr-sev-${sev}`}>{sev}</span>}
                 {item.file && (
                   <span className="ci-filechip" title={item.file + (item.line > 0 ? `:${item.line}` : "")}>
                     {item.file.split("/").slice(-2).join("/")}{item.line > 0 ? `:${item.line}` : ""}
@@ -2286,7 +2341,8 @@ function ReviewTab({ task, diff }) {
                 </div>
               )}
             </div>
-          ))}
+            );
+          })}
         </div>
       </section>
       {testResults && (

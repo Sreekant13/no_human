@@ -300,6 +300,110 @@ function relativeTimeFrom(iso, nowMs = Date.now()) {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
+// ── review verdict, severity-class aware ───────────────────────────────────
+// The gate fails on BLOCKING findings only: a reviewer grades each finding and
+// anything graded low/nit is advisory. Mirrors ADVISORY_SEVERITIES in
+// src/no_human/review/reviewer.py, including its degrade-safe rule that an
+// unclassified finding blocks. slideOverSummary.test.mjs reads that frozenset
+// out of the Python source and asserts the two sets are identical, so this
+// cannot silently drift.
+export const ADVISORY_SEVERITIES = new Set(["low", "nit"]);
+
+function normSeverity(item) {
+  return String(item?.severity ?? "").trim().toLowerCase();
+}
+
+// A failing finding blocks unless the reviewer graded it low or nit.
+export function isBlockingFinding(item) {
+  if (!item || item.passed) return false;
+  return !ADVISORY_SEVERITIES.has(normSeverity(item));
+}
+
+// The chip text for one checklist row, or null when the attempt carries no
+// grade (older attempts stored severity as "" or omitted the key) — the caller
+// renders no chip rather than an empty one.
+export function severityChip(item) {
+  return normSeverity(item) || null;
+}
+
+// Row modifier: a passing row, an advisory (non-blocking) finding, or a
+// blocking failure. Advisory gets its own class so it never wears the
+// blocking red.
+export function checklistRowClass(item) {
+  if (!item || item.passed) return "pass";
+  return isBlockingFinding(item) ? "fail" : "advisory";
+}
+
+const SEVERITY_ORDER = ["critical", "high", "major", "med", "medium", "low", "nit"];
+
+function severityBreakdown(failed) {
+  const counts = new Map();
+  for (const it of failed) {
+    const key = normSeverity(it) || "unrated";
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  const rank = (k) => {
+    const i = SEVERITY_ORDER.indexOf(k);
+    return i === -1 ? SEVERITY_ORDER.length : i;
+  };
+  return [...counts.entries()]
+    .sort((a, b) => rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0]))
+    .map(([sev, n]) => `${n} ${sev}`);
+}
+
+// The review section's header. On a PASS the verdict word leads and the
+// findings are counted as findings — never as a pass ratio, which read as an
+// 80% failure on a review that passed with 4 advisory findings and 1 criterion.
+// A FAIL is unchanged: verdict word, no detail.
+export function reviewVerdict(checklist) {
+  const items = checklist?.items || [];
+  const failed = items.filter((it) => !it.passed);
+  const blocking = failed.filter(isBlockingFinding).length;
+  const advisory = failed.length - blocking;
+  if (checklist?.passed !== true) {
+    return { verdict: "FAILED", tone: "fail", detail: null, blocking, advisory, findings: failed.length };
+  }
+  let detail = null;
+  if (failed.length) {
+    const noun = failed.length === 1 ? "finding" : "findings";
+    const kind = blocking === 0 ? "non-blocking " : "";
+    detail = `${failed.length} ${kind}${noun} (${severityBreakdown(failed).join(", ")})`;
+  }
+  return { verdict: "PASSED", tone: "pass", detail, blocking, advisory, findings: failed.length };
+}
+
+// ── approval feedback ──────────────────────────────────────────────────────
+// Approve recorded server-side while the drawer said nothing, so the operator
+// read a successful approval as a dead button. These two pure helpers give the
+// click an immediate state change and a live-region message.
+
+// `outcome` is null before the click resolves, "ok" once the server recorded
+// the approval, "error" if it did not.
+export function approveButtonState({ busy = false, outcome = null } = {}) {
+  if (outcome === "ok") return { label: "Approved", disabled: true, tone: "ok" };
+  if (busy) return { label: "Approving…", disabled: true, tone: "busy" };
+  if (outcome === "error") return { label: "Retry approve", disabled: false, tone: "error" };
+  return { label: "Approve", disabled: false, tone: "idle" };
+}
+
+// The banner text plus the ARIA role it lands in. The server's own message
+// leads when it sends one — an already-satisfied approval has no PR to merge,
+// so a hardcoded merge instruction would lie on that path.
+export function approvalFeedback({ ok = true, message = "", remaining = 0, error = "" } = {}) {
+  if (!ok) {
+    const why = String(error || "").trim();
+    return {
+      role: "alert",
+      tone: "error",
+      text: `Approval NOT recorded${why ? ` - ${why}` : ""}. Nothing changed; click Retry approve.`,
+    };
+  }
+  const base = String(message || "").trim()
+    || "Approval recorded. You merge the PR in your git host - the agent never merges.";
+  const more = remaining > 0 ? ` ${remaining} more waiting - use Next review.` : "";
+  return { role: "status", tone: "ok", text: base + more };
+}
+
 function reviewMicro(task) {
   const attempts = task.attempts || [];
   const last = attempts[attempts.length - 1];
@@ -319,6 +423,13 @@ function reviewMicro(task) {
   }
   if (failed === 0 && checklist.passed === false) {
     return { text: "Reviewer failed", colorVar: "var(--red)" };
+  }
+  // A review that PASSED can still carry findings — the gate fails on blocking
+  // ones only. Counting those as "1/5 passed" read as an 80% failure on a
+  // legitimate PASS, so the verdict leads and the ratio is gone.
+  if (checklist.passed === true) {
+    const v = reviewVerdict(checklist);
+    return { text: `Passed - ${v.detail}`, colorVar: "var(--green)" };
   }
   const prev = attempts[attempts.length - 2]?.review_checklist;
   if (prev?.items?.length === total) {

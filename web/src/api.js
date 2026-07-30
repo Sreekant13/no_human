@@ -52,7 +52,13 @@ export async function uploadAttachment(taskId, file) {
 
 export async function approveTask(id) {
   const r = await fetch(`${BASE}/api/tasks/${id}/approve`, { method: "POST" });
-  if (!r.ok) throw new Error(`POST approve → ${r.status}`);
+  if (!r.ok) {
+    // The server explains WHY (409: the task is no longer awaiting approval).
+    // A bare status code left the operator with no way to tell a rejected
+    // approval from a network blip.
+    const detail = await r.json().catch(() => ({}));
+    throw new Error(detail.detail || `POST approve → ${r.status}`);
+  }
   return r.json();
 }
 

@@ -43,10 +43,18 @@ const PARKED = mkTask("parked00aaaabbbbcccc", "awaiting_input", {
 const REVIEW = mkTask("review00aaaabbbbcccc", "awaiting_approval", { pr_url: "https://example.com/pull/1" });
 const RUNNING = mkTask("running0aaaabbbbcccc", "implementing");
 
-const api = (task) => (route) => {
+const api = (task, opts = {}) => (route) => {
   const u = route.request().url();
   const j = (b) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(b) });
-  if (route.request().method() !== "GET") return route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
+  if (route.request().method() !== "GET") {
+    if (opts.approveFails && u.includes("/approve")) {
+      return route.fulfill({
+        status: 409, contentType: "application/json",
+        body: JSON.stringify({ detail: "task is 'done', not awaiting_approval" }),
+      });
+    }
+    return route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
+  }
   if (u.includes("/api/onboarding")) return j({ completed: true });
   if (u.includes("/api/projects")) return j([]);
   if (u.match(/\/api\/tasks\/[^/]+\/diff/)) return j({ diff: "" });
@@ -58,14 +66,14 @@ const api = (task) => (route) => {
 
 const browser = await chromium.launch();
 
-async function open(task, viewport = { width: 1440, height: 900 }, theme = "dark") {
+async function open(task, viewport = { width: 1440, height: 900 }, theme = "dark", opts = {}) {
   const ctx = await browser.newContext({ viewport });
   const page = await ctx.newPage();
   const errors = [];
   page.on("console", (m) => { if (m.type() === "error" && !m.text().includes("WebSocket")) errors.push(m.text()); });
   page.on("pageerror", (e) => errors.push("pageerror: " + e.message));
   await page.addInitScript((t) => localStorage.setItem("nh-theme", t), theme);
-  await page.route("**/api/**", api(task));
+  await page.route("**/api/**", api(task, opts));
   await page.goto("http://127.0.0.1:4640/", { waitUntil: "networkidle" });
   await page.waitForTimeout(500);
   await page.locator(".task-card").first().click();
@@ -608,6 +616,121 @@ const forceMutationInDrawer = (page) => page.evaluate(() => {
     (await page.locator(".sendback-modal").count()) === 0 ? ""
       : "Cancel did not close the reply modal — the fix made live controls inert");
   check("[disabled-strand] no page errors", errors.length === 0, errors[0] || "");
+  await ctx.close();
+}
+
+// ── DEFECT 1 (operator report): a PASSED review rendered as an 80% failure ──
+// The severity-class rule fails the gate on BLOCKING findings only. A review
+// that passed with 4 non-blocking findings + 1 passing criterion rendered
+// "4 findings · 1/5 passed" — read as a failure, so a legitimate PASS was
+// distrusted. Measured in the browser: the header text and the row styling.
+const PASSED_REVIEW = mkTask("passrev0aaaabbbbcccc", "awaiting_approval", {
+  pr_url: "https://example.com/pull/7",
+  attempts: [{
+    review_checklist: {
+      passed: true,
+      items: [
+        { label: "Acceptance criterion 1 met", passed: true, evidence: "e" },
+        { label: "Name shadows the outer binding", passed: false, severity: "low", comment: "rename it", file: "a.js", line: 3 },
+        { label: "Redundant null check", passed: false, severity: "low", comment: "drop it", file: "a.js", line: 9 },
+        { label: "Comment typo", passed: false, severity: "nit", comment: "typo", file: "b.js", line: 1 },
+        { label: "Prefer const", passed: false, severity: "nit", comment: "const", file: "b.js", line: 4 },
+      ],
+    },
+  }],
+});
+{
+  const { ctx, page, errors } = await open(PASSED_REVIEW);
+  const header = await page.locator(".slideover .so-section.open .so-section-label-row").first().innerText();
+  const body = await page.locator(".slideover").innerText();
+  check("[D1] a PASSED review leads with PASSED", /PASSED/.test(header) && !/FAILED/.test(header), header);
+  check("[D1] …and counts its findings as non-blocking, with severities",
+    header.toLowerCase().includes("4 non-blocking findings (2 low, 2 nit)"), header);
+  check("[D1] the reported '1/5 passed' reading is gone", !/\d+\s*\/\s*\d+\s*passed/.test(body),
+    (body.match(/\d+\s*\/\s*\d+\s*passed/) || [""])[0]);
+  const chips = await page.locator(".slideover .so-checklist .cr-sev").allInnerTexts();
+  check("[D1] every graded row carries a severity chip",
+    chips.length === 4 && chips.filter((c) => /low/i.test(c)).length === 2
+      && chips.filter((c) => /nit/i.test(c)).length === 2, JSON.stringify(chips));
+  const nAdvisory = await page.locator(".slideover .checklist-item.advisory").count();
+  const nBlocking = await page.locator(".slideover .checklist-item.fail").count();
+  check("[D1] non-blocking rows are advisory, not blocking failures",
+    nAdvisory === 4 && nBlocking === 0, `advisory=${nAdvisory} fail=${nBlocking}`);
+  check("[D1] no page errors", errors.length === 0, errors[0] || "");
+  await ctx.close();
+}
+
+// …and an older attempt with no severity key must render no chip, not crash.
+const UNGRADED_REVIEW = mkTask("oldrev00aaaabbbbcccc", "awaiting_approval", {
+  pr_url: "https://example.com/pull/8",
+  attempts: [{
+    review_checklist: {
+      passed: false,
+      items: [
+        { label: "Blocking problem", passed: false, evidence: "e", file: "a.js", line: 2 },
+        { label: "Advisory nit", passed: false, severity: "nit", comment: "c", file: "a.js", line: 5 },
+      ],
+    },
+  }],
+});
+{
+  const { ctx, page, errors } = await open(UNGRADED_REVIEW);
+  const header = await page.locator(".slideover .so-section.open .so-section-label-row").first().innerText();
+  check("[D1] a FAILED review keeps today's failure-first header", /FAILED/.test(header), header);
+  const chips = await page.locator(".slideover .so-checklist .cr-sev").allInnerTexts();
+  check("[D1] an item with no severity key omits the chip rather than crashing",
+    chips.length === 1 && /nit/i.test(chips[0]), JSON.stringify(chips));
+  const colors = await page.evaluate(() => {
+    const q = (s) => document.querySelector(s);
+    const c = (s) => { const el = q(s); return el ? getComputedStyle(el).borderLeftColor : null; };
+    return { blocking: c(".slideover .checklist-item.fail"), advisory: c(".slideover .checklist-item.advisory") };
+  });
+  check("[D1] a non-blocking row does not reuse the blocking red",
+    !!colors.blocking && !!colors.advisory && colors.blocking !== colors.advisory, JSON.stringify(colors));
+  check("[D1] no page errors", errors.length === 0, errors[0] || "");
+  await ctx.close();
+}
+
+// ── DEFECT 2 (operator report): Approve gave no visible confirmation ────────
+// The approval DID record (context.approved_at was set) but the drawer said
+// nothing, so the operator read a successful approval as a dead button.
+{
+  const { ctx, page, errors } = await open(REVIEW);
+  const btn = page.locator(".slideover .so-actions .btn-approve").first();
+  const before = (await btn.innerText()).trim();
+  check("[D2] the action bar offers Approve", /^approve$/i.test(before), before);
+  await btn.click();
+  await page.waitForTimeout(600);
+  const after = (await btn.innerText()).trim();
+  const disabled = await btn.isDisabled();
+  check("[D2] the button label changes once the approval lands", /^approved$/i.test(after), `"${before}" → "${after}"`);
+  check("[D2] …and it is disabled so it cannot be double-approved", disabled);
+  const status = page.locator('.slideover [role="status"]').first();
+  const statusText = (await status.count()) ? await status.innerText() : "";
+  check("[D2] a status live region confirms the approval was recorded",
+    /approval recorded/i.test(statusText), statusText);
+  check("[D2] …and says the human merges, never the agent",
+    /agent never merges/i.test(statusText), statusText);
+  check("[D2] no page errors", errors.length === 0, errors[0] || "");
+  await ctx.close();
+}
+{
+  const { ctx, page, errors } = await open(REVIEW, { width: 1440, height: 900 }, "dark", { approveFails: true });
+  const btn = page.locator(".slideover .so-actions .btn-approve").first();
+  await btn.click();
+  await page.waitForTimeout(600);
+  const after = (await btn.innerText()).trim();
+  check("[D2] a failed approval leaves a retryable button", /retry/i.test(after), after);
+  check("[D2] …that is not disabled", !(await btn.isDisabled()));
+  const alert = page.locator('.slideover [role="alert"]').first();
+  const alertText = (await alert.count()) ? await alert.innerText() : "";
+  check("[D2] the failure is announced, and never claims it was recorded",
+    /not recorded/i.test(alertText) && !/^Approval recorded/i.test(alertText), alertText);
+  check("[D2] the server's own reason reaches the operator",
+    /not awaiting_approval/.test(alertText), alertText);
+  // The 409 is the point of this block; any OTHER console error is a real bug.
+  const unexpected = errors.filter((e) => !e.includes("409"));
+  check("[D2] no unexpected page errors", unexpected.length === 0, unexpected[0] || "");
   await ctx.close();
 }
 
