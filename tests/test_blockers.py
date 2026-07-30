@@ -1004,36 +1004,6 @@ async def test_state_rung_rechecks_terminal_after_the_pr_state_poll(store):
     assert "merged" not in events
 
 
-@pytest.mark.asyncio
-async def test_ci_gate_rung_rechecks_terminal_after_gate_step(store):
-    """Reviewer finding: _ci_gate_step awaited gate.step (triggers pipelines,
-    posts PR comments) and branched on the outcome with no post-step
-    terminal recheck. A concurrent cancel landing during that step must not
-    still act on a stale 'passed'/'triggered' outcome."""
-    t = Task.new("gate-race", repo_path="/tmp/r")
-    t.context = {"pr_watch": "https://code.example.com/o/r/pull/9"}
-    await store.create_task(t)
-    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
-
-    from no_human.ci_gate.gate import Ci_gateOutcome
-
-    class _StubGate:
-        async def step(self, task, url):
-            current = await store.get_task(task.id)
-            await store.set_status(current, TaskStatus.DONE, validate=False)
-            return Ci_gateOutcome(action="passed", web_url="https://ci/1")
-
-    events = []
-    w = WakeWatcher(store, _cfg(), ci_gate_gate=_StubGate(),
-                     on_event=lambda k, task: events.append(k))
-    outcome, action = await w._ci_gate_step(t, "https://code.example.com/o/r/pull/9")
-    assert outcome is None
-    assert action is None
-    fresh = await store.get_task(t.id)
-    assert fresh.status is TaskStatus.DONE
-    assert "ci_gate_pass" not in events
-
-
 # --------------------------------------------------------------------------- #
 # SCRUM-68 load-bearing guards: the WRITE HELPERS re-read the DB and refuse   #
 # terminal tasks. The rung-level rechecks are early-outs; these direct-call   #

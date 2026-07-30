@@ -1,0 +1,178 @@
+"""Post a review comment to the RIGHT PR/MR on the RIGHT forge.
+
+A cross-repo code review spans change sets on *different* version
+control systems — e.g. acme-test on code.example.com (GitHub Enterprise) and two
+metrics-core MRs on gitlab.acme.net (GitLab). A finding must go to the change set
+that actually contains its file, using that forge's API:
+  - GitHub / GHE → ``gh api`` (inline review comment, falling back to an issue
+    comment when the line isn't in the diff)
+  - GitLab      → ``glab api`` (a merge-request note)
+
+The attribution (which PR owns a finding's file) and file extraction are pure and
+unit-tested here; the posting shells out and is covered at the endpoint.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+
+from .pr_watcher import parse_pr_url
+
+_DIFF_FILE = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)
+_DIFF_GIT = re.compile(r"^diff --git a/.+ b/(.+)$", re.MULTILINE)
+
+
+def files_in_diff(diff: str) -> list[str]:
+    """Every file path touched in a unified diff (the ``b/`` side)."""
+    files: list[str] = []
+    seen: set[str] = set()
+    for pat in (_DIFF_FILE, _DIFF_GIT):
+        for m in pat.finditer(diff or ""):
+            f = m.group(1).strip()
+            if f and f != "/dev/null" and f not in seen:
+                seen.add(f)
+                files.append(f)
+    return files
+
+
+def pick_pr_for_file(file: str, pr_files: dict[str, list[str]], fallback: str | None) -> str | None:
+    """Return the PR/MR URL whose change set contains *file*.
+
+    The reviewer may cite a path more or less qualified than the diff's (a
+    trailing-segment match handles ``a/b/x.yaml`` vs ``b/x.yaml``). Falls back to
+    *fallback* (the anchor PR) when nothing matches — better a landed comment on
+    the anchor than a lost one.
+    """
+    if not file:
+        return fallback
+    for url, files in (pr_files or {}).items():
+        for f in files:
+            if f == file or f.endswith("/" + file) or file.endswith("/" + f):
+                return url
+    return fallback
+
+
+def _run(argv: list[str], timeout: int = 15) -> tuple[bool, str]:
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        if p.returncode == 0:
+            return True, ""
+        return False, (p.stderr.strip() or p.stdout.strip())[:300]
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+
+
+def post_to_pr(url: str, body: str, file: str | None = None, line: int | None = None) -> dict:
+    """Post *body* to the PR/MR at *url* using its forge's API.
+
+    Returns ``{"ok": bool, "mode": "inline"|"issue_comment"|"mr_note", "error": str}``.
+    """
+    parsed = parse_pr_url(url)
+    if not parsed:
+        return {"ok": False, "mode": None, "error": f"unparseable PR URL: {url}"}
+    forge, host, slug, number = parsed
+    host_args = ["--hostname", host]
+
+    if forge == "gitlab":
+        # A real review comments ON the code line. GitLab inline = a Discussion
+        # with a diff position (the MR's base/start/head SHAs + file + line).
+        if file and line and line > 0:
+            ok, err = _post_gitlab_inline(host, slug, number, body, file, line)
+            if ok:
+                return {"ok": True, "mode": "inline", "error": ""}
+        # Fall back to a general MR note (location prefixed) when there's no line
+        # or the position isn't a valid diff line.
+        loc = f"`{file}:{line}` — " if file and line else ""
+        ok, err = _run(["glab", "api", *host_args, "-X", "POST",
+                        f"projects/{slug}/merge_requests/{number}/notes",
+                        "-f", f"body={loc}{body}"])
+        return {"ok": ok, "mode": "mr_note", "error": err}
+
+    # GitHub / GHE. Try an inline review comment when we have a file:line.
+    if file and line and line > 0:
+        ok_sha, sha = _head_sha(host_args, slug, number)
+        if ok_sha and sha:
+            ok, err = _run(["gh", "api", *host_args, "-X", "POST",
+                            f"repos/{slug}/pulls/{number}/comments",
+                            "-f", f"body={body}", "-f", f"commit_id={sha}",
+                            "-f", f"path={file}", "-F", f"line={line}",
+                            "-f", "side=RIGHT"])
+            if ok:
+                return {"ok": True, "mode": "inline", "error": ""}
+        # Inline failed (line not in this PR's diff, or SHA fetch failed): fall
+        # back to a general issue comment with the location prefixed.
+        ok, err = _run(["gh", "api", *host_args, "-X", "POST",
+                        f"repos/{slug}/issues/{number}/comments",
+                        "-f", f"body=`{file}:{line}` — {body}"])
+        return {"ok": ok, "mode": "issue_comment", "error": err}
+
+    ok, err = _run(["gh", "api", *host_args, "-X", "POST",
+                    f"repos/{slug}/issues/{number}/comments", "-f", f"body={body}"])
+    return {"ok": ok, "mode": "issue_comment", "error": err}
+
+
+def _gitlab_diff_refs(host: str, slug: str, number: int) -> dict | None:
+    """The MR's {base_sha, start_sha, head_sha} — required to anchor an inline
+    discussion to a diff line."""
+    import json as _json
+    try:
+        p = subprocess.run(
+            ["glab", "api", "--hostname", host, f"projects/{slug}/merge_requests/{number}"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if p.returncode != 0:
+            return None
+        return (_json.loads(p.stdout) or {}).get("diff_refs")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _post_gitlab_inline(host: str, slug: str, number: int, body: str,
+                        file: str, line: int) -> tuple[bool, str]:
+    """Post an inline GitLab MR discussion anchored to ``file:line`` (RIGHT side).
+
+    Sends a JSON body with a ``Content-Type: application/json`` header — glab's
+    ``-f position[...]`` form encoding silently drops the nested position and the
+    comment lands as a general note instead of on the line (learned the hard way).
+    """
+    import json as _json
+
+    refs = _gitlab_diff_refs(host, slug, number)
+    if not refs or not refs.get("head_sha"):
+        return False, "no diff_refs for inline position"
+    payload = _json.dumps({
+        "body": body,
+        "position": {
+            "position_type": "text",
+            "base_sha": refs.get("base_sha", ""),
+            "start_sha": refs.get("start_sha", ""),
+            "head_sha": refs["head_sha"],
+            "new_path": file,
+            "old_path": file,
+            "new_line": line,
+        },
+    })
+    try:
+        p = subprocess.run(
+            ["glab", "api", "--hostname", host, "-X", "POST",
+             "-H", "Content-Type: application/json",
+             f"projects/{slug}/merge_requests/{number}/discussions", "--input", "-"],
+            input=payload, capture_output=True, text=True, timeout=20,
+        )
+        if p.returncode == 0:
+            return True, ""
+        return False, (p.stderr.strip() or p.stdout.strip())[:300]
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+
+
+def _head_sha(host_args: list[str], slug: str, number: int) -> tuple[bool, str]:
+    try:
+        p = subprocess.run(
+            ["gh", "api", *host_args, f"repos/{slug}/pulls/{number}", "--jq", ".head.sha"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return (p.returncode == 0, p.stdout.strip())
+    except subprocess.TimeoutExpired:
+        return False, ""

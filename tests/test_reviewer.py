@@ -1,0 +1,782 @@
+"""Adversarial reviewer: output parsing + review logic with a fake backend."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+
+import pytest
+
+from no_human.agent.claude_backend import AgentEvent, AgentResult
+from no_human.core.task import Task
+from no_human.review.reviewer import (
+    AdversarialReviewer,
+    ReviewDecision,
+    _build_code_review_prompt,
+    _build_review_prompt,
+    _full_file_context,
+    _parse_review_output,
+)
+
+
+# --------------------------------------------------------------------------- #
+# Parsing                                                                      #
+# --------------------------------------------------------------------------- #
+
+def _block(passed: bool, items: list[dict]) -> str:
+    data = {"passed": passed, "items": items}
+    return f"Some preamble text.\n\nREVIEW_JSON_START\n{json.dumps(data)}\nREVIEW_JSON_END\n"
+
+
+def test_parse_passing_block():
+    text = _block(True, [
+        {"label": "criterion 1", "passed": True, "evidence": "foo.py:10"},
+        {"label": "tests added", "passed": True, "evidence": "test_foo.py:5"},
+    ])
+    d = _parse_review_output(text)
+    assert d.passed is True
+    assert len(d.checklist) == 2
+    assert d.checklist[0].evidence == "foo.py:10"
+
+
+def test_parse_failing_block():
+    text = _block(False, [
+        {"label": "criterion 1", "passed": False, "evidence": "returns None, expected int"},
+        {"label": "tests added", "passed": True, "evidence": "test_foo.py:5"},
+    ])
+    d = _parse_review_output(text)
+    assert d.passed is False
+    assert len(d.failed_items) == 1
+    assert d.failed_items[0].label == "criterion 1"
+
+
+def test_parse_disagreement_reviewer_says_pass_but_items_fail():
+    # Reviewer claims passed=True but has a failing item — we fail closed.
+    text = _block(True, [
+        {"label": "criterion 1", "passed": False, "evidence": "not implemented"},
+    ])
+    d = _parse_review_output(text)
+    assert d.passed is False
+
+
+def test_parse_no_block_fails_closed():
+    d = _parse_review_output("The reviewer wrote a lot but forgot the JSON block.")
+    assert d.passed is False
+    assert "no parseable REVIEW_JSON block" in d.checklist[0].evidence
+
+
+def test_parse_malformed_json_fails_closed():
+    d = _parse_review_output("REVIEW_JSON_START\n{invalid json here\nREVIEW_JSON_END")
+    assert d.passed is False
+    assert d.checklist[0].label == "json parse"
+
+
+def test_parse_empty_items_with_passed_true_fails_closed():
+    """A passed:true with ZERO checklist items is a vacuous pass — the reviewer
+    presented no evidence. The absence of evidence is not evidence of passing;
+    this exact hole is what let `nh watch` drive tasks toward a PR with a
+    rubber-stamp verdict. The gate fails closed."""
+    text = _block(True, [])
+    d = _parse_review_output(text)
+    assert d.passed is False
+    assert d.checklist == []
+
+
+# --------------------------------------------------------------------------- #
+# Prompt content                                                               #
+# --------------------------------------------------------------------------- #
+
+def test_review_prompt_contains_criteria_and_no_score():
+    t = Task.new("Fix AnalyticsExport retention")
+    t.acceptance_criteria = ["returns 200 OK"]
+    prompt = _build_review_prompt(t, "diff text", "pytest output", "")
+    assert "returns 200 OK" in prompt
+    assert "REFUTE" in prompt
+    assert "score" not in prompt.lower() or "not" in prompt.lower()
+    # Must not request a numeric score
+    import re
+    assert not re.search(r"score\s+(1|from|0)\s*[-–]\s*10", prompt, re.IGNORECASE)
+
+
+def test_review_prompt_includes_held_out():
+    t = Task.new("x")
+    prompt = _build_review_prompt(t, "diff", "tests passed", "held-out: 2 passed")
+    assert "held-out" in prompt
+    assert "held-out: 2 passed" in prompt
+
+
+def test_review_prompt_3_pass_structure():
+    """The enhanced prompt includes the two-stage review structure."""
+    t = Task.new("Fix bug")
+    t.acceptance_criteria = ["Bug is fixed"]
+    prompt = _build_review_prompt(t, "diff", "tests", "")
+    assert "STAGE 1" in prompt
+    assert "SPEC COMPLIANCE" in prompt
+    assert "STAGE 2" in prompt
+    assert "CODE QUALITY" in prompt
+    assert "Staff Software Engineer" in prompt
+
+
+def test_review_prompt_includes_profile_context():
+    t = Task.new("Fix bug")
+    prompt = _build_review_prompt(
+        t, "diff", "tests", "",
+        profile_context="Ecosystem: python\n  Test command: pytest -q",
+    )
+    assert "python" in prompt
+    assert "pytest" in prompt
+    assert "conventions as a baseline" in prompt
+
+
+def test_review_prompt_includes_confirmed_rules():
+    t = Task.new("Fix bug")
+    prompt = _build_review_prompt(
+        t, "diff", "tests", "",
+        confirmed_rules="  - [rule] Never use python3 in CI: CI has no python3\n"
+                        "  - [skill] Use POSIX sed: portable across CI images",
+    )
+    assert "Never use python3" in prompt
+    assert "POSIX sed" in prompt
+    assert "learned these the hard way" in prompt
+
+
+def test_review_prompt_rule_adherence_pass():
+    """Phase 5d: PASS 4 RULE ADHERENCE fires when confirmed rules are present."""
+    t = Task.new("Fix bug")
+    rules = "  - [rule] Never use python3 in CI\n  - [skill] Use POSIX sed"
+    prompt = _build_review_prompt(t, "diff", "tests", "", confirmed_rules=rules)
+    assert "PASS 4: RULE ADHERENCE" in prompt
+    assert "Cite the rule text" in prompt
+    # Without rules, no rule adherence pass
+    prompt_no_rules = _build_review_prompt(t, "diff", "tests", "")
+    assert "RULE ADHERENCE" not in prompt_no_rules
+
+
+def test_review_prompt_scope_renumbers_with_rules():
+    """When rules exist AND diff is large, SCOPE becomes PASS 5."""
+    t = Task.new("Fix bug")
+    rules = "  - [rule] Never use python3 in CI"
+    large_diff = "\n".join([f"+line {i}" for i in range(200)])
+    prompt = _build_review_prompt(t, large_diff, "tests", "", confirmed_rules=rules)
+    assert "PASS 4: RULE ADHERENCE" in prompt
+    assert "PASS 5: SCOPE" in prompt
+
+
+def test_review_prompt_no_profile_no_rules_still_works():
+    """When no profile or rules are available, the prompt still has 2 stages."""
+    t = Task.new("Fix bug")
+    prompt = _build_review_prompt(t, "diff", "tests", "")
+    assert "STAGE 1" in prompt
+    assert "Project profile" not in prompt
+    assert "Confirmed rules" not in prompt
+
+
+# --------------------------------------------------------------------------- #
+# Full-file context (D16)                                                      #
+# --------------------------------------------------------------------------- #
+
+def _git(repo, *args):
+    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+
+@pytest.fixture
+def declared_outside_hunk(tmp_path):
+    """A repo whose HEAD commit uses a symbol declared far above the changed
+    hunk — the exact shape that made the reviewer report a false positive."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t.t")
+    _git(repo, "config", "user.name", "t")
+
+    body = "\n".join(f"    // filler {i}" for i in range(200))
+    (repo / "Jenkinsfile").write_text(
+        f"pipeline {{\n    def commitSha = ''\n{body}\n}}\n"
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+
+    # Change only the tail of the file — the declaration stays outside the hunk.
+    (repo / "Jenkinsfile").write_text(
+        f"pipeline {{\n    def commitSha = ''\n{body}\n    echo commitSha\n}}\n"
+    )
+    (repo / "gone.txt").write_text("x\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "use commitSha")
+    return repo
+
+
+def test_full_file_context_shows_a_declaration_the_diff_omits(declared_outside_hunk):
+    """D16: the reviewer failed a gate on `commitSha` being 'never assigned',
+    because the diff shows only hunks and the declaration sat above them."""
+    repo = declared_outside_hunk
+    diff = subprocess.run(
+        ["git", "diff", "HEAD~1..HEAD", "--patch"],
+        cwd=repo, capture_output=True, text=True,
+    ).stdout
+    assert "def commitSha = ''" not in diff  # the blind spot, reproduced
+
+    block, omitted = _full_file_context(repo, "HEAD~1", "HEAD")
+    assert "def commitSha = ''" in block  # ...and closed
+    assert omitted == []
+    assert "Jenkinsfile" in block
+
+
+def test_full_file_context_skips_deleted_and_binary_files(tmp_path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t.t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "doomed.txt").write_text("bye\n")
+    (repo / "keep.txt").write_text("hi\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+
+    (repo / "doomed.txt").unlink()
+    (repo / "keep.txt").write_text("hi there\n")
+    (repo / "blob.bin").write_bytes(b"\x00\x01\x02binary\x00")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "delete, edit, add binary")
+
+    block, omitted = _full_file_context(repo, "HEAD~1", "HEAD")
+    assert "keep.txt" in block
+    assert "doomed.txt" not in block  # deleted: no text at `after`
+    assert "blob.bin" not in block  # binary: never inlined
+    assert omitted == []
+
+
+def test_full_file_context_omits_whole_files_rather_than_truncating(declared_outside_hunk):
+    """A mid-file cut could land above the declaration, recreating the bug. So
+    an oversized file is omitted whole and named, never partially included."""
+    block, omitted = _full_file_context(declared_outside_hunk, "HEAD~1", "HEAD", cap=50)
+    assert omitted == ["Jenkinsfile"]  # named, so the reviewer reads it with tools
+    assert "filler 0" not in block  # not one line of it leaked in
+    assert "gone.txt" in block  # the small file still fits (smallest-first)
+
+
+def test_gate_prompt_never_forbids_reading_files_and_carries_full_text():
+    t = Task.new("Fix bug")
+    prompt = _build_review_prompt(
+        t, "diff", "tests", "",
+        full_files="--- Jenkinsfile (full text @ HEAD) ---\ndef commitSha = ''\n",
+        omitted_files=["huge.py"],
+    )
+    assert "Do NOT read any files" not in prompt
+    assert "MUST: before asserting" in prompt
+    assert "def commitSha = ''" in prompt
+    assert "huge.py" in prompt  # named so the reviewer knows to read it
+
+
+def test_prompt_without_tools_keeps_the_no_tools_policy():
+    """The diff_override path runs single-turn with no tools; saying it MAY read
+    files would be a lie."""
+    t = Task.new("Fix bug")
+    prompt = _build_review_prompt(t, "diff", "tests", "", allow_tools=False)
+    assert "Do NOT read any files" in prompt
+    assert "MUST: before asserting" not in prompt
+
+
+# --------------------------------------------------------------------------- #
+# AdversarialReviewer with fake backend                                        #
+# --------------------------------------------------------------------------- #
+
+class FakeBackend:
+    """Returns a scripted final_text without touching the LLM."""
+
+    def __init__(self, final_text: str):
+        self._final_text = final_text
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None, on_event=None,
+                  supervisor_hook=None):
+        return AgentResult(
+            final_text=self._final_text,
+            num_turns=3, is_error=False,
+            tokens_used=200, session_id="fake", stop_reason="end_turn",
+        )
+
+
+@pytest.fixture
+def simple_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True, capture_output=True)
+    (repo / "calc.py").write_text("def add(a, b): return a + b\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+    # second commit (the "change") so HEAD~1..HEAD works
+    (repo / "calc.py").write_text("def add(a, b): return a + b\n\ndef mul(a, b): return a * b\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "add mul"], check=True, capture_output=True)
+    return repo
+
+
+async def test_reviewer_pass(simple_repo):
+    output = _block(True, [
+        {"label": "mul(a,b) implemented", "passed": True, "evidence": "calc.py:3"},
+    ])
+    reviewer = AdversarialReviewer(backend=FakeBackend(output))
+    t = Task.new("add mul()")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    decision = await reviewer.review(t, repo_path=simple_repo)
+    assert decision.passed is True
+    assert len(decision.checklist) == 1
+
+
+async def test_reviewer_fail_with_evidence(simple_repo):
+    output = _block(False, [
+        {"label": "mul(a,b) implemented", "passed": False,
+         "evidence": "calc.py:3 returns a*b but edge case a=0 not tested"},
+        {"label": "tests added", "passed": True, "evidence": "test_calc.py:4"},
+    ])
+    reviewer = AdversarialReviewer(backend=FakeBackend(output))
+    t = Task.new("add mul()")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    decision = await reviewer.review(t, repo_path=simple_repo)
+    assert decision.passed is False
+    assert decision.failed_items[0].evidence != ""
+
+
+async def test_reviewer_no_structured_block_fails_closed(simple_repo):
+    """No REVIEW_JSON block means the gate did not run.
+
+    The safety property is unchanged and strengthened: it must never pass. It
+    used to return a *failing* decision, which the orchestrator then handed to
+    the coder as a finding to fix — spending one of its bounded attempts on a
+    defect nobody found (task 84251cb2, attempt 13). It now escalates instead.
+    """
+    from no_human.review.reviewer import ReviewerUnavailable
+
+    reviewer = AdversarialReviewer(backend=FakeBackend("I could not determine if this is done."))
+    t = Task.new("x")
+    with pytest.raises(ReviewerUnavailable):
+        await reviewer.review(t, repo_path=simple_repo)
+
+
+# --------------------------------------------------------------------------- #
+# Code review prompt                                                           #
+# --------------------------------------------------------------------------- #
+
+def test_code_review_prompt_constructive_tone():
+    t = Task.new("Review PR")
+    t.acceptance_criteria = ["Tests pass"]
+    prompt = _build_code_review_prompt(t, "diff text", 9)
+    assert "constructive" in prompt.lower()
+    assert "REFUTE" not in prompt
+    assert "MAY use read/search tools" in prompt
+    assert "severity" in prompt
+
+
+def test_code_review_prompt_includes_pr_comments():
+    t = Task.new("Review PR")
+    prompt = _build_code_review_prompt(
+        t, "diff text", 9,
+        pr_comments="  @eyal [src/foo.py:10]: this is fragile",
+    )
+    assert "@eyal" in prompt
+    assert "this is fragile" in prompt
+    assert "whether each was addressed" in prompt
+
+
+def test_code_review_prompt_truncation_notice():
+    # diff_total_len > len(diff) → truncation notice must appear
+    t = Task.new("Review PR")
+    prompt = _build_code_review_prompt(t, "short", 100_000)
+    assert "truncated" in prompt
+    assert "100,000" in prompt
+    assert "Do NOT flag" in prompt
+
+
+def test_code_review_prompt_no_truncation_notice_when_full():
+    t = Task.new("Review PR")
+    diff = "full diff text"
+    prompt = _build_code_review_prompt(t, diff, len(diff))
+    # The specific truncation notice with char counts should not appear
+    assert "truncated from" not in prompt
+
+
+def test_code_review_prompt_description_fallback():
+    t = Task.new("Review PR")
+    t.acceptance_criteria = []
+    t.description = "check that mTLS certs are handled"
+    prompt = _build_code_review_prompt(t, "diff", 4)
+    assert "mTLS certs" in prompt
+    assert "derived from description" in prompt
+
+
+def test_code_review_prompt_no_criteria_no_description():
+    t = Task.new("Review PR")
+    t.acceptance_criteria = []
+    t.description = ""
+    prompt = _build_code_review_prompt(t, "diff", 4)
+    assert "none stated" in prompt
+
+
+# --------------------------------------------------------------------------- #
+# Severity parsing                                                             #
+# --------------------------------------------------------------------------- #
+
+def test_parse_severity_field():
+    text = _block(False, [
+        {"label": "bug", "passed": False, "evidence": "oops",
+         "severity": "critical"},
+        {"label": "nit", "passed": True, "evidence": "ok",
+         "severity": "nit"},
+    ])
+    d = _parse_review_output(text)
+    assert d.checklist[0].severity == "critical"
+    assert d.checklist[1].severity == "nit"
+
+
+def test_parse_missing_severity_defaults_empty():
+    text = _block(True, [
+        {"label": "ok", "passed": True, "evidence": "fine"},
+    ])
+    d = _parse_review_output(text)
+    assert d.checklist[0].severity == ""
+
+
+# --------------------------------------------------------------------------- #
+# Code review mode routing                                                     #
+# --------------------------------------------------------------------------- #
+
+async def test_code_review_mode_uses_full_diff(simple_repo):
+    """Code review mode should NOT truncate diff to the 12K gate cap."""
+    big_diff = "x" * 50_000
+    calls = []
+
+    class CapturingBackend:
+        async def run(self, prompt, *, cwd, max_turns, effort=None,
+                      resume=None, on_event=None, supervisor_hook=None):
+            calls.append({"prompt_len": len(prompt), "max_turns": max_turns})
+            output = _block(True, [{"label": "ok", "passed": True,
+                                    "evidence": "all good", "severity": "low"}])
+            return AgentResult(
+                final_text=output, num_turns=3, is_error=False,
+                tokens_used=200, session_id="fake", stop_reason="end_turn",
+            )
+
+    reviewer = AdversarialReviewer(backend=CapturingBackend())
+    t = Task.new("Review PR")
+    decision = await reviewer.review(
+        t, repo_path=simple_repo, diff_override=big_diff, mode="code_review",
+    )
+    assert decision.passed is True
+    # The 50K diff should NOT be truncated to 12K (gate cap)
+    assert calls[0]["prompt_len"] > 40_000
+    # Multi-turn agent mode, not single-turn
+    assert calls[0]["max_turns"] > 1
+
+
+async def test_gate_mode_still_truncates(simple_repo):
+    """Gate mode should still use the 60K cap."""
+    big_diff = "x" * 100_000  # exceeds 60K cap
+    calls = []
+
+    class CapturingBackend:
+        async def run(self, prompt, *, cwd, max_turns, effort=None,
+                      resume=None, on_event=None, supervisor_hook=None):
+            calls.append({"prompt_len": len(prompt), "max_turns": max_turns})
+            output = _block(True, [{"label": "ok", "passed": True, "evidence": "fine"}])
+            return AgentResult(
+                final_text=output, num_turns=1, is_error=False,
+                tokens_used=100, session_id="fake", stop_reason="end_turn",
+            )
+
+    reviewer = AdversarialReviewer(backend=CapturingBackend())
+    t = Task.new("Fix bug")
+    decision = await reviewer.review(
+        t, repo_path=simple_repo, diff_override=big_diff, mode="gate",
+    )
+    assert decision.passed is True
+    # Gate mode: prompt should use 60K cap, so shorter than the raw 100K diff
+    assert calls[0]["prompt_len"] < 80_000
+    # Single-turn fast review for gate mode with diff_override
+    assert calls[0]["max_turns"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# PR URL parsing                                                               #
+# --------------------------------------------------------------------------- #
+
+def test_parse_pr_url_github():
+    # EH2: the single canonical grammar carries the host so GHE PRs resolve.
+    from no_human.vcs.pr_watcher import parse_pr_url
+    assert parse_pr_url(
+        "https://code.example.com/dev/metrics-core-query-service/pull/513"
+    ) == ("github", "code.example.com", "dev/metrics-core-query-service", 513)
+
+
+def test_parse_pr_url_gitlab():
+    from no_human.vcs.pr_watcher import parse_pr_url
+    parts = parse_pr_url("https://gitlab.com/org/repo/-/merge_requests/42")
+    assert parts is not None
+    assert parts[0] == "gitlab"
+    assert parts[3] == 42
+
+
+def test_parse_pr_url_invalid():
+    from no_human.vcs.pr_watcher import parse_pr_url
+    assert parse_pr_url("not a url") is None
+
+
+def test_fetch_pr_comments_forwards_ghe_host(monkeypatch):
+    """EH2 regression: a GitHub Enterprise PR must query its own host, not
+    github.com. Before the fix _parse_pr_url_parts dropped the host and the
+    reviewer got zero comments for every code.example.com PR (the metrics-core case)."""
+    import asyncio
+    from no_human.core.orchestrator import Orchestrator
+    import no_human.vcs.pr_watcher as prw
+
+    seen: dict = {}
+
+    async def _fake_gh(repo, num, *, since=None, host=None):
+        seen["repo"], seen["num"], seen["host"] = repo, num, host
+        return []
+
+    monkeypatch.setattr(prw, "fetch_github_pr_comments", _fake_gh)
+    orch = object.__new__(Orchestrator)  # method uses no instance state
+    asyncio.run(orch._fetch_pr_comments_text(
+        "https://code.example.com/dev/metrics-core-query-service/pull/513"))
+    assert seen == {"repo": "dev/metrics-core-query-service", "num": 513,
+                    "host": "code.example.com"}
+
+
+# ── C3-G1: tier-gated multi-angle review ─────────────────────────────────────
+
+def _item(label, passed=False, evidence="foo.py:10", severity=None):
+    from no_human.review.reviewer import ChecklistItem
+    it = ChecklistItem(label, passed, evidence)
+    if severity is not None:
+        it.severity = severity
+    return it
+
+
+def test_merge_appends_prefixed_non_duplicate_findings():
+    from no_human.review.reviewer import ReviewDecision, merge_angle_findings
+    main = ReviewDecision(passed=True, checklist=[_item("criteria met", True)])
+    sec = ReviewDecision(passed=False, checklist=[
+        _item("shell injection via unsanitized branch name")])
+    merged = merge_angle_findings(main, [("security", sec)])
+    labels = [i.label for i in merged.checklist]
+    assert any(l.startswith("security: shell injection") for l in labels)
+    assert merged.passed is False  # a blocking angle finding flips pass->fail
+
+
+def test_merge_dedups_overlapping_findings():
+    from no_human.review.reviewer import ReviewDecision, merge_angle_findings
+    main = ReviewDecision(passed=False, checklist=[
+        _item("branch name shell injection in push helper")])
+    sec = ReviewDecision(passed=False, checklist=[
+        _item("shell injection via branch name")])
+    merged = merge_angle_findings(main, [("security", sec)])
+    # near-duplicate not appended
+    assert len(merged.checklist) == 1
+
+
+def test_merge_never_flips_fail_to_pass_and_sums_tokens():
+    from no_human.review.reviewer import ReviewDecision, merge_angle_findings
+    main = ReviewDecision(passed=False, checklist=[_item("broken thing")],
+                          tokens_used=100, cache_read_tokens=1000)
+    clean = ReviewDecision(passed=True, checklist=[_item("ok", True)],
+                           tokens_used=50, cache_read_tokens=500)
+    merged = merge_angle_findings(main, [("tests", clean)])
+    assert merged.passed is False
+    assert merged.tokens_used == 150 and merged.cache_read_tokens == 1500
+
+
+def test_merge_advisory_angle_finding_does_not_flip_pass():
+    from no_human.review.reviewer import ReviewDecision, merge_angle_findings
+    main = ReviewDecision(passed=True, checklist=[_item("criteria met", True)])
+    nit = ReviewDecision(passed=False, checklist=[
+        _item("test names could be clearer", severity="low")])
+    merged = merge_angle_findings(main, [("tests", nit)])
+    assert merged.passed is True          # low-severity is advisory, not a gate
+    assert any(i.label.startswith("tests: ") for i in merged.checklist)
+
+
+async def test_angles_run_only_for_complex_tier(tmp_path):
+    """Complex tier -> main + 2 angle calls; untagged/simple -> 1 call."""
+    from no_human.review.reviewer import AdversarialReviewer
+    from no_human.core.task import Task
+
+    calls = []
+
+    class _B:
+        model = "claude-opus-5"
+        async def run(self, prompt, **kw):
+            calls.append(prompt[:60])
+            from no_human.agent.claude_backend import AgentResult
+            # Must be a REAL verdict block: the parser fails CLOSED without
+            # the REVIEW_JSON markers, so a fenced-json stub produced a FAILED
+            # main review — and after B2 #11 (angles skipped on a decided FAIL)
+            # that silently meant "no angles", which is what this test caught.
+            block = _block(True, [{"label": "x", "passed": True,
+                                   "evidence": "d.py:1"}])
+            return AgentResult(final_text=block, num_turns=1, is_error=False,
+                               tokens_used=10, session_id="s", stop_reason="end")
+
+    r = AdversarialReviewer(backend=_B())
+    t = Task.new("big task", repo_path=str(tmp_path))
+    t.acceptance_criteria = ["works"]
+
+    t.context = {"complexity_tier": "complex"}
+    await r.review(t, repo_path=tmp_path, diff_override="+ x = 1\n")
+    # D2 #6 added the silent-failure lens → main + 3 angles.
+    assert len(calls) == 4, f"expected main+3 angles, got {len(calls)}"
+
+    calls.clear()
+    t.context = {"complexity_tier": "simple"}
+    await r.review(t, repo_path=tmp_path, diff_override="+ x = 1\n")
+    assert len(calls) == 1
+
+
+
+async def test_angle_timeout_never_fails_the_gate(tmp_path):
+    """An angle that times out is dropped with a visible advisory note — the
+    fail-closed rule belongs to the MAIN review only."""
+    from no_human.review.reviewer import AdversarialReviewer
+    from no_human.core.task import Task
+    from no_human.agent.claude_backend import AgentResult
+
+    calls = {"n": 0}
+
+    class _B:
+        model = "claude-opus-5"
+        async def run(self, prompt, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:  # main review passes
+                block = ('REVIEW_JSON_START\n{"passed": true, "items": '
+                         '[{"label": "ok", "passed": true, "severity": "low",'
+                         ' "evidence": "d.py:1"}]}\nREVIEW_JSON_END')
+                return AgentResult(final_text=block, num_turns=1, is_error=False,
+                                   tokens_used=10, session_id="s", stop_reason="end")
+            import asyncio as _a
+            await _a.sleep(999)  # angle hangs -> _fast_review 180s timeout path
+
+    import no_human.review.reviewer as rv
+    # shrink the timeout for the test by monkeypatching wait_for timeout via
+    # asyncio — simplest: patch asyncio.wait_for inside the module
+    real_wait_for = rv.asyncio.wait_for
+    async def quick_wait_for(coro, timeout):
+        return await real_wait_for(coro, timeout=0.05 if timeout == 180 else timeout)
+    rv.asyncio.wait_for = quick_wait_for
+    try:
+        r = AdversarialReviewer(backend=_B())
+        t = Task.new("big task", repo_path=str(tmp_path))
+        t.context = {"complexity_tier": "complex"}
+        d = await r.review(t, repo_path=tmp_path, diff_override="+ x = 1\n")
+    finally:
+        rv.asyncio.wait_for = real_wait_for
+
+    assert d.passed is True, "an angle timeout must not fail the gate"
+    notes = [i for i in d.checklist if "did not run" in i.label]
+    # D2 #6 added a third angle (silent-failure lens).
+    assert len(notes) == 3 and all(i.passed for i in notes)
+
+
+def test_angle_prompt_warns_when_the_diff_is_truncated():
+    """B2 #20: angles run single-turn with no tools, so a _DIFF_CAP-truncated
+    diff is all they see. They must be TOLD it is partial, or a PASS silently
+    means 'the whole change is clean' when it only saw the head."""
+    from no_human.review.reviewer import _build_angle_prompt
+
+    t = Task.new("big change", repo_path="/r")
+    t.acceptance_criteria = []
+    # A visible slice much smaller than the true length → warning present.
+    p = _build_angle_prompt(t, "small visible diff", "SECURITY ONLY",
+                            diff_total_len=200_000)
+    assert "TRUNCATED" in p
+    assert "Judge ONLY the part shown" in p
+
+    # A fully-visible diff → no scary note.
+    diff = "a" * 100
+    p2 = _build_angle_prompt(t, diff, "SECURITY ONLY", diff_total_len=len(diff))
+    assert "TRUNCATED" not in p2
+
+
+# --------------------------------------------------------------------------- #
+# The already-satisfied claim verification mode                                #
+# --------------------------------------------------------------------------- #
+
+def test_already_satisfied_prompt_demands_refuting_each_citation():
+    """The review artifact is the coder's zero-diff claim, not a diff: the
+    reviewer must be told to OPEN every cited file and refute each MET line,
+    with the same parseable REVIEW_JSON verdict contract as the diff gate."""
+    from no_human.review.reviewer import _build_already_satisfied_prompt
+
+    t = Task.new("add retry to fetch")
+    t.acceptance_criteria = ["fetch retries on 5xx"]
+    claim = ("ALREADY-SATISFIED\n"
+             "CRITERION: fetch retries on 5xx — MET — evidence: src/fetcher.py:42\n")
+    p = _build_already_satisfied_prompt(t, claim)
+    assert "src/fetcher.py:42" in p          # the claim rides in the prompt
+    assert "fetch retries on 5xx" in p       # criteria present
+    assert "REVIEW_JSON_START" in p          # same parseable verdict contract
+    assert "REFUTE" in p                     # adversarial stance
+    assert "Do NOT modify any files" in p    # read-only tools
+    assert "NO code changes" in p            # the zero-diff framing is explicit
+
+
+async def test_review_mode_already_satisfied_routes_the_claim(simple_repo):
+    """mode='already_satisfied' must reach the multi-turn agent review with the
+    claim as the artifact and return the parsed verdict."""
+    output = _block(True, [
+        {"label": "mul(a,b) returns product", "passed": True,
+         "severity": "low", "evidence": "calc.py:1 defines mul returning a*b"},
+    ])
+
+    prompts: list[str] = []
+
+    class CapturingBackend(FakeBackend):
+        async def run(self, prompt, **kwargs):
+            prompts.append(prompt)
+            return await super().run(prompt, **{
+                "cwd": kwargs.get("cwd"), "max_turns": kwargs.get("max_turns"),
+                "effort": kwargs.get("effort"), "on_event": kwargs.get("on_event"),
+            })
+
+    reviewer = AdversarialReviewer(backend=CapturingBackend(output))
+    t = Task.new("add mul()")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    claim = ("ALREADY-SATISFIED\n"
+             "CRITERION: mul(a,b) returns product — MET — evidence: calc.py:1\n")
+    decision = await reviewer.review(
+        t, repo_path=simple_repo, mode="already_satisfied", claim_report=claim)
+    assert decision.passed is True
+    assert prompts and "ALREADY-SATISFIED" in prompts[0]
+    assert "calc.py:1" in prompts[0]
+
+
+async def test_already_satisfied_refutation_of_a_fabricated_citation_blocks(simple_repo):
+    """PR #101 review CRITICAL: in claim mode the citation-demotion rule
+    inverts — a reviewer refuting a FABRICATED citation names the nonexistent
+    path, and demoting that refutation passes the fabricated claim. Claim mode
+    must not demote on citation existence."""
+    output = _block(False, [
+        {"label": "fetch retries on 5xx", "passed": False, "severity": "critical",
+         "evidence": "src/retry_helper.py does not exist — the citation is fiction",
+         "file": "src/retry_helper.py", "line": 42},
+    ])
+    reviewer = AdversarialReviewer(backend=FakeBackend(output))
+    t = Task.new("add retry")
+    t.acceptance_criteria = ["fetch retries on 5xx"]
+    claim = ("ALREADY-SATISFIED\n"
+             "CRITERION: fetch retries on 5xx — MET — evidence: src/retry_helper.py:42\n")
+    decision = await reviewer.review(
+        t, repo_path=simple_repo, mode="already_satisfied", claim_report=claim)
+    assert decision.passed is False
+    assert not decision.demoted_citations
+
+
+def test_already_satisfied_prompt_is_not_diff_shaped():
+    """PR #101 review NIT: the shared verdict format speaks of diff headers and
+    diff sides — incoherent for a diff-less mode and it feeds the demotion trap."""
+    from no_human.review.reviewer import _build_already_satisfied_prompt
+    t = Task.new("add retry")
+    t.acceptance_criteria = ["x"]
+    p = _build_already_satisfied_prompt(t, "ALREADY-SATISFIED\nCRITERION: x — MET — evidence: a.py:1")
+    assert "REVIEW_JSON_START" in p
+    assert "diff header" not in p and "side of the diff" not in p

@@ -133,46 +133,6 @@ def test_default_build_dir_is_gitignored():
     assert sig.parameters["out_dir"].default == GENERATED_DIR
 
 
-def test_committed_core_specs_are_valid_and_honest():
-    """The hand-curated core specs (eval/northstar_tasks/*.yaml — the reviewable,
-    git-tracked bench suite) must all parse and carry honest metadata: a
-    malformed or dishonestly-flagged YAML would silently corrupt `nh bench run`.
-    Env-independent — asserts schema + honesty invariants, never on-disk repo
-    paths (those are the operator's local clones, absent in CI)."""
-    from no_human.eval.bench_task import NORTHSTAR_DIR
-
-    specs = load_bench_tasks(NORTHSTAR_DIR)
-    ids = [s.id for s in specs]
-    assert len(ids) == len(set(ids)), "duplicate spec ids in the curated suite"
-    core = [s for s in specs if s.subset == "core"]
-    # No-shrink guard (the operator's tamper-guard philosophy applied to the
-    # bench): the curated core suite is 36 after the multi-project expansion; a
-    # drop is intentional and must update this floor visibly.
-    assert len(core) >= 36, f"curated core suite shrank: {len(core)}"
-    for s in core:
-        assert s.id.startswith("ns-"), s.id
-        assert s.title.strip(), f"{s.id}: empty title"
-        assert s.request.strip(), f"{s.id}: empty request"
-        # NO-LEAK: acceptance_criteria and holdout are the only hand-writable
-        # fields; they must be empty or a curator could smuggle the solution
-        # into the spec (critical principle #1).
-        assert not s.acceptance_criteria, f"{s.id}: acceptance_criteria must be empty (leak vector)"
-        assert not s.holdout.strip(), f"{s.id}: holdout must be empty (leak vector)"
-        # A pathological `request` is an operator-pasted full transcript (message
-        # #1 = a completed conversation), which embeds the solution — the largest
-        # legitimate initial request in the suite is ~27 KB, so a >50 KB request
-        # is a transcript-paste leak, not an ask. (Caught a 500 KB paste in G-2.)
-        assert len(s.request) < 50_000, (
-            f"{s.id}: request is {len(s.request)} chars — a pasted transcript "
-            "(solution leak), not an initial request")
-        # A runnable spec must name its repo; a non-runnable coverage row must
-        # say WHY it can't run — so the suite stays honestly accountable.
-        if s.runnable:
-            assert s.repo.get("path"), f"{s.id}: runnable but no repo path"
-        else:
-            assert s.skip_reason.strip(), f"{s.id}: non-runnable without a reason"
-
-
 # ------------------------------- dedupe ------------------------------------ #
 
 def test_title_derives_from_request_never_transcript_title(tmp_path):

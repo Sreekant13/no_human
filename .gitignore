@@ -21,6 +21,10 @@ secrets/
 
 # Test scratch
 /tmp_e2e/
+# pytest's node-id cache stores collected test names verbatim, so it carries
+# whatever the test bodies spell. It was NOT ignored — only `__pycache__/` and
+# `*.py[oc]` were — so a `git add -A` after a test run could have tracked it.
+.pytest_cache/
 
 # IDE-generated (skills, local settings)
 .claude/

@@ -70,7 +70,7 @@ def html_list_items(value: str | None) -> list[str]:
 
 
 def dv(field: Any) -> str:
-    """Read a Acme field that may be a {value, display_value} dict or scalar."""
+    """Read a tracker field that may be a {value, display_value} dict or scalar."""
     if isinstance(field, dict):
         return str(field.get("display_value") or field.get("value") or "")
     return "" if field is None else str(field)
