@@ -19,8 +19,18 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from ..blockers import Blocker, BlockerCategory, BlockerOption
+from ..blockers import Blocker, BlockerCategory, BlockerOption, is_plan_approval_action
 from .task import Task, TaskStatus
+
+
+class PlanNotApproved(RuntimeError):
+    """Raised where code would be written for a task whose gate is unapproved.
+
+    The gate is enforced at the head of the orchestrator's attempt loop, on
+    every route into it. This is the backstop at the one place that actually
+    spends an implementation session, so a future route that reaches it
+    without passing the gate fails loudly in a test instead of opening a PR.
+    """
 
 # The per-task option key. It lives on ``task.config`` because that is where
 # every other per-task, human-only override already lives (`nh task config`,
@@ -41,6 +51,7 @@ STATE_APPROVED = "approved"
 MAX_REPLANS = 1
 
 APPROVE_LABEL = "Approve the plan - start implementing"
+STOP_LABEL = "Stop the task - keep it parked as it is"
 _NO_PLAN = (
     "No plan was produced (planning is disabled for this run, or the planner "
     "assessed the task as a one-line change). Approve to implement without a "
@@ -62,9 +73,23 @@ def state(task: Task) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def awaiting(task: Task) -> bool:
-    """True while a human still owes this task an approve-or-correct."""
-    return state(task).get("state") in (STATE_AWAITING, STATE_CORRECTING)
+def at_gate(task: Task) -> bool:
+    """True when the task's LIVE blocker is this gate — i.e. the question the
+    human is answering right now is "approve this plan?".
+
+    Read off the blocker, never off ``context["plan_approval"]["state"]``.
+    Nothing ever cleared that state, so a stale ``awaiting`` re-routed a later,
+    UNRELATED answer ("which db?", mid-implementation) back into PLANNING and
+    threw away the WIP sha with it. The blocker is replaced wholesale on every
+    park, so it cannot go stale: the routing becomes self-cleaning and no
+    resume route has to remember to clear anything.
+    """
+    options = (task.blocker or {}).get("options") or []
+    return any(
+        is_plan_approval_action(o.get("action"))
+        for o in options
+        if isinstance(o, dict)
+    )
 
 
 def approved(task: Task) -> bool:
@@ -86,9 +111,18 @@ def can_replan(task: Task) -> bool:
     return replans_used(task) < MAX_REPLANS
 
 
-def pending_correction(task: Task) -> bool:
-    """True when a correction reply is waiting to be acted on."""
-    return state(task).get("state") == STATE_CORRECTING and bool(correction(task))
+def correcting(task: Task) -> bool:
+    """True when a human's correction is waiting to be re-planned.
+
+    Keyed on the STATE alone, never on the correction TEXT. The writer (the
+    reply paths) and the claimer disagreed about what counted as a correction:
+    a blank answer wrote ``state=correcting, correction=""``, which no seam
+    picked up, so the task sat in PLANNING with no worker and 409'd every
+    further reply — until a restart converted the strand into a gate bypass.
+    Blank answers are now rejected at both boundaries as well, but this
+    predicate no longer depends on that holding.
+    """
+    return state(task).get("state") == STATE_CORRECTING
 
 
 def park_patch(task: Task, plan_text: str) -> dict[str, Any]:
@@ -110,7 +144,14 @@ def reply_patch(task: Task, *, approve: bool, answer: str) -> dict[str, Any]:
     """The ``plan_approval`` context value written by a reply at the gate."""
     if approve:
         return {"state": STATE_APPROVED, "approved_at": _now(), "correction": None}
-    return {"state": STATE_CORRECTING, "correction": answer, "corrected_at": _now()}
+    # `approved_at: None` deletes (RFC 7396). Two replies can race — an approve
+    # and a correction, both landing while the gate blocker is live — and the
+    # merge is last-writer-wins on `state`. Whichever order they land in, the
+    # gate itself holds (a correction leaves it un-approved; an approve is a
+    # human's own approval), but a correcting record that still carried an
+    # `approved_at` read as both at once.
+    return {"state": STATE_CORRECTING, "correction": answer,
+            "corrected_at": _now(), "approved_at": None}
 
 
 def replan_patch(task: Task) -> dict[str, Any]:
@@ -122,10 +163,10 @@ def resume_status(task: Task, *, approve: bool) -> TaskStatus:
     """Where a reply resumes this task to.
 
     IMPLEMENTING for every reply the product has ever handled; PLANNING only
-    for a correction at an un-approved plan gate, which must re-plan before it
-    is allowed to spend an implementation session.
+    for a correction given at a LIVE plan gate (`at_gate`), which must re-plan
+    before it is allowed to spend an implementation session.
     """
-    if awaiting(task) and not approve:
+    if at_gate(task) and not approve:
         return TaskStatus.PLANNING
     return TaskStatus.IMPLEMENTING
 
@@ -146,6 +187,13 @@ def build_blocker(task: Task, plan_text: str, *, capped: bool = False) -> Blocke
         )
     else:
         question = _NO_PLAN
+    options = [BlockerOption(label=APPROVE_LABEL, action={"approve_plan": True})]
+    if capped:
+        # The capped question tells the human to "stop the task" and used to
+        # ship no way to do it. `{"park": true}` is the existing terminal verb
+        # (`is_terminal_action`): it records the answer and leaves the task
+        # parked as-is, stamped `human_stopped` so the wake sweep cannot undo it.
+        options.append(BlockerOption(label=STOP_LABEL, action={"park": True}))
     return Blocker(
         category=BlockerCategory.AMBIGUITY,
         transient=False,
@@ -157,7 +205,7 @@ def build_blocker(task: Task, plan_text: str, *, capped: bool = False) -> Blocke
         ),
         evidence=plan_text or "(no plan produced)",
         question=question,
-        options=[BlockerOption(label=APPROVE_LABEL, action={"approve_plan": True})],
+        options=options,
     )
 
 

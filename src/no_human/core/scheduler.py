@@ -260,9 +260,12 @@ class Scheduler:
         # it must be re-planned before a token is spent implementing it. That
         # status is otherwise mid-run-only, so it is claimed here on the one
         # marker a live planning worker can never carry: a correction a human
-        # left on a parked task (`plan_gate.pending_correction`).
+        # left on a parked task (`plan_gate.correcting` — keyed on the STATE,
+        # never on the correction text: a blank answer used to write the state
+        # with empty text, which this claim missed and the orphan sweep below
+        # then turned into a gate bypass).
         for t in await self.store.list_tasks(TaskStatus.PLANNING):
-            if t.id not in self._inflight and plan_gate.pending_correction(t):
+            if t.id not in self._inflight and plan_gate.correcting(t):
                 out.append(t)
         return out
 
@@ -286,7 +289,7 @@ class Scheduler:
                 # plan correction on it is WAITING to be re-planned, and
                 # requeueing it as IMPLEMENTING would spend the run on the
                 # very plan they rejected. `_claimable` picks it up instead.
-                if plan_gate.pending_correction(t):
+                if plan_gate.correcting(t):
                     continue
                 await self.store.set_status(
                     t, TaskStatus.IMPLEMENTING, validate=False)
