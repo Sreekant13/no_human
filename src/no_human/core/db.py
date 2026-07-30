@@ -546,17 +546,40 @@ class Store:
         row = await cur.fetchone()
         return int(row["n"]) if row else 0
 
+    # The four model tiers the attempts table meters, and the three token
+    # columns each one carries. `eval/northstar.py` already sums exactly this
+    # set to report cost; the budget gate below now matches it, so the two can
+    # no longer disagree about what a task spent.
+    _USAGE_TIERS = ("", "review_", "plan_", "utility_")
+
+    @classmethod
+    def _usage_columns(cls) -> tuple[str, ...]:
+        cols: list[str] = []
+        for tier in cls._USAGE_TIERS:
+            cols.append("tokens_used" if tier == "" else f"{tier}tokens_used")
+            cols.append(f"{tier}cache_read_tokens")
+            cols.append(f"{tier}cache_creation_tokens")
+        return tuple(cols)
+
     async def lifetime_usage(self, task_id: str) -> tuple[int, int]:
         """(attempts, tokens) spent over the task's WHOLE life, resumes included.
 
-        Tokens = in/out + cache reads — cache reads are where the real burn
-        lives (93–95% of it), so a budget that ignored them would be theater.
+        Tokens = everything the attempt metered: in/out, cache reads AND cache
+        creation, across all four model tiers (coder, reviewer, planner,
+        utility). Cache reads are where the bulk of the burn lives (~83%), but
+        this used to sum ONLY the coder's ``tokens_used + cache_read_tokens``
+        — 2 of 12 columns. The gate was therefore blind to every reviewer,
+        planner and utility token, and to cache creation everywhere. Measured
+        over 574 real attempt rows that blind spot is 16.2% of true spend, and
+        a task whose burn was mostly reviewer or utility could never trip the
+        cap at all. Cache creation is billed, so a spend gate must count it.
+
         Interrupted/killed rows count: they spent the attempt even if their
         token columns under-report (pre-1638427 rows recorded zero).
         """
+        summed = " + ".join(f"COALESCE({c}, 0)" for c in self._usage_columns())
         cur = await self.db.execute(
-            "SELECT COUNT(*) AS n, "
-            "COALESCE(SUM(COALESCE(tokens_used, 0) + COALESCE(cache_read_tokens, 0)), 0) AS toks "
+            f"SELECT COUNT(*) AS n, COALESCE(SUM({summed}), 0) AS toks "
             "FROM attempts WHERE task_id = ?",
             (task_id,),
         )

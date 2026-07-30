@@ -104,14 +104,34 @@ def test_budget_ceiling_is_scoped_to_the_running_task(store, tmp_path):
     orch._agent_sink(ev, role=CODER_ROLE)  # must not raise
 
 
-def test_cache_creation_does_not_count_toward_the_cap(store, tmp_path):
-    """The lifetime ledger (db.lifetime_usage) counts in/out + cache READS; the
-    running total must count the same things or the two gates disagree."""
+def test_cache_creation_counts_toward_the_cap(store, tmp_path):
+    """The running total must count what the lifetime ledger counts, or the two
+    gates disagree.
+
+    This assertion was INVERTED until db.lifetime_usage was corrected: it
+    required a 5,000-token cache-creation burn against a 1,000 ceiling NOT to
+    abort, pinning the very blind spot that let cache creation — a billed
+    bucket, 16.2% of true spend once the reviewer/planner/utility tiers are
+    included — accumulate unwatched. Same intent as before, now anchored to a
+    ledger that counts all twelve columns.
+    """
     orch = _orch(store, tmp_path)
     orch._active_task_id = "task-1"
     orch._begin_attempt_accounting("task-1", remaining_tokens=1_000)
     ev = AgentEvent("usage", meta={"tokens_used": 100, "cache_read_tokens": 0,
                                    "cache_creation_tokens": 5_000})
+    with pytest.raises(BudgetAbort):
+        orch._agent_sink(ev, role=CODER_ROLE)
+
+
+def test_spend_below_the_ceiling_still_does_not_abort(store, tmp_path):
+    """The counterpart: counting more buckets must not make the watch
+    trigger-happy — under the ceiling is still under the ceiling."""
+    orch = _orch(store, tmp_path)
+    orch._active_task_id = "task-1"
+    orch._begin_attempt_accounting("task-1", remaining_tokens=10_000)
+    ev = AgentEvent("usage", meta={"tokens_used": 100, "cache_read_tokens": 200,
+                                   "cache_creation_tokens": 300})
     orch._agent_sink(ev, role=CODER_ROLE)  # must not raise
 
 
