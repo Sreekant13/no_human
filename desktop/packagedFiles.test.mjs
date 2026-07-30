@@ -116,3 +116,55 @@ test("the frozen server is actually shipped as extraResources", () => {
   assert.match(srv, /"nh-server",\s*"nh"/,
     "bundledNhPath no longer matches the extraResources destination");
 });
+
+// --------------------------------------------------------------------------
+// Operator decision D1 (2026-07-30): src/no_human/ci_gate/ - the glab/kubectl/
+// metrics-core post-PR gate built one customer deep - does not ship. It stays in
+// this repo for internal use, so nothing in the source tree signals the
+// restriction; only the three build files below carry it, and each one is
+// silent on its own when it drifts. A DMG built on 2026-07-30 shipped all five
+// ci_gate modules as frozen bytecode.
+const repoRoot = path.join(here, "..");
+const readRepo = (rel) => fs.readFileSync(path.join(repoRoot, rel), "utf8");
+
+test("ci_gate still exists in the source tree, so the exclusions are live", () => {
+  // Guard the guard: once ci_gate leaves the tree the three tests below assert
+  // nothing, and a green run would mean the opposite of what it looks like.
+  assert.ok(fs.existsSync(path.join(repoRoot, "src", "no_human", "ci_gate")),
+    "src/no_human/ci_gate is gone - the exclusion guards below now pass " +
+    "vacuously; retire them along with the module");
+});
+
+test("the PyInstaller spec excludes no_human.ci_gate from the freeze", () => {
+  const spec = readRepo("packaging/nh-server.spec");
+  const m = spec.match(/excludes\s*=\s*\[([\s\S]*?)\]/);
+  assert.ok(m, "nh-server.spec has no excludes= list - this guard has gone blind");
+  assert.match(m[1], /["']no_human\.ci_gate["']/,
+    "nh-server.spec no longer excludes no_human.ci_gate - PyInstaller follows " +
+    "the lazy import in blockers/wake.py and freezes the package into the PYZ " +
+    "the DMG ships");
+});
+
+test("the wheel build excludes src/no_human/ci_gate", () => {
+  const toml = readRepo("pyproject.toml");
+  const table = toml.split(/^\[/m)
+    .find((t) => t.startsWith("tool.hatch.build.targets.wheel]"));
+  assert.ok(table, "pyproject.toml has no [tool.hatch.build.targets.wheel] table");
+  assert.match(table, /exclude\s*=\s*\[[^\]]*["']src\/no_human\/ci_gate["']/,
+    "the wheel target no longer excludes src/no_human/ci_gate - packages = " +
+    '["src/no_human"] takes the whole tree, ci_gate included');
+});
+
+test("the installer build fails when ci_gate reaches the frozen output", () => {
+  const sh = readRepo("packaging/build-installer.sh");
+  const at = sh.indexOf("FAIL: no_human.ci_gate is frozen into the bundle");
+  assert.ok(at > 0,
+    "build-installer.sh no longer fails the build on a frozen ci_gate - the " +
+    "spec exclude becomes an unchecked claim");
+  assert.match(sh.slice(at, at + 300), /exit 1/,
+    "the ci_gate check reports but does not stop the build");
+  assert.match(sh, /PYZ-\*\.toc/,
+    "the check must read PyInstaller's own module table - the PYZ is " +
+    "zlib-compressed, so searching the bundle for the name reads clean while " +
+    "the module sits inside it");
+});

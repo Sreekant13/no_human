@@ -42,4 +42,22 @@ sql_count="$(find "${BUNDLE}/migrations" -name '*.sql' | wc -l | tr -d ' ')"
 test "${sql_count}" -gt 0 || {
   echo "FAIL: no migrations in ${BUNDLE}/migrations" >&2; exit 1; }
 
-echo "OK: ${BUNDLE} ($(du -sh "${BUNDLE}" | cut -f1)), 0 .py files"
+# no_human.ci_gate is the glab/kubectl/metrics-core post-PR gate written for one
+# employer's pipeline and must not ship (operator decision D1, 2026-07-30).
+# nh-server.spec excludes it; this is the check that the exclusion took, since
+# a new import elsewhere pulls the package back into the freeze silently.
+# Searching the bundle for the name cannot do this job: pure modules live in
+# the zlib-compressed PYZ, so the string is absent from the bytes while the
+# module is inside. PyInstaller's own module table is the readable inventory.
+pyz_toc="$(find "${OUT}/.work/nh-server" -name 'PYZ-*.toc' | head -1)"
+test -n "${pyz_toc}" || {
+  echo "FAIL: no PYZ table under ${OUT}/.work/nh-server - cannot read what was frozen" >&2
+  exit 1; }
+gate_modules="$(grep -o 'no_human\.ci_gate[A-Za-z0-9_.]*' "${pyz_toc}" | sort -u || true)"
+if [ -n "${gate_modules}" ]; then
+  echo "FAIL: no_human.ci_gate is frozen into the bundle (D1: it must not ship)" >&2
+  echo "${gate_modules}" >&2
+  exit 1
+fi
+
+echo "OK: ${BUNDLE} ($(du -sh "${BUNDLE}" | cut -f1)), 0 .py files, no ci_gate"

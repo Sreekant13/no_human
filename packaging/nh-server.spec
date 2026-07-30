@@ -50,9 +50,18 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # Trimming the test/build toolchain a friend never runs.
+    # Trimming the test/build toolchain a friend never runs, plus one product
+    # package that must not leave this repo: `no_human.ci_gate` is the
+    # glab/kubectl/metrics-core post-PR gate, written for one employer's pipeline
+    # (operator decision D1, 2026-07-30). It stays in the source tree for
+    # internal use and is excluded here instead. blockers/wake.py imports it
+    # lazily inside a try/except that logs and returns None, and nothing else
+    # imports the package, so the frozen server runs with the rung disabled.
+    # Excluding the package drops its submodules with it (PyInstaller resolves
+    # `no_human.ci_gate.gate` through the excluded parent).
     excludes=["pytest", "pytest_asyncio", "pytest_xdist", "playwright",
-              "tkinter", "PyInstaller"],
+              "tkinter", "PyInstaller",
+              "no_human.ci_gate"],
     noarchive=False,
     optimize=0,
 )
