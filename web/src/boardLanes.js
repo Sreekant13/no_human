@@ -55,6 +55,15 @@ export function routeTask(task) {
 
 // "blocked" routes dynamically: WITH a wake_condition it self-resolves → Working
 // (shown as parked on the card); WITHOUT, a human must act → Needs Answer.
+//
+// The split is on TRUTHINESS, deliberately, so "" routes like absent. The two
+// languages' falsy sets are NOT the same: [] and {} are truthy here and FALSY in
+// core/lanes.py, so a wake condition of [] would route to Working here and to
+// Needs Answer there. Unreachable today — the field is typed
+// `blocker_wake_condition: str | None` on TaskSummaryOut and pydantic rejects a
+// list or a dict before routing sees it, which is why the shared fixture carries
+// no such case. Widen that field and the two implementations diverge; add the
+// case to testdata/lane_conformance.json if you ever do.
 export function computeLane(task) {
   if (task?.status === "blocked") {
     return task.blocker_wake_condition ? "working" : "answer";
@@ -81,6 +90,16 @@ const NEEDS_YOU_LANES = new Set(LANES.filter((l) => l.needsYou).map((l) => l.key
 // board uses. A status-only set drifted from the lanes (blocked-without-wake
 // sits in Needs Answer but a status set missed it, so the header said "6 need
 // you" while the lanes showed 7). Count, badge, and notifications all use this.
+//
+// BLAST RADIUS, now that routeTask prefers a SERVED lane: isNeedsYou routes
+// through routeTask, so a wrong `lane` on the payload can SILENCE "N need you"
+// for a PR genuinely waiting on a human — the count, the badge, and the
+// notification all go quiet together. That was impossible while routing was
+// purely local: the worst a bad server field could do was mislabel a column.
+// The design is still right (one definition beats two), but the server value is
+// now load-bearing for an alert, not just for a label — which is why the
+// conformance fixture and the bogus-lane fallback in routeTask exist, and why
+// TaskSummaryOut.lane defaults to None rather than to any real lane key.
 export function isNeedsYou(task) {
   // B2 #19: an APPROVED PR still sits in awaiting_approval until the merge
   // lands — it is not waiting on you any more, so it must stop shouting in

@@ -78,6 +78,16 @@ def lane_for(task: Any) -> str:
     sits in Working (parked, see :func:`is_waiting`); WITHOUT one a human must
     act, so it goes to Needs Answer. Every other status routes off
     :data:`LANE_STATUSES`, and anything unrecognised falls back to Working.
+
+    The wake-condition split is on TRUTHINESS, deliberately, so ``""`` routes
+    like absent. Note that Python's and JS's falsy sets are not the same: ``[]``
+    and ``{}`` are falsy here and TRUTHY in ``boardLanes.js``, so a wake
+    condition of ``[]`` would route to Needs Answer in Python and to Working in
+    the JS. This is unreachable today - the field is
+    ``TaskSummaryOut.blocker_wake_condition: str | None``, and pydantic rejects
+    a list or a dict before routing sees it, which is why the conformance
+    fixture carries no such case. If that field ever widens beyond ``str |
+    None``, the two languages diverge and the shared fixture must gain the case.
     """
     status = _status_of(task)
     if status == _BLOCKED:
