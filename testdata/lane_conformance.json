@@ -1,0 +1,173 @@
+{
+  "note": "Shared lane-routing fixtures. Read by BOTH tests/test_lane_conformance.py (no_human.core.lanes) and web/src/laneConformance.test.mjs (web/src/boardLanes.js) so the two implementations cannot drift apart silently. Every value of TaskStatus (src/no_human/core/task.py) must appear in at least one case - the Python test enforces that.",
+  "cases": [
+    {
+      "name": "pending",
+      "task": { "id": "t-pending", "status": "pending" },
+      "lane": "working",
+      "waiting": false
+    },
+    {
+      "name": "context",
+      "task": { "id": "t-context", "status": "context" },
+      "lane": "working",
+      "waiting": false
+    },
+    {
+      "name": "planning",
+      "task": { "id": "t-planning", "status": "planning" },
+      "lane": "working",
+      "waiting": false
+    },
+    {
+      "name": "implementing",
+      "task": { "id": "t-implementing", "status": "implementing" },
+      "lane": "working",
+      "waiting": false
+    },
+    {
+      "name": "reviewing",
+      "task": { "id": "t-reviewing", "status": "reviewing" },
+      "lane": "working",
+      "waiting": false
+    },
+    {
+      "name": "testing",
+      "task": { "id": "t-testing", "status": "testing" },
+      "lane": "working",
+      "waiting": false
+    },
+    {
+      "name": "compound_parent",
+      "task": { "id": "t-compound", "status": "compound_parent" },
+      "lane": "working",
+      "waiting": false
+    },
+    {
+      "name": "implementing with a stale wake condition still routes on status",
+      "task": { "id": "t-impl-wake", "status": "implementing", "blocker_wake_condition": "ci_green_on:main" },
+      "lane": "working",
+      "waiting": false
+    },
+    {
+      "name": "awaiting_approval gets its own Review PR lane",
+      "task": { "id": "t-approval", "status": "awaiting_approval" },
+      "lane": "review",
+      "waiting": false
+    },
+    {
+      "name": "an approved PR keeps its Review lane until the merge lands",
+      "task": { "id": "t-approved", "status": "awaiting_approval", "approved_at": "2026-07-15T00:00:00Z" },
+      "lane": "review",
+      "waiting": false
+    },
+    {
+      "name": "awaiting_input",
+      "task": { "id": "t-input", "status": "awaiting_input" },
+      "lane": "answer",
+      "waiting": false
+    },
+    {
+      "name": "escalated",
+      "task": { "id": "t-escalated", "status": "escalated" },
+      "lane": "answer",
+      "waiting": false
+    },
+    {
+      "name": "escalated routes to Needs Answer even WITH a wake condition",
+      "task": { "id": "t-escalated-wake", "status": "escalated", "blocker_wake_condition": "ci_green_on:main" },
+      "lane": "answer",
+      "waiting": false
+    },
+    {
+      "name": "PRESERVED DEFECT: a terminally-answered escalation stays in Needs Answer",
+      "task": { "id": "t-escalated-stopped", "status": "escalated", "blocker_human_stopped": true },
+      "lane": "answer",
+      "waiting": false
+    },
+    {
+      "name": "PRESERVED DEFECT: a terminally-answered awaiting_input stays in Needs Answer",
+      "task": { "id": "t-input-stopped", "status": "awaiting_input", "blocker_human_stopped": true },
+      "lane": "answer",
+      "waiting": false
+    },
+    {
+      "name": "blocked without a wake condition needs a human",
+      "task": { "id": "t-blocked", "status": "blocked" },
+      "lane": "answer",
+      "waiting": false
+    },
+    {
+      "name": "blocked with a null wake condition needs a human",
+      "task": { "id": "t-blocked-null", "status": "blocked", "blocker_wake_condition": null },
+      "lane": "answer",
+      "waiting": false
+    },
+    {
+      "name": "blocked with an EMPTY wake condition needs a human (falsy, not just absent)",
+      "task": { "id": "t-blocked-empty", "status": "blocked", "blocker_wake_condition": "" },
+      "lane": "answer",
+      "waiting": false
+    },
+    {
+      "name": "blocked with a wake condition self-resolves into Working, parked",
+      "task": { "id": "t-blocked-wake", "status": "blocked", "blocker_wake_condition": "ci_green_on:main" },
+      "lane": "working",
+      "waiting": true
+    },
+    {
+      "name": "PRESERVED DEFECT: a human-stopped blocked task stays in Needs Answer",
+      "task": { "id": "t-blocked-stopped", "status": "blocked", "blocker_human_stopped": true },
+      "lane": "answer",
+      "waiting": false
+    },
+    {
+      "name": "a human-stopped blocked task WITH a wake condition still routes on the wake condition",
+      "task": { "id": "t-blocked-stopped-wake", "status": "blocked", "blocker_wake_condition": "pr_mergeable", "blocker_human_stopped": true },
+      "lane": "working",
+      "waiting": true
+    },
+    {
+      "name": "paused_quota sits in Working, parked on its own signal",
+      "task": { "id": "t-quota", "status": "paused_quota" },
+      "lane": "working",
+      "waiting": true
+    },
+    {
+      "name": "done",
+      "task": { "id": "t-done", "status": "done" },
+      "lane": "done",
+      "waiting": false
+    },
+    {
+      "name": "failed",
+      "task": { "id": "t-failed", "status": "failed" },
+      "lane": "failed",
+      "waiting": false
+    },
+    {
+      "name": "a cancelled task still routes to Failed",
+      "task": { "id": "t-cancelled", "status": "failed", "cancelled": true },
+      "lane": "failed",
+      "waiting": false
+    },
+    {
+      "name": "an unknown status falls back to Working, never lost",
+      "task": { "id": "t-unknown", "status": "some_new_state" },
+      "lane": "working",
+      "waiting": false
+    },
+    {
+      "name": "a null status falls back to Working",
+      "task": { "id": "t-null-status", "status": null },
+      "lane": "working",
+      "waiting": false
+    },
+    {
+      "name": "a task with no status field at all falls back to Working",
+      "task": { "id": "t-no-status" },
+      "lane": "working",
+      "waiting": false
+    }
+  ]
+}

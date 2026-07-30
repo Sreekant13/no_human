@@ -35,14 +35,32 @@ export const LANES = [
 export const BOARD_LANES = LANES.filter((l) => !l.outcome);
 export const OUTCOME_LANES = LANES.filter((l) => l.outcome);
 
+const LANE_KEYS = new Set(LANES.map((l) => l.key));
+
+// The lane DECISION now lives server-side, in src/no_human/core/lanes.py, and
+// arrives on the task payload as `lane`. This file keeps the PRESENTATION half
+// (labels, order, colours) and prefers what the server said, so the board and a
+// CLI reading the same API cannot disagree — the drift this repo already
+// shipped once (PR-007: correct counts, lying lane label).
+//
+// computeLane stays as the fallback for a payload with no `lane` field: an
+// older server, or a summary built outside the board path (POST /api/tasks).
+// Deleting it is what would make this unsafe to deploy.
+// testdata/lane_conformance.json runs the same cases through both.
+export function routeTask(task) {
+  const served = task?.lane;
+  if (typeof served === "string" && LANE_KEYS.has(served)) return served;
+  return computeLane(task);
+}
+
 // "blocked" routes dynamically: WITH a wake_condition it self-resolves → Working
 // (shown as parked on the card); WITHOUT, a human must act → Needs Answer.
-export function routeTask(task) {
-  if (task.status === "blocked") {
+export function computeLane(task) {
+  if (task?.status === "blocked") {
     return task.blocker_wake_condition ? "working" : "answer";
   }
   for (const lane of LANES) {
-    if (lane.statuses.includes(task.status)) return lane.key;
+    if (lane.statuses.includes(task?.status)) return lane.key;
   }
   return "working";
 }
@@ -52,8 +70,8 @@ export function routeTask(task) {
 // like live work. This is the distinction the old Waiting column carried.
 export function isWaiting(task) {
   return (
-    task.status === "paused_quota" ||
-    (task.status === "blocked" && !!task.blocker_wake_condition)
+    task?.status === "paused_quota" ||
+    (task?.status === "blocked" && !!task.blocker_wake_condition)
   );
 }
 
