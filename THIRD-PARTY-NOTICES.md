@@ -42,7 +42,7 @@ application under this repository's own terms:
 > files into combinations with other programs, and to distribute those
 > combinations without any restriction coming from the use of those files. (The
 > General Public License restrictions do apply in other respects; for example,
-> they cover modification of the file, and distribution when not linked into a
+> they cover modification of the files, and distribution when not linked into a
 > combined executable.)"
 
 The bootloader is used unmodified. If it is ever modified, this exception no

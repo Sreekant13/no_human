@@ -137,8 +137,8 @@ theme variables, and accessibility logic.
 so neither failure blocks anything today.
 
 On **Node 20** — the version CI pins for this job, and therefore the version you
-are most likely to have installed for it — eslint 10.7.0 dies before it lints
-anything:
+are most likely to have installed for it — eslint 10.7.0 lints fine and then
+dies printing the result:
 
 ```
 ESLint: 10.7.0
@@ -146,24 +146,34 @@ TypeError: util.styleText is not a function
     at .../eslint/lib/cli-engine/formatters/stylish.js:22:9
 ```
 
-`util.styleText` arrived in Node 22. The `stylish` formatter calls it
-unconditionally, so on Node 20 the run crashes while formatting its own output.
+`util.styleText` arrived in Node 22. The `stylish` formatter reaches for it once
+per result it prints, so on Node 20 eslint crashes while formatting its own
+output — but only when it has something to print. On a file with no findings it
+exits 0. That is the worse failure mode of the two: the tool looks fine right up
+to the moment it has a problem to tell you about.
 
-On **Node 22** eslint gets far enough to lint, and then reports the config
-problem underneath:
+On **Node 22** eslint gets far enough to print, and then reports the problem
+underneath:
 
 ```
 web/src/Integrations.jsx
   283:5  error  Definition for rule 'react-hooks/exhaustive-deps' was not found
 ```
 
-`eslint-plugin-react-hooks` is not in `web/package.json`, so
-`web/eslint.config.mjs` names a rule nothing provides.
+`eslint-plugin-react-hooks` is not in `web/package.json`. The config does not
+name that rule either — `web/eslint.config.mjs` enables exactly one, `no-undef`.
+What names it is an `// eslint-disable-next-line react-hooks/exhaustive-deps`
+comment at `web/src/Integrations.jsx:283`, and eslint errors on a disable
+directive for a rule it cannot find.
 
-Fixing this is a welcome PR, but it is two fixes: pin or configure eslint so it
-runs on the Node version this job uses, *and* add the missing plugin (or drop
-the rule). A PR that only does the second still leaves `npm run lint` unusable
-on Node 20.
+Fixing this is a welcome PR, and it is two independent fixes. Adding
+`eslint-plugin-react-hooks` (or deleting the disable comment) clears the error,
+and because the crash only fires when there is a result to format, that alone
+makes `npm run lint` exit 0 on Node 20 today. It does not make it *work* there —
+the next real lint finding brings the crash straight back. So also pin eslint to
+a version whose formatter runs on Node 20, pick a formatter that does not use
+`util.styleText`, or run lint on Node 22 — `npm test` is what needs Node 20 here,
+not lint, and the two do not have to share a runtime.
 
 ### Desktop shell
 
@@ -249,7 +259,8 @@ npm run e2e       # the live-flows suite needs a server on :8420
 5. Open the PR against `main` and fill in the template.
 6. The maintainer reviews and merges. There is no auto-merge on this repo.
 
-CI runs the Python, web, and desktop suites on every push and pull request. It
+CI runs the Python, web, and desktop suites on every pull request, and on
+pushes to `main` — not on pushes to a branch that has no PR open yet. It
 runs nothing that needs a credential, a model API call, or a push to a real
 repository.
 

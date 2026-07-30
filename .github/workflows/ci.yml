@@ -63,6 +63,11 @@ jobs:
               # Bot accounts (dependabot[bot], github-actions[bot]) hold no
               # copyright, so there is nothing for them to license.
               "$MAINTAINER"|*'[bot]') continue ;;
+              # Never resolve the null-login sentinel to a filename: committing
+              # contributors/unlinked-email.md would otherwise turn this job
+              # green for an author GitHub cannot identify, which is the one
+              # thing the ledger exists to prevent.
+              UNLINKED-EMAIL) missing="${missing} ${author}"; continue ;;
             esac
             handle=$(printf '%s' "$author" | tr '[:upper:]' '[:lower:]')
             if [ ! -f "contributors/${handle}.md" ]; then

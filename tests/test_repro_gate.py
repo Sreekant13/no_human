@@ -476,7 +476,23 @@ def test_sanity_timeout_bounded_well_under_run_timeout():
 
 
 def test_sanity_reason_strings_are_distinct(tmp_path, monkeypatch):
-    monkeypatch.setattr(repro_gate, "_SANITY_TIMEOUT", 0.3)
+    # The budget below bounds ONE probe (the sleeping one, which is meant to
+    # time out) but is imposed on all six, and the other five are real CPython
+    # spawns. At the 0.3s this used to carry, that left 6-10x headroom over a
+    # bare interpreter start on an idle machine and none at all on a busy one:
+    # a probe that overran returned the *timeout* reason instead of its own,
+    # six distinct strings collapsed to five, and this assertion failed —
+    # never on an idle machine, about half the time under CPU saturation,
+    # which is exactly what `-n 4` on a 2-4 vCPU CI runner is. Distinctness
+    # never needed a tight budget, so give the five honest probes room and
+    # push the sleep far past the bound so the sixth still times out for the
+    # right reason.
+    #
+    # Sized from measurement, not taste: under CPU saturation the slowest
+    # honest probe took 0.379s — it blows a 0.3s budget outright — so 3.0s
+    # leaves about 8x headroom over the worst observed spawn. At 3.0s this
+    # test failed 0/35 under a load that fails it 5/10 at 0.3s.
+    monkeypatch.setattr(repro_gate, "_SANITY_TIMEOUT", 3.0)
     _, r127 = repro_gate._runner_sanity_check(
         _py("import sys; sys.exit(127)"), tmp_path, {})
     _, r126 = repro_gate._runner_sanity_check(
@@ -489,7 +505,7 @@ def test_sanity_reason_strings_are_distinct(tmp_path, monkeypatch):
         _py("import os, signal; os.kill(os.getpid(), signal.SIGKILL)"),
         tmp_path, {})
     _, r_timeout = repro_gate._runner_sanity_check(
-        _py("import time; time.sleep(5)"), tmp_path, {})
+        _py("import time; time.sleep(90)"), tmp_path, {})
     assert len({r127, r126, r_os, r_nonzero, r_signal, r_timeout}) == 6
 
 
