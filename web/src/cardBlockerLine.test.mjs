@@ -4,8 +4,9 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { cardBlockerLine } from "./cardBlockerLine.js";
 
-// Verbatim from the live DB (GET /api/tasks, 2026-08-01): four BUDGET_EXHAUSTED
-// tasks that sat in the Needs You lane at the same time.
+// Four instances of the backend's BUDGET_EXHAUSTED template as it is actually
+// emitted — same cap, different overspend. This is the shape the card has to
+// tell apart; the numbers are the only thing that differs.
 const LIVE = [
   "This task has exhausted its lifetime budget (tokens 15,324,491/12,000,000). Spend more, or stop here?",
   "This task has exhausted its lifetime budget (tokens 12,441,414/12,000,000). Spend more, or stop here?",

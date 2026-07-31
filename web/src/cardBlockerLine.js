@@ -1,17 +1,16 @@
 // The one line a board card shows for a parked task's blocker.
 //
-// Why this exists: BUDGET_EXHAUSTED is by far the most common park (79 of the
-// 91 blockers carrying a question in the live DB), and the backend writes it
-// from a fixed template:
+// Why this exists: BUDGET_EXHAUSTED is the most common park, and the backend
+// writes it from a fixed template (see _park_budget in the bounded loop):
 //
 //   "This task has exhausted its lifetime budget (tokens 15,324,491/12,000,000).
 //    Spend more, or stop here?"
 //
 // Every one of those is byte-identical for the first 47 characters, and the
-// card clamps the text to two lines. Four such cards sat in Needs You together
-// and rendered as four indistinguishable grey paragraphs — the operator could
-// not tell which task had burned 15.3M and which had barely tipped over 12M
-// without opening each drawer in turn.
+// card clamps the text to two lines. So a lane holding several of them renders
+// several indistinguishable grey paragraphs: nothing on the card says which
+// task burned far past its cap and which barely tipped over it, short of
+// opening each drawer in turn.
 //
 // So the CARD leads with the number that differs. This is a rendering choice,
 // not a rewrite of the agent's words: the agent's own trailing ask is carried
