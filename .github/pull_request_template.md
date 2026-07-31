@@ -21,7 +21,12 @@ Example:
 - [ ] Test count and assertion count did not go down, or the PR body explains why.
 - [ ] Lockfiles committed if a dependency changed.
 - [ ] Nothing in the diff reads or writes a credential inside the repo.
-- [ ] This does not conflict with the constraints in `CLAUDE.md`.
+- [ ] This does not conflict with the project's standing constraints: the
+      agent never merges (it opens a PR and stops; merge is a human action),
+      review stays evidence-based (independent fresh-context reviewer, never
+      a numeric self-scoring gate), and the locally installed product keeps
+      its lean stack (SQLite only, a single Claude backend via the Agent SDK,
+      no extra services).
 - [ ] First PR only: I have read `CLA.md` and added my `contributors/<handle>.md`
       entry to this PR. (Ticking this box is not the record — the file is. CI
       checks for the file.)

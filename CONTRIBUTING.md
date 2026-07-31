@@ -3,9 +3,21 @@
 Thanks for taking the time. This page covers setup, the test suites, the
 conventions the codebase holds to, and how a change gets merged.
 
-Read [`CLAUDE.md`](CLAUDE.md) before you write code. It holds the constraints
-that the project treats as correctness requirements rather than preferences.
-A change that violates one of them will be rejected even if the tests pass.
+Before you write code, know the constraints the project treats as correctness
+requirements rather than preferences. A change that violates one of them will
+be rejected even if the tests pass:
+
+- The agent never merges. It opens a PR and stops; merging is always a human
+  action, and there is no auto-merge anywhere.
+- The stack stays lean: SQLite only, a single Claude backend through the Agent
+  SDK, no vector database.
+- Review is evidence-based — an independent fresh-context reviewer producing a
+  pass/fail checklist with cited evidence. Never a numeric self-score.
+- Only verifiable signals are trusted: a net reduction in test count or
+  assertion count is blocked.
+- Task loops are bounded, and a blocker is never resolved by weakening tests,
+  expanding scope, or faking "done".
+- Credentials are never read from or written to anywhere in the repo.
 
 ## Before you open a PR
 
@@ -232,7 +244,7 @@ npm run e2e       # the live-flows suite needs a server on :8420
 - Python 3.12, standard library first. The dependency list in `pyproject.toml`
   is short on purpose.
 - Do not add to the stack. SQLite only. One Claude backend through the Agent
-  SDK. No vector database. This is written down in `CLAUDE.md` and it is not
+  SDK. No vector database. This is a standing project constraint and it is not
   negotiable in a PR.
 - Tests ship with the module they cover. A PR that adds behaviour and no test
   will be sent back.
