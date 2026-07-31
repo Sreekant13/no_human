@@ -39,7 +39,7 @@ def _finding(content="never push to main", cat="rule", cascade="c1", msg=2):
 
 def _transcript():
     return Transcript(
-        cascade_id="cascade-123", title="Retention Bug", created="2026-06-17",
+        cascade_id="cascade-123", title="Widget Alignment", created="2021-03-04",
         messages=[
             Message("assistant", "I'll take a look.", "STEP"),
             Message("user", "never commit secrets to the repo", "STEP"),

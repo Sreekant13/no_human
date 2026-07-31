@@ -165,17 +165,20 @@ SUPERVISOR_STOP
 
 ### What the Supervisor Can Answer (Replacing the Human)
 
-Based on the conversations you've shown me, the human (you) does these things:
+The interventions a human makes during a task fall into six kinds. These are
+paraphrased shapes, not transcript quotes — the sessions they were derived from
+are private, and a verbatim line is identifying in a way a category is not:
 
-1. **"Why is the description field tiny?"** → UI/UX correction (Supervisor sees
-   the CSS edit result and course-corrects)
-2. **"Did you complete the work?"** → Progress check (Supervisor tracks
-   acceptance criteria completion)
-3. **"You're going down the wrong path"** → Architectural redirect (Supervisor
-   compares approach to rules/skills)
-4. **"Use sed not python3 in CI"** → Rule enforcement (Supervisor has the rules)
-5. **"That scored 9/10, stop"** → Quality gate (Supervisor enforces the
-   never-ship-9/10 rule)
+1. **A UI/UX correction** — the rendered result is wrong in a way the diff did
+   not show (Supervisor sees the edit result and course-corrects)
+2. **A progress check** — "is the work actually finished?" (Supervisor tracks
+   acceptance-criteria completion)
+3. **An architectural redirect** — the approach is wrong, not the code
+   (Supervisor compares the approach to the rules/skills)
+4. **Rule enforcement** — a project- or shop-specific convention the agent
+   ignored (Supervisor has the rules)
+5. **A quality gate** — refusing "nearly done" (Supervisor enforces the
+   never-ship-a-near-miss rule)
 6. **Domain questions** → Supervisor has the confirmed skills/learnings
 
 What the Supervisor CANNOT answer (stays with human):

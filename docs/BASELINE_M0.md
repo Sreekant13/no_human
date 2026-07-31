@@ -82,8 +82,9 @@ total                   13,825,259
 is the reason the dead `_distill_large_chunks` path was never worth fixing: it
 addressed under 1% of the burn.
 
-Cost of this run: **~$620** of a $1000 Claude Enterprise budget. Two bugs since
-fixed inflated it — duplicate execution (`2f2b229`) ran two orchestrators, and
+Cost of this run: a large fraction of a month's Claude budget — the absolute
+figure and the budget it came out of are a third party's procurement detail and
+are not published here. Two bugs since fixed inflated it — duplicate execution (`2f2b229`) ran two orchestrators, and
 the zero-diff bug (`8034df1`) burned four attempts that produced nothing.
 
 ## Derived denominators for later milestones
@@ -115,8 +116,8 @@ gate, review continuity, lifetime budget, and the post-PR CI watch landed.
 attempts_with_pr_url = 4
 ```
 
-PR #531 exists and has passed the gate three times: attempt 21 (first reviewed
-PR in the project's history), attempt 22 (CPS `MethodTooLargeException` fix,
+The PR exists and has passed the gate three times: attempt 21 (first reviewed
+PR in the project's history), attempt 22 (a pipeline-DSL bytecode-limit fix,
 operator-rejected round), attempt 23 (the first fully autonomous post-PR CI
 fix round — the WakeWatcher saw the red Jenkins checks, injected the console
 log, and resumed the coder with no human in the loop).
@@ -127,7 +128,7 @@ log, and resumed the coder with no human in the loop).
 | --- | --- | --- |
 | Attempts | 9 | 23 |
 | Review passes | 0 | 4 (attempts 20–23) |
-| PRs opened | 0 | 1 (PR #531, draft) |
+| PRs opened | 0 | 1 (draft) |
 | Wall clock | 3.09 h | 17.73 h |
 | Events | 865 | 2,645 |
 | Coder cache-read | 13.13 M | 64.32 M |

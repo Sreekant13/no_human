@@ -57,6 +57,6 @@ def test_the_crashing_title_renders():
     from rich.console import Console
     from rich.markup import escape
     import io
-    title = "@[/Users/dev/Downloads/db_issue.csv] go over this splunk"
+    title = "@[/Users/dev/Downloads/db_issue.csv] go over these results"
     c = Console(file=io.StringIO(), force_terminal=False)
     c.print(f"[dim]· ns-cbb81747 {escape(title[:60])}[/]")  # must not raise
