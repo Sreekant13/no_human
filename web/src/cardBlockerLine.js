@@ -27,9 +27,9 @@ import { fmtTokens } from "./cost.js";
 // not laziness — the backend renamed its token unit to "cost-weighted tokens"
 // while this branch was open, and an enumerated `(tokens|attempts)` stopped
 // matching and silently passed the paragraph straight through, which looks
-// exactly like the bug being fixed. A live board carries both spellings at once
-// (45 rows still say "tokens", 2 say "cost-weighted tokens"), so both must work
-// forever, and the next rename must not need a code change here.
+// exactly like the bug being fixed. A board mid-migration carries both
+// spellings at once — rows written before and after the rename — so both must
+// keep working, and the next rename must not need a code change here.
 // cardBlockerLine.test.mjs reads the template out of orchestrator.py and fails
 // if this stops matching it.
 const BUDGET = /^This task has exhausted its lifetime budget \(([a-z][a-z-]*(?: [a-z][a-z-]*)*) ([\d,]+)\s*\/\s*([\d,]+)\)\.\s*(.+)$/;
