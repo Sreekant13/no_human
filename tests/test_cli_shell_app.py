@@ -20,6 +20,7 @@ import sys
 
 import pytest
 from click.testing import CliRunner
+from textual.widgets import RichLog
 
 from no_human.cli import shell as shell_mod
 from no_human.cli.api_client import NhApiError, NhServerUnreachable
@@ -27,6 +28,12 @@ from no_human.cli.commands import cli
 from no_human.cli.shell import ShellApp, run_shell
 
 SIZE = (150, 50)
+
+#: A terminal narrow enough that the right-hand panes are thinner than
+#: `RichLog.min_width` (78). Every layout test above runs at SIZE, where the
+#: conversation pane happens to be ~78 columns wide - which is exactly why the
+#: truncation this file now guards went unnoticed for so long.
+NARROW = (84, 24)
 
 
 def frame(app) -> str:
@@ -134,6 +141,74 @@ async def test_the_shell_mounts_lanes_conversation_and_detail_panes():
     async with app.run_test(size=SIZE):
         for pane in ("#header", "#lanes", "#conversation", "#detail", "#prompt"):
             assert app.query_one(pane) is not None
+
+
+def painted_rows(app, pane: str) -> list[str]:
+    """The rows a terminal would actually PAINT for `pane`.
+
+    A RichLog stores each write as a strip rendered at some width and then
+    CROPS that strip to the visible width on the way to the screen
+    (`RichLog.render_line` -> `Strip.crop_extend`). A line rendered wider than
+    the pane is therefore cut here and nowhere else: `log.lines` still holds
+    the whole sentence, so an assertion on the widget's state would pass while
+    the operator reads half a word. Only the cropped rows tell the truth.
+    """
+    log = app.query_one(pane, RichLog)
+    return [log.render_line(y).text for y in range(log.size.height)]
+
+
+def reflowed(rows: list[str]) -> str:
+    """The painted rows read back as running text, so a sentence split across
+    two rows by word wrap compares equal to the sentence that was written."""
+    return " ".join(" ".join(rows).split())
+
+
+MOUNT_SENTENCE = (
+    "It goes to the same intake grill the board uses. "
+    "/help for the slash commands."
+)
+
+
+async def test_the_mount_text_wraps_onto_a_second_row_on_a_narrow_terminal():
+    """The regression: on an 84-column terminal the two lines that say what
+    this shell IS were cut mid-word ("...in pla" / "...the boar"), because
+    `RichLog.min_width` defaults to 78 and is applied AFTER `shrink` has
+    clamped the render width down to the pane. See shell.py's compose()."""
+    app = make_app(FakeClient([]))
+    async with app.run_test(size=NARROW) as pilot:
+        await pilot.pause()
+        rows = painted_rows(app, "#conversation")
+
+    used = [r for r in rows if r.strip()]
+    assert len(used) >= 3, (
+        "both mount sentences are longer than the pane, so a wrapping "
+        f"conversation pane paints more than two rows; got {used!r}"
+    )
+    text = reflowed(used)
+    assert MOUNT_SENTENCE in text, (
+        f"the mount text was cut instead of wrapped; painted: {used!r}"
+    )
+    assert "say what you want done, in plain English." in text
+
+
+@pytest.mark.parametrize("pane", ["#conversation", "#detail"])
+async def test_a_line_wider_than_the_pane_survives_into_a_second_row(pane):
+    """Not just the mount strings: ANY write wider than the pane has to wrap.
+    Constraining callers to ~40 characters is not a fix, it is a workaround."""
+    long_line = " ".join(f"word{n:02d}" for n in range(20))  # 139 cells
+    app = make_app(FakeClient([]))
+    async with app.run_test(size=NARROW) as pilot:
+        await pilot.pause()
+        app.query_one(pane, RichLog).clear()
+        app.query_one(pane, RichLog).write(long_line)
+        await pilot.pause()
+        rows = painted_rows(app, pane)
+
+    used = [r for r in rows if r.strip()]
+    assert len(used) >= 2, f"{pane} painted one row for a 139-cell line: {used!r}"
+    assert reflowed(used) == long_line, (
+        f"{pane} cut the line instead of wrapping it; painted: {used!r}"
+    )
 
 
 async def test_the_lanes_pane_draws_the_board_columns_in_board_order():

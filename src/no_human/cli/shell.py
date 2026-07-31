@@ -117,14 +117,39 @@ class ShellApp(App):
 
     # -- layout ------------------------------------------------------------- #
 
+    # `min_width=0` on the two RichLogs is load-bearing, not tidying.
+    #
+    # `wrap=True` alone does NOT make a RichLog wrap to its pane. Textual
+    # 8.2.7's `RichLog.write` computes the render width like this:
+    #
+    #     if shrink and renderable_width > scrollable_content_width:
+    #         render_width = min(renderable_width, scrollable_content_width)
+    #     render_width = max(render_width, self.min_width)   # min_width=78
+    #
+    # The `min_width` floor is applied AFTER the shrink, so it undoes it: on an
+    # 84-column terminal these panes are 41 columns of content, the shrink
+    # correctly picks 41, and the floor puts it back to 78. The text really is
+    # wrapped - at 78 - and then `render_line` crops each 78-cell strip to the
+    # 41 visible columns, so the operator reads the first 41 characters of
+    # every line and the rest is gone. It looked like "wrap does nothing"
+    # because the cut lands mid-word exactly where a non-wrapping log would cut.
+    # It was invisible in tests because they run at 150 columns, where these
+    # panes are ~78 wide and the floor never bites.
+    #
+    # Do not "fix" this by keeping written lines under ~40 characters; that
+    # only hides it, and the wrapped width changes with the terminal.
+    # Guarded by test_cli_shell_app.py::
+    #   test_a_line_wider_than_the_pane_survives_into_a_second_row.
     def compose(self) -> ComposeResult:
         yield Static("", id="header")
         with Horizontal(id="body"):
             with VerticalScroll(id="lanes-scroll"):
                 yield Static("", id="lanes")
             with Vertical(id="right"):
-                yield RichLog(id="conversation", markup=True, wrap=True, highlight=False)
-                yield RichLog(id="detail", markup=True, wrap=True, highlight=False)
+                yield RichLog(id="conversation", markup=True, wrap=True,
+                              highlight=False, min_width=0)
+                yield RichLog(id="detail", markup=True, wrap=True,
+                              highlight=False, min_width=0)
         yield Input(placeholder="Say what you want done - or /help", id="prompt")
         yield Footer()
 

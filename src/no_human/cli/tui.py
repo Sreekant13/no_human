@@ -49,7 +49,13 @@ class WatchApp(App):
         yield Header(show_clock=True)
         with Vertical():
             yield Static("", id="status")
-            yield RichLog(id="log", highlight=True, markup=True, wrap=True)
+            # min_width=0 for the same reason as shell.py's panes: RichLog's
+            # min_width floor (78) is applied after `shrink` and undoes it, so
+            # on a terminal under ~80 columns every event line is rendered at
+            # 78 and then cropped mid-word to what fits. See the long comment
+            # above ShellApp.compose.
+            yield RichLog(id="log", highlight=True, markup=True, wrap=True,
+                          min_width=0)
         yield Footer()
 
     def on_mount(self) -> None:
