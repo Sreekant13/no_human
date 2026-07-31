@@ -58,7 +58,39 @@ import logging
 
 log = logging.getLogger("no_human.api")
 
-_WEB_DIST = Path(__file__).resolve().parents[3] / "web" / "dist"
+def _resolve_web_dist() -> Path:
+    """Locate the built React board across the three ways this code ships.
+
+    There is no single path that works for all three, so each is tried in turn:
+
+    1. **Repo checkout / frozen desktop bundle** — ``parents[3]/web/dist``.
+       In a checkout ``__file__`` is ``<repo>/src/no_human/api/app.py``, so
+       parents[3] is the repo root. Under a PyInstaller onedir freeze it is
+       ``<bundle>/_internal/no_human/api/app.py``, so parents[3] is the bundle
+       root, which is where ``packaging/build-installer.sh`` copies the board.
+       Both land on ``web/dist`` with no change to this line — that equivalence
+       is deliberate and ``packaging/nh-server.spec`` depends on it.
+    2. **Wheel install** — ``<site-packages>/no_human/web_dist``. parents[3] is
+       meaningless there (it points at ``lib/python3.X``, outside the package),
+       so the board is shipped INSIDE the package instead. ``pyproject.toml``
+       force-includes ``web/dist`` to that name at build time.
+
+    Returning the first candidate that exists means a repo checkout never sees
+    a stale wheel-style copy and vice versa: at most one of these ever exists.
+    The first candidate is returned as the fallback when neither is present, so
+    the "board was never built" message names the path a developer expects.
+    """
+    candidates = (
+        Path(__file__).resolve().parents[3] / "web" / "dist",  # checkout / frozen
+        Path(__file__).resolve().parent.parent / "web_dist",   # installed wheel
+    )
+    for candidate in candidates:
+        if (candidate / "index.html").is_file():
+            return candidate
+    return candidates[0]
+
+
+_WEB_DIST = _resolve_web_dist()
 
 
 @asynccontextmanager
@@ -3112,7 +3144,7 @@ async def ws_board(ws: WebSocket) -> None:
 # Serve the React SPA (if built)                                               #
 # --------------------------------------------------------------------------- #
 
-if _WEB_DIST.exists():
+if (_WEB_DIST / "index.html").is_file():
     app.mount("/assets", StaticFiles(directory=str(_WEB_DIST / "assets")), name="assets")
 
     @app.get("/", include_in_schema=False)
@@ -3129,3 +3161,44 @@ if _WEB_DIST.exists():
         # static server — stayed green). Hashed /assets remain long-cacheable.
         return FileResponse(str(_WEB_DIST / "index.html"),
                             headers={"Cache-Control": "no-cache"})
+
+else:
+    # The board is missing. Before this branch existed the server simply had no
+    # "/" route, so `nh start` — which README calls the primary entrypoint —
+    # answered the browser with FastAPI's bare `{"detail":"Not Found"}` and the
+    # user had no way to tell a broken install from a broken app. The API and
+    # the worker are genuinely fine in this state, so this is not a hard
+    # failure; it is a route that says which of the two situations it is and
+    # what to do about it.
+    log.warning(
+        "board not found at %s — serving the API only. `nh start` will not "
+        "render a UI. If this is a source checkout, build it with "
+        "`cd web && npm install && npm run build`.", _WEB_DIST,
+    )
+
+    _NO_BOARD_MESSAGE = (
+        "no_human: the web board is not installed.\n"
+        "\n"
+        f"Looked for index.html at: {_WEB_DIST}\n"
+        "\n"
+        "The API and the task worker are running normally — only the UI is\n"
+        "missing, so the CLI works: `nh task`, `nh status`, `nh logs`,\n"
+        "`nh approve`.\n"
+        "\n"
+        "To get the board:\n"
+        "  * source checkout -> cd web && npm install && npm run build\n"
+        "  * pip/uv install  -> this is a packaging bug, please report it;\n"
+        "    a released wheel always ships the board.\n"
+    )
+
+    @app.get("/", include_in_schema=False)
+    @app.get("/{path:path}", include_in_schema=False)
+    async def spa_missing(path: str = "") -> PlainTextResponse:
+        # Identical carve-out to the served case: /api/ and /ws are backend
+        # routes, and a genuine 404 there must stay a plain 404 rather than be
+        # answered with the board-missing notice.
+        if path.startswith("api/") or path.startswith("ws"):
+            return PlainTextResponse(f"Not found: /{path}", status_code=404)
+        # 503, not 404: the resource is meant to exist and the deployment is
+        # incomplete. A 404 reads as "wrong URL" and sends the user hunting.
+        return PlainTextResponse(_NO_BOARD_MESSAGE, status_code=503)

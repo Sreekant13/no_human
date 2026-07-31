@@ -58,6 +58,30 @@ packages = ["src/no_human"]
 # server, and packaging/build-installer.sh fails the build if it slips back in.
 exclude = ["src/no_human/ci_gate"]
 
+# Ship the built React board inside the package.
+#
+# `nh start` is the documented primary entrypoint (README), and it serves the
+# board. web/dist is gitignored (it is a build artifact), so without this the
+# wheel installed a CLI whose main command came up with no UI — the API answered
+# and nothing rendered. It cannot live at the repo-relative `web/dist` in an
+# installed wheel, because that path resolves outside site-packages; it goes
+# inside the package instead and `api/app.py::_resolve_web_dist` looks in both.
+#
+# force-include is deliberate over an `artifacts`/`include` glob: it raises
+# `FileNotFoundError: Forced include not found` when web/dist is absent, so a
+# wheel built without running `npm run build` FAILS instead of quietly shipping
+# the broken product again. Nothing in CI builds a wheel, so this only ever
+# fires on a release build. Cost measured 2026-07-31: +486 KB compressed
+# (724 KB -> 1.2 MB), against a dependency tree of tens of MB.
+[tool.hatch.build.targets.wheel.force-include]
+"web/dist" = "no_human/web_dist"
+
+# The sdist keeps the board at its repo-relative path so that a wheel built
+# FROM the sdist (what `pip install` does when it cannot use a wheel) still
+# finds `web/dist` where the wheel target above expects it.
+[tool.hatch.build.targets.sdist.force-include]
+"web/dist" = "web/dist"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
