@@ -19,9 +19,24 @@
 
 import { fmtTokens } from "./cost.js";
 
-// The backend template, kept deliberately tight: a loose regex that half-matched
-// some future blocker would silently mangle an agent's real question.
-const BUDGET = /^This task has exhausted its lifetime budget \((tokens|attempts) ([\d,]+)\s*\/\s*([\d,]+)\)\.\s*(.+)$/;
+// The backend template (orchestrator._park_budget), kept deliberately tight: a
+// loose regex that half-matched some future blocker would silently mangle an
+// agent's real question.
+//
+// The UNIT is captured rather than enumerated, and echoed back verbatim. That is
+// not laziness — the backend renamed its token unit to "cost-weighted tokens"
+// while this branch was open, and an enumerated `(tokens|attempts)` stopped
+// matching and silently passed the paragraph straight through, which looks
+// exactly like the bug being fixed. A live board carries both spellings at once
+// (45 rows still say "tokens", 2 say "cost-weighted tokens"), so both must work
+// forever, and the next rename must not need a code change here.
+// cardBlockerLine.test.mjs reads the template out of orchestrator.py and fails
+// if this stops matching it.
+const BUDGET = /^This task has exhausted its lifetime budget \(([a-z][a-z-]*(?: [a-z][a-z-]*)*) ([\d,]+)\s*\/\s*([\d,]+)\)\.\s*(.+)$/;
+
+// Only this unit is a token count worth compacting; anything else is echoed
+// with its numbers intact (attempts are single digits and must stay exact).
+const COMPACTABLE = /(^|\s)tokens$/;
 
 const toNumber = (s) => {
   const n = Number(String(s).replace(/,/g, ""));
@@ -51,9 +66,11 @@ export function cardBlockerLine(question) {
   // the same wall of digits the operator was already failing to read. fmtTokens
   // is the board's existing compaction and keeps two decimals, which is what
   // separates 12.44M from 12.26M. Attempts are single digits; leave them alone.
-  const shown = unit === "tokens"
+  // A unit we do not compact keeps the backend's own formatting, separators and
+  // all — reprinting the parsed Number turned "1,500,000" into "1500000".
+  const shown = COMPACTABLE.test(unit)
     ? `${fmtTokens(used)} of ${fmtTokens(cap)}`
-    : `${used} of ${cap}`;
+    : `${usedRaw} of ${capRaw}`;
 
   return `Budget: ${shown} ${unit}. ${ask}`;
 }

@@ -41,6 +41,43 @@ test("two budget blockers no longer open with the same 47 characters", () => {
   }
 });
 
+test("the backend's CURRENT unit spelling still matches", () => {
+  // The backend renamed its token unit to "cost-weighted tokens" mid-branch.
+  // An enumerated `(tokens|attempts)` stopped matching and passed the paragraph
+  // through untouched — indistinguishable from the bug this file fixes.
+  assert.equal(
+    cardBlockerLine("This task has exhausted its lifetime budget (cost-weighted tokens 2,660,051/2,382,000). Spend more, or stop here?"),
+    "Budget: 2.66M of 2.38M cost-weighted tokens. Spend more, or stop here?",
+  );
+  // A board in service carries both spellings at once, so the old one cannot
+  // be dropped when the new one is added.
+  assert.match(cardBlockerLine(LIVE[0]), /^Budget: 15\.32M of 12\.00M tokens\./);
+});
+
+test("the regex is pinned to the template the backend actually emits", () => {
+  // This is the coupling that broke. Rather than trusting a comment, read the
+  // f-string out of the orchestrator and prove a rendered instance of it still
+  // parses — including whatever the unit is called this month.
+  const py = readFileSync(
+    fileURLToPath(new URL("../../src/no_human/core/orchestrator.py", import.meta.url)), "utf8");
+  const template = py.match(/"This task has exhausted its lifetime budget "\s*\n\s*f"\(\{(\w+)\}\)\. ([^"]*)"/);
+  assert.ok(template, "orchestrator.py no longer builds the question this file parses — re-derive the regex");
+  const [, slot, tail] = template;
+  assert.equal(slot, "over", "the interpolated slot changed name; check what it now holds");
+
+  // …and the unit labels that fill that slot, also read from the source.
+  const units = [...py.matchAll(/f"((?:cost-weighted )?(?:tokens|attempts)) \{used_\w+:?,?\}\/\{cap_\w+:?,?\}"/g)]
+    .map((m) => m[1]);
+  assert.ok(units.length >= 2, `expected to find the unit labels in orchestrator.py, found ${units.join(", ")}`);
+  for (const unit of units) {
+    const rendered = `This task has exhausted its lifetime budget (${unit} 12/34). ${tail}`.trim();
+    const out = cardBlockerLine(rendered);
+    assert.notEqual(out, rendered, `the "${unit}" form is passed through unparsed — the card fix is silently off`);
+    assert.match(out, /^Budget: /, `the "${unit}" form must render as a Budget line`);
+    assert.ok(out.includes(unit), `the unit "${unit}" must survive verbatim, not be renamed by the UI`);
+  }
+});
+
 test("the attempts variant of the same template is handled", () => {
   assert.equal(
     cardBlockerLine("This task has exhausted its lifetime budget (attempts 6/6). Spend more, or stop here?"),
@@ -73,12 +110,29 @@ test("a real question from an agent is passed through untouched", () => {
 test("anything that only half-matches the template is left alone", () => {
   for (const q of [
     "This task has exhausted its lifetime budget (tokens 15,324,491/12,000,000).", // no ask
-    "This task has exhausted its lifetime budget (seconds 10/5). Spend more?",      // unknown unit
     "This task has exhausted its lifetime budget. Spend more, or stop here?",       // no numbers
     "Budget: this task has exhausted its lifetime budget (tokens 1/2). Stop?",      // not at the start
+    "This task has exhausted its lifetime budget (tokens 1/2/3). Stop?",            // not a pair
   ]) {
     assert.equal(cardBlockerLine(q), q, q);
   }
+});
+
+test("a unit nobody has seen yet is rendered, not rejected", () => {
+  // Deliberate: an earlier draft enumerated `(tokens|attempts)` and the backend
+  // renamed its unit, which turned the whole feature off with no signal. The
+  // leading sentence is specific enough that only the budget template can reach
+  // here, so an unfamiliar unit is echoed verbatim rather than dropped — the
+  // failure mode is "a unit we did not compact", not "the fix stopped working".
+  assert.equal(
+    cardBlockerLine("This task has exhausted its lifetime budget (seconds 10/5). Spend more?"),
+    "Budget: 10 of 5 seconds. Spend more?",
+  );
+  // Only a token count is compacted; an unknown unit keeps its exact numbers.
+  assert.match(
+    cardBlockerLine("This task has exhausted its lifetime budget (widgets 1,500,000/1,000,000). Stop?"),
+    /^Budget: 1,500,000 of 1,000,000 widgets\./,
+  );
 });
 
 test("missing or empty input yields nothing to render", () => {
