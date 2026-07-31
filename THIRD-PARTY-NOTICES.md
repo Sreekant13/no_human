@@ -1,7 +1,7 @@
 # Third-party notices
 
 no_human
-Copyright (c) 2025-2026 eyalgolan
+Copyright (c) 2026 Eyal Golan
 
 **This file is not a licence.** no_human is released under the MIT Licence; the
 terms are in [`LICENSE`](LICENSE) and nothing here changes them. What this file

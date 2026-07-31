@@ -3,8 +3,10 @@
 Measured against the SDK (claude-agent-sdk, CLI 2.1.220) on 2026-07-30 with two
 real subagent runs, recorded at ``testdata/subagent_usage_stream.json`` (one
 subagent, one API response) and ``testdata/subagent_usage_stream_multi.json``
-(one subagent, six API responses). Five properties were established and this
-module pins all five:
+(one subagent, six API responses). The identifiers in both fixtures
+(message/session/tool-use/task ids) were replaced with synthetic stand-ins
+after recording — repeat structure and every usage number are unmodified.
+Five properties were established and this module pins all five:
 
 1. ``ResultMessage.usage`` covers ONLY the parent's own API requests. In the
    recording the parent's cache reads total 74,002 and the subagent's 8,197 —
@@ -141,10 +143,10 @@ SUBAGENT_TOTAL = sum(u["input_tokens"] + u["output_tokens"]
 SUBAGENT_SCALAR = sum(r["usage"]["total_tokens"]
                       for r in _RECORDS if r["type"] == "task_notification")  # 11067
 # The subagent's own transcript records in=10 out=45 cr=8,197 cc=2,852 for
-# msg_011CdYRgNms2TE7e9oWdhMHE. That file is NOT reachable from the parent's
+# msg_TESTFIXTURE0000000000004. That file is NOT reachable from the parent's
 # SDK stream, and it is NOT in this repo: it lives in a machine-local CLI
 # transcript directory (~/.claude-personal/projects/-private-tmp-wt-tokens-probe/
-# 6a403c36-.../subagents/agent-a483262a49fffc186.jsonl — note ".claude-personal",
+# 00000000-.../subagents/agent-00000000000000001.jsonl — note ".claude-personal",
 # not ".claude"). So this constant is TRANSCRIBED, not derived from the fixture,
 # and a reader on another machine cannot re-derive it. Treat the residual test
 # below as documentation of a measurement taken once, not as a live check.
