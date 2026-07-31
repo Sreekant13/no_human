@@ -14,9 +14,23 @@ contextBridge.exposeInMainWorld("nhSetup", {
   quit: () => ipcRenderer.invoke("nh:quit"),
 });
 
+// `npm_package_version` is set by `npm run`, and NOTHING sets it in a packaged
+// app — this read was always the literal string "dev" in every shipped DMG.
+// That is load-bearing now: the update UI compares this against the released
+// version, and "dev" compares as "not newer" than everything, so a stale
+// install would never be told it was stale. electron-builder writes the real
+// version into the packaged package.json, so read that and keep the env var
+// only as the `npm run desktop` fallback.
+let appVersion = process.env.npm_package_version || "dev";
+try {
+  appVersion = require("./package.json").version || appVersion;
+} catch {
+  /* keep the fallback — a missing package.json is already guarded elsewhere */
+}
+
 contextBridge.exposeInMainWorld("nhDesktop", {
   shell: true,
-  version: process.env.npm_package_version || "dev",
+  version: appVersion,
   // The application menu (main process) drives the board's own navigation:
   // main sends "nh:menu" with a page id ("board"/"stats"/"settings") or
   // "new-task"; App.jsx subscribes and updates its existing state. Returns an
@@ -26,4 +40,17 @@ contextBridge.exposeInMainWorld("nhDesktop", {
     ipcRenderer.on("nh:menu", listener);
     return () => ipcRenderer.removeListener("nh:menu", listener);
   },
+  // Updates. The shell finds them; the board decides what to say and when the
+  // user acts. `download` and `install` are separate on purpose — the operator
+  // asked that users be informed and then choose, so nothing moves bytes or
+  // restarts the app without a distinct click.
+  onUpdate: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("nh:update", listener);
+    return () => ipcRenderer.removeListener("nh:update", listener);
+  },
+  checkForUpdates: () => ipcRenderer.invoke("nh:update-check"),
+  downloadUpdate: () => ipcRenderer.invoke("nh:update-download"),
+  installUpdate: () => ipcRenderer.invoke("nh:update-install"),
+  deferUpdate: (version) => ipcRenderer.invoke("nh:update-defer", version),
 });

@@ -55,8 +55,15 @@ const EXPECTED = {
                // failed-restart copy; omitting it here left the blindness guard
                // itself partly blind.
                "setupUi.mjs",
+               // The update flow. main.mjs also READS package.json at runtime
+               // (packagedSigning) — an undeclared package.json would make
+               // every packaged build read as unsigned and silently disable
+               // updates, which is a failure nothing else would catch.
+               "updater.mjs", "updatePolicy.mjs", "updateState.mjs", "package.json",
                "server.mjs", "error.html", "token.html"],
-  "preload.cjs": [],
+  // preload.cjs requires package.json for the app version it hands the board.
+  "preload.cjs": ["package.json"],
+  "updater.mjs": ["updatePolicy.mjs"],
   // HTML pages load ES modules too: token.html imports setupUi.mjs, and an
   // undeclared one is a blank screen in the packaged app.
   "token.html": ["setupUi.mjs"],
@@ -101,12 +108,18 @@ test("both shell pages declare a language (WCAG 3.1.1)", () => {
   }
 });
 
+// The real electron-builder configuration. It moved out of package.json into a
+// .cjs file because the signing decision has to branch on the environment, so
+// these invariants must be read from the file the BUILD actually uses — a test
+// still asserting against package.json.build would pass while the shipped
+// config said something else entirely.
+const builderConfig = await import("./electron-builder.config.cjs")
+  .then((m) => m.default ?? m);
+
 test("the frozen server is actually shipped as extraResources", () => {
   // `files` is guarded above; the PAYLOAD was not. Deleting this block builds a
   // DMG that launches and can never start a server.
-  const pkg = JSON.parse(fs.readFileSync(
-    new URL("./package.json", import.meta.url), "utf8"));
-  const extra = pkg.build?.extraResources ?? [];
+  const extra = builderConfig.extraResources ?? [];
   const server = extra.find((e) => (e.to ?? e) === "nh-server");
   assert.ok(server, `no nh-server in extraResources: ${JSON.stringify(extra)}`);
   assert.match(server.from ?? "", /packaging\/dist\/nh-server$/,
@@ -115,6 +128,82 @@ test("the frozen server is actually shipped as extraResources", () => {
   const srv = fs.readFileSync(new URL("./server.mjs", import.meta.url), "utf8");
   assert.match(srv, /"nh-server",\s*"nh"/,
     "bundledNhPath no longer matches the extraResources destination");
+});
+
+test("the MIT licence text ships inside the app bundle", () => {
+  // The DMG carries only the .app; MIT asks for the licence text to travel
+  // with substantial copies, so it rides as an extraResource.
+  const extra = builderConfig.extraResources ?? [];
+  const lic = extra.find((e) => (e.to ?? e) === "LICENSE");
+  assert.ok(lic, `no LICENSE in extraResources: ${JSON.stringify(extra)}`);
+  const src = fs.readFileSync(path.join(here, lic.from), "utf8");
+  assert.match(src, /MIT License/, "extraResources LICENSE is not the MIT text");
+});
+
+test("the mac targets include zip, or auto-update cannot work at all", () => {
+  // Squirrel.Mac updates from a ZIP. electron-builder only emits
+  // latest-mac.yml — the file electron-updater fetches — when a zip target is
+  // present, so `["dmg"]` alone produces a build whose updater fails at
+  // runtime with ERR_UPDATER_ZIP_FILE_NOT_FOUND. Nothing else in the suite
+  // would notice: the DMG builds, launches, and simply never updates.
+  const targets = builderConfig.mac?.target ?? [];
+  assert.ok(targets.includes("zip"),
+    `mac.target must include "zip" for the update feed, got ${JSON.stringify(targets)}`);
+});
+
+test("the build config and the packaging guard read the SAME file list", () => {
+  // The allowlist above is only meaningful if it is the list the build uses.
+  assert.deepEqual(builderConfig.files, pkg.build.files,
+    "electron-builder.config.cjs must source `files` from package.json, or the "
+    + "guard protects a list nobody ships");
+});
+
+test("the signing verdict is stamped into the packaged app", () => {
+  // main.mjs decides whether it may auto-update by reading these from its own
+  // package.json. Dropping extraMetadata makes every build read as unsigned —
+  // updates silently off, forever, with no error anywhere.
+  const meta = builderConfig.extraMetadata ?? {};
+  assert.ok(Object.hasOwn(meta, "nhSigning"),
+    "the build must record which signing mode produced it");
+  assert.ok(Object.hasOwn(meta, "nhCanAutoUpdate"),
+    "the build must record whether the shipped app may update itself");
+  // This suite runs without signing credentials, so the honest answer is no.
+  assert.equal(meta.nhCanAutoUpdate, false,
+    "an unsigned CI build must not claim it can auto-update");
+});
+
+test("a publish provider exists so latest-mac.yml is generated", () => {
+  // Without a publish block electron-builder writes no update metadata, and
+  // the updater has nothing to fetch. `--publish never` on every script is
+  // what prevents an actual upload — this block only says where to LOOK.
+  const publish = builderConfig.publish ?? [];
+  assert.ok(publish.length > 0, "no publish provider — no update feed");
+  assert.equal(publish[0].provider, "github");
+});
+
+test("the version handed to the board is the real one, not npm_package_version", () => {
+  // `npm_package_version` is set only by `npm run`, so in every packaged DMG
+  // this read was the literal string "dev". That is now load-bearing: the
+  // update UI compares it against the released version, and "dev" parses as
+  // nothing, so a stale install would never learn it was stale. This is a
+  // build-config invariant (like the rest of this file) because preload.cjs
+  // cannot be imported without a real Electron renderer.
+  const preload = fs.readFileSync(new URL("./preload.cjs", import.meta.url), "utf8");
+  assert.match(preload, /require\(["']\.\/package\.json["']\)/,
+    "preload.cjs must read the packaged package.json for the app version");
+  const versionLine = preload.match(/version:\s*(.+),/)?.[1] ?? "";
+  assert.doesNotMatch(versionLine, /npm_package_version/,
+    "the exposed version must not come straight from npm_package_version");
+});
+
+test("no script publishes anything", () => {
+  // Publishing is the operator's call, and an accidental `--publish always`
+  // would push a release from a developer machine.
+  for (const [name, script] of Object.entries(pkg.scripts)) {
+    if (!script.includes("electron-builder")) continue;
+    assert.ok(script.includes("--publish never"),
+      `script "${name}" runs electron-builder without --publish never`);
+  }
 });
 
 // --------------------------------------------------------------------------

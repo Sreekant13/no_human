@@ -13,6 +13,7 @@ import { authPanelView } from "./authPanelView.js";
 import { groupLearningsByProject } from "./learningGroups.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 import { pluralize } from "./pluralize.js";
+import { updateNotice } from "./updateNotice.js";
 import IntegrationsPanel from "./Integrations.jsx";
 
 const SECTIONS = [
@@ -22,7 +23,83 @@ const SECTIONS = [
   { key: "learnings", label: "Learnings" },
   { key: "integrations", label: "Integrations" },
   { key: "account",   label: "Account" },
+  { key: "updates",   label: "Updates" },
 ];
+
+// The Updates panel. All of the decision-making lives in updateNotice.js so it
+// can be tested without a renderer; this component only renders the result and
+// forwards clicks to the desktop shell over the preload bridge.
+//
+// In a plain browser there is no shell, so there are no actions — the panel
+// says so rather than showing a button that cannot work.
+function UpdatesPanel() {
+  const [update, setUpdate] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const desktop = typeof window !== "undefined" ? window.nhDesktop : undefined;
+  const inShell = Boolean(desktop?.shell);
+
+  useEffect(() => desktop?.onUpdate?.((payload) => setUpdate(payload)), [desktop]);
+
+  const view = updateNotice({ inShell, current: desktop?.version, update });
+
+  const run = useCallback(async (fn) => {
+    if (!fn) return;
+    setBusy(true);
+    try {
+      const result = await fn();
+      if (result) setUpdate(result);
+    } catch (err) {
+      setUpdate({ mode: "failed", error: String(err?.message ?? err) });
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  const label = {
+    check: "Check for updates",
+    download: "Download now",
+    install: "Restart and install",
+    later: "Later",
+    "download-page": "Open downloads",
+  };
+
+  const onAction = (action) => {
+    if (action === "check") return run(() => desktop?.checkForUpdates?.());
+    if (action === "download") return run(() => desktop?.downloadUpdate?.());
+    if (action === "install") return run(() => desktop?.installUpdate?.());
+    if (action === "later") return run(() => desktop?.deferUpdate?.(update?.latest));
+    if (action === "download-page") {
+      window.open("https://github.com/eyalgolan/no_human/releases", "_blank",
+        "noopener,noreferrer");
+      return undefined;
+    }
+    return undefined;
+  };
+
+  return (
+    <div className="memory-panel">
+      <div className="memory-header">
+        <h3 className="memory-title"><span className="panel-title-text">Updates</span></h3>
+      </div>
+      <div className={`nh-alarm update-notice update-${view.tone}`}
+           role={view.tone === "error" ? "alert" : "status"}>
+        <strong>{view.title}</strong>
+        <div className="update-detail">{view.detail}</div>
+      </div>
+      {view.actions.length > 0 && (
+        <div className="update-actions">
+          {view.actions.map((action) => (
+            <button key={action} type="button" disabled={busy}
+                    className={action === "later" ? "btn" : "btn btn-approve"}
+                    onClick={() => onAction(action)}>
+              {label[action] ?? action}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 // The Account panel: which OAuth profile pays, whether the running server has
 // drifted from the configured one, and a WRITE-ONLY editor for the token. The
@@ -310,6 +387,7 @@ export default function SettingsOverlay({ onClose }) {
             {section === "learnings" && <LearningsPanel />}
             {section === "integrations" && <IntegrationsPanel />}
             {section === "account"     && <AuthPanel />}
+            {section === "updates"     && <UpdatesPanel />}
           </div>
         </div>
       </div>

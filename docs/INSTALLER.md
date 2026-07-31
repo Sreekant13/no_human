@@ -20,9 +20,15 @@ That runs three steps:
    `packaging/nh-server.spec`, places runtime data at the bundle root, and
    **fails the build** if the frozen tree contains any `.py` file or is missing
    the board or the migrations.
-2. `electron-builder --mac dir` — wraps it as `no_human.app`, with the frozen
-   server copied in as `extraResources`.
-3. `packaging/make-dmg.sh` — produces `packaging/dist/no_human.dmg`.
+2. `electron-builder --config electron-builder.config.cjs --mac` — wraps it as
+   `no_human.app`, with the frozen server copied in as `extraResources`, and
+   also emits the `.zip` + `latest-mac.yml` the auto-updater consumes.
+3. `packaging/make-dmg.sh` — produces
+   `packaging/dist/no_human-<version>[-UNSIGNED|-UNNOTARIZED].dmg`.
+
+The filename carries the signing verdict: only a signed **and** notarized build
+gets the plain `no_human-<version>.dmg` name, so an unshippable artifact cannot
+be uploaded by mistake. See `docs/DISTRIBUTION.md` for the signing runbook.
 
 Step 2 has no build-time assertion of its own: electron-builder's `files` is a
 literal allowlist, and a file omitted there is simply absent from `app.asar`
@@ -109,7 +115,7 @@ default is 8420, and a dev server already bound there would answer the `curl`
 and make the check pass without proving anything.
 
 ```bash
-hdiutil attach packaging/dist/no_human.dmg -nobrowse -readonly
+hdiutil attach packaging/dist/no_human-0.1.0-UNSIGNED.dmg -nobrowse -readonly
 find /Volumes/no_human -name '*.py'            # must print nothing
 
 H=$(mktemp -d); mkdir -p "$H/.no_human"

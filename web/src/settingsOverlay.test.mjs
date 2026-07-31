@@ -24,9 +24,30 @@ test("the Config section is gone: no ConfigPanel, no config entry in the section
   assert.doesNotMatch(settingsJsx, /label:\s*["']Config["']/);
 });
 
-test("the section list covers exactly Projects, Rules, Skills, Learnings, Integrations", () => {
-  for (const label of ["Projects", "Rules", "Skills", "Learnings", "Integrations"]) {
+test("the section list covers Projects, Rules, Skills, Learnings, Integrations, Account, Updates", () => {
+  // The name used to claim "exactly" while only checking presence, so adding a
+  // section quietly made the title a lie. Both directions are asserted now:
+  // every expected label is there, and the list holds nothing else.
+  const expected = ["Projects", "Rules", "Skills", "Learnings", "Integrations",
+                    "Account", "Updates"];
+  for (const label of expected) {
     assert.match(settingsJsx, new RegExp(`label:\\s*["']${label}["']`), `missing section: ${label}`);
+  }
+  const sectionsBlock = settingsJsx.match(/const SECTIONS = \[[\s\S]*?\];/)?.[0] ?? "";
+  const found = [...sectionsBlock.matchAll(/label:\s*["']([^"']+)["']/g)].map((m) => m[1]);
+  assert.deepEqual(found, expected,
+    "SECTIONS holds a label this test does not know about");
+});
+
+test("every section key has a panel wired into the dispatch", () => {
+  // A section in the list with no matching render line is a menu entry that
+  // opens a blank pane — it looks fine until it is clicked.
+  const sectionsBlock = settingsJsx.match(/const SECTIONS = \[[\s\S]*?\];/)?.[0] ?? "";
+  const keys = [...sectionsBlock.matchAll(/key:\s*["']([^"']+)["']/g)].map((m) => m[1]);
+  assert.ok(keys.length >= 7, `expected the full section list, got ${keys}`);
+  for (const key of keys) {
+    assert.match(settingsJsx, new RegExp(`section === ["']${key}["']\\s*&&`),
+      `section "${key}" is listed but never rendered`);
   }
 });
 

@@ -665,6 +665,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "slack_webhook_url": None,
         "email_to": "dev@example.com",
     },
+    "updates": {
+        # A once-a-day check against PyPI's public JSON API that prints a single
+        # line when a newer `nh` has been published. It never blocks a command
+        # (the fetch runs on a daemon thread and the notice is rendered from the
+        # previous run's cache) and never fails one. Set false — or export
+        # NH_NO_UPDATE_CHECK=1, which also covers CI — to turn it off entirely.
+        # No telemetry: this is an outbound GET for a version string, and
+        # nothing about the machine or the operator is sent.
+        "enabled": True,
+        "interval_seconds": 86400,
+    },
     "approval": {
         "require_before_merge": True,   # ALWAYS true — agent never merges
         "auto_merge_on_approval": False,  # there is no auto-merge

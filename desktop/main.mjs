@@ -18,6 +18,10 @@ import { createServerLifecycle } from "./serverLifecycle.mjs";
 import { quitAction } from "./quitPolicy.mjs";
 import { parseBadgeCount } from "./badge.mjs";
 import { buildMenuTemplate } from "./menu.mjs";
+import { createUpdater } from "./updater.mjs";
+import { updateMessage } from "./updatePolicy.mjs";
+import { readUpdateState, writeUpdateState } from "./updateState.mjs";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -95,12 +99,100 @@ function sendToRenderer(action) {
   if (win && !win.isDestroyed()) win.webContents.send("nh:menu", action);
 }
 
+// ------------------------------- updates -------------------------------- //
+//
+// Whether this build may install its own updates is decided at BUILD time, not
+// here: `process.env.CSC_LINK` is meaningless inside a shipped app, so
+// electron-builder.config.cjs stamps the answer into the packaged
+// package.json. Reading the live environment instead would let any user turn
+// on an update path macOS will refuse.
+export function packagedSigning() {
+  try {
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(__dirname, "package.json"), "utf8"));
+    return {
+      mode: pkg.nhSigning || "unsigned",
+      // Strict true, so a missing or malformed field fails CLOSED.
+      canAutoUpdate: pkg.nhCanAutoUpdate === true,
+    };
+  } catch {
+    return { mode: "unsigned", canAutoUpdate: false };
+  }
+}
+
+let updater = null;
+
+// electron-updater is imported LAZILY and never at module scope: it touches
+// app.getVersion() and app-update.yml on import, which throws in an unpackaged
+// run and makes main.mjs unimportable under the test loader.
+async function getUpdater() {
+  if (updater) return updater;
+  let autoUpdater;
+  try {
+    const mod = await import("electron-updater");
+    autoUpdater = (mod.default ?? mod).autoUpdater;
+  } catch (err) {
+    console.error("electron-updater unavailable:", (err && err.message) || err);
+    return null;
+  }
+  if (!autoUpdater) return null;
+  const dir = app.getPath("userData");
+  updater = createUpdater({
+    autoUpdater,
+    plan: packagedSigning(),
+    currentVersion: app.getVersion(),
+    isPackaged: app.isPackaged,
+    readState: () => readUpdateState(dir),
+    writeState: (s) => writeUpdateState(dir, s),
+    onEvent: (payload) => sendUpdateEvent(payload),
+    log: (m) => console.log(`[update] ${m}`),
+  });
+  updater.configure();
+  return updater;
+}
+
+// The board renders the notice; the shell never puts a modal in the way. An
+// update is information, not an interruption.
+function sendUpdateEvent(payload) {
+  if (win && !win.isDestroyed()) {
+    win.webContents.send("nh:update", {
+      ...payload,
+      message: updateMessage({
+        mode: payload.mode, latest: payload.latest,
+        current: payload.current ?? app.getVersion(),
+        canAutoUpdate: payload.canAutoUpdate,
+      }),
+    });
+  }
+}
+
+async function checkForUpdates({ manual = false } = {}) {
+  const u = await getUpdater();
+  if (!u) {
+    if (manual) {
+      sendUpdateEvent({ mode: "failed",
+        error: "The updater component is not available in this build." });
+    }
+    return null;
+  }
+  // Never allowed to reject: a failed update check must not surface as a
+  // startup error or an unhandled rejection.
+  return u.check({ manual }).catch((err) => {
+    console.error("update check failed:", (err && err.message) || err);
+    return null;
+  });
+}
+
 function buildAppMenu() {
   const template = buildMenuTemplate({
     isMac: process.platform === "darwin",
     isDev: !app.isPackaged,
     onNavigate: (page) => sendToRenderer(page),
     onNewTask: () => sendToRenderer("new-task"),
+    onCheckForUpdates: () => {
+      showWindow();
+      checkForUpdates({ manual: true });
+    },
     onReenterToken: async () => {
       showWindow();
       if (win && !win.isDestroyed()) {
@@ -402,6 +494,40 @@ ipcMain.handle("nh:quit", (event) => {
   return true;
 });
 
+// Update IPC. Deliberately NOT gated by fromSetupScreen: that predicate admits
+// only token.html, and these are driven by the BOARD. They are safe to expose
+// there because none of them accepts a URL, a path, or a credential — the feed
+// is fixed at build time and the only inputs are "yes", "later", and "restart".
+ipcMain.handle("nh:update-check", async () => {
+  const r = await checkForUpdates({ manual: true });
+  return r ?? { mode: "failed", error: "the updater is unavailable" };
+});
+
+ipcMain.handle("nh:update-download", async () => {
+  const u = await getUpdater();
+  if (!u) return { mode: "failed", error: "the updater is unavailable" };
+  return u.download();
+});
+
+ipcMain.handle("nh:update-install", async () => {
+  const u = await getUpdater();
+  if (!u) return { mode: "failed", error: "the updater is unavailable" };
+  // Refuse before latching `quitting`: if nothing is downloaded the app keeps
+  // running, and a latched flag would turn the next window-close into a real
+  // quit instead of hide-to-tray.
+  if (!u.downloaded) return { mode: "failed", error: "no update has been downloaded" };
+  // Quitting for an install is a real quit, not a hide-to-tray. The flag must
+  // be set BEFORE install() — quitAndInstall fires the quit path immediately.
+  quitting = true;
+  return u.install();
+});
+
+ipcMain.handle("nh:update-defer", async (_event, version) => {
+  const u = await getUpdater();
+  if (!u) return { mode: "failed", error: "the updater is unavailable" };
+  return u.defer(version);
+});
+
 async function createWindow() {
   const dark = nativeTheme.shouldUseDarkColors;
   // Pre-paint color follows the OS theme — a light-mode launch used to flash
@@ -480,6 +606,10 @@ if (!gotLock) {
     try { buildTray(); } catch (err) { console.error("tray failed:", err); }
     buildAppMenu();
     await createWindow();
+    // AFTER the window exists (it is the thing that renders the notice) and
+    // deliberately NOT awaited: a slow or dead update feed must never delay the
+    // board appearing. Throttled to once a day inside the updater.
+    checkForUpdates().catch(() => {});
   }).catch((err) => {
     // Startup must never end in an unhandled rejection: that leaves a blank
     // window with no error page and no Retry.

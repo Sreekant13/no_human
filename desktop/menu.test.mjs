@@ -75,3 +75,25 @@ test("the token item is omitted when no handler is supplied", () => {
   const file = t.find((m) => m.label === "File");
   assert.equal(file.submenu.some((i) => i.label === "Re-enter Claude Token…"), false);
 });
+
+test("File menu exposes Check for Updates and it routes", () => {
+  // Once a user picks "Later", the automatic prompt for that version is gone
+  // for good. This item is the only way back to it, so its absence turns
+  // "later" into "never" with no error and nothing to notice.
+  let called = 0;
+  const t = buildMenuTemplate({
+    isMac: true, isDev: false, onNavigate() {}, onNewTask() {},
+    onCheckForUpdates: () => { called += 1; },
+  });
+  const file = t.find((m) => m.label === "File");
+  const item = file.submenu.find((i) => i.label === "Check for Updates…");
+  assert.ok(item, "the manual update path must be reachable from the menu");
+  item.click();
+  assert.equal(called, 1, "it must invoke onCheckForUpdates");
+});
+
+test("the update item is omitted when no handler is supplied", () => {
+  const t = buildMenuTemplate({ isMac: true, isDev: false, onNavigate() {}, onNewTask() {} });
+  const file = t.find((m) => m.label === "File");
+  assert.equal(file.submenu.some((i) => i.label === "Check for Updates…"), false);
+});

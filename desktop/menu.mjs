@@ -9,7 +9,7 @@
 // the Edit menu (copy/paste/select-all) must be included explicitly or text
 // inputs lose it.
 export function buildMenuTemplate({ isMac, isDev, onNavigate, onNewTask,
-                                    onReenterToken }) {
+                                    onReenterToken, onCheckForUpdates }) {
   const nav = (label, page, accelerator) => ({
     label, accelerator, click: () => onNavigate(page),
   });
@@ -26,6 +26,14 @@ export function buildMenuTemplate({ isMac, isDev, onNavigate, onNewTask,
       // opens and fails every task with no in-app remedy.
       ...(onReenterToken
         ? [{ label: "Re-enter Claude Token…", click: () => onReenterToken() },
+           { type: "separator" }]
+        : []),
+      // The manual half of "download it then or when they want": a user who
+      // chose Later has silenced the automatic prompt for that version, so this
+      // is the ONLY way back to it. Without it, "Later" is indistinguishable
+      // from "never".
+      ...(onCheckForUpdates
+        ? [{ label: "Check for Updates…", click: () => onCheckForUpdates() },
            { type: "separator" }]
         : []),
       isMac ? { role: "close" } : { role: "quit" },
