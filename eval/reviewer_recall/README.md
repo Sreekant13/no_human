@@ -64,8 +64,8 @@ lines before quoting a specificity number.
 
 A base fixture is cut from a **pre-sweep** commit — that is what makes it a base
 — so it can carry vendor/employer terms that the tree-wide de-identification
-sweep has since removed from live source. `eval/reviewer_recall/` is **not** in
-`EXPORT_EXCLUDE.txt`: this corpus is published, so such a term is a public leak.
+sweep has since removed from live source. `eval/reviewer_recall/` is classified
+`ship` in `EXPORT_CLASSIFICATION.txt`: this corpus is published, so such a term is a public leak.
 
 That happened. On 2026-07-30 one branch swept a term out of live source and
 another materialised base fixtures from pre-sweep commits; merged in that order,

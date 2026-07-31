@@ -128,7 +128,8 @@ id, which reads as a measurement of that model — exactly the re-attribution th
 exists to prevent.
 
 **No catch-rate is currently published on any user-facing surface.** The retired 4.8 figure
-is named only in `.agents/product-marketing.md` and `CLAUDE.md`, in both cases in order to
+is named only in `CLAUDE.md` and in an internal positioning note that is not part of this
+repository's public surface, in both cases in order to
 **forbid** its reuse — which is the opposite of publishing it. (An earlier draft of this
 line said "anywhere in this repo", the same false absolute that was caught and rescoped in
 `README.md`; it was fixed there and left standing here, one file away, in the very document

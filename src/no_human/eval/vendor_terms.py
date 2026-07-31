@@ -22,8 +22,8 @@ in ANY form — and a hex-encoded inventory of exactly what was scrubbed, sittin
 in a file whose docstring explains the encoding, is a labelled index, not a
 redaction. Hex is only unreadable to grep; it is not unreadable.
 
-So the employer half lives in `_vendor_terms_private.py`, which is listed in
-`EXPORT_EXCLUDE.txt` and is deleted from the public export. This file carries
+So the employer half lives in `_vendor_terms_private.py`, which is classified
+`drop` in `EXPORT_CLASSIFICATION.txt` and is deleted from the public export. This file carries
 only the competitor/model half, which is not employer-identifying.
 
 The import is optional on purpose. In the private repo the supplement is present
