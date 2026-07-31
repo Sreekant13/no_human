@@ -34,7 +34,7 @@ _INFRA_REASONS = frozenset({
 
 _PIPELINE_URL_RE = re.compile(r"https://[^\s]*/pipelines?/(\d+)")
 _PIPELINE_ID_RE = re.compile(r"[Pp]ipeline[:\s#]+(\d+)")
-_INFRA_BACKOFF_SECONDS = 120  # 2 minutes (CLAUDE.md)
+_INFRA_BACKOFF_SECONDS = 120  # 2 minutes between infra retries
 
 
 def _parse_trigger_output(text: str) -> tuple[str, str]:

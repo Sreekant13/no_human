@@ -288,7 +288,7 @@ TEST_RESULTS = {
 
 #: Which model holds which role. `orchestrator.py:_active_models` reads these
 #: off the live objects, so the four keys are fixed: coder / planner / reviewer
-#: / supervisor. The values are the four tiers in CLAUDE.md.
+#: / supervisor. The values are the project's four fixed model tiers.
 MODELS = {
     "coder": "claude-sonnet-5",
     "planner": "claude-opus-5",

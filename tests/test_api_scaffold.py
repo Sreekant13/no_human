@@ -2,9 +2,9 @@
 
 The composer's "create a new repo" affordance calls this: given a parent
 directory and a name it creates the directory, `git init`s it, writes a
-minimal README, makes the initial commit under the AGENT identity (CLAUDE.md
-constraint #2 - history must say plainly which commits a machine wrote), and
-registers the result as a project so the composer can proceed in it.
+minimal README, makes the initial commit under the AGENT identity (the history
+must say plainly which commits a machine wrote), and registers the result as a
+project so the composer can proceed in it.
 
 The parent path is operator input flowing straight into filesystem writes, so
 the validation tests here are the security surface: resolve() before the
@@ -77,8 +77,8 @@ async def test_scaffold_creates_repo_with_one_commit_and_readme(client):
 
 @pytest.mark.asyncio
 async def test_scaffold_commits_under_the_agent_identity(client):
-    """CLAUDE.md #2: a machine-made commit carries the agent identity, both as
-    author and committer - never the operator's global git config."""
+    """A machine-made commit carries the agent identity, both as author and
+    committer - never the operator's global git config."""
     home = Path.home()
     (home / "git").mkdir()
     r = await client.post("/api/repos/scaffold",
@@ -290,7 +290,7 @@ async def test_scaffold_mkdir_race_does_not_delete_the_other_writers_dir(
 async def test_scaffold_ignores_git_author_env(client, monkeypatch):
     """GIT_AUTHOR_NAME/EMAIL in the server's environment override `-c user.*`
     in git's precedence order, so they must be scrubbed from the child env -
-    the commit stays under the agent identity (CLAUDE.md #2)."""
+    the commit stays under the agent identity."""
     monkeypatch.setenv("GIT_AUTHOR_NAME", "Operator Env")
     monkeypatch.setenv("GIT_AUTHOR_EMAIL", "operator@env.example")
     home = Path.home()

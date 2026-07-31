@@ -1625,6 +1625,194 @@ async def test_planning_failure_is_best_effort(bare_repo, tmp_path, store):
 
 
 # --------------------------------------------------------------------------- #
+# The planner's ERRORED result must never become the plan.                     #
+#                                                                              #
+# A terminal SDK failure is not an exception the planner's try/except sees: the #
+# backend swallows it and YIELDS a result event carrying the error string as   #
+# its text, with is_error=True (claude_backend.py, the `except Exception` tail  #
+# of stream()). The coder path has always gated on `result.is_error`; the      #
+# planner path did not, so that one sentence was persisted as task.context      #
+# ['plan'], written to .no_human/PLAN.md and inlined into the coder prompt      #
+# under "IMPLEMENTATION PLAN (follow this plan closely...)" — while             #
+# TaskSpec.from_plan parsed it to an EMPTY spec, silently emptying the scope    #
+# guard, the test-plan block and the supervisor's file list.                   #
+# --------------------------------------------------------------------------- #
+
+#: Verbatim shape of the SDK's max-turns failure text, as `stream()` puts it on
+#: the corrective result event (`msg` is kept clean for max_turns — no traceback
+#: is appended), and as `run()` then hands it back as `final_text`.
+_MAX_TURNS_ERROR = (
+    "Claude Code returned an error result: Reached maximum number of turns (10)"
+)
+
+
+class ErroringPlannerBackend:
+    """A backend whose run() RETURNS (never raises) a terminal-error result.
+
+    This is the shape that actually reaches `_generate_plan` in production —
+    `FailingPlannerBackend` above (which raises) exercises a different, already
+    guarded path.
+    """
+
+    def __init__(self, text: str = _MAX_TURNS_ERROR,
+                 stop_reason: str = "max_turns"):
+        self._text = text
+        self._stop = stop_reason
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        return AgentResult(final_text=self._text, num_turns=10, is_error=True,
+                           tokens_used=1234, session_id="s",
+                           stop_reason=self._stop)
+
+
+def _single_planner_config(tmp_path):
+    """Planning on, MoA fan-out off — pins these tests to the single-planner
+    path regardless of what the complexity gate would decide."""
+    cfg = _planning_config(tmp_path)
+    cfg.data.setdefault("llm", {})["moa_planning"] = {"enabled": False}
+    return cfg
+
+
+async def test_planner_error_result_never_becomes_the_plan(
+    bare_repo, tmp_path, store,
+):
+    """The 74-character SDK error string must not be persisted, materialized
+    or inlined into the coder prompt as an implementation plan."""
+    cfg = _single_planner_config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+    await store.create_task(t)
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend",
+                return_value=ErroringPlannerBackend()):
+        plan = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert plan == ""
+    # …so the whole propagation surface stays empty. `_persist_plan` no-ops on a
+    # falsy plan, which is also the guard on the .no_human/PLAN.md write.
+    await orch._persist_plan(t, plan)
+    assert not (t.context or {}).get("plan")
+    assert "IMPLEMENTATION PLAN" not in orch._build_implement_prompt(t)
+    assert _MAX_TURNS_ERROR not in orch._build_implement_prompt(t)
+
+    planning = [e for e in events if e.get("kind") == "planning"]
+    # The failure is named out loud: what stopped it, how far it got, what it
+    # cost, and what it actually said.
+    failed = [e for e in planning if "max_turns" in e.get("text", "")]
+    assert failed, planning
+    assert "10 turns" in failed[0]["text"]
+    assert "1234 tokens" in failed[0]["text"]
+    assert "Reached maximum number of turns" in failed[0]["text"]
+
+
+async def test_planner_quota_wall_raises_instead_of_planning_blind(
+    bare_repo, tmp_path, store,
+):
+    """A planner that dies on the billing wall parks the task, exactly as the
+    coder path does — proceeding plan-less would just hit the same wall."""
+    from no_human.core.bounds import QuotaExhausted
+
+    cfg = _single_planner_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=[].append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+
+    quota_text = ("Claude Code returned an error result: You've hit your "
+                  "monthly spend limit")
+    with _patch("no_human.core.orchestrator.ClaudeBackend",
+                return_value=ErroringPlannerBackend(quota_text, "error")):
+        with pytest.raises(QuotaExhausted) as exc:
+            await orch._generate_plan(t, GitRepo(bare_repo))
+    assert "spend limit" in str(exc.value)
+
+
+async def test_quota_from_the_planning_step_parks_the_task(
+    bare_repo, tmp_path, store,
+):
+    """Planning runs BEFORE the first attempt exists, so the attempt loop's own
+    QuotaExhausted handler cannot see it — `_drive_watched` parks it."""
+    from no_human.core.bounds import QuotaExhausted
+
+    cfg = _single_planner_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=[].append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+    # The state `_drive` is actually in when the planner runs (it sets CONTEXT
+    # then PLANNING before the first planning call) — an ACTIVE state, from
+    # which PAUSED_QUOTA is a legal off-ramp.
+    await store.set_status(t, TaskStatus.CONTEXT)
+    await store.set_status(t, TaskStatus.PLANNING)
+
+    async def _boom(self, task, repo):
+        raise QuotaExhausted("monthly spend limit")
+
+    with _patch.object(Orchestrator, "_drive", _boom):
+        outcome = await orch._drive_watched(t, GitRepo(bare_repo))
+
+    assert outcome.status == TaskStatus.PAUSED_QUOTA
+    assert (await store.get_task(t.id)).status == TaskStatus.PAUSED_QUOTA
+
+
+async def test_planner_prose_with_no_sections_is_dropped(
+    bare_repo, tmp_path, store,
+):
+    """Belt to the is_error gate: a non-error plan that parses to a completely
+    empty TaskSpec carries nothing the pipeline can use, but WOULD still be
+    inlined as an authoritative plan and empty the scope guard."""
+    cfg = _single_planner_config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+
+    prose = "I looked at the repo but could not determine what to change."
+    from no_human.core.task import TaskSpec
+    spec = TaskSpec.from_plan(prose)
+    assert not (spec.files_to_change or spec.approach or spec.test_plan)
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend",
+                return_value=PlannerBackend(prose)):
+        plan = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert plan == ""
+    planning = [e for e in events if e.get("kind") == "planning"]
+    assert any("unusable" in e.get("text", "") for e in planning), planning
+
+
+async def test_healthy_plan_still_flows_through_untouched(
+    bare_repo, tmp_path, store,
+):
+    """Negative control for the two gates above: a normal multi-section plan
+    from a non-error result is returned, persisted, and reaches the coder."""
+    cfg = _single_planner_config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend",
+                return_value=PlannerBackend(_SAMPLE_PLAN)):
+        plan = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert plan == _SAMPLE_PLAN.strip()
+    await orch._persist_plan(t, plan)
+    assert (t.context or {})["plan"] == _SAMPLE_PLAN.strip()
+    assert (t.context or {})["spec"]["files_to_change"] == ["calc.py: add mul()"]
+    prompt = orch._build_implement_prompt(t)
+    assert "IMPLEMENTATION PLAN" in prompt
+    assert "Do not rename existing functions." in prompt
+    planning = [e for e in events if e.get("kind") == "planning"]
+    assert any("plan generated" in e.get("text", "") for e in planning)
+    assert not any("unusable" in e.get("text", "") for e in planning)
+
+
+# --------------------------------------------------------------------------- #
 # B1: MoA (Mixture-of-Agents) planning fan-out — on by default.               #
 # --------------------------------------------------------------------------- #
 
@@ -1638,10 +1826,16 @@ class MoAFakeBackend:
 
     def __init__(self, proposals: dict[str, str] | None = None,
                  aggregate_text: str = "", fail_lenses: set[str] | None = None,
-                 single_path_text: str = ""):
+                 single_path_text: str = "",
+                 error_lenses: set[str] | None = None,
+                 aggregate_is_error: bool = False):
         self.proposals = proposals or {}
         self.aggregate_text = aggregate_text
         self.fail_lenses = fail_lenses or set()
+        # `fail_lenses` RAISES; `error_lenses` returns the terminal-error result
+        # the SDK actually hands back (is_error=True, the error string as text).
+        self.error_lenses = error_lenses or set()
+        self.aggregate_is_error = aggregate_is_error
         self.single_path_text = single_path_text
         self.prompts: list[str] = []
 
@@ -1651,6 +1845,15 @@ class MoAFakeBackend:
         for lens_name in self.fail_lenses:
             if f"LENS ({lens_name})" in prompt:
                 raise RuntimeError(f"simulated failure for {lens_name}")
+        for lens_name in self.error_lenses:
+            if f"LENS ({lens_name})" in prompt:
+                return AgentResult(final_text=_MAX_TURNS_ERROR, num_turns=10,
+                                   is_error=True, tokens_used=1234,
+                                   session_id="s", stop_reason="max_turns")
+        if "=== PROPOSAL (" in prompt and self.aggregate_is_error:
+            return AgentResult(final_text=_MAX_TURNS_ERROR, num_turns=10,
+                               is_error=True, tokens_used=1234,
+                               session_id="s", stop_reason="max_turns")
         for lens_name, text in self.proposals.items():
             if f"LENS ({lens_name})" in prompt:
                 return AgentResult(final_text=text, num_turns=2, is_error=False,
@@ -1710,6 +1913,68 @@ async def test_moa_planning_synthesizes_proposals(bare_repo, tmp_path, store):
     assert any("synthesized" in e.get("text", "") for e in moa_events)
     planning_events = [e for e in events if e.get("kind") == "planning"]
     assert any("plan generated" in e.get("text", "") for e in planning_events)
+
+
+async def test_moa_errored_proposer_is_excluded_from_the_drafts(
+    bare_repo, tmp_path, store,
+):
+    """A proposer that ends on a terminal SDK error is a FAILED draft — its
+    error string must never be handed to the aggregator as a proposal."""
+    cfg = _moa_config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    fake = MoAFakeBackend(
+        proposals={
+            "minimal-first": _SAMPLE_PLAN,
+            "test-first": _SAMPLE_PLAN.replace("test_mul", "test_mul_first"),
+        },
+        error_lenses={"risk-first"},
+        aggregate_text="## FILES TO CHANGE/CREATE\n- calc.py: synthesized\n",
+    )
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
+        result = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    # The two healthy proposers still carry the plan through.
+    assert result == "## FILES TO CHANGE/CREATE\n- calc.py: synthesized"
+    agg_prompt = next(p for p in fake.prompts if "=== PROPOSAL (" in p)
+    assert "=== PROPOSAL (risk-first) ===" not in agg_prompt
+    assert _MAX_TURNS_ERROR not in agg_prompt
+    assert "=== PROPOSAL (minimal-first) ===" in agg_prompt
+    moa = [e for e in events if e.get("kind") == "planning_moa"]
+    assert any("risk-first" in e.get("text", "") and "max_turns" in e.get("text", "")
+               for e in moa), moa
+
+
+async def test_moa_errored_aggregator_falls_back_to_a_proposal(
+    bare_repo, tmp_path, store,
+):
+    """An aggregator that errors out takes the existing "produced no output"
+    fallback — never ships its error string as the synthesized plan."""
+    cfg = _moa_config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    fake = MoAFakeBackend(
+        proposals={
+            "minimal-first": _SAMPLE_PLAN,
+            "risk-first": _SAMPLE_PLAN.replace("mul", "mul_edge"),
+            "test-first": _SAMPLE_PLAN.replace("test_mul", "test_mul_first"),
+        },
+        aggregate_is_error=True,
+    )
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
+        result = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert result == _SAMPLE_PLAN.strip()   # drafts[0] — the first proposal
+    moa = [e for e in events if e.get("kind") == "planning_moa"]
+    assert any("using first proposal" in e.get("text", "") for e in moa), moa
 
 
 async def test_moa_announces_the_fan_out_and_attributes_each_lens(
@@ -1898,8 +2163,8 @@ async def test_moa_reports_a_failed_proposer_by_lens(bare_repo, tmp_path, store)
 
 
 async def test_moa_aggregator_prompt_forbids_numeric_score(bare_repo, tmp_path, store):
-    """CLAUDE.md #3: evidence-based review/synthesis, never a numeric
-    self-score. The aggregator prompt must not invite one."""
+    """Review and synthesis are evidence-based, never a numeric self-score.
+    The aggregator prompt must not invite one."""
     import re as _re
     cfg = _moa_config(tmp_path)
     orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),

@@ -1,2 +1,2 @@
-64b93da3bc2081bba7c6b608716054c097ffb93b  src/no_human/cli/commands.py  5862cd0395089a507012da9c9ba010aab1a21e6b
+b585af892e8b1caab57e62ba3b7810da17da8d0f  src/no_human/cli/commands.py  5862cd0395089a507012da9c9ba010aab1a21e6b
 d5dd336d37fcf96c5fe2a81a78d2008e308dbe72  tests/test_cli_commands.py

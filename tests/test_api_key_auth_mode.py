@@ -1,6 +1,6 @@
 """BYO-API-key auth mode (llm.auth_mode: "api_key").
 
-An operator-authorized, explicit departure from OAuth-only (CLAUDE.md #1): a
+An operator-authorized, explicit departure from the OAuth-only default: a
 friend/commercial install can pay Anthropic directly with THEIR OWN
 ANTHROPIC_API_KEY instead of a Claude subscription token. The invariants that
 must still hold:

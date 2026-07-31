@@ -46,13 +46,20 @@ nh task add --title "Fix the flaky E2E test" --repo ~/git/my-repo
 nh task add https://github.com/org/repo/issues/42 --repo ~/git/my-repo
 ```
 
-## 5. Watch it work
+## 5. Run one in the foreground
 
 ```bash
 nh watch <task-id>
 ```
 
-This opens a live TUI showing tool calls, agent reasoning, and progress.
+This opens a live Textual TUI showing tool calls, agent reasoning, and progress.
+
+> ⚠️ Despite the name, `nh watch` **runs** the task in a foreground TUI — it is
+> not a read-only viewer (`cli/commands.py`: "Run a staged task in the live
+> Textual TUI"). Point it only at a *staged* task. Do **not** point it at one
+> that `nh start`'s worker is already working, or the task runs twice. To just
+> look at a running task, use `nh status`, `nh logs <task-id>`, or the web
+> board.
 
 ## 6. Check on tasks
 

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..core.db import Store
+from ..core.pricing import CACHE_CREATION_WEIGHT, CACHE_READ_WEIGHT
 from ..core.events import EventPersister
 from ..core.orchestrator import Orchestrator
 from ..core.task import Task, TaskStatus
@@ -109,15 +110,24 @@ class BenchScore:
         """Price-weighted ratio using Anthropic's cache multipliers
         (fresh=1.0, cache_read=0.1, cache_creation=1.25) applied SYMMETRICALLY
         to both sides — tracks dollar cost, where cache-read is ~95% of real
-        burn and the plain token_ratio is blind to it."""
+        burn and the plain token_ratio is blind to it.
+
+        The multipliers used to be inline literals here, which made this the
+        second price table in the tree; they now come from `core.pricing`, the
+        same one the budget gate weights its caps with. Values unchanged — this
+        is a de-duplication, not a re-pricing, so published ratios still stand.
+        The arithmetic is kept in float (rather than routed through
+        `pricing.weighted_tokens`, which floors to an int for the caps) so a
+        ratio over small samples is not quantised.
+        """
         orig = (self.orig_tokens
-                + 0.1 * self.orig_cache_tokens
-                + 1.25 * self.orig_cache_creation_tokens)
+                + CACHE_READ_WEIGHT * self.orig_cache_tokens
+                + CACHE_CREATION_WEIGHT * self.orig_cache_creation_tokens)
         if orig <= 0:
             return None
         nh = (self.nh_tokens
-              + 0.1 * self.nh_cache_tokens
-              + 1.25 * self.nh_cache_creation_tokens)
+              + CACHE_READ_WEIGHT * self.nh_cache_tokens
+              + CACHE_CREATION_WEIGHT * self.nh_cache_creation_tokens)
         return nh / orig
 
     def as_dict(self) -> dict[str, Any]:

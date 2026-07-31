@@ -28,8 +28,9 @@ body:
     attributes:
       label: Constraints
       description: >
-        CLAUDE.md lists constraints this project treats as correctness
-        requirements. A proposal that breaks one of them will be declined.
+        CONTRIBUTING.md lists the constraints this project treats as
+        correctness requirements rather than preferences. A proposal that
+        breaks one of them will be declined.
       options:
-        - label: I have read CLAUDE.md and this proposal does not conflict with it.
+        - label: I have read those constraints and this proposal does not conflict with them.
           required: true

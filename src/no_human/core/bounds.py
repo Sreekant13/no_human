@@ -51,8 +51,39 @@ class Bounds:
     # tasks at 22.8M/15M/12.7M). So 8M clears every real success with headroom and
     # parks a runaway an order of magnitude sooner than the old 25M did (which the
     # 61.5M task blew past entirely, across resumes).
+    #
+    # UNIT CHANGE, 2026-07-31: `lifetime_tokens` and `attempt_tokens` are now
+    # COST-WEIGHTED tokens (`core.pricing.weighted_tokens`) — fresh in/out at
+    # 1.0, cache creation at 1.25, cache read at 0.1 — not raw token counts.
+    # The raw counter was measuring conversation LENGTH and calling it spend:
+    # task d6e4b72a died at "12,367,237/12,000,000" on an attempt whose real
+    # burn was 877,127 fresh-equivalent tokens, 97% of it prefix re-reads that
+    # bill at a tenth of the rate the cap charged them.
+    #
+    # The numbers below are the old raw caps CONVERTED, not relaxed. Measured
+    # over this install's whole ledger (193 tasks / 602 attempts / 1.718B raw
+    # tokens): weighted spend is 0.1985x raw. 8,000,000 x 0.1985 = 1,588,000,
+    # and 1,600,000 is also the empirical optimum — swept over 400k..4M in 50k
+    # steps it reproduces the raw 8M cap's park-or-spare verdict on 191 of the
+    # 193 real tasks (0 tasks newly spared, 2 newly parked). So the DOLLAR
+    # bound is unchanged; what changes is that it is now the SAME dollar bound
+    # for every task. The per-task weighted/raw ratio ranges 0.122..0.697 in
+    # that corpus, so the raw cap was handing a cache-heavy task 5.7x the real
+    # budget of a fresh-heavy one while printing the same number at both.
+    #
+    # CUTOVER, and it is handled — see `core.pricing.raw_cap_as_weighted`.
+    # Per-task raises written before this change are RAW numbers: 165 tasks on
+    # this install carry a `task.config["lifetime_tokens"]` of 12M-68M and 162
+    # carry a raw `attempt_tokens`. An earlier draft of this comment said "156
+    # ... on mostly-finished tasks"; both halves were wrong. 94 of the 165 are
+    # escalated/failed/paused — precisely what a mass retry re-runs — and read
+    # verbatim they would have granted 1.388 BILLION of ceiling across the 91
+    # escalated+failed where ~275M was intended. Overrides are therefore read
+    # through a unit guard that treats an UNMARKED config as raw and converts
+    # it; only a config carrying `budget_unit: "weighted"` (stamped by every
+    # write in blockers/actions.py) is taken at face value.
     lifetime_attempts: int = 9
-    lifetime_tokens: int = 8_000_000
+    lifetime_tokens: int = 1_600_000
     # Per-ATTEMPT spend cap (v6 taxonomy, 2026-07-16): four live specs burned
     # the entire 8M lifetime budget in attempt #1 — the mid-attempt watch was
     # armed with the remaining LIFETIME budget, so the bounded loop never got a
@@ -62,7 +93,15 @@ class Bounds:
     # measured successful attempt (complex tier: 3.06M cache-read) with ~30%
     # headroom and leaves the loop at least two real attempts inside 8M.
     # Per-task overridable via task.config["attempt_tokens"] (human-only).
-    attempt_tokens: int = 4_000_000
+    #
+    # Also cost-weighted since 2026-07-31, converted the same way: the old raw
+    # 4,000,000 x 0.1985 = 794,000, rounded to 800,000. Swept over the same
+    # ledger's 602 attempt rows, 800,000 weighted reproduces the raw 4M cap's
+    # verdict on 566 of them (750,000 peaks at 571 — inside the noise, since
+    # attempt rows pile up exactly AT the cap that truncated them, so the
+    # rounder number is taken). The measured complex-tier attempt this cap has
+    # to clear — 3.06M raw, almost all cache-read — is 306,000 weighted.
+    attempt_tokens: int = 800_000
 
     @staticmethod
     def from_config(cfg: dict | None) -> "Bounds":

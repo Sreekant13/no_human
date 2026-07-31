@@ -340,7 +340,7 @@ async def test_correction_reply_replans_once_and_parks_again(
 async def test_second_correction_does_not_replan_again(
     bare_repo, tmp_path, store, client,
 ):
-    """Bounded loop (CLAUDE.md #5): the re-plan is capped at one. A further
+    """The loop is bounded: the re-plan is capped at one. A further
     correction parks again WITHOUT spending another planner session."""
     coder = CountingCoder()
     planner = ScriptedPlanner(_PLAN_A, _PLAN_B)

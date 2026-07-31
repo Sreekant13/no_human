@@ -66,7 +66,7 @@ class ReviewerUnavailable(RuntimeError):
     verdict after its bounded retries.
 
     Raised instead of returning a decision. A passing decision would make the
-    gate a rubber stamp (CLAUDE.md #3); a *failing* one is subtler and just as
+    gate a rubber stamp; a *failing* one is subtler and just as
     wrong — its checklist becomes feedback the coder is told to act on, so a
     reviewer that merely ran out of turns costs the coder a bounded attempt for
     a defect nobody found.

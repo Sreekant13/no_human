@@ -4,4 +4,4 @@
 82c1a5bc574a48ba291a178a52ba99c5dcbaff0e  src/no_human/eval/northstar_card.py
 8ea2c0e81cede74c814ae002eed9c0c0a3d09064  web/src/Stats.jsx
 c56ac6e7ab5c6f748e7733a863995f1e34a4c81f  src/no_human/api/app.py  4f565a9f5f608ff012be570c7c2ab9cf121ad0b1
-e0f84c7d1cc22e1797f53eb095c00a51cd0d4707  src/no_human/cli/commands.py  1230a5fdc17d6de49f331dcab77b609799de9ffc
+f6a2fc28d22ab2fce5a4249c7da2cf097218c00a  src/no_human/cli/commands.py  1230a5fdc17d6de49f331dcab77b609799de9ffc

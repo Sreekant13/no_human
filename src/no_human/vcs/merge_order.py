@@ -2,9 +2,9 @@
 
 An edge ``(child, parent)`` means *parent must merge before child* (else the
 child merges code that references an un-merged base). This module computes the
-safe merge ORDER and which PRs are ready right now. The agent never merges
-(CLAUDE.md #2) — an operator drives the actual merges (``nh merge-stack``) using
-this order. Pure functions so the topology is unit-pinned.
+safe merge ORDER and which PRs are ready right now. The agent never merges: it
+opens PRs and stops, and a human drives the actual merges (``nh merge-stack``)
+using this order. Pure functions so the topology is unit-pinned.
 """
 
 from __future__ import annotations

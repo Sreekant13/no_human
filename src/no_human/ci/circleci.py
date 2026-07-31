@@ -21,7 +21,7 @@ from urllib.parse import quote
 from .base import CIBackend, CIResult, HumanGatedCI, JobResult, PipelineStatus
 
 _API = "https://circleci.com/api/v2"
-_INFRA_BACKOFF_SECONDS = 120  # 2 minutes between infra retries (CLAUDE.md)
+_INFRA_BACKOFF_SECONDS = 120  # 2 minutes between infra retries
 
 
 def _http_get(url: str, headers: dict):
@@ -139,7 +139,8 @@ class CircleCICI(CIBackend):
 
         Retries only on INFRA failures (transient 5xx/network), up to
         ``max_infra_retries`` with a backoff — matching the gitlab/jenkins
-        backends and the CLAUDE.md rule. An access wall or a real test failure is
+        backends and the project rule that ONLY infra failures are ever
+        retried, never a verdict. An access wall or a real test failure is
         never retried; ``HumanGatedCI`` (no pipeline for the branch) propagates."""
         if not self.token:
             return self._access()

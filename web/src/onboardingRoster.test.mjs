@@ -73,8 +73,17 @@ test("the intro paragraph still advertises the investigation capability, and doe
     /read-only/i,
     "the .ob-lede must NOT call investigations read-only — they are not, and this claim was retracted 2026-07-29",
   );
-  // The thesis line itself is explicitly out of scope for this task.
-  assert.match(jsx, /Stop hand-holding one chat\. Ship 10× in parallel — at a tenth of the cost\./);
+  // The thesis line. "10× in parallel" was removed 2026-08-01: it is an
+  // unmeasured design ambition (nothing measures delivery volume, and
+  // concurrency ships OFF by default at max_workers 2), and an unmeasured
+  // number standing beside the measured cost claim spends its credibility.
+  // The cost half IS measured and stays.
+  assert.match(jsx, /Stop hand-holding one chat\. Hand over the ticket, review the finished PR — at a tenth of the cost\./);
+  assert.doesNotMatch(
+    jsx,
+    /10×|10x in parallel/i,
+    "the first-run headline must not re-introduce the unmeasured 10× claim",
+  );
 });
 
 test("the Coder card uses the Coder colour token; the Orchestrator card uses the orchestrator token", () => {

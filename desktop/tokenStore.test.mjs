@@ -117,7 +117,7 @@ test("writeToken: refuses to persist an invalid value", () => {
   assert.equal(fs.existsSync(envPath(h)), false, "nothing written on reject");
 });
 
-// ── E2: BYO API key — the sanctioned opt-in mode (CLAUDE.md #1) ─────────────
+// ── E2: BYO API key — the sanctioned opt-in billing mode ────────────────────
 // The desktop screen historically accepted ONLY a subscription token; the
 // backend has supported llm.auth_mode: "api_key" since 2026-07-24. These pin
 // the desktop half: mode-aware validation, storage, config upsert, and gate.

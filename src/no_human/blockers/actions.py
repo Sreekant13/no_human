@@ -20,6 +20,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+# `core.pricing` is a leaf (it imports nothing from this package), so this
+# cannot reintroduce the cycle the TYPE_CHECKING guard below exists for.
+from ..core.pricing import (
+    BUDGET_UNIT_KEY, TOKEN_CAP_KEYS, WEIGHTED_UNIT, config_is_weighted,
+    raw_cap_as_weighted,
+)
+
 if TYPE_CHECKING:  # pragma: no cover — typing only, avoids an import cycle
     from ..core.task import Task
 
@@ -122,6 +129,17 @@ def apply_action(
         # The human CLI path (human_override=True) is the explicit gate and sets
         # the exact requested value instead, raising or lowering.
         prior = existing.get(key)
+        if isinstance(prior, int) and not isinstance(prior, bool):
+            # ...COMPARED IN ONE UNIT. The token caps became cost-weighted on
+            # 2026-07-31 and 165 pre-cutover overrides on this install are raw
+            # numbers 5x too large for the new scale. Comparing a weighted
+            # request against a raw prior means the raw one always "wins" the
+            # never-lower guard and is then written back as if it were
+            # weighted — so the stale 12M-68M ceilings would be permanent,
+            # unreachable by the very flow that exists to correct a budget.
+            # Normalising the prior first is what makes them correctable.
+            if key in TOKEN_CAP_KEYS and not config_is_weighted(existing):
+                prior = max(raw_cap_as_weighted(prior), 1)
         if (not human_override
                 and isinstance(prior, int) and not isinstance(prior, bool)
                 and prior > value):
@@ -132,4 +150,35 @@ def apply_action(
             notes[key] = f"{key}={value}"
 
     task.config = {**existing, **resolved}
+    # Stamp the unit on any write that touches a token cap, so this config is
+    # never re-converted. Written here rather than asked of every caller: the
+    # blocker's raise option, `nh task config` and the API all land in this one
+    # function, and a caller that forgot would silently shrink its own cap by
+    # 5x on the next read.
+    if TOKEN_CAP_KEYS & set(resolved):
+        # The marker describes the WHOLE dict, so stamping it makes a claim
+        # about every token cap in it — including ones this write never
+        # touched. A partial write is the NORMAL case, not a corner: the
+        # BUDGET_EXHAUSTED raise option writes {lifetime_attempts,
+        # lifetime_tokens} and never attempt_tokens, and 162 tasks on this
+        # install carry both keys in raw units. Stamping without converting
+        # the untouched sibling promoted a raw 6,000,000 attempt_tokens to
+        # 6,000,000 weighted — 5.04x — and permanently, since the marker is
+        # then present. The damage is not mainly dollars: on all 27 escalated
+        # tasks that reach a raise, the inflated attempt cap lands at or above
+        # the remaining lifetime budget, so the per-attempt brake goes inert
+        # and the bounded loop degenerates to a single attempt — verbatim the
+        # v6 taxonomy failure that `Bounds.attempt_tokens` exists to prevent.
+        #
+        # So: bring every untouched cap into the unit the marker is about to
+        # claim, using the same conversion the reader would have applied. The
+        # invariant this restores is that a write to one key cannot change
+        # what another key MEANS.
+        if not config_is_weighted(existing):
+            for other in TOKEN_CAP_KEYS - set(resolved):
+                stale = existing.get(other)
+                if (isinstance(stale, int) and not isinstance(stale, bool)
+                        and stale > 0):
+                    task.config[other] = max(raw_cap_as_weighted(stale), 1)
+        task.config[BUDGET_UNIT_KEY] = WEIGHTED_UNIT
     return ", ".join(notes[k] for k in sorted(notes))

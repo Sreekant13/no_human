@@ -61,7 +61,7 @@ _RESULT_STATUS = {
     "NOT_BUILT": PipelineStatus.SKIPPED,
 }
 
-_INFRA_BACKOFF_SECONDS = 120  # 2 minutes (CLAUDE.md)
+_INFRA_BACKOFF_SECONDS = 120  # 2 minutes between infra retries
 _CONSOLE_TAIL_LINES = 40
 
 # curl -w marker so we can read the HTTP status without -f (which would collapse

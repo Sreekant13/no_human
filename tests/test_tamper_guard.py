@@ -1,5 +1,7 @@
 """Test-tampering guard (§3.4): net reduction in tests/assertions => fail closed."""
 
+import pytest
+
 from no_human.testing import tamper_guard
 
 PY_TESTS = '''
@@ -694,3 +696,30 @@ def test_known_cost_deleting_a_fixture_snapshot_is_no_longer_flagged():
         {"tests/test_reviewer_recall_runner.py": snapshot}, {}
     )
     assert gone.tampered, gone.reasons
+
+
+def test_tamper_check_refuses_a_missing_worktree_instead_of_crashing(tmp_path):
+    """A guard that cannot look must say so, not answer "clean".
+
+    Observed twice on 2026-07-31: a resumed attempt whose worktree had been
+    removed reached tamper_check_between and died on an opaque
+    FileNotFoundError raised by a subprocess several frames down, taking the
+    worker pool's task with it and leaving no diagnosable cause. The failure
+    mode that would be WORSE is a clean TamperReport — the guard would then
+    launder "I did not look" into "nothing was wrong", which is exactly the
+    reward-hacking window it exists to close. So this asserts the error, and
+    asserts it is not a passing report.
+    """
+    from no_human.testing.runner import TamperCheckUnavailable, tamper_check_between
+
+    missing = tmp_path / "worktree-that-was-removed"
+    with pytest.raises(TamperCheckUnavailable) as exc:
+        tamper_check_between(missing)
+    assert str(missing) in str(exc.value), "the error must name the path"
+
+    # A directory that exists but is not a checkout is the same class of
+    # "cannot inspect" — a bare mkdir left behind by a half-torn-down worktree.
+    not_a_checkout = tmp_path / "empty"
+    not_a_checkout.mkdir()
+    with pytest.raises(TamperCheckUnavailable):
+        tamper_check_between(not_a_checkout)

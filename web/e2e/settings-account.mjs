@@ -40,7 +40,7 @@ async function openAccount(page) {
 
 function baseStatus(over = {}) {
   return {
-    configured_profile: "personal", active_profile: "personal2",
+    configured_profile: "personal", active_profile: "second-profile",
     restart_required: true, token_var: "CLAUDE_CODE_OAUTH_TOKEN_PERSONAL",
     token_present: true,
     profiles: [{ name: "default", token_present: true }, { name: "personal", token_present: true }],
@@ -77,7 +77,7 @@ function baseStatus(over = {}) {
     await page.locator('.nh-alarm', { hasText: /ANTHROPIC_API_KEY/ }).isVisible().catch(() => false));
   check("[s1] configured vs active billing profile are both surfaced",
     (await page.locator('.auth-status').innerText().catch(() => "")).match(/personal/) &&
-    (await page.locator('.auth-status').innerText().catch(() => "")).includes("personal2"));
+    (await page.locator('.auth-status').innerText().catch(() => "")).includes("second-profile"));
 
   const input = page.locator('input[aria-label="OAuth token"]');
   check("[s1] token field is write-only (type=password)", (await input.getAttribute("type")) === "password");

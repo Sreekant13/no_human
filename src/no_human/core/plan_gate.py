@@ -47,7 +47,8 @@ STATE_APPROVED = "approved"
 
 # A correction re-plans ONCE. Beyond that the gate parks without spending
 # another planner session — a plan the human keeps rejecting is a decision to
-# make, not a loop to run (CLAUDE.md #5).
+# make, not a loop to run: every agent loop here is bounded, and a blocker is
+# parked honestly rather than spun on.
 MAX_REPLANS = 1
 
 APPROVE_LABEL = "Approve the plan - start implementing"

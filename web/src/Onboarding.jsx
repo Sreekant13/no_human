@@ -331,7 +331,7 @@ export default function Onboarding({ onComplete }) {
                   `*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }`
                   reset near the top of styles.css. If that reset is ever narrowed, this
                   headline needs an explicit margin-top. */}
-              <h2 className="ob-h1">Stop hand-holding one chat. Ship 10× in parallel — at a tenth of the cost.</h2>
+              <h2 className="ob-h1">Stop hand-holding one chat. Hand over the ticket, review the finished PR — at a tenth of the cost.</h2>
               <p className="ob-lede">
                 no_human fields an <em>entire team of specialized agents at once</em> — many
                 tasks, across many repos, in parallel. Each one is carried from intake to an

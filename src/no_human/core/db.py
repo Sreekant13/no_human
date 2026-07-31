@@ -664,13 +664,61 @@ class Store:
     _USAGE_TIERS = ("", "review_", "plan_", "utility_")
 
     @classmethod
+    def _usage_columns_by_class(cls) -> dict[str, tuple[str, ...]]:
+        """The same twelve columns, grouped by PRICE CLASS rather than by tier.
+
+        The four tiers all bill at the same three rates, so the classes — not
+        the tiers — are what a cost-weighted budget has to keep apart
+        (``core.pricing``). Keyed by the coder-tier column name so a caller can
+        splat the result straight into ``pricing.weighted_tokens``.
+        """
+        return {
+            "tokens_used": tuple(
+                "tokens_used" if tier == "" else f"{tier}tokens_used"
+                for tier in cls._USAGE_TIERS
+            ),
+            "cache_read_tokens": tuple(
+                f"{tier}cache_read_tokens" for tier in cls._USAGE_TIERS),
+            "cache_creation_tokens": tuple(
+                f"{tier}cache_creation_tokens" for tier in cls._USAGE_TIERS),
+        }
+
+    @classmethod
     def _usage_columns(cls) -> tuple[str, ...]:
-        cols: list[str] = []
-        for tier in cls._USAGE_TIERS:
-            cols.append("tokens_used" if tier == "" else f"{tier}tokens_used")
-            cols.append(f"{tier}cache_read_tokens")
-            cols.append(f"{tier}cache_creation_tokens")
-        return tuple(cols)
+        # Derived, never re-listed: a column added to one of these and not the
+        # other would make the raw total and the weighted total disagree about
+        # what the task spent.
+        return tuple(
+            col for cols in cls._usage_columns_by_class().values() for col in cols
+        )
+
+    async def lifetime_usage_by_class(
+        self, task_id: str
+    ) -> tuple[int, dict[str, int]]:
+        """(attempts, {tokens_used, cache_read_tokens, cache_creation_tokens}).
+
+        The same rows and the same twelve columns ``lifetime_usage`` sums, kept
+        in their three price classes so the budget gate can weight them
+        (``core.pricing.weighted_tokens``). The classes are summed across all
+        four model tiers — coder, reviewer, planner, utility — because they all
+        bill at the same three rates.
+        """
+        selects = ", ".join(
+            "COALESCE(SUM({}), 0) AS {}".format(
+                " + ".join(f"COALESCE({c}, 0)" for c in cols), name)
+            for name, cols in self._usage_columns_by_class().items()
+        )
+        cur = await self.db.execute(
+            f"SELECT COUNT(*) AS n, {selects} FROM attempts WHERE task_id = ?",
+            (task_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return (0, {name: 0 for name in self._usage_columns_by_class()})
+        return (
+            int(row["n"]),
+            {name: int(row[name]) for name in self._usage_columns_by_class()},
+        )
 
     async def lifetime_usage(self, task_id: str) -> tuple[int, int]:
         """(attempts, tokens) spent over the task's WHOLE life, resumes included.
@@ -687,15 +735,16 @@ class Store:
 
         Interrupted/killed rows count: they spent the attempt even if their
         token columns under-report (pre-1638427 rows recorded zero).
+
+        RAW, and deliberately still raw: this is the burn figure `nh`, the web
+        surfaces and `eval/northstar.py` all report, and it must keep matching
+        them token for token. The BUDGET gate no longer compares against it —
+        it uses ``lifetime_usage_by_class`` and weights the classes by price
+        (``core.pricing``), because a raw sum bounds conversation length, not
+        spend. Computed from the same one query so the two cannot drift.
         """
-        summed = " + ".join(f"COALESCE({c}, 0)" for c in self._usage_columns())
-        cur = await self.db.execute(
-            f"SELECT COUNT(*) AS n, COALESCE(SUM({summed}), 0) AS toks "
-            "FROM attempts WHERE task_id = ?",
-            (task_id,),
-        )
-        row = await cur.fetchone()
-        return (int(row["n"]), int(row["toks"])) if row else (0, 0)
+        attempts, by_class = await self.lifetime_usage_by_class(task_id)
+        return attempts, sum(by_class.values())
 
     # ---------------------- unattributed usage ledger ----------------------- #
 

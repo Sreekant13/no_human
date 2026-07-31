@@ -272,10 +272,10 @@ async def test_base_protection_also_covers_the_context_base(store, tmp_path):
 
 async def test_agent_commits_carry_the_machine_identity(store, tmp_path):
     """PR #531's commit was authored `dev <dev@example.com>`.
-    CLAUDE.md #2 requires a distinct identity: the history must say plainly
-    which commits a machine wrote. GitRepo passes `-c user.name` for its own
-    commits, but a `git commit` the agent runs in Bash inherits the operator's
-    global config."""
+    The agent must commit under a DISTINCT identity: the history must say
+    plainly which commits a machine wrote. GitRepo passes `-c user.name` for
+    its own commits, but a `git commit` the agent runs in Bash inherits the
+    operator's global config."""
     orch = _orch_for_guards(store, tmp_path)
     env = orch._agent_git_identity()
     assert env["GIT_AUTHOR_NAME"] == "no_human"

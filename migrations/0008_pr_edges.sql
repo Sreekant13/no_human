@@ -1,8 +1,8 @@
 -- 2.2 Stacked-PR ordered merge: a dependency DAG over PRs so a chain of
 -- dependent PRs can be merged in the correct order (a child PR must not merge
 -- before its parent, or it merges code that references an un-merged base).
--- The AGENT never merges (CLAUDE.md #2) — this records the ORDER; an operator
--- (or the watching Claude Code session) executes the merges via `nh merge-stack`.
+-- The AGENT never merges: it opens the PRs and stops. This table records the
+-- ORDER; a human executes the merges via `nh merge-stack`.
 -- A row means: child_pr depends on parent_pr (parent must merge first).
 CREATE TABLE IF NOT EXISTS pr_edges (
   child_pr TEXT NOT NULL,              -- PR/MR URL or ref that depends on the parent

@@ -57,6 +57,9 @@ blocked unconditionally.
   the reviewer as evidence the implementer never saw.
 - **CI retry** only on infra failures (max 2); real failures never auto-retry.
 
+Each of those gates, with the code that enforces it and what it does *not*
+cover: [verification.md](verification.md).
+
 ## 5. Bounded loop + honest blockers
 
 `max_attempts`, per-attempt `max_turns`, and stuck detection (same error

@@ -14,9 +14,9 @@ import pytest
 def _no_real_backoffs(monkeypatch):
     from no_human.core.orchestrator import Orchestrator
     monkeypatch.setattr(Orchestrator, "PR_OPEN_RETRY_DELAY", 0)
-    # CI infra backoffs (module constants, 120s each — CLAUDE.md's 2-minute
-    # retry rule; the tests that exercise retries patch sleep themselves, but
-    # one unpatched path used to cost 2 real minutes).
+    # CI infra backoffs (module constants, 120s each — the project's 2-minute
+    # infra-retry rule; the tests that exercise retries patch sleep themselves,
+    # but one unpatched path used to cost 2 real minutes).
     import no_human.ci.gitlab as _gl
     import no_human.ci.jenkins as _jk
     monkeypatch.setattr(_gl, "_INFRA_BACKOFF_SECONDS", 0)

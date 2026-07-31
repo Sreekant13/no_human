@@ -204,7 +204,12 @@ def test_apply_action_never_lowers_an_existing_cap():
     from no_human.core.task import Task
 
     t = Task.new("x", repo_path="/tmp/x")
-    t.config = {"lifetime_tokens": 16_000_000}
+    # Both numbers in ONE unit — `budget_unit` says the stored cap is already
+    # weighted. Never-lower is a comparison, and comparing a weighted request
+    # against a pre-cutover RAW prior is not one; that cross-unit case has its
+    # own test (test_lifetime_budget.py::
+    # test_a_stale_raw_ceiling_is_correctable_and_does_not_become_permanent).
+    t.config = {"lifetime_tokens": 16_000_000, "budget_unit": "weighted"}
 
     # A lower request keeps the existing (higher) cap and says so.
     summary = apply_action(t, {"set_task_config": {"lifetime_tokens": 8_000_000}})

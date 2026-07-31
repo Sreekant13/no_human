@@ -1,6 +1,7 @@
 """Termination bounds + stuck detection (§3.5)."""
 
 from no_human.core.bounds import Bounds, StuckDetector, error_signature
+from no_human.core.pricing import weighted_tokens
 
 
 def test_signature_stable_across_volatile_tokens():
@@ -218,13 +219,21 @@ def test_hard_stuck_not_fooled_by_progress():
 
 
 def test_attempt_tokens_default_and_override():
-    """Per-attempt spend cap (v6: four specs burned the whole 8M lifetime
-    budget in attempt #1). Default must clear the largest measured successful
-    attempt (3.06M complex-tier cache-read) with headroom, and stay well under
-    the lifetime cap so the bounded loop keeps at least two real attempts."""
+    """Per-attempt spend cap (v6: four specs burned the whole lifetime budget
+    in attempt #1). Default must clear the largest measured successful attempt
+    (3.06M raw complex-tier cache-read = 306,000 cost-weighted) with headroom,
+    and stay well under the lifetime cap so the bounded loop keeps at least two
+    real attempts.
+
+    Both caps are COST-WEIGHTED tokens since 2026-07-31 (core.pricing): the old
+    raw 4M/8M converted at the measured 0.1985 weighted/raw ratio. The floor
+    below is the SAME measured attempt as before, converted the same way — the
+    headroom is not quietly relaxed, it is 2.6x here against 1.3x before."""
     b = Bounds()
-    assert b.attempt_tokens == 4_000_000
-    assert b.attempt_tokens > 3_060_000        # measured complex attempt
+    assert b.attempt_tokens == 800_000
+    # The measured complex attempt (3.06M raw, ~all cache-read) in the cap's
+    # own unit: 3_060_000 x CACHE_READ_WEIGHT.
+    assert b.attempt_tokens > weighted_tokens(cache_read_tokens=3_060_000)
     assert b.attempt_tokens <= b.lifetime_tokens // 2
     assert Bounds.from_config({"attempt_tokens": 123}).attempt_tokens == 123
 

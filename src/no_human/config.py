@@ -512,7 +512,7 @@ def set_profile_token(profile: str, token: str,
 def _assert_api_key_mode(env_path: Path | None) -> ScrubReport:
     """BYO-API-key billing (``llm.auth_mode: "api_key"``).
 
-    An operator-authorized, explicit departure from OAuth-only (CLAUDE.md #1)
+    An operator-authorized, explicit departure from the OAuth-only default,
     for friends/commercial installs that pay Anthropic directly with THEIR OWN
     ``ANTHROPIC_API_KEY``. Invariants preserved: the run still bills exactly ONE
     path, so every OTHER metered redirect (auth token, Bedrock, Vertex) is
@@ -552,7 +552,7 @@ def assert_subscription_mode(
 ) -> ScrubReport:
     """Enforce the configured billing mode before any task runs.
 
-    ``auth_mode="subscription"`` (default, CLAUDE.md #1):
+    ``auth_mode="subscription"`` (the default):
       1. Scrub all metered-auth variables from the process environment.
       2. If ``ANTHROPIC_API_KEY`` was present, refuse to start (``strict``) — the
          user must unset it; a silent scrub-and-continue would mask a real
@@ -606,7 +606,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "backend": "claude",
     },
     "llm": {
-        # Billing mode. "subscription" (default, CLAUDE.md #1) bills a Claude
+        # Billing mode. "subscription" (the default) bills a Claude
         # subscription via CLAUDE_CODE_OAUTH_TOKEN and scrubs ANTHROPIC_API_KEY.
         # "api_key" (operator-authorized BYO-API-key, for friends/commercial
         # installs) bills the operator's own ANTHROPIC_API_KEY from .env instead;
@@ -633,13 +633,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Utility tier: single-turn, effort="low", advisory jobs that summarize,
         # classify, or distill — never the implement/plan/review gates. Routing
         # these to Haiku frees the Opus window; a wrong answer here degrades a
-        # hint, never a verdict. Authorized by the user 2026-07-09 (CLAUDE.md #7).
+        # hint, never a verdict. It is never the implementer, planner, reviewer
+        # or supervisor — those four tiers are fixed above.
         "utility_model": "claude-haiku-4-5",
         # MoA (Mixture-of-Agents) planning fan-out — on by default. Runs N
         # independent plan proposals from different angles, then ONE
         # aggregator call synthesizes a single plan (evidence-based synthesis,
-        # never a numeric score — CLAUDE.md #3). Reuses planner_model; no new
-        # model tier introduced. Only the (cheap) planning step is affected —
+        # never a numeric score). Reuses planner_model; no new model tier
+        # introduced. Only the (cheap) planning step is affected —
         # never the implement/review loop. Set enabled=False to fall back to
         # a single planner call.
         "moa_planning": {
@@ -735,12 +736,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # blocker — an honest park; the human raises the budget or abandons.
         # Both are per-task overridable via task.config (the option's action).
         "lifetime_attempts": 9,
-        # 8M is a per-token-billing cost guardrail (see core.bounds.Bounds for the
-        # measured rationale). Kept in step with the dataclass default.
-        "lifetime_tokens": 8_000_000,
+        # COST-WEIGHTED tokens, not raw ones: fresh in/out x1.0, cache write
+        # x1.25, cache read x0.1 (core.pricing). 1.6M weighted is the old raw
+        # 8M converted at this install's measured 0.1985 weighted/raw ratio —
+        # the same real spend, now bounded the same way for every task rather
+        # than 5.7x looser for a cache-heavy one. Measured rationale and the
+        # migration note live on core.bounds.Bounds; kept in step with it.
+        "lifetime_tokens": 1_600_000,
         # Per-attempt spend cap — ends the ATTEMPT (bounded loop retries),
-        # never parks the task. Rationale on core.bounds.Bounds.attempt_tokens.
-        "attempt_tokens": 4_000_000,
+        # never parks the task. Also cost-weighted (old raw 4M converted).
+        # Rationale on core.bounds.Bounds.attempt_tokens.
+        "attempt_tokens": 800_000,
     },
     "bounds_investigation": {
         "max_attempts": 8,
@@ -880,7 +886,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "hostname": "gitlab.acme.net",
         "variables": {},          # extra pipeline variables (sent as the POST body's variables array)
         "timeout_minutes": 60,
-        "max_infra_retries": 2,   # CLAUDE.md: retry after 2 min, max 2
+        "max_infra_retries": 2,   # infra failures only: retry after 2 min, max 2
         "poll_interval": 30,
         "result_parser": "pytest",  # or "surefire" for Maven projects
         # --- Jenkins backend (build.example.com) ---

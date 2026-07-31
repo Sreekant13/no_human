@@ -619,13 +619,12 @@ async def default_branch_shipped(repo_path: str, branch: str, base: str = "main"
     """Whether ``branch``'s changes are actually present in ``base``, checked
     by tree CONTENT rather than commit ancestry.
 
-    The operator's hard rule (CLAUDE.md) is that what lands on ``main`` is a
-    local, identity-normalized squash merge -- never `gh pr merge`. A squash
-    merge writes a brand-new commit onto ``base`` with its own SHA, so
-    `git merge-base --is-ancestor <branch> <base>` is FALSE for every one of
-    our merges even when the change is fully landed: ancestry tracks commit
-    lineage, and a squash commit has no lineage back to the branch it came
-    from. It is therefore not a valid "did this ship" test here.
+    A branch's changes routinely land on ``base`` as a SQUASH merge — one
+    brand-new commit carrying the content but none of the branch's commits.
+    When they do, `git merge-base --is-ancestor <branch> <base>` is FALSE even
+    though the change is fully landed: ancestry tracks commit lineage, and a
+    squash commit has no lineage back to the branch it came from. Ancestry is
+    therefore not a valid "did this ship" test here.
 
     Instead: find the files ``branch`` touched relative to its merge-base with
     ``base``, then diff those same paths between ``branch`` and ``base``'s

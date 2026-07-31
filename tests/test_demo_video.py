@@ -442,7 +442,7 @@ def test_the_models_frame_names_every_role_the_board_labels():
         assert frame["text"].startswith("coder=")
         for role, model in frame["models"].items():
             assert f"{role}={model}" in frame["text"]
-    # The four tiers of CLAUDE.md, unabbreviated and undated.
+    # The project's four fixed model tiers, unabbreviated and undated.
     assert fx.MODELS["coder"] == "claude-sonnet-5"
     assert fx.MODELS["planner"] == fx.MODELS["reviewer"] == "claude-opus-5"
     assert fx.MODELS["supervisor"] == "claude-sonnet-5"

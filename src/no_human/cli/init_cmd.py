@@ -152,10 +152,11 @@ def _metered_key_in_env() -> str | None:
 def setup_token() -> tuple[bool, str]:
     """Guide the user through billing setup. Returns ``(ready, auth_mode)``.
 
-    Two sanctioned paths: a Claude **subscription** (OAuth token — the default,
-    CLAUDE.md #1) or the user's **own Anthropic API key** (BYO-API-key, metered
-    and billed to them — for friends/commercial installs). The chosen mode is
-    persisted as ``llm.auth_mode`` by :func:`ensure_config`.
+    Two sanctioned paths: a Claude **subscription** (OAuth token — the default;
+    personal and enterprise subscriptions are equally first-class) or the user's
+    **own Anthropic API key** (BYO-API-key, metered and billed to them — for
+    friends/commercial installs). The chosen mode is persisted as
+    ``llm.auth_mode`` by :func:`ensure_config`.
     """
     # A re-run on a working install must not re-interrogate the operator: if a
     # mode is already configured and its credential is present, respect it.

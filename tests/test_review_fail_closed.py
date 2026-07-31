@@ -2,7 +2,7 @@
 
 The reviewer is the only gate between an unreviewed diff and a PR. Returning a
 passing decision when it is absent turns the hard gate into a silent rubber
-stamp — CLAUDE.md #3. `nh watch` did exactly that in production.
+stamp. `nh watch` did exactly that in production.
 """
 
 import ast

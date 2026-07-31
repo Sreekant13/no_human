@@ -32,10 +32,42 @@ from no_human.config import DEFAULT_CONFIG
 REPO = Path(__file__).resolve().parents[1]
 README = REPO / "README.md"
 
+# RETARGET (2026-08-01). The README was cut from 255 lines to ~120: the config
+# table moved to docs/configuration.md and the gate/limits detail — which
+# carried every ``file.py:LINE`` citation — moved to docs/verification.md.
+#
+# The claims did not go away and they did not get weaker, so neither do the
+# guards. Two of them now read the UNION of the surfaces the claim can live on
+# rather than the README alone. That is a STRENGTHENING in both directions: a
+# stale default is now caught wherever it is written, and moving a claim back
+# onto the front page re-arms the same check without an edit here. What is
+# unchanged is every assertion, including the mandatory-hit assertions that stop
+# a guard passing vacuously once its subject leaves a surface.
+DOCUMENTED_SURFACES = (
+    README,
+    REPO / "docs" / "configuration.md",
+    REPO / "docs" / "verification.md",
+)
+
 
 @pytest.fixture(scope="module")
 def readme() -> str:
     return README.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def documented() -> str:
+    """README + the docs pages the front page delegates its claims to.
+
+    Concatenated with a blank line between, so no regex can match across the
+    seam between two files.
+    """
+    missing = [p for p in DOCUMENTED_SURFACES if not p.exists()]
+    assert not missing, (
+        f"surface(s) named here do not exist: {[p.name for p in missing]} — a "
+        f"guard pointed at a missing file would silently check nothing"
+    )
+    return "\n\n".join(p.read_text(encoding="utf-8") for p in DOCUMENTED_SURFACES)
 
 
 def _config_rows(readme: str) -> dict[str, str]:
@@ -100,13 +132,13 @@ def test_required_rows_are_real_config_keys():
     )
 
 
-def test_config_table_documents_the_required_keys(readme):
-    documented = set(_config_rows(readme))
-    missing = REQUIRED_ROWS - documented
+def test_config_table_documents_the_required_keys(documented):
+    present = set(_config_rows(documented))
+    missing = REQUIRED_ROWS - present
     assert not missing, f"config table no longer documents: {sorted(missing)}"
 
 
-def test_every_documented_default_matches_config(readme):
+def test_every_documented_default_matches_config(documented):
     """Walks EVERY dotted config row rather than a hand-kept list, so a newly
     documented default is covered the day it is added.
 
@@ -115,11 +147,11 @@ def test_every_documented_default_matches_config(readme):
     fail on formatting, not on truth.
     """
     wrong = []
-    for key, documented in _config_rows(readme).items():
+    for key, stated in _config_rows(documented).items():
         actual = _resolve(key)
         if actual is _MISSING or isinstance(actual, (list, dict)):
             continue
-        norm = documented.strip()
+        norm = stated.strip()
         if norm.lower() in {"null", "none", "*(none)*", "(none)", "—"}:
             norm = None
         elif norm.lower() in {"true", "false"}:
@@ -129,15 +161,23 @@ def test_every_documented_default_matches_config(readme):
             continue
         if isinstance(actual, bool):
             if norm is not actual:
-                wrong.append(f"{key}: README says {documented!r}, config says {actual!r}")
+                wrong.append(f"{key}: docs say {stated!r}, config says {actual!r}")
         elif str(norm) != str(actual):
-            wrong.append(f"{key}: README says {documented!r}, config says {actual!r}")
+            wrong.append(f"{key}: docs say {stated!r}, config says {actual!r}")
     assert not wrong, "config table disagrees with DEFAULT_CONFIG:\n  " + "\n  ".join(wrong)
 
 
-def test_prose_default_matches_config(readme):
+def test_prose_default_matches_config(documented):
     """The original defect lived in PROSE — the troubleshooting row told users to
-    raise max_turns_per_attempt from a number that was never the default."""
+    raise max_turns_per_attempt from a number that was never the default.
+
+    Reads the union (see DOCUMENTED_SURFACES): the 2026-08-01 rewrite moved the
+    prose statement of this default to docs/verification.md along with the rest
+    of the bounded-loop paragraph. Every stated spelling on every surface is
+    still checked, and the mandatory-hit assertion still fails if the claim
+    disappears from all of them.
+    """
+    readme = documented
     actual = DEFAULT_CONFIG["bounds"]["max_turns_per_attempt"]
     # A bare finditer guards nothing when the prose is reworded past its one
     # spelling — the loop body never runs and the test passes green. Accept the
@@ -189,18 +229,21 @@ def _stated_category_counts(text: str) -> list[int]:
     return out
 
 
-def test_blocker_category_count_matches_the_enum(readme):
+def test_blocker_category_count_matches_the_enum(documented):
     """The README said "8-category" for a 10-member enum.
 
     The 2026-07-30 rewrite restated the same claim in words ("one of ten
-    categories"). The claim stayed on this surface, so the guard stays pointed
-    here — it now reads both spellings. That is a STRENGTHENING: the old digit-
-    only pattern would have waved through "eight categories" without a word.
+    categories") — it now reads both spellings. That is a STRENGTHENING: the old
+    digit-only pattern would have waved through "eight categories" without a
+    word. Union-scoped 2026-08-01: the count is now stated on TWO surfaces (the
+    README bullet and the docs/verification.md paragraph it links to), and the
+    "every stated count must agree" assertion below is exactly what makes that
+    worth checking on both.
     """
     n = len(BlockerCategory)
-    stated = _stated_category_counts(readme)
+    stated = _stated_category_counts(documented)
     assert stated, (
-        f"README states no blocker-category count at all; the taxonomy has {n} "
+        f"docs state no blocker-category count at all; the taxonomy has {n} "
         f"members ({', '.join(c.name for c in BlockerCategory)}). A count that "
         f"is not stated cannot be checked — restate it or this guard is blind."
     )
@@ -216,8 +259,19 @@ def test_blocker_category_count_matches_the_enum(readme):
 _SOURCE_CITATION_RE = re.compile(r"`([\w/]+\.py):(\d+)(?:-(\d+))?`")
 
 
-def test_readme_source_citations_resolve(readme):
-    """Every ``file.py:LINE`` the README cites must exist and have that line.
+def test_documented_source_citations_resolve(documented):
+    """Every ``file.py:LINE`` the front page or its docs cite must exist.
+
+    RETARGET (2026-08-01), second time for this guard. The 2026-07-30 rewrite
+    pointed it at the README's 15-odd ``config.py:676``-style citations. The
+    2026-08-01 rewrite moved that whole block — the four gates, the bounded
+    loop, the limits — to ``docs/verification.md``, because a front page whose
+    job is "install and run one task" is the wrong place for line numbers.
+
+    Nothing was dropped, so this reads DOCUMENTED_SURFACES instead of the README
+    alone. The floor of 10 is unchanged and is now a floor across the union: it
+    still cannot pass vacuously, and it now also covers a citation added to the
+    config or verification page, which nothing checked before.
 
     RETARGET (2026-07-30). This guard was ``test_architecture_tree_lists_every_
     package``: it pinned the README's ``src/no_human/`` tree to the filesystem so
@@ -252,10 +306,11 @@ def test_readme_source_citations_resolve(readme):
     ambiguous citation fails rather than being skipped: a citation the reader
     cannot follow is the defect, not an exemption.
     """
-    cites = _SOURCE_CITATION_RE.findall(readme)
+    cites = _SOURCE_CITATION_RE.findall(documented)
     assert len(cites) >= 10, (
-        f"only {len(cites)} source citations found in the README; this guard is "
-        f"the only thing checking them and it must not pass vacuously"
+        f"only {len(cites)} source citations found across "
+        f"{[p.name for p in DOCUMENTED_SURFACES]}; this guard is the only thing "
+        f"checking them and it must not pass vacuously"
     )
     bad: list[str] = []
     for path, start, end in cites:
@@ -276,7 +331,7 @@ def test_readme_source_citations_resolve(readme):
                 f"{path}:{start}-{last} cites past end of file "
                 f"({hits[0].relative_to(REPO)} has {total} lines)"
             )
-    assert not bad, "README cites source that does not resolve:\n  " + "\n  ".join(bad)
+    assert not bad, "docs cite source that does not resolve:\n  " + "\n  ".join(bad)
 
 
 # REMOVED (2026-07-30): test_architecture_tree_lists_every_package.
@@ -316,13 +371,16 @@ RETIRED_CLAIMS = [
 
 
 @pytest.mark.parametrize("claim,why", RETIRED_CLAIMS)
-def test_retired_false_claim_has_not_returned(readme, claim, why):
-    assert claim.lower() not in readme.lower(), (
-        f"README reintroduces a claim review already disproved: {claim!r} — {why}"
+def test_retired_false_claim_has_not_returned(documented, claim, why):
+    """Union-scoped (2026-08-01). A retired claim is retired from the PRODUCT,
+    not from one file — moving the prose that used to carry it onto a docs page
+    must not move it out of this guard's reach."""
+    assert claim.lower() not in documented.lower(), (
+        f"docs reintroduce a claim review already disproved: {claim!r} — {why}"
     )
 
 
-def test_every_documented_cli_command_exists(readme):
+def test_every_documented_cli_command_exists(documented):
     """Commands are cheap to document and easy to rename out from under a doc.
 
     Checks the SUBCOMMAND too: ``cli.commands`` is a flat dict of top-level
@@ -340,7 +398,7 @@ def test_every_documented_cli_command_exists(readme):
     from no_human.cli.commands import cli
 
     unknown: list[str] = []
-    for name, sub in re.findall(r"^nh (\S+)(?:\s+(\S+))?", readme, re.M):
+    for name, sub in re.findall(r"^nh (\S+)(?:\s+(\S+))?", documented, re.M):
         cmd = cli.commands.get(name)
         if cmd is None:
             unknown.append(f"nh {name}")
@@ -366,13 +424,28 @@ def test_every_documented_cli_command_exists(readme):
     )
 
 
-def test_local_links_resolve(readme):
-    """A broken link on the front page is the cheapest possible own-goal."""
+@pytest.mark.parametrize("surface", DOCUMENTED_SURFACES, ids=lambda p: p.name)
+def test_local_links_resolve(surface):
+    """A broken link on the front page is the cheapest possible own-goal.
+
+    Widened 2026-08-01 from the README to every DOCUMENTED_SURFACE. It is
+    PARAMETRISED rather than fed the concatenated text, because a relative link
+    resolves against the file that wrote it: ``blockers.md`` and
+    ``../src/no_human/config.py`` in docs/verification.md mean different paths
+    from the same strings in README.md. Resolving them all against the repo root
+    — what the union fixture would force — would report false breaks and, worse,
+    silently pass a real one that happened to exist at the root.
+
+    docs/verification.md alone carries 19 local links and had no check at all
+    between the 2026-08-01 relocation and this widening.
+    """
+    text = surface.read_text(encoding="utf-8")
     # `[text](path "title")` is valid Markdown — the title is not part of the
     # path, so stop at the first whitespace or the link resolves to nothing.
-    targets = [t.split()[0] for t in re.findall(r"\]\((?!https?:)([^)#]+)", readme) if t.strip()]
-    broken = [t for t in targets if not (REPO / t).exists()]
-    assert not broken, f"README links to missing files: {broken}"
+    targets = [t.split()[0] for t in re.findall(r"\]\((?!https?:)([^)#]+)", text) if t.strip()]
+    assert targets, f"{surface.name} has no local links — is this guard pointed at the right file?"
+    broken = [t for t in targets if not (surface.parent / t).exists()]
+    assert not broken, f"{surface.name} links to missing files: {broken}"
 
 
 BENCH_REPORT = REPO / "docs" / "NORTH_STAR_BENCH.md"

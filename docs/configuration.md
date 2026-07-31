@@ -1,5 +1,31 @@
 # Configuration
 
+## Settings at a glance
+
+The settings most installs touch. This table moved off the README on 2026-08-01
+(the front page now links here instead of restating it); it is pinned to
+`config.DEFAULT_CONFIG` by `tests/test_readme_claims.py`, so a default that
+changes in code and not here fails the suite.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `llm.auth_mode` | `subscription` | `subscription` (OAuth) or `api_key` (your own key) |
+| `llm.primary_model` | `claude-sonnet-5` | The implementer |
+| `llm.review_model` | `claude-opus-5` | The fresh-context reviewer |
+| `bounds.max_attempts` | `3` | Implement/review cycles in one loop |
+| `bounds.max_turns_per_attempt` | `500` | Agent turns before an attempt is cut off |
+| `server.port` | `8420` | Web board bind port |
+| `concurrency.enabled` | `false` | Parallel task workers, each in its own worktree |
+| `ci.enabled` | `false` | Trigger and poll GitLab CI, GitHub Actions, Jenkins or CircleCI |
+
+Concurrency ships off, and `concurrency.max_workers` defaults to 2 when you turn
+it on. In the default `subscription` mode a present `ANTHROPIC_API_KEY` aborts
+startup rather than being silently ignored
+([`config.py:546`](../src/no_human/config.py)) — silently scrubbing it would hide
+a misconfiguration that costs real money. In `api_key` mode the reverse holds:
+your key is the billing path and every *other* metered route is scrubbed, so a
+run bills exactly one thing and records which.
+
 Config lives at `~/.no_human/config.yaml`, auto-generated with defaults on first
 run. The user's values are deep-merged over the defaults. The metered
 `ANTHROPIC_API_KEY` must never appear here — in **every** `llm.auth_mode`,
@@ -65,22 +91,22 @@ git:
   agent_identity_email: "no-human@acme.com"   # distinct from you
 
 safety:
-  max_files_changed: 20           # exceed => SCOPE_EXPLOSION escalation
-  max_lines_changed: 500
+  max_files_changed: null         # no size cap by default; set an int to escalate
+  max_lines_changed: null         # SCOPE_EXPLOSION past it. The human is the gate.
   forbidden_paths: [".env", "secrets/", "*.key", "*.pem"]
   block_test_weakening: true
 
 bounds:
   max_attempts: 3
-  max_turns_per_attempt: 60
-  escalate_after: 3
+  max_turns_per_attempt: 500
+  lifetime_attempts: 9             # across resumes; exhausting it parks BUDGET_EXHAUSTED
   max_correction_rounds: 2         # also caps autonomous PR-comment->revise rounds;
                                    # exceeding it escalates to a human (no infinite revise)
 
 hooks:
-  per_edit_lint: false            # B1: after each Edit/Write, lint the changed file and
-                                  # feed hard errors straight back to the agent. Default off
-                                  # (no-op unless the repo has a confirmed lint command).
+  per_edit_lint: true             # B1: after each Edit/Write, lint the changed file and
+                                  # feed hard errors straight back to the agent. A no-op
+                                  # unless the repo has a confirmed lint command.
 
 blockers:                         # Part 22
   max_alternatives_before_escalate: 2

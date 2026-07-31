@@ -1405,8 +1405,8 @@ async def scaffold_repo(body: ScaffoldRepoRequest, request: Request) -> dict[str
     """Create a brand-new git repo and register it as a project.
 
     The composer's "create a new repo" affordance: mkdir + `git init` + a
-    minimal README committed under the AGENT identity (CLAUDE.md #2 - history
-    must say which commits a machine wrote), then the same registration path
+    minimal README committed under the AGENT identity (the history must say
+    plainly which commits a machine wrote), then the same registration path
     POST /api/projects uses, so the composer proceeds in it immediately.
     """
     # This endpoint writes to the operator's filesystem, so it takes the same

@@ -152,8 +152,8 @@ def test_no_fake_auto_pr_switch():
 
 def test_supervisor_has_its_own_model_key():
     """The supervisor rode on review_model, so it silently ran at the reviewer's
-    tier — an inherited choice nobody made. CLAUDE.md #7 (amended) puts it on
-    Sonnet 5."""
+    tier — an inherited choice nobody made. The supervisor is a sparse,
+    single-turn course-corrector, so it has its own tier: Sonnet 5."""
     from no_human.config import DEFAULT_CONFIG
     llm = DEFAULT_CONFIG["llm"]
     assert llm["supervisor_model"] == "claude-sonnet-5"
@@ -163,8 +163,8 @@ def test_supervisor_has_its_own_model_key():
 
 
 def test_utility_tier_exists_and_does_not_touch_the_four_gates():
-    """CLAUDE.md #7 (amended 2026-07-09): a utility tier for advisory
-    summarize/classify/distill jobs. It must never become a gate."""
+    """A fourth, advisory tier for summarize/classify/distill jobs, kept off
+    the implement/plan/review/supervise path. It must never become a gate."""
     from no_human.config import DEFAULT_CONFIG
     llm = DEFAULT_CONFIG["llm"]
     assert llm["utility_model"] == "claude-haiku-4-5"

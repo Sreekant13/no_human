@@ -2,9 +2,9 @@
 //
 // Two modes, mirroring the backend's llm.auth_mode (config.py): a Claude
 // subscription OAuth token (the default), or the operator's own Anthropic API
-// key — the sanctioned opt-in (CLAUDE.md #1). The MODE lives in config.yaml;
-// the credential itself lives only in .env, 0600, and never crosses the IPC
-// bridge back to a renderer.
+// key — the sanctioned opt-in for installs that pay Anthropic directly. The
+// MODE lives in config.yaml; the credential itself lives only in .env, 0600,
+// and never crosses the IPC bridge back to a renderer.
 
 import fs from "node:fs";
 import os from "node:os";

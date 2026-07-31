@@ -83,14 +83,16 @@ def test_only_the_implementer_session_stuck_aborts(store, tmp_path, role):
 
 
 def test_sink_aborts_when_spend_crosses_the_remaining_budget(store, tmp_path):
+    # The ceiling is in COST-WEIGHTED tokens (core.pricing), so each event is
+    # worth 300 fresh x1.0 + 300 cache-read x0.1 = 330, not its raw 600.
     orch = _orch(store, tmp_path)
     orch._active_task_id = "task-1"
-    orch._begin_attempt_accounting("task-1", remaining_tokens=1_000)
+    orch._begin_attempt_accounting("task-1", remaining_tokens=500)
     ev = AgentEvent("usage", meta={"tokens_used": 300, "cache_read_tokens": 300,
                                    "cache_creation_tokens": 0})
-    orch._agent_sink(ev, role=CODER_ROLE)  # 600 — under the ceiling
+    orch._agent_sink(ev, role=CODER_ROLE)  # 330 — under the ceiling
     with pytest.raises(BudgetAbort):
-        orch._agent_sink(ev, role=CODER_ROLE)  # 1,200 — over
+        orch._agent_sink(ev, role=CODER_ROLE)  # 660 — over
 
 
 def test_budget_ceiling_is_scoped_to_the_running_task(store, tmp_path):
@@ -291,8 +293,13 @@ class _TokenGusherBackend:
 async def test_mid_attempt_budget_cross_parks_behind_budget_exhausted(
     store, bare_repo, tmp_path
 ):
+    # `budget_unit` marks this override as already being in the weighted
+    # unit. Without it the cutover guard reads a stored cap as pre-2026-07-31
+    # RAW tokens and converts it (core.pricing.raw_cap_as_weighted), which is
+    # right for the 165 real rows written before the cutover and wrong for a
+    # fixture that means "a small weighted cap this backend will cross".
     task = Task.new("add mul()", repo_path=str(bare_repo))
-    task.config = {"lifetime_tokens": 50_000}
+    task.config = {"lifetime_tokens": 50_000, "budget_unit": "weighted"}
     await store.create_task(task)
 
     orch = _orch(store, tmp_path, backend=_TokenGusherBackend())
@@ -369,7 +376,8 @@ async def test_attempt_cap_fails_the_attempt_and_the_loop_retries(
 ):
     task = Task.new("add mul()", repo_path=str(bare_repo))
     task.acceptance_criteria = ["mul(a,b) returns a*b"]
-    task.config = {"attempt_tokens": 50_000}  # lifetime cap (8M) stays far away
+    task.config = {"attempt_tokens": 50_000, "budget_unit": "weighted"}
+    # lifetime cap (the 1.6M default) stays far away
     await store.create_task(task)
 
     backend = _TokenGusherThenFixBackend()
@@ -419,7 +427,7 @@ async def test_lifetime_park_still_records_a_resume_checkpoint(
     lifetime path would clean the tree before _raise_blocker's [WIP-BLOCKED]
     checkpoint and lose the blocker's resume_commit."""
     task = Task.new("add mul()", repo_path=str(bare_repo))
-    task.config = {"lifetime_tokens": 50_000}
+    task.config = {"lifetime_tokens": 50_000, "budget_unit": "weighted"}
     await store.create_task(task)
 
     orch = _orch(store, tmp_path, backend=_TokenGusherWithWipBackend())
@@ -446,8 +454,16 @@ async def test_lifetime_park_still_records_a_resume_checkpoint(
 
 
 def test_supervisor_budget_status_reads_the_armed_accounting(store, tmp_path):
-    """The nudge must count EXACTLY what the hard abort counts (in/out +
-    cache reads) and be scoped to the running task (worker-pool reuse)."""
+    """The nudge must count EXACTLY what the hard abort counts and be scoped to
+    the running task (worker-pool reuse).
+
+    It did not, on two counts, until the caps became cost-weighted: it summed
+    in/out + cache reads only (silently dropping cache CREATION, which the hard
+    abort has always counted), and it summed them RAW against a ceiling the
+    abort compares WEIGHTED. The second one mattered most — the supervisor
+    divides this spend by this ceiling and force-stops exploration at 85%, so a
+    raw numerator over a weighted denominator ordered the coder to wrap up at
+    roughly a fifth of the budget it actually had."""
     orch = _orch(store, tmp_path)
     t = Task.new("investigate", repo_path=str(tmp_path))
     hook = orch._build_supervisor(t, str(tmp_path))
@@ -457,11 +473,25 @@ def test_supervisor_budget_status_reads_the_armed_accounting(store, tmp_path):
     assert hook.budget_status() is None
 
     orch._begin_attempt_accounting(t.id, remaining_tokens=9_999_999,
-                                   attempt_cap=4_000_000)
+                                   attempt_cap=800_000)
     orch._attempt_usage["tokens_used"] = 100
     orch._attempt_usage["cache_read_tokens"] = 200
-    orch._attempt_usage["cache_creation_tokens"] = 7_777  # must NOT count
-    assert hook.budget_status() == (300, 4_000_000)
+    orch._attempt_usage["cache_creation_tokens"] = 7_777  # counts, at x1.25
+    # 100x1.0 + 200x0.1 + 7,777x1.25 = 9,841.25, floored.
+    assert hook.budget_status() == (9_841, 800_000)
+    # Anchored to the ABORT, not just to a literal: the same usage fed to the
+    # sink must cross a ceiling of exactly this number, or the nudge and the
+    # force-stop are measuring different things again.
+    orch._active_task_id = t.id
+    orch._begin_attempt_accounting(t.id, remaining_tokens=9_841)
+    orch._agent_sink(
+        AgentEvent("usage", meta={"tokens_used": 100, "cache_read_tokens": 200,
+                                  "cache_creation_tokens": 7_776}),
+        role=CODER_ROLE)  # 9,840 — one under, must not abort
+    with pytest.raises(BudgetAbort):
+        orch._agent_sink(
+            AgentEvent("usage", meta={"cache_creation_tokens": 1}),
+            role=CODER_ROLE)  # 9,841.25 — crosses
 
     # Armed for a DIFFERENT task → None.
     orch._begin_attempt_accounting("other-task", remaining_tokens=1_000)
@@ -734,7 +764,11 @@ async def test_the_budget_abort_EVENT_carries_the_spend_shape(
     from the code under test proves nothing; break the WIRING and it must fail.
     """
     cfg = _config(tmp_path)
-    cfg.data.setdefault("bounds", {})["attempt_tokens"] = 500_000
+    # 54,500 COST-WEIGHTED tokens = exactly 5 of this backend's messages. Each
+    # is 100,000 raw in the production shape below — 1,000 fresh (x1.0) +
+    # 99,000 cache-read (x0.1) = 10,900 weighted. The old literal was the same
+    # boundary in the old raw unit (5 x 100,000).
+    cfg.data.setdefault("bounds", {})["attempt_tokens"] = 54_500
     events: list = []
     orch = Orchestrator(store, cfg.data, _BudgetBurnBackend(per_message=100_000),
                         SlackNotifier(None), event_sink=events.append)
@@ -809,11 +843,11 @@ async def test_the_parked_task_evidence_actually_SHOWS_the_spend_shape(store, tm
     aid = await store.create_attempt(t.id, 1)
     await store.update_attempt(aid, status="failed", tokens_used=5_000_000,
                                cache_read_tokens=0, cache_creation_tokens=0)
-    t.config = {"lifetime_tokens": 1_000_000}
+    t.config = {"lifetime_tokens": 1_000_000, "budget_unit": "weighted"}
     blocker = await orch._check_lifetime_budget(t)
     assert blocker is not None, "the lifetime cap should have produced a blocker"
     assert "4 assistant messages" in blocker.evidence, blocker.evidence
-    assert "10,000 tokens/message" in blocker.evidence, blocker.evidence
+    assert "10,000 raw tokens/message" in blocker.evidence, blocker.evidence
     # The causal clause must be EVIDENCED, not asserted. This fixture is 99%
     # cache-read (100 fresh / 9,900 cached), so the clause is true and appears —
     # and the percentage that justifies it is printed beside it.

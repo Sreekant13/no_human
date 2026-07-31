@@ -154,7 +154,7 @@ def test_the_gate_prompt_judges_scope_against_the_criteria():
 
 
 def test_severity_is_a_classification_not_a_score():
-    """CLAUDE.md #3: never numeric self-scoring."""
+    """The gate classifies severity; it never self-scores numerically."""
     t = Task.new("x")
     prompt = _build_review_prompt(t, "diff", "", "", diff_total_len=4)
     assert "never a score" in prompt
