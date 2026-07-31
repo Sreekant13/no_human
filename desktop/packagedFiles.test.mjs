@@ -273,3 +273,16 @@ test("the installer build fails when ci_gate reaches the frozen output", () => {
     "zlib-compressed, so searching the bundle for the name reads clean while " +
     "the module sits inside it");
 });
+
+test("the app ships the brand icon, not Electron's stock atom", () => {
+  // electron-builder reads buildResources/icon.icns for the mac target; if
+  // either half goes missing the build silently falls back to the Electron
+  // default icon — which is exactly what shipped until 2026-07-31.
+  assert.equal(builderConfig.directories.buildResources, "build",
+    "buildResources no longer points at desktop/build");
+  const icns = path.join(here, "build", "icon.icns");
+  assert.ok(fs.existsSync(icns), "desktop/build/icon.icns is missing");
+  // icns magic bytes, so a truncated or mislabeled file cannot pass.
+  const head = fs.readFileSync(icns).subarray(0, 4).toString("latin1");
+  assert.equal(head, "icns", "desktop/build/icon.icns is not an icns file");
+});

@@ -52,7 +52,10 @@ const mac = {
 module.exports = {
   appId: "dev.nohuman.board",
   productName: "no_human",
-  directories: { output: "dist" },
+  // buildResources holds icon.icns — the brand mark the dock, Finder and the
+  // DMG show. Generated from the site's mark-dark-512.png; without it every
+  // build wore Electron's stock atom icon.
+  directories: { output: "dist", buildResources: "build" },
   files: require("./package.json").build.files,
   asar: true,
   extraResources: [

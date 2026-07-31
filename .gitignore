@@ -2,6 +2,11 @@
 __pycache__/
 *.py[oc]
 build/
+# ...except the app icon: desktop/build is electron-builder's buildResources
+# and the brand icns is a tracked INPUT that lives there, not an output.
+!desktop/build/
+desktop/build/*
+!desktop/build/icon.icns
 dist/
 wheels/
 *.egg-info
