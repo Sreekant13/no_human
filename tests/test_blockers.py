@@ -862,9 +862,9 @@ async def test_wake_sweep_never_touches_a_human_stopped_task(tmp_path):
 
 @pytest.mark.asyncio
 async def test_done_task_with_human_merged_event_ignores_new_pr_comment(store):
-    """Live incident 2026-07-26: task ad7f5a41 (SCRUM-63) was marked done via
-    POST /shipped (human_merged event recorded), then the supervising session
-    posted a merge-notice comment on its PR. The pr_feedback rung counted
+    """Live incident 2026-07-26: a task was marked done via POST /shipped
+    (human_merged event recorded), then the human who merged it posted a
+    merge-notice comment on its PR. The pr_feedback rung counted
     that as '1 new PR comment(s)' and resumed the done task to implementing.
     Terminal is terminal — the sweep must do nothing."""
     t = Task.new("done-task", repo_path="/tmp/r")
