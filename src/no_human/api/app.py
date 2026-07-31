@@ -45,7 +45,7 @@ from pydantic import BaseModel
 from ..config import _atomic_write_text, load_config
 from ..core.db import Store
 from ..core.lanes import lane_for
-from ..core.orchestrator import is_agent_session
+from ..core.orchestrator import is_agent_session, is_narration
 from ..core.task import Task, TaskStatus
 from .models import (
     AttemptOut, BoardPayload, CreateProjectRequest, CreateTaskRequest,
@@ -1883,6 +1883,13 @@ def _summarize_tool(tool: str, inp: dict) -> str:
 
 _RESULT_PREVIEW_CAP = 400  # chars of tool output surfaced in the activity feed
 
+# The review verdict's substance. `text` says it in prose for a human, but the
+# board decides PASS vs FAIL from `passed` and counts the findings from these —
+# strip them and a PASSING round renders as "FAIL (? blocking)", which is worse
+# than the silence this whole fix replaced. Same reason `message` is carried
+# for the supervisor: on these events the meta IS the content.
+_VERDICT_META = ("passed", "failed_count", "blocking_count", "advisory_count")
+
 
 def _format_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
@@ -1891,13 +1898,13 @@ def _format_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         source = e.get("source", "")
         kind = e.get("kind", "")
 
-        # Always include orchestrator AND watcher events. The watcher filter
-        # gap starved the whole post-PR ladder out of the UI: ci_gate_*/merged/
-        # pr_ci_red events (source:"watcher") were dropped here, so the
-        # Shepherding stage could never light up despite being wired (found
-        # by the 2026-07-11 persona walk: 2015 events served, 0 from watcher).
-        if source in ("orchestrator", "watcher", "human") \
-                or kind in ("result", "error"):
+        # Always include narration — see `is_narration`. This used to be a
+        # hand-kept list of narration SOURCES and it drifted twice by omission:
+        # `watcher` (the post-PR ladder starved out of the UI — 2015 events
+        # served, 0 from watcher, found by the 2026-07-11 persona walk) and then
+        # `reviewer` (the review verdict itself invisible). Both copies of the
+        # list now ask the one predicate instead.
+        if is_narration(source, kind) or kind in ("result", "error"):
             entry = {"ts": e.get("ts"), "kind": kind,
                      "text": e.get("text", ""), "source": source}
             # Carry the per-role model map so the System view can label each
@@ -1910,6 +1917,9 @@ def _format_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             # actionable guidance.
             if isinstance(e.get("message"), str) and e["message"]:
                 entry["message"] = e["message"]
+            for key in _VERDICT_META:
+                if key in e:
+                    entry[key] = e[key]
             out.append(entry)
             pending_tool_use = None
             continue
@@ -2072,10 +2082,10 @@ async def task_events_stream(task_id: str, request: Request):
                 source = e.get("source", "")
                 kind = e.get("kind", "")
                 text = ""
-                # watcher/human pass through like orchestrator — same filter
-                # gap as _format_events (post-PR ladder was invisible live).
-                if source in ("orchestrator", "watcher", "human") \
-                        or kind in ("result", "error"):
+                # Narration passes through live exactly as it does in
+                # _format_events — the same predicate, so the replayed log and
+                # the live stream can never disagree about what a human sees.
+                if is_narration(source, kind) or kind in ("result", "error"):
                     text = e.get("text", "")
                 elif is_agent_session(source) and kind == "tool_use":
                     text = _summarize_tool(e.get("tool_name", ""), e.get("tool_input") or {})
@@ -2093,6 +2103,9 @@ async def task_events_stream(task_id: str, request: Request):
                     frame_data["models"] = e["models"]
                 if isinstance(e.get("message"), str) and e["message"]:
                     frame_data["message"] = e["message"]
+                for key in _VERDICT_META:
+                    if key in e:
+                        frame_data[key] = e[key]
                 if kind.startswith("subagent_"):
                     for key in ("task_id", "task_type", "status"):
                         if key in e:

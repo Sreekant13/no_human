@@ -2137,3 +2137,181 @@ async def test_retry_clears_the_resume_checkpoint_so_a_fresh_run_is_fresh(client
     assert ctx.get("resume_from") is None, (
         "retry inherited a checkpoint it never chose, so a 'fresh run' branches "
         f"from a stale sha: {ctx.get('resume_from')}")
+
+
+# --------------------------------------------------------------------------- #
+# The review gate's verdict reaches the human (both event surfaces)            #
+# --------------------------------------------------------------------------- #
+#
+# Second recurrence of the `watcher` filter gap. `source:"reviewer"` was in
+# neither the replay formatter's narration list nor the live stream's, so the
+# one event that says whether a task was blocked, and why, was dropped by both.
+#
+# The source is OVERLOADED — `_emit_review` narrates the gate under it and
+# `_reviewer_sink` forwards the reviewer session's raw SDK traffic under the
+# same name — so the fix cannot be "add the source". Replaying task
+# 84251cb2 (2770 real events, 15 review rounds) through the naive version
+# surfaced 164 extra reviewer rows, 139 of them BLANK, burying the verdicts it
+# was supposed to reveal.
+
+# One review round as the orchestrator really emits it: the verdict and its
+# ladder from `_emit_review`, interleaved with the reviewer session's own SDK
+# chatter from `_reviewer_sink`. Kinds and shapes copied from stored events.
+_REVIEW_ROUND = [
+    {"ts": 1, "source": "orchestrator", "kind": "state", "text": "reviewing"},
+    {"ts": 2, "source": "reviewer", "kind": "review_start",
+     "text": "running independent staff-level reviewer"},
+    {"ts": 3, "source": "reviewer", "kind": "tool_use",
+     "tool_name": "Read", "tool_input": {"file_path": "calc.py"}},
+    {"ts": 4, "source": "reviewer", "kind": "thinking",
+     "text": "the held-out suite was not run"},
+    {"ts": 5, "source": "reviewer", "kind": "usage", "text": ""},
+    {"ts": 6, "source": "reviewer", "kind": "review",
+     "text": "FAIL — 1 blocking, 0 advisory finding(s)\n"
+             "  · [high] add() drops the carry (calc.py:12): returns a+b "
+             "without the carry bit, so test_add_large fails",
+     "passed": False, "failed_count": 1, "blocking_count": 1,
+     "advisory_count": 0},
+]
+
+# The substrings that ARE the operator's answer to "why was this blocked".
+_VERDICT_MARKERS = ("FAIL", "1 blocking", "add() drops the carry", "calc.py:12")
+
+
+def test_format_events_serves_the_review_verdict_and_not_the_chatter():
+    """The verdict, its cited evidence and the ladder around it must survive the
+    replay formatter — while the reviewer session's own tool calls and usage
+    telemetry (same `source`, empty `text`) must not become blank rows."""
+    from no_human.api.app import _format_events
+
+    out = _format_events(_REVIEW_ROUND)
+    served = {(e["source"], e["kind"]): e for e in out}
+
+    assert ("reviewer", "review") in served, (
+        "the review VERDICT was dropped — a human cannot see why the task was "
+        f"blocked without opening the database. served: {sorted(served)}")
+    assert ("reviewer", "review_start") in served
+
+    verdict = served[("reviewer", "review")]["text"]
+    for marker in _VERDICT_MARKERS:
+        assert marker in verdict, (
+            f"the verdict reached the surface but {marker!r} did not: {verdict!r}")
+
+    # The other half of the fix: narration only, never the raw session.
+    for noisy in ("tool_use", "thinking", "usage"):
+        assert ("reviewer", noisy) not in served, (
+            f"reviewer SDK {noisy} events leaked into the narration feed — the "
+            "verdict is now buried rather than invisible")
+
+
+async def test_the_live_stream_serves_the_same_verdict_as_the_replay(store):
+    """DoD: fixing one surface and not the other just moves the bug. The live
+    stream and the replayed log are asserted against the SAME input here, so a
+    change to either one alone fails this test."""
+    from types import SimpleNamespace
+    from no_human.api.app import _format_events, task_events_stream
+    from no_human.core.task import Task
+
+    t = Task.new("verdict visibility", repo_path="/tmp/x")
+    await store.create_task(t)
+
+    class FakeSched:
+        inflight = set()             # not running → the stream closes on idle
+        _event_log = {t.id: None}
+        _event_notify = {}
+        def task_events(self, tid):
+            return _REVIEW_ROUND
+
+    req = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(scheduler=FakeSched(), store=store)),
+        headers={},
+    )
+    resp = await task_events_stream(t.id, req)
+    body = ""
+    async for chunk in resp.body_iterator:
+        body += chunk if isinstance(chunk, str) else chunk.decode()
+        if '"done"' in body:
+            break
+
+    streamed = [json.loads(line[len("data: "):])
+                for line in body.splitlines() if line.startswith("data: ")]
+    kinds = {(e.get("source"), e.get("kind")) for e in streamed}
+    assert ("reviewer", "review") in kinds, (
+        f"the live stream dropped the verdict: {sorted(kinds)}")
+
+    (live,) = [e for e in streamed
+               if (e.get("source"), e.get("kind")) == ("reviewer", "review")]
+    (replayed,) = [e for e in _format_events(_REVIEW_ROUND)
+                   if (e["source"], e["kind"]) == ("reviewer", "review")]
+    assert live["text"] == replayed["text"], (
+        "the live stream and the replayed log disagree about the verdict — one "
+        "of the two filters was fixed and the other was not")
+    for marker in _VERDICT_MARKERS:
+        assert marker in live["text"]
+
+    for noisy in ("tool_use", "thinking", "usage"):
+        assert ("reviewer", noisy) not in kinds, (
+            f"reviewer SDK {noisy} events leaked into the live stream")
+
+
+def test_both_surfaces_carry_the_meta_the_board_reads_the_verdict_from():
+    """The board does NOT parse the verdict prose: summaries.js branches on
+    `passed` and counts findings from `blocking_count`. Serving the event
+    without them renders a PASSING round as "FAIL (? blocking)" — a wrong
+    verdict is worse than the missing one this fix replaced."""
+    from no_human.api.app import _VERDICT_META, _format_events
+
+    passing = {"ts": 1, "source": "reviewer", "kind": "review",
+               "text": "PASS — 0 blocking, 4 advisory finding(s)",
+               "passed": True, "failed_count": 4, "blocking_count": 0,
+               "advisory_count": 4}
+    (out,) = _format_events([passing])
+
+    assert out["passed"] is True, (
+        "the board reads PASS/FAIL from `passed`; stripped, a passing review "
+        f"renders as FAIL: {out}")
+    assert out["blocking_count"] == 0 and out["advisory_count"] == 4
+    assert set(_VERDICT_META) <= set(out), f"verdict meta stripped: {out}"
+
+    # ...and it must not be sprayed onto events that never carried it.
+    (plain,) = _format_events(
+        [{"ts": 2, "source": "orchestrator", "kind": "state", "text": "x"}])
+    assert not (set(_VERDICT_META) & set(plain)), plain
+
+
+async def test_the_live_stream_carries_the_verdict_meta_too(store):
+    """The other half of the same list — the stream had its own copy of the
+    carry-through and would otherwise disagree with the replayed log."""
+    from types import SimpleNamespace
+    from no_human.api.app import _VERDICT_META, task_events_stream
+    from no_human.core.task import Task
+
+    t = Task.new("verdict meta", repo_path="/tmp/x")
+    await store.create_task(t)
+    passing = {"ts": 1, "source": "reviewer", "kind": "review",
+               "text": "PASS — 0 blocking, 4 advisory finding(s)",
+               "passed": True, "failed_count": 4, "blocking_count": 0,
+               "advisory_count": 4}
+
+    class FakeSched:
+        inflight = set()
+        _event_log = {t.id: None}
+        _event_notify = {}
+        def task_events(self, tid):
+            return [passing]
+
+    req = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(scheduler=FakeSched(), store=store)),
+        headers={},
+    )
+    resp = await task_events_stream(t.id, req)
+    body = ""
+    async for chunk in resp.body_iterator:
+        body += chunk if isinstance(chunk, str) else chunk.decode()
+        if '"done"' in body:
+            break
+
+    (frame,) = [json.loads(l[len("data: "):]) for l in body.splitlines()
+                if l.startswith("data: ") and '"review"' in l]
+    assert frame["passed"] is True, f"the live stream lost the verdict: {frame}"
+    assert set(_VERDICT_META) <= set(frame)

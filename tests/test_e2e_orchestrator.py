@@ -4186,10 +4186,13 @@ class _CleanReviewer:
     """Reviewer stub: passes the review with zero findings."""
 
     async def review(self, task, **kwargs):
-        from types import SimpleNamespace
-        return SimpleNamespace(
-            passed=True, failed_items=[], checklist=[],
-            as_dict=lambda: {"passed": True, "items": []},
+        # The real type, not a SimpleNamespace: this stub used to hand-roll a
+        # subset of ReviewDecision and silently lacked `blocking_items` /
+        # `advisory_items`, so a caller that read them crashed only here and
+        # only in tests. Building the real thing cannot drift out of contract.
+        from no_human.review.reviewer import ReviewDecision
+        return ReviewDecision(
+            passed=True, checklist=[],
             raw_output="Reviewed thoroughly: LGTM, no defects found.",
             tokens_used=10, cache_read_tokens=0, cache_creation_tokens=0,
         )

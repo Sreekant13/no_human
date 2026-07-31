@@ -730,6 +730,48 @@ def _is_blocking(item: ChecklistItem) -> bool:
     return (item.severity or "").strip().lower() not in ADVISORY_SEVERITIES
 
 
+def findings_from_checklist(
+    checklist: "str | dict[str, Any] | None",
+) -> tuple[list[ChecklistItem], list[ChecklistItem]]:
+    """Split a STORED `attempts.review_checklist` into (blocking, advisory).
+
+    The gate's verdict is persisted as JSON and then read back by surfaces that
+    are not the reviewer — `nh logs` most of all, which is where a human asks
+    "why was this blocked". Those surfaces must not re-derive what counts as
+    blocking: severity grading is the gate's own rule (`_is_blocking`), and a
+    second copy of it in a renderer is a copy that can disagree with the gate.
+    So rehydrate the items and ask the real predicate.
+
+    Tolerates a JSON string, a decoded dict, None, and malformed rows — a
+    display path must never be the thing that raises.
+    """
+    if isinstance(checklist, str):
+        try:
+            checklist = json.loads(checklist)
+        except (ValueError, TypeError):
+            return [], []
+    if not isinstance(checklist, dict):
+        return [], []
+    blocking: list[ChecklistItem] = []
+    advisory: list[ChecklistItem] = []
+    for raw in checklist.get("items") or []:
+        if not isinstance(raw, dict):
+            continue
+        item = ChecklistItem(
+            label=str(raw.get("label") or ""),
+            passed=bool(raw.get("passed")),
+            evidence=str(raw.get("evidence") or ""),
+            file=str(raw.get("file") or ""),
+            line=int(raw.get("line") or 0),
+            comment=str(raw.get("comment") or ""),
+            severity=str(raw.get("severity") or ""),
+        )
+        if item.passed:
+            continue
+        (blocking if _is_blocking(item) else advisory).append(item)
+    return blocking, advisory
+
+
 # ── C3-G1: tier-gated multi-angle review ────────────────────────────────────
 # Complex-tier diffs get two extra single-turn angle passes (security,
 # test-adequacy) run in parallel with the same parser/citation rules — the
