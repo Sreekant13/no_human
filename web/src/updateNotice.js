@@ -10,7 +10,12 @@
 // part is the decision, and a decision buried in JSX can only be tested by
 // regexing the source — which this project has already paid for once.
 //
-// It NEVER fabricates a version. Unknown is rendered as unknown.
+// It NEVER fabricates a version: the `version` field is "unknown" whenever the
+// caller could not supply one. The browser COPY no longer prints that word,
+// though — it just leaves the version out of the sentence, because "you are
+// running no_human unknown" reads as a bug rather than as an honest gap.
+// (Settings now sources the version from GET /api/version outside the shell, so
+// that gap is rare.)
 
 /** Closed set of tones, mirroring the rest of the board's status vocabulary. */
 export const TONES = ["ok", "info", "warn", "error"];
@@ -26,9 +31,15 @@ export function updateNotice({ inShell = false, current = null, update = null } 
   const version = current || "unknown";
 
   if (!inShell) {
+    // The browser path had no source for `current` at all, so this sentence
+    // always read "You are running no_human unknown in a browser" — a word that
+    // tells the operator nothing and looks like a bug. The version now comes
+    // from GET /api/version (the server IS the installed package); on the rare
+    // path where that lookup fails, say less rather than saying "unknown".
+    const running = current ? `no_human ${current}` : "no_human";
     return {
       title: "Updates",
-      detail: `You are running no_human ${version} in a browser. Upgrade the`
+      detail: `You are running ${running} in a browser. Upgrade the`
         + " command line with: pip install --upgrade no-human",
       tone: "info",
       actions: [],

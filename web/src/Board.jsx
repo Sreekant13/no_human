@@ -6,6 +6,7 @@ import { taskProgress } from "./taskProgress.js";
 import { topPrioritised } from "./laneView.js";
 import { partitionAnswerLane, shouldResetStaleOpen } from "./answerLane.js";
 import { showConflictBadge, conflictRoundLabel } from "./conflictStatus.js";
+import { cardBlockerLine } from "./cardBlockerLine.js";
 import { httpPrUrl } from "./prUrl.js";
 
 // 5B: how many cards a collapsible lane shows before the expand arrow. 4 keeps
@@ -351,11 +352,15 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClic
         <div className="card-description">{task.description_short}</div>
       )}
       {task.blocker_question && isAwaiting && (
-        <div className="card-blocker-q">
+        <div className="card-blocker-q" title={task.blocker_question}>
           {/* The clamp lives on an inner span: `overflow:hidden` clips at the PADDING
               box, so a padded clamped box lets the next line show through its bottom
-              padding as a sliced sliver of text. */}
-          <span>{task.blocker_question}</span>
+              padding as a sliced sliver of text.
+              cardBlockerLine leads with the number that differs between two budget
+              blockers — clamped to two lines they were otherwise byte-identical
+              paragraphs. The untouched sentence stays available on hover and in
+              the drawer. */}
+          <span>{cardBlockerLine(task.blocker_question)}</span>
         </div>
       )}
       {isAwaiting && actionHint(task) && (

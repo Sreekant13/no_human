@@ -2484,6 +2484,26 @@ async def show_config(request: Request) -> dict[str, Any]:
     return _scrub_secrets(data)
 
 
+@app.get("/api/version")
+async def show_version() -> dict[str, str]:
+    """The running `nh` version.
+
+    The board runs in two places. Inside the desktop shell the version arrives
+    over the preload bridge as ``window.nhDesktop.version``; in a plain browser
+    there is no bridge, so Settings > Updates printed "You are running no_human
+    unknown in a browser". The server always knows — it IS the installed
+    package — so it says so. Deliberately NOT folded into /api/config: a version
+    is not configuration, and that payload is already broader than it should be.
+
+    ``no_human.__version__`` is the same string ``nh --version`` prints and the
+    same one the update check compares against, so all three agree by
+    construction.
+    """
+    from .. import __version__
+
+    return {"version": __version__}
+
+
 @app.get("/api/integrations")
 async def list_integrations_endpoint(request: Request) -> dict[str, Any]:
     """Status of every integration (configured + kind; healthy is null until a

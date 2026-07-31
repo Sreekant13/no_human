@@ -6,7 +6,7 @@ import {
   fetchRules, fetchSkills, rejectLearning, removeRule, removeSkill,
   fetchProjects, createProject, updateProject, deleteProject,
   fetchProfiles, detectRepos, onboardRepo,
-  fetchAuthStatus, setAuthToken,
+  fetchAuthStatus, setAuthToken, fetchVersion,
 } from "./api.js";
 import { capName, PROFILE_CAP, TOKENVAR_CAP } from "./capName.js";
 import { authPanelView } from "./authPanelView.js";
@@ -35,12 +35,29 @@ const SECTIONS = [
 function UpdatesPanel() {
   const [update, setUpdate] = useState(null);
   const [busy, setBusy] = useState(false);
+  // In a plain browser there is no preload bridge, so `desktop.version` is
+  // undefined and the panel said "You are running no_human unknown in a
+  // browser". The server IS the installed package, so it can be asked.
+  const [servedVersion, setServedVersion] = useState(null);
   const desktop = typeof window !== "undefined" ? window.nhDesktop : undefined;
   const inShell = Boolean(desktop?.shell);
 
   useEffect(() => desktop?.onUpdate?.((payload) => setUpdate(payload)), [desktop]);
 
-  const view = updateNotice({ inShell, current: desktop?.version, update });
+  useEffect(() => {
+    if (inShell) return undefined;
+    let live = true;
+    // Best-effort, exactly like the composer's greeting: a failed lookup leaves
+    // the version unknown, which is what it always was. Never fabricated.
+    fetchVersion().then((v) => { if (live) setServedVersion(v); }).catch(() => {});
+    return () => { live = false; };
+  }, [inShell]);
+
+  const view = updateNotice({
+    inShell,
+    current: desktop?.version ?? servedVersion,
+    update,
+  });
 
   const run = useCallback(async (fn) => {
     if (!fn) return;

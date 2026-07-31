@@ -292,6 +292,16 @@ export async function fetchConfig() {
   return r.json();
 }
 
+// The running `nh` version, for the browser path where there is no desktop
+// bridge to read it from. Never throws a version out of thin air: the caller
+// treats a failure as "unknown", which is what it was before this existed.
+export async function fetchVersion() {
+  const r = await fetch(`${BASE}/api/version`);
+  if (!r.ok) throw new Error(`GET /api/version → ${r.status}`);
+  const d = await r.json();
+  return typeof d?.version === "string" && d.version ? d.version : null;
+}
+
 export async function fetchProfiles() {
   const r = await fetch(`${BASE}/api/profiles`);
   if (!r.ok) return [];

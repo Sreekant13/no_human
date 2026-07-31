@@ -5,6 +5,8 @@
 // (where macOS will refuse the install). Both would look fine in a screenshot.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { TONES, updateNotice } from "./updateNotice.js";
 
 test("every branch returns a known tone and a non-empty title", () => {
@@ -26,11 +28,46 @@ test("every branch returns a known tone and a non-empty title", () => {
   }
 });
 
+test("Settings actually sources the version for the browser path", () => {
+  // No React renderer in this harness (settingsOverlay.test.mjs), so the wiring
+  // is read from the source: without this fetch the pure function above is
+  // correct and the panel still says nothing useful.
+  const src = readFileSync(fileURLToPath(new URL("./Settings.jsx", import.meta.url)), "utf8");
+  assert.match(src, /fetchVersion/, "Settings must import and call fetchVersion");
+  assert.match(src, /current:\s*desktop\?\.version\s*\?\?\s*servedVersion/,
+    "the shell's own version must still win; the server is the fallback");
+  const api = readFileSync(fileURLToPath(new URL("./api.js", import.meta.url)), "utf8");
+  assert.match(api, /\/api\/version/, "fetchVersion must call the endpoint that serves it");
+});
+
 test("a browser is never offered an in-app download", () => {
   const n = updateNotice({ inShell: false, current: "0.1.0" });
   assert.deepEqual(n.actions, [],
     "there is no shell to install into — the only route is pip");
   assert.match(n.detail, /pip install --upgrade no-human/);
+});
+
+test("a browser states the version it is actually running", () => {
+  // There is no preload bridge outside the shell, so `current` used to be
+  // undefined here and the panel printed "You are running no_human unknown in
+  // a browser". Settings now sources it from GET /api/version.
+  const n = updateNotice({ inShell: false, current: "0.4.2" });
+  assert.match(n.detail, /You are running no_human 0\.4\.2 in a browser/);
+  assert.equal(n.version, "0.4.2");
+});
+
+test("a browser that cannot learn its version says less, not 'unknown'", () => {
+  // The remaining path is a failed lookup. "unknown" is a non-answer that reads
+  // as a bug; the sentence is still true with the version left out.
+  for (const current of [null, undefined, ""]) {
+    const n = updateNotice({ inShell: false, current });
+    assert.match(n.detail, /You are running no_human in a browser/);
+    assert.equal(n.detail.includes("unknown"), false, "the word must be gone from the copy");
+    assert.equal(n.detail.includes("null"), false);
+    assert.equal(n.detail.includes("undefined"), false);
+    // The structured field is unchanged — it still never invents a version.
+    assert.equal(n.version, "unknown");
+  }
 });
 
 test("an available update offers download AND later, and downloads nothing yet", () => {

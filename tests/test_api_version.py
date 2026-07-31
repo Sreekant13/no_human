@@ -1,0 +1,71 @@
+"""GET /api/version — the board's only source of truth for the running version
+when it is served in a plain browser.
+
+Inside the desktop shell the version arrives over the preload bridge as
+``window.nhDesktop.version``. In a browser there is no bridge, so Settings >
+Updates rendered "You are running no_human unknown in a browser". The server is
+the installed package, so it can simply say which one it is.
+"""
+from __future__ import annotations
+
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+
+import no_human
+from no_human.api.app import app
+from no_human.config import Config
+from no_human.core.db import Store
+
+
+@pytest_asyncio.fixture
+async def store(tmp_path):
+    s = await Store(tmp_path / "test.db").connect()
+    yield s
+    await s.close()
+
+
+@pytest_asyncio.fixture
+async def client(store, tmp_path):
+    app.state.store = store
+    app.state.config = Config(data={}, path=tmp_path / "config.yaml")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+
+
+@pytest.mark.asyncio
+async def test_version_is_the_running_package_version(client):
+    r = await client.get("/api/version")
+    assert r.status_code == 200
+    assert r.json() == {"version": no_human.__version__}
+
+
+@pytest.mark.asyncio
+async def test_version_is_a_real_version_string_not_a_placeholder(client):
+    """The whole point is to stop printing "unknown"; serving another
+    placeholder would just move the defect."""
+    version = (await client.get("/api/version")).json()["version"]
+    assert isinstance(version, str) and version
+    assert version.lower() not in {"unknown", "none", "null", ""}
+    assert version[0].isdigit(), f"expected a version number, got {version!r}"
+
+
+@pytest.mark.asyncio
+async def test_version_carries_nothing_but_the_version(client):
+    """It is deliberately NOT part of /api/config: that payload is already
+    broader than it should be, and a version is not configuration. This pins the
+    shape so nothing else gets attached to it later."""
+    body = (await client.get("/api/version")).json()
+    assert set(body) == {"version"}
+
+
+@pytest.mark.asyncio
+async def test_version_needs_no_config_or_store(tmp_path):
+    """Settings fetches this on open; it must not depend on request state that
+    a partially-initialised app might not have."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        r = await c.get("/api/version")
+    assert r.status_code == 200
+    assert r.json()["version"] == no_human.__version__
