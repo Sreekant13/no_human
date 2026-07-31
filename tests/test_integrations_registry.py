@@ -254,7 +254,7 @@ async def test_test_integration_jira_health_ok(monkeypatch):
         class _R:
             status_code = 200
             def json(self):
-                return {"displayName": "Eyal"}
+                return {"displayName": "Dana Lee"}
         return _R()
 
     monkeypatch.setattr(reg, "_http_get", fake_get)

@@ -12,7 +12,7 @@ A source URL or id is detected and routed to an adapter that produces a `Task`
 
 | Source | How | Notes |
 |--------|-----|-------|
-| **TRACKER / Acme** | REST (`{value, display_value}` shape) | HTML acceptance-criteria parsing; verified on a real tracker record |
+| **TRACKER / Acme** | REST (`{value, display_value}` shape) | HTML acceptance-criteria parsing; verified against a live story record |
 | **GitHub Issues** | `gh api` | includes `code.example.com` enterprise |
 | **GitLab Issues** | `glab api` | `gitlab.acme.net` |
 | **Freeform** | `--title` / `--description` / `--criteria` | no external system |

@@ -12,7 +12,7 @@ test("derives a first name from a human-looking work address", () => {
 });
 
 test("handles a single-part local address", () => {
-  assert.equal(greetingName({ notifications: { email_to: "eyal@example.com" } }), "Eyal");
+  assert.equal(greetingName({ notifications: { email_to: "sam@example.com" } }), "Sam");
 });
 
 test("handles a hyphenated name", () => {

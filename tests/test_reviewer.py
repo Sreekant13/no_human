@@ -373,9 +373,9 @@ def test_code_review_prompt_includes_pr_comments():
     t = Task.new("Review PR")
     prompt = _build_code_review_prompt(
         t, "diff text", 9,
-        pr_comments="  @eyal [src/foo.py:10]: this is fragile",
+        pr_comments="  @dana [src/foo.py:10]: this is fragile",
     )
-    assert "@eyal" in prompt
+    assert "@dana" in prompt
     assert "this is fragile" in prompt
     assert "whether each was addressed" in prompt
 

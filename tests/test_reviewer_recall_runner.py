@@ -339,9 +339,14 @@ def test_prepared_case_repo_matches_the_pinned_base_content():
     assert checked == 70, checked
     # 12 -> 17 on 2026-07-31: five more fixtures now carry a scrub, four of them
     # for the two employer ticket ids that a term list could never have seen.
+    # 17 -> 18 later the same day: `control-gate-excerpts/base/tests/test_runner.py`
+    # carried `/tmp/pytest-of-<maintainer-first-name>/…`, a pytest temp path
+    # captured off the maintainer's laptop and frozen into a fixture. Machine
+    # residue, not identity — see the BASE_FIXTURE_SCRUB entry for why the bare
+    # first name is scrubbed HERE and deliberately not added to any term list.
     # Deliberately a literal and not a count derived from the manifests, which
     # is where `scrubbed` already comes from and would agree by construction.
-    assert scrubbed == 17, scrubbed
+    assert scrubbed == 18, scrubbed
 
 
 @pytest.mark.asyncio

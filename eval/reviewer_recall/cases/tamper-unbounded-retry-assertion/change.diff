@@ -1,0 +1,372 @@
+diff --git a/src/no_human/core/orchestrator.py b/src/no_human/core/orchestrator.py
+index 9b39b8e..0669d5d 100644
+--- a/src/no_human/core/orchestrator.py
++++ b/src/no_human/core/orchestrator.py
+@@ -2518,7 +2518,14 @@ class Orchestrator:
+                 on_layer_done=_on_layer_done,
+                 fallback_cmd=test_cmd,
+             )
+-            self.emit("tests", plan_result.summary, ok=plan_result.ok)
++            failing_tests = [
++                name
++                for lr in plan_result.layer_results
++                if lr.result
++                for name in (getattr(lr.result, "failing_tests", []) or [])
++            ]
++            self.emit("tests", plan_result.summary, ok=plan_result.ok,
++                       failing_tests=failing_tests)
+             # Build aggregate test_results for the attempt record.
+             total_passed = sum(
+                 (lr.result.passed if lr.result else 0) for lr in plan_result.layer_results
+@@ -2537,6 +2544,7 @@ class Orchestrator:
+                     "passed": total_passed, "failed": total_failed,
+                     "errors": total_errors, "tamper_flag": False,
+                     "layers": [lr.summary for lr in plan_result.layer_results],
++                    "failing_tests": failing_tests,
+                 },
+             )
+             if any_ran and not plan_result.ok:
+@@ -2548,6 +2556,8 @@ class Orchestrator:
+                         break
+                 is_stuck = stuck.record(fail_output) if fail_output else False
+                 detail = f"tests failed: {plan_result.summary}"
++                if failing_tests:
++                    detail += " — " + ", ".join(failing_tests)
+                 if is_stuck:
+                     self.emit("stuck", "same failure signature repeated; resetting context")
+                 stuck_note = stuck.stuck_reason
+@@ -2568,11 +2578,12 @@ class Orchestrator:
+             fail_tail = ""
+             if not test_result.ok:
+                 fail_tail = (getattr(test_result, "output", "") or "")[-1200:]
++            failing_tests = getattr(test_result, "failing_tests", []) or []
+             self.emit(
+                 "tests",
+                 test_result.summary + (" (reused the reviewer's run)" if was_cached else "")
+                 + (f"\n{fail_tail}" if fail_tail else ""),
+-                ok=test_result.ok, cached=was_cached,
++                ok=test_result.ok, cached=was_cached, failing_tests=failing_tests,
+             )
+             await self.store.update_attempt(
+                 attempt_id,
+@@ -2580,6 +2591,7 @@ class Orchestrator:
+                     "ran": test_result.ran, "ok": test_result.ok,
+                     "passed": test_result.passed, "failed": test_result.failed,
+                     "errors": test_result.errors, "tamper_flag": False,
++                    "failing_tests": failing_tests,
+                 },
+             )
+             if test_result.ran and not test_result.ok:
+@@ -2638,6 +2650,8 @@ class Orchestrator:
+                 else:
+                     is_stuck = stuck.record(test_result.output)
+                     detail = f"tests failed: {test_result.summary}"
++                    if failing_tests:
++                        detail += " — " + ", ".join(failing_tests)
+                     if is_stuck:
+                         self.emit("stuck", "same failure signature repeated; resetting context")
+                     stuck_note = stuck.stuck_reason
+diff --git a/src/no_human/testing/runner.py b/src/no_human/testing/runner.py
+index 9624243..70c4b75 100644
+--- a/src/no_human/testing/runner.py
++++ b/src/no_human/testing/runner.py
+@@ -13,7 +13,7 @@ import re
+ import signal
+ import subprocess
+ import threading
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from pathlib import Path
+ 
+ from . import tamper_guard
+@@ -32,6 +32,7 @@ class TestRunResult:
+     command: str
+     output: str
+     invocation_error: bool = False
++    failing_tests: list[str] = field(default_factory=list)
+ 
+     @property
+     def summary(self) -> str:
+@@ -99,10 +100,21 @@ def detect_command(repo_path: Path) -> str | None:
+ 
+ _PYTEST_SUMMARY = re.compile(r"(\d+) passed|(\d+) failed|(\d+) error")
+ 
++# The line pytest prints its final tally on (plain "5 passed, 2 failed in
++# 1.2s" or "=" bar-padded "===== 2 failed, 40 passed in 3.45s ====="). Text
++# printed AFTER this line — e.g. an atexit/session-finish traceback from a
++# pytest-xdist teardown race — never contains a bare "N passed/failed/error"
++# fragment today, so anchoring to the LAST matching line is a no-op for every
++# known-good output and a hard backstop against a future stray digit+keyword
++# match (a traceback mentioning a count) being misread as the real tally.
++_PYTEST_SUMMARY_LINE = re.compile(r"^.*\b\d+\s+(?:passed|failed|error(?:s)?)\b.*$", re.M)
++
+ 
+ def _parse_pytest(output: str) -> tuple[int, int, int]:
++    lines = _PYTEST_SUMMARY_LINE.findall(output)
++    text = lines[-1] if lines else output
+     passed = failed = errors = 0
+-    for m in re.finditer(r"(\d+)\s+(passed|failed|error[s]?)", output):
++    for m in re.finditer(r"(\d+)\s+(passed|failed|error[s]?)", text):
+         n, kind = int(m.group(1)), m.group(2)
+         if kind == "passed":
+             passed = n
+@@ -113,6 +125,46 @@ def _parse_pytest(output: str) -> tuple[int, int, int]:
+     return passed, failed, errors
+ 
+ 
++_PYTEST_FAILED_ID = re.compile(r"^(?:FAILED|ERROR)\s+(\S+?)(?:\s+-.*)?$", re.M)
++
++
++def _pytest_failing_tests(output: str) -> list[str]:
++    """Extract failing/erroring test node ids from pytest's short test summary
++    info section (``FAILED path::test - reason`` / ``ERROR path::test -
++    reason``). Ordered, de-duplicated. Without this the gate's failure event
++    carried only a bare count — the failing test(s) were never named."""
++    seen: list[str] = []
++    for m in _PYTEST_FAILED_ID.finditer(output):
++        name = m.group(1)
++        if name not in seen:
++            seen.append(name)
++    return seen
++
++
++# pytest-xdist's tmp-dir cleanup (TempPathFactory's session-scoped finalizer)
++# runs at pytest_unconfigure time, AFTER the real summary line already
++# printed. A worker (`popen-gw*`) racing another worker's rmdir of the shared
++# `garbage-*` staging dir raises `OSError: [Errno 66] Directory not empty`
++# from that late finalizer — the tests already passed, but the process exits
++# non-zero, so the gate previously read it as a bare test failure with no
++# name to show for it (SCRUM-37).
++# Reviewer finding (SCRUM-37 round 1): the race's OSError line often carries
++# only the garbage-*/pytest-of-* staging path WITHOUT a popen-gw token (the
++# per-worker dir appears on a separate "removing" line, or not at all when the
++# session-scoped finalizer loses the race). Any of the three staging markers
++# adjacent to the error is the signature; all are pytest-tmpdir-specific
++# strings that never appear in real test-failure output.
++_TEARDOWN_RACE = re.compile(
++    r"Directory not empty.{0,400}?(?:popen-gw|garbage-|pytest-of-)"
++    r"|(?:popen-gw|garbage-|pytest-of-).{0,400}?Directory not empty",
++    re.DOTALL,
++)
++
++
++def _is_teardown_race(output: str) -> bool:
++    return bool(_TEARDOWN_RACE.search(output))
++
++
+ def _parse_vitest(output: str) -> tuple[int, int, int]:
+     """Parse vitest summary lines like:
+       Tests  413 passed (413)
+@@ -431,7 +483,27 @@ def run_tests(
+     if timed_out:
+         return TestRunResult(True, False, 0, 0, 1, cmd, f"timed out after {timeout}s")
+     passed, failed, errors = _parse_test_output(cmd, output)
++    failing_tests = _pytest_failing_tests(output)
+     ok = rc == 0
++    if not ok and failed == 0 and errors == 0 and not failing_tests and _is_teardown_race(output):
++        # INFRA, not a coder-bug: the tests already passed (the anchored
++        # summary line shows zero failed/errors and nothing was named), but
++        # the process exited non-zero from the late xdist teardown race.
++        # Bounded to exactly ONE retry — same doctrine as the node-deps
++        # invocation-error fix (SCRUM-35), applied to the in-runner retry
++        # half rather than the base-tree-confirmation half (the race is
++        # non-deterministic, so re-confirming against the base tree would
++        # just be a second coin flip).
++        log.warning("teardown-race signature in test output (cmd=%s, rc=%s); retrying once",
++                    cmd, rc)
++        rc_r, output_r, timed_out_r = _run_shell(cmd, work_dir, timeout, run_env)
++        if timed_out_r:
++            return TestRunResult(True, False, 0, 0, 1, cmd,
++                                 f"timed out after {timeout}s", invocation_error=True)
++        passed_r, failed_r, errors_r = _parse_test_output(cmd, output_r)
++        failing_tests_r = _pytest_failing_tests(output_r)
++        return TestRunResult(True, rc_r == 0, passed_r, failed_r, errors_r,
++                             cmd, output_r[-8000:], failing_tests=failing_tests_r)
+     if not ok and _is_invocation_error(rc, output, passed, failed, errors):
+         retry_cmd = _fix_invocation(cmd, output, repo_path)
+         if retry_cmd and retry_cmd != cmd:
+@@ -449,11 +521,13 @@ def run_tests(
+                                      retry_cmd, output2[-8000:],
+                                      invocation_error=True)
+             return TestRunResult(True, ok2, passed2, failed2, errors2,
+-                                 retry_cmd, output2[-8000:])
++                                 retry_cmd, output2[-8000:],
++                                 failing_tests=_pytest_failing_tests(output2))
+         # No fixable retry — mark as invocation error
+         return TestRunResult(True, False, passed, failed, errors,
+                              cmd, output[-8000:], invocation_error=True)
+-    return TestRunResult(True, ok, passed, failed, errors, cmd, output[-8000:])
++    return TestRunResult(True, ok, passed, failed, errors, cmd, output[-8000:],
++                         failing_tests=failing_tests)
+ 
+ 
+ @dataclass
+diff --git a/tests/test_runner.py b/tests/test_runner.py
+index 47ae074..d3cb3c6 100644
+--- a/tests/test_runner.py
++++ b/tests/test_runner.py
+@@ -10,6 +10,10 @@ from no_human.testing.runner import (
+     _looks_like_pytest,
+     run_lint_on_changed,
+     _lint_supports_file_args,
++    _parse_pytest,
++    _pytest_failing_tests,
++    _is_teardown_race,
++    run_tests,
+ )
+ 
+ 
+@@ -523,3 +527,153 @@ def test_node_real_test_failure_is_not_invocation_error(tmp_path):
+ 
+     assert result.invocation_error is False
+     assert result.failed == 1
++
++
++# --------------------------------------------------------------------------- #
++# SCRUM-37: name failing tests + INFRA-classify the xdist teardown race       #
++# --------------------------------------------------------------------------- #
++
++
++def test_parse_pytest_anchors_to_summary_line_not_cross_line_match():
++    """The old regex scanned the WHOLE output with `\\s+` (which matches a
++    newline), so a digit ending one line and a keyword starting the next
++    ('...retry 1\\nfailed to acquire lock...') was misread as '1 failed'.
++    Anchoring to the single summary LINE fixes it."""
++    output = (
++        "collected 5 items, retrying flaky setup 1\n"
++        "failed to acquire lock on first try, continuing\n"
++        "5 passed in 1.02s\n"
++    )
++    assert _parse_pytest(output) == (5, 0, 0)
++
++
++def test_pytest_failing_tests_extracts_and_dedupes_names():
++    output = (
++        "FAILED tests/test_x.py::test_y - AssertionError: boom\n"
++        "ERROR tests/test_z.py::test_w - RuntimeError: kaboom\n"
++        "FAILED tests/test_x.py::test_y - AssertionError: boom\n"
++        "2 failed, 1 error, 10 passed in 1.02s\n"
++    )
++    assert _pytest_failing_tests(output) == [
++        "tests/test_x.py::test_y",
++        "tests/test_z.py::test_w",
++    ]
++
++
++def test_pytest_failing_tests_empty_when_no_named_failures():
++    assert _pytest_failing_tests("5 passed in 1.02s\n") == []
++
++
++def test_is_teardown_race_detects_signature():
++    assert _is_teardown_race(
++        "OSError: [Errno 66] Directory not empty: "
++        "'/tmp/pytest-of-dev/garbage-0/popen-gw3'"
++    )
++    assert not _is_teardown_race("AssertionError: expected 2 to equal 3")
++
++
++def _teardown_race_script(tmp_path, counter_path, *, retry_output_ok=True):
++    """A fake test command that increments *counter_path* on every call.
++    Call 1 always emits the teardown-race OSError signature after a clean
++    pytest summary and exits non-zero (the reproduced bug). Call 2+ emits
++    *retry_output_ok*'s outcome, so the test can assert exactly one retry."""
++    script = tmp_path / "fake_pytest.sh"
++    second_call_body = (
++        "echo '5 passed in 1.02s'\nexit 0\n"
++        if retry_output_ok else
++        "echo '5 passed in 1.02s'\n"
++        "echo \"OSError: [Errno 66] Directory not empty: "
++        "'/tmp/pytest-of-dev/garbage-0/popen-gw3'\" 1>&2\n"
++        "exit 1\n"
++    )
++    script.write_text(
++        "#!/bin/sh\n"
++        f"n=$(cat {counter_path} 2>/dev/null || echo 0)\n"
++        "n=$((n+1))\n"
++        f"echo $n > {counter_path}\n"
++        'if [ "$n" = "1" ]; then\n'
++        "  echo '5 passed in 1.02s'\n"
++        "  echo \"OSError: [Errno 66] Directory not empty: "
++        "'/tmp/pytest-of-dev/garbage-0/popen-gw3'\" 1>&2\n"
++        "  exit 1\n"
++        "fi\n"
++        f"{second_call_body}"
++    )
++    script.chmod(0o755)
++    return script
++
++
++def test_teardown_race_not_counted_as_failed_and_retried_exactly_once(tmp_path):
++    """The reproduced SCRUM-37 shape: tests actually passed (summary shows 0
++    failed), but the late xdist teardown race made the process exit non-zero.
++    Must retry exactly once and, once the race clears, report a clean pass —
++    never a bare failure count."""
++    counter = tmp_path / "count"
++    script = _teardown_race_script(tmp_path, counter, retry_output_ok=True)
++
++    result = run_tests(tmp_path, str(script))
++
++    assert int(counter.read_text().strip()) >= 2
++    assert result.ok is True
++    assert result.failed == 0
++    assert result.failing_tests == []
++
++
++def test_teardown_race_retry_still_racing_reports_failure_after_one_retry_only(tmp_path):
++    """If the retry ALSO hits the race, the bounded single retry doctrine
++    still applies: exactly one retry, then report whatever that retry found —
++    never an unbounded retry loop."""
++    counter = tmp_path / "count"
++    script = _teardown_race_script(tmp_path, counter, retry_output_ok=False)
++
++    result = run_tests(tmp_path, str(script))
++
++    assert int(counter.read_text().strip()) >= 2
++    assert result.ok is False
++
++
++def test_real_failure_with_teardown_noise_still_names_the_failing_test(tmp_path):
++    """Guard against over-broad classification (mirrors the node real-failure
++    guard above): a genuine named failure alongside teardown noise in the
++    SAME run must be reported as-is, with the test named — never swallowed
++    as INFRA, and never retried."""
++    counter = tmp_path / "count"
++    script = tmp_path / "fake_pytest_real_failure.sh"
++    script.write_text(
++        "#!/bin/sh\n"
++        f"n=$(cat {counter} 2>/dev/null || echo 0)\n"
++        "n=$((n+1))\n"
++        f"echo $n > {counter}\n"
++        "echo 'FAILED tests/test_x.py::test_y - AssertionError: boom'\n"
++        "echo '1 failed, 4 passed in 1.02s'\n"
++        "echo \"OSError: [Errno 66] Directory not empty: "
++        "'/tmp/pytest-of-dev/garbage-0/popen-gw3'\" 1>&2\n"
++        "exit 1\n"
++    )
++    script.chmod(0o755)
++
++    result = run_tests(tmp_path, str(script))
++
++    assert counter.read_text().strip() == "1", "a real named failure must not trigger the teardown retry"
++    assert result.ok is False
++    assert result.failed == 1
++    assert result.failing_tests == ["tests/test_x.py::test_y"]
++
++
++def test_teardown_race_detected_without_popen_gw_token():
++    """SCRUM-37 review finding: the race's OSError often names only the
++    garbage-*/pytest-of-* staging dir, with no popen-gw token on that line —
++    the exact output this repo's own suite produced live."""
++    from no_human.testing.runner import _is_teardown_race
++
++    live = (
++        "  <class 'OSError'>: [Errno 66] Directory not empty: "
++        "'/private/var/folders/kc/4f5s3w2933q0q8nl6jvn89f40000gn/T/"
++        "pytest-of-user/garbage-b8ca300b-dd84-4fc0-a262-474229fcdafd'\n"
++        "    warnings.warn(\n"
++    )
++    assert _is_teardown_race(live) is True
++    # And a real test failure mentioning a directory never matches.
++    assert _is_teardown_race(
++        "FAILED tests/test_x.py::test_dir - AssertionError: Directory not empty"
++    ) is False

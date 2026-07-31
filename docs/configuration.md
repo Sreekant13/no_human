@@ -105,12 +105,12 @@ integration-gate:                           # M6: post-PR integration gate (Wake
   project_id: 12345               # your integration-gate project's numeric id
   hostname: gitlab.acme.net
   ref: main
-  repos: [metrics-core-query-service]     # PR repos this gate governs
-  namespace_template: "metrics-core-integration-gate-pr{pr_number}"   # throwaway, collision-guarded
+  repos: [<your-service>]         # PR repos this gate governs
+  namespace_template: "<your-prefix>-integration-gate-pr{pr_number}"  # throwaway, collision-guarded
   variables: {...}                # the proven static flag set (see config.py)
   poll_interval: 30
   timeout: 3600
-  kubeconfig: ~/.kube/configs/enterprise-ci.yaml     # latest_dev images + ns guard
+  kubeconfig: ~/.kube/configs/<your-ci-cluster>.yaml   # latest_dev images + ns guard
   pr_build: true                  # code PRs: build the image FROM the PR via the
                                   # Jenkins enrich job (external SSO trigger); false
                                   # = escalate code PRs honestly instead
