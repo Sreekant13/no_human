@@ -61,7 +61,13 @@ a = Analysis(
     # `no_human.ci_gate.gate` through the excluded parent).
     excludes=["pytest", "pytest_asyncio", "pytest_xdist", "playwright",
               "tkinter", "PyInstaller",
-              "no_human.ci_gate"],
+              "no_human.ci_gate",
+              # The employer half of the publish guard's term inventory — its
+              # docstring forbids publication in any form, and vendor_terms.py
+              # ships an empty-list fallback for exactly this absence. Frozen
+              # into every DMG until 2026-07-31; build-installer.sh now fails
+              # the build if either module reappears in the PYZ table.
+              "no_human.eval._vendor_terms_private"],
     noarchive=False,
     optimize=0,
 )

@@ -56,7 +56,19 @@ packages = ["src/no_human"]
 # blockers/wake.py, imports it lazily inside a try/except and disables the rung
 # when the import fails. packaging/nh-server.spec excludes it from the frozen
 # server, and packaging/build-installer.sh fails the build if it slips back in.
-exclude = ["src/no_human/ci_gate"]
+exclude = [
+  "src/no_human/ci_gate",
+  # The employer half of the publish guard's term inventory. Its own docstring
+  # says it must not be published IN ANY FORM, including hex; vendor_terms.py
+  # imports it with an empty-list fallback designed for exactly this absence.
+  # It was export-excluded from day one but shipped in every wheel/sdist/freeze
+  # until a 2026-07-31 review decoded it out of the sdist.
+  "src/no_human/eval/_vendor_terms_private.py",
+  # Editor droppings and VCS junk that live UNDER the allowlisted root: an
+  # allowlist of directories admits whatever is inside them, and an untracked
+  # vim swap of a source file can carry unsaved pre-scrub content.
+  "**/.*.swp", "**/*.swp", "**/*.orig", "**/*.rej", "**/.DS_Store",
+]
 
 # Ship the built React board inside the package.
 #
@@ -76,9 +88,37 @@ exclude = ["src/no_human/ci_gate"]
 [tool.hatch.build.targets.wheel.force-include]
 "web/dist" = "no_human/web_dist"
 
+# The sdist is a MEMBERSHIP list, not "the repo tree minus mistakes". Without
+# `only-include`, hatchling packages everything under the project root that is
+# not ignored — which on a development machine includes UNTRACKED local files
+# (a 2026-07-31 byte-scan of a freshly built sdist found local scratch notes
+# and the private half of the vendor-term corpus inside it). An sdist built
+# anywhere must contain exactly what a wheel build needs and nothing else.
+[tool.hatch.build.targets.sdist]
+only-include = ["src/no_human"]
+# Same carve-out as the wheel: the wheel's `exclude` is target-scoped, so
+# without this line the sdist ships the ci_gate sources the wheel exists to
+# withhold (D1) — proven by unpacking one, not assumed. Same list as the wheel:
+# the private inventory and editor junk must not ride in either artifact.
+exclude = [
+  "src/no_human/ci_gate",
+  # The employer half of the publish guard's term inventory. Its own docstring
+  # says it must not be published IN ANY FORM, including hex; vendor_terms.py
+  # imports it with an empty-list fallback designed for exactly this absence.
+  # It was export-excluded from day one but shipped in every wheel/sdist/freeze
+  # until a 2026-07-31 review decoded it out of the sdist.
+  "src/no_human/eval/_vendor_terms_private.py",
+  # Editor droppings and VCS junk that live UNDER the allowlisted root: an
+  # allowlist of directories admits whatever is inside them, and an untracked
+  # vim swap of a source file can carry unsaved pre-scrub content.
+  "**/.*.swp", "**/*.swp", "**/*.orig", "**/*.rej", "**/.DS_Store",
+]
+
 # The sdist keeps the board at its repo-relative path so that a wheel built
 # FROM the sdist (what `pip install` does when it cannot use a wheel) still
-# finds `web/dist` where the wheel target above expects it.
+# finds `web/dist` where the wheel target above expects it. force-include on
+# purpose (not a member of only-include): it fails the build loudly when
+# web/dist has not been built.
 [tool.hatch.build.targets.sdist.force-include]
 "web/dist" = "web/dist"
 

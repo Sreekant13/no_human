@@ -59,5 +59,12 @@ if [ -n "${gate_modules}" ]; then
   echo "${gate_modules}" >&2
   exit 1
 fi
+# Same check for the private half of the term inventory: hex-encoded employer
+# terms plus their replacement mapping. Never distributable in any artifact.
+private_terms="$(grep -o 'no_human\.eval\._vendor_terms_private' "${pyz_toc}" | sort -u || true)"
+if [ -n "${private_terms}" ]; then
+  echo "FAIL: no_human.eval._vendor_terms_private is frozen into the bundle (it must never ship)" >&2
+  exit 1
+fi
 
 echo "OK: ${BUNDLE} ($(du -sh "${BUNDLE}" | cut -f1)), 0 .py files, no ci_gate"
