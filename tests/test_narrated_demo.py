@@ -570,7 +570,7 @@ def test_nothing_synthetic_impersonates_a_real_company():
 #: both passed the denylist version of this file. Against a closed set they
 #: fail without anyone having predicted them.
 _ALLOWED_PROPER_NOUNS = frozenset("""
-    And Nobody They Ten
+    And Nobody They Ten Try
     Each Edit Extract Files Five Hand Monday Mondays Nightly Nothing One Pick
     Rate Read Record Run Sprint Tag That The Then You Your Delivery Digest
     Order Unsubscribe Webhook Chargeback Idempotency Deflake Cap
@@ -745,9 +745,9 @@ def test_exactly_one_task_bounces_off_review_and_still_lands():
 
 
 def test_the_bounce_is_on_camera_when_it_is_narrated():
-    """"The refactor came back once. It went again." starts at 50.60 — by
+    """"The refactor did not pass. It went back…" starts at 50.60 — by
     then ORD-2187 must be visibly on its second round, and not yet done."""
-    line = next(ln for ln in nr.LINES if "came back once" in ln.text)
+    line = next(ln for ln in nr.LINES if "did not pass" in ln.text)
     status, _live, _burn, _turns, attempt = sp.stage_at("ORD-2187", line.start)
     assert attempt == 2
     assert status in ("implementing", "testing", "reviewing"), status
@@ -994,9 +994,9 @@ def test_the_gui_schedule_is_ordered_and_anchored():
     assert sp.stage_at(sp.HERO_KEY, sprint_gui.REVIEW_AT)[0] == \
         "awaiting_approval"
     # The drawer is closed while the bounce and the five PRs are narrated.
-    bounce_line = next(ln for ln in nr.LINES if "came back once" in ln.text)
-    five_prs_line = next(ln for ln in nr.LINES if "five pull requests"
-                         in ln.text)
+    bounce_line = next(ln for ln in nr.LINES if "did not pass" in ln.text)
+    five_prs_line = next(ln for ln in nr.LINES
+                         if "five pull requests" in ln.text.lower())
     for t in (bounce_line.start, five_prs_line.start):
         assert sprint_gui.CLOSE_DRAWER_AT <= t < sprint_gui.REOPEN_DRAWER_AT
 

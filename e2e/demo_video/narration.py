@@ -101,10 +101,10 @@ BEATS: tuple[Beat, ...] = (
         cli="The shell, quiet: same one leftover task in its Review lane",
         lines=(
             Line(0.80, "It's Monday. Ten tickets just landed with your name."),
-            Line(4.40, "A webhook that double-charges. A test that fails "
-                       "one run in thirty.",
-                 spoken="A webhook that double-charges. A test that "
-                        "fails one run in thirty."),
+            Line(4.40, "A webhook that double-charges. A flaky test. "
+                       "And no time to babysit either.",
+                 spoken="A webhook that double-charges. A flaky test. "
+                        "And no time to babysit either."),
         ),
     ),
     Beat(
@@ -115,8 +115,8 @@ BEATS: tuple[Beat, ...] = (
         lines=(
             Line(9.40, "You pick five. And hand them over.",
                  spoken="You pick five. And... hand them over."),
-            Line(12.40, "Tag them in your tracker, or paste them in. "
-                        "That's the whole handoff."),
+            Line(12.40, "That's the whole handoff. No prompting, "
+                        "no hand-holding, no watching."),
         ),
     ),
     Beat(
@@ -128,8 +128,8 @@ BEATS: tuple[Beat, ...] = (
             "pane - models, plan, edits, tests",
         lines=(
             Line(17.60, "Each one gets a team of agents, on its own branch."),
-            Line(21.80, "Each one writes a plan before it writes code. "
-                        "Files, approach, tests. It gets held to that plan."),
+            Line(21.80, "Each one writes a plan before it writes code — "
+                        "files, approach, tests. Then it is held to that plan."),
             Line(29.20, "The webhook fix is already editing code. "
                         "The flaky test is being reproduced, not guessed at."),
             Line(35.40, "Nobody is waiting on you."),
@@ -149,8 +149,8 @@ BEATS: tuple[Beat, ...] = (
                         "done."),
             Line(46.20, "It reads the diff line by line, and cites its "
                         "evidence."),
-            Line(50.60, "The refactor came back once. It went again. "
-                        "No rubber stamps."),
+            Line(50.60, "The refactor did not pass. It went back, "
+                        "and it went again. No rubber stamps."),
         ),
     ),
     Beat(
@@ -161,8 +161,8 @@ BEATS: tuple[Beat, ...] = (
         cli="/logs replays the evidence trail - tests, tamper guard, lint, "
             "PR; /approve is typed and answered",
         lines=(
-            Line(56.40, "The result: five pull requests, each with tests "
-                        "and review evidence attached."),
+            Line(56.40, "Five pull requests, tests and evidence attached. "
+                        "A sprint's work, for a tenth of the cost."),
             Line(62.20, "They are all still sitting there. The agent doesn't merge."),
             Line(66.20, "You read. You approve."),
         ),
@@ -174,10 +174,10 @@ BEATS: tuple[Beat, ...] = (
             "PRs, holds to the fade",
         cli="The whole shell - full lanes, quiet prompt - holds to the fade",
         lines=(
-            Line(70.60, "no_human. Your sprint, run in parallel. "
-                        "You keep the merge button.",
-                 spoken="no human. Your sprint, run in parallel. "
-                        "You keep the merge button."),
+            Line(70.60, "no_human. Your sprint, in parallel — and you "
+                        "keep the merge button. Try one ticket.",
+                 spoken="no human. Your sprint, in parallel — and you "
+                        "keep the merge button. Try one ticket."),
         ),
     ),
 )
