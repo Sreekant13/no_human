@@ -31,7 +31,7 @@ spoken *no human*.
 > **12.40** — Tag them in your tracker, or paste them in. That's the whole handoff.
 
 ### 3 · Parallel — 17.00 s
-> **17.60** — Five agents pick them up, each on its own branch.
+> **17.60** — Each one gets a team of agents, on its own branch.
 > **21.80** — Each one writes a plan before it writes code. Files, approach, tests. It gets held to that plan.
 > **29.20** — The webhook fix is already editing code. The flaky test is being reproduced, not guessed at.
 > **35.40** — Nobody is waiting on you.

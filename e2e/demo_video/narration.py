@@ -121,13 +121,13 @@ BEATS: tuple[Beat, ...] = (
     ),
     Beat(
         "parallel", 17.00,
-        caption="Five agents run your tickets in parallel",
+        caption="A team of agents on every ticket",
         gui="Statuses tick on every card; the drawer opens on the webhook "
             "fix: its written plan, then the live agent lanes",
         cli="The webhook task is selected; its event stream fills the detail "
             "pane - models, plan, edits, tests",
         lines=(
-            Line(17.60, "Five agents pick them up, each on its own branch."),
+            Line(17.60, "Each one gets a team of agents, on its own branch."),
             Line(21.80, "Each one writes a plan before it writes code. "
                         "Files, approach, tests. It gets held to that plan."),
             Line(29.20, "The webhook fix is already editing code. "
