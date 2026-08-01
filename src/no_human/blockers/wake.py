@@ -124,7 +124,7 @@ class WakeWatcher:
             blockers_cfg.get("max_ci_gate_fix_rounds", 3)
         )
         # Comment authors whose PR comments never trigger a revision. Live
-        # incident: system-codeadmin posts a unit-test-results table on every
+        # incident: a CI service account posts a unit-test-results table on every
         # build, which the comment rung injected as human feedback and resumed
         # the task — one wasted attempt per PR, forever. "[bot]" logins are
         # always ignored on top of this list. In-code default rather than
@@ -132,7 +132,7 @@ class WakeWatcher:
         # that map wholesale (the deep-merge shadowing trap).
         self.ignore_comment_authors = {
             str(a).lower()
-            for a in blockers_cfg.get("ignore_comment_authors", ["system-codeadmin"])
+            for a in blockers_cfg.get("ignore_comment_authors", [])
         }
         self._pr_merged = pr_merged
         self._ci_green = ci_green

@@ -792,11 +792,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "transient_infra_retries": 2,
         "escalate_on_low_confidence_below": 0.6,
         # PR comments from these authors never trigger a revision ("[bot]"
-        # logins are always ignored on top). system-codeadmin posts a test-
-        # results table on every build; treating it as operator feedback
-        # burned an attempt per PR. NOTE: a user-yaml `blockers:` section
+        # logins are always ignored on top). A CI service account that posts a
+        # test-results table on every build is the shape this exists for:
+        # treated as operator feedback, it burns an attempt per PR. The
+        # default names none — set yours in `blockers:`. NOTE: a user-yaml `blockers:` section
         # replaces this map wholesale, so wake.py carries the same default.
-        "ignore_comment_authors": ["system-codeadmin"],
+        "ignore_comment_authors": [],
         "max_ci_fix_rounds": 3,
         # Bounded CI_GATE-failure → fix cycles on an open PR (M6), counted per
         # distinct failure signature like max_ci_fix_rounds; past the cap the

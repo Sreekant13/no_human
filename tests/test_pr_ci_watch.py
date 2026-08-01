@@ -30,13 +30,19 @@ async def _approval_task(store, url="https://code.example.com/dev/x/pull/7004"):
     return t
 
 
-def _watcher(store, *, state="OPEN", checks=None, log="", events=None, comments=None):
+def _watcher(store, *, state="OPEN", checks=None, log="", events=None, comments=None,
+             ignore_authors=None):
     async def pr_state(url): return state
     async def pr_checks(url): return checks or []
     async def ci_log(link): return log
     async def pr_comment(url): return comments or []
+    # The ignore list is CONFIGURED here rather than inherited from a default.
+    # It used to ship naming a real CI service account, which meant a test
+    # about ignoring bot chatter only passed because the product came
+    # pre-loaded with one employer's bot. A user sets their own; so does this.
+    cfg = {"blockers": {"ignore_comment_authors": ignore_authors}} if ignore_authors else {}
     return WakeWatcher(
-        store, {}, pr_state=pr_state, pr_checks=pr_checks, ci_log=ci_log,
+        store, cfg, pr_state=pr_state, pr_checks=pr_checks, ci_log=ci_log,
         pr_comment=pr_comment,
         on_event=(lambda k, t: events.append((k, t))) if events is not None else None,
     )
@@ -250,19 +256,23 @@ class _Comment:
 
 
 async def test_bot_comments_never_trigger_a_revision(store):
-    """Live incident: system-codeadmin's per-build test-results table was
-    injected as operator feedback and resumed the task straight into the
-    budget gate — one wasted attempt per PR. Bot chatter must advance the
-    cursor (never reconsidered) without resuming."""
+    """A CI service account's per-build test-results table was injected as
+    operator feedback and resumed the task straight into the budget gate —
+    one wasted attempt per PR. Bot chatter must advance the cursor (never
+    reconsidered) without resuming.
+
+    The account name and the build's own numbers are deliberately generic: a
+    real one names an employer's CI estate, and a test about ignoring bot
+    chatter needs the SHAPE of a bot comment, not a transcript of one."""
     t = await _approval_task(store)
     t.context["pr_comment_since"] = "2026-07-10T00:00:00Z"
     await store.update_task(t)
     bots = [
-        _Comment("system-codeadmin", "## Unit Test Results\n583 passed", "2026-07-10T11:15:52Z"),
+        _Comment("ci-results-bot", "## Unit Test Results\n42 passed", "2026-07-10T11:15:52Z"),
         _Comment("renovate[bot]", "dep dashboard", "2026-07-10T11:16:00Z"),
     ]
     events = []
-    out = await _watcher(store, comments=bots, events=events)._check_open_pr(t)
+    out = await _watcher(store, comments=bots, events=events, ignore_authors=["ci-results-bot"])._check_open_pr(t)
     assert out is None
     fresh = await store.get_task(t.id)
     assert fresh.status is TaskStatus.AWAITING_APPROVAL
@@ -281,10 +291,11 @@ async def test_human_comment_mixed_with_bot_chatter_injects_only_the_human(store
     t.context["pr_comment_since"] = "2026-07-10T00:00:00Z"
     await store.update_task(t)
     mixed = [
-        _Comment("system-codeadmin", "## Unit Test Results", "2026-07-10T11:15:52Z"),
+        _Comment("ci-results-bot", "## Unit Test Results", "2026-07-10T11:15:52Z"),
         _Comment("dev", "please rename the stage", "2026-07-10T11:20:00Z"),
     ]
-    out = await _watcher(store, comments=mixed)._check_open_pr(t)
+    out = await _watcher(store, comments=mixed,
+                         ignore_authors=["ci-results-bot"])._check_open_pr(t)
     assert out == "resumed"
     fresh = await store.get_task(t.id)
     fb = fresh.context["send_back_feedback"]
