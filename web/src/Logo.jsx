@@ -1,21 +1,17 @@
-// Legion logo — an app-icon-style mark (like Claude/Gemini): a blue badge with
-// three ascending white chevrons (legion ranks / a formation advancing).
+// The no_human brand mark: the `nh` monogram — two arches sharing a stroke,
+// picking up the lane colours at the feet.
+//
+// This serves the SAME image file the marketing site serves, rather than a
+// hand-authored SVG copy of it. A copy would be a restatement, and
+// restatements drift silently: nothing fails when one of two hand-maintained
+// versions of a logo stops matching the other. Serving the asset means the
+// app cannot disagree with the site about what the brand looks like.
+//
+// What was here before was a blue badge with three chevrons, from an earlier
+// name. It outlived the rebrand and shipped in demo recordings.
 export function LegionLogo({ size = 30 }) {
   return (
-    <svg className="legion-logo" width={size} height={size} viewBox="0 0 32 32"
-         role="img" aria-label="no_human" fill="none">
-      <defs>
-        <linearGradient id="legion-grad" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stopColor="#4C9AFF" />
-          <stop offset="1" stopColor="#0C66E4" />
-        </linearGradient>
-      </defs>
-      <rect width="32" height="32" rx="8" fill="url(#legion-grad)" />
-      <g stroke="#fff" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round">
-        <polyline points="9,13 16,9 23,13" />
-        <polyline points="9,18.5 16,14.5 23,18.5" />
-        <polyline points="9,24 16,20 23,24" />
-      </g>
-    </svg>
+    <img className="legion-logo" src="/nh-mark-512.png" alt="" aria-hidden="true"
+         width={size} height={size} decoding="async" />
   );
 }
