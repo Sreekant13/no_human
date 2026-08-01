@@ -1473,17 +1473,22 @@ class Orchestrator:
         from ..learning.triggers import filter_triggered
         _haystack = (f"{task.title} {task.description or ''} "
                      f"{' '.join(task.acceptance_criteria or [])}")
-        self._active_memories = filter_triggered(_all_memories, _haystack)
-        _held = len(_all_memories) - len(self._active_memories)
+        _triggered = filter_triggered(_all_memories, _haystack)
+        self._active_memories, _held_terms = self._screen_memories_for_terms(_triggered)
+        _held = len(_all_memories) - len(_triggered)
         if _all_memories:
             # agent-a-style "Accessed Knowledge" audit: name WHICH rules fired (not
             # just the count), so an autonomous run is debuggable — you can see
-            # exactly which knowledge influenced the coder (2.4).
+            # exactly which knowledge influenced the coder (2.4). A rule held for
+            # terms is named too, and separately from a trigger miss: one is the
+            # feature working, the other is a rule the operator needs to clean.
             _injected = [m.get("title", "?") for m in self._active_memories]
             self.emit("knowledge_accessed",
                       f"{len(self._active_memories)} rule(s) injected"
-                      + (f", {_held} held (trigger not matched)" if _held else ""),
-                      injected=_injected)
+                      + (f", {_held} held (trigger not matched)" if _held else "")
+                      + (f", {len(_held_terms)} held (banned term)"
+                         if _held_terms else ""),
+                      injected=_injected, held_for_terms=_held_terms)
 
         # 1.4 Playbooks: the one operator-authored procedure whose trigger
         # matches this task (at most one, to keep the prompt focused). Inert
@@ -4682,10 +4687,10 @@ class Orchestrator:
         prof = await self._usable_profile(repo.path)
         self._active_profile = prof
         from ..learning.triggers import filter_triggered
-        self._active_memories = filter_triggered(
+        self._active_memories, _ = self._screen_memories_for_terms(filter_triggered(
             await self.store.list_memories(confirmed=True, project=task.repo_path),
             f"{task.title} {task.description or ''} "
-            f"{' '.join(task.acceptance_criteria or [])}")
+            f"{' '.join(task.acceptance_criteria or [])}"))
 
         profile_ctx = ""
         if prof:
@@ -7351,6 +7356,49 @@ class Orchestrator:
     # be silently exceeded.
     _RULES_CRITICAL_CAP = 8000   # chars for high-importance rules (full content)
     _RULES_RELEVANT_CAP = 4000   # chars for med-importance rules (compact)
+
+    def _screen_memories_for_terms(self, mems: list[dict]) -> tuple[list[dict], list[str]]:
+        """Hold back any memory carrying a banned vendor term.
+
+        The learning store is written by the product itself, from transcripts of
+        real sessions, so a rule can arrive carrying a customer's or an employer's
+        name. Injected, it reaches the coder, the reviewer, and — via
+        ``_write_skill_memories`` — files on disk, any of which can end up in a
+        commit message, a PR body or a doc destined for a public repo. Observed
+        2026-07-31: a rule whose title named a private project was injected into a
+        task targeting this repo. That output happened to be clean; the channel is
+        probabilistic, and screening removes the channel rather than the luck.
+
+        Held, never deleted: the store is the operator's, and a rule that trips
+        this is usually a good rule with a bad noun. The event names what was held
+        so it can be found and cleaned.
+
+        Screened at the point ``_active_memories`` is ASSIGNED, which is the one
+        chokepoint every consumer reads from — the prompt formatter, the skill
+        writer, and the direct iterations — so a new consumer is covered without
+        having to remember this.
+
+        LIMITS, stated because a screen is read as a guarantee: this is the
+        publish guard's matcher, so it sees plaintext terms on letter boundaries
+        and nothing else. It cannot see an obfuscated or encoded term, and it
+        cannot see prose that identifies without naming — a sentence describing a
+        private arrangement passes. It narrows the channel; it does not close it.
+        """
+        from ..eval.vendor_terms import find_banned_terms
+
+        kept: list[dict] = []
+        held: list[str] = []
+        for m in mems or []:
+            text = f"{m.get('title', '')}\n{m.get('content', '')}"
+            try:
+                hits = find_banned_terms(text)
+            except Exception:  # noqa: BLE001 — a screen that errors must not
+                hits = []      # silently drop the rule; fall through to keeping it
+            if hits:
+                held.append(m.get("title", "?"))
+            else:
+                kept.append(m)
+        return kept, held
 
     def _format_active_memories(self) -> str:
         """Format confirmed rules + skills for prompt injection (importance-
