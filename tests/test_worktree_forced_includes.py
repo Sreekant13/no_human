@@ -33,6 +33,19 @@ from no_human.testing.runner import _ensure_forced_build_artifacts
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# `web/dist` is gitignored, so REPO_ROOT is itself boardless whenever this file
+# runs from a task worktree rather than the primary checkout — and then there is
+# nothing to provision FROM. Skipping is the honest outcome: the provisioning
+# tests would otherwise assert that a copy appeared from an empty source, which
+# is the same environment-dependence that made two scheduler tests pass or fail
+# on whether an editor happened to be open.
+needs_a_built_source = pytest.mark.skipif(
+    not (REPO_ROOT / "web" / "dist" / "index.html").is_file(),
+    reason="this checkout has no built board to provision from "
+           "(gitignored artifact — run `cd web && npm run build`, or this is a "
+           "task worktree, where the runner provisions it at test time)",
+)
+
 
 def test_pyproject_still_force_includes_something():
     """Guards the guard: this whole file is moot if nothing is forced."""
@@ -67,6 +80,7 @@ def test_a_fresh_worktree_really_is_missing_the_forced_path(worktree):
     assert not (worktree / "web" / "dist").exists()
 
 
+@needs_a_built_source
 def test_provisioning_makes_the_forced_path_resolvable(worktree):
     _ensure_forced_build_artifacts(worktree, REPO_ROOT)
     dist = worktree / "web" / "dist"
@@ -75,6 +89,7 @@ def test_provisioning_makes_the_forced_path_resolvable(worktree):
         "provisioned, but the board is not readable through it")
 
 
+@needs_a_built_source
 def test_it_is_a_copy_so_a_rebuild_cannot_reach_the_developers_checkout(worktree):
     """The isolation property, and the one place this deliberately differs from
     `_ensure_node_deps`.
