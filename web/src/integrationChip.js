@@ -20,19 +20,22 @@ export function statusChip(it) {
 }
 
 export const NAME_LABEL = {
-  jira: "Jira", github: "GitHub", gitlab: "GitLab",
+  jira: "Jira", linear: "Linear", github: "GitHub", gitlab: "GitLab",
   jenkins: "Jenkins", circleci: "CircleCI", slack: "Slack",
+  teams: "Microsoft Teams",
 };
 
 // Where each integration is configured (shown in the expand, so the operator
 // knows which file/section to edit — there is one source of truth per setting).
 export const CONFIG_HINT = {
   jira: "config.yaml → integrations.jira",
+  linear: "config.yaml → integrations.linear",
   circleci: "config.yaml → ci (backend: circleci) + integrations.circleci",
   github: "config.yaml → ci (backend: github_actions)",
   gitlab: "config.yaml → ci (backend: gitlab)",
   jenkins: "config.yaml → ci (backend: jenkins)",
   slack: "config.yaml → notifications.slack_webhook_url",
+  teams: "config.yaml → notifications.teams_webhook_url",
 };
 
 export const KIND_LABEL = {
@@ -46,17 +49,24 @@ export const KIND_LABEL = {
 // so the same recognizable color reads in both light and dark.
 export const BRAND_COLOR = {
   jira: "#2684FF",
+  linear: "#5E6AD2",
   github: "#6E7681",
   gitlab: "#FC6D26",
   jenkins: "#D33833",
   circleci: "#00CF69",
   slack: "#E01E5A",
+  teams: "#6264A7",
 };
 
 // Which ~/.no_human/.env key backs each integration's secret (shown, never the
 // value), so the config-expand can tell the operator exactly what to set.
 export const SECRET_ENV_KEY = {
   jira: "JIRA_API_TOKEN",
+  linear: "LINEAR_API_KEY",
   circleci: "CIRCLECI_TOKEN",
+  // Both notify-out webhook URLs live in config.yaml, not .env — that is where
+  // notify/build_notifier reads them from. They are still secrets (never
+  // echoed back, scrubbed from /api/config).
   slack: "(webhook in config)",
+  teams: "(webhook in config)",
 };

@@ -47,11 +47,21 @@ credential at runtime, no_human escalates a `MISSING_ACCESS` blocker naming the
 |---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | Default `llm.auth_mode: subscription` — **required**, the coding backend's subscription auth. Create with `claude setup-token`. |
 | `ANTHROPIC_API_KEY` | Only when `llm.auth_mode: api_key` — the operator's own metered key, BYO-API-key billing (see below). Never set otherwise. |
-| `SLACK_WEBHOOK_URL` | Optional — write-only notify-out channel (else logs only). |
+| `JIRA_API_TOKEN` | Jira intake (`integrations.jira.enabled`). Paired with `integrations.jira.email` as HTTP Basic auth. |
+| `LINEAR_API_KEY` | Linear intake (`integrations.linear.enabled`). Create at Linear → Security & access settings. |
 | `JENKINS_USER`, `JENKINS_API_TOKEN` | Repos whose CI is Jenkins (`build.example.com`) or human-gated on a `Jenkinsfile`. |
+| `CIRCLECI_TOKEN` | Repos whose CI backend is CircleCI (`integrations.circleci`). |
 | `GITLAB_TOKEN` | Repos whose CI backend is GitLab, or whose VCS host is a GitLab. |
 | `GH_ENTERPRISE_TOKEN` | Opening PRs against a GitHub-Enterprise host (e.g. `code.example.com`). Public `github.com` uses `gh auth login` instead. |
-| `TRACKER_TOKEN` / TRACKER creds | TRACKER/Acme intake + traceability writes (see `docs/adapters.md`). |
+| `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` | Only for the opt-in Slack Socket-Mode **intake** worker (`integrations.slack.intake`). Unrelated to notify-out. |
+
+> **The notify-out webhooks are NOT `.env` keys.** Slack's and Teams' webhook
+> URLs live in `config.yaml` under `notifications.slack_webhook_url` and
+> `notifications.teams_webhook_url` — that is where the code reads them from
+> (`notify/build_notifier`). They are still treated as secrets: never echoed
+> back by the settings UI, and scrubbed from `/api/config`. Earlier revisions of
+> this table listed a `SLACK_WEBHOOK_URL` env var and a `TRACKER_TOKEN`; **no
+> code has ever read either one.** They are removed rather than reworded.
 
 In the default `subscription` mode, `ANTHROPIC_API_KEY` and any Bedrock/Vertex
 var must **never** appear here — they are scrubbed on startup and a present
@@ -74,9 +84,36 @@ llm:
 database:
   path: ~/.no_human/no_human.db   # SQLite (WAL). No Postgres/Redis.
 
-notifications:
-  slack_webhook_url: null         # write-only alert webhook; null = log only
+notifications:                    # write-only notify-out; null = log only
+  slack_webhook_url: null         # Slack incoming webhook
+  teams_webhook_url: null         # Microsoft Teams — a Power Automate WORKFLOWS
+                                  # webhook. NOT a classic Office 365 connector:
+                                  # those were disabled in May 2026 and a
+                                  # connector URL is refused, not posted to.
+  board_url: null                 # optional deep link; becomes the Teams card's
+                                  # "Open in no_human" button. Leave null unless
+                                  # the board is reachable from where Teams is
+                                  # read — a 127.0.0.1 link is dead on a phone.
   email_to: you@example.com
+
+integrations:
+  jira:                           # polled intake (not `nh task add`); off by default
+    enabled: false
+    site: ""                      # https://you.atlassian.net
+    project_key: ""
+    email: ""                     # paired with JIRA_API_TOKEN as Basic auth
+    jql: ""                       # operator-authored; blank = open issues in project
+    default_repo: ""              # where polled-in tasks run
+    write_back: false             # opt-in: comment + category-matched transition
+    poll_interval: 5m             # floor 60s
+  linear:                         # polled intake; off by default
+    enabled: false
+    team_key: ""                  # e.g. "ENG" — the prefix in ENG-123
+    state_types: [triage, backlog, unstarted]   # which workflow states to pull in
+    label: ""                     # optional: only issues carrying this label
+    default_repo: ""
+    write_back: false             # opt-in: comment + type-matched state move
+    poll_interval: 5m             # floor 60s
 
 approval:
   require_before_merge: true      # ALWAYS true — agent never merges

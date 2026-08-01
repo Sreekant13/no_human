@@ -1611,7 +1611,8 @@ async def test_integrations_list_endpoint(client, mock_ambient_probes):
     r = await client.get("/api/integrations")
     assert r.status_code == 200
     items = r.json()["integrations"]
-    assert [i["name"] for i in items] == ["jira", "github", "gitlab", "jenkins", "circleci", "slack"]
+    assert [i["name"] for i in items] == ["jira", "linear", "github", "gitlab",
+                                          "jenkins", "circleci", "slack", "teams"]
     assert all(i["configured"] is False for i in items)   # default config
     assert all(i["healthy"] is None for i in items)       # not tested yet
 
@@ -1628,7 +1629,7 @@ async def test_integrations_list_includes_status_field(client, mock_ambient_prob
     items = {i["name"]: i for i in r.json()["integrations"]}
     assert items["github"]["status"] == "ambient"
     assert items["gitlab"]["status"] == "unconfigured"
-    for name in ("jira", "jenkins", "circleci", "slack"):
+    for name in ("jira", "linear", "jenkins", "circleci", "slack", "teams"):
         assert items[name]["status"] == "unconfigured"
 
 

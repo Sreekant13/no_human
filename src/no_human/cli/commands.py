@@ -31,7 +31,7 @@ from ..core.events import EventPersister
 from ..core.orchestrator import CODER_ROLE, Orchestrator, is_agent_session
 from ..core.task import Task, TaskStatus
 from ..intake import classify_kind, ingest_from_url, parse_source
-from ..notify.slack import SlackNotifier
+from ..notify import build_notifier
 
 console = Console()
 
@@ -139,7 +139,9 @@ def _build_orchestrator(config, store: Store, *, event_sink=None, task=None) -> 
         never_push_to=config["git"]["never_push_to"],
     )
     review_backend = None  # reviewer defaults to ClaudeBackend(readonly=True)
-    notifier = SlackNotifier(config["notifications"].get("slack_webhook_url"))
+    # Fan-out over every configured notify-OUT channel (Slack + Teams). One
+    # source of truth for which channels are live: notify.build_notifier.
+    notifier = build_notifier(config.data)
     gatherer = ContextGatherer(build_default_sources(store, config.data))
     from ..learning import LearningQueue
     from ..review.reviewer import AdversarialReviewer
@@ -2367,6 +2369,22 @@ async def _jira_poll_loop(poller, stop, poll_interval: int) -> None:
             pass
 
 
+async def _linear_poll_loop(poller, stop, poll_interval: int) -> None:
+    """Tick the Linear poller every ``poll_interval`` seconds until ``stop`` is
+    set. Deliberately a sibling of ``_jira_poll_loop`` rather than a shared
+    helper, matching the precedent already set for the Jira block in `start`:
+    each tracker keeps its own patchable seam and its own log label."""
+    while not stop.is_set():
+        try:
+            await poller.tick()
+        except Exception as exc:  # noqa: BLE001 — never kill serve on a Linear hiccup
+            console.print(f"[red]Linear poll error[/] {exc}")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=poll_interval)
+        except asyncio.TimeoutError:
+            pass
+
+
 @cli.command("serve")
 @click.option("--max-workers", type=int, default=None,
               help="Run the pool with this many workers for this invocation, "
@@ -2482,6 +2500,24 @@ def serve(max_workers):
                 console.print(f"[green]Jira intake[/] project={jira_cfg.get('project_key') or '?'} "
                               f"poll={jira_secs}s")
                 coros.append(_jira_poll_loop(poller, stop, jira_secs))
+
+            # Linear intake: same role as the Jira block above (a polled issue
+            # source, not an `nh task add` argument). Opt-in via
+            # integrations.linear.enabled.
+            linear_cfg = (config.data.get("integrations") or {}).get("linear") or {}
+            if linear_cfg.get("enabled"):
+                from ..config import load_env_var
+                from ..intake.linear import LinearAdapter
+                from ..intake.linear_poll import LinearPoller
+                load_env_var("LINEAR_API_KEY")  # from ~/.no_human/.env into the process env
+                linear_secs = max(60, int((parse_duration(str(linear_cfg.get("poll_interval", "5m")))
+                                           or parse_duration("5m")).total_seconds()))
+                linear_poller = LinearPoller(
+                    LinearAdapter(config.data), store, config=config.data,
+                    on_event=lambda k, t: console.print(f"[cyan]◆ {k}[/] {t}"))
+                console.print(f"[green]Linear intake[/] team={linear_cfg.get('team_key') or '?'} "
+                              f"poll={linear_secs}s")
+                coros.append(_linear_poll_loop(linear_poller, stop, linear_secs))
 
             # Slack intake (SCRUM-60, foundation only — no @mention handlers
             # attached yet, that's SCRUM-61/62): Socket-Mode worker, opt-in via
@@ -3748,6 +3784,36 @@ def start(host, port, workers, no_open):
                     await jira_store.close()
                     jira_store = None
 
+        # Linear intake: same shape, same opt-in discipline, its own store and
+        # stop event so neither tracker's failure can take the other down.
+        linear_task = None
+        linear_stop = None
+        linear_store = None
+        linear_cfg = (config.data.get("integrations") or {}).get("linear") or {}
+        if linear_cfg.get("enabled"):
+            try:
+                from ..config import load_env_var
+                from ..intake.linear import LinearAdapter
+                from ..intake.linear_poll import LinearPoller
+                load_env_var("LINEAR_API_KEY")  # from ~/.no_human/.env into the process env
+                linear_secs = max(60, int((parse_duration(str(linear_cfg.get("poll_interval", "5m")))
+                                           or parse_duration("5m")).total_seconds()))
+                linear_store = await Store(config.db_path).connect()
+                linear_poller = LinearPoller(
+                    LinearAdapter(config.data), linear_store, config=config.data,
+                    on_event=lambda k, t: console.print(f"[cyan]◆ {k}[/] {t}"))
+                console.print(f"[green]Linear intake[/] team={linear_cfg.get('team_key') or '?'} "
+                              f"poll={linear_secs}s")
+                linear_stop = asyncio.Event()
+                linear_task = asyncio.create_task(
+                    _linear_poll_loop(linear_poller, linear_stop, linear_secs))
+            except Exception as exc:  # noqa: BLE001 — optional integration, never break `start`
+                console.print(f"[yellow]Linear intake failed to start[/] {exc}")
+                linear_task = linear_stop = None
+                if linear_store is not None:
+                    await linear_store.close()
+                    linear_store = None
+
         try:
             await server.serve()
         finally:
@@ -3759,6 +3825,14 @@ def start(host, port, workers, no_open):
                     jira_task.cancel()
             if jira_store is not None:
                 await jira_store.close()
+            if linear_task is not None:
+                linear_stop.set()
+                try:
+                    await asyncio.wait_for(linear_task, timeout=10)
+                except asyncio.TimeoutError:
+                    linear_task.cancel()
+            if linear_store is not None:
+                await linear_store.close()
 
     try:
         asyncio.run(_go())

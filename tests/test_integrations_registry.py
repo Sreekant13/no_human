@@ -191,20 +191,24 @@ def test_probe_gitlab_ambient_false_when_probe_errors(monkeypatch):
 def test_ambient_unknown_provider_is_never_ambient(mock_ambient_probes):
     # jira/circleci/jenkins/slack have no ambient concept.
     st = {s.name: s for s in list_integrations_with_ambient(_UNCONFIGURED_CFG, cache={})}
-    for name in ("jira", "jenkins", "circleci", "slack"):
+    for name in ("jira", "linear", "jenkins", "circleci", "slack", "teams"):
         assert st[name].status == "unconfigured"
 
 
-def test_list_all_six_unconfigured():
+def test_list_all_unconfigured():
     st = list_integrations({"integrations": {}, "ci": {}, "notifications": {}})
-    assert [s.name for s in st] == ["jira", "github", "gitlab", "jenkins", "circleci", "slack"]
+    # Listing order is issue tracker → VCS → CI → notifications.
+    assert [s.name for s in st] == ["jira", "linear", "github", "gitlab",
+                                    "jenkins", "circleci", "slack", "teams"]
     assert all(isinstance(s, IntegrationStatus) for s in st)
     assert all(s.configured is False for s in st)
     assert all(s.healthy is None for s in st)          # None until test_integration runs
     kinds = {s.name: s.kind for s in st}
     assert kinds == {
-        "jira": "issue_tracker", "github": "vcs", "gitlab": "vcs",
-        "jenkins": "ci", "circleci": "ci", "slack": "notifications",
+        "jira": "issue_tracker", "linear": "issue_tracker",
+        "github": "vcs", "gitlab": "vcs",
+        "jenkins": "ci", "circleci": "ci",
+        "slack": "notifications", "teams": "notifications",
     }
 
 
@@ -230,7 +234,7 @@ def test_null_sections_are_safe():
     # Config deep-merge shadowing trap: a user setting `integrations:` (or ci /
     # notifications) to null must not crash the registry.
     st = list_integrations({"integrations": None, "ci": None, "notifications": None})
-    assert len(st) == 6
+    assert len(st) == 8
     assert all(s.configured is False for s in st)
 
 
@@ -299,3 +303,152 @@ async def test_test_integration_unconfigured_jira_is_not_healthy(monkeypatch):
 async def test_test_integration_unknown_name_raises():
     with pytest.raises(ValueError, match="unknown integration"):
         await reg.test_integration("mystery", {})
+
+
+# --------------------------------------------------------------------------- #
+# Linear (issue tracker) + Teams (notifications)                               #
+# --------------------------------------------------------------------------- #
+
+def test_linear_and_teams_are_registered_with_the_right_kinds():
+    names = [s.name for s in list_integrations({})]
+    assert "linear" in names and "teams" in names
+    kinds = {s.name: s.kind for s in list_integrations({})}
+    assert kinds["linear"] == "issue_tracker"     # intake, like jira
+    assert kinds["teams"] == "notifications"      # notify-OUT, NOT the context source
+    assert reg.KIND_BY_NAME["linear"] == "issue_tracker"
+    assert reg.KIND_BY_NAME["teams"] == "notifications"
+
+
+def test_linear_status_needs_a_team_key():
+    st = {s.name: s for s in list_integrations(
+        {"integrations": {"linear": {"team_key": "ENG", "label": "Bug"}}})}
+    assert st["linear"].configured is True
+    assert "ENG" in st["linear"].detail and "Bug" in st["linear"].detail
+    st = {s.name: s for s in list_integrations({"integrations": {"linear": {"label": "Bug"}}})}
+    assert st["linear"].configured is False
+
+
+def test_linear_secret_lives_in_env_not_config():
+    specs = {f.name: f for f in reg.FIELD_SPECS["linear"]}
+    assert specs["api_key"].secret is True
+    assert specs["api_key"].env_var == "LINEAR_API_KEY"
+    assert specs["api_key"].config_path is None      # never written to config.yaml
+    assert specs["team_key"].config_path == "integrations.linear.team_key"
+
+
+def test_teams_webhook_is_marked_secret_and_never_echoed():
+    url = "https://prod-9.westus.logic.azure.com:443/workflows/x?sig=SECRETSIG"
+    specs = {f.name: f for f in reg.FIELD_SPECS["teams"]}
+    assert specs["webhook_url"].secret is True
+    assert specs["webhook_url"].config_path == "notifications.teams_webhook_url"
+    for s in list_integrations({"notifications": {"teams_webhook_url": url}}):
+        assert "SECRETSIG" not in s.detail
+
+
+def test_a_retired_teams_connector_url_is_reported_as_broken_not_configured():
+    # Microsoft disabled Office 365 connectors in May 2026. Reporting such a
+    # URL as a working channel would hide the breakage until an alert failed.
+    st = {s.name: s for s in list_integrations({"notifications": {
+        "teams_webhook_url": "https://outlook.office.com/webhook/a/IncomingWebhook/b/c"}})}
+    assert st["teams"].healthy is False
+    assert "retired" in st["teams"].detail.lower()
+    assert "Power Automate" in st["teams"].detail
+
+
+@pytest.mark.asyncio
+async def test_test_integration_linear_health_uses_the_raw_key_header(monkeypatch):
+    monkeypatch.setenv("LINEAR_API_KEY", "lin-should-not-leak")
+    calls = {}
+
+    async def fake_post(url, headers=None, json=None, timeout=None):
+        calls.update(url=url, headers=headers, json=json)
+
+        class _R:
+            status_code = 200
+
+            def json(self):
+                return {"data": {"viewer": {"id": "u1", "name": "Dana Lee"}}}
+        return _R()
+
+    monkeypatch.setattr(reg, "_http_post", fake_post)
+    s = await reg.test_integration("linear", {"integrations": {"linear": {"team_key": "ENG"}}})
+    assert s.healthy is True and "Dana Lee" in s.detail
+    assert calls["url"] == "https://api.linear.app/graphql"
+    # RAW key, not Bearer — Linear's documented personal-key header.
+    assert calls["headers"]["Authorization"] == "lin-should-not-leak"
+    assert "lin-should-not-leak" not in s.detail
+
+
+@pytest.mark.asyncio
+async def test_test_integration_linear_reports_a_200_with_errors_as_unhealthy(monkeypatch):
+    monkeypatch.setenv("LINEAR_API_KEY", "k")
+
+    async def fake_post(url, headers=None, json=None, timeout=None):
+        class _R:
+            status_code = 200
+
+            def json(self):
+                return {"errors": [{"message": "nope",
+                                    "extensions": {"code": "AUTHENTICATION_ERROR"}}]}
+        return _R()
+
+    monkeypatch.setattr(reg, "_http_post", fake_post)
+    s = await reg.test_integration("linear", {"integrations": {"linear": {"team_key": "ENG"}}})
+    assert s.healthy is False
+    assert "AUTHENTICATION_ERROR" in s.detail
+
+
+@pytest.mark.asyncio
+async def test_test_integration_linear_names_throttling_at_http_400(monkeypatch):
+    monkeypatch.setenv("LINEAR_API_KEY", "k")
+
+    async def fake_post(url, headers=None, json=None, timeout=None):
+        class _R:
+            status_code = 400
+
+            def json(self):
+                return {"errors": [{"message": "slow down",
+                                    "extensions": {"code": "RATELIMITED"}}]}
+        return _R()
+
+    monkeypatch.setattr(reg, "_http_post", fake_post)
+    s = await reg.test_integration("linear", {"integrations": {"linear": {"team_key": "ENG"}}})
+    assert s.healthy is False
+    assert "rate limited" in s.detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_test_integration_linear_without_a_key_says_which_key(monkeypatch):
+    monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+    s = await reg.test_integration("linear", {"integrations": {"linear": {"team_key": "ENG"}}})
+    assert s.healthy is False
+    assert "LINEAR_API_KEY" in s.detail
+
+
+@pytest.mark.asyncio
+async def test_test_integration_teams_never_posts_a_probe_message(monkeypatch):
+    # Microsoft's terms: "It's a violation of the terms of use to use Microsoft
+    # Teams as a log file. Only send messages that people will read." A health
+    # check must not put noise in a human's channel.
+    import httpx
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: pytest.fail("must not post"))
+    monkeypatch.setattr(reg, "_http_post",
+                        lambda *a, **k: pytest.fail("must not post"))
+    s = await reg.test_integration("teams", {"notifications": {
+        "teams_webhook_url": "https://prod-9.westus.logic.azure.com:443/workflows/x?sig=S"}})
+    assert s.healthy is True
+    assert "run time" in s.detail
+
+
+@pytest.mark.asyncio
+async def test_test_integration_teams_reports_a_retired_connector_url(monkeypatch):
+    s = await reg.test_integration("teams", {"notifications": {
+        "teams_webhook_url": "https://acme.webhook.office.com/webhookb2/a/IncomingWebhook/b/c"}})
+    assert s.healthy is False
+    assert "retired" in s.detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_test_integration_teams_unconfigured():
+    s = await reg.test_integration("teams", {"notifications": {}})
+    assert s.configured is False and s.healthy is False

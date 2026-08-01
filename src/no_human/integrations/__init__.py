@@ -26,20 +26,23 @@ from typing import Any, Callable
 
 KIND_BY_NAME = {
     "jira": "issue_tracker",
+    "linear": "issue_tracker",
     "github": "vcs",
     "gitlab": "vcs",
     "jenkins": "ci",
     "circleci": "ci",
     "slack": "notifications",
+    "teams": "notifications",
 }
 
 # The order the UI lists them (issue tracker → VCS → CI → notifications).
-_ORDER = ["jira", "github", "gitlab", "jenkins", "circleci", "slack"]
+_ORDER = ["jira", "linear", "github", "gitlab", "jenkins", "circleci", "slack", "teams"]
 
 
 @dataclass
 class IntegrationStatus:
-    name: str            # "jira" | "github" | "gitlab" | "jenkins" | "circleci" | "slack"
+    # One of the names in `_ORDER` below — that list is the source of truth.
+    name: str
     kind: str            # "issue_tracker" | "vcs" | "ci" | "notifications"
     configured: bool
     healthy: bool | None  # None = never checked
@@ -84,6 +87,14 @@ FIELD_SPECS: dict[str, list[FieldSpec]] = {
         FieldSpec("jql", "JQL filter", False, config_path="integrations.jira.jql"),
         FieldSpec("api_token", "API token", True, env_var="JIRA_API_TOKEN"),
     ],
+    # intake/linear.py reads integrations.linear.* / LINEAR_API_KEY. The key
+    # header is the RAW key (`Authorization: <key>`), not `Bearer <key>` —
+    # see intake/linear.py's docstring.
+    "linear": [
+        FieldSpec("team_key", "Team key", False, config_path="integrations.linear.team_key"),
+        FieldSpec("label", "Label filter", False, config_path="integrations.linear.label"),
+        FieldSpec("api_key", "API key", True, env_var="LINEAR_API_KEY"),
+    ],
     # ci/circleci.py reads CIRCLECI_TOKEN; integrations.circleci.* is the
     # first-class config section (see _circleci_status above).
     "circleci": [
@@ -112,6 +123,12 @@ FIELD_SPECS: dict[str, list[FieldSpec]] = {
     "slack": [
         FieldSpec("webhook_url", "Webhook URL", True, config_path="notifications.slack_webhook_url"),
     ],
+    # notify/teams.py reads notifications.teams_webhook_url. Secret for the
+    # same reason Slack's is: the Power Automate URL carries its own SAS
+    # credential (`sp`/`sv`/`sig`) in the query string.
+    "teams": [
+        FieldSpec("webhook_url", "Webhook URL", True, config_path="notifications.teams_webhook_url"),
+    ],
 }
 
 
@@ -133,6 +150,39 @@ def _jira_status(config: dict) -> IntegrationStatus:
     configured = bool(j.get("site") and j.get("project_key") and j.get("email"))
     detail = f"{j['site']} · {j['project_key']}" if configured else "not configured"
     return IntegrationStatus("jira", "issue_tracker", configured, None, detail,
+                              status=_status_str(configured))
+
+
+def _linear_status(config: dict) -> IntegrationStatus:
+    lin = _sect(config, "integrations").get("linear") or {}
+    team = lin.get("team_key")
+    configured = bool(team)
+    if configured:
+        label = lin.get("label")
+        detail = f"team {team}" + (f" · label {label}" if label else "")
+    else:
+        detail = "not configured"
+    return IntegrationStatus("linear", "issue_tracker", configured, None, detail,
+                              status=_status_str(configured))
+
+
+def _teams_status(config: dict) -> IntegrationStatus:
+    # The webhook is a secret — report only that one is set, never the URL.
+    # A RETIRED Office 365 connector URL is reported as configured-but-broken
+    # rather than as a working channel: Microsoft disabled those endpoints in
+    # May 2026, so it can never deliver and saying "configured" would hide
+    # that until an alert failed to arrive.
+    from ..notify.teams import is_retired_connector_url
+
+    url = _sect(config, "notifications").get("teams_webhook_url")
+    configured = bool(url)
+    if configured and is_retired_connector_url(url):
+        return IntegrationStatus(
+            "teams", "notifications", True, False,
+            "retired Office 365 connector URL — replace with a Power Automate "
+            "Workflows webhook", status="configured")
+    detail = "webhook configured" if configured else "not configured"
+    return IntegrationStatus("teams", "notifications", configured, None, detail,
                               status=_status_str(configured))
 
 
@@ -175,8 +225,9 @@ def _slack_status(config: dict) -> IntegrationStatus:
 
 
 _STATUS = {
-    "jira": _jira_status, "github": _github_status, "gitlab": _gitlab_status,
-    "jenkins": _jenkins_status, "circleci": _circleci_status, "slack": _slack_status,
+    "jira": _jira_status, "linear": _linear_status, "github": _github_status,
+    "gitlab": _gitlab_status, "jenkins": _jenkins_status,
+    "circleci": _circleci_status, "slack": _slack_status, "teams": _teams_status,
 }
 
 
@@ -472,6 +523,78 @@ async def _check_jira(config: dict) -> IntegrationStatus:
     return replace(base, healthy=False, detail=f"HTTP {r.status_code}")
 
 
+async def _http_post(url, headers=None, json=None, timeout=10.0):
+    """Thin async POST seam (monkeypatched in tests; real impl uses httpx).
+
+    Linear's API is GraphQL-only, so its health check cannot reuse
+    ``_http_get``.
+    """
+    import httpx
+    async with httpx.AsyncClient() as client:
+        return await client.post(url, headers=headers, json=json, timeout=timeout)
+
+
+async def _check_linear(config: dict) -> IntegrationStatus:
+    base = _linear_status(config)
+    if not base.configured:
+        return replace(base, healthy=False, detail="not configured")
+    key = os.environ.get("LINEAR_API_KEY")
+    if not key:
+        return replace(base, healthy=False,
+                       detail="LINEAR_API_KEY not set in ~/.no_human/.env")
+    from ..intake.linear import API_URL
+    try:
+        r = await _http_post(
+            API_URL,
+            # RAW key, not Bearer — Linear's documented personal-key header.
+            headers={"Authorization": key, "Content-Type": "application/json"},
+            json={"query": "{ viewer { id name } }"}, timeout=10.0)
+    except Exception as exc:  # noqa: BLE001 — a health check never raises
+        return replace(base, healthy=False, detail=f"connection failed: {type(exc).__name__}")
+    # Linear returns field errors at 200, auth failure at 401 and rate limiting
+    # at 400 — every one of them carries an `errors` array, so a 200 alone does
+    # not mean success.
+    body: Any = {}
+    try:
+        body = r.json() or {}
+    except Exception:  # noqa: BLE001
+        body = {}
+    errors = body.get("errors") if isinstance(body, dict) else None
+    if errors:
+        first = errors[0] if isinstance(errors, list) and errors else {}
+        code = ((first.get("extensions") or {}).get("code") or "") if isinstance(first, dict) else ""
+        if code == "RATELIMITED":
+            return replace(base, healthy=False,
+                           detail="rate limited (Linear reports this as HTTP 400)")
+        return replace(base, healthy=False, detail=f"API error: {code or 'unknown'}")
+    if r.status_code == 200:
+        who = ""
+        if isinstance(body, dict):
+            who = ((body.get("data") or {}).get("viewer") or {}).get("name", "")
+        return replace(base, healthy=True,
+                       detail=f"authenticated as {who}" if who else "authenticated")
+    return replace(base, healthy=False, detail=f"HTTP {r.status_code}")
+
+
+async def _check_teams(config: dict) -> IntegrationStatus:
+    """Teams is a status view, not a ping.
+
+    There is deliberately no live probe: the only way to exercise a Workflows
+    webhook is to POST a message, and Microsoft's Graph/Teams terms state it is
+    a violation "to use Microsoft Teams as a log file — only send messages that
+    people will read". A health check must not put noise in a human's channel.
+    What IS checked is the one failure we can see without sending: a retired
+    Office 365 connector URL, which can never deliver.
+    """
+    base = _teams_status(config)
+    if not base.configured:
+        return replace(base, healthy=False, detail="not configured")
+    if base.healthy is False:      # retired connector URL, detail already set
+        return base
+    return replace(base, healthy=True,
+                   detail=f"{base.detail} — verified by the webhook at run time")
+
+
 async def _check_circleci(config: dict) -> IntegrationStatus:
     base = _circleci_status(config)
     if not base.configured:
@@ -518,6 +641,8 @@ async def _check_view(status_fn, name: str, config: dict) -> IntegrationStatus:
 
 _CHECKERS = {
     "jira": _check_jira,
+    "linear": _check_linear,
+    "teams": _check_teams,
     "circleci": _check_circleci,
     "github": lambda c: _check_view(_github_status, "github", c),
     "gitlab": lambda c: _check_view(_gitlab_status, "gitlab", c),

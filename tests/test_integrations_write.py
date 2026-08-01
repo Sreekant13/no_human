@@ -177,8 +177,9 @@ def test_config_yaml_nonsecret_round_trip_preserves_unrelated_keys(tmp_path):
     assert reloaded.data["integrations"]["jira"]["site"] == "https://acme.atlassian.net"
 
 
-def test_field_specs_cover_all_six_integrations():
-    assert set(FIELD_SPECS) == {"jira", "github", "gitlab", "jenkins", "circleci", "slack"}
+def test_field_specs_cover_every_integration():
+    assert set(FIELD_SPECS) == {"jira", "linear", "github", "gitlab", "jenkins",
+                                "circleci", "slack", "teams"}
     for name, specs in FIELD_SPECS.items():
         for spec in specs:
             assert bool(spec.env_var) != bool(spec.config_path), name

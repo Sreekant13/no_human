@@ -24,6 +24,18 @@ class SlackNotifier:
         self.webhook_url = webhook_url
 
     @property
+    def configured(self) -> bool:
+        """The operator asked for this channel (a URL is set).
+
+        Distinct from ``enabled``, which is "could actually deliver". For
+        Slack the two always agree; they diverge for Teams, where a retired
+        connector URL is configured but can never deliver. The fan-out uses
+        the difference to tell "not set up" (skip, fine) apart from "set up
+        and broken" (report a failed delivery) — see notify/__init__.py.
+        """
+        return bool(self.webhook_url)
+
+    @property
     def enabled(self) -> bool:
         return bool(self.webhook_url)
 

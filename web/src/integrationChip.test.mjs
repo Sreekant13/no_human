@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { statusChip, KIND_LABEL, BRAND_COLOR, NAME_LABEL, CONFIG_HINT } from "./integrationChip.js";
 
-const ALL = ["jira", "github", "gitlab", "jenkins", "circleci", "slack"];
+// Must match integrations/__init__.py `_ORDER`.
+const ALL = ["jira", "linear", "github", "gitlab", "jenkins", "circleci",
+             "slack", "teams"];
 
 test("statusChip maps the four non-ambient states", () => {
   assert.deepEqual(statusChip({ configured: false }), { label: "Unconfigured", tone: "neutral" });
@@ -58,11 +60,12 @@ test("KIND_LABEL covers every integration kind", () => {
   }
 });
 
-test("BRAND_COLOR / NAME_LABEL / CONFIG_HINT cover all six integrations", () => {
+test("BRAND_COLOR / NAME_LABEL / CONFIG_HINT cover every integration", () => {
   for (const name of ALL) {
     assert.match(BRAND_COLOR[name], /^#[0-9A-Fa-f]{6}$/, `brand color: ${name}`);
     assert.ok(NAME_LABEL[name], `name label: ${name}`);
     assert.ok(CONFIG_HINT[name], `config hint: ${name}`);
   }
   assert.equal(NAME_LABEL.circleci, "CircleCI");   // proper casing, not "Circleci"
+  assert.equal(NAME_LABEL.teams, "Microsoft Teams");
 });

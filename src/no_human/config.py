@@ -661,9 +661,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "database": {"path": str(DB_PATH)},
     "notifications": {
-        # Write-only webhook, alert channel only. Read context uses separate
-        # read-only tokens (Phase 1). None disables Slack (logs instead).
+        # Write-only webhooks, alert channel only. Read context uses separate
+        # read-only tokens (Phase 1). None disables the channel (logs instead);
+        # with both None, notifications are logged and nothing is sent.
         "slack_webhook_url": None,
+        # Microsoft Teams, via a Power Automate "Workflows" webhook. NOT the
+        # classic Office 365 connector — Microsoft disabled those between
+        # 2026-05-18 and 2026-05-22 and they no longer function, so
+        # notify/teams.py refuses a connector URL loudly instead of posting
+        # into a dead endpoint. Create one in Teams: Workflows app → "Post to a
+        # channel when a webhook request is received". The URL carries its own
+        # SAS credential in the query string — treat it as a secret (it is
+        # scrubbed from /api/config like every other *webhook* key).
+        "teams_webhook_url": None,
+        # Where a human should click through to. Rendered as the Teams Adaptive
+        # Card's single "Open in no_human" button (Action.OpenUrl) — the button
+        # that card format was chosen for. NOT a secret and not scrubbed. Left
+        # None because the board binds 127.0.0.1 by default and a localhost
+        # link is dead on the phone these alerts are read on; set it only when
+        # the board is actually reachable from where Teams is read.
+        "board_url": None,
         "email_to": "dev@example.com",
     },
     "updates": {
@@ -928,6 +945,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
             # JIRA_API_TOKEN in ~/.no_human/.env
             "default_repo": "",       # where polled-in tasks run
             "write_back": False,      # opt-in: comment on status change (never transition/close)
+            "poll_interval": "5m",    # floor 60s enforced at the serve hook
+        },
+        "linear": {
+            # Polled issue intake, same role as `jira` above (a server-side
+            # poller, not an argument to `nh task add`). LINEAR_API_KEY lives
+            # in ~/.no_human/.env, never in this world-readable file.
+            "enabled": False,
+            "team_key": "",           # e.g. "ENG" — the prefix in ENG-123
+            # WorkflowState.type values to pull in. Linear's seven documented
+            # types are triage/backlog/unstarted/started/completed/canceled/
+            # duplicate; the default takes only work nobody has started.
+            "state_types": ["triage", "backlog", "unstarted"],
+            "label": "",              # optional: only issues carrying this label
+            "default_repo": "",       # where polled-in tasks run
+            "write_back": False,      # opt-in: comment + type-matched state move
             "poll_interval": "5m",    # floor 60s enforced at the serve hook
         },
         "circleci": {

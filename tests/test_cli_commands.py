@@ -1098,6 +1098,97 @@ def test_start_skips_jira_poller_when_disabled(tmp_path, monkeypatch):
     assert "jira" not in result.output.lower()
 
 
+def _make_start_cfg_linear(db_path: Path, *, linear_enabled: bool):
+    """Same shape as _make_start_cfg, with Jira off so the two trackers'
+    wiring can be asserted independently."""
+    class _Cfg:
+        primary_model = "claude-sonnet-4-6"
+        review_model = "claude-sonnet-4-6"
+        data = {
+            "server": {"port": 8420},
+            "concurrency": {},
+            "integrations": {
+                "jira": {"enabled": False},
+                "linear": {
+                    "enabled": linear_enabled,
+                    "team_key": "ENG",
+                    "poll_interval": "5m",
+                },
+            },
+        }
+
+        def get(self, key, default=None):
+            return self.data.get(key, default)
+
+        def __getitem__(self, key):
+            return self.data[key]
+
+    _Cfg.db_path = db_path
+    return _Cfg()
+
+
+def test_start_runs_linear_poller_when_enabled(tmp_path, monkeypatch):
+    import no_human.intake.linear as linear_mod
+    import no_human.intake.linear_poll as linear_poll_mod
+
+    cfg = _make_start_cfg_linear(tmp_path / "test.db", linear_enabled=True)
+    cmd_mod = _patch_start_scaffolding(monkeypatch, cfg)
+
+    mock_poller_instance = MagicMock()
+    mock_poller_cls = MagicMock(return_value=mock_poller_instance)
+    monkeypatch.setattr(linear_poll_mod, "LinearPoller", mock_poller_cls)
+    monkeypatch.setattr(linear_mod, "LinearAdapter", MagicMock())
+    # A real coroutine (not an AsyncMock) so the SHUTDOWN path is observable:
+    # it records the stop event `start` handed it, and the assertion below
+    # checks `start`'s finally-block actually set it. With an AsyncMock the
+    # task completes instantly and a missing shutdown looks identical to a
+    # working one.
+    seen = {}
+
+    async def fake_loop(poller, stop, poll_interval):
+        seen["poller"] = poller
+        seen["stop"] = stop
+        seen["interval"] = poll_interval
+
+    monkeypatch.setattr(cmd_mod, "_linear_poll_loop", fake_loop)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["start", "--no-open", "--port", "8420"])
+
+    assert result.exit_code == 0, result.output
+    mock_poller_cls.assert_called_once()
+    assert seen["poller"] is mock_poller_instance
+    assert seen["interval"] == 300           # "5m", floored at 60s
+    # `start` must stop the poll loop on the way out, or `nh start` would
+    # leave a polling task running after the server exits.
+    assert seen["stop"].is_set() is True
+    assert "linear intake" in result.output.lower()
+    # Jira is off in this config: the two trackers must be independent.
+    assert "jira" not in result.output.lower()
+
+
+def test_start_skips_linear_poller_when_disabled(tmp_path, monkeypatch):
+    import no_human.intake.linear as linear_mod
+    import no_human.intake.linear_poll as linear_poll_mod
+
+    cfg = _make_start_cfg_linear(tmp_path / "test.db", linear_enabled=False)
+    cmd_mod = _patch_start_scaffolding(monkeypatch, cfg)
+
+    mock_poller_cls = MagicMock()
+    monkeypatch.setattr(linear_poll_mod, "LinearPoller", mock_poller_cls)
+    monkeypatch.setattr(linear_mod, "LinearAdapter", MagicMock())
+    mock_poll_loop = AsyncMock(return_value=None)
+    monkeypatch.setattr(cmd_mod, "_linear_poll_loop", mock_poll_loop)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["start", "--no-open", "--port", "8420"])
+
+    assert result.exit_code == 0, result.output
+    mock_poller_cls.assert_not_called()
+    mock_poll_loop.assert_not_called()
+    assert "linear" not in result.output.lower()
+
+
 # --------------------------------------------------------------------------- #
 # nh stop                                                                      #
 # --------------------------------------------------------------------------- #

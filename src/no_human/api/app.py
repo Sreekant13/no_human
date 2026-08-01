@@ -107,7 +107,7 @@ async def lifespan(app: FastAPI):
     from ..core.orchestrator import Orchestrator
     from ..core.scheduler import Scheduler, resolve_max_workers
     from ..learning import LearningQueue
-    from ..notify.slack import SlackNotifier
+    from ..notify import build_notifier
     from ..review.reviewer import AdversarialReviewer
 
     def _orch_factory(task=None):
@@ -119,7 +119,8 @@ async def lifespan(app: FastAPI):
             never_push_to=config["git"]["never_push_to"],
         )
         review_backend = None  # reviewer defaults to ClaudeBackend(readonly=True)
-        notifier = SlackNotifier(config["notifications"].get("slack_webhook_url"))
+        # Fan-out over every configured notify-OUT channel (Slack + Teams).
+        notifier = build_notifier(config.data)
         gatherer = ContextGatherer(build_default_sources(store, config.data))
         reviewer = AdversarialReviewer(model=config.review_model, backend=review_backend)
         return Orchestrator(
