@@ -3629,7 +3629,7 @@ def doctor():
 
     async def _go():
         async with Store(config.db_path) as store:
-            d = await diagnose(store)
+            d = await diagnose(store, config.data)
 
         # Live readiness (not history): can the coding backend actually run a
         # task right now? A missing `claude` CLI makes the board load green

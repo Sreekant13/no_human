@@ -787,6 +787,24 @@ def test_the_push_that_ends_every_task_is_disclosed_as_egress(security_doc):
     disclosure is what fails the test and REWORDING it is free. Every arm was
     watched failing; the matrix and the benign-rewording tests below are the
     record.
+
+    WHY THIS IS SEPARATE FROM ``tests/test_egress_disclosure.py``, which also
+    guards §7 — do not merge them for tidiness. That guard asks "does every
+    module with an outbound call appear ANYWHERE in §7"; this one asks "is the
+    ONE channel that cannot be turned off still disclosed, and still true".
+    Measured against each other's known positives, neither covers the other:
+
+      known positive                          drift guard   this guard
+      delete the whole push bullet ........... FAIL          FAIL
+      drop ONLY the no-opt-out sentence ...... pass          FAIL
+      gut that claim in place, anchors kept .. pass          FAIL
+      strip the push bullet's citation ....... FAIL          FAIL
+      plant an undisclosed httpx module ...... FAIL          pass
+
+    The two middle rows are why a merged test would be weaker: the drift guard
+    matches module PATHS, so gutting the sentence that says the egress cannot be
+    disabled leaves every path in place and it stays green. The last row is why
+    this one cannot absorb that guard: it never looks at modules at all.
     """
     vcs_init = VCS_INIT.read_text(encoding="utf-8")
     orch = (REPO / "src" / "no_human" / "core" / "orchestrator.py").read_text(

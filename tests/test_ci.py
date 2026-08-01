@@ -984,3 +984,141 @@ def test_gha_no_commit_404_is_infra_not_access():
     result = asyncio.run(ci.trigger("branch"))
     assert result.infra_failure
     assert not result.access_failure  # a token won't fix a missing SHA
+
+
+# --------------------------------------------------------------------------- #
+# CI backend resolution: which source wins, and what happens when none works.  #
+#                                                                             #
+# The defect these pin: the global `ci:` block was documented in config.py and #
+# docs/configuration.md and read by NOTHING. The profile path was dead too —   #
+# `ci_from_config({"ci": prof.ci})` needs `enabled`, and nothing in onboard.py #
+# or profile.py ever writes one. A user configuring CI exactly as documented   #
+# got no gate, no warning and no diagnostic.                                    #
+# --------------------------------------------------------------------------- #
+
+from no_human.profile import ProjectProfile  # noqa: E402
+
+
+def _resolve(cfg_ci=None, prof_ci=None, *, injected=None):
+    """Run _resolve_ci_runner in isolation; return (runner, events)."""
+    import copy
+
+    from no_human.config import DEFAULT_CONFIG
+
+    data = copy.deepcopy(DEFAULT_CONFIG)
+    if cfg_ci is not None:
+        data["ci"] = cfg_ci
+    events: list[dict] = []
+    orch = Orchestrator(
+        None, data, None, SlackNotifier(None),
+        event_sink=events.append, ci_runner=injected,
+    )
+    prof = None
+    if prof_ci is not None:
+        prof = ProjectProfile(repo_path="/tmp/r", ci=prof_ci)
+    orch._resolve_ci_runner(prof)
+    return orch.ci_runner, events
+
+
+def _advisories(events):
+    return [e["text"] for e in events if e["kind"] == "advisory"]
+
+
+def test_global_ci_block_is_actually_read():
+    """THE defect: a documented, enabled global `ci:` block builds a backend."""
+    runner, events = _resolve(
+        cfg_ci={"enabled": True, "backend": "gitlab", "project": "grp/repo"})
+    assert isinstance(runner, GitLabCI)
+    assert runner.project == "grp/repo"
+    assert not _advisories(events), "a working config must not warn"
+    origins = [e for e in events if e["kind"] == "ci_backend"]
+    assert origins and origins[0]["origin"] == "global config"
+
+
+def test_no_ci_config_anywhere_changes_nothing():
+    """Devil's advocate: an install that never configured CI is untouched.
+
+    Asserted against DEFAULT_CONFIG, not a loaded config — load_config()
+    deep-merges the operator's own ~/.no_human/config.yaml, so a check against
+    the loaded config would only prove something about this machine.
+    """
+    from no_human.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["ci"]["enabled"] is False, "the shipped default is off"
+    runner, events = _resolve()
+    assert runner is None
+    assert not events, "no CI configured => not one event, not one warning"
+
+
+def test_profile_ci_builds_a_backend_at_all():
+    """Regression pin: prof.ci has no `enabled` key (onboard.py never writes
+    one), so the pre-fix call returned None for every profile that ever existed.
+    """
+    runner, events = _resolve(prof_ci={"backend": "gitlab", "project": "grp/proj"})
+    assert isinstance(runner, GitLabCI)
+    assert runner.project == "grp/proj"
+    assert not _advisories(events)
+
+
+def test_profile_beats_global_config():
+    """Precedence: the more specific, human-confirmed source wins."""
+    runner, events = _resolve(
+        cfg_ci={"enabled": True, "backend": "gitlab", "project": "global/repo"},
+        prof_ci={"backend": "gitlab", "project": "profile/repo"},
+    )
+    assert runner.project == "profile/repo"
+    assert [e for e in events if e["kind"] == "ci_backend"][0]["origin"] \
+        == "project profile"
+
+
+def test_global_is_a_fallback_when_the_profile_names_no_target():
+    """`nh onboard` writes a bare {"backend": "gitlab"} on seeing a
+    .gitlab-ci.yml. That is a detection hint, not a claim: it must fall through
+    to the global block WITHOUT warning, or every GitLab repo warns every run.
+    """
+    runner, events = _resolve(
+        cfg_ci={"enabled": True, "backend": "gitlab", "project": "global/repo"},
+        prof_ci={"backend": "gitlab"},
+    )
+    assert runner.project == "global/repo"
+    assert not _advisories(events), "a detection hint must not be reported as broken"
+
+
+def test_enabled_but_targetless_global_block_warns():
+    """The signal that never existed: configured-but-unusable is now VISIBLE."""
+    runner, events = _resolve(cfg_ci={"enabled": True, "backend": "gitlab",
+                                      "project": ""})
+    assert runner is None
+    adv = _advisories(events)
+    assert len(adv) == 1
+    assert "UNUSABLE" in adv[0] and "global config" in adv[0]
+    assert "NO CI gate" in adv[0]
+
+
+def test_unknown_backend_warns_instead_of_killing_the_run():
+    runner, events = _resolve(cfg_ci={"enabled": True, "backend": "travis",
+                                      "project": "grp/repo"})
+    assert runner is None, "an unknown backend yields no gate"
+    adv = _advisories(events)
+    assert len(adv) == 1
+    assert "ValueError" in adv[0] and "travis" in adv[0]
+
+
+def test_explicit_injection_still_wins():
+    """The constructor arg must override both config sources (test/embedder seam)."""
+    sentinel = FakeCI(CIResult("1", "u", PipelineStatus.SUCCESS))
+    runner, events = _resolve(
+        cfg_ci={"enabled": True, "backend": "gitlab", "project": "grp/repo"},
+        prof_ci={"backend": "gitlab", "project": "p/r"},
+        injected=sentinel,
+    )
+    assert runner is sentinel
+    assert not events
+
+
+def test_disabled_global_block_is_not_a_source():
+    """`enabled: false` is the operator's own switch — honoured before the wrap."""
+    runner, events = _resolve(cfg_ci={"enabled": False, "backend": "gitlab",
+                                      "project": "grp/repo"})
+    assert runner is None
+    assert not events

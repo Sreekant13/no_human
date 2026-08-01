@@ -1,10 +1,20 @@
 """CI backends: pluggable trigger + wait + result parsing.
 
-Usage — wire from config / project profile:
+Selecting the backend is NOT done here and not by callers — it belongs to
+``Orchestrator._resolve_ci_runner``, which ranks an explicit injection, the
+project profile's ``ci`` block and the global ``ci:`` config block, in that
+order, and raises an advisory when a configured source cannot be built.
 
-    ci_runner = ci_from_config(config.data)
-    if ci_runner:
-        result = await ci_runner.trigger(branch)
+Do not copy ``ci_from_config(config.data)`` into new code. This docstring
+taught exactly that call for a long time while nothing in the product made it,
+which is plausibly why the global ``ci:`` block ended up documented in two more
+places and read by none of them: users configured a gate they never got.
+
+Both entry points require a truthy ``ci.enabled``, which is why callers wrap
+the dict rather than passing a raw profile/layer block:
+
+    backend = ci_from_layer(layer.ci)                      # TestLayer ci block
+    backend = ci_from_config({"ci": {**conf, "enabled": True}})
 
 The orchestrator depends only on the ``CIBackend`` interface, never on a
 provider CLI. Adding a provider = a new ``CIBackend`` subclass + a branch here.

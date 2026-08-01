@@ -297,3 +297,48 @@ async def test_doctor_accepts_report_only_design_doc_as_done(tmp_path):
         assert not any(t.id[:8] in g for g in d.evidence_gaps), d.evidence_gaps
     finally:
         await store.close()
+
+
+# --------------------------------------------------------------------------- #
+# Configured-but-unusable CI. Not a history check: this failure mode leaves no #
+# events at all, so no amount of event counting could ever have found it.      #
+# --------------------------------------------------------------------------- #
+
+async def test_ci_enabled_but_targetless_is_a_contradiction(store):
+    d = await diagnose(store, {"ci": {"enabled": True, "backend": "gitlab",
+                                      "project": ""}})
+    assert any("CI BACKEND UNUSABLE" in c for c in d.contradictions)
+    assert not d.healthy, "a gate the operator believes in but does not have"
+
+
+async def test_ci_unknown_backend_is_a_contradiction(store):
+    d = await diagnose(store, {"ci": {"enabled": True, "backend": "travis",
+                                      "project": "g/r"}})
+    assert any("ValueError" in c for c in d.contradictions)
+
+
+async def test_working_ci_config_is_not_flagged(store):
+    d = await diagnose(store, {"ci": {"enabled": True, "backend": "gitlab",
+                                      "project": "g/r"}})
+    assert not any("CI BACKEND" in c for c in d.contradictions)
+    assert d.healthy
+
+
+async def test_shipped_default_ci_config_is_silent(store):
+    """Devil's advocate: doctor must stay green for an install that never
+    configured CI. Read from DEFAULT_CONFIG — load_config() deep-merges the
+    operator's own ~/.no_human/config.yaml, so asserting on a loaded config
+    would prove something about this machine, not about the product.
+    """
+    from no_human.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["ci"]["enabled"] is False
+    d = await diagnose(store, DEFAULT_CONFIG)
+    assert not any("CI BACKEND" in c for c in d.contradictions)
+    assert d.healthy
+
+
+async def test_diagnose_without_config_is_unchanged(store):
+    """26 existing callers pass only the store — they must keep working."""
+    d = await diagnose(store)
+    assert d.healthy

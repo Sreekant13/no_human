@@ -852,6 +852,74 @@ class Orchestrator:
         log.warning("advisory: %s", text)
         self.emit("advisory", text)
 
+    # Keys that name WHICH pipeline to drive. A ci block carrying none of them
+    # is a detection hint, not a request for a gate: `nh onboard` writes a bare
+    # {"backend": "gitlab"} the moment it sees a .gitlab-ci.yml, and treating
+    # that as a claim would fire an advisory on every run of every GitLab repo.
+    _CI_TARGET_KEYS: tuple[str, ...] = ("project", "repo", "job")
+
+    def _resolve_ci_runner(self, prof: Any | None) -> None:
+        """Pick this run's CI backend. Precedence, most specific first:
+
+        1. an explicit ``ci_runner=`` constructor injection (embedders, tests),
+        2. the ProjectProfile's ``ci`` block — one repo, confirmed by a human
+           through ``nh onboard``,
+        3. the global ``ci:`` block in config — the install-wide fallback.
+
+        The profile beats the global block because it is the more SPECIFIC
+        statement: it describes the repo in front of us, while
+        ``~/.no_human/config.yaml`` describes every repo this install will ever
+        touch. Setting both can only mean "this one is different". The global
+        block is a fallback, never an override — otherwise onboarding's proven,
+        human-confirmed answer would lose to a stale install-wide default.
+
+        Both dict sources are wrapped with ``enabled: True``, exactly as
+        ``ci_from_layer`` already does. That wrap is load-bearing for the
+        profile: nothing in ``onboard.py`` or ``profile.py`` ever writes an
+        ``enabled`` key, so the pre-fix call ``ci_from_config({"ci": prof.ci})``
+        returned None for EVERY profile — the profile path was exactly as dead
+        as the global one, which is why precedence between them had never
+        mattered in practice. The global block is treated differently on
+        purpose: there ``enabled`` is the operator's own opt-in switch, so it
+        is honoured BEFORE the wrap — ``enabled: false`` is not a source at all.
+
+        A source that claims CI and cannot be built is never silent: it emits
+        ``_advisory``, which ``nh doctor`` counts under
+        ``advisory_degradations``. A gate the user believes in but does not
+        have is the whole defect this method exists to prevent.
+        """
+        if self.ci_runner is not None:
+            return                       # explicit injection always wins
+
+        sources: list[tuple[str, dict[str, Any]]] = []
+        prof_ci = dict(getattr(prof, "ci", None) or {})
+        if any(str(prof_ci.get(k) or "").strip() for k in self._CI_TARGET_KEYS):
+            sources.append(("project profile", prof_ci))
+        global_ci = dict(self.config.get("ci") or {})
+        if global_ci.get("enabled"):
+            sources.append(("global config", global_ci))
+        if not sources:
+            return                       # no CI configured anywhere — unchanged
+
+        from ..ci import ci_from_config
+        for origin, conf in sources:
+            try:
+                built = ci_from_config({"ci": {**conf, "enabled": True}})
+                why = ("no pipeline target set — "
+                       f"{'/'.join(self._CI_TARGET_KEYS)} are all empty")
+            except Exception as exc:  # noqa: BLE001 — a bad block never kills the run
+                built, why = None, f"{type(exc).__name__}: {exc}"
+            if built is not None:
+                self.ci_runner = built
+                self.emit("ci_backend", f"CI from {origin}: {built.name}",
+                          origin=origin, backend=built.name)
+                return
+            self._advisory(
+                f"CI backend configured in {origin} "
+                f"(backend={conf.get('backend', 'gitlab')!r}) but UNUSABLE: "
+                f"{why}. This run has NO CI gate."
+            )
+
     def _sink_for(self, role: str) -> Callable[[AgentEvent], None]:
         """An ``on_event`` callback that attributes the session to ``role``.
 
@@ -1554,16 +1622,9 @@ class Orchestrator:
             self.emit("profile",
                       f"using confirmed profile (test: {prof.test_cmd!r}"
                       + (f", ci: {prof.ci.get('backend')}" if prof.ci else "") + ")")
-            if self.ci_runner is None and prof.ci:
-                from ..ci import ci_from_config
-                try:
-                    built = ci_from_config({"ci": prof.ci})
-                except Exception as exc:  # noqa: BLE001
-                    built = None
-                    log.warning("CI from profile failed: %s", exc)
-                if built is not None:
-                    self.ci_runner = built
-                    self.emit("ci_backend", f"CI from profile: {built.name}")
+        # Resolve CI OUTSIDE the `if prof:` block: a repo with no confirmed
+        # profile must still get the gate its global `ci:` config asks for.
+        self._resolve_ci_runner(prof)
 
         # Pre-fetch confirmed rules + skills for prompt injection (Phase G).
         # Scope to this task's repo plus globals, so a rule learned for one

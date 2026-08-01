@@ -152,7 +152,7 @@ blockers:                         # Part 22
   transient_infra_retries: 2
   escalate_on_low_confidence_below: 0.6   # unsure what's wrong => ask, don't thrash
 
-ci:                               # opt-in per project
+ci:                               # opt-in; the install-wide fallback (see below)
   enabled: false
   backend: gitlab
   project: ""                     # e.g. "group/subgroup/repo"
@@ -182,6 +182,29 @@ ci_gate:                          # post-PR CI gate (WakeWatcher rung 5)
   jenkins_controller: https://build.example.com/<controller>
   registry_prefix: registry.example.com/<org>/<image-path>
 ```
+
+### `ci:` — which source wins
+
+A run's CI backend is resolved from three places, **most specific first**:
+
+1. an explicit backend injected by an embedder (rare; tests use this),
+2. the **project profile's** `ci` block, written by `nh onboard` and confirmed
+   by you — it describes *this* repo,
+3. the global **`ci:`** block above — the install-wide fallback.
+
+The profile wins over the global block because it is the more specific
+statement: `~/.no_human/config.yaml` describes every repo this install will
+ever touch, so setting both can only mean "this one is different". A profile
+block that names no pipeline target (`project` / `repo` / `job`) is treated as
+a detection hint rather than a claim — `nh onboard` writes a bare
+`{backend: gitlab}` just for seeing a `.gitlab-ci.yml` — so it falls through to
+the global block instead of overriding it.
+
+If a source asks for CI but cannot produce a backend (say `enabled: true` with
+an empty `project`), the run does **not** silently proceed ungated: it emits an
+`advisory` event naming the source and the reason, and `nh doctor` reports
+`CI BACKEND UNUSABLE`. A gate you believe in but do not have is worse than no
+gate, so this case is always visible.
 
 ### `llm.auth_mode` — two modes
 

@@ -79,6 +79,38 @@ REQUIRED_EVIDENCE: dict[str, tuple[str, ...]] = {
 PR_LESS_KINDS: tuple[str, ...] = ("code_review", "investigation", "design_doc")
 
 
+def ci_config_problems(config: dict[str, Any] | None) -> list[str]:
+    """The global ``ci:`` block is switched ON but cannot produce a backend.
+
+    Static config check rather than a history check: the failure mode leaves no
+    events at all, so counting events could never find it. For a long time the
+    global block was documented in ``config.py`` and ``docs/configuration.md``
+    and read by nothing — a user who configured it exactly as documented got no
+    gate, no warning and no diagnostic.
+
+    Reported as a contradiction, not an advisory, on the same reasoning as the
+    ``CODING BACKEND UNUSABLE`` live probe: ``ci.enabled: true`` is an explicit
+    request, and a gate the operator believes in but does not have is worse
+    than no gate at all. Returns [] when CI is off — which is the
+    ``DEFAULT_CONFIG`` state, so an install that never configured CI is silent.
+    """
+    ci_conf = (config or {}).get("ci") or {}
+    if not ci_conf.get("enabled"):
+        return []
+    from .ci import ci_from_config
+    try:
+        if ci_from_config({"ci": ci_conf}) is not None:
+            return []
+        why = "no pipeline target set — project/repo/job are all empty"
+    except Exception as exc:  # noqa: BLE001 — a bad block must not kill doctor
+        why = f"{type(exc).__name__}: {exc}"
+    return [
+        f"CI BACKEND UNUSABLE: config `ci.enabled` is true "
+        f"(backend={ci_conf.get('backend', 'gitlab')!r}) but no backend can be "
+        f"built — {why}. Tasks run with NO CI gate."
+    ]
+
+
 @dataclass
 class Diagnosis:
     mechanisms: list[dict[str, Any]] = field(default_factory=list)
@@ -102,8 +134,9 @@ async def _kind_stats(store: Store) -> dict[str, tuple[int, float]]:
     return {row[0]: (row[1], row[2] or 0.0) for row in await cur.fetchall() if row[0]}
 
 
-async def diagnose(store: Store) -> Diagnosis:
+async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagnosis:
     d = Diagnosis()
+    d.contradictions.extend(ci_config_problems(config))
     stats = await _kind_stats(store)
 
     def total(kinds: tuple[str, ...]) -> tuple[int, float]:
