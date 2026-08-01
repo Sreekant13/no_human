@@ -46,16 +46,44 @@ Two limits, so this paragraph does not read as a clean bill of health:
     column existed holds NULL, and NULL prices at the old 1.0 — a known
     under-count on historical data, not a silent one. NULL is deliberate: a 0
     there would assert those attempts emitted no output at all.
-  * The 5x ratio is Opus 5's. Sonnet and Haiku bill at their own in/out
-    ratios, and this table is model-blind — one weight for every tier. It is
-    an approximation chosen to be honest about the biggest error (a 5x class
-    priced at 1x), not a per-model price list.
+  * The output premium is resolved PER MODEL, from the recorded model id —
+    see ``MODEL_PRICES_USD_PER_MTOK`` and ``output_extra_weight``. What that
+    lookup returns today, for every model in the table, is 4.0: every Claude
+    model Anthropic publishes prices for bills output at exactly 5x input
+    ($5/$25 Opus, $3/$15 Sonnet, $1/$5 Haiku, $10/$50 Fable). An earlier
+    version of this paragraph said "Sonnet and Haiku bill at their own in/out
+    ratios" in a way that implied those ratios DIFFER from Opus's. They do not.
+    The table is keyed per model so that a future model which breaks the 5:1
+    pattern prices correctly the day its id first appears in the ledger — not
+    because any of today's ids disagree.
 
-``web/src/cost.js``, the dollar-denominated twin below, prices per model and
-per class in dollars and is the place to go for a real invoice estimate.
+THE MODEL-BLINDNESS THAT REMAINS, stated plainly so it is not mistaken for
+solved. The output PREMIUM is now per model; the fresh-input RATE is not. One
+Opus reviewer token and one Sonnet coder token both weigh 1.0 here, and Opus
+input costs $5/M against Sonnet's $3/M — so this unit is "fresh-input-
+equivalent tokens *of the tier that spent them*", which is not a currency and
+does not sum across tiers into one. Measured on this install's ledger (219
+tasks, 684 attempts), repricing the classes by each model's input rate moves
+the per-task weighted total by a median of 23–46% — direction and size both
+depending on which model you anchor at 1.0 and what you charge the
+unattributed utility tier. That is a budget-gate change, not a rounding
+detail, and it is deliberately NOT made here.
+
+``web/src/cost.js`` is the dollar-denominated twin and does NOT currently
+agree with this file: it prices everything at one flat $3/1M fresh rate
+(Sonnet's) with no per-model dimension at all, folds cache CREATION in at that
+same fresh rate rather than 1.25x, and carries no output premium whatsoever.
+The claim this docstring used to make — that cost.js "prices per model and per
+class" and is "the place to go for a real invoice estimate" — was false on
+both counts. Treat any dollar figure it prints as a floor, not an estimate.
 """
 
 from __future__ import annotations
+
+import logging
+from collections import Counter
+
+_log = logging.getLogger(__name__)
 
 #: Relative to one fresh input token. See the module docstring for what each
 #: one is and for what this table approximates rather than knows.
@@ -70,6 +98,117 @@ CACHE_READ_WEIGHT = 0.1
 #: beside it: pass both and the total is priced once, correctly.
 OUTPUT_EXTRA_WEIGHT = 4.0
 
+#: Published Anthropic LIST prices, USD per million tokens, as
+#: ``(input, output)``, keyed on the model id EXACTLY AS IT IS RECORDED in
+#: ``attempts.models``. Keying on the recorded string is the whole point: the
+#: Opus tier moved from ``claude-opus-4-8`` to ``claude-opus-5`` on 2026-07-26,
+#: and 441 of this install's 684 attempt rows still say ``claude-opus-4-8``.
+#: Resolving through ``config.llm.*`` instead would silently re-price every one
+#: of those historical rows at whatever the tier happens to be TODAY, which is
+#: not what they cost.
+#:
+#: SOURCE, per row rather than in aggregate, because "cite where each came
+#: from" is the difference between a price table and a guess. Every value below
+#: is from Anthropic's published model/pricing table as carried by the bundled
+#: ``claude-api`` skill (``SKILL.md`` § Current Models, cached 2026-06-24; the
+#: live pages are ``platform.claude.com/docs/en/about-claude/models/overview``
+#: and ``.../docs/en/pricing``). No value here is inferred, interpolated, or
+#: extrapolated from a sibling model.
+#:
+#:   claude-opus-5      $5 / $25    skill table, "Claude Opus 5" row
+#:   claude-opus-4-8    $5 / $25    skill table, "Claude Opus 4.8" row
+#:   claude-opus-4-7    $5 / $25    skill table, "Claude Opus 4.7" row
+#:   claude-opus-4-6    $5 / $25    skill table, "Claude Opus 4.6" row
+#:   claude-sonnet-5    $3 / $15    skill table, "Claude Sonnet 5" row. That
+#:                                  row also carries an introductory $2/$10
+#:                                  through 2026-08-31. The intro price is NOT
+#:                                  used here: this table exists to derive a
+#:                                  RATIO, the intro price is 5:1 exactly as
+#:                                  list is, and a promotional rate that lapses
+#:                                  mid-ledger would make historical rows
+#:                                  disagree with each other for no gain.
+#:   claude-sonnet-4-6  $3 / $15    skill table, "Claude Sonnet 4.6" row
+#:   claude-haiku-4-5   $1 / $5     skill table, "Claude Haiku 4.5" row
+#:
+#: Deliberately ABSENT: ``claude-fable-5``/``claude-mythos-5`` ($10/$50) and
+#: Opus 5 fast mode ($10/$50) are published and are also 5:1, but no such id
+#: has ever appeared in this ledger and none is reachable from `config.py`'s
+#: four tiers. Adding ids this product cannot emit would be padding the table
+#: to make it look more per-model than it is.
+MODEL_PRICES_USD_PER_MTOK: dict[str, tuple[float, float]] = {
+    "claude-opus-5": (5.0, 25.0),
+    "claude-opus-4-8": (5.0, 25.0),
+    "claude-opus-4-7": (5.0, 25.0),
+    "claude-opus-4-6": (5.0, 25.0),
+    "claude-sonnet-5": (3.0, 15.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+}
+
+#: Every model id that reached `output_extra_weight` and was not in the table,
+#: with a hit count. This exists so an unpriced id is VISIBLE rather than
+#: silently absorbed into the fallback — the failure mode that made a
+#: per-attempt brake inert on 27 of 27 tasks was exactly an unrecorded value
+#: quietly pricing at nothing. Read it with `unknown_pricing_models()`.
+_unknown_models: Counter[str] = Counter()
+
+
+def unknown_pricing_models() -> dict[str, int]:
+    """Model ids seen by the pricer that had no published price, and how often.
+
+    A COPY, so a caller cannot mutate the counter it is reading. Empty is the
+    expected steady state; a non-empty result means some tier is being priced
+    at the fallback and somebody should add a sourced row above.
+    """
+    return dict(_unknown_models)
+
+
+def _reset_unknown_pricing_models() -> None:
+    """Clear the unknown-id counter. For tests, which must not leak into each
+    other through module state; never call this from product code."""
+    _unknown_models.clear()
+
+
+def output_extra_weight(model: str | None) -> float:
+    """The output PREMIUM for one model — its ``out/in`` ratio, minus the 1.0
+    that ``tokens_used`` has already charged.
+
+    Keyed on the RECORDED id (see ``MODEL_PRICES_USD_PER_MTOK``), never on
+    live config, so a historical row keeps the price it was actually billed at.
+
+    THE FALLBACK, and why it is what it is. ``None``/empty (11 of this
+    install's 684 attempt rows carry ``models = '{}'``, and the utility tier
+    has never been recorded at all) and any id absent from the table both fall
+    back to ``OUTPUT_EXTRA_WEIGHT`` = 4.0 — the premium every model Anthropic
+    currently publishes charges, and the value this whole file used before it
+    was keyed per model. It is conservative in the only direction that matters:
+    it is the HIGHEST premium in the table, so an unknown tier is never priced
+    below a known one, and it can never be 0. A 0 or a missing multiplier here
+    would price unknown output at nothing, which is the precise defect that
+    once left a per-attempt brake inert on 27 of 27 tasks.
+
+    An unknown NON-EMPTY id is also recorded in ``unknown_pricing_models()``
+    and logged once — silence and a default would be the same bug wearing a
+    different hat. ``None`` is not logged: it is the documented "this caller
+    does not know the model" path, not an anomaly.
+    """
+    if not model:
+        return OUTPUT_EXTRA_WEIGHT
+    priced = MODEL_PRICES_USD_PER_MTOK.get(model)
+    if priced is None:
+        first_sighting = model not in _unknown_models
+        _unknown_models[model] += 1
+        if first_sighting:
+            _log.warning(
+                "no published price for model %r; pricing its output at the "
+                "fallback premium %.1fx. Add a sourced row to "
+                "core.pricing.MODEL_PRICES_USD_PER_MTOK.",
+                model, OUTPUT_EXTRA_WEIGHT,
+            )
+        return OUTPUT_EXTRA_WEIGHT
+    price_in, price_out = priced
+    return price_out / price_in - 1.0
+
 
 def weighted_tokens(
     *,
@@ -77,6 +216,7 @@ def weighted_tokens(
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
     output_tokens: int | None = None,
+    model: str | None = None,
 ) -> int:
     """Spend in fresh-input-equivalent tokens — the unit every budget cap is in.
 
@@ -93,11 +233,21 @@ def weighted_tokens(
     function makes: an existing caller that has not been taught the keyword,
     and any historical row, gets the number it always got.
 
+    ``model`` is the id that SPENT these tokens, as recorded in
+    ``attempts.models`` — it selects the output premium (see
+    ``output_extra_weight``). It is optional and defaults to ``None`` because
+    the classes are summed across four tiers on almost every call site, and one
+    id cannot describe four tiers; ``None`` takes the conservative fallback,
+    which is what every one of those call sites got before this parameter
+    existed. Pass it only where a single tier's spend is being priced on its
+    own. Note that ``None`` here does NOT mean "free" — it means "unknown",
+    and unknown prices at the highest published premium.
+
     Floored to an int so the caps stay integer comparisons end to end.
     """
     return int(
         int(tokens_used or 0) * FRESH_WEIGHT
-        + int(output_tokens or 0) * OUTPUT_EXTRA_WEIGHT
+        + int(output_tokens or 0) * output_extra_weight(model)
         + int(cache_read_tokens or 0) * CACHE_READ_WEIGHT
         + int(cache_creation_tokens or 0) * CACHE_CREATION_WEIGHT
     )
@@ -166,6 +316,7 @@ def class_breakdown(
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
     output_tokens: int | None = None,
+    model: str | None = None,
 ) -> str:
     """The raw per-class numbers, for a human reading a parked task.
 
@@ -179,15 +330,19 @@ def class_breakdown(
     surface. It is omitted entirely when it is 0 or unknown, so a task with no
     recorded split reads exactly as it did before the column existed rather
     than gaining a misleading "0 output".
+
+    ``model`` selects the output multiplier the same way it does in
+    ``weighted_tokens``, and must be passed the same way at both call sites:
+    the whole job of this string is to let a human reconcile the number the
+    gate acted on, so printing a rate the gate did not charge would be worse
+    than printing nothing.
     """
     fresh = int(tokens_used or 0)
     read = int(cache_read_tokens or 0)
     creation = int(cache_creation_tokens or 0)
     out = int(output_tokens or 0)
-    out_note = (
-        f" of which {out:,} output (x{FRESH_WEIGHT + OUTPUT_EXTRA_WEIGHT:g})"
-        if out else ""
-    )
+    out_rate = FRESH_WEIGHT + output_extra_weight(model)
+    out_note = f" of which {out:,} output (x{out_rate:g})" if out else ""
     return (
         f"raw {fresh + read + creation:,} = {fresh:,} fresh (x{FRESH_WEIGHT:g})"
         f"{out_note} "

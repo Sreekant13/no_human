@@ -6093,7 +6093,14 @@ class Orchestrator:
         """
         used_attempts, by_class = await self.store.lifetime_usage_by_class(task.id)
         used_tokens = _weighted_tokens(**by_class)
-        raw_tokens = sum(by_class.values())
+        # The three ADDEND classes only. `by_class` also carries
+        # `output_tokens`, which is a SLICE of `tokens_used` rather than a
+        # bucket beside it, so a bare `sum(by_class.values())` double-counts
+        # every output token — the exact mistake `Store.lifetime_usage`'s
+        # docstring names. Latent only because no historical row has a split
+        # recorded yet; it inflates the moment one does, and it inflates the
+        # RAW figure this blocker prints as the reconcilable one.
+        raw_tokens = sum(by_class[n] for n in Store._usage_columns_by_class())
         breakdown = _class_breakdown(**by_class)
         cap_attempts, cap_tokens = self._lifetime_limits(task)
         if used_attempts < cap_attempts and used_tokens < cap_tokens:
