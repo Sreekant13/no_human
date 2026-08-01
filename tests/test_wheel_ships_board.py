@@ -47,12 +47,27 @@ def test_pyproject_force_includes_the_board_in_wheel_and_sdist():
     cfg = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
     targets = cfg["tool"]["hatch"]["build"]["targets"]
 
-    assert targets["wheel"]["force-include"] == {"web/dist": "no_human/web_dist"}
-    # The sdist keeps the repo-relative path, so a wheel built FROM the sdist
-    # still finds `web/dist` where the wheel target expects to read it. `uv
-    # build` does exactly that, and `pip install` does it whenever it cannot
-    # use a prebuilt wheel.
-    assert targets["sdist"]["force-include"] == {"web/dist": "web/dist"}
+    # Asserted as an EXACT mapping, not per-entry. Relaxing it to per-entry
+    # lookups (as this file briefly did when `migrations` was added) leaves the
+    # wheel with no membership guard anywhere in the suite: a rogue entry such
+    # as `"src/no_human/eval" = "no_human/leaked_eval"` becomes invisible, and
+    # shipping the private eval vendor-terms supplement in every wheel is a leak
+    # this repo has already had once. The sdist has a separate exact-membership
+    # test (`test_sdist_members_are_exactly_the_allowlist`); the wheel has only
+    # this. The cost is one line here per legitimate addition, which is the
+    # guard working rather than the guard being in the way.
+    assert targets["wheel"]["force-include"] == {
+        "web/dist": "no_human/web_dist",
+        "migrations": "no_human/migrations",
+    }
+    # The sdist keeps repo-relative paths, so a wheel built FROM the sdist still
+    # finds them where the wheel target expects to read them. `uv build` does
+    # exactly that, and `pip install` does it whenever it cannot use a prebuilt
+    # wheel.
+    assert targets["sdist"]["force-include"] == {
+        "web/dist": "web/dist",
+        "migrations": "migrations",
+    }
 
 
 def test_resolve_web_dist_prefers_checkout_then_package_data(tmp_path, monkeypatch):

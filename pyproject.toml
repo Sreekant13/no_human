@@ -87,6 +87,16 @@ exclude = [
 # (724 KB -> 1.2 MB), against a dependency tree of tens of MB.
 [tool.hatch.build.targets.wheel.force-include]
 "web/dist" = "no_human/web_dist"
+# The schema. `migrations/*.sql` is what creates the tables on first run, and
+# it lives at the REPO ROOT, so `packages = ["src/no_human"]` never packaged
+# it: every wheel ever built shipped zero migrations. `core/db.py` globbed a
+# directory that did not exist, got no matches (glob does not raise), created
+# no schema, and the first `ALTER TABLE` blew up with "no such table: tasks" —
+# which then HUNG the process forever on aiosqlite's non-daemon worker thread.
+# `nh status`, `nh doctor` and `nh task list` never returned for any user who
+# installed the wheel. force-include for the same reason as the board above:
+# absence must fail the BUILD, not the customer.
+"migrations" = "no_human/migrations"
 
 # The sdist is a MEMBERSHIP list, not "the repo tree minus mistakes". Without
 # `only-include`, hatchling packages everything under the project root that is
@@ -121,6 +131,10 @@ exclude = [
 # web/dist has not been built.
 [tool.hatch.build.targets.sdist.force-include]
 "web/dist" = "web/dist"
+# Same rationale as web/dist: kept at its repo-relative path so a wheel built
+# FROM the sdist (what `pip install` does when it cannot use a prebuilt wheel)
+# still finds `migrations` where the wheel target above reads it.
+"migrations" = "migrations"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

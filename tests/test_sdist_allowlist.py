@@ -47,15 +47,24 @@ def test_sdist_is_an_explicit_allowlist():
     for target in (sdist, wheel):
         assert "src/no_human/eval/_vendor_terms_private.py" in target["exclude"]
         assert "**/*.swp" in target["exclude"]
-    # The board rides via force-include so its absence fails the build loudly.
-    assert sdist["force-include"] == {"web/dist": "web/dist"}
+    # The board and the schema ride via force-include so their absence fails
+    # the build loudly. Asserted as an EXACT mapping: an allowlist that only
+    # checks the entries it expects cannot see one it does not, and this file's
+    # whole subject is membership. migrations/*.sql is the schema — it is not
+    # under `only-include`, so without that entry the sdist, and every wheel
+    # built from it, ships no schema at all, which hung every first-run command
+    # (2026-08-01).
+    assert sdist["force-include"] == {
+        "web/dist": "web/dist",
+        "migrations": "migrations",
+    }
 
 
 # Paths hatchling itself always adds to an sdist, plus the two roots we name.
 # A member is allowed iff it is one of these files or under one of these
 # directories — set membership, not pattern matching.
 _ALLOWED_FILES = {"PKG-INFO", "pyproject.toml", "README.md", "LICENSE", ".gitignore"}
-_ALLOWED_DIRS = ("src/no_human/", "web/dist/")
+_ALLOWED_DIRS = ("src/no_human/", "web/dist/", "migrations/")
 
 
 @pytest.mark.slow
@@ -101,6 +110,9 @@ def test_sdist_members_are_exactly_the_allowlist(tmp_path):
     assert "PKG-INFO" in members
     assert "src/no_human/__init__.py" in members
     assert "web/dist/index.html" in members
+    # The schema. Absent, every command that opens the store hangs on first run.
+    assert [m for m in members
+            if m.startswith("migrations/") and m.endswith(".sql")]
 
     _assert_wheel_builds_from_sdist(sdist_path, tmp_path)
 
@@ -128,6 +140,10 @@ def _assert_wheel_builds_from_sdist(sdist_path: Path, tmp_path: Path) -> None:
     names = zipfile.ZipFile(wheel_path).namelist()
     assert "no_human/web_dist/index.html" in names, (
         "the wheel built from the sdist lost the board")
+    assert [n for n in names
+            if n.startswith("no_human/migrations/") and n.endswith(".sql")], (
+        "the wheel built from the sdist lost the schema — every command that "
+        "opens the store would hang on first run")
     assert not [n for n in names if n.startswith("no_human/ci_gate")], (
         "the wheel built from the sdist ships ci_gate")
     assert "no_human/eval/_vendor_terms_private.py" not in names, (

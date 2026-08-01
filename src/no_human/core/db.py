@@ -17,7 +17,44 @@ from .task import Task, TaskStatus, assert_transition
 
 log = logging.getLogger("no_human.db")
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[3] / "migrations"
+
+def _resolve_migrations_dir() -> Path:
+    """Locate the schema migrations across the ways this code ships.
+
+    Mirrors `api/app.py::_resolve_web_dist`, for the same reason and with the
+    same two layouts:
+
+    1. **Repo checkout / frozen desktop bundle** — ``parents[3]/migrations``.
+       In a checkout ``__file__`` is ``<repo>/src/no_human/core/db.py``, so
+       parents[3] is the repo root. Under a PyInstaller onedir freeze it is
+       ``<bundle>/_internal/no_human/core/db.py``, so parents[3] is the bundle
+       root, which is where ``packaging/build-installer.sh`` copies them.
+    2. **Wheel install** — ``<site-packages>/no_human/migrations``. parents[3]
+       is meaningless there (it points at ``lib/python3.X``, outside the
+       package), so the migrations are shipped INSIDE the package instead;
+       ``pyproject.toml`` force-includes ``migrations`` to that name.
+
+    Layout 2 did not exist until 2026-08-01, and layout 1 silently resolved to
+    ``<venv>/lib/python3.X/migrations`` — a directory that is simply absent.
+    `Path.glob` on a missing directory does not raise, it yields nothing, so
+    `_migrate` ran zero migrations, created no schema, and every wheel install
+    of no_human was unusable from its very first command. See `_migrate` for
+    the fail-closed check that now backs this up.
+
+    The first candidate is returned as the fallback when neither exists, so the
+    error names the path a developer expects to see.
+    """
+    candidates = (
+        Path(__file__).resolve().parents[3] / "migrations",   # checkout / frozen
+        Path(__file__).resolve().parent.parent / "migrations",  # installed wheel
+    )
+    for candidate in candidates:
+        if any(candidate.glob("*.sql")):
+            return candidate
+    return candidates[0]
+
+
+MIGRATIONS_DIR = _resolve_migrations_dir()
 
 _T = TypeVar("_T")
 
@@ -93,10 +130,38 @@ class Store:
         from ..config import ensure_private_dir
         ensure_private_dir(self.path.parent)
         self._db = await aiosqlite.connect(self.path)
-        self._db.row_factory = aiosqlite.Row
-        await self._db.execute("PRAGMA journal_mode = WAL")
-        await self._db.execute("PRAGMA foreign_keys = ON")
-        await self._migrate()
+        # connect() is ATOMIC: it either returns a usable Store or leaves no
+        # trace of itself. Anything less hangs the process forever.
+        #
+        # `aiosqlite.connect()` starts a worker thread, and that thread is NOT
+        # a daemon (`aiosqlite/core.py`: `Thread(target=_connection_worker_thread,
+        # args=(self._tx,))`, no `daemon=True`). Its loop is a blocking
+        # `tx.get()` that only ever ends when `close()` enqueues the stop
+        # sentinel. So if any step below raises, the exception propagates to
+        # the caller perfectly well — and then the interpreter reaches
+        # `threading._shutdown`, joins that live non-daemon thread, and blocks
+        # there for the rest of time. The user sees a traceback, if anything,
+        # and a command that never returns; ^C is the only way out.
+        #
+        # That converted "no such table: tasks" (the wheel shipped no
+        # migrations) into an unbounded silent hang on `nh status`, `nh doctor`
+        # and `nh task list` for every new user. Closing here is what makes the
+        # failure a normal, fast, reported error. It is not specific to that
+        # bug: EVERY failure path in connect() had it, and every future one
+        # would too.
+        try:
+            self._db.row_factory = aiosqlite.Row
+            await self._db.execute("PRAGMA journal_mode = WAL")
+            await self._db.execute("PRAGMA foreign_keys = ON")
+            await self._migrate()
+        except BaseException:
+            db, self._db = self._db, None
+            try:
+                await db.close()  # stops the worker thread (its `finally` does)
+            except BaseException:  # pragma: no cover - never mask the real error
+                log.debug("closing the sqlite connection after a failed "
+                          "connect() also failed", exc_info=True)
+            raise
         return self
 
     async def close(self) -> None:
@@ -118,7 +183,24 @@ class Store:
 
     @serialized_write
     async def _migrate(self) -> None:
-        for sql_file in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        # Fail CLOSED. `Path.glob` on a directory that does not exist does not
+        # raise — it yields nothing — so the natural spelling of this loop is a
+        # fail-open in the one place that must not have one: zero migrations
+        # runs cleanly, creates no schema, and hands the caller a connection to
+        # an empty database. The first symptom then surfaces two frames later
+        # in `_ensure_task_columns` as `no such table: tasks`, which names
+        # neither the real cause nor the path that was searched.
+        sql_files = sorted(MIGRATIONS_DIR.glob("*.sql"))
+        if not sql_files:
+            raise RuntimeError(
+                f"no_human cannot create its database schema: no *.sql "
+                f"migrations found in {MIGRATIONS_DIR}. This installation is "
+                f"incomplete — the migrations are part of the package and "
+                f"should have been installed alongside it. Reinstall no_human "
+                f"(or, in a source checkout, verify that the repo's "
+                f"migrations/ directory is present)."
+            )
+        for sql_file in sql_files:
             await self.db.executescript(sql_file.read_text())
         await self._ensure_task_columns()
         await self.db.commit()
