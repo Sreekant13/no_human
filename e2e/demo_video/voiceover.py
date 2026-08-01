@@ -150,6 +150,46 @@ def mix_args(line_files: list[Path], out_m4a: Path) -> list[str]:
     return args
 
 
+#: A local neural voice, if one is reachable. macOS `say` on a machine with
+#: only COMPACT voices installed is the robot-sounding read this file used to
+#: ship — formant synthesis, flat prosody, audibly not a person. Kokoro is an
+#: 82M-parameter neural TTS (Apache-2.0, so it may ship commercially), runs
+#: locally with no API key and no account, and is what an earlier product video
+#: on this machine was narrated with.
+#:
+#: DETECTED, never required. There is no new declared dependency: if the CLI is
+#: absent, or node is too old, the build falls straight back to `say` and says
+#: so. That keeps the recorder runnable on a bare checkout, which is the whole
+#: reason it lives in this repo.
+KOKORO_VOICE = "am_adam"
+KOKORO_SPEED = "1.06"
+
+
+def kokoro_cmd(text: str, dst: Path, voice: str = KOKORO_VOICE) -> list[str]:
+    """The hyperframes invocation. Pure, so a test can hold the shape still."""
+    return ["npx", "--yes", "hyperframes", "tts", text,
+            "-o", str(dst), "-v", voice, "-s", KOKORO_SPEED]
+
+
+def kokoro_available() -> bool:
+    """True when the neural voice can actually render — probed, not assumed.
+
+    Runs the real thing on a one-word script rather than checking for a binary
+    on PATH: `npx` exists on almost every machine and will happily report
+    success while the package underneath refuses (hyperframes needs node >= 22,
+    and node 20 is what a stock install has). The only honest test is a render.
+    """
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        probe = Path(td) / "probe.wav"
+        try:
+            r = subprocess.run(kokoro_cmd("Ready.", probe), capture_output=True,
+                               text=True, timeout=180)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return r.returncode == 0 and probe.is_file() and probe.stat().st_size > 1024
+
+
 def build(out_dir: Path, voice: str | None = None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     if voice is None:
@@ -158,13 +198,25 @@ def build(out_dir: Path, voice: str | None = None) -> Path:
         voice = pick_voice(parse_voices(listing))
     print(f"[vo] voice: {voice}  rate: {RATE} wpm")
 
+    use_kokoro = kokoro_available()
+    print(f"[vo] engine: {'kokoro (neural)' if use_kokoro else 'say (formant)'}")
+    if not use_kokoro:
+        print("[vo] NOTE: falling back to `say`. On a machine with only compact "
+              "voices this reads as a robot. Install node >= 22 and the neural "
+              "voice renders instead — no API key, no account.")
+
     line_files: list[Path] = []
     durations: list[float] = []
     for i, line in enumerate(nr.LINES):
-        dst = out_dir / f"line{i:02d}.aiff"
-        subprocess.run(
-            ["say", "-v", voice, "-r", str(RATE), "-o", str(dst),
-             "--data-format=BEF32@22050", line.tts_text], check=True)
+        if use_kokoro:
+            dst = out_dir / f"line{i:02d}.wav"
+            subprocess.run(kokoro_cmd(line.tts_text, dst), check=True,
+                           capture_output=True)
+        else:
+            dst = out_dir / f"line{i:02d}.aiff"
+            subprocess.run(
+                ["say", "-v", voice, "-r", str(RATE), "-o", str(dst),
+                 "--data-format=BEF32@22050", line.tts_text], check=True)
         line_files.append(dst)
         durations.append(probe_duration(dst))
     check_fit(durations)
