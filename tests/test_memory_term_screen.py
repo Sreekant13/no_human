@@ -274,3 +274,69 @@ async def test_sessions_source_honours_archived(tmp_path):
 
         assert not [c for c in chunks if "conventions" in c.title], (
             "an archived memory was recalled into the prompt")
+
+
+# --------------------------------------------------------------------------- #
+# Stale files on disk — what the read-side screen alone cannot reach            #
+# --------------------------------------------------------------------------- #
+
+def test_a_stale_skill_file_carrying_a_term_is_removed(tmp_path):
+    """Screening what we WRITE does not remove what is already written.
+
+    `_materialize_skills` adopts an existing `SKILL.md` rather than rewriting it,
+    and `discover_skills` reads the directory rather than the store — so a file
+    written before the screen existed survives every later run and keeps feeding
+    the SDK. Measured on this machine 2026-08-01: 21 of 89 materialized files
+    carried an employer term, several with the term in the skill NAME, which also
+    reaches `instructions.md`'s skill list.
+    """
+    term = BANNED_TERMS[0]
+    skills = tmp_path / ".claude" / "skills"
+    (skills / "dirty-skill").mkdir(parents=True)
+    (skills / "dirty-skill" / "SKILL.md").write_text(
+        f"---\nname: dirty-skill\n---\n\nRun the {term} pipeline first.\n")
+    (skills / "clean-skill").mkdir(parents=True)
+    (skills / "clean-skill" / "SKILL.md").write_text(
+        "---\nname: clean-skill\n---\n\nRun the tests first.\n")
+
+    _orch()._purge_unscreened_skill_files(skills)
+
+    assert not (skills / "dirty-skill").exists(), "the stale dirty skill survived"
+    assert (skills / "clean-skill" / "SKILL.md").is_file(), (
+        "the clean skill was removed — this must be surgical, not a sweep")
+
+
+def test_a_term_in_the_skill_NAME_alone_is_caught(tmp_path):
+    """Several observed files were clean in the body and named after the system.
+    The name reaches `instructions.md`'s skill list even if the body never does."""
+    term = BANNED_TERMS[0]
+    skills = tmp_path / ".claude" / "skills"
+    (skills / f"{term}-orient").mkdir(parents=True)
+    (skills / f"{term}-orient" / "SKILL.md").write_text(
+        "---\nname: orient\n---\n\nNothing sensitive in this body.\n")
+
+    _orch()._purge_unscreened_skill_files(skills)
+    assert not (skills / f"{term}-orient").exists()
+
+
+def test_the_purge_touches_nothing_that_is_not_a_skill_file(tmp_path):
+    """Narrow by construction. A cleanup with a wide blast radius on a path that
+    prepares a task is worse than the file it removes."""
+    term = BANNED_TERMS[0]
+    skills = tmp_path / ".claude" / "skills"
+    skills.mkdir(parents=True)
+    bystander = skills / "notes.md"
+    bystander.write_text(f"the {term} runbook lives here\n")
+    other = tmp_path / "src.py"
+    other.write_text(f"# {term}\n")
+
+    _orch()._purge_unscreened_skill_files(skills)
+
+    assert bystander.is_file(), "a non-SKILL.md file was deleted"
+    assert other.is_file(), "a file outside the skills dir was deleted"
+
+
+def test_the_purge_never_raises_on_a_missing_directory(tmp_path):
+    """It runs while preparing a task; a cleanup that aborted the run would be
+    the worse failure."""
+    _orch()._purge_unscreened_skill_files(tmp_path / "nope" / "skills")

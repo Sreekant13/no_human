@@ -6111,6 +6111,46 @@ class Orchestrator:
             budget_status=budget_status,
         )
 
+    def _purge_unscreened_skill_files(self, skills_dir: Path) -> None:
+        """Delete materialized SKILL.md files whose name or body carries a term.
+
+        Best-effort and narrow: only `<skills_dir>/<name>/SKILL.md`, only when
+        the screen refuses it, never anything else in the tree. A failure here is
+        logged, never raised — this runs on the path that prepares a task, and a
+        cleanup that aborted the run would be worse than the file it removes.
+        """
+        from ..eval.vendor_terms import find_banned_terms
+
+        try:
+            candidates = sorted(skills_dir.glob("*/SKILL.md"))
+        except OSError:
+            return
+        for path in candidates:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            try:
+                hit = find_banned_terms(f"{path.parent.name}\n{text}")
+            except Exception:  # noqa: BLE001 — a screen error must not delete
+                continue
+            if not hit:
+                continue
+            shutil.rmtree(path.parent, ignore_errors=True)
+            log.info("removed a stale skill file carrying a screened term: %s",
+                     path.parent.name)
+            # Surfacing it to the operator is a bonus, not a requirement: this
+            # runs while a task is being prepared and the event sink may not
+            # exist yet. Catching only OSError here was wrong — the first run of
+            # this code raised AttributeError from the advisory itself, which is
+            # exactly the "never raises" claim failing on its own docstring.
+            try:
+                self._advisory(
+                    f"removed a stale skill file that carried a screened term: "
+                    f"{path.parent.name}")
+            except Exception:  # noqa: BLE001 — reporting must not break cleanup
+                pass
+
     def _materialize_skills(self, repo_path: Path) -> list[str]:
         """Write confirmed skill memories to ``.claude/skills/<name>/SKILL.md``
         in the working tree so the SDK can load them via ``skills=``.
@@ -6124,6 +6164,19 @@ class Orchestrator:
         """
         skills_dir = repo_path / ".claude" / "skills"
         materialized: list[str] = []
+        # A skill already on disk is adopted rather than rewritten, and
+        # `discover_skills` reads the DIRECTORY, not the store — so a SKILL.md
+        # written before the term screen existed survives every later run and
+        # keeps feeding the SDK. Measured 2026-08-01 on this machine: 21 of 89
+        # materialized files carried an employer term, several with the term in
+        # the skill NAME, which also reaches instructions.md's skill list.
+        #
+        # Screening only what we are about to WRITE would not have removed one of
+        # them, so a stale file is deleted here. It is regenerable by
+        # construction: if the memory behind it is still permitted, the loop
+        # below rewrites it; if it is not, it should not exist. Nothing that is
+        # not a materialized skill is touched.
+        self._purge_unscreened_skill_files(skills_dir)
 
         # Confirmed DB skills: materialize if not already on disk.
         for m in (getattr(self, "_active_memories", None) or []):
