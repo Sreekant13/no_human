@@ -7,6 +7,33 @@ from ..core.task import Task
 from .base import ContextChunk, keywords
 
 
+def _has_banned_term(title: str | None, content: str | None) -> bool:
+    """True when a stored memory carries a vendor/employer term.
+
+    This source reads the `memories` table with its own SQL, so it bypasses
+    `list_memories` -> `filter_triggered` -> `Orchestrator._active_memories`
+    and the screen that sits on that assignment. Its chunk TITLES reach
+    `_context_digest` and go verbatim into the implement prompt, which makes it
+    a second, independent route from the learning store into a prompt — proven
+    at runtime, not inferred: a confirmed rule whose title carried a banned term
+    appeared in the digest under `[sessions]`.
+
+    Screened here rather than at the caller because the bypass IS the direct
+    query; anything layered above it would miss this for the same reason the
+    original screen did.
+
+    Fails OPEN on a matcher error, matching `_screen_memories_for_terms`: this
+    is advisory context, and a matcher bug that silently emptied it would
+    degrade every run for a reason nobody could see.
+    """
+    from ..eval.vendor_terms import find_banned_terms
+
+    try:
+        return bool(find_banned_terms(f"{title or ''}\n{content or ''}"))
+    except Exception:  # noqa: BLE001 — never let the screen become the failure
+        return False
+
+
 class SessionsSource:
     name = "sessions"
 
@@ -24,16 +51,19 @@ class SessionsSource:
         params: list[str] = []
         for t in terms:
             params += [f"%{t}%", f"%{t}%"]
+        # `archived` is honoured here the way `Store.list_memories` honours it.
+        # This source queries `memories` directly, so an operator who archived a
+        # rule was still getting it back through this path.
         cur = await self.store.db.execute(
             f"SELECT type, title, content FROM memories WHERE confirmed = 1 AND "
-            f"({clauses}) LIMIT ?",
+            f"(archived IS NULL OR archived = 0) AND ({clauses}) LIMIT ?",
             (*params, self.limit),
         )
         rows = await cur.fetchall()
         chunks = [
             ContextChunk(source="sessions", title=f"[{r['type']}] {r['title']}",
                          content=r["content"][:2000])
-            for r in rows
+            for r in rows if not _has_banned_term(r["title"], r["content"])
         ]
         chunks += await self._recall_failures(terms)
         return chunks
