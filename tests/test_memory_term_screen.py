@@ -17,6 +17,8 @@ would also be a term shipped in this file.
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from no_human.eval.vendor_terms import BANNED_TERMS, find_banned_terms
@@ -95,82 +97,99 @@ def test_the_screen_agrees_with_the_publish_guard(screen):
         assert kept == [] and len(held) == 1, f"screen disagreed with the guard"
 
 
-def test_every_write_to_active_memories_goes_through_the_screen():
-    """The wiring, which the tests above cannot see.
+def _orch():
+    """A bare Orchestrator instance, no __init__ — only the property is exercised."""
+    from no_human.core.orchestrator import Orchestrator
+    return Orchestrator.__new__(Orchestrator)
 
-    Every test in this file calls the screen directly, so all of them pass even
-    if nothing calls it — the shape of guard this repo has shipped before and
-    had to come back and fix. The claim is not "the screen works", it is
-    "memories cannot reach a prompt unscreened", and that claim lives at the
-    write sites.
 
-    Walked as an AST rather than matched as a regex. The first version of this
-    guard matched assignment lines textually and a reviewer bypassed it with
-    nine forms, including a one-line `self._active_memories += await
-    self.store.list_memories(confirmed=True)` — which appends every confirmed
-    memory, unfiltered and unscreened, into the prompt path — while all eight
-    tests here stayed green. Tuple targets, augmented assignment, `setattr` and
-    `__dict__` writes are all ordinary Python and none of them look like the
-    line the regex expected.
+def test_active_memories_is_a_property_not_a_plain_attribute():
+    """The structural fact everything below rests on.
 
-    Asserted against the real source, deliberately: the point of screening at
-    the write chokepoint is that a FUTURE site is covered without anyone
-    remembering this file exists, and a test that drove today's call sites would
-    not fail when a third is added unscreened.
+    The screen used to sit at each assignment, with a test asserting every
+    assignment routed through it. A reviewer defeated that with nine ordinary
+    Python forms — tuple targets, `+=`, `setattr`, a `__dict__` write, a slice
+    assignment, an alias mutated afterwards — several of which put every
+    confirmed memory unscreened into the coder's prompt. That guard was a claim
+    about how the code is WRITTEN, and there are unbounded ways to write a store.
+    Screening on READ makes the write form irrelevant: there is exactly one way
+    to read an attribute.
     """
-    import ast
-    from pathlib import Path
+    from no_human.core.orchestrator import Orchestrator
+    attr = inspect.getattr_static(Orchestrator, "_active_memories")
+    assert isinstance(attr, property), (
+        "_active_memories is a plain attribute again — every write form is "
+        "unscreened and the bypasses below are live")
+    assert attr.fset is not None and attr.fget is not None
 
-    import no_human.core.orchestrator as orch
 
-    NAME = "_active_memories"
-    tree = ast.parse(Path(orch.__file__).read_text())
-    src_lines = Path(orch.__file__).read_text().splitlines()
+@pytest.mark.parametrize("bypass", [
+    "plain",          # self._active_memories = raw
+    "augmented",      # self._active_memories += raw
+    "setattr",        # setattr(self, "_active_memories", raw)
+    "computed_name",  # setattr(self, "_active" + "_memories", raw)
+    "slice",          # self._active_memories[:] = raw
+    "alias_extend",   # alias = self._active_memories; alias.extend(raw)
+    "dunder_dict",    # self.__dict__["_active_memories"] = raw
+])
+def test_no_write_form_can_put_a_dirty_rule_in_front_of_a_reader(bypass):
+    """Every bypass a reviewer found, run as behaviour rather than as source text.
 
-    def _targets(node):
-        """Every attribute name written by this statement, tuples included."""
-        found = []
-        stack = list(getattr(node, "targets", [])) + \
-            ([node.target] if hasattr(node, "target") else [])
-        while stack:
-            t = stack.pop()
-            if isinstance(t, (ast.Tuple, ast.List)):
-                stack.extend(t.elts)
-            elif isinstance(t, ast.Attribute):
-                found.append(t.attr)
-        return found
+    Each one previously passed a guard that read the source. What matters is not
+    whether the line looks like an assignment — it is whether a reader can end up
+    holding a rule that names a customer or an employer.
+    """
+    term = BANNED_TERMS[0]
+    dirty = [_mem(title="dirty", content=f"the {term} runbook"), _mem(title="clean")]
+    o = _orch()
 
-    writes = []  # (lineno, source_line)
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
-            if NAME in _targets(node):
-                writes.append(node.lineno)
-        # setattr(self, "_active_memories", ...) and .extend()/.append() on it
-        elif isinstance(node, ast.Call):
-            f = node.func
-            if isinstance(f, ast.Name) and f.id == "setattr" and len(node.args) >= 2:
-                a = node.args[1]
-                if isinstance(a, ast.Constant) and a.value == NAME:
-                    writes.append(node.lineno)
-            elif (isinstance(f, ast.Attribute)
-                  and f.attr in {"extend", "append", "insert", "__setitem__"}
-                  and isinstance(f.value, ast.Attribute)
-                  and f.value.attr == NAME):
-                writes.append(node.lineno)
+    if bypass == "plain":
+        o._active_memories = dirty
+    elif bypass == "augmented":
+        o._active_memories = []
+        o._active_memories += dirty
+    elif bypass == "setattr":
+        setattr(o, "_active_memories", dirty)
+    elif bypass == "computed_name":
+        setattr(o, "_active" + "_memories", dirty)
+    elif bypass == "slice":
+        o._active_memories = []
+        o._active_memories[:] = dirty
+    elif bypass == "alias_extend":
+        o._active_memories = []
+        alias = o._active_memories
+        alias.extend(dirty)
+    elif bypass == "dunder_dict":
+        o.__dict__["_active_memories"] = dirty
 
-    assert writes, "no write found — this guard has stopped guarding"
-    unscreened = [
-        f"{ln}: {src_lines[ln - 1].strip()}"
-        for ln in sorted(set(writes))
-        # the screen's own `return` inside _screen_memories_for_terms is not a
-        # write to the attribute; only real writes reach here
-        if "_screen_memories_for_terms" not in "\n".join(
-            src_lines[max(0, ln - 1):ln + 2])
-    ]
-    assert not unscreened, (
-        "these put memories into the prompt path without screening them for "
-        "banned terms:\n  " + "\n  ".join(unscreened)
-    )
+    titles = [m["title"] for m in (o._active_memories or [])]
+    assert "dirty" not in titles, (
+        f"the {bypass!r} write form put a rule naming a banned term where a "
+        f"reader can see it: {titles}")
+
+
+def test_a_reader_still_gets_the_clean_rules():
+    """The control. A property that returned nothing would pass every test above
+    and silently delete the operator's knowledge base."""
+    o = _orch()
+    o._active_memories = [_mem(title="clean one"), _mem(title="clean two")]
+    assert [m["title"] for m in o._active_memories] == ["clean one", "clean two"]
+
+
+def test_the_setter_records_what_it_held_so_the_event_can_name_it():
+    """Screening on read is the guarantee; the setter screens too, so the audit
+    event can name what was held at the moment it was held."""
+    term = BANNED_TERMS[0]
+    o = _orch()
+    o._active_memories = [_mem(title="dirty", content=f"{term} runbook"),
+                          _mem(title="clean")]
+    assert o._memories_held_for_terms == ["dirty"]
+
+
+def test_reading_before_any_write_is_empty_not_an_error():
+    """Two call sites read it through `getattr(self, ..., None) or []`, so the
+    unset case has to be ordinary."""
+    assert _orch()._active_memories == []
 
 
 def test_a_screen_failure_keeps_the_rule_rather_than_dropping_it(monkeypatch, screen):

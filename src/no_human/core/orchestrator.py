@@ -1474,7 +1474,8 @@ class Orchestrator:
         _haystack = (f"{task.title} {task.description or ''} "
                      f"{' '.join(task.acceptance_criteria or [])}")
         _triggered = filter_triggered(_all_memories, _haystack)
-        self._active_memories, _held_terms = self._screen_memories_for_terms(_triggered)
+        self._active_memories = _triggered
+        _held_terms = getattr(self, "_memories_held_for_terms", [])
         _held = len(_all_memories) - len(_triggered)
         if _all_memories:
             # agent-a-style "Accessed Knowledge" audit: name WHICH rules fired (not
@@ -4687,7 +4688,7 @@ class Orchestrator:
         prof = await self._usable_profile(repo.path)
         self._active_profile = prof
         from ..learning.triggers import filter_triggered
-        self._active_memories, _ = self._screen_memories_for_terms(filter_triggered(
+        self._active_memories = (filter_triggered(
             await self.store.list_memories(confirmed=True, project=task.repo_path),
             f"{task.title} {task.description or ''} "
             f"{' '.join(task.acceptance_criteria or [])}"))
@@ -7356,6 +7357,40 @@ class Orchestrator:
     # be silently exceeded.
     _RULES_CRITICAL_CAP = 8000   # chars for high-importance rules (full content)
     _RULES_RELEVANT_CAP = 4000   # chars for med-importance rules (compact)
+
+    # `_active_memories` is a PROPERTY, not a plain attribute, and the screen
+    # lives on the READ side.
+    #
+    # It was first written as a screen at each assignment, guarded by a test that
+    # asserted every assignment routed through it. A reviewer defeated that with
+    # nine ordinary Python forms — tuple targets, `+=`, `setattr`, a `__dict__`
+    # write, a slice assignment, and an alias mutated after the fact — several of
+    # which put every confirmed memory, unscreened, into the coder's prompt. The
+    # guard was a claim about how the code is WRITTEN, and there are unbounded
+    # ways to write a store.
+    #
+    # Screening on read makes the write form irrelevant: however the list got
+    # there, and whoever mutated it afterwards, a reader receives screened rules.
+    # There is exactly one way to read an attribute, and this is it.
+    #
+    # The setter still screens too, so the audit event can name what was held at
+    # the moment it was held. Screening twice is idempotent and costs nothing on
+    # a list this size.
+    _ACTIVE_MEMORIES_RAW = "_active_memories_backing"
+
+    @property
+    def _active_memories(self) -> list[dict]:
+        raw = getattr(self, self._ACTIVE_MEMORIES_RAW, None)
+        if not raw:
+            return raw if raw is not None else []
+        kept, _ = self._screen_memories_for_terms(raw)
+        return kept
+
+    @_active_memories.setter
+    def _active_memories(self, mems) -> None:
+        kept, held = self._screen_memories_for_terms(list(mems or []))
+        object.__setattr__(self, self._ACTIVE_MEMORIES_RAW, kept)
+        object.__setattr__(self, "_memories_held_for_terms", held)
 
     def _screen_memories_for_terms(self, mems: list[dict]) -> tuple[list[dict], list[str]]:
         """Hold back any memory carrying a banned vendor term.
