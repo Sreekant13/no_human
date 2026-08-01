@@ -2921,9 +2921,19 @@ def review_comments(task_id, post_spec):
                 mark = "[green]✓ posted[/]" if d.get("posted") else "[dim]draft[/]"
                 loc = (f"{d.get('file')}:{d.get('line')}"
                        if d.get("file") and d.get("line") else "(general)")
-                sev = f" [{d['severity']}]" if d.get("severity") else ""
-                console.print(f"  [bold]{i}.[/] {mark} [cyan]{loc}[/]{sev}")
-                console.print(f"     {d.get('comment')}\n")
+                # The severity and the comment are MODEL-authored. Wrapping a
+                # model string in square brackets does not decorate it — rich
+                # parses it as a markup tag, so every realistic lowercase value
+                # ("high", "medium", "blocking") was silently swallowed and only
+                # an uppercase one survived, by accident of not being a valid
+                # tag. The field a human reads first to triage was invisible.
+                # escape() the value AND keep the brackets out of the markup.
+                sev = (f" \\[{escape(str(d['severity']))}]"
+                       if d.get("severity") else "")
+                console.print(f"  [bold]{i}.[/] {mark} [cyan]{escape(loc)}[/]{sev}",
+                              emoji=False)
+                console.print(f"     {escape(str(d.get('comment') or ''))}\n",
+                              emoji=False)
             if not post_spec:
                 console.print(
                     "[dim]Approve + post with:  "

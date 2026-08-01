@@ -1683,3 +1683,51 @@ def test_print_path_error_keeps_square_brackets_in_a_path():
     path = "/home/dev/proj[b]/repo"
     out = _render("[red]not a git repo:[/]", path, 200)
     assert path in out, out
+
+
+def test_review_comments_shows_every_severity_not_just_uppercase():
+    """A model-authored severity must be visible, whatever its case.
+
+    `nh review-comments` built the label as f" [{severity}]" — wrapping model
+    output in square brackets does not decorate it, rich PARSES it as a markup
+    tag. Every realistic value ("high", "medium", "blocking") was silently
+    swallowed; only an uppercase one survived, by accident of not being a valid
+    tag. The field a human reads first to triage a review was invisible, and
+    the command looked like it was working.
+    """
+    from rich.console import Console
+    from rich.markup import escape
+    import io
+
+    def render(sev: str) -> str:
+        buf = io.StringIO()
+        c = Console(file=buf, width=100, no_color=True, highlight=False)
+        label = f" \\[{escape(str(sev))}]" if sev else ""
+        c.print(f"  [bold]1.[/] [dim]draft[/] [cyan]app.py:12[/]{label}", emoji=False)
+        return buf.getvalue()
+
+    for sev in ("high", "medium", "blocking", "HIGH"):
+        assert sev in render(sev), f"severity {sev!r} was swallowed by the renderer"
+
+
+def test_review_comments_renders_model_text_literally():
+    """Mutation guard for the test above.
+
+    That test only proves the severity survives. The comment body is also model
+    authored, and carries the two shapes that bite: rich markup, and a file:line
+    citation that emoji substitution rewrites (`:100:` becomes an emoji), which
+    would destroy the evidence the review gate is built on.
+    """
+    from rich.console import Console
+    from rich.markup import escape
+    import io
+
+    def render(text: str) -> str:
+        buf = io.StringIO()
+        c = Console(file=buf, width=100, no_color=True, highlight=False)
+        c.print(f"     {escape(str(text))}", emoji=False)
+        return buf.getvalue()
+
+    assert "the list[/] was empty" in render("the list[/] was empty")
+    assert "commands.py:100:" in render("see commands.py:100: here")
+    assert ":warning:" in render("see :warning: for details")
