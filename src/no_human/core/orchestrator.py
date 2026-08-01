@@ -7473,7 +7473,11 @@ class Orchestrator:
         """
         raw = getattr(self, self._ACTIVE_MEMORIES_RAW, None)
         if not raw:
-            return raw if raw is not None else []
+            # Always a NEW list, even when the backing store is empty — the
+            # original short-circuit returned `raw` itself here, so with an
+            # empty backing list the "read" was the backing list by identity
+            # and an append to it silently persisted.
+            return []
         kept, _ = self._screen_memories_for_terms(raw)
         return kept
 
