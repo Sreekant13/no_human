@@ -267,7 +267,12 @@ def render_event(event: dict) -> None:
             args = event.get("tool_input") or {}
             summary = escape(", ".join(
                 f"{k}={str(v)[:60]}" for k, v in list(args.items())[:3]))
-            console.print(f"  {who}[cyan]→ {event.get('tool_name')}[/]([dim]{summary}[/])")
+            # emoji=False: tool arguments are file paths, and rich rewrites
+            # `:100:` in a path into an emoji. escape() on the tool name too —
+            # an MCP server chooses its own names.
+            console.print(
+                f"  {who}[cyan]→ {escape(str(event.get('tool_name') or ''))}[/]"
+                f"([dim]{summary}[/])", emoji=False)
         elif kind == "text" and text.strip():
             console.print(f"  {who}[white]{text.strip()[:500]}[/]")
         elif kind == "thinking" and text.strip():
@@ -1454,7 +1459,8 @@ def rules_remove(rule_id):
                 console.print(f"[red]no rule matching[/] {rule_id}")
                 sys.exit(1)
             await store.delete_memory(m["id"])
-            console.print(f"[red]removed[/] {m['id'][:8]}: {m['title']}")
+            console.print(f"[red]removed[/] {m['id'][:8]}: {escape(str(m['title']))}",
+                          emoji=False)
 
     asyncio.run(_go())
 
@@ -1739,7 +1745,8 @@ def skills_remove(skill_id):
                 console.print(f"[red]no skill matching[/] {skill_id}")
                 sys.exit(1)
             await store.delete_memory(m["id"])
-            console.print(f"[red]removed[/] {m['id'][:8]}: {m['title']}")
+            console.print(f"[red]removed[/] {m['id'][:8]}: {escape(str(m['title']))}",
+                          emoji=False)
 
     asyncio.run(_go())
 
@@ -3290,9 +3297,11 @@ def learnings_curate(apply_llm):
                 f"archive, {len(report.llm_consolidate_proposed)} consolidate"
                 f"{' — APPLIED' if report.llm_applied else ' (dry: rerun with --apply)'}")
             for a in report.llm_archive_proposed[:15]:
-                console.print(f"  [dim]archive {a.get('id')}: {a.get('reason','')[:80]}[/]")
+                console.print(f"  [dim]archive {a.get('id')}: "
+                          f"{escape(str(a.get('reason',''))[:80])}[/]", emoji=False)
             for c in report.llm_consolidate_proposed[:10]:
-                console.print(f"  [dim]merge {c.get('ids')}: {c.get('title','')[:70]}[/]")
+                console.print(f"  [dim]merge {c.get('ids')}: "
+                          f"{escape(str(c.get('title',''))[:70])}[/]", emoji=False)
 
     asyncio.run(_go())
 
