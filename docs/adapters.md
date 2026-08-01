@@ -24,6 +24,13 @@ nh task add https://github.com/org/repo/issues/12 --repo /path/to/repo
 nh task add --title "Add greet(name)" --repo /path/to/repo --criteria "returns 'hi, X'"
 ```
 
+A positional source must be an **issue URL** — `parse_source` routes on
+`/issues/` (or `/-/issues/`) and classifies everything else as freeform, which
+`ingest_from_url` then rejects. A bare tracker key (`nh task add PROJ-42`)
+therefore prints `intake failed: not a recognized task URL/id` and exits 1; use
+`--title` to file that text as a freeform task. Pinned by
+`tests/test_intake.py::test_a_bare_tracker_key_is_rejected_not_ingested_as_freeform`.
+
 **2. Polled trackers.** Jira and Linear are *not* `nh task add` arguments.
 They are server-side pollers that `nh serve` / `nh start` tick on their own
 cadence, creating one task per new issue matching an **operator-authored**

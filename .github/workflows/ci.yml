@@ -121,8 +121,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      # --strict: on the released tree a tracked file with no manifest row is a
+      # defect, so it must fail here exactly as it did before the warn/fail
+      # split. The split exists for working repositories, where ~93 unlisted
+      # paths are the normal state and used to mask real hash mismatches behind
+      # an exit code that was already 1.
       - name: Tree matches RELEASE_MANIFEST.txt
-        run: python scripts/check_release_manifest.py
+        run: python scripts/check_release_manifest.py --strict
 
   python:
     name: Python

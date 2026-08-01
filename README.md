@@ -22,7 +22,13 @@ reviewed by a second model that never saw it being written, runs your tests,
 opens the pull request — and stops. You review and merge.
 
 It runs on your machine, against your checkout, on your own Claude credential.
-Only prompts leave your machine.
+It is not, however, an offline tool: it sends your code to Anthropic as prompts,
+and it finishes a task by **pushing your branch to your git host and opening a
+pull request** — that is the deliverable, and there is no setting that turns it
+off. The coder session also runs with an unrestricted tool set, so it can reach
+the network on its own. The full list of what talks to the outside, what you can
+switch off, and what you cannot:
+[docs/security.md](docs/security.md#7-what-leaves-your-machine).
 
 ## Install
 
@@ -67,7 +73,7 @@ nh reject <id> --reason "..."        # send it back with feedback
 - **An honest stop.** When it cannot finish, it parks with one specific question
   instead of inventing a plausible diff.
 
-## It never merges
+## It waits for you to approve the PR
 
 `gh pr merge`, `glab mr merge` and the REST equivalents are denied before they
 execute. Pushes to `main`/`master`/`release/*` are refused at the git layer, and
@@ -79,21 +85,6 @@ repo. Detail: [docs/security.md](docs/security.md).
 Every task carries an enforced spend cap. `nh logs <id>` shows real spend
 against it, per task.
 
-## Limits
-
-- **A vague ticket escalates.** The limit is clarity, not the kind of work —
-  features, bugs, refactors and investigations are all in scope. It will not
-  guess; an unclear ticket comes back with a question.
-- **No published catch-rate for the reviewer.** The last full measurement ran on
-  a previous model. Quoting it would describe a model that is no longer
-  shipping, so no number is published. Method:
-  [docs/REVIEWER_RECALL_METHOD.md](docs/REVIEWER_RECALL_METHOD.md).
-- **The benchmark is self-run and not reproducible on your machine** — its specs
-  pin to local repo paths, and the coder is non-deterministic. The committed
-  run: [docs/NORTH_STAR_BENCH.md](docs/NORTH_STAR_BENCH.md).
-- **No deploy step**, and language coverage is uneven: the reproduction gate is
-  pytest-only. Full list:
-  [docs/verification.md](docs/verification.md#limits--things-this-does-not-do-and-numbers-it-does-not-have).
 
 ## Docs
 

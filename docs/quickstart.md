@@ -20,36 +20,51 @@ git clone <repo_url> no_human && cd no_human
 uv sync
 ```
 
+`uv sync` installs the `nh` entry point into `.venv/bin/nh`. It does **not** put
+`nh` on your `PATH`, so every command below is written as `uv run nh …`. To type
+a bare `nh` instead, either install it as a tool —
+
+```bash
+uv tool install --editable .      # then `nh` works from anywhere
+```
+
+— or activate the venv (`source .venv/bin/activate`) in each shell.
+
 ## 3. Run `nh init`
 
 ```bash
-nh init
+uv run nh init
 ```
 
 This guided wizard will:
 - Check that python, git, uv, and claude CLI are installed
 - Create `~/.no_human/` with secure permissions
 - Guide you through subscription token setup (`claude setup-token`)
-- Generate `~/.no_human/config.yaml` with your git identity
+- Generate `~/.no_human/config.yaml` with a distinct agent git identity
+  (your own identity is read and shown, but the agent commits under its own)
 - Offer to onboard your first repo
 
 ## 4. Add your first task
 
 ```bash
-# From a TRACKER story/defect number:
-nh task add PROJ-42 --repo ~/git/my-repo
+# From a GitHub/GitLab issue URL:
+uv run nh task add https://github.com/org/repo/issues/42 --repo ~/git/my-repo
 
 # From a freeform title:
-nh task add --title "Fix the flaky E2E test" --repo ~/git/my-repo
-
-# From a GitHub/GitLab URL:
-nh task add https://github.com/org/repo/issues/42 --repo ~/git/my-repo
+uv run nh task add --title "Fix the flaky E2E test" --repo ~/git/my-repo
 ```
+
+`nh task add` takes an issue **URL** or a freeform title. A bare tracker key
+(`PROJ-42`) is **rejected**: `ingest_from_url` raises
+`not a recognized task URL/id`, the CLI prints `intake failed:` and exits 1.
+Use `--title` if you want that text as a freeform task. Jira is supported as an
+opt-in server-side **poller**, not as an argument here — see
+[adapters.md](adapters.md).
 
 ## 5. Run one in the foreground
 
 ```bash
-nh watch <task-id>
+uv run nh watch <task-id>
 ```
 
 This opens a live Textual TUI showing tool calls, agent reasoning, and progress.
@@ -64,26 +79,30 @@ This opens a live Textual TUI showing tool calls, agent reasoning, and progress.
 ## 6. Check on tasks
 
 ```bash
-nh task list          # board as a table
-nh blocked            # parked/escalated tasks + what each needs
-nh status             # portfolio overview
-nh dashboard          # open the web board in your browser
+uv run nh task list          # board as a table
+uv run nh blocked            # parked/escalated tasks + what each needs
+uv run nh status             # portfolio overview
 ```
+
+`nh dashboard` is an alias for `nh start`: it also starts a task worker and
+the wake watcher, so it *runs* queued work rather than just showing it. To only
+look, use `nh status` / `nh logs`, or open the board a running server already
+serves.
 
 ## 7. Review and approve
 
 When a task produces a PR:
 
 ```bash
-nh review <task-id>   # evidence-backed review checklist
-nh diff <task-id>     # the git diff
-nh approve <task-id>  # record your approval — YOU merge the PR
+uv run nh review <task-id>   # evidence-backed review checklist
+uv run nh diff <task-id>     # the git diff
+uv run nh approve <task-id>  # record your approval — YOU merge the PR
 ```
 
 If you want changes:
 
 ```bash
-nh reject <task-id> --reason "The error handling needs a retry"
+uv run nh reject <task-id> --reason "The error handling needs a retry"
 ```
 
 ## 8. Overnight drain (parallel)
@@ -92,11 +111,11 @@ Queue up several tasks with `--no-run` so they stage as PENDING instead of
 running immediately, then drain them all in one bounded pool:
 
 ```bash
-nh task add --title "Fix the flaky E2E test" --repo ~/git/my-repo --no-run
-nh task add --title "Add input validation to isqrt" --repo ~/git/my-repo --no-run
-nh task add PROJ-42 --repo ~/git/my-repo --no-run
+uv run nh task add --title "Fix the flaky E2E test" --repo ~/git/my-repo --no-run
+uv run nh task add --title "Add input validation to isqrt" --repo ~/git/my-repo --no-run
+uv run nh task add https://github.com/org/repo/issues/42 --repo ~/git/my-repo --no-run
 
-nh serve --max-workers 3
+uv run nh serve --max-workers 3
 ```
 
 `--max-workers N` runs the pool for this invocation even if
@@ -128,11 +147,12 @@ in step 7 — **merge always stays a human action**, `nh serve` never merges.
 startup so a run bills exactly one path. `unset ANTHROPIC_API_KEY`, or opt in
 to `llm.auth_mode: api_key` to bill that key deliberately.
 
-**`auth error: CLAUDE_CODE_OAUTH_TOKEN not found`**
+**`auth error: No subscription token found. Expected CLAUDE_CODE_OAUTH_TOKEN in …`**
 → Run `claude setup-token`, then add the token to `~/.no_human/.env`
 
 **`no profile to confirm`**
-→ Run `nh onboard <repo>` first, then `nh onboard <repo> --confirm`
+→ Run `uv run nh onboard <repo>` first, then `uv run nh onboard <repo> --confirm`
 
-**`inbox unavailable`**
-→ Configure TRACKER credentials in `~/.no_human/.env` (see `docs/adapters.md`)
+**`intake failed: not a recognized task URL/id`**
+→ `nh task add` takes an issue URL or `--title "…"`. A bare tracker key is not
+an accepted argument; see step 4.

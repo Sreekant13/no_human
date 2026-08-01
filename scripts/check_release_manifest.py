@@ -14,6 +14,22 @@ agree:
 `--write` regenerates the manifest from the current tree — run it after adding,
 removing or editing files, and commit the result with the change it reflects.
 
+Two problem classes, two exit codes, because they mean different things:
+
+  * a **hash mismatch** (or a row pointing at a file that is gone) says the tree
+    is not the tree the manifest was reviewed against. Always exit 1.
+  * a **tracked file with no row** says the manifest is incomplete. On the
+    released tree that is a defect; in a working repository it is the normal
+    state — this repo carries ~93 of them on purpose, because `--write` would
+    otherwise sweep private files into a RELEASE inventory.
+
+Collapsing the two made the exit code carry no signal here: the script was
+already 1 from the unlisted paths, so a genuinely bad merge resolution — a real
+hash mismatch — changed nothing an automated caller could see, and only reading
+the body revealed it. Unlisted paths are therefore WARNINGS by default and do
+not set the exit code; `--strict` restores the old behaviour and is what CI runs
+on the released tree, where completeness is a hard invariant.
+
 Standard library + `git` only. Exit 0 when the tree matches, 1 otherwise.
 """
 
@@ -84,7 +100,7 @@ def write_manifest(root: Path) -> int:
     return 0
 
 
-def check_manifest(root: Path) -> int:
+def check_manifest(root: Path, *, strict: bool = False) -> int:
     manifest_path = root / MANIFEST_NAME
     if not manifest_path.exists():
         print(f"FAIL: {MANIFEST_NAME} not found at the repository root",
@@ -93,7 +109,11 @@ def check_manifest(root: Path) -> int:
     listed = parse_manifest(manifest_path.read_text(encoding="utf-8"))
     tracked = tracked_files(root)
 
+    # `problems` fail the run; `unlisted` only fails it under --strict. Kept as
+    # two lists rather than one tagged list so that no future edit can append a
+    # real mismatch to the warning bucket by accident.
     problems: list[str] = []
+    unlisted: list[str] = []
     if MANIFEST_NAME in listed:
         problems.append(f"{MANIFEST_NAME} lists itself; it cannot pin its own "
                         "content")
@@ -101,7 +121,7 @@ def check_manifest(root: Path) -> int:
     listed_set = set(listed) - {MANIFEST_NAME}
 
     for rel in sorted(tracked_set - listed_set):
-        problems.append(f"{rel}: tracked but not listed — run "
+        unlisted.append(f"{rel}: tracked but not listed — run "
                         f"`python scripts/check_release_manifest.py --write`")
     for rel in sorted(listed_set - tracked_set):
         problems.append(f"{rel}: listed but not in the tree")
@@ -112,12 +132,27 @@ def check_manifest(root: Path) -> int:
                 f"{rel}: content differs from the manifest "
                 f"(listed {listed[rel][:12]}…, actual {actual[:12]}…)")
 
+    if unlisted:
+        label = "FAIL" if strict else "WARN"
+        print(f"{label}: {len(unlisted)} tracked file(s) not listed in "
+              f"{MANIFEST_NAME}:", file=sys.stderr)
+        for u in unlisted:
+            print(f"  {u}", file=sys.stderr)
+        if not strict:
+            print("  (warning only — re-run with --strict to fail on these; "
+                  "the exit code below reflects hash mismatches only)",
+                  file=sys.stderr)
+
     if problems:
         print(f"FAIL: the tree does not match {MANIFEST_NAME}:", file=sys.stderr)
         for p in problems:
             print(f"  {p}", file=sys.stderr)
         return 1
-    print(f"OK: {len(listed_set)} file(s) match {MANIFEST_NAME}")
+    if unlisted and strict:
+        return 1
+    matched = len(listed_set & tracked_set)
+    suffix = f" ({len(unlisted)} tracked file(s) unlisted)" if unlisted else ""
+    print(f"OK: {matched} file(s) match {MANIFEST_NAME}{suffix}")
     return 0
 
 
@@ -129,9 +164,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="regenerate the manifest from the current tree")
     ap.add_argument("--root", type=Path, default=None,
                     help="repository root (default: the repo this script is in)")
+    ap.add_argument("--strict", action="store_true",
+                    help="also fail on tracked files with no manifest row "
+                         "(the released tree's invariant; a working repository "
+                         "legitimately carries these)")
     args = ap.parse_args(argv)
     root = (args.root or repo_root()).resolve()
-    return write_manifest(root) if args.write else check_manifest(root)
+    if args.write:
+        return write_manifest(root)
+    return check_manifest(root, strict=args.strict)
 
 
 if __name__ == "__main__":

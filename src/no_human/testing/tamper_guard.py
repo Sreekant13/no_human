@@ -46,6 +46,14 @@ _TEST_FILE_PATTERNS = (
 )
 _TEST_FILE_RE = re.compile("|".join(_TEST_FILE_PATTERNS))
 
+# Suite-wide test-support code, by path. A conftest.py governs every test under
+# its directory, including tests it never declares, so it is excluded from the
+# "a new path has no baseline" exemption in `check()` — see the comment there.
+# Deliberately the same shape as the `conftest.py` entry in the patterns above
+# rather than a bare `endswith`, so a file honestly named `myconftest.py` is not
+# swept in; either way the failure direction is closed, this one is just narrower.
+_CONFTEST_RE = re.compile(r"(^|/)conftest\.py$")
+
 # Test-function declarations. The `test`, `it`, and `describe` alternatives
 # use a negative lookbehind (not just \b) to exclude `.test(` / `foo.test(` —
 # RegExp.prototype.test() calls, not test declarations — and likewise
@@ -102,6 +110,11 @@ _SKIP_MARK = re.compile(
     r"|@unittest\.skip\w*\b"
     r"|@(skip|skipUnless|skipIf|Disabled|Ignore)\b"
     r"|pytest\.skip\s*\(|pytest\.xfail\s*\("
+    # The programmatic marker form. A conftest.py autouse fixture cannot
+    # DECORATE a test, so `@pytest.mark.xfail` above never matches the way a
+    # conftest neuters a suite it does not declare; `add_marker` is how that is
+    # actually written, and it read as zero skips. Repo-wide usage today: 0.
+    r"|\badd_marker\s*\(\s*pytest\.mark\.(?:skip|skipif|xfail)\b"
     r"|\b(it|test|describe)\.skip\s*\("
     r"|\bx(it|describe|test)\s*\(",
 )
@@ -209,6 +222,26 @@ def count_faking_fixtures(source: str) -> int:
     A fixture block is approximated as the file when both signals co-occur; we
     count the smaller of (autouse markers, fake-patch calls) so adding one
     autouse monkeypatch.setattr fixture counts as exactly one cheat signal.
+
+    KNOWN ASYMMETRY, kept deliberately. `check()` exempts a brand-new path from
+    the *skip* comparison ("absent is not zero"), but does NOT exempt it from
+    this one: a new `tests/test_x.py` carrying a legitimate autouse
+    `monkeypatch.setattr` clock freeze is reported as a cheat signal and
+    escalates. That is a false positive and it is not being fixed here, for a
+    reason worth stating rather than leaving to be rediscovered:
+
+      * it fails CLOSED — the run parks for a human, it does not go green — so
+        it is a nuisance, not a weakening, and the two are not interchangeable;
+      * the exemption that would cure it is exactly the hole rule 4 exists to
+        block. "New file + autouse + patch the system-under-test" is the cheat
+        itself, not an approximation of it, and unlike the skip case there is
+        no path-shaped carve-out (conftest.py) that separates the honest use
+        from the dishonest one — both live in ordinary test files.
+
+    So the trade is: a real cheat is always caught, and an honest clock freeze
+    in a new file costs a human a look. If that nuisance is ever measured to be
+    frequent, the fix is a narrower `_FAKE_PATCH` (patching the SUT's own module
+    vs. patching `time`/`datetime`), NOT a new-file exemption.
     """
     if not _AUTOUSE.search(source):
         return 0
@@ -259,10 +292,26 @@ def check(
 
     tb = ta = ab = aa = 0
     sb = sa = autb = auta = ffb = ffa = 0
+    sb_cmp = sa_cmp = 0
     reasons: list[str] = []
     for p in sorted(paths):
         b_src = before.get(p, "")
         a_src = after.get(p, "")
+        # A path absent from `before` has NO baseline — absent is not zero. The
+        # rule this guard enforces is net REDUCTION, and a file that did not
+        # exist cannot have reduced anything, so its counts are not a delta.
+        #
+        # A conftest.py is NEVER new for this purpose, however cleanly it is a
+        # new path. Its markers apply to tests it never declares: a five-line
+        # root conftest.py whose autouse fixture calls `pytest.skip()` skips the
+        # WHOLE suite, turning `1 failed, 1 passed` into `2 skipped, exit=0`,
+        # which runner.py:_parse_pytest reads as ok=True. That payload scores 0
+        # in `count_faking_fixtures` (which needs autouse AND a _FAKE_PATCH
+        # primitive, and `pytest.skip()` is neither), so `count_skips` is the
+        # only counter that sees it — the exact counter the exemption relaxes.
+        # Excluding conftest.py from the exemption is what keeps rule 2 able to
+        # see the reach a conftest has and an ordinary test file does not.
+        is_new = p not in before and not _CONFTEST_RE.search(p)
         b_tests, b_asserts = count_tests(b_src), count_assertions(b_src)
         a_tests, a_asserts = count_tests(a_src), count_assertions(a_src)
         b_skips, a_skips = count_skips(b_src), count_skips(a_src)
@@ -274,6 +323,14 @@ def check(
         aa += a_asserts
         sb += b_skips
         sa += a_skips
+        # Reported totals above stay raw — they describe the tree. The COMPARISON
+        # below excludes new files, because a skip in a file that did not exist is
+        # not a delta against anything. Keeping both apart matters: fixing only the
+        # per-path reason while `sa > sb` still fired aggregately would leave the
+        # verdict TAMPERED with no reason printed, which is worse than the bug.
+        if not is_new:
+            sb_cmp += b_skips
+            sa_cmp += a_skips
         autb += b_taut
         auta += a_taut
         ffb += b_ff
@@ -284,12 +341,22 @@ def check(
             reasons.append(f"{p}: tests {b_tests}->{a_tests}")
         elif a_asserts < b_asserts:
             reasons.append(f"{p}: assertions {b_asserts}->{a_asserts}")
-        if a_skips > b_skips:
+        # Skips are exempt on a NEW file: none of its tests ran before, so a
+        # `pytest.skip()` or `@pytest.mark.skipif` there neuters nothing. That
+        # marker is the ordinary idiom for a platform- or dependency-conditional
+        # test, and flagging it escalated correct work on every such task.
+        if a_skips > b_skips and not is_new:
             reasons.append(f"{p}: skip/xfail markers {b_skips}->{a_skips} (test neutered)")
+        # Tautologies are deliberately NOT exempt on a new file. Padding a new
+        # file with no-op passing tests is how a real deletion elsewhere gets
+        # netted back to positive — the totals below are what the caller trusts.
+        # Only the wording changes: nothing was "replaced" in a file that did
+        # not exist.
         if a_taut > b_taut:
             reasons.append(
                 f"{p}: tautological assertions {b_taut}->{a_taut} "
-                f"(real assertion replaced by a no-op)")
+                + ("(new file padded with no-op tests)" if is_new
+                   else "(real assertion replaced by a no-op)"))
         if a_ff > b_ff:
             reasons.append(
                 f"{p}: autouse monkeypatch fixture {b_ff}->{a_ff} "
@@ -308,7 +375,8 @@ def check(
     # human justifies it, which is how it is meant to work.
     deleted = [p for p in before if p not in after]
     tampered = (
-        bool(deleted) or ta < tb or aa < ab or sa > sb or auta > autb or ffa > ffb
+        bool(deleted) or ta < tb or aa < ab or sa_cmp > sb_cmp
+        or auta > autb or ffa > ffb
     )
     return TamperReport(
         tampered=tampered,

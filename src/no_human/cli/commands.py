@@ -629,11 +629,17 @@ def task() -> None:
               help="Stop after planning and wait for you to approve the plan "
                    "before any implementation token is spent.")
 def task_add(source, title, repo, description, criteria, external_id, kind, linked_repo, run, verbose, grill, backend, approve_plan):
-    """Add a task — from a GitHub/GitLab URL or id, or a freeform --title.
+    """Add a task — from a GitHub/GitLab issue URL, or a freeform --title.
+
+    A positional SOURCE must be an issue URL. `parse_source` routes on
+    `/issues/` and calls everything else freeform, which `ingest_from_url`
+    rejects — so a bare tracker key exits 1 with "not a recognized task
+    URL/id". Use --title for that. (The "or id" this line used to claim, and
+    the `nh task add PROJ-42` example below it, documented a command that
+    always failed.)
 
     Examples:
       nh task add https://code.example.com/org/repo/issues/12 --repo ~/repo
-      nh task add PROJ-42 --repo ~/repo
       nh task add --title "Fix X" --repo ~/repo
     """
     config, _ = _bootstrap()

@@ -1135,3 +1135,92 @@ async def test_inject_pr_feedback_refuses_a_terminal_task(store):
     fresh = await store.get_task(t.id)
     assert (fresh.context or {}).get("send_back_feedback") is None
     assert "pr_feedback" not in events
+
+
+def test_every_blocker_category_has_a_route():
+    """`Blocker.route` is a bare `_ROUTING[category]`, so a missing entry is a
+    KeyError on a live path, not a default. STAGNATION was absent.
+
+    CORRECTED 2026-08-01, and RE-CITED 2026-08-02 by symbol rather than by line
+    (main's convention since "docs: cite symbols, not line numbers"). The line
+    numbers this docstring used to carry had ALL rotted within a day: `:1936` had
+    drifted into `_recurring_finding`, `:2661` into the middle of an unrelated
+    call, `:3961-3963` into `_gate_already_satisfied`. Every one still read as a
+    precise citation. A symbol survives edits above it and fails by name when it
+    is renamed, which is the defect a reader actually hits.
+
+    The first version of this docstring said the stuck detector "crashed on the
+    case it exists to serve". That is FALSE, and it was the stated reason for the
+    fix, so it is corrected rather than quietly dropped. The stuck detector never
+    reaches `triage()` at all: `Orchestrator._drive` in `core/orchestrator.py`
+    raises its STAGNATION blocker with `escalate_now=True`, and
+    `Orchestrator._raise_blocker` builds `Route(ESCALATED, notify_now=True,
+    parked=False)` INLINE in that branch without consulting the table.
+    `triage()` — the only consumer of `_ROUTING` anywhere in `src/` — is called
+    solely in the `else`.
+
+    The reachable path is an AGENT-EMITTED stagnation blocker:
+    `Orchestrator._run_attempt` in `core/orchestrator.py` calls `parse_blocker`
+    on the agent's final text and passes the result straight to
+    `_raise_blocker(task, emitted, repo=..., branch=...)` with no
+    `escalate_now`, so it lands in the `else`, calls `triage()`, reads
+    `blocker.route`, and raises KeyError. Real bug, real crash, different
+    trigger — and one the stuck detector could not have produced.
+
+    A per-category assertion would have missed it the same way the routing table
+    did; this asserts over the ENUM, so the next category added without a route
+    fails here instead of in production.
+    """
+    from no_human.blockers.taxonomy import route_for
+
+    missing = []
+    for category in BlockerCategory:
+        try:
+            route_for(category)
+        except KeyError:
+            missing.append(category.name)
+    assert not missing, f"BlockerCategory with no route: {missing}"
+
+
+def test_a_stagnation_blocker_escalates_rather_than_parking():
+    """Parking requires a wake condition and stagnation has none — nothing
+    external will change — so the honest route is to escalate with the report.
+    """
+    b = Blocker(category=BlockerCategory.STAGNATION, transient=False,
+                confidence=0.9, goal="ship it",
+                root_cause_hypothesis="review pass rate flat for 2 attempts")
+    assert b.route.notify_now is True
+    assert b.route.parked is False
+
+
+def test_routing_stagnation_turns_it_into_a_learning_proposal():
+    """The consequence of the route, which the original change did not state.
+
+    Before, an agent-emitted STAGNATION raised KeyError and nothing downstream
+    ran. Now it routes to ESCALATED with `parked=False`, and
+    `Orchestrator._raise_blocker` in `core/orchestrator.py` calls
+    `_propose_learning` on exactly `route.target_status == ESCALATED`. STAGNATION is deliberately NOT in
+    `NON_LEARNABLE_CATEGORIES` — which holds only the categories whose cause is
+    outside the agent (TRANSIENT_INFRA, QUOTA, DEPENDENCY_WAIT,
+    BUDGET_EXHAUSTED, MISSING_ACCESS) — so agent-raised stagnation now feeds the
+    learning queue as an anti-pattern proposal.
+
+    That is defensible: repeated no-progress on a shape of task is exactly the
+    kind of thing worth learning from. But it is a NEW behaviour that the
+    routing fix switched on as a side effect, and a queue that floods has been a
+    real failure mode here before, so it is pinned rather than left implicit. If
+    stagnation proposals turn out to be noise, the fix is to add STAGNATION to
+    NON_LEARNABLE_CATEGORIES and change this test deliberately.
+    """
+    from no_human.learning.queue import NON_LEARNABLE_CATEGORIES
+
+    assert "STAGNATION" not in NON_LEARNABLE_CATEGORIES, (
+        "STAGNATION is now non-learnable — that is a real product decision, but "
+        "it contradicts the route added alongside this test; update both"
+    )
+    route = route_for(BlockerCategory.STAGNATION)
+    assert route.target_status is TaskStatus.ESCALATED
+    assert route.parked is False, (
+        "a parked route would NOT reach _propose_learning; the learning "
+        "consequence pinned here depends on parked=False"
+    )

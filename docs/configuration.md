@@ -163,14 +163,15 @@ ci:                               # opt-in per project
   poll_interval: 30
   result_parser: pytest           # or "surefire" for Maven
 
-integration-gate:                           # M6: post-PR integration gate (WakeWatcher rung 5)
-  enabled: false                  # `nh integration-gate run <task>` force-enables for one run
-  project_id: 12345               # your integration-gate project's numeric id
-  hostname: gitlab.acme.net
+ci_gate:                          # post-PR CI gate (WakeWatcher rung 5)
+  enabled: false                  # `nh ci-gate run <task>` force-enables for one run
+  project_id: 12345               # your CI project's numeric id
+  hostname: gitlab.example.com
   ref: main
   repos: [<your-service>]         # PR repos this gate governs
-  namespace_template: "<your-prefix>-integration-gate-pr{pr_number}"  # throwaway, collision-guarded
-  variables: {...}                # the proven static flag set (see config.py)
+  namespace_template: "ci-gate-pr{pr_number}"   # throwaway, collision-guarded
+  namespace_variable: CI_GATE_NAMESPACE         # pipeline var carrying the namespace
+  variables: {}                   # extra pipeline variables
   poll_interval: 30
   timeout: 3600
   kubeconfig: ~/.kube/configs/<your-ci-cluster>.yaml   # latest_dev images + ns guard

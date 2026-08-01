@@ -723,3 +723,170 @@ def test_tamper_check_refuses_a_missing_worktree_instead_of_crashing(tmp_path):
     not_a_checkout.mkdir()
     with pytest.raises(TamperCheckUnavailable):
         tamper_check_between(not_a_checkout)
+
+
+# --- absent is not zero: a NEW test file has no baseline ---------------------
+#
+# The guard read a path missing from `before` as a baseline of ZERO, so a brand
+# new test file carrying `@pytest.mark.skipif` reported "skip/xfail markers
+# 0->1 (test neutered)". Nothing was neutered: none of its tests ran before.
+# `skipif` is the ordinary platform/dependency-conditional idiom, so every task
+# that added one escalated on correct work, via the `if tamper.tampered:` branch
+# of `Orchestrator._run_attempt` in `core/orchestrator.py`, which routes into
+# `Orchestrator._escalate`. Cited by symbol, not by line: the line number this
+# comment used to carry (`:2904-2910`) had already drifted onto the unrelated
+# SCOPE_EXPLOSION size-limit block, and still read as a precise citation.
+#
+# The four tests below are one set on purpose. The obvious fix — exempt new
+# files wholesale — silently blinds the padding defence, and fixing only the
+# per-path reason leaves the AGGREGATE `sa > sb` firing with no reason printed,
+# which is worse than the bug. Each arm has to be pinned separately.
+
+_REAL = 'from mypkg import parse\ndef test_a():\n    assert parse("a: 1")["a"] == 1\n'
+_SKIPIF = (
+    'import pytest, sys\nfrom mypkg import parse\n'
+    '@pytest.mark.skipif(sys.platform == "win32", reason="posix only")\n'
+    'def test_a():\n    assert parse("a: 1")["a"] == 1\n'
+)
+_NEUTERED = (
+    'import pytest\nfrom mypkg import parse\n@pytest.mark.skip("flaky")\n'
+    'def test_a():\n    assert parse("a: 1")["a"] == 1\n'
+)
+_PADDING = 'def test_p1():\n    assert True\ndef test_p2():\n    assert 1 == 1\n'
+
+
+def test_a_new_test_file_with_a_conditional_skip_is_not_tampering():
+    """The bug. A file that did not exist cannot have neutered anything."""
+    r = tamper_guard.check({}, {"tests/test_new.py": _SKIPIF})
+    assert not r.tampered, r.reasons
+    assert not any("neutered" in x for x in r.reasons), r.reasons
+
+
+def test_an_existing_file_that_gains_a_skip_is_still_tampering():
+    """The arm the fix must NOT relax: a previously-running test disabled."""
+    r = tamper_guard.check({"tests/test_e.py": _REAL}, {"tests/test_e.py": _NEUTERED})
+    assert r.tampered
+    assert any("neutered" in x for x in r.reasons), r.reasons
+
+
+def test_a_new_file_padded_with_no_op_tests_is_still_tampering():
+    """Tautologies are deliberately NOT exempt on a new file.
+
+    Padding a new file with passing no-ops is how a real deletion elsewhere
+    gets netted back to positive, so this arm stays live. Only the wording
+    changes — nothing was "replaced" in a file that did not exist.
+
+    This test names WHICH mechanism holds the verdict, because the obvious
+    reading is wrong. `tampered` here is carried by the AGGREGATE
+    `auta > autb`, which sums raw per-path totals; the per-path reason string
+    is a separate arm. Mutating only the per-path arm to
+    `if a_taut > b_taut and not is_new:` leaves `tampered` True and fails just
+    the wording assertion — measured, not assumed. So the totals below are
+    asserted directly: they are the thing that actually keeps this closed, and
+    the mutation that would open it for real is routing tautologies through a
+    new-file-excluded total the way skips are routed through `sa_cmp`.
+    """
+    r = tamper_guard.check({}, {"tests/test_pad.py": _PADDING})
+    assert r.tampered, r.summary
+    # The aggregate arm, pinned directly rather than through the verdict.
+    assert (r.tautologies_before, r.tautologies_after) == (0, 2), r.summary
+    assert r.tautologies_after > r.tautologies_before, r.summary
+    # The per-path arm, which the verdict above does NOT pin on its own.
+    assert any("padded with no-op tests" in x for x in r.reasons), r.reasons
+
+
+def test_deleting_a_file_and_re_adding_it_as_a_new_one_is_still_tampering():
+    """The evasion path the exemption could have opened, and does not.
+
+    Laundering neutered tests through a delete-and-recreate still trips the
+    deletion arm, which fires on the vanished path regardless of the totals.
+    """
+    r = tamper_guard.check({"tests/test_e.py": _REAL}, {"tests/test_n.py": _SKIPIF})
+    assert r.tampered
+    assert any("deleted" in x for x in r.reasons), r.reasons
+
+
+# --- ...but a conftest.py is never "new" for that purpose --------------------
+#
+# The exemption above keys on "path absent from `before`". A conftest.py is a
+# new path whose markers reach tests it never declares, so the exemption handed
+# an agent a five-line, whole-suite kill switch that scored clean.
+#
+# Measured end to end, not reasoned about: a temp project with
+# `1 failed, 1 passed` (pytest exit 1) drops to `2 skipped` (pytest exit 0) on
+# adding _KILL_SWITCH as a root conftest.py, and runner.py reads exit 0 as
+# ok=True (`ok = proc.returncode == 0`, runner.py:871) while `_parse_pytest`
+# returns (0, 0, 0) — zero failures, zero errors. Nothing downstream can tell
+# that from an honest green.
+#
+# `count_faking_fixtures` cannot see it: it needs autouse AND a _FAKE_PATCH
+# primitive, and `pytest.skip()` is not one, so the payload scores 0 there.
+# `count_skips` is the only counter that sees it, which is exactly the counter
+# the new-file exemption switched off.
+
+_KILL_SWITCH = (
+    'import pytest\n\n\n@pytest.fixture(autouse=True)\ndef _skip_all():\n'
+    '    pytest.skip("infra unavailable")\n'
+)
+_KILL_SWITCH_XFAIL = (
+    'import pytest\n\n\n@pytest.fixture(autouse=True)\ndef _xfail_all():\n'
+    '    pytest.xfail("wip")\n'
+)
+_KILL_SWITCH_ADD_MARKER = (
+    'import pytest\n\n\n@pytest.fixture(autouse=True)\ndef _xfail_all(request):\n'
+    '    request.node.add_marker(pytest.mark.xfail(reason="wip"))\n'
+)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["conftest.py", "tests/conftest.py", "tests/sub/conftest.py"],
+    ids=["root", "tests", "nested"],
+)
+@pytest.mark.parametrize(
+    "body",
+    [_KILL_SWITCH, _KILL_SWITCH_XFAIL, _KILL_SWITCH_ADD_MARKER],
+    ids=["pytest_skip", "pytest_xfail", "add_marker_xfail"],
+)
+def test_a_new_conftest_that_skips_the_whole_suite_is_tampering(path, body):
+    """The payload the new-file exemption let through, at every depth and form.
+
+    Nested paths are covered because a conftest.py governs its own subtree and
+    nothing about the evasion requires the repo root.
+    """
+    before = {"tests/test_e.py": _REAL}
+    r = tamper_guard.check(before, {**before, path: body})
+    assert r.tampered, r.summary
+    assert any(path in x and "neutered" in x for x in r.reasons), r.reasons
+
+
+def test_the_new_file_exemption_still_holds_for_an_ordinary_new_test_file():
+    """The carve-out is scoped to conftest.py and nothing wider.
+
+    Pinned beside the tests above so a future "just exempt nothing" cure to
+    them cannot quietly re-open the false positive they were built to fix.
+    """
+    before = {"tests/test_e.py": _REAL}
+    r = tamper_guard.check(before, {**before, "tests/sub/test_new.py": _SKIPIF})
+    assert not r.tampered, r.summary
+    assert not any("neutered" in x for x in r.reasons), r.reasons
+
+
+def test_count_faking_fixtures_cannot_see_a_skip_only_kill_switch():
+    """Why the skip counter had to be the one that stays live for conftest.py.
+
+    If rule 4 caught this payload the exemption would have been harmless. It
+    does not: `pytest.skip()` is not a _FAKE_PATCH primitive, so an autouse
+    fixture built from it scores zero cheat signals there. This is the load-
+    bearing premise of the carve-out above, so it is pinned rather than
+    asserted in a comment.
+    """
+    assert tamper_guard.count_faking_fixtures(_KILL_SWITCH) == 0
+    assert tamper_guard.count_faking_fixtures(_KILL_SWITCH_XFAIL) == 0
+    # ...while the patch-based form it CAN see still scores, so this test
+    # cannot pass merely because the counter is broken for everything.
+    patching = (
+        'import pytest\n@pytest.fixture(autouse=True)\ndef f(monkeypatch):\n'
+        '    monkeypatch.setattr("mypkg.parse", lambda s: {"a": 1})\n'
+    )
+    assert tamper_guard.count_faking_fixtures(patching) == 1

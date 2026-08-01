@@ -61,3 +61,42 @@ def test_gitlab_normalize():
     assert task.source == "gitlab"
     assert task.external_id == "g/s/p#3"
     assert task.acceptance_criteria == ["retries 3x"]
+
+
+def test_a_bare_tracker_key_is_rejected_not_ingested_as_freeform():
+    """docs/quickstart.md said `PROJ-42` "is ingested as freeform text". It is not.
+
+    `parse_source` classifies it as freeform, and `ingest_from_url` raises on
+    exactly that classification — so `nh task add PROJ-42` prints
+    "intake failed:" and exits 1. A quickstart is the first thing a new user
+    reads, and this told them a command would work that always fails.
+
+    Both halves are asserted, because the doc's error was believing the first
+    one implied the second.
+    """
+    from no_human.intake import ingest_from_url
+
+    assert parse_source("PROJ-42").kind == "freeform"
+    with pytest.raises(ValueError, match="not a recognized task URL/id"):
+        ingest_from_url("PROJ-42")
+
+
+def test_quickstart_does_not_promise_freeform_ingestion_of_a_tracker_key():
+    """The doc half of the coupling above.
+
+    Anchored to the behaviour, not to phrasing: the guard reads the sentence
+    only to confirm it has not gone back to promising ingestion.
+    """
+    from pathlib import Path
+
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "quickstart.md").read_text(
+        encoding="utf-8")
+    assert "PROJ-42" in doc, (
+        "quickstart no longer discusses a bare tracker key — if the section was "
+        "removed, remove this guard deliberately rather than letting it pass "
+        "over a subject that is gone"
+    )
+    assert "ingested as freeform text" not in doc, (
+        "quickstart claims a bare tracker key is ingested as freeform text; "
+        "ingest_from_url raises and the CLI exits 1"
+    )

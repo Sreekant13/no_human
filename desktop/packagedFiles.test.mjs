@@ -140,6 +140,65 @@ test("the MIT licence text ships inside the app bundle", () => {
   assert.match(src, /MIT License/, "extraResources LICENSE is not the MIT text");
 });
 
+test("Electron's and Chromium's notices ship too, or the DMG is undistributable", () => {
+  // THE_DEFECT: this file guarded only our own MIT `LICENSE` entry, so the
+  // build shipped for months with no notice for Electron (MIT) or Chromium
+  // (BSD) at all — verified absent on desktop/dist/mac-arm64/no_human.app.
+  // Chromium's BSD terms require the notice to be reproduced with a binary
+  // distribution, so this is a redistribution blocker, not tidiness.
+  //
+  // Why they vanish, since the comment in the config was wrong once already:
+  // electron-builder DELETES them. electronMac.js:219-220 unlinks
+  // `appOutDir/LICENSE` and `appOutDir/LICENSES.chromium.html` (appOutDir is
+  // dist/mac-arm64/, one level ABOVE the .app), and ElectronFramework.js:236-239
+  // performs the `LICENSE -> LICENSE.electron.txt` rename that would have
+  // preserved Electron's only when the platform is NOT macOS. Nothing was ever
+  // overwritten: Electron's notices sit beside Electron.app in
+  // node_modules/electron/dist/, and Contents/Resources has never held a file
+  // named LICENSE.
+  const extra = builderConfig.extraResources ?? [];
+  const required = [
+    { to: "LICENSE.electron.txt",
+      from: /node_modules\/electron\/dist\/LICENSE$/,
+      text: /Copyright \(c\) [\d\-, ]*GitHub Inc\./ },
+    { to: "LICENSES.chromium.html",
+      from: /node_modules\/electron\/dist\/LICENSES\.chromium\.html$/,
+      text: /Chromium/ },
+  ];
+  for (const want of required) {
+    const entry = extra.find((e) => (e.to ?? e) === want.to);
+    assert.ok(entry, `no ${want.to} in extraResources: ${JSON.stringify(extra)} `
+      + "— the bundle would ship without a third-party notice it must carry");
+    assert.match(entry.from ?? "", want.from,
+      `${want.to} is sourced from somewhere other than electron's dist`);
+    // Content check only where node_modules is present. Coder worktrees do not
+    // install it, and a hard read there would fail this test for a reason that
+    // has nothing to do with the invariant. The two assertions above are
+    // unconditional, so the test can still fail everywhere it runs.
+    const src = path.join(here, entry.from);
+    if (fs.existsSync(src)) {
+      assert.match(fs.readFileSync(src, "utf8").slice(0, 4000), want.text,
+        `${entry.from} does not look like the notice it claims to be`);
+    }
+  }
+
+  // The destination names must not collide with our own MIT LICENSE, which is
+  // the whole reason they are renamed rather than shipped under their own.
+  const dests = extra.map((e) => e.to ?? e);
+  assert.equal(new Set(dests).size, dests.length,
+    `extraResources has colliding destinations: ${JSON.stringify(dests)} — a `
+    + "later entry silently replaces an earlier one at the same path");
+
+  // And the notices file that tells a distributor all this must name them, so
+  // the obligation and the mechanism cannot drift apart again.
+  const notices = fs.readFileSync(
+    path.join(here, "..", "THIRD-PARTY-NOTICES.md"), "utf8");
+  for (const want of required) {
+    assert.ok(notices.includes(want.to),
+      `THIRD-PARTY-NOTICES.md does not mention ${want.to}`);
+  }
+});
+
 test("the mac targets include zip, or auto-update cannot work at all", () => {
   // Squirrel.Mac updates from a ZIP. electron-builder only emits
   // latest-mac.yml — the file electron-updater fetches — when a zip target is

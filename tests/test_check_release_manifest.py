@@ -66,13 +66,58 @@ def test_a_changed_file_fails_on_its_hash(tmp_path):
     assert "pkg/a.py: content differs from the manifest" in proc.stderr
 
 
-def test_a_tracked_file_missing_from_the_manifest_fails(tmp_path):
+def test_a_tracked_file_missing_from_the_manifest_warns_and_fails_under_strict(
+    tmp_path,
+):
+    """Split from "fails" (2026-08-02), and the reason is the exit code's signal.
+
+    An unlisted path and a hash mismatch used to share exit 1. In this working
+    repository ~93 paths are legitimately unlisted, so the script was ALREADY 1
+    before any change: a deliberately bad merge resolution produced a real
+    mismatch and the exit code did not move. Only reading the body revealed it,
+    which is not a gate.
+
+    So the classes are separated, and BOTH halves are pinned here: the unlisted
+    path is still reported by name (it is not being hidden), it no longer sets
+    the exit code by itself, and `--strict` — what CI runs on the released tree,
+    where completeness is a hard invariant — still fails on it exactly as
+    before.
+    """
     repo = make_repo(tmp_path)
     write_manifest(repo)
     (repo / "pkg" / "new.py").write_text("N = 1\n")
     subprocess.check_call(["git", "add", "pkg/new.py"], cwd=str(repo))
+
+    proc = run("--root", str(repo))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "pkg/new.py: tracked but not listed" in proc.stderr
+    assert "WARN" in proc.stderr
+
+    strict = run("--root", str(repo), "--strict")
+    assert strict.returncode == 1, strict.stdout + strict.stderr
+    assert "pkg/new.py: tracked but not listed" in strict.stderr
+
+
+def test_a_hash_mismatch_still_fails_when_unlisted_paths_are_present(tmp_path):
+    """The defect this split exists to fix, pinned as a test.
+
+    An unlisted path and a changed file at the same time: before the split both
+    produced exit 1 and the mismatch was invisible to any automated caller. The
+    unlisted path must now warn, the mismatch must still fail, and the mismatch
+    must be the thing that decides the exit code.
+    """
+    repo = make_repo(tmp_path)
+    write_manifest(repo)
+    # An unlisted path — on its own, only a warning.
+    (repo / "pkg" / "new.py").write_text("N = 1\n")
+    subprocess.check_call(["git", "add", "pkg/new.py"], cwd=str(repo))
+    assert run("--root", str(repo)).returncode == 0
+
+    # ...and now a real mismatch on top of it.
+    (repo / "pkg" / "a.py").write_text("A = 2\n")
     proc = run("--root", str(repo))
     assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "pkg/a.py: content differs from the manifest" in proc.stderr
     assert "pkg/new.py: tracked but not listed" in proc.stderr
 
 

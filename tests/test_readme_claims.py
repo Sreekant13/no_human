@@ -581,24 +581,456 @@ def test_published_bench_report_is_internally_consistent(bench_report):
     )
 
 
-def test_readme_does_not_carry_a_stale_bench_label(readme, bench_report):
-    """The front page must not name a bench run other than the published one.
+def test_documented_surfaces_do_not_carry_a_stale_bench_label(
+    documented, bench_report
+):
+    """No documented surface may name a bench run other than the published one.
 
     The original defect was the README describing v8 while linking a v13 report,
-    with the suite green throughout. The README no longer quotes figures, but it
-    still LINKS the report, so that exact rot is still reachable and this half of
-    the old coupling is kept pointed at the README.
+    with the suite green throughout.
 
-    The link assertion is deliberately positive: it fails if someone drops the
-    reference entirely, which would end the coupling silently.
+    RETARGET (2026-08-01). This read the README alone, and when the operator cut
+    the Limits section the README stopped mentioning the benchmark at all. The
+    repair attempt made the link assertion CONDITIONAL on a benchmark claim being
+    present — which made the whole test vacuous, since the shipped README trips
+    none of the trigger words. Proven at the time and re-proven since: mutating
+    the published report's label to ``expanded-core-v99`` left this test PASSING.
+    The conditional's vocabulary was drawn from the same regex that decided
+    whether to check anything, so the mutation could never reach it — a verifier
+    built out of the thing it verifies.
+
+    The fix is the one every sibling guard in this file already uses: read
+    ``DOCUMENTED_SURFACES`` (:46-50), not the README alone. The claim did not
+    disappear when it left the front page — it moved to ``docs/verification.md``,
+    which links the report. So the mandatory-hit assertion can go back to being
+    unconditional without dictating a word of the README: it is satisfied today
+    by ``docs/verification.md:95-115``, it is phrasing-independent, and it fires
+    only if the report goes UNREFERENCED from every documented surface, which is
+    the rot — a claim separated from its evidence.
+
+    That also restores the file's own policy at :44-45, which forbids removing
+    the mandatory-hit assertions that stop a guard passing vacuously. The
+    conditional violated it while leaving the policy text unedited.
+
+    Stated plainly so it is not mistaken for coverage: the label-disagreement
+    assertion is DORMANT today, because no documented surface names a run label
+    at all. It arms itself the moment one does, which is the point of reading
+    the union. The mandatory hit below is what makes this test able to fail
+    right now — verified by mutation in both directions: dropping the reference
+    from every surface fails it, and adding ``expanded-core-v8`` to the README
+    fails it. Mutating the published label alone still passes, and that is
+    correct rather than vacuous: with no label written down anywhere, there is
+    nothing for the report to disagree WITH.
     """
     label = re.search(r"label: (\S+)", bench_report).group(1).rstrip(".")
-    named = set(re.findall(r"\b(expanded-core-v\d+)\b", readme))
+    named = set(re.findall(r"\b(expanded-core-v\d+)\b", documented))
     assert not (named - {label}), (
-        f"README names bench run(s) {sorted(named - {label})}; the published "
-        f"report is {label!r} — the front page and the report disagree"
+        f"documented surfaces name bench run(s) {sorted(named - {label})}; the "
+        f"published report is {label!r} — the docs and the report disagree"
     )
-    assert "docs/NORTH_STAR_BENCH.md" in readme, (
-        "README no longer links docs/NORTH_STAR_BENCH.md; the benchmark claim "
-        "and its evidence are no longer connected from the front page"
+    # Mandatory hit. Unconditional on purpose: see the docstring. Matched on the
+    # bare filename rather than a path, so moving the reference between surfaces
+    # (or writing it as a relative link) does not break the coupling.
+    assert "NORTH_STAR_BENCH.md" in documented, (
+        "no documented surface links NORTH_STAR_BENCH.md; the benchmark claim "
+        "and its evidence are no longer connected from anywhere a reader lands"
+    )
+
+
+# --- egress: the docs must not claim an enumeration they cannot back ---------
+#
+# README and docs/security.md both said prompts were the only thing that left
+# the machine ("The only thing sent about your code is the prompt", "Two things,
+# and nothing else"). Both were false when written, and the second was worse
+# than the first because it read as an audited enumeration.
+#
+# These guards are anchored to the MECHANISM, not to wording, and each carries a
+# mandatory hit that fails if its subject disappears from the source — the
+# policy at :44-45. They check two things a trust document must get right:
+# (a) the terminal push is disclosed, and (b) no surface re-asserts a closed
+# enumeration of egress, which no process handing an agent an unrestricted shell
+# can honestly make.
+
+SECURITY_DOC = REPO / "docs" / "security.md"
+VCS_INIT = REPO / "src" / "no_human" / "vcs" / "__init__.py"
+CLAUDE_BACKEND = REPO / "src" / "no_human" / "agent" / "claude_backend.py"
+
+
+@pytest.fixture(scope="module")
+def security_doc() -> str:
+    return SECURITY_DOC.read_text(encoding="utf-8")
+
+
+#: Invisible anchors around the push-egress bullet in ``docs/security.md`` §7.
+#:
+#: RE-ANCHORED 2026-08-02. The previous marker was the bullet's own heading
+#: prose (``- **`git push` of the task branch to your git remote**``). That was
+#: correct about WHAT to protect and wrong about HOW: three rewordings that left
+#: the disclosure completely intact still failed the guard (measured — rewording
+#: the heading, restating the no-opt-out sentence, and changing the citation
+#: spelling). Anchoring on prose means every edit to the prose is a test change,
+#: which trains a reader to "fix" the guard rather than read it.
+#:
+#: An HTML comment renders as nothing in every Markdown viewer, so the reader
+#: never sees these, the author can reword the bullet freely, and DELETING the
+#: bullet still takes the anchors with it — which is the asymmetry this guard
+#: wants. The strictness that matters is preserved below, on the *content*
+#: between the anchors, not on its wording.
+PUSH_BULLET_OPEN = "<!-- egress:push -->"
+PUSH_BULLET_CLOSE = "<!-- /egress:push -->"
+#: Inner anchors, around the sentence that says the egress cannot be turned off.
+#: Nested on purpose: without them, "reword freely" would also permit deleting
+#: the load-bearing half of the disclosure while leaving a bullet behind, and
+#: RED 3 of the red-green matrix (drop only the no-opt-out claim) would stop
+#: failing. The anchors travel with the sentence, so deleting it fails.
+PUSH_NO_OPTOUT_OPEN = "<!-- egress:push:no-optout -->"
+PUSH_NO_OPTOUT_CLOSE = "<!-- /egress:push:no-optout -->"
+
+#: The no-opt-out slice must still make a negative claim about disabling. This
+#: is a REQUIRED vocabulary, not a banned one, and the direction matters: an
+#: unlisted spelling produces a loud failure on a doc edit (cheap, and the next
+#: reader adds the spelling), where dropping the check entirely would let the
+#: sentence be gutted in place — "**This ships your source to your git host,
+#: and**" — with the anchors still present and the suite still green. That
+#: silent direction is the one this file has already been burned by.
+_NO_OPTOUT_NEGATIONS = ("no ", "not ", "cannot", "can't", "never", "nothing")
+_NO_OPTOUT_DISABLERS = (
+    "disable", "disabled", "disables", "turn it off", "turned off",
+    "turn off", "switch it off", "switched off", "opt out", "opt-out",
+)
+
+
+def _slice_between(text: str, open_marker: str, close_marker: str) -> str:
+    """The text between two markers, or "" if either is missing/out of order."""
+    start = text.find(open_marker)
+    if start == -1:
+        return ""
+    end = text.find(close_marker, start + len(open_marker))
+    if end == -1:
+        return ""
+    return text[start + len(open_marker):end]
+
+
+def _push_egress_bullet(security_doc: str) -> str:
+    """Return just the push bullet's text from §7, or "" if it is gone.
+
+    Scoped deliberately. An older version of this guard asserted over the whole
+    §7 body, which meant the *fetch* bullet's `vcs/git.py` citation satisfied the
+    "the push names a source location" assertion — deleting the push bullet
+    entirely left the suite green (reproduced 2026-08-01). The slice is now
+    marker-delimited rather than prose-delimited, so it keeps that scoping
+    without also failing on rewordings.
+    """
+    section = security_doc.split("## 7.", 1)
+    assert len(section) == 2, "docs/security.md has no '## 7.' egress section"
+    return _slice_between(section[1], PUSH_BULLET_OPEN, PUSH_BULLET_CLOSE)
+
+
+def _pushes_inside_open_pr(source: str) -> bool:
+    """True iff ``open_pr`` really contains a ``.push(...)`` **call**.
+
+    Parsed, not grepped. A whole-file substring test for ``repo.push(`` was
+    satisfied by the docstring-comment at ``vcs/__init__.py:26``: renaming the
+    live call site at :72 to ``repo.pushX(`` left the suite green (reproduced
+    2026-08-01). Comments and strings are invisible to the AST, so they cannot
+    stand in for the mechanism here.
+
+    RELAXED 2026-08-02: the receiver is no longer constrained to the *name*
+    ``repo``. Requiring ``func.value.id == "repo"`` made this wrong on two of
+    six refactors that keep the mechanism fully intact — an aliased receiver
+    (``_r = repo; _r.push(...)``) and an attribute chain
+    (``self.repo.push(...)``) both read as "the push is gone" and would have
+    sent a reader to re-check a doc that was still correct. What this guard is
+    for is detecting that ``open_pr`` no longer pushes at all; the receiver's
+    spelling is not part of that claim. The two checks that carry the weight are
+    unchanged: it must be a `Call` (so a comment or a string cannot satisfy it)
+    and the attribute must be exactly ``push`` (so RED 2, renaming the live call
+    site to ``repo.pushX(``, still fails).
+
+    🔴 What this does NOT check, stated so a green run is not over-read: syntactic
+    presence is not reachability. ``if False: repo.push(branch)`` satisfies it.
+    Accepted deliberately rather than fixed — deciding reachability needs a
+    control-flow analysis, and the failure mode it would buy is someone
+    deliberately disguising the removal of the push while leaving the call in
+    the source. The realistic defect is the push being deleted, moved or
+    renamed, which is what this catches. A reader who wants the stronger claim
+    should read ``open_pr``; this guard's job is to fail when the doc's subject
+    has left the file.
+    """
+    import ast
+
+    defs = (ast.FunctionDef, ast.AsyncFunctionDef)
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, defs) or node.name != "open_pr":
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "push"
+            ):
+                return True
+    return False
+
+
+def test_the_push_that_ends_every_task_is_disclosed_as_egress(security_doc):
+    """`open_pr` pushes the user's source. The trust document must say so.
+
+    Mandatory hit first: a real ``.push(...)`` call inside ``open_pr`` in
+    ``vcs/__init__.py``, and `open_pr(` in the orchestrator. If either vanishes
+    this test fails loudly rather than passing over a mechanism that is no
+    longer there — the failure then means "re-check the doc", not "the doc is
+    wrong".
+
+    Then the doc side, anchored to the bullet's invisible HTML-comment markers
+    rather than to the §7 body or to the bullet's prose, so that DELETING the
+    disclosure is what fails the test and REWORDING it is free. Every arm was
+    watched failing; the matrix and the benign-rewording tests below are the
+    record.
+    """
+    vcs_init = VCS_INIT.read_text(encoding="utf-8")
+    orch = (REPO / "src" / "no_human" / "core" / "orchestrator.py").read_text(
+        encoding="utf-8")
+    assert _pushes_inside_open_pr(vcs_init), (
+        "vcs/__init__.py no longer calls repo.push(...) inside open_pr — the "
+        "egress this guard exists to keep disclosed has moved; re-point it"
+    )
+    assert "open_pr(" in orch, (
+        "the orchestrator no longer calls open_pr — re-point this guard"
+    )
+
+    _assert_push_bullet_discloses(security_doc)
+
+
+def _assert_push_bullet_discloses(security_doc: str) -> None:
+    """The doc half of the guard above, over any §7 text.
+
+    Split out so the red-green matrix and the benign-rewording cases below run
+    the REAL assertions against mutated documents, instead of a paraphrase of
+    them that could drift from what ships.
+    """
+    bullet = _push_egress_bullet(security_doc)
+    assert bullet.strip(), (
+        f"docs/security.md §7 no longer carries the {PUSH_BULLET_OPEN}…"
+        f"{PUSH_BULLET_CLOSE} bullet; shipping the user's source to their git "
+        "host is the largest thing that leaves the machine and it cannot be "
+        "an omission. These anchors are HTML comments precisely so that "
+        "REWORDING the bullet needs no change here — if you are reading this "
+        "message you removed the bullet or its anchors, and the fix is to put "
+        "the disclosure back, not to delete this assertion."
+    )
+
+    no_optout = _slice_between(
+        bullet, PUSH_NO_OPTOUT_OPEN, PUSH_NO_OPTOUT_CLOSE
+    ).lower()
+    assert no_optout.strip(), (
+        f"the push-egress bullet no longer carries a {PUSH_NO_OPTOUT_OPEN}…"
+        f"{PUSH_NO_OPTOUT_CLOSE} sentence — that the egress cannot be turned "
+        "off is the load-bearing half of the disclosure, not a flourish"
+    )
+    assert any(n in no_optout for n in _NO_OPTOUT_NEGATIONS) and any(
+        d in no_optout for d in _NO_OPTOUT_DISABLERS
+    ), (
+        f"the no-opt-out sentence ({no_optout.strip()!r}) no longer says that "
+        "the push cannot be disabled. If it says so in a spelling this guard "
+        "does not know, ADD the spelling to _NO_OPTOUT_NEGATIONS / "
+        "_NO_OPTOUT_DISABLERS — the check is a required vocabulary, and a "
+        "missing spelling is meant to fail loudly rather than pass silently."
+    )
+
+    assert (
+        "vcs/__init__.py" in bullet
+        or "vcs/git.py" in bullet
+        or "GitRepo.push" in bullet
+    ), (
+        "the push-egress bullet names no source location for the push — a "
+        "trust document's claims have to be checkable against the code. Note "
+        "the neighbouring fetch bullet also cites vcs/git.py; this assertion "
+        "is scoped to the push bullet so that citation cannot satisfy it"
+    )
+
+
+#: Placements of an anchor that are invisible to a reader of the SOURCE but not
+#: to a reader of the RENDERED page. Both were measured against a CommonMark
+#: renderer while writing the anchors above, and both shipped in a first draft:
+#:
+#:   * an HTML comment that STARTS a line inside a bullet list is parsed as an
+#:     HTML block, which closes the list. The §7 list rendered as three separate
+#:     `<ul>`s instead of one.
+#:   * an anchor placed immediately after a list marker and immediately before
+#:     `**` breaks the emphasis run: `**This ships your source…**` rendered as
+#:     literal asterisks, i.e. the load-bearing sentence of a trust document
+#:     lost its emphasis on the published page.
+#:
+#: Neither is detectable by any assertion about the doc's TEXT — the first draft
+#: passed every content check in this file. So the shape is pinned here instead.
+#: A renderer is deliberately NOT imported: the lean-stack rule forbids adding a
+#: dependency, and these two shapes are the whole of what was measured to break.
+def _anchor_placement_problems(security_doc: str) -> list[str]:
+    bad: list[str] = []
+    for n, line in enumerate(security_doc.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("<!--") and "egress:" in stripped:
+            bad.append(
+                f"docs/security.md:{n}: an egress anchor starts the line. A "
+                f"line-initial HTML comment inside a list is an HTML block and "
+                f"splits the list; put the anchor mid-line. Line: {stripped!r}"
+            )
+        if re.search(r"^\s*[-*]\s+<!--\s*/?egress:", line):
+            bad.append(
+                f"docs/security.md:{n}: an egress anchor directly follows the "
+                f"list marker. Immediately before a `**` run this breaks the "
+                f"emphasis. Move it after the bullet's bold heading."
+            )
+    return bad
+
+
+def test_the_egress_anchors_are_invisible_when_rendered(security_doc):
+    """The anchors must not change how docs/security.md renders.
+
+    They exist so the bullet can be reworded without a test edit. An anchor that
+    silently reformats a published trust page has cost more than it bought.
+    """
+    assert "egress:push" in security_doc, (
+        "no egress anchors in docs/security.md at all — this shape guard would "
+        "pass vacuously; the disclosure guard above is the one that failed first"
+    )
+    problems = _anchor_placement_problems(security_doc)
+    assert not problems, "egress anchors are placed where they alter rendering:\n  " + "\n  ".join(problems)
+
+
+#: Edits that change how the push-egress bullet READS while leaving what it
+#: DISCLOSES completely intact. All three failed the prose-anchored version of
+#: this guard (measured 2026-08-02, 3/3 false positives); all three must pass
+#: now. They are held here as tests rather than as a note, because a guard whose
+#: brittleness was changed without a false-positive suite is unverified — and
+#: because the next person to reword the bullet should find out from a green run
+#: that they were allowed to.
+BENIGN_REWORDINGS = (
+    (
+        "reworded-heading",
+        "- **`git push` of the task branch to your git remote**",
+        "- **Pushing the task branch to whichever git remote you configured**",
+    ),
+    (
+        "restated-no-optout",
+        "there is no key that disables it",
+        "no configuration key can disable it",
+    ),
+    (
+        "symbol-citation-swapped",
+        "`GitRepo.push` in `vcs/git.py`",
+        "[`GitRepo.push`](../src/no_human/vcs/git.py)",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "old,new", [(o, n) for _, o, n in BENIGN_REWORDINGS],
+    ids=[i for i, _, _ in BENIGN_REWORDINGS],
+)
+def test_rewording_the_push_bullet_is_not_a_finding(security_doc, old, new):
+    """A reword that keeps the disclosure must not fail the disclosure guard.
+
+    The guard is deliberately brittle in the direction that matters — deleting
+    the bullet, or gutting the no-opt-out sentence, still fails, and that is
+    checked by the red-green matrix. Brittleness in THIS direction buys nothing
+    and costs trust in the guard, so it is pinned closed.
+    """
+    assert old in security_doc, (
+        f"the fixture for this false-positive case is stale: {old!r} is no "
+        f"longer in docs/security.md, so this test is no longer exercising a "
+        f"rewording of the shipped text. Re-point it at what the bullet says."
+    )
+    _assert_push_bullet_discloses(security_doc.replace(old, new))
+
+
+#: (id, body of ``open_pr``, whether the mechanism is really still there).
+#: The four attacks an independent review ran against the strict version, plus
+#: the shipped shape and the comment-only shape. The strict version — which also
+#: required ``func.value.id == "repo"`` — was WRONG on ``aliased-receiver`` and
+#: ``attribute-chain``: it reported the push gone while it was right there.
+PUSH_SHAPES = (
+    ("shipped", "    pushed_sha = repo.push(branch)\n", True),
+    ("aliased-receiver", "    _r = repo\n    pushed_sha = _r.push(branch)\n", True),
+    ("attribute-chain", "    pushed_sha = self.repo.push(branch)\n", True),
+    ("call-through-index", "    pushed_sha = repos[0].push(branch)\n", True),
+    # RED 2: the live call site renamed. The mechanism really is gone.
+    ("renamed-call", "    pushed_sha = repo.pushX(branch)\n", False),
+    # The defect that made the round-2 version unable to fail: a comment.
+    ("comment-only", "    # repo.push(branch) happens here\n    pass\n", False),
+    # Moved to a helper: open_pr itself no longer pushes, so this guard should
+    # fail loudly and send a reader to re-point it. That is the safe direction.
+    ("moved-to-helper", "    pushed_sha = _do_the_push(repo, branch)\n", False),
+)
+
+
+@pytest.mark.parametrize(
+    "body,expected", [(b, e) for _, b, e in PUSH_SHAPES],
+    ids=[i for i, _, _ in PUSH_SHAPES],
+)
+def test_the_open_pr_push_detector_reads_calls_not_names(body, expected):
+    """`_pushes_inside_open_pr` over every shape the mechanism is known to take.
+
+    Held here so the detector's reach is a regression test rather than a claim
+    in a commit message. A comment cannot satisfy it (that was the round-2
+    HIGH), renaming the call still fails it, and the receiver's spelling is
+    correctly irrelevant.
+    """
+    assert _pushes_inside_open_pr(f"def open_pr(repo, branch):\n{body}") is expected
+
+
+def test_the_unbounded_egress_channel_is_named(security_doc):
+    """The coder session has Bash and no tool allowlist. Say it, don't imply it.
+
+    Mandatory hit: the default really is `bypassPermissions` and there really is
+    no `allowed_tools`/`disallowed_tools` restriction. If someone ADDS a
+    restriction, this fails — correctly, because the doc would then be
+    overstating the risk and needs rewriting in the other direction.
+    """
+    backend = CLAUDE_BACKEND.read_text(encoding="utf-8")
+    assert 'permission_mode: str = "bypassPermissions"' in backend, (
+        "claude_backend no longer defaults to bypassPermissions — the egress "
+        "doc's central caveat may now be wrong; re-read it"
+    )
+    assert "allowed_tools" not in backend, (
+        "claude_backend now restricts tools — docs/security.md says the coder "
+        "session is unrestricted, and that is no longer true"
+    )
+
+    body = security_doc.split("## 7.", 1)[1]
+    assert "bypassPermissions" in body, (
+        "the egress section does not name the unbounded channel; without it "
+        "the rest reads as a complete enumeration, which it is not"
+    )
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "Only prompts leave your machine",
+        "The only thing sent about your code is the prompt",
+        "Two things, and nothing else",
+    ],
+    ids=["only-prompts", "only-thing-sent", "two-things"],
+)
+def test_no_surface_re_asserts_a_retired_exhaustive_egress_claim(
+    documented, security_doc, claim
+):
+    """A closed list of sentences that shipped and were false.
+
+    Deliberately a regression pin on exact retired strings, not a style rule: a
+    general "don't say only" matcher would be a phrasing heuristic, and this
+    file has already been burned once by a guard whose vocabulary decided its
+    own reach. These three are pinned because each one WAS in the tree.
+
+    Occurrences inside the History subsection are expected — the doc quotes the
+    claims in order to retract them — so they are excluded by looking only at
+    the text before it.
+    """
+    haystack = documented + "\n\n" + security_doc.split("### History", 1)[0]
+    assert claim.lower() not in haystack.lower(), (
+        f"a documented surface asserts {claim!r} again. It is false: open_pr "
+        f"pushes the user's source at the end of every task, and the coder "
+        f"session's egress is unbounded. See docs/security.md section 7."
     )

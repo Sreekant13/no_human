@@ -76,3 +76,82 @@ or escalates with a structured report (see [blockers.md](blockers.md)).
 - `nh eval --gate` is green and the red-team suite shows zero tamper / faked-done
   incidents.
 - `never_push_to` and `forbidden_paths` match your repo's protected surface.
+
+## 7. What leaves your machine
+
+**Read this first: no_human is not an offline tool, and this page does not claim
+to be an exhaustive list of its network traffic.** It cannot be one. The coder
+session is a Claude Agent SDK session built with **no tool restrictions** and
+`permission_mode="bypassPermissions"` (`agent/claude_backend.py:296`, `:406-416`)
+— no tool allowlist, no tool denylist, no per-call permission callback. It has
+Bash. Anything an agent decides to run — `curl`, `pip install`, `npm i`, a test
+suite that hits a staging API — leaves your machine, and nothing in no_human sits
+between it and the network. An exhaustive egress claim cannot survive that, so
+this page does not make one. If that is unacceptable for your codebase, the
+control is the machine (a container, a network policy, an egress proxy), not a
+config key here.
+
+What follows is the traffic that is **ours** — deliberate, in our code, and the
+part we are accountable for.
+
+### Deliberate, and carries your code
+
+- **Prompts to Anthropic**, on your own credential (`llm.auth_mode`). Source
+  files, diffs, test output and ticket text go into these. This is the point of
+  the tool.
+- **`git push` of the task branch to your git remote**,<!-- egress:push --> followed by opening a
+  pull request (`GitRepo.push` in `vcs/git.py`, via `open_pr` in
+  `vcs/__init__.py`, called from `Orchestrator._finalize` in
+  `core/orchestrator.py`). <!-- egress:push:no-optout -->**This ships your source to your git host, and
+  there is no key that disables it**<!-- /egress:push:no-optout --> — a task's deliverable IS the PR. This is
+  the channel that made the retired prompts-only claim false; see History
+  below. `never_push_to` (default `main`, `master`, `release/*`)
+  chooses **where** a push may land, never **whether** one happens; a branch it
+  protects is refused at the git layer (`ProtectedBranch`), and the agent is
+  denied `gh pr merge` / `glab mr merge` regardless.<!-- /egress:push -->
+- **PR body, and review comments that quote your code.** The PR body carries the
+  commit summary and test evidence; reviewer findings cite file and line and
+  quote the lines they are about. Same destination as the push.
+
+### Deliberate, and carries nothing about you
+
+- **PR receipt and status polling** — `gh` calls for the PR's head SHA,
+  mergeability (`vcs/pr_watcher.py:507-535`) and comments, plus
+  `git fetch origin` (`vcs/git.py:372-381`), while a task waits on CI or review.
+  These read; they send only the identifiers of a PR you just created.
+- **One `GET https://pypi.org/pypi/no-human/json` per day**, to notice a newer
+  release (`updates.py:39`). No identifier, no repo name, no telemetry — the
+  same request `pip install` makes. On by default (`updates.enabled: true`,
+  `interval_seconds: 86400`); off with `updates.enabled: false` in
+  `~/.no_human/config.yaml` or `NH_NO_UPDATE_CHECK=1`
+  (`updates.py:52`, which also covers CI).
+- **The desktop app checks GitHub Releases at startup**, once a day
+  (`desktop/main.mjs:612` → `desktop/updater.mjs:104`, feed
+  `provider: github, owner: eyalgolan, repo: no_human`). It never downloads on
+  its own (`autoDownload` is off). **This is a separate code path from the PyPI
+  check above and neither `NH_NO_UPDATE_CHECK` nor `updates.enabled` exists in
+  `desktop/` — those switches do not reach it.** Today the only way to stop it
+  is to not run the desktop app. That gap is a defect, not a design.
+
+### What you actually control
+
+| | |
+|---|---|
+| Which credential pays, and that only one does | `llm.auth_mode`, `nh auth use <profile>` |
+| Which branches can never be pushed to | `git.never_push_to` |
+| Which paths the agent may not touch | `forbidden_paths` |
+| Whether the CLI checks PyPI | `updates.enabled`, `NH_NO_UPDATE_CHECK=1` |
+| Whether a PR is pushed at all | **nothing — it always is** |
+| Whether the desktop app checks for updates | **nothing — don't run it** |
+| What else the coder session may reach | **nothing in-process — use the OS** |
+
+### History
+
+Until 2026-08-01 this page and the README said prompts were the only thing that
+left the machine. That was false when written: `open_pr` terminates every task.
+The first correction added the PyPI check and repeated the false claim in a new
+form ("two things, and nothing else"), which was worse — it read as an audited
+enumeration. The lesson is recorded here rather than quietly fixed: **an
+exhaustive claim about egress cannot be made about a process that gives an agent
+an unrestricted shell.** Name the channels that are yours, name the unbounded
+one, and let the reader decide.

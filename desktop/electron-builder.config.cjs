@@ -68,6 +68,29 @@ module.exports = {
     // MIT asks for the licence text to travel with substantial copies; the DMG
     // carries only the .app, so the text rides inside Contents/Resources.
     { from: "../LICENSE", to: "LICENSE" },
+    // The built bundle carried our MIT text and no notice for Electron or
+    // Chromium at all (verified on desktop/dist/mac-arm64/no_human.app).
+    //
+    // NOT because ours overwrote theirs — that was the first explanation given
+    // here and it was wrong. Electron's LICENSE and LICENSES.chromium.html live
+    // at the TOP of node_modules/electron/dist/, beside Electron.app; nothing
+    // named LICENSE has ever existed in Contents/Resources, so the line above
+    // collided with nothing. electron-builder DELETES them:
+    //   * electronMac.js:219-220 unlinkIfExists(appOutDir/LICENSE) and
+    //     (appOutDir/LICENSES.chromium.html) — appOutDir is dist/mac-arm64/,
+    //     one level ABOVE the .app;
+    //   * ElectronFramework.js:236-239 renames LICENSE -> LICENSE.electron.txt
+    //     only when NOT macOS (`isMac ? Promise.resolve() : rename(...)`), so
+    //     the step that would have preserved it never runs here.
+    // Chromium's BSD terms require the notice to be reproduced with a binary
+    // distribution, so both ride back in explicitly, at names that cannot
+    // collide with ours. Guarded by packagedFiles.test.mjs.
+    //
+    // LICENSES.chromium.html is ~14 MB on a ~140 MB DMG. That is the price of
+    // redistributing Chromium, not an oversight to trim later.
+    { from: "node_modules/electron/dist/LICENSE", to: "LICENSE.electron.txt" },
+    { from: "node_modules/electron/dist/LICENSES.chromium.html",
+      to: "LICENSES.chromium.html" },
   ],
   // Read at runtime by main.mjs (packagedSigning) and never from the live
   // environment, so a user cannot enable the update path by exporting a var.

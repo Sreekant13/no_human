@@ -93,6 +93,15 @@ _ROUTING: dict[BlockerCategory, Route] = {
     # Spending more is a human's call, never a retry's.
     BlockerCategory.BUDGET_EXHAUSTED: Route(
         TaskStatus.ESCALATED, notify_now=True, parked=False),
+    # Stagnation is the one blocker a retry provably cannot clear: it is RAISED
+    # because two consecutive attempts made no progress (orchestrator.py, review
+    # pass rate flat with a recurring specific failure). Parking needs a wake
+    # condition and there is none — nothing external will change — so the only
+    # honest route is to escalate with the report. This entry was MISSING, and
+    # `Blocker.route` is a bare `_ROUTING[category]`, so every stagnation blocker
+    # raised KeyError on the one path the stuck detector exists to serve.
+    BlockerCategory.STAGNATION: Route(
+        TaskStatus.ESCALATED, notify_now=True, parked=False),
 }
 
 

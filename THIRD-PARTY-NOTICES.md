@@ -28,8 +28,44 @@ this file does not by itself discharge.
   inside the bundle, in `Contents/Resources`.
 - It embeds a frozen Python server produced with **PyInstaller** (see below).
 
-Do not distribute a build until those notices are included. See
-[`packaging/build-installer.sh`](packaging/build-installer.sh).
+Do not distribute a build until those notices are included. They are shipped by
+`extraResources` in
+[`desktop/electron-builder.config.cjs`](desktop/electron-builder.config.cjs),
+which places Electron's licence at `Contents/Resources/LICENSE.electron.txt` and
+Chromium's at `Contents/Resources/LICENSES.chromium.html`.
+
+This paragraph previously cited `packaging/build-installer.sh`. That script
+freezes the Python server and does not build the `.app`; it contains no licence
+handling at all, and the notices were in fact **absent** from the built bundle.
+A legal obligation pointed at a mechanism that does not exist is worse than one
+with no pointer, because it reads as already discharged.
+
+**Why they were absent** — corrected 2026-08-01; the first explanation given
+here was wrong. Nothing of Electron's was overwritten. Electron ships `LICENSE`
+and `LICENSES.chromium.html` at the *top* of `node_modules/electron/dist/`,
+alongside `Electron.app` — **not** inside `Contents/Resources`, which has never
+contained a `LICENSE` at all (checked: `ls node_modules/electron/dist/` lists
+`Electron.app`, `LICENSE`, `LICENSES.chromium.html`, `version`; the same `ls`
+inside `Electron.app/Contents/Resources/` matches nothing for `licen`). So our
+`{ from: "../LICENSE", to: "LICENSE" }` never collided with anything.
+
+electron-builder *deletes* them instead, and on macOS skips the rename that
+would have kept Electron's:
+
+* `app-builder-lib/out/electron/electronMac.js:219-220` calls
+  `unlinkIfExists(appOutDir/LICENSE)` and
+  `unlinkIfExists(appOutDir/LICENSES.chromium.html)`. `appOutDir` is
+  `dist/mac-arm64/`, one level *above* the `.app` — which is why a built
+  `dist/mac-arm64/` contains `no_human.app` and nothing else.
+* `app-builder-lib/out/electron/ElectronFramework.js:236-239` renames
+  `LICENSE` to `LICENSE.electron.txt` **only when the platform is not macOS**
+  (`isMac ? Promise.resolve() : rename(...)`). On macOS that preservation step
+  never runs.
+
+So the notices are not lost to a name collision that a rename could fix; they
+are removed by the packager, and shipping them requires putting them back
+explicitly. That is what the `extraResources` entries below do, at names chosen
+so they cannot collide with our own `LICENSE`.
 
 ## PyInstaller bootloader
 
