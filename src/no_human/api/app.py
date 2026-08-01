@@ -3174,6 +3174,24 @@ if (_WEB_DIST / "index.html").is_file():
         # If they reach here, it means the route doesn't exist (404).
         if path.startswith("api/") or path.startswith("ws"):
             return PlainTextResponse(f"Not found: /{path}", status_code=404)
+        # Vite copies `web/public/` to the ROOT of dist, not under /assets, so
+        # a root-level static file (the brand mark, robots.txt, a manifest) is
+        # outside the only mounted directory and would fall through to the app
+        # shell. It did: the installed app answered /nh-mark-64.png with 601
+        # bytes of index.html, so its own favicon was broken for every user
+        # while every content check passed — the file was present, built and
+        # bundled, and simply unreachable.
+        #
+        # resolve() then a parent check, because `path` is caller-controlled:
+        # without it, `../../etc/passwd` reads outside the board directory.
+        if path:
+            candidate = (_WEB_DIST / path).resolve()
+            try:
+                inside = candidate.is_relative_to(_WEB_DIST.resolve())
+            except AttributeError:                       # py<3.9
+                inside = str(candidate).startswith(str(_WEB_DIST.resolve()))
+            if inside and candidate.is_file():
+                return FileResponse(str(candidate))
         # no-cache: index.html references content-hashed assets; without an
         # explicit header Chromium's HEURISTIC freshness serves a stale app
         # shell after every deploy (found live: the Electron shell ran a

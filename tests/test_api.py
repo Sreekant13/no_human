@@ -1133,6 +1133,39 @@ async def test_spa_index_is_no_cache(client):
     assert r.headers.get("cache-control") == "no-cache"
 
 
+async def test_root_level_static_files_are_served_not_the_app_shell(client):
+    """A file at the ROOT of the board directory must be served as itself.
+
+    Vite copies `web/public/` to the root of dist, not under /assets, and only
+    /assets was mounted — so a root-level file fell through to the SPA
+    catch-all. The installed app answered /nh-mark-64.png with 601 bytes of
+    index.html: its own favicon was broken for every user while every content
+    check passed, because the file was present, built and bundled, and simply
+    unreachable. Found by running the DMG, not by inspecting it.
+    """
+    r = await client.get("/nh-mark-64.png")
+    if r.status_code == 404:  # dist not built in this env
+        return
+    assert r.content[:8] == b"\x89PNG\r\n\x1a\n", (
+        "served something other than the PNG: " + repr(r.content[:40]))
+
+
+async def test_the_static_route_cannot_escape_the_board_directory(client):
+    """Mutation guard for the test above.
+
+    That test asserts a positive, so it would still pass if the handler served
+    ANY path off disk. `path` is caller-controlled, so serving it unresolved
+    reads outside the board directory. A traversal must fall through to the app
+    shell, not return a file.
+    """
+    r = await client.get("/../../../etc/passwd")
+    if r.status_code == 404:
+        return
+    assert b"root:" not in r.content, "path traversal served a file outside the board"
+    assert r.content.lstrip()[:9].lower() == b"<!doctype", (
+        "a traversal should fall through to the app shell")
+
+
 # --------------------- B2 #9/#10 board-truthfulness ------------------------ #
 
 async def test_task_fingerprint_sees_every_card_field(store):
