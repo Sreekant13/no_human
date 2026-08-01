@@ -6467,18 +6467,36 @@ class Orchestrator:
                 "Bearer. Never cross-wire credentials between services."
             )
 
-        # 7. Known local repos (C1, R1.3).
-        try:
-            from ..context.repo_discovery import discover_local_repos
-            repos = discover_local_repos()
-            if repos:
-                repo_lines = [f"- {name}: `{path}`" for name, path in
-                              list(repos.items())[:15]]
-                sections.append(
-                    "**Known local repos:**\n" + "\n".join(repo_lines)
-                )
-        except Exception:  # noqa: BLE001
-            pass  # best-effort — never block the pipeline
+        # 7. The repos THIS task works in (C1, R1.3).
+        #
+        # This used to be `discover_local_repos()`, which scans ~/git to depth 2
+        # and wrote up to 15 lines of `- <name>: /Users/<user>/git/<name>` into
+        # every task's instructions. Measured on the maintainer's machine: 19
+        # repositories, absolute home paths, and 8 vendor/employer terms — none
+        # of it related to the task, all of it read by the coder. `.claude/**` is
+        # _EPHEMERAL so the file never reaches a PR diff, but "the coder reads
+        # it" is precisely the threat model the memory screen exists for, and
+        # this was the same exposure unscreened and an order of magnitude wider.
+        #
+        # The legitimate use is a multi-repo task needing to find its sibling, so
+        # that is what is listed: the task's own repo and the repos it explicitly
+        # declares. A path the task already names is not a disclosure. Nothing
+        # else on the machine is anyone's business, term-clean or not — which is
+        # why this is a scope change rather than a screen.
+        task_repos: list[tuple[str, str]] = []
+        for path_str in ([task.repo_path] if task.repo_path else []) + \
+                list(task.linked_repos or []):
+            try:
+                name = Path(path_str).name
+            except (TypeError, ValueError):
+                continue
+            if name and not any(p == path_str for _, p in task_repos):
+                task_repos.append((name, path_str))
+        if len(task_repos) > 1:
+            sections.append(
+                "**Repos in this task:**\n"
+                + "\n".join(f"- {name}: `{path}`" for name, path in task_repos)
+            )
 
         # 8. Skills manifest (C6, R1.3).
         skills = getattr(self, "_discovered_skills_info", None)
