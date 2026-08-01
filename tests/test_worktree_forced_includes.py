@@ -1,0 +1,143 @@
+"""A task worktree must be able to build, or the coder cannot run anything.
+
+`web/dist` is a gitignored build artifact, and `pyproject.toml` `force-include`s
+it into both the wheel and the sdist. Hatchling raises `FileNotFoundError:
+Forced include not found` when a forced source is absent — deliberately, so a
+release cut without `npm run build` fails loudly instead of shipping a boardless
+wheel.
+
+`git worktree add` never creates a gitignored path, so in a task worktree that
+same deliberate loudness kills `uv run` / `uv build` / any editable install
+BEFORE test collection. The coder cannot run the suite at all, and the failure
+does not look like a packaging problem — it looks like a broken repo.
+
+Observed 2026-08-01: a task burned its entire lifetime budget (2.58M
+cost-weighted tokens in one attempt) without ever reaching a green run, and its
+reviewer traced the red suite to exactly this.
+
+Same class as the `node_modules` trap `_ensure_node_deps` already solves, and
+solved the same way — symlink from the source checkout rather than rebuild.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import tomllib
+from pathlib import Path
+
+import pytest
+
+from no_human.testing.runner import _ensure_forced_build_artifacts
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_pyproject_still_force_includes_something():
+    """Guards the guard: this whole file is moot if nothing is forced."""
+    cfg = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    targets = cfg["tool"]["hatch"]["build"]["targets"]
+    forced = set()
+    for target in targets.values():
+        forced.update((target.get("force-include") or {}).keys())
+    assert forced, "no force-include left — this provisioning step is dead code"
+
+
+def _worktree(tmp_path: Path) -> Path:
+    """A real `git worktree add`, because the defect IS a property of one."""
+    wt = tmp_path / "wt"
+    subprocess.run(["git", "worktree", "add", "-q", "--detach", str(wt), "HEAD"],
+                   cwd=REPO_ROOT, check=True, capture_output=True)
+    return wt
+
+
+@pytest.fixture
+def worktree(tmp_path):
+    wt = _worktree(tmp_path)
+    yield wt
+    subprocess.run(["git", "worktree", "remove", "--force", str(wt)],
+                   cwd=REPO_ROOT, capture_output=True)
+
+
+def test_a_fresh_worktree_really_is_missing_the_forced_path(worktree):
+    """The precondition. If this ever fails the defect is gone and so is the
+    reason for the code under test — better to be told than to keep a passing
+    test that proves nothing."""
+    assert not (worktree / "web" / "dist").exists()
+
+
+def test_provisioning_makes_the_forced_path_resolvable(worktree):
+    _ensure_forced_build_artifacts(worktree, REPO_ROOT)
+    dist = worktree / "web" / "dist"
+    assert dist.exists(), "forced include still missing after provisioning"
+    assert (dist / "index.html").is_file(), (
+        "linked, but the board is not readable through it")
+
+
+def test_it_is_a_link_to_the_source_not_a_copy(worktree):
+    """A copy would go stale the moment the source rebuilds, and would cost a
+    full duplicate per worktree."""
+    _ensure_forced_build_artifacts(worktree, REPO_ROOT)
+    dist = worktree / "web" / "dist"
+    assert dist.is_symlink()
+    assert dist.resolve() == (REPO_ROOT / "web" / "dist").resolve()
+
+
+def test_it_never_clobbers_a_real_directory(worktree):
+    """A worktree that built its own board keeps it."""
+    dist = worktree / "web" / "dist"
+    dist.mkdir(parents=True)
+    (dist / "index.html").write_text("<html>mine</html>")
+    _ensure_forced_build_artifacts(worktree, REPO_ROOT)
+    assert not dist.is_symlink()
+    assert (dist / "index.html").read_text() == "<html>mine</html>"
+
+
+def test_it_is_a_no_op_without_a_source_repo(worktree):
+    """`source_repo is None` means this IS the primary checkout — there is
+    nothing to borrow from and nothing to fix."""
+    _ensure_forced_build_artifacts(worktree, None)
+    assert not (worktree / "web" / "dist").exists()
+
+
+def test_it_never_raises_on_a_repo_with_no_pyproject(tmp_path):
+    """Best-effort, like the node twin: a provisioning failure must not become
+    the reason a test run fails."""
+    (tmp_path / "empty").mkdir()
+    _ensure_forced_build_artifacts(tmp_path / "empty", REPO_ROOT)  # must not raise
+
+
+def test_it_never_raises_when_the_source_has_not_built_it_either(worktree, tmp_path):
+    """Then the loud failure is CORRECT — there is genuinely no board to
+    package — so this must decline quietly rather than invent one."""
+    bare = tmp_path / "bare-source"
+    bare.mkdir()
+    _ensure_forced_build_artifacts(worktree, bare)
+    assert not (worktree / "web" / "dist").exists()
+
+
+@pytest.mark.slow
+def test_the_worktree_can_actually_build_after_provisioning(worktree, tmp_path):
+    """The claim, end to end, at the level the defect actually bit.
+
+    Every test above asserts on the filesystem; none of them proves hatchling
+    is satisfied. This runs the real build in a real worktree — first proving it
+    FAILS without provisioning, so the test cannot pass for the wrong reason.
+    """
+    import shutil
+    if shutil.which("uv") is None:
+        pytest.skip("uv is not on PATH — cannot build")
+    if not (REPO_ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("the source checkout has no built board to link")
+
+    before = subprocess.run(["uv", "build", "--wheel", "-o", str(tmp_path / "d1")],
+                            cwd=worktree, capture_output=True, text=True, timeout=600)
+    assert before.returncode != 0, (
+        "precondition failed: the worktree built WITHOUT provisioning, so this "
+        "test would pass even if the fix were removed")
+    assert "Forced include not found" in (before.stderr + before.stdout)
+
+    _ensure_forced_build_artifacts(worktree, REPO_ROOT)
+
+    after = subprocess.run(["uv", "build", "--wheel", "-o", str(tmp_path / "d2")],
+                           cwd=worktree, capture_output=True, text=True, timeout=600)
+    assert after.returncode == 0, f"build still failed:\n{after.stderr[-2000:]}"
