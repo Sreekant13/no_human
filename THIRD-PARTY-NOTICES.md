@@ -83,3 +83,49 @@ application under this repository's own terms:
 
 The bootloader is used unmodified. If it is ever modified, this exception no
 longer applies and the GPL terms govern that component.
+
+## Third-party trademarks
+
+Everything above is about *copyright* licences. This section is about *trademarks*,
+which those licences do not touch: an MIT grant over a vendor's code says nothing
+about their name or their logo, and a CC licence over a logo file does not license
+the mark it depicts.
+
+no_human integrates with products made by other companies, and names them so that
+users know what it works with. That is nominative use. Two of these acknowledgements
+are **required** by the owner rather than offered as a courtesy — GitLab's Trademark
+Guidelines §1.2.2 and the Jenkins project's trademark policy each prescribe a
+statement — and the rest are the forms the owners publish.
+
+- Jira is a trademark of Atlassian Pty Ltd.
+- GITLAB is a trademark of GitLab Inc. in the United States and other countries and
+  regions.
+- GitHub is a trademark of GitHub, Inc.
+- Slack is a trademark and service mark of Slack Technologies, Inc., registered in
+  the U.S. and in other countries.
+- Jenkins® is a registered trademark of LF Charities Inc.
+- CircleCI is a trademark or registered trademark of Circle Internet Services, Inc.
+- Claude and Anthropic are trademarks of Anthropic PBC.
+
+All other trademarks are the property of their respective owners.
+
+**no_human is an independent product. It is not affiliated with, endorsed, sponsored
+or approved by any of these companies, and nothing in this repository or in its
+marketing should be read as saying otherwise.**
+
+Two standing rules follow from this, and they are the reason this section exists
+rather than being a formality:
+
+1. **Do not ship a vendor's logo — official or redrawn — without checking that
+   vendor's current guidelines.** Redrawing a mark is not the safe option; it is the
+   worse one, because it adds a modification breach (and possibly a copyright one) to
+   the trademark question. GitLab forbids third-party logo use outright; Microsoft and
+   CircleCI require a written licence.
+2. **Do not describe no_human as a partner, an official integration, or as certified
+   by anyone.** It is none of those things.
+
+The reasoning, the clauses these lines come from, and what still needs a lawyer are
+in [`docs/INTEGRATIONS_LEGAL.md`](docs/INTEGRATIONS_LEGAL.md). The strings above were
+transcribed from vendor pages read on 2026-08-01 and should be re-checked against the
+live pages before a public release — a paraphrase in a trademark notice is worse than
+no notice.

@@ -1,54 +1,68 @@
-// Inline brand marks for the Integrations panel — no remote fetches (the
-// Electron CSP and the artifact rule both forbid them). Simple, recognizable,
-// mono-friendly marks tinted with each integration's brand color.
+// Inline glyphs for the Integrations panel — no remote fetches (the Electron CSP
+// and the artifact rule both forbid them).
+//
+// These are deliberately GENERIC CATEGORY glyphs — a ticket, a branch, a merge, a
+// build, a pipeline, a message — and NOT the vendors' marks. They used to be
+// hand-drawn approximations of the real ones (an octocat silhouette, the Slack
+// octothorpe, the tanuki, the Atlassian chevrons), which is a trademark problem and
+// not a small one: every vendor here publishes a no-modification rule, a redraw is a
+// modification however good the likeness, and this file ships inside the DMG. GitHub
+// and GitLab answer the redraw question by name — "You may not use an octocat,
+// created by GitHub or by you", and "Can I create my own version of the tanuki? No."
+// GitLab forbids third-party logo use outright. See docs/INTEGRATIONS_LEGAL.md §4.3.
+//
+// A generic glyph beside the vendor's NAME says what the row is without claiming to
+// be anyone's mark, and it needs nobody's permission. Do not "improve" these back
+// toward the real logos; if official marks are ever wanted here they are the official
+// asset files, unmodified, with permission where the vendor requires it.
 import { BRAND_COLOR } from "./integrationChip.js";
 
 const MARKS = {
-  // Jira — the stacked Atlassian chevrons.
+  // Issue tracker — a ticket with a torn stub.
   jira: (c) => (
-    <g fill="none" stroke={c} strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M4 8.5l8 8 8-8" />
-      <path d="M8 5l4 4 4-4" />
+    <g fill="none" stroke={c} strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3.5 7.5h17v3a1.8 1.8 0 0 0 0 3.6v2.9h-17v-2.9a1.8 1.8 0 0 0 0-3.6z" />
+      <path d="M9.2 10.4h6M9.2 13.6h4" />
     </g>
   ),
-  // GitHub — an octocat silhouette (head + ears + eyes).
+  // Version control — a branch.
   github: (c) => (
-    <g fill={c}>
-      <path d="M6 5.5l1.6 2.2A6 6 0 0 1 12 6.4a6 6 0 0 1 4.4 1.3L18 5.5c.9 1.4.7 3 .4 3.8A5.6 5.6 0 0 1 20 13c0 4-2.6 5.1-5 5.4.4.4.7 1 .7 2v2.1h-7.4V20c0-1 .3-1.6.7-2-2.4-.3-5-1.4-5-5.4 0-1.6.6-2.8 1.6-3.7-.3-.8-.5-2.4.4-3.4z" />
+    <g fill="none" stroke={c} strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="7" cy="5.5" r="2.2" />
+      <circle cx="7" cy="18.5" r="2.2" />
+      <circle cx="17" cy="9.5" r="2.2" />
+      <path d="M7 7.7v8.6M17 11.7v.6a3.5 3.5 0 0 1-3.5 3.5H9.6" />
     </g>
   ),
-  // GitLab — the tanuki as three triangles.
+  // Version control — a merge.
   gitlab: (c) => (
-    <g fill={c}>
-      <path d="M12 21.5l3.1-9.6H8.9L12 21.5z" opacity="0.95" />
-      <path d="M12 21.5L8.9 11.9H4.5L12 21.5z" opacity="0.75" />
-      <path d="M12 21.5l3.1-9.6h4.4L12 21.5z" opacity="0.75" />
-      <path d="M4.5 11.9L3.3 8.2a.6.6 0 0 1 .2-.7l.9-.7L6 11.9H4.5z" opacity="0.6" />
-      <path d="M19.5 11.9l1.2-3.7a.6.6 0 0 0-.2-.7l-.9-.7L18 11.9h1.5z" opacity="0.6" />
-      <path d="M6 4.9l1.5 7H16.5l1.5-7-2.5 7H8.5L6 4.9z" opacity="0.9" />
+    <g fill="none" stroke={c} strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="6.5" cy="5.5" r="2.2" />
+      <circle cx="17.5" cy="5.5" r="2.2" />
+      <circle cx="12" cy="18.5" r="2.2" />
+      <path d="M6.5 7.7v1.1a3.5 3.5 0 0 0 3.5 3.5h4a3.5 3.5 0 0 0 3.5-3.5V7.7M12 12.3v4" />
     </g>
   ),
-  // Jenkins — a build cog.
+  // CI — a build cog.
   jenkins: (c) => (
-    <g fill="none" stroke={c} strokeWidth="2">
+    <g fill="none" stroke={c} strokeWidth="1.9">
       <circle cx="12" cy="12" r="3.2" />
       <path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1" strokeLinecap="round" />
     </g>
   ),
-  // CircleCI — the ring + hub.
+  // CI — a pipeline of stages.
   circleci: (c) => (
-    <g fill="none" stroke={c} strokeWidth="2">
-      <circle cx="12" cy="12" r="8.2" />
-      <circle cx="12" cy="12" r="2.6" fill={c} stroke="none" />
+    <g fill="none" stroke={c} strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="2.6" y="8.8" width="5.4" height="6.4" rx="1.4" />
+      <rect x="16" y="8.8" width="5.4" height="6.4" rx="1.4" />
+      <path d="M8.6 12h6.8M13.2 9.9 15.5 12l-2.3 2.1" />
     </g>
   ),
-  // Slack — the octothorpe of rounded bars.
+  // Notifications — a message.
   slack: (c) => (
-    <g fill={c}>
-      <rect x="8.6" y="3.6" width="2.3" height="16.8" rx="1.15" />
-      <rect x="13.1" y="3.6" width="2.3" height="16.8" rx="1.15" />
-      <rect x="3.6" y="8.6" width="16.8" height="2.3" rx="1.15" />
-      <rect x="3.6" y="13.1" width="16.8" height="2.3" rx="1.15" />
+    <g fill="none" stroke={c} strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M20.4 14.2a2 2 0 0 1-2 2H8.9L4.6 19.6V6a2 2 0 0 1 2-2h11.8a2 2 0 0 1 2 2z" />
+      <path d="M8.4 8.9h8.2M8.4 12.1h5.4" />
     </g>
   ),
 };
