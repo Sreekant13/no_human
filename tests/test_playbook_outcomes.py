@@ -46,6 +46,26 @@ async def test_playbook_outcomes_join_usage_to_result_and_burn(store):
     assert bad["tokens_per_task"] == 5000   # the liability is visible
 
 
+async def test_an_operator_cancel_is_not_charged_to_the_playbook(store):
+    """A cancel is a WITHDRAWAL, not a verdict on the playbook.
+
+    `nh task cancel` and the board's cancel button both store `failed` plus a
+    `cancel_reason` in context; this reproduces that exact write order. Counting
+    it as `escalated_or_failed` blames the playbook for a human's decision to
+    stop — on the author's store, 6 of one playbook's 31 recorded "failures".
+    """
+    await _task_with_playbook(store, "pb", TaskStatus.ESCALATED, 100)
+    t = await _task_with_playbook(store, "pb", TaskStatus.PENDING, 100)
+    await store.merge_context(t.id, {"cancel_reason": "operator stopped it"})
+    await store.set_status(t, TaskStatus.FAILED, validate=False,
+                           human_override=True)
+
+    row = {r["playbook"]: r for r in await playbook_outcomes(store)}["pb"]
+    assert row["tasks"] == 2
+    assert row["escalated_or_failed"] == 1   # the escalation, and only it
+    assert row["cancelled"] == 1
+
+
 async def test_no_playbook_usage_yields_no_rows(store):
     t = Task.new("plain", repo_path="/r")
     await store.create_task(t)

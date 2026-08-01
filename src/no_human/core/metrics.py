@@ -190,6 +190,14 @@ async def playbook_outcomes(store) -> list[dict]:
     playbook that correlates with escalations and high spend is a liability,
     not an asset — the mined-playbook set can finally be pruned on evidence
     instead of vibes. Pure SQL over what is already recorded.
+
+    An operator cancel is stored as `failed` plus a `cancel_reason` in context
+    (`nh task cancel`, and the board's cancel button). It is a WITHDRAWAL, not
+    a verdict on the playbook, so it is counted as `cancelled` rather than
+    `escalated_or_failed` — the same `status == FAILED and cancel_reason` test
+    the read sites in `cli/commands.py` and `api/app.py` already apply. Without
+    this, a playbook is charged for every task a human chose to stop: on the
+    author's own store that was 6 of one playbook's 31 recorded "failures".
     """
     db = store.db
     cur = await db.execute(
@@ -207,7 +215,11 @@ async def playbook_outcomes(store) -> list[dict]:
                SUM(CASE WHEN t.status IN ('awaiting_approval','done')
                         THEN 1 ELSE 0 END)                      AS reached_gate,
                SUM(CASE WHEN t.status IN ('escalated','failed')
+                         AND json_extract(t.context, '$.cancel_reason') IS NULL
                         THEN 1 ELSE 0 END)                      AS escalated_or_failed,
+               SUM(CASE WHEN t.status = 'failed'
+                         AND json_extract(t.context, '$.cancel_reason') IS NOT NULL
+                        THEN 1 ELSE 0 END)                      AS cancelled,
                COALESCE(SUM(a.tokens_used + a.cache_read_tokens), 0) AS tokens,
                COUNT(a.id)                                      AS attempts
         FROM used u
