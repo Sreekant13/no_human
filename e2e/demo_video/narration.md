@@ -24,7 +24,7 @@ spoken *no human*.
 
 ### 1 · Hook — 0.60 s
 > **0.80** — It's Monday. Ten tickets just landed with your name.
-> **4.40** — A webhook that double-charges. A flaky test. And no time to babysit either.
+> **4.40** — A webhook that double-charges. A flaky test. No time to babysit either.
 
 ### 2 · Handoff — 9.00 s
 > **9.40** — You pick five. And hand them over.

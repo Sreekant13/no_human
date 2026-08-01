@@ -102,9 +102,9 @@ BEATS: tuple[Beat, ...] = (
         lines=(
             Line(0.80, "It's Monday. Ten tickets just landed with your name."),
             Line(4.40, "A webhook that double-charges. A flaky test. "
-                       "And no time to babysit either.",
+                       "No time to babysit either.",
                  spoken="A webhook that double-charges. A flaky test. "
-                        "And no time to babysit either."),
+                        "No time to babysit either."),
         ),
     ),
     Beat(
