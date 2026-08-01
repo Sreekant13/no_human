@@ -3257,6 +3257,13 @@ def logs(task_id):
                 )
                 if a.get("branch_name"):
                     console.print(f"    branch: {a['branch_name']}")
+                if a.get("resume_checkpoint_lost"):
+                    # "why did this attempt start from scratch?" is asked here
+                    # first, and nothing on the attempt row used to answer it.
+                    # Yellow, not red: the attempt is not failed.
+                    console.print(
+                        f"    [yellow]resume: "
+                        f"{escape(str(a['resume_checkpoint_lost']))}[/]")
                 if a.get("pr_url"):
                     console.print(f"    PR:     {a['pr_url']}")
                 if a.get("review_passed") is not None:

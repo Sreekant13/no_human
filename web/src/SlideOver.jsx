@@ -1744,6 +1744,7 @@ const EVENT_LABELS = {
   // checkpoint & resume (existing, unlabelled)
   checkpoint: "Checkpoint",
   resume_wip: "Resume WIP",
+  resume_checkpoint_lost: "Checkpoint lost",
   // compound tasks / lead agent (Item 5)
   decompose: "Decompose",
   compound_done: "Compound done",
@@ -2551,6 +2552,11 @@ function AttemptsTab({ task }) {
               </span>
             )}
           </div>
+          {a.resume_checkpoint_lost && (
+            <div className="attempt-resume-lost" data-testid="attempt-resume-lost">
+              {a.resume_checkpoint_lost}
+            </div>
+          )}
           {a.failure_reason && (
             <div className="test-result-fail-msg">{a.failure_reason}</div>
           )}

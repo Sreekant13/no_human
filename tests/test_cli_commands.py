@@ -408,6 +408,30 @@ def test_logs_shows_attempts(tmp_path, monkeypatch):
     assert "max_turns" in result.output
 
 
+def test_logs_names_a_resume_checkpoint_that_could_not_be_read(tmp_path, monkeypatch):
+    """`nh logs` reads ATTEMPTS, not the event stream, and it is the first place
+    a human asks "why did this attempt start from scratch?". A checkpoint the
+    orchestrator could not resume from must answer that here — and must not be
+    dressed as a failure: the attempt succeeded, it just lost prior work."""
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.DONE, title="Resumed task")
+    _seed_attempt(
+        db, task_id, status="succeeded", turns_used=7,
+        resume_checkpoint_lost=(
+            "checkpoint 5013e6c9 is no longer in the repository — this attempt "
+            "branched from main instead"),
+    )
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["logs", task_id[:8]])
+
+    assert result.exit_code == 0, result.output
+    assert "5013e6c9" in result.output, result.output
+    assert "branched from main" in result.output, result.output
+    assert "reason:" not in result.output, \
+        "a lost checkpoint is not a failure reason and must not print as one"
+
+
 def test_logs_no_attempts(tmp_path, monkeypatch):
     db = tmp_path / "test.db"
     task_id = _seed_task(db, TaskStatus.PENDING)

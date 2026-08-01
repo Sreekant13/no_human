@@ -64,7 +64,7 @@ from .prompt_blocks import (
 )
 from ..project_config import apply_repo_config, load_repo_config
 from .report_quality import report_inadequacy
-from ..vcs import GitRepo, ProtectedBranch, open_pr
+from ..vcs import GitError, GitRepo, ProtectedBranch, open_pr
 from ..vcs.receipts import verify_pr_receipt
 from . import plan_gate
 from .bounds import Bounds, QuotaExhausted, StuckDetector
@@ -2057,16 +2057,71 @@ class Orchestrator:
             checkpoint = self._resume_branch_point(repo, ctx, attempt_n)
             effective_base = base
             if checkpoint:
-                try:
-                    repo._run("rev-parse", "--verify", checkpoint, check=True)
-                    effective_base = checkpoint
+                # NOTHING PUSHES A CHECKPOINT. The only two push sites in the
+                # product are on the success path (after the review passes, so
+                # CI can fetch the branch, and inside `open_pr`), so a parked,
+                # blocked, escalated or timed-out attempt holds its work ONLY in
+                # the local object store — where a prune or a history rewrite
+                # can take it. That makes "the checkpoint is gone" a routine
+                # condition, not a theoretical one, and branching from base IS
+                # the only correct action once it happens: after a rewrite there
+                # may be nothing left to resume onto. So this never fails the
+                # attempt. It must, however, be impossible to MISS — a
+                # [WIP-BLOCKED] commit a human gated, or a [WIP-PARTIAL] the
+                # previous attempt paid tens of turns for, is being discarded,
+                # and a run that discarded it used to look exactly like one that
+                # resumed correctly.
+                if self._commit_exists(repo, checkpoint):
+                    # OUTSIDE any try: `_is_own_partial` decides whether the
+                    # zero-diff honesty gate stays armed, and a genuine bug in
+                    # it is a different failure with a different meaning than a
+                    # missing sha. It must surface, not be swallowed as "the
+                    # checkpoint is gone". (It also cannot be run BEFORE the
+                    # existence check: it reads the commit.)
                     branched_from_own_partial = self._is_own_partial(
                         repo, ctx, checkpoint)
+                    # Assigned only once every check has passed. The previous
+                    # form set it first and then ran the fallible calls, so the
+                    # `except` could not undo it — the "fall back to base" the
+                    # comment promised could not happen on that path at all.
+                    effective_base = checkpoint
                     kind = "WIP-PARTIAL" if branched_from_own_partial else "WIP-BLOCKED"
                     self.emit("resume_wip",
                               f"branching from {kind} {checkpoint[:8]}")
-                except Exception:  # noqa: BLE001 — fall back to base if it is gone
-                    pass
+                else:
+                    lost = (
+                        f"checkpoint {checkpoint[:8]} is no longer in the "
+                        f"repository — the commit it names cannot be read "
+                        f"(pruned, or dropped by a history rewrite; nothing "
+                        f"pushes checkpoints, so they live only in the local "
+                        f"object store). This attempt branched from "
+                        f"{base or repo.current_branch()} instead, so any work "
+                        f"committed on that checkpoint is NOT in it."
+                    )
+                    # `ok=False` so every surface that colours events by outcome
+                    # renders this as the loss it is, and its own kind rather
+                    # than `advisory` — `doctor.py` counts `advisory` events as
+                    # silently-degraded SUBSYSTEMS, and nothing here is degraded.
+                    self.emit("resume_checkpoint_lost", lost,
+                              ok=False, sha=checkpoint)
+                    # ...and on the ATTEMPT, because the event stream and the
+                    # attempt log are different surfaces: `nh logs` reads
+                    # attempts only, and it is the first place a human looks
+                    # when asking "why did this attempt start from scratch?".
+                    await self.store.update_attempt(
+                        attempt_id, resume_checkpoint_lost=lost)
+                    # DELIBERATELY not marked as a burnt/consumed attempt, and
+                    # deliberately not parked. The bounded loop's retry policy
+                    # keys on what an attempt DELIVERED (zero-diff, timeout,
+                    # inadequate report), and branching from base is exactly
+                    # what an ordinary un-resumed attempt does — it is a loss of
+                    # PRIOR work, not a predictor that this attempt will fail.
+                    # Nor does it repeat: once this attempt checkpoints its own
+                    # [WIP-PARTIAL], `handoff.wip_sha` names a commit created in
+                    # this same object store, which is present. Consuming the
+                    # loop's budget here would trade a recoverable condition for
+                    # a park a human has to clear, which is the honesty
+                    # regression in the other direction.
             if effective_base is None:
                 effective_base = repo.current_branch()
             if base is None:
@@ -7869,6 +7924,38 @@ SIX of them read a checkpoint and TWO do not — but do
         except Exception:  # noqa: BLE001 — unreadable ⇒ assume the unsafe side
             return True
         return subject.strip().startswith("[WIP-PARTIAL]")
+
+    @staticmethod
+    def _commit_exists(repo, sha: str) -> bool:
+        """Is ``sha`` a commit this repository can actually READ?
+
+        🔴 ``git rev-parse --verify <sha>`` is NOT an existence check, and the
+        guard this replaced used exactly that. Git accepts any full 40-hex
+        string as a well-formed object NAME and echoes it back — exit 0 —
+        without ever consulting the object store, and every checkpoint sha in
+        this system is a full 40-hex (``repo.head_sha()`` /
+        ``blocker.resume_commit``). So the check passed EVERY vanished
+        checkpoint, the "fall back to base if it is gone" branch below it was
+        unreachable for the case it was written for, and the run instead
+        emitted `resume_wip` claiming a branch point it did not have and then
+        died in `git checkout -B` with "unable to read tree".
+
+        ``^{commit}`` forces the peel, which needs the object; that is what
+        makes this an existence test rather than a syntax test.
+
+        Fails CLOSED (unreadable ⇒ absent): the caller then branches from base
+        and says so loudly, which is recoverable. Catches ``GitError`` only —
+        anything else coming out of the git layer is a bug that should surface
+        rather than be relabelled "the checkpoint is gone".
+        """
+        if not sha:
+            return False
+        try:
+            repo._run("rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}",
+                      check=True)
+            return True
+        except GitError:
+            return False
 
     @staticmethod
     def _ancestor_of(repo, ancestor: str, descendant: str) -> bool:

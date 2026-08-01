@@ -268,6 +268,14 @@ class Store:
             # auth_profile: they answer different questions — who paid, and
             # what the agent knew — and one column cannot answer both.
             "brain_watermark": "INTEGER",
+            # The checkpoint this attempt was supposed to resume from and could
+            # not, plus what it did instead. NULL on every attempt that resumed
+            # normally or never had a checkpoint, which is almost all of them.
+            # Its own column rather than `failure_reason`: the attempt is not
+            # failed — it branched from base and may well open a PR — and
+            # writing "why did this fail" on a succeeding attempt would put a
+            # red line under it on every surface that prints that column.
+            "resume_checkpoint_lost": "TEXT",
         }
         for col, decl in att_wanted.items():
             if col not in att_existing:
