@@ -19,6 +19,7 @@ other's index and branch, so the pool refuses rather than downgrading.
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 import yaml
@@ -223,7 +224,9 @@ async def test_a_default_run_works_in_a_worktree_not_the_live_checkout(
     await orch.run_task(t)
 
     assert seen["path"] != live_checkout
-    assert seen["path"] == tmp_path / "wt" / t.id
+    # One directory per RUN, under the configured root, named for the task.
+    assert seen["path"].parent == tmp_path / "wt"
+    assert seen["path"].name.startswith(t.id + ".")
     assert "# WIP" in seen["wip"], "the operator's uncommitted work survived"
 
 
@@ -300,3 +303,180 @@ async def test_a_repo_path_that_is_not_a_git_repo_fails_before_any_worktree(
     assert called == []
     assert outcome.status is TaskStatus.FAILED
     assert "not a git repo" in outcome.detail
+
+
+# --------------------------------------------------------------------------- #
+# Two attempts of ONE task overlap — and must not share a directory            #
+# --------------------------------------------------------------------------- #
+#
+# The defect: `_worktree_path` keyed the checkout on the task id alone, so every
+# attempt of a task landed in the SAME directory. Overlap is not hypothetical —
+# the scheduler's orphan recovery requeues a task whose previous process is
+# still winding down (a server restart is enough). Two processes then wrote one
+# checkout, and whichever finished first `git worktree remove`d the directory
+# the other was still working in:
+#
+#     Claude Code returned an error result: Path
+#     "/Users/…/.no_human/worktrees/<task_id>" does not exist
+#
+# Seen on four live tasks in one day; they burned 14-20M tokens across 5-8
+# attempts and delivered nothing. Serialising the attempts is NOT the fix —
+# overlap is legitimate. The shared path is the defect.
+
+
+def _finished(task):
+    from no_human.core.orchestrator import TaskOutcome
+    from no_human.core.task import TaskStatus
+
+    return TaskOutcome(task, status=TaskStatus.DONE, detail="stub")
+
+
+async def test_overlapping_attempts_of_one_task_get_separate_worktrees(
+    live_checkout, tmp_path, store,
+):
+    """Attempt A starts, attempt B starts while A is live, A finishes (and tears
+    its worktree down) — B's checkout must still be on disk and usable.
+
+    Both halves of the bug are pinned here: B's *acquire* must not delete A's
+    live checkout, and A's *teardown* must not delete B's."""
+    import asyncio
+
+    cfg = load_config(tmp_path / "config.yaml")
+    cfg.data["isolation"]["worktree_root"] = str(tmp_path / "wt")
+    orch_a = _orchestrator(store, cfg)
+    orch_b = _orchestrator(store, cfg)
+    t = await _task(store, live_checkout)
+
+    b_acquired = asyncio.Event()
+    a_torn_down = asyncio.Event()
+    seen: dict = {}
+
+    async def drive_a(task, repo):
+        seen["a"] = Path(repo.path)
+        # Hold A open until B has its own checkout, so the two really overlap.
+        await asyncio.wait_for(b_acquired.wait(), 30)
+        seen["a_alive_after_b_acquired"] = (Path(repo.path) / "calc.py").exists()
+        return _finished(task)
+
+    async def drive_b(task, repo):
+        seen["b"] = Path(repo.path)
+        b_acquired.set()
+        await asyncio.wait_for(a_torn_down.wait(), 30)
+        seen["b_alive_after_a_torn_down"] = (Path(repo.path) / "calc.py").exists()
+        return _finished(task)
+
+    orch_a._drive_watched = drive_a
+    orch_b._drive_watched = drive_b
+
+    async def _run_a():
+        try:
+            return await orch_a.run_task(t)
+        finally:
+            a_torn_down.set()
+
+    outcome_a, outcome_b = await asyncio.gather(_run_a(), orch_b.run_task(t))
+
+    assert seen["a"] != seen["b"], (
+        "both attempts were handed the SAME directory — this is the defect")
+    assert seen["a_alive_after_b_acquired"] is True, (
+        "acquiring B's worktree destroyed the checkout A was working in")
+    assert seen["b_alive_after_a_torn_down"] is True, (
+        "A's teardown removed the checkout B was still working in")
+    assert not seen["a"].exists(), "A's own worktree was not cleaned up"
+    assert outcome_a.status.value == outcome_b.status.value
+
+
+async def test_a_superseded_attempts_worktree_is_reclaimed(
+    live_checkout, tmp_path, store,
+):
+    """Disk must not fill. A directory left by a DEAD owner is reclaimed at the
+    next acquire; one owned by a live process is left strictly alone."""
+    import os
+
+    cfg = load_config(tmp_path / "config.yaml")
+    root = tmp_path / "wt"
+    cfg.data["isolation"]["worktree_root"] = str(root)
+    orch = _orchestrator(store, cfg)
+    t = await _task(store, live_checkout)
+
+    root.mkdir(parents=True)
+    # A crashed run of THIS task: owner pid long gone.
+    dead = root / f"{t.id}.4194303.aaaaaaaa"
+    (dead / "sub").mkdir(parents=True)
+    # The pre-fix directory shape, from an install that ran the old code.
+    legacy = root / t.id
+    legacy.mkdir()
+    # A live foreign owner (pid 1 is always alive and is never us).
+    live_owner = root / f"{t.id}.1.bbbbbbbb"
+    live_owner.mkdir()
+    # Another task's leftovers are none of our business.
+    other = root / "0123456789abcdef0123456789abcdef.4194303.cccccccc"
+    other.mkdir()
+    # This task's id, but no readable owner and not the one legacy shape:
+    # unprovable, so untouchable.
+    unreadable = root / f"{t.id}.notapid.dddddddd"
+    unreadable.mkdir()
+
+    seen: dict = {}
+
+    async def drive(task, repo):
+        seen["path"] = Path(repo.path)
+        seen["dead_gone"] = not dead.exists()
+        seen["legacy_gone"] = not legacy.exists()
+        seen["live_owner_kept"] = live_owner.exists()
+        seen["other_kept"] = other.exists()
+        seen["unreadable_kept"] = unreadable.exists()
+        return _finished(task)
+
+    orch._drive_watched = drive
+    await orch.run_task(t)
+
+    assert seen["dead_gone"] is True, "a crashed attempt's checkout leaks disk"
+    assert seen["legacy_gone"] is True, "the pre-fix directory shape leaks disk"
+    assert seen["live_owner_kept"] is True, (
+        "reclaimed a directory whose owner process is still alive")
+    assert seen["other_kept"] is True, "reclaimed another task's worktree"
+    assert seen["unreadable_kept"] is True, (
+        "reclaimed a directory whose owner could not be read — the reaper may "
+        "only delete what it can PROVE is dead")
+    assert seen["path"].name.startswith(t.id + "."), (
+        "the worktree name must carry the task id so the doctor can find it")
+    assert os.getpid() == int(seen["path"].name.split(".")[1]), (
+        "the owner pid must be in the name — it is what makes reclaim safe")
+
+
+# --------------------------------------------------------------------------- #
+# The naming grammar every OTHER reader of the path depends on                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_worktree_name_is_attributable_to_its_task_and_owner():
+    from no_human.config import worktree_owner
+
+    assert worktree_owner("deadbeef1234.4321.a1b2c3d4") == ("deadbeef1234", 4321)
+
+
+def test_the_pre_fix_worktree_name_still_parses():
+    """Directories in the old bare-`<task_id>` shape exist under live worktree
+    roots. They must stay attributable, or the doctor silently stops finding
+    them — a reader that compares the whole name would have."""
+    from no_human.config import worktree_owner
+
+    assert worktree_owner("deadbeef1234") == ("deadbeef1234", None)
+
+
+def test_an_unparseable_worktree_name_reports_no_owner():
+    """No owner means "cannot prove this is dead", never "safe to delete"."""
+    from no_human.config import worktree_owner
+
+    assert worktree_owner("deadbeef1234.notapid.x") == ("deadbeef1234", None)
+
+
+def test_pid_liveness_errs_toward_in_use():
+    import os
+
+    from no_human.config import pid_alive
+
+    assert pid_alive(os.getpid()) is True
+    assert pid_alive(1) is True, "a pid we cannot signal must read as in use"
+    assert pid_alive(4194303) is False

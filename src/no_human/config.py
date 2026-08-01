@@ -1044,6 +1044,51 @@ def worktree_root(config: dict[str, Any]) -> Path:
     return Path(root).expanduser() if root else (NO_HUMAN_HOME / "worktrees")
 
 
+# A worktree directory is named `<task_id>.<owner_pid>.<token>`. The three parts
+# each do one job: the task id makes the directory attributable (the doctor's
+# orphan check reads it, and so does an operator staring at the root), the owner
+# pid says which process is entitled to it, and the random token is what makes
+# the name UNIQUE PER RUN — the whole point. Before this shape the path was the
+# bare task id, so overlapping attempts of one task shared one checkout and the
+# first to finish removed the directory the other was working in.
+#
+# Directories in the OLD bare-`<task_id>` shape still exist under existing
+# worktree roots; both readers below accept them (the parse simply yields the
+# whole name) so nothing is orphaned by the rename.
+def worktree_owner(dir_name: str) -> tuple[str, int | None]:
+    """Split a worktree directory NAME into ``(task_id, owner_pid)``.
+
+    ``owner_pid`` is None for the legacy bare-``<task_id>`` shape and for any
+    name that does not parse — callers must treat "no owner" as "cannot prove a
+    live owner", never as "definitely dead"… except where the old code already
+    took the directory (see the orchestrator's reaper, which is scoped to the
+    one task it is about to run and is the same reclaim the old acquire did).
+    """
+    parts = dir_name.split(".")
+    if len(parts) >= 3 and parts[1].isdigit():
+        return parts[0], int(parts[1])
+    return parts[0], None
+
+
+def pid_alive(pid: int) -> bool:
+    """Whether *pid* names a live process.
+
+    Errs toward ALIVE. Every caller uses this to decide whether removing a
+    worktree is safe, so an unanswerable question — a pid we are not allowed to
+    signal, a platform that refuses — must read as "in use". A recycled pid
+    likewise reads as alive: that leaks a directory the doctor then reports,
+    where the opposite error deletes a checkout somebody is working in.
+    """
+    import os
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
+
+
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Recursively merge ``override`` onto a copy of ``base``."""
     merged = dict(base)

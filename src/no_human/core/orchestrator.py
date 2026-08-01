@@ -81,6 +81,29 @@ log = logging.getLogger("no_human.orchestrator")
 # .claude/** is _EPHEMERAL).
 _COPIED_SKILL_MARKER = ".nh-copied"
 
+# Worktree paths THIS PROCESS is currently running a task in. Only the reaper
+# reads it, and only to answer one question: "is this directory, which carries
+# my own pid, one I am using right now, or one my own earlier crashed run left
+# behind?" — a question `os.kill(pid, 0)` cannot answer for our own pid.
+#
+# It is NOT a lock. Nothing waits on it, nothing is excluded by it, and two
+# attempts of one task still start freely and run side by side; it only ever
+# decides what is safe to DELETE. Serialising attempts would be the wrong fix:
+# overlap is legitimate, the shared path was the defect.
+_LIVE_WORKTREES: set[str] = set()
+
+
+def _new_worktree_token() -> str:
+    """The `<owner_pid>.<token>` suffix that makes a worktree name unique per run.
+
+    The pid is in the NAME on purpose. It is the only durable record of who owns
+    a directory that survives the owning process being SIGKILLed — which is the
+    case the reclaim exists for. A sidecar file would need writing before the
+    checkout exists (or a concurrent reaper sees an unowned directory), and the
+    name is written atomically by mkdir instead."""
+    import uuid
+    return f"{os.getpid()}.{uuid.uuid4().hex[:8]}"
+
 
 def _routing_note(prof) -> str:
     """Change-scoped routing rendered for compaction-surviving files
@@ -1024,7 +1047,14 @@ class Orchestrator:
         task.context = ctx
         await self.store.update_task(task)
 
-        wt_path = self._worktree_path(task)
+        # One directory per RUN, not per task: two attempts of one task really do
+        # overlap (the scheduler's orphan recovery requeues a task whose previous
+        # process is still winding down), and a shared path meant the first to
+        # finish deleted the checkout the other was working in.
+        wt_path = self._worktree_path(task, _new_worktree_token())
+        # Reclaim this task's DEAD leftovers before adding another directory —
+        # per-run paths would otherwise leak a full checkout per crash.
+        self._reap_dead_worktrees(main_repo, task, keep=wt_path)
         try:
             repo = self._acquire_worktree(main_repo, wt_path, base)
         except Exception as exc:  # noqa: BLE001
@@ -1055,9 +1085,14 @@ class Orchestrator:
             except Exception:  # noqa: BLE001 — teardown must never crash
                 pass
             try:
+                # Only ever OUR OWN directory. `wt_path` is unique to this run,
+                # so no concurrent attempt of the same task can be inside it —
+                # that is exactly the property the per-run name buys.
                 main_repo.remove_worktree(wt_path)
             except Exception as exc:  # noqa: BLE001 — cleanup must never mask outcome
                 log.warning("worktree cleanup failed for %s: %s", task.id[:8], exc)
+            finally:
+                _LIVE_WORKTREES.discard(str(wt_path))
 
     # ------------------------ cooperative cancellation --------------------- #
 
@@ -5533,23 +5568,97 @@ class Orchestrator:
         from ..config import worktree_isolation_enabled
         return worktree_isolation_enabled(self.config)
 
-    def _worktree_path(self, task: Task) -> Path:
-        """Stable per-task worktree location outside the repo tree."""
+    def _worktree_path(self, task: Task, token: str) -> Path:
+        """Per-RUN worktree location outside the repo tree: `<task_id>.<token>`,
+        where ``token`` is `<owner_pid>.<random>` from `_new_worktree_token`.
+
+        It used to be the bare task id — stable per TASK. Two attempts of one
+        task therefore shared one checkout, which is unsafe twice over: two
+        processes wrote the same working tree, and the first to return removed
+        the directory the other was still in ("Path …/worktrees/<task_id> does
+        not exist", four live tasks in one day, 14-20M tokens delivered
+        nothing). The task id stays the FIRST component so every reader that
+        attributes a directory to a task — `config.worktree_owner`, and through
+        it the doctor's orphan check — still can."""
         from ..config import worktree_root
-        return worktree_root(self.config) / task.id
+        return worktree_root(self.config) / f"{task.id}.{token}"
+
+    def _reap_dead_worktrees(
+        self, main_repo: GitRepo, task: Task, *, keep: Path,
+    ) -> None:
+        """Reclaim directories left under the worktree root by DEAD runs of
+        *this* task. Never raises — cleanup must not be able to fail a task.
+
+        Per-run paths would otherwise leak a whole checkout every time a run is
+        killed rather than unwound (a server restart, an OOM), because nothing
+        would ever reuse the name. The old code got this for free: its acquire
+        force-removed whatever sat at the one shared path. That is also why it
+        deleted live checkouts, so the reclaim is kept and the "whatever" is
+        replaced by a liveness test.
+
+        A directory is reclaimed only when it is provably not in use:
+          * owned by a pid that no longer exists; or
+          * owned by THIS process but not in `_LIVE_WORKTREES` — our own earlier
+            run, already finished or crashed, since a live one is registered; or
+          * named EXACTLY `<task_id>` — the pre-fix shape, which only pre-fix
+            code creates and which pre-fix code already force-removed here.
+        Anything else — a live foreign pid, a recycled pid, another task's
+        directory, and any name carrying no readable owner that is not the one
+        legacy shape — is left strictly alone. The failure mode of this rule is
+        a leaked directory the doctor reports, never a deleted checkout somebody
+        is working in.
+        """
+        try:
+            from ..config import pid_alive, worktree_owner, worktree_root
+            root = worktree_root(self.config)
+            if not root.is_dir():
+                return
+            for entry in root.iterdir():
+                if not entry.is_dir() or entry == keep:
+                    continue
+                owner_task, owner_pid = worktree_owner(entry.name)
+                if owner_task != task.id:
+                    continue          # another task's business, not ours
+                if owner_pid is None:
+                    if entry.name != task.id:
+                        continue      # no readable owner and not the legacy
+                        #               shape: we cannot prove it is dead
+                    # legacy `<task_id>`: the old acquire took this one too
+                elif owner_pid == os.getpid():
+                    if str(entry) in _LIVE_WORKTREES:
+                        continue      # a concurrent attempt in THIS process
+                elif pid_alive(owner_pid):
+                    continue          # someone else is working in there
+                try:
+                    runner.terminate_running(entry)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    main_repo.remove_worktree(entry)
+                except Exception:  # noqa: BLE001 — best-effort prune
+                    pass
+                shutil.rmtree(entry, ignore_errors=True)
+                log.info("reclaimed superseded worktree %s (task %s)",
+                         entry.name, task.id[:8])
+        except Exception as exc:  # noqa: BLE001 — reclaim never fails a task
+            log.warning("worktree reclaim failed for %s: %s", task.id[:8], exc)
 
     def _acquire_worktree(self, main_repo: GitRepo, wt_path: Path, base: str) -> GitRepo:
-        """Detached worktree at ``base`` for one task. A stale worktree at the
-        path (e.g. from a crashed prior run) is pruned first so re-acquire on
-        resume is idempotent. The attempt loop creates the feature branch inside."""
-        try:
-            main_repo.remove_worktree(wt_path)
-        except Exception:  # noqa: BLE001 — best-effort prune of a stale path
-            pass
-        import shutil
-        if Path(wt_path).exists():
-            shutil.rmtree(wt_path, ignore_errors=True)
-        return main_repo.add_worktree(wt_path, base=base, detach=True)
+        """Detached worktree at ``base`` for one run of one task. The attempt
+        loop creates the feature branch inside.
+
+        There is no longer a prune of the target path: `wt_path` is unique to
+        this run, so nothing of ours can be sitting there, and the blind
+        `remove_worktree` + `rmtree` that used to run here is precisely what
+        destroyed a concurrent attempt's live checkout. Reclaiming SUPERSEDED
+        directories is `_reap_dead_worktrees`, which checks liveness first.
+
+        Registration happens after the checkout exists, and the pid is already
+        in the directory NAME, so a reaper that runs in between still sees an
+        owner (us) that is alive and leaves it alone."""
+        repo = main_repo.add_worktree(wt_path, base=base, detach=True)
+        _LIVE_WORKTREES.add(str(wt_path))
+        return repo
 
     async def _arm_attempt_budget(self, task: Task) -> None:
         """Arm the mid-attempt budget watch (B2 #2) — the third enforcement

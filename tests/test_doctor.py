@@ -200,6 +200,44 @@ async def test_orphaned_worktree_is_a_contradiction(store, tmp_path, monkeypatch
     assert not any("ORPHANED WORKTREE" in c for c in d.contradictions)
 
 
+async def test_orphaned_worktree_is_found_under_the_per_run_name(
+    store, tmp_path, monkeypatch,
+):
+    """Worktree directories are named `<task_id>.<owner_pid>.<token>` — one per
+    RUN, so two overlapping attempts of a task cannot share a checkout. The
+    orphan check has to READ that name: matching the directory against task ids
+    whole would simply have stopped finding anything, with no test failing.
+
+    It also gains a signal the per-task shape could not carry. An ACTIVE task
+    can own a leftover — killed run, live run, both on disk — and a dead owner
+    pid says which is which without guessing.
+    """
+    fake_home = tmp_path / ".no_human"
+    wt = fake_home / "worktrees"
+    dead_owner = wt / "deadbeef1234.4194303.a1b2c3d4"
+    dead_owner.mkdir(parents=True)
+    monkeypatch.setattr("no_human.config.NO_HUMAN_HOME", fake_home)
+
+    t = Task.new("crashed mid-run", repo_path="/tmp/x")
+    t.id = "deadbeef1234"
+    await store.create_task(t)
+
+    # ACTIVE task, but this directory's owner process is gone: still an orphan.
+    await store.set_status(t, TaskStatus.IMPLEMENTING, validate=False)
+    d = await diagnose(store)
+    assert any("ORPHANED WORKTREE" in c and str(dead_owner) in c
+               for c in d.contradictions), "the per-run name was not attributed"
+    assert any("owner process 4194303 is gone" in c for c in d.contradictions)
+
+    # The SAME task's live directory — owner alive — is not an orphan.
+    import os
+
+    live = wt / f"deadbeef1234.{os.getpid()}.b2c3d4e5"
+    live.mkdir()
+    d = await diagnose(store)
+    assert not any(str(live) in c for c in d.contradictions)
+
+
 async def test_done_code_review_needs_no_pr_open(store):
     """A standalone code-review finishes with cited comments, not a PR — 'done'
     without pr_open must NOT be flagged as an evidence gap for it (false positive

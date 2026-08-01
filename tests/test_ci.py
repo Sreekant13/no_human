@@ -704,7 +704,10 @@ async def test_concurrency_worktree_mode_opens_pr_and_cleans_up(bare_repo, tmp_p
     # Worktree cleaned up: only the primary checkout remains.
     main = GitRepo(bare_repo)
     assert all("/wt/" not in w for w in main.list_worktrees())
-    assert not (tmp_path / "wt" / t.id).exists()
+    # Worktree directories are named `<task_id>.<owner_pid>.<token>` — one per
+    # RUN. Probing the bare `<task_id>` path would now pass without looking at
+    # anything, so match every directory the task could have left behind.
+    assert not list((tmp_path / "wt").glob(f"{t.id}*"))
     # The agent worked in the worktree, never the primary checkout.
     assert "mul" not in (bare_repo / "calc.py").read_text()
 

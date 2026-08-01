@@ -205,11 +205,18 @@ async def diagnose(store: Store) -> Diagnosis:
         )
 
     # W2.6: orphaned worktrees. A crash between acquire and cleanup leaves a
-    # full checkout under ~/.no_human/worktrees/<task_id> holding a stale git
+    # full checkout under ~/.no_human/worktrees/ holding a stale git
     # registration in the primary repo — invisible until the next acquire
     # fails or the disk fills. A worktree whose task is not currently ACTIVE
     # is an orphan (worktrees are disposable by design; resume re-creates).
-    from .config import NO_HUMAN_HOME
+    #
+    # Directory names are `<task_id>.<owner_pid>.<token>` (one per RUN, so two
+    # overlapping attempts of a task cannot share a checkout); the pre-fix bare
+    # `<task_id>` shape still exists under older roots and `worktree_owner`
+    # parses both. Reading the name rather than comparing it whole is what keeps
+    # this check alive across the rename — matching `entry.name` against task ids
+    # would simply have stopped finding anything, silently.
+    from .config import NO_HUMAN_HOME, pid_alive, worktree_owner
     wt_root = NO_HUMAN_HOME / "worktrees"
     if wt_root.is_dir():
         # A worktree is this store's orphan only if its dir name is a task
@@ -225,11 +232,20 @@ async def diagnose(store: Store) -> Diagnosis:
         for entry in sorted(wt_root.iterdir()):
             if not entry.is_dir():
                 continue
-            st = known.get(entry.name)
-            if st is not None and st not in active_states:
+            task_id, owner_pid = worktree_owner(entry.name)
+            st = known.get(task_id)
+            if st is None:
+                continue
+            # An ACTIVE task can still own a leftover: it may be running in a
+            # different per-run directory while a killed earlier run's is still
+            # on disk. A dead owner pid settles that without guessing.
+            dead_owner = owner_pid is not None and not pid_alive(owner_pid)
+            if dead_owner or st not in active_states:
+                why = (f"its owner process {owner_pid} is gone" if dead_owner
+                       else f"its task is {st}, not active")
                 d.contradictions.append(
-                    f"ORPHANED WORKTREE: {entry} — its task is {st}, not "
-                    "active; a crashed/finished run left the checkout behind. "
+                    f"ORPHANED WORKTREE: {entry} — {why}; "
+                    "a crashed/finished run left the checkout behind. "
                     f"Remove it with `git worktree remove --force {entry}` "
                     "(from the primary repo) or delete it and "
                     "`git worktree prune`."
