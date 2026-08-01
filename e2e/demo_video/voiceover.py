@@ -190,6 +190,16 @@ def kokoro_available() -> bool:
         return r.returncode == 0 and probe.is_file() and probe.stat().st_size > 1024
 
 
+def engine_id() -> str:
+    """Which renderer will actually be used, as a cache key component.
+
+    The engine is DETECTED at build time, so the same script can produce two
+    completely different reads on two machines. A cache keyed on the script
+    alone would call those identical.
+    """
+    return f"kokoro:{KOKORO_VOICE}:{KOKORO_SPEED}" if kokoro_available() else "say"
+
+
 def build(out_dir: Path, voice: str | None = None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     if voice is None:

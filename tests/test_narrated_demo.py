@@ -286,6 +286,7 @@ def test_the_document_names_no_real_company_either():
 #: `source` field of every synthetic ticket, and naming it is the point of that
 #: beat rather than an accident.
 _DOC_PROSE_NOUNS = frozenset("""
+    And Nobody They
     All BOTH Beat CLI Close Duration Event Every FAILS GUI Gate Handed Handoff
     Hook Jira Kept Key Narration Only PASSED PRs Parallel Pause Payoff Queued
     Second Short Starts Statuses Ten Tests Timing Voice Why
@@ -569,6 +570,7 @@ def test_nothing_synthetic_impersonates_a_real_company():
 #: both passed the denylist version of this file. Against a closed set they
 #: fail without anyone having predicted them.
 _ALLOWED_PROPER_NOUNS = frozenset("""
+    And Nobody They Ten
     Each Edit Extract Files Five Hand Monday Mondays Nightly Nothing One Pick
     Rate Read Record Run Sprint Tag That The Then You Your Delivery Digest
     Order Unsubscribe Webhook Chargeback Idempotency Deflake Cap
@@ -666,7 +668,12 @@ def test_the_five_are_all_running_before_the_voice_says_five():
     agents). Both were right by their own definition and the pair was
     unreadable — a viewer counts, and one of the two numbers is then wrong.
     """
-    line = next(ln for ln in nr.LINES if "Five agents start" in ln.text)
+    # Found by TIME, not by a phrase. This is a timing assertion: what matters
+    # is that the ramp has finished before the beat that announces five, and the
+    # beat is defined by its second on the map. Keying it to wording made a copy
+    # edit throw StopIteration here — a test coupled to the thing it is not
+    # about.
+    line = next(ln for ln in nr.LINES if abs(ln.start - 17.60) < 0.01)
     assert sp.inflight_at(line.start) == 5, sp.queue_health_at(line.start)
     assert sp.queued_at(line.start) == 0
     # And it holds for the whole line, not just its first frame.

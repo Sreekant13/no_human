@@ -40,6 +40,7 @@ accessibility both want the beat named on screen.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import asyncio
 import concurrent.futures
 import shutil
@@ -205,9 +206,27 @@ def sxs_args(gui_stage: Path, cli_stage: Path, audio: Path,
 
 def cut(work: Path, out: Path, which: str = "both") -> None:
     out.mkdir(parents=True, exist_ok=True)
-    audio = work / "audio" / "narration.m4a"
-    if not audio.is_file():
-        audio = voiceover.build(work / "audio")
+    # The audio is cached so a re-cut never forces a re-record — but the cache
+    # has to know what it is a cache OF. Keyed on the script's own text plus the
+    # engine, because otherwise editing a line and re-cutting silently ships the
+    # PREVIOUS narration over the new picture, and nothing fails: the file is
+    # the right length, the captions still match, verify_sync still passes. That
+    # happened once (a neural voice replaced `say` and the render came out
+    # byte-identical to the old one), which is what this stamp is for.
+    audio_dir = work / "audio"
+    stamp = audio_dir / "script.stamp"
+    key = hashlib.sha256(
+        ("\x00".join(l.tts_text for l in nr.LINES)
+         + "\x00" + voiceover.engine_id()).encode()).hexdigest()
+    audio = audio_dir / "narration.m4a"
+    if audio.is_file() and stamp.is_file() and stamp.read_text().strip() == key:
+        print(f"[compose] audio cache HIT ({key[:12]})")
+    else:
+        if audio.is_file():
+            print(f"[compose] audio cache STALE — script or engine changed; "
+                  f"re-rendering the narration")
+        audio = voiceover.build(audio_dir)
+        stamp.write_text(key)
     bars = asyncio.run(render_bars(work / "bars"))
     plan = [name for name in ("gui", "cli") if which in (name, "both")]
     for name in plan:

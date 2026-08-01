@@ -23,46 +23,31 @@ spoken *no human*.
 ## The script (read top to bottom; times are when each line starts)
 
 ### 1 · Hook — 0.60 s
-> **0.80** — Monday. Sprint planning just handed you ten tickets.
->
-> **4.40** — A webhook bug. A flaky test. A refactor nobody wants to touch.
+> **0.80** — It's Monday. Ten tickets just landed with your name.
+> **4.40** — A webhook that double-charges. A test that fails one run in thirty.
 
 ### 2 · Handoff — 9.00 s
-> **9.40** — Pick five. Hand them to no_human.
->
-> **12.40** — Tag them in your tracker, or paste them in. That's the whole
-> handoff.
+> **9.40** — You pick five. And hand them over.
+> **12.40** — Tag them in your tracker, or paste them in. That's the whole handoff.
 
 ### 3 · Parallel — 17.00 s
-> **17.60** — Five agents start. In parallel, on real branches.
->
-> **21.80** — Each one writes a plan before it writes code. Files, approach,
-> tests. It gets held to that plan.
->
-> **29.20** — The webhook fix is already editing code. The flaky test is
-> being reproduced, not guessed at.
->
-> **35.40** — Nothing here waits for you.
+> **17.60** — Five agents pick them up, each on its own branch.
+> **21.80** — Each one writes a plan before it writes code. Files, approach, tests. It gets held to that plan.
+> **29.20** — The webhook fix is already editing code. The flaky test is being reproduced, not guessed at.
+> **35.40** — Nobody is waiting on you.
 
 ### 4 · Gate — 38.00 s
-> **38.60** — Then the gate. An independent reviewer, in a fresh context,
-> with one brief: prove this task is not done.
->
+> **38.60** — Then the gate. An independent reviewer, in a fresh context, with one brief: prove this task is not done.
 > **46.20** — It reads the diff line by line, and cites its evidence.
->
 > **50.60** — The refactor came back once. It went again. No rubber stamps.
 
 ### 5 · Payoff — 56.00 s
-> **56.40** — The result: five pull requests, each with tests and review
-> evidence attached.
->
-> **62.20** — The agent never merges. That click stays yours.
->
+> **56.40** — The result: five pull requests, each with tests and review evidence attached.
+> **62.20** — They are all still sitting there. The agent doesn't merge.
 > **66.20** — You read. You approve.
 
 ### 6 · Close — 70.00 s
-> **70.60** — no_human. Your sprint, run in parallel. You keep the merge
-> button.
+> **70.60** — no_human. Your sprint, run in parallel. You keep the merge button.
 
 ---
 

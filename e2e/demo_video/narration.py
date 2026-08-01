@@ -100,8 +100,7 @@ BEATS: tuple[Beat, ...] = (
         gui="The board, quiet: one leftover PR in Review, empty Working lane",
         cli="The shell, quiet: same one leftover task in its Review lane",
         lines=(
-            Line(0.80, "It's Monday. Ten tickets just landed with your name "
-                       "on them."),
+            Line(0.80, "It's Monday. Ten tickets just landed with your name."),
             Line(4.40, "A webhook that double-charges. A test that fails "
                        "one run in thirty.",
                  spoken="A webhook that double-charges. A test that "
@@ -114,10 +113,10 @@ BEATS: tuple[Beat, ...] = (
         gui="Five cards land in Queued/Working, Jira keys in the titles",
         cli="The same five tasks fill the shell's lanes, same keys",
         lines=(
-            Line(9.40, "So you pick five. And you just hand them over.",
-                 spoken="So you pick five. And you just... hand them over."),
+            Line(9.40, "You pick five. And hand them over.",
+                 spoken="You pick five. And... hand them over."),
             Line(12.40, "Tag them in your tracker, or paste them in. "
-                        "That's it. That's the whole handoff."),
+                        "That's the whole handoff."),
         ),
     ),
     Beat(
@@ -128,7 +127,7 @@ BEATS: tuple[Beat, ...] = (
         cli="The webhook task is selected; its event stream fills the detail "
             "pane - models, plan, edits, tests",
         lines=(
-            Line(17.60, "Five agents pick them up. In parallel, each on its own branch."),
+            Line(17.60, "Five agents pick them up, each on its own branch."),
             Line(21.80, "Each one writes a plan before it writes code. "
                         "Files, approach, tests. It gets held to that plan."),
             Line(29.20, "The webhook fix is already editing code. "
