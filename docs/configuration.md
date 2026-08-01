@@ -21,7 +21,7 @@ changes in code and not here fails the suite.
 Concurrency ships off, and `concurrency.max_workers` defaults to 2 when you turn
 it on. In the default `subscription` mode a present `ANTHROPIC_API_KEY` aborts
 startup rather than being silently ignored
-([`config.py:546`](../src/no_human/config.py)) — silently scrubbing it would hide
+([`assert_subscription_mode`](../src/no_human/config.py)) — silently scrubbing it would hide
 a misconfiguration that costs real money. In `api_key` mode the reverse holds:
 your key is the billing path and every *other* metered route is scrubbed, so a
 run bills exactly one thing and records which.

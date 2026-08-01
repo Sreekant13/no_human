@@ -256,82 +256,161 @@ def test_blocker_category_count_matches_the_enum(documented):
     )
 
 
-_SOURCE_CITATION_RE = re.compile(r"`([\w/]+\.py):(\d+)(?:-(\d+))?`")
+# A citation names a SYMBOL, not a line. Two spellings are accepted, and they
+# are the only two the docs may use:
+#
+#   1. a markdown link whose text is the symbol:  [`_make_guard_hook`](../src/...py)
+#   2. prose:  `_verify_citations` in `reviewer.py`
+#              `A`, `B` and `C` in [`core/bounds.py`](../src/...py)
+#
+# Form 2 anchors on the FILE and walks backwards over the run of backticked
+# identifiers immediately before it, so a list of symbols sharing one file is
+# captured whole rather than only its last member.
+_SYMBOL = r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?"
+_SYMBOL_LINK_RE = re.compile(
+    r"\[`(" + _SYMBOL + r")`\]\(([^)]+\.py)\)"
+)
+#: `A`, `B` and `C` in `file.py` — the file optionally wrapped in a link.
+_SYMBOL_PROSE_RE = re.compile(
+    r"((?:`" + _SYMBOL + r"`(?:,|\s+and\b|\s+)\s*)*`" + _SYMBOL + r"`)"
+    r"\s+in\s+(?:\[)?`([\w/]+\.py)`"
+)
+_BACKTICKED = re.compile(r"`(" + _SYMBOL + r")`")
+
+
+def _resolve_source(path: str) -> list[Path]:
+    """Every file a reader could land on following a cited path.
+
+    A slashed path is tried from the repo root and then from the package root
+    (``agent/guard.py`` means ``src/no_human/agent/guard.py``). A bare basename
+    must resolve to exactly ONE file under src/no_human: an ambiguous citation
+    fails rather than being skipped, because a citation the reader cannot follow
+    is the defect, not an exemption.
+    """
+    if "/" in path:
+        for base in (REPO, REPO / "src" / "no_human", REPO / "src"):
+            candidate = (base / path).resolve()
+            if candidate.exists():
+                return [candidate]
+        return []
+    return sorted((REPO / "src" / "no_human").rglob(path))
+
+
+def _defined_symbols(source: Path) -> set[str]:
+    """Module-level names, classes, and ``Class.method`` pairs defined in a file."""
+    import ast
+
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    names: set[str] = set()
+
+    def visit(node, prefix: str = "") -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(prefix + child.name)
+                # One level of nesting is enough for `Class.method`; a citation
+                # deeper than that is not a citation a reader can follow.
+                if isinstance(child, ast.ClassDef):
+                    visit(child, prefix + child.name + ".")
+            elif isinstance(child, ast.Assign):
+                for target in child.targets:
+                    if isinstance(target, ast.Name):
+                        names.add(prefix + target.id)
+            elif isinstance(child, ast.AnnAssign):
+                if isinstance(child.target, ast.Name):
+                    names.add(prefix + child.target.id)
+            elif isinstance(child, (ast.If, ast.Try)):
+                visit(child, prefix)
+
+    visit(tree)
+    return names
+
+
+def _documented_symbol_citations(text: str) -> list[tuple[str, str]]:
+    """Every (symbol, path) pair the docs cite, in either accepted spelling."""
+    cites: list[tuple[str, str]] = [
+        (sym, path) for sym, path in _SYMBOL_LINK_RE.findall(text)
+    ]
+    for group, path in _SYMBOL_PROSE_RE.findall(text):
+        for sym in _BACKTICKED.findall(group):
+            cites.append((sym, path))
+    return cites
 
 
 def test_documented_source_citations_resolve(documented):
-    """Every ``file.py:LINE`` the front page or its docs cite must exist.
+    """Every symbol the front page or its docs cite must still be defined.
 
-    RETARGET (2026-08-01), second time for this guard. The 2026-07-30 rewrite
-    pointed it at the README's 15-odd ``config.py:676``-style citations. The
-    2026-08-01 rewrite moved that whole block — the four gates, the bounded
-    loop, the limits — to ``docs/verification.md``, because a front page whose
-    job is "install and run one task" is the wrong place for line numbers.
+    RETARGET (2026-08-01), third time for this guard. It checked ``file.py:LINE``
+    citations, and could only catch a line PAST THE END of the file — its own
+    docstring said so in red: ``config.py:676 -> config.py:1`` passed. A survey
+    of all 170 line citations in tracked docs found that residual risk had gone
+    from theoretical to typical: of the 17 in docs/verification.md alone, 9
+    pointed at code with nothing to do with the sentence citing them
+    (``config.py:713-726`` was cited for ``bounds`` and landed in the planning
+    block; ``orchestrator.py:845`` was cited for budget enforcement and landed
+    in ``_emit_review``). Every one of those passed the old check.
 
-    Nothing was dropped, so this reads DOCUMENTED_SURFACES instead of the README
-    alone. The floor of 10 is unchanged and is now a floor across the union: it
-    still cannot pass vacuously, and it now also covers a citation added to the
-    config or verification page, which nothing checked before.
+    Line numbers rot on every edit above them, so the docs were converted to
+    cite SYMBOLS and this guard was converted to match. That trades a weak check
+    of a fragile thing for a strong check of a stable one: a symbol that is
+    renamed or deleted fails here by name, which is the actual defect a reader
+    hits. The floor of 10 is unchanged and still cannot pass vacuously.
 
-    RETARGET (2026-07-30). This guard was ``test_architecture_tree_lists_every_
-    package``: it pinned the README's ``src/no_human/`` tree to the filesystem so
-    the tree could not omit or invent a package. The rewrite deleted that tree
-    (PLAN.md is the architecture surface; the front page duplicated it), so the
-    enumeration it checked exists on no surface at all and cannot be pointed
-    somewhere else.
-
-    What replaces it is not a deletion. The rewrite swapped one kind of claim
-    about the source layout for another: instead of one tree, the README now
-    makes 15 individually checkable claims of the form ``config.py:676``. Those
-    are the same defect class this file exists for — "a claim about a component
-    that nobody verified" — and NOTHING checked them: ``test_local_links_resolve``
-    only sees markdown link targets, and most of these citations are bare code
-    spans with no link. Line numbers were never checked by anything at all.
-
-    Coverage traded, stated plainly: the completeness half is gone (no listing
-    claims to be exhaustive any more, so there is nothing to be incomplete
-    about). The invention half is checked per FILE and per LINE BOUND — not per
-    directory as before, but not semantically either.
-
-    🔴 What this does NOT check, so nobody over-reads a green run: that the cited
-    line says what the README says it says. `config.py:676` -> `config.py:1`
-    passes here, and review demonstrated exactly that. Only a citation past the
-    end of the file is caught. Binding a line number to its content would mean
-    restating the code in the test, which rots faster than the citation does; the
-    residual risk is a citation that drifts by a few lines after an edit above
-    it, and that is left to the human. An earlier draft of this docstring said
-    "per file AND per line number", which overstated it.
-
-    A bare basename must resolve to exactly ONE file under src/no_human. An
-    ambiguous citation fails rather than being skipped: a citation the reader
-    cannot follow is the defect, not an exemption.
+    🔴 What this still does NOT check, so nobody over-reads a green run: that the
+    cited symbol does what the prose says it does. ``_gate_verdict`` could be
+    gutted to ``return True`` and this stays green. Existence and reachability
+    are what a test can own; whether the code means what the sentence claims is
+    left to the human, as before.
     """
-    cites = _SOURCE_CITATION_RE.findall(documented)
+    cites = _documented_symbol_citations(documented)
     assert len(cites) >= 10, (
-        f"only {len(cites)} source citations found across "
+        f"only {len(cites)} symbol citations found across "
         f"{[p.name for p in DOCUMENTED_SURFACES]}; this guard is the only thing "
         f"checking them and it must not pass vacuously"
     )
     bad: list[str] = []
-    for path, start, end in cites:
-        if "/" in path:
-            hits = [REPO / path] if (REPO / path).exists() else []
-        else:
-            hits = sorted((REPO / "src" / "no_human").rglob(path))
+    for symbol, path in cites:
+        hits = _resolve_source(path)
         if len(hits) != 1:
             bad.append(
-                f"{path}:{start} resolves to {len(hits)} files"
+                f"{symbol} in {path}: path resolves to {len(hits)} files"
                 f"{' — disambiguate with a path prefix' if len(hits) > 1 else ''}"
             )
             continue
-        total = len(hits[0].read_text(encoding="utf-8").splitlines())
-        last = int(end or start)
-        if last > total:
+        defined = _defined_symbols(hits[0])
+        if symbol not in defined:
             bad.append(
-                f"{path}:{start}-{last} cites past end of file "
-                f"({hits[0].relative_to(REPO)} has {total} lines)"
+                f"{symbol} is not defined in {hits[0].relative_to(REPO)} — "
+                f"renamed or deleted, and the docs still send readers to it"
             )
-    assert not bad, "docs cite source that does not resolve:\n  " + "\n  ".join(bad)
+    assert not bad, "docs cite source symbols that do not resolve:\n  " + "\n  ".join(bad)
+
+
+# Every symbol below MUST be found by the parser above, in the file named. This
+# is the mandatory-hit half: the floor of 10 proves *something* is parsed, but
+# not that the sentences carrying the load-bearing claims are among them. A
+# rewording that moved one of these out of an accepted spelling would otherwise
+# drop it silently and still clear the floor on the others.
+MANDATORY_CITATIONS = (
+    ("_make_guard_hook", "claude_backend.py"),   # the PreToolUse safety hook
+    ("_gate_verdict", "reviewer.py"),            # verdict recomputed, not trusted
+    ("_verify_citations", "reviewer.py"),        # hallucinated-location demotion
+    ("_FORGE_MERGE", "guard.py"),                # the merge ban
+    ("DEFAULT_CONFIG", "config.py"),             # every documented default
+    ("assert_subscription_mode", "config.py"),   # one billing path per run
+)
+
+
+@pytest.mark.parametrize("symbol,basename", MANDATORY_CITATIONS)
+def test_load_bearing_claim_still_cites_its_symbol(documented, symbol, basename):
+    cited = {
+        (sym, Path(path).name) for sym, path in _documented_symbol_citations(documented)
+    }
+    assert (symbol, basename) in cited, (
+        f"no documented citation of `{symbol}` in {basename} was parsed. Either "
+        f"the claim was reworded past the two accepted citation spellings — fix "
+        f"the wording, not this list — or it was dropped, and the guard above "
+        f"was about to check one citation fewer without saying so."
+    )
 
 
 # REMOVED (2026-07-30): test_architecture_tree_lists_every_package.

@@ -24,7 +24,7 @@ Jira is supported as an opt-in server-side poller, not as an argument to
 `nh task add`.
 
 Implementation runs behind a `PreToolUse` hook
-([`claude_backend.py:143`](../src/no_human/agent/claude_backend.py)) that
+([`_make_guard_hook`](../src/no_human/agent/claude_backend.py)) that
 enforces forbidden paths, protected branches, the merge ban and a
 destructive-shell circuit breaker. A failed review loops back to implement.
 Branching, committing and pushing are done by no_human's own git code, not by
@@ -34,16 +34,18 @@ the model. The PR lands in `awaiting_approval` and waits.
 
 [`src/no_human/review/reviewer.py`](../src/no_human/review/reviewer.py) opens a
 fresh Agent SDK session with read-only tools, on a different model from the
-implementer by default (`claude-opus-5` reviewing `claude-sonnet-5`,
-[`config.py:624-626`](../src/no_human/config.py)), and tells it to refute
+implementer by default (`claude-opus-5` reviewing `claude-sonnet-5` —
+`llm.review_model` and `llm.primary_model` in
+[`DEFAULT_CONFIG`](../src/no_human/config.py)), and tells it to refute
 "done". It returns a checklist of findings with `file`, `line` and severity — a
 boolean verdict, never a score. Three things make that verdict hard to game:
 every cited location is checked against the actual tree, and a finding citing a
-location that does not exist is demoted to advisory (`reviewer.py:904`); the
-pass/fail is recomputed deterministically from the checklist rather than taken
-on the model's word (`_gate_verdict`, `reviewer.py:917`); and a reviewer that
-crashes, times out, or emits no parseable verdict fails closed
-(`reviewer.py:880`, `:1136`).
+location that does not exist is demoted to advisory (`_verify_citations` in
+`reviewer.py`); the pass/fail is recomputed deterministically from the checklist
+rather than taken on the model's word (`_gate_verdict` in `reviewer.py`); and a
+reviewer that crashes, times out, or emits no parseable verdict fails closed
+(`_parse_review_output`, `AdversarialReviewer._fast_review` and
+`AdversarialReviewer._agent_review` in `reviewer.py`).
 
 ## Deterministic lint evidence — not a gate, an input
 
@@ -70,16 +72,18 @@ takes the tests the coder says demonstrate its change, copies them into a
 worktree at the merge base, and requires them to **fail there** and **pass on
 the new tree**. A bugfix whose test also passes on the unfixed code has proved
 nothing. Default mode is `advisory`, which still enforces for a Python bugfix
-([`config.py:739-758`](../src/no_human/config.py)).
+(`repro_gate.mode` in [`DEFAULT_CONFIG`](../src/no_human/config.py)).
 
 ## When it cannot finish
 
 The loop is bounded and it is allowed to give up. `bounds.max_attempts` is 3 per
 loop, `bounds.max_turns_per_attempt` is 500, and `bounds.lifetime_attempts` is 9
-across resumes ([`config.py:713-726`](../src/no_human/config.py)). An identical
-tool call repeated in a loop (`orchestrator.py:878`) or the same agent-error
-signature seen again (`orchestrator.py:2470`) trips stuck detection, which
-resets context instead of stacking more corrections on a confused session.
+across resumes (the `bounds` block of
+[`DEFAULT_CONFIG`](../src/no_human/config.py)). An identical tool call repeated
+in a loop, or the same agent-error signature seen again, trips stuck detection —
+`StuckDetector.record_tool_call` and `StuckDetector.record` in
+[`core/bounds.py`](../src/no_human/core/bounds.py) — which resets context
+instead of stacking more corrections on a confused session.
 
 When it runs out, it does not invent a plausible diff. It classifies the blocker
 into one of ten categories — `MISSING_ACCESS`, `AMBIGUITY`, `SCOPE_EXPLOSION`,
@@ -116,10 +120,12 @@ hour to review.
 - **No dollar figure is a billed number.** Every task carries an enforced spend
   cap, and the cap is denominated in **cost-weighted** tokens, not raw ones: a
   cache read counts 0.1 of a fresh input token and a cache write 1.25
-  ([`src/no_human/core/pricing.py:43`](../src/no_human/core/pricing.py);
-  enforced at
-  `orchestrator.py:845`, and the per-task ledger sums the raw classes for
-  reporting at `metrics.py:38`). Summing the classes 1:1 measures conversation
+  (`CACHE_READ_WEIGHT` and `CACHE_CREATION_WEIGHT` in
+  [`core/pricing.py`](../src/no_human/core/pricing.py); enforced by
+  `Orchestrator._check_lifetime_budget` in
+  [`core/orchestrator.py`](../src/no_human/core/orchestrator.py), and the
+  per-task ledger sums the raw classes for reporting — `compute_metrics` in
+  [`core/metrics.py`](../src/no_human/core/metrics.py)). Summing the classes 1:1 measures conversation
   *length* rather than cost — one task was killed at "12.4M/12M tokens" having
   spent about a fourteenth of that in fresh-equivalent terms, which is why the
   cap was re-denominated on 2026-07-31. Cache reads still dominate the traffic:
@@ -138,15 +144,16 @@ hour to review.
   separate problem and not one this solves.
 - **Language coverage is uneven.** `nh onboard` auto-derives a test command for
   pytest, `npm test` and `mvn`
-  ([`onboard.py:220-261`](../src/no_human/onboard.py)); anything else you
+  ([`DeclarationDeriver`](../src/no_human/onboard.py)); anything else you
   configure by hand. The tamper guard reads Python, JS/TS and Java test files.
   The reproduction gate is pytest-only.
 
 ## The merge ban, in code
 
 `gh pr merge`, `glab mr merge` and the equivalent REST calls are denied before
-they execute ([`src/no_human/agent/guard.py:130`](../src/no_human/agent/guard.py)),
-and pushes to `main`, `master` and `release/*` are denied too — the denial is at
-[`guard.py:300`](../src/no_human/agent/guard.py), the default patterns at
-[`config.py:676`](../src/no_human/config.py). The full safety model, including
+they execute (`_FORGE_MERGE` in
+[`agent/guard.py`](../src/no_human/agent/guard.py)), and pushes to `main`,
+`master` and `release/*` are denied too, by `_push_targets_protected` and
+`evaluate` in `agent/guard.py`; the default patterns are `git.never_push_to` in
+[`DEFAULT_CONFIG`](../src/no_human/config.py). The full safety model, including
 the one-billing-path-per-run rule, is in [security.md](security.md).
