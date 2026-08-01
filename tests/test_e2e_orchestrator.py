@@ -6,6 +6,7 @@ case proves the tamper guard blocks a test-weakening change and escalates.
 """
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -26,6 +27,14 @@ from no_human.testing.repro_gate import MANIFEST as REPRO_MANIFEST
 
 def _git(cwd, *args):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _git_out(cwd, *args):
+    return subprocess.run(["git", *args], cwd=cwd, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 @pytest.fixture
@@ -147,6 +156,10 @@ async def test_receipt_survives_main_moving_after_the_push(
     def spy_open_pr(repo, branch, title, body, **kwargs):
         result = real_open_pr(repo, branch, title, body, **kwargs)
         captured["pushed_sha"] = result.pushed_sha
+        # Independent source of truth: the branch tip read directly via
+        # `git rev-parse <branch>`, NOT anything the code under test
+        # returned. This is what makes the check below non-tautological.
+        captured["branch_tip"] = _git_out(repo.path, "rev-parse", branch)
         # main moves in the SAME working tree after the push landed — e.g. a
         # human merged an unrelated PR while this task waited on CI/review.
         # repo.head_sha() now reads main's tip, not the pushed branch's head.
@@ -204,6 +217,14 @@ async def test_receipt_survives_main_moving_after_the_push(
     assert captured["local_sha"] == captured["pushed_sha"], (
         "local_sha passed to verify_pr_receipt must be the SHA captured at "
         "push time, not a HEAD re-resolved after main moved")
+    # Independent checks against the git-tracking-message regression: a real
+    # SHA, and one that matches the branch tip read separately (not merely
+    # threaded consistently through the code under test).
+    assert _SHA_RE.match(captured["pushed_sha"]), (
+        f"pushed_sha is not a 40-char lowercase-hex SHA: {captured['pushed_sha']!r}")
+    assert captured["pushed_sha"] == captured["branch_tip"], (
+        "pushed_sha must equal the branch tip read independently via "
+        f"`git rev-parse`: {captured['pushed_sha']!r} != {captured['branch_tip']!r}")
     assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
     attempts = await store.list_attempts(t.id)
     assert attempts[-1]["status"] == "succeeded"
