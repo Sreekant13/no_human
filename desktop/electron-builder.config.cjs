@@ -37,7 +37,12 @@ if (plan.fatal) {
 
 const mac = {
   category: "public.app-category.developer-tools",
-  target: ["dir", "zip"],
+  // "The DMG remains the thing a human downloads" (see the header) — but `dmg`
+  // was never in this list, so no build has ever produced one. The header
+  // described the intent; the list did not implement it. Both are needed and
+  // they are not alternatives: dropping `zip` breaks the updater exactly as the
+  // header warns, and omitting `dmg` leaves a human with a bare .app in a zip.
+  target: ["dir", "zip", "dmg"],
   // `undefined` means "auto-discover from CSC_LINK/CSC_NAME"; `null` means
   // "explicitly do not sign". They are NOT interchangeable — see signing.cjs.
   identity: plan.identity,
