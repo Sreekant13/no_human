@@ -95,6 +95,40 @@ def test_the_screen_agrees_with_the_publish_guard(screen):
         assert kept == [] and len(held) == 1, f"screen disagreed with the guard"
 
 
+def test_every_assignment_to_active_memories_goes_through_the_screen():
+    """The wiring, which the tests above cannot see.
+
+    Every test in this file calls the screen directly, so all of them pass even
+    if nothing calls it — which is the shape of guard this repo has shipped
+    before and had to come back and fix. The claim in the docstring is not "the
+    screen works", it is "memories cannot reach a prompt unscreened", and that
+    claim lives at the assignment sites.
+
+    Asserted against the real source rather than by driving the orchestrator,
+    deliberately: the point of screening at the assignment chokepoint is that a
+    FUTURE site is covered without anyone remembering this file exists. A test
+    that exercised today's two call sites would not fail when a third is added
+    unscreened, which is the regression actually worth catching.
+    """
+    import re
+    from pathlib import Path
+
+    import no_human.core.orchestrator as orch
+
+    src = Path(orch.__file__).read_text()
+    assignments = [
+        line.strip()
+        for line in src.splitlines()
+        if re.match(r"\s*self\._active_memories\s*(,[^=]*)?=", line)
+    ]
+    assert assignments, "no assignment found — this guard has stopped guarding"
+    unscreened = [a for a in assignments if "_screen_memories_for_terms" not in a]
+    assert not unscreened, (
+        "these assignments put memories into the prompt path without screening "
+        "them for banned terms:\n  " + "\n  ".join(unscreened)
+    )
+
+
 def test_a_screen_failure_keeps_the_rule_rather_than_dropping_it(monkeypatch, screen):
     """If the matcher itself raises, the rule is kept.
 
