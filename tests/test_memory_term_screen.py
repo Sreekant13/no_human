@@ -21,6 +21,7 @@ import inspect
 
 import pytest
 
+from no_human.core.orchestrator import purge_unscreened_skill_files as _purge
 from no_human.eval.vendor_terms import BANNED_TERMS, find_banned_terms
 
 
@@ -299,7 +300,7 @@ def test_a_stale_skill_file_carrying_a_term_is_removed(tmp_path):
     (skills / "clean-skill" / "SKILL.md").write_text(
         "---\nname: clean-skill\n---\n\nRun the tests first.\n")
 
-    _orch()._purge_unscreened_skill_files(skills)
+    _purge(skills)
 
     assert not (skills / "dirty-skill").exists(), "the stale dirty skill survived"
     assert (skills / "clean-skill" / "SKILL.md").is_file(), (
@@ -315,7 +316,7 @@ def test_a_term_in_the_skill_NAME_alone_is_caught(tmp_path):
     (skills / f"{term}-orient" / "SKILL.md").write_text(
         "---\nname: orient\n---\n\nNothing sensitive in this body.\n")
 
-    _orch()._purge_unscreened_skill_files(skills)
+    _purge(skills)
     assert not (skills / f"{term}-orient").exists()
 
 
@@ -330,7 +331,7 @@ def test_the_purge_touches_nothing_that_is_not_a_skill_file(tmp_path):
     other = tmp_path / "src.py"
     other.write_text(f"# {term}\n")
 
-    _orch()._purge_unscreened_skill_files(skills)
+    _purge(skills)
 
     assert bystander.is_file(), "a non-SKILL.md file was deleted"
     assert other.is_file(), "a file outside the skills dir was deleted"
@@ -339,4 +340,4 @@ def test_the_purge_touches_nothing_that_is_not_a_skill_file(tmp_path):
 def test_the_purge_never_raises_on_a_missing_directory(tmp_path):
     """It runs while preparing a task; a cleanup that aborted the run would be
     the worse failure."""
-    _orch()._purge_unscreened_skill_files(tmp_path / "nope" / "skills")
+    _purge(tmp_path / "nope" / "skills")
