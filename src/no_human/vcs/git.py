@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+from .push_hook import install_pre_push_guard
+
 
 # Patterns stripped from commit messages to prevent AI attribution leaking
 # into the repo history (the agent identity is set via git config, not trailers).
@@ -449,6 +451,14 @@ class GitRepo:
                 self._run("worktree", "add", "-b", branch, str(wt), base)
             else:
                 self._run("worktree", "add", str(wt), branch)
+        # Second enforcement point. Every agent worktree comes through here
+        # (the orchestrator's `_acquire_worktree` and the `worktree()` scope
+        # both call it), so this is where the pre-push hook goes: the string
+        # matcher in `agent/guard.py` cannot resolve `git push origin $(echo
+        # main)`, and the hook -- which reads the ref git already resolved --
+        # does not have to. Failure to install is fatal on purpose: a worktree
+        # handed to an agent without it has only the string matcher.
+        install_pre_push_guard(wt, list(self.never_push_to))
         return GitRepo(
             wt,
             identity_name=self.identity_name,

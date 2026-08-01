@@ -31,6 +31,7 @@ import fnmatch
 import re
 import shlex
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 
 WRITE_TOOLS = {"Write", "Edit", "NotebookEdit", "MultiEdit"}
 
@@ -190,6 +191,104 @@ def _push_targets_protected(cmd: str, never_push_to: list[str]) -> bool:
     return False
 
 
+# --------------------------------------------------------------------------- #
+# `git push` analysis — defence in depth under the pre-push hook.
+#
+# The matcher above is lexical, and lexical analysis cannot resolve shell
+# expansion: `git push origin $(echo main)`, `B=main; git push origin $B` and
+# `git push origin `echo main`` all reach `main` while carrying no token that
+# reads as `main`. The real fix is the per-worktree pre-push hook installed by
+# `vcs/push_hook.py`, which reads the ref git ALREADY RESOLVED. What is added
+# here is the lexical half of that pair: an argv we cannot resolve, or one that
+# disarms the hook, is refused instead of waved through.
+# --------------------------------------------------------------------------- #
+
+#: Command separators. Splitting before quote-parsing can cut inside a quoted
+#: string; a fragment produced that way simply fails the "argv[0] is git" test.
+_CMD_SEP = re.compile(r"(?:\|\||&&|[;\n|&])")
+
+#: Leading words that prefix a real command without being it.
+_WRAPPERS = frozenset({"env", "sudo", "nohup", "command", "exec", "time", "builtin"})
+
+#: `$` and backtick: command substitution, variable and arithmetic expansion.
+#: Any of them in a `git push` argv means the resolved ref is not knowable here.
+_UNRESOLVABLE = re.compile(r"[$`]")
+
+#: `--no-verify` skips pre-push hooks outright; `-c core.hooksPath=...` and
+#: `--git-dir`/`--exec-path` relocate or neuter them. A push that disables the
+#: enforcement point below this one is refused at this one.
+_HOOK_DISARM = re.compile(
+    r"--no-verify\b|core\.hookspath\b|--git-dir\b|--exec-path\b", re.IGNORECASE
+)
+
+
+def _looks_like_git_push(text: str) -> bool:
+    return bool(re.search(r"\bgit\b.*\bpush\b", text, re.DOTALL))
+
+
+def _git_push_invocations(cmd: str, _depth: int = 0) -> list[tuple[str, list[str]]]:
+    """Every `git ... push ...` invocation in ``cmd``, as (segment, argv).
+
+    Recurses one level into quoted arguments so `sh -c "git push origin $B"`
+    is analysed rather than dismissed because argv[0] is `sh`. Bounded depth —
+    a guard must not become a parser with unbounded work.
+    """
+    found: list[tuple[str, list[str]]] = []
+    for seg in _CMD_SEP.split(cmd):
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            tokens = shlex.split(seg)
+        except ValueError:
+            tokens = seg.split()
+        # strip `VAR=value` assignments and wrapper words off the front
+        i = 0
+        while i < len(tokens) and (
+            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[i])
+            or tokens[i] in _WRAPPERS
+        ):
+            i += 1
+        argv = tokens[i:]
+        if argv and PurePosixPath(argv[0]).name == "git" and "push" in argv:
+            found.append((seg, argv))
+            continue
+        if _depth < 2:
+            # `sh -c "..."`, `bash -lc "..."`, `xargs git push ...` etc.
+            for tok in argv[1:] if argv else []:
+                if _looks_like_git_push(tok):
+                    found.extend(_git_push_invocations(tok, _depth + 1))
+    return found
+
+
+def _push_denial_reason(cmd: str, never_push_to: list[str]) -> str | None:
+    """Why this command's `git push` must be denied, or None to allow it."""
+    for seg, argv in _git_push_invocations(cmd):
+        if _HOOK_DISARM.search(seg):
+            return (
+                f"push blocked: {seg}. It disables or relocates the pre-push "
+                "hook (--no-verify / core.hooksPath / --git-dir / --exec-path), "
+                "which is the check that enforces protected branches after git "
+                "has resolved the refspec. Push with a plain `git push "
+                "<remote> <branch>`."
+            )
+        if _UNRESOLVABLE.search(seg):
+            return (
+                f"push blocked: {seg}. The branch is produced by shell "
+                "expansion (`$...` or a backtick), so this guard cannot tell "
+                "which ref it resolves to and refuses rather than guess. Push "
+                "a literal branch name — e.g. `git push origin "
+                "my-task-branch` — not a substituted or variable one."
+            )
+        if _push_targets_protected(" ".join(argv), never_push_to):
+            return (
+                f"push to protected branch blocked: {seg}. Push to your own "
+                "branch and open a PR instead — pushing to the base branch is "
+                "merging without review."
+            )
+    return None
+
+
 def _line_count(path: str) -> int:
     """Lines in a file, or 0 when unknowable (missing/binary/unreadable) —
     the guard must never fail a tool call because it could not stat a file."""
@@ -296,6 +395,9 @@ def evaluate(
                 "credentials regardless of checkout. Test CLI behavior through "
                 "the test suite (CliRunner), never a live process.",
             )
+        # Kept as-is: catches `git push` spelled in ways argv analysis does not
+        # reach (inside a heredoc, an alias, a quoted fragment of a larger
+        # script). The argv analysis below is additive, never a replacement.
         if re.search(r"\bgit\s+push\b", cmd) and _push_targets_protected(
             cmd, never_push_to
         ):
@@ -305,5 +407,8 @@ def evaluate(
                 "branch and open a PR instead — pushing to the base branch is "
                 "merging without review.",
             )
+        push_reason = _push_denial_reason(cmd, never_push_to)
+        if push_reason:
+            return GuardDecision(False, push_reason)
 
     return GuardDecision(True)
