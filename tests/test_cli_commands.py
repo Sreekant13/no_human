@@ -141,6 +141,19 @@ def test_approve_unknown_id(tmp_path, monkeypatch):
     assert "no task" in result.output.lower()
 
 
+@pytest.mark.parametrize("argv", [["approve", "deadbeef"], ["review", "deadbeef"]])
+def test_unknown_id_tells_user_how_to_find_a_task_id(tmp_path, monkeypatch, argv):
+    db = tmp_path / "test.db"
+    _seed_task(db, TaskStatus.PENDING)  # ensure DB exists
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, argv)
+
+    assert result.exit_code == 1, result.output
+    assert "no task matching" in result.output
+    assert "nh task list" in result.output
+
+
 # --------------------------------------------------------------------------- #
 # nh reject                                                                    #
 # --------------------------------------------------------------------------- #

@@ -36,6 +36,16 @@ from ..notify.slack import SlackNotifier
 console = Console()
 
 
+def print_no_task_matching(task_id: str) -> None:
+    """Print the task-not-found error with a remediation hint.
+
+    ``task_id`` is user-supplied and may contain rich markup characters
+    (brackets); it is always escaped so it renders literally.
+    """
+    console.print(f"[red]no task matching[/] {escape(str(task_id))}")
+    console.print("Fix: run 'nh task list' to see task ids (a unique id prefix is enough).")
+
+
 def _server_owns_worker(config) -> bool:
     """True when an `nh start` server is up, and therefore owns the worker pool.
 
@@ -731,7 +741,7 @@ def task_context(task_id):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 return
             gatherer = ContextGatherer(build_default_sources(store, config.data))
             ctx = await gatherer.gather(t)
@@ -763,7 +773,7 @@ def task_tier(task_id):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 sys.exit(1)
             ctx = t.context or {}
             # `or {}`: config.yaml is hand-edited and a bare `llm:`/`moa_planning:`
@@ -818,7 +828,7 @@ def task_config(task_id, assignments):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 sys.exit(1)
             try:
                 applied = apply_action(t, {"set_task_config": settings}, human_override=True)
@@ -969,7 +979,7 @@ def task_show(task_id):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 return
             console.print(f"[bold]{t.id}[/]  [blue]{t.status.value}[/]  [magenta]{t.kind}[/]")
             console.print(f"title: {t.title}")
@@ -1014,7 +1024,7 @@ def task_pause(task_id, reason):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 sys.exit(1)
             if t.status in _PARKED or t.status in {TaskStatus.DONE, TaskStatus.FAILED}:
                 console.print(
@@ -1061,7 +1071,7 @@ def task_resume(task_id):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 sys.exit(1)
             if t.status not in _PARKED:
                 console.print(
@@ -1115,7 +1125,7 @@ def task_restore_approval(task_id, reason):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 sys.exit(1)
             if t.status != TaskStatus.ESCALATED:
                 console.print(f"[yellow]task is {t.status.value!r}, not "
@@ -1157,7 +1167,7 @@ def task_cancel(task_id, reason):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 sys.exit(1)
             if t.status in {TaskStatus.DONE, TaskStatus.FAILED}:
                 console.print(f"[yellow]task is already {t.status.value}[/]")
@@ -1198,7 +1208,7 @@ def task_retry(task_id):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 sys.exit(1)
             if t.status != TaskStatus.FAILED:
                 console.print(
@@ -1995,7 +2005,7 @@ def ci_gate_run(task_id, poll_interval, namespace):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 sys.exit(1)
             url = (t.context or {}).get("pr_watch")
             if not url:
@@ -2117,7 +2127,7 @@ def reply(task_id, answer, choose, run):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 sys.exit(1)
             if t.status not in _PARKED_STATES:
                 console.print(
@@ -2775,7 +2785,7 @@ def unblock(task_id, fail):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 sys.exit(1)
             if t.status == TaskStatus.DONE:
                 console.print(f"[red]task is already done[/] — cannot unblock {t.id[:8]}")
@@ -2841,7 +2851,7 @@ def approve(task_id):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 sys.exit(1)
             if t.status != TaskStatus.AWAITING_APPROVAL:
                 console.print(
@@ -2895,7 +2905,7 @@ def review_comments(task_id, post_spec):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 sys.exit(1)
             ctx = t.context or {}
             drafts = ctx.get("draft_review_comments") or []
@@ -2948,7 +2958,7 @@ def reject(task_id, reason):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 sys.exit(1)
             if t.status == TaskStatus.DONE:
                 console.print(f"[red]task is already done[/] — cannot reject {t.id[:8]}")
@@ -2982,7 +2992,7 @@ def diff(task_id):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 sys.exit(1)
             if not t.repo_path:
                 console.print("[yellow]no repo_path recorded for this task[/]")
@@ -3052,7 +3062,7 @@ def review(target, repo):
                 return
             t = await store.find_task(target)
             if not t:
-                console.print(f"[red]no task matching[/] {target}")
+                print_no_task_matching(target)
                 sys.exit(1)
             attempts = await store.list_attempts(t.id)
             attempt = next(
@@ -3093,7 +3103,7 @@ def investigate(question, repo, show_id):
             if show_id:
                 t = await store.find_task(show_id)
                 if not t:
-                    console.print(f"[red]no task matching[/] {show_id}")
+                    print_no_task_matching(show_id)
                     sys.exit(1)
                 findings = (t.context or {}).get("findings")
                 if not findings:
@@ -3130,7 +3140,7 @@ def logs(task_id):
         async with Store(config.db_path) as store:
             t = await store.find_task(task_id)
             if not t:
-                console.print(f"[red]no task matching[/] {task_id}")
+                print_no_task_matching(task_id)
                 sys.exit(1)
             console.print(
                 f"[bold]{t.id[:8]}[/] [blue]{t.status.value}[/] — {t.title}"
