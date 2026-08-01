@@ -25,10 +25,15 @@ nh task add --title "Add greet(name)" --repo /path/to/repo --criteria "returns '
 ```
 
 A positional source must be an **issue URL** — `parse_source` routes on
-`/issues/` (or `/-/issues/`) and classifies everything else as freeform, which
-`ingest_from_url` then rejects. A bare tracker key (`nh task add PROJ-42`)
-therefore prints `intake failed: not a recognized task URL/id` and exits 1; use
-`--title` to file that text as a freeform task. Pinned by
+`/issues/` (GitHub) or `/-/issues/` (GitLab) and classifies everything else as
+freeform, which `ingest_from_url` then rejects. **Anything else — including a
+bare ticket key like `PROJ-42` — is not an intake source**: the CLI prints
+`intake failed: not a recognized task URL/id` and exits 1. Use `--title` to
+file that text as a freeform task. The standalone tracker adapter that used to
+accept bare keys has been removed; the trackers below are pollers, so a key
+that exists in one arrives on its own rather than by being typed. The error
+names what IS accepted, because typing the key is the first thing a developer
+tries. Pinned by
 `tests/test_intake.py::test_a_bare_tracker_key_is_rejected_not_ingested_as_freeform`.
 
 **2. Polled trackers.** Jira and Linear are *not* `nh task add` arguments.
@@ -45,6 +50,22 @@ filter. Both are opt-in and off by default, both dedupe on
 A tracker's filter is never built from a task's own text. A transport error
 logs and is retried on the next tick; it never crashes the pool and never
 half-creates a task.
+
+### Jira
+
+- Descriptions arrive as **Atlassian Document Format** and are flattened to
+  text; checklist lines become acceptance criteria.
+- Search uses `/rest/api/3/search/jql` — the successor endpoint. The older
+  `/rest/api/3/search` is on Atlassian's deprecation path.
+- The token is `JIRA_API_TOKEN` in `~/.no_human/.env`, never in `config.yaml`
+  and never logged. Auth is Atlassian Cloud HTTP Basic `email:token`, so
+  `integrations.jira.email` must be the account the token belongs to. With
+  `enabled: true` and no token the adapter reports itself unconfigured and the
+  poller does nothing — it does not error.
+- `write_back: true` posts work-note comments and advances the issue into its
+  own workflow's In Progress / Done **status category**, resolved at runtime
+  from the issue's available transitions — never a hardcoded transition id. It
+  never closes an issue and never merges: those stay human actions.
 
 ### Linear specifics
 
@@ -87,7 +108,7 @@ never a score.
   in `context.m365.token`.
 
 ```bash
-nh task context <id>   # gather + show, no implementation run
+uv run nh task context <id>   # gather + show, no implementation run
 ```
 
 > **Teams appears twice in this document, in two unrelated roles.**
@@ -155,7 +176,59 @@ blocked by the PreToolUse hook.
 
 ## CI (`no_human/ci/`)
 
-Opt-in per project (`ci.enabled`). GitLab backend:
+Opt-in per project (`ci.enabled`). Five backends, selected by `ci.backend`.
+The **identifier in the left column is the literal string** `ci.backend` takes;
+each backend reads a different set of `ci.*` keys, and a key another backend
+needs is ignored rather than rejected, so getting the set wrong produces a
+backend that builds and then fails against the real service.
+
+| `ci.backend` | required keys | credentials (`~/.no_human/.env`) |
+|---|---|---|
+| `gitlab` | `project` (`group/subgroup/repo`), `hostname` | `GITLAB_TOKEN` |
+| `github_actions` | `repo` (`org/repo`), `workflow` | `gh auth login`, or `GH_ENTERPRISE_TOKEN` for GHE |
+| `jenkins` | `job` (path form, e.g. `job/folder/job/main`), `base_url` | `JENKINS_USER` + `JENKINS_API_TOKEN`; `SSO_USERNAME` + `SSO_PASSWORD` for `auth: cookie` |
+| `circleci` | `project` — a **project slug** `<vcs>/<org>/<repo>`, e.g. `gh/acme/svc` | `CIRCLECI_TOKEN` |
+| `ghe_checkruns` | `repo`, `hostname` | `GH_ENTERPRISE_TOKEN` |
+
+Shared keys, all optional: `mode` (`watch` — poll the pipeline your push
+already started, the default for `jenkins` and `circleci` — or `trigger`, which
+starts one), `timeout_minutes` (60), `poll_interval` (30), `max_infra_retries`
+(2), `result_parser` (`pytest`, or `surefire` for Maven), `variables`.
+
+Jenkins-only keys: `auth` (`token`, the default basic-auth mode, or `cookie`
+for controllers that reject API-token basic auth), `crumb_path`
+(`crumbIssuer/api/json`), `storage_state_path`, `cookie_auto_refresh`,
+`wake_hint`.
+
+> **CircleCI's `project` is not the GitLab `project`.** It is the slug
+> `<vcs>/<org>/<repo>` (`gh/acme/svc`), not a `group/subgroup/repo` path.
+> Copying the GitLab sample below builds a backend that then 404s on every
+> call.
+
+### How a CI result gates the loop
+
+CI runs **last**, after review, the tamper guard and the local suite have all
+passed, and the branch is pushed first so the pipeline can see it. The verdict
+routes four ways, and the difference matters because only one of them is the
+coder's problem:
+
+| verdict | what happens |
+|---|---|
+| passed | proceed to open the PR |
+| failed (real) | back to implement within `max_attempts`, with the failing jobs as evidence |
+| `infra_failure` | retry after 120 s, up to `max_infra_retries`, then escalate |
+| `access_failure` | park with a `MISSING_ACCESS` blocker naming the exact `.env` key |
+| `HumanGatedCI` | park with a wake condition — a human must start this pipeline |
+
+**A misconfigured CI does not currently escalate.** If `ci.enabled` is true but
+the backend cannot be built — a missing required key, or a misspelled
+`ci.backend` — the run proceeds with the local suite as the only gate. It is
+not silent about it: an `advisory` event names the source and the reason, and
+`nh doctor` reports `CI BACKEND UNUSABLE`. But it does not stop, so the PR is
+opened ungated. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) KI-5 before relying on
+the gate.
+
+### GitLab backend detail
 
 - **trigger** `glab api --hostname {host} --method POST projects/{enc}/pipeline
   --input body.json` with body `{"ref": {b}, "variables": [{"key","value"}…]}`

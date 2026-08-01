@@ -54,3 +54,6 @@ desktop/node_modules/
 desktop/node_modules
 web/node_modules
 desktop/dist/
+
+# The adoption harness writes its report here on every run.
+e2e/adoption/out/

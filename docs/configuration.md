@@ -47,10 +47,11 @@ credential at runtime, no_human escalates a `MISSING_ACCESS` blocker naming the
 |---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | Default `llm.auth_mode: subscription` — **required**, the coding backend's subscription auth. Create with `claude setup-token`. |
 | `ANTHROPIC_API_KEY` | Only when `llm.auth_mode: api_key` — the operator's own metered key, BYO-API-key billing (see below). Never set otherwise. |
-| `JIRA_API_TOKEN` | Jira intake (`integrations.jira.enabled`). Paired with `integrations.jira.email` as HTTP Basic auth. |
+| `JIRA_API_TOKEN` | Jira intake (`integrations.jira.enabled: true`). An Atlassian Cloud API token; auth is HTTP Basic `integrations.jira.email` + this token. See [adapters.md](adapters.md#jira). |
 | `LINEAR_API_KEY` | Linear intake (`integrations.linear.enabled`). Create at Linear → Security & access settings. |
-| `JENKINS_USER`, `JENKINS_API_TOKEN` | Repos whose CI is Jenkins (`build.example.com`) or human-gated on a `Jenkinsfile`. |
-| `CIRCLECI_TOKEN` | Repos whose CI backend is CircleCI (`integrations.circleci`). |
+| `JENKINS_USER`, `JENKINS_API_TOKEN` | Repos whose CI is Jenkins (`build.example.com`) or human-gated on a `Jenkinsfile`. Basic auth — the default `ci.auth: token` mode. |
+| `SSO_USERNAME`, `SSO_PASSWORD` | Jenkins controllers that reject API-token basic auth, i.e. `ci.auth: cookie`. Used once to capture a session cookie. |
+| `CIRCLECI_TOKEN` | `ci.backend: circleci`. A CircleCI personal API token; sent as the `Circle-Token` header. |
 | `GITLAB_TOKEN` | Repos whose CI backend is GitLab, or whose VCS host is a GitLab. |
 | `GH_ENTERPRISE_TOKEN` | Opening PRs against a GitHub-Enterprise host (e.g. `code.example.com`). Public `github.com` uses `gh auth login` instead. |
 | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` | Only for the opt-in Slack Socket-Mode **intake** worker (`integrations.slack.intake`). Unrelated to notify-out. |
@@ -154,14 +155,33 @@ blockers:                         # Part 22
 
 ci:                               # opt-in; the install-wide fallback (see below)
   enabled: false
+  # One of: gitlab | github_actions | jenkins | circleci | ghe_checkruns.
+  # Each reads a DIFFERENT required key — see docs/adapters.md#ci-no_humanci for the
+  # per-backend table. A key another backend needs is ignored, not rejected.
   backend: gitlab
-  project: ""                     # e.g. "group/subgroup/repo"
+  project: ""                     # gitlab: "group/subgroup/repo"
+                                  # circleci: the slug "<vcs>/<org>/<repo>",
+                                  #   e.g. "gh/acme/svc" — NOT a path
+  # repo: "org/repo"              # github_actions / ghe_checkruns
+  # workflow: "ci.yml"            # github_actions
+  # job: "job/folder/job/main"    # jenkins
+  # base_url: https://build.example.com   # jenkins — required, the default is
+                                  #   a placeholder and will not resolve
+  # auth: token                   # jenkins: token (basic) | cookie (SSO)
   hostname: gitlab.acme.net
+  mode: watch                     # watch = poll the pipeline your push started
+                                  # trigger = start one (jenkins/circleci opt-in)
   variables: {}                   # extra pipeline variables (POST body array)
   timeout_minutes: 60
   max_infra_retries: 2            # retry infra failures after 120s, max 2
   poll_interval: 30
   result_parser: pytest           # or "surefire" for Maven
+
+  # NOTE: if `enabled` is true but the chosen backend cannot be built — a
+  # missing required key above, or a misspelled `backend` — the run proceeds
+  # with the LOCAL test suite as its only gate. It is no longer silent about
+  # that (see "which source wins" below), but it does not stop either. Whether
+  # it SHOULD stop is open: docs/KNOWN_ISSUES.md KI-5.
 
 ci_gate:                          # post-PR CI gate (WakeWatcher rung 5)
   enabled: false                  # `nh ci-gate run <task>` force-enables for one run

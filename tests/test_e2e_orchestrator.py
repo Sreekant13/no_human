@@ -4835,3 +4835,114 @@ async def test_single_command_failure_stuck_note_precedes_excerpt_block(
     assert "Root Cause Here" in detail
     assert detail.index(note) < detail.index("Root Cause Here"), (
         "stuck note must precede the excerpt block")
+
+
+# --------------------------------------------------------------------------- #
+# A config that ASKS for CI but cannot build a backend must not be silent       #
+# --------------------------------------------------------------------------- #
+
+async def test_a_ci_block_that_cannot_build_a_backend_is_announced(bare_repo, tmp_path, store):
+    """`ci.enabled: true` + no pipeline target must not pass unremarked.
+
+    Two defects met here, and both were found by the adoption harness before
+    either was fixed. `ci_from_config` returns None — not an error — when the
+    selected backend's required key is absent (KNOWN_ISSUES KI-5), and the
+    global `ci:` block that `docs/configuration.md` documents was read by
+    nothing at all, so the documented way to configure a gate produced no gate
+    and no diagnostic. A user who configured CI, got one key wrong, and was
+    therefore NOT gated, saw nothing: no event, no blocker, and a `ci_skipped`
+    message saying "no remote CI configured" — the opposite of what happened.
+
+    `Orchestrator._resolve_ci_runner` now reads the global block and emits an
+    `advisory` when a source claims CI and cannot be built. This asserts that
+    end to end, through `run_task`, from the config a user actually writes —
+    the unit tests for the resolver live in `tests/test_ci.py`, and a resolver
+    that is right in isolation is not the same claim as a run that reports it.
+
+    The gate itself is deliberately unchanged; that decision is KI-5's own
+    item. What is asserted here is that the situation is VISIBLE, because
+    invisibility is what let it survive.
+    """
+    def mutate(cwd):
+        (cwd / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+        (cwd / "test_calc.py").write_text(
+            "from calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n")
+
+    cfg = _config(tmp_path)
+    # Exactly what docs/configuration.md tells a user to write, minus the one
+    # key GitLab needs. This is the shape that used to be read by nothing.
+    cfg.data["ci"] = {"enabled": True, "backend": "gitlab",
+                      "hostname": "gitlab.example"}
+
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add add()", repo_path=str(bare_repo))
+    await store.create_task(t)
+    await orch.run_task(t)
+
+    kinds = [e["kind"] for e in events]
+    advisories = [e for e in events if e["kind"] == "advisory"
+                  and "CI backend configured" in e.get("text", "")]
+    assert advisories, (
+        "a global `ci:` block asking for CI whose backend could not be built "
+        "produced no advisory — this is exactly the silence KI-5 is about\n"
+        f"events: {kinds}")
+    text = advisories[0]["text"]
+    # The message has to name the origin and the cause, or it is a different
+    # kind of silence: "something is wrong somewhere" is not actionable.
+    assert "global config" in text, text
+    assert "gitlab" in text, text
+    assert "NO CI gate" in text, text
+
+    # And the honest-reporting event must no longer claim CI was unconfigured.
+    skipped = [e for e in events if e["kind"] == "ci_skipped"]
+    if skipped:
+        assert "no remote CI configured" not in skipped[0]["text"], (
+            "`ci_skipped` still claims CI was not configured, on a run where it "
+            "WAS configured and merely unbuildable")
+
+
+async def test_no_ci_block_at_all_stays_silent_and_proceeds(bare_repo, tmp_path, store):
+    """The negative control, without which the test above proves nothing.
+
+    A repo with no `ci` block has not asked for anything, so it must NOT get the
+    advisory. If it fired for every ungated repo it would be noise within a week
+    and would be muted, which is how the original defect became invisible in the
+    first place. `DEFAULT_CONFIG["ci"]["enabled"]` is False, so this is also the
+    assertion that an install which never configured CI is unaffected by the
+    resolver reading the global block at all.
+    """
+    from no_human.profile import ProjectProfile
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+        (cwd / "test_calc.py").write_text(
+            "from calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n")
+
+    prof = ProjectProfile(
+        repo_path=str(bare_repo), ecosystem="python-pytest",
+        test_cmd="pytest -q", derived_from=["test"],
+        proven={"test_cmd": True}, confirmed=True,
+    )
+    await store.upsert_profile(prof)
+
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add add()", repo_path=str(bare_repo))
+    await store.create_task(t)
+    await orch.run_task(t)
+
+    kinds = [e["kind"] for e in events]
+    ci_advisories = [e for e in events if e["kind"] == "advisory"
+                     and "CI backend configured" in e.get("text", "")]
+    assert not ci_advisories, (
+        "the advisory fired for a repo that never asked for CI — it would "
+        f"become noise and be ignored\nevents: {[e['text'] for e in ci_advisories]}")
+    # ...and prove the branch that WOULD emit was actually reached, so this
+    # control cannot pass merely because the run stopped early.
+    assert "profile" in kinds, (
+        "the profile was never loaded, so this run never reached the code that "
+        f"decides whether to emit — the control proves nothing\nevents: {kinds}")

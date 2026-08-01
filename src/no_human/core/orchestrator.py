@@ -3393,9 +3393,16 @@ class Orchestrator:
             # Surface that honestly (constraint #4): a local pass is necessary
             # but is not a remote-CI pass — the human must know the change was
             # not gated on CI when they approve the PR.
+            # NOTE the wording: "no remote CI RAN", not "none was configured".
+            # A repo that ASKED for CI — in its profile or in the global `ci:`
+            # block — and whose backend could not be built lands here too, and
+            # this event used to tell that user the opposite of what had
+            # happened. `_resolve_ci_runner` carries the reason in that case:
+            # it emits an `advisory` naming the origin and why the backend was
+            # unusable, which `nh doctor` counts under advisory_degradations.
             self.emit(
                 "ci_skipped",
-                "no remote CI configured — gated on the repo's local test suite "
+                "no remote CI ran — gated on the repo's local test suite "
                 "only (a local pass is necessary, not a remote-CI pass)",
                 remote_ci=False,
             )

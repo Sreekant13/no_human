@@ -898,6 +898,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": False,
     },
     "ci": {
+        # The install-wide FALLBACK. `Orchestrator._resolve_ci_runner` reads
+        # this block when the project profile names no pipeline target; the
+        # profile wins when it does, because it describes one repo and this
+        # describes every repo the install touches. Read that method for the
+        # precedence rules and docs/configuration.md for the user-facing
+        # version. Until 2026-08-02 nothing read this at all — a user who
+        # configured CI exactly as documented got no gate and no diagnostic —
+        # so if you are changing the resolver, that is the regression to avoid.
+        #
         # Opt-in per project. Set enabled=true and provide project path.
         "enabled": False,
         "backend": "gitlab",      # gitlab | github_actions | jenkins | circleci

@@ -1,0 +1,41 @@
+{
+  "_what_this_is": "The known-findings ratchet. The daily run fails on a NEW fatal or high finding relative to this file, and reports findings that have since been resolved as a non-blocking note. It does not cap the NUMBER of findings: a count-based gate drifts upward one finding at a time and never fails.",
+  "_how_to_refresh": "Deliberately, in the commit that fixes or accepts something — never to turn a red run green. Copy the `findings` array out of e2e/adoption/out/adoption-report.json after a run you have read.",
+  "recorded": "2026-08-02",
+  "product_commit": "79123aa9",
+  "mode": "smoke",
+  "findings": [
+    {
+      "ticket": "ADOPT-27",
+      "severity": "high",
+      "persona": "Marco",
+      "step": "ci-misconfig-is-not-silently-no-gate",
+      "summary": "4 CI misconfigurations (circleci_missing_slug, github_actions_missing_repo, gitlab_missing_project, jenkins_missing_job) make `ci_from_config` return None rather than raise. A user who set `ci.enabled: true`, asked for a gate, and got one config key wrong still has NO GATE: the run proceeds and opens a PR having never been gated on CI. That part is unchanged and is what this finding is about. What HAS changed (2026-08-02) is that it is no longer silent: `Orchestrator._resolve_ci_runner` emits an `advisory` naming the source and the reason, `nh doctor` counts it under advisory_degradations and reports it statically, and `ci_skipped` no longer claims CI was unconfigured. So the user can now find out — but only by looking. Whether this should ESCALATE and stop the run instead of proceeding ungated is the open question, tracked as KI-5.",
+      "tracked_as": "docs/KNOWN_ISSUES.md KI-5 — accepted deliberately: the silence is fixed (advisory + nh doctor), and whether this should ESCALATE is its own review"
+    },
+    {
+      "ticket": "ADOPT-3",
+      "severity": "medium",
+      "persona": "Dana",
+      "step": "nh-init-noninteractive",
+      "summary": "`nh init` is interactive-only — there is no --yes/--non-interactive flag and no documented way to produce a working ~/.no_human without a TTY. A team that wants every developer's machine set up the same way has to reverse-engineer config.yaml from the source.",
+      "tracked_as": "docs/KNOWN_ISSUES.md KI-2"
+    },
+    {
+      "ticket": "ADOPT-17",
+      "severity": "medium",
+      "persona": "Sam",
+      "step": "serve-help",
+      "summary": "`nh serve` has no drain-and-exit mode: it runs until interrupted, and its only option is --max-workers. There is therefore no supported way to run 'work the queue, then stop' from a script, a CI job or a cron entry, and no exit code that says whether the queue drained. Anyone automating the overnight drain the quickstart recommends has to supervise the process themselves and poll `nh status --json` to know when to stop it.",
+      "tracked_as": "docs/KNOWN_ISSUES.md KI-3"
+    },
+    {
+      "ticket": "ADOPT-4",
+      "severity": "low",
+      "persona": "Dana",
+      "step": "doctor",
+      "summary": "`nh doctor` is the one command that tells a new user whether the install is real, and it is named in neither the README nor the quickstart. It is also the natural place to surface the two problems above and does not.",
+      "tracked_as": ""
+    }
+  ]
+}

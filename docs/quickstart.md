@@ -21,20 +21,26 @@ uv sync
 ```
 
 `uv sync` installs the `nh` entry point into `.venv/bin/nh`. It does **not** put
-`nh` on your `PATH`, so every command below is written as `uv run nh …`. To type
-a bare `nh` instead, either install it as a tool —
+`nh` on your `PATH`, so every command below is written as `uv run nh …`. If you
+would rather type a bare `nh`, either install it as a tool —
 
 ```bash
 uv tool install --editable .      # then `nh` works from anywhere
 ```
 
-— or activate the venv (`source .venv/bin/activate`) in each shell.
+— or activate the venv once per shell (`source .venv/bin/activate`) and drop
+the `uv run` prefix everywhere.
 
 ## 3. Run `nh init`
 
 ```bash
 uv run nh init
 ```
+
+`nh init` is an interactive wizard: it asks how you want to pay for Claude and
+walks you through the token. There is currently no non-interactive/`--yes` mode,
+so it cannot be run from a provisioning script or over a pipe — see
+[docs/KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
 This guided wizard will:
 - Check that python, git, uv, and claude CLI are installed
@@ -47,19 +53,21 @@ This guided wizard will:
 ## 4. Add your first task
 
 ```bash
-# From a GitHub/GitLab issue URL:
-uv run nh task add https://github.com/org/repo/issues/42 --repo ~/git/my-repo
+# From a freeform title (works with no tracker at all):
+uv run nh task add --title "Fix the flaky E2E test" --repo ~/git/my-repo \
+  --description "..." --criteria "the test passes 20 runs in a row"
 
-# From a freeform title:
-uv run nh task add --title "Fix the flaky E2E test" --repo ~/git/my-repo
+# From a GitHub or GitLab issue URL:
+uv run nh task add https://github.com/org/repo/issues/42 --repo ~/git/my-repo
 ```
 
-`nh task add` takes an issue **URL** or a freeform title. A bare tracker key
-(`PROJ-42`) is **rejected**: `ingest_from_url` raises
-`not a recognized task URL/id`, the CLI prints `intake failed:` and exits 1.
-Use `--title` if you want that text as a freeform task. Jira is supported as an
-opt-in server-side **poller**, not as an argument here — see
-[adapters.md](adapters.md).
+`nh task add` takes **a GitHub/GitLab issue URL, or `--title`**. A bare
+ticket key such as `PROJ-42` is *not* a supported argument: `ingest_from_url`
+raises, the CLI prints `intake failed: not a recognized task URL/id` and exits
+1 — the standalone tracker adapter that once accepted it has been removed. Use
+`--title` if you want that text as a freeform task. Jira issues come in through
+the **poller** instead, not through `nh task add`; see
+[adapters.md](adapters.md#jira) for the `integrations.jira` config block.
 
 ## 5. Run one in the foreground
 
@@ -73,8 +81,8 @@ This opens a live Textual TUI showing tool calls, agent reasoning, and progress.
 > not a read-only viewer (`cli/commands.py`: "Run a staged task in the live
 > Textual TUI"). Point it only at a *staged* task. Do **not** point it at one
 > that `nh start`'s worker is already working, or the task runs twice. To just
-> look at a running task, use `nh status`, `nh logs <task-id>`, or the web
-> board.
+> look at a running task, use `uv run nh status`, `uv run nh logs <task-id>`,
+> or the web board.
 
 ## 6. Check on tasks
 
@@ -151,8 +159,14 @@ to `llm.auth_mode: api_key` to bill that key deliberately.
 → Run `claude setup-token`, then add the token to `~/.no_human/.env`
 
 **`no profile to confirm`**
-→ Run `uv run nh onboard <repo>` first, then `uv run nh onboard <repo> --confirm`
+→ Run `uv run nh onboard <repo>` first, then `uv run nh onboard <repo> --confirm`.
+If the proving step prints `[FAILED] test: … (exit N)`, run that command yourself
+in the repo to see the real error — onboarding does not yet show it.
 
 **`intake failed: not a recognized task URL/id`**
 → `nh task add` takes an issue URL or `--title "…"`. A bare tracker key is not
 an accepted argument; see step 4.
+
+**`nh: command not found`**
+→ `uv sync` installs `nh` into `.venv`, not onto your `PATH`. Use `uv run nh …`,
+or `source .venv/bin/activate` once per shell.
