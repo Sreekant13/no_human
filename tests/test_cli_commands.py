@@ -341,6 +341,50 @@ def test_review_no_checklist(tmp_path, monkeypatch):
     assert "no review" in result.output.lower()
 
 
+def test_review_checklist_escapes_model_authored_markup(tmp_path, monkeypatch):
+    # A reviewer-authored label/evidence containing ALPHABETIC bracket tags must
+    # survive to the terminal literally — rich only eats alphabetic tags, so a
+    # numeric payload like "high[2]" is inert and proves nothing (per the task).
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.DONE)
+    label = "a[b]c [dim]hidden[/] end"
+    evidence = "before [red]boom[/] after"
+    checklist = {
+        "passed": True,
+        "items": [
+            {"label": label, "passed": True, "evidence": evidence},
+        ],
+    }
+    _seed_attempt(db, task_id, review_checklist=checklist, review_passed=1)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["review", task_id[:8]])
+
+    assert result.exit_code == 0, result.output
+    assert label in result.output
+    assert evidence in result.output
+
+
+def test_investigate_show_escapes_model_authored_findings(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.DONE)
+    findings = "root cause: [bold]x[/] is unguarded"
+
+    async def _set_findings():
+        async with Store(db) as s:
+            t = await s.find_task(task_id)
+            t.context = {"findings": findings}
+            await s.update_task(t)
+    asyncio.run(_set_findings())
+
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["investigate", "--show", task_id[:8]])
+
+    assert result.exit_code == 0, result.output
+    assert findings in result.output
+
+
 # --------------------------------------------------------------------------- #
 # nh logs                                                                      #
 # --------------------------------------------------------------------------- #

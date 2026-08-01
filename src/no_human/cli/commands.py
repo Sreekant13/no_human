@@ -3079,9 +3079,11 @@ def review(target, repo):
             console.rule(f"[bold]review — attempt #{attempt['attempt_number']} — {verdict}")
             for item in checklist.get("items") or []:
                 icon = "[green]✓[/]" if item.get("passed") else "[red]✗[/]"
-                console.print(f"  {icon} {item.get('label', '')}")
+                console.print(f"  {icon} {escape(str(item.get('label', '')))}",
+                              soft_wrap=True, emoji=False)
                 if item.get("evidence"):
-                    console.print(f"    [dim]{item['evidence']}[/]")
+                    console.print(f"    [dim]{escape(str(item['evidence']))}[/]",
+                                  soft_wrap=True, emoji=False)
 
     asyncio.run(_go())
 
@@ -3110,7 +3112,7 @@ def investigate(question, repo, show_id):
                     console.print("[dim]no report yet — investigation not complete[/]")
                     return
                 console.rule(f"[bold]investigation report — {t.title[:60]}")
-                console.print(findings)
+                console.print(escape(str(findings)), soft_wrap=True, emoji=False)
                 return
             if not question:
                 console.print("[red]provide a question to investigate, or "
