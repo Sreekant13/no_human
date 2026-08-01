@@ -38,11 +38,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def test_pyproject_force_includes_the_board_in_wheel_and_sdist():
     """The declaration that puts the board in the wheel.
 
-    `force-include` specifically, not an `include`/`artifacts` glob: hatchling
-    raises `FileNotFoundError: Forced include not found` when the source is
-    absent, so a release built without `npm run build` fails loudly instead of
-    silently shipping the broken product again. A glob would match nothing and
-    build a quiet, boardless wheel — which is the bug this file exists for.
+    A forced include, not an `include`/`artifacts` glob: absence of the source
+    must FAIL a release built without `npm run build`, rather than silently
+    shipping the broken product again. A glob would match nothing and build a
+    quiet, boardless wheel — which is the bug this file exists for.
+
+    The board's entry moved OUT of the static `force-include` table and into
+    `hatch_build.py` (2026-08-01), because a static entry is evaluated for the
+    EDITABLE wheel too and made a clean clone uninstallable — `uv sync` died in
+    `build_editable`. What is asserted here is that the entry still exists, with
+    the same source and the same destination; what makes it version-aware is
+    asserted in `tests/test_clean_clone_installable.py`.
     """
     cfg = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
     targets = cfg["tool"]["hatch"]["build"]["targets"]
@@ -55,18 +61,28 @@ def test_pyproject_force_includes_the_board_in_wheel_and_sdist():
     # this repo has already had once. The sdist has a separate exact-membership
     # test (`test_sdist_members_are_exactly_the_allowlist`); the wheel has only
     # this. The cost is one line here per legitimate addition, which is the
-    # guard working rather than the guard being in the way.
+    # guard working rather than the guard being in the way. The hook below is
+    # held to the same exactness for the same reason: it is the other way a path
+    # now reaches the artifact.
     assert targets["wheel"]["force-include"] == {
-        "web/dist": "no_human/web_dist",
         "migrations": "no_human/migrations",
+    }
+    assert targets["wheel"]["hooks"]["custom"] == {
+        "path": "hatch_build.py",
+        "source": "web/dist",
+        "target": "no_human/web_dist",
     }
     # The sdist keeps repo-relative paths, so a wheel built FROM the sdist still
     # finds them where the wheel target expects to read them. `uv build` does
     # exactly that, and `pip install` does it whenever it cannot use a prebuilt
     # wheel.
     assert targets["sdist"]["force-include"] == {
-        "web/dist": "web/dist",
         "migrations": "migrations",
+    }
+    assert targets["sdist"]["hooks"]["custom"] == {
+        "path": "hatch_build.py",
+        "source": "web/dist",
+        "target": "web/dist",
     }
 
 

@@ -70,23 +70,27 @@ exclude = [
   "**/.*.swp", "**/*.swp", "**/*.orig", "**/*.rej", "**/.DS_Store",
 ]
 
-# Ship the built React board inside the package.
+# The built React board is NOT declared here — see `hatch_build.py`.
 #
-# `nh start` is the documented primary entrypoint (README), and it serves the
-# board. web/dist is gitignored (it is a build artifact), so without this the
-# wheel installed a CLI whose main command came up with no UI — the API answered
-# and nothing rendered. It cannot live at the repo-relative `web/dist` in an
-# installed wheel, because that path resolves outside site-packages; it goes
-# inside the package instead and `api/app.py::_resolve_web_dist` looks in both.
+# It used to be: `"web/dist" = "no_human/web_dist"`, chosen over an
+# `artifacts`/`include` glob because force-include RAISES when the source is
+# absent, so a release cut without `npm run build` fails instead of quietly
+# shipping a CLI whose board never renders (that shipped once). The guarantee is
+# right and is preserved; the mechanism was too wide. force-include is static, so
+# it is evaluated for every build version — including the EDITABLE wheel that
+# `uv sync` and `pip install -e .` build. web/dist is gitignored, so a clean
+# clone has none, and the release-time guard fired on a developer's first
+# command: `uv sync` on a fresh clone died in `build_editable` with
+# `FileNotFoundError: Forced include not found`, before test collection. (The
+# comment that stood here claimed "nothing in CI builds a wheel, so this only
+# ever fires on a release build" — false, as that reproduction shows.)
 #
-# force-include is deliberate over an `artifacts`/`include` glob: it raises
-# `FileNotFoundError: Forced include not found` when web/dist is absent, so a
-# wheel built without running `npm run build` FAILS instead of quietly shipping
-# the broken product again. Nothing in CI builds a wheel, so this only ever
-# fires on a release build. Cost measured 2026-07-31: +486 KB compressed
+# `hatch_build.py` re-adds the same entry through `build_data["force_include"]`,
+# where the build VERSION is visible: a standard wheel/sdist still FAILS without
+# the board, now with a message naming `npm run build`; an editable install
+# warns and proceeds. Cost when present, measured 2026-07-31: +486 KB compressed
 # (724 KB -> 1.2 MB), against a dependency tree of tens of MB.
 [tool.hatch.build.targets.wheel.force-include]
-"web/dist" = "no_human/web_dist"
 # The schema. `migrations/*.sql` is what creates the tables on first run, and
 # it lives at the REPO ROOT, so `packages = ["src/no_human"]` never packaged
 # it: every wheel ever built shipped zero migrations. `core/db.py` globbed a
@@ -94,9 +98,23 @@ exclude = [
 # no schema, and the first `ALTER TABLE` blew up with "no such table: tasks" —
 # which then HUNG the process forever on aiosqlite's non-daemon worker thread.
 # `nh status`, `nh doctor` and `nh task list` never returned for any user who
-# installed the wheel. force-include for the same reason as the board above:
-# absence must fail the BUILD, not the customer.
+# installed the wheel. force-include for the same reason as the board:
+# absence must fail the BUILD, not the customer. It stays STATIC where the board
+# became a hook, because `migrations/` is TRACKED — every clone and every
+# worktree has it, so this can only fire on a real deletion, never on a clean
+# clone.
 "migrations" = "no_human/migrations"
+
+# The board's force-include, made version-aware. `source`/`target` are read by
+# the hook (and by `testing/runner.py::_ensure_forced_build_artifacts`, which
+# provisions gitignored forced paths into task worktrees). The wheel puts the
+# board INSIDE the package: the repo-relative `web/dist` resolves outside
+# site-packages once installed, so `api/app.py::_resolve_web_dist` looks in both
+# places and this is the one it finds in a wheel.
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+source = "web/dist"
+target = "no_human/web_dist"
 
 # The sdist is a MEMBERSHIP list, not "the repo tree minus mistakes". Without
 # `only-include`, hatchling packages everything under the project root that is
@@ -124,17 +142,24 @@ exclude = [
   "**/.*.swp", "**/*.swp", "**/*.orig", "**/*.rej", "**/.DS_Store",
 ]
 
-# The sdist keeps the board at its repo-relative path so that a wheel built
-# FROM the sdist (what `pip install` does when it cannot use a wheel) still
-# finds `web/dist` where the wheel target above expects it. force-include on
-# purpose (not a member of only-include): it fails the build loudly when
-# web/dist has not been built.
+# The board is declared by `hatch_build.py` for this target too — same reason as
+# the wheel, and the sdist has no editable version, so in practice the hook here
+# only ever raises or includes. It keeps the board at its repo-relative path so
+# that a wheel built FROM the sdist (what `pip install` does when it cannot use
+# a prebuilt wheel) still finds `web/dist` where the wheel target expects it.
+# Note hatchling force-includes `hatch_build.py` into every sdist by itself
+# (`SdistBuilder.get_default_build_data`, DEFAULT_BUILD_SCRIPT), so the sdist
+# stays a sufficient build source without a line here.
 [tool.hatch.build.targets.sdist.force-include]
-"web/dist" = "web/dist"
 # Same rationale as web/dist: kept at its repo-relative path so a wheel built
 # FROM the sdist (what `pip install` does when it cannot use a prebuilt wheel)
 # still finds `migrations` where the wheel target above reads it.
 "migrations" = "migrations"
+
+[tool.hatch.build.targets.sdist.hooks.custom]
+path = "hatch_build.py"
+source = "web/dist"
+target = "web/dist"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

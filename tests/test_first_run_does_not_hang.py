@@ -349,8 +349,8 @@ def test_wheel_in_a_clean_venv_answers_the_first_commands(tmp_path):
         pytest.skip("uv is not on PATH — cannot build the wheel")
     if not (REPO_ROOT / "web" / "dist" / "index.html").is_file():
         pytest.skip(
-            "web/dist is not built in this checkout, so the wheel's "
-            "force-include of the board fails the build before migrations are "
+            "web/dist is not built in this checkout, so the board's forced "
+            "include (hatch_build.py) fails a WHEEL build before migrations are "
             "reached. Run `cd web && npm install && npm run build` first. "
             "(CI's python job has no npm, so this is expected there.)"
         )

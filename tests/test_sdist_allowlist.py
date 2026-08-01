@@ -47,7 +47,7 @@ def test_sdist_is_an_explicit_allowlist():
     for target in (sdist, wheel):
         assert "src/no_human/eval/_vendor_terms_private.py" in target["exclude"]
         assert "**/*.swp" in target["exclude"]
-    # The board and the schema ride via force-include so their absence fails
+    # The board and the schema ride via forced includes so their absence fails
     # the build loudly. Asserted as an EXACT mapping: an allowlist that only
     # checks the entries it expects cannot see one it does not, and this file's
     # whole subject is membership. migrations/*.sql is the schema — it is not
@@ -55,15 +55,29 @@ def test_sdist_is_an_explicit_allowlist():
     # built from it, ships no schema at all, which hung every first-run command
     # (2026-08-01).
     assert sdist["force-include"] == {
-        "web/dist": "web/dist",
         "migrations": "migrations",
+    }
+    # The board's entry lives in `hatch_build.py` since 2026-08-01 — a static
+    # one also applied to the editable wheel and made a clean clone
+    # uninstallable. It is still exact membership: the hook is now the second
+    # way a path can enter the sdist, so an unreviewed `source`/`target` here
+    # would be exactly the invisible addition the assertion above exists to
+    # refuse.
+    assert sdist["hooks"]["custom"] == {
+        "path": "hatch_build.py",
+        "source": "web/dist",
+        "target": "web/dist",
     }
 
 
 # Paths hatchling itself always adds to an sdist, plus the two roots we name.
 # A member is allowed iff it is one of these files or under one of these
 # directories — set membership, not pattern matching.
-_ALLOWED_FILES = {"PKG-INFO", "pyproject.toml", "README.md", "LICENSE", ".gitignore"}
+# `hatch_build.py` is in the list because hatchling force-includes the build
+# script into every sdist itself (`SdistBuilder.get_default_build_data`), and it
+# has to: a wheel built FROM the sdist runs that hook to place the board.
+_ALLOWED_FILES = {"PKG-INFO", "pyproject.toml", "README.md", "LICENSE",
+                  ".gitignore", "hatch_build.py"}
 _ALLOWED_DIRS = ("src/no_human/", "web/dist/", "migrations/")
 
 

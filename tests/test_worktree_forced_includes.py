@@ -1,15 +1,19 @@
 """A task worktree must be able to build, or the coder cannot run anything.
 
-`web/dist` is a gitignored build artifact, and `pyproject.toml` `force-include`s
-it into both the wheel and the sdist. Hatchling raises `FileNotFoundError:
-Forced include not found` when a forced source is absent — deliberately, so a
-release cut without `npm run build` fails loudly instead of shipping a boardless
-wheel.
+`web/dist` is a gitignored build artifact, and it is force-included into both
+the wheel and the sdist (by `hatch_build.py` since 2026-08-01; by a static
+`force-include` before that). A forced source that is absent fails the build —
+deliberately, so a release cut without `npm run build` fails loudly instead of
+shipping a boardless wheel.
 
 `git worktree add` never creates a gitignored path, so in a task worktree that
-same deliberate loudness kills `uv run` / `uv build` / any editable install
-BEFORE test collection. The coder cannot run the suite at all, and the failure
-does not look like a packaging problem — it looks like a broken repo.
+same deliberate loudness killed `uv run` / `uv build` / any editable install
+BEFORE test collection. The coder could not run the suite at all, and the
+failure did not look like a packaging problem — it looked like a broken repo.
+(`hatch_build.py` since makes the EDITABLE install warn instead of die, which is
+the same defect met from the other side — a clean clone could not `uv sync`.
+Provisioning still matters: a boardless worktree still cannot build a wheel, and
+its board tests have nothing to run against.)
 
 Observed 2026-08-01: a task burned its entire lifetime budget (2.58M
 cost-weighted tokens in one attempt) without ever reaching a green run, and its
@@ -49,13 +53,27 @@ needs_a_built_source = pytest.mark.skipif(
 
 
 def test_pyproject_still_force_includes_something():
-    """Guards the guard: this whole file is moot if nothing is forced."""
+    """Guards the guard: this whole file is moot if nothing is forced.
+
+    Both declaration sites count. `web/dist` is force-included by
+    `hatch_build.py` rather than by the static table since 2026-08-01, and the
+    provisioning under test reads the hook's `source` for exactly that reason —
+    checking only the static table would have left this passing on `migrations`
+    alone while the path this file is about had quietly stopped being
+    provisioned.
+    """
     cfg = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
     targets = cfg["tool"]["hatch"]["build"]["targets"]
     forced = set()
     for target in targets.values():
         forced.update((target.get("force-include") or {}).keys())
+        for hook in (target.get("hooks") or {}).values():
+            if isinstance(hook.get("source"), str):
+                forced.add(hook["source"])
     assert forced, "no force-include left — this provisioning step is dead code"
+    assert "web/dist" in forced, (
+        "the board is no longer a forced path anywhere, so provisioning it into "
+        "a task worktree is dead code and this file's subject is gone")
 
 
 def _worktree(tmp_path: Path) -> Path:
@@ -168,7 +186,9 @@ def test_the_worktree_can_actually_build_after_provisioning(worktree, tmp_path):
     assert before.returncode != 0, (
         "precondition failed: the worktree built WITHOUT provisioning, so this "
         "test would pass even if the fix were removed")
-    assert "Forced include not found" in (before.stderr + before.stdout)
+    # `hatch_build.py` replaced hatchling's raw `Forced include not found` with
+    # an actionable one; a WHEEL build must still be the loud case.
+    assert "npm run build" in (before.stderr + before.stdout)
 
     _ensure_forced_build_artifacts(worktree, REPO_ROOT)
 
