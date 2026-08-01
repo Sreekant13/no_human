@@ -235,7 +235,7 @@ test("the PyInstaller spec excludes no_human.ci_gate from the freeze", () => {
 });
 
 test("the PyInstaller spec excludes the private term inventory from the freeze", () => {
-  // The employer half of the publish guard's term list. Its docstring forbids
+  // The private half of the publish guard's term list. Its docstring forbids
   // publication in any form; vendor_terms.py has an empty-fallback import for
   // exactly this absence. It was frozen into every DMG until 2026-07-31.
   const spec = readRepo("packaging/nh-server.spec");
@@ -243,7 +243,7 @@ test("the PyInstaller spec excludes the private term inventory from the freeze",
   assert.ok(m, "nh-server.spec has no excludes= list - this guard has gone blind");
   assert.match(m[1], /["']no_human\.eval\._vendor_terms_private["']/,
     "nh-server.spec no longer excludes no_human.eval._vendor_terms_private - " +
-    "the hex-encoded employer inventory freezes into the PYZ the DMG ships");
+    "the hex-encoded private inventory freezes into the PYZ the DMG ships");
   // And the build script's fail-closed check for the same module.
   const installer = readRepo("packaging/build-installer.sh");
   assert.match(installer, /_vendor_terms_private/,

@@ -52,7 +52,7 @@ a = Analysis(
     runtime_hooks=[],
     # Trimming the test/build toolchain a friend never runs, plus one product
     # package that must not leave this repo: `no_human.ci_gate` is the
-    # glab/kubectl/metrics-core post-PR gate, written for one employer's pipeline
+    # a post-PR gate wired to one specific CI estate, not general-purpose
     # (operator decision D1, 2026-07-30). It stays in the source tree for
     # internal use and is excluded here instead. blockers/wake.py imports it
     # lazily inside a try/except that logs and returns None, and nothing else
@@ -62,7 +62,7 @@ a = Analysis(
     excludes=["pytest", "pytest_asyncio", "pytest_xdist", "playwright",
               "tkinter", "PyInstaller",
               "no_human.ci_gate",
-              # The employer half of the publish guard's term inventory — its
+              # The private half of the publish guard's term inventory — its
               # docstring forbids publication in any form, and vendor_terms.py
               # ships an empty-list fallback for exactly this absence. Frozen
               # into every DMG until 2026-07-31; build-installer.sh now fails

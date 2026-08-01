@@ -50,15 +50,15 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/no_human"]
 # `packages` takes the tree whole, so a carve-out has to be spelled out.
-# no_human/ci_gate is the glab/kubectl/metrics-core post-PR gate written for one
-# employer's pipeline (operator decision D1, 2026-07-30): it stays in this repo
-# for internal use and is kept out of anything distributed. Its one importer,
+# no_human/ci_gate is a post-PR gate wired to one specific CI estate — it is
+# not general-purpose, so it stays in this repo for internal use and is kept
+# out of anything distributed. Its one importer,
 # blockers/wake.py, imports it lazily inside a try/except and disables the rung
 # when the import fails. packaging/nh-server.spec excludes it from the frozen
 # server, and packaging/build-installer.sh fails the build if it slips back in.
 exclude = [
   "src/no_human/ci_gate",
-  # The employer half of the publish guard's term inventory. Its own docstring
+  # The private half of the publish guard's term inventory. Its own docstring
   # says it must not be published IN ANY FORM, including hex; vendor_terms.py
   # imports it with an empty-list fallback designed for exactly this absence.
   # It was export-excluded from day one but shipped in every wheel/sdist/freeze

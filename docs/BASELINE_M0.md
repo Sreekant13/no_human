@@ -82,9 +82,8 @@ total                   13,825,259
 is the reason the dead `_distill_large_chunks` path was never worth fixing: it
 addressed under 1% of the burn.
 
-Cost of this run: a large fraction of a month's Claude budget — the absolute
-figure and the budget it came out of are a third party's procurement detail and
-are not published here. Two bugs since fixed inflated it — duplicate execution (`2f2b229`) ran two orchestrators, and
+Cost of this run: a large fraction of a month's Claude budget. The absolute
+figure is not published here. Two bugs since fixed inflated it — duplicate execution (`2f2b229`) ran two orchestrators, and
 the zero-diff bug (`8034df1`) burned four attempts that produced nothing.
 
 ## Derived denominators for later milestones

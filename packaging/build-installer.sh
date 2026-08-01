@@ -42,8 +42,8 @@ sql_count="$(find "${BUNDLE}/migrations" -name '*.sql' | wc -l | tr -d ' ')"
 test "${sql_count}" -gt 0 || {
   echo "FAIL: no migrations in ${BUNDLE}/migrations" >&2; exit 1; }
 
-# no_human.ci_gate is the glab/kubectl/metrics-core post-PR gate written for one
-# employer's pipeline and must not ship (operator decision D1, 2026-07-30).
+# no_human.ci_gate is a post-PR gate wired to one specific CI estate. It is not
+# general-purpose and must not ship.
 # nh-server.spec excludes it; this is the check that the exclusion took, since
 # a new import elsewhere pulls the package back into the freeze silently.
 # Searching the bundle for the name cannot do this job: pure modules live in
@@ -59,7 +59,7 @@ if [ -n "${gate_modules}" ]; then
   echo "${gate_modules}" >&2
   exit 1
 fi
-# Same check for the private half of the term inventory: hex-encoded employer
+# Same check for the private half of the term inventory: hex-encoded
 # terms plus their replacement mapping. Never distributable in any artifact.
 private_terms="$(grep -o 'no_human\.eval\._vendor_terms_private' "${pyz_toc}" | sort -u || true)"
 if [ -n "${private_terms}" ]; then
