@@ -12,8 +12,8 @@
 #    both succeed, so it is the bundle specifically).
 #
 # So: create a read-write image, copy into it, FORCE-detach, convert compressed.
-# The force is required because CrowdStrike's data-protection agent holds a
-# volume containing an app bundle — a plain `detach` returns
+# The force is required because an endpoint-security agent can hold a volume
+# containing an app bundle — a plain `detach` returns
 # "couldn't unmount diskN - Operation not permitted".
 set -euo pipefail
 

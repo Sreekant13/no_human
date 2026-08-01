@@ -294,7 +294,7 @@ class QuotaExhausted(Exception):
         # one billing wall.
         #
         # A fixed hour rather than the reset time parsed out of the message.
-        # The CLI phrases it "resets 2pm (Asia/Jerusalem)" or "resets Jul 24 at
+        # The CLI phrases it "resets 2pm (<zone>)" or "resets Jul 24 at
         # 6pm (...)", and getting that wrong is bad in both directions — too
         # far ahead stalls the whole pool for days, too near thrashes. An hour
         # is self-correcting: if the wall is still up the task re-parks, which

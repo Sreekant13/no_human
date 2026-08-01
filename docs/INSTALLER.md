@@ -78,7 +78,7 @@ Three constraints drove the design, each found by measuring a real build:
   target drives Finder over AppleScript and then dies in `hdiutil detach`.
   `hdiutil create -srcfolder` on a directory containing an `.app` fails with
   `Resource busy`. What works: create a read-write image, copy into it,
-  force-detach, convert. The force is required because CrowdStrike's
+  force-detach, convert. The force is required because an endpoint-security
   data-protection agent holds a volume containing an app bundle.
 
 ## Known limits
