@@ -52,11 +52,11 @@ def test_blocks_rm_rf():
 def test_blocks_merging_a_pull_request():
     """The agent never merges (§3.2). Until 2026-07-10 only `git merge` was
     blocked — which is not how a PR gets merged. `gh pr merge` sailed through,
-    and PR #531 was opened by an agent with nothing stopping it merging."""
-    assert not _ev("Bash", {"command": "gh pr merge 531 --squash"}).allow
+    and PR #7004 was opened by an agent with nothing stopping it merging."""
+    assert not _ev("Bash", {"command": "gh pr merge 7004 --squash"}).allow
     assert not _ev("Bash", {"command": "glab mr merge 12"}).allow
     assert not _ev(
-        "Bash", {"command": "gh api -X PUT repos/o/r/pulls/531/merge"}
+        "Bash", {"command": "gh api -X PUT repos/o/r/pulls/7004/merge"}
     ).allow
 
 

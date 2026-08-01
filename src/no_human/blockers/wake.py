@@ -169,7 +169,7 @@ class WakeWatcher:
                     return False
                 _, host, slug, num = parsed
                 # UPDATE the one CI_GATE comment instead of posting a new one every
-                # attempt (PR #531 piled up 17 near-identical comments).
+                # attempt (a PR once accumulated 17 near-identical comments).
                 return await upsert_agent_comment(f"{host}/{slug}#{num}", body, key="ci_gate")
 
             return CiGate(
@@ -601,9 +601,9 @@ class WakeWatcher:
            check's log, feed it back, resume onto the PR branch. Rounds are
            counted per distinct failure *signature* — a re-run of the same red
            check never burns a round — and past the cap the specific failing
-           check is handed to the human. This is the gap PR #531 exposed: the
-           Jenkinsfile died in Jenkins' CPS compiler while every local check
-           passed, and nothing was watching.
+           check is handed to the human. This is the gap a real run exposed:
+           the CI pipeline definition failed to compile on the server while
+           every local check passed, and nothing was watching.
         """
         ctx = task.context or {}
         url = ctx.get("pr_watch")

@@ -221,7 +221,7 @@ def test_a_high_turn_cap_is_only_safe_because_pause_is_real():
     assert issubclass(CancelRequested, Exception)
 
 
-# ---- 5. the agent opened PR #531 and committed as the human ----------------- #
+# ---- 5. the agent opened PR #7004 and committed as the human ----------------- #
 
 
 def _orch_for_guards(store, tmp_path):
@@ -271,7 +271,7 @@ async def test_base_protection_also_covers_the_context_base(store, tmp_path):
 
 
 async def test_agent_commits_carry_the_machine_identity(store, tmp_path):
-    """PR #531's commit was authored `dev <dev@example.com>`.
+    """PR #7004's commit was authored `dev <dev@example.com>`.
     The agent must commit under a DISTINCT identity: the history must say
     plainly which commits a machine wrote. GitRepo passes `-c user.name` for
     its own commits, but a `git commit` the agent runs in Bash inherits the

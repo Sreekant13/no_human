@@ -348,7 +348,7 @@ async def upsert_agent_comment(pr_ref: str, message: str, key: str = "") -> bool
     """Post OR update the ONE agent comment scoped by *key* on a PR/MR.
 
     Re-runs must UPDATE a single comment, not pile up: the CI_GATE gate posting a
-    fresh comment on every one of its 23 attempts is how PR #531 ended up with 17
+    fresh comment on every one of its 23 attempts is how one PR ended up with 17
     near-identical comments. *key* (e.g. "ci_gate") scopes the comment so distinct
     report types each keep exactly one, updated in place. Falls back to a plain
     create if listing/patching isn't possible. Never mentions "no_human" in the

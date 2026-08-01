@@ -4247,8 +4247,8 @@ def test_pr_url_parts_delegates_to_canonical_parser():
     """EH2: there is ONE PR-URL grammar — vcs.pr_watcher.parse_pr_url — and it
     carries the host (forge, host, slug, number) so GHE/self-hosted resolve."""
     from no_human.vcs.pr_watcher import parse_pr_url
-    assert parse_pr_url("https://code.example.com/dev/metrics-core-query-service/pull/513") == \
-        ("github", "code.example.com", "dev/metrics-core-query-service", 513)
+    assert parse_pr_url("https://code.example.com/dev/metrics-core-query-service/pull/7003") == \
+        ("github", "code.example.com", "dev/metrics-core-query-service", 7003)
     assert parse_pr_url("https://gitlab.com/org/repo/-/merge_requests/42") == \
         ("gitlab", "gitlab.com", "org%2Frepo", 42)
     assert parse_pr_url("https://gitlab.acme.net/ci_gate/customer/metrics-core-service/-/merge_requests/7") == \

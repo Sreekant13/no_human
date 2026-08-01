@@ -127,7 +127,7 @@ _LIVE_SERVER = re.compile(
 # Merging the PR — the one action that is always a human's (§3.2). `git merge`
 # is NOT this: a PR is merged through the forge, and that is what must be denied.
 _FORGE_MERGE = re.compile(
-    r"\b(?:gh\s+pr\s+merge"           # gh pr merge 531 --squash
+    r"\b(?:gh\s+pr\s+merge"           # gh pr merge 7004 --squash
     r"|glab\s+mr\s+merge"             # glab mr merge 12
     r"|gh\s+api\b[^|;&]*?/(?:pulls|merge_requests)/\d+/merge"  # the REST call
     r"|glab\s+api\b[^|;&]*?/merge_requests/\d+/merge)"

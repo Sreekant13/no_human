@@ -946,14 +946,14 @@ async def test_shipped_transitions_from_each_allowed_status(client, store, statu
 async def test_shipped_records_human_merged_event_with_sha_and_note_verbatim(client, store):
     t = await _seed_task(store, status=TaskStatus.AWAITING_APPROVAL)
     r = await client.post(f"/api/tasks/{t.id}/shipped",
-                           json={"sha": "deadbeef1234", "note": "shipped via PR #531"})
+                           json={"sha": "deadbeef1234", "note": "shipped via PR #7004"})
     assert r.status_code == 200, r.text
 
     events = await store.list_events(t.id)
     merged = [e for e in events if e.get("kind") == "human_merged"]
     assert len(merged) == 1
     assert merged[0]["sha"] == "deadbeef1234"
-    assert merged[0]["note"] == "shipped via PR #531"
+    assert merged[0]["note"] == "shipped via PR #7004"
 
 
 @pytest.mark.asyncio
