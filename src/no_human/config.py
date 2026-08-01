@@ -1013,6 +1013,33 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "refresh_interval_seconds": 3600,  # HEAD-diff check cadence when serving
         "max_turns": 12,                   # bound the read-only recon session
     },
+    # The team-brain client (src/no_human/brain/). THREE keys, and this is the
+    # whole of its configuration surface — see that package's docstring for why
+    # a fourth would be a problem rather than a feature.
+    #
+    # `enabled: false` is not a default, it is invariant L4: with it false the
+    # package is never imported, no file is created, no socket is opened, and
+    # not one byte of any prompt differs from a build with src/no_human/brain/
+    # deleted. tests/test_brain_invariants.py asserts that byte-identity.
+    #
+    # `control_plane_url` is the ONLY thing this product knows about the hosted
+    # service. No region, no account id, no table, no bucket, no ARN — the
+    # service's shape is deliberately unlearnable from the client, and a grep
+    # gate in the same test file fails the build if any of it appears.
+    #
+    # No credential lives here. The brain credential is a separate secret in a
+    # separate file (~/.no_human/brain/credentials.json) read by a separate
+    # loader, and it is never placed in os.environ — unlike the Claude token
+    # above, which is exported on purpose because the Agent SDK subprocess must
+    # inherit it. That difference is the point.
+    "team_brain": {
+        "enabled": False,
+        "control_plane_url": "",
+        # A withdrawn rule must not live forever on a laptop that stopped
+        # syncing: past this many days without a VERIFIED sync, remote rules
+        # stop being injected until one succeeds.
+        "max_stale_days": 14,
+    },
 }
 
 

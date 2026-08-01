@@ -1985,8 +1985,19 @@ class Orchestrator:
         # Say out loud, once per attempt and in the DB, which model has which
         # role. This is the signal whose absence hid the config drift.
         models = self._active_models()
+        # T5: pin the team-brain watermark for the WHOLE attempt, here, beside
+        # the credential that paid for it. Every prompt in this attempt reads
+        # remote rules as of this version, so an admission landing mid-task
+        # cannot change the judgement of a task already under way — the cloud
+        # translation of "gate rules are read from the base branch, never the
+        # head". None when the feature is off, which is the default.
+        #
+        # auth_profile and brain_watermark answer DIFFERENT questions — who paid,
+        # and what the agent knew — and one column cannot answer both.
+        self._brain_watermark = self._pin_brain_watermark()
         await self.store.update_attempt(
-            attempt_id, models=models, auth_profile=active_auth_profile()
+            attempt_id, models=models, auth_profile=active_auth_profile(),
+            brain_watermark=self._brain_watermark,
         )
         self._emit_models(models)
 
@@ -7377,6 +7388,10 @@ class Orchestrator:
         extra = self._format_active_memories()
         if extra:
             rules += extra
+        # Team-brain rules, in their OWN block after the local ones — never
+        # merged into `extra`, and never reaching the reviewer or supervisor.
+        # "" when the feature is off, so this line adds no bytes by default.
+        brain_block = self._team_brain_block()
         digest = self._context_digest(task)
         resume = self._resume_digest(task)
         # Multi-repo context (Phase D / WS-E).
@@ -7523,6 +7538,7 @@ class Orchestrator:
             f"{profile_block}"
             f"{repo_hints_block}"
             f"{rules}\n"
+            f"{brain_block}"
             + blocker_prompt_suffix()
             + "\n\n"
             # ── volatile task-specific content ──
@@ -7652,6 +7668,55 @@ class Orchestrator:
             else:
                 kept.append(m)
         return kept, held
+
+    # --- team brain (optional, off by default) ------------------------------
+    #
+    # The ONLY two places the local product reaches into src/no_human/brain/.
+    # Both are lazy, both are inside try/except, and both return the empty
+    # answer the moment anything is wrong — mirroring how blockers/wake.py
+    # imports ci_gate and how eval/vendor_terms.py handles its absent private
+    # half. That is invariant L5 in code: no task may block, slow, or fail
+    # because of the brain. There is no network call on either path; sync is an
+    # explicit command a human typed.
+    #
+    # With `team_brain.enabled` false — the default — the import never happens
+    # and `_team_brain_block()` returns "", so the f-string that interpolates it
+    # produces BYTE-IDENTICAL bytes to a build with the package deleted. That is
+    # invariant L4, and tests/test_brain_invariants.py compares the two.
+
+    def _pin_brain_watermark(self) -> int | None:
+        try:
+            if not (self.config.get("team_brain") or {}).get("enabled"):
+                return None
+            from ..brain import pin_watermark
+            return pin_watermark(self.config)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _team_brain_block(self) -> str:
+        """The remote-rules block for the CODER prompt. "" when off or empty.
+
+        Deliberately NOT merged into `_format_active_memories()`. That one
+        string feeds the coder, the supervisor AND the reviewer, and
+        review/reviewer.py turns it into a numbered RULE ADHERENCE pass — so
+        merging remote text into it would make a shared brain a supply chain
+        into the independent review gate, which is the one thing this product's
+        trustworthiness rests on. Remote rules render in their own block, with
+        their own provenance framing, and reach the coder only.
+        """
+        try:
+            if not (self.config.get("team_brain") or {}).get("enabled"):
+                return ""
+            from ..brain import coder_context
+            ctx = coder_context(self.config, getattr(self, "_brain_watermark", None))
+            if ctx.block and ctx.rule_ids:
+                self.emit("knowledge_accessed",
+                          f"{len(ctx.rule_ids)} team-brain rule(s) injected "
+                          f"(watermark {getattr(self, '_brain_watermark', None)})",
+                          injected=list(ctx.rule_ids), source="team_brain")
+            return ctx.block
+        except Exception:  # noqa: BLE001
+            return ""
 
     def _format_active_memories(self) -> str:
         """Format confirmed rules + skills for prompt injection (importance-

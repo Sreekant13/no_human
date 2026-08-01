@@ -261,6 +261,13 @@ class Store:
             # Which subscription paid for this attempt (profile name, never a
             # token). NULL on attempts that predate auth profiles.
             "auth_profile": "TEXT",
+            # Which team-brain version this attempt read remote rules AS OF,
+            # pinned once at attempt start. NULL whenever the feature is off,
+            # which is the default and every attempt before it existed.
+            # Deliberately a SECOND column rather than folded into
+            # auth_profile: they answer different questions — who paid, and
+            # what the agent knew — and one column cannot answer both.
+            "brain_watermark": "INTEGER",
         }
         for col, decl in att_wanted.items():
             if col not in att_existing:

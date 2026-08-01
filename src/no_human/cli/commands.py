@@ -1971,6 +1971,52 @@ def docs_generate(repo):
 
 
 # --------------------------------------------------------------------------- #
+# Team brain (optional, off by default)                                       #
+# --------------------------------------------------------------------------- #
+
+
+class _LazyBrainGroup(click.Group):
+    """``nh brain`` without importing ``no_human.brain`` until it is used.
+
+    A plain ``cli.add_command(brain_group)`` would import the whole client on
+    every ``nh`` invocation, including ``nh --help`` on a machine that has the
+    feature off. Invariant L4 says the package is never imported when the
+    feature is off, and ``tests/test_brain_invariants.py`` asserts exactly that
+    by importing this module and checking ``sys.modules``.
+
+    It is also the only import site outside prompt assembly, and it fails soft:
+    delete ``src/no_human/brain/`` and ``nh brain`` reports that the client is
+    not installed. Everything else in the product keeps working, which is the
+    other half of L4.
+    """
+
+    _NOT_INSTALLED = ("the team-brain client is not installed in this build "
+                      "(src/no_human/brain/ is absent)")
+
+    def _delegate(self):
+        try:
+            from ..brain.cli import brain_group
+        except ImportError:
+            return None
+        return brain_group
+
+    def list_commands(self, ctx):
+        delegate = self._delegate()
+        return delegate.list_commands(ctx) if delegate else []
+
+    def get_command(self, ctx, cmd_name):
+        delegate = self._delegate()
+        if delegate is None:
+            raise click.UsageError(self._NOT_INSTALLED)
+        return delegate.get_command(ctx, cmd_name)
+
+
+@cli.group("brain", cls=_LazyBrainGroup)
+def brain_group() -> None:
+    """Team brain: shared, admin-approved rules (off by default)."""
+
+
+# --------------------------------------------------------------------------- #
 # Enterprise CI integration validation (M6)                                          #
 # --------------------------------------------------------------------------- #
 
