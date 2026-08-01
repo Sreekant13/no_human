@@ -15,6 +15,8 @@
 
 </div>
 
+![The board and the shell at the end of a sprint: five pull requests waiting for review, and the shell showing what was checked on the one in focus — tamper guard, lint, tests, the commit, the PR.](docs/assets/demo-sprint-still.png)
+
 Hand it a ticket and walk away. It plans, writes the change, has the work
 reviewed by a second model that never saw it being written, runs your tests,
 opens the pull request — and stops. You review and merge.

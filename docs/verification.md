@@ -128,8 +128,7 @@ hour to review.
   at a tenth of the weight they are the largest single line in the bill.
   Tooling that reports "tokens used" without them is reporting roughly 1% of
   the traffic. Real-work
-  attempts in that record measure 12k–32k output tokens each
-  ([NORTH_STAR_PAYOFF.md](NORTH_STAR_PAYOFF.md)), and a one-surface PR takes one
+  attempts in that record measure 12k–32k output tokens each, and a one-surface PR takes one
   to three attempts. Any dollar figure derived from that is an estimate, not an
   invoice. `nh logs <id>` shows spend against the cap per task.
 - **The reviewer and implementer being different models is a default, not an
