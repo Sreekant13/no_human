@@ -260,29 +260,86 @@ async def test_reanalysis_maybe_run_skips_when_not_due(store):
     assert result is None
 
 
+def _fixed_transcripts(monkeypatch):
+    """Feed the job one transcript instead of scanning the developer's machine.
+
+    ``ReanalysisJob._run`` → ``TranscriptIngester.ingest`` → ``extract_transcripts``,
+    which hunts for a live IDE process and raises ``IDENotRunningError`` when it
+    finds none. That made both tests below pass or fail on whether an editor
+    happened to be open, which is neither a property of the scheduler nor
+    reproducible for anyone else running the suite.
+
+    Only the machine scan is replaced. Everything the tests actually assert on —
+    analysis, enqueueing, the transcript cache, the dedupe key — runs for real.
+    The patch targets the name bound in ``ingester``'s namespace, which is what
+    ``ingest`` resolves at call time.
+    """
+    from no_human.history.extractor import Message, Transcript
+
+    transcript = Transcript(
+        cascade_id="cascade-reanalysis", title="A session", created="2026-07-01",
+        messages=[
+            Message("assistant", "I'll take a look.", "STEP"),
+            Message("user", "never commit secrets to the repo", "STEP"),
+        ],
+    )
+    monkeypatch.setattr("no_human.history.ingester.extract_transcripts",
+                        lambda **kw: [transcript])
+    return transcript
+
+
 @pytest.mark.asyncio
-async def test_reanalysis_maybe_run_produces_result(store):
-    """maybe_run returns a result dict with expected keys when due."""
+async def test_reanalysis_maybe_run_produces_result(store, monkeypatch):
+    """maybe_run returns a populated result when due."""
+    _fixed_transcripts(monkeypatch)
     job = ReanalysisJob(store, interval_seconds=60, days=1)
     # Due because _last_run is 0.
     result = await job.maybe_run()
     assert result is not None
-    assert "transcripts" in result
-    assert "proposed" in result
+    assert result["transcripts"] == 1
+    # The transcript carries a user correction the heuristic analyzer flags, so
+    # this asserts the pipeline actually produced something rather than merely
+    # returning a dict with the right keys.
+    assert result["proposed"] > 0
     assert "duplicates" in result
 
 
 @pytest.mark.asyncio
-async def test_reanalysis_dedup_across_runs(store):
-    """Running re-analysis twice does not duplicate proposals."""
+async def test_reanalysis_dedup_across_runs(store, monkeypatch):
+    """Re-running over the same transcript proposes nothing new — both layers.
+
+    Dedup is two independent mechanisms, and the old assertion (``duplicates >=
+    0``, true of any count) could not detect either one breaking. Layer 1 is the
+    transcript cache: an unchanged transcript is never re-analyzed. Layer 2 is
+    the content-based dedupe key: even when analysis IS redone, a finding
+    already in the queue is counted as a duplicate rather than enqueued twice.
+    """
+    _fixed_transcripts(monkeypatch)
     job = ReanalysisJob(store, interval_seconds=0, days=1)
+
     r1 = await job.maybe_run()
+    assert r1 is not None and r1["proposed"] > 0
+
+    # Layer 1 — same transcript, still cached: nothing is re-analyzed. Asserted
+    # on `findings`, not `proposed`: layer 2 would hold `proposed` at 0 even
+    # with the cache broken, so `proposed` alone cannot tell the layers apart
+    # and a cache regression would slip through green.
     job._running = False  # reset guard
     job._last_run = 0     # force re-run
     r2 = await job.maybe_run()
-    # Second run: any findings from r1 are now cached/deduped.
     assert r2 is not None
-    assert r2["duplicates"] >= 0  # no new proposals if transcripts unchanged
+    assert r2["findings"] == 0, "cached transcript was re-analyzed"
+    assert r2["proposed"] == 0, "cached transcript was re-proposed"
+
+    # Layer 2 — drop the cache so the same findings are produced again. They are
+    # already queued, so they must land as duplicates, not as new proposals.
+    await store.history_cache_clear()
+    job._running = False
+    job._last_run = 0
+    r3 = await job.maybe_run()
+    assert r3 is not None
+    assert r3["proposed"] == 0, "re-analyzed findings were proposed a second time"
+    assert r3["duplicates"] > 0, "dedupe key did not recognize the repeat findings"
 
 
 @pytest.mark.asyncio
