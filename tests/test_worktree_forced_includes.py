@@ -23,6 +23,7 @@ would let a UI task rebuild into the developer's checkout. 1 MB buys isolation.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import tomllib
 from pathlib import Path
@@ -174,3 +175,40 @@ def test_the_worktree_can_actually_build_after_provisioning(worktree, tmp_path):
     after = subprocess.run(["uv", "build", "--wheel", "-o", str(tmp_path / "d2")],
                            cwd=worktree, capture_output=True, text=True, timeout=600)
     assert after.returncode == 0, f"build still failed:\n{after.stderr[-2000:]}"
+
+
+def test_a_tracked_forced_path_is_never_restored(worktree):
+    """A deletion the branch made must stay visible to the branch's own tests.
+
+    Found in review: `migrations/` is force-included AND tracked, so a task that
+    deleted the whole directory had it silently restored here and could watch
+    its own suite go green — including the test whose entire job is to assert
+    the migrations exist. Provisioning exists for gitignored build artifacts;
+    a tracked path is absent for exactly one reason, and that reason is news.
+
+    The export gate refuses that deletion downstream on a count pin and nine
+    content pins, so nothing could ship — but a task must not be able to mislead
+    itself in the meantime.
+    """
+    import tomllib as _t
+    cfg = _t.loads((worktree / "pyproject.toml").read_text())
+    targets = cfg["tool"]["hatch"]["build"]["targets"]
+    forced = set()
+    for target in targets.values():
+        forced.update((target.get("force-include") or {}).keys())
+    tracked = [r for r in forced
+               if subprocess.run(["git", "ls-files", "--error-unmatch", r],
+                                 cwd=worktree, capture_output=True).returncode == 0]
+    if not tracked:
+        pytest.skip("no tracked path is force-included, so nothing can be masked")
+
+    victim = worktree / tracked[0]
+    shutil.rmtree(victim) if victim.is_dir() else victim.unlink()
+    assert not victim.exists()
+
+    _ensure_forced_build_artifacts(worktree, REPO_ROOT)
+
+    assert not victim.exists(), (
+        f"{tracked[0]} is tracked and was deleted by the branch, but "
+        "provisioning restored it — the branch's own tests would go green on a "
+        "deletion it made")
