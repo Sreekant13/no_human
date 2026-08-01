@@ -2,7 +2,7 @@
 
     source .venv/bin/activate
     cd web && npm run build && cd ..          # once, if web/dist is stale
-    PYTHONPATH=src python -m e2e.demo_video.record --out ~/git/nemlot-site/assets
+    PYTHONPATH=src python -m e2e.demo_video.record --out ~/path/to/site/assets
 
 Produces demo-gui.{webm,mp4}, demo-cli.{webm,mp4} and a .jpg poster for each,
 all 1600x960, 26.000 s, 30 fps, 780 frames, silent, frame-locked to each other.

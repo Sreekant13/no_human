@@ -23,6 +23,12 @@ class PrResult:
     url: str
     kind: str  # github | gitlab | local
     branch: str
+    # The SHA `repo.push()` actually sent, captured at push time — the receipt
+    # check must compare the forge's PR head against THIS, never against a
+    # HEAD re-resolved later (HEAD can drift while a long-running task waits
+    # on CI/review). Empty when a caller fabricates a PrResult without a real
+    # push (tests); receipts.py treats a falsy local_sha as "skip the check".
+    pushed_sha: str = ""
 
 
 def open_pr(
@@ -63,18 +69,18 @@ def open_pr(
             "GitHub Enterprise instance."
         )
 
-    repo.push(branch)
+    pushed_sha = repo.push(branch)
     if is_github:
         return PrResult(github.open_pr(repo.path, branch, title, body, base=base,
                                        labels=labels,
                                        update_existing_body=update_existing_body),
-                        "github", branch)
+                        "github", branch, pushed_sha=pushed_sha)
     if is_gitlab:
         return PrResult(gitlab.open_mr(repo.path, branch, title, body, base=base,
                                        labels=labels),
-                        "gitlab", branch)
+                        "gitlab", branch, pushed_sha=pushed_sha)
 
     # Local (file-path) remote — the Phase 0 testing target: no PR API, the
     # push itself proves the branch/commit/PR-open path.
     marker = f"local-pr://{Path(url).name or 'remote'}/{branch}"
-    return PrResult(marker, "local", branch)
+    return PrResult(marker, "local", branch, pushed_sha=pushed_sha)

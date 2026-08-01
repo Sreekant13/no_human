@@ -129,6 +129,140 @@ async def test_full_pipeline_opens_local_pr(bare_repo, tmp_path, store):
     assert ci_skipped and ci_skipped[0].get("remote_ci") is False
 
 
+async def test_receipt_survives_main_moving_after_the_push(
+        bare_repo, tmp_path, store, monkeypatch):
+    """Live incident abc7e570: a correctly-opened PR was reported 'lost'
+    because the receipt check compared the PR head against a re-resolved
+    `repo.head_sha()`. By the time that ran, main had moved in the SAME
+    working tree (a human merged something else while this task waited) —
+    HEAD no longer pointed at the pushed branch's tip, so a correct delivery
+    read as lost. The receipt must compare against the SHA that was actually
+    pushed, captured at push time — not HEAD re-resolved later."""
+    from no_human.core import orchestrator as orch_mod
+
+    real_open_pr = orch_mod.open_pr
+    real_verify = orch_mod.verify_pr_receipt
+    captured = {}
+
+    def spy_open_pr(repo, branch, title, body, **kwargs):
+        result = real_open_pr(repo, branch, title, body, **kwargs)
+        captured["pushed_sha"] = result.pushed_sha
+        # main moves in the SAME working tree after the push landed — e.g. a
+        # human merged an unrelated PR while this task waited on CI/review.
+        # repo.head_sha() now reads main's tip, not the pushed branch's head.
+        _git(repo.path, "checkout", "main")
+        (repo.path / "unrelated.md").write_text("docs\n")
+        _git(repo.path, "add", "-A")
+        _git(repo.path, "commit", "-m", "unrelated docs commit")
+        return result
+
+    def spy_verify(repo_path, pr_url, *, expected_files, local_sha,
+                   committed_files=None, runner=None):
+        captured["local_sha"] = local_sha
+
+        # Stand in for the forge: it genuinely reports the pushed branch's
+        # head — the PR is correct, the defect is in the comparand, not
+        # the forge's view.
+        def fake_runner(args, **kw):
+            class P:
+                returncode = 0
+                stdout = json.dumps(
+                    {"files": [], "headRefOid": captured["pushed_sha"]})
+                stderr = ""
+            return P()
+
+        return real_verify(repo_path, pr_url, expected_files=expected_files,
+                           local_sha=local_sha, committed_files=committed_files,
+                           runner=fake_runner)
+
+    monkeypatch.setattr(orch_mod, "open_pr", spy_open_pr)
+    monkeypatch.setattr(orch_mod, "verify_pr_receipt", spy_verify)
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+
+    cfg = _config(tmp_path)
+    cfg.data["isolation"]["enabled"] = False   # repo IS bare_repo; no linked
+                                               # worktree, so "main" can be
+                                               # checked out in the same path.
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert captured["local_sha"] == captured["pushed_sha"], (
+        "local_sha passed to verify_pr_receipt must be the SHA captured at "
+        "push time, not a HEAD re-resolved after main moved")
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    attempts = await store.list_attempts(t.id)
+    assert attempts[-1]["status"] == "succeeded"
+    receipts = [e for e in events if e["kind"] == "receipt"]
+    assert receipts and receipts[-1]["status"] == "landed", receipts
+
+
+async def test_receipt_still_lost_on_a_genuine_sha_mismatch(
+        bare_repo, tmp_path, store, monkeypatch):
+    """Negative control: the fix must not weaken the check into a warning.
+    When the forge's PR head genuinely differs from what was pushed (a real
+    force-push/squash divergence), the receipt must still report 'lost', and
+    the message must name which refs were compared."""
+    from no_human.core import orchestrator as orch_mod
+
+    real_verify = orch_mod.verify_pr_receipt
+
+    def spy_verify(repo_path, pr_url, *, expected_files, local_sha,
+                   committed_files=None, runner=None):
+        def fake_runner(args, **kw):
+            class P:
+                returncode = 0
+                stdout = json.dumps(
+                    {"files": [], "headRefOid": "deadbeef0000000000000000000000000000dead"})
+                stderr = ""
+            return P()
+        return real_verify(repo_path, pr_url, expected_files=expected_files,
+                           local_sha=local_sha, committed_files=committed_files,
+                           runner=fake_runner)
+
+    monkeypatch.setattr(orch_mod, "verify_pr_receipt", spy_verify)
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
+        )
+        (cwd / "test_calc.py").write_text(
+            "from calc import add, mul\n\n"
+            "def test_add():\n    assert add(1, 2) == 3\n\n"
+            "def test_mul():\n    assert mul(2, 3) == 6\n"
+        )
+
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    receipts = [e for e in events if e["kind"] == "receipt"]
+    assert receipts and receipts[-1]["status"] == "lost", receipts
+    detail = receipts[-1]["text"]
+    assert "head" in detail.lower() and "pushed" in detail.lower(), detail
+    assert outcome.status is not TaskStatus.AWAITING_APPROVAL, outcome.detail
+
+
 @pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
 async def test_repro_gate_runs_advisory_inside_the_pipeline(bare_repo, tmp_path, store):
     """The coder declares its demonstrating test; the gate proves both

@@ -344,9 +344,16 @@ def test_prepared_case_repo_matches_the_pinned_base_content():
     # captured off the maintainer's laptop and frozen into a fixture. Machine
     # residue, not identity — see the BASE_FIXTURE_SCRUB entry for why the bare
     # first name is scrubbed HERE and deliberately not added to any term list.
+    # 18 -> 19 on 2026-08-01: `specmiss-credential-load-outside-gate/base/tests/
+    # test_cli_commands.py` carried four seeded strings that between them
+    # reconstruct a real debugging episode — a build server behind corporate SSO,
+    # a 401 loop, and the credential rule that came out of it. Every noun in it
+    # is a PUBLIC product name with no host, number or ticket, so no term list,
+    # shape rule or ordinal guard could ever have seen it; a reader found it by
+    # asking whether the prose narrates something that really happened.
     # Deliberately a literal and not a count derived from the manifests, which
     # is where `scrubbed` already comes from and would agree by construction.
-    assert scrubbed == 18, scrubbed
+    assert scrubbed == 19, scrubbed
 
 
 @pytest.mark.asyncio

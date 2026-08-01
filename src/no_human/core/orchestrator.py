@@ -3462,7 +3462,13 @@ class Orchestrator:
             repo.path, pr.url,
             expected_files=self._repo_relative_edits(repo),
             committed_files=committed,
-            local_sha=repo.head_sha(),
+            # The SHA `open_pr` actually pushed, captured at push time — NOT
+            # repo.head_sha() re-resolved here. HEAD can drift away from the
+            # pushed branch while this task waited on CI/review (main moves
+            # in a shared tree, another checkout), and re-resolving compared
+            # a correct PR against whatever HEAD happened to be at verify
+            # time instead of what was actually sent.
+            local_sha=pr.pushed_sha,
         )
         self.emit("receipt", f"pr_open {receipt.status}: {receipt.detail}",
                   status=receipt.status)

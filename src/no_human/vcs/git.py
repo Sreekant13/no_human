@@ -395,14 +395,28 @@ class GitRepo:
 
     def push(self, branch: str | None = None, *, remote: str = "origin",
              set_upstream: bool = True) -> str:
+        """Push ``branch`` to ``remote`` and return the SHA that was pushed.
+
+        Resolved from the branch ref right BEFORE the push runs — not from
+        HEAD afterwards, and not by the caller re-resolving HEAD later. A
+        long-running task can sit for minutes waiting on CI/PR review, during
+        which HEAD can move out from under this same working tree (another
+        checkout, a later commit); re-resolving at that point silently swaps
+        in whatever the tree now points at. That is exactly how a correctly
+        landed PR got reported "lost": the receipt check compared the PR's
+        head against a re-resolved `repo.head_sha()` that had drifted to
+        main's tip, not the commit this push actually sent.
+        """
         branch = branch or self.current_branch()
         if _branch_protected(branch, self.never_push_to):
             raise ProtectedBranch(f"refusing to push protected branch: {branch}")
+        sha = self._run("rev-parse", branch)
         args = ["push"]
         if set_upstream:
             args += ["-u"]
         args += [remote, branch]
-        return self._run(*args)
+        self._run(*args)
+        return sha
 
     # ----------------------------- worktrees ------------------------------- #
     # Phase 7 foundation: per-task isolation. A linked git worktree gives a task
