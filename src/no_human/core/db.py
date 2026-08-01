@@ -254,6 +254,32 @@ class Store:
             "utility_tokens_used": "INTEGER DEFAULT 0",
             "utility_cache_read_tokens": "INTEGER DEFAULT 0",
             "utility_cache_creation_tokens": "INTEGER DEFAULT 0",
+            # The OUTPUT share of the `*tokens_used` column beside each one.
+            # `_usage_quad` in the backend always had this number and the
+            # backend summed it away (`input_tokens + output_tokens`) before
+            # anything downstream could see it, so output — which bills ~5x
+            # input — was priced at the input rate everywhere: the stats
+            # dollars, the cost tiles, and the lifetime brake.
+            #
+            # A SUBSET, not a fourth addend: `tokens_used` keeps meaning
+            # input+output, exactly as all 52 files that read it already
+            # assume, and this says how much of that total was output. Input
+            # is `tokens_used - output_tokens`. One source of truth for the
+            # total, so the two can never drift into disagreeing about it.
+            #
+            # NO `DEFAULT 0`, unlike every column above — and that is the
+            # whole point of them being separate lines. ADD COLUMN backfills
+            # the declared default, so `DEFAULT 0` would stamp "this attempt
+            # emitted no output tokens" onto every row in the ledger. The
+            # split was discarded AT CAPTURE; there is nothing to backfill
+            # from and there never will be. NULL reads "unknown" and prices at
+            # the old rate; 0 reads "free" and is a lie. A 0 written for an
+            # unreported field is how a per-attempt brake went inert on 27 of
+            # 27 tasks once already.
+            "output_tokens": "INTEGER",
+            "review_output_tokens": "INTEGER",
+            "plan_output_tokens": "INTEGER",
+            "utility_output_tokens": "INTEGER",
             # Which model actually ran which role on this attempt. Nothing
             # recorded it, which is how a frozen config.yaml silently inverted
             # coder and reviewer for a week.
@@ -789,21 +815,60 @@ class Store:
             col for cols in cls._usage_columns_by_class().values() for col in cols
         )
 
+    @classmethod
+    def _output_columns_by_class(cls) -> dict[str, tuple[str, ...]]:
+        """The output SHARE of the four ``*tokens_used`` columns.
+
+        Kept OUT of ``_usage_columns_by_class`` on purpose, and this is the
+        one thing to understand before editing either method. Those three
+        classes are ADDENDS — ``lifetime_usage`` sums them to get the raw
+        token total. ``output_tokens`` is not an addend; it is a slice of the
+        ``tokens_used`` addend, already inside it. Folding it in would count
+        every output token twice and silently inflate the raw figure that
+        ``nh``, the web surfaces and ``eval/northstar.py`` all print.
+
+        It rides along in ``lifetime_usage_by_class`` anyway, because the
+        WEIGHTED path does need it: ``pricing.weighted_tokens`` charges it
+        ``OUTPUT_EXTRA_WEIGHT`` — the premium over the 1.0 that
+        ``tokens_used`` already applied — so the splat keeps working and the
+        total is priced once.
+        """
+        return {
+            "output_tokens": tuple(
+                "output_tokens" if tier == "" else f"{tier}output_tokens"
+                for tier in cls._USAGE_TIERS
+            ),
+        }
+
     async def lifetime_usage_by_class(
         self, task_id: str
     ) -> tuple[int, dict[str, int]]:
-        """(attempts, {tokens_used, cache_read_tokens, cache_creation_tokens}).
+        """(attempts, {tokens_used, cache_read_tokens, cache_creation_tokens,
+        output_tokens}).
 
         The same rows and the same twelve columns ``lifetime_usage`` sums, kept
         in their three price classes so the budget gate can weight them
-        (``core.pricing.weighted_tokens``). The classes are summed across all
+        (``core.pricing.weighted_tokens``), plus a FOURTH key that is not a
+        fourth class: ``output_tokens`` is the output slice of ``tokens_used``,
+        carried here so the splat into ``weighted_tokens`` can charge it the
+        output premium. It is deliberately absent from ``lifetime_usage``'s
+        raw total, which would otherwise count it twice. The classes are
+        summed across all
         four model tiers — coder, reviewer, planner, utility — because they all
         bill at the same three rates.
         """
+        # The three raw classes PLUS the output share, which is a slice of the
+        # first of them rather than a fourth class — see
+        # `_output_columns_by_class`. The inner `COALESCE(col, 0)` is what
+        # makes a NULL split cost nothing extra instead of poisoning the SUM:
+        # an attempt whose split was never recorded prices exactly as it did
+        # before the column existed, which is the honest treatment of
+        # "unknown" and the only one available (there is no backfill).
+        wanted = {**self._usage_columns_by_class(), **self._output_columns_by_class()}
         selects = ", ".join(
             "COALESCE(SUM({}), 0) AS {}".format(
                 " + ".join(f"COALESCE({c}, 0)" for c in cols), name)
-            for name, cols in self._usage_columns_by_class().items()
+            for name, cols in wanted.items()
         )
         cur = await self.db.execute(
             f"SELECT COUNT(*) AS n, {selects} FROM attempts WHERE task_id = ?",
@@ -811,11 +876,8 @@ class Store:
         )
         row = await cur.fetchone()
         if not row:
-            return (0, {name: 0 for name in self._usage_columns_by_class()})
-        return (
-            int(row["n"]),
-            {name: int(row[name]) for name in self._usage_columns_by_class()},
-        )
+            return (0, {name: 0 for name in wanted})
+        return (int(row["n"]), {name: int(row[name]) for name in wanted})
 
     async def lifetime_usage(self, task_id: str) -> tuple[int, int]:
         """(attempts, tokens) spent over the task's WHOLE life, resumes included.
@@ -839,9 +901,17 @@ class Store:
         it uses ``lifetime_usage_by_class`` and weights the classes by price
         (``core.pricing``), because a raw sum bounds conversation length, not
         spend. Computed from the same one query so the two cannot drift.
+
+        Sums the three ADDEND classes only. ``lifetime_usage_by_class`` also
+        returns ``output_tokens``, which is a slice of ``tokens_used`` and not
+        a bucket beside it; `sum(by_class.values())` would double-count it and
+        move a number this docstring promises will keep matching every surface
+        token for token.
         """
         attempts, by_class = await self.lifetime_usage_by_class(task_id)
-        return attempts, sum(by_class.values())
+        return attempts, sum(
+            by_class[name] for name in self._usage_columns_by_class()
+        )
 
     # ---------------------- unattributed usage ledger ----------------------- #
 

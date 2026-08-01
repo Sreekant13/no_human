@@ -128,6 +128,19 @@ class AgentResult:
     denials: list[str] = field(default_factory=list)
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    # The OUTPUT share of `tokens_used` above, which is input+output. Output
+    # bills ~5x input, and `_usage_quad` has always returned the number — this
+    # dataclass was where it got thrown away, so no cost surface downstream
+    # could price it. `tokens_used` is unchanged and still means the total;
+    # input is `tokens_used - output_tokens`.
+    #
+    # `None`, not 0, and that distinction is load-bearing all the way to the
+    # DB column: 0 asserts "this run emitted no output tokens", which is true
+    # of almost no run, whereas None says the usage block never arrived (an
+    # errored result, a session that produced no ResultMessage). It is
+    # persisted as SQL NULL and priced at the old input rate — an under-count
+    # that is at least visible as unknown rather than asserted as free.
+    output_tokens: int | None = None
     # HTTP status of the failing API call (429/529/500...). The SDK sets it on
     # the result event precisely when is_error is true and the subtype is
     # "success" — i.e. THIS incident's shape. It was captured on the event but
@@ -449,6 +462,12 @@ class ClaudeBackend:
         # treats the attempt as failed rather than crashing or committing
         # half-finished work.
         last_turns = last_tokens = 0
+        # The PARENT's output tokens, and whether any usage block was ever
+        # seen. `saw_usage` is what keeps "never reported" (None -> SQL NULL)
+        # distinct from "reported zero output" (0), which are different facts
+        # and price differently.
+        last_output = 0
+        saw_usage = False
         # The CLI's OWN explanation, carried on the last result event. The
         # SDK then replaces the trailing ProcessError with
         # "Claude Code returned an error result: <subtype>" — which for a
@@ -562,6 +581,13 @@ class ClaudeBackend:
                             meta={
                                 "tokens_used": int(usage.get("input_tokens", 0))
                                 + int(usage.get("output_tokens", 0)),
+                                # The output SLICE of the total beside it, so
+                                # the in-flight budget watch prices output at
+                                # its real ~5x rate instead of at the input
+                                # rate. Not an extra addend — see
+                                # `core.pricing.OUTPUT_EXTRA_WEIGHT`.
+                                "output_tokens": int(
+                                    usage.get("output_tokens", 0)),
                                 "cache_read_tokens": int(
                                     usage.get("cache_read_input_tokens", 0)),
                                 "cache_creation_tokens": int(
@@ -636,11 +662,20 @@ class ClaudeBackend:
                     )
                 elif isinstance(message, ResultMessage):
                     usage = message.usage or {}
-                    tokens = int(usage.get("input_tokens", 0)) + int(
-                        usage.get("output_tokens", 0)
-                    )
-                    cache_read = int(usage.get("cache_read_input_tokens", 0))
-                    cache_creation = int(usage.get("cache_creation_input_tokens", 0))
+                    # `_usage_quad` has always returned all four numbers; this
+                    # site used to inline two of them and add them together,
+                    # which is where the input/output split was lost.
+                    in_tokens, out_tokens, cache_read, cache_creation = _usage_quad(
+                        usage)
+                    tokens = in_tokens + out_tokens
+                    if message.usage:
+                        # Only a real usage block counts as having SEEN a
+                        # split. Without this flag an errored result with no
+                        # usage would report output=0 — indistinguishable from
+                        # a run that genuinely emitted none — and that 0 is
+                        # what would land in the DB column.
+                        saw_usage = True
+                        last_output += out_tokens
                     denials = [str(d) for d in (message.permission_denials or [])]
                     last_turns, last_tokens = message.num_turns, last_tokens + tokens
                     # ONLY from an ERRORED result. Capturing a SUCCESSFUL
@@ -675,6 +710,20 @@ class ClaudeBackend:
                             # update_attempt), so folding the rollup in here is
                             # what actually stops subagents billing as free.
                             "tokens_used": last_tokens + sub_io,
+                            # The PARENT's output only, and deliberately so.
+                            # The parent's figure is exact (verified byte-exact
+                            # against ResultMessage.usage); the subagent
+                            # stream's output is a documented early snapshot,
+                            # and a FLOORED subagent has no output signal at
+                            # all. Summing an exact number with an unreliable
+                            # one and calling the result "the output share"
+                            # would hide which is which. So this is a LOWER
+                            # BOUND whenever subagents ran: their output stays
+                            # inside `tokens_used` and prices at the input
+                            # rate, the same under-count as before this
+                            # column existed, now confined to the subagent
+                            # share instead of the whole run.
+                            "output_tokens": last_output if saw_usage else None,
                             "session_id": message.session_id,
                             "stop_reason": message.stop_reason,
                             "denials": denials,
@@ -717,6 +766,9 @@ class ClaudeBackend:
                     "num_turns": last_turns or (max_turns if is_max_turns else 0),
                     "is_error": True,
                     "tokens_used": last_tokens + sub_io,
+                    # A run that died mid-flight may never have seen a usage
+                    # block; NULL then, not 0.
+                    "output_tokens": last_output if saw_usage else None,
                     "session_id": last_session,
                     "stop_reason": "max_turns" if is_max_turns else "error",
                     "denials": [],
@@ -774,6 +826,13 @@ class ClaudeBackend:
                     denials=m.get("denials", []),
                     cache_read_tokens=int(m.get("cache_read_tokens", 0)),
                     cache_creation_tokens=int(m.get("cache_creation_tokens", 0)),
+                    # NOT coerced through `int(... or 0)`: None must survive as
+                    # None all the way to the DB column, where it is the
+                    # difference between "unknown" and "emitted no output".
+                    output_tokens=(
+                        None if m.get("output_tokens") is None
+                        else int(m["output_tokens"])
+                    ),
                     api_error_status=m.get("api_error_status"),
                     subagent_tokens_used=int(m.get("subagent_tokens_used", 0)),
                     subagent_cache_read_tokens=int(

@@ -312,18 +312,40 @@ _CANCEL_POLL_SECONDS = 3.0
 
 
 def _usage_classes(usage: dict) -> dict[str, int]:
-    """The three PRICE classes out of an `_attempt_usage` dict.
+    """The priced fields out of an `_attempt_usage` dict.
 
     That dict also carries `assistant_messages`, which is a message COUNT and
     not a token bucket — splatting the whole thing into `weighted_tokens`
     would charge it as if it were fresh input. Named explicitly here so the
     one place that would go wrong cannot.
+
+    `output_tokens` is the output SLICE of `tokens_used`, not a fourth class
+    beside it; `weighted_tokens` charges it the PREMIUM over the 1.0 already
+    applied. A None (no usage block seen yet) collapses to 0 here, which
+    prices exactly as this function did before the split existed — the right
+    reading of "unknown" for a live gate, and the only one available.
     """
     return {
         "tokens_used": int(usage.get("tokens_used", 0) or 0),
+        "output_tokens": int(usage.get("output_tokens", 0) or 0),
         "cache_read_tokens": int(usage.get("cache_read_tokens", 0) or 0),
         "cache_creation_tokens": int(usage.get("cache_creation_tokens", 0) or 0),
     }
+
+
+def _accumulate_output(bucket: dict, result) -> None:
+    """Fold one session's output-token count into a tier accumulator.
+
+    Its own function because the None handling is the whole point and it is
+    needed identically by the planner and utility tiers. `output_tokens` stays
+    None until some session actually reports a split; only then does it start
+    summing. A tier that never reported one persists SQL NULL — "unknown" —
+    rather than a 0 that would assert the tier emitted no output tokens.
+    """
+    reported = getattr(result, "output_tokens", None)
+    if reported is not None:
+        bucket["output_tokens"] = int(bucket.get("output_tokens") or 0) + int(
+            reported)
 
 
 class CancelRequested(RuntimeError):
@@ -898,6 +920,13 @@ class Orchestrator:
                     event.meta.get("cache_read_tokens", 0))
                 usage["cache_creation_tokens"] += int(
                     event.meta.get("cache_creation_tokens", 0))
+                # Assigned rather than `+=`d into a zero, so the counter stays
+                # None until an event actually reports a split. Once one does,
+                # it accumulates like the others.
+                if event.meta.get("output_tokens") is not None:
+                    usage["output_tokens"] = int(
+                        usage["output_tokens"] or 0) + int(
+                        event.meta["output_tokens"])
                 # COST-WEIGHTED, matching the ceiling's unit (core.pricing).
                 # The counters above stay RAW because they are what gets
                 # persisted to the attempt row; only the comparison is priced.
@@ -2458,6 +2487,7 @@ class Orchestrator:
             await self.store.update_attempt(
                 attempt_id, status="failed", failure_reason=detail,
                 commit_sha=wip_sha or None, tokens_used=u["tokens_used"],
+                output_tokens=u["output_tokens"],
                 cache_read_tokens=u["cache_read_tokens"],
                 cache_creation_tokens=u["cache_creation_tokens"],
                 **self._pop_aux_usage(),
@@ -2490,6 +2520,7 @@ class Orchestrator:
             await self.store.update_attempt(
                 attempt_id, status="failed", failure_reason=detail,
                 commit_sha=wip_sha or None, tokens_used=u["tokens_used"],
+                output_tokens=u["output_tokens"],
                 cache_read_tokens=u["cache_read_tokens"],
                 cache_creation_tokens=u["cache_creation_tokens"],
                 **self._pop_aux_usage(),
@@ -2506,6 +2537,7 @@ class Orchestrator:
             await self.store.update_attempt(
                 attempt_id, status="failed", failure_reason=detail,
                 tokens_used=u["tokens_used"],
+                output_tokens=u["output_tokens"],
                 cache_read_tokens=u["cache_read_tokens"],
                 cache_creation_tokens=u["cache_creation_tokens"],
                 **self._pop_aux_usage(),
@@ -2575,6 +2607,9 @@ class Orchestrator:
         # so no exit loses or leaks it).
         await self.store.update_attempt(
             attempt_id, turns_used=result.num_turns, tokens_used=result.tokens_used,
+            # None when the session reported no usage block — persisted as SQL
+            # NULL, never coerced to 0.
+            output_tokens=getattr(result, "output_tokens", None),
             cache_read_tokens=result.cache_read_tokens,
             cache_creation_tokens=result.cache_creation_tokens,
             **self._pop_aux_usage(),
@@ -3066,6 +3101,9 @@ class Orchestrator:
         await self.store.update_attempt(
             attempt_id,
             review_tokens_used=getattr(decision, "tokens_used", 0) or 0,
+            # NOT `or 0` like its neighbours: None means the reviewer session
+            # reported no usage block, and that must reach the column as NULL.
+            review_output_tokens=getattr(decision, "output_tokens", None),
             review_cache_read_tokens=getattr(decision, "cache_read_tokens", 0) or 0,
             review_cache_creation_tokens=getattr(decision, "cache_creation_tokens", 0) or 0,
         )
@@ -3421,12 +3459,13 @@ class Orchestrator:
         u = getattr(self, "_plan_usage", None)
         if u is None:
             u = {"tokens_used": 0, "cache_read_tokens": 0,
-                 "cache_creation_tokens": 0}
+                 "cache_creation_tokens": 0, "output_tokens": None}
             self._plan_usage = u
         u["tokens_used"] += int(getattr(result, "tokens_used", 0) or 0)
         u["cache_read_tokens"] += int(getattr(result, "cache_read_tokens", 0) or 0)
         u["cache_creation_tokens"] += int(
             getattr(result, "cache_creation_tokens", 0) or 0)
+        _accumulate_output(u, result)
 
     def _note_utility_usage(self, result) -> None:
         """Accumulate utility-tier burn for the attempt row.
@@ -3446,12 +3485,13 @@ class Orchestrator:
         u = getattr(self, "_utility_usage", None)
         if u is None:
             u = {"tokens_used": 0, "cache_read_tokens": 0,
-                 "cache_creation_tokens": 0}
+                 "cache_creation_tokens": 0, "output_tokens": None}
             self._utility_usage = u
         u["tokens_used"] += int(getattr(result, "tokens_used", 0) or 0)
         u["cache_read_tokens"] += int(getattr(result, "cache_read_tokens", 0) or 0)
         u["cache_creation_tokens"] += int(
             getattr(result, "cache_creation_tokens", 0) or 0)
+        _accumulate_output(u, result)
 
     def _repo_relative_edits(self, repo) -> set[str]:
         """Coder-touched paths as repo-relative strings (receipt input);
@@ -3889,6 +3929,9 @@ class Orchestrator:
         await self.store.update_attempt(
             attempt_id,
             review_tokens_used=getattr(decision, "tokens_used", 0) or 0,
+            # NOT `or 0` like its neighbours: None means the reviewer session
+            # reported no usage block, and that must reach the column as NULL.
+            review_output_tokens=getattr(decision, "output_tokens", None),
             review_cache_read_tokens=getattr(decision, "cache_read_tokens", 0) or 0,
             review_cache_creation_tokens=getattr(decision, "cache_creation_tokens", 0) or 0,
         )
@@ -4886,6 +4929,10 @@ class Orchestrator:
             review_passed=1 if decision.passed else 0,
             review_checklist=decision.as_dict(),
             tokens_used=getattr(decision, "tokens_used", 0) or 0,
+            # A code_review task's ONLY spend is the reviewer's, so it lands in
+            # the coder-tier column here rather than the review_ one. The
+            # output slice follows it, and keeps None -> NULL.
+            output_tokens=getattr(decision, "output_tokens", None),
             cache_read_tokens=getattr(decision, "cache_read_tokens", 0) or 0,
             cache_creation_tokens=getattr(decision, "cache_creation_tokens", 0) or 0,
             status="succeeded",
@@ -5807,10 +5854,18 @@ class Orchestrator:
         #
         # All three remaining gaps are documented rather than papered over with
         # a number this path cannot actually observe.
-        self._attempt_usage: dict[str, int] = {
+        self._attempt_usage: dict[str, int | None] = {
             "tokens_used": 0,
             "cache_read_tokens": 0,
             "cache_creation_tokens": 0,
+            # Starts as None, NOT 0, and only becomes a number once a usage
+            # event actually carries one. These counters are what the abort
+            # paths persist onto the attempt row, so a 0 here would be written
+            # to `attempts.output_tokens` as a measurement — asserting the
+            # attempt emitted no output — for an attempt that reported nothing
+            # at all. NULL is the honest value and the column has no default
+            # precisely so it can hold it.
+            "output_tokens": None,
             # S1.2. Counted here, NOT written to attempts.turns_used, because it is
             # not the same quantity: turns_used holds the SDK's ResultMessage.num_turns
             # (success path only — there is no result on a BudgetAbort), whereas this

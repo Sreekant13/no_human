@@ -89,6 +89,13 @@ class ReviewDecision:
     tokens_used: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    # The output SLICE of `tokens_used`, which is input+output. The reviewer
+    # is the most output-heavy tier in the system — it reads a diff once and
+    # writes a whole checklist — and output bills ~5x input, so pricing its
+    # burn at the input rate under-states the gate's cost the most of any
+    # tier. None (not 0) when the session reported no usage block: the
+    # attempt column it lands in is nullable for exactly that reason.
+    output_tokens: int | None = None
 
     @property
     def failed_items(self) -> list[ChecklistItem]:
@@ -817,6 +824,10 @@ def merge_angle_findings(
         main.tokens_used += d.tokens_used
         main.cache_read_tokens += d.cache_read_tokens
         main.cache_creation_tokens += d.cache_creation_tokens
+        # Only angles that actually reported a split contribute; if none did,
+        # the merged decision keeps None rather than acquiring a 0.
+        if d.output_tokens is not None:
+            main.output_tokens = (main.output_tokens or 0) + d.output_tokens
         main.demoted_citations.extend(d.demoted_citations)
         for item in d.failed_items:
             toks = _title_tokens(item.label)
@@ -1187,6 +1198,9 @@ class AdversarialReviewer:
         decision.tokens_used = result.tokens_used
         decision.cache_read_tokens = getattr(result, "cache_read_tokens", 0)
         decision.cache_creation_tokens = getattr(result, "cache_creation_tokens", 0)
+        # Default None, not 0 — an absent split must stay distinguishable from
+        # a measured zero all the way to `attempts.review_output_tokens`.
+        decision.output_tokens = getattr(result, "output_tokens", None)
         return decision
 
     async def _agent_review(
@@ -1287,4 +1301,7 @@ class AdversarialReviewer:
         decision.tokens_used = result.tokens_used
         decision.cache_read_tokens = getattr(result, "cache_read_tokens", 0)
         decision.cache_creation_tokens = getattr(result, "cache_creation_tokens", 0)
+        # Default None, not 0 — an absent split must stay distinguishable from
+        # a measured zero all the way to `attempts.review_output_tokens`.
+        decision.output_tokens = getattr(result, "output_tokens", None)
         return decision, ""

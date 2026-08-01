@@ -431,9 +431,15 @@ async def test_the_under_budget_event_carries_both_numbers(store):
 
 
 async def test_the_class_split_sees_every_tier_and_column(store):
-    """`lifetime_usage_by_class` must reach all twelve columns, like
+    """`lifetime_usage_by_class` must reach all twelve ADDEND columns, like
     `lifetime_usage` — a tier missed here is spend the price weighting never
-    sees. Distinct powers of ten so any dropped column is identifiable."""
+    sees. Distinct powers of ten so any dropped column is identifiable.
+
+    Plus the four `*output_tokens` columns, which are NOT addends: each is the
+    output slice of the `*tokens_used` column beside it. They are set to that
+    same value here — an all-output attempt, which is coherent and keeps the
+    powers of ten distinct — so a dropped output column is identifiable the
+    same way, while the raw total must not move by a single token."""
     t = Task.new("all tiers", repo_path="/tmp/x")
     await store.create_task(t)
     aid = await store.create_attempt(t.id, 1)
@@ -450,15 +456,24 @@ async def test_the_class_split_sees_every_tier_and_column(store):
             value = 10 ** (i * 3 + j + 1)
             cols[col] = value
             per_class[cls] += value
+        cols[f"{tier}output_tokens"] = cols[base]
     await store.update_attempt(aid, **cols)
 
     attempts, by_class = await store.lifetime_usage_by_class(t.id)
     assert attempts == 1
-    assert by_class == per_class
-    # And the raw total is still exactly the sum of the classes, so the burn
-    # figure every other surface shows cannot drift from the priced one.
+    assert {k: v for k, v in by_class.items() if k != "output_tokens"} == per_class
+    # Every output column reached, and none double-counted: an attempt that is
+    # 100% output reports exactly the fresh class as its output share.
+    assert by_class["output_tokens"] == per_class["tokens_used"]
+    # And the raw total is still exactly the sum of the three ADDEND classes,
+    # so the burn figure every other surface shows cannot drift from the priced
+    # one — the output slice is inside `tokens_used`, never beside it.
     _, raw = await store.lifetime_usage(t.id)
     assert raw == sum(per_class.values())
+    # The priced number, by contrast, MUST move: that is the defect this
+    # column exists to close. An all-output fresh class bills 5x, not 1x.
+    assert weighted_tokens(**by_class) == weighted_tokens(
+        **per_class) + 4 * per_class["tokens_used"]
 
 
 async def test_the_mid_attempt_watch_prices_the_same_way_the_gate_does(store):
