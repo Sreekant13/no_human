@@ -164,7 +164,23 @@ class ShellApp(App):
 
     # -- output helpers ------------------------------------------------------ #
 
+    # Every writer below is reachable from a background worker, and a worker
+    # OUTLIVES the widgets it writes to. Textual's `App._shutdown()` clears
+    # `_running`, then closes every screen - which unmounts the widgets - and
+    # only the message loop's own `finally` cancels the workers, strictly
+    # afterwards. So on quit there is a window in which a worker is scheduled
+    # with no DOM left to write to: `query_one` raises `NoMatches`, Textual
+    # wraps it as `WorkerFailed`, and it comes back out of the app. Quitting
+    # `nh shell` while the detail pane was streaming printed that traceback
+    # instead of exiting.
+    #
+    # `is_running` is exactly that window, and it is a safe guard rather than a
+    # narrower race because no `await` sits between the check and the query -
+    # the flag cannot flip underneath a single call.
+
     def _say(self, markup: str) -> None:
+        if not self.is_running:
+            return
         self.query_one("#conversation", RichLog).write(markup)
 
     def _say_error(self, exc: BaseException) -> None:
@@ -174,6 +190,8 @@ class ShellApp(App):
             self._say(f"[red]{_escape(line)}[/]")
 
     def _detail(self, markup: str) -> None:
+        if not self.is_running:
+            return
         self.query_one("#detail", RichLog).write(markup)
 
     # -- board --------------------------------------------------------------- #
@@ -191,6 +209,11 @@ class ShellApp(App):
             self._say_error(exc)
             return
         self.tasks = list(tasks)
+        if not self.is_running:
+            # Quit while the board request was in flight. `_select` clears
+            # `#detail` and `_paint` updates `#header`/`#lanes`, and by now
+            # none of the three exist - see the note above `_say`.
+            return
         self._reconcile_selection()
         self._paint()
 
@@ -248,6 +271,11 @@ class ShellApp(App):
                 self._say_error(exc)
                 return
             if not self.follow_reconnect:
+                return
+            if not self.is_running:
+                # Quitting. Cancellation is coming, but not until the message
+                # loop unwinds, and until then this loop would keep opening
+                # streams against the server for a pane that no longer exists.
                 return
             await asyncio.sleep(self.follow_reconnect)
 

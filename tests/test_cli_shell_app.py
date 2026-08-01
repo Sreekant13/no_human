@@ -17,6 +17,7 @@ import html
 import json
 import re
 import sys
+import time
 
 import pytest
 from click.testing import CliRunner
@@ -124,6 +125,39 @@ async def type_line(pilot, text):
     for _ in range(6):
         await pilot.pause()
         await asyncio.sleep(0)
+
+
+async def wait_until(pilot, predicate, *, timeout=5.0, poll=0.005) -> bool:
+    """Pump the app until `predicate()` holds. True if it did, False on deadline.
+
+    Waiting a fixed number of pauses is a wait on a DURATION for a CONDITION,
+    and it is wrong in both directions. Too short and a loaded machine fails a
+    correct app - that is the classic flake. Long enough to be safe and it is
+    worse than slow: the app keeps working the whole time. The reconnect test
+    below used to run `range(20)` pauses against a 10ms reconnect timer, and
+    measured on this machine that was ~19 seconds and ~1500 reconnects to prove
+    a fact settled by the second one. Every one of those extra cycles was
+    another chance to land on the shutdown race in `shell.py` - so the fixed
+    duration did not merely tolerate the flake, it manufactured it.
+
+    So: poll the condition, stop the moment it holds, and bound the wait with a
+    deadline rather than a cycle count.
+
+    The poll is a plain sleep and NOT `pilot.pause()`, which is the difference
+    between ~2 reconnects and ~80. `pause()` returns when the app's message
+    queue goes IDLE, and an app with a live 10ms reconnect timer never is - so
+    each `pause()` here ran about a second whatever the condition had already
+    done. Sleeping yields to the app just as well (it runs on its own task) and
+    returns the moment the condition holds. A caller that goes on to assert on
+    the RENDERED frame should `await pilot.pause()` itself; `pilot` stays in the
+    signature because a wait on app state is meaningless without one.
+    """
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(poll)
+    return True
 
 
 def make_app(client, **kw):
@@ -333,21 +367,58 @@ async def test_the_detail_pane_reopens_the_stream_the_server_closed():
     the pane permanently silent, and re-selecting the task was the only cure.
 
     The reconnect carries the `last-event-id` cursor, so it resumes rather than
-    replaying the server's 200-event deque."""
+    replaying the server's 200-event deque.
+
+    The wait is on the CONDITION - a second stream open - under a deadline, not
+    on a cycle count; `wait_until`'s docstring records what the count cost."""
     client = FakeClient(
         [_t(id="tailme000001", status="implementing")],
         event_frames=[{"kind": "tool_use", "text": "Edit shell.py", "ts": 1712.5}],
     )
     app = make_app(client, follow_reconnect=0.01)
     async with app.run_test(size=SIZE) as pilot:
-        for _ in range(20):
-            await pilot.pause()
-            await asyncio.sleep(0.01)
+        reopened = await wait_until(pilot, lambda: len(client.stream_cursors) >= 2)
         opened = [c for c in client.calls if c[0] == "stream_events"]
         cursors = list(client.stream_cursors)
+    assert reopened, "the stream never re-opened within the deadline"
     assert len(opened) > 1, "one pass and the pane goes dead for good"
     assert cursors[0] == ""
     assert cursors[1] == "1712.5", "a reconnect resumes, it does not replay"
+
+
+async def test_quitting_while_the_stream_is_live_exits_instead_of_crashing():
+    """Textual's `App._shutdown()` closes the screens - which unmounts every
+    widget - and only the message loop's own `finally` cancels the workers,
+    strictly afterwards. `_follow` is therefore scheduled at least once with no
+    `#detail` left: `query_one` raised `NoMatches`, Textual re-raised it as
+    `WorkerFailed`, and quitting `nh shell` with the detail pane streaming
+    printed a traceback instead of exiting.
+
+    This is what made the reconnect test above flaky rather than the reconnect
+    logic: that test spun the loop ~1500 times, and each pass was another draw
+    against this race. Against an endless stream the race is not rare at all -
+    10/10 crashes before the guard in `shell.py`, 0/10 after.
+    """
+    class Endless(FakeClient):
+        """A stream the server never closes, so the worker is always inside
+        the write path when the app tears down."""
+
+        async def stream_events(self, task_id, *, last_event_id=""):
+            self.calls.append(("stream_events", task_id))
+            while True:
+                await asyncio.sleep(0)
+                yield {"kind": "tool_use", "text": "Edit shell.py", "ts": 1.0}
+
+    client = Endless([_t(id="tailme000001", status="implementing")])
+    app = make_app(client, follow_reconnect=0.001)
+    async with app.run_test(size=SIZE) as pilot:
+        streaming = await wait_until(
+            pilot, lambda: ("stream_events", "tailme000001") in client.calls)
+        assert streaming, "the stream never opened, so nothing was under test"
+    # `run_test.__aexit__` re-raises whatever killed a worker, so arriving here
+    # is already the verdict - but say it out loud, because a silent pass is
+    # exactly what this test is here to stop being mistaken for.
+    assert app._exception is None, app._exception
 
 
 async def test_moving_the_selection_switches_which_stream_is_followed():

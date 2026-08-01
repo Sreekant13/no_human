@@ -26,10 +26,20 @@ from no_human.core.task import Task, TaskStatus
 # Helpers — each opens a fresh Store connection in its own asyncio.run()      #
 # --------------------------------------------------------------------------- #
 
-def _seed_task(db_path: Path, status: TaskStatus, *, title="Test task") -> str:
+def _seed_task(db_path: Path, status: TaskStatus, *, title="Test task",
+               task_id: str | None = None) -> str:
+    """Seed one task. `task_id` pins the id instead of taking `Task.new`'s uuid.
+
+    Pin it whenever the test asserts on rendered output. A uuid is random data
+    printed into the same frame the assertions read, and a substring assertion
+    cannot tell it apart from the value under test - which is exactly how the
+    agents-table test below started failing at random.
+    """
     async def _go():
         async with Store(db_path) as s:
             t = Task.new(title, repo_path="/tmp/repo")
+            if task_id is not None:
+                t.id = task_id
             await s.create_task(t)
             await s.set_status(t, status, validate=False)
             return t.id
@@ -51,6 +61,26 @@ def _get_task(db_path: Path, task_id: str) -> Task:
         async with Store(db_path) as s:
             return await s.find_task(task_id)
     return asyncio.run(_go())
+
+
+def _table_rows(output: str) -> list[dict[str, str]]:
+    """Parse a rendered `rich` Table into one {column: cell} dict per data row.
+
+    A cell is the unit a table assertion actually means. Asserting on a
+    substring of the whole frame instead is what made the agents test flaky:
+    every column's text is in that one string, including the random uuid.
+    """
+    header: list[str] = []
+    rows: list[dict[str, str]] = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if "┃" in stripped and not header:
+            header = [c.strip() for c in stripped.strip("┃").split("┃")]
+        elif "│" in stripped and header:
+            cells = [c.strip() for c in stripped.strip("│").split("│")]
+            if len(cells) == len(header):
+                rows.append(dict(zip(header, cells)))
+    return rows
 
 
 def _make_runner(path: Path, monkeypatch) -> CliRunner:
@@ -934,9 +964,19 @@ def test_agents_table_shows_BURN_not_non_cache_coder_tokens(tmp_path, monkeypatc
     """The Agent Sessions table is what an operator watches a runaway on, so
     it was the worst place to print the smallest number: it carried the same
     5500x under-report `nh logs` did (`tokens_used` is NON-CACHE CODER tokens).
+
+    The id below is pinned, and pinned to a COLLIDING one on purpose. This test
+    used to seed a random uuid and assert `"731" not in <whole frame>`; the id
+    column prints `t.id[:8]`, so it failed whenever those eight hex digits
+    happened to contain "731" - which is roughly 1 run in 700, and cost this
+    project three misdiagnoses in a single session when a uuid came up
+    `731a952d`. That id is now the fixture. The assertions read the burn CELL,
+    so the test is its own positive control: the collision is on screen every
+    run, and it passes only because nothing asserts on the frame as a whole.
     """
     db = tmp_path / "test.db"
-    task_id = _seed_task(db, TaskStatus.IMPLEMENTING, title="Runaway")
+    task_id = _seed_task(db, TaskStatus.IMPLEMENTING, title="Runaway",
+                         task_id="731a952d" + "f" * 24)
     _seed_attempt(
         db, task_id, tokens_used=731,
         cache_read_tokens=4_053_498, cache_creation_tokens=197_948,
@@ -948,12 +988,18 @@ def test_agents_table_shows_BURN_not_non_cache_coder_tokens(tmp_path, monkeypatc
     runner = _make_runner(db, monkeypatch)
 
     result = runner.invoke(cli, ["agents"])
-    out = result.output.replace("\n", "").replace(" ", "")
+    rows = _table_rows(result.output)
 
     assert result.exit_code == 0, result.output
-    assert "4,992,820" in out, result.output
-    # The old value must be gone, not merely joined by the new one.
-    assert "731" not in out.replace("4,992,820", ""), result.output
+    assert len(rows) == 1, result.output
+    # The collision really is rendered - otherwise the guard below proves
+    # nothing and this test quietly stops being a control.
+    assert rows[0]["id"] == "731a952d", result.output
+    assert rows[0]["burn"] == "4,992,820", result.output
+    # The old value must be gone, not merely joined by the new one - anywhere
+    # in the row except the id, which is an identifier and not a number.
+    non_id = " ".join(v for k, v in rows[0].items() if k != "id")
+    assert "731" not in non_id.replace("4,992,820", ""), result.output
 
 
 def test_burn_includes_the_REVIEWER_session(tmp_path, monkeypatch):
