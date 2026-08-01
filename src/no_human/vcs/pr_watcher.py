@@ -562,11 +562,12 @@ async def default_pr_files(ref: str) -> list[str]:
 async def default_ci_log_excerpt(link: str) -> str:
     """A short excerpt of a failing Jenkins build's console log, or "".
 
-    Proven against build.example.com: `<build>/consoleText` answers HTTP Basic
-    with the SSO credentials from ~/.no_human/.env (the browser URL the human
-    sees is an SSO redirect, but the API path takes Basic auth). The corporate
-    chain is self-signed, so verification is disabled for this host — the
-    excerpt feeds a prompt, it is not an integrity boundary. Best-effort by
+    `<build>/consoleText` answers HTTP Basic with the credentials from
+    ~/.no_human/.env even where the browser URL redirects to SSO — the API path
+    and the human path authenticate differently, which is the whole reason this
+    reaches for Basic. Where the TLS chain is an internal CA, verification is
+    disabled for that host: the excerpt feeds a prompt, it is not an integrity
+    boundary. Best-effort by
     design: "" simply means the feedback carries only the check name + link.
     """
     if "/display/redirect" in link:

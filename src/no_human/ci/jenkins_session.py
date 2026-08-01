@@ -1,7 +1,7 @@
-"""Jenkins session-cookie auth for CloudBees Jenkins (build.example.com).
+"""Jenkins session-cookie auth, for instances that refuse API-token basic auth.
 
-This Jenkins uses a **local form login** (``j_username`` / ``j_password``);
-API-token basic auth is rejected. We obtain a session cookie (``JSESSIONID*``)
+Some Jenkins deployments are configured for **local form login**
+(``j_username`` / ``j_password``) and reject API-token basic auth outright. We obtain a session cookie (``JSESSIONID*``)
 via a one-time Playwright form login, persist it as a Playwright
 ``storage_state`` JSON (chmod 600), and reuse it for the curl-based REST calls
 in ``JenkinsCI``. On expiry we refresh headlessly.
