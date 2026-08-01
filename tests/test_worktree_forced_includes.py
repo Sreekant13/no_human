@@ -16,7 +16,9 @@ cost-weighted tokens in one attempt) without ever reaching a green run, and its
 reviewer traced the red suite to exactly this.
 
 Same class as the `node_modules` trap `_ensure_node_deps` already solves, and
-solved the same way — symlink from the source checkout rather than rebuild.
+taken from the source checkout the same way rather than rebuilt. It is COPIED
+where node_modules is symlinked: `vite build` writes into `web/dist`, so a link
+would let a UI task rebuild into the developer's checkout. 1 MB buys isolation.
 """
 
 from __future__ import annotations
@@ -70,16 +72,32 @@ def test_provisioning_makes_the_forced_path_resolvable(worktree):
     dist = worktree / "web" / "dist"
     assert dist.exists(), "forced include still missing after provisioning"
     assert (dist / "index.html").is_file(), (
-        "linked, but the board is not readable through it")
+        "provisioned, but the board is not readable through it")
 
 
-def test_it_is_a_link_to_the_source_not_a_copy(worktree):
-    """A copy would go stale the moment the source rebuilds, and would cost a
-    full duplicate per worktree."""
+def test_it_is_a_copy_so_a_rebuild_cannot_reach_the_developers_checkout(worktree):
+    """The isolation property, and the one place this deliberately differs from
+    `_ensure_node_deps`.
+
+    `web/package.json`'s build script is `vite build`, which WRITES into
+    `web/dist`. Through a symlink, a task that touches the UI would rebuild
+    straight into the developer's checkout — the same cross-contamination class
+    that a hijacked venv caused on 2026-08-01. `node_modules` is linked because
+    it is hundreds of megabytes; this is 1 MB, so isolation is nearly free.
+
+    Asserted by WRITING through the provisioned path, which is what a task would
+    actually do — a `is_symlink()` check alone would not prove the source is
+    safe from a rebuild that replaces the directory.
+    """
     _ensure_forced_build_artifacts(worktree, REPO_ROOT)
     dist = worktree / "web" / "dist"
-    assert dist.is_symlink()
-    assert dist.resolve() == (REPO_ROOT / "web" / "dist").resolve()
+    assert not dist.is_symlink(), "a symlink lets a task rebuild into the source"
+
+    source_index = REPO_ROOT / "web" / "dist" / "index.html"
+    before = source_index.read_bytes()
+    (dist / "index.html").write_text("<html>rebuilt by a task</html>")
+    assert source_index.read_bytes() == before, (
+        "writing to the worktree's board changed the developer's checkout")
 
 
 def test_it_never_clobbers_a_real_directory(worktree):
