@@ -47,7 +47,7 @@ class Bounds:
     # TOKEN, so the cap is a cost guardrail, not just a doom-loop stop. Measured
     # 2026-07-13 (29 tasks): the largest PR-producing task burned 6.15M and every
     # other success ≤1.71M — NO success sat above 6.15M. Six failed/parked tasks
-    # sat above 8M (CI_GATE 61.5M + 10.18M, metrics-core 20.8M, and ordinary failed feature
+    # sat above 8M (the CI-gate outliers at 61.5M and 10.18M, another at 20.8M, and
     # tasks at 22.8M/15M/12.7M). So 8M clears every real success with headroom and
     # parks a runaway an order of magnitude sooner than the old 25M did (which the
     # 61.5M task blew past entirely, across resumes).

@@ -690,7 +690,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # recognized). Add your GHE host (e.g. "code.example.com") to open real PRs.
         "github_hosts": ["github.com", "code.example.com"],
         # Labels applied when the agent opens a PR/MR. Some repos gate CI on a
-        # label (e.g. metrics-core requires a V* version label on PRs into dev). Usually
+        # label (some repos require a V* version label on PRs into their integration
+        # branch). Usually
         # a per-repo concern — a task can override via its own `pr_labels`.
         "pr_labels": [],
         "agent_identity_name": "no_human",
@@ -943,7 +944,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "ci_gate": {
         # M6: post-PR CI_GATE integration validation, run as a WakeWatcher rung
-        # (blockers/wake.py) once the PR's normal CI is green. Deploys metrics-core +
+        # (blockers/wake.py) once the PR's normal CI is green. Deploys the service +
         # runs the integration tests on the GitLab pipeline project in a
         # throwaway per-PR namespace — NEVER a prod environment. Trigger is a
         # subprocess to `glab` (operator's local auth), not the Agent SDK.
