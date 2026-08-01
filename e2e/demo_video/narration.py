@@ -102,9 +102,9 @@ BEATS: tuple[Beat, ...] = (
         lines=(
             Line(0.80, "It's Monday. Ten tickets just landed with your name."),
             Line(4.40, "A webhook that double-charges. A flaky test. "
-                       "No time to babysit either.",
+                       "No time to babysit.",
                  spoken="A webhook that double-charges. A flaky test. "
-                        "No time to babysit either."),
+                        "No time to babysit."),
         ),
     ),
     Beat(
@@ -150,7 +150,7 @@ BEATS: tuple[Beat, ...] = (
             Line(46.20, "It reads the diff line by line, and cites its "
                         "evidence."),
             Line(50.60, "The refactor did not pass. It went back, "
-                        "and it went again. No rubber stamps."),
+                        "and it cleared the second review."),
         ),
     ),
     Beat(

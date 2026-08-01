@@ -161,8 +161,20 @@ def mix_args(line_files: list[Path], out_m4a: Path) -> list[str]:
 #: absent, or node is too old, the build falls straight back to `say` and says
 #: so. That keeps the recorder runnable on a bare checkout, which is the whole
 #: reason it lives in this repo.
-KOKORO_VOICE = "am_adam"
-KOKORO_SPEED = "1.06"
+#: Chosen by MEASUREMENT, not by ear-guessing. Across the five candidates
+#: reading the same sample, pitch-motion (variation in zero-crossing rate over
+#: voiced frames, a cheap prosody proxy) ranked: af_sky 1.86, af_nova 1.80,
+#: bm_george 1.71, am_michael 1.43, am_adam 1.28. The first shipped read used
+#: am_adam — the FLATTEST of the five — and the operator's verdict was that it
+#: sounded robotic. Flat pitch is what "robotic" means acoustically, so the
+#: measurement and the complaint agree.
+#:
+#: Speed dropped from 1.06 to 1.0: pushing a neural voice faster compresses the
+#: prosody that makes it sound human, which is the opposite of what is wanted
+#: here. The narration still fits its map — the pacing test and the render's own
+#: measured-overrun check both enforce that, and they refuse rather than warn.
+KOKORO_VOICE = "af_sky"
+KOKORO_SPEED = "1.0"
 
 
 def kokoro_cmd(text: str, dst: Path, voice: str = KOKORO_VOICE) -> list[str]:

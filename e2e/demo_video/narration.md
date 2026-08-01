@@ -24,7 +24,7 @@ spoken *no human*.
 
 ### 1 · Hook — 0.60 s
 > **0.80** — It's Monday. Ten tickets just landed with your name.
-> **4.40** — A webhook that double-charges. A flaky test. No time to babysit either.
+> **4.40** — A webhook that double-charges. A flaky test. No time to babysit.
 
 ### 2 · Handoff — 9.00 s
 > **9.40** — You pick five. And hand them over.
@@ -39,7 +39,7 @@ spoken *no human*.
 ### 4 · Gate — 38.00 s
 > **38.60** — Then the gate. An independent reviewer, in a fresh context, with one brief: prove this task is not done.
 > **46.20** — It reads the diff line by line, and cites its evidence.
-> **50.60** — The refactor did not pass. It went back, and it went again. No rubber stamps.
+> **50.60** — The refactor did not pass. It went back, and it cleared the second review.
 
 ### 5 · Payoff — 56.00 s
 > **56.40** — Five pull requests, tests and evidence attached. A sprint's work, for a tenth of the cost.
