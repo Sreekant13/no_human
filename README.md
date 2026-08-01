@@ -109,9 +109,12 @@ number; `nh logs <id>` shows real spend against the cap, per task.
 
 ## What it does not do
 
-- **Ambitious or vague tickets are not the target.** It is aimed at well-scoped
-  work — bugfixes, test gaps, small features, investigations. A vague ticket
-  produces an escalation. That is the intended behaviour, not a workaround.
+- **A vague ticket escalates.** The limit is CLARITY, not the kind of work: a
+  feature, a bug, a refactor and an investigation are all in scope, and the
+  intake grill exists to turn a rough ask into a spec with testable acceptance
+  criteria. What it will not do is guess. A ticket nobody can make concrete
+  comes back as an escalation with a question, which is the intended behaviour
+  and not a workaround.
 - **No published catch-rate for the reviewer.** The last full measurement
   against the seeded-defect corpus ran on `claude-opus-4-8`. The shipping
   reviewer has been `claude-opus-5` since 2026-07-26 and has **not** been
