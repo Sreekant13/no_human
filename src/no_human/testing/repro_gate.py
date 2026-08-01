@@ -105,9 +105,14 @@ def _pytest_python(repo_path: Path) -> str | None:
         return sys.executable
     from .runner import _venv_bin
 
+    from .runner import _IS_WINDOWS
+
     bin_dir = _venv_bin(repo_path)
     if bin_dir is not None:
-        return str(bin_dir / "python")
+        # `_venv_bin` returns `<venv>\Scripts` on Windows, where the
+        # interpreter is `python.exe` — an extensionless `python` there is not
+        # a file, so this returned a path that does not exist.
+        return str(bin_dir / ("python.exe" if _IS_WINDOWS else "python"))
     for name in ("python3", "python"):
         found = shutil.which(name)
         if found:

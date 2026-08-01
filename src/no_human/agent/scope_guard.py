@@ -152,7 +152,11 @@ def check_scope(
     norm = edited_path.removeprefix("./")
     if repo_root:
         try:
-            norm = str(Path(norm).relative_to(repo_root))
+            # `as_posix()`, not `str()`: plan files are `/`-separated (they come
+            # from the plan text and from git), and `str(WindowsPath)` produces
+            # backslashes, so the membership test below never matched on
+            # Windows and EVERY edit was reported as out of scope.
+            norm = Path(norm).relative_to(repo_root).as_posix()
         except ValueError:
             pass
     if norm in plan_files:

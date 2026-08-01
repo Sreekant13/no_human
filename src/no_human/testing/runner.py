@@ -27,6 +27,47 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 log = logging.getLogger(__name__)
 
+# Read the platform through a constant, never an inline `os.name` test, so the
+# Windows branches below are reachable from a test on any host.
+_IS_WINDOWS = os.name == "nt"
+
+# `start_new_session` is POSIX-only. Windows has no session/process-group in
+# that sense; CREATE_NEW_PROCESS_GROUP is the nearest equivalent and is what
+# detaches the child from our console so a Ctrl-C to `nh` does not also hit it.
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_NEW_GROUP_KWARGS: dict[str, object] = (
+    {"creationflags": _CREATE_NEW_PROCESS_GROUP} if _IS_WINDOWS
+    else {"start_new_session": True}
+)
+
+
+def _kill_process_tree(proc: "subprocess.Popen") -> bool:
+    """Kill *proc* AND its descendants. True only if the TREE kill succeeded.
+
+    POSIX: ``killpg`` over the session ``start_new_session=True`` created.
+
+    Windows: ``os.killpg`` and ``os.getpgid`` DO NOT EXIST, so this path raised
+    AttributeError and a wedged test run could never be reaped — the exact
+    orphaned-xdist-worker failure the POSIX branch was written to prevent.
+    ``taskkill /F /T`` walks the tree instead; CREATE_NEW_PROCESS_GROUP alone
+    would not, because a Windows process group is not a kill target.
+    UNTESTED ON WINDOWS.
+    """
+    if _IS_WINDOWS:
+        try:
+            done = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return done.returncode == 0
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
 
 @dataclass
 class TestRunResult:
@@ -428,9 +469,15 @@ def _venv_bin(repo_path: Path) -> Path | None:
         p.name for p in repo_path.glob(".venv*")
         if p.is_dir() and p.name not in names
     )
+    # Windows venvs are `<venv>\Scripts\python.exe`, not `<venv>/bin/python`.
+    # Probing only the POSIX shape there found NO venv, ever — so the PATH and
+    # VIRTUAL_ENV injection in `_env_for` silently did nothing and every test
+    # command ran against whatever interpreter happened to be first on PATH,
+    # which is the "TESTING had never actually run" failure mode.
+    sub, exe = ("Scripts", "python.exe") if _IS_WINDOWS else ("bin", "python")
     for name in names:
-        bin_dir = repo_path / name / "bin"
-        if (bin_dir / "python").exists():
+        bin_dir = repo_path / name / sub
+        if (bin_dir / exe).exists():
             return bin_dir
     return None
 
@@ -619,10 +666,9 @@ def terminate_running(under: Path | str) -> int:
                  if wd == root or wd.startswith(root + os.sep)]
     killed = 0
     for p in procs:
-        try:
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        if _kill_process_tree(p):
             killed += 1
-        except (ProcessLookupError, PermissionError):
+        else:
             try:
                 p.kill()
             except Exception:  # noqa: BLE001
@@ -639,8 +685,9 @@ def _run_shell_streaming(
     of being collected in one ``communicate()``.
 
     Everything that makes a run a PROOF is deliberately unchanged — same command
-    string, same cwd, same env, same ``shell=True``, same ``start_new_session``
-    process group, same kill-the-group-on-timeout. Only the *reading* differs,
+    string, same cwd, same env, same ``shell=True``, same ``_NEW_GROUP_KWARGS``
+    process group/creation flags, same kill-the-tree-on-timeout. Only the
+    *reading* differs,
     so a run watched live by the web wizard proves exactly what an unwatched run
     would (see onboard.py's module docstring: proving must never drift from what
     the orchestrator later executes).
@@ -651,7 +698,7 @@ def _run_shell_streaming(
     proc = subprocess.Popen(
         cmd, cwd=work_dir, shell=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        bufsize=1, env=run_env, start_new_session=True,
+        bufsize=1, env=run_env, **_NEW_GROUP_KWARGS,
     )
     _register(work_dir, proc)
     chunks: list[str] = []
@@ -676,9 +723,7 @@ def _run_shell_streaming(
         reader.join(timeout=15)
         return proc.returncode, "".join(chunks), False
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
+        if not _kill_process_tree(proc):
             proc.kill()  # fallback: at least the direct child
         reader.join(timeout=15)
         return None, "".join(chunks), True
@@ -692,8 +737,9 @@ def _run_shell(
     """Run a shell test command, capturing stdout+stderr. Returns
     ``(returncode, output, timed_out)``.
 
-    On timeout the WHOLE process group is killed (``start_new_session=True``
-    puts the shell in its own group, ``killpg`` reaps it), so the shell's
+    On timeout the WHOLE process tree is killed (``_NEW_GROUP_KWARGS`` puts
+    the shell in its own group on POSIX, ``_kill_process_tree`` reaps it —
+    ``killpg`` there, ``taskkill /T`` on Windows), so the shell's
     grandchildren — pytest and its ``-n auto`` xdist workers — die too instead
     of being orphaned. Orphaned workers keep the worktree's ``.venv`` open, and
     the attempt's teardown then rmtree's it out from under them (the xdist
@@ -703,16 +749,14 @@ def _run_shell(
     proc = subprocess.Popen(
         cmd, cwd=work_dir, shell=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        env=run_env, start_new_session=True,
+        env=run_env, **_NEW_GROUP_KWARGS,
     )
     _register(work_dir, proc)
     try:
         out, err = proc.communicate(timeout=timeout)
         return proc.returncode, (out or "") + (err or ""), False
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
+        if not _kill_process_tree(proc):
             proc.kill()  # fallback: at least the direct child
         try:
             out, err = proc.communicate(timeout=15)

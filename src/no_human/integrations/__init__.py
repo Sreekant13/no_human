@@ -25,6 +25,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+# Read the platform through a constant, never an inline `os.name` test, so the
+# Windows branch below is reachable from a test on any host.
+_IS_WINDOWS = os.name == "nt"
+
 KIND_BY_NAME = {
     "jira": "issue_tracker",
     "linear": "issue_tracker",
@@ -310,7 +314,19 @@ def _git_credential_present(host: str) -> bool:
     nothing after the read can raise, so that was never exploitable — it is
     done anyway, because the alternative is a containment claim that promises
     more than its mechanism delivers."""
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/usr/bin/true"}
+    # GIT_ASKPASS must name a program that exists and exits 0 silently.
+    # `/usr/bin/true` is not one on Windows, and Windows ships no equivalent
+    # single binary, so do not invent a path there: GIT_TERMINAL_PROMPT=0
+    # already refuses the terminal prompt, and GCM_INTERACTIVE=never is the
+    # matching knob for Git Credential Manager, which is the thing that would
+    # otherwise open a GUI dialog. (`_run_probe` also bounds this at 2s, so a
+    # prompt could stall the probe but never wedge the process.)
+    # UNTESTED ON WINDOWS.
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    if _IS_WINDOWS:
+        env["GCM_INTERACTIVE"] = "never"
+    else:
+        env["GIT_ASKPASS"] = "/usr/bin/true"
     proc = _run_probe(
         ["git", "credential", "fill"],
         input_text=f"protocol=https\nhost={host}\n\n", env=env,

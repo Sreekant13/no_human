@@ -22,13 +22,17 @@ spawns the CLI (a live auth probe would spend quota) and never mutates the env.
 
 from __future__ import annotations
 
-import platform
+import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
+_IS_WINDOWS = os.name == "nt"
+
 # Mirror of the SDK's fallback search list (subprocess_cli._find_cli). Order is
 # not load-bearing for presence, but kept identical so a divergence is obvious.
+# These are POSIX shapes: on Windows npm installs the CLI as a `claude.cmd`
+# shim, so the names are re-derived per platform in `_fallback_candidates`.
 _CLI_FALLBACK_LOCATIONS = (
     ".npm-global/bin/claude",
     ".local/bin/claude",
@@ -36,6 +40,35 @@ _CLI_FALLBACK_LOCATIONS = (
     ".yarn/bin/claude",
     ".claude/local/claude",
 )
+
+# Extensions Windows will actually execute for an npm-installed CLI, in the
+# order npm and the Node ecosystem produce them.
+_WINDOWS_CLI_SUFFIXES = (".cmd", ".exe", ".bat")
+
+
+def _fallback_candidates() -> list[Path]:
+    """Concrete paths to probe after ``PATH``, for the current platform.
+
+    POSIX is byte-for-byte the SDK's list. Windows is a deliberate SUPERSET and
+    the divergence is stated rather than hidden: the SDK's entries are
+    extensionless, which no Windows install ever produces, so applied verbatim
+    they can only ever report a working install as MISSING — the worse of the
+    two errors, since it tells the operator to reinstall a CLI they have. In
+    the normal Windows install npm's global bin is on ``PATH`` and the
+    ``shutil.which`` step above has already resolved it, so these entries are
+    only reached on a machine where they are the operator's real install.
+    ``/usr/local/bin`` is dropped there: on Windows it names a path on whatever
+    the current drive happens to be, and nothing runnable can live there.
+    """
+    home = Path.home()
+    if not _IS_WINDOWS:
+        return [Path("/usr/local/bin/claude"),
+                *(home / rel for rel in _CLI_FALLBACK_LOCATIONS)]
+    dirs = [home / Path(rel).parent for rel in _CLI_FALLBACK_LOCATIONS]
+    # The Windows-native npm global prefix, the analogue of `.npm-global/bin`.
+    if appdata := os.environ.get("APPDATA"):
+        dirs.append(Path(appdata) / "npm")
+    return [d / f"claude{ext}" for d in dirs for ext in _WINDOWS_CLI_SUFFIXES]
 
 
 def find_claude_cli() -> str | None:
@@ -45,7 +78,7 @@ def find_claude_cli() -> str | None:
     locations. Returns the resolved path string, or ``None`` when nothing the SDK
     would accept exists.
     """
-    cli_name = "claude.exe" if platform.system() == "Windows" else "claude"
+    cli_name = "claude.exe" if _IS_WINDOWS else "claude"
 
     # 1. Bundled CLI shipped inside the SDK package. The SDK computes this as
     #    <package_root>/_bundled/<cli_name>; package_root is the dir holding
@@ -61,15 +94,15 @@ def find_claude_cli() -> str | None:
     except Exception:  # noqa: BLE001 — SDK absent/unimportable ⇒ no bundled CLI
         pass
 
-    # 2. System-wide search on PATH.
+    # 2. System-wide search on PATH. Asked for the bare name on BOTH platforms,
+    #    exactly as the SDK does: on Windows `shutil.which` expands PATHEXT, so
+    #    the bare name is what finds `claude.cmd`/`claude.exe` — passing
+    #    "claude.exe" here would NARROW the search and miss the npm shim.
     if cli := shutil.which("claude"):
         return cli
 
-    # 3. Known install locations (absolute + $HOME-relative), as the SDK checks.
-    home = Path.home()
-    candidates = [Path("/usr/local/bin/claude")]
-    candidates += [home / rel for rel in _CLI_FALLBACK_LOCATIONS]
-    for path in candidates:
+    # 3. Known install locations, per platform (see `_fallback_candidates`).
+    for path in _fallback_candidates():
         if path.is_file():
             return str(path)
     return None

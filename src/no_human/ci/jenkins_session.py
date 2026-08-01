@@ -18,9 +18,11 @@ crash.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+from pathlib import Path
 from urllib.parse import urlparse
 
 log = logging.getLogger("no_human.ci.jenkins_session")
@@ -43,7 +45,7 @@ def load_cookies(state_path: str, base_url: str) -> dict[str, str]:
     to the host, which is how the session cookie (set on ``/cjoc``) authenticates
     the REST API. Returns {} if the file is missing/unparseable."""
     try:
-        with open(state_path) as fh:
+        with open(state_path, encoding="utf-8") as fh:
             state = json.load(fh)
     except (OSError, ValueError):
         return {}
@@ -102,7 +104,17 @@ def refresh(
                 pass
             os.makedirs(os.path.dirname(state_path) or ".", exist_ok=True)
             ctx.storage_state(path=state_path)
-            os.chmod(state_path, 0o600)
+            # Session cookies are a credential. `os.chmod(.., 0o600)` alone was
+            # a SILENT NO-OP on Windows, leaving them at the directory's ACL.
+            # If they cannot be restricted, delete them rather than persist an
+            # unprotected session — the caller degrades to "refresh failed".
+            from ..config import secure_credential_file
+            try:
+                secure_credential_file(Path(state_path))
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.unlink(state_path)
+                raise
             browser.close()
     except Exception as exc:  # noqa: BLE001 — refresh is best-effort
         log.warning("Jenkins session refresh failed: %s", exc)

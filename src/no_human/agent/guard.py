@@ -28,10 +28,15 @@ keeping the policy a pure function lets us unit-test it without the SDK.
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 import shlex
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+
+# Read the platform through a constant, never an inline `os.name` test, so the
+# Windows branch below is reachable from a test on any host.
+_IS_WINDOWS = os.name == "nt"
 
 WRITE_TOOLS = {"Write", "Edit", "NotebookEdit", "MultiEdit"}
 
@@ -154,6 +159,14 @@ class GuardDecision:
 
 
 def _path_forbidden(path: str, forbidden: list[str]) -> bool:
+    # Every rule below is written in `/` terms, but on Windows the SDK hands us
+    # `C:\repo\secrets\key.pem` — so `norm.rsplit("/")` returned the WHOLE path
+    # as the basename and no prefix rule could ever match. A guard that stops
+    # matching is a guard that fails OPEN, so normalise the separator first.
+    # Only on Windows: a backslash is a legal (if rare) character in a POSIX
+    # filename and rewriting it there would change what the guard matches.
+    if _IS_WINDOWS:
+        path = path.replace("\\", "/")
     norm = path.removeprefix("./").rstrip("/")
     base = norm.rsplit("/", 1)[-1]
     for pat in forbidden:

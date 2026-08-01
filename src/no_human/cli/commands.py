@@ -41,6 +41,11 @@ from ..notify import build_notifier
 
 console = Console()
 
+# Read the platform through a constant, never an inline `os.name` test, so the
+# Windows branches below are reachable from a test on any host — no Windows
+# machine or runner is available to this project.
+_IS_WINDOWS = os.name == "nt"
+
 
 def print_no_task_matching(task_id: str) -> None:
     """Print the task-not-found error with a remediation hint.
@@ -3964,11 +3969,15 @@ def _acquire_pid_lock() -> bool:
     if lock_path.exists():
         try:
             old_pid = int(lock_path.read_text().strip())
-            # Check if the old process is still alive.
-            os.kill(old_pid, 0)
+            # Check if the old process is still alive — WITHOUT signalling it.
+            alive = _probe_pid(old_pid)
+        except (ValueError, OSError):
+            alive = False  # stale/unreadable lock — treat as dead
+        if alive is True:
             return False  # process alive → another instance running
-        except (ValueError, ProcessLookupError, PermissionError, OSError):
-            pass  # stale lock — old process is dead
+        # None (another user's pid) keeps its previous meaning here: not ours
+        # to reason about, so the lock is taken. Unchanged from the POSIX
+        # behaviour, where PermissionError fell into the same branch.
 
     lock_path.write_text(str(os.getpid()))
     return True
@@ -4264,12 +4273,83 @@ def _denied_message(pid: int) -> None:
     )
 
 
-def _try_kill(pid: int, sig: int):
-    """Send sig to pid, tolerating a process that exits between the caller's
-    liveness check and this call. Returns True if the signal was delivered,
-    False if the process was already gone (ProcessLookupError), or None if
-    the pid is owned by another user (PermissionError) — the caller must
-    treat None as a hard stop and print nothing further."""
+def _kernel32():
+    """The Win32 ``kernel32`` handle. Imported lazily — ``ctypes.WinDLL`` does
+    not exist off Windows — and split out so a test can substitute it."""
+    import ctypes
+
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _windows_pid_alive(pid: int):
+    """Whether *pid* is a live process, WITHOUT signalling it.
+
+    UNTESTED ON WINDOWS. Returns True (alive), False (no such process) or None
+    (exists but not ours to touch), matching the POSIX branch's tri-state.
+    """
+    import ctypes
+
+    ERROR_ACCESS_DENIED = 5
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    k32 = _kernel32()
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        # ERROR_ACCESS_DENIED means the process EXISTS but belongs to someone
+        # else; every other failure (ERROR_INVALID_PARAMETER) means no such pid.
+        denied = ctypes.get_last_error() == ERROR_ACCESS_DENIED
+        return None if denied else False
+    try:
+        code = ctypes.c_ulong()
+        if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True  # we hold a handle, so it exists; state unreadable
+        return code.value == STILL_ACTIVE
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _probe_pid(pid: int):
+    """Is *pid* alive? True / False / None (another user's process).
+
+    ``os.kill(pid, 0)`` is the POSIX idiom and is kept verbatim there. It CANNOT
+    be used on Windows: ``os.kill`` on Windows always calls ``TerminateProcess``
+    — signal 0 included — so the liveness probe that guards the instance lock
+    KILLED the running ``nh`` it was asked to detect, then reported the lock
+    free and took it.
+    """
+    if _IS_WINDOWS:
+        return _windows_pid_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    return True
+
+
+# Escalation levels, named rather than passed as signal numbers: `signal.SIGKILL`
+# does not exist on Windows and merely NAMING it is an AttributeError, which is
+# how `nh stop` died there before it stopped anything.
+_KILL_TERM = "term"
+_KILL_FORCE = "force"
+
+
+def _try_kill(pid: int, level: str = _KILL_TERM):
+    """Ask *pid* to stop (``_KILL_TERM``) or force it (``_KILL_FORCE``).
+
+    Returns True if the request was delivered, False if the process was already
+    gone, or None if the pid is owned by another user — the caller must treat
+    None as a hard stop and print nothing further.
+
+    On Windows this is ``taskkill`` (with ``/T`` for the process tree), because
+    there is no signal to send: POSIX SIGTERM has no Windows equivalent for a
+    non-console child, and SIGKILL has no equivalent at all. UNTESTED ON
+    WINDOWS.
+    """
+    if _IS_WINDOWS:
+        return _windows_try_kill(pid, force=level == _KILL_FORCE)
+    sig = signal.SIGKILL if level == _KILL_FORCE else signal.SIGTERM
     try:
         os.kill(pid, sig)
         return True
@@ -4280,20 +4360,41 @@ def _try_kill(pid: int, sig: int):
         return None
 
 
+def _windows_try_kill(pid: int, *, force: bool):
+    """``taskkill`` the pid (and its tree). See :func:`_try_kill`."""
+    import subprocess
+
+    argv = ["taskkill", *(["/F"] if force else []), "/T", "/PID", str(pid)]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+    except OSError:
+        return None
+    out = f"{proc.stdout or ''}{proc.stderr or ''}".lower()
+    if proc.returncode == 0:
+        return True
+    if "not found" in out or proc.returncode == 128:
+        return False
+    if "denied" in out:
+        _denied_message(pid)
+        return None
+    # Unknown failure: report it as delivered so the caller's wait/escalate
+    # path decides, rather than claiming the process is gone.
+    return True
+
+
 def _wait_for_exit(pid: int, timeout: float):
-    """Poll os.kill(pid, 0) until the process is gone or timeout elapses.
+    """Poll :func:`_probe_pid` until the process is gone or timeout elapses.
 
     Always checks at least once before consulting the clock, so timeout=0
     still confirms a process that already exited by the time this is
     called. Returns True once gone, False if still alive at the deadline,
-    or None if the pid is owned by another user (PermissionError)."""
+    or None if the pid is owned by another user."""
     deadline = time.monotonic() + timeout
     while True:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        state = _probe_pid(pid)
+        if state is False:
             return True
-        except PermissionError:
+        if state is None:
             _denied_message(pid)
             return None
         if time.monotonic() >= deadline:
@@ -4331,17 +4432,16 @@ def _stop_server(timeout: float) -> int:
         lock_path.unlink(missing_ok=True)
         return 1
 
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+    state = _probe_pid(pid)
+    if state is False:
         console.print(f"[yellow]stale pidfile[/] — pid {pid} not running; cleaning up")
         lock_path.unlink(missing_ok=True)
         return 1
-    except PermissionError:
+    if state is None:
         _denied_message(pid)
         return 1
 
-    result = _try_kill(pid, signal.SIGTERM)
+    result = _try_kill(pid, _KILL_TERM)
     if result is None:
         return 1
     if result is False:
@@ -4357,8 +4457,8 @@ def _stop_server(timeout: float) -> int:
         console.print(f"[green]✓ stopped[/] (pid {pid})")
         return 0
 
-    # Wedged: SIGTERM didn't take effect within the bound — escalate.
-    result = _try_kill(pid, signal.SIGKILL)
+    # Wedged: the graceful stop didn't take effect within the bound — escalate.
+    result = _try_kill(pid, _KILL_FORCE)
     if result is None:
         return 1
     if result is False:

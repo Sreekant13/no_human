@@ -60,6 +60,11 @@ import logging
 
 log = logging.getLogger("no_human.api")
 
+# Read the platform through a constant, never an inline `os.name` test, so the
+# Windows branches below are reachable from a test on any host. No Windows
+# machine or runner is available to this project.
+_IS_WINDOWS = os.name == "nt"
+
 def _resolve_web_dist() -> Path:
     """Locate the built React board across the three ways this code ships.
 
@@ -1083,12 +1088,65 @@ async def cancel_task(
     return {"ok": True, "message": f"Cancelled {task_id[:8]}"}
 
 
+def _windows_kill_by_cmdline(task_id: str) -> int:
+    """Windows equivalent of ``pkill -9 -f <task_id>``. Returns 1 if it ran.
+
+    Windows has NO built-in kill-by-command-line, so this is two steps rather
+    than one, and the choice between the candidates matters:
+
+    * ``wmic`` would do it in one call, but it is deprecated and REMOVED from
+      Windows 11 24H2 onward — a cleanup that silently stops working on new
+      machines is the same class of defect as the ``pkill`` that was never
+      there.
+    * ``taskkill`` can only match an image name or a PID, never a command line,
+      so on its own it cannot find a task's children at all.
+
+    So: enumerate PIDs with PowerShell over ``Win32_Process.CommandLine``
+    (present on every supported Windows), then ``taskkill /F /T`` each one.
+    ``/T`` also takes the process TREE, which is what "the task's SDK and
+    pytest subprocesses" actually means and which ``pkill -f`` only achieved
+    because each child carried the id in its own argv.
+
+    UNTESTED ON WINDOWS — no Windows host was available. What is tested here is
+    the argv shape, the self-exclusion, and that the branch is taken at all.
+    """
+    # The id is interpolated into a PowerShell string, so it must not be able
+    # to carry quoting. Task ids are 32-hex; anything else is refused rather
+    # than escaped, because an escaping bug here is a command injection.
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", task_id):
+        log.warning("cancel: refusing to match on a non-alphanumeric task id")
+        return 0
+    # Both this PowerShell and our own process carry the id in their command
+    # lines, so both are excluded — otherwise the cleanup kills the server.
+    script = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "Get-CimInstance Win32_Process | Where-Object { "
+        + f"$_.CommandLine -like '*{task_id}*' -and $_.ProcessId -ne $PID "
+        + f"-and $_.ProcessId -ne {os.getpid()} "
+        + "} | ForEach-Object { $_.ProcessId }"
+    )
+    enum = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True, text=True, timeout=20,
+    )
+    if enum.returncode != 0:
+        return 0
+    for line in (enum.stdout or "").split():
+        if not line.isdigit():
+            continue
+        subprocess.run(["taskkill", "/F", "/T", "/PID", line],
+                       capture_output=True, timeout=10)
+    return 1
+
+
 async def _kill_task_processes(task_id: str) -> int:
     """Best-effort kill of a task's worktree subprocesses (SDK + pytest) by its
     unique id. Returns how many pkill patterns matched (for tests/telemetry)."""
     if not task_id or len(task_id) < 12:  # never pkill on a too-broad pattern
         return 0
     try:
+        if _IS_WINDOWS:
+            return await asyncio.to_thread(_windows_kill_by_cmdline, task_id)
         proc = await asyncio.to_thread(
             subprocess.run, ["pkill", "-9", "-f", task_id],
             capture_output=True, timeout=10,
@@ -1487,6 +1545,14 @@ _GIT_ENV_KEEP = frozenset({
     "TMPDIR",                      # where git writes its temp files
     "LANG", "LC_ALL", "LC_CTYPE",  # message and path encoding
     "TZ",                          # timezone offset stamped on the commit
+    # Windows equivalents. Git for Windows resolves `~` from USERPROFILE (or
+    # HOMEDRIVE+HOMEPATH) and NOT from HOME, so with only "HOME" on this list
+    # the sanitised env had no home at all there and ~/.gitconfig — identity,
+    # credential helper, core.autocrlf — was silently never read. SystemRoot
+    # and COMSPEC are needed for a process to start at all on Windows; PATHEXT
+    # is how the loader finds `git.exe` from the bare name.
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "TEMP", "TMP", "SystemRoot", "SYSTEMROOT", "COMSPEC", "PATHEXT",
 })
 
 

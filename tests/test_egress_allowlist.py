@@ -165,6 +165,10 @@ NET_IMPORTS: dict[str, str] = {
     "telnetlib": "sock:telnetlib",
     "xmlrpc.client": "http:xmlrpc.client",
     "webbrowser": "http:webbrowser",   # hands a URL to the user's browser
+    # Not a socket itself, but it can load ANY library — including one that
+    # opens sockets — so it is charged as a channel and each use needs an
+    # allowlist line naming which DLL and why (kernel32, for `nh stop`).
+    "ctypes": "pkg:ctypes",
     # -- third party
     "httpx": "http:httpx",
     "requests": "http:requests",
@@ -274,6 +278,8 @@ PROGRAMS: dict[str, tuple[str, str]] = {
     "grep": (LOCAL, "reads files"),
     "cp": (LOCAL, "copies files"),
     "pkill": (LOCAL, "signals local processes by pattern"),
+    "taskkill": (LOCAL, "the Windows pkill/kill: terminates local processes "
+                 "by PID (/T takes the tree); no network reach"),
     # Network tools. These lines are documentation, not permission — the
     # default is EXTERNAL anyway, so removing one changes nothing. They exist
     # so the table reads as a whole rather than as a list of exceptions.
@@ -426,6 +432,16 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
             "nothing off this machine — signals local processes matching the "
             "task id (:1013, refused for ids under 12 chars)",
             "loopback: local process control only"),
+        # The Windows half of the same cancel path. PowerShell could reach the
+        # network in general, which is why it is not in PROGRAMS as LOCAL; this
+        # call site runs a fixed Get-CimInstance template over Win32_Process
+        # command lines, with the task id refused (not escaped) unless it is
+        # [A-Za-z0-9_-]+, and feeds the PIDs to taskkill.
+        "exec:powershell": Allowed(
+            "nothing off this machine — enumerates local process command "
+            "lines to find a cancelled task's children "
+            "(`_windows_kill_by_cmdline`)",
+            _ON + "task cancel, on Windows only; the POSIX path is pkill"),
     },
     "brain/credentials.py": {
         "sock:http.server": Allowed(
@@ -453,6 +469,16 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
         "http:urllib.request": Allowed(
             "no_human's own API", "loopback: http://{server.host}:{server.port}"
             "/api/tasks, server.host defaults to 127.0.0.1"),
+        # ctypes is charged as a channel because in general it can name any
+        # DLL; this module loads exactly kernel32, for OpenProcess /
+        # GetExitCodeProcess — the liveness probe that replaces the
+        # `os.kill(pid, 0)` idiom, which on Windows TERMINATES the probed
+        # process instead of testing it.
+        "pkg:ctypes": Allowed(
+            "nothing off this machine — kernel32 process-liveness queries for "
+            "the instance lock and `nh stop` (`_windows_pid_alive`)",
+            _ON + "pidfile lock check and `nh stop`, on Windows only; the "
+            "POSIX path keeps os.kill(pid, 0)"),
         # `nh merge-stack run` is the operator's command. The agent is never
         # allowed to reach `gh pr merge` (constraint #2, docs/security.md §2).
         "exec:gh": Allowed("your GitHub host — `gh pr merge`",
