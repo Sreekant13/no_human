@@ -411,7 +411,13 @@ def test_wheel_in_a_clean_venv_answers_the_first_commands(tmp_path):
                 f"install with an empty HOME. This is the first-run hang."
             ) from None
         elapsed = time.monotonic() - started
-        assert proc.returncode == 0, (
+        # `doctor` is a diagnostic gate: it exits 1 when it finds a
+        # contradiction, and a clean HOME with no OAuth token on file IS one.
+        # This test is about hangs and crashes, not about health, so accept
+        # its diagnostic 1 — but keep it decisive by requiring the full
+        # rendering below, which a crash or traceback would not produce.
+        ok = (0, 1) if args == ["doctor"] else (0,)
+        assert proc.returncode in ok, (
             f"`nh {' '.join(args)}` exited {proc.returncode} in {elapsed:.1f}s\n"
             f"--- stdout ---\n{proc.stdout[-3000:]}\n"
             f"--- stderr ---\n{proc.stderr[-3000:]}"
@@ -419,6 +425,11 @@ def test_wheel_in_a_clean_venv_answers_the_first_commands(tmp_path):
         assert proc.stdout.strip(), (
             f"`nh {' '.join(args)}` produced no output at all"
         )
+        if args == ["doctor"]:
+            assert "mechanism liveness" in proc.stdout, (
+                "`nh doctor` exited without rendering its report — that is a "
+                f"crash, not a diagnosis:\n{proc.stdout[-3000:]}"
+            )
 
     # And the DB really was built, rather than the commands merely not crashing.
     db_path = home / ".no_human" / "no_human.db"

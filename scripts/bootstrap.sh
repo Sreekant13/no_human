@@ -172,7 +172,12 @@ else
     # shellcheck disable=SC1091
     source .venv/bin/activate
   fi
-  run nh doctor
+  # `nh doctor` now exits 1 when it finds a contradiction, and on a FRESH
+  # bootstrap it always finds one: no OAuth token is on file yet — that is
+  # literally the next step printed below. Under `set -e` an unguarded call
+  # would abort the installer at its last step and swallow those next steps,
+  # so the diagnosis is printed for the human and its exit code ignored here.
+  run nh doctor || true
 fi
 
 echo ""

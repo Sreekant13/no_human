@@ -6,7 +6,11 @@ had; these tests pin each one to a synthetic DB that reproduces it.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -342,3 +346,94 @@ async def test_diagnose_without_config_is_unchanged(store):
     """26 existing callers pass only the store — they must keep working."""
     d = await diagnose(store)
     assert d.healthy
+
+
+# --------------------------------------------------------------------------- #
+# `nh doctor`'s EXIT CODE — the machine-readable half of the command.          #
+#                                                                              #
+# It used to be a constant 0: the command printed a red contradiction and told #
+# its caller everything was fine, so `nh doctor || exit 1` in a CI job could   #
+# never fire and every gate reporting through doctor was invisible to          #
+# automation. These run the real CLI in a subprocess, because an in-process    #
+# CliRunner would not exercise the process exit code at all — and would read   #
+# the operator's REAL ~/.no_human, since NO_HUMAN_HOME is resolved at import.  #
+# HOME and TMPDIR are therefore redirected per test.                           #
+# --------------------------------------------------------------------------- #
+
+DOCTOR_SRC = Path(__file__).resolve().parent.parent / "src"
+
+
+def _run_doctor(home: Path, tmpdir: Path, *, config: str | None = None,
+                token: bool = True) -> subprocess.CompletedProcess:
+    """Run `nh doctor` against an isolated HOME. Returns the completed process
+    so the caller can assert on ``returncode`` directly."""
+    (home / ".no_human").mkdir(parents=True, exist_ok=True)
+    if config is not None:
+        (home / ".no_human" / "config.yaml").write_text(config)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("ANTHROPIC_", "CLAUDE_", "AWS_"))}
+    env.update({"HOME": str(home), "TMPDIR": str(tmpdir),
+                "PYTHONPATH": str(DOCTOR_SRC), "NO_COLOR": "1",
+                "COLUMNS": "200"})
+    if token:
+        # Presence-only probe (backend_check never makes a live auth call), so
+        # a placeholder is enough and no real credential is ever read here.
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = "sk-ant-oat-not-a-real-token"
+    return subprocess.run(
+        [sys.executable, "-m", "no_human.cli.commands", "doctor"],
+        capture_output=True, text=True, timeout=180, env=env, cwd=str(tmpdir),
+    )
+
+
+def test_doctor_exits_nonzero_on_a_contradiction(tmp_path):
+    """`nh doctor || exit 1` must actually fire. `ci.enabled: true` with no
+    pipeline target is a contradiction the doctor already prints in red."""
+    proc = _run_doctor(tmp_path / "home", _mktmp(tmp_path),
+                       config="ci:\n  enabled: true\n  backend: gitlab\n")
+    assert "CI BACKEND UNUSABLE" in proc.stdout, proc.stdout
+    assert proc.returncode != 0, (
+        "doctor printed a contradiction and reported success — the exit code "
+        f"carries no information:\n{proc.stdout}"
+    )
+    assert proc.returncode == 1, f"expected 1, got {proc.returncode}"
+
+
+def test_doctor_exits_zero_when_healthy(tmp_path):
+    """The control that proves the fix is not just "always fail": a fresh
+    install with a usable backend and no contradictions still exits 0."""
+    proc = _run_doctor(tmp_path / "home", _mktmp(tmp_path))
+    assert "no contradictions, no evidence gaps" in proc.stdout, proc.stdout
+    assert proc.returncode == 0, (
+        f"a healthy install must exit 0, got {proc.returncode}:\n{proc.stdout}"
+    )
+
+
+def test_doctor_advisory_alone_does_not_change_the_exit_code(tmp_path):
+    """An advisory is informational — a leaked eval sandbox is a disk leak, not
+    a broken gate. If advisories flipped the exit code, `nh doctor || exit 1`
+    would fire on benign conditions, someone would delete it from their
+    pipeline, and the check would protect nothing."""
+    tmpdir = _mktmp(tmp_path)
+    sandbox = tmpdir / "nh-eval-advisory-only"
+    sandbox.mkdir()
+    old = time.time() - 3 * 3600  # older than doctor's 2h staleness cutoff
+    os.utime(sandbox, (old, old))
+
+    proc = _run_doctor(tmp_path / "home", tmpdir)
+    assert "LEAKED EVAL SANDBOX" in proc.stdout, (
+        f"the advisory was not even reported:\n{proc.stdout}")
+    assert "✗" not in proc.stdout, (  # the contradiction bullet
+        f"this fixture must produce an advisory ONLY:\n{proc.stdout}")
+    assert "no contradictions, no evidence gaps" in proc.stdout, proc.stdout
+    assert proc.returncode == 0, (
+        f"an advisory must never fail the doctor gate, got {proc.returncode}:"
+        f"\n{proc.stdout}"
+    )
+
+
+def _mktmp(tmp_path: Path) -> Path:
+    """A private TMPDIR, so the machine's real /tmp leftovers cannot leak into
+    (or out of) a test that asserts on advisories."""
+    d = tmp_path / "tmp"
+    d.mkdir(exist_ok=True)
+    return d

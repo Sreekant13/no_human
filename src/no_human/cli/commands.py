@@ -3619,6 +3619,14 @@ def doctor():
     The system's worst bugs were silences, not crashes — TESTING dead for its
     entire life, a watcher that persisted nothing. This enumerates every
     mechanism's lifetime firings and flags the known silent-death patterns.
+
+    \b
+    Exit code (so `nh doctor || exit 1` in a pipeline actually fires):
+      0  healthy — no contradictions, no evidence gaps
+      1  at least one contradiction or evidence gap
+
+    Advisories NEVER affect the exit code: they are prunable leftovers, and a
+    gate that fails on benign conditions is a gate people delete.
     """
     from datetime import datetime
 
@@ -3673,8 +3681,17 @@ def doctor():
                 console.print(f"  [cyan]•[/] {a}")
         if d.healthy:
             console.print("\n[green]no contradictions, no evidence gaps[/]")
+        return d.healthy
 
-    asyncio.run(_go())
+    # The exit code is the machine-readable half of this command, and for a
+    # long time it was a constant 0 — `nh doctor || exit 1` in a CI job or a
+    # pre-flight script could never fire, so every gate reporting through
+    # doctor was invisible to automation. `healthy` is the existing severity
+    # line (contradictions + evidence gaps, never advisories); the exit code
+    # simply follows it rather than introducing a second one. Output is
+    # unchanged — anything parsing stdout keeps working.
+    if not asyncio.run(_go()):
+        sys.exit(1)
 
 
 @cli.command("start")
