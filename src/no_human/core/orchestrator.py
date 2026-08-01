@@ -7439,6 +7439,14 @@ class Orchestrator:
 
     @property
     def _active_memories(self) -> list[dict]:
+        """A fresh screened list on every read.
+
+        Identity is NOT stable, so `self._active_memories.append(x)` is a silent
+        no-op — it appends to a list nobody keeps. Assign, or use `+=` (which is
+        get, `__iadd__`, set, and does persist). Nothing in `src/` mutates it in
+        place today; this is here so the next person does not lose an afternoon
+        to a bug that raises nothing.
+        """
         raw = getattr(self, self._ACTIVE_MEMORIES_RAW, None)
         if not raw:
             return raw if raw is not None else []
@@ -7467,16 +7475,30 @@ class Orchestrator:
         this is usually a good rule with a bad noun. The event names what was held
         so it can be found and cleaned.
 
-        Screened at the point ``_active_memories`` is ASSIGNED, which is the one
-        chokepoint every consumer reads from — the prompt formatter, the skill
-        writer, and the direct iterations — so a new consumer is covered without
-        having to remember this.
+        Called from the ``_active_memories`` property, on READ as well as on
+        write — see the comment above that property for why the write site alone
+        was not enough. This function is the matcher; the property is what makes
+        it unavoidable.
+
+        Do NOT restate this as "the one chokepoint every consumer reads from".
+        That sentence was here, it was false, and it survived two redesigns of
+        the mechanism it described. ``SessionsSource`` reaches the same rows with
+        its own SQL and is screened separately in ``context/sessions.py``. There
+        is no claim here that a third route does not exist.
 
         LIMITS, stated because a screen is read as a guarantee: this is the
         publish guard's matcher, so it sees plaintext terms on letter boundaries
         and nothing else. It cannot see an obfuscated or encoded term, and it
         cannot see prose that identifies without naming — a sentence describing a
         private arrangement passes. It narrows the channel; it does not close it.
+
+        And it is only as good as its term list. In an install WITHOUT the
+        private supplement — which is every install but the operator's, since
+        ``_vendor_terms_private.py`` is drop-classified and never ships — the
+        list is 8 competitor names. It then screens nothing in the customer or
+        employer class this docstring is otherwise about, while holding rules
+        that legitimately mention a competitor, with no per-install override. A
+        configurable term source is the fix; it does not exist yet.
         """
         from ..eval.vendor_terms import find_banned_terms
 
