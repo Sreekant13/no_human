@@ -353,7 +353,11 @@ def test_prepared_case_repo_matches_the_pinned_base_content():
     # asking whether the prose narrates something that really happened.
     # Deliberately a literal and not a count derived from the manifests, which
     # is where `scrubbed` already comes from and would agree by construction.
-    assert scrubbed == 19, scrubbed
+    # 19 -> 20 on 2026-08-01: the SINGLE-DIGIT form of the tracker prefix.
+    # The shape rule needs six digits and the literals covered the 8- and
+    # 3-digit forms, so nothing in the tree could see it; it was found by
+    # hunting the vocabulary of the other projects on the machine.
+    assert scrubbed == 20, scrubbed
 
 
 @pytest.mark.asyncio
