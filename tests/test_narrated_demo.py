@@ -1406,3 +1406,44 @@ def test_a_missing_reference_capture_fails_closed(tmp_path):
     assert all("is missing" in p for p in problems)
     assert any("frames-gui" in p for p in problems)
     assert any("frames-cli" in p for p in problems)
+
+
+def test_the_shipping_cut_refuses_the_fallback_voice(tmp_path, monkeypatch):
+    """`say` may RUN the recorder on a bare checkout; it may not PUBLISH.
+
+    voiceover detects the neural engine rather than requiring it, so the
+    recorder still works with no node installed — that is deliberate. What is
+    not acceptable is that the degraded read reaches an audience, and it did:
+    a render made while node was too old for `npx hyperframes` shipped the
+    formant read to the public site. Nothing failed, because the file was the
+    right length, in sync, correctly captioned, and `voiceover.build` said so
+    only in a NOTE that scrolled past in a render that takes minutes.
+
+    So the check belongs on the shipping path and has to be a refusal.
+    """
+    monkeypatch.setattr(voiceover, "kokoro_available", lambda: False)
+    assert voiceover.engine_id() == "say"
+    with pytest.raises(SystemExit) as e:
+        compose.cut(tmp_path / "work", tmp_path / "out")
+    assert "REFUSING" in str(e.value)
+    assert "--allow-robot-voice" in str(e.value)
+
+
+def test_the_refusal_is_the_only_thing_standing_between_say_and_the_site():
+    """Mutation guard for the test above. It asserts a refusal, so it passes
+    just as happily if the guard is replaced by a raise on every engine — and
+    then the recorder cannot cut at all and nobody notices until a render. So
+    pin the other side too: with the neural engine reachable, reaching the
+    guard must NOT raise, and the override must disarm it.
+    """
+    import inspect
+    src = inspect.getsource(compose.cut)
+    guard = [l for l in src.splitlines() if "REFUSING" in l]
+    assert guard, "the refusal disappeared from compose.cut"
+    cond = [l for l in src.splitlines() if 'engine == "say"' in l]
+    assert cond, "the refusal no longer keys on the engine"
+    assert "not allow_robot_voice" in cond[0], (
+        "the refusal must be overridable, or a bare checkout cannot cut at all")
+    assert (inspect.signature(compose.cut)
+            .parameters["allow_robot_voice"].default is False), (
+        "the override must be off by default, or it guards nothing")

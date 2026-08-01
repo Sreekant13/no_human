@@ -3,5 +3,5 @@
 57c75883bec81bf0924feb7a95d304df89c04461  src/no_human/profile.py
 a5ae7c3be2b9b22adb76053bb4b06fcbc1b414b9  src/no_human/api/app.py  9041b3c38dbccae4f0f8f3a3423097995272da8d
 ab99c29c6cc2c4a15937b3bb53f9ec8c04331b25  tests/test_jira_intake.py
+b2d591bf928697d0f4ee62bd6a4ba2d10818dee3  src/no_human/cli/commands.py  73bf6076504ca8eb4536bdf23b6ab1cbd0dab39a
 cd3754606387f98afb9424d1fdd8c291be24b81d  tests/test_api.py
-ea99fb8a035c938a0ad8afcba9c8269a7a107c00  src/no_human/cli/commands.py  73bf6076504ca8eb4536bdf23b6ab1cbd0dab39a

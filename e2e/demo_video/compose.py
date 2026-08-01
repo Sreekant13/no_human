@@ -204,8 +204,26 @@ def sxs_args(gui_stage: Path, cli_stage: Path, audio: Path,
             "-c:a", "aac", "-b:a", "96k", "-shortest", str(out_mp4)]
 
 
-def cut(work: Path, out: Path, which: str = "both") -> None:
+def cut(work: Path, out: Path, which: str = "both",
+        allow_robot_voice: bool = False) -> None:
     out.mkdir(parents=True, exist_ok=True)
+    # `say` is a legitimate fallback for RUNNING the recorder on a bare checkout
+    # — that is why voiceover.py detects rather than requires. It is not a
+    # legitimate thing to PUBLISH: on a machine with only compact voices it
+    # reads as a robot. voiceover.build already prints a NOTE when it degrades,
+    # and that is exactly how the robot read reached the public site — a NOTE
+    # scrolls past in a render that takes minutes and produces a file that is
+    # the right length, in sync, and passes every other check. So the shipping
+    # path refuses instead of warning. The usual cause is node < 22, which makes
+    # `npx hyperframes` fail while npx itself reports fine.
+    engine = voiceover.engine_id()
+    if engine == "say" and not allow_robot_voice:
+        raise SystemExit(
+            "[compose] REFUSING to cut: the neural voice is not reachable, so "
+            "this render would ship the `say` formant read (the robot voice).\n"
+            "  Fix: use node >= 22 (`nvm use 22`) and re-run — `npx` succeeds "
+            "on older node while hyperframes underneath refuses.\n"
+            "  Override with --allow-robot-voice only for a throwaway cut.")
     # The audio is cached so a re-cut never forces a re-record — but the cache
     # has to know what it is a cache OF. Keyed on the script's own text plus the
     # engine, because otherwise editing a line and re-cutting silently ships the
@@ -217,7 +235,7 @@ def cut(work: Path, out: Path, which: str = "both") -> None:
     stamp = audio_dir / "script.stamp"
     key = hashlib.sha256(
         ("\x00".join(l.tts_text for l in nr.LINES)
-         + "\x00" + voiceover.engine_id()).encode()).hexdigest()
+         + "\x00" + engine).encode()).hexdigest()
     audio = audio_dir / "narration.m4a"
     if audio.is_file() and stamp.is_file() and stamp.read_text().strip() == key:
         print(f"[compose] audio cache HIT ({key[:12]})")
@@ -257,10 +275,13 @@ def main(argv=None) -> None:
     ap.add_argument("--work", default=WORK, type=Path)
     ap.add_argument("--only", choices=["gui", "cli", "both"], default="both")
     ap.add_argument("--skip-capture", action="store_true")
+    ap.add_argument("--allow-robot-voice", action="store_true",
+                    help="cut even when the neural voice is unreachable; the "
+                         "result is a `say` read and must not be published")
     args = ap.parse_args(argv)
     if not args.skip_capture:
         asyncio.run(capture(args.work, args.only))
-    cut(args.work, args.out, args.only)
+    cut(args.work, args.out, args.only, args.allow_robot_voice)
 
 
 if __name__ == "__main__":
