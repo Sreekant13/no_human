@@ -65,15 +65,14 @@ def _iso_cutoff(minutes: int, *, now: datetime | None = None) -> str:
     return (base - timedelta(minutes=minutes)).isoformat()
 
 
-async def _median_attempt_seconds(db: Any, limit: int) -> float | None:
+async def _median_attempt_seconds(store: Any, limit: int) -> float | None:
     """Median wall-time of recently completed attempts, derived from existing
     started_at/completed_at timestamps (no schema change: julianday() parses
     both SQLite datetime('now') and ISO-T forms)."""
-    cur = await db.execute(
+    rows = await store.query(
         "SELECT (julianday(completed_at) - julianday(started_at)) * 86400.0 "
         "FROM attempts WHERE completed_at IS NOT NULL AND started_at IS NOT NULL "
         "ORDER BY completed_at DESC LIMIT ?", (limit,))
-    rows = await cur.fetchall()
     secs = [float(r[0]) for r in rows if r[0] is not None and float(r[0]) > 0]
     return statistics.median(secs) if secs else None
 
@@ -83,11 +82,13 @@ async def queue_health(
     now: datetime | None = None, inflight_ids: Any = None, max_workers: int = 0,
     attempt_sample: int = 20,
 ) -> QueueHealth:
-    db = store.db
+    # `store.query`/`query_one`, never `store.db`. This runs on the board's
+    # live store while the pool writes through the same connection, and an
+    # aliased raw connection is how it opened cursors outside the critical
+    # section — see `Store._fetchone` and `tests/test_db_concurrency.py`.
 
     async def count(sql: str, *args) -> int:
-        cur = await db.execute(sql, args)
-        row = await cur.fetchone()
+        row = await store.query_one(sql, args)
         return int(row[0] or 0) if row else 0
 
     open_q = ",".join("?" * len(OPEN_STATUSES))
@@ -110,12 +111,11 @@ async def queue_health(
     h.workers_busy = len(inflight)
     h.max_workers = int(max_workers)
 
-    cur = await db.execute(
+    rows = await store.query(
         f"SELECT id FROM tasks WHERE status IN ({claimable_q})", CLAIMABLE_STATUSES)
-    rows = await cur.fetchall()
     h.queue_depth = sum(1 for (tid,) in rows if tid not in inflight)
 
-    median_secs = await _median_attempt_seconds(db, attempt_sample)
+    median_secs = await _median_attempt_seconds(store, attempt_sample)
     # Denominator is AVAILABLE workers (max - busy), not max_workers: busy
     # workers can't claim new tasks, so this is a conservative (slower, not
     # optimistic) estimate of drain time.

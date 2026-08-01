@@ -1289,7 +1289,7 @@ async def api_search(request: Request, q: str, limit: int = 30) -> list[dict[str
     query = " OR ".join('"' + t.replace('"', "") + '"' for t in terms)
     lim = max(1, min(int(limit or 30), 30))
     try:
-        cur = await store.db.execute(
+        rows = await store.query(
             """SELECT te.task_id,
                       json_extract(te.data, '$.kind'),
                       snippet(events_fts, 0, '', '', '…', 12),
@@ -1299,7 +1299,6 @@ async def api_search(request: Request, q: str, limit: int = 30) -> list[dict[str
                WHERE events_fts MATCH ? ORDER BY rank LIMIT ?""",
             (query, lim),
         )
-        rows = await cur.fetchall()
     except Exception:  # noqa: BLE001 — search is advisory, never a 500
         return []
     if not rows:

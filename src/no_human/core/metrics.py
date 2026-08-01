@@ -15,11 +15,15 @@ from .db import Store
 
 
 async def compute_metrics(store: Store) -> dict[str, Any]:
-    db = store.db
+    # `store.query`/`query_one`, never `store.db`. Aliasing the raw connection
+    # (`db = store.db`) is how this module opened twelve cursors OUTSIDE the
+    # connection's critical section while the pool wrote through it — see
+    # `Store._fetchone` and `tests/test_db_concurrency.py`. /api/metrics runs
+    # this on the board's live store, so the cursors were concurrent with the
+    # pool's writes by construction.
 
     async def one(sql: str, *args) -> Any:
-        cur = await db.execute(sql, args)
-        row = await cur.fetchone()
+        row = await store.query_one(sql, args)
         return row[0] if row else None
 
     prs_opened = await one(
@@ -31,7 +35,7 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
 
     # Per auth profile: attempts and token burn. The profile is stamped on the
     # attempt row from what the process actually exported, not from config.
-    cur = await db.execute(
+    rows = await store.query(
         """SELECT COALESCE(auth_profile, 'unknown') AS profile,
                   COUNT(*) AS attempts,
                   COALESCE(SUM(COALESCE(tokens_used, 0)), 0) AS tokens,
@@ -39,12 +43,12 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
            FROM attempts GROUP BY profile ORDER BY attempts DESC""")
     by_profile = [
         {"profile": r[0], "attempts": r[1], "tokens": r[2], "cache_read": r[3]}
-        for r in await cur.fetchall()
+        for r in rows
     ]
 
     # Per complexity tier (C1.5): cost AND quality, so a cheaper setting
     # is kept only where quality holds — measured, never assumed.
-    cur = await db.execute(
+    rows = await store.query(
         """SELECT COALESCE(json_extract(t.context, '$.complexity_tier'),
                            'unclassified') AS tier,
                   COUNT(*) AS attempts,
@@ -56,7 +60,7 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
     by_tier = [
         {"tier": r[0], "attempts": r[1], "tokens": r[2], "cache_read": r[3],
          "succeeded": r[4] or 0}
-        for r in await cur.fetchall()
+        for r in rows
     ]
 
     # Gate outcomes: review verdicts and what blocked. The rejection reasons
@@ -70,24 +74,24 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
         "SELECT COUNT(*) FROM task_events WHERE "
         "json_extract(data, '$.kind') = 'review' "
         "AND json_extract(data, '$.passed') = 0")
-    cur = await db.execute(
+    rows = await store.query(
         """SELECT substr(COALESCE(json_extract(data, '$.text'), ''), 1, 200)
            FROM task_events
            WHERE json_extract(data, '$.kind') = 'attempt_failed'
            ORDER BY ts DESC LIMIT 10""")
-    rejection_reasons = [r[0] for r in await cur.fetchall() if r[0]]
+    rejection_reasons = [r[0] for r in rows if r[0]]
 
     # Cache economics (P0.3): cache_creation is full-price input; cache_read
     # is ~10% price. A rising creation share means the prompt prefix is being
     # rebuilt instead of reused — the failure mode all context work must
     # avoid (93% of lifetime burn is coder cache-reads).
-    cur = await db.execute(
+    rows = await store.query(
         """SELECT COUNT(*),
                   COALESCE(SUM(COALESCE(cache_creation_tokens, 0)), 0),
                   COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0)
            FROM attempts WHERE COALESCE(cache_read_tokens, 0) > 0
               OR COALESCE(cache_creation_tokens, 0) > 0""")
-    n_attempts, sum_creation, sum_read = await cur.fetchone()
+    n_attempts, sum_creation, sum_read = rows[0]
     cache_economics = {
         "attempts_measured": n_attempts,
         "cache_creation_total": sum_creation,
@@ -99,13 +103,13 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
     }
 
     # CI_GATE integration gate (M6): runs started / passed / failed.
-    cur = await db.execute(
+    rows = await store.query(
         """SELECT json_extract(data, '$.kind'), COUNT(*)
            FROM task_events
            WHERE json_extract(data, '$.kind')
                  IN ('ci_gate_trigger', 'ci_gate_pass', 'ci_gate_fail')
            GROUP BY 1""")
-    ci_gate_raw = {r[0]: r[1] for r in await cur.fetchall()}
+    ci_gate_raw = {r[0]: r[1] for r in rows}
     ci_gate = {
         "triggered": ci_gate_raw.get("ci_gate_trigger", 0),
         "passed": ci_gate_raw.get("ci_gate_pass", 0),
@@ -113,39 +117,39 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
     }
 
     # Repro-gate verdict split (advisory data — decides when "required" ships).
-    cur = await db.execute(
+    rows = await store.query(
         """SELECT COALESCE(json_extract(data, '$.verdict'), '?'), COUNT(*)
            FROM task_events WHERE json_extract(data, '$.kind') = 'repro_gate'
            GROUP BY 1""")
-    repro = {r[0]: r[1] for r in await cur.fetchall()}
+    repro = {r[0]: r[1] for r in rows}
 
     # Error-class breakdown (0.2/0.3): how terminal agent errors split, so the
     # wasted-attempt causes are visible — a refusal (fail-fast, needs a human)
     # vs a retryable rate-limit/infra vs a genuine error. Populated by
     # _classify_error; agent_error events from before it group as 'unclassified'.
-    cur = await db.execute(
+    rows = await store.query(
         """SELECT COALESCE(json_extract(data, '$.error_class'), 'unclassified'),
                   COUNT(*)
            FROM task_events WHERE json_extract(data, '$.kind') = 'agent_error'
            GROUP BY 1""")
-    error_breakdown = {r[0]: r[1] for r in await cur.fetchall()}
+    error_breakdown = {r[0]: r[1] for r in rows}
 
     total_cache_read = sum(p["cache_read"] for p in by_profile)
     total_tokens = sum(p["tokens"] for p in by_profile)
 
     # The reviewer's burn, kept apart from the coder's so per-tier/per-profile attribution stays
     # honest — but surfaced, so the UI can finally price the whole run instead of the coder half.
-    cur = await db.execute(
+    rows = await store.query(
         """SELECT COALESCE(SUM(COALESCE(review_tokens_used, 0)), 0),
                   COALESCE(SUM(COALESCE(review_cache_creation_tokens, 0)), 0),
                   COALESCE(SUM(COALESCE(review_cache_read_tokens, 0)), 0)
            FROM attempts""")
-    rev_used, rev_creation, rev_read = await cur.fetchone()
+    rev_used, rev_creation, rev_read = rows[0]
     # B2 #5/#6 (review #2): planning + utility burn ran on separate backends
     # and now has its own columns. Surface it here too, or /api/metrics
     # under-counts by the whole planning slice while the bench counts it —
     # the surfaces-disagree class this cost work exists to kill.
-    cur = await db.execute(
+    rows = await store.query(
         """SELECT COALESCE(SUM(COALESCE(plan_tokens_used, 0)
                              + COALESCE(utility_tokens_used, 0)), 0),
                   COALESCE(SUM(COALESCE(plan_cache_read_tokens, 0)
@@ -153,7 +157,7 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
                   COALESCE(SUM(COALESCE(plan_cache_creation_tokens, 0)
                              + COALESCE(utility_cache_creation_tokens, 0)), 0)
            FROM attempts""")
-    aux_used, aux_read, aux_creation = await cur.fetchone()
+    aux_used, aux_read, aux_creation = rows[0]
     return {
         "prs_opened": prs_opened or 0,
         "prs_merged": prs_merged or 0,
@@ -199,8 +203,7 @@ async def playbook_outcomes(store) -> list[dict]:
     this, a playbook is charged for every task a human chose to stop: on the
     author's own store that was 6 of one playbook's 31 recorded "failures".
     """
-    db = store.db
-    cur = await db.execute(
+    rows = await store.query(
         """
         WITH used AS (
           SELECT DISTINCT
@@ -229,7 +232,7 @@ async def playbook_outcomes(store) -> list[dict]:
         ORDER BY tasks DESC
         """
     )
-    rows = [dict(r) for r in await cur.fetchall()]
+    rows = [dict(r) for r in rows]
     for r in rows:
         tasks = r["tasks"] or 0
         r["gate_rate"] = round((r["reached_gate"] or 0) / tasks, 3) if tasks else 0.0

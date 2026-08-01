@@ -127,11 +127,11 @@ class Diagnosis:
 
 async def _kind_stats(store: Store) -> dict[str, tuple[int, float]]:
     """kind → (count, last_ts) over all persisted task events."""
-    cur = await store.db.execute(
+    rows = await store.query(
         "SELECT json_extract(data, '$.kind') AS kind, COUNT(*), MAX(ts) "
         "FROM task_events GROUP BY kind"
     )
-    return {row[0]: (row[1], row[2] or 0.0) for row in await cur.fetchall() if row[0]}
+    return {row[0]: (row[1], row[2] or 0.0) for row in rows if row[0]}
 
 
 async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagnosis:
@@ -171,10 +171,9 @@ async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagno
             f"UNREVIEWED PRs: {counts['pr_open']} pr_open event(s) with zero "
             "review events — the gate was bypassed."
         )
-    cur = await store.db.execute(
+    parked = (await store.query_one(
         "SELECT COUNT(*) FROM tasks WHERE status = 'awaiting_approval'"
-    )
-    parked = (await cur.fetchone())[0]
+    ))[0]
     if parked > 0:
         # A healthy watcher leaves either actions or heartbeats. Neither, or
         # both stale, means nothing is shepherding the parked PRs right now.
@@ -198,14 +197,14 @@ async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagno
     # A CI_GATE validation that STARTED must have finished green before the
     # task may claim done — a done task whose integration run never passed is
     # a verdict without its evidence (the M6 contradiction).
-    cur = await store.db.execute(
+    rows = await store.query(
         """SELECT t.id FROM tasks t WHERE t.status = 'done' AND EXISTS (
               SELECT 1 FROM task_events e WHERE e.task_id = t.id
               AND json_extract(e.data, '$.kind') = 'ci_gate_trigger')
            AND NOT EXISTS (
               SELECT 1 FROM task_events e WHERE e.task_id = t.id
               AND json_extract(e.data, '$.kind') = 'ci_gate_pass')""")
-    for (task_id,) in await cur.fetchall():
+    for (task_id,) in rows:
         d.contradictions.append(
             f"CI_GATE UNPROVEN: task {task_id[:8]} is 'done' but its CI_GATE "
             "integration run was triggered and never passed."
@@ -216,7 +215,7 @@ async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagno
     # by something that wasn't human feedback (the 2026-07-10 self-comment
     # incident) — the spend was already capped, so the escalation is noise
     # pointing at a resume-trigger bug, not at the budget.
-    cur = await store.db.execute(
+    rows = await store.query(
         """SELECT t.id FROM tasks t
            WHERE t.status = 'escalated'
              AND json_extract(t.blocker, '$.category') = 'BUDGET_EXHAUSTED'
@@ -229,7 +228,7 @@ async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagno
                AND e2.ts > (SELECT MAX(e3.ts) FROM task_events e3
                             WHERE e3.task_id = t.id
                             AND json_extract(e3.data, '$.kind') = 'ci_gate_pass'))""")
-    for (task_id,) in await cur.fetchall():
+    for (task_id,) in rows:
         d.contradictions.append(
             f"SPURIOUS ESCALATION: task {task_id[:8]} escalated "
             "BUDGET_EXHAUSTED after its integration validation passed with no "
@@ -257,8 +256,7 @@ async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagno
         # isn't in this store at all belongs to a different install/db (or is
         # an isolated test's tmp DB against the real ~/.no_human) — not our
         # concern, and flagging it made the empty-DB doctor test fail.
-        rows = await (await store.db.execute(
-            "SELECT id, status FROM tasks")).fetchall()
+        rows = await store.query("SELECT id, status FROM tasks")
         known = {r[0]: r[1] for r in rows}
         active_states = {"pending", "context", "planning",
                          "implementing", "reviewing", "testing"}
@@ -314,14 +312,14 @@ async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagno
             kf_ph = ",".join("?" for _ in PR_LESS_KINDS)
             kind_filter = f" AND COALESCE(t.kind, '') NOT IN ({kf_ph})"
             kind_params = PR_LESS_KINDS
-        cur = await store.db.execute(
+        rows = await store.query(
             f"""SELECT t.id FROM tasks t WHERE t.status = ?{kind_filter}
                 AND NOT EXISTS (
                   SELECT 1 FROM task_events e WHERE e.task_id = t.id
                   AND json_extract(e.data, '$.kind') IN ({placeholders}))""",
             (status, *kind_params, *kinds),
         )
-        for (task_id,) in await cur.fetchall():
+        for (task_id,) in rows:
             d.evidence_gaps.append(
                 f"task {task_id[:8]} is '{status}' with no {'/'.join(kinds)} "
                 "event — the status is not backed by evidence."
@@ -331,19 +329,19 @@ async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagno
     # the "post-implement failure came back empty" gap that made task 6cfdb936
     # undiagnosable for 6 attempts. The store backstop prevents new ones; this
     # catches historical rows and any path that bypasses the store.
-    cur = await store.db.execute(
+    rows = await store.query(
         """SELECT id, task_id, status FROM attempts
            WHERE status IN ('failed', 'interrupted')
            AND COALESCE(TRIM(failure_reason), '') = ''""")
-    for (attempt_id, task_id, a_status) in await cur.fetchall():
+    for (attempt_id, task_id, a_status) in rows:
         d.evidence_gaps.append(
             f"attempt {attempt_id[:8]} (task {task_id[:8]}) is '{a_status}' "
             "with an empty failure_reason — the stop is undiagnosable."
         )
-    cur = await store.db.execute(
+    rows = await store.query(
         "SELECT id, blocker FROM tasks WHERE status = 'escalated'"
     )
-    for task_id, blocker in await cur.fetchall():
+    for task_id, blocker in rows:
         data = json.loads(blocker) if blocker else {}
         if not data.get("question") and not data.get("root_cause_hypothesis"):
             d.evidence_gaps.append(

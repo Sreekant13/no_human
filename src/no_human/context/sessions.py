@@ -54,12 +54,11 @@ class SessionsSource:
         # `archived` is honoured here the way `Store.list_memories` honours it.
         # This source queries `memories` directly, so an operator who archived a
         # rule was still getting it back through this path.
-        cur = await self.store.db.execute(
+        rows = await self.store.query(
             f"SELECT type, title, content FROM memories WHERE confirmed = 1 AND "
             f"(archived IS NULL OR archived = 0) AND ({clauses}) LIMIT ?",
             (*params, self.limit),
         )
-        rows = await cur.fetchall()
         chunks = [
             ContextChunk(source="sessions", title=f"[{r['type']}] {r['title']}",
                          content=r["content"][:2000])
@@ -79,14 +78,13 @@ class SessionsSource:
         if not query:
             return []
         try:
-            cur = await self.store.db.execute(
+            rows = await self.store.query(
                 """SELECT te.task_id, json_extract(te.data, '$.kind'),
                           substr(json_extract(te.data, '$.text'), 1, 700)
                    FROM events_fts f JOIN task_events te ON te.id = f.rowid
                    WHERE events_fts MATCH ? ORDER BY rank LIMIT 3""",
                 (query,),
             )
-            rows = await cur.fetchall()
         except Exception:  # noqa: BLE001 — recall is a bonus, never a blocker
             return []
         return [
