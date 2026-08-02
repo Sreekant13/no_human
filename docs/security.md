@@ -145,9 +145,12 @@ named here.
 Every channel below sends nothing at all on a default install. Each names the
 config key that turns it on and the default that keeps it off.
 
-- **Your CI provider.** `ci.enabled` defaults to **`false`**, and every backend
-  additionally needs a `ci.project`/`ci.job` — with neither, `ci_from_config`
-  returns `None` and no backend is ever constructed (`ci/__init__.py:51-58`).
+- **Your CI provider.** `ci.enabled` defaults to **`false`**, and with it off
+  `ci_from_config` returns `None` and no backend is ever constructed. Every
+  backend additionally needs a `ci.project`/`ci.job`/`ci.repo`; enabled with
+  none of them, `ci_from_config` raises `CIMisconfigured` and the run
+  escalates rather than proceeding ungated — still no backend, still nothing
+  sent anywhere (`ci/__init__.py`).
   Once you enable one:
   - **GitLab CI** (`ci.backend: "gitlab"`, the default *choice* but not a
     default *state*) POSTs a pipeline via

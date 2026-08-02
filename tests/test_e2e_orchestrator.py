@@ -4859,9 +4859,12 @@ async def test_a_ci_block_that_cannot_build_a_backend_is_announced(bare_repo, tm
     the unit tests for the resolver live in `tests/test_ci.py`, and a resolver
     that is right in isolation is not the same claim as a run that reports it.
 
-    The gate itself is deliberately unchanged; that decision is KI-5's own
-    item. What is asserted here is that the situation is VISIBLE, because
-    invisibility is what let it survive.
+    What is asserted HERE is only that the situation is VISIBLE, because
+    invisibility is what let it survive. Visible was not the same as binding:
+    the run below still opened an ungated PR, which is asserted — and now
+    prevented — by `test_ci_enabled_without_a_target_does_not_open_an_ungated_pr`
+    at the end of this file. This test keeps its narrower claim on purpose; if
+    the escalation is ever relaxed, the advisory must still fire.
     """
     def mutate(cwd):
         (cwd / "calc.py").write_text("def add(a, b):\n    return a + b\n")
@@ -4946,3 +4949,92 @@ async def test_no_ci_block_at_all_stays_silent_and_proceeds(bare_repo, tmp_path,
     assert "profile" in kinds, (
         "the profile was never loaded, so this run never reached the code that "
         f"decides whether to emit — the control proves nothing\nevents: {kinds}")
+
+
+# --------------------------------------------------------------------------- #
+# A CI block that asks for a gate and cannot produce one must not open a PR.   #
+#                                                                             #
+# The advisory above made the failure VISIBLE; it did not make it BINDING.     #
+# `_resolve_ci_runner` left `self.ci_runner = None`, and the only reader of    #
+# that is `if self.ci_runner is None:` — which means "no remote CI is wired    #
+# for this repo, the local suite is the only gate" and proceeds to open a PR.  #
+# So a user who mistyped one key got exactly the run a user who deliberately   #
+# declined CI gets: a PR, no gate, and the belief that the advertised gate     #
+# ran. KNOWN_ISSUES KI-5, "what a fix has to prove" #1 and #2.                 #
+# --------------------------------------------------------------------------- #
+
+def _ci_mutate(cwd):
+    """A REAL change (calc.py gains mul), so the control test reaches open_pr
+    instead of tripping the zero-diff gate — which would make it pass for a
+    reason that has nothing to do with CI."""
+    (cwd / "calc.py").write_text(
+        "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+    (cwd / "test_calc.py").write_text(
+        "from calc import add, mul\n\n"
+        "def test_add():\n    assert add(1, 2) == 3\n\n"
+        "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+
+async def _run_with_ci_block(store, tmp_path, bare_repo, ci_block):
+    cfg = _config(tmp_path)
+    cfg.data["ci"] = ci_block
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(_ci_mutate), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add add()", repo_path=str(bare_repo))
+    await store.create_task(t)
+    outcome = await orch.run_task(t)
+    return outcome, events, t
+
+
+@pytest.mark.parametrize("backend,missing", [
+    ("gitlab", "project"),
+    ("github_actions", "repo"),
+])
+async def test_ci_enabled_without_a_target_does_not_open_an_ungated_pr(
+        backend, missing, bare_repo, tmp_path, store):
+    """Both backends, through `run_task`, from the config a user writes."""
+    outcome, events, t = await _run_with_ci_block(
+        store, tmp_path, bare_repo,
+        {"enabled": True, "backend": backend, "hostname": "ci.example"})
+
+    kinds = [e["kind"] for e in events]
+    assert outcome.status is TaskStatus.ESCALATED, (
+        f"a run that asked for CI and had none still completed: {outcome.status} "
+        f"({outcome.detail})\nevents: {kinds}")
+    assert outcome.pr_url is None, "an ungated PR was opened anyway"
+    assert "pr_open" not in kinds, f"a PR was opened: {kinds}"
+
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status is TaskStatus.ESCALATED
+    blocker = refreshed.blocker or {}
+    assert blocker, "escalated with no blocker — the human has nothing to act on"
+    # 22.4: the human fixes this in under a minute only if the report names the
+    # key. "CI is misconfigured" costs them the same search the code just did.
+    assert missing in json.dumps(blocker), json.dumps(blocker)
+    assert backend in json.dumps(blocker), json.dumps(blocker)
+
+    # The advisory is still emitted — this replaces nothing, it BINDS what was
+    # already visible.
+    assert [e for e in events if e["kind"] == "advisory"
+            and "CI backend configured" in e.get("text", "")], kinds
+
+
+async def test_ci_deliberately_disabled_still_opens_a_pr(bare_repo, tmp_path, store):
+    """The control that decides whether the fix is safe to ship.
+
+    `ci.enabled: false` is a supported, common configuration — the shipped
+    DEFAULT — and this same targetless block under it must stay silent, cheap
+    and PR-opening. If this escalated, the fix would have turned every install
+    that never configured CI into a parked task.
+    """
+    outcome, events, t = await _run_with_ci_block(
+        store, tmp_path, bare_repo,
+        {"enabled": False, "backend": "gitlab", "hostname": "ci.example"})
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    assert outcome.pr_url
+    assert not [e for e in events if e["kind"] == "advisory"
+                and "CI backend configured" in e.get("text", "")]
+    assert [e for e in events if e["kind"] == "ci_skipped"], \
+        "the honest 'no remote CI ran' signal must still fire"

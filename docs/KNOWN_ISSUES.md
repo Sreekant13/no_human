@@ -201,13 +201,15 @@ problem that the captured stderr would have named immediately.
 
 ## KI-5 — a misconfigured CI backend silently becomes "no CI gate"
 
-**Status:** open, and the most consequential entry in this file. Found
-2026-08-01 by the adoption harness (`e2e/adoption/`), persona "Marco, DevOps",
-step `ci-misconfig-is-not-silently-no-gate`.
+**Status:** CLOSED 2026-08-02. Found 2026-08-01 by the adoption harness
+(`e2e/adoption/`), persona "Marco, DevOps", step
+`ci-misconfig-is-not-silently-no-gate`. The history below is kept because the
+shape of this defect — a fix that lands, is believed, and leaves the thing it
+was about — is worth being able to re-read.
 
-**Symptom.** `ci_from_config` returns `None` — not an error — when `ci.enabled`
-is true but the selected backend's required key is absent. Measured, by calling
-the real function:
+**Symptom (as found).** `ci_from_config` returned `None` — not an error — when
+`ci.enabled` was true but the selected backend's required key was absent.
+Measured, by calling the real function:
 
 ```
 gitlab_missing_project        -> None (NO GATE)
@@ -250,21 +252,45 @@ so a user who configured CI the documented way got no gate and no warning.
 Both production routes to a backend were inert. They are wired now, with
 stated precedence (injection > profile > global config).
 
-Whether this should **escalate** rather than proceed is not fixed here, on
-purpose. It is a change to the gate itself; it would turn currently-completing
-runs into parked tasks for anyone with a half-configured `ci` block, and it
-deserves its own review rather than being folded into a documentation pass.
+**The part that was deferred, and is now done (2026-08-02).** Making the
+failure visible did not make it BINDING: `_resolve_ci_runner` left
+`self.ci_runner = None`, and the only reader of that means "no remote CI is
+wired for this repo, the local suite is the only gate" — so the run still
+completed and still opened an ungated PR. A user who mistyped one key got
+exactly the run a user who deliberately declined CI gets. Two changes closed
+it, at the two different altitudes the defect lived at:
 
-**What a fix has to prove**
+* `ci_from_config` now returns `None` for EXACTLY ONE reason — CI is switched
+  off — and raises `CIMisconfigured` (a `ValueError`, carrying `.backend` and
+  `.missing`) for every other way to fail, including an unknown `ci.backend`.
+  A sentinel or a second return value would have removed the ambiguity while
+  leaving the DEFAULT wrong: both need every caller, forever, to remember a
+  check, and forgetting is invisible. An exception cannot be defaulted past.
+  All five backends had the identical hole and all five are closed the same
+  way (gitlab/`project`, github_actions/`repo`, jenkins/`job`,
+  ghe_checkruns/`repo`, circleci/`project`).
+* `_resolve_ci_runner` returns the reason the run has no gate, and `run_task`
+  escalates on it with an `IMPOSSIBLE` blocker naming the exact key — before
+  the first token is spent, since no attempt can fix a config file. Only when
+  EVERY claiming source failed: one working source is a working install.
 
-1. `ci.enabled: true` with an unbuildable backend does not reach `open_pr`. It
-   escalates with a blocker naming the missing key.
-2. `ci.enabled: false` still proceeds silently on the local suite — the
+**What the fix proves**
+
+1. ✅ `ci.enabled: true` with an unbuildable backend does not reach `open_pr`.
+   It escalates with a blocker naming the missing key.
+   (`test_ci_enabled_without_a_target_does_not_open_an_ungated_pr`, both
+   gitlab and github_actions, through `run_task`.)
+2. ✅ `ci.enabled: false` still proceeds silently on the local suite — the
    operator declining CI is not an error and must not become one.
-3. An unknown `ci.backend` is rejected at config load, not at attempt time, so
-   the user hears about a typo before a run is spent.
-4. The existing zero-config path (no `ci` block at all) is untouched: it still
-   emits `ci_skipped` and proceeds.
+   (`test_ci_deliberately_disabled_still_opens_a_pr`, the control that decides
+   whether the fix was safe to ship at all.)
+3. ⬜ An unknown `ci.backend` is still rejected at ATTEMPT time, not at config
+   load. It now escalates instead of proceeding ungated, so the run is no
+   longer spent — but the user still hears about the typo one run late.
+   Config-load validation remains open and is a separate change.
+4. ✅ The existing zero-config path (no `ci` block at all) is untouched: it
+   still emits `ci_skipped` and proceeds.
+   (`test_no_ci_block_at_all_stays_silent_and_proceeds`.)
 
 **Verified to work, in the same run** (real adapters, local fakes — see the
 boundary note below): for both Jenkins and CircleCI, a green pipeline yields

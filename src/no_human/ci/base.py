@@ -31,6 +31,41 @@ class HumanGatedCI(Exception):
                 "kind": self.kind, "name": self.name}
 
 
+class CIMisconfigured(ValueError):
+    """``ci.enabled`` is true but the block cannot produce a backend.
+
+    RAISED, never returned, and that is the whole point. There are two ways to
+    end up with no CI backend and they are not the same answer:
+
+    * ``ci.enabled: false`` — the operator declined CI. Supported, silent,
+      cheap; the caller proceeds on the local suite. Still a bare ``None``.
+    * ``ci.enabled: true`` with no pipeline target — the operator asked for a
+      gate and does not have one.
+
+    ``ci_from_config`` used to answer both with ``None``, so no caller could
+    tell them apart, and the reading every caller defaulted to was the silent
+    one: PRs opened ungated while the user believed the advertised gate ran
+    (KNOWN_ISSUES KI-5). A sentinel or a second return value would have fixed
+    the *ambiguity* while leaving the *default* wrong — both require every
+    caller, forever, to remember a check, and the cost of forgetting is
+    invisible. An exception cannot be defaulted past: a caller that does not
+    handle it stops. That asymmetry is the design.
+
+    Subclasses ``ValueError`` because the unknown-backend branch has always
+    raised one and callers guard on it — widening what is raised must never
+    narrow what is caught.
+
+    ``backend`` and ``missing`` are carried structurally, not only in the
+    message, so an escalation can name the exact key without re-parsing prose.
+    """
+
+    def __init__(self, message: str, *, backend: str = "",
+                 missing: tuple[str, ...] = ()):
+        super().__init__(message)
+        self.backend = backend
+        self.missing = tuple(missing)
+
+
 class PipelineStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"

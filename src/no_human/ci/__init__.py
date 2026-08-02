@@ -3,7 +3,9 @@
 Selecting the backend is NOT done here and not by callers — it belongs to
 ``Orchestrator._resolve_ci_runner``, which ranks an explicit injection, the
 project profile's ``ci`` block and the global ``ci:`` config block, in that
-order, and raises an advisory when a configured source cannot be built.
+order, emits an advisory when a configured source cannot be built, and
+escalates the run when NO configured source can be built (an ungated PR must
+never be the answer to "my CI config has a typo").
 
 Do not copy ``ci_from_config(config.data)`` into new code. This docstring
 taught exactly that call for a long time while nothing in the product made it,
@@ -24,7 +26,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import CIBackend, CIResult, HumanGatedCI, JobResult, PipelineStatus
+from .base import (
+    CIBackend, CIMisconfigured, CIResult, HumanGatedCI, JobResult, PipelineStatus,
+)
 from .circleci import CircleCICI
 from .ghe_checkruns import GHECheckRunsCI
 from .github_actions import GitHubActionsCI
@@ -38,24 +42,51 @@ def ci_from_layer(layer_ci: dict[str, Any]) -> CIBackend | None:
 
     Reuses ``ci_from_config`` by wrapping the layer dict as
     ``{"ci": {"enabled": True, ...}}``.  Returns ``None`` if *layer_ci*
-    is empty or missing ``backend``/``project``.
+    is empty — the layer asked for nothing.  A layer that DOES name a backend
+    but no pipeline target raises ``CIMisconfigured`` from ``ci_from_config``;
+    ``plan_runner`` turns that into a failed layer result naming the key,
+    which is the same distinction this module makes everywhere else.
     """
     if not layer_ci or not (layer_ci.get("backend") or layer_ci.get("project")):
         return None
     return ci_from_config({"ci": {"enabled": True, **layer_ci}})
 
 
+def _target(ci_conf: dict[str, Any], backend: str, *keys: str) -> str:
+    """The first non-blank pipeline target among *keys*, or raise.
+
+    Blank-but-present is the case that mattered: ``project: ""`` (and
+    ``project: "   "``, which used to build a backend pointed at whitespace
+    and fail later as an unrelated-looking remote error).
+    """
+    for key in keys:
+        value = str(ci_conf.get(key) or "").strip()
+        if value:
+            return value
+    names = " / ".join(f"ci.{k}" for k in keys)
+    raise CIMisconfigured(
+        f"ci.enabled is true and ci.backend is {backend!r}, but no pipeline "
+        f"target is set: {names} is empty. This config asks for a CI gate that "
+        f"cannot run — set ci.{keys[0]}, or set ci.enabled: false.",
+        backend=backend, missing=keys,
+    )
+
+
 def ci_from_config(config: dict[str, Any]) -> CIBackend | None:
-    """Build a CI backend from the config dict, or None if CI is disabled."""
+    """Build a CI backend from the config dict.
+
+    Returns ``None`` for EXACTLY ONE reason: CI is switched off. Every other
+    way to fail raises ``CIMisconfigured`` (see its docstring) — a caller can
+    therefore read ``None`` as "the operator declined CI" without a second
+    check, and cannot silently read a broken block as the same thing.
+    """
     ci_conf = config.get("ci") or {}
     if not ci_conf.get("enabled"):
         return None
     backend = ci_conf.get("backend", "gitlab")
 
     if backend == "gitlab":
-        project = ci_conf.get("project", "")
-        if not project:
-            return None
+        project = _target(ci_conf, backend, "project")
         return GitLabCI(
             project=project,
             hostname=ci_conf.get("hostname", "gitlab.acme.net"),
@@ -67,9 +98,7 @@ def ci_from_config(config: dict[str, Any]) -> CIBackend | None:
         )
 
     if backend == "github_actions":
-        repo = ci_conf.get("repo") or ci_conf.get("project", "")
-        if not repo:
-            return None
+        repo = _target(ci_conf, backend, "repo", "project")
         return GitHubActionsCI(
             repo=repo,
             workflow=ci_conf.get("workflow", ""),
@@ -81,9 +110,7 @@ def ci_from_config(config: dict[str, Any]) -> CIBackend | None:
         )
 
     if backend == "jenkins":
-        job = ci_conf.get("job") or ci_conf.get("project", "")
-        if not job:
-            return None
+        job = _target(ci_conf, backend, "job", "project")
         return JenkinsCI(
             job=job,
             base_url=ci_conf.get("base_url", "https://build.example.com"),
@@ -100,9 +127,7 @@ def ci_from_config(config: dict[str, Any]) -> CIBackend | None:
         )
 
     if backend == "ghe_checkruns":
-        repo = ci_conf.get("repo") or ci_conf.get("project", "")
-        if not repo:
-            return None
+        repo = _target(ci_conf, backend, "repo", "project")
         return GHECheckRunsCI(
             repo=repo,
             hostname=ci_conf.get("hostname", ""),
@@ -113,9 +138,7 @@ def ci_from_config(config: dict[str, Any]) -> CIBackend | None:
     if backend == "circleci":
         # Project-slug "<vcs>/<org>/<repo>" (e.g. "gh/acme/svc"). Watch-first;
         # trigger mode is opt-in via ci.mode. Token: CIRCLECI_TOKEN in .env.
-        slug = ci_conf.get("project", "")
-        if not slug:
-            return None
+        slug = _target(ci_conf, backend, "project")
         return CircleCICI(
             project_slug=slug,
             mode=ci_conf.get("mode", "watch"),
@@ -125,12 +148,18 @@ def ci_from_config(config: dict[str, Any]) -> CIBackend | None:
             result_parser=ci_conf.get("result_parser", "pytest"),
         )
 
-    raise ValueError(f"unknown ci.backend: {backend!r}")
+    raise CIMisconfigured(
+        f"unknown ci.backend: {backend!r} — no backend can be built, so a "
+        f"config with ci.enabled: true has no gate. Supported: gitlab, "
+        f"github_actions, jenkins, ghe_checkruns, circleci.",
+        backend=str(backend),
+    )
 
 
 __all__ = [
     "CIBackend", "CIResult", "HumanGatedCI", "JobResult", "PipelineStatus",
     "GitLabCI", "GitHubActionsCI", "JenkinsCI", "GHECheckRunsCI", "CircleCICI",
+    "CIMisconfigured",
     "ci_from_config", "ci_from_layer",
     "parse_results",
 ]

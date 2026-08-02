@@ -3,6 +3,7 @@ wake-condition watcher."""
 
 from .report import (
     blocker_prompt_suffix,
+    ci_misconfigured,
     fallback_blocker,
     missing_access,
     notification_line,
@@ -45,6 +46,7 @@ __all__ = [
     "notification_line",
     "fallback_blocker",
     "missing_access",
+    "ci_misconfigured",
     "blocker_prompt_suffix",
     "WakeWatcher",
     "parse_duration",

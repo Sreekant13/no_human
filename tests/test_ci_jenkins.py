@@ -293,8 +293,13 @@ def test_ci_from_config_jenkins():
     assert ci.job == JOB
 
 
-def test_ci_from_config_jenkins_no_job_is_none():
-    assert ci_from_config({"ci": {"enabled": True, "backend": "jenkins"}}) is None
+def test_ci_from_config_jenkins_no_job_raises():
+    """Was `is None` — the same answer `ci.enabled: false` gives, which is how
+    a half-configured Jenkins block became a silent no-gate (KI-5)."""
+    from no_human.ci import CIMisconfigured
+    with pytest.raises(CIMisconfigured, match="ci.job"):
+        ci_from_config({"ci": {"enabled": True, "backend": "jenkins"}})
+    assert ci_from_config({"ci": {"enabled": False, "backend": "jenkins"}}) is None
 
 
 # --------------------------------------------------------------------------- #

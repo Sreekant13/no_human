@@ -148,10 +148,14 @@ def test_ci_from_config_ghe_checkruns():
     assert runner.hostname == "code.example.com"
 
 
-def test_ci_from_config_ghe_no_repo():
-    from no_human.ci import ci_from_config
+def test_ci_from_config_ghe_no_repo_raises():
+    """Was `is None`, i.e. indistinguishable from CI being switched off (KI-5).
+    Only `enabled: false` may answer None."""
+    from no_human.ci import CIMisconfigured, ci_from_config
     cfg = {"ci": {"enabled": True, "backend": "ghe_checkruns"}}
-    assert ci_from_config(cfg) is None
+    with pytest.raises(CIMisconfigured, match="ci.repo"):
+        ci_from_config(cfg)
+    assert ci_from_config({**cfg, "ci": {**cfg["ci"], "enabled": False}}) is None
 
 
 # --- CI.1b: Commit Status API (statuses_to_result + merge_ci_results) ---------

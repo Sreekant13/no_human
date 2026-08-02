@@ -161,6 +161,45 @@ def missing_access(
     )
 
 
+def ci_misconfigured(reason: str, *, goal: str = "") -> Blocker:
+    """Build the blocker for "this run asked for a CI gate and cannot have one".
+
+    IMPOSSIBLE, not MISSING_ACCESS: nothing is being withheld, the request
+    itself cannot be satisfied as written (the taxonomy's own alias for the
+    category is ``INVALID``). It routes to ESCALATED + notify — the run stops
+    and a human hears about it — which is the point. The alternative, which is
+    what shipped for a long time, is a PR opened with no gate while the user
+    believes the advertised gate ran.
+
+    Confidence is high on purpose: this is a static read of the config, not a
+    hypothesis, so ``triage``'s low-confidence override has nothing to do.
+
+    *reason* comes from the resolver and already names the origin (project
+    profile / global config) and the exact key — do not paraphrase it here.
+    """
+    return Blocker(
+        category=BlockerCategory.IMPOSSIBLE,
+        transient=False,
+        confidence=0.95,
+        goal=goal,
+        root_cause_hypothesis=(
+            "This repo's configuration asks for a CI gate, but no CI backend "
+            "can be built from it, so the task can only be finished UNGATED. "
+            "Retrying cannot resolve it — the config has to change."
+        ),
+        evidence=reason,
+        question=(
+            "Fix the CI config and re-run, or set `ci.enabled: false` to accept "
+            "running on the local test suite alone. no_human will not open a PR "
+            "claiming a gate that did not run."
+        ),
+        options=[
+            BlockerOption(label="I'll fix the CI config, then re-run"),
+            BlockerOption(label="Proceed without CI — set ci.enabled: false"),
+        ],
+    )
+
+
 def blocker_prompt_suffix() -> str:
     """Instruction appended to the agent prompt so it can self-report a blocker.
 

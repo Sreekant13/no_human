@@ -315,10 +315,29 @@ async def test_ci_enabled_but_targetless_is_a_contradiction(store):
     assert not d.healthy, "a gate the operator believes in but does not have"
 
 
+@pytest.mark.parametrize("backend,key", [
+    ("gitlab", "ci.project"),
+    ("github_actions", "ci.repo"),
+    ("jenkins", "ci.job"),
+])
+async def test_ci_contradiction_names_the_key_to_set(store, backend, key):
+    """`nh doctor` is the surface a user checks when they suspect this, so the
+    line has to end their search, not start it. It used to say "project/repo/job
+    are all empty" for every backend — true, and it leaves the user to work out
+    which one THEIR backend needs."""
+    d = await diagnose(store, {"ci": {"enabled": True, "backend": backend}})
+    assert d.contradictions
+    assert any(key in c for c in d.contradictions), d.contradictions
+
+
 async def test_ci_unknown_backend_is_a_contradiction(store):
     d = await diagnose(store, {"ci": {"enabled": True, "backend": "travis",
                                       "project": "g/r"}})
-    assert any("ValueError" in c for c in d.contradictions)
+    # Asserts the MESSAGE, not the exception class name: `unknown ci.backend`
+    # is what the operator reads, and CIMisconfigured (a ValueError) now
+    # carries it. A diagnostic that leaked "ValueError" told them nothing.
+    assert any("unknown ci.backend" in c for c in d.contradictions)
+    assert any("travis" in c for c in d.contradictions)
 
 
 async def test_working_ci_config_is_not_flagged(store):

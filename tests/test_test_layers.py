@@ -298,9 +298,16 @@ def test_ci_from_layer_empty():
     assert ci_from_layer(None) is None
 
 
-def test_ci_from_layer_no_project():
-    """ci_from_layer returns None when backend is set but project is missing."""
-    assert ci_from_layer({"backend": "gitlab"}) is None
+def test_ci_from_layer_no_project_raises():
+    """A layer that NAMES a backend but no target is broken, not absent.
+
+    It used to return None — the same value an empty `ci` block returns — so
+    `_run_ci_layer` reported "CI config incomplete" without saying which key.
+    Now it raises and `plan_runner` names the key in the layer result.
+    """
+    from no_human.ci import CIMisconfigured
+    with pytest.raises(CIMisconfigured, match="ci.project"):
+        ci_from_layer({"backend": "gitlab"})
 
 
 # --------------------------------------------------------------------------- #
@@ -317,6 +324,22 @@ def test_run_ci_layer_no_config():
     lr = _run_ci_layer(layer)
     assert lr.deferred
     assert lr.ok  # deferred is not a failure
+
+
+def test_run_ci_layer_with_a_backend_but_no_target_is_not_ok():
+    """The third caller of ci_from_config, through ci_from_layer.
+
+    A layer with NO `ci` dict asked for nothing and defers (above). A layer
+    that names a backend and no pipeline target is BROKEN, and the two must
+    not land in the same place: `ok` is False, and the message names the key,
+    so a gating layer fails instead of quietly deferring past the gate.
+    """
+    layer = TestLayer(name="ci-test", command="", runner=Runner.CI,
+                      ci={"backend": "gitlab"})
+    lr = _run_ci_layer(layer)
+    assert not lr.ok
+    assert not lr.deferred
+    assert "ci.project" in (lr.error or ""), lr.error
 
 
 def test_run_ci_layer_success(monkeypatch):

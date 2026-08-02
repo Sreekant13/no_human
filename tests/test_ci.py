@@ -352,9 +352,89 @@ def test_ci_from_config_gitlab():
     assert ci.result_parser == "surefire"
 
 
-def test_ci_from_config_no_project_returns_none():
+# --------------------------------------------------------------------------- #
+# CI OFF vs CI ON-but-broken: two different answers, and they must LOOK          #
+# different. `ci_from_config` returned a bare None for both, so a caller could   #
+# not tell "the operator declined CI" from "the operator asked for CI and the    #
+# block is broken" — and the silent, ungated reading is the one every caller     #
+# defaulted to. See KNOWN_ISSUES KI-5.                                           #
+# --------------------------------------------------------------------------- #
+
+def _answer(ci_conf):
+    """What a caller actually observes from ci_from_config: a returned value or
+    a raised exception. Deliberately symbol-free so it pins the DISTINCTION,
+    not the mechanism that provides it."""
+    try:
+        return ("returned", ci_from_config({"ci": ci_conf}))
+    except Exception as exc:  # noqa: BLE001 — the observation IS the point
+        return ("raised", type(exc).__name__)
+
+
+def test_misconfigured_ci_is_distinguishable_from_disabled():
+    """The defect, stated as the smallest thing a caller can see.
+
+    `ci.enabled: false` is a supported configuration and must stay a quiet
+    `None`. `ci.enabled: true` with no pipeline target is a gate the user
+    believes in and does not have, and it must NOT produce the same answer.
+    """
+    disabled = _answer({"enabled": False, "backend": "gitlab", "project": ""})
+    assert disabled == ("returned", None), disabled
+
+    broken = _answer({"enabled": True, "backend": "gitlab", "project": ""})
+    assert broken != disabled, (
+        "CI-off and CI-on-but-unbuildable give the CALLER the same answer "
+        f"({broken!r}); a caller cannot distinguish them, so it proceeds "
+        "UNGATED while the user believes the advertised gate ran")
+
+
+@pytest.mark.parametrize("backend,missing", [
+    ("gitlab", "project"),
+    ("github_actions", "repo"),
+    ("jenkins", "job"),
+    ("ghe_checkruns", "repo"),
+    ("circleci", "project"),
+])
+def test_every_backend_rejects_an_enabled_block_with_no_target(backend, missing):
+    """All five backends had the identical hole; all five are closed the same
+    way. The message must name the key the user has to set — a blocker that
+    says "something is wrong" costs the same minute this project spends its
+    escalation-precision budget on avoiding."""
+    from no_human.ci import CIMisconfigured
+
+    with pytest.raises(CIMisconfigured) as exc:
+        ci_from_config({"ci": {"enabled": True, "backend": backend}})
+    assert missing in str(exc.value), str(exc.value)
+    assert backend in str(exc.value), str(exc.value)
+    assert exc.value.backend == backend
+    assert missing in exc.value.missing
+
+
+def test_misconfigured_is_a_valueerror_so_old_handlers_still_catch_it():
+    """`unknown ci.backend` has always raised ValueError and callers guard on
+    it. CIMisconfigured subclasses ValueError so widening what is raised never
+    narrows what is caught."""
+    from no_human.ci import CIMisconfigured
+
+    assert issubclass(CIMisconfigured, ValueError)
+    with pytest.raises(ValueError):
+        ci_from_config({"ci": {"enabled": True, "backend": "gitlab"}})
+
+
+def test_whitespace_only_target_is_not_a_target():
+    """A `project: "   "` used to build a backend pointed at whitespace, which
+    fails later, remotely, as an unrelated-looking CI error."""
+    from no_human.ci import CIMisconfigured
+
+    with pytest.raises(CIMisconfigured):
+        ci_from_config({"ci": {"enabled": True, "backend": "gitlab",
+                               "project": "   "}})
+
+
+def test_ci_from_config_no_project_raises_not_none():
     cfg = {"ci": {"enabled": True, "backend": "gitlab", "project": ""}}
-    assert ci_from_config(cfg) is None
+    from no_human.ci import CIMisconfigured
+    with pytest.raises(CIMisconfigured):
+        ci_from_config(cfg)
 
 
 def test_gitlab_check_status_terminal():
@@ -1101,7 +1181,8 @@ def test_unknown_backend_warns_instead_of_killing_the_run():
     assert runner is None, "an unknown backend yields no gate"
     adv = _advisories(events)
     assert len(adv) == 1
-    assert "ValueError" in adv[0] and "travis" in adv[0]
+    # The advisory a human reads must name the typo, not the exception class.
+    assert "unknown ci.backend" in adv[0] and "travis" in adv[0]
 
 
 def test_explicit_injection_still_wins():
@@ -1122,3 +1203,55 @@ def test_disabled_global_block_is_not_a_source():
                                       "project": "grp/repo"})
     assert runner is None
     assert not events
+
+
+# --------------------------------------------------------------------------- #
+# The resolver's RETURN value: the run's own answer to "may I proceed?".        #
+# An advisory made the failure visible; it did not make it BINDING. The reason  #
+# string is what run_task escalates on, so the two no-CI outcomes are           #
+# distinguishable at the one call site where proceeding ungated happens.        #
+# --------------------------------------------------------------------------- #
+
+def _resolve_reason(cfg_ci=None, prof_ci=None, *, injected=None):
+    import copy
+
+    from no_human.config import DEFAULT_CONFIG
+
+    data = copy.deepcopy(DEFAULT_CONFIG)
+    if cfg_ci is not None:
+        data["ci"] = cfg_ci
+    orch = Orchestrator(None, data, None, SlackNotifier(None),
+                        event_sink=lambda e: None, ci_runner=injected)
+    prof = ProjectProfile(repo_path="/tmp/r", ci=prof_ci) if prof_ci is not None else None
+    return orch._resolve_ci_runner(prof)
+
+
+def test_resolver_reports_no_reason_when_nothing_asked_for_ci():
+    assert _resolve_reason() is None
+
+
+def test_resolver_reports_no_reason_when_ci_is_deliberately_off():
+    assert _resolve_reason(cfg_ci={"enabled": False, "backend": "gitlab",
+                                   "project": "grp/repo"}) is None
+
+
+def test_resolver_reports_no_reason_when_a_backend_was_built():
+    assert _resolve_reason(cfg_ci={"enabled": True, "backend": "gitlab",
+                                   "project": "grp/repo"}) is None
+
+
+def test_resolver_returns_the_reason_when_every_claiming_source_failed():
+    reason = _resolve_reason(cfg_ci={"enabled": True, "backend": "gitlab",
+                                     "project": ""})
+    assert reason, "an unbuildable, CI-claiming config must yield a reason"
+    assert "global config" in reason and "project" in reason
+
+
+def test_resolver_reports_no_reason_when_a_later_source_recovers():
+    """A broken profile block plus a working global block is a WORKING install:
+    the advisory is right, escalating would not be."""
+    reason = _resolve_reason(
+        cfg_ci={"enabled": True, "backend": "gitlab", "project": "global/repo"},
+        prof_ci={"backend": "travis", "project": "p/r"},
+    )
+    assert reason is None

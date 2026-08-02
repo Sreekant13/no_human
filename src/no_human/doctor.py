@@ -97,11 +97,17 @@ def ci_config_problems(config: dict[str, Any] | None) -> list[str]:
     ci_conf = (config or {}).get("ci") or {}
     if not ci_conf.get("enabled"):
         return []
-    from .ci import ci_from_config
+    from .ci import CIMisconfigured, ci_from_config
     try:
         if ci_from_config({"ci": ci_conf}) is not None:
             return []
         why = "no pipeline target set — project/repo/job are all empty"
+    except CIMisconfigured as exc:
+        # The one exception this function exists to report: pass its message
+        # through verbatim rather than wrapping it in a class name. It already
+        # names the exact key to set, which is the difference between a
+        # diagnostic a user can act on and one they have to research.
+        why = str(exc)
     except Exception as exc:  # noqa: BLE001 — a bad block must not kill doctor
         why = f"{type(exc).__name__}: {exc}"
     return [

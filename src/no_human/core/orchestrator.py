@@ -858,7 +858,7 @@ class Orchestrator:
     # that as a claim would fire an advisory on every run of every GitLab repo.
     _CI_TARGET_KEYS: tuple[str, ...] = ("project", "repo", "job")
 
-    def _resolve_ci_runner(self, prof: Any | None) -> None:
+    def _resolve_ci_runner(self, prof: Any | None) -> str | None:
         """Pick this run's CI backend. Precedence, most specific first:
 
         1. an explicit ``ci_runner=`` constructor injection (embedders, tests),
@@ -887,9 +887,19 @@ class Orchestrator:
         ``_advisory``, which ``nh doctor`` counts under
         ``advisory_degradations``. A gate the user believes in but does not
         have is the whole defect this method exists to prevent.
+
+        RETURNS the reason the run has no gate, or None when it is fine to
+        proceed — which is the case whenever CI was not asked for, was
+        deliberately switched off, or a source built. The advisory made the
+        failure VISIBLE but not BINDING: the only reader of ``self.ci_runner
+        is None`` treats it as "no remote CI is wired for this repo" and opens
+        a PR, so a user who mistyped one key got exactly the run a user who
+        declined CI gets. The caller escalates on this string instead. Note it
+        is only non-None when EVERY claiming source failed — one working source
+        is a working install, and the advisory on the others is enough.
         """
         if self.ci_runner is not None:
-            return                       # explicit injection always wins
+            return None                  # explicit injection always wins
 
         sources: list[tuple[str, dict[str, Any]]] = []
         prof_ci = dict(getattr(prof, "ci", None) or {})
@@ -899,26 +909,34 @@ class Orchestrator:
         if global_ci.get("enabled"):
             sources.append(("global config", global_ci))
         if not sources:
-            return                       # no CI configured anywhere — unchanged
+            return None                  # no CI configured anywhere — unchanged
 
-        from ..ci import ci_from_config
+        from ..ci import CIMisconfigured, ci_from_config
+        unusable: list[str] = []
         for origin, conf in sources:
             try:
                 built = ci_from_config({"ci": {**conf, "enabled": True}})
                 why = ("no pipeline target set — "
                        f"{'/'.join(self._CI_TARGET_KEYS)} are all empty")
+            except CIMisconfigured as exc:
+                # Pass the message through unwrapped: it names the exact key,
+                # and this string reaches a human in the escalation report.
+                built, why = None, str(exc)
             except Exception as exc:  # noqa: BLE001 — a bad block never kills the run
                 built, why = None, f"{type(exc).__name__}: {exc}"
             if built is not None:
                 self.ci_runner = built
                 self.emit("ci_backend", f"CI from {origin}: {built.name}",
                           origin=origin, backend=built.name)
-                return
+                return None
             self._advisory(
                 f"CI backend configured in {origin} "
                 f"(backend={conf.get('backend', 'gitlab')!r}) but UNUSABLE: "
                 f"{why}. This run has NO CI gate."
             )
+            unusable.append(
+                f"{origin} (ci.backend={conf.get('backend', 'gitlab')!r}): {why}")
+        return "\n".join(unusable)
 
     def _sink_for(self, role: str) -> Callable[[AgentEvent], None]:
         """An ``on_event`` callback that attributes the session to ``role``.
@@ -1624,7 +1642,18 @@ class Orchestrator:
                       + (f", ci: {prof.ci.get('backend')}" if prof.ci else "") + ")")
         # Resolve CI OUTSIDE the `if prof:` block: a repo with no confirmed
         # profile must still get the gate its global `ci:` config asks for.
-        self._resolve_ci_runner(prof)
+        ci_unusable = self._resolve_ci_runner(prof)
+        if ci_unusable:
+            # A config that ASKS for a gate and cannot produce one stops the run
+            # HERE — before a single token is spent — rather than completing and
+            # opening a PR that silently was not gated (KNOWN_ISSUES KI-5). This
+            # is the one no-CI case that escalates; `ci.enabled: false` and "no
+            # ci block at all" are untouched and still proceed on the local
+            # suite. Nothing has been edited yet, so there is no WIP to check
+            # point and no branch to name.
+            from ..blockers import ci_misconfigured
+            return await self._raise_blocker(
+                task, ci_misconfigured(ci_unusable, goal=task.title))
 
         # Pre-fetch confirmed rules + skills for prompt injection (Phase G).
         # Scope to this task's repo plus globals, so a rule learned for one
