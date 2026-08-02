@@ -269,10 +269,18 @@ it, at the two different altitudes the defect lived at:
   All five backends had the identical hole and all five are closed the same
   way (gitlab/`project`, github_actions/`repo`, jenkins/`job`,
   ghe_checkruns/`repo`, circleci/`project`).
-* `_resolve_ci_runner` returns the reason the run has no gate, and `run_task`
-  escalates on it with an `IMPOSSIBLE` blocker naming the exact key — before
-  the first token is spent, since no attempt can fix a config file. Only when
-  EVERY claiming source failed: one working source is a working install.
+* `_resolve_ci_runner` returns the reason the run has no gate, and `_drive`
+  escalates on it with an `IMPOSSIBLE` blocker naming the exact key. It sits
+  at the TOP of `_drive`, above the first metered call — above
+  `_gather_context`, the intake evaluator, `_run_intake_grill` and the MoA
+  `_generate_plan`. That placement is the point, not a detail: the escalation
+  is deterministic, so anywhere below it a broken `ci:` block buys a full
+  planning round on every run and every retry before saying the one thing it
+  knew at second zero. Knowing costs `_usable_profile` — a SQLite row and a
+  `project.yml` read, no LLM. Fires only when EVERY claiming source failed
+  (one working source is a working install) and only for task kinds that can
+  open a PR — a standalone `code_review`, `investigation` or `design_doc`
+  produces a document, never a PR, so a missing gate cannot make it dishonest.
 
 **What the fix proves**
 
@@ -291,6 +299,37 @@ it, at the two different altitudes the defect lived at:
 4. ✅ The existing zero-config path (no `ci` block at all) is untouched: it
    still emits `ci_skipped` and proceeds.
    (`test_no_ci_block_at_all_stays_silent_and_proceeds`.)
+
+**What is STILL open, and it is the ticket's own sentence.** The escalation
+covers the global `ci:` block. It does **not** cover a **project profile**
+whose `ci` block names no pipeline target — including the literal case "a user
+enabled CI and mistyped `project`", if they mistyped it in the profile:
+
+```
+profile ci={'backend':'gitlab'}                     -> no source, no advisory, UNGATED
+profile ci={'backend':'gitlab','project':''}        -> no source, no advisory, UNGATED
+profile ci={'backend':'gitlab','projct':'a/b'}      -> no source, no advisory, UNGATED
+```
+
+`_resolve_ci_runner` admits a profile as a source only when one of
+`project`/`repo`/`job` is non-blank, so none of these reaches
+`ci_from_config`, and `doctor.ci_config_problems` reads only the GLOBAL block,
+so `nh doctor` is silent on it too.
+
+The gating is defensible and predates this fix: `nh onboard` writes a bare
+`{"backend": "gitlab"}` the moment it sees a `.gitlab-ci.yml`, and a detection
+hint is not a request for a gate — treating it as one would escalate every
+onboarded GitLab repo on its first run, which is a worse failure than the one
+being fixed. The real cure is for onboarding to record INTENT (this repo's CI
+is to be driven) separately from DETECTION, which is a different change.
+
+It is pinned rather than left incidental, in both directions:
+`test_profile_ci_with_no_target_and_no_global_block_is_not_a_source`
+(tests/test_ci.py, five profile shapes) and
+`test_profile_ci_hint_with_no_global_block_still_opens_a_pr`
+(tests/test_e2e_orchestrator.py). Both should FAIL when someone closes this —
+that is what they are for. Without them, widening `_CI_TARGET_KEYS` would park
+every onboarded repo with the whole suite green.
 
 **Verified to work, in the same run** (real adapters, local fakes — see the
 boundary note below): for both Jenkins and CircleCI, a green pipeline yields

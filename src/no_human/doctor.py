@@ -99,9 +99,13 @@ def ci_config_problems(config: dict[str, Any] | None) -> list[str]:
         return []
     from .ci import CIMisconfigured, ci_from_config
     try:
-        if ci_from_config({"ci": ci_conf}) is not None:
-            return []
-        why = "no pipeline target set — project/repo/job are all empty"
+        # `ci.enabled` is truthy above and that is the ONLY reason
+        # `ci_from_config` returns None, so returning at all means a backend
+        # was built. (A `why = "project/repo/job are all empty"` fallback used
+        # to live here for the None case; it is unreachable, and it was the
+        # backend-agnostic string the per-key message replaced.)
+        ci_from_config({"ci": ci_conf})
+        return []
     except CIMisconfigured as exc:
         # The one exception this function exists to report: pass its message
         # through verbatim rather than wrapping it in a class name. It already

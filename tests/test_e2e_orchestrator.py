@@ -4975,13 +4975,13 @@ def _ci_mutate(cwd):
         "def test_mul():\n    assert mul(2, 3) == 6\n")
 
 
-async def _run_with_ci_block(store, tmp_path, bare_repo, ci_block):
+async def _run_with_ci_block(store, tmp_path, bare_repo, ci_block, *, kind="feature"):
     cfg = _config(tmp_path)
     cfg.data["ci"] = ci_block
     events = []
     orch = Orchestrator(store, cfg.data, FakeBackend(_ci_mutate), SlackNotifier(None),
                         event_sink=events.append)
-    t = Task.new("add add()", repo_path=str(bare_repo))
+    t = Task.new("add add()", repo_path=str(bare_repo), kind=kind)
     await store.create_task(t)
     outcome = await orch.run_task(t)
     return outcome, events, t
@@ -5018,6 +5018,84 @@ async def test_ci_enabled_without_a_target_does_not_open_an_ungated_pr(
     # already visible.
     assert [e for e in events if e["kind"] == "advisory"
             and "CI backend configured" in e.get("text", "")], kinds
+
+    # ...and it BINDS BEFORE ANY METERED CALL. This is the assertion behind the
+    # cost claim in the comment at the escalation site, which is otherwise a
+    # sentence nothing tests: a first draft escalated below the spine, so the
+    # trail read [..., 'planning', 'advisory', ...] and every deterministic
+    # re-run bought a full MoA planning round to learn what was knowable from
+    # a SQLite read. If any of these appears, the escalation has drifted back
+    # down the spine and the claim is false again.
+    for spent in ("planning", "attempt_start", "prompt_size", "tool_use",
+                  "knowledge_accessed", "skills_loaded"):
+        assert spent not in kinds, (
+            f"{spent!r} ran before the CI escalation — it is below a metered "
+            f"call again\nevents: {kinds}")
+    assert [e for e in events if e["kind"] == "state"
+            and e.get("status") in ("context", "planning")] == [], kinds
+
+
+async def test_profile_ci_hint_with_no_global_block_still_opens_a_pr(
+        bare_repo, tmp_path, store):
+    """The gap this fix does NOT close, pinned end to end so it is deliberate.
+
+    `nh onboard` writes a bare `{"backend": "gitlab"}` on seeing a
+    `.gitlab-ci.yml` — a detection hint, not a request for a gate — so
+    `_resolve_ci_runner` does not treat it as a CI source and the run proceeds
+    ungated with no advisory and no escalation. A user who onboarded and then
+    MISTYPED `project` in the profile lands here too, which is the same shape
+    the escalation exists for. Recorded in KNOWN_ISSUES KI-5; see
+    `test_profile_ci_with_no_target_and_no_global_block_is_not_a_source` in
+    tests/test_ci.py for why closing it needs onboarding to record intent.
+
+    If someone closes that gap, this test SHOULD fail. That is the point: it
+    is a tripwire on a known-wrong behaviour, not an endorsement of it.
+    """
+    from no_human.profile import ProjectProfile
+
+    prof = ProjectProfile(
+        repo_path=str(bare_repo), ecosystem="python-pytest",
+        test_cmd="pytest -q", derived_from=["test"],
+        proven={"test_cmd": True}, confirmed=True,
+        ci={"backend": "gitlab"},          # the bare detection hint
+    )
+    await store.upsert_profile(prof)
+
+    cfg = _config(tmp_path)               # no `ci` block at all
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(_ci_mutate), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    assert outcome.pr_url, "ungated, and that is the pinned (wrong) behaviour"
+    assert not [e for e in events if e["kind"] == "advisory"
+                and "CI backend configured" in e.get("text", "")]
+
+
+@pytest.mark.parametrize("kind", ["code_review", "investigation", "design_doc"])
+async def test_pr_less_kinds_are_not_escalated_for_a_broken_ci_block(
+        kind, bare_repo, tmp_path, store):
+    """A missing CI gate can only make a PR dishonest, and these open none.
+
+    `doctor.py` already names these three as legitimately PR-less. Escalating
+    one for a broken `ci:` block would park work the gate was never going to
+    cover — a false positive the fix created for itself by moving the check to
+    the top of `_drive`: below the kind branches, `code_review` returned before
+    CI was ever resolved, so nothing had to think about it.
+    """
+    _, events, t = await _run_with_ci_block(
+        store, tmp_path, bare_repo,
+        {"enabled": True, "backend": "gitlab", "hostname": "ci.example"},
+        kind=kind)
+
+    refreshed = await store.get_task(t.id)
+    blob = json.dumps(refreshed.blocker or {})
+    assert "ci.project" not in blob, (
+        f"a {kind} task was blocked on a CI gate it would never have used: {blob}")
+    assert "IMPOSSIBLE" not in blob, blob
 
 
 async def test_ci_deliberately_disabled_still_opens_a_pr(bare_repo, tmp_path, store):

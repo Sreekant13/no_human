@@ -915,9 +915,14 @@ class Orchestrator:
         unusable: list[str] = []
         for origin, conf in sources:
             try:
+                # `enabled` is forced True, and `ci_from_config` returns None
+                # for exactly one reason — CI switched off — so a return here
+                # is always a built backend and there is no third outcome to
+                # describe. (There used to be a `why` fallback string on this
+                # line saying "project/repo/job are all empty"; it named no
+                # backend and no key, and it is now unreachable.)
                 built = ci_from_config({"ci": {**conf, "enabled": True}})
-                why = ("no pipeline target set — "
-                       f"{'/'.join(self._CI_TARGET_KEYS)} are all empty")
+                why = ""
             except CIMisconfigured as exc:
                 # Pass the message through unwrapped: it names the exact key,
                 # and this string reaches a human in the escalation report.
@@ -1495,6 +1500,40 @@ class Orchestrator:
         if plan_gate.correcting(task):
             return await self._replan_for_approval(task, repo)
 
+        # A config that ASKS for a CI gate and cannot produce one stops the run
+        # HERE, and "here" is load-bearing: it is above the first metered call.
+        # Everything on the spine below is paid for — `_gather_context`, the
+        # intake evaluator, `_run_intake_grill` (two sessions, on every task),
+        # and `_generate_plan` (an MoA fan-out on the planner tier) — and this
+        # escalation is DETERMINISTIC, so a broken `ci:` block would otherwise
+        # buy a full planning round on every run and every retry before saying
+        # the one thing it knew at second zero. What it costs to know is
+        # `_usable_profile`: a SQLite row plus a `project.yml` read, no LLM.
+        #
+        # The alternative is worse than expensive: completing the run and
+        # opening a PR that silently was not gated (KNOWN_ISSUES KI-5). This is
+        # the one no-CI case that escalates — `ci.enabled: false` and "no ci
+        # block at all" are untouched and still proceed on the local suite.
+        # Nothing has been edited yet, so there is no WIP to checkpoint and no
+        # branch to name.
+        #
+        # `prof` is threaded down to the profile block rather than re-read:
+        # `_resolve_ci_runner` emits `ci_backend`, so calling it twice would
+        # double every event it produces.
+        # Scoped to kinds that can OPEN A PR, which is the only thing a missing
+        # CI gate can make dishonest. A standalone code review produces cited
+        # comments and an investigation produces findings — `doctor.py` already
+        # names these as legitimately PR-less — so escalating one for a broken
+        # `ci:` block would park work the gate was never going to cover. Moving
+        # the check up the spine is what made this reachable: below the kind
+        # branches, `code_review` returned before it.
+        prof = await self._usable_profile(repo.path)
+        ci_unusable = self._resolve_ci_runner(prof)
+        if ci_unusable and task.kind not in _REPORT_KINDS + ("code_review",):
+            from ..blockers import ci_misconfigured
+            return await self._raise_blocker(
+                task, ci_misconfigured(ci_unusable, goal=task.title))
+
         # Walk the pre-implementation spine. Context/planning are minimal in
         # Phase 0 (real gathering = Phase 1); the states are honoured so the
         # transition map and the board reflect the true lifecycle.
@@ -1630,30 +1669,15 @@ class Orchestrator:
 
         # A human-confirmed, proven ProjectProfile (nh onboard) is the source of
         # truth for how to test/build this repo and which CI to drive — it
-        # replaces the detect_command heuristic. Resolve it once per run: surface
-        # the proven test command and, when CI wasn't explicitly injected, build
-        # the profile's CI backend. An explicit injection always wins.
-        prof = await self._usable_profile(repo.path)
+        # replaces the detect_command heuristic. Resolved once per run, at the
+        # top of `_drive` (the CI gate check needs it before anything metered
+        # runs); this surfaces the proven test command and applies repo safety.
         self._active_profile = prof
         self._apply_repo_safety(repo.path)
         if prof:
             self.emit("profile",
                       f"using confirmed profile (test: {prof.test_cmd!r}"
                       + (f", ci: {prof.ci.get('backend')}" if prof.ci else "") + ")")
-        # Resolve CI OUTSIDE the `if prof:` block: a repo with no confirmed
-        # profile must still get the gate its global `ci:` config asks for.
-        ci_unusable = self._resolve_ci_runner(prof)
-        if ci_unusable:
-            # A config that ASKS for a gate and cannot produce one stops the run
-            # HERE — before a single token is spent — rather than completing and
-            # opening a PR that silently was not gated (KNOWN_ISSUES KI-5). This
-            # is the one no-CI case that escalates; `ci.enabled: false` and "no
-            # ci block at all" are untouched and still proceed on the local
-            # suite. Nothing has been edited yet, so there is no WIP to check
-            # point and no branch to name.
-            from ..blockers import ci_misconfigured
-            return await self._raise_blocker(
-                task, ci_misconfigured(ci_unusable, goal=task.title))
 
         # Pre-fetch confirmed rules + skills for prompt injection (Phase G).
         # Scope to this task's repo plus globals, so a rule learned for one

@@ -147,10 +147,15 @@ config key that turns it on and the default that keeps it off.
 
 - **Your CI provider.** `ci.enabled` defaults to **`false`**, and with it off
   `ci_from_config` returns `None` and no backend is ever constructed. Every
-  backend additionally needs a `ci.project`/`ci.job`/`ci.repo`; enabled with
-  none of them, `ci_from_config` raises `CIMisconfigured` and the run
-  escalates rather than proceeding ungated — still no backend, still nothing
-  sent anywhere (`ci/__init__.py`).
+  backend additionally needs a `ci.project`/`ci.job`/`ci.repo`; asked for a
+  backend with none of them, `ci_from_config` raises `CIMisconfigured` — still
+  no backend, still nothing sent anywhere (`ci/__init__.py`). For the **global
+  `ci:` block** the run then escalates rather than proceeding ungated. That
+  escalation does **not** cover a project profile whose `ci` block names no
+  pipeline target: `nh onboard` writes a bare `{"backend": "gitlab"}` as a
+  *detection hint* on seeing a `.gitlab-ci.yml`, and a hint is not a request,
+  so such a profile is not treated as a CI source at all — no backend, and no
+  escalation either (see `docs/KNOWN_ISSUES.md` KI-5).
   Once you enable one:
   - **GitLab CI** (`ci.backend: "gitlab"`, the default *choice* but not a
     default *state*) POSTs a pipeline via

@@ -1247,6 +1247,41 @@ def test_resolver_returns_the_reason_when_every_claiming_source_failed():
     assert "global config" in reason and "project" in reason
 
 
+@pytest.mark.parametrize("prof_ci", [
+    {"backend": "gitlab"},
+    {"backend": "gitlab", "project": ""},
+    {"backend": "gitlab", "project": "   "},
+    {"backend": "travis"},
+    {"backend": "gitlab", "projct": "typo/key"},
+])
+def test_profile_ci_with_no_target_and_no_global_block_is_not_a_source(prof_ci):
+    """PINS A KNOWN GAP ON PURPOSE — read this before "fixing" it.
+
+    None of these reaches `ci_from_config` at all: `_resolve_ci_runner` admits
+    a profile as a source only when one of `_CI_TARGET_KEYS` is non-blank, so
+    with no global `ci:` block there is no source, no advisory, no reason, and
+    the run proceeds on the local suite. The last row is a MISTYPED KEY, which
+    is the shape the escalation exists for — so this gap is real and it is
+    recorded in KNOWN_ISSUES KI-5, not hidden.
+
+    Why it is not closed here: `nh onboard` writes a bare
+    `{"backend": "gitlab"}` the moment it sees a `.gitlab-ci.yml`. That is a
+    detection hint, not a request for a gate. Treating it as a claim would
+    escalate every onboarded GitLab repo on its first run — a worse failure
+    than the one being fixed, and the cure needs onboarding to record intent,
+    which is a different change.
+
+    The test exists so the behaviour is DELIBERATE rather than incidental: a
+    future widening of `_CI_TARGET_KEYS` would otherwise park every onboarded
+    repo with the whole suite still green.
+    """
+    runner, events = _resolve(prof_ci=prof_ci)
+    assert runner is None
+    assert not events, "a detection hint must stay silent"
+    assert _resolve_reason(prof_ci=prof_ci) is None, \
+        "this run is ungated and does NOT escalate — see the docstring"
+
+
 def test_resolver_reports_no_reason_when_a_later_source_recovers():
     """A broken profile block plus a working global block is a WORKING install:
     the advisory is right, escalating would not be."""
