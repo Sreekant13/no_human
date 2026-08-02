@@ -408,6 +408,26 @@ class Scheduler:
             log.warning("task %s crashed in pool: %s", task.id[:8], exc,
                         exc_info=True)
             self._on_event("task_error", f"{task.id[:8]}: {exc}")
+            # Durable reason. `_on_event` above is the LIVE pool stream — it is
+            # gone the moment nobody is watching, and `log.warning` lands in a
+            # file the board never reads. Without this the task is FAILED with
+            # no recorded cause anywhere a human looks: the drawer's "Why it
+            # failed" reads the last attempt's failure_reason, and a crash here
+            # can happen with no attempt row to carry one. Same durable channel
+            # this file already uses for `orphan_recovered` above.
+            #
+            # Its own try: a write that fails must not cost us the set_status
+            # below, and neither may kill the pool worker this except exists to
+            # protect (see the stderr note above — that hazard is real, but it
+            # is about writing to a broken pipe, not about the store).
+            try:
+                await self.store.save_events(task.id, [{
+                    "source": "scheduler", "kind": "task_crashed",
+                    "text": f"{type(exc).__name__}: {exc}",
+                    "ts": time.time(),
+                }])
+            except Exception:  # noqa: BLE001
+                pass
             # Mark the task as FAILED so it doesn't stay stuck.
             try:
                 from .task import TaskStatus as _TS

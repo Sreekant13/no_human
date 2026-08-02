@@ -803,3 +803,39 @@ async def test_startup_recovers_orphaned_midrun_tasks(tmp_path):
         assert (await store.get_task(healthy.id)).status is TaskStatus.ESCALATED
     finally:
         await store.close()
+
+
+async def test_a_pool_crash_records_a_durable_reason(store):
+    """A task killed by a pool-level exception must say WHY, somewhere durable.
+
+    The handler logged to a file the board never reads and emitted `task_error`
+    on the LIVE pool stream — gone the moment nobody is watching — then set
+    FAILED. So the task ended with no recorded cause anywhere a human looks.
+    That matters more since the drawer's "Why it failed" reads the last
+    attempt's failure_reason: a crash here can happen with no attempt row at
+    all, so the task explains itself nowhere.
+    """
+    class CrashingOrch:
+        async def run_task(self, task):
+            raise RuntimeError("boom inside the pool")
+
+    sched = Scheduler(store, lambda task=None: CrashingOrch(), max_workers=1)
+    ids = await _mk_tasks(store, 1)
+
+    await sched.tick()
+    await asyncio.sleep(0.05)
+
+    t = await store.find_task(ids[0])
+    assert t.status is TaskStatus.FAILED, "the crash must still terminate the task"
+
+    events = await store.list_events(ids[0])
+    crashed = [e for e in events if e.get("kind") == "task_crashed"]
+    assert crashed, (
+        "a pool crash left no durable record — only a log line and a transient "
+        f"live event; got kinds: {[e.get('kind') for e in events]}")
+    assert "boom inside the pool" in crashed[0]["text"], (
+        "the record must carry the actual exception, not just that one happened")
+    assert "RuntimeError" in crashed[0]["text"], "and its type"
+
+    # The pool must SURVIVE the crash — the whole reason that except exists.
+    assert sched.inflight == set(), "the crashed task was not released"
