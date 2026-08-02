@@ -1122,6 +1122,69 @@ def test_task_out_reports_cache_creation_burn():
     assert bare.total_cache_creation is None
 
 
+def test_task_out_surfaces_the_failure_reason_the_drawer_asks_for():
+    """The drawer's "Why it failed" banner could never render.
+
+    `web/src/SlideOver.jsx` gates it on `task.failure_reason`, but that is a
+    column on ATTEMPTS and was never on the task payload — so the banner was
+    dead for every failed task while 461 of 461 failed attempts carried a
+    reason. `web/e2e/failure-reason.mjs` passes regardless: it builds its own
+    task object with the field already set, so it pins the COMPONENT's contract
+    and never exercises the API that has to satisfy it.
+    """
+    from no_human.api.models import TaskOut
+    from no_human.core.task import Task, TaskStatus
+    t = Task.new("x", repo_path="/tmp/r")
+    t.status = TaskStatus.FAILED
+    attempts = [
+        {"id": "a1", "attempt_number": 1, "status": "failed",
+         "failure_reason": "first stop"},
+        {"id": "a2", "attempt_number": 2, "status": "failed",
+         "failure_reason": "the reason that explains the final state"},
+    ]
+    # The LAST attempt's reason — a retry's stop is what the task ended on.
+    assert TaskOut.from_task(t, attempts).failure_reason == (
+        "the reason that explains the final state")
+
+    # Out of order on the wire: ordering is by attempt_number, not list order.
+    assert TaskOut.from_task(t, list(reversed(attempts))).failure_reason == (
+        "the reason that explains the final state")
+
+    # Nothing recorded -> None, not "" and not a misleading empty banner.
+    assert TaskOut.from_task(t, [{"id": "a", "attempt_number": 1}]).failure_reason is None
+    assert TaskOut.from_task(t, []).failure_reason is None
+
+
+def test_task_out_withholds_a_failure_reason_that_would_be_a_lie():
+    """Two cases where a plausible string is worse than nothing.
+
+    A task that failed attempt 1 and passed attempt 2 is not failed, and an
+    operator CANCEL is stored as `failed` plus a `cancel_reason` — the last
+    attempt's reason there describes interrupted work, under a heading that
+    claims the task failed. Same distinction `cli/commands.py` and
+    `api/app.py` already make at their read sites.
+    """
+    from no_human.api.models import TaskOut
+    from no_human.core.task import Task, TaskStatus
+    attempts = [{"id": "a1", "attempt_number": 1, "status": "failed",
+                 "failure_reason": "an interrupted attempt"}]
+
+    done = Task.new("x", repo_path="/tmp/r")
+    done.status = TaskStatus.DONE
+    assert TaskOut.from_task(done, attempts).failure_reason is None
+
+    cancelled = Task.new("y", repo_path="/tmp/r")
+    cancelled.status = TaskStatus.FAILED
+    cancelled.context = {"cancel_reason": "operator stopped it"}
+    assert TaskOut.from_task(cancelled, attempts).failure_reason is None
+
+    # Control: same attempts, genuinely failed, no cancel -> it DOES surface,
+    # so the two None results above are the guards firing and not a dead path.
+    failed = Task.new("z", repo_path="/tmp/r")
+    failed.status = TaskStatus.FAILED
+    assert TaskOut.from_task(failed, attempts).failure_reason == "an interrupted attempt"
+
+
 #: What the API answers when `web/dist` is missing (``api/app.py``'s
 #: ``_NO_BOARD_MESSAGE``). It is a **200**, not a 404: the API and worker are
 #: fine, only the UI is absent, so the route explains itself rather than lying
