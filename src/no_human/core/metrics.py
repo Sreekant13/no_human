@@ -199,9 +199,19 @@ async def playbook_outcomes(store) -> list[dict]:
     (`nh task cancel`, and the board's cancel button). It is a WITHDRAWAL, not
     a verdict on the playbook, so it is counted as `cancelled` rather than
     `escalated_or_failed` — the same `status == FAILED and cancel_reason` test
-    the read sites in `cli/commands.py` and `api/app.py` already apply. Without
-    this, a playbook is charged for every task a human chose to stop: on the
-    author's own store that was 6 of one playbook's 31 recorded "failures".
+    every read site applies. Without this, a playbook is charged for every task
+    a human chose to stop: on the author's own store that was 6 of one
+    playbook's 31 recorded "failures".
+
+    THE RULE LIVES IN TWO PLACES, AND IT HAS TO. Python callers can share one
+    helper; the predicate below is inside a SQL string, so no Python helper can
+    reach it. A refactor that centralises the Python sites therefore leaves the
+    SQL ones spelling the pair out by hand — and looks, from the Python side,
+    like the rule is now defined once. It is not. When the Python definition
+    moves, grep for `cancel_reason` and confirm every SQL predicate still
+    agrees with it; this file and `core/db.py` are the ones that cannot follow
+    a rename. Three separate defects in this codebase have been one consumer
+    applying a judgement its sibling did not.
     """
     rows = await store.query(
         """
