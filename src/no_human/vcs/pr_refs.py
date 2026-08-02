@@ -2,7 +2,7 @@
 
 A code_review task is often described the way a human writes it in a ticket:
 "code.example.com/dev/acme-test PR #7001" or
-"gitlab.acme.net ci_gate/customer/metrics-core MR !7006" — not a full
+"gitlab.acme.net ci_gate/subgroup/metrics-core MR !7006" — not a full
 ``https://…/pull/7001`` URL, and usually more than one. The old single-URL
 regex found zero of these and failed the task at the gate.
 

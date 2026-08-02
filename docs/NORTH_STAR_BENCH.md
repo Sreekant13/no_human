@@ -4,6 +4,13 @@
 
 _Project labels and repo paths in this report are pseudonymised or `<redacted>`; every number is exactly as measured. A run may predate the current corpus — check the run date above before treating it as reproducible._
 
+_Post-publication redaction (2026-08-02): the `notes` cell for ns-09918e07 quoted an
+internal skill directory by its full name. That one path segment is replaced with
+`<redacted>`, per the convention declared immediately above — the same convention the
+generator already applies to repo paths elsewhere in this table. Nothing else in that
+row was touched: the task id, the outcome, the ✅, and every measured number are as
+published. This is the only hand edit to a generated file in this document._
+
 ## Headline
 
 - **Success (goal satisfied, unattended): 25/53 ran (47%)**  ·  skipped (non-runnable): 3
@@ -21,7 +28,7 @@ _Project labels and repo paths in this report are pseudonymised or `<redacted>`;
 |---|---|---|---|---|---|---|---|
 | ns-01c3d46d | awaiting_approval | ❌ | 30,600 | 0 | — | 32 | The guardrail portion of the request is verifiably met: source uses the correct  |
 | ns-02fbd7b8 | escalated | ❌ | 21,522 | 0 | — | 4 | did not reach the human gate (escalated) |
-| ns-09918e07 | awaiting_approval | ✅ | 14,649 | 0 | — | 0 | Verified via `ls -la ~/.claude/skills/integration-gate-metrics-core-pipeline/`: the |
+| ns-09918e07 | awaiting_approval | ✅ | 14,649 | 0 | — | 0 | Verified via `ls -la ~/.claude/skills/<redacted>/`: the |
 | ns-0a2066b7 | done | ✅ | 23,703 | 0 | — | 4 | The request asked for a code review of the branch; the deliverable is a report ( |
 | ns-0bf1d2f2 | escalated | ✅ | 37,623 | 0 | — | 8 | honestly escalated as expected |
 | ns-0e7bf1ae | done | ✅ | 51,411 | 0 | — | 45 | The request is a direct question; the deliverable is the report, so an empty dif |

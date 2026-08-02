@@ -4406,8 +4406,8 @@ def test_pr_url_parts_delegates_to_canonical_parser():
         ("github", "code.example.com", "dev/metrics-core-query-service", 7003)
     assert parse_pr_url("https://gitlab.com/org/repo/-/merge_requests/42") == \
         ("gitlab", "gitlab.com", "org%2Frepo", 42)
-    assert parse_pr_url("https://gitlab.acme.net/ci_gate/customer/metrics-core-service/-/merge_requests/7") == \
-        ("gitlab", "gitlab.acme.net", "ci_gate%2Fcustomer%2Fmetrics-core-service", 7)
+    assert parse_pr_url("https://gitlab.acme.net/ci_gate/subgroup/metrics-core-service/-/merge_requests/7") == \
+        ("gitlab", "gitlab.acme.net", "ci_gate%2Fsubgroup%2Fmetrics-core-service", 7)
     assert parse_pr_url("not a url") is None
 
 

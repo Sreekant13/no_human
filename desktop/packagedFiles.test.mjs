@@ -266,8 +266,8 @@ test("no script publishes anything", () => {
 });
 
 // --------------------------------------------------------------------------
-// Operator decision D1 (2026-07-30): src/no_human/ci_gate/ - the glab/kubectl/
-// metrics-core post-PR gate built one customer deep - does not ship. It stays in
+// Operator decision D1 (2026-07-30): src/no_human/ci_gate/ - the glab/kubectl
+// post-PR gate, built one deployment deep - does not ship. It stays in
 // this repo for internal use, so nothing in the source tree signals the
 // restriction; only the three build files below carry it, and each one is
 // silent on its own when it drifts. A DMG built on 2026-07-30 shipped all five

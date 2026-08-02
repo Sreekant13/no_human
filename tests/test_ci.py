@@ -334,7 +334,7 @@ def test_ci_from_config_gitlab():
         "ci": {
             "enabled": True,
             "backend": "gitlab",
-            "project": "ci_gate/customer/metrics-core",
+            "project": "ci_gate/subgroup/metrics-core",
             "hostname": "gitlab.acme.net",
             "timeout_minutes": 30,
             "max_infra_retries": 1,
@@ -345,7 +345,7 @@ def test_ci_from_config_gitlab():
     }
     ci = ci_from_config(cfg)
     assert ci is not None
-    assert ci.project == "ci_gate/customer/metrics-core"
+    assert ci.project == "ci_gate/subgroup/metrics-core"
     assert ci.hostname == "gitlab.acme.net"
     assert ci.max_infra_retries == 1
     assert ci.variables == {"ENV": "test"}

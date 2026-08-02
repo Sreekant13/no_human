@@ -8,7 +8,7 @@ from no_human.vcs.pr_watcher import parse_pr_url
 _STRY = (
     "Perform a code review of the three change sets: "
     "(1) code.example.com/dev/acme-test PR #7001, "
-    "(2) gitlab.acme.net ci_gate/customer/metrics-core MR !7006, "
+    "(2) gitlab.acme.net ci_gate/subgroup/metrics-core MR !7006, "
     "(3) gitlab.acme.net acme-k8s/apps/metrics-core/metrics-core MR !7007."
 )
 
@@ -17,7 +17,7 @@ def test_extracts_all_three_shorthand_refs():
     urls = parse_pr_refs(_STRY)
     assert urls == [
         "https://code.example.com/dev/acme-test/pull/7001",
-        "https://gitlab.acme.net/ci_gate/customer/metrics-core/-/merge_requests/7006",
+        "https://gitlab.acme.net/ci_gate/subgroup/metrics-core/-/merge_requests/7006",
         "https://gitlab.acme.net/acme-k8s/apps/metrics-core/metrics-core/-/merge_requests/7007",
     ]
 

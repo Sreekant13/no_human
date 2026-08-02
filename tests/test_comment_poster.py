@@ -5,7 +5,7 @@ GitLab)."""
 from no_human.vcs.comment_poster import files_in_diff, pick_pr_for_file
 
 GHE = "https://code.example.com/dev/acme-test/pull/7001"
-MR7006 = "https://gitlab.acme.net/ci_gate/customer/metrics-core/-/merge_requests/7006"
+MR7006 = "https://gitlab.acme.net/ci_gate/subgroup/metrics-core/-/merge_requests/7006"
 MR7007 = "https://gitlab.acme.net/acme-k8s/apps/metrics-core/metrics-core/-/merge_requests/7007"
 
 _PR_FILES = {

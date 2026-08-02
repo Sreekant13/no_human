@@ -46,7 +46,7 @@ await page.route("**/api/**", (route) => {
     return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ detail: "no stream in test" }) });
   }
   if (u.includes("/api/grill")) {
-    return j({ type: "question", question: "Which database does the export read from?", suggestions: ["A: metrics-core", "B: analytics"], round: 1 });
+    return j({ type: "question", question: "Which datastore should the endpoint read from?", suggestions: ["A: primary", "B: replica"], round: 1 });
   }
   if (u.includes("/api/onboarding")) return j({ completed: true });
   if (u.includes("/api/tasks")) return j([]);

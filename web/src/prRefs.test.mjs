@@ -31,8 +31,8 @@ test("expands GitHub shorthand 'host/path PR #n' to a canonical URL", () => {
 
 test("expands GitLab shorthand 'host path MR !n' to a canonical URL", () => {
   assert.deepEqual(
-    parsePrRefs("gitlab.acme.net ci_gate/customer/metrics-core MR !7006"),
-    ["https://gitlab.acme.net/ci_gate/customer/metrics-core/-/merge_requests/7006"],
+    parsePrRefs("gitlab.acme.net ci_gate/subgroup/metrics-core MR !7006"),
+    ["https://gitlab.acme.net/ci_gate/subgroup/metrics-core/-/merge_requests/7006"],
   );
 });
 

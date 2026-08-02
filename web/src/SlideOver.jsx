@@ -1002,7 +1002,7 @@ function RichEvent({ event, elapsed, role }) {
     const toolName = event.tool_name || text.split(" ")[0] || "tool";
     const file = toolFile(event);
     // `text` is already a human-readable one-liner from the backend
-    // (e.g. "Read metrics-core-query-service/Jenkinsfile", "Run `wc -l ...`") — show
+    // (e.g. "Read <repo>/Jenkinsfile", "Run `wc -l ...`") — show
     // the remainder after the tool name/file chip rather than re-deriving
     // raw tool_input (which would just repeat absolute paths verbosely).
     const args = text.replace(toolName, "").trim();

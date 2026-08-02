@@ -38,7 +38,7 @@ await new Promise((r) => server.listen(4603, r));
 
 const PROJECTS = [
   { id: "p1", name: "no_human", repo_paths: ["/a/no_human"], primary_repo: "/a/no_human" },
-  { id: "p2", name: "metrics-core", repo_paths: ["/a/metrics-core-query", "/a/metrics-core-ingest"], primary_repo: "/a/metrics-core-query" },
+  { id: "p2", name: "metrics-core", repo_paths: ["/a/metrics-core-a", "/a/metrics-core-b"], primary_repo: "/a/metrics-core-a" },
 ];
 const CONFIG = { notifications: { email_to: "dana.lee@example.com" }, llm: { auth_profile: "personal" } };
 
