@@ -10,11 +10,9 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shutil
 import signal
 import subprocess
 import threading
-import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,18 +33,12 @@ class TestRunResult:
     output: str
     invocation_error: bool = False
     failing_tests: list[str] = field(default_factory=list)
-    traceback_excerpts: dict[str, str] = field(default_factory=dict)
 
     @property
     def summary(self) -> str:
         if not self.ran:
             return "no tests run"
         return f"{'PASS' if self.ok else 'FAIL'}: {self.passed} passed, {self.failed} failed, {self.errors} errors"
-
-    @property
-    def traceback_block(self) -> str:
-        """Human-readable, untruncated rendering of ``traceback_excerpts``."""
-        return render_traceback_excerpts(self.traceback_excerpts)
 
 
 def _dir_has_python(d: Path) -> bool:
@@ -133,12 +125,7 @@ def _parse_pytest(output: str) -> tuple[int, int, int]:
     return passed, failed, errors
 
 
-# The captured id must contain "::" — a real pytest node id always does.
-# Review 2026-07-25: without it, any log line shaped "ERROR <logger> - msg"
-# (log_cli repos) minted a phantom "failing test", which ALSO defeated the
-# teardown-race INFRA classifier via its `not failing_tests` gate.
-_PYTEST_FAILED_ID = re.compile(
-    r"^(?:FAILED|ERROR)\s+(\S+::\S+?)(?:\s+-.*)?$", re.M)
+_PYTEST_FAILED_ID = re.compile(r"^(?:FAILED|ERROR)\s+(\S+?)(?:\s+-.*)?$", re.M)
 
 
 def _pytest_failing_tests(output: str) -> list[str]:
@@ -152,103 +139,6 @@ def _pytest_failing_tests(output: str) -> list[str]:
         if name not in seen:
             seen.append(name)
     return seen
-
-
-# pytest's FAILURES section prints one block per failing test, headed by a
-# rule of underscores around the (short) test name:
-#   _________________________ test_y _________________________
-# and terminated either by the next such header or by a "=" bar line (e.g.
-# the trailing "===== short test summary info =====" / "===== 2 failed in
-# 1.2s ====="). SCRUM-40: the gate previously named only the failing test,
-# with no assertion detail — an escalation could not be triaged without a
-# live reproduction.
-_TRACEBACK_HEADER = re.compile(r"^_{3,}\s+(.+?)\s+_{3,}\s*$", re.M)
-_BAR_LINE = re.compile(r"^={3,}.*$", re.M)
-
-_EXCERPT_MAX_LINES = 40
-_EXCERPT_MAX_BYTES = 2048
-_EXCERPT_MAX_TESTS = 3
-
-
-def _short_test_name(node_id: str) -> str:
-    """``tests/test_x.py::TestC::test_y`` -> ``TestC.test_y``; a node id with
-    no ``::`` (shouldn't happen for a FAILED/ERROR line) is returned as-is."""
-    parts = node_id.split("::")
-    if len(parts) <= 1:
-        return node_id
-    return ".".join(parts[1:])
-
-
-def _cap_excerpt(text: str) -> str:
-    lines = text.strip("\n").splitlines()
-    truncated = len(lines) > _EXCERPT_MAX_LINES
-    capped = "\n".join(lines[:_EXCERPT_MAX_LINES])
-    if len(capped) > _EXCERPT_MAX_BYTES:
-        capped = capped[:_EXCERPT_MAX_BYTES]
-        truncated = True
-    if truncated:
-        capped += "\n… [truncated]"
-    return capped
-
-
-def _pytest_traceback_excerpts(
-    output: str, failing_tests: list[str],
-) -> dict[str, str]:
-    """Map each name in *failing_tests* to a capped excerpt of its FAILURES
-    block in *output*. Unmatched node ids (malformed/absent output) are
-    silently skipped — never raises. When more than ``_EXCERPT_MAX_TESTS``
-    tests match, keeps the ones with the largest (most diagnostic, by
-    uncapped line count) blocks, tiebroken by original failure order."""
-    if not failing_tests:
-        return {}
-    headers = list(_TRACEBACK_HEADER.finditer(output))
-    if not headers:
-        return {}
-    # Short header names are not unique across files (tests/a.py::test_y and
-    # tests/b.py::test_y both header as "test_y"), so keep every same-name
-    # block in output order and pair them positionally with the node ids —
-    # pytest emits the FAILURES section and the summary in the same order.
-    blocks: dict[str, list[str]] = {}
-    for i, m in enumerate(headers):
-        name = m.group(1).strip()
-        start = m.end()
-        next_header_start = headers[i + 1].start() if i + 1 < len(headers) else len(output)
-        bar_match = _BAR_LINE.search(output, start, next_header_start)
-        end = bar_match.start() if bar_match else next_header_start
-        blocks.setdefault(name, []).append(output[start:end])
-
-    consumed: dict[str, int] = {}
-    matched: list[tuple[str, str]] = []
-    for node_id in failing_tests:
-        name = _short_test_name(node_id)
-        bodies = blocks.get(name)
-        nth = consumed.get(name, 0)
-        if not bodies or nth >= len(bodies):
-            continue  # unmatched node ids are silently skipped (docstring)
-        consumed[name] = nth + 1
-        matched.append((node_id, bodies[nth]))
-    if not matched:
-        return {}
-
-    indexed = [(node_id, body, idx) for idx, (node_id, body) in enumerate(matched)]
-    if len(indexed) > _EXCERPT_MAX_TESTS:
-        indexed.sort(key=lambda t: (-len(t[1].strip("\n").splitlines()), t[2]))
-        indexed = indexed[:_EXCERPT_MAX_TESTS]
-        indexed.sort(key=lambda t: t[2])  # restore chronological order
-
-    return {node_id: _cap_excerpt(body) for node_id, body, _idx in indexed}
-
-
-def render_traceback_excerpts(excerpts: dict[str, str]) -> str:
-    """Human-readable, non-truncated rendering of *excerpts* for the
-    ``attempt_failed`` event text. Returns "" when empty so callers can
-    append conditionally, exactly like ``failing_tests``."""
-    if not excerpts:
-        return ""
-    parts = ["Traceback excerpts:"]
-    for name, excerpt in excerpts.items():
-        parts.append(f"\n——— {name} ———\n{excerpt}")
-    return "\n".join(parts)
 
 
 # pytest-xdist's tmp-dir cleanup (TempPathFactory's session-scoped finalizer)
@@ -480,98 +370,6 @@ def _ensure_node_deps(repo_path: Path, work_dir: Path, source_repo: Path | None)
         )
 
 
-def _ensure_forced_build_artifacts(repo_path: Path, source_repo: Path | None) -> None:
-    """Make `pyproject.toml`'s force-included paths present in a task worktree.
-
-    Same trap as `_ensure_node_deps`, reached from the Python side. `web/dist` is
-    a gitignored build artifact that `git worktree add` never creates, and the
-    wheel and sdist targets both force-include it. Absence is deliberately loud,
-    so a release cut without `npm run build` fails instead of shipping a
-    boardless wheel. In a task worktree that same loudness used to mean ANY
-    `uv run` / `uv build` / editable install died before collection, so the
-    coder could not run the suite at all.
-
-    Since `hatch_build.py`, the board's entry is injected per build VERSION and
-    an editable install only WARNS, so a boardless worktree can now at least
-    install and collect. This still runs: without it the worktree's board tests
-    skip or run against nothing, and any real wheel build there still fails.
-
-    Observed 2026-08-01: a task burned its entire lifetime budget (2.58M
-    cost-weighted tokens, one attempt) without reaching a green run, and its
-    reviewer traced the red suite to exactly this — `uv run pytest` could not
-    reach collection because `web/dist` was missing from the worktree.
-
-    Taken from the source checkout rather than rebuilt: `npm run build` in a
-    fresh worktree is slow and network-dependent, which is the same reasoning
-    `_ensure_node_deps` gives. If the source checkout has not built it either,
-    nothing is provisioned and the loud failure stands — which is correct,
-    because then there genuinely is no board to package.
-
-    COPIED, where `_ensure_node_deps` symlinks, and the difference is
-    deliberate. `web/package.json`'s build script is `vite build`, which WRITES
-    into `web/dist`; through a symlink a task that touches the UI would rebuild
-    straight into the developer's checkout. `node_modules` is hundreds of
-    megabytes, so linking it is the only practical option and the write-through
-    risk is accepted; this is 1 MB across 27 files, so isolation is nearly free
-    and there is no reason to accept it here.
-
-    Best-effort: never raises.
-    """
-    if source_repo is None:
-        return
-    repo_path, source_repo = Path(repo_path), Path(source_repo)
-    try:
-        cfg = tomllib.loads((repo_path / "pyproject.toml").read_text())
-    except (OSError, tomllib.TOMLDecodeError):
-        return
-    targets = (cfg.get("tool", {}).get("hatch", {})
-                  .get("build", {}).get("targets", {}))
-    forced: set[str] = set()
-    for target in targets.values():
-        forced.update((target.get("force-include") or {}).keys())
-        # `web/dist` is no longer a STATIC force-include: it is injected by
-        # `hatch_build.py`, which only fails a distributable build (a clean
-        # clone must stay installable — see that file). The path still has to be
-        # provisioned here, or a task worktree runs the board's tests against a
-        # board that is not there, so the hook's declared `source` counts as
-        # forced too. Read from config rather than hardcoded, so the two cannot
-        # drift.
-        for hook in (target.get("hooks") or {}).values():
-            source = (hook or {}).get("source")
-            if isinstance(source, str) and source:
-                forced.add(source)
-    for rel in sorted(forced):
-        dest = repo_path / rel
-        if dest.exists() or dest.is_symlink():
-            continue
-        # Only provision what git genuinely does not carry. A TRACKED forced
-        # path is absent from a worktree for exactly one reason — the branch
-        # deleted it — and restoring it would hide that from the branch's own
-        # test run: a task that deleted the whole schema directory would watch
-        # its suite go green. The gitignored case is the one this exists for.
-        # (Caught in review of the commit that added this, against a real
-        # deletion of `migrations/`; the export gate refuses that downstream on
-        # both a count pin and nine content pins, but a task must not be able to
-        # mislead itself in the meantime.)
-        try:
-            tracked = subprocess.run(
-                ["git", "ls-files", "--error-unmatch", rel],
-                cwd=repo_path, capture_output=True, timeout=30,
-            ).returncode == 0
-        except (OSError, subprocess.SubprocessError):
-            tracked = False
-        if tracked:
-            continue
-        src = source_repo / rel
-        try:
-            if src.is_dir():
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(src, dest, symlinks=True)
-        except OSError as exc:
-            log.warning("forced-include provisioning failed (%s -> %s): %s",
-                        dest, src, exc)
-
-
 def _env_for(repo_path: Path, env: dict[str, str] | None = None) -> dict[str, str]:
     """Process env for a repo command: the server's, plus the repo's venv."""
     run_env = {**os.environ, **(env or {})}
@@ -682,34 +480,18 @@ def run_tests(
         return TestRunResult(False, True, 0, 0, 0, "", "no test command detected")
     if source_repo is not None and _is_node_cmd(cmd):
         _ensure_node_deps(repo_path, work_dir, Path(source_repo))
-    # Unconditional, unlike the node case: a forced-include miss kills `uv run` /
-    # `uv build` / any editable install before collection, so it breaks a python
-    # command whatever that command turns out to be.
-    _ensure_forced_build_artifacts(repo_path, source_repo)
     run_env = _env_for(repo_path, env)
-    # The shared venv's editable install resolves the package to the MAIN
-    # checkout, so a worktree's tests silently import main's code — the python
-    # twin of the node-deps trap above (SCRUM-18 burned its whole budget on 5
-    # "failures" that were main's code, not the branch's). sys.path (which
-    # PYTHONPATH feeds) is consulted before appended editable finders, so the
-    # tested tree's src/ must lead. Review 2026-07-25: the original gate
-    # (work_dir != repo_path only) NEVER fired in the production shape — the
-    # orchestrator passes repo_path=<worktree> with cwd=None, so work_dir ==
-    # repo_path. `source_repo is not None` is true exactly when repo_path is a
-    # task worktree with a primary checkout elsewhere — that is the case that
-    # needs repo_path/src injected. The work_dir branch stays for explicit
-    # cross-dir cwds.
-    inject: list[Path] = []
-    if source_repo is not None and (repo_path / "src").is_dir():
-        inject.append(repo_path / "src")
-    wd_src = work_dir / "src"
-    if work_dir != repo_path and wd_src.is_dir() and wd_src not in inject:
-        inject.append(wd_src)
-    if inject:
+    src_dir = work_dir / "src"
+    if work_dir != repo_path and src_dir.is_dir():
+        # The shared venv's editable install resolves the package to the MAIN
+        # checkout, so a worktree's tests silently import main's code — the
+        # python twin of the node-deps trap above (SCRUM-18 burned its whole
+        # budget on 5 "failures" that were main's code, not the branch's).
+        # sys.path (which PYTHONPATH feeds) is consulted before appended
+        # editable finders, so the worktree's src/ must lead.
         prior = run_env.get("PYTHONPATH", "")
-        joined = os.pathsep.join(str(p) for p in inject)
         run_env["PYTHONPATH"] = (
-            f"{joined}{os.pathsep}{prior}" if prior else joined
+            f"{src_dir}{os.pathsep}{prior}" if prior else str(src_dir)
         )
     rc, output, timed_out = _run_shell(cmd, work_dir, timeout, run_env)
     if timed_out:
@@ -730,18 +512,12 @@ def run_tests(
                     cmd, rc)
         rc_r, output_r, timed_out_r = _run_shell(cmd, work_dir, timeout, run_env)
         if timed_out_r:
-            # Same classification as the first-run timeout above: a hanging
-            # suite must never earn the advisory invocation_error path.
             return TestRunResult(True, False, 0, 0, 1, cmd,
-                                 f"timed out after {timeout}s")
+                                 f"timed out after {timeout}s", invocation_error=True)
         passed_r, failed_r, errors_r = _parse_test_output(cmd, output_r)
-        if rc_r != 0 and _is_invocation_error(rc_r, output_r, passed_r, failed_r, errors_r):
-            return TestRunResult(True, False, passed_r, failed_r, errors_r,
-                                 cmd, output_r[-8000:], invocation_error=True)
         failing_tests_r = _pytest_failing_tests(output_r)
         return TestRunResult(True, rc_r == 0, passed_r, failed_r, errors_r,
-                             cmd, output_r[-8000:], failing_tests=failing_tests_r,
-                             traceback_excerpts=_pytest_traceback_excerpts(output_r, failing_tests_r))
+                             cmd, output_r[-8000:], failing_tests=failing_tests_r)
     if not ok and _is_invocation_error(rc, output, passed, failed, errors):
         retry_cmd = _fix_invocation(cmd, output, repo_path)
         if retry_cmd and retry_cmd != cmd:
@@ -749,28 +525,23 @@ def run_tests(
                         cmd, rc, retry_cmd)
             rc2, output2, timed_out2 = _run_shell(retry_cmd, work_dir, timeout, run_env)
             if timed_out2:
-                # Timeout doctrine (see the first-run and teardown-retry
-                # returns): a hanging suite never earns the advisory
-                # invocation_error path, no matter which retry it hangs in.
                 return TestRunResult(True, False, 0, 0, 1, retry_cmd,
-                                     f"timed out after {timeout}s")
+                                     f"timed out after {timeout}s",
+                                     invocation_error=True)
             passed2, failed2, errors2 = _parse_test_output(retry_cmd, output2)
             ok2 = rc2 == 0
             if _is_invocation_error(rc2, output2, passed2, failed2, errors2):
                 return TestRunResult(True, False, passed2, failed2, errors2,
                                      retry_cmd, output2[-8000:],
                                      invocation_error=True)
-            failing_tests2 = _pytest_failing_tests(output2)
             return TestRunResult(True, ok2, passed2, failed2, errors2,
                                  retry_cmd, output2[-8000:],
-                                 failing_tests=failing_tests2,
-                                 traceback_excerpts=_pytest_traceback_excerpts(output2, failing_tests2))
+                                 failing_tests=_pytest_failing_tests(output2))
         # No fixable retry — mark as invocation error
         return TestRunResult(True, False, passed, failed, errors,
                              cmd, output[-8000:], invocation_error=True)
     return TestRunResult(True, ok, passed, failed, errors, cmd, output[-8000:],
-                         failing_tests=failing_tests,
-                         traceback_excerpts=_pytest_traceback_excerpts(output, failing_tests))
+                         failing_tests=failing_tests)
 
 
 @dataclass
@@ -889,40 +660,11 @@ def run_held_out_tests(repo_path: Path, *, timeout: int = 120) -> TestRunResult 
     return TestRunResult(True, ok, passed, failed, errors, cmd, output[-4000:])
 
 
-class TamperCheckUnavailable(RuntimeError):
-    """The tamper guard could not be run — the checkout was not inspectable.
-
-    Distinct from "the guard ran and found nothing" on purpose; see
-    `tamper_check_between`.
-    """
-
-
 def tamper_check_between(
     repo_path: Path, before_ref: str = "HEAD~1", after_ref: str = "HEAD"
 ) -> tamper_guard.TamperReport:
-    """Snapshot test files at two refs and run the tamper guard between them.
-
-    Raises `TamperCheckUnavailable` when the checkout is not there to inspect.
-    That is deliberately an ERROR and never a clean report: a missing worktree
-    means the guard could not run, and a guard that answers "no tampering"
-    when it did not look is worse than no guard — it launders the absence of
-    evidence into evidence of absence. A resumed attempt whose worktree had
-    been removed used to reach this function and die on an opaque
-    FileNotFoundError raised by a subprocess several frames down, which is how
-    it crashed the worker pool with no diagnosable cause (observed twice on
-    2026-07-31).
-
-    NOTE — the other half of that fix is NOT here: the orchestrator's call site
-    still lets this propagate into the pool's crash handler. Turning it into a
-    structured, task-visible attempt failure belongs there.
-    """
+    """Snapshot test files at two refs and run the tamper guard between them."""
     repo_path = Path(repo_path)
-    if not repo_path.is_dir():
-        raise TamperCheckUnavailable(
-            f"cannot run the tamper guard: {repo_path} does not exist")
-    if not (repo_path / ".git").exists():
-        raise TamperCheckUnavailable(
-            f"cannot run the tamper guard: {repo_path} is not a git checkout")
     before, after = {}, {}
     for path in _git_files(repo_path, before_ref):
         if tamper_guard.is_test_file(path):

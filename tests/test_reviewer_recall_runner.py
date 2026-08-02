@@ -357,7 +357,20 @@ def test_prepared_case_repo_matches_the_pinned_base_content():
     # The shape rule needs six digits and the literals covered the 8- and
     # 3-digit forms, so nothing in the tree could see it; it was found by
     # hunting the vocabulary of the other projects on the machine.
-    assert scrubbed == 20, scrubbed
+    # 20 -> 29 on 2026-08-02, the largest single jump and the first that is not
+    # about identifiers at all: BEHAVIOURAL PROSE. Sentences built from an
+    # APPROVED pseudonym plus a verb that describes the real system — what a
+    # repo's harness prints, that it ships a pre-push, its PR-label policy, its
+    # directory layout. No term list can see them because every term in them is
+    # allowed. Live source was generalised; these nine fixtures (three
+    # `runner.py`, three `test_runner.py`, `test_vcs.py`, `test_profile.py` and
+    # three `styles.css` — two more were already scrubbed for other reasons and
+    # did not move the count) kept the originals, because a base fixture is cut
+    # from a pre-sweep commit. That is worth spelling out: a first pass edited
+    # only the live tree, saw every gate go green, and shipped all of it
+    # unchanged in the frozen twins. The gates check pins and terms; neither
+    # asks "did my edit survive materialisation". Verify on the BUILT EXPORT.
+    assert scrubbed == 29, scrubbed
 
 
 @pytest.mark.asyncio

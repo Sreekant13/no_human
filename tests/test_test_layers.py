@@ -269,13 +269,13 @@ def test_ci_from_layer_gitlab():
     """ci_from_layer builds a GitLabCI from a layer ci dict."""
     ci = ci_from_layer({
         "backend": "gitlab",
-        "project": "ci_gate-analytics-export-tests",
+        "project": "ci_gate-integration-suite",
         "hostname": "gitlab.acme.net",
         "variables": {"METHOD": "create", "TEST": "true"},
         "timeout_minutes": 45,
     })
     assert isinstance(ci, GitLabCI)
-    assert ci.project == "ci_gate-analytics-export-tests"
+    assert ci.project == "ci_gate-integration-suite"
     assert ci.hostname == "gitlab.acme.net"
     assert ci.variables == {"METHOD": "create", "TEST": "true"}
     assert ci.timeout_minutes == 45

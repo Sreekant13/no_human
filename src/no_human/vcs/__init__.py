@@ -48,7 +48,7 @@ def open_pr(
     so a GHE remote like code.example.com is recognized as GitHub.
 
     ``labels`` are attached when the PR/MR is created. Some CI jobs validate
-    labels on PR-open (a repo can require a release-version label), so applying
+    labels on PR-open (a repo can require a label of its own), so applying
     them after the fact would race the first CI run.
 
     For a local bare-repo remote (Phase 0 testing target) there is no PR API, so

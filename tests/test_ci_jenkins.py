@@ -323,7 +323,7 @@ def test_unrelated_when_failing_tests_not_in_diff():
 
 def test_related_when_failing_test_matches_changed_file():
     ci = _ci_with_failures(["com.acme.analytics-export.api.tests.analyticsexport.AnalyticsExportE2EIT.testExport"])
-    changed = ["analytics-export-tests/.../AnalyticsExportE2EIT.java"]
+    changed = ["integration-suite/.../AnalyticsExportE2EIT.java"]
     assert _ci_failure_unrelated(ci, changed) is None
 
 

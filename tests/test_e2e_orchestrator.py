@@ -435,8 +435,8 @@ async def _run_and_capture_pr_labels(bare_repo, tmp_path, store, monkeypatch,
 
 async def test_pr_labels_come_from_git_config(bare_repo, tmp_path, store, monkeypatch):
     labels = await _run_and_capture_pr_labels(
-        bare_repo, tmp_path, store, monkeypatch, git_labels=["V17"])
-    assert labels == ["V17"]
+        bare_repo, tmp_path, store, monkeypatch, git_labels=["needs-review"])
+    assert labels == ["needs-review"]
 
 
 @pytest.mark.slow  # EH1: >45s of real subprocess work — runs in `run_tests.sh full`/`slow`
@@ -444,8 +444,8 @@ async def test_task_config_overrides_global_pr_labels(bare_repo, tmp_path, store
                                                       monkeypatch):
     labels = await _run_and_capture_pr_labels(
         bare_repo, tmp_path, store, monkeypatch,
-        git_labels=["V17"], task_config={"pr_labels": ["V18"]})
-    assert labels == ["V18"]
+        git_labels=["needs-review"], task_config={"pr_labels": ["backport"]})
+    assert labels == ["backport"]
 
 
 async def test_task_can_opt_out_of_global_pr_labels(bare_repo, tmp_path, store,
@@ -453,7 +453,7 @@ async def test_task_can_opt_out_of_global_pr_labels(bare_repo, tmp_path, store,
     """An explicit [] on the task means "no labels" — not "fall back to global"."""
     labels = await _run_and_capture_pr_labels(
         bare_repo, tmp_path, store, monkeypatch,
-        git_labels=["V17"], task_config={"pr_labels": []})
+        git_labels=["needs-review"], task_config={"pr_labels": []})
     assert labels == []
 
 
