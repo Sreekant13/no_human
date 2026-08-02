@@ -12,6 +12,16 @@ constant was always right there. The defect only exists once the code has been
 copied somewhere else. So the test below builds the real wheel, installs it into
 a genuinely clean virtualenv, starts a real HTTP server out of that venv, and
 reads the bytes off a socket.
+
+PRESENT IS NOT THE SAME AS VALID, and neither is the same as REACHABLE. Every
+content check in this repo passed while the installed app answered
+`/nh-mark-64.png` with 601 bytes of index.html: the favicon was broken for every
+user because the file was present, built, bundled — and outside the only mounted
+directory, so the SPA catch-all swallowed it. It was found by RUNNING the app,
+not by inspecting it. The BYTE TIER at the bottom of this file closes the half
+of that a static reader can close (`89 50 4E 47` really is at the front of every
+shipped PNG, in both artefacts), and the probe's root-asset arm closes the other
+half by comparing what the socket returns against what is on disk.
 """
 
 from __future__ import annotations
@@ -19,6 +29,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -173,12 +184,18 @@ pytestmark_reason_board = (
 # the repo — that is the whole point — so it is passed as source text and talks
 # back over stdout as JSON.
 _PROBE = r"""
-import json, re, sys, threading, time, urllib.request, socket
+import json, pathlib, re, sys, threading, time, urllib.request, socket
 import uvicorn
 import no_human
+import no_human.config
 from no_human.api.app import app, _WEB_DIST
 
-out = {"pkg": no_human.__file__, "web_dist": str(_WEB_DIST)}
+# Reported so the caller can PROVE the temp-HOME override took. The operator's
+# live worker is on the real ~/.no_human; a probe that silently fell back to it
+# would be touching a database in use.
+out = {"pkg": no_human.__file__, "web_dist": str(_WEB_DIST),
+       "home": str(pathlib.Path.home()),
+       "nh_home": str(no_human.config.NO_HUMAN_HOME)}
 
 sock = socket.socket()
 sock.bind(("127.0.0.1", 0))
@@ -212,17 +229,49 @@ if m:
     out["asset_status"], out["asset_bytes"] = st, len(data)
 
 out["api_404_status"] = get("/api/definitely-not-a-route")[0]
+
+# Root-level board files, fetched over the socket and compared against the bytes
+# on disk. Vite copies web/public to the ROOT of dist, not under /assets, so
+# these live outside the one mounted directory; when only /assets was mounted
+# they fell through to the SPA catch-all and every one of them answered with 601
+# bytes of index.html. Enumerated from the installed package rather than named,
+# so a root asset added later is covered the day it is added.
+roots = {}
+if _WEB_DIST.is_dir():
+    for p in sorted(_WEB_DIST.iterdir()):
+        if not p.is_file() or p.name == "index.html":
+            continue
+        disk = p.read_bytes()
+        st, served = get("/" + p.name)
+        roots[p.name] = {"status": st, "disk_len": len(disk),
+                         "served_len": len(served),
+                         "disk_head": disk[:8].hex(),
+                         "served_head": served[:8].hex(),
+                         "identical": served == disk}
+out["root_assets"] = roots
+
 server.should_exit = True
 print("PROBE_JSON:" + json.dumps(out))
 """
 
 
-def _run_probe(venv_python: Path) -> dict:
+def _run_probe(venv_python: Path, home: Path) -> dict:
     # The whole point is a CLEAN import. The developer loop this repo documents
     # (`PYTHONPATH=<checkout>/src pytest …`) would leak the checkout into the
     # probe via inherited env and make it import the repo, not the wheel — the
     # exact failure mode this test exists to catch, reported backwards.
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    # `config.NO_HUMAN_HOME` is `Path.home() / ".no_human"`, and `Path.home()`
+    # is `$HOME` on POSIX — so this redirects the whole no_human state directory
+    # into tmp for the life of the probe. Without it the probe boots a server
+    # against the REAL ~/.no_human, which on a maintainer's machine is a live
+    # database another process is using. The probe reports the home it actually
+    # resolved and the caller asserts on it, so this is proven per run rather
+    # than assumed.
+    home.mkdir(parents=True, exist_ok=True)
+    env["HOME"] = str(home)
+    env.pop("XDG_CONFIG_HOME", None)
+    env.pop("XDG_DATA_HOME", None)
     proc = subprocess.run([str(venv_python), "-c", _PROBE],
                           capture_output=True, text=True, timeout=180, env=env,
                           cwd=tempfile.gettempdir())  # never run from the repo
@@ -268,13 +317,23 @@ def test_wheel_installed_in_a_clean_venv_serves_the_board(tmp_path):
     )
     assert inst.returncode == 0, f"install failed:\n{inst.stderr}"
 
-    result = _run_probe(venv_python)
+    fake_home = tmp_path / "home"
+    result = _run_probe(venv_python, fake_home)
 
     # Really the installed copy, not the repo.
     assert str(REPO_ROOT) not in result["pkg"], (
         f"probe imported the repo, not the wheel: {result['pkg']}")
     assert "site-packages" in result["pkg"], result["pkg"]
     assert result["started"], "server never came up"
+
+    # The temp-home override took. Asserted, not assumed: if `$HOME` stopped
+    # reaching `config.NO_HUMAN_HOME` this test would start booting a server
+    # against the developer's real, possibly in-use, state directory — and would
+    # do it silently.
+    assert result["home"] == str(fake_home), (
+        f"HOME override did not take: probe resolved home to {result['home']!r}")
+    assert result["nh_home"] == str(fake_home / ".no_human"), (
+        f"NO_HUMAN_HOME escaped the temp home: {result['nh_home']!r}")
 
     # The board itself.
     assert result["root_status"] == 200, (
@@ -294,10 +353,48 @@ def test_wheel_installed_in_a_clean_venv_serves_the_board(tmp_path):
     # The SPA catch-all must still not swallow unknown API routes.
     assert result["api_404_status"] == 404, result["api_404_status"]
 
-    _assert_missing_board_is_honest(venv_python, tmp_path)
+    _assert_root_assets_are_served_verbatim(result)
+
+    _assert_missing_board_is_honest(venv_python, tmp_path, fake_home)
 
 
-def _assert_missing_board_is_honest(venv_python: Path, tmp_path: Path) -> None:
+def _assert_root_assets_are_served_verbatim(result: dict) -> None:
+    """Every root-level board file must come back off the socket byte-identical.
+
+    THE INCIDENT THIS IS FOR. `/nh-mark-64.png` answered 200 with 601 bytes of
+    index.html: correct status, plausible size, and the app shell instead of the
+    brand mark, because only `/assets` was mounted and Vite puts `web/public` at
+    the ROOT of `dist`. A status check passes on that. A "does the file exist in
+    the package" check passes on that. Comparing the served bytes with the bytes
+    on disk is what does not.
+
+    Byte equality is asserted rather than magic numbers, because it subsumes
+    them: a served PNG cannot start `89504e47` and still be a different file.
+    """
+    roots = result["root_assets"]
+    # A board with no root-level asset at all would make every loop below
+    # vacuous — the classic way this guard would rot into a no-op.
+    assert roots, (
+        "no root-level files in the installed board — the brand marks Vite "
+        "copies from web/public are gone, or the enumeration broke. Either way "
+        "the root-asset arm just checked nothing.")
+
+    broken = {
+        name: info for name, info in roots.items()
+        if info["status"] != 200 or not info["identical"]
+    }
+    assert not broken, (
+        "root-level board asset(s) are not served as themselves:\n  - "
+        + "\n  - ".join(
+            f"/{name}: HTTP {i['status']}, served {i['served_len']} bytes "
+            f"starting {i['served_head']}, but the file on disk is "
+            f"{i['disk_len']} bytes starting {i['disk_head']}"
+            for name, i in sorted(broken.items()))
+        + "\n(the original defect: the SPA catch-all answered with index.html)")
+
+
+def _assert_missing_board_is_honest(venv_python: Path, tmp_path: Path,
+                                    home: Path) -> None:
     """With the board removed, `GET /` must explain itself, not just 404.
 
     Folded into the slow test rather than given its own, because it needs the
@@ -308,7 +405,7 @@ def _assert_missing_board_is_honest(venv_python: Path, tmp_path: Path) -> None:
     assert board.is_dir(), board
     shutil.rmtree(board)
 
-    result = _run_probe(venv_python)
+    result = _run_probe(venv_python, home)
 
     assert result["root_status"] == 503, (
         "a missing board must not answer 200 or a bare 404; got "
@@ -320,3 +417,216 @@ def _assert_missing_board_is_honest(venv_python: Path, tmp_path: Path) -> None:
     assert "nh task" in body, body[:300]
     # And a real API 404 must stay a 404 rather than become the notice.
     assert result["api_404_status"] == 404, result["api_404_status"]
+
+
+# --------------------------------------------------------------------------- #
+# Byte tier — the shipped board's BYTES, in both artefacts that carry it        #
+# --------------------------------------------------------------------------- #
+#
+# WHY A SEPARATE TIER AND NOT MORE ASSERTIONS IN THE SLOW TEST. The slow test
+# above needs `uv`, builds a wheel and boots a server; it costs about a minute
+# and is deselected by `-m "not slow"`. These read bytes off disk and cost
+# milliseconds, so they run in places the slow test is skipped out of. They also
+# reach an artefact the wheel path cannot see at all — see below.
+#
+# WHAT EACH ARTEFACT CAN AND CANNOT SEE, stated so neither is trusted for the
+# other's blind spot:
+#
+#   web/dist (the build OUTPUT, in this checkout)
+#       CAN see: `npm run build` emitting a truncated, zero-length or
+#       wrong-format asset. This is the common ancestor — `hatch_build.py` copies
+#       it into the wheel and `packaging/build-installer.sh` copies it into the
+#       frozen bundle — so a fault here is a fault in everything downstream, and
+#       naming it here says WHICH step broke.
+#       CANNOT see: anything either packaging step does. A wheel that ships no
+#       board at all leaves this arm green.
+#
+#   the .app payload (what the DMG actually hands a user)
+#       CAN see: the frozen-bundle copy — `cp -R` into `packaging/dist/nh-server`,
+#       electron-builder's `extraResources` copy into `Contents/Resources`, and
+#       codesigning walking the bundle afterwards. This is the last place the
+#       bytes exist before a user has them.
+#       CANNOT see: reachability. Constraint: this tier does NOT boot the frozen
+#       server (it would write to the operator's live `~/.no_human`), so it can
+#       prove the PNG in the bundle is a PNG and cannot prove a request for it
+#       returns it. That is exactly the half the original incident lived in, and
+#       it is covered instead by `_assert_root_assets_are_served_verbatim`, which
+#       compares socket bytes against disk bytes in the clean-venv probe.
+#
+#   the wheel's `no_human/web_dist`
+#       Deliberately NOT given its own static arm. The slow test already installs
+#       that wheel and fetches its assets over HTTP, which is strictly stronger
+#       than reading them off disk — it sees byte validity AND routing. A static
+#       arm over the same tree would only duplicate what the probe already proves.
+#
+# Both static arms SKIP in CI and in a fresh clone (`web/dist` and `desktop/dist`
+# are gitignored). The skips name what did not run and how many files were read,
+# so an artefact that quietly stopped being produced cannot read as a pass.
+
+#: First bytes every file of this suffix must begin with. A board asset whose
+#: magic number is wrong is a file the browser will refuse, however plausible its
+#: name and size — the 601-byte index.html served as a PNG had a perfectly
+#: sensible name and a perfectly sensible size.
+_MAGIC_BY_SUFFIX: dict[str, tuple[bytes, str]] = {
+    ".png": (b"\x89PNG\r\n\x1a\n", "PNG"),
+    ".ico": (b"\x00\x00\x01\x00", "ICO"),
+    ".gif": (b"GIF8", "GIF"),
+    ".jpg": (b"\xff\xd8\xff", "JPEG"),
+    ".jpeg": (b"\xff\xd8\xff", "JPEG"),
+    ".woff": (b"wOFF", "WOFF"),
+    ".woff2": (b"wOF2", "WOFF2"),
+}
+
+#: Suffixes the build is known to emit as text. Listed rather than inferred so
+#: that a NEW binary kind appearing in the board is a red test and a human
+#: decision, not a file that silently goes unvalidated. See `_UNKNOWN` below.
+_TEXT_SUFFIXES = frozenset({".html", ".js", ".css", ".map", ".json", ".svg", ".txt"})
+
+#: A JS bundle under this is a truncated or stubbed build, not a React app. The
+#: real one is ~600 kB; the floor is deliberately far below that so ordinary
+#: growth and ordinary trimming never touch it, and far above the few hundred
+#: bytes a broken build emits.
+_JS_BUNDLE_FLOOR = 100_000
+
+
+def _board_problems(board: Path) -> tuple[list[str], int]:
+    """``(problems, files read)`` for one built board directory.
+
+    Returns rather than asserts so the caller can report every fault at once and
+    name each file. A guard that stops at the first bad byte makes a caller fix
+    one asset per run.
+    """
+    files = sorted(p for p in board.rglob("*") if p.is_file())
+    problems: list[str] = []
+
+    for path in files:
+        rel = path.relative_to(board)
+        raw = path.read_bytes()
+        if not raw:
+            problems.append(f"{rel}: 0 bytes — nothing shipped in this file")
+            continue
+        magic = _MAGIC_BY_SUFFIX.get(path.suffix.lower())
+        if magic is not None:
+            expect, kind = magic
+            if not raw.startswith(expect):
+                problems.append(
+                    f"{rel}: not a {kind} — expected magic {expect.hex()}, "
+                    f"file starts {raw[:len(expect)].hex()} "
+                    f"({len(raw)} bytes total)")
+        elif path.suffix.lower() not in _TEXT_SUFFIXES:
+            problems.append(
+                f"{rel}: suffix {path.suffix!r} is neither a known binary kind "
+                "nor known text, so nothing here validated its bytes. Add it to "
+                "_MAGIC_BY_SUFFIX with its magic number, or to _TEXT_SUFFIXES, "
+                "and say which in the commit — what must not happen is a new "
+                "asset kind shipping unchecked.")
+
+    index = board / "index.html"
+    if not index.is_file():
+        problems.append("index.html: missing — this is not a built board")
+    else:
+        head = index.read_bytes()[:512].decode("utf-8", "replace")
+        if not head.lstrip().lower().startswith("<!doctype html"):
+            problems.append(
+                "index.html: no HTML doctype — starts " + repr(head[:80]))
+        if 'id="root"' not in index.read_text(encoding="utf-8", errors="replace"):
+            problems.append('index.html: no id="root" mount point for the SPA')
+
+    scripts = [p for p in files if p.suffix == ".js"]
+    if not scripts:
+        problems.append("no .js bundle anywhere in the board")
+    else:
+        biggest = max(scripts, key=lambda p: p.stat().st_size)
+        size = biggest.stat().st_size
+        if size < _JS_BUNDLE_FLOOR:
+            problems.append(
+                f"{biggest.relative_to(board)}: largest JS bundle is {size} "
+                f"bytes, under the {_JS_BUNDLE_FLOOR}-byte floor — truncated or "
+                "stubbed build")
+
+    return problems, len(files)
+
+
+def _assert_board_bytes(board: Path, what: str) -> int:
+    problems, read = _board_problems(board)
+    assert not problems, (
+        f"the shipped board at {what} has {len(problems)} byte-level "
+        f"fault(s) across {read} file(s):\n  - " + "\n  - ".join(problems))
+    return read
+
+
+def test_built_board_assets_have_valid_bytes():
+    """`web/dist` — the build output every packaging step copies from."""
+    board = REPO_ROOT / "web" / "dist"
+    if not (board / "index.html").is_file():
+        pytest.skip(
+            "the board byte check DID NOT RUN over web/dist — absent from this "
+            "checkout. It is a gitignored build artifact; run `cd web && npm "
+            "install && npm run build` to make this check live. Reported as a "
+            "skip and not a pass because 0 file(s) were actually read.")
+    read = _assert_board_bytes(board, "web/dist")
+    # A tripwire against the scan silently going empty: the board has always
+    # carried at least the shell, a stylesheet, a bundle and the brand mark. A
+    # walk that breaks, or a root that resolves somewhere with one stray file,
+    # must not read as "found no faults".
+    assert read >= 4, f"only {read} file(s) under {board} — that is not a board"
+
+
+def _app_board() -> tuple[Path | None, str]:
+    """``(board dir or None, the .app path as the packaging script declares it)``.
+
+    The .app path is READ FROM `packaging/make-dmg.sh` rather than hardcoded, so
+    a rename of the build output turns this red instead of quietly scanning a
+    directory that no longer ships. Fails closed on every step.
+    """
+    script = REPO_ROOT / "packaging" / "make-dmg.sh"
+    assert script.is_file(), (
+        "packaging/make-dmg.sh is gone. Either the DMG is no longer a "
+        "deliverable — delete this arm in the same commit and say so — or it "
+        "moved and this reader is now checking nothing at all.")
+    found = re.findall(r'^APP="\$\{ROOT\}/(?P<path>[^"$]+)"[ \t]*$',
+                       script.read_text(encoding="utf-8"), re.M)
+    assert len(found) == 1, (
+        'expected exactly one `APP="${ROOT}/..."` declaration in '
+        f"packaging/make-dmg.sh, found {len(found)}: {found}")
+    rel = found[0].rstrip("/")
+    assert not rel.startswith("/") and ".." not in rel.split("/"), rel
+    app = REPO_ROOT / rel
+
+    if not app.is_dir():
+        return None, rel
+
+    # electron-builder drops the frozen server under Contents/Resources as an
+    # `extraResources` entry, and build-installer.sh puts the board at
+    # <bundle>/web/dist inside it. Located by shape rather than by name: if the
+    # resource is renamed the board is still found, and if the board has
+    # genuinely stopped shipping this is RED — the .app is here, so "nothing to
+    # scan" is a fault, not an absence.
+    boards = sorted((app / "Contents" / "Resources").glob("*/web/dist"))
+    boards = [b for b in boards if b.is_dir()]
+    assert len(boards) == 1, (
+        f"expected exactly one board under {rel}/Contents/Resources/*/web/dist, "
+        f"found {len(boards)}: {[str(b) for b in boards]}. The .app exists, so "
+        "this is a packaging change to look at and never a silent pass.")
+    return boards[0], rel
+
+
+def test_dmg_payload_board_assets_have_valid_bytes():
+    """The board inside the .app that goes into the disk image.
+
+    This is the copy a user actually receives, and it is three copies downstream
+    of `web/dist` — `cp -R` into the PyInstaller bundle, electron-builder's
+    `extraResources`, then codesigning walking the whole tree. Each of those has
+    written to files in this bundle; none of them has any business changing a
+    PNG's first eight bytes.
+    """
+    board, rel = _app_board()
+    if board is None:
+        pytest.skip(
+            f"the board byte check DID NOT RUN over {rel} — absent from this "
+            "checkout. `desktop/dist` is a gitignored build output; run `cd "
+            "desktop && npm install && npm run dist:bundled` to make this check "
+            "live. Reported as a skip and not a pass because 0 file(s) were "
+            "actually read.")
+    read = _assert_board_bytes(board, rel + "/Contents/Resources/*/web/dist")
+    assert read >= 4, f"only {read} file(s) under {board} — that is not a board"
