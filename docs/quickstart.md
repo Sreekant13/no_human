@@ -50,6 +50,23 @@ This guided wizard will:
   (your own identity is read and shown, but the agent commits under its own)
 - Offer to onboard your first repo
 
+Then confirm the install is actually working before you rely on it:
+
+```bash
+uv run nh doctor
+```
+
+`nh doctor` is a liveness check, and it answers a question no other command
+does: **which guarded mechanisms have actually ever fired.** It enumerates every
+mechanism's lifetime firings, flags the known silent-death patterns (a gate that
+has never run, a watcher that has persisted nothing), reports your auth profile
+and mode, and refuses if the coding backend is unusable. It exits non-zero on a
+contradiction or an evidence gap, so `nh doctor || exit 1` works in a pipeline.
+
+On a brand-new install most counters will read zero, which is expected — nothing
+has run yet. Its value is later: run it whenever something behaves oddly, and
+paste it into any bug report.
+
 ## 4. Add your first task
 
 ```bash

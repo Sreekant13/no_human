@@ -1052,3 +1052,28 @@ def test_no_surface_re_asserts_a_retired_exhaustive_egress_claim(
         f"pushes the user's source at the end of every task, and the coder "
         f"session's egress is unbounded. See docs/security.md section 7."
     )
+
+
+@pytest.mark.parametrize("doc_name", ["README.md", "docs/quickstart.md"])
+def test_the_onboarding_docs_name_the_command_that_verifies_the_install(doc_name):
+    r"""`nh doctor` must appear in the two documents a new user actually reads.
+
+    Found by the adoption harness (ADOPT-4, 2026-08-02). `nh doctor` is the one
+    command that tells someone whether their install is real -- it is what
+    distinguishes "the commands ran" from "the product works". It was documented
+    in `adapters.md`, `configuration.md`, `KNOWN_ISSUES.md` and a design doc, and
+    appeared **zero** times in the README and the quickstart. A persona following
+    only the public onboarding path could not discover it, which is precisely the
+    population that needs it.
+
+    Asserted POSITIVELY and per-document on purpose. The retired-claim tests in
+    this file are negative assertions that an empty file would satisfy; this one
+    fails if the mention is ever dropped from either document, and naming the
+    document in the parametrisation means the failure says which one.
+    """
+    doc = (REPO / doc_name).read_text(encoding="utf-8")
+    assert "nh doctor" in doc, (
+        f"{doc_name} never mentions `nh doctor`. It is the only command that "
+        f"verifies an install is real, and a user following only the public "
+        f"onboarding path has no way to find it. See ADOPT-4."
+    )

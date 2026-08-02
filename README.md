@@ -36,6 +36,7 @@ switch off, and what you cannot:
 git clone <your-clone-url>/no_human.git && cd no_human
 uv sync                 # installs the `nh` entry point into .venv
 uv run nh init          # token, config, first repo (about 2 minutes)
+uv run nh doctor        # verify the install is real before relying on it
 ```
 
 Needs Python 3.12+, [uv](https://github.com/astral-sh/uv), git, and a Claude
