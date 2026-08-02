@@ -750,6 +750,32 @@ def test_reply_needs_exactly_one_of_answer_or_choose(tmp_path, monkeypatch):
 # nh status --json                                                             #
 # --------------------------------------------------------------------------- #
 
+def test_status_counts_pending_as_queued_not_working(tmp_path, monkeypatch):
+    """`working N/max_workers` must not exceed the number of worker slots.
+
+    PENDING is a task waiting to be picked up — the scheduler's `_CLAIMABLE`
+    treats it that way and no worker is spending on it. Counting it as working
+    printed impossible ratios like `working 5/4`, and that ratio is the one
+    number here an operator reads to decide whether the pool is saturated. The
+    command's docstring has always promised a "queued (pending)" lane.
+    """
+    db = tmp_path / "test.db"
+    for _ in range(5):
+        _seed_task(db, TaskStatus.PENDING)
+    _seed_task(db, TaskStatus.IMPLEMENTING)
+    runner = _make_runner(db, monkeypatch)
+
+    out = json.loads(runner.invoke(cli, ["status", "--json"]).output)
+    assert out["queued"] == 5, "five pending tasks are queued, not in flight"
+    assert out["working"] == 1, (
+        "only the IMPLEMENTING task occupies a worker; this read 6 before, "
+        "which is more than max_workers and cannot be true")
+
+    # And the human-readable line shows the same split.
+    text = runner.invoke(cli, ["status"]).output
+    assert "queued" in text and "5" in text
+
+
 def test_status_json_bucket_counts(tmp_path, monkeypatch):
     db = tmp_path / "test.db"
     _seed_task(db, TaskStatus.AWAITING_APPROVAL)
@@ -767,7 +793,8 @@ def test_status_json_bucket_counts(tmp_path, monkeypatch):
     # any of them); with no intake spend seeded it reports an explicit zero
     # rather than being absent, so consumers see a stable shape.
     assert json.loads(result.output) == {
-        "needs you": 2, "working": 1, "waiting": 1, "failed": 1, "done": 1,
+        "needs you": 2, "queued": 0, "working": 1, "waiting": 1,
+        "failed": 1, "done": 1,
         "unattributed_usage": {
             "calls": 0, "tokens_used": 0, "cache_read_tokens": 0,
             "cache_creation_tokens": 0, "total": 0,
@@ -810,7 +837,8 @@ def test_status_json_empty(tmp_path, monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.output) == {
-        "needs you": 0, "working": 0, "waiting": 0, "failed": 0, "done": 0,
+        "needs you": 0, "queued": 0, "working": 0, "waiting": 0,
+        "failed": 0, "done": 0,
         "unattributed_usage": {
             "calls": 0, "tokens_used": 0, "cache_read_tokens": 0,
             "cache_creation_tokens": 0, "total": 0,

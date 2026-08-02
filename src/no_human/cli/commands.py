@@ -2564,14 +2564,22 @@ def status(as_json):
     config, _ = _bootstrap(require_auth=False)
     needs_you = {TaskStatus.AWAITING_APPROVAL, TaskStatus.AWAITING_INPUT,
                   TaskStatus.ESCALATED}
-    working = {TaskStatus.PENDING, TaskStatus.CONTEXT, TaskStatus.PLANNING,
+    # PENDING is QUEUED, not working: the scheduler's `_CLAIMABLE` treats it as
+    # a task waiting to be picked up, and no worker is spending on it. Counting
+    # it as working made `working N/max_workers` print impossible ratios like
+    # `working 5/4` — more in-flight than there are slots to run them — which is
+    # the one number in this line an operator uses to decide whether the pool is
+    # saturated. The docstring above has always described a "queued (pending)"
+    # lane; only the buckets disagreed.
+    queued = {TaskStatus.PENDING}
+    working = {TaskStatus.CONTEXT, TaskStatus.PLANNING,
                TaskStatus.IMPLEMENTING, TaskStatus.REVIEWING, TaskStatus.TESTING}
     waiting = {TaskStatus.PAUSED_QUOTA}
 
     async def _go():
         async with Store(config.db_path) as store:
             tasks = await store.list_tasks()
-            buckets = {"needs you": 0, "working": 0, "waiting": 0,
+            buckets = {"needs you": 0, "queued": 0, "working": 0, "waiting": 0,
                        "failed": 0, "done": 0}
             for t in tasks:
                 if t.status == TaskStatus.BLOCKED:
@@ -2581,6 +2589,8 @@ def status(as_json):
                     buckets["waiting" if wake else "needs you"] += 1
                 elif t.status in needs_you:
                     buckets["needs you"] += 1
+                elif t.status in queued:
+                    buckets["queued"] += 1
                 elif t.status in working:
                     buckets["working"] += 1
                 elif t.status in waiting:
@@ -2606,6 +2616,7 @@ def status(as_json):
             mw = config.data.get("concurrency", {}).get("max_workers", 1)
             console.print(
                 f"[yellow]needs you[/] {buckets['needs you']}  "
+                f"[dim]queued[/] {buckets['queued']}  "
                 f"[bold]working[/] {buckets['working']}/{mw}  "
                 f"[blue]waiting[/] {buckets['waiting']}  "
                 f"[red]failed[/] {buckets['failed']}  "
