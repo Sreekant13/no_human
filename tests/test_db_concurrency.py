@@ -522,6 +522,25 @@ def _connection_holders(src: str) -> list[str]:
     return sorted(set(out))
 
 
+def _members_returning_the_connection(src: str) -> list[str]:
+    """Every `Store` member that RETURNS `self._db` — the leak the pinned list
+    above is really about, stated as a property instead of a name list."""
+    cls = next(n for n in ast.walk(ast.parse(src))
+               if isinstance(n, ast.ClassDef) and n.name == "Store")
+    out = []
+    for member in cls.body:
+        if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(member):
+            if not isinstance(node, ast.Return) or node.value is None:
+                continue
+            for v in ast.walk(node.value):
+                if (isinstance(v, ast.Attribute) and v.attr == "_db"
+                        and isinstance(v.value, ast.Name) and v.value.id == "self"):
+                    out.append(member.name)
+    return sorted(set(out))
+
+
 def test_the_connection_has_exactly_one_public_accessor():
     """The chokepoint claim, enumerated instead of assumed.
 
@@ -535,10 +554,31 @@ def test_the_connection_has_exactly_one_public_accessor():
     closed here: the set of members that may touch `self._db` is pinned.
     """
     assert _connection_holders(DB_PY.read_text()) == [
-        "__init__", "close", "connect", "db"], (
-        "a Store member other than __init__/connect/close/db touches self._db. "
+        "__init__", "_rollback_quietly", "close", "connect", "db", "reconnect"], (
+        "a Store member other than the pinned set touches self._db. "
         "If it hands the connection out, the tree-wide guard is no longer a "
         "chokepoint — every caller of the new accessor is invisible to it.")
+
+    # `_rollback_quietly` and `reconnect` (2026-08-02, the frozen-snapshot fix)
+    # touch `self._db` to END a connection's life — roll its transaction back,
+    # or replace it — which is the opposite of handing it out. Widening an
+    # allowlist weakens it, so the property the list was standing in for is
+    # asserted directly instead: `db` is still the ONLY member that returns the
+    # connection. That covers every future member, named or not.
+    holders_returning_db = _members_returning_the_connection(DB_PY.read_text())
+    assert holders_returning_db == ["db"], (
+        f"these Store members return the raw connection: {holders_returning_db}. "
+        "Only the `db` property may, or `.db` stops being the chokepoint the "
+        "tree-wide guard scans for.")
+
+    # Known positive for the returns-check: it must see a leak under any name,
+    # and must not be satisfied by a member that merely touches `self._db`.
+    assert _members_returning_the_connection(
+        "class Store:\n"
+        "    def handle(self):\n        return self._db\n") == ["handle"]
+    assert _members_returning_the_connection(
+        "class Store:\n"
+        "    async def r(self):\n        await self._db.rollback()\n") == []
 
     # Known positive: the guard must see a second accessor, whatever it is called.
     assert _connection_holders(

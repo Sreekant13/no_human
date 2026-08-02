@@ -226,6 +226,48 @@ async def lifespan(app: FastAPI):
     worker_task = asyncio.create_task(
         sched.run_forever(stop=stop_event, poll_interval=poll_interval)
     )
+
+    def _worker_died(task: "asyncio.Task") -> None:
+        """Record the worker loop's death where a human can see it.
+
+        WITHOUT THIS THE SERVER LIES FOREVER. `create_task` returns a task
+        nobody awaits until shutdown, so an exception inside `run_forever` is
+        never retrieved: the coroutine stops, `app.state.scheduler` keeps
+        answering, and `/api/worker/status` reports `running: true` for the rest
+        of the process's life. asyncio's only complaint is a
+        "Task exception was never retrieved" line at garbage-collection time.
+
+        This is not hypothetical, and it is the incident's own mechanism one
+        step earlier: `run_forever` awaits `_recover_orphans()` BEFORE its loop
+        with no try/except, and that method issues unguarded writes. A
+        connection wedged at startup — the inferred first cause of the very
+        wedge this release detects — fails those writes with `database is
+        locked` and kills the loop before its first tick.
+
+        The endpoint reads `worker_error` and drops `healthy`, exactly as it
+        already does for `watcher_error`.
+        """
+        if task.cancelled():
+            return                       # ordinary shutdown, not a failure
+        exc = task.exception()
+        if exc is None:
+            # Returned early without raising. Still fatal — nothing ticks again
+            # — and still silent, so it is reported too.
+            app.state.worker_error = (
+                "the worker loop exited on its own without an error; no task "
+                "will be dispatched until the server is restarted")
+            log.error("%s", app.state.worker_error)
+            return
+        app.state.worker_error = f"{type(exc).__name__}: {exc}"
+        log.error("THE WORKER LOOP DIED — no task will be dispatched until the "
+                  "server is restarted: %s", exc, exc_info=exc)
+
+    # Cleared BEFORE the callback is registered, not after. Safe either way
+    # today only because no `await` separates the two lines, so the callback
+    # cannot run in between; insert one and a death recorded by `_worker_died`
+    # would be silently wiped back to None.
+    app.state.worker_error = None
+    worker_task.add_done_callback(_worker_died)
     app.state.scheduler = sched
     app.state.worker_stop = stop_event
     log.info("embedded worker started: %d worker(s), poll=%ds",
@@ -2258,24 +2300,106 @@ def _loaded_code_stale() -> str | None:
 
 @app.get("/api/worker/status")
 async def worker_status(request: Request) -> dict[str, Any]:
-    """Is the embedded worker running? How many tasks in-flight? And which
-    code is actually loaded — the server never reloads, so a merged fix is not
-    live until it restarts."""
+    """Is the embedded worker running, how many tasks in-flight — and if none,
+    WHY none?
+
+    The first two fields alone cannot tell idle from wedged. On 2026-08-01 this
+    endpoint returned `{"running":true,"inflight":0,"max_workers":4,
+    "watcher_error":null}` for six hours while the scheduler's database view was
+    frozen three hours in the past, re-dispatching two finished tasks ~12x/min
+    and unable to see the one real task waiting. Every field was accurate.
+
+    So `inflight` keeps its meaning and `idle_reason` supplies the one bit it
+    never carried: `queue_empty` (nothing to do) vs `db_view_stale` (the queue
+    only LOOKS empty) vs `quota_cooldown` vs `claimable_not_dispatched`. The
+    counters beside it — crash rate, consecutive status-write failures, last
+    successful write, stale detections and reconnects — are what makes the
+    difference checkable from a single `curl` rather than by reading 46,000
+    lines of log.
+
+    ONE HONEST LIMIT, because it was measured rather than assumed. The
+    staleness probe runs per scheduler TICK, not per request — a status
+    endpoint that opened a second SQLite connection on every poll would put the
+    board's polling on the database's critical path. So a poll landing between
+    the wedge and the next tick still answers `healthy: true`; the flag is at
+    most one `poll_interval` behind. `seconds_since_last_tick` is published for
+    exactly that reason, and it doubles as the alarm for the failure no
+    per-tick check can report on itself: a scheduler loop that has stopped
+    ticking at all.
+
+    `loaded_code` / `loaded_code_stale` answer a different question on the same
+    poll: WHICH code is running. The server never reloads, so a merged fix is
+    not live until it restarts.
+    """
     sched = getattr(request.app.state, "scheduler", None)
     watcher_error = getattr(request.app.state, "watcher_error", None)
+    # Set by the worker task's done-callback. `running: true` means "a Scheduler
+    # object is wired up", which is NOT the same as "the loop is alive" — the
+    # loop can die and leave the object answering.
+    worker_error = getattr(request.app.state, "worker_error", None)
     common = {
         "watcher_error": watcher_error,
+        "worker_error": worker_error,
         "loaded_code": getattr(request.app.state, "loaded_code", None),
         "loaded_code_stale": await asyncio.to_thread(_loaded_code_stale),
     }
     if sched is None:
-        return {"running": False, "inflight": 0, "max_workers": 0, **common}
-    return {
+        return {"running": False, "inflight": 0, "max_workers": 0, **common,
+                "idle_reason": "no_scheduler",
+                "db_view_stale": False, "healthy": False}
+    out: dict[str, Any] = {
         "running": True,
         "inflight": len(sched.inflight),
         "max_workers": sched.max_workers,
         **common,
     }
+    snapshot = getattr(sched, "health_snapshot", None)
+    if callable(snapshot):
+        try:
+            out.update(snapshot())
+        except Exception as exc:  # noqa: BLE001 — status must always answer
+            out["health_error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        # FAIL CLOSED. Defaulting `healthy` to true for an object that cannot
+        # describe itself is the same fail-open this change removed everywhere
+        # else. Unreachable in production (one assignment site, always a real
+        # Scheduler), which is exactly why it must not be left to luck.
+        out["health_error"] = ("the scheduler cannot report its health "
+                               "(no health_snapshot)")
+    # One boolean for the surfaces that only want a light. Every clause is a
+    # state that used to render as green, and the last two were added after a
+    # review found the first version still had two reachable modes resolving to
+    # `healthy: true` / `queue_empty` — the exact pre-incident reading:
+    #
+    #   * `tick_stalled` — the scheduler loop has stopped ticking. Every other
+    #     field here is WRITTEN by a tick, so a stalled loop freezes them all in
+    #     their last-known-good state and this endpoint reports the past.
+    #     Publishing `seconds_since_last_tick` without consuming it surfaced
+    #     nothing; a field with no reader is not a signal.
+    #   * `consecutive_probe_failures` — the staleness detector itself is
+    #     failing. That means the view is UNKNOWN, and "unknown" must not
+    #     resolve to "healthy", or the detector fails open into the very silence
+    #     it was built to break.
+    #   * `worker_error` — the loop is DEAD. Nothing else here can say so:
+    #     every other field is written by a tick, and a loop that died before
+    #     its first tick leaves them all at their initial values.
+    #
+    # `tick_stalled` now also covers a loop that has NEVER ticked and has had
+    # longer than its own threshold to do so, which is the same fault one step
+    # earlier and reported `healthy: true` permanently until a review found it.
+    # The two are complementary and neither replaces the other: the callback
+    # catches a loop that DIED, the threshold catches one that is alive but
+    # wedged inside a call that never returns — where no callback ever fires.
+    out["healthy"] = (
+        not out.get("db_view_stale", False)
+        and not out.get("tick_stalled", False)
+        and not out.get("consecutive_probe_failures", 0)
+        and not out.get("consecutive_status_write_failures", 0)
+        and watcher_error is None
+        and worker_error is None
+        and "health_error" not in out
+    )
+    return out
 
 
 @app.get("/api/queue/health")

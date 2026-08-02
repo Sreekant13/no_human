@@ -238,6 +238,32 @@ class Scheduler:
         self._compound_locks: dict[str, asyncio.Lock] = {}
         # Live status: short human-readable summary of what the agent is doing.
         self._live_status: dict[str, str] = {}
+        # --- liveness (2026-08-01 incident) ------------------------------- #
+        # `inflight: 0` read identically for "queue empty" and "the connection
+        # is serving a three-hour-old snapshot and I am crashing 12x/minute".
+        # These make the two distinguishable from outside the process.
+        self._last_tick_at: float | None = None
+        self._last_dispatch_at: float | None = None
+        self._last_claimable_count: int | None = None
+        self._crash_times: deque = deque(maxlen=500)
+        self._db_view_stale = False
+        self._db_stale_since: float | None = None
+        self._status_write_failures = 0
+        self._consecutive_status_write_failures = 0
+        self._last_status_write_error: str | None = None
+        # The probe can fail too, and a detector that fails open is worth
+        # nothing: without these, "the probe raised on every tick for three
+        # hours" and "the view is fine" are the same JSON. See
+        # `_check_db_liveness`.
+        self._probe_failures = 0
+        self._consecutive_probe_failures = 0
+        self._last_probe_error: str | None = None
+        # `run_forever` overwrites this with the interval it was actually given.
+        self._poll_interval = 10.0
+        # When this Scheduler came into existence. The anchor for "has never
+        # ticked, and has had long enough that it should have" — without it,
+        # "never ticked" is indistinguishable from "started four seconds ago".
+        self._created_at = time.time()
 
     @property
     def inflight(self) -> set[str]:
@@ -304,10 +330,257 @@ class Scheduler:
                     "orphan_recovered",
                     f"{t.id[:8]} was orphaned in {status.value} — requeued")
 
+    async def _check_db_liveness(self) -> None:
+        """Per-tick: is the Store's read view still the database's?
+
+        THIS IS THE GUARD THAT SURVIVES AN UNKNOWN FIRST CAUSE. The rollback
+        added in `db.py` closes one route to a pinned connection, but the
+        2026-08-01 incident's timeline does not fit that route — the process was
+        pinned three hours before its own first read, i.e. stale from birth,
+        which points at a recovered stale WAL index rather than at anything this
+        process did. Detection does not need to know: whatever pins the
+        connection, the pinned connection disagrees with the file, and that
+        disagreement is what is measured here.
+
+        Never raises. A probe that can kill the pool is worse than no probe —
+        and the probe touches a second connection, so it has its own failure
+        modes (a full disk, a locked file) that must not become the pool's.
+        """
+        probe = getattr(self.store, "probe_snapshot_staleness", None)
+        if probe is None:      # a Store double in a test; nothing to check
+            return
+        try:
+            result = await probe()
+        except Exception as exc:  # noqa: BLE001 — never kill the pool
+            # FAILING OPEN SILENTLY IS THE INCIDENT'S OWN SHAPE. Returning here
+            # without a counter left `db_view_stale: False`, `healthy: true`,
+            # `idle_reason: queue_empty` — byte-identical to health — while the
+            # only thing that knew better was a log line, back in the 46,000
+            # lines this change exists to make unnecessary. A detector that
+            # cannot report its own failure is not a detector.
+            #
+            # It still must not kill the pool, so the tick continues; what
+            # changes is that the failure is now COUNTED and published, exactly
+            # like `status_write_failures`.
+            self._probe_failures += 1
+            self._consecutive_probe_failures += 1
+            self._last_probe_error = f"{type(exc).__name__}: {exc}"
+            log.error(
+                "db staleness probe FAILED (%d in a row): %s. While it is "
+                "failing, nothing is checking whether the scheduler's view of "
+                "the queue is real — treat the view as UNKNOWN, not healthy.",
+                self._consecutive_probe_failures, exc, exc_info=True)
+            self._on_event(
+                "db_probe_failed",
+                f"staleness probe failed ({self._consecutive_probe_failures} "
+                f"in a row): {exc}")
+            return
+        self._consecutive_probe_failures = 0
+        if not result.stale:
+            if self._db_view_stale:
+                log.warning("db read view recovered")
+                self._on_event("db_view_recovered",
+                               "database read view is live again")
+            self._db_view_stale = False
+            self._db_stale_since = None
+            return
+
+        if not self._db_view_stale:
+            self._db_stale_since = time.time()
+        self._db_view_stale = True
+        # ERROR, not warning: on 2026-08-01 this state ran for six hours with
+        # every surface reporting health. It is never routine.
+        log.error(
+            "DATABASE READ VIEW IS FROZEN: this connection sees %d task(s) up "
+            "to %s, the file has %d up to %s. Every task written since is "
+            "INVISIBLE to the scheduler and cannot be dispatched. Reconnecting.",
+            result.shared.count, result.shared.max_updated_at,
+            result.fresh.count, result.fresh.max_updated_at)
+        self._on_event(
+            "db_view_stale",
+            f"frozen read snapshot: connection sees {result.shared.count} "
+            f"task(s), file has {result.fresh.count} — reconnecting")
+
+        reconnect = getattr(self.store, "reconnect", None)
+        if reconnect is None:
+            return
+        try:
+            await reconnect()
+        except Exception as exc:  # noqa: BLE001
+            log.error("reconnect after a frozen read view FAILED: %s", exc,
+                      exc_info=True)
+            self._on_event("db_reconnect_failed", str(exc))
+            return
+        # Verify the recovery rather than assume it. If the view is still
+        # frozen after a fresh connection, the cause is not this connection and
+        # the flag must stay up — silently clearing it would recreate exactly
+        # the false all-clear this whole change exists to remove.
+        try:
+            after = await probe()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("post-reconnect staleness probe failed: %s", exc)
+            return
+        if after.stale:
+            log.error("STILL FROZEN after reconnecting — the stale view is not "
+                      "this connection's doing; escalate")
+            self._on_event("db_view_stale",
+                           "still frozen after reconnect — needs a human")
+            return
+        self._db_view_stale = False
+        self._db_stale_since = None
+        log.warning("reconnected; read view is live again (now sees %d task(s))",
+                    after.shared.count)
+        self._on_event("db_view_recovered",
+                       f"reconnected — now sees {after.shared.count} task(s)")
+
+    def _crashes_since(self, seconds: float) -> int:
+        cutoff = time.time() - seconds
+        return sum(1 for t in self._crash_times if t >= cutoff)
+
+    def health_snapshot(self) -> dict:
+        """What `/api/worker/status` needs to tell idle from wedged.
+
+        `inflight: 0` is the same number in both states — it was honest
+        throughout the 2026-08-01 incident, because each crash was instantaneous
+        and a poll almost never landed inside a run. So the number is kept and
+        the CONTEXT is added: `idle_reason` names why nothing is running, and
+        the counters say whether the last tick achieved anything.
+        """
+        inflight = len(self._inflight)
+        since_tick = (None if self._last_tick_at is None
+                      else time.time() - self._last_tick_at)
+        # A LOOP THAT HAS STOPPED TICKING INVALIDATES EVERY OTHER FIELD HERE,
+        # which is why it is judged first. `db_view_stale`, `claimable` and the
+        # crash counts are all written BY a tick, so a stalled loop freezes them
+        # at their last values and they read healthy forever — the same failure this
+        # change exists to remove, one level up. Publishing
+        # `seconds_since_last_tick` and leaving it out of `healthy` was not
+        # enough: a field nobody reads surfaces nothing.
+        #
+        # The threshold is derived from the interval the loop was actually
+        # given, not a constant, so it stays correct under any `poll_interval`.
+        # Six intervals (>=60s) is deliberately generous: a tick does real work
+        # — the wake watcher, the probe, re-analysis — and a false "stalled"
+        # would be its own bad alarm. A tick that genuinely takes over a minute
+        # is also not dispatching, so reporting it is right either way.
+        stall_after = max(60.0, self._poll_interval * 6)
+        # A LOOP THAT HAS NEVER TICKED AT ALL is the same failure one step
+        # earlier, and the first version of this reported it healthy FOREVER:
+        # `since_tick` is None before the first tick, so `since_tick > ...` was
+        # never evaluated and `tick_stalled` stayed False. The `starting` branch
+        # below existed and simply was not carried into `healthy`.
+        #
+        # It is REACHABLE, and by this incident's own mechanism: `run_forever`
+        # awaits `_recover_orphans()` before the loop with no try/except, and
+        # that method issues unguarded `set_status`/`save_events` WRITES. A
+        # connection wedged at startup — "stale from birth", the inferred first
+        # cause of the incident this module now guards against — fails those
+        # writes with `database is locked`, killing `run_forever` before tick 1.
+        #
+        # BOUNDED, not unconditional: `healthy: true` during the genuine first
+        # poll_interval is correct, and a server that has been up for four
+        # seconds must not report a fault. So the same threshold applies, timed
+        # from when this Scheduler was constructed.
+        never_ticked_too_long = (
+            self._last_tick_at is None
+            and time.time() - self._created_at > stall_after)
+        tick_stalled = (
+            (since_tick is not None and since_tick > stall_after)
+            or never_ticked_too_long)
+
+        # ORDERING. Faults first, then ordinary operating states. A fault
+        # reported as `slots_full` or `queue_empty` is the defect this whole
+        # change exists to remove, so nothing that describes NORMAL operation
+        # may mask something that describes a BREAKAGE. Every adjacent pair
+        # below is pinned by a test that constructs both conditions at once —
+        # the argument used to live only in this comment, where it was free to
+        # regress silently.
+        if never_ticked_too_long:
+            # Distinguished from `tick_loop_stalled`: "it never started" and "it
+            # stopped" have different causes and different first questions.
+            idle_reason = "never_ticked"
+        elif tick_stalled:
+            # Outranks everything: `db_view_stale`, `claimable` and the crash
+            # counts are all written BY a tick, so a stalled loop freezes them
+            # at their last values and they all read healthy. Their content is
+            # not evidence any more, and saying so first is the honest report.
+            idle_reason = "tick_loop_stalled"
+        elif self._db_view_stale:
+            # A CONFIRMED observation, so it outranks the probe-failure case
+            # below (an ABSENCE of information) and every normal state. The
+            # queue looks empty precisely BECAUSE the view is frozen, so
+            # reporting `queue_empty` here would be the original lie in a new
+            # field.
+            idle_reason = "db_view_stale"
+        elif self._consecutive_probe_failures:
+            # Not "the view is stale" — "nobody knows whether it is".
+            idle_reason = "db_probe_failing"
+        elif self._last_tick_at is None:
+            # Genuinely still starting, inside the first threshold.
+            idle_reason = "starting"
+        elif inflight >= self.max_workers:
+            idle_reason = "slots_full"
+        elif self._quota_cooldown_until is not None and \
+                datetime.now(timezone.utc) < self._quota_cooldown_until:
+            idle_reason = "quota_cooldown"
+        elif inflight > 0:
+            idle_reason = None
+        elif self._last_claimable_count:
+            idle_reason = "claimable_not_dispatched"
+        else:
+            idle_reason = "queue_empty"
+
+        store_liveness = {}
+        getter = getattr(self.store, "liveness", None)
+        if callable(getter):
+            try:
+                store_liveness = getter()
+            except Exception:  # noqa: BLE001
+                store_liveness = {}
+        return {
+            "idle_reason": idle_reason,
+            "db_view_stale": self._db_view_stale,
+            "db_stale_since": self._db_stale_since,
+            "last_tick_at": self._last_tick_at,
+            # HOW FRESH `db_view_stale` IS. The probe runs per TICK, not per
+            # request: a status endpoint that opened a second SQLite connection
+            # on every poll would put the board's polling on the database's
+            # critical path. So this flag is at most one poll_interval old, and
+            # a caller that needs to know that is told rather than left to
+            # assume. It is also the alarm for the other silent failure — a
+            # scheduler whose loop has stopped ticking at all, which no
+            # per-tick check can ever report on its own.
+            "seconds_since_last_tick": (
+                None if since_tick is None else round(since_tick, 1)),
+            "tick_stalled": tick_stalled,
+            "never_ticked": never_ticked_too_long,
+            "seconds_since_start": round(time.time() - self._created_at, 1),
+            "tick_stall_threshold_s": stall_after,
+            "probe_failures": self._probe_failures,
+            "consecutive_probe_failures": self._consecutive_probe_failures,
+            "last_probe_error": self._last_probe_error,
+            "last_dispatch_at": self._last_dispatch_at,
+            "claimable": self._last_claimable_count,
+            "crashes_last_5m": self._crashes_since(300),
+            "crashes_last_1m": self._crashes_since(60),
+            "status_write_failures": self._status_write_failures,
+            "consecutive_status_write_failures":
+                self._consecutive_status_write_failures,
+            "last_status_write_error": self._last_status_write_error,
+            "quota_cooldown_until": (self._quota_cooldown_until.isoformat()
+                                     if self._quota_cooldown_until else None),
+            "db": store_liveness,
+        }
+
     async def tick(self, *, now: datetime | None = None) -> list[str]:
         """One scheduling pass: resume parked tasks, then dispatch up to the free
         slots. Returns the task ids started this tick."""
         now = now or datetime.now(timezone.utc)
+        self._last_tick_at = time.time()
+        # BEFORE anything reads the queue. Every decision below this line is
+        # made from `store`, so if the connection's view is frozen the whole
+        # tick is reasoning about a database that no longer exists.
+        await self._check_db_liveness()
         if self.wake is not None:
             try:
                 # Pass the claimed set so the stuck-active sweep judges only
@@ -324,11 +597,14 @@ class Scheduler:
         if slots <= 0:
             return []
         started: list[str] = []
-        for task in (await self._claimable())[:slots]:
+        claimable = await self._claimable()
+        self._last_claimable_count = len(claimable)
+        for task in claimable[:slots]:
             self._inflight.add(task.id)          # reserve BEFORE scheduling
             asyncio.ensure_future(self._run(task))
             started.append(task.id)
         if started:
+            self._last_dispatch_at = time.time()
             self._on_event("dispatch", f"started {len(started)} task(s); "
                            f"{len(self._inflight)}/{self.max_workers} busy")
         # PR-E: periodic re-analysis (best-effort, never blocks task dispatch).
@@ -408,6 +684,7 @@ class Scheduler:
             log.warning("task %s crashed in pool: %s", task.id[:8], exc,
                         exc_info=True)
             self._on_event("task_error", f"{task.id[:8]}: {exc}")
+            self._crash_times.append(time.time())
             # Durable reason. `_on_event` above is the LIVE pool stream — it is
             # gone the moment nobody is watching, and `log.warning` lands in a
             # file the board never reads. Without this the task is FAILED with
@@ -432,8 +709,35 @@ class Scheduler:
             try:
                 from .task import TaskStatus as _TS
                 await self.store.set_status(task, _TS.FAILED, validate=False)
-            except Exception:  # noqa: BLE001
-                pass
+                self._consecutive_status_write_failures = 0
+            except Exception as werr:  # noqa: BLE001
+                # This used to be `except Exception: pass`, with no counter.
+                # That is the line that made the 2026-08-01 wedge silent: when
+                # the DB is the broken thing, THIS write fails too, the task
+                # keeps a claimable status, and the next tick re-dispatches it —
+                # ~12x/minute for three hours, with nothing logged above debug.
+                #
+                # It stays non-fatal (one task must not kill the pool), but a
+                # crash handler whose own fallback cannot write is a DB-LEVEL
+                # alarm, not a per-task detail, and is reported as one. No
+                # retry cap is added here on purpose: during the incident the
+                # scheduler was behaving correctly on the data it could see, so
+                # capping retries would have hidden the fault instead of fixing
+                # it. Visibility is the fix; `_check_db_liveness` is the cure.
+                self._status_write_failures += 1
+                self._consecutive_status_write_failures += 1
+                self._last_status_write_error = f"{type(werr).__name__}: {werr}"
+                log.error(
+                    "could not mark task %s FAILED after its crash: %s. The "
+                    "task keeps a claimable status and WILL be re-dispatched. "
+                    "%d consecutive status-write failure(s) — if this is "
+                    "climbing, the database connection is the fault, not the "
+                    "task.", task.id[:8], werr,
+                    self._consecutive_status_write_failures, exc_info=True)
+                self._on_event(
+                    "status_write_failed",
+                    f"{task.id[:8]}: could not record FAILED ({werr}); "
+                    f"{self._consecutive_status_write_failures} in a row")
         finally:
             self._inflight.discard(task.id)
             self._live_status.pop(task.id, None)
@@ -490,6 +794,10 @@ class Scheduler:
         self, *, stop: asyncio.Event, poll_interval: float = 10.0
     ) -> None:
         """Loop until ``stop`` is set, then drain in-flight tasks."""
+        # Recorded so `health_snapshot` can judge "this loop has stopped
+        # ticking" against the interval it is SUPPOSED to tick at, rather than
+        # against a constant that would be wrong for any other configuration.
+        self._poll_interval = float(poll_interval)
         await self._recover_orphans()
         while not stop.is_set():
             await self.tick()

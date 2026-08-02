@@ -94,6 +94,34 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def read_file_marker(path: Path) -> "SnapshotMarker":
+    """Read the database file's true head through a brand-new connection.
+
+    MODULE-LEVEL, and not a `Store` method, because it is deliberately not an
+    operation on the Store's connection — it is the second opinion the Store's
+    connection is checked against, and `tests/test_db_concurrency.py::
+    test_no_store_read_keeps_a_raw_cursor` is right to flag a raw `fetchone()`
+    inside the class. Putting it here says what it is.
+
+    Stdlib `sqlite3` rather than another `Store`: `Store.connect()` runs the
+    migrations, and migration 0009 WRITES (it drops and recreates an FTS trigger
+    on every connect). A health probe that writes to the database it is auditing
+    is not a health probe. `query_only` makes that structural rather than a
+    promise, which matters because this runs against the operator's live file.
+
+    Blocking on purpose — callers hand it to `asyncio.to_thread`.
+    """
+    import sqlite3
+    conn = sqlite3.connect(str(path), timeout=5.0)
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        row = conn.execute(
+            "SELECT count(*), max(updated_at) FROM tasks").fetchone()
+        return SnapshotMarker(int(row[0]), row[1])
+    finally:
+        conn.close()
+
+
 def serialized_write(
     fn: Callable[..., Awaitable[_T]],
 ) -> Callable[..., Awaitable[_T]]:
@@ -195,10 +223,83 @@ def serialized_write(
     @functools.wraps(fn)
     async def wrapper(self: "Store", *args: Any, **kwargs: Any) -> _T:
         async with self._critical():
-            return await fn(self, *args, **kwargs)
+            # ROLLBACK ON THE ERROR PATH. Without this, one exception between
+            # `execute()` and `commit()` pinned the connection FOREVER, and
+            # `db.py` contained no `rollback` anywhere at all (grep it; use
+            # `journal_mode` as the known positive that the grep works).
+            #
+            # `aiosqlite.connect()` passes no `isolation_level`, so Python's
+            # legacy implicit-BEGIN applies: the first INSERT/UPDATE/DELETE
+            # opens a transaction that only COMMIT or ROLLBACK can end. A write
+            # that raised after that point left the transaction open, and every
+            # later statement on the shared connection ran inside it — reads
+            # served from a snapshot frozen at the moment of the failure, writes
+            # failing `database is locked` (SQLITE_BUSY / _BUSY_SNAPSHOT).
+            # Restarting the server was the only known cure.
+            #
+            # WHAT THIS DOES NOT FIX, measured rather than reasoned. An earlier
+            # draft of this comment claimed `rollback()` also resets every
+            # statement on the connection and therefore ends a READ pin left by
+            # an unreset cursor. That is FALSE on this stack. Measured on
+            # CPython 3.12 + aiosqlite: pin a connection with `execute("SELECT *
+            # FROM tasks")` + one `fetchone()` on a 9-row table, let a peer
+            # commit, call `rollback()` — the connection still sees 8 rows while
+            # the file holds 9.
+            #
+            # So this rollback ends a WRITE transaction and nothing else, which
+            # is exactly one of the ways a connection gets pinned. That is the
+            # concrete reason `probe_snapshot_staleness` is the load-bearing
+            # guard and this is the cheap one: detection covers the read pin,
+            # the recovered-stale-WAL case, and whatever else there turns out to
+            # be. `tests/test_frozen_snapshot_guard.py` holds the measurement so
+            # the claim cannot quietly come back.
+            #
+            # It is a no-op when no transaction is open, the common case.
+            #
+            # `BaseException`, not `Exception`: a `CancelledError` between
+            # `execute()` and `commit()` pins the connection exactly as hard as
+            # a `sqlite3.Error` does, and cancellation is routine here (the pool
+            # cancels workers on shutdown).
+            try:
+                result = await fn(self, *args, **kwargs)
+            except BaseException:
+                await self._rollback_quietly()
+                raise
+            self.last_successful_write_at = _now()
+            return result
 
     wrapper.__nh_serialized_write__ = True  # type: ignore[attr-defined]
     return wrapper
+
+
+class SnapshotMarker(NamedTuple):
+    """How far through the write history one connection can see.
+
+    `count` alone is not enough: an UPDATE-only wedge (a task escalating) moves
+    `max_updated_at` without changing the row count, and that is precisely the
+    shape the 2026-08-01 incident took for its first two symptoms.
+    """
+
+    count: int
+    max_updated_at: str | None
+
+    def behind(self, other: "SnapshotMarker") -> bool:
+        return (self.count < other.count
+                or (self.max_updated_at or "") < (other.max_updated_at or ""))
+
+
+class StalenessProbe(NamedTuple):
+    """One verdict from `Store.probe_snapshot_staleness`."""
+
+    stale: bool
+    shared: SnapshotMarker
+    fresh: SnapshotMarker
+    recheck: SnapshotMarker | None   # the confirming re-read; None if not needed
+    reason: str
+
+    def __repr__(self) -> str:  # keeps log lines and repro output readable
+        return (f"StalenessProbe(stale={self.stale}, shared={tuple(self.shared)}, "
+                f"fresh={tuple(self.fresh)}, reason={self.reason!r})")
 
 
 class JiraImportedTaskRow(NamedTuple):
@@ -220,6 +321,14 @@ class Store:
         # Guards every write critical section on this connection — see
         # `serialized_write` for why one connection + N coroutines needs it.
         self._write_lock = asyncio.Lock()
+        # Liveness counters. Read by `/api/worker/status` so that "idle" and
+        # "wedged" stop reading identically (they were the same JSON for six
+        # hours on 2026-08-01).
+        self.last_successful_write_at: str | None = None
+        self.stale_detections = 0
+        self.last_stale_at: str | None = None
+        self.reconnects = 0
+        self.last_reconnect_at: str | None = None
 
     async def connect(self) -> "Store":
         # no_human.db sits beside the credential store; the directory must be
@@ -281,6 +390,138 @@ class Store:
         if self._db is not None:
             await self._db.close()
             self._db = None
+
+    async def _rollback_quietly(self) -> None:
+        """End whatever transaction a failed write left open. Never raises.
+
+        The caller is already handling an exception; a failure here must not
+        replace it with a less informative one. It is logged rather than
+        swallowed, because a rollback that itself fails means the connection is
+        in the state `probe_snapshot_staleness` exists to catch.
+        """
+        db = self._db
+        if db is None:
+            return
+        try:
+            await db.rollback()
+        except asyncio.CancelledError:
+            # NOT ours to swallow. `await db.rollback()` is a suspension point,
+            # so a cancellation can arrive DURING it — and catching that here
+            # let the task finish with the ORIGINAL exception and
+            # `task.cancelled() == False`, i.e. a cancelled task that does not
+            # report as cancelled. `serialized_write` reasons carefully about
+            # `CancelledError` in the OUTER handler and the first version of
+            # this inner one quietly undid it.
+            #
+            # Re-raising replaces the original exception with the
+            # `CancelledError`, which is correct: cancellation outranks it, and
+            # the caller that cancelled is entitled to see cancellation. The
+            # transaction is left to the connection's teardown, which is the
+            # same position every other cancelled write is in.
+            raise
+        except BaseException:  # noqa: BLE001 — never mask the original error
+            log.warning("rollback after a failed write also failed; this "
+                        "connection may be serving a frozen snapshot",
+                        exc_info=True)
+
+    # --- staleness: never trust the shared connection's own answer --------- #
+    #
+    # WHY THIS EXISTS AND WHY IT IS THE LOAD-BEARING GUARD. On 2026-08-01 the
+    # server's shared connection served a read snapshot pinned three hours in
+    # the past. Rows written after the pin were invisible to it, so the
+    # scheduler re-dispatched two long-finished tasks ~12x/minute and never saw
+    # the one real task waiting. Every surface reported health, because every
+    # surface asked THE POISONED CONNECTION.
+    #
+    # The rollback above removes ONE way to get pinned, and the incident's own
+    # timeline argues it was not the way that happened: the process started at
+    # 23:28:37 and was pinned to before 20:34:30, three hours before its own
+    # first read, with the first crash at log line 220 of 46,000 — i.e. the
+    # connection was stale FROM BIRTH, which no transaction this process left
+    # open can explain (a stale WAL index recovered at startup can). The first
+    # cause is therefore still INFERRED.
+    #
+    # So this check deliberately does not care what caused the pin. It asks a
+    # second, independent connection what the FILE says and compares. Any
+    # mechanism that freezes the shared connection — an un-rolled-back write, an
+    # unreset cursor, a recovered stale `-shm`, or something not yet imagined —
+    # produces the same divergence and is caught here.
+
+    async def _shared_marker(self) -> SnapshotMarker:
+        row = await self._fetchone(
+            "SELECT count(*) AS n, max(updated_at) AS m FROM tasks")
+        return SnapshotMarker(int(row["n"]), row["m"])
+
+    async def probe_snapshot_staleness(self) -> StalenessProbe:
+        """Is this connection's read view behind the file? Cheap; per-tick.
+
+        THE FALSE-POSITIVE THAT WOULD MAKE THIS UNSAFE TO ACT ON. The shared
+        read and the fresh read cannot be simultaneous, so a peer committing
+        between them leaves the fresh marker legitimately ahead. Reconnecting on
+        that would churn the connection under ordinary concurrent load — and
+        peers are guaranteed here (`nh start` opens Stores for the Jira and
+        Linear pollers, and every `nh` CLI command opens one in another
+        process).
+
+        The discriminator is a CONFIRMING RE-READ, and it works because the two
+        states differ in exactly one observable way: a healthy connection starts
+        a new read transaction per statement and so sees the peer's commit
+        immediately, whereas a pinned one can never catch up by definition. Only
+        a connection still behind on the SECOND read is reported stale.
+
+        Being behind is also the only direction that matters. The shared marker
+        reading AHEAD of the fresh one is the same benign race viewed from the
+        other side, never a pin.
+        """
+        shared = await self._shared_marker()
+        fresh = await asyncio.to_thread(read_file_marker, self.path)
+        if not shared.behind(fresh):
+            return StalenessProbe(False, shared, fresh, None, "up-to-date")
+        recheck = await self._shared_marker()
+        if not recheck.behind(fresh):
+            # It caught up, so it was never pinned: a peer simply committed
+            # between the two reads.
+            return StalenessProbe(False, recheck, fresh, recheck,
+                                  "concurrent-write-race")
+        self.stale_detections += 1
+        self.last_stale_at = _now()
+        return StalenessProbe(True, recheck, fresh, recheck, "frozen-snapshot")
+
+    async def reconnect(self) -> None:
+        """Drop the connection and open a new one. Recovery for a frozen view.
+
+        Held under the critical section so no coroutine is mid-statement on the
+        connection being replaced. `connect()` re-enters that section through
+        `_migrate`; `_critical` is reentrant for the same task and Store, so
+        that is safe rather than a deadlock.
+
+        The reference is dropped BEFORE the close is attempted: if closing a
+        wedged connection fails, the wedged object must not survive as
+        `self._db`. If the subsequent connect also fails, `self.db` raises a
+        clear "not connected" error, which is a loud failure — the state this
+        method exists to escape is the silent one.
+        """
+        async with self._critical():
+            old, self._db = self._db, None
+            if old is not None:
+                try:
+                    await old.close()
+                except BaseException:  # noqa: BLE001
+                    log.warning("closing the stale connection failed; "
+                                "replacing it anyway", exc_info=True)
+            await self.connect()
+            self.reconnects += 1
+            self.last_reconnect_at = _now()
+
+    def liveness(self) -> dict[str, Any]:
+        """Connection-health counters for `/api/worker/status`."""
+        return {
+            "last_successful_write_at": self.last_successful_write_at,
+            "stale_detections": self.stale_detections,
+            "last_stale_at": self.last_stale_at,
+            "reconnects": self.reconnects,
+            "last_reconnect_at": self.last_reconnect_at,
+        }
 
     async def __aenter__(self) -> "Store":
         return await self.connect()
