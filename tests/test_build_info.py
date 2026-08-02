@@ -6,7 +6,10 @@ on main was right; the process was stale. Nothing on the record could tell the
 two apart, so the failure was attributed to the ticket.
 """
 
+import importlib
 import subprocess
+import threading
+import time
 
 import pytest
 
@@ -255,6 +258,80 @@ async def test_attempt_records_the_loaded_code_version(store):
     assert [r["id"] for r in rows] == [attempt_id]
     assert rows[0]["loaded_code_version"] == loaded_code().descriptor
     assert rows[0]["loaded_code_version"]  # never blank — "unknown" at worst
+
+
+def test_concurrent_staleness_checks_spawn_one_git_at_a_time(monkeypatch):
+    """The degraded case is the dangerous one: git is slow exactly when the
+    board is polling every ~2s, so a plain cache-miss check lets ~15 pollers
+    each start their own git before the first answer lands."""
+    # NOT `import no_human.api.app as api`: the api package's __init__
+    # binds the name `app` to the FastAPI INSTANCE, which shadows the
+    # submodule and silently hands back the wrong object.
+    api = importlib.import_module("no_human.api.app")
+
+    started = []
+    release = threading.Event()
+
+    def slow_note():
+        started.append(1)
+        release.wait(timeout=5)
+        return "behind"
+
+    monkeypatch.setattr(api, "_stale_cache", None)
+    monkeypatch.setattr("no_human.core.build_info.staleness_note", slow_note)
+
+    threads = [threading.Thread(target=api._loaded_code_stale) for _ in range(15)]
+    for t in threads:
+        t.start()
+    # Give the losers time to take the fast path rather than queue behind it.
+    time.sleep(0.2)
+    assert started == [1], f"{len(started)} concurrent git measurements"
+    release.set()
+    for t in threads:
+        t.join(timeout=5)
+    assert started == [1]
+
+
+def test_a_loser_does_not_block_on_the_slow_measurement(monkeypatch):
+    """Losers must return immediately. Parking them would swap a git herd for
+    a thread-pool herd — these run under `asyncio.to_thread`, whose executor
+    is small enough that 15 waiters would starve everything else."""
+    # NOT `import no_human.api.app as api`: the api package's __init__
+    # binds the name `app` to the FastAPI INSTANCE, which shadows the
+    # submodule and silently hands back the wrong object.
+    api = importlib.import_module("no_human.api.app")
+
+    release = threading.Event()
+    monkeypatch.setattr(api, "_stale_cache", None)
+    monkeypatch.setattr("no_human.core.build_info.staleness_note",
+                        lambda: release.wait(timeout=5) or "behind")
+
+    winner = threading.Thread(target=api._loaded_code_stale)
+    winner.start()
+    time.sleep(0.1)
+    started = time.monotonic()
+    api._loaded_code_stale()          # must not wait for the winner
+    assert time.monotonic() - started < 0.5
+    release.set()
+    winner.join(timeout=5)
+
+
+def test_stale_cache_is_stamped_on_completion_not_entry(monkeypatch):
+    """With a slow git, entry and completion differ by most of the TTL.
+    Stamping entry re-arms the miss almost immediately and reopens the herd."""
+    # NOT `import no_human.api.app as api`: the api package's __init__
+    # binds the name `app` to the FastAPI INSTANCE, which shadows the
+    # submodule and silently hands back the wrong object.
+    api = importlib.import_module("no_human.api.app")
+
+    monkeypatch.setattr(api, "_stale_cache", None)
+    monkeypatch.setattr(api, "_STALE_TTL_SECONDS", 0.6)
+    monkeypatch.setattr("no_human.core.build_info.staleness_note",
+                        lambda: time.sleep(0.4) or "behind")
+    api._loaded_code_stale()
+    entered_at, _ = api._stale_cache
+    # Stamped at completion, the entry is younger than the call took.
+    assert time.monotonic() - entered_at < 0.3
 
 
 async def test_recorded_version_survives_later_updates(store):

@@ -1920,3 +1920,57 @@ def test_review_comments_renders_model_text_literally():
     assert "the list[/] was empty" in render("the list[/] was empty")
     assert "commands.py:100:" in render("see commands.py:100: here")
     assert ":warning:" in render("see :warning: for details")
+
+
+# --------------------------------------------------------------------------- #
+# nh task show — which code produced each attempt's verdict                    #
+# --------------------------------------------------------------------------- #
+
+def test_task_show_prints_the_recorded_loaded_code(tmp_path, monkeypatch):
+    """The honest CLI surface: the value the SERVER stamped on the attempt.
+
+    Deliberately a pure DB read. `nh` is its own process, so anything this
+    command measured about its own checkout would describe the CLI and not the
+    server that judged the attempt — the same borrowed-provenance trap the
+    `_is_tracked` fix closed, wearing a different hat.
+    """
+    db = tmp_path / "test.db"
+
+    async def _seed():
+        async with Store(db) as s:
+            t = Task.new("a task", repo_path="/tmp/r")
+            await s.create_task(t)
+            attempt_id = await s.create_attempt(t.id, 1)
+            await s.update_attempt(attempt_id,
+                                   loaded_code_version="git:" + "b" * 40)
+            return t.id
+
+    task_id = asyncio.run(_seed())
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["task", "show", task_id[:8]])
+
+    assert result.exit_code == 0, result.output
+    assert "git:" + "b" * 40 in result.output, result.output
+
+
+def test_task_show_says_nothing_when_no_code_was_recorded(tmp_path, monkeypatch):
+    """Attempts predating the column are NULL. Print nothing rather than
+    invent a value or render a bare `code: None` that reads as a finding."""
+    db = tmp_path / "test.db"
+
+    async def _seed():
+        async with Store(db) as s:
+            t = Task.new("older task", repo_path="/tmp/r")
+            await s.create_task(t)
+            attempt_id = await s.create_attempt(t.id, 1)
+            await s.update_attempt(attempt_id, loaded_code_version=None)
+            return t.id
+
+    task_id = asyncio.run(_seed())
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["task", "show", task_id[:8]])
+
+    assert result.exit_code == 0, result.output
+    assert "code:" not in result.output, result.output

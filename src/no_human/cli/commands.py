@@ -1013,6 +1013,18 @@ def task_show(task_id):
                     f"branch={a['branch_name']} pr={a['pr_url']} "
                     f"turns={a['turns_used']} tests={a['test_results']}"
                 )
+                # Which code produced this verdict. Printed from the RECORDED
+                # column — a pure DB read of what the server stamped at the
+                # time, never a measurement taken now. That distinction is the
+                # whole point: `nh` runs in its own process, so anything this
+                # command measured about ITS OWN checkout would describe the
+                # CLI, not the server that judged the attempt. Rows written
+                # before this column existed are NULL and print nothing rather
+                # than inviting a guess.
+                if a.get("loaded_code_version"):
+                    console.print(
+                        f"    code: {a['loaded_code_version']}"
+                    )
 
     asyncio.run(_go())
 

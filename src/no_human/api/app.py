@@ -20,6 +20,7 @@ import contextlib
 import os
 import re
 import subprocess
+import threading
 import time
 from dataclasses import asdict
 from contextlib import asynccontextmanager
@@ -2200,6 +2201,7 @@ _STALE_TTL_SECONDS = 60.0
 # platform where time.monotonic() starts near zero it serves an answer nobody
 # ever calculated for the first minute of the process's life.
 _stale_cache: tuple[float, str | None] | None = None
+_stale_inflight = threading.Lock()
 
 
 def _loaded_code_stale() -> str | None:
@@ -2209,15 +2211,38 @@ def _loaded_code_stale() -> str | None:
     the board polls this endpoint every couple of seconds and each check is a
     git subprocess, so it is cached. Purely informational: no caller gates on
     it, and by design nothing here can stop a task being claimed.
+
+    Single-flight, and NON-BLOCKING about it. A cache miss alone is not enough
+    to serialize on: the miss window is however long `staleness_note` takes,
+    and the case this feature exists to detect is exactly the one where git is
+    slow. At a ~2s poll and the ~30s the timeouts permit, ~15 pollers would
+    each have spawned their own git process before the first result landed —
+    a process herd in precisely the degraded condition being measured.
+
+    A loser therefore returns the LAST KNOWN answer instead of waiting. Waiting
+    would trade a git herd for a thread-pool herd: these run under
+    `asyncio.to_thread`, whose default executor is small, so 15 waiters parked
+    for 30s would starve every other `to_thread` in the process. Serving a
+    slightly stale advisory value costs nothing — the note is already up to
+    60s old by design.
     """
     global _stale_cache
+    cached = _stale_cache          # read once; another thread may swap it
     now = time.monotonic()
-    if _stale_cache is not None and now - _stale_cache[0] < _STALE_TTL_SECONDS:
-        return _stale_cache[1]
-    from ..core.build_info import staleness_note
-    note = staleness_note()
-    _stale_cache = (now, note)
-    return note
+    if cached is not None and now - cached[0] < _STALE_TTL_SECONDS:
+        return cached[1]
+    if not _stale_inflight.acquire(blocking=False):
+        return cached[1] if cached is not None else None
+    try:
+        from ..core.build_info import staleness_note
+        note = staleness_note()
+        # Stamp completion time, not entry time: with a slow git the two differ
+        # by most of the TTL, and stamping entry would re-arm the miss almost
+        # immediately and reopen the herd this guard just closed.
+        _stale_cache = (time.monotonic(), note)
+        return note
+    finally:
+        _stale_inflight.release()
 
 
 @app.get("/api/worker/status")

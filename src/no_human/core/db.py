@@ -255,8 +255,11 @@ class Store:
             # this is the one place EVERY entrypoint passes through — the
             # server's lifespan, but equally `nh` commands and the eval
             # harnesses, none of which have a lifespan to pre-warm them. Left
-            # cold, the first `create_attempt` pays two blocking git
-            # subprocesses (~236ms measured, 10s per-call timeout ceiling)
+            # cold, the first `create_attempt` pays three blocking git
+            # subprocesses — `ls-files`, `rev-parse`, `status` (220ms measured
+            # on this checkout; 10s per-call timeout, so 30s worst case). It
+            # was TWO until the tracking check closed the borrowed-sha hole:
+            # this count is a measured claim and moves when the calls do.
             # while holding the sqlite write transaction its own UPDATE just
             # opened. This repo has already lost days to lock storms; a
             # telemetry stamp must not be able to start another one.
