@@ -1122,14 +1122,42 @@ def test_task_out_reports_cache_creation_burn():
     assert bare.total_cache_creation is None
 
 
+#: What the API answers when `web/dist` is missing (``api/app.py``'s
+#: ``_NO_BOARD_MESSAGE``). It is a **200**, not a 404: the API and worker are
+#: fine, only the UI is absent, so the route explains itself rather than lying
+#: about the resource.
+_NO_BOARD_SENTINEL = b"no_human: the web board is not installed"
+
+
+def _skip_without_a_built_board(r) -> None:
+    """Skip — loudly — when this checkout has no built board.
+
+    `web/dist` is a gitignored build artifact, so CI's Python job (which runs
+    `uv sync` and no npm) and every fresh clone have none. These three tests
+    guarded for that with ``if r.status_code == 404: return``, and the board is
+    absent as a **200** carrying the explainer above, so the guard never fired:
+    CI went red on all three from the commit that added the first one, while
+    they passed locally where `web/dist` exists.
+
+    A bare ``return`` is the other half of the bug — a skipped test that reports
+    as a PASS. Three real assertions could have been retired and the suite would
+    have looked identical. `pytest.skip` says which assertion did not run.
+    """
+    if r.status_code == 404 or _NO_BOARD_SENTINEL in r.content:
+        pytest.skip(
+            "no built board in this checkout, so the board-serving routes "
+            "cannot be exercised — this assertion DID NOT RUN. Build it with "
+            "`cd web && npm install && npm run build`."
+        )
+
+
 async def test_spa_index_is_no_cache(client):
     """index.html must carry Cache-Control: no-cache — without it Chromium's
     heuristic freshness serves a stale app shell after every deploy (found
     live: the desktop shell ran a bundle two deploys old). Hashed /assets
     stay long-cacheable; only the entry document revalidates."""
     r = await client.get("/")
-    if r.status_code == 404:  # dist not built in this env — header rule moot
-        return
+    _skip_without_a_built_board(r)
     assert r.headers.get("cache-control") == "no-cache"
 
 
@@ -1144,8 +1172,7 @@ async def test_root_level_static_files_are_served_not_the_app_shell(client):
     unreachable. Found by running the DMG, not by inspecting it.
     """
     r = await client.get("/nh-mark-64.png")
-    if r.status_code == 404:  # dist not built in this env
-        return
+    _skip_without_a_built_board(r)
     assert r.content[:8] == b"\x89PNG\r\n\x1a\n", (
         "served something other than the PNG: " + repr(r.content[:40]))
 
@@ -1159,8 +1186,7 @@ async def test_the_static_route_cannot_escape_the_board_directory(client):
     shell, not return a file.
     """
     r = await client.get("/../../../etc/passwd")
-    if r.status_code == 404:
-        return
+    _skip_without_a_built_board(r)
     assert b"root:" not in r.content, "path traversal served a file outside the board"
     assert r.content.lstrip()[:9].lower() == b"<!doctype", (
         "a traversal should fall through to the app shell")
