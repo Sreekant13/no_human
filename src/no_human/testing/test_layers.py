@@ -5,9 +5,8 @@ live in a different repo/branch than the code being changed. Layers are ordered
 by ``depends_on`` and have explicit gating (blocking vs advisory).
 
 The topology lives on the **Project** (not a single repo profile) because it
-spans repos — e.g. analytics-export code in the analytics-export repo,
-integration tests in a separate analytics-export-tests repo, E2E in a
-GitLab pipeline.
+spans repos — e.g. a service's code in its own repo, its integration tests in a
+separate ``<service>-tests`` repo, E2E in a GitLab pipeline.
 
 Each per-repo ProfileProject still holds the fast local unit ``test_cmd``.
 """

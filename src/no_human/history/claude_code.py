@@ -52,8 +52,8 @@ _MACHINE_DIR_MARKERS = (
 # session's FIRST user message.
 _MACHINE_PROMPT_PREFIXES = (
     # Sources: no_human's own prompt templates (grep '"You are ' in src/)
-    # PLUS the operator's other automation that spawns Claude sessions
-    # (incident-monitor's SRE prompts). Keep in sync when adding agent prompts.
+    # PLUS the operator's other automation that spawns Claude sessions, whose
+    # prompts are its own. Keep in sync when adding agent prompts.
     "You are the Supervisor of an autonomous coding agent",
     "You are the Supervisor reviewing an autonomous coding agent",
     "You are implementing a software task",       # "in/on the repo at" variants

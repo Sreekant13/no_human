@@ -34,7 +34,7 @@ def test_exact_hyphenated_name_still_delivers():
 
 
 def test_irrelevant_skill_does_not_match():
-    s = _skill("metrics-core-troubleshoot", "Troubleshoot metrics-core deployments and pods")
+    s = _skill("metrics-core-troubleshoot", "Troubleshoot service deployments and pods")
     assert not skill_matches_task(
         s, "Add a formatBytes helper to web utils")
 
@@ -42,7 +42,7 @@ def test_irrelevant_skill_does_not_match():
 def test_stopwords_do_not_create_relevance():
     """Common English words shared by any two texts must not count as overlap,
     or the filter keeps everything and filters nothing."""
-    s = _skill("analytics-export-orient", "Get oriented with the ANALYTICS-EXPORT framework and its layout")
+    s = _skill("analytics-export-orient", "Get oriented with the service framework and its layout")
     assert not skill_matches_task(s, "Fix the pluralize helper and its tests")
 
 

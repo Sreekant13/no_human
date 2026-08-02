@@ -71,9 +71,9 @@ def test_allows_the_agent_to_merge_into_its_own_branch():
 
 
 def test_the_pr_base_branch_must_be_pushable_by_nobody():
-    """`never_push_to` lists main/master/release/* — but metrics-core's base is `dev`,
-    so `git push origin HEAD:dev` merged without review. The orchestrator adds
-    the task's base to the protected list per attempt."""
+    """`never_push_to` lists main/master/release/* — but a real task's base was
+    `dev`, so `git push origin HEAD:dev` merged without review. The orchestrator
+    adds the task's base to the protected list per attempt."""
     d = guard.evaluate(
         "Bash", {"command": "git push origin HEAD:dev"},
         forbidden_paths=FORBIDDEN, never_push_to=[*PROTECTED, "dev"],

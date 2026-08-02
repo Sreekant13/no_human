@@ -35,10 +35,10 @@ def open_pr(
 
     ``labels`` are applied at creation time, not after, so a CI job that validates
     labels on PR-open never observes an unlabelled PR. A label that doesn't exist
-    on THIS repo (e.g. metrics-core's ``V17`` applied to a repo that never defined it)
-    must not block the PR: `gh` fails the whole create, so we retry once without
-    labels and open the PR unlabelled (logged). A retry that still fails is a
-    real error and is surfaced.
+    on THIS repo (a release-version label another repo requires, applied to a
+    repo that never defined it) must not block the PR: `gh` fails the whole
+    create, so we retry once without labels and open the PR unlabelled
+    (logged). A retry that still fails is a real error and is surfaced.
     """
     def _create(with_labels: bool) -> subprocess.CompletedProcess:
         return subprocess.run(

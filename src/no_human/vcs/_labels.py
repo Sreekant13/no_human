@@ -10,10 +10,11 @@ from __future__ import annotations
 
 def is_label_error(stderr: str) -> bool:
     """True if a forge `create` failed specifically because a label doesn't
-    exist on the repo (e.g. metrics-core's ``V17`` applied to a repo that never defined
-    it). Such a failure must not block the whole PR — the caller retries without
-    labels. Kept deliberately narrow so a non-label failure is never mistaken
-    for one (which would silently drop a real error)."""
+    exist on the repo (a release-version label one repo requires, applied to a
+    repo that never defined it). Such a failure must not block the whole PR —
+    the caller retries without labels. Kept deliberately narrow so a non-label
+    failure is never mistaken for one (which would silently drop a real
+    error)."""
     s = (stderr or "").lower()
     if "label" not in s:
         return False

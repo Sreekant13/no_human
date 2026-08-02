@@ -382,8 +382,8 @@ def test_goal_judge_parse_fails_closed():
 
 
 def test_ref_signature_ignores_unrelated_branch_activity(tmp_path):
-    """A live repo has its own automation (incident-monitor pushes alert state
-    to data-* branches continuously). An unrelated branch moving is NOT a
+    """A live repo has its own automation (background jobs pushing state to
+    their own branches continuously). An unrelated branch moving is NOT a
     bench escape — it crashed two specs on a run where the bench wrote
     nothing. Only agent-namespace refs and HEAD are watched."""
     repo = _src_repo(tmp_path)
@@ -744,8 +744,8 @@ def test_sandbox_copy_is_instant_isolated_and_survives_a_dirty_source(tmp_path):
 
 
 def test_sandbox_copy_strips_source_hooks(tmp_path):
-    """Clone parity: a file copy carries ACTIVE hooks (metrics-core-query-service
-    ships a pre-push) that would execute foreign code on sandbox pushes —
+    """Clone parity: a file copy carries ACTIVE hooks (a real work repo did
+    ship a pre-push) that would execute foreign code on sandbox pushes —
     git clone never copies hooks."""
     import subprocess
     from types import SimpleNamespace

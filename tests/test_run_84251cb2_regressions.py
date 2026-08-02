@@ -243,8 +243,8 @@ def _orch_for_guards(store, tmp_path):
 
 
 async def test_the_pr_base_branch_is_protected_from_the_agent(store, tmp_path):
-    """`git.never_push_to` is main/master/release/*. metrics-core's base is `dev`, so
-    `git push origin HEAD:dev` was allowed — merging with no PR and no review."""
+    """`git.never_push_to` is main/master/release/*. A real task's base was `dev`,
+    so `git push origin HEAD:dev` was allowed — merging with no PR and no review."""
     orch = _orch_for_guards(store, tmp_path)
     task = Task.new("t", repo_path="/r")
 

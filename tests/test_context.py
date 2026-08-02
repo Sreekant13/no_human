@@ -65,7 +65,7 @@ async def test_codebase_source_excludes_pytest_cache(code_repo):
 async def test_codebase_source_excludes_suffixed_venv_dirs(code_repo):
     """Exact-name matching missed suffixed virtualenv dirs (e.g. `.venv312`,
     `venv39`) that coexist with a plain `.venv` in the same repo — a real
-    case observed in metrics-core-query-service. The exclusion must be a glob."""
+    case observed in a work repo. The exclusion must be a glob."""
     venv_dir = code_repo / ".venv312" / "lib" / "site-packages" / "pytest"
     venv_dir.mkdir(parents=True)
     (venv_dir / "__init__.py").write_text(

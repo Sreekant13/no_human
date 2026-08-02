@@ -177,7 +177,7 @@ def _sandbox_copy(src: Path, dst: Path) -> None:
                               capture_output=True)
         if proc.returncode == 0:
             # Clone parity: a file copy carries the source's ACTIVE hooks
-            # (metrics-core-query-service ships a pre-push), which would execute
+            # (a real work repo did ship an active pre-push), which would execute
             # foreign code on the coder's sandbox pushes — git clone never
             # copies hooks. Strip them.
             hooks = dst / ".git" / "hooks"
@@ -251,10 +251,10 @@ def _setup_sandbox(spec: BenchTask, workdir: Path) -> Path:
 def _ref_signature(repo: Path) -> str:
     """Tamper check for the SOURCE repo: the refs a bench escape would touch.
 
-    NOT all refs. A live repo has automation of its own — incident-monitor's
-    data-* branches carry alert state pushed continuously by the operator's
-    jobs, and comparing every ref made an unrelated background push look like
-    a bench escape (it crashed two specs on a run where the bench wrote
+    NOT all refs. A live repo has automation of its own — background jobs that
+    push state to their own branches continuously, outside any namespace the
+    agent uses — and comparing every ref made one such push look like a bench
+    escape (it crashed two specs on a run where the bench wrote
     nothing). The bench can only ever create refs under the agent's own
     namespaces, so the signature watches exactly those plus the refs a task
     could rewrite: HEAD's branch and any no-human/* or bench-* ref.
