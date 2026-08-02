@@ -4144,6 +4144,27 @@ def bench_build(days, roots, out_dir):
                   "into eval/northstar_tasks/ and setting subset: core[/]")
 
 
+def _bench_cost_cell(cost_ratio: float | None) -> str:
+    """The per-spec cost cell in `nh bench run`'s live output.
+
+    Named so the rule is testable: it lives inside a long async run loop and
+    could not otherwise be exercised without a full bench run.
+
+    Falsy, not `is not None`. `cost_ratio` is 0.0 when no_human spent nothing —
+    crashed, skipped, or escalated before any model call — and this cell printed
+    `cost×0.00` for it, the best possible cost result, next to a ❌. The
+    aggregate already refuses that reading: `northstar_card.priced_scores`
+    excludes both None and 0.0 because "a 0.0 is a non-result, not a cost win".
+    The median was therefore honest while the rows above it were not.
+
+    Deliberately NOT fixed in `BenchScore.cost_ratio`: nh/orig genuinely IS 0.0
+    there, and `tests/test_northstar_card.py` pins that. The judgement about
+    what a 0.0 MEANS belongs to each consumer, and this was the consumer that
+    was not making it.
+    """
+    return f"cost×{cost_ratio:.2f}" if cost_ratio else "cost n/a"
+
+
 @bench.command("run")
 @click.option("--full", is_flag=True,
               help="Run the FULL corpus (default: subset core only).")
@@ -4405,8 +4426,7 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
                                   f"({escape(crash_note[:80])})")
                 else:
                     mark = {True: "✅", False: "❌", None: "⏭"}[score.goal_satisfied]
-                    ratio = (f"cost×{score.cost_ratio:.2f}"
-                             if score.cost_ratio is not None else "cost n/a")
+                    ratio = _bench_cost_cell(score.cost_ratio)
                     console.print(
                         f"  {mark} {escape(spec.id)} {score.outcome_status} ({ratio})")
                 # Checkpoint after EVERY completion so a mid-run death (quota

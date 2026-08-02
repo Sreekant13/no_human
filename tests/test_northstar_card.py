@@ -762,3 +762,22 @@ def test_per_project_count_beside_the_median_is_the_priced_population():
 
     assert "(2)" in row, row
     assert "| 3 |" in row, row  # `tasks` column: still the full population
+
+
+def test_the_per_spec_cost_cell_refuses_to_call_zero_spend_a_win():
+    """`nh bench run`'s per-spec line printed `cost×0.00` for a dead spec.
+
+    A spec that crashed/skipped/escalated before any model call has
+    `cost_ratio == 0.0` — pinned deliberately above, because nh/orig really is
+    zero. The AGGREGATE already refuses to read that as a cost win
+    (`priced_scores` drops both None and 0.0). The per-spec cell did not, so
+    the run printed the best possible cost result next to a ❌ while the median
+    below it was honest.
+    """
+    from no_human.cli.commands import _bench_cost_cell
+    assert _bench_cost_cell(0.0) == "cost n/a", "zero spend is not a cost win"
+    assert _bench_cost_cell(None) == "cost n/a", "no baseline is not a cost win"
+    # Control: a real ratio still renders, so the guard is not swallowing
+    # everything — including one below 0.005, which rounds to 0.00 but is real.
+    assert _bench_cost_cell(0.09) == "cost×0.09"
+    assert _bench_cost_cell(0.001) == "cost×0.00"
