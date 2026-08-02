@@ -314,6 +314,40 @@ def test_reply_with_an_explicit_id_splits_id_from_message():
     assert cmd.arg == "go with option 2"
 
 
+def test_a_head_word_with_a_trailing_newline_is_not_read_as_a_task_id():
+    """`$` matches before a trailing newline, `\\Z` does not.
+
+    The head word is split on a literal SPACE, not on whitespace, so a newline
+    rides along inside it: `/reply 1234abcd\\n <message>` puts "1234abcd\\n" in
+    the id slot, and a `$` anchor accepted that as an id.
+
+    A BACKSTOP, NOT A LIVE EXPLOIT — the reachability was checked in both
+    directions and the value cannot get here, nor out if it did:
+
+    * It cannot reach `parse_slash`. The sole caller is `shell.py`'s
+      `on_input_submitted`, fed by a stock Textual `Input` (no subclass, no
+      `on_paste` override, no non-TTY feed). Textual 8.2.7 keeps only
+      `event.text.splitlines()[0]` on paste and inserts a keystroke only when
+      `event.is_printable`, which is False for `\\n`.
+    * It would not reach the wire. `api_client.reply` interpolates the id into
+      `/api/tasks/{task_id}/reply`, and httpx refuses to build that URL
+      (`InvalidURL: Invalid non-printable ASCII character in URL`). That is not
+      caught by `shell.py`'s `(NhServerUnreachable, NhApiError)` handler, so the
+      outcome would be a crashed worker, not a control character in a request.
+
+    So this pins the anchor as the MIDDLE of three guards, on the principle that
+    a backstop must hold on its own: the Textual one is upstream of it, the
+    httpx one downstream, and neither is stated at this line. Do not read the
+    test as evidence of a live defect.
+    """
+    cmd = parse_slash("/reply 1234abcd\n go with option 2",
+                      selected_id="deadbeef")
+    assert cmd.task_id == "deadbeef"
+    # The other half of the correct reading: the token is not an id, so the
+    # whole line is the message rather than being silently cut at the space.
+    assert cmd.arg == "1234abcd\n go with option 2"
+
+
 def test_reply_without_a_message_is_an_error():
     err = parse_slash("/reply", selected_id="deadbeef")
     assert isinstance(err, SlashError)

@@ -219,6 +219,23 @@ def test_set_auth_profile_edits_only_the_llm_block(tmp_path):
     assert data["llm"]["auth_profile"] == "personal"
 
 
+def test_the_profile_name_pattern_rejects_a_trailing_newline():
+    """`$` matches before a trailing newline, `\\Z` does not.
+
+    `validate_profile_name` strips before it matches, so today this pattern is
+    never handed a value ending in a newline — the strip is the live guard and
+    the anchor is the backstop behind it. Asserted at the pattern because that
+    is where the claim lives: the character class says "lowercase letters,
+    digits, '-' and '_' only", and a `$` anchor silently exempts one trailing
+    newline from that claim. If the strip is ever moved or dropped, this is the
+    line that keeps a name with a control character out of the config file.
+
+    Same class as its sibling in tests/test_cli_shell_model.py: both are
+    backstops being made to hold on their own, neither is a live exploit.
+    """
+    assert config._PROFILE_NAME_RE.match("personal2\n") is None
+
+
 @pytest.mark.parametrize(
     "bad",
     ["personal\nserver:\n  port: 9999", "../etc", "a b", "", "-lead", "x: y"],

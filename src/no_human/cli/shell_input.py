@@ -16,7 +16,11 @@ from typing import Any
 #: A task id as the lanes pane prints it. Only a token this long and this
 #: hex-shaped is read as an id in a free-text command, so `/reply added the
 #: missing case` keeps its first word instead of losing it to an id slot.
-_TASK_ID = re.compile(r"^[0-9a-f]{8,}$")
+#: `\Z`, not `$`: `$` also matches just before a trailing newline, and the head
+#: word is split on a literal space, so "1234abcd\n" would have passed as an id.
+#: A backstop — the value cannot arrive here and would not reach the wire if it
+#: did; both guards are named in tests/test_cli_shell_model.py.
+_TASK_ID = re.compile(r"^[0-9a-f]{8,}\Z")
 
 MAX_TITLE = 120
 

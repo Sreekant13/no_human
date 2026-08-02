@@ -138,7 +138,9 @@ def _read_env_file(env_path: Path | None = None) -> dict[str, str]:
     return entries
 
 
-_PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+# `\Z`, not `$`: `$` also matches just BEFORE a trailing newline, so the
+# charset above would have exempted one — "personal2\n" read as valid.
+_PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*\Z")
 # A profile name is a label, not free text. The regex alone accepts
 # `sk-ant-oat01-…` — a credential is lowercase letters, digits and hyphens — so
 # a token pasted into the profile box was stored as a NAME and then echoed back
