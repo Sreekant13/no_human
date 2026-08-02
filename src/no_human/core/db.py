@@ -251,6 +251,17 @@ class Store:
             await self._db.execute("PRAGMA journal_mode = WAL")
             await self._db.execute("PRAGMA foreign_keys = ON")
             await self._migrate()
+            # Warm the loaded-code snapshot HERE, off the event loop, because
+            # this is the one place EVERY entrypoint passes through — the
+            # server's lifespan, but equally `nh` commands and the eval
+            # harnesses, none of which have a lifespan to pre-warm them. Left
+            # cold, the first `create_attempt` pays two blocking git
+            # subprocesses (~236ms measured, 10s per-call timeout ceiling)
+            # while holding the sqlite write transaction its own UPDATE just
+            # opened. This repo has already lost days to lock storms; a
+            # telemetry stamp must not be able to start another one.
+            from .build_info import loaded_code
+            await asyncio.to_thread(loaded_code)
         except BaseException:
             db, self._db = self._db, None
             try:
@@ -993,6 +1004,12 @@ class Store:
 
     @serialized_write
     async def create_attempt(self, task_id: str, attempt_number: int) -> str:
+        # Read BEFORE the UPDATE below opens a write transaction. `connect()`
+        # has already warmed this, so it is a cached attribute read — but
+        # ordering it here means even a cold cache cannot shell out to git
+        # while the write lock is held.
+        from .build_info import loaded_code
+        code_version = loaded_code().descriptor
         # An earlier attempt of this task still 'in_progress' cannot be running:
         # attempts are serial, so a new one starting means the old process died
         # (kill -9, crash) without ever closing its row. Left alone, those rows
@@ -1011,12 +1028,11 @@ class Store:
         # rather than at each of the orchestrator's three creation sites — a
         # site added later would otherwise silently record nothing, and an
         # attempt with no provenance is exactly the row this exists to prevent.
-        # The value is a process fact, cached at startup; never raises.
-        from .build_info import loaded_code
+        # `code_version` was resolved above, outside the write transaction.
         await self.db.execute(
             "INSERT INTO attempts (id, task_id, attempt_number, "
             "loaded_code_version) VALUES (?, ?, ?, ?)",
-            (attempt_id, task_id, attempt_number, loaded_code().descriptor),
+            (attempt_id, task_id, attempt_number, code_version),
         )
         await self.db.commit()
         return attempt_id

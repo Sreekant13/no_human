@@ -59,14 +59,82 @@ def test_edits_outside_the_package_do_not_mark_it_dirty(repo):
     assert _detect(repo / "src" / "no_human").dirty is False
 
 
-def test_no_checkout_reports_unknown_not_a_borrowed_sha(tmp_path, monkeypatch):
-    """Installed from a wheel there is no sha. Say so."""
+def test_no_repo_at_all_reports_unknown(tmp_path, monkeypatch):
+    """The easy half: nothing above us is a git repo, so there is no sha.
+
+    Named for what it actually proves. Its predecessor was called
+    "…not_a_borrowed_sha" while testing only this case — a directory with no
+    repo above it cannot borrow a sha, so the test could never fail for the
+    reason its name claimed. The borrowing case is `venv_inside_a_user_project`
+    below, and it FAILED when this file first shipped.
+    """
     monkeypatch.setattr("no_human.core.build_info._dist_version", lambda: None)
     outside = tmp_path / "site-packages" / "no_human"
     outside.mkdir(parents=True)
     info = _detect(outside)
     assert info.sha is None
     assert info.descriptor == "unknown"
+
+
+@pytest.fixture
+def venv_inside_a_user_project(tmp_path):
+    """The documented PyPI install: our wheel under `.venv/` in the user's own
+    git repo. `.venv/` is gitignored, which is what makes this dangerous —
+    `rev-parse HEAD` succeeds and `status --porcelain` is empty, so the naive
+    reading is "their commit, and clean"."""
+    proj = tmp_path / "userproj"
+    pkg = proj / ".venv" / "lib" / "python3.12" / "site-packages" / "no_human"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("# ours, installed\n")
+    _git(tmp_path, "init", "-q", str(proj))
+    _git(proj, "config", "user.email", "u@example.com")
+    _git(proj, "config", "user.name", "u")
+    (proj / ".gitignore").write_text(".venv/\n")
+    (proj / "app.py").write_text("their code\n")
+    _git(proj, "add", "-A")
+    _git(proj, "commit", "-qm", "the user's own project")
+    return proj, pkg
+
+
+def test_installed_wheel_never_borrows_the_users_project_sha(venv_inside_a_user_project):
+    """The HIGH defect. Being inside a repo is not being tracked by it."""
+    proj, pkg = venv_inside_a_user_project
+    info = _detect(pkg)
+    users_sha = _git(proj, "rev-parse", "HEAD")
+    assert info.sha != users_sha
+    assert info.sha is None, f"borrowed {users_sha} from the user's project"
+    assert not info.descriptor.startswith("git:")
+    # And it must not claim the borrowed tree was clean, either.
+    assert info.dirty is None
+
+
+def test_no_fabricated_staleness_when_the_user_commits_to_their_own_repo(
+        venv_inside_a_user_project):
+    """The compounding failure: with a borrowed sha, the user's next commit
+    makes our snapshot a strict ancestor of THEIR HEAD, and we tell the
+    operator to restart over a repo we have nothing to do with."""
+    proj, pkg = venv_inside_a_user_project
+    info = _detect(pkg)
+    (proj / "feature.py").write_text("the user adds a feature\n")
+    _git(proj, "add", "-A")
+    _git(proj, "commit", "-qm", "user moves on")
+    assert staleness_note(info, package_root=pkg) is None
+
+
+def test_untracked_checkout_of_our_own_layout_is_also_unknown(tmp_path):
+    """Same rule, no venv involved: a package copied into a repo that does not
+    track it gets no attribution. Guards the check itself rather than the
+    scenario that motivated it."""
+    root = tmp_path / "repo2"
+    (root / "vendored" / "no_human").mkdir(parents=True)
+    (root / "vendored" / "no_human" / "__init__.py").write_text("x\n")
+    _git(tmp_path, "init", "-q", str(root))
+    _git(root, "config", "user.email", "t@example.com")
+    _git(root, "config", "user.name", "t")
+    (root / "README.md").write_text("only this is tracked\n")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "-qm", "init")
+    assert _detect(root / "vendored" / "no_human").sha is None
 
 
 def test_no_checkout_falls_back_to_the_distribution_version(tmp_path, monkeypatch):
@@ -84,6 +152,49 @@ def test_dirty_is_tri_state_not_collapsed_to_clean():
     """None means unknowable. Reporting it as False would present a wheel as
     a verified-clean checkout."""
     assert LoadedCode(dist_version="1.0").dirty is None
+
+
+def test_the_tri_state_survives_into_the_descriptor():
+    """The dataclass is not what anyone reads — `attempts.loaded_code_version`
+    and the status line are, and both take the descriptor. Three states, three
+    spellings, or the distinction dies exactly where it is needed."""
+    sha = "a" * 40
+    assert LoadedCode(sha=sha, dirty=False).descriptor == f"git:{sha}"
+    assert LoadedCode(sha=sha, dirty=True).descriptor == f"git:{sha}+dirty"
+    assert LoadedCode(sha=sha, dirty=None).descriptor == f"git:{sha}+dirty?"
+    # The load-bearing assertion: unknown must not read as clean.
+    assert (LoadedCode(sha=sha, dirty=None).descriptor
+            != LoadedCode(sha=sha, dirty=False).descriptor)
+
+
+def test_unreadable_index_attributes_nothing_at_all(repo):
+    """A corrupt index takes the tracking check down with it, and tracking is
+    a precondition for attribution — so this degrades all the way to unknown,
+    not to a sha with unknown dirtiness. `rev-parse` still succeeds here; that
+    is exactly the reading we must NOT act on."""
+    assert _git(repo, "rev-parse", "HEAD")  # refs are fine
+    (repo / ".git" / "index").write_bytes(b"corrupt")
+    info = _detect(repo / "src" / "no_human")
+    assert info.sha is None
+    assert not info.descriptor.startswith("git:")
+
+
+def test_unknowable_dirtiness_keeps_the_sha_but_says_so(repo, monkeypatch):
+    """The `dirty=None` branch, reached the way it actually happens in
+    production: tracking and HEAD resolve, and only `status` fails — it is the
+    expensive call, and it is the one that hits the 10s timeout on a large
+    repo under load. The sha is real; the cleanliness is not knowable."""
+    import no_human.core.build_info as bi
+    real = bi._git
+
+    def only_status_fails(cwd, *args):
+        return None if args[:1] == ("status",) else real(cwd, *args)
+
+    monkeypatch.setattr(bi, "_git", only_status_fails)
+    info = bi._detect(repo / "src" / "no_human")
+    assert info.sha == real(repo, "rev-parse", "HEAD")
+    assert info.dirty is None
+    assert info.descriptor.endswith("+dirty?")
 
 
 # --- the advisory staleness signal ----------------------------------------

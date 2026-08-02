@@ -100,14 +100,20 @@ async def lifespan(app: FastAPI):
     # sha of what this process holds in memory rather than of whatever HEAD
     # happens to be the first time something asks. The server never reloads:
     # every attempt this process records will carry this value.
+    # Off the event loop: this is four git subprocesses (~294ms measured, and
+    # 40s in the worst case the timeouts allow). Startup is exactly when the
+    # loop has other things to do.
     from ..core.build_info import loaded_code, staleness_note
-    code = loaded_code()
+    code = await asyncio.to_thread(loaded_code)
     app.state.loaded_code = code.descriptor
     log.info("loaded code: %s", code.descriptor)
     # WARNING level on purpose: uvicorn runs at log_level="warning", so INFO is
     # dropped and only the line that has something to say survives. Advisory —
     # nothing below reads it, and no task is prevented from being claimed.
-    _startup_stale = staleness_note(code)
+    # This line alone is NOT the surface: it scrolls past at boot, and the case
+    # that matters is a server that has been up for hours. See the board banner
+    # fed by /api/worker/status.
+    _startup_stale = await asyncio.to_thread(staleness_note, code)
     if _startup_stale:
         log.warning("%s", _startup_stale)
     store = await Store(config.db_path).connect()
@@ -2189,7 +2195,11 @@ async def task_events_stream(task_id: str, request: Request):
 
 
 _STALE_TTL_SECONDS = 60.0
-_stale_cache: tuple[float, str | None] = (0.0, None)
+# None means "never computed", which is NOT the same as "computed, found
+# current" (a cached None). A (0.0, None) seed conflates them, and on a
+# platform where time.monotonic() starts near zero it serves an answer nobody
+# ever calculated for the first minute of the process's life.
+_stale_cache: tuple[float, str | None] | None = None
 
 
 def _loaded_code_stale() -> str | None:
@@ -2202,7 +2212,7 @@ def _loaded_code_stale() -> str | None:
     """
     global _stale_cache
     now = time.monotonic()
-    if now - _stale_cache[0] < _STALE_TTL_SECONDS:
+    if _stale_cache is not None and now - _stale_cache[0] < _STALE_TTL_SECONDS:
         return _stale_cache[1]
     from ..core.build_info import staleness_note
     note = staleness_note()

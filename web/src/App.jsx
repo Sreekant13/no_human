@@ -872,6 +872,18 @@ export default function App() {
               Wake watcher down — parked tasks won't wake
             </div>
           )}
+          {/* The server loads its backend once and never reloads it, so a
+              merged fix is not live until a restart — a task can be judged by
+              code that was superseded hours ago. The startup log line cannot
+              show this: by definition it matters on a server that has been up
+              a long time, and that line scrolled away at boot. role="status"
+              rather than "alert" — advisory, and nothing here blocks a claim. */}
+          {workerStatus?.loaded_code_stale && (
+            <div className="nh-alarm nh-stale" role="status"
+                 title={`${workerStatus.loaded_code_stale}. Loaded: ${workerStatus.loaded_code || "unknown"}.`}>
+              Running superseded code — restart to pick up merged fixes
+            </div>
+          )}
           <div className="nh-status-indicator" title={wsLive ? "Browser is connected to the no_human server" : "Connection lost — reconnecting…"}>
             <div className={`nh-ws-dot${wsLive ? " live" : ""}`} />
             <span className="nh-status-label">{wsLive ? "Connected" : "Reconnecting…"}</span>

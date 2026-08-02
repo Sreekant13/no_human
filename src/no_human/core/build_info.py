@@ -23,10 +23,25 @@ Three honesty requirements shape the API:
   reported as ``dist:<version>`` (or ``unknown``) — never as a fabricated or
   borrowed sha, and never as the sha of whatever repo the process happens to
   be *cwd*'d into, which is a different thing entirely.
+
+  "Borrowed" is not hypothetical, and being inside a git repository is NOT
+  evidence that the repository knows about you. The documented PyPI install
+  (``docs/DISTRIBUTION.md``) puts the package under ``.venv/`` inside the
+  USER'S project, which is itself a git repo — so ``rev-parse HEAD`` there
+  cheerfully returns the user's application commit, and since ``.venv/`` is
+  gitignored, ``status --porcelain`` on the package is empty and the answer
+  is even labelled *clean*. Attribution therefore requires that the repo
+  actually TRACKS the package (``ls-files --error-unmatch``), not merely that
+  a repo encloses it. Without that check the failure compounds: when the user
+  commits to their own project, our loaded sha becomes a strict ancestor of
+  their HEAD and we emit a confident, entirely fabricated "restart to pick up
+  merged fixes". A wrong sha is strictly worse than ``unknown`` in the one
+  column whose whole purpose is honest provenance.
 - **A sha alone can misrepresent a dirty tree.** A checkout with uncommitted
   edits to the package is not the code that sha names, so the descriptor
   carries an explicit ``+dirty`` suffix rather than implying fidelity it does
-  not have.
+  not have — and ``+dirty?`` when dirtiness could not be determined at all,
+  because silently printing those as clean is the same lie in a quieter voice.
 - **The snapshot is taken once, at startup.** ``loaded_code()`` caches, so a
   later call cannot silently answer with a newer HEAD than the one whose code
   is in memory — which would defeat the entire purpose.
@@ -85,16 +100,44 @@ class LoadedCode:
         Prefixed by provenance so a reader never has to guess whether the
         payload is a commit: ``git:`` is a real sha, ``dist:`` explicitly is
         not, ``unknown`` claims nothing at all.
+
+        The three dirty states get three distinct spellings. An earlier draft
+        rendered None as bare ``git:<sha>`` — identical to verified-clean —
+        which quietly undid the tri-state everywhere it actually matters: the
+        dataclass is not what anyone reads, ``attempts.loaded_code_version``
+        and the status line are, and both take this string. Preserving a
+        distinction on an object and collapsing it on the way to the record
+        preserves nothing.
         """
         if self.sha:
-            return f"git:{self.sha}" + ("+dirty" if self.dirty else "")
+            suffix = {True: "+dirty", False: "", None: "+dirty?"}[self.dirty]
+            return f"git:{self.sha}{suffix}"
         if self.dist_version:
             return f"dist:{self.dist_version}"
         return "unknown"
 
 
+def _is_tracked(package_root: Path) -> bool:
+    """Does the enclosing repo actually track this package?
+
+    The question `rev-parse HEAD` answers is "is there a repo above me", which
+    is NOT the question. A pip-installed wheel under `.venv/` sits inside the
+    user's own project repo and would otherwise be attributed that project's
+    commits. `ls-files --error-unmatch` exits non-zero for a path the index
+    does not contain, which is the actual test.
+
+    `__init__.py` is the probe because it is the one file every Python package
+    must have; if it is untracked, so is the package. Any failure — no repo, no
+    such file, no git — reads as untracked, so this fails CLOSED to `unknown`.
+    """
+    return _git(package_root, "ls-files", "--error-unmatch",
+                str(package_root / "__init__.py")) is not None
+
+
 def _detect(package_root: Path) -> LoadedCode:
     """Measure the provenance of the package tree at ``package_root``."""
+    if not _is_tracked(package_root):
+        return LoadedCode(dist_version=_dist_version())
     sha = _git(package_root, "rev-parse", "HEAD")
     if sha and len(sha) == 40 and all(c in "0123456789abcdef" for c in sha):
         # Scope the dirty check to the package tree itself. A repo-wide

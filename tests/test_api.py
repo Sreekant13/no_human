@@ -1388,8 +1388,19 @@ async def test_worker_status_surfaces_the_loaded_code(client):
     The status line says WHICH code is answering — advisory only; nothing here
     gates a claim (HEAD moves constantly, so a block would halt the loop)."""
     from no_human.api.app import app as _app
-    _app.state.loaded_code = "git:" + "a" * 40
-    r = await client.get("/api/worker/status")
+    # `app` is a module-level singleton shared by every test through the
+    # `client` fixture, so this must be put back — an attribute left behind
+    # here is a cross-test dependency waiting for someone to add an assertion.
+    sentinel = object()
+    previous = getattr(_app.state, "loaded_code", sentinel)
+    try:
+        _app.state.loaded_code = "git:" + "a" * 40
+        r = await client.get("/api/worker/status")
+    finally:
+        if previous is sentinel:
+            _app.state._state.pop("loaded_code", None)
+        else:
+            _app.state.loaded_code = previous
     body = r.json()
     assert body.get("loaded_code") == "git:" + "a" * 40
     # Present even when there is nothing to report, so a reader can tell
