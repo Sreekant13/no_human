@@ -5,7 +5,12 @@ github/gitlab/jenkins are read-only views over ``ci.*`` and slack over
 ``notifications.*``. Secrets are never surfaced in a status detail.
 """
 
+import asyncio
+import logging
+import os
+import socket
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -83,6 +88,224 @@ def test_ambient_cache_never_stores_a_credential_only_bool_and_timestamp(monkeyp
     assert isinstance(result, bool)
 
 
+# --------------------------------------------------------------------------- #
+# "No ambient probe performs network I/O" — the class-wide property.           #
+#                                                                              #
+# An ambient probe fires when an integration is UNCONFIGURED. That is the one  #
+# moment a privacy-conscious reader is entitled to assume nothing is sent, so  #
+# it is the one moment egress is least acceptable — and `_probe_github_ambient`#
+# shipped for months running `gh auth status`, which validates the stored      #
+# token against the GitHub API (measured 1.7-2.0s on a dev machine, against    #
+# ~10ms for a local credential read). The property below is pinned for the     #
+# WHOLE CLASS rather than that one function, because the next probe will be    #
+# written by somebody who never read this comment.                             #
+# --------------------------------------------------------------------------- #
+
+
+class _NetworkAttempted(RuntimeError):
+    """Raised by ``block_network`` the moment a probe reaches for the wire."""
+
+
+#: argv[0]s an ambient probe is allowed to spawn. An ALLOWLIST, not a denylist:
+#: the defect being guarded against is a program nobody realised made a network
+#: call, and a denylist can only ever name the programs somebody already knew
+#: about. A probe that spawns anything else fails until a human justifies it.
+_LOCAL_ONLY_PROGRAMS = {
+    "git": "`git credential fill` consults locally configured credential "
+           "helpers and returns immediately if none has anything; "
+           "GIT_TERMINAL_PROMPT=0 + a no-op GIT_ASKPASS keep it from blocking",
+}
+
+
+@pytest.fixture
+def block_network(monkeypatch):
+    """Make any attempt to reach the network an immediate, deterministic error.
+
+    Two arms, because a probe can egress two ways and each is invisible to the
+    other's guard:
+
+    * **In-process.** ``socket.socket`` / ``socket.create_connection`` /
+      ``socket.getaddrinfo`` are replaced with raisers, so a Python-level
+      connection (httpx, urllib, a raw socket) dies at the syscall boundary.
+      This is asserted, not timed: a timing threshold is flaky, and a slow
+      local keychain read and a fast HTTP round-trip are indistinguishable.
+    * **In a child.** Monkeypatching *this* process's ``socket`` says nothing
+      whatsoever about a subprocess — ``gh auth status`` opened its socket in a
+      child, which is exactly why the bug survived every existing test. So the
+      spawn is intercepted and argv[0] checked against ``_LOCAL_ONLY_PROGRAMS``;
+      an allowlisted program is then run for real, so the probe under test
+      executes the code path a user actually gets.
+
+      The interception point is ``subprocess.Popen``, NOT ``subprocess.run``.
+      An audit of 14 spawn vectors found five that bypass a ``run``-only guard
+      — ``subprocess.Popen``, ``subprocess.call``, ``os.popen``, ``os.system``,
+      ``os.spawnv`` — and one, ``asyncio.create_subprocess_exec``, that a
+      ``run``-only guard blocked merely *incidentally*, via the socket arm
+      firing on event-loop construction, which does not happen from an
+      already-running loop. That already-running loop is the real production
+      path: ``_check_view`` reaches these probes through
+      ``asyncio.to_thread``. ``run``/``call``/``check_output``/``os.popen``
+      and asyncio's own ``_UnixSubprocessTransport`` all funnel through
+      ``Popen``, so guarding it covers them by construction rather than by
+      luck. ``os.system`` and the ``os.spawn*``/``os.posix_spawn`` family do
+      not funnel through anything, so they are blocked outright — no ambient
+      probe has any business reaching for them.
+
+    WHAT THIS CANNOT SEE, stated so the guard is not oversold (the same honesty
+    ``tests/test_egress_disclosure.py`` states about itself): an *allowlisted*
+    program that grows a network call of its own, or that spawns a GRANDCHILD
+    of its own — a Git Credential Manager doing an OAuth refresh would pass
+    this, and so does an arbitrary helper reached via ``GIT_CONFIG_GLOBAL``
+    (demonstrated: the harness sees only ``['git']``). It bounds what our code
+    asks for, not what every binary on the machine then does.
+
+    Yields the list of argv[0]s the probe spawned, so a test can assert on it.
+    """
+    def _blocked(*_a, **_k):
+        raise _NetworkAttempted("a probe attempted network I/O in this process")
+
+    real_socket = socket.socket
+
+    def _blocked_socket(family=socket.AF_INET, *args, **kwargs):
+        # AF_UNIX is local IPC and cannot reach the network; asyncio builds its
+        # event-loop self-pipe out of one, so blocking it would make this
+        # harness unusable from an async test while adding no safety at all.
+        if family == getattr(socket, "AF_UNIX", object()):
+            return real_socket(family, *args, **kwargs)
+        raise _NetworkAttempted("a probe attempted network I/O in this process")
+
+    monkeypatch.setattr(socket, "socket", _blocked_socket)
+    for attr in ("create_connection", "getaddrinfo"):
+        monkeypatch.setattr(socket, attr, _blocked)
+
+    def _blocked_spawn(*_a, **_k):
+        raise _NetworkAttempted(
+            "an ambient probe reached for a raw os-level spawn primitive; "
+            "these bypass the argv allowlist entirely and no probe needs one"
+        )
+
+    # Not funnelled through Popen — blocked outright. getattr-guarded because
+    # the os.spawn*/posix_spawn set is not identical across platforms.
+    for attr in ("system", "spawnv", "spawnve", "spawnvp", "spawnvpe",
+                 "posix_spawn", "posix_spawnp", "execv", "execvp"):
+        if hasattr(os, attr):
+            monkeypatch.setattr(os, attr, _blocked_spawn)
+
+    real_popen = subprocess.Popen
+    spawned: list[str] = []
+
+    def _guarded_popen(args, *rest, **kwargs):
+        argv0 = args[0] if isinstance(args, (list, tuple)) and args else args
+        spawned.append(argv0)
+        if argv0 not in _LOCAL_ONLY_PROGRAMS:
+            raise _NetworkAttempted(
+                f"an ambient probe spawned {argv0!r}, which is not in "
+                "_LOCAL_ONLY_PROGRAMS. An ambient probe must establish that a "
+                "credential is PRESENT without validating it. If this program "
+                "really is local, add it there with the evidence."
+            )
+        return real_popen(args, *rest, **kwargs)
+
+    monkeypatch.setattr(reg.subprocess, "Popen", _guarded_popen)
+    return spawned
+
+
+def test_block_network_catches_an_in_process_connection(block_network):
+    """Control, arm 1. A green below must mean 'nothing connected', never 'the
+    harness is inert' — so show it catching a known positive first."""
+    with pytest.raises(_NetworkAttempted):
+        socket.create_connection(("example.invalid", 443))
+
+
+def test_block_network_catches_the_pre_fix_github_probe(block_network):
+    """Control, arm 2 — and the red-green proof kept in the suite.
+
+    This is ``_probe_github_ambient`` EXACTLY as it shipped before this fix.
+    `gh auth status` is not a local check: it puts the operator's GitHub token
+    on the wire to validate it, from a probe whose whole purpose is to run when
+    GitHub is unconfigured. If this stops raising, the harness has gone blind
+    and every assertion below it is worthless."""
+    def _pre_fix_probe_github_ambient() -> bool:
+        proc = reg._run_probe(["gh", "auth", "status"])
+        return proc is not None and proc.returncode == 0
+
+    with pytest.raises(_NetworkAttempted, match="'gh'"):
+        _pre_fix_probe_github_ambient()
+    assert block_network == ["gh"]
+
+
+@pytest.mark.parametrize("spawn", [
+    pytest.param(lambda: subprocess.run(["gh", "auth", "status"]), id="subprocess.run"),
+    pytest.param(lambda: subprocess.Popen(["gh", "auth", "status"]), id="subprocess.Popen"),
+    pytest.param(lambda: subprocess.call(["gh", "auth", "status"]), id="subprocess.call"),
+    pytest.param(lambda: subprocess.check_output(["gh", "auth", "status"]),
+                 id="subprocess.check_output"),
+    pytest.param(lambda: os.popen("gh auth status"), id="os.popen"),
+])
+def test_block_network_catches_every_popen_backed_spawn(block_network, spawn):
+    """Control, arm 2 — the escape matrix. A ``subprocess.run``-only guard let
+    four of these five straight through; all five funnel through ``Popen``, so
+    guarding that one point closes them by construction. Each is asserted
+    individually rather than assumed, because "it funnels through Popen" is a
+    claim about CPython internals and this repo has been wrong before about a
+    mechanism it only reasoned about. `os.popen` takes a shell STRING, so the
+    reported argv[0] is the whole command — still refused, since only exact
+    allowlist members pass."""
+    with pytest.raises(_NetworkAttempted, match="gh"):
+        spawn()
+
+
+@pytest.mark.parametrize("name,call", [
+    ("os.system", lambda: os.system("gh auth status")),
+    ("os.spawnv", lambda: os.spawnv(os.P_WAIT, "/bin/sh", ["sh", "-c", "gh auth status"])),
+])
+def test_block_network_catches_raw_os_spawn_primitives(block_network, name, call):
+    """These funnel through nothing — no ``Popen``, no allowlist — so they are
+    refused outright rather than argv-checked."""
+    with pytest.raises(_NetworkAttempted):
+        call()
+
+
+async def test_block_network_catches_an_asyncio_subprocess_from_a_running_loop(block_network):
+    """The vector the previous guard blocked only by ACCIDENT. A
+    ``subprocess.run``-only guard never saw ``asyncio.create_subprocess_exec``;
+    what stopped it was the socket arm firing while the event loop was being
+    constructed — which does not happen when a loop is ALREADY running. That is
+    the production shape: ``_check_view`` reaches the probes from a live loop
+    via ``asyncio.to_thread``. This test runs inside a running loop precisely so
+    the incidental block cannot be what passes it."""
+    assert asyncio.get_running_loop().is_running()
+    with pytest.raises(_NetworkAttempted, match="'gh'"):
+        await asyncio.create_subprocess_exec("gh", "auth", "status")
+
+
+def test_block_network_lets_an_allowlisted_program_through(block_network):
+    """The other half of a discriminating guard: it must not simply refuse
+    everything, or a green anywhere above would mean nothing."""
+    assert reg._run_probe(["git", "--version"]) is not None
+    assert block_network == ["git"]
+
+
+def test_ambient_probe_inventory_is_not_empty():
+    """The corpus guard. An empty ``_AMBIENT_PROBES`` would make the
+    parametrised property below vacuous rather than failing — empty is not
+    zero. Re-derived 2026-08-02: exactly github and gitlab have an ambient
+    path; jira/linear/jenkins/circleci/slack/teams have no 'already
+    authenticated CLI' concept."""
+    assert set(reg._AMBIENT_PROBES) >= {"github", "gitlab"}
+
+
+@pytest.mark.parametrize("name", sorted(reg._AMBIENT_PROBES))
+def test_no_ambient_probe_performs_network_io(block_network, name):
+    """THE property, pinned over ``_AMBIENT_PROBES`` so a third probe is
+    covered the day it is added and not the day somebody remembers.
+
+    Detecting whether a credential is PRESENT never requires validating it —
+    validity is settled later, visibly, at the point of use."""
+    result = reg._AMBIENT_PROBES[name]()
+    assert type(result) is bool
+
+
 class _FakeCompleted:
     """Stand-in for subprocess.CompletedProcess — only the two fields the
     probes actually read."""
@@ -121,28 +344,215 @@ def test_run_probe_passes_a_finite_timeout_to_subprocess_run(monkeypatch):
         return _FakeCompleted(returncode=0)
 
     monkeypatch.setattr(reg.subprocess, "run", _fake_run)
-    reg._run_probe(["gh", "auth", "status"])
+    reg._run_probe(["git", "credential", "fill"])
     assert isinstance(captured.get("timeout"), (int, float))
     # Pinned to the shipped default: 5.0 was the pre-SCRUM-81 value, and a
     # loose bound here let a revert back to it pass unnoticed.
     assert 0 < captured["timeout"] <= 2.0
 
 
-def test_probe_github_ambient_true_on_returncode_zero(monkeypatch):
-    monkeypatch.setattr(reg.subprocess, "run", lambda *a, **k: _FakeCompleted(returncode=0))
+#: A value no real token can collide with, used to assert that no detection
+#: path ever lets a credential out of the probe.
+_SENTINEL_TOKEN = "gho_SENTINEL_MUST_NEVER_ESCAPE_00000000"
+
+
+@pytest.fixture
+def gh_config(monkeypatch, tmp_path):
+    """Isolate `_probe_github_ambient` from the developer's real gh install:
+    no token env vars, an empty config dir, and no git credential helper with
+    anything to say. Returns the `hosts.yml` path the probe will read."""
+    for var in ("GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(reg, "_git_credential_present", lambda host: False)
+    cfg = tmp_path / "gh"
+    cfg.mkdir()
+    monkeypatch.setenv("GH_CONFIG_DIR", str(cfg))
+    return cfg / "hosts.yml"
+
+
+@pytest.mark.parametrize("var", ["GH_TOKEN", "GITHUB_TOKEN"])
+def test_probe_github_ambient_true_when_token_env_var_is_set(gh_config, monkeypatch, var):
+    # Detection path 1 — what gh itself prefers over any stored credential,
+    # and the only one visible inside a container/CI.
+    monkeypatch.setenv(var, _SENTINEL_TOKEN)
     assert reg._probe_github_ambient() is True
 
 
-def test_probe_github_ambient_false_on_nonzero_returncode(monkeypatch):
-    # A runner that FAILED (e.g. `gh` installed but logged out) must never
-    # read as ambient — the mutation that drops this check survived once.
-    monkeypatch.setattr(reg.subprocess, "run", lambda *a, **k: _FakeCompleted(returncode=1))
+def test_probe_github_ambient_false_when_token_env_var_is_blank(gh_config, monkeypatch):
+    # `GH_TOKEN=""` is how a shell UNSETS a token for one command; it is an
+    # absent credential, not a present one.
+    monkeypatch.setenv("GH_TOKEN", "   ")
     assert reg._probe_github_ambient() is False
 
 
-def test_probe_github_ambient_false_when_probe_errors(monkeypatch):
-    monkeypatch.setattr(reg, "_run_probe", lambda *a, **k: None)
+def test_probe_github_ambient_true_when_git_credential_has_one(gh_config, monkeypatch):
+    # Detection path 2 — the case that matters most in practice: `gh auth
+    # login` puts the token in the OS keyring, NOT in hosts.yml, and registers
+    # `gh auth git-credential` as github.com's helper. Verified on the dev
+    # machine: hosts.yml there has users/user/git_protocol and zero
+    # `oauth_token:` lines, while `git credential fill` returns a credential
+    # in 85-93 ms. Without this path the probe would never fire on a keyring
+    # install — i.e. on a default macOS `gh auth login`.
+    seen = []
+
+    def _fake(host):
+        seen.append(host)
+        return True
+
+    monkeypatch.setattr(reg, "_git_credential_present", _fake)
+    assert reg._probe_github_ambient() is True
+    assert seen == ["github.com"]
+
+
+def test_probe_github_ambient_true_when_hosts_file_has_a_token(gh_config):
+    # Detection path 3 — a gh login with no keyring, or where `gh auth
+    # setup-git` never ran so path 2 has no helper to ask.
+    gh_config.write_text(f"github.com:\n    user: someone\n    oauth_token: {_SENTINEL_TOKEN}\n")
+    assert reg._probe_github_ambient() is True
+
+
+def test_probe_github_ambient_true_for_a_token_nested_under_users(gh_config):
+    # gh writes the token under `users:` as well as at host level; a scan that
+    # only understood the top level would miss a real credential.
+    gh_config.write_text(
+        "github.com:\n"
+        "    users:\n"
+        f"        someone:\n            oauth_token: {_SENTINEL_TOKEN}\n"
+        "    git_protocol: https\n"
+    )
+    assert reg._probe_github_ambient() is True
+
+
+def test_probe_github_ambient_ignores_a_token_under_a_different_host(gh_config):
+    """Path 3 must be HOST-SCOPED. A `hosts.yml` naming only an enterprise host
+    is a credential for THAT host; reporting github.com as ambient off the back
+    of it is the false "yes" this probe's docstring calls a lie. (`gh auth
+    status` had the same any-host semantics, so this is a tightening, not a
+    regression — but path 2 is host-scoped and path 3 must agree with it.)"""
+    gh_config.write_text(f"ghe.corp.example:\n    oauth_token: {_SENTINEL_TOKEN}\n")
     assert reg._probe_github_ambient() is False
+
+
+def test_probe_github_ambient_finds_github_when_another_host_is_listed_first(gh_config):
+    """The other direction: host-scoping must not become a way to MISS a real
+    github.com token that happens to be listed second."""
+    gh_config.write_text(
+        f"ghe.corp.example:\n    oauth_token: {_SENTINEL_TOKEN}\n"
+        f"github.com:\n    oauth_token: {_SENTINEL_TOKEN}\n"
+    )
+    assert reg._probe_github_ambient() is True
+
+
+def test_probe_github_ambient_ignores_a_commented_out_token(gh_config):
+    gh_config.write_text(f"github.com:\n    # oauth_token: {_SENTINEL_TOKEN}\n")
+    assert reg._probe_github_ambient() is False
+
+
+def test_probe_github_ambient_false_when_hosts_file_has_only_a_username(gh_config):
+    # The sibling's distinction, applied here: a host entry and a username are
+    # a PREFERENCE, not proof of a credential. This is the real shape of the
+    # dev machine's hosts.yml under a keyring install, so getting it wrong
+    # would report "ambient" for every gh user whose token this cannot see.
+    gh_config.write_text(
+        "github.com:\n    users:\n        someone:\n    git_protocol: https\n    user: someone\n"
+    )
+    assert reg._probe_github_ambient() is False
+
+
+@pytest.mark.parametrize("line", ["    oauth_token:", "    oauth_token: ", '    oauth_token: ""',
+                                  "    oauth_token: ''"])
+def test_probe_github_ambient_false_when_hosts_token_is_empty(gh_config, line):
+    gh_config.write_text(f"github.com:\n{line}\n")
+    assert reg._probe_github_ambient() is False
+
+
+def test_probe_github_ambient_false_when_nothing_is_present(gh_config):
+    # The negative: no env var, no git credential, no hosts.yml at all.
+    assert not gh_config.exists()
+    assert reg._probe_github_ambient() is False
+
+
+def test_probe_github_ambient_false_when_hosts_path_is_unreadable(gh_config):
+    # Fails CLOSED. A hosts.yml that is a directory raises IsADirectoryError
+    # (an OSError) out of read_text; "cannot tell" must read as "not present".
+    gh_config.mkdir()
+    assert reg._probe_github_ambient() is False
+
+
+def test_probe_github_ambient_survives_undecodable_hosts_bytes(gh_config):
+    # UnicodeDecodeError is a ValueError, not an OSError — it would sail past
+    # the fail-closed guard and crash GET /api/integrations if the read were
+    # strict. errors="replace" is what keeps this a bool.
+    gh_config.write_bytes(b"github.com:\n    user: \xff\xfe\n")
+    assert reg._probe_github_ambient() is False
+
+
+def test_probe_github_ambient_returns_a_bool_and_never_logs_the_token(gh_config, caplog):
+    caplog.set_level(logging.DEBUG)
+    gh_config.write_text(f"github.com:\n    oauth_token: {_SENTINEL_TOKEN}\n")
+    result = reg._probe_github_ambient()
+    assert type(result) is bool and result is True
+    assert _SENTINEL_TOKEN not in caplog.text
+
+
+def test_ambient_token_value_never_reaches_the_integration_status(gh_config):
+    """The end-to-end escape check: a present token must change the STATUS and
+    nothing else. `repr` of the whole list covers every field at once, so a
+    future detail string that helpfully quotes the credential fails here."""
+    gh_config.write_text(f"github.com:\n    oauth_token: {_SENTINEL_TOKEN}\n")
+    statuses = list_integrations_with_ambient(_UNCONFIGURED_CFG, cache={})
+    assert {s.name: s.status for s in statuses}["github"] == "ambient"
+    assert _SENTINEL_TOKEN not in repr(statuses)
+
+
+def test_gh_hosts_path_resolution_matches_gh(monkeypatch, tmp_path):
+    """GH_CONFIG_DIR wins; else XDG_CONFIG_HOME/gh; else ~/.config/gh — the
+    order gh uses. Getting this wrong is a silent false negative, which is the
+    quiet failure mode of a fail-closed probe."""
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "explicit"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert reg._gh_hosts_path() == tmp_path / "explicit" / "hosts.yml"
+
+    monkeypatch.delenv("GH_CONFIG_DIR")
+    assert reg._gh_hosts_path() == tmp_path / "xdg" / "gh" / "hosts.yml"
+
+    monkeypatch.delenv("XDG_CONFIG_HOME")
+    monkeypatch.setattr(reg.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    assert reg._gh_hosts_path() == tmp_path / "home" / ".config" / "gh" / "hosts.yml"
+
+
+def test_probe_github_ambient_never_shells_out_to_a_token_printer(gh_config, monkeypatch):
+    """`gh auth token` prints the credential in the clear. Neither it nor any
+    other subprocess is reachable from the github probe once the env and
+    hosts.yml paths are the only ones left."""
+    def _forbidden(*a, **k):
+        raise AssertionError(f"github probe spawned a subprocess: {a!r}")
+
+    monkeypatch.setattr(reg.subprocess, "run", _forbidden)
+    gh_config.write_text(f"github.com:\n    oauth_token: {_SENTINEL_TOKEN}\n")
+    assert reg._probe_github_ambient() is True
+
+
+def test_git_credential_present_scrubs_the_credential_from_its_frame(monkeypatch):
+    """`proc.stdout` holds `password=<TOKEN>`, and a frame local is reachable
+    from a traceback — an independent review pulled a sentinel out of exactly
+    that. Nothing in `src/no_human/` renders frame locals and there is no
+    realistic raise point after the binding, so this was never exploitable;
+    it is fixed anyway because the alternative is a containment claim that
+    overstates its mechanism."""
+    fake = _FakeCompleted(returncode=0, stdout=f"password={_SENTINEL_TOKEN}\n")
+    monkeypatch.setattr(reg, "_run_probe", lambda *a, **k: fake)
+    assert reg._git_credential_present("github.com") is True
+    assert _SENTINEL_TOKEN not in fake.stdout
+
+
+def test_git_credential_present_scrubs_even_when_no_password_came_back(monkeypatch):
+    # The scrub must not be conditional on the answer: a `username=`-only reply
+    # still carries whatever the helper chose to print.
+    fake = _FakeCompleted(returncode=0, stdout=f"username={_SENTINEL_TOKEN}\n")
+    monkeypatch.setattr(reg, "_run_probe", lambda *a, **k: fake)
+    assert reg._git_credential_present("github.com") is False
+    assert _SENTINEL_TOKEN not in fake.stdout
 
 
 def test_probe_gitlab_ambient_true_when_password_line_present(monkeypatch):

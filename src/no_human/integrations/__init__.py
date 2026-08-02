@@ -22,7 +22,7 @@ import subprocess
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 KIND_BY_NAME = {
     "jira": "issue_tracker",
@@ -258,34 +258,160 @@ def _run_probe(
         return None
 
 
-def _probe_github_ambient() -> bool:
-    """`gh auth status` exits 0 iff at least one host is logged in."""
-    proc = _run_probe(["gh", "auth", "status"])
-    return proc is not None and proc.returncode == 0
-
-
-def _probe_gitlab_ambient() -> bool:
+def _git_credential_present(host: str) -> bool:
     """Ask git's OWN credential subsystem whether it can produce a credential
-    for gitlab.com, without prompting and without a network round-trip:
+    for ``host``, without prompting and without a network round-trip:
     `git credential fill` consults whatever helper is configured (netrc,
-    credential store, manager, ...) and returns immediately if none has
-    anything — GIT_TERMINAL_PROMPT=0 + a no-op GIT_ASKPASS guarantee it never
-    blocks waiting on input. Only WHETHER a non-empty `password=` line came
-    back is inspected — never its value — so this can never leak a secret.
-    A username alone (e.g. a bare `credential.gitlab.com.username` config
-    entry with no stored password) is a preference, not proof of an
-    authenticated session, and must not read as ambient."""
+    credential store, osxkeychain, manager, `gh auth git-credential`, ...) and
+    returns immediately if none has anything — GIT_TERMINAL_PROMPT=0 + a no-op
+    GIT_ASKPASS guarantee it never blocks waiting on input. Only WHETHER a
+    non-empty `password=` line came back is inspected — never its value — so
+    this can never leak a secret. A username alone (e.g. a bare
+    `credential.<host>.username` config entry with no stored password) is a
+    preference, not proof of an authenticated session, and must not read as
+    ambient. `fill` only reads; storing is `approve`/`reject`, never issued
+    here.
+
+    The credential's lifetime is bounded to this frame on purpose: `stdout`
+    carries `password=<TOKEN>`, and a function's locals stay reachable from a
+    traceback for as long as the frame does, so the reply is cleared before
+    returning either way. Nothing in this package renders frame locals and
+    nothing after the read can raise, so that was never exploitable — it is
+    done anyway, because the alternative is a containment claim that promises
+    more than its mechanism delivers."""
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/usr/bin/true"}
     proc = _run_probe(
         ["git", "credential", "fill"],
-        input_text="protocol=https\nhost=gitlab.com\n\n", env=env,
+        input_text=f"protocol=https\nhost={host}\n\n", env=env,
     )
     if proc is None or proc.returncode != 0:
         return False
-    return any(
-        line.startswith("password=") and line != "password="
-        for line in proc.stdout.splitlines()
-    )
+    try:
+        return any(
+            line.startswith("password=") and line != "password="
+            for line in proc.stdout.splitlines()
+        )
+    finally:
+        proc.stdout = ""
+        del proc
+
+
+#: Token variables `gh` itself prefers over any stored credential. Presence of
+#: one is checked, never its value.
+_GH_TOKEN_ENV_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
+
+
+def _gh_hosts_path() -> Path:
+    """`gh`'s `hosts.yml`, resolved the way gh resolves it: `GH_CONFIG_DIR`,
+    else `XDG_CONFIG_HOME/gh`, else `~/.config/gh`."""
+    base = os.environ.get("GH_CONFIG_DIR") or ""
+    if not base:
+        xdg = os.environ.get("XDG_CONFIG_HOME") or ""
+        base = str(Path(xdg) / "gh") if xdg else str(Path.home() / ".config" / "gh")
+    return Path(base) / "hosts.yml"
+
+
+def _gh_hosts_block_lines(text: str, host: str) -> Iterator[str]:
+    """Yield only the lines of a `hosts.yml` that sit under the top-level
+    ``host:`` key. `hosts.yml` is a map of HOST -> settings, so a token in it
+    belongs to whichever host block encloses it; a scan that ignores the
+    enclosing block reports a credential for an enterprise host as if it were
+    a github.com one. (`gh auth status` had exactly that any-host semantics —
+    "exits 0 iff at least one host is logged in" — so scoping this is a
+    tightening rather than a regression, but it has to agree with
+    `_git_credential_present`, which asks about one host by name.)
+
+    A top-level key is a line starting in column 0; everything indented after
+    it belongs to that block, which is all the structure this needs and is why
+    it does not pull in a YAML parser (one would bind the whole parsed tree,
+    tokens included, to a local)."""
+    in_block = False
+    for line in text.splitlines():
+        if line[:1] not in (" ", "\t", ""):
+            in_block = line.split(":", 1)[0].strip().strip("\"'") == host
+        elif in_block:
+            yield line
+
+
+def _is_gh_oauth_token_line(line: str) -> bool:
+    """True iff *line* is a `hosts.yml` `oauth_token:` entry with something
+    after the colon. Takes a line and returns a bool: the value is touched only
+    inside this frame, is never returned, stored, logged or compared against
+    anything, and nothing here can raise (so it can never reach a traceback
+    either). Empty and `""`/`''` placeholders are not a credential."""
+    stripped = line.strip()
+    if not stripped.startswith("oauth_token:"):
+        return False
+    return bool(stripped[len("oauth_token:"):].strip().strip("\"'"))
+
+
+def _probe_github_ambient() -> bool:
+    """Is a GitHub credential PRESENT on this machine? Presence only — never
+    validity — and with no network round-trip.
+
+    WHY THIS IS NOT `gh auth status`, which it was until 2026-08-02: that
+    command is not a local check. It validates the stored token against the
+    GitHub API — measured on a dev machine at 1700 ms and 2036 ms, against
+    85-93 ms for the local credential read below and ~10 ms for a file read.
+    So the old probe TRANSMITTED THE OPERATOR'S GITHUB TOKEN, undisclosed, and
+    it did so precisely when GitHub was UNCONFIGURED, since that is the only
+    time an ambient probe runs — inverting the one guarantee the reader who
+    configured nothing is entitled to. Deciding whether an integration is worth
+    OFFERING needs presence, not validity; an expired token fails later,
+    visibly, at the point of use, which is a better place to learn it.
+
+    Three local sources, each covering a case the others cannot see, checked
+    cheapest-first and short-circuiting:
+
+    1. `GH_TOKEN` / `GITHUB_TOKEN` in the environment — what gh itself prefers
+       over stored credentials, and invisible to (2).
+    2. git's credential subsystem for github.com, via the same
+       `_git_credential_present` helper `_probe_gitlab_ambient` uses. This is
+       the case that matters most in practice: `gh auth login` stores the token
+       in the OS keyring (not in a file) and registers
+       `gh auth git-credential` as github.com's helper, so this is the only
+       local way to see a keyring-stored login.
+    3. a non-empty `oauth_token:` line **inside the `github.com:` block** of
+       gh's `hosts.yml` — a gh login on a machine with no keyring, or where
+       `gh auth setup-git` never ran so (2) has no helper to ask. Host-scoped,
+       because a token under `ghe.corp.example:` is a credential for that host
+       and reporting github.com as ambient on the strength of it would be the
+       false "yes" this docstring calls a lie. The cost is that a GHE-only
+       login no longer reads as ambient here; that is the fail-closed side.
+
+    Only WHETHER a non-empty token exists is ever inspected. No value is
+    returned, logged, stored, or put in an exception message, and none survives
+    the frame that inspects it — see the lifetime note in
+    `_git_credential_present`. `gh auth token`, which prints the token in the
+    clear, is deliberately not used. What this does NOT claim is that no value
+    is ever bound at all: `read_text` necessarily holds the file, and a
+    credential helper's reply necessarily exists for the length of the check.
+
+    Fails CLOSED — if it cannot tell, it reports "not present" and the panel
+    says "Unconfigured". A false "no" costs a suggestion; a false "yes" is a
+    lie, and the only ways to shrink that gap further would be to prompt the
+    operator for keychain access or to validate on the wire, which is the
+    defect this replaces."""
+    if any(os.environ.get(v, "").strip() for v in _GH_TOKEN_ENV_VARS):
+        return True
+    if _git_credential_present("github.com"):
+        return True
+    try:
+        # errors="replace" so an undecodable byte fails closed to False rather
+        # than raising a ValueError past the OSError guard.
+        return any(
+            _is_gh_oauth_token_line(line)
+            for line in _gh_hosts_block_lines(
+                _gh_hosts_path().read_text(errors="replace"), "github.com")
+        )
+    except OSError:
+        return False
+
+
+def _probe_gitlab_ambient() -> bool:
+    """Is a GitLab credential present? Same local, presence-only mechanism as
+    the GitHub probe — see `_git_credential_present`."""
+    return _git_credential_present("gitlab.com")
 
 
 # Only github/gitlab have an ambient path — jira/circleci/jenkins/slack have no
