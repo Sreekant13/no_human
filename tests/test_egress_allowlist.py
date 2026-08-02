@@ -1813,10 +1813,22 @@ def test_the_two_word_refutation_specifically() -> None:
         "subprocess.run", "_sp.run").replace("subprocess.TimeoutExpired",
                                              "_sp.TimeoutExpired"))
     assert "exec:gh" in aliased, aliased
-    # And the real thing, in the shipped tree, at the line it lives on.
-    orchestrator = channels_of((PKG / "core/orchestrator.py").read_text())
-    assert 2395 in orchestrator.get("exec:git fetch", []), \
-        "core/orchestrator.py:2395 `git fetch origin` is not being detected"
+    # And the real thing, in the shipped tree. Assert what the charged line SAYS,
+    # never a literal line number: a hardcoded number breaks on any unrelated edit
+    # above it, and its failure mode reads as "bump the constant" — which is how a
+    # gate teaches its reader to rubber-stamp. It fired exactly that way once, when
+    # an unrelated hoist in _run_attempt moved this call from 2395 to 2448.
+    src = (PKG / "core/orchestrator.py").read_text()
+    lines = src.splitlines()
+    charged = channels_of(src).get("exec:git fetch", [])
+    assert charged, "`git fetch origin` in core/orchestrator.py is not being detected"
+    for n in charged:
+        # The channel is charged to the CALL line; the argv sits a few lines below
+        # it (`asyncio.to_thread(` / `_sp_fetch.run,` / `["git", "fetch", ...]`).
+        window = "\n".join(lines[n - 1:n + 4])
+        assert "fetch" in window, (
+            f"exec:git fetch charged to core/orchestrator.py:{n}, but no fetch "
+            f"appears within 5 lines of it — the channel is on the wrong line:\n{window}")
 
 
 def test_every_imported_root_is_classified() -> None:
