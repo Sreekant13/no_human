@@ -608,3 +608,42 @@ class TestSessionTag:
         ctx = out["hookSpecificOutput"]["additionalContext"]
         assert ctx.startswith(supervisor_channel_tag())
         assert "Wrong file" in ctx
+
+
+def test_an_unparseable_supervisor_response_says_what_it_could_not_parse(caplog):
+    """The fallback was invisible twice over, so nobody could measure it.
+
+    An unparseable response returns action="continue", which the orchestrator
+    emits as `supervisor_decision: continue` — byte-identical to a supervisor
+    that genuinely said carry on. The warning said only THAT a parse failed.
+    So on this install, 3,105 recorded `continue` verdicts cannot be separated
+    into "agreed" and "we could not read it".
+
+    `raw` has always carried the text (its field comment says "for logging");
+    it just was not logged.
+    """
+    import logging
+    with caplog.at_level(logging.WARNING):
+        d = parse_decision("no tag here, just prose")
+
+    assert d.action == "continue", "the safe fallback itself must not change"
+    assert d.raw == "no tag here, just prose"
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "unparseable" in msg
+    assert "no tag here" in msg, (
+        "the warning must carry an excerpt of what it could not parse — "
+        f"got: {msg!r}")
+
+
+def test_the_unparseable_excerpt_cannot_break_the_log_line(caplog):
+    """Control on the %.200r: a multi-line or overlong response is a real
+    failure shape, and must not smear across log lines or dump a whole
+    transcript into the operator's log."""
+    import logging
+    noisy = "line one\nline two\r\n" + ("x" * 5000)
+    with caplog.at_level(logging.WARNING):
+        parse_decision(noisy)
+
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "\n" not in msg, "a raw newline would break the log line"
+    assert len(msg) < 400, f"excerpt not truncated: {len(msg)} chars"

@@ -126,7 +126,22 @@ def parse_decision(text: str) -> SupervisorDecision:
             return SupervisorDecision(action=action, message=after, raw=text)
     # No recognisable tag → default to CONTINUE (safe fallback: don't
     # inject noise when the LLM's response is unparseable).
-    log.warning("supervisor: unparseable LLM output, defaulting to CONTINUE")
+    # Log the excerpt, which is what `raw` is FOR (see its field comment) and
+    # was never doing. Without it this fallback is invisible twice over: the
+    # warning said only THAT a parse failed, and the decision returned
+    # "continue" — which the orchestrator emits as `supervisor_decision:
+    # continue`, byte-identical to a real one. So an unparseable supervisor and
+    # a supervisor that genuinely said "carry on" are indistinguishable in both
+    # the log and the event stream, and nobody can measure how often the tier
+    # actually fails.
+    #
+    # `%.200r` — repr, so a multi-line or control-character response cannot
+    # break the log line, and truncated because the point is to recognise the
+    # SHAPE of a bad response, not to archive it.
+    log.warning(
+        "supervisor: unparseable LLM output, defaulting to CONTINUE; raw: %.200r",
+        text,
+    )
     return SupervisorDecision(action="continue", raw=text)
 
 
