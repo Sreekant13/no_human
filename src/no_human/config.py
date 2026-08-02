@@ -104,8 +104,147 @@ CODEX_ALTERNATE_ROUTING_VARS = (
 )
 
 
+# Windows cannot express POSIX permission bits: `os.chmod` there only toggles
+# FILE_ATTRIBUTE_READONLY, and the mode argument to `os.open` is ignored except
+# for that same bit. So every `0o600` in this module is a SILENT NO-OP on
+# Windows and the credential file inherits whatever ACL its directory carries.
+# Read it through this constant rather than testing `os.name` inline, so the
+# Windows branches are reachable (and therefore testable) from any platform.
+_IS_WINDOWS = os.name == "nt"
+
+# The one ACE we allow on a credential file, besides the owner's own.
+# ``icacls /inheritance:r /grant:r <user>:(R,W)`` leaves exactly one grantee, so
+# anything else in the readback means the restriction did not take.
+_ICACLS_OK_TAIL = ("Successfully processed", "Failed processing")
+
+
 class AuthError(RuntimeError):
     """Raised when the process is not provably in subscription-billing mode."""
+
+
+class CredentialPermissionError(AuthError):
+    """Raised when a credential file cannot be restricted to its owner.
+
+    This is a FAIL-CLOSED signal, not a warning. The alternative — writing an
+    OAuth token or an ``ANTHROPIC_API_KEY`` into a file whose permissions we
+    could not verify — is the failure this class exists to make impossible.
+    """
+
+
+def _windows_owner_principal() -> str:
+    """The account to grant the credential file to, as ``DOMAIN\\USER``.
+
+    Derived from the process environment rather than from a Win32 call so no
+    dependency is added. ``USERNAME`` is set by every interactive and service
+    logon; if it is missing we cannot name a grantee and must fail closed.
+    """
+    user = (os.environ.get("USERNAME") or "").strip()
+    if not user:
+        raise CredentialPermissionError(
+            "cannot secure the credential file: USERNAME is not set, so there "
+            "is no account to restrict it to. Set USERNAME, or move "
+            "NO_HUMAN_HOME to a directory only you can read."
+        )
+    domain = (os.environ.get("USERDOMAIN") or "").strip()
+    return f"{domain}\\{user}" if domain else user
+
+
+def _icacls_grantees(path: Path, output: str) -> set[str]:
+    """Parse ``icacls <path>`` output into the set of granted principals.
+
+    ``icacls`` prints ``<path> <PRINCIPAL>:(perms)`` on the first line and
+    ``<PRINCIPAL>:(perms)`` (indented) on each subsequent one, then a summary.
+    Parsing is deliberately permissive about WHAT the permissions are: any
+    principal appearing at all is access we did not intend to grant.
+    """
+    grantees: set[str] = set()
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(_ICACLS_OK_TAIL):
+            continue
+        # Strip the path prefix icacls repeats on its first line.
+        if line.startswith(str(path)):
+            line = line[len(str(path)):].strip()
+        if ":(" not in line:
+            continue
+        grantees.add(line.split(":(", 1)[0].strip())
+    return grantees
+
+
+def _run_icacls(args: list[str]) -> tuple[int, str]:
+    """Run ``icacls`` with *args*; return ``(returncode, stdout+stderr)``.
+
+    Split out so tests can drive both the Windows success and failure paths
+    from a POSIX host, where ``icacls`` does not exist.
+    """
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    exe = _shutil.which("icacls")
+    if exe is None:
+        raise CredentialPermissionError(
+            "cannot secure the credential file: `icacls` was not found on "
+            "PATH, so its permissions cannot be restricted to your account. "
+            "Refusing to write a credential that any account on this machine "
+            "could read."
+        )
+    proc = _subprocess.run(
+        [exe, *args], capture_output=True, text=True, timeout=30,
+    )
+    return proc.returncode, f"{proc.stdout}\n{proc.stderr}"
+
+
+def windows_restrict_to_owner(path: Path, *, directory: bool = False) -> None:
+    """Replace *path*'s ACL with an owner-only one, then VERIFY the result.
+
+    Two steps, and the second is the one that matters: a ``chmod`` that returns
+    successfully having done nothing is exactly the defect this replaces, so
+    the ACL is read back and every principal on it is checked. Raises
+    :class:`CredentialPermissionError` if the file is still reachable by any
+    account other than its owner.
+
+    UNTESTED ON WINDOWS — no Windows host was available. The command shapes and
+    the readback parser are covered by tests that drive them from POSIX.
+    """
+    principal = _windows_owner_principal()
+    # (OI)(CI) makes a directory's ACE inheritable by its future contents; on a
+    # file those flags are meaningless and icacls rejects them.
+    rights = "(OI)(CI)(F)" if directory else "(R,W)"
+    code, out = _run_icacls([
+        str(path), "/inheritance:r", "/grant:r", f"{principal}:{rights}",
+    ])
+    if code != 0:
+        raise CredentialPermissionError(
+            f"cannot secure {path}: icacls exited {code}. {out.strip()}"
+        )
+    windows_assert_owner_only(path)
+
+
+def windows_assert_owner_only(path: Path) -> None:
+    """Raise unless *path*'s ACL grants access to its owner and nobody else."""
+    principal = _windows_owner_principal()
+    code, out = _run_icacls([str(path)])
+    if code != 0:
+        raise CredentialPermissionError(
+            f"cannot verify permissions on {path}: icacls exited {code}. "
+            f"{out.strip()}"
+        )
+    grantees = _icacls_grantees(path, out)
+    if not grantees:
+        raise CredentialPermissionError(
+            f"cannot verify permissions on {path}: icacls listed no grantees, "
+            f"so the restriction cannot be confirmed to have taken effect."
+        )
+    # Case-insensitive: Windows account names are, and a case difference here
+    # would fail closed on a correctly secured file.
+    extra = {g for g in grantees if g.casefold() != principal.casefold()}
+    if extra:
+        raise CredentialPermissionError(
+            f"refusing to write a credential to {path}: it is still readable "
+            f"by {', '.join(sorted(extra))}. Move NO_HUMAN_HOME to a location "
+            f"only your account can reach, or fix the ACL with: "
+            f'icacls "{path}" /inheritance:r /grant:r "{principal}:(R,W)"'
+        )
 
 
 @dataclass
@@ -165,7 +304,11 @@ def _read_env_file(env_path: Path | None = None) -> dict[str, str]:
     # split("\n"), NOT splitlines(): the latter also breaks on \x0b \x0c
     # \x1c \x1d \x1e \x85 U+2028 U+2029, so a value carrying any of them
     # would be parsed as EXTRA VARIABLES that no writer ever wrote.
-    for raw in env_path.read_text().split("\n"):
+    # Explicit UTF-8 both here and in `atomic_write_0600`: Python's default
+    # text encoding is the locale's, which is cp1252 on most Windows installs,
+    # so a round trip through the default would corrupt (or raise on) any
+    # non-ASCII value this file has always been able to hold.
+    for raw in env_path.read_text(encoding="utf-8").split("\n"):
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -417,6 +560,21 @@ def assert_single_env_line(text: str, what: str = "value") -> None:
         raise AuthError(f"{what} must be a single line")
 
 
+def secure_credential_file(path: Path) -> None:
+    """Restrict an ALREADY-WRITTEN credential file to its owner, or raise.
+
+    For writers that cannot use :func:`atomic_write_0600` because something
+    else produced the file (Playwright's ``storage_state``, for one). POSIX:
+    ``chmod 0600``. Windows: owner-only ACL plus readback, because ``chmod``
+    there is a silent no-op. Raises on Windows when the restriction cannot be
+    proven — the caller must then DELETE the file it could not secure.
+    """
+    if _IS_WINDOWS:
+        windows_restrict_to_owner(Path(path))
+    else:
+        os.chmod(path, 0o600)
+
+
 def ensure_private_dir(path: Path) -> Path:
     """Create *path* and make it private (0700), even if it ALREADY EXISTS.
 
@@ -441,6 +599,20 @@ def ensure_private_dir(path: Path) -> Path:
     # this call creates. It does not, and nothing observes the difference, so
     # dropping `mode=` was the one mutation the suite did not catch.
     os.makedirs(path, mode=0o700, exist_ok=True)
+    if _IS_WINDOWS:
+        # `mode=` and the chmod walk below are no-ops on Windows. Apply the
+        # ACL equivalent instead. Unlike the credential FILE this is NOT fatal:
+        # the directory holds config.yaml, the DB and the cache, none of them
+        # credentials, and `nh init` refusing to run over a directory ACL it
+        # cannot rewrite would be worse than the exposure. The .env inside is
+        # secured (and fails closed) independently.
+        try:
+            windows_restrict_to_owner(path, directory=True)
+        except (CredentialPermissionError, OSError) as exc:
+            log.warning("could not secure %s (%s); the credential file inside "
+                        "is still restricted to your account independently",
+                        path, exc)
+        return path
     # Secure the ANCESTORS too, up to and including ~/.no_human. `parents=True`
     # creates every missing level at the process umask, so
     # `ensure_private_dir(~/.no_human/cache)` on a fresh machine left
@@ -499,15 +671,31 @@ def atomic_write_0600(path: Path, content: str) -> None:
     never a window where it exists at the process umask), then ``os.replace``s
     it onto *path* — atomic on POSIX and immune to a world/group-readable
     window even on first creation.
+
+    On WINDOWS the 0600 above is a silent no-op (see ``_IS_WINDOWS``), so the
+    temp file's ACL is replaced with an owner-only one and READ BACK to confirm
+    it took — both while the file is still EMPTY, so a credential byte is never
+    written to a file whose permissions are unproven. If it cannot be secured,
+    this raises :class:`CredentialPermissionError` and leaves *path* untouched
+    rather than writing a token any account on the machine could read.
     """
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
     try:
-        with os.fdopen(fd, "w") as f:
+        if _IS_WINDOWS:
+            # Release the handle before handing the path to icacls, and secure
+            # + verify it BEFORE any content exists in it.
+            os.close(fd)
+            windows_restrict_to_owner(tmp)
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_TRUNC)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
         os.replace(tmp, path)
     finally:
-        with contextlib.suppress(FileNotFoundError):
+        # Broader than FileNotFoundError: on Windows the unlink of a leftover
+        # temp can fail with PermissionError, and that must not mask the
+        # CredentialPermissionError that is the reason we are here.
+        with contextlib.suppress(OSError):
             os.unlink(tmp)
 
 
@@ -524,7 +712,8 @@ def upsert_env_var(env_path: Path, key: str, value: str) -> None:
     """
     assert_single_env_line(key, "key")
     assert_single_env_line(value, "value")
-    lines = env_path.read_text().split("\n") if env_path.exists() else []
+    lines = (env_path.read_text(encoding="utf-8").split("\n")
+             if env_path.exists() else [])
     if lines and lines[-1] == "":
         lines.pop()   # split("\n") keeps the trailing empty field
     out: list[str] = []

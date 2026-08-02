@@ -437,6 +437,18 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
             "a language server on this machine",
             "loopback: host defaults to 127.0.0.1; transcript-research reader"),
     },
+    # The channel is `<dynamic>` because argv is assembled at runtime: the
+    # binary is `icacls`, resolved by shutil.which in `_run_icacls` (:174),
+    # called at :213/:226 to replace and then read back the credential file's
+    # ACL. Windows only — the POSIX path is os.chmod and spawns nothing.
+    "config.py": {
+        "exec:<dynamic>": Allowed(
+            "nothing off this machine — `icacls` rewrites the credential "
+            "file's ACL to owner-only and reads it back (fail-closed; a "
+            "readback listing anyone else raises CredentialPermissionError)",
+            _ON + "every credential-file write, on Windows only; there is no "
+            "key that stops it because an unrestricted credential is worse"),
+    },
     "cli/commands.py": {
         "http:urllib.request": Allowed(
             "no_human's own API", "loopback: http://{server.host}:{server.port}"
