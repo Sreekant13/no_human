@@ -256,13 +256,15 @@ class Store:
             # server's lifespan, but equally `nh` commands and the eval
             # harnesses, none of which have a lifespan to pre-warm them. Left
             # cold, the first `create_attempt` pays three blocking git
-            # subprocesses — `ls-files`, `rev-parse`, `status` (220ms measured
-            # on this checkout; 10s per-call timeout, so 30s worst case). It
-            # was TWO until the tracking check closed the borrowed-sha hole:
-            # this count is a measured claim and moves when the calls do.
-            # while holding the sqlite write transaction its own UPDATE just
-            # opened. This repo has already lost days to lock storms; a
-            # telemetry stamp must not be able to start another one.
+            # subprocesses while holding the sqlite write transaction its own
+            # UPDATE just opened. This repo has already lost days to lock
+            # storms; a telemetry stamp must not be able to start another one.
+            #
+            # Three is `ls-files`, `rev-parse`, `status` — 220ms measured on
+            # this checkout, and a 30s worst case under the 10s per-call
+            # timeout. It was TWO until the tracking check closed the
+            # borrowed-sha hole: this count is a measured claim, and it moves
+            # when the calls do.
             from .build_info import loaded_code
             await asyncio.to_thread(loaded_code)
         except BaseException:

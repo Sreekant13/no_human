@@ -310,8 +310,35 @@ def test_a_loser_does_not_block_on_the_slow_measurement(monkeypatch):
     winner.start()
     time.sleep(0.1)
     started = time.monotonic()
-    api._loaded_code_stale()          # must not wait for the winner
+    got = api._loaded_code_stale()    # must not wait for the winner
     assert time.monotonic() - started < 0.5
+    # WHAT it returns, not just how fast. With nothing cached yet a loser gets
+    # None, which the board renders as no banner — indistinguishable from
+    # "current". That is the intended trade: during the first cold miss the
+    # honest choices are silence or a claim we have not finished checking, and
+    # silence beats fabricating a staleness warning. Self-heals next poll.
+    assert got is None
+    release.set()
+    winner.join(timeout=5)
+
+
+def test_a_loser_serves_the_last_known_value_once_there_is_one(monkeypatch):
+    """After the first measurement the trade has no downside: a loser returns
+    the previous answer rather than silence."""
+    # NOT `import no_human.api.app as api`: the api package's __init__
+    # binds the name `app` to the FastAPI INSTANCE, which shadows the
+    # submodule and hands back the wrong object.
+    api = importlib.import_module("no_human.api.app")
+
+    release = threading.Event()
+    monkeypatch.setattr(api, "_stale_cache", (time.monotonic() - 3600, "behind"))
+    monkeypatch.setattr("no_human.core.build_info.staleness_note",
+                        lambda: release.wait(timeout=5) or "behind again")
+
+    winner = threading.Thread(target=api._loaded_code_stale)
+    winner.start()
+    time.sleep(0.1)
+    assert api._loaded_code_stale() == "behind"   # stale but not silent
     release.set()
     winner.join(timeout=5)
 

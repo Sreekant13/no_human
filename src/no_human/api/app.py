@@ -2208,23 +2208,34 @@ def _loaded_code_stale() -> str | None:
     """The advisory staleness note, recomputed at most once a minute.
 
     HEAD moves after startup, so this cannot be a startup-time constant — but
-    the board polls this endpoint every couple of seconds and each check is a
-    git subprocess, so it is cached. Purely informational: no caller gates on
-    it, and by design nothing here can stop a task being claimed.
+    every open board tab polls this endpoint on a timer and each check is a git
+    subprocess, so it is cached. Purely informational: no caller gates on it,
+    and by design nothing here can stop a task being claimed.
 
     Single-flight, and NON-BLOCKING about it. A cache miss alone is not enough
     to serialize on: the miss window is however long `staleness_note` takes,
     and the case this feature exists to detect is exactly the one where git is
-    slow. At a ~2s poll and the ~30s the timeouts permit, ~15 pollers would
-    each have spawned their own git process before the first result landed —
-    a process herd in precisely the degraded condition being measured.
+    slow. Measured, rather than assumed: the board polls every 10s
+    (`App.jsx`: `setInterval(poll, 10000)`), and with `loaded_code()` already
+    warmed this path makes 1 git call when current and 2 when stale
+    (`rev-parse`, then `merge-base`) — a 10-20s ceiling under `_GIT_TIMEOUT`,
+    NOT `_detect`'s 30s, which is a different path. So a slow measurement
+    outlives roughly two polls per open tab, and every one of those would start
+    its own git: a process herd in precisely the degraded condition being
+    measured, growing with the number of tabs.
 
     A loser therefore returns the LAST KNOWN answer instead of waiting. Waiting
     would trade a git herd for a thread-pool herd: these run under
-    `asyncio.to_thread`, whose default executor is small, so 15 waiters parked
-    for 30s would starve every other `to_thread` in the process. Serving a
-    slightly stale advisory value costs nothing — the note is already up to
-    60s old by design.
+    `asyncio.to_thread`, whose executor holds `min(32, cpu_count + 4)` threads
+    — 16 here — so a dozen-odd waiters parked for the full ceiling would leave
+    the whole process about one worker. Serving a slightly stale advisory value
+    costs nothing: the note is already up to 60s old by design.
+
+    With no cached value at all, a loser returns None, which renders as "no
+    banner" — indistinguishable from "current". That is deliberate: during the
+    first cold miss under concurrency the honest options are silence or a claim
+    we have not finished checking, and silence errs toward not fabricating a
+    staleness warning. It self-heals on the next poll.
     """
     global _stale_cache
     cached = _stale_cache          # read once; another thread may swap it
