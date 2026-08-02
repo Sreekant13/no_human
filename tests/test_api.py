@@ -1383,6 +1383,20 @@ async def test_worker_status_surfaces_watcher_error(client):
     assert r.json().get("watcher_error") == "boom: config"
 
 
+async def test_worker_status_surfaces_the_loaded_code(client):
+    """The server never reloads, so a merged fix is not live until restart.
+    The status line says WHICH code is answering — advisory only; nothing here
+    gates a claim (HEAD moves constantly, so a block would halt the loop)."""
+    from no_human.api.app import app as _app
+    _app.state.loaded_code = "git:" + "a" * 40
+    r = await client.get("/api/worker/status")
+    body = r.json()
+    assert body.get("loaded_code") == "git:" + "a" * 40
+    # Present even when there is nothing to report, so a reader can tell
+    # "checked, current" apart from "never checked".
+    assert "loaded_code_stale" in body
+
+
 async def test_queue_health_endpoint(client, store):
     from no_human.core.task import Task, TaskStatus
     t = Task.new("open one", repo_path="/r")

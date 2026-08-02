@@ -96,6 +96,20 @@ _WEB_DIST = _resolve_web_dist()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config = load_config()
+    # Pin the loaded-code snapshot HERE, before anything can run, so it is the
+    # sha of what this process holds in memory rather than of whatever HEAD
+    # happens to be the first time something asks. The server never reloads:
+    # every attempt this process records will carry this value.
+    from ..core.build_info import loaded_code, staleness_note
+    code = loaded_code()
+    app.state.loaded_code = code.descriptor
+    log.info("loaded code: %s", code.descriptor)
+    # WARNING level on purpose: uvicorn runs at log_level="warning", so INFO is
+    # dropped and only the line that has something to say survives. Advisory —
+    # nothing below reads it, and no task is prevented from being claimed.
+    _startup_stale = staleness_note(code)
+    if _startup_stale:
+        log.warning("%s", _startup_stale)
     store = await Store(config.db_path).connect()
     app.state.store = store
     app.state.config = config
@@ -2174,19 +2188,47 @@ async def task_events_stream(task_id: str, request: Request):
     )
 
 
+_STALE_TTL_SECONDS = 60.0
+_stale_cache: tuple[float, str | None] = (0.0, None)
+
+
+def _loaded_code_stale() -> str | None:
+    """The advisory staleness note, recomputed at most once a minute.
+
+    HEAD moves after startup, so this cannot be a startup-time constant — but
+    the board polls this endpoint every couple of seconds and each check is a
+    git subprocess, so it is cached. Purely informational: no caller gates on
+    it, and by design nothing here can stop a task being claimed.
+    """
+    global _stale_cache
+    now = time.monotonic()
+    if now - _stale_cache[0] < _STALE_TTL_SECONDS:
+        return _stale_cache[1]
+    from ..core.build_info import staleness_note
+    note = staleness_note()
+    _stale_cache = (now, note)
+    return note
+
+
 @app.get("/api/worker/status")
 async def worker_status(request: Request) -> dict[str, Any]:
-    """Is the embedded worker running? How many tasks in-flight?"""
+    """Is the embedded worker running? How many tasks in-flight? And which
+    code is actually loaded — the server never reloads, so a merged fix is not
+    live until it restarts."""
     sched = getattr(request.app.state, "scheduler", None)
     watcher_error = getattr(request.app.state, "watcher_error", None)
+    common = {
+        "watcher_error": watcher_error,
+        "loaded_code": getattr(request.app.state, "loaded_code", None),
+        "loaded_code_stale": await asyncio.to_thread(_loaded_code_stale),
+    }
     if sched is None:
-        return {"running": False, "inflight": 0, "max_workers": 0,
-                "watcher_error": watcher_error}
+        return {"running": False, "inflight": 0, "max_workers": 0, **common}
     return {
         "running": True,
         "inflight": len(sched.inflight),
         "max_workers": sched.max_workers,
-        "watcher_error": watcher_error,
+        **common,
     }
 
 

@@ -593,6 +593,18 @@ class Store:
             # writing "why did this fail" on a succeeding attempt would put a
             # red line under it on every surface that prints that column.
             "resume_checkpoint_lost": "TEXT",
+            # Which CODE produced this attempt's verdict — the sha of what the
+            # server actually has IN MEMORY, not HEAD at query time. The server
+            # loads the backend once; merging a fix to main does not reload it,
+            # so a verdict from superseded code was indistinguishable from a
+            # verdict from the fix (task ecfe1789 escalated on a tamper-guard
+            # false positive 3h18m after the commit that fixed that exact false
+            # positive had merged). With this stamped on the row, such an
+            # escalation can be RE-JUDGED afterwards instead of being charged
+            # to the ticket — which is also what was corrupting the dogfood
+            # success measurement. See core/build_info.py for the format and
+            # for why this records rather than blocks.
+            "loaded_code_version": "TEXT",
         }
         for col, decl in att_wanted.items():
             if col not in att_existing:
@@ -995,9 +1007,16 @@ class Store:
             (task_id, attempt_number),
         )
         attempt_id = uuid.uuid4().hex
+        # Stamped HERE, at the single chokepoint every attempt passes through,
+        # rather than at each of the orchestrator's three creation sites — a
+        # site added later would otherwise silently record nothing, and an
+        # attempt with no provenance is exactly the row this exists to prevent.
+        # The value is a process fact, cached at startup; never raises.
+        from .build_info import loaded_code
         await self.db.execute(
-            "INSERT INTO attempts (id, task_id, attempt_number) VALUES (?, ?, ?)",
-            (attempt_id, task_id, attempt_number),
+            "INSERT INTO attempts (id, task_id, attempt_number, "
+            "loaded_code_version) VALUES (?, ?, ?, ?)",
+            (attempt_id, task_id, attempt_number, loaded_code().descriptor),
         )
         await self.db.commit()
         return attempt_id
