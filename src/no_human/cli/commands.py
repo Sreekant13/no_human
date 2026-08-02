@@ -418,7 +418,20 @@ def _schedule_update_notice(ctx: click.Context) -> None:
         pass
 
 
-@click.group(invoke_without_command=True)
+@click.group(
+    invoke_without_command=True,
+    # The installed app ships NO documentation — 0 .md files in the bundle,
+    # verified by mounting the round-3 DMG. The only documents in
+    # Contents/Resources are LICENSE, LICENSE.electron.txt and
+    # LICENSES.chromium.html, which are notices a redistribution owes, not
+    # something a user reads to learn the product. So `--help` was the whole
+    # manual, and it named no next step.
+    #
+    # It points at the SITE, deliberately, and not at the GitHub repo: the
+    # repository is private until the operator makes it public, and a link that
+    # 404s for every user is worse than no link. Revisit once it is public.
+    epilog="Docs: https://getnohuman.com/docs.html",
+)
 @click.version_option(__version__, prog_name="nh")
 @click.option("--repo", default=None, type=click.Path(),
               help="Repo the shell files tasks against (default: the git repo you are in).")
