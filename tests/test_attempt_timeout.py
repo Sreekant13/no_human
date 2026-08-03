@@ -14,7 +14,20 @@ from no_human.core.orchestrator import Orchestrator
 from no_human.core.task import Task, TaskStatus
 from no_human.notify.slack import SlackNotifier
 
-from .test_e2e_orchestrator import FakeBackend, _config, bare_repo, store  # noqa: F401
+from .test_e2e_orchestrator import (  # noqa: F401
+    RESUMABLE, FakeBackend, _config, bare_repo, store,
+)
+
+
+#: A zero-diff completion whose report does not parse as an ALREADY-SATISFIED
+#: claim now buys ONE single-turn reformat follow-up, delivered on the same
+#: session (`resume=<session_id>`). That follow-up is NOT an attempt: the fakes
+#: below count `run` calls to count ATTEMPTS, so they answer it separately and
+#: leave the counter alone. The reply deliberately does not parse either, so
+#: the zero-diff failure each test is about still stands.
+_NUDGE_REPLY = AgentResult(
+    final_text="nothing further to say", num_turns=1, is_error=False,
+    tokens_used=10, session_id="s", stop_reason="end_turn")
 
 
 class _HangBackend:
@@ -168,9 +181,12 @@ class _ZeroDiffThenHang:
     A MIXED streak in that order — SCRUM-46's (zero_diff, timeout) case,
     which used to be misread as "two consecutive timeouts"."""
 
+    capabilities = RESUMABLE
     calls = 0
 
-    async def run(self, *a, **k):
+    async def run(self, *a, resume=None, **k):
+        if resume is not None:
+            return _NUDGE_REPLY
         type(self).calls += 1
         if type(self).calls == 1:
             return AgentResult(final_text="already done, nothing to edit",
@@ -216,9 +232,12 @@ class _HangThenZeroDiff:
     ask the misleading zero-diff 'already implemented?' question right after
     a hang, with the hang itself never mentioned."""
 
+    capabilities = RESUMABLE
     calls = 0
 
-    async def run(self, *a, **k):
+    async def run(self, *a, resume=None, **k):
+        if resume is not None:
+            return _NUDGE_REPLY
         type(self).calls += 1
         if type(self).calls == 1:
             await asyncio.sleep(30)
@@ -268,9 +287,12 @@ class _FailThenZeroDiffThenHang:
     mixed — not a stale kind leaking across the reset, and not 3 turns of
     budget burned before the human hears about the mix."""
 
+    capabilities = RESUMABLE
     calls = 0
 
-    async def run(self, *a, **k):
+    async def run(self, *a, resume=None, **k):
+        if resume is not None:
+            return _NUDGE_REPLY
         type(self).calls += 1
         if type(self).calls == 1:
             return AgentResult(final_text="unexpected SDK error", num_turns=1,

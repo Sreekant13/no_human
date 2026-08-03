@@ -473,6 +473,36 @@ def _parse_already_satisfied(text: str | None, n_criteria: int) -> str | None:
     return t
 
 
+#: The substring that identifies the reformat follow-up in a prompt log. Named
+#: so a test (and a human reading `backend.prompts`) can tell the ONE nudge
+#: apart from the attempt prompts without matching the whole paragraph.
+_REFORMAT_NUDGE_MARKER = "did not follow the required already-satisfied contract"
+
+#: The one follow-up a non-parsing zero-diff completion gets before the attempt
+#: fails. Measured defect (bench, 2026-08-03): agents answer lookup and
+#: investigation tasks CORRECTLY and then omit the strict claim format in ~2/3
+#: of trials, so `_parse_already_satisfied` returns None and a right answer dies
+#: on phrasing. This asks for the format and nothing else — it must never read
+#: as permission to change the verdict, which is why it spells out the NOT-all-
+#: satisfied branch as an equally acceptable answer. One turn, no work.
+_REFORMAT_NUDGE = (
+    "Your final report ended with zero file changes and "
+    f"{_REFORMAT_NUDGE_MARKER}. If every acceptance criterion is genuinely "
+    "already satisfied, restate your final report in EXACTLY the contract "
+    "format (line `ALREADY-SATISFIED`, then one `CRITERION: <text> — MET — "
+    "evidence: <file:line or command+output>` per criterion). If it is NOT all "
+    "satisfied, say so and state what remains. Change nothing else; do not "
+    "edit files."
+)
+
+#: Wall-clock ceiling for that one turn. Its own number, not the coder's
+#: `bounds.attempt_timeout_s` (an hour by default): this is a single low-effort
+#: restatement of text the session already holds, so an hour is not a bound on
+#: it in any useful sense. Used as a CEILING on the attempt knob, never a floor
+#: — shortening the attempt ceiling shortens this too.
+_NUDGE_TIMEOUT_S = 120.0
+
+
 def _moa_complexity_signals(task: "Task", moa_cfg: dict) -> list[str]:
     """Pre-plan complexity signals gating the MoA fan-out (B2).
 
@@ -3108,6 +3138,31 @@ class Orchestrator:
                     result.final_text or "",
                     len(task.acceptance_criteria or []),
                 )
+                if claim is None:
+                    # …and if the report did not parse, ONE single-turn
+                    # follow-up asking for the contract format before the
+                    # attempt dies on phrasing. Nothing else about this branch
+                    # moves: no nudge on empty text, and a nudge that still
+                    # does not parse falls straight through to the failure
+                    # below (`_reformat_nudge`).
+                    #
+                    # The three sink controls are caught HERE, not inside the
+                    # nudge. The coder turn's own handlers for them are the
+                    # `except` clauses on the try block far above, which closed
+                    # before `has_changes()` was ever asked — so an abort raised
+                    # this late reaches no handler at all and would escape
+                    # `_run_attempt` entirely (`_drive` catches only
+                    # QuotaExhausted; verified by reading it, not assumed).
+                    try:
+                        claim = await self._reformat_nudge(
+                            task, result, repo=repo, attempt_id=attempt_id)
+                    except CancelRequested as exc:
+                        return await self._honor_cancel(
+                            task, repo, branch, str(exc))
+                    except (BudgetAbort, StuckAbort) as exc:
+                        return await self._abort_during_nudge(
+                            task, repo, attempt_id, exc, result=result,
+                            branch=branch)
                 if claim is not None:
                     return await self._gate_already_satisfied(
                         task, repo, attempt_id, claim, branch=branch,
@@ -3122,6 +3177,12 @@ class Orchestrator:
                 # this as the reason for THIS attempt, and a conditional write
                 # would let a talkative attempt 1 put words in a silent
                 # attempt 2's mouth.
+                # The ORIGINAL final text, deliberately, even when a reformat
+                # nudge ran and also failed to parse: this field answers "what
+                # did the agent conclude", and the nudge's reply is a restatement
+                # of that under a formatting instruction WE wrote. Escalating
+                # with our own prompt's echo instead of the agent's reasoning is
+                # the exact loss (task d9d458b5) this field was added to stop.
                 ctx = task.context or {}
                 ctx["zero_diff_reason"] = (result.final_text or "").strip()[:2000]
                 task.context = ctx
@@ -4317,6 +4378,316 @@ class Orchestrator:
         )
         return await self._raise_blocker(
             task, blocker, repo=repo, branch=branch, escalate_now=True,
+        )
+
+    async def _abort_during_nudge(
+        self, task: Task, repo: GitRepo, attempt_id: str,
+        exc: "BudgetAbort | StuckAbort", *, result, branch: str | None,
+    ) -> TaskOutcome:
+        """A budget or stuck abort raised out of the reformat nudge.
+
+        Same three obligations the coder turn's own handlers carry, in the same
+        order and with the same detail strings, because those strings are what
+        the board, the escalation and `_drive` read:
+
+        1. **Persist the TRUE spend before anything else.** An attempt
+           reporting zero tokens for a turn that spent them is how 21.2M once
+           slipped past every cap. The number written is the coder turn's own
+           authoritative total (already on the row) PLUS the sink-measured
+           delta the nudge fed before it was stopped — not the sink's absolute
+           running total, which is a different, estimated quantity and would
+           overwrite an exact measurement with it.
+        2. **Route a budget cross on the LIFETIME ledger, not on this attempt.**
+           `_check_lifetime_budget` is consulted AFTER the write above, so its
+           decision sees this attempt's spend. Over the lifetime cap parks
+           behind BUDGET_EXHAUSTED; under it, the per-attempt cap fired and the
+           bounded loop retries with fresh context.
+        3. **Never checkpoint.** The coder's handlers commit `[WIP-PARTIAL]`
+           because the tree may hold real work. Here it provably cannot: this
+           branch only runs when `has_changes()` is false, and the nudge's own
+           `finally` has already reverted anything it wrote. A checkpoint would
+           be an empty commit that makes the next attempt look resumed.
+        """
+        is_budget = isinstance(exc, BudgetAbort)
+        detail = f"{'budget' if is_budget else 'stuck'}-abort: {exc}"
+        partial = self.__dict__.pop("_nudge_partial_usage", None) or {}
+
+        def _billed(field: str) -> int:
+            return (int(getattr(result, field, 0) or 0)
+                    + int(partial.get(field) or 0))
+
+        # output_tokens keeps its None-honesty: 0 asserts "this turn emitted no
+        # output", NULL says nobody reported a split. Only a real report starts
+        # the sum.
+        out_coder = getattr(result, "output_tokens", None)
+        out_nudge = partial.get("output_tokens") or 0
+        out_total = (None if out_coder is None and not out_nudge
+                     else int(out_coder or 0) + int(out_nudge))
+        await self.store.update_attempt(
+            attempt_id, status="failed", failure_reason=detail,
+            tokens_used=_billed("tokens_used"),
+            output_tokens=out_total,
+            cache_read_tokens=_billed("cache_read_tokens"),
+            cache_creation_tokens=_billed("cache_creation_tokens"),
+            **self._pop_aux_usage(),
+        )
+        self.emit("agent_error", detail,
+                  error_class="budget" if is_budget else "stuck")
+        if is_budget:
+            budget_blocker = await self._check_lifetime_budget(task)
+            if budget_blocker is not None:
+                return await self._raise_blocker(
+                    task, budget_blocker, repo=repo, branch=branch)
+        return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+
+    @staticmethod
+    def _worktree_state(repo: GitRepo) -> dict[str, str]:
+        """``{path: porcelain status code}`` for the whole tree, untracked
+        files included and listed individually (``--untracked-files=all``, so a
+        new file inside an existing directory is a path and not a bare ``dir/``
+        that names nothing revertible).
+
+        Deliberately WITHOUT `GitRepo`'s ephemeral excludes: this is a
+        before/after comparison, and excluding a class of path here would be
+        excluding it from the revert. The excludes stay where they belong — in
+        `stage_all`, which is why an ephemeral path cannot reach a commit even
+        if this misses it.
+        """
+        out = repo._run("status", "--porcelain", "--untracked-files=all",
+                        check=False)
+        state: dict[str, str] = {}
+        for line in out.splitlines():
+            if len(line) < 4:
+                continue
+            code, rel = line[:2], line[3:].strip()
+            if rel.startswith('"') and rel.endswith('"'):
+                rel = rel[1:-1]
+            if " -> " in rel:                      # rename: "old -> new"
+                rel = rel.split(" -> ", 1)[1]
+            if rel:
+                state[rel] = code
+        return state
+
+    def _revert_worktree_writes(
+        self, repo: GitRepo, before: dict[str, str],
+    ) -> list[str]:
+        """Undo whatever the nudge wrote, and SAY so. Returns the paths.
+
+        Scoped to exactly the paths whose status changed since *before* — never
+        a whole-tree `reset --hard`, `checkout -- .` or `clean -fd`, whose blast
+        radius includes work this method has no business touching. A path that
+        is newly untracked is deleted; anything else is restored from the index.
+
+        Honest limit: this compares STATUS CODES, so a nudge that edited a file
+        which was ALREADY dirty before it ran is not detected. That case cannot
+        exist on this path — the branch only runs when `has_changes()` is false
+        — except for the ephemeral paths `has_changes()` excludes (`.env`,
+        `.idea/`, `.vscode/`), and `stage_all` excludes those from every commit,
+        so they cannot reach a PR either way.
+
+        TOTAL by construction, because it is called from a ``finally``: an
+        exception escaping here would REPLACE an in-flight CancelRequested /
+        BudgetAbort / StuckAbort, turning a routed park into an unhandled crash.
+        A revert that fails therefore degrades to a loud advisory naming what it
+        could not restore — the residual risk (a stray file surviving into the
+        next attempt) is the defect this method exists to close, so it is
+        stated here rather than hidden behind a bare `except`.
+        """
+        try:
+            return self._revert_worktree_writes_unguarded(repo, before)
+        except Exception as exc:  # noqa: BLE001 — see TOTAL, above
+            self._advisory(
+                "could not restore the worktree after the reformat nudge "
+                f"({exc}) — a file it wrote may survive into the next attempt")
+            return []
+
+    def _revert_worktree_writes_unguarded(
+        self, repo: GitRepo, before: dict[str, str],
+    ) -> list[str]:
+        after = self._worktree_state(repo)
+        changed = sorted(p for p, code in after.items() if before.get(p) != code)
+        if not changed:
+            return []
+        fresh = [p for p in changed
+                 if p not in before and after[p].strip() == "??"]
+        tracked = [p for p in changed if p not in fresh]
+        for rel in fresh:
+            try:
+                (repo.path / rel).unlink()
+            except OSError as exc:  # noqa: PERF203 — per-path, best effort
+                log.warning("could not remove nudge-written %s: %s", rel, exc)
+        if tracked:
+            repo._run("checkout", "--", *tracked, check=False)
+        # An advisory, not a log line: `nh doctor` counts these, and a nudge
+        # that writes files is a prompt that is not being obeyed — somebody
+        # should see it accumulate.
+        self._advisory(
+            "the reformat nudge wrote to the worktree despite being told not "
+            f"to; reverted {len(changed)} path(s): {', '.join(changed[:5])}"
+            + (" …" if len(changed) > 5 else ""))
+        return changed
+
+    async def _reformat_nudge(
+        self, task: Task, result, *, repo: GitRepo, attempt_id: str,
+    ) -> str | None:
+        """ONE single-turn follow-up asking a zero-diff completion to restate
+        its report in the ALREADY-SATISFIED contract format. Returns the parsed
+        claim, or None — in which case the caller fails the attempt exactly as
+        it did before this existed.
+
+        Why it exists: the bench (2026-08-03) shows the agent getting lookup and
+        investigation tasks RIGHT and then writing "## Answer …" instead of the
+        contract, ~2/3 of trials. `_parse_already_satisfied` is deliberately
+        strict — it diverts the anti-fabrication default — so a correct answer
+        in the wrong shape is indistinguishable from a stall. This buys one
+        cheap turn to tell them apart instead of burning a whole retry attempt
+        on phrasing (July's only passing run survived exactly that way, by
+        luck).
+
+        What it does NOT relax:
+        * **Empty final text gets no nudge.** There is nothing to reformat, so
+          asking would be inviting the agent to author a claim rather than
+          restate one — the anti-fabrication default, unchanged.
+        * **The verdict is still the agent's.** The prompt names "not all
+          satisfied" as an acceptable answer, and a NOT-MET admission simply
+          does not parse, which fails the attempt exactly as today.
+        * **The reviewer still verifies.** A parse here routes to
+          `_gate_already_satisfied` like a first-try parse: the citations are
+          refuted by a fresh-context reviewer, never taken on the coder's word.
+        * **Once per attempt, ever.** Keyed on `attempt_id`, so a second
+          zero-diff completion inside one attempt cannot buy a second turn.
+
+        The channel is the backend protocol's own session continuation
+        (``run(..., resume=<session_id>)``, capability ``session_resume``) — not
+        a new one — so the agent restates from the context it already has, which
+        is what makes the turn cheap. A backend that cannot resume, or a session
+        that reported no id, gets no nudge rather than a fresh-context session
+        being asked to restate a report it never wrote.
+
+        Cheapness is bought with ``max_turns=1``, ``effort="low"`` and a 120s
+        ceiling, NOT with a tool restriction: tools are fixed when the backend
+        is CONSTRUCTED (``readonly=``) and the whole point here is to continue
+        the coder's existing session, so a read-only instance is not available
+        to this call. "do not edit files" is therefore an INSTRUCTION, and the
+        enforcement is the snapshot/revert below rather than the sentence.
+
+        🔴 WHY THE SNAPSHOT IS LOAD-BEARING, not defensive coding. This turn
+        runs AFTER ``repo.has_changes()`` was evaluated, so anything it writes
+        lands in a tree the attempt has already judged empty and NOTHING
+        downstream re-reads that judgement. A review probe drove it: the nudge
+        wrote a file, the attempt failed as zero-diff as designed, and then the
+        NEXT attempt's coder edited nothing — but `has_changes()` was now TRUE,
+        so `commit_all` committed the stray file, a PR opened carrying a file no
+        coder ever produced, and the two-consecutive-zero-diff escalation was
+        deleted because attempt 2 no longer looked unproductive. So the tree is
+        snapshotted immediately before the turn and restored immediately after,
+        in a ``finally`` so an aborted or timed-out nudge is cleaned too. The
+        invariant being restored is exact: after this method returns or raises,
+        the worktree is byte-for-byte what the zero-diff branch already decided
+        it was.
+        """
+        final = (result.final_text or "").strip()
+        if not final:
+            return None
+        nudged = self.__dict__.setdefault("_reformat_nudged", set())
+        if attempt_id in nudged:
+            return None
+        session = getattr(result, "session_id", None)
+        caps = getattr(self.backend, "capabilities", None)
+        # FAIL CLOSED on the default. A backend that does not declare
+        # `session_resume` is one we know nothing about, and the failure of
+        # guessing "yes" is a fresh-context session asked to restate a report it
+        # never wrote — which would invent one.
+        if not session or not getattr(caps, "session_resume", False):
+            return None
+        nudged.add(attempt_id)
+        self.emit(
+            "reformat_nudge",
+            "zero diff and no ALREADY-SATISFIED contract — one turn to restate "
+            "the report in the required format",
+        )
+        before = self._worktree_state(repo)
+        # The sink's running totals as they stand BEFORE this turn. An abort
+        # has no AgentResult to bill, so the only measurement of what the nudge
+        # fed is how far these move while it runs — and the coder turn's own
+        # (authoritative) numbers are already on the attempt row, so a DELTA is
+        # what has to be added to them. Writing the sink's absolute total
+        # instead would overwrite an exact measurement with a running estimate
+        # of a different quantity.
+        # `getattr`, like `_agent_sink`'s own read of it: the accumulator is
+        # armed per attempt by `_begin_attempt_accounting`, and this method is
+        # reachable (from a test) without one.
+        usage_baseline = dict(getattr(self, "_attempt_usage", None) or {})
+        nudge = None
+        try:
+            # Wall-clock bounded, and TIGHTER than the coder turn's knob (B20):
+            # this is one low-effort turn that writes nothing, so the hour a
+            # legitimately long attempt may need is not a bound on it at all.
+            # Still capped by the attempt knob so a test (or an operator) that
+            # shortens the attempt ceiling shortens this too.
+            nudge = await asyncio.wait_for(
+                self.backend.run(
+                    _REFORMAT_NUDGE, cwd=repo.path, max_turns=1, effort="low",
+                    resume=session, on_event=self._agent_sink,
+                ),
+                timeout=min(
+                    float((self.config.get("bounds") or {}).get(
+                        "attempt_timeout_s") or 3600),
+                    _NUDGE_TIMEOUT_S),
+            )
+        except (CancelRequested, BudgetAbort, StuckAbort):
+            # The sink's three controls, RE-RAISED rather than swallowed. Each
+            # carries a reason, a routing decision and a spend the ledger has
+            # not seen yet — a pause must still park, a lifetime-budget cross
+            # must still reach BUDGET_EXHAUSTED, and the tokens this turn fed
+            # before it was stopped must still be billed. The caller catches
+            # these around the call and persists/routes them exactly as the
+            # coder turn's own handlers do; swallowing them here lost all three
+            # (review-verified: 7 fed tokens never reached the ledger).
+            # Single-use, popped by `_abort_during_nudge`.
+            _now_usage = getattr(self, "_attempt_usage", None) or {}
+            self._nudge_partial_usage = {
+                k: max(int(_now_usage.get(k) or 0)
+                       - int(usage_baseline.get(k) or 0), 0)
+                for k in ("tokens_used", "cache_read_tokens",
+                          "cache_creation_tokens", "output_tokens")
+            }
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # Everything genuinely unexpected — a transport error, a timeout, a
+            # backend that raised. The rescue is best-effort by construction, so
+            # this degrades to "no claim" and the attempt fails as it did before
+            # the nudge existed.
+            self._advisory(f"reformat nudge skipped: {exc}")
+            return None
+        finally:
+            self._revert_worktree_writes(repo, before)
+        if nudge is None:
+            return None
+        # The nudge is a turn of the CODER's session, so it bills where the
+        # coder's turns bill. `update_attempt` SETS these columns and the row
+        # already holds the first run's numbers, so both are summed here rather
+        # than written alone — writing the nudge's numbers by themselves would
+        # erase the attempt it is part of.
+        totals: dict[str, int | None] = {"output_tokens": None}
+        _accumulate_output(totals, result)
+        _accumulate_output(totals, nudge)
+
+        def _both(field: str) -> int:
+            return (int(getattr(result, field, 0) or 0)
+                    + int(getattr(nudge, field, 0) or 0))
+
+        await self.store.update_attempt(
+            attempt_id,
+            turns_used=_both("num_turns"),
+            tokens_used=_both("tokens_used"),
+            output_tokens=totals["output_tokens"],
+            cache_read_tokens=_both("cache_read_tokens"),
+            cache_creation_tokens=_both("cache_creation_tokens"),
+        )
+        return _parse_already_satisfied(
+            getattr(nudge, "final_text", "") or "",
+            len(task.acceptance_criteria or []),
         )
 
     async def _gate_already_satisfied(
@@ -6372,6 +6743,11 @@ class Orchestrator:
         whole 8M lifetime budget because only the former existed); the label
         travels in the tuple so the abort message says which one fired.
         """
+        # One attempt, one reformat nudge. Keyed by attempt id, so clearing the
+        # set at each attempt boundary changes no decision — every attempt
+        # already has a fresh id — and it stops the set growing for the whole
+        # life of a pooled Orchestrator.
+        self.__dict__.pop("_reformat_nudged", None)
         # The abort paths (attempt-timeout, stuck-abort, BudgetAbort) persist
         # THIS to the ledger, because an aborted run never produced a
         # ResultMessage to roll up. It already includes subagent spend — the

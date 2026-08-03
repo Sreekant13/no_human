@@ -16,7 +16,9 @@ from types import SimpleNamespace as _SimpleNamespace
 from no_human.agent.claude_backend import AgentEvent, AgentResult
 from no_human.config import load_config
 from no_human.core.db import Store
-from no_human.core.orchestrator import Orchestrator
+from no_human.core.orchestrator import (
+    Orchestrator, _REFORMAT_NUDGE, _REFORMAT_NUDGE_MARKER,
+)
 from no_human.core.task import Task, TaskStatus
 from no_human.notify.slack import SlackNotifier
 from no_human.vcs import PrResult
@@ -3137,6 +3139,13 @@ async def test_non_investigation_no_changes_still_fails(bare_repo, tmp_path, sto
 # A3: the zero-diff attempt breaker                                            #
 # --------------------------------------------------------------------------- #
 
+#: Backends that can continue a session declare it, exactly as the real ones do
+#: (`BackendCapabilities.session_resume`). The reformat nudge FAILS CLOSED on
+#: this: a fake without it gets no nudge at all, which is the point — a fake
+#: that has not said it can resume must not be handed a `resume=` argument.
+RESUMABLE = _SimpleNamespace(name="fake", session_resume=True)
+
+
 class ZeroDiffBackend:
     """Edits nothing and says the work is already done — verbatim in spirit to
     what task d9d458b5's agent said on all three of its attempts."""
@@ -3144,6 +3153,7 @@ class ZeroDiffBackend:
     STATEMENT = ("The implementation is already complete. I made zero edits. "
                  "I did not need to fabricate changes — doing so would violate "
                  "the 'smallest change' rule.")
+    capabilities = RESUMABLE
 
     def __init__(self):
         self.prompts: list[str] = []
@@ -3171,8 +3181,13 @@ async def test_two_zero_diff_attempts_escalate_with_the_agents_reason(
     outcome = await orch.run_task(t)
 
     assert outcome.status is TaskStatus.ESCALATED
-    # bounds.max_attempts is 3 — the third never ran.
-    assert len(backend.prompts) == 2
+    # bounds.max_attempts is 3 — the third never ran. Each of the two attempts
+    # also spends its ONE reformat nudge (this report does not parse either),
+    # so the ATTEMPT prompts are the non-nudge ones.
+    coder_prompts = [p for p in backend.prompts
+                     if _REFORMAT_NUDGE_MARKER not in p]
+    assert len(coder_prompts) == 2
+    assert len(backend.prompts) == 4
     assert len(await store.list_attempts(t.id)) == 2
 
     blocker = outcome.task.blocker
@@ -3270,7 +3285,10 @@ async def test_zero_diff_preamble_appears_on_retry_and_forbids_fabrication(
 
     await orch.run_task(t)
 
-    first, second = backend.prompts
+    # The two ATTEMPT prompts; each attempt also spends one reformat nudge,
+    # which is a follow-up on the same session and carries no preamble.
+    first, second = [p for p in backend.prompts
+                     if _REFORMAT_NUDGE_MARKER not in p]
     assert "FINISHED WITHOUT EDITING ANY FILE" not in first
     assert "FINISHED WITHOUT EDITING ANY FILE" in second
     assert "Do NOT invent an edit" in second
@@ -3470,6 +3488,409 @@ async def test_already_satisfied_reviewer_crash_fails_the_attempt(
     assert outcome.status in (TaskStatus.FAILED, TaskStatus.ESCALATED)
     attempts = await store.list_attempts(t.id)
     assert any("crashed" in (a.get("failure_reason") or "") for a in attempts)
+
+
+# --------------------------------------------------------------------------- #
+# The one reformat nudge: a right answer must not die on phrasing              #
+# --------------------------------------------------------------------------- #
+
+class WrongShapeBackend:
+    """Zero edits, a CORRECT report — in the wrong shape.
+
+    The measured defect (bench, 2026-08-03): the agent answers the question and
+    writes "## Answer …" with real evidence, `_parse_already_satisfied` returns
+    None, and the attempt dies on formatting. `restated` is what it says when
+    asked (on its own session, via ``resume``) to restate it in the contract.
+    """
+
+    REPORT = ("## Answer\n\n"
+              "mul(a, b) already exists and returns the product — see calc.py:4. "
+              "Nothing to change.")
+    CONTRACT = ("ALREADY-SATISFIED\n"
+                "CRITERION: mul(a,b) returns product — MET — evidence: calc.py:4\n")
+    capabilities = RESUMABLE
+
+    def __init__(self, restated: str = CONTRACT, first: str = REPORT):
+        self.calls: list[dict] = []
+        self._restated = restated
+        self._first = first
+
+    @property
+    def prompts(self) -> list[str]:
+        return [c["prompt"] for c in self.calls]
+
+    @property
+    def nudges(self) -> list[dict]:
+        return [c for c in self.calls if _REFORMAT_NUDGE_MARKER in c["prompt"]]
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        self.calls.append({"prompt": prompt, "resume": resume,
+                           "max_turns": max_turns, "effort": effort})
+        if resume is not None:
+            return AgentResult(final_text=self._restated, num_turns=1,
+                               is_error=False, tokens_used=40, session_id="s",
+                               stop_reason="end_turn")
+        return AgentResult(final_text=self._first, num_turns=5, is_error=False,
+                           tokens_used=100, session_id="s", stop_reason="end_turn")
+
+
+async def test_wrong_shaped_zero_diff_report_gets_exactly_one_reformat_nudge(
+    bare_repo, tmp_path, store
+):
+    """A correct answer in the wrong format buys ONE cheap single-turn restate
+    on the SAME session — and, once it parses, goes to the same reviewer gate a
+    first-try parse would have reached."""
+    passing = ReviewDecision(passed=True, checklist=[
+        ChecklistItem("mul(a,b) returns product", True,
+                      "calc.py:4 defines mul returning a*b")])
+    reviewer = FakeReviewer(passing)
+    cfg = _config(tmp_path)
+    backend = WrongShapeBackend()
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None),
+                        reviewer=reviewer)
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    # Pin intake, as every test in this section does: live enrichment would
+    # expand the criteria the claim's coverage check counts against.
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    # Exactly one nudge, carrying the contract text verbatim.
+    assert len(backend.nudges) == 1, backend.prompts
+    nudge = backend.nudges[0]
+    assert nudge["prompt"] == _REFORMAT_NUDGE
+    assert "ALREADY-SATISFIED" in nudge["prompt"]
+    assert "do not edit files" in nudge["prompt"]
+    # Cheap, and on the agent's OWN session — not a fresh one.
+    assert nudge["resume"] == "s"
+    assert nudge["max_turns"] == 1
+    assert nudge["effort"] == "low"
+    # The reviewer gate is reached exactly as a first-try parse reaches it.
+    assert reviewer.calls and reviewer.calls[-1]["mode"] == "already_satisfied"
+    assert "calc.py:4" in reviewer.calls[-1]["claim_report"]
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert "ALREADY-SATISFIED" in (outcome.report or "")
+    # One attempt: the nudge rescued it in place, it did not buy a retry.
+    attempts = await store.list_attempts(t.id)
+    assert len(attempts) == 1
+    assert attempts[-1]["status"] == "succeeded"
+    # The nudge's spend bills where the coder's turns bill — summed onto the
+    # attempt row, never dropped and never written over the coder's own.
+    assert attempts[-1]["tokens_used"] == 140
+    assert attempts[-1]["turns_used"] == 6
+
+
+async def test_a_nudge_that_still_does_not_parse_fails_the_attempt_unchanged(
+    bare_repo, tmp_path, store
+):
+    """The rescue is one turn, not a negotiation: a reply that still misses the
+    contract fails on the SAME detail string as before the nudge existed, and
+    the escalation still carries the agent's ORIGINAL words."""
+    from no_human.core.orchestrator import _NO_CHANGES_DETAIL
+
+    cfg = _config(tmp_path)
+    backend = WrongShapeBackend(restated="Still just prose, I'm afraid.")
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    attempts = await store.list_attempts(t.id)
+    assert attempts, "no attempt was recorded"
+    assert all(a["failure_reason"] == _NO_CHANGES_DETAIL for a in attempts), \
+        [a["failure_reason"] for a in attempts]
+    # ONE nudge per attempt — never two for the same zero-diff completion.
+    assert len(backend.nudges) == len(attempts), backend.prompts
+    # zero_diff_reason keeps the ORIGINAL report, not the nudge's restatement:
+    # it answers "what did the agent conclude", and the restatement is an echo
+    # of a formatting instruction we wrote.
+    refreshed = await store.find_task(t.id)
+    stated = (refreshed.context or {}).get("zero_diff_reason") or ""
+    assert stated == WrongShapeBackend.REPORT
+    assert "Still just prose" not in stated
+
+
+async def test_an_empty_final_report_is_never_nudged(bare_repo, tmp_path, store):
+    """Anti-fabrication, unchanged: with nothing to restate, asking for the
+    contract would be asking the agent to AUTHOR a claim. Immediate fail."""
+    from no_human.core.orchestrator import _NO_CHANGES_DETAIL
+
+    cfg = _config(tmp_path)
+    backend = WrongShapeBackend(first="   \n  ")
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    assert backend.nudges == [], backend.prompts
+    assert all(c["resume"] is None for c in backend.calls)
+    attempts = await store.list_attempts(t.id)
+    assert attempts and all(
+        a["failure_reason"] == _NO_CHANGES_DETAIL for a in attempts)
+
+
+async def test_only_one_nudge_per_attempt_even_on_a_second_zero_diff(
+    bare_repo, tmp_path, store
+):
+    """The budget is per ATTEMPT, not per zero-diff completion: a second
+    non-parsing completion inside the same attempt buys no second turn."""
+    from no_human.vcs import GitRepo
+
+    cfg = _config(tmp_path)
+    backend = WrongShapeBackend()
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    await store.create_task(t)
+    attempt_id = await store.create_attempt(t.id, 1)
+    result = AgentResult(
+        final_text=WrongShapeBackend.REPORT, num_turns=5, is_error=False,
+        tokens_used=100, session_id="s", stop_reason="end_turn")
+    # A REAL repo: the nudge snapshots and restores the worktree around the
+    # turn, so a stand-in with only a `.path` would not exercise it.
+    repo = GitRepo(bare_repo)
+
+    first = await orch._reformat_nudge(
+        t, result, repo=repo, attempt_id=attempt_id)
+    second = await orch._reformat_nudge(
+        t, result, repo=repo, attempt_id=attempt_id)
+
+    assert first is not None and "ALREADY-SATISFIED" in first
+    assert second is None
+    assert len(backend.nudges) == 1, backend.prompts
+    # A DIFFERENT attempt gets its own one.
+    other = await store.create_attempt(t.id, 2)
+    assert await orch._reformat_nudge(
+        t, result, repo=repo, attempt_id=other) is not None
+    assert len(backend.nudges) == 2
+
+
+async def test_no_nudge_without_a_session_to_continue(bare_repo, tmp_path, store):
+    """The nudge is a CONTINUATION — it asks the agent to restate what it just
+    wrote. Three ways that is not available, and all three must yield NO nudge
+    rather than a fresh-context session being asked to restate a report it
+    never wrote. The third is the fail-closed default: a backend that says
+    NOTHING about resuming is treated as unable to, never assumed able."""
+    from no_human.vcs import GitRepo
+
+    cfg = _config(tmp_path)
+    backend = WrongShapeBackend()
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    await store.create_task(t)
+    repo = GitRepo(bare_repo)
+
+    sessionless = AgentResult(
+        final_text=WrongShapeBackend.REPORT, num_turns=5, is_error=False,
+        tokens_used=100, session_id=None, stop_reason="end_turn")
+    assert await orch._reformat_nudge(
+        t, sessionless, repo=repo,
+        attempt_id=await store.create_attempt(t.id, 1)) is None
+
+    with_session = AgentResult(
+        final_text=WrongShapeBackend.REPORT, num_turns=5, is_error=False,
+        tokens_used=100, session_id="s", stop_reason="end_turn")
+    backend.capabilities = _SimpleNamespace(session_resume=False)
+    assert await orch._reformat_nudge(
+        t, with_session, repo=repo,
+        attempt_id=await store.create_attempt(t.id, 2)) is None
+
+    # SILENT on the question — the default must be NO, not yes.
+    backend.capabilities = _SimpleNamespace(name="fake")
+    assert not hasattr(backend.capabilities, "session_resume")
+    assert await orch._reformat_nudge(
+        t, with_session, repo=repo,
+        attempt_id=await store.create_attempt(t.id, 3)) is None
+
+    assert backend.calls == []
+
+
+class SneakyNudgeBackend(WrongShapeBackend):
+    """The nudge turn IGNORES "do not edit files" and writes one.
+
+    Not a hypothetical: a review probe drove exactly this and watched the stray
+    file get committed by the NEXT attempt and opened in a PR, because the
+    nudge runs after `has_changes()` has already been read.
+    """
+
+    STRAY = "sneaky.py"
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        if resume is not None:
+            (Path(cwd) / self.STRAY).write_text("# no coder wrote this\n")
+        return await super().run(
+            prompt, cwd=cwd, max_turns=max_turns, effort=effort, resume=resume,
+            on_event=on_event, supervisor_hook=supervisor_hook, **kwargs)
+
+
+async def test_a_nudge_that_writes_files_is_reverted_before_the_next_attempt(
+    bare_repo, tmp_path, store
+):
+    """🔴 The regression the review proved. The nudge is a WRITE-CAPABLE turn
+    running after `has_changes()` was evaluated, so a file it drops is invisible
+    to this attempt and gets committed by the next one — a PR carrying a file no
+    coder produced, and a deleted two-zero-diff escalation because attempt 2 no
+    longer looked unproductive. The tree must be restored before the nudge
+    returns."""
+    from no_human.core.orchestrator import _NO_CHANGES_DETAIL
+
+    cfg = _config(tmp_path)
+    backend = SneakyNudgeBackend(restated="Still prose. Also I wrote a file.")
+    events: list = []
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    # The nudge DID write (otherwise this test proves nothing about reverting).
+    assert len(backend.nudges) >= 1, backend.prompts
+    # …and every write was reverted, with an advisory naming the path.
+    reverts = [e for e in events if e.get("kind") == "advisory"
+               and SneakyNudgeBackend.STRAY in (e.get("text") or "")]
+    assert reverts, [e for e in events if e.get("kind") == "advisory"]
+    # Both attempts still fail as zero-diff — the stray file never made one of
+    # them look productive.
+    attempts = await store.list_attempts(t.id)
+    assert len(attempts) == 2, attempts
+    assert all(a["failure_reason"] == _NO_CHANGES_DETAIL for a in attempts), \
+        [a["failure_reason"] for a in attempts]
+    # …so the two-consecutive-zero-diff escalation still fires, and no PR opened.
+    assert outcome.status is TaskStatus.ESCALATED, outcome
+    assert outcome.pr_url is None
+    # Nothing committed the stray file, on any branch, ever.
+    committed = subprocess.run(
+        ["git", "log", "--all", "--name-only", "--format="],
+        cwd=bare_repo, capture_output=True, text=True).stdout
+    assert SneakyNudgeBackend.STRAY not in committed, committed
+    assert not (Path(bare_repo) / SneakyNudgeBackend.STRAY).exists()
+
+
+class _AbortingNudgeBackend(WrongShapeBackend):
+    """The nudge turn raises one of the sink's three controls mid-flight, the
+    way `_agent_sink` does when a pause / budget cross / doom-loop is seen."""
+
+    def __init__(self, exc):
+        super().__init__()
+        self._exc = exc
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        if resume is not None:
+            self.calls.append({"prompt": prompt, "resume": resume,
+                               "max_turns": max_turns, "effort": effort})
+            raise self._exc
+        return await super().run(
+            prompt, cwd=cwd, max_turns=max_turns, effort=effort, resume=resume,
+            on_event=on_event, supervisor_hook=supervisor_hook, **kwargs)
+
+
+async def test_a_budget_abort_in_the_nudge_still_parks_and_still_bills(
+    bare_repo, tmp_path, store
+):
+    """Swallowing the sink's controls lost three things at once: the reason,
+    the BUDGET_EXHAUSTED routing, and the tokens the turn had already fed. The
+    lifetime cap is set below what the attempt spends, so the cross must PARK,
+    not just fail the attempt."""
+    from no_human.core.orchestrator import BudgetAbort
+
+    cfg = _config(tmp_path)
+    backend = _AbortingNudgeBackend(BudgetAbort("attempt spend crossed the cap"))
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    t.context = {"eval_result": {"verdict": "accept"}}
+    # Lifetime ceiling under this attempt's own spend, so the ledger read that
+    # follows the abort is unambiguously over it. (`budget_unit: weighted`
+    # marks the number as already being in the current unit — an unmarked cap
+    # is migrated, which would silently multiply it.)
+    t.config = {"lifetime_tokens": 1, "budget_unit": "weighted"}
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    attempts = await store.list_attempts(t.id)
+    # ONE attempt. The park is THIS handler's routing decision, not a later
+    # loop-head budget check — which is the whole difference between "the
+    # controls were re-raised" and "they were swallowed and something else
+    # noticed eventually".
+    assert len(attempts) == 1, [a["failure_reason"] for a in attempts]
+    assert attempts[-1]["status"] == "failed"
+    assert "budget-abort" in (attempts[-1]["failure_reason"] or ""), attempts[-1]
+    # The reason survived — not "agent produced no file changes".
+    assert "crossed the cap" in (attempts[-1]["failure_reason"] or "")
+    # The spend reached the ledger rather than being dropped with the exception.
+    assert (attempts[-1]["tokens_used"] or 0) > 0, attempts[-1]
+    # And the lifetime cross parked instead of quietly failing an attempt.
+    fresh = await store.find_task(t.id)
+    assert (fresh.blocker or {}).get("category") == "BUDGET_EXHAUSTED", \
+        fresh.blocker
+    assert outcome.status in (TaskStatus.BLOCKED, TaskStatus.ESCALATED), outcome
+
+
+async def test_a_stuck_abort_in_the_nudge_fails_the_attempt_with_its_reason(
+    bare_repo, tmp_path, store
+):
+    """StuckAbort keeps its own semantics: a FAILED attempt carrying the
+    doom-loop reason, so the bounded loop retries with fresh context — never a
+    zero-diff failure wearing the wrong label."""
+    from no_human.core.orchestrator import StuckAbort
+
+    cfg = _config(tmp_path)
+    backend = _AbortingNudgeBackend(StuckAbort("identical tool call x3"))
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    attempts = await store.list_attempts(t.id)
+    assert attempts[0]["status"] == "failed"
+    assert "stuck-abort: identical tool call x3" == attempts[0]["failure_reason"]
+    assert (attempts[0]["tokens_used"] or 0) > 0, attempts[0]
+
+
+async def test_an_unexpected_nudge_error_falls_back_to_the_zero_diff_failure(
+    bare_repo, tmp_path, store
+):
+    """Everything that is NOT one of the three controls stays swallowed: the
+    rescue is best-effort, so a transport error degrades to 'no claim' and the
+    attempt fails exactly as it did before the nudge existed."""
+    from no_human.core.orchestrator import _NO_CHANGES_DETAIL
+
+    cfg = _config(tmp_path)
+    backend = _AbortingNudgeBackend(RuntimeError("transport died"))
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    attempts = await store.list_attempts(t.id)
+    assert attempts and all(
+        a["failure_reason"] == _NO_CHANGES_DETAIL for a in attempts), \
+        [a["failure_reason"] for a in attempts]
+    refreshed = await store.find_task(t.id)
+    assert (refreshed.context or {}).get(
+        "zero_diff_reason") == WrongShapeBackend.REPORT
 
 
 # --------------------------------------------------------------------------- #
