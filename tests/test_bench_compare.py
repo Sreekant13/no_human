@@ -14,12 +14,17 @@ import pytest
 
 from no_human.eval.bench_compare import (
     MIN_DISCORDANT_FOR_POWER,
+    REQUIRED_SCORE_KEYS,
+    ResultsSchemaError,
     compare_runs,
     flaky_canary,
     interpretation,
     mcnemar_exact_p,
+    order_runs,
     spec_verdicts,
     trial_flip_count,
+    undated_run_indices,
+    validate_results,
 )
 from no_human.eval.northstar import BenchScore
 from no_human.eval.northstar_card import (
@@ -309,6 +314,148 @@ def test_canary_counts_only_the_flipping_spec():
 def test_canary_min_flips_is_tunable_but_defaults_to_two():
     assert [c.task_id for c in flaky_canary(_hist(True, False, False),
                                             min_flips=1)] == ["s1"]
+
+
+# --------------------------------------------------------------------------- #
+# ordering — an undated run must not be promoted to the front (review F1)
+# --------------------------------------------------------------------------- #
+
+def test_an_undated_run_sorts_LAST_not_first():
+    """`str(created_at or "")` sorts "" BEFORE every real timestamp, so an
+    undated run used to be silently promoted to the FRONT of the history
+    whatever position the caller supplied it in."""
+    dated = _run("r1", [_row("s1", ok=True)], created_at="2026-01-01T00:00:00")
+    undated = _run("rX", [_row("s1", ok=False)], created_at="")
+    assert [r["label"] for r in order_runs([dated, undated])] == ["r1", "rX"]
+    assert [r["label"] for r in order_runs([undated, dated])] == ["r1", "rX"]
+
+
+def test_undated_runs_keep_their_supplied_order_among_themselves():
+    a = _run("a", [_row("s1", ok=True)], created_at="")
+    b = _run("b", [_row("s1", ok=True)], created_at="")
+    mid = _run("m", [_row("s1", ok=True)], created_at="2026-01-01T00:00:00")
+    assert [r["label"] for r in order_runs([b, mid, a])] == ["m", "b", "a"]
+
+
+def test_undated_run_indices_names_them_in_supplied_order():
+    runs = [_run("a", [_row("s1")], created_at="2026-01-01T00:00:00"),
+            _run("b", [_row("s1")], created_at=""),
+            _run("c", [_row("s1")], created_at="2026-01-02T00:00:00"),
+            _run("d", [_row("s1")], created_at="")]
+    assert undated_run_indices(runs) == [1, 3]
+    assert undated_run_indices(runs[:1]) == []
+
+
+def test_an_undated_fourth_run_supplied_last_does_not_change_the_verdict():
+    """The review's verdict-changing case, both ways round.
+
+    History ✓ ✗ ✓ flips twice and is flagged. Append a fourth run that agrees
+    with the third: dated, it extends the chain and the spec stays flagged at
+    2 flips. UNDATED and supplied last, it must land in the same place — the
+    old key put it FIRST, which made the chain ✓ ✓ ✗ ✓ ... and moved the
+    counts. The two must agree, or a missing date silently re-times history.
+    """
+    base = [
+        _run("r1", [_row("s1", ok=True)], created_at="2026-01-01T00:00:00"),
+        _run("r2", [_row("s1", ok=False)], created_at="2026-01-02T00:00:00"),
+        _run("r3", [_row("s1", ok=True)], created_at="2026-01-03T00:00:00"),
+    ]
+    dated_4th = _run("r4", [_row("s1", ok=False)],
+                     created_at="2026-01-04T00:00:00")
+    undated_4th = _run("r4", [_row("s1", ok=False)], created_at="")
+
+    with_dated = flaky_canary(base + [dated_4th])
+    with_undated = flaky_canary(base + [undated_4th])
+    assert [(c.task_id, c.flips, c.pairs, c.history) for c in with_dated] == \
+           [(c.task_id, c.flips, c.pairs, c.history) for c in with_undated]
+    assert with_undated[0].history == ["✓", "✗", "✓", "✗"]
+    assert with_undated[0].flips == 3
+
+
+def test_an_undated_run_no_longer_flips_a_spec_into_the_canary():
+    """The other half of the review's demonstration: flagged-vs-not must not
+    turn on whether one run carries a date. ✓ ✗ ✗ flips once (not flagged);
+    prepending an undated ✗ leaves it at once, where the old key would have
+    made the chain ✗ ✓ ✗ ✗ — two flips, flagged."""
+    dated = [
+        _run("r1", [_row("s1", ok=True)], created_at="2026-01-01T00:00:00"),
+        _run("r2", [_row("s1", ok=False)], created_at="2026-01-02T00:00:00"),
+        _run("r3", [_row("s1", ok=False)], created_at="2026-01-03T00:00:00"),
+    ]
+    undated_fail = _run("rX", [_row("s1", ok=False)], created_at="")
+    assert flaky_canary(dated) == []
+    assert flaky_canary([undated_fail] + dated) == []
+    assert flaky_canary(dated + [undated_fail]) == []
+
+
+# --------------------------------------------------------------------------- #
+# shape validation — refuse a drifted file, never render one (review F2)
+# --------------------------------------------------------------------------- #
+
+def test_validate_accepts_a_well_formed_run():
+    validate_results(_run("ok", [_row("s1", ok=True),
+                                 _row("s2", ok=None, status="skipped")]))
+
+
+def test_validate_refuses_rows_that_carry_only_task_id_and_title():
+    """The reviewer's case. Such rows count as RAN (the skip test is an
+    inequality) and as FAILED (`bool(None)`), so the file renders a confident
+    wall of regressions that reads exactly like a real catastrophe."""
+    drifted = _run("drift", [{"task_id": "s1", "title": "t"},
+                             {"task_id": "s2", "title": "t"}])
+    with pytest.raises(ResultsSchemaError) as exc:
+        validate_results(drifted, source="drift.json")
+    msg = str(exc.value)
+    assert "drift.json" in msg and "2 of 2" in msg
+    assert "outcome_status" in msg and "goal_satisfied" in msg
+    # And it says WHICH rows, not just how many.
+    assert "s1" in msg
+
+
+def test_validate_refuses_a_dict_with_no_scores_key():
+    """The other reviewer case: two of these compare to '0.0% of 0 measured
+    spec(s)', zero flips, p=1.0 — a green report over no data at all."""
+    for empty in ({"created_at": "2026-01-01", "label": "x"},
+                  _run("x", [])):
+        with pytest.raises(ResultsSchemaError):
+            validate_results(empty, source="empty.json")
+
+
+def test_the_unvalidated_empty_pair_really_did_render_clean():
+    """Non-vacuity for the refusal above: the comparison itself is pure and
+    total, so it STILL produces this. The refusal is the only thing standing
+    between a drifted file and a confident report — if this assertion ever
+    fails, the guard above is no longer the thing protecting anyone."""
+    cmp = compare_runs({"label": "a"}, {"label": "b"})
+    assert cmp.paired == 0 and cmp.p_value == 1.0 and cmp.rate_a == 0.0
+
+
+def test_validate_refuses_a_partially_drifted_file_rather_than_skipping_rows():
+    """One bad row condemns the file. Skipping it would silently compare a
+    spec set nobody chose — the same 'filtered slice stands for the corpus'
+    failure the publish gate exists to stop."""
+    mixed = _run("mixed", [_row("s1", ok=True), {"task_id": "s2"}])
+    with pytest.raises(ResultsSchemaError) as exc:
+        validate_results(mixed, source="mixed.json")
+    assert "1 of 2" in str(exc.value)
+
+
+def test_validate_checks_key_PRESENCE_not_truthiness():
+    """`goal_satisfied: None` (judge skipped) and `outcome_status: "skipped"`
+    are both legitimate on a real card; a truthiness check would refuse every
+    run that contains a skip."""
+    validate_results(_run("ok", [_row("s1", ok=None, status="skipped")]))
+    assert set(REQUIRED_SCORE_KEYS) == {"task_id", "outcome_status",
+                                        "goal_satisfied"}
+
+
+def test_validate_refuses_non_objects():
+    with pytest.raises(ResultsSchemaError):
+        validate_results(["not", "a", "card"], source="list.json")
+    with pytest.raises(ResultsSchemaError):
+        validate_results({"scores": "nope"}, source="str.json")
+    with pytest.raises(ResultsSchemaError):
+        validate_results(_run("x", [None]), source="none-row.json")
 
 
 # --------------------------------------------------------------------------- #

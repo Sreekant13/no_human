@@ -4954,13 +4954,20 @@ def bench_publish(results_file: str, force: bool):
 
 
 def _load_results_json(name: str) -> tuple[dict, Path]:
-    """Load a results file by path or by bare filename inside RESULTS_DIR.
+    """Load and SHAPE-CHECK a results file by path or bare filename.
 
     Same resolution `bench publish` uses, so `nh bench compare v13.json
-    v14.json` works from anywhere in the repo. Exits 1 on an unreadable file:
-    that is a USAGE failure, not a verdict — the comparison itself never exits
-    non-zero (see the command docstring).
+    v14.json` works from anywhere in the repo. Exits 1 on an unreadable OR
+    schema-drifted file: both are USAGE failures, not verdicts — the
+    comparison itself never exits non-zero (see the command docstring).
+
+    The shape check is not fussiness. A row missing `outcome_status` counts as
+    RAN and a row missing `goal_satisfied` counts as FAILED, so a drifted file
+    renders a confident wall of regressions indistinguishable from a real
+    catastrophe; two files with no `scores` key at all render "0.0% of 0
+    measured spec(s)" and exit 0. `validate_results` states the whole argument.
     """
+    from ..eval.bench_compare import ResultsSchemaError, validate_results
     from ..eval.northstar_card import RESULTS_DIR
     path = Path(name)
     if not path.exists():
@@ -4971,8 +4978,10 @@ def _load_results_json(name: str) -> tuple[dict, Path]:
         console.print(f"[red]not a readable results file:[/] "
                       f"{escape(str(path))} — {escape(str(exc))}")
         sys.exit(1)
-    if not isinstance(data, dict):
-        console.print(f"[red]not a results card:[/] {escape(str(path))}")
+    try:
+        validate_results(data, source=path.name)
+    except ResultsSchemaError as exc:
+        console.print(f"[bold red]refusing to compare:[/] {escape(str(exc))}")
         sys.exit(1)
     return data, path
 
@@ -5008,7 +5017,7 @@ def bench_compare(run_a: str, run_b: str, canary_files):
     """
     from ..eval.bench_compare import (
         MIN_DISCORDANT_FOR_POWER, compare_runs, flaky_canary, headline_caveat,
-        interpretation)
+        interpretation, undated_run_indices)
 
     card_a, path_a = _load_results_json(run_a)
     card_b, path_b = _load_results_json(run_b)
@@ -5023,7 +5032,12 @@ def bench_compare(run_a: str, run_b: str, canary_files):
 
     console.print(f"  paired specs: {int(cmp.paired)}  ·  "
                   f"both pass {int(cmp.both_pass)}  ·  "
-                  f"both fail {int(cmp.both_fail)}")
+                  f"both fail {int(cmp.both_fail)}  ·  "
+                  # DISTINCT specs the pairing could not reach. A run compared
+                  # against a baseline it shares half a corpus with is not a
+                  # paired comparison, and this is the number that says so —
+                  # the four lists below say which specs and why.
+                  f"unpaired {int(cmp.unpaired)}")
     console.print(f"  [red]regressed (A✓→B✗) b={int(cmp.b_regressed)}[/]  ·  "
                   f"[green]fixed (A✗→B✓) c={int(cmp.c_fixed)}[/]")
     # Formatted OUTSIDE the print: an `escape(f"{x:.4f}")` nested inside the
@@ -5072,15 +5086,29 @@ def bench_compare(run_a: str, run_b: str, canary_files):
 
     if canary_files:
         history = [card_a, card_b]
+        names = [path_a.name, path_b.name]
         for extra in canary_files:
-            data, _ = _load_results_json(str(extra))
+            data, extra_path = _load_results_json(str(extra))
             history.append(data)
+            names.append(extra_path.name)
         canaries = flaky_canary(history)
         console.print("")
         console.print(f"  [bold]flaky canary[/] over {int(len(history))} run(s), "
                       "ordered by created_at — a spec that flips across 2+ "
                       "consecutive run-pairs is noise, not a result "
                       "(repetition, not isolation, decides)")
+        # "ordered by created_at" must not be asserted over runs that have no
+        # date. They are placed LAST rather than dropped, and named here, so a
+        # reader can see that the chain's tail is an assumption and not a
+        # measurement — an undated run in a different position changes which
+        # runs are adjacent, and therefore which specs flip.
+        undated = [names[i] for i in undated_run_indices(history)]
+        if undated:
+            console.print(
+                f"  [yellow]⚠ {int(len(undated))} run(s) carry no created_at "
+                f"and were placed LAST, in the order given: "
+                f"{escape(', '.join(undated))} — the chain's order is only as "
+                f"good as the dates on it[/]")
         if not canaries:
             console.print("  [dim]no spec flipped in 2+ consecutive run-pairs[/]")
         for c in canaries:

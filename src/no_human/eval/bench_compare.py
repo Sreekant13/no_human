@@ -87,6 +87,88 @@ def _scores(run: dict[str, Any]) -> list[dict[str, Any]]:
     return list(run.get("scores") or [])
 
 
+# --------------------------------------------------------------------------- #
+# Shape validation — refuse a drifted file, never render one
+# --------------------------------------------------------------------------- #
+
+class ResultsSchemaError(ValueError):
+    """A results file whose SHAPE cannot be compared, named rather than coped
+    with. Raised only by ``validate_results``; the comparison itself stays
+    pure and total."""
+
+
+#: Every score row must carry these KEYS. Presence, not truthiness:
+#: ``goal_satisfied`` is legitimately ``None`` when the judge was skipped, and
+#: ``outcome_status`` is legitimately "skipped".
+REQUIRED_SCORE_KEYS = ("task_id", "outcome_status", "goal_satisfied")
+
+
+def validate_results(run: Any, source: str = "<results>") -> None:
+    """Refuse a results dict this module would otherwise MISREPRESENT.
+
+    WHY THIS IS A REFUSAL AND NOT A TOLERANCE. Every default here fails in the
+    confident direction, which is the worst one for a report a human reads to
+    decide whether a change shipped:
+
+      - a row with no ``outcome_status`` reads as a row that RAN (the skip test
+        is an inequality), so a schema-drifted file's every spec enters the
+        pairing;
+      - a row with no ``goal_satisfied`` reads as FAILED (``bool(None)``), so
+        those specs pair as regressions against a healthy baseline;
+      - two files with no ``scores`` key at all compare cleanly: "0.0% of 0
+        measured spec(s)", zero flips, p=1.0, exit 0 — a green report over no
+        data whatsoever.
+
+    None of those is detectable downstream: the wall of fake regressions looks
+    exactly like a real catastrophe, and a reader has no way to tell them
+    apart. So the shape is checked ONCE, at load, and a file that fails it is
+    named and refused.
+
+    BAD ROWS ARE NOT SKIPPED. Dropping them would silently shrink the corpus —
+    the same "filtered slice stands for the corpus" failure the publish gate
+    exists to stop — and the resulting comparison would be over a spec set
+    nobody chose. One bad row condemns the file.
+    """
+    if not isinstance(run, dict):
+        raise ResultsSchemaError(
+            f"{source}: not a results card — expected a JSON object with "
+            f"`scores`, got {type(run).__name__}")
+    rows = run.get("scores")
+    if rows is None:
+        raise ResultsSchemaError(
+            f"{source}: no `scores` key — this is not a bench results file. "
+            f"Two such files compare to '0.0% of 0 measured spec(s)' with zero "
+            f"flips and p=1.0, which is a green report over no data")
+    if not isinstance(rows, list):
+        raise ResultsSchemaError(
+            f"{source}: `scores` is {type(rows).__name__}, not a list")
+    if not rows:
+        raise ResultsSchemaError(
+            f"{source}: `scores` is empty — there is nothing to pair, and an "
+            f"empty run compared against anything prints a clean result")
+    bad: list[str] = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            bad.append(f"row {i} is {type(row).__name__}, not an object")
+            continue
+        missing = [k for k in REQUIRED_SCORE_KEYS if k not in row]
+        if missing:
+            tid = row.get("task_id")
+            who = f"row {i}" if not tid else f"row {i} ({tid})"
+            bad.append(f"{who} lacks {', '.join(missing)}")
+    if bad:
+        shown = "; ".join(bad[:3])
+        more = f" (+{len(bad) - 3} more)" if len(bad) > 3 else ""
+        raise ResultsSchemaError(
+            f"{source}: {len(bad)} of {len(rows)} score row(s) do not carry "
+            f"{', '.join(REQUIRED_SCORE_KEYS)} — {shown}{more}. A row missing "
+            f"`outcome_status` counts as RAN and a row missing "
+            f"`goal_satisfied` counts as FAILED, so a drifted file renders a "
+            f"confident wall of regressions that reads exactly like a real "
+            f"one. Bad rows are refused, never skipped: dropping them would "
+            f"compare a spec set nobody chose")
+
+
 def spec_verdicts(run: dict[str, Any]) -> tuple[dict[str, SpecVerdict], list[str]]:
     """``({task_id: SpecVerdict}, unmeasured_task_ids)`` for one results dict.
 
@@ -358,15 +440,55 @@ class CanarySpec:
 MIN_CANARY_FLIPS = 2
 
 
+def undated_run_indices(runs: list[dict[str, Any]]) -> list[int]:
+    """Positions of runs carrying no ``created_at``, in the order supplied.
+
+    The canary's whole claim is "consecutive observations", and a run with no
+    date cannot be placed among them. It is not dropped — it is ORDERED LAST
+    and it is NAMED, so a caller can print the caveat instead of asserting an
+    ordering it does not have.
+    """
+    return [i for i, r in enumerate(runs) if not str(r.get("created_at") or "")]
+
+
+def order_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Chronological by ``created_at``, with UNDATED runs LAST.
+
+    THE BUG THIS FIXES, found by review: the key used to be
+    ``str(r.get("created_at") or "")``, and the empty string sorts BEFORE every
+    real timestamp — so an undated run was silently promoted to the FRONT of
+    the history, whatever position the caller supplied it in. That is not a
+    cosmetic ordering difference: the canary reads consecutive PAIRS, so moving
+    one run to the other end of the chain changes which specs are adjacent and
+    therefore which specs flip. The reviewer demonstrated the same four runs
+    flipping between flagged and not-flagged purely on whether the fourth run
+    carried a date. The old docstring claimed undated runs "keep their given
+    order", which was true of neither the code nor any caller's expectation.
+
+    Undated runs now sort after every dated one and keep their supplied order
+    among themselves (the index is the final tiebreak, so this is a stable
+    order without relying on a stable sort's incidental behaviour). ``last`` is
+    the honest position for a run whose date is unknown: it makes no claim
+    about a run it cannot place, and the caller names it in the output.
+    """
+    return [r for _, r in sorted(
+        enumerate(runs),
+        key=lambda ir: ((0, str(ir[1].get("created_at")), ir[0])
+                        if str(ir[1].get("created_at") or "")
+                        else (1, "", ir[0])))]
+
+
 def flaky_canary(runs: list[dict[str, Any]],
                  min_flips: int = MIN_CANARY_FLIPS) -> list[CanarySpec]:
     """Specs whose verdict flipped across ≥ ``min_flips`` consecutive run-pairs.
 
-    Takes the run history ORDERED BY ``created_at`` — and sorts by it here
-    anyway, stably, because a caller that globs a directory gets filesystem
-    order and a canary computed over shuffled history is noise measuring
-    itself. Runs with no ``created_at`` keep their given order (a stable sort
-    leaves equal keys alone).
+    Takes the run history ORDERED BY ``created_at`` — and re-orders by it here
+    anyway, through ``order_runs``, because a caller that globs a directory
+    gets filesystem order and a canary computed over shuffled history is noise
+    measuring itself. A run with NO ``created_at`` cannot be placed in a
+    chronology, so it sorts LAST rather than first, keeping its supplied order
+    among other undated runs; ``undated_run_indices`` names them so a caller
+    can say so in its output instead of asserting an order it does not have.
 
     A spec ABSENT from a run (or unmeasured in it) breaks the chain rather than
     counting as a failure: the dominant absence here is a repo that did not
@@ -378,8 +500,7 @@ def flaky_canary(runs: list[dict[str, Any]],
     """
     if len(runs) < 2:
         return []
-    ordered = sorted(runs, key=lambda r: str(r.get("created_at") or ""))
-    per_run = [spec_verdicts(r)[0] for r in ordered]
+    per_run = [spec_verdicts(r)[0] for r in order_runs(runs)]
 
     every_id: list[str] = []
     seen: set[str] = set()
