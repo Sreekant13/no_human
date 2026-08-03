@@ -25,6 +25,7 @@ import unicodedata
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -3021,6 +3022,7 @@ class Orchestrator:
                 if claim is not None:
                     return await self._gate_already_satisfied(
                         task, repo, attempt_id, claim, branch=branch,
+                        attempt_n=attempt_n,
                     )
                 detail = _NO_CHANGES_DETAIL
                 # Keep what the agent SAID. Task d9d458b5 explained three times
@@ -3350,7 +3352,8 @@ class Orchestrator:
             # blindly re-implementing. This reuses the bounded attempt loop
             # (max_attempts) — the tamper guard still fires first on every round,
             # so the worker cannot weaken tests to satisfy the reviewer.
-            await self._record_review_feedback(task, failed, decision.suggested_next)
+            await self._record_review_feedback(
+                task, failed, decision.suggested_next, attempt_n=attempt_n)
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
         await self.store.update_attempt(
             attempt_id,
@@ -4135,7 +4138,7 @@ class Orchestrator:
 
     async def _gate_already_satisfied(
         self, task: Task, repo: GitRepo, attempt_id: str, claim: str, *,
-        branch: str | None,
+        branch: str | None, attempt_n: int | None = None,
     ) -> TaskOutcome:
         """A zero-diff attempt claimed every criterion is ALREADY met, with the
         per-criterion evidence table. Never take the coder's word for it: the
@@ -4213,7 +4216,13 @@ class Orchestrator:
             # review findings on a diff. Detail differs from _NO_CHANGES_DETAIL
             # on purpose: a refuted claim resets the zero-diff streak and gets
             # the normal bounded retries.
-            await self._record_review_feedback(task, failed, decision.suggested_next)
+            await self._record_review_feedback(
+                task, failed, decision.suggested_next, attempt_n=attempt_n,
+                # This route reviews via `self.reviewer.review` directly, NOT
+                # via `_run_review`, so nothing appended this round to
+                # review_history: the round is one PAST what that list holds.
+                review_round=len(
+                    (task.context or {}).get("review_history") or []) + 1)
             return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
         await self.store.update_attempt(
             attempt_id, review_checklist=decision.as_dict(), review_passed=1,
@@ -4633,6 +4642,7 @@ class Orchestrator:
     async def _record_review_feedback(
         self, task: Task, failed_items: list,
         suggested_next: str | None = None,
+        *, attempt_n: int | None = None, review_round: int | None = None,
     ) -> None:
         """Persist the reviewer's failed checklist items so the NEXT attempt's
         prompt targets them (EVOLUTION_PLAN §2.2). Cited evidence (file:line) and
@@ -4654,6 +4664,104 @@ class Orchestrator:
             ctx["review_suggested_next"] = suggested_next
         task.context = ctx
         await self.store.update_task(task)
+        # B1/G2: the SAME findings, distilled once into a proposal the human can
+        # confirm. Above, they live for the length of this task; here they get a
+        # chance to outlive it. Hooked at the single point both FAIL routes
+        # (`_run_attempt`'s review, `_gate_already_satisfied`'s refutation) go
+        # through, so a third route cannot forget to learn.
+        await self._propose_review_learning(
+            task, ctx["review_feedback"], attempt_n=attempt_n,
+            review_round=review_round)
+
+    async def _propose_review_learning(
+        self, task: Task, findings: list[dict], *, attempt_n: int | None = None,
+        review_round: int | None = None,
+    ) -> None:
+        """Queue ONE proposal distilled from this FAIL round's blocking findings.
+
+        Wholly advisory, in both directions:
+        * it can never fail the attempt — every exception is swallowed into an
+          advisory (`brain/__init__.py`'s idiom; `nh doctor` counts these), and
+        * it can never reach the gate that produced it. It writes
+          ``confirmed=0``, and `confirmed_rules` is built from
+          ``list_memories(confirmed=True, …)`` — a HUMAN stands between a
+          reviewer's verdict and any rule derived from it.
+        """
+        if self.learning_queue is None or not findings:
+            return
+        try:
+            # Spend guard: a task already at its ceiling must not buy a utility
+            # call to learn from the round that exhausted it. Same predicate as
+            # the loop-head gate, without the blocker (`_check_lifetime_budget`).
+            if await self._at_lifetime_ceiling(task):
+                self._advisory(
+                    "review learning skipped: task is at its lifetime budget")
+                return
+            # `_run_review` has already appended THIS round to review_history,
+            # so its length IS the round number — but only on that route. The
+            # already-satisfied gate calls `self.reviewer.review` directly and
+            # never appends, so on that route the same expression reads the
+            # PREVIOUS round's count (or 1 on the first attempt) and the
+            # provenance line would name a round the reviewer did not run.
+            # That caller therefore passes its round explicitly.
+            round_no = review_round or (
+                len((task.context or {}).get("review_history") or []) or 1)
+            mem_id = await self.learning_queue.propose_from_review(
+                task, findings=findings, attempt=attempt_n,
+                review_round=round_no, distill=partial(
+                    self._distill_review_lesson, task),
+                # Refusal and dedupe both return a bare None; route the reason
+                # into the advisory stream so neither is silent.
+                note=self._advisory,
+            )
+            if mem_id:
+                self.emit("learning_proposed",
+                          f"queued review proposal {mem_id[:8]}")
+        except Exception as exc:  # noqa: BLE001 — advisory; never fails the attempt
+            self._advisory(f"review learning proposal skipped: {exc}")
+
+    async def _distill_review_lesson(self, task: Task, prompt: str) -> str:
+        """One bounded utility-tier turn: findings → a repo-level lesson.
+        Same shape as `_generate_stuck_hypothesis` — readonly, max_turns=1,
+        low effort, usage booked to the attempt's utility columns."""
+        backend = ClaudeBackend(model=self._utility_model(), readonly=True)
+        result = await backend.run(
+            prompt, cwd=Path(task.repo_path or "."), max_turns=1, effort="low",
+        )
+        self._note_utility_usage(result)
+        return (result.final_text or "")[:600]
+
+    @staticmethod
+    def _over_lifetime_caps(
+        used_attempts: int, cap_attempts: int, used_tokens: int, cap_tokens: int,
+    ) -> bool:
+        """THE lifetime-ceiling predicate — the single definition of "this task
+        has spent its whole life's budget", on either axis.
+
+        It exists as one function because it had briefly become two: the
+        BUDGET_EXHAUSTED gate (`_check_lifetime_budget`) and the advisory
+        spend guard (`_at_lifetime_ceiling`) each carried their own copy of
+        ``used_attempts < cap_attempts and used_tokens < cap_tokens``. A copy is
+        not a shared predicate: the two could drift into disagreeing about what
+        "exhausted" means, and the attempts half of the duplicate had no test
+        that could tell — deleting it left every test green. Both callers now
+        route here, so there is exactly one thing to test and to change.
+
+        Tokens are COST-WEIGHTED at both call sites (`core.pricing`); this
+        function does no weighting itself, it only compares what it is given.
+        """
+        return not (used_attempts < cap_attempts and used_tokens < cap_tokens)
+
+    async def _at_lifetime_ceiling(self, task: Task) -> bool:
+        """Has the task spent its whole lifetime budget? The exact predicate
+        `_check_lifetime_budget` gates on (cost-weighted tokens OR attempts) —
+        literally the same function, `_over_lifetime_caps` — with no blocker
+        built and no event emitted, for advisory callers that only need to know
+        whether spending more is allowed."""
+        used_attempts, by_class = await self.store.lifetime_usage_by_class(task.id)
+        cap_attempts, cap_tokens = self._lifetime_limits(task)
+        return self._over_lifetime_caps(
+            used_attempts, cap_attempts, _weighted_tokens(**by_class), cap_tokens)
 
     def _review_base(self, repo: GitRepo, base: str | None) -> str:
         """The commit the whole change should be reviewed against.
@@ -6305,7 +6413,10 @@ class Orchestrator:
         raw_tokens = sum(by_class[n] for n in Store._usage_columns_by_class())
         breakdown = _class_breakdown(**by_class)
         cap_attempts, cap_tokens = self._lifetime_limits(task)
-        if used_attempts < cap_attempts and used_tokens < cap_tokens:
+        # The shared predicate — see `_over_lifetime_caps`. This gate and the
+        # advisory `_at_lifetime_ceiling` used to hold separate copies of it.
+        if not self._over_lifetime_caps(
+                used_attempts, cap_attempts, used_tokens, cap_tokens):
             self.emit(
                 "lifetime_budget",
                 # Headline only, and it must stay inside 60 characters:
