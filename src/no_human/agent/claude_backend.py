@@ -86,6 +86,37 @@ _TRANSPORT_RETRY_DELAY_S = 5.0
 TRANSPORT_DIAGNOSIS_MARKER = "[transport]"
 
 
+def _opening_span(text: str) -> tuple[str, int]:
+    """``(haystack, opening_len)`` — the text's opening, de-wrapped.
+
+    The first line is where the CLI's own wording lands, but "the first line"
+    as ``splitlines()[0]`` reports it is decided by whatever wrapped the text:
+    a terminal, a log formatter, or an exception renderer may put the break in
+    the middle of ``Stream closed``, and may double the spaces around it. So
+    the opening line is whitespace-normalised, and the line that FOLLOWS it is
+    appended — with a single space, exactly as if the break were never there.
+
+    ``opening_len`` is what stops that from becoming a wider search: it is the
+    length of the opening line alone, and a caller must require the marker to
+    start before it. A marker that starts on the second line is therefore still
+    a miss; only one that starts on the first and spills over is a hit.
+
+    Leading blank lines are skipped so a text that begins with a newline still
+    has an opening (``.strip()`` upstream covers the common case, this covers
+    a caller that does not strip).
+    """
+    lines = text.splitlines()
+    start = 0
+    while start < len(lines) and not lines[start].strip():
+        start += 1
+    if start >= len(lines):
+        return "", 0
+    opening = " ".join(lines[start].split())
+    following = (
+        " ".join(lines[start + 1].split()) if start + 1 < len(lines) else "")
+    return f"{opening} {following}".strip(), len(opening)
+
+
 def is_transport_failure(result: "AgentResult") -> bool:
     """Did this run die in the transport rather than fail as a task?
 
@@ -107,7 +138,7 @@ def is_transport_failure(result: "AgentResult") -> bool:
       path in ``_run_once``). Either means the failure is the SESSION's, not
       something the model wrote, so the marker may match anywhere in the text
       (the traceback the exception path appends is several lines down); or
-    * the marker is on the **first line**. ``_run_once`` leads with what the
+    * the marker **opens** the text. ``_run_once`` leads with what the
       CLI itself said (``last_result_text`` is prepended before the traceback,
       and is only ever captured from an errored result), and the observed
       incident's text is literally ``Stream closed unexpectedly``. Model prose
@@ -117,8 +148,15 @@ def is_transport_failure(result: "AgentResult") -> bool:
     observed shape outright — the recorded incident arrives as ``is_error=True,
     subtype="success", stop_reason=None, api_error_status=None`` (see the stub
     in ``tests/test_stream_closure_retry.py``, which reproduces it over a real
-    subprocess). Requiring only the first line would miss the exception path
+    subprocess). Requiring only the opening would miss the exception path
     when the CLI said nothing and the traceback is all there is.
+
+    "Opens" is read off ``_opening_span`` rather than off ``splitlines()[0]``,
+    because a physical first line is an artefact of whatever wrapped the text:
+    ``Stream\\nclosed unexpectedly`` and ``Stream  closed`` are the same message
+    as ``Stream closed unexpectedly`` and used to dodge the match. What did NOT
+    change is how much text is eligible: the marker must still START in the
+    opening line. A phrase quoted further down is still not a transport death.
     """
     if not result.is_error:
         return False
@@ -127,8 +165,11 @@ def is_transport_failure(result: "AgentResult") -> bool:
         return False
     structured = bool(getattr(result, "api_error_status", None)) or (
         (result.stop_reason or "") == "error")
-    haystack = text if structured else text.splitlines()[0]
-    return any(m in haystack for m in _TRANSPORT_FAILURE_MARKERS)
+    if structured:
+        return any(m in text for m in _TRANSPORT_FAILURE_MARKERS)
+    opening, first_len = _opening_span(text)
+    return any(0 <= opening.find(m) < first_len
+               for m in _TRANSPORT_FAILURE_MARKERS)
 
 
 #: What this backend can do, for the seam. Every field is True except the two

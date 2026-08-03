@@ -613,6 +613,76 @@ def test_model_prose_about_transports_is_not_a_transport_death():
     # deliberate stopping point, and the shape above is the one that occurs.
 
 
+def test_a_wrapped_opening_line_is_still_a_transport_death():
+    """Whoever wrapped the text does not get to decide whether we retry.
+
+    The corroborating signal is "the marker OPENS the text", but it used to be
+    read off `splitlines()[0]` — so a break or a doubled space landing inside
+    `Stream closed` made the recorded incident's own message invisible. The
+    message is the same message however a terminal, a log formatter or an
+    exception renderer laid it out.
+
+    The width of the search is unchanged, and the second half of this test is
+    the control that says so: the marker must still START on the opening line.
+    """
+    def r(text):
+        return AgentResult(
+            final_text=text, num_turns=1, is_error=True, tokens_used=0,
+            session_id=None, stop_reason=None, api_error_status=None)
+
+    # WRAPPED — the break falls inside the phrase.
+    assert is_transport_failure(r("Stream\nclosed unexpectedly by consumer"))
+    assert is_transport_failure(r("API request failed with a connection\n"
+                                  "error: upstream hung up\n"
+                                  "  at Object.<anonymous>"))
+    # RE-SPACED, and indented by whatever printed it.
+    assert is_transport_failure(r("   Stream  closed unexpectedly"))
+    assert is_transport_failure(r("\n\n\tStream\tclosed unexpectedly"))
+    # Still the observed shape, unwrapped, with the traceback under it.
+    assert is_transport_failure(
+        r("Stream closed unexpectedly\n" + _PROSE_ABOUT_TRANSPORTS))
+
+    # CONTROL — a marker that starts on the SECOND line is not an opening, and
+    # de-wrapping must not turn it into one. `_PROSE_ABOUT_TRANSPORTS` is
+    # exactly this shape: a lead-in line, then a bullet naming the phrase.
+    assert not is_transport_failure(r(_PROSE_ABOUT_TRANSPORTS))
+    assert not is_transport_failure(
+        r("Done. Summary of the change:\nStream closed handling added"))
+    # ...and quoting one mid-text, several lines down, is still not a match.
+    assert not is_transport_failure(
+        r("Fixed the retry.\n\nThe CLI reports it as\n"
+          '"Stream closed unexpectedly" and we now retry once.'))
+    # THE STOPPING POINT, stated rather than hidden: a wrap that pushes the
+    # WHOLE phrase onto the next line reads identically to a prose lead-in
+    # followed by a bullet about it, and stays a miss. Widening to cover it
+    # would take `_PROSE_ABOUT_TRANSPORTS` with it, which is the defect this
+    # whole section exists for.
+    assert not is_transport_failure(r("API request failed with a\n"
+                                      "connection error: upstream hung up"))
+
+
+def test_opening_span_keeps_the_search_one_line_wide():
+    """The de-wrapping helper, directly: it joins the following line so a split
+    phrase reads whole, and reports the opening line's own length so a caller
+    can refuse anything that starts past it. Without that second return value
+    the join would silently double the eligible text.
+    """
+    from no_human.agent.claude_backend import _opening_span
+
+    haystack, opening_len = _opening_span("stream\nclosed unexpectedly\nmore")
+    assert haystack == "stream closed unexpectedly"   # third line excluded
+    assert opening_len == len("stream")
+    assert haystack.find("stream closed") < opening_len
+
+    # A marker wholly inside the joined-on line starts at/after opening_len.
+    haystack, opening_len = _opening_span("done:\nstream closed here")
+    assert haystack.find("stream closed") >= opening_len
+
+    # Whitespace-only input, and a following blank line, both stay safe.
+    assert _opening_span("   \n\t\n") == ("", 0)
+    assert _opening_span("stream closed\n\ntail") == ("stream closed", 13)
+
+
 async def test_prose_about_transports_never_buys_a_second_session(
         tmp_path, monkeypatch):
     """The consequence, on the real `run()` path rather than on the predicate:
