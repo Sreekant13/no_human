@@ -66,6 +66,17 @@ half-creates a task.
   own workflow's In Progress / Done **status category**, resolved at runtime
   from the issue's available transitions — never a hardcoded transition id. It
   never closes an issue and never merges: those stay human actions.
+- **A one-click hand-off from inside Jira** is available as an optional Jira
+  app in [`integrations/jira-forge/`](../integrations/jira-forge/README.md).
+  It adds a "Send to no_human" action for one issue or a whole selection —
+  and it does **not** talk to no_human. It cannot: a Forge app runs in
+  Atlassian's cloud and no_human runs on `127.0.0.1`. It writes a **label**,
+  and this poller picks the issue up on its next tick with a JQL such as
+  `labels = "no_human" AND statusCategory != Done`. The poller is the whole
+  transport, so there is no inbound network path, no hosted tier and no
+  credential in the app. Pressing the button twice cannot create two tasks —
+  dedupe on `(source, external_id)` is what guarantees it, asserted in
+  `tests/test_jira_forge_label_roundtrip.py`.
 
 ### Linear specifics
 
