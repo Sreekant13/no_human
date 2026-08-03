@@ -1683,6 +1683,136 @@ async def test_planner_prompt_carries_linked_repos(bare_repo, tmp_path, store):
     assert all("Never assume a linked repo is absent" in p for p in prompts)
 
 
+async def test_planner_prompt_carries_repo_conventions(bare_repo, tmp_path, store):
+    """The planner receives the target repo's own conventions EXPLICITLY.
+
+    It used to receive them by accident: read-only sessions emitted no
+    `--setting-sources` flag, so the SDK loaded the repo's instruction files on
+    its own. Closing that leak (the repo under review was instructing the
+    reviewer judging it) took the planner's conventions with it, because one
+    mechanism served both. This pins the deliberate replacement, so the next
+    person to touch `setting_sources` cannot silently un-inject it.
+
+    This config does NOT fan out (the MoA gate needs signals), so this test
+    sees exactly one prompt and says so with an assertion rather than an
+    `all()` over a single element. The MoA path has its own test below — an
+    earlier version of this docstring claimed to cover it, and a planted mutant
+    that stripped the conventions from the proposer path alone survived the
+    whole file.
+    """
+    cfg = _planning_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    (bare_repo / "AGENTS.md").write_text("PLANNER_CONVENTION_MARKER: use tabs.")
+    t = Task.new("a task", repo_path=str(bare_repo))
+    backend = PromptCapturingPlannerBackend(_SAMPLE_PLAN)
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=backend):
+        await orch._generate_plan(t, GitRepo(bare_repo))
+
+    prompts = _base_prompts(backend)
+    assert len(prompts) == 1, (
+        f"expected the single-planner path, captured {len(prompts)} base "
+        "prompts — if MoA now fires by default this test's scope claim is wrong")
+    assert "PLANNER_CONVENTION_MARKER: use tabs." in prompts[0]
+    # ADVISORY, never the coder's "AUTHORITATIVE … follow these over generic
+    # guidance". That header would rank repo-authored text above the planner's
+    # own directives, and the plan feeds `declared_files`, which the coder's
+    # scope guard reads. The framing is the guard here, so pin it.
+    assert "advisory" in prompts[0].lower()
+    assert "AUTHORITATIVE" not in prompts[0], (
+        "the planner must not be told the repo's files outrank its instructions")
+    # HONEST SCOPE, because the assertion above reads stronger than it is: this
+    # fixture writes a benign AGENTS.md, so it pins the header WE emit and
+    # nothing more. Repo text is interpolated verbatim, so a repo that writes
+    # the word AUTHORITATIVE — or "ignore the label above" — puts it in the
+    # prompt and no assertion here can stop it. An independent reviewer
+    # demonstrated exactly that. The framing is a real improvement over handing
+    # the planner the coder's authority header; it is NOT a containment
+    # boundary, and this test must not be read as claiming one.
+    # And the subordination clause must name what is genuinely below it in THIS
+    # prompt. The coder's clause says "the standing safety rules below still
+    # apply", which is true there and vacuous here — no safety rules follow.
+    assert "planning instructions below" in prompts[0]
+
+
+async def test_planner_prompt_unchanged_when_repo_has_no_conventions(
+    bare_repo, tmp_path, store
+):
+    """A repo that declares no conventions gets NO conventions block — not an
+    empty header, not a stray blank. The guard against 'fixed one path,
+    perturbed every other repo'.
+
+    Scoped honestly: this asserts the block is ABSENT, which is what it can
+    see. It does not assert byte-identity against the pre-change prompt — that
+    needs the old revision to compare against, and a docstring claiming it
+    while asserting two `not in`s is the kind of overclaim this file has been
+    bitten by."""
+    cfg = _planning_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    # A PRECONDITION, asserted, not a cleanup loop. `bare_repo` is
+    # function-scoped, so it never carries an instruction file and the deletion
+    # this used to do could not fire — a no-op dressed as a safeguard, which
+    # reads as protection and provides none. Assert the state instead, so the
+    # day `bare_repo` starts seeding one, this fails loudly rather than quietly
+    # testing nothing. Derived from the orchestrator's own list so a third
+    # recognised filename is covered with no edit here.
+    present = [r for r in orch._REPO_INSTRUCTION_FILES if (bare_repo / r).is_file()]
+    assert not present, (
+        f"bare_repo now seeds {present}; this test needs a repo that declares "
+        "no conventions, so it is no longer testing what it claims")
+    t = Task.new("a task", repo_path=str(bare_repo))
+    backend = PromptCapturingPlannerBackend(_SAMPLE_PLAN)
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=backend):
+        await orch._generate_plan(t, GitRepo(bare_repo))
+
+    prompts = _base_prompts(backend)
+    assert prompts
+    assert all("advisory" not in p.lower() for p in prompts)
+    assert all("--- AGENTS.md ---" not in p for p in prompts)
+
+
+async def test_every_moa_proposer_gets_the_repo_conventions(bare_repo, tmp_path, store):
+    """The conventions must reach EVERY proposer, not just the lone planner.
+
+    This test exists because its absence was proven, not suspected. An
+    independent reviewer planted a mutant that stripped the conventions from
+    `_generate_plan_moa`'s `base_prompt` only, left the single-planner path
+    intact, and ran the whole file: 149 passed. A regression down the fan-out
+    path was invisible.
+
+    `min_signals=0` forces the fan-out, so this exercises the proposer path
+    rather than the complexity gate.
+    """
+    cfg = _moa_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None))
+    (bare_repo / "AGENTS.md").write_text("MOA_CONVENTION_MARKER: prefer composition.")
+    t = Task.new("a task", repo_path=str(bare_repo))
+    await store.create_task(t)
+    fake = MoAFakeBackend(
+        proposals={
+            "minimal-first": _SAMPLE_PLAN,
+            "risk-first": _SAMPLE_PLAN,
+            "test-first": _SAMPLE_PLAN,
+        },
+        aggregate_text="## FILES TO CHANGE/CREATE\n- calc.py: synthesized\n",
+    )
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
+        await orch._generate_plan(t, GitRepo(bare_repo))
+
+    prompts = _base_prompts(fake)
+    # The count is the load-bearing part: `all()` over one element is what let
+    # the mutant survive last time.
+    assert len(prompts) == 3, (
+        f"expected 3 proposer prompts, captured {len(prompts)} — the fan-out "
+        "did not fire, so this asserts nothing about the MoA path")
+    assert all("MOA_CONVENTION_MARKER: prefer composition." in p for p in prompts)
+    assert all("AUTHORITATIVE" not in p for p in prompts)
+
+
 async def test_planner_prompt_unchanged_for_single_repo(bare_repo, tmp_path, store):
     """No linked repos → no block, so the cacheable prefix is untouched."""
     cfg = _planning_config(tmp_path)
@@ -5116,3 +5246,41 @@ async def test_ci_deliberately_disabled_still_opens_a_pr(bare_repo, tmp_path, st
                 and "CI backend configured" in e.get("text", "")]
     assert [e for e in events if e["kind"] == "ci_skipped"], \
         "the honest 'no remote CI ran' signal must still fire"
+
+
+async def test_planning_emits_what_steered_the_plan(bare_repo, tmp_path, store):
+    """A human approving at the plan gate sees the plan, never what shaped it.
+
+    The emit is the only record that repo-authored text entered the planner's
+    context. It must name the files, and it must name the ones DROPPED by the
+    aggregate cap — a file absent from the context is precisely the one an
+    approver cannot otherwise know to ask about.
+
+    It must NOT carry the file contents: those are already in the prompt, and
+    duplicating them into the event stream would swamp it.
+    """
+    cfg = _planning_config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    # From the orchestrator's own list — see the note in test_repo_instructions.
+    _f1, _f2, _f3 = Orchestrator._REPO_INSTRUCTION_FILES[:3]
+    (bare_repo / _f1).write_text("c" * 20_000)
+    (bare_repo / _f2).write_text("a" * 20_000)
+    (bare_repo / _f3).write_text("CANARY_SHOULD_NOT_BE_EMITTED")
+    t = Task.new("a task", repo_path=str(bare_repo))
+    backend = PromptCapturingPlannerBackend(_SAMPLE_PLAN)
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=backend):
+        await orch._generate_plan(t, GitRepo(bare_repo))
+
+    lines = [e.get("text", "") for e in events
+             if "repo conventions used as context" in e.get("text", "")]
+    assert len(lines) == 1, f"expected exactly one audit line, got {lines}"
+    line = lines[0]
+    assert _f1 in line and _f2 in line
+    assert "truncated" in line
+    assert "DROPPED" in line and _f3 in line, (
+        f"a file the planner never saw was not named: {line}")
+    assert "CANARY_SHOULD_NOT_BE_EMITTED" not in line, (
+        "the audit line is leaking file CONTENT into the event stream")

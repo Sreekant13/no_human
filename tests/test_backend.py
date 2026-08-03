@@ -180,10 +180,29 @@ def test_coder_sessions_are_project_scoped(tmp_path):
     opts_bare = b._options(tmp_path, 40)
     assert opts_bare.setting_sources == ["project"]
 
-    # Read-only sessions (reviewer/planner/supervisor) stay hermetic.
+    # Read-only sessions (reviewer/planner/supervisor) are hermetic — and the
+    # value must be the EMPTY LIST, never None.
+    #
+    # This assertion used to read `is None`, which is how the hole stayed
+    # invisible: it encoded the belief that None means "no sources". None means
+    # "no --setting-sources flag is emitted", and the CLI then applies its own
+    # default, which loads `user` and `project`. Proven with a live canary — a
+    # read-only session pointed at a directory whose only file was a project
+    # instruction file carrying a canary word returned that word. (Generic on
+    # purpose: the export drops that document, and the line above already spends
+    # this file's one declared citation of it.)
+    #
+    # The consequence was that the repository under review supplied instructions
+    # into the context of the reviewer judging it. `[]` emits the flag with no
+    # sources, which is the only value that actually means hermetic.
     r = ClaudeBackend(model="claude-opus-5", readonly=True)
     opts_ro = r._options(tmp_path, 40)
-    assert opts_ro.setting_sources is None
+    assert opts_ro.setting_sources == [], (
+        "None does not mean hermetic — it means the CLI picks the default")
+
+    # A read-only session WITH skills still needs project scope to find them.
+    opts_ro_skills = r._options(tmp_path, 40, skills=["a"])
+    assert opts_ro_skills.setting_sources == ["project"]
 
 
 async def test_the_clis_own_reason_survives_the_sdk_wrapper(tmp_path, monkeypatch):
