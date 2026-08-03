@@ -121,6 +121,75 @@ def test_partial_work_off_the_resume_line_is_rejected(orch, chain):
         chain["repo"], ctx, attempt_n=2) == chain["resume_point"]
 
 
+def _lose_a_commit(work) -> str:
+    """A real commit, then really pruned — the shape a `git gc` or a history
+    rewrite leaves behind. A hand-written fake sha would not prove the decision
+    consults the object store; the `cat-file -e` assertion is the probe that the
+    positive case really became negative. Everything else in `chain` stays
+    reachable through `main` and `unrelated`, so only this commit goes."""
+    _git(work, "checkout", "-q", "-b", "gone")
+    (work / "gated.py").write_text("the commit a human gated\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "[WIP-BLOCKED] gated")
+    sha = _git(work, "rev-parse", "HEAD")
+    _git(work, "checkout", "-q", "main")
+    _git(work, "branch", "-D", "gone")
+    _git(work, "reflog", "expire", "--expire=now", "--all")
+    _git(work, "gc", "--prune=now", "--quiet")
+    assert subprocess.run(["git", "cat-file", "-e", sha], cwd=work,
+                          capture_output=True).returncode != 0, \
+        "the resume point must really be gone, or this test proves nothing"
+    return sha
+
+
+def test_a_vanished_resume_point_does_not_veto_the_partial_that_survived(
+        orch, chain):
+    """THE DATA LOSS. Nothing pushes a checkpoint, so a pruned resume point is
+    routine — and `_ancestor_of` fails CLOSED, which on an unreadable ancestor
+    is not caution but a veto cast by a commit that no longer exists. It
+    rejected the [WIP-PARTIAL] the previous attempt paid tens of turns for, won
+    `candidate or resume_sha`, and sent the attempt back to base; the caller
+    then announced the loss of the commit it could not read and said nothing
+    about the work it could."""
+    work = chain["repo"].path
+    gone = _lose_a_commit(work)
+    ctx = {"resume_from": {"sha": gone, "by": "human"},
+           "handoff": {"wip_sha": chain["wip"]}}
+    assert orch._resume_branch_point(chain["repo"], ctx, attempt_n=2) == chain["wip"]
+
+
+def test_a_vanished_resume_point_still_reaches_the_caller_to_be_announced(
+        orch, chain):
+    """The loud fallback must stay reachable. With no partial to fall back to
+    (attempt 1 of a run has none), the vanished sha is still what this returns —
+    `_run_attempt` needs it to name the loss it is about to report."""
+    work = chain["repo"].path
+    gone = _lose_a_commit(work)
+    ctx = {"resume_from": {"sha": gone, "by": "human"},
+           "handoff": {"wip_sha": chain["wip"]}}
+    assert orch._resume_branch_point(chain["repo"], ctx, attempt_n=1) == gone
+    assert orch._resume_branch_point(
+        chain["repo"], {"resume_from": {"sha": gone}}, attempt_n=2) == gone
+
+
+def test_a_vanished_resume_point_cannot_veto_on_lineage_it_cannot_prove(
+        orch, chain):
+    """The policy, stated executably. `orphan` does NOT descend from the resume
+    point, and while that point is READABLE the check rejects it — see
+    `test_partial_work_off_the_resume_line_is_rejected`, the control for this.
+    Once the point is gone the ancestry question is unanswerable, and the choice
+    is no longer "resume point vs partial" (nothing can branch onto a commit the
+    object store lacks) but "partial vs base". Base discards work that exists,
+    so the partial wins; the caller announces the substitution and names both
+    shas."""
+    work = chain["repo"].path
+    gone = _lose_a_commit(work)
+    ctx = {"resume_from": {"sha": gone, "by": "human"},
+           "handoff": {"wip_sha": chain["orphan"]}}
+    assert orch._resume_branch_point(
+        chain["repo"], ctx, attempt_n=2) == chain["orphan"]
+
+
 def test_unresumed_run_still_uses_its_own_partial_work(orch, chain):
     """No resume_from at all (the ordinary retry loop) — unchanged behaviour."""
     ctx = {"handoff": {"wip_sha": chain["wip"]}}

@@ -2272,6 +2272,32 @@ class Orchestrator:
                     kind = "WIP-PARTIAL" if branched_from_own_partial else "WIP-BLOCKED"
                     self.emit("resume_wip",
                               f"branching from {kind} {checkpoint[:8]}")
+                    # A checkpoint was USED, and a different one was still lost:
+                    # the human-gated resume point the repository can no longer
+                    # read, which `_resume_branch_point` stepped over to reach
+                    # the newest work that survives. Continuing is right — the
+                    # gated commit is unrecoverable and this is the only work
+                    # left — but `nh logs` reads ATTEMPTS, and an attempt row
+                    # carrying nothing but a clean `resume_wip` reads as "the
+                    # human's answer was continued from", which is not what
+                    # happened.
+                    gated = (ctx.get("resume_from") or {}).get("sha", "")
+                    if (gated and gated != checkpoint
+                            and not self._commit_exists(repo, gated)):
+                        stepped_over = (
+                            f"checkpoint {gated[:8]} is no longer in the "
+                            f"repository — the commit it names cannot be read "
+                            f"(pruned, or dropped by a history rewrite; nothing "
+                            f"pushes checkpoints, so they live only in the local "
+                            f"object store). This attempt continued from "
+                            f"{kind} {checkpoint[:8]} instead — the newest work "
+                            f"that still exists — so anything committed only on "
+                            f"{gated[:8]} is NOT in it."
+                        )
+                        self.emit("resume_checkpoint_lost", stepped_over,
+                                  ok=False, sha=gated)
+                        await self.store.update_attempt(
+                            attempt_id, resume_checkpoint_lost=stepped_over)
                 else:
                     lost = (
                         f"checkpoint {checkpoint[:8]} is no longer in the "
@@ -2302,10 +2328,18 @@ class Orchestrator:
                     # PRIOR work, not a predictor that this attempt will fail.
                     # Nor does it repeat: once this attempt checkpoints its own
                     # [WIP-PARTIAL], `handoff.wip_sha` names a commit created in
-                    # this same object store, which is present. Consuming the
-                    # loop's budget here would trade a recoverable condition for
-                    # a park a human has to clear, which is the honesty
-                    # regression in the other direction.
+                    # this same object store, which is present — and
+                    # `_resume_branch_point` PREFERS it, because it skips the
+                    # ancestry test when the resume point cannot be read. That
+                    # sentence was written before the skip existed and was false
+                    # for as long: the ancestry test fell closed on the
+                    # unreadable sha, rejected the present partial, and this
+                    # branch fired again on every attempt — announcing the loss
+                    # of a commit that was already gone while silently
+                    # discarding one that was not. Consuming the loop's budget
+                    # here would trade a recoverable condition for a park a
+                    # human has to clear, which is the honesty regression in the
+                    # other direction.
             if effective_base is None:
                 effective_base = repo.current_branch()
             if base is None:
@@ -8225,14 +8259,33 @@ class Orchestrator:
         The partial work normally DESCENDS from the resume point, so preferring
         it loses nothing. When it does not — a handoff left over from before the
         human's answer, which that answer may have been redirecting away from —
-        the ancestry check rejects it and the resume point stands.
+        the ancestry check rejects it and the resume point stands. That test is
+        evidence only while the resume point can be READ; see below.
         """
         resume_sha = (ctx.get("resume_from") or {}).get("sha", "")
         # attempt 1 of a run has no predecessor of its own to inherit from.
         candidate = (ctx.get("handoff") or {}).get("wip_sha", "") if attempt_n > 1 else ""
-        if candidate and resume_sha and not self._ancestor_of(
-            repo, resume_sha, candidate
-        ):
+        # 🔴 The readability gate is load-bearing, and its absence was a live
+        # data loss. `_ancestor_of` fails CLOSED, and a resume point that has
+        # been pruned fails it for a reason that says nothing about the
+        # candidate's lineage — so a vanished sha rejected a PRESENT
+        # [WIP-PARTIAL] and then won `candidate or resume_sha`, on EVERY
+        # attempt. The caller announced the loss of the commit it could not
+        # read and said nothing about the tens of turns of work it could:
+        # fail-closed here is fail-OPEN on data loss.
+        #
+        # Once the resume point is unreadable the choice is not "resume point
+        # vs candidate" — nothing can branch onto a commit the object store
+        # does not have. It is "candidate vs base", and base discards work that
+        # exists. The candidate wins even when its lineage is unknowable (a
+        # stale handoff from before the human's answer is possible, and cannot
+        # be told apart from a fresh one without the commit the test needs);
+        # the caller announces that substitution with the same
+        # `resume_checkpoint_lost` event, naming both shas, so a human reading
+        # `nh logs` can still see which direction the attempt started from.
+        if (candidate and resume_sha
+                and self._commit_exists(repo, resume_sha)
+                and not self._ancestor_of(repo, resume_sha, candidate)):
             candidate = ""
         return candidate or resume_sha
 

@@ -107,9 +107,14 @@ def _plant_and_lose_checkpoint(work) -> str:
     return sha
 
 
-async def _attempt_with_checkpoint(repo, tmp_path, store, monkeypatch, sha):
+async def _attempt_with_checkpoint(repo, tmp_path, store, monkeypatch, sha,
+                                   *, wip_sha=None, attempt_n=1):
     """Drive the REAL `_run_attempt` branch decision with `sha` as the task's
-    human-gated resume point, and stop the moment the decision is made."""
+    human-gated resume point, and stop the moment the decision is made.
+
+    ``wip_sha``/``attempt_n`` describe the OTHER checkpoint: the [WIP-PARTIAL]
+    an earlier attempt of this run left behind, which only attempt 2+ inherits.
+    """
     cfg = load_config(tmp_path / "config.yaml")
     events: list[dict] = []
     # A stub coder: nothing calls it — `_build_implement_prompt` stops the
@@ -122,12 +127,15 @@ async def _attempt_with_checkpoint(repo, tmp_path, store, monkeypatch, sha):
         lambda self, *a, **k: (_ for _ in ()).throw(_Stop()))
 
     t = Task.new("resume me", repo_path=str(repo))
-    t.context = {"resume_from": {"sha": sha, "by": "human"}}
+    ctx = {"resume_from": {"sha": sha, "by": "human"}}
+    if wip_sha:
+        ctx["handoff"] = {"wip_sha": wip_sha}
+    t.context = ctx
     await store.create_task(t)
     await store.set_status(t, TaskStatus.IMPLEMENTING, validate=False)
 
     with pytest.raises(_Stop):
-        await orch._run_attempt(t, GitRepo(repo), 1, "main")
+        await orch._run_attempt(t, GitRepo(repo), attempt_n, "main")
     return t, events, (await store.list_attempts(t.id))[-1]
 
 
@@ -193,6 +201,86 @@ async def test_a_checkpoint_that_is_present_is_still_resumed_from(
 
     assert _git(repo, "rev-parse", attempt["branch_name"]) == kept
     assert [e for e in events if e.get("kind") == "resume_wip"]
+    assert not [e for e in events if e.get("kind") == "resume_checkpoint_lost"]
+    assert attempt["resume_checkpoint_lost"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_vanished_checkpoint_does_not_take_the_partial_work_with_it(
+    repo, tmp_path, store, monkeypatch,
+):
+    """THE SECOND LOSS, and the one nothing announced.
+
+    The fallback above is correct for the commit that is GONE. It was wrong for
+    the one that is still here: `_resume_branch_point` asked whether the
+    previous attempt's [WIP-PARTIAL] descends from the resume point, and
+    `_ancestor_of` fails CLOSED, so the pruned sha — which cannot answer that
+    question at all — vetoed the partial and won. Every attempt of the run then
+    branched from base, discarding tens of turns of work that was READABLE,
+    while the event stream announced only the loss of a commit that was already
+    unrecoverable. The run said `resume_checkpoint_lost` and meant it about the
+    wrong sha.
+    """
+    lost = _plant_and_lose_checkpoint(repo)
+    # ...and now attempt 1's own checkpoint, made AFTER the prune so it survives
+    # it, held on a branch exactly as the loop's own attempt branch holds it.
+    _git(repo, "checkout", "-q", "-b", "no-human/deadbeef")
+    (repo / "partial.py").write_text("# tens of turns of attempt 1's work\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "[WIP-PARTIAL] work")
+    wip = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", "main")
+    assert _readable(repo, wip)
+
+    _t, events, attempt = await _attempt_with_checkpoint(
+        repo, tmp_path, store, monkeypatch, lost, wip_sha=wip, attempt_n=2)
+
+    # --- the work that still exists is what the attempt starts from ---
+    branch = attempt["branch_name"]
+    assert _git(repo, "rev-parse", branch) == wip, (
+        "attempt 2 branched from base and threw away the [WIP-PARTIAL] that "
+        "survived, because a sha that did not survive vetoed it")
+    assert "partial.py" in _git(repo, "ls-tree", "-r", "--name-only", branch)
+    assert [e for e in events if e.get("kind") == "resume_wip"]
+
+    # --- and the gated checkpoint it stepped over is still announced ---
+    lost_events = [e for e in events if e.get("kind") == "resume_checkpoint_lost"]
+    assert len(lost_events) == 1, [e.get("kind") for e in events]
+    ev = lost_events[0]
+    assert ev.get("ok") is False
+    assert ev.get("sha") == lost
+    assert lost[:8] in ev["text"], "the event must NAME the sha that was lost"
+    assert wip[:8] in ev["text"], "...and the checkpoint it continued from"
+    assert attempt["resume_checkpoint_lost"], \
+        "nh logs shows attempts, not events — the event alone is not enough"
+    assert lost[:8] in attempt["resume_checkpoint_lost"]
+    assert wip[:8] in attempt["resume_checkpoint_lost"]
+    assert attempt["failure_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_present_resume_point_is_not_reported_as_lost(
+    repo, tmp_path, store, monkeypatch,
+):
+    """The negative control for the announcement above. A resume point that IS
+    readable, stepped over in favour of a newer partial that descends from it,
+    is the ordinary attempt-2 path — it lost nothing and must say nothing, or
+    the event stops meaning anything."""
+    _git(repo, "checkout", "-q", "-b", "no-human/deadbeef")
+    (repo / "gated.py").write_text("the commit a human gated\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "[WIP-BLOCKED] gated")
+    gated = _git(repo, "rev-parse", "HEAD")
+    (repo / "partial.py").write_text("# attempt 1's work, on top of it\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "[WIP-PARTIAL] work")
+    wip = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", "main")
+
+    _t, events, attempt = await _attempt_with_checkpoint(
+        repo, tmp_path, store, monkeypatch, gated, wip_sha=wip, attempt_n=2)
+
+    assert _git(repo, "rev-parse", attempt["branch_name"]) == wip
     assert not [e for e in events if e.get("kind") == "resume_checkpoint_lost"]
     assert attempt["resume_checkpoint_lost"] is None
 
