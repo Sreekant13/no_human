@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass, replace
@@ -53,6 +54,19 @@ class IntegrationStatus:
     # integration ever configured) | 'unconfigured'. Only github/gitlab are
     # ever 'ambient' — see `_AMBIENT_PROBES` below.
     status: str = "unconfigured"
+    # Whether the integration's own on/off switch in
+    # ``integrations.<name>.*`` is on. None = this integration HAS no such
+    # switch (github/gitlab/jenkins are views over `ci.*`, whose on/off is
+    # `ci.enabled`), so the UI must not render one.
+    #
+    # This is deliberately SEPARATE from `configured`. A Jira/Linear install
+    # can have every setting filled in and still poll nothing, because
+    # `nh serve` starts the poller only when `integrations.<name>.enabled` is
+    # true (cli/commands.py) — and before this field existed the panel said
+    # "Configured" for exactly that case, which is the "I don't have Linear"
+    # report. Folding it into `configured` instead would have changed what
+    # `configured` means for every existing caller and test.
+    enabled: bool | None = None
 
 
 @dataclass
@@ -231,9 +245,26 @@ _STATUS = {
 }
 
 
+def _status_for(name: str, config: dict) -> IntegrationStatus:
+    """One integration's status, with the ``enabled`` on/off switch filled in
+    from its own config block (see :func:`enable_field` — None when it has
+    none).
+
+    A config block with no status function yet (a NEW integration, added to
+    DEFAULT_CONFIG before the registry catches up) reports unconfigured rather
+    than raising: `setup_specs` discovers blocks, so it would otherwise crash
+    the whole wizard on the day someone adds one."""
+    derive = _STATUS.get(name)
+    if derive is None:
+        return IntegrationStatus(name, KIND_BY_NAME.get(name, ""), False, None,
+                                 "not configured",
+                                 enabled=enable_state(config, name))
+    return replace(derive(config), enabled=enable_state(config, name))
+
+
 def list_integrations(config: dict) -> list[IntegrationStatus]:
     """Every integration's configured/kind status. Pure; ``healthy`` is None."""
-    return [_STATUS[name](config) for name in _ORDER]
+    return [_status_for(name, config) for name in _ORDER]
 
 
 # --------------------------------------------------------------------------- #
@@ -604,13 +635,325 @@ def save_integration_config(name: str, fields: dict[str, str]) -> IntegrationSta
         _write_config_values(_config_mod.CONFIG_PATH, config_updates)
 
     refreshed = _config_mod.load_config(_config_mod.CONFIG_PATH)
-    status = _STATUS[name](refreshed.data)
+    status = _status_for(name, refreshed.data)
     # Saving (or clearing) a field must not make an ambiently-authenticated
     # github/gitlab look worse than the list endpoint already reports it —
     # overlay the same ambient check here (see list_integrations_with_ambient).
     if not status.configured and ambient_available(name):
         status = replace(status, status="ambient", detail=_AMBIENT_DETAIL)
     return status
+
+
+# --------------------------------------------------------------------------- #
+# Setup surface (onboarding "Connect your tools")                              #
+#                                                                               #
+# The wizard's integrations step is generated from THIS, not from a list of    #
+# names typed into the UI: `setup_specs` walks whatever blocks exist under     #
+# `DEFAULT_CONFIG["integrations"]`, so a sixth integration block appears in    #
+# onboarding with no JSX change at all.                                        #
+#                                                                               #
+# HARD RULE, and the reason this is a separate surface from                    #
+# `save_integration_config` above: NOTHING here ever writes a credential into  #
+# config.yaml. Onboarding collects the non-secret settings (team key, project  #
+# key, filters, on/off) and NAMES the ~/.no_human/.env variable the secret     #
+# belongs in — it never accepts the secret itself. `assert_config_safe_field`  #
+# is the enforcement point and every write goes through it.                    #
+# --------------------------------------------------------------------------- #
+
+#: Which ``~/.no_human/.env`` variable(s) hold each integration's credential,
+#: and the module that reads them. Values are NEVER read here — this maps a
+#: name to a name, so the wizard can tell the operator what to export.
+SETUP_SECRET_ENV: dict[str, tuple[str, ...]] = {
+    "jira": ("JIRA_API_TOKEN",),                       # intake/jira.py
+    "linear": ("LINEAR_API_KEY",),                     # intake/linear.py
+    "circleci": ("CIRCLECI_TOKEN",),                   # ci/circleci.py
+    # integrations/slack/worker.py — Socket Mode needs both.
+    "slack": ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"),
+    "teams": (),                                       # see SETUP_SECRET_NOTE
+}
+
+#: Plain-language note about an integration's credential, shown next to (or
+#: instead of) the env-var names. Teams is the awkward case and says so: its
+#: Power Automate URL is a secret that the code it feeds
+#: (notify.build_notifier) reads from ``notifications.teams_webhook_url`` in
+#: config.yaml, so onboarding refuses to collect it and points at the one
+#: place that already handles it.
+SETUP_SECRET_NOTE: dict[str, str] = {
+    "teams": (
+        "The Power Automate webhook URL carries its own credential in the "
+        "query string. Onboarding will not take it — paste it in "
+        "Settings → Integrations → Microsoft Teams."
+    ),
+}
+
+#: Every ``config.yaml`` path that FIELD_SPECS marks as a secret, and every
+#: field NAME it marks as a secret. Derived, not typed out: these are the two
+#: independent registries that already know what a credential is, so the guard
+#: below tracks them instead of restating them.
+_SECRET_CONFIG_PATHS = frozenset(
+    s.config_path for specs in FIELD_SPECS.values() for s in specs
+    if s.secret and s.config_path
+)
+_SECRET_FIELD_NAMES = frozenset(
+    s.name for specs in FIELD_SPECS.values() for s in specs if s.secret
+)
+_SECRET_ENV_FIELD_NAMES = frozenset(
+    s.name for specs in FIELD_SPECS.values() for s in specs if s.env_var
+)
+#: The mirror image: field names the registry explicitly declares NON-secret.
+#: Used only to resolve the `*_key` ambiguity below — never to override a
+#: secret declaration, which is checked first.
+_NONSECRET_FIELD_NAMES = frozenset(
+    s.name for specs in FIELD_SPECS.values() for s in specs if not s.secret
+)
+
+#: Last-resort name heuristic, for a credential that no registry knows about
+#: yet — a NEW integration block whose author forgot to declare it. These are
+#: words that are only ever credentials.
+_CREDENTIAL_NAME_RE = re.compile(
+    r"(?:^|_)(?:token|secret|password|passwd|pwd|credential|credentials|"
+    r"apikey|webhook|cookie|signature|sig|bearer|oauth|auth|pat)(?:_|$)",
+    re.IGNORECASE,
+)
+
+#: `*_key` cannot be decided by the word alone: Jira's `project_key` and
+#: Linear's `team_key` are plain settings, while PagerDuty's `routing_key` and
+#: anyone's `api_key` are credentials. So it is resolved by DECLARATION, not by
+#: spelling, and it fails CLOSED — see :func:`is_credential_name`.
+_AMBIGUOUS_KEY_RE = re.compile(r"(?:^|_)key$", re.IGNORECASE)
+
+
+def is_credential_name(field: str) -> bool:
+    """Would a field called *field* hold a credential?
+
+    Four oracles, checked in order; any "yes" wins:
+
+    1. FIELD_SPECS declares a field of that name secret.
+    2. FIELD_SPECS routes a field of that name to ``.env`` (which makes it a
+       secret by construction).
+    3. The name contains a word that is only ever a credential.
+    4. The name ends in ``key`` AND no FIELD_SPEC declares it non-secret.
+
+    (4) is the FAIL-CLOSED rule, and it is what makes this useful against the
+    field nobody has thought of yet: an unrecognised ``*_key`` on a NEW
+    integration is assumed to be a credential until someone deliberately
+    declares otherwise. The cost of a false positive is one setting missing
+    from the wizard; the cost of a false negative is a token in a
+    world-readable file."""
+    if field in _SECRET_FIELD_NAMES or field in _SECRET_ENV_FIELD_NAMES:
+        return True
+    if _CREDENTIAL_NAME_RE.search(field):
+        return True
+    return bool(_AMBIGUOUS_KEY_RE.search(field)) and field not in _NONSECRET_FIELD_NAMES
+
+
+def assert_config_safe_field(name: str, field: str) -> None:
+    """Raise ``ValueError`` unless ``integrations.<name>.<field>`` is a field
+    onboarding may write into config.yaml.
+
+    Three conditions, all required:
+
+    1. ``name`` is a real integration block.
+    2. ``field`` is not a credential — not a path FIELD_SPECS marks secret,
+       not a name it marks secret or routes to .env, and not credential-shaped
+       (:func:`is_credential_name`).
+    3. ``field`` is a real key of ``DEFAULT_CONFIG["integrations"][name]``,
+       which stops an arbitrary dotted path being injected through the API.
+
+    (2) is checked BEFORE (3) deliberately. Ordered the other way, the
+    credential rule is only ever reached for a field that already exists in
+    the block, so for today's five integrations the "unknown setting" check
+    would be the one actually doing the work and the credential rule would sit
+    there untested — a guard whose coverage nothing observes. This way every
+    credential-shaped field is refused BY THE CREDENTIAL RULE, and says so.
+    """
+    from ..config import DEFAULT_CONFIG
+
+    block = (DEFAULT_CONFIG.get("integrations") or {}).get(name)
+    if block is None:
+        raise ValueError(f"unknown integration: {name!r}")
+    if f"integrations.{name}.{field}" in _SECRET_CONFIG_PATHS or is_credential_name(field):
+        raise ValueError(
+            f"refusing to write {name}.{field} to config.yaml: it is a "
+            f"credential. Secrets belong in ~/.no_human/.env"
+        )
+    if field not in block:
+        raise ValueError(
+            f"unknown setting for integration {name!r}: {field!r}")
+
+
+def enable_field(name: str) -> str | None:
+    """The name of *name*'s on/off key in its own config block, or None when
+    it has none (github/gitlab/jenkins are views over ``ci.*``).
+
+    Discovered from the defaults rather than listed: ``enabled`` when the
+    block has one, else its single boolean key — which is how
+    ``integrations.slack`` (whose switch is ``intake``, the Socket-Mode
+    worker) is handled without naming it here."""
+    from ..config import DEFAULT_CONFIG
+
+    block = (DEFAULT_CONFIG.get("integrations") or {}).get(name)
+    if not isinstance(block, dict):
+        return None
+    if isinstance(block.get("enabled"), bool):
+        return "enabled"
+    bools = [k for k, v in block.items() if isinstance(v, bool)]
+    return bools[0] if len(bools) == 1 else None
+
+
+def enable_default(name: str) -> bool:
+    """The shipped default of *name*'s on/off key."""
+    from ..config import DEFAULT_CONFIG
+
+    field = enable_field(name)
+    if field is None:
+        return False
+    block = (DEFAULT_CONFIG.get("integrations") or {}).get(name) or {}
+    return bool(block.get(field, False))
+
+
+def enable_state(config: dict, name: str) -> bool | None:
+    """Is *name* switched on in *config*? None when it has no switch."""
+    field = enable_field(name)
+    if field is None:
+        return None
+    block = _sect(config, "integrations").get(name) or {}
+    return bool(block.get(field, enable_default(name)))
+
+
+def _humanize(field: str) -> str:
+    """`project_key` → `Project key`. Generated, so a new setting gets a
+    readable label without anyone maintaining a table of them."""
+    words = field.replace("-", "_").split("_")
+    return " ".join([words[0].capitalize(), *words[1:]]) if words else field
+
+
+def _setup_label(name: str, field: str) -> str:
+    """The label for one setting: FIELD_SPECS' hand-written one when that
+    registry already describes this field (so the wizard and Settings say the
+    same thing — "Site URL", "JQL filter", not "Site" and "Jql"), else a
+    generated one, so a field no registry knows about still reads."""
+    for spec in FIELD_SPECS.get(name, []):
+        if spec.name == field and not spec.secret:
+            return spec.label
+    return _humanize(field)
+
+
+def _setup_fields(name: str, defaults: dict, current: dict) -> list[dict[str, Any]]:
+    """The non-secret, renderable settings of one integration block.
+
+    Kinds are derived from the DEFAULT's type: bool → a checkbox, str → a text
+    box, list-of-str → a comma list. Anything else (None, nested dict, mixed
+    list) is skipped rather than guessed at — a field the wizard cannot render
+    honestly must not be rendered at all."""
+    out: list[dict[str, Any]] = []
+    for key, default in defaults.items():
+        try:
+            assert_config_safe_field(name, key)
+        except ValueError:
+            continue  # a credential, or not writable — never offered
+        value = current.get(key, default)
+        if isinstance(default, bool):
+            kind, value = "bool", bool(value)
+        elif isinstance(default, str):
+            kind, value = "text", str(value or "")
+        elif isinstance(default, list) and all(isinstance(x, str) for x in default):
+            kind = "list"
+            value = [str(x) for x in (value if isinstance(value, list) else default)]
+        else:
+            continue
+        out.append({"name": key, "label": _setup_label(name, key),
+                    "kind": kind, "value": value})
+    return out
+
+
+def setup_specs(config: dict) -> list[dict[str, Any]]:
+    """Everything the onboarding step needs to render itself, discovered from
+    ``DEFAULT_CONFIG["integrations"]``.
+
+    Per integration: its current values (non-secret only), which key is its
+    on/off switch, whether it is on, the .env variable names its credential
+    needs and whether each is already set. Never a secret VALUE — the
+    credential fields report ``set: bool`` exactly like
+    :func:`integration_fields` does."""
+    from .. import config as _config_mod
+    from ..config import DEFAULT_CONFIG
+
+    out: list[dict[str, Any]] = []
+    for name, defaults in (DEFAULT_CONFIG.get("integrations") or {}).items():
+        if not isinstance(defaults, dict):
+            continue
+        current = _sect(config, "integrations").get(name) or {}
+        env_vars = SETUP_SECRET_ENV.get(name, ())
+        set_map = _config_mod.credential_status(list(env_vars), _config_mod.ENV_PATH) \
+            if env_vars else {}
+        status = _status_for(name, config)
+        out.append({
+            "name": name,
+            "kind": KIND_BY_NAME.get(name, ""),
+            "enable_field": enable_field(name),
+            "enabled": enable_state(config, name),
+            "configured": status.configured,
+            "detail": status.detail,
+            "fields": _setup_fields(name, defaults, current),
+            "secrets": [{"env_var": v, "set": bool(set_map.get(v, False))} for v in env_vars],
+            "secret_note": SETUP_SECRET_NOTE.get(name, ""),
+        })
+    return out
+
+
+def _coerce_setup_value(name: str, field: str, default: Any, value: Any) -> Any:
+    """Coerce one submitted value to the type its default declares, refusing
+    anything that cannot be one. Strings are single-line: a newline in a
+    config value is how a YAML write turns into two settings."""
+    if isinstance(default, bool):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+            return value.strip().lower() == "true"
+        raise ValueError(f"{name}.{field} must be true or false")
+    if isinstance(default, str):
+        if not isinstance(value, str):
+            raise ValueError(f"{name}.{field} must be text")
+        if len(value.splitlines()) > 1 or value != value.strip("\r\n"):
+            raise ValueError(f"{name}.{field} must be a single line")
+        return value
+    if isinstance(default, list):
+        if isinstance(value, str):
+            value = [p.strip() for p in value.split(",") if p.strip()]
+        if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+            raise ValueError(f"{name}.{field} must be a list of strings")
+        return value
+    raise ValueError(f"{name}.{field} is not settable here")
+
+
+def apply_setup(name: str, values: dict[str, Any]) -> dict[str, Any]:
+    """Persist one integration's NON-SECRET settings to config.yaml and return
+    its refreshed spec entry.
+
+    Every field is validated through :func:`assert_config_safe_field` and
+    coerced BEFORE anything is written, so a rejected field leaves config.yaml
+    byte-for-byte untouched rather than half-written."""
+    from .. import config as _config_mod
+    from ..config import DEFAULT_CONFIG
+
+    defaults = (DEFAULT_CONFIG.get("integrations") or {}).get(name)
+    if not isinstance(defaults, dict):
+        raise ValueError(f"unknown integration: {name!r}")
+
+    updates: dict[str, Any] = {}
+    for field, raw in values.items():
+        assert_config_safe_field(name, field)
+        updates[f"integrations.{name}.{field}"] = _coerce_setup_value(
+            name, field, defaults[field], raw)
+
+    if updates:
+        _write_config_values(_config_mod.CONFIG_PATH, updates)
+    refreshed = _config_mod.load_config(_config_mod.CONFIG_PATH)
+    for spec in setup_specs(refreshed.data):
+        if spec["name"] == name:
+            return spec
+    raise ValueError(f"unknown integration: {name!r}")  # pragma: no cover
 
 
 # --------------------------------------------------------------------------- #
@@ -790,4 +1133,7 @@ __all__ = [
     "IntegrationStatus", "KIND_BY_NAME", "list_integrations", "test_integration",
     "FieldSpec", "FIELD_SPECS", "integration_fields", "save_integration_config",
     "ambient_available", "list_integrations_with_ambient",
+    "SETUP_SECRET_ENV", "SETUP_SECRET_NOTE", "assert_config_safe_field",
+    "is_credential_name", "enable_field", "enable_default", "enable_state",
+    "setup_specs", "apply_setup",
 ]

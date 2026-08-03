@@ -28,7 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from ..agent.claude_backend import AgentEvent, ClaudeBackend
+from ..agent.backend import AgentEvent, CodingBackend
+from ..agent.claude_backend import ClaudeBackend
 from ..agent.scope_guard import SCRATCH_DIR, is_agent_owned
 from ..agent.supervisor import SupervisorHook
 from ..blockers import (
@@ -689,7 +690,13 @@ class Orchestrator:
         self,
         store: Store,
         config: dict[str, Any],
-        backend: ClaudeBackend,
+        # The SEAM (agent/backend.py). This annotation is the acceptance
+        # criterion of the two-backend work made checkable: the orchestrator
+        # is written against the protocol, not against a vendor. The
+        # `ClaudeBackend` import that remains below is for the READ-ONLY
+        # helper sessions (planner, distiller, supervisor, MoA aggregator),
+        # which the review-gate and model-tier constraints pin to Claude by ID.
+        backend: CodingBackend,
         notifier: SlackNotifier,
         *,
         event_sink: EventSink | None = None,
@@ -957,6 +964,40 @@ class Orchestrator:
 
     def _emit_review(self, kind: str, text: str = "", **meta: Any) -> None:
         self._sink({"source": REVIEWER_ROLE, "kind": kind, "text": text, **meta})
+
+    @staticmethod
+    def _subagent_definitions() -> dict[str, "AgentDefinition"]:
+        """The Agent-tool subagents offered to the implementer.
+
+        Extracted out of the attempt body so the Claude-SDK-only
+        ``AgentDefinition`` import is not evaluated on a code path a
+        backend without subagents takes. Content is byte-identical to
+        what was inlined before; only its location changed.
+        """
+        from claude_agent_sdk import AgentDefinition
+
+        return {
+            "no_human_researcher": AgentDefinition(
+                description="Read-only codebase researcher for focused investigation",
+                prompt=(
+                    "You are a focused codebase researcher. Your job is to find specific "
+                    "information in the codebase and report back with precise file paths "
+                    "and line numbers.\n\n"
+                    "RULES:\n"
+                    "- NEVER edit files. You are read-only.\n"
+                    "- Use grep, read, and glob tools to explore.\n"
+                    "- Always cite exact file paths and line numbers.\n"
+                    "- If a repo wiki exists under `.no_human/wiki/`, consult "
+                    "the relevant page first before broad grepping — it is "
+                    "advisory; the actual code is authoritative.\n"
+                    "- Return a concise summary of what you found.\n"
+                    "- If you cannot find what was asked for, say so explicitly."
+                ),
+                tools=["Read", "Grep", "Glob", "Bash"],
+                permissionMode="bypassPermissions",
+                maxTurns=10,
+            ),
+        }
 
     def _agent_sink(self, event: AgentEvent, *, role: str = CODER_ROLE) -> None:
         self._sink(
@@ -2373,10 +2414,44 @@ class Orchestrator:
                 plan, repo.path, on_event=self.emit,
             )
 
+        # WHAT THIS BACKEND CAN ACTUALLY DO. Every optional feature below is
+        # gated on it, and that gate is not defensive padding: a second coding
+        # backend exists (agent/backend.py) and it has no PostToolUse hook, no
+        # Agent Skills and no named subagents. Passing them anyway would make
+        # the orchestrator EMIT "supervisor active" and "N skill(s) loaded" for
+        # a session where neither happened — a check nothing observes. Absent
+        # `capabilities` (a test double), assume the Claude contract, which is
+        # what every pre-existing double was written against.
+        caps = getattr(self.backend, "capabilities", None)
+        _can_hooks = getattr(caps, "post_tool_hooks", True)
+        _can_skills = getattr(caps, "skills", True)
+        _can_subagents = getattr(caps, "subagents", True)
+        _can_thinking = getattr(caps, "thinking_budget", True)
+
         # Only pass hooks when active, so backends that predate the params
         # (e.g. test doubles) are unaffected while they stay default-off.
         extra: dict = {}
-        if lint_hook is not None or scope_hook is not None:
+        if not _can_hooks and (lint_hook is not None or scope_hook is not None
+                               or supervisor is not None):
+            # Said out loud, once, on the event stream — the operator chose
+            # this backend and is entitled to know which guards it costs them.
+            # Deliberately AFTER the "supervisor active" emit above, which it
+            # corrects: what is lost is the per-tool-call course correction and
+            # the two PostToolUse hooks. The PRE-FLIGHT plan check is not a hook
+            # (it is a separate read-only Claude call) and has already run, so
+            # claiming the supervisor did nothing at all would overstate it.
+            self.emit(
+                "backend_degraded",
+                f"backend {getattr(caps, 'name', '?')!r} has no PostToolUse "
+                "hook — superseding 'supervisor active': the supervisor's "
+                "per-tool-call course correction, the lint feedback hook and "
+                "the scope guard do not run this attempt (the pre-flight plan "
+                "check, which is not a hook, still did)",
+                backend=getattr(caps, "name", None),
+            )
+            supervisor = None
+            self._active_supervisor = None
+        if _can_hooks and (lint_hook is not None or scope_hook is not None):
             from ..agent.lint_hook import LintFeedbackHook as _LFH  # noqa: F811
             # Combine lint + scope into a single composite PostToolUse hook
             # since ClaudeBackend only accepts one lint_hook.
@@ -2401,40 +2476,18 @@ class Orchestrator:
         # .claude/skills/<name>/SKILL.md so the SDK can load them. The VCS
         # commit path already excludes .claude/** (_EPHEMERAL), so these
         # never appear in PR diffs.
-        sdk_skills = self._materialize_skills(repo.path)
+        sdk_skills = self._materialize_skills(repo.path) if _can_skills else []
         if sdk_skills:
             extra["skills"] = sdk_skills
 
         # Materialize built-in subagent definitions so the SDK can delegate
         # focused sub-tasks (e.g. read-only research) to sandboxed agents.
-        self._materialize_subagents(repo.path, task)
-
-        # Wire subagent definitions via the SDK's programmatic API so the
-        # Agent tool is available to the implementing agent.
-        from claude_agent_sdk import AgentDefinition
-        extra["agents"] = {
-            "no_human_researcher": AgentDefinition(
-                description="Read-only codebase researcher for focused investigation",
-                prompt=(
-                    "You are a focused codebase researcher. Your job is to find specific "
-                    "information in the codebase and report back with precise file paths "
-                    "and line numbers.\n\n"
-                    "RULES:\n"
-                    "- NEVER edit files. You are read-only.\n"
-                    "- Use grep, read, and glob tools to explore.\n"
-                    "- Always cite exact file paths and line numbers.\n"
-                    "- If a repo wiki exists under `.no_human/wiki/`, consult "
-                    "the relevant page first before broad grepping — it is "
-                    "advisory; the actual code is authoritative.\n"
-                    "- Return a concise summary of what you found.\n"
-                    "- If you cannot find what was asked for, say so explicitly."
-                ),
-                tools=["Read", "Grep", "Glob", "Bash"],
-                permissionMode="bypassPermissions",
-                maxTurns=10,
-            ),
-        }
-
+        # `AgentDefinition` is a Claude Agent SDK type, so this whole block is
+        # gated on the backend actually having subagents rather than merely on
+        # the import succeeding.
+        if _can_subagents:
+            self._materialize_subagents(repo.path, task)
+            extra["agents"] = self._subagent_definitions()
         # Materialize the verify skill with the repo's proven test command
         # so the agent can re-read it after context compaction.
         self._materialize_verify_skill(repo.path)
@@ -2508,7 +2561,7 @@ class Orchestrator:
             await self.store.update_task(task)
             self.emit("complexity", f"tier {_tier} ({', '.join(_signals) or 'no signals'})",
                       tier=_tier, signals=_signals)
-        use_thinking = is_complex(task)
+        use_thinking = is_complex(task) and _can_thinking
         if use_thinking:
             extra["thinking"] = True
             extra["max_thinking_tokens"] = self.config.get(

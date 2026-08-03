@@ -54,6 +54,47 @@ const mac = {
   gatekeeperAssess: false,
 };
 
+// Ad-hoc re-seal when we are NOT signing for real.
+//
+// `identity: null` tells electron-builder not to sign AT ALL. That does not
+// leave an unsigned bundle: it leaves ELECTRON'S own ad-hoc signature, from the
+// prebuilt binary — which electron-builder then INVALIDATES by injecting our
+// app and `extraResources` into Contents/. The shipped .app verified as
+//     code has no resources but signature indicates they must be present
+// and reported `Identifier=Electron`. macOS calls that app DAMAGED, and
+// right-click -> Open cannot bypass a broken seal. It is strictly worse than
+// shipping something honestly unsigned, and it is what the DMG on disk did.
+//
+// Re-sealing ad-hoc needs no Apple credential and costs nothing. It turns the
+// hard "damaged" failure back into the ordinary "unidentified developer"
+// prompt a tester can accept, and it restores the real bundle identifier.
+// It does NOT notarize and does NOT enable auto-update — `nhCanAutoUpdate`
+// still comes from the signing plan, so this cannot make the updater offer an
+// install macOS would refuse.
+async function adhocSeal(context) {
+  if (context.electronPlatformName !== "darwin") return;
+  // `plan.identity !== null`, NOT `mode === "signed"`. An independent reviewer
+  // enumerated signingPlan and found THREE modes, not two: `signed-not-notarized`
+  // (CSC_LINK or CSC_NAME without the notarization vars) is also a real Developer
+  // ID signature -- `identity: undefined` means "auto-discover", not "don't sign".
+  // The mode check let the hook run there, and it was harmless only by ordering
+  // accident: doSignAfterPack happens after emitAfterPack and --force-resigns.
+  // Keyed on identity, this asks the question that actually matters -- "are we
+  // signing for real?" -- and stays correct if that ordering ever changes.
+  if (plan.identity !== null) return;  // a real signer owns the bundle
+  const { execFileSync } = require("child_process");
+  const path = require("path");
+  const app = path.join(context.appOutDir,
+    `${context.packager.appInfo.productFilename}.app`);
+  execFileSync("codesign", ["--force", "--deep", "--sign", "-", app],
+    { stdio: "inherit" });
+  // Verify rather than trust: a silent codesign failure here would ship the
+  // exact defect this hook exists to remove.
+  execFileSync("codesign", ["--verify", "--deep", "--strict", app],
+    { stdio: "inherit" });
+  console.log(`  \u2713 ad-hoc sealed and verified: ${app}`);
+}
+
 module.exports = {
   appId: "dev.nohuman.board",
   productName: "no_human",
@@ -120,6 +161,7 @@ module.exports = {
     nhCanAutoUpdate: plan.canAutoUpdate,
   },
   mac,
+  afterPack: adhocSeal,
   // Generates latest-mac.yml locally. `--publish never` on every script means
   // nothing is ever uploaded; this block only tells the updater where to LOOK
   // once a release exists.

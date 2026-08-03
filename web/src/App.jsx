@@ -5,6 +5,7 @@ import SettingsOverlay from "./Settings.jsx";
 import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
 import TaskComposer from "./TaskComposer.jsx";
+import UnprovenBanner from "./UnprovenBanner.jsx";
 import Outcomes from "./Outcomes.jsx";
 import { keepFocusInDialog } from "./keepFocusInDialog.js";
 import { LegionLogo } from "./Logo.jsx";
@@ -577,11 +578,15 @@ export default function App() {
   const failedCount = tasks.filter(isRealFailure).length;
   const cancelledCount = tasks.filter((t) => t.status === "failed" && t.cancelled).length;
 
-  // Theme: persisted choice, else the OS preference. Light mode was fully built
-  // but unreachable (no toggle) — this exposes it.
+  // Theme: the operator's persisted choice, else DARK. Light mode is fully built
+  // and reachable via the toggle.
   const [theme, setTheme] = useState(() =>
-    localStorage.getItem("nh-theme")
-    || (window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark"));
+    // DARK BY DEFAULT, regardless of the OS setting. Following
+    // prefers-color-scheme meant a user whose Mac is in light mode saw a light
+    // app on first run -- which is what the first external tester got, and it is
+    // not the product's intended look. An explicit choice still wins: the
+    // toggle writes "nh-theme" and that is read first.
+    localStorage.getItem("nh-theme") || "dark");
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
     localStorage.setItem("nh-theme", theme);
@@ -752,7 +757,16 @@ export default function App() {
   }
 
   if (onboarded === false) {
-    return <Onboarding onComplete={() => setOnboarded(true)} />;
+    // Onboarding hands back the repo it proved, so setup ends on a first task
+    // rather than an empty board.
+    return (
+      <Onboarding
+        onComplete={(res) => {
+          setOnboarded(true);
+          if (res && res.firstTaskRepo) setShowNewTask(true);
+        }}
+      />
+    );
   }
 
   if (fetchError) {
@@ -927,6 +941,7 @@ export default function App() {
             <button className="btn btn-new-task" aria-haspopup="dialog" aria-expanded={showNewTask} onClick={() => setShowNewTask(true)}>+ New Task</button>
           </div>
         )}
+        {page === "board" && <UnprovenBanner />}
         {page === "board" && <Board tasks={tasks} pendingOpenId={pendingOpenId} onPendingOpenHandled={() => setPendingOpenId(null)} />}
         {page === "done" && <Outcomes tasks={tasks} lane="done" />}
         {page === "failed" && <Outcomes tasks={tasks} lane="failed" />}

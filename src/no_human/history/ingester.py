@@ -23,6 +23,7 @@ import logging
 from dataclasses import dataclass, field
 
 from ..core.db import Store
+from ..learning.pii import contains_pii
 from .analyzer import (
     Finding,
     analyze_transcript,
@@ -64,6 +65,7 @@ class IngestResult:
     duplicates: int = 0        # deduped (already proposed)
     transcripts: int = 0
     findings: int = 0
+    dropped_pii: int = 0       # findings refused at the personal-data gate
     proposals: list[dict] = field(default_factory=list)
 
 
@@ -81,9 +83,23 @@ class TranscriptIngester:
         """Enqueue each finding as a ``source="proposed"`` memory (confirmed=0).
 
         Idempotent via per-finding ``dedupe_key``: a finding whose key already
-        exists is counted as a duplicate, not re-proposed."""
+        exists is counted as a duplicate, not re-proposed.
+
+        This method is the last thing between a mined finding and the database,
+        so the personal-data gate is applied HERE as well as upstream in the
+        analyzer: every caller — the CLI, the onboarding wizard, periodic
+        re-analysis, and any future one — funnels through it, and a gate placed
+        only in the analyzer would be bypassed by anything that builds Findings
+        another way. Refused findings are DROPPED, never redacted, and counted
+        in ``dropped_pii``."""
         result = IngestResult(findings=len(findings))
         for f in findings:
+            pii = contains_pii(f.title, f.content)
+            if pii is not None:
+                result.dropped_pii += 1
+                log.info("refused a proposed learning carrying personal data "
+                         "(%s) from transcript %s", pii.kind, f.source_transcript)
+                continue
             tags = list(f.tags)
             # Carry provenance in tags (no new table — EVOLUTION_PLAN DB section):
             # source transcript + message index, so the rules-review UI can show
@@ -108,16 +124,27 @@ class TranscriptIngester:
             if mem_id:
                 result.proposed += 1
                 result.proposals.append({
+                    # The FULL content, not a slice of it. This used to be
+                    # `f.content[:400]`, which is what the rules-review step in the
+                    # wizard renders — so a heuristic finding (whose content is the
+                    # user's own message, verbatim) arrived cut off mid-sentence,
+                    # with no marker and no way to reach the rest. The row written
+                    # by add_memory above already holds the whole thing, and
+                    # /api/rules already serves whole memory rows to Settings, so
+                    # nothing here is a new size class; the slice only ever hid
+                    # text the caller is being asked to APPROVE.
                     "id": mem_id, "category": f.category, "title": f.title,
-                    "content": f.content[:400], "importance": f.importance,
+                    "content": f.content, "importance": f.importance,
                     "source_transcript": f.source_transcript,
                     "source_message": f.source_message,
                 })
             else:
                 result.duplicates += 1
         log.info(
-            "ingested %d findings: %d proposed, %d duplicate",
+            "ingested %d findings: %d proposed, %d duplicate, %d refused "
+            "(personal data)",
             result.findings, result.proposed, result.duplicates,
+            result.dropped_pii,
         )
         return result
 

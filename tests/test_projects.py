@@ -158,6 +158,69 @@ async def test_api_create_and_list(client, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_api_create_project_persists_explicit_primary(client, store, tmp_path):
+    """A primary_repo sent by the client must reach the projects table.
+
+    BUG (first external DMG tester): "one repo should be the default but
+    configurable". The column and the reader both existed — db.py's INSERT lists
+    primary_repo, TaskComposer.jsx reads `project.primary_repo` — but onboarding
+    posted {name, repo_paths} only, so the server fell back to repo_paths[0]:
+    whichever repo the user happened to tick first. Onboarding now sends a chosen
+    primary (web/src/onboardingProjects.js).
+
+    Asserted where it is stored, not where it is echoed: a response body can be
+    right while the INSERT drops the column. The chosen repo is deliberately NOT
+    repo_paths[0], so the pre-existing fallback cannot produce this answer.
+    """
+    repos = []
+    for name in ("first", "second"):
+        r = tmp_path / name
+        r.mkdir()
+        (r / ".git").mkdir()
+        repos.append(str(r))
+
+    resp = await client.post("/api/projects", json={
+        "name": "chosen-primary",
+        "repo_paths": repos,
+        "primary_repo": repos[1],
+    })
+    assert resp.status_code == 201, resp.text
+
+    # 1. The store's own read path.
+    proj = await store.get_project_by_name("chosen-primary")
+    assert proj is not None
+    assert proj.primary_repo == repos[1]
+    assert proj.linked_repos == [repos[0]]
+
+    # 2. The column itself, straight out of SQLite — so a model-level default
+    #    cannot stand in for a value that was never written.
+    row = await store._fetchone(
+        "SELECT primary_repo FROM projects WHERE name = ?", ("chosen-primary",)
+    )
+    assert dict(row)["primary_repo"] == repos[1]
+
+
+@pytest.mark.asyncio
+async def test_api_create_project_defaults_primary_when_client_sends_none(
+    client, store, tmp_path
+):
+    """Omitting primary_repo still stores one — the fallback stays intact."""
+    repos = []
+    for name in ("alpha", "beta"):
+        r = tmp_path / name
+        r.mkdir()
+        (r / ".git").mkdir()
+        repos.append(str(r))
+
+    resp = await client.post("/api/projects", json={
+        "name": "defaulted-primary", "repo_paths": repos,
+    })
+    assert resp.status_code == 201, resp.text
+    proj = await store.get_project_by_name("defaulted-primary")
+    assert proj.primary_repo == repos[0]
+
+
+@pytest.mark.asyncio
 async def test_api_create_duplicate_409(client, store):
     await store.create_project(Project.new("dup"))
     r = await client.post("/api/projects", json={"name": "dup"})

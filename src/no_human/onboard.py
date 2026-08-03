@@ -350,13 +350,37 @@ class OnboardEngine:
     """Derive candidates, prove each by running it, build a proposed profile."""
 
     def __init__(self, deriver: Any | None = None, *, prove_timeout: int = 600,
-                 github_hosts: list[str] | None = None):
+                 github_hosts: list[str] | None = None,
+                 on_event: "Any | None" = None):
         self.deriver = deriver or DeclarationDeriver()
         self.prove_timeout = prove_timeout
         self.github_hosts = github_hosts or ["github.com"]
+        # Optional progress sink: called with small JSON-able dicts as proving
+        # happens, so a caller (the web wizard) can show the REAL output live
+        # instead of a spinner. Advisory only — it can never change a verdict.
+        self.on_event = on_event
 
-    async def onboard(self, repo_path: str | Path) -> OnboardResult:
+    def _emit(self, frame: dict[str, Any]) -> None:
+        if self.on_event is None:
+            return
+        try:
+            self.on_event(frame)
+        except Exception:  # noqa: BLE001 — a broken sink never fails a proof
+            pass
+
+    async def onboard(self, repo_path: str | Path,
+                      overrides: dict[str, str] | None = None) -> OnboardResult:
+        """Derive + prove. ``overrides`` maps a kind ("test"/"install"/"lint")
+        to a command the OPERATOR typed — used when the web wizard's first
+        derived command failed and the human corrected it. An override REPLACES
+        that kind's derived candidates: we prove exactly the string the human
+        gave us, byte for byte, and never a "helpful" variant of it. That is the
+        same discipline as the derive/prove split in this module's docstring —
+        the human may choose the command, but only a real clean exit proves it.
+        """
         repo = Path(repo_path).expanduser().resolve()
+        overrides = {k: v.strip() for k, v in (overrides or {}).items()
+                     if isinstance(v, str) and v.strip()}
         derived = self.deriver.derive(repo)
         if inspect.isawaitable(derived):
             derived = await derived
@@ -367,12 +391,29 @@ class OnboardEngine:
         chosen: dict[str, CommandCandidate] = {}
         proven: dict[str, bool] = {}
 
+        def _candidates(kind: str) -> list[CommandCandidate]:
+            if kind in overrides:
+                return [CommandCandidate(kind, overrides[kind], "operator-supplied")]
+            return derived.of_kind(kind)
+
+        self._emit({
+            "kind": "derived",
+            "ecosystem": derived.ecosystem,
+            "sources": sorted(set(derived.sources)),
+            "candidates": {k: [c.command for c in _candidates(k)] for k in _KINDS},
+        })
+
         # Prove in install → test → lint order; the first candidate of each kind
         # that runs clean wins. install runs before test so deps are present.
         for kind in _KINDS:
-            for cand in derived.of_kind(kind):
+            for cand in _candidates(kind):
+                self._emit({"kind": "prove_start", "cmd_kind": kind,
+                            "command": cand.command, "source": cand.source})
                 outcome = await self._prove(repo, cand)
                 proofs.append(outcome)
+                self._emit({"kind": "prove_result", "cmd_kind": kind,
+                            "command": cand.command, "ok": outcome.ok,
+                            "exit_code": outcome.exit_code})
                 if outcome.ok:
                     chosen[kind] = cand
                     proven[f"{kind}_cmd"] = True
@@ -416,18 +457,41 @@ class OnboardEngine:
         url = proc.stdout.strip()
         return _host_from_remote(url), _strip_remote_credentials(url)
 
+    def _line_sink(self, kind: str, command: str) -> "Any | None":
+        """A per-line callback that forwards raw output to ``on_event``, or None
+        when nobody is watching (the CLI path, unchanged)."""
+        if self.on_event is None:
+            return None
+
+        def _sink(line: str) -> None:
+            self._emit({"kind": "output", "cmd_kind": kind,
+                        "command": command, "line": line})
+        return _sink
+
     async def _prove(self, repo: Path, cand: CommandCandidate) -> ProveOutcome:
+        on_line = self._line_sink(cand.kind, cand.command)
         if cand.kind == "test":
             # Reuse the orchestrator's own test path so we prove what it will run.
             res = await asyncio.to_thread(
-                runner.run_tests, repo, cand.command, timeout=self.prove_timeout
+                runner.run_tests, repo, cand.command, timeout=self.prove_timeout,
+                on_line=on_line,
             )
             ok = res.ran and res.ok
+            # `runner.run_tests` has a bounded self-correcting retry that can
+            # rewrite a broken invocation (python->python3, stripping addopts).
+            # The orchestrator calls the SAME function, so the proof still holds
+            # for `cand.command`; but a human confirming on evidence must be
+            # told the string that actually exited clean was not the one shown.
+            actual = getattr(res, "command", "") or cand.command
+            if actual != cand.command:
+                self._emit({"kind": "rewritten", "cmd_kind": cand.kind,
+                            "command": cand.command, "actual_command": actual})
             return ProveOutcome(
                 cand.kind, cand.command, ok, 0 if ok else 1, res.output, cand.source
             )
         ok, code, out = await asyncio.to_thread(
-            runner.run_command, repo, cand.command, timeout=self.prove_timeout
+            runner.run_command, repo, cand.command, timeout=self.prove_timeout,
+            on_line=on_line,
         )
         return ProveOutcome(cand.kind, cand.command, ok, code, out, cand.source)
 
@@ -442,3 +506,35 @@ class OnboardEngine:
                 + "; ".join(f"{p.kind}={p.command!r} (exit {p.exit_code})" for p in unproven)
             )
         return " | ".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# The human confirm gate                                                       #
+# --------------------------------------------------------------------------- #
+
+
+class ProfileNotProven(RuntimeError):
+    """Raised when something tries to confirm a profile whose test command was
+    never proven. Deliberately an exception rather than a False return: every
+    caller must handle it, and none may quietly downgrade to "confirmed anyway".
+    """
+
+
+def confirm_profile(profile: ProjectProfile) -> ProjectProfile:
+    """Flip ``confirmed`` on a profile whose TEST COMMAND was proven — the one
+    human gate that makes a profile usable (``ProjectProfile.is_usable``).
+
+    Single source of truth for `nh onboard --confirm` (CLI) and the web
+    wizard's confirm step, so the two can never drift into different notions of
+    what may be confirmed. It only ever flips the flag: it does not run
+    anything, and it CANNOT create a proof — the proof must already exist,
+    written by a real clean exit in ``OnboardEngine._prove``.
+    """
+    if not profile.test_cmd or not profile.proven.get("test_cmd"):
+        raise ProfileNotProven(
+            "cannot confirm: the test command is not proven "
+            f"(test_cmd={profile.test_cmd!r}). Run the test command until it "
+            "exits clean — trust requires proof, and nothing here fakes one."
+        )
+    profile.confirmed = True
+    return profile

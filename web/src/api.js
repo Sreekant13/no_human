@@ -520,6 +520,62 @@ export const discoverRepos = async (limit) => {
 };
 
 export const onboardRepo       = (repo_path) => _post("/api/onboarding/repos/onboard", { repo_path });
+
+// PROVE a repo's commands by really running them, streaming the real output.
+// POST-based SSE (same shape as grillStepSSE above — EventSource is GET-only).
+// `onFrame` receives every frame; the caller decides what to render. Returns a
+// handle whose close() aborts the stream (the run itself is bounded server-side).
+export function proveRepoSSE({ repo_path, test_cmd, install_cmd, timeout }, onFrame, onError) {
+  const ctrl = new AbortController();
+  (async () => {
+    try {
+      const r = await fetch(`${BASE}/api/onboarding/repos/prove`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repo_path, test_cmd, install_cmd, timeout }),
+        signal: ctrl.signal,
+      });
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        if (onError) onError(new Error(detailMessage(d, `POST /api/onboarding/repos/prove → ${r.status}`)));
+        return;
+      }
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (data.kind === "stream_end") return;
+            if (data.kind === "error") {
+              if (onError) onError(new Error(data.text || "prove failed"));
+              return;
+            }
+            if (onFrame) onFrame(data);
+          } catch { /* skip malformed */ }
+        }
+      }
+    } catch (err) {
+      if (err.name !== "AbortError" && onError) onError(err);
+    }
+  })();
+  return { close: () => ctrl.abort() };
+}
+
+export const confirmRepoProfile = (repo_path) => _post("/api/onboarding/repos/confirm", { repo_path });
+
+export async function fetchReadiness() {
+  const r = await fetch(`${BASE}/api/onboarding/readiness`);
+  if (!r.ok) throw new Error(`GET onboarding/readiness → ${r.status}`);
+  return r.json();
+}
 export const extractHistory    = ()        => _post("/api/onboarding/history/extract", {});
 export const analyzeHistory    = (days = 30) => _post("/api/onboarding/history/analyze", { days });
 export const confirmRules      = (ids)     => _post("/api/onboarding/rules/confirm", { ids });
@@ -540,6 +596,20 @@ export const testIntegration = (name) =>
 // never a secret value. Throws with the server's 422/404 `detail` message.
 export const saveIntegrationConfig = (name, fields) =>
   _put(`/api/integrations/${encodeURIComponent(name)}/config`, { fields });
+
+// ── Onboarding "Connect your tools" (config.yaml only, NEVER a secret) ──────
+// One card per block under DEFAULT_CONFIG["integrations"], discovered server-
+// side, so a new integration appears with no change here. `secrets` carries
+// only env-var NAMES + a `set` bool.
+export async function fetchIntegrationSetup() {
+  const r = await fetch(`${BASE}/api/integrations/setup`);
+  if (!r.ok) return { integrations: [] };
+  return _jsonSafe(r, { integrations: [] });
+}
+// Persist one integration's non-secret settings. The server refuses (422) any
+// field that would put a credential in config.yaml.
+export const saveIntegrationSetup = (name, values) =>
+  _put(`/api/integrations/${encodeURIComponent(name)}/setup`, { values });
 
 // Task 1.6: browse/pick a configured Jira project's tickets (Import from
 // Jira). Throws with the server's 503 (unconfigured) / 502 (upstream error)

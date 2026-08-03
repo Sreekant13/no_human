@@ -18,6 +18,7 @@ from typing import Any
 
 from ..core.db import Store
 from ..core.task import Task, TaskStatus
+from .pii import contains_pii
 
 log = logging.getLogger("no_human.learning")
 
@@ -78,6 +79,14 @@ class LearningQueue:
         """
         proposal = self._build(task, status=status, blocker=blocker, summary=summary)
         if proposal is None:
+            return None
+        # Personal data is never a durable engineering lesson. A task title or a
+        # blocker's root-cause text can quote a user's data verbatim; drop the
+        # whole proposal rather than redact it (see learning/pii.py).
+        pii = contains_pii(proposal.title, proposal.content)
+        if pii is not None:
+            log.info("refused a proposed learning carrying personal data (%s)",
+                     pii.kind)
             return None
         return await self.store.add_memory(
             mem_type=proposal.mem_type,

@@ -115,6 +115,28 @@ integrations:
     default_repo: ""
     write_back: false             # opt-in: comment + type-matched state move
     poll_interval: 5m             # floor 60s
+  circleci:                       # CI status source; off by default
+    enabled: false
+    org_slug: ""                  # e.g. gh/your-org
+    project: ""
+  slack:
+    intake: false                 # opt-in Socket-Mode intake worker; needs
+                                  # SLACK_BOT_TOKEN + SLACK_APP_TOKEN in .env
+  teams:
+    enabled: true                 # mute switch over the notify-OUT channel.
+                                  # The webhook URL itself is NOT here — it
+                                  # stays at notifications.teams_webhook_url,
+                                  # where the notifier reads it. Set this false
+                                  # to silence Teams without deleting the URL.
+
+The first-run wizard's **Connect your tools** step edits everything in this
+`integrations:` block, and Settings → Integrations edits it afterwards. Neither
+takes a credential: every token stays in `~/.no_human/.env`, and the wizard
+names the variable rather than accepting a value — `config.yaml` is
+world-readable. `enabled` (and Slack's `intake`) is what actually starts a
+poller or a worker, so an integration with every setting filled in but
+`enabled: false` does nothing, and both UIs say so rather than reporting it as
+configured.
 
 approval:
   require_before_merge: true      # ALWAYS true — agent never merges

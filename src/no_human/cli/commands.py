@@ -24,7 +24,13 @@ from rich.table import Table
 from . import print_path_error
 from .. import __version__
 from ..agent.claude_backend import ClaudeBackend
-from ..config import AuthError, assert_subscription_mode, load_config
+from ..agent.backend import make_backend, resolve_backend_name
+from ..config import (
+    AuthError,
+    assert_codex_api_key_mode,
+    assert_subscription_mode,
+    load_config,
+)
 from ..context import ContextGatherer, build_default_sources
 from ..core.db import Store
 from ..core.events import EventPersister
@@ -91,8 +97,23 @@ def _bootstrap(*, require_auth: bool = True):
                 profile=_llm.get("auth_profile"),
                 auth_mode=_llm.get("auth_mode", "subscription"),
             )
+            # The Anthropic assertion above still runs unconditionally, even
+            # when the CODER is Codex: the reviewer, planner, supervisor and
+            # utility tiers stay on Claude — the review gate and the four
+            # model tiers are fixed by constraint — so an install
+            # that dropped the Claude credential would lose its review gate and
+            # discover it one task later. Codex adds a SECOND per-vendor
+            # assertion; it never replaces the first.
+            if resolve_backend_name(config.data) == "codex":
+                assert_codex_api_key_mode()
         except AuthError as exc:
             console.print(f"[bold red]auth error:[/] {exc}")
+            # The Codex failure carries its own complete remedy (add
+            # OPENAI_API_KEY, or switch back to claude). Appending the Claude
+            # recipe under it would send the operator to `claude setup-token`
+            # for a problem that has nothing to do with their Claude token.
+            if "OPENAI_API_KEY" in str(exc):
+                sys.exit(2)
             console.print(
                 "\n[bold]Fix:[/] run [bold]nh init[/] to set up authentication, or:\n"
                 "  1. [bold]claude setup-token[/]  (creates a subscription token)\n"
@@ -128,13 +149,39 @@ def _assert_backend_usable() -> None:
             "Verify with [bold]nh doctor[/] (it now checks this)."
         )
         sys.exit(2)
+    # The `claude` CLI above is required even when the CODER is Codex, because
+    # the reviewer, planner, supervisor and utility tiers stay on Claude. When
+    # Codex is selected there is a SECOND binary with the same all-or-nothing
+    # property, and the same silent cliff if it is missing.
+    #
+    # Signature deliberately unchanged (no parameters): both call sites pass
+    # none, and a test double is `lambda: None`. Config is re-read here rather
+    # than threaded through.
+    cfg = load_config()
+    if resolve_backend_name(cfg.data) == "codex":
+        from ..agent.codex_backend import find_codex_cli
+
+        if find_codex_cli((cfg.get("llm") or {}).get("codex_cli_path")) is None:
+            console.print(
+                "[bold red]coding backend unavailable:[/] worker.backend is "
+                "'codex' but the `codex` CLI was not found.\n"
+                "Every coder task would fail at launch.\n\n"
+                "[bold]Fix:[/] install it, then restart:\n"
+                "  [bold]npm install -g @openai/codex[/]\n"
+                "…or set [bold]worker.backend: claude[/] in ~/.no_human/config.yaml."
+            )
+            sys.exit(2)
 
 
 def _build_orchestrator(config, store: Store, *, event_sink=None, task=None) -> Orchestrator:
-    # Single in-process Claude Agent SDK backend (lean-stack; no alternate
-    # backend abstraction).
-    backend = ClaudeBackend(
+    # THE ONE SWITCH. `make_backend` returns exactly the ClaudeBackend this
+    # line used to construct — same class, same arguments — unless
+    # `worker.backend` says otherwise. The orchestrator below is handed a
+    # `CodingBackend` and cannot tell which it got.
+    backend = make_backend(
         model=config.primary_model,
+        config=config.data,
+        role="coder",
         forbidden_paths=config["safety"]["forbidden_paths"],
         never_push_to=config["git"]["never_push_to"],
     )
@@ -1862,7 +1909,10 @@ def onboard(repo, confirm, agent):
     # backend; the deterministic deriver + subprocess proving need no token.
     config, _ = _bootstrap(require_auth=agent)
     repo_path = str(Path(repo).resolve())
-    from ..onboard import AgentDeriver, DeclarationDeriver, OnboardEngine
+    from ..onboard import (
+        AgentDeriver, DeclarationDeriver, OnboardEngine, ProfileNotProven,
+        confirm_profile,
+    )
     from ..profile import ProjectProfile
 
     async def _go():
@@ -1873,14 +1923,14 @@ def onboard(repo, confirm, agent):
                     console.print("[red]no profile to confirm[/] — run "
                                   f"[bold]nh onboard {repo}[/] first")
                     sys.exit(1)
-                if not prof.proven.get("test_cmd"):
-                    console.print(
-                        "[red]cannot confirm:[/] the test command is not proven "
-                        f"(test_cmd={prof.test_cmd!r}). Re-run onboarding until it "
-                        "runs clean — trust requires proof."
-                    )
+                # The gate lives in onboard.confirm_profile so the CLI and the
+                # web wizard's confirm step cannot drift apart on what may be
+                # confirmed (they used to have separate copies of this check).
+                try:
+                    confirm_profile(prof)
+                except ProfileNotProven as exc:
+                    console.print(f"[red]{exc}[/]")
                     sys.exit(1)
-                prof.confirmed = True
                 prof.save()
                 await store.upsert_profile(prof)
                 console.print(f"[bold green]confirmed[/] profile for {repo_path}")
@@ -3592,10 +3642,20 @@ def history(days, output, analyze, json_out, roots):
         from ..learning import LearningQueue
 
         async def _propose():
+            from ..learning.pii import contains_pii
             async with Store(config.db_path) as store:
                 q = LearningQueue(store)
                 proposed = 0
+                dropped_pii = 0
                 for f in findings:
+                    # This path writes to the queue directly rather than through
+                    # TranscriptIngester, so it needs the personal-data gate of
+                    # its own — a gate that only covers one of two doors is not
+                    # a gate. Dropped, never redacted (see learning/pii.py).
+                    pii = contains_pii(f.title, f.content)
+                    if pii is not None:
+                        dropped_pii += 1
+                        continue
                     mid = await store.add_memory(
                         mem_type=f.category,
                         title=f.title,
@@ -3611,6 +3671,12 @@ def history(days, output, analyze, json_out, roots):
                         console.print(
                             f"  [magenta]{f.category}[/] {f.title[:60]}"
                         )
+                if dropped_pii:
+                    console.print(
+                        f"[yellow]{dropped_pii} dropped[/] — they carried "
+                        "personal data (address / phone / email / payment / "
+                        "ID / date of birth), which is never a coding rule"
+                    )
                 console.print(
                     f"\n[green]{proposed} proposals queued[/] — "
                     "review with: nh learnings"

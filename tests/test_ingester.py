@@ -232,3 +232,36 @@ async def test_ingest_transcripts_with_llm_pass(store):
     titles = [p["title"] for p in pending]
     assert any("test-linking" in t for t in titles)
     assert res.proposed >= 2
+
+
+async def test_proposal_carries_the_whole_rule_text_not_a_slice(store):
+    """The wizard's rules-review step renders `proposal["content"]` and nothing
+    else, so whatever this dict carries IS what the human is asked to approve.
+
+    It used to carry ``f.content[:400]``. A heuristic finding's content is the
+    user's own message verbatim (analyzer.analyze_transcript passes
+    ``content=msg.content``), which routinely runs past 400 characters — so the
+    card ended mid-sentence, with no ellipsis, no marker, and nothing in the UI
+    able to reach the rest. Reported by the first external DMG tester.
+
+    The DB row already holds the full text; only the response was clipped.
+    """
+    body = (
+        "never push straight to main. "
+        + "always run the full suite before you open a pull request, and paste the output. "
+        * 12
+        + "and the last sentence must survive intact."
+    )
+    assert len(body) > 400, "the fixture has to be long enough to have been clipped"
+
+    ing = TranscriptIngester(store)
+    res = await ing.ingest_findings([_finding(content=body)])
+    assert res.proposed == 1
+    (proposal,) = res.proposals
+
+    # The whole thing, byte for byte — not a prefix of it.
+    assert proposal["content"] == body
+    assert proposal["content"].endswith("and the last sentence must survive intact.")
+    # And the response agrees with the row that was actually written.
+    pending = await LearningQueue(store).pending()
+    assert pending[0]["content"] == proposal["content"]

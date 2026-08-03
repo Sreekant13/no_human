@@ -50,7 +50,8 @@ from ..core.orchestrator import is_agent_session, is_narration
 from ..core.task import Task, TaskStatus
 from .models import (
     AttemptOut, BoardPayload, CreateProjectRequest, CreateTaskRequest,
-    GrillQuestionOut, GrillResultOut, GrillStepRequest, JiraImportedInfo,
+    GrillQuestionOut, GrillResultOut, GrillStepRequest, IntegrationSetupRequest,
+    JiraImportedInfo,
     JiraIssueOut, ProjectOut, ReplyRequest, SaveIntegrationConfigRequest,
     SendBackRequest, ShippedRequest, TaskOut, TaskSummaryOut, UpdateProjectRequest,
 )
@@ -1258,11 +1259,27 @@ async def list_profiles(request: Request) -> list[dict[str, Any]]:
     except Exception:  # noqa: BLE001 — table may not exist yet
         rows = []
     if rows:
-        return [{"repo_path": r.get("repo_path", ""),
-                 "ecosystem": r.get("ecosystem", ""),
-                 "confirmed": bool(r.get("confirmed", False)),
-                 "name": r.get("repo_path", "").rstrip("/").rsplit("/", 1)[-1] if r.get("repo_path") else ""}
-                for r in rows]
+        # `proven`/`is_usable` ride along so a caller can tell "onboarded" from
+        # "has a test command the review gate can actually run" — the two the
+        # board's chip used to conflate.
+        from ..profile import ProjectProfile
+        out_rows: list[dict[str, Any]] = []
+        for r in rows:
+            repo_path = r.get("repo_path", "") or ""
+            row = {"repo_path": repo_path,
+                   "ecosystem": r.get("ecosystem", ""),
+                   "confirmed": bool(r.get("confirmed", False)),
+                   "name": repo_path.rstrip("/").rsplit("/", 1)[-1] if repo_path else "",
+                   "proven": {}, "test_proven": False, "is_usable": False,
+                   "test_cmd": ""}
+            if r.get("data"):
+                try:
+                    row.update(_profile_readiness(
+                        ProjectProfile.from_dict(json.loads(r["data"]))))
+                except (ValueError, TypeError) as exc:
+                    log.warning("unreadable profile row for %s: %s", repo_path, exc)
+            out_rows.append(row)
+        return out_rows
     # Fallback: unique repo_paths from existing tasks.
     tasks = await store.list_tasks()
     seen: set[str] = set()
@@ -2736,6 +2753,48 @@ async def list_integrations_endpoint(request: Request) -> dict[str, Any]:
     return {"integrations": out}
 
 
+@app.get("/api/integrations/setup")
+async def integration_setup_specs(request: Request) -> dict[str, Any]:
+    """What the onboarding "Connect your tools" step renders itself from.
+
+    One entry per block under ``DEFAULT_CONFIG["integrations"]`` — DISCOVERED,
+    not a list of names in the UI, so adding a sixth block makes a sixth card
+    appear with no frontend change. Carries the non-secret current values, the
+    on/off switch, and the NAMES of the ~/.no_human/.env variables each
+    integration's credential needs (plus whether each is set) — never a secret
+    value, and never a field the wizard is allowed to write a secret into."""
+    from ..integrations import setup_specs
+    cfg = request.app.state.config
+    return {"integrations": setup_specs(cfg.data)}
+
+
+@app.put("/api/integrations/{name}/setup")
+async def save_integration_setup(
+    name: str, body: IntegrationSetupRequest, request: Request
+) -> dict[str, Any]:
+    """Persist one integration's NON-SECRET onboarding settings to config.yaml.
+
+    Distinct from ``/api/integrations/{name}/config`` on purpose: that route
+    can route a field to ~/.no_human/.env, this one writes config.yaml ONLY
+    and refuses (422) any field that reads as a credential, so the wizard can
+    never put a token in a world-readable file. Same local-origin guard as
+    every other config write."""
+    from ..integrations import apply_setup
+
+    _require_local_origin(request, writing=True)
+    try:
+        spec = await asyncio.to_thread(apply_setup, name, dict(body.values))
+    except ValueError as exc:
+        # Unknown integration/field and "that's a credential" are both the
+        # caller's mistake; 422 carries the message the UI shows verbatim.
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    from ..config import CONFIG_PATH, load_config
+    refreshed = load_config(CONFIG_PATH)
+    request.app.state.config.data = refreshed.data
+    return spec
+
+
 @app.post("/api/integrations/{name}/test")
 async def test_integration_endpoint(name: str, request: Request) -> dict[str, Any]:
     """Run a live health check for one integration. The returned `detail` is a
@@ -2914,15 +2973,40 @@ async def jira_issue_detail_endpoint(key: str, request: Request) -> JiraIssueOut
 
 # --------------------------------------------------------------------------- #
 # Onboarding wizard (web first-run). Reuses the existing onboard/history/      #
-# learning logic — no parallel machinery. Heavy proving (running a repo's      #
-# tests) stays on the `nh onboard` path; here we derive + persist an unproven  #
-# profile, consistent with the codebase's deliberate derive/prove split.       #
+# learning logic — no parallel machinery.                                      #
+#                                                                              #
+# The derive/prove split is preserved, but BOTH halves are now reachable from  #
+# the app: `/repos/onboard` derives (fast, one click) and `/repos/prove`       #
+# streams a REAL run of the derived commands (`OnboardEngine`, the same engine #
+# `nh onboard` drives), then `/repos/confirm` applies the same human gate the  #
+# CLI applies (`onboard.confirm_profile`).                                     #
+#                                                                              #
+# Why this matters, stated so it is not re-broken: without a proven test       #
+# command a task still RUNS — it just runs with no test command, so            #
+# `runner.run_tests` falls back to `detect_command` and, when that finds        #
+# nothing, reports "no tests run" as a non-failure. The PR still opens. The     #
+# missing proof does not block the product; it hollows out the evidence the    #
+# product's review gate is supposed to stand on. Proving in the wizard is      #
+# about EVIDENCE, not about unblocking anyone.                                 #
 # --------------------------------------------------------------------------- #
 
 class RepoDetectRequest(BaseModel):
     root: str | None = None  # defaults to ~/git
 
 class RepoOnboardRequest(BaseModel):
+    repo_path: str
+
+class RepoProveRequest(BaseModel):
+    """Prove a repo's commands by RUNNING them. The optional command fields are
+    the human's correction after a failed attempt; each REPLACES that kind's
+    derived candidates so we prove exactly the string the human typed."""
+    repo_path: str
+    test_cmd: str | None = None
+    install_cmd: str | None = None
+    lint_cmd: str | None = None
+    timeout: int = 1800
+
+class RepoConfirmRequest(BaseModel):
     repo_path: str
 
 class HistoryAnalyzeRequest(BaseModel):
@@ -3115,9 +3199,10 @@ async def onboarding_onboard_repo(
         required_credentials=derive_required_credentials(
             derived.ci, vcs_host, derived.human_gated_steps, github_hosts),
         derived_from=sorted(set(derived.sources)),
-        proven={},          # unproven — prove via `nh onboard <repo>`
+        proven={},          # unproven — prove via /repos/prove (or `nh onboard`)
         confirmed=False,
-        notes="derived in onboarding wizard (unproven — run `nh onboard` to prove)",
+        notes="derived in onboarding wizard (unproven — prove it to give the "
+              "review gate a test command to run)",
     )
     await store.upsert_profile(profile)
     return {
@@ -3130,6 +3215,179 @@ async def onboarding_onboard_repo(
         "required_credentials": profile.required_credentials,
         "proven": False,
     }
+
+
+def _profile_readiness(prof: Any) -> dict[str, Any]:
+    """The one shape the whole app uses to describe how far a repo profile got
+    up the trust ladder. ``is_usable`` is READ from ``ProjectProfile`` — never
+    recomputed here, so no surface can disagree with the orchestrator's gate."""
+    return {
+        "repo_path": prof.repo_path,
+        "name": (prof.repo_path or "").rstrip("/").rsplit("/", 1)[-1],
+        "ecosystem": prof.ecosystem,
+        "install_cmd": prof.install_cmd,
+        "test_cmd": prof.test_cmd,
+        "lint_cmd": prof.lint_cmd,
+        "proven": dict(prof.proven or {}),
+        "test_proven": bool((prof.proven or {}).get("test_cmd")),
+        "confirmed": bool(prof.confirmed),
+        "is_usable": bool(prof.is_usable),
+    }
+
+
+@app.get("/api/onboarding/readiness")
+async def onboarding_readiness(request: Request) -> dict[str, Any]:
+    """Which onboarded repos can back a task with REAL test evidence.
+
+    This is what the summary step and the board banner read, so neither can
+    claim "Ready." while every profile is unproven. A repo missing from
+    ``usable`` is not blocked — its tasks will run — but its review gate will
+    have no test command to execute, which is the thing worth saying out loud.
+    """
+    store = _store(request)
+    try:
+        rows = await store.list_profiles()
+    except Exception:  # noqa: BLE001 — table may not exist yet
+        rows = []
+    from ..profile import ProjectProfile
+    repos = [_profile_readiness(ProjectProfile.from_dict(json.loads(r["data"])))
+             for r in rows if r.get("data")]
+    usable = [r for r in repos if r["is_usable"]]
+    return {
+        "repos": repos,
+        "total": len(repos),
+        "usable": len(usable),
+        "needs_proving": [r for r in repos if not r["is_usable"]],
+        "first_usable": usable[0]["repo_path"] if usable else None,
+    }
+
+
+@app.post("/api/onboarding/repos/prove")
+async def onboarding_prove_repo(body: RepoProveRequest, request: Request):
+    """PROVE a repo's derived commands by actually RUNNING them, streaming the
+    real output back as SSE so the user watches the thing that decides.
+
+    This is the same `OnboardEngine` `nh onboard` drives — not a second
+    implementation — so the command proven here is byte-for-byte the command
+    `runner.run_tests` executes for the orchestrator later. Nothing in this
+    endpoint can create a proof: it only reports the exit status of a real
+    subprocess, and it always persists the profile UNCONFIRMED. Confirming is a
+    separate human act (`/repos/confirm`).
+
+    A failing command is a legitimate outcome, not an error: the stream reports
+    it with its output and the caller may re-POST with a corrected `test_cmd`.
+    """
+    store = _store(request)
+    config = request.app.state.config
+    repo = Path(body.repo_path).expanduser().resolve()
+    if not repo.is_dir() or not (repo / ".git").exists():
+        raise HTTPException(422, f"{body.repo_path!r} is not a git repository")
+
+    from ..onboard import DeclarationDeriver, OnboardEngine
+
+    github_hosts = (config.data.get("git") or {}).get("github_hosts") or ["github.com"]
+    overrides = {"test": body.test_cmd or "", "install": body.install_cmd or "",
+                 "lint": body.lint_cmd or ""}
+    timeout = max(30, min(int(body.timeout or 1800), 7200))
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _emit(frame: dict[str, Any] | None) -> None:
+        # Called from the prove worker thread (each output line) as well as from
+        # the loop, so it must hop threads explicitly.
+        loop.call_soon_threadsafe(queue.put_nowait, frame)
+
+    async def _run_prove() -> None:
+        try:
+            engine = OnboardEngine(
+                DeclarationDeriver(), prove_timeout=timeout,
+                github_hosts=github_hosts, on_event=_emit,
+            )
+            result = await engine.onboard(repo, overrides=overrides)
+            prof = result.profile
+            # Never inherit an earlier confirm: the command may have changed, so
+            # the human re-confirms against THIS evidence.
+            prof.confirmed = False
+            await store.upsert_profile(prof)
+            try:
+                prof.save()
+            except OSError as exc:
+                log.warning("could not write project.yml for %s: %s", repo, exc)
+            _emit({
+                "kind": "done",
+                **_profile_readiness(prof),
+                "proofs": [
+                    {"kind": p.kind, "command": p.command, "ok": p.ok,
+                     "exit_code": p.exit_code, "output": (p.output or "")[-4000:]}
+                    for p in result.proofs
+                ],
+            })
+        except Exception as exc:  # noqa: BLE001
+            log.warning("prove failed for %s: %s", repo, type(exc).__name__)
+            _emit({"kind": "error", "text": f"{type(exc).__name__}: {exc}"})
+        finally:
+            _emit(None)  # sentinel
+
+    async def _generate():
+        task = asyncio.create_task(_run_prove())
+        started = time.monotonic()
+        try:
+            while True:
+                try:
+                    frame = await asyncio.wait_for(queue.get(), timeout=10)
+                except asyncio.TimeoutError:
+                    # A quiet suite is normal (compiling, installing). Say so
+                    # with an elapsed count rather than leaving a dead spinner.
+                    yield ("data: " + json.dumps({
+                        "kind": "heartbeat",
+                        "elapsed": int(time.monotonic() - started),
+                    }) + "\n\n")
+                    continue
+                if frame is None:
+                    yield "data: {\"kind\": \"stream_end\"}\n\n"
+                    return
+                yield f"data: {json.dumps(frame)}\n\n"
+        finally:
+            task.cancel()
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/onboarding/repos/confirm")
+async def onboarding_confirm_repo(
+    body: RepoConfirmRequest, request: Request
+) -> dict[str, Any]:
+    """The human gate, from the app: mark a PROVEN profile confirmed.
+
+    Delegates the decision to ``onboard.confirm_profile`` — the same function
+    `nh onboard --confirm` calls — so the GUI can never confirm something the
+    CLI would refuse. An unproven profile is rejected here; the remedy is to
+    prove it, never to relax this.
+    """
+    store = _store(request)
+    repo = Path(body.repo_path).expanduser().resolve()
+
+    from ..onboard import ProfileNotProven, confirm_profile
+    from ..profile import ProjectProfile
+
+    prof = await store.get_profile(str(repo)) or ProjectProfile.load(repo)
+    if prof is None:
+        raise HTTPException(404, f"no profile for {body.repo_path!r} — onboard it first")
+    try:
+        confirm_profile(prof)
+    except ProfileNotProven as exc:
+        raise HTTPException(422, str(exc)) from exc
+    try:
+        prof.save()
+    except OSError as exc:
+        log.warning("could not write project.yml for %s: %s", repo, exc)
+    await store.upsert_profile(prof)
+    return {"ok": True, **_profile_readiness(prof)}
 
 
 async def _gather_history(days: int) -> tuple[list, dict[str, int]]:
@@ -3219,8 +3477,13 @@ async def onboarding_history_analyze(
     # so the rules-review shows them and (once confirmed) the Supervisor's
     # "skill-exists" detector knows they exist (EVOLUTION_PLAN §1.3 row 1).
     from ..history.skills import discover_skills
+    from ..learning.pii import contains_pii
     skills_added = 0
     for s in await asyncio.to_thread(discover_skills):
+        # Same personal-data gate as the mined findings — a skill's name or
+        # description is user-authored text and reaches the same queue.
+        if contains_pii(s.name, s.description or "") is not None:
+            continue
         mid = await store.add_memory(
             mem_type="skill", title=s.name, content=s.description or s.name,
             tags=["skill", "claude_code"], source="proposed", confirmed=False,
@@ -3231,9 +3494,20 @@ async def onboarding_history_analyze(
             proposals.append({"id": mid, "category": "skill", "title": s.name,
                               "content": s.description or s.name, "importance": "med"})
 
+    # NOTHING IS PRE-SELECTED. A real user was shown their own home address and
+    # phone number already TICKED for confirmation as standing guidance — one
+    # click from becoming an active rule. Confirmation is opt-in per memory:
+    # the server states the default explicitly rather than leaving it to the
+    # client to decide, so any client (SPA, future CLI/TUI, a third-party one)
+    # inherits opt-in rather than re-inventing pre-ticking.
+    for p in proposals:
+        p["selected"] = False
+
     return {"available": True, "proposed": result.proposed + skills_added,
             "duplicates": result.duplicates, "messages": messages,
             "sources": sources, "skills": skills_added,
+            "dropped_pii": result.dropped_pii,
+            "default_selected": False,
             "transcripts": result.transcripts, "proposals": proposals}
 
 

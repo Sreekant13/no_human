@@ -14,6 +14,14 @@ export function statusChip(it) {
   if (!it) return { label: "Unconfigured", tone: "neutral" };
   if (it.status === "ambient") return { label: "Active via CLI auth", tone: "ambient" };
   if (!it.configured) return { label: "Unconfigured", tone: "neutral" };
+  // Configured, but its own switch (`integrations.<name>.enabled`, or Slack's
+  // `intake`) is off — so `nh serve` starts no poller and no worker for it.
+  // This panel said "Configured" for exactly that state, which is how a fully
+  // filled-in Linear that polls nothing reads as working. `enabled` is null
+  // for github/gitlab/jenkins, which have no switch of their own, so they can
+  // never land here. Checked before healthy: a passing test on a switched-off
+  // integration proves the credential works, not that anything is running.
+  if (it.enabled === false) return { label: "Configured, off", tone: "neutral" };
   if (it.healthy === false) return { label: "Error", tone: "error" };
   if (it.healthy === true) return { label: "Connected", tone: "ok" };
   return { label: "Configured", tone: "ok" };

@@ -17,8 +17,12 @@ import threading
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import tamper_guard
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Callable
 
 
 log = logging.getLogger(__name__)
@@ -626,6 +630,62 @@ def terminate_running(under: Path | str) -> int:
     return killed
 
 
+def _run_shell_streaming(
+    cmd: str, work_dir: Path, timeout: int, run_env: dict[str, str],
+    on_line: "Callable[[str], None]",
+) -> tuple[int | None, str, bool]:
+    """The streaming half of ``_run_shell``: identical process setup, but the
+    output is read line-by-line and handed to *on_line* as it arrives instead
+    of being collected in one ``communicate()``.
+
+    Everything that makes a run a PROOF is deliberately unchanged — same command
+    string, same cwd, same env, same ``shell=True``, same ``start_new_session``
+    process group, same kill-the-group-on-timeout. Only the *reading* differs,
+    so a run watched live by the web wizard proves exactly what an unwatched run
+    would (see onboard.py's module docstring: proving must never drift from what
+    the orchestrator later executes).
+
+    ``stderr`` is folded into ``stdout`` here so the caller sees the two
+    interleaved in real time, which is how a human reads a failing test run.
+    """
+    proc = subprocess.Popen(
+        cmd, cwd=work_dir, shell=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        bufsize=1, env=run_env, start_new_session=True,
+    )
+    _register(work_dir, proc)
+    chunks: list[str] = []
+
+    def _pump() -> None:
+        try:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                chunks.append(line)
+                try:
+                    on_line(line.rstrip("\n"))
+                except Exception:  # noqa: BLE001
+                    # A broken/disconnected consumer (the user closed the tab)
+                    # must never fail the run or corrupt its exit status.
+                    pass
+        except (ValueError, OSError):  # pipe closed under us on kill
+            pass
+
+    reader = threading.Thread(target=_pump, daemon=True)
+    reader.start()
+    try:
+        proc.wait(timeout=timeout)
+        reader.join(timeout=15)
+        return proc.returncode, "".join(chunks), False
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()  # fallback: at least the direct child
+        reader.join(timeout=15)
+        return None, "".join(chunks), True
+    finally:
+        _deregister(proc)
+
+
 def _run_shell(
     cmd: str, work_dir: Path, timeout: int, run_env: dict[str, str],
 ) -> tuple[int | None, str, bool]:
@@ -668,7 +728,11 @@ def run_tests(
     cwd: Path | None = None, timeout: int = 1800,
     env: dict[str, str] | None = None,
     source_repo: Path | None = None,
+    on_line: "Callable[[str], None] | None" = None,
 ) -> TestRunResult:
+    # ``on_line``, when given, receives each output line as it is produced so a
+    # caller can show live progress (the web wizard's prove step). It changes
+    # nothing about WHAT runs — see _run_shell_streaming.
     # timeout was 600s — shorter than a real suite in a fresh worktree venv
     # under parallel load. Every dogfood task of the first parallel run
     # (2026-07-11) failed as "0 passed, 0 failed, 1 errors": the TIMEOUT,
@@ -711,7 +775,17 @@ def run_tests(
         run_env["PYTHONPATH"] = (
             f"{joined}{os.pathsep}{prior}" if prior else joined
         )
-    rc, output, timed_out = _run_shell(cmd, work_dir, timeout, run_env)
+    # Streaming is opt-in and additive: with no watcher this is literally
+    # `_run_shell`, resolved at call time so existing monkeypatches of it
+    # still apply. With a watcher it is the same process setup, read a line
+    # at a time (_run_shell_streaming) — the command, cwd, env and shell are
+    # identical either way, which is what keeps a watched run a real proof.
+    if on_line is None:
+        _shell = _run_shell
+    else:
+        def _shell(c, w, t, e):
+            return _run_shell_streaming(c, w, t, e, on_line)
+    rc, output, timed_out = _shell(cmd, work_dir, timeout, run_env)
     if timed_out:
         return TestRunResult(True, False, 0, 0, 1, cmd, f"timed out after {timeout}s")
     passed, failed, errors = _parse_test_output(cmd, output)
@@ -728,7 +802,7 @@ def run_tests(
         # just be a second coin flip).
         log.warning("teardown-race signature in test output (cmd=%s, rc=%s); retrying once",
                     cmd, rc)
-        rc_r, output_r, timed_out_r = _run_shell(cmd, work_dir, timeout, run_env)
+        rc_r, output_r, timed_out_r = _shell(cmd, work_dir, timeout, run_env)
         if timed_out_r:
             # Same classification as the first-run timeout above: a hanging
             # suite must never earn the advisory invocation_error path.
@@ -747,7 +821,7 @@ def run_tests(
         if retry_cmd and retry_cmd != cmd:
             log.warning("test invocation error (cmd=%s, rc=%s), retrying with: %s",
                         cmd, rc, retry_cmd)
-            rc2, output2, timed_out2 = _run_shell(retry_cmd, work_dir, timeout, run_env)
+            rc2, output2, timed_out2 = _shell(retry_cmd, work_dir, timeout, run_env)
             if timed_out2:
                 # Timeout doctrine (see the first-run and teardown-retry
                 # returns): a hanging suite never earns the advisory
@@ -833,11 +907,22 @@ def _lint_supports_file_args(cmd: str) -> bool:
 
 
 def run_command(
-    repo_path: Path, command: str, *, timeout: int = 600
+    repo_path: Path, command: str, *, timeout: int = 600,
+    on_line: "Callable[[str], None] | None" = None,
 ) -> tuple[bool, int, str]:
     """Run an arbitrary shell command in ``repo_path``; return (ok, exit_code,
     output_tail). Used by `nh onboard` to PROVE a derived install/lint command by
-    actually running it — the literal command, no agent in the loop."""
+    actually running it — the literal command, no agent in the loop.
+
+    With *on_line* the identical command is streamed line-by-line instead of
+    captured in one go (``_run_shell_streaming``) — same command, cwd, env and
+    shell, so the proof is worth exactly the same."""
+    if on_line is not None:
+        rc, output, timed_out = _run_shell_streaming(
+            command, Path(repo_path), timeout, dict(os.environ), on_line)
+        if timed_out:
+            return False, -1, f"timed out after {timeout}s"
+        return rc == 0, (rc if rc is not None else -1), output[-4000:]
     try:
         proc = subprocess.run(
             command, cwd=repo_path, shell=True, capture_output=True, text=True,

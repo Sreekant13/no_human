@@ -26,6 +26,32 @@ test("statusChip renders a distinct third state for status: 'ambient'", () => {
   );
 });
 
+// `nh serve` starts the Jira/Linear pollers only when
+// `integrations.<name>.enabled` is true (cli/commands.py). A fully configured
+// integration with that switch off runs NOTHING, and this panel used to call
+// it "Configured" — which is the "I don't have Linear" report.
+test("statusChip does not call a switched-off integration Configured", () => {
+  assert.deepEqual(
+    statusChip({ configured: true, healthy: null, enabled: false }),
+    { label: "Configured, off", tone: "neutral" },
+  );
+  // Even a PASSING connection test doesn't make it running — that proves the
+  // credential works, not that a poller was started.
+  assert.equal(statusChip({ configured: true, healthy: true, enabled: false }).label,
+               "Configured, off");
+});
+
+test("statusChip is unchanged for integrations that have no switch", () => {
+  // github/gitlab/jenkins are views over ci.*; the API sends enabled: null.
+  assert.deepEqual(statusChip({ configured: true, healthy: null, enabled: null }),
+                   { label: "Configured", tone: "ok" });
+  assert.deepEqual(statusChip({ configured: true, healthy: true, enabled: true }),
+                   { label: "Connected", tone: "ok" });
+  // A payload from before the field existed must behave exactly as it did.
+  assert.deepEqual(statusChip({ configured: true, healthy: true }),
+                   { label: "Connected", tone: "ok" });
+});
+
 test("statusChip renders all three states distinctly from a fixture payload list", () => {
   const fixture = [
     { name: "jira", configured: true, healthy: null, status: "configured" },

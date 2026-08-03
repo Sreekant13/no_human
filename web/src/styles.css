@@ -4765,6 +4765,12 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .integration-chip.tone-ambient {
   color: var(--purple); background: color-mix(in oklab, var(--purple) 14%, transparent);
 }
+/* "On, but not usable yet" — an integration whose switch is on while its
+   credential or its settings are still missing. Distinct from tone-error
+   (something tried and failed) and from tone-ok (it would actually run). */
+.integration-chip.tone-warn {
+  color: var(--amber); background: color-mix(in oklab, var(--amber) 14%, transparent);
+}
 .integration-chev { color: var(--text-dim); flex: none; font-size: 15px; }
 .integration-card.open .integration-chev { transform: rotate(90deg); }
 .integration-body {
@@ -4833,6 +4839,46 @@ a.so-chip-value:hover { color: var(--accent-300); }
   color: var(--text-dim);
 }
 .ob-integration .integration-chip { margin-left: auto; }
+
+/* Configurable integration card in the wizard: the status row above stays as
+   it was, and everything below only exists while the integration is switched
+   on. There is deliberately no password input in this family — the wizard
+   writes config.yaml only and NAMES the .env variable a credential goes in
+   (.ob-integration-secret). */
+.ob-integration-card {
+  display: flex; flex-direction: column;
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--bg-card); overflow: hidden;
+}
+.ob-integration-card .ob-integration { border: 0; border-radius: 0; background: none; }
+.ob-integration-card.on .ob-integration { border-bottom: 1px solid var(--border); }
+.ob-integration-switch {
+  display: flex; align-items: center; gap: 6px; flex: none;
+  font-size: 12px; color: var(--text-muted); cursor: pointer; white-space: nowrap;
+}
+.ob-integration-switch input { cursor: pointer; }
+.ob-integration-body {
+  display: flex; flex-direction: column; gap: 10px; padding: 11px 12px 12px;
+}
+.ob-integration-fields {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 9px;
+}
+.ob-integration-field { display: flex; flex-direction: column; gap: 4px; }
+.ob-integration-label {
+  font-size: 10.5px; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--text-dim);
+}
+.ob-integration-check {
+  display: flex; align-items: center; gap: 6px; font-size: 12.5px;
+  color: var(--text-muted); cursor: pointer;
+}
+.ob-integration-secret {
+  margin: 0; font-size: 12px; color: var(--text-muted);
+  background: var(--bg-panel); border-radius: var(--r-sm); padding: 7px 10px;
+}
+.ob-integration-actions { display: flex; align-items: center; gap: 10px; }
+.ob-integration-ok { font-size: 12px; font-weight: 600; color: var(--green); }
+.ob-integration-err { font-size: 12px; color: var(--red); }
 
 /* ── ONBOARDING WIZARD — premium first-run (Warm Editorial) ──────────────── */
 .ob-shell {
@@ -5007,7 +5053,15 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .cat-rule { color: var(--agent-supervisor); background: color-mix(in oklab, var(--agent-supervisor) 16%, transparent); }
 .cat-anti_pattern { color: var(--state-failed); background: color-mix(in oklab, var(--state-failed) 16%, transparent); }
 .cat-skill { color: var(--agent-reviewer); background: color-mix(in oklab, var(--agent-reviewer) 16%, transparent); }
-.ob-rule-text { font-size: 13px; color: var(--text-body); line-height: 1.5; margin-top: 6px; white-space: pre-wrap; }
+/* Long rule text stays fully READABLE, never clipped: the server used to send only
+   the first 400 characters of a mined rule, so the card ended mid-sentence with no
+   way to reach the rest. It now sends the whole thing, and a heuristic finding is a
+   verbatim user message, which can be long. Same treatment .memory-card-content
+   already gives the identical content in Settings — cap the height, scroll the
+   overflow — so one long proposal cannot bury the others, and every character is
+   still reachable. Do NOT add line-clamp/text-overflow here: that would put the
+   truncation back, in CSS. */
+.ob-rule-text { font-size: 13px; color: var(--text-body); line-height: 1.5; margin-top: 6px; white-space: pre-wrap; max-height: 200px; overflow-y: auto; }
 
 /* callouts / summary / empty */
 .ob-callout { margin-top: 18px; padding: 14px 16px; border-radius: var(--r-md); background: var(--surface-1); border: 1px solid var(--border); border-left: 3px solid var(--state-waiting); font-size: 14px; color: var(--text-body); line-height: 1.6; }
@@ -5023,6 +5077,9 @@ a.so-chip-value:hover { color: var(--accent-300); }
 /* nav + buttons */
 .ob-nav { display: flex; align-items: center; gap: 10px; padding: 0 4px; }
 .ob-nav-spacer { flex: 1; }
+/* Why Back is locked, next to the locked Back. A disabled button gets no tooltip
+   in any browser, so the reason has to be on the page or it is not said at all. */
+.ob-nav-note { font-size: 12px; color: var(--text-muted); line-height: 1.4; }
 .ob-btn {
   font-family: var(--font-ui); font-weight: 600; font-size: 14px; letter-spacing: 0.01em;
   padding: 11px 22px; border-radius: var(--r-md); border: 1px solid var(--accent-500);
@@ -5985,3 +6042,63 @@ select:disabled,
 textarea:disabled {
   pointer-events: none;
 }
+
+/* ── Proving a repo's test command (onboarding wizard + board banner) ─────────
+   The "unproven" state used to be a grey chip with no remedy. These styles back
+   the affordance that replaced it: run the command, show the real output, and
+   either confirm it or correct it. Muted-but-visible, never an error red for the
+   merely-unproven case — an unproven repo still runs tasks, it just runs them
+   without a test command for the review gate. */
+.ob-repo-status.warn { color: var(--state-waiting); }
+.ob-repo-row { display: block; }
+.ob-prove {
+  margin: 2px 0 12px 30px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--border);
+  font-size: 12px;
+}
+.ob-prove.ok { border-left-color: var(--state-done); }
+.ob-prove.failed { border-left-color: var(--state-failed); }
+.ob-prove .ob-row { margin-bottom: 6px; }
+.ob-prove-cmd, .ob-prove-log {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.ob-prove-log, .unproven-log {
+  max-height: 220px;
+  overflow: auto;
+  background: var(--bg-panel);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 6px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+.ob-prove-verdict { font-size: 12px; line-height: 1.6; }
+.ob-prove-verdict.ok, .unproven-panel-head .ok { color: var(--state-done); }
+.ob-prove-verdict.bad, .unproven-panel-head .bad { color: var(--state-failed); }
+
+.unproven-banner {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--state-waiting);
+  border-radius: 8px;
+  background: var(--bg-raised);
+}
+.unproven-head {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.unproven-text { flex: 1; min-width: 240px; font-size: 13px; }
+.unproven-why { color: var(--text-muted); font-size: 12px; }
+.unproven-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.unproven-panel { margin-top: 10px; }
+.unproven-panel-head { font-size: 12px; margin-bottom: 4px; }
+.unproven-retry { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.unproven-retry .ob-input { flex: 1; min-width: 220px; }
+.btn-prove { background: var(--accent-500); color: var(--bg); font-weight: 600; }

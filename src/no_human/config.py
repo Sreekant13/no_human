@@ -66,6 +66,44 @@ METERED_AUTH_VARS = (
 )
 
 
+# --------------------------------------------------------------------------- #
+# The SECOND coding backend's credential (OpenAI Codex).                       #
+# --------------------------------------------------------------------------- #
+#
+# BYO-API-KEY IS THE ONLY SANCTIONED PATH, and that is a legal constraint, not a
+# convenience. OpenAI's terms prohibit using ChatGPT to power third-party
+# services, so no_human never routes a user's ChatGPT subscription: there is no
+# browser-login flow here, no `codex login`, and the Codex CLI is invoked with
+# `preferred_auth_method="apikey"` so it cannot silently fall back to a ChatGPT
+# credential that happens to exist on the machine.
+#
+# The same discipline as the Anthropic key applies verbatim: the MODE
+# (`worker.backend: codex`) may live in config.yaml, the KEY never does — it
+# comes from ~/.no_human/.env, chmod 600 (see `_reject_api_key_in_config`,
+# which names both vendors' keys).
+CODEX_API_KEY_VAR = "OPENAI_API_KEY"
+
+# Variables that would silently REROUTE an OpenAI call to somebody else's
+# endpoint or somebody else's bill. Deliberately a SEPARATE tuple from
+# METERED_AUTH_VARS rather than an extension of it: that tuple is the Anthropic
+# scrub list, is asserted verbatim by a test, and is applied on EVERY run —
+# including runs that use no OpenAI at all. Scrubbing these is only correct when
+# Codex is the selected backend, which is exactly when `assert_codex_api_key_mode`
+# runs.
+#
+# NOT included, deliberately: OPENAI_ORG_ID / OPENAI_PROJECT. They select which
+# of the key-holder's OWN org/projects is billed, which is a legitimate choice an
+# operator may have made in their shell; removing them would silently move their
+# invoice. The ones below point the request somewhere else entirely.
+CODEX_ALTERNATE_ROUTING_VARS = (
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_AD_TOKEN",
+)
+
+
 class AuthError(RuntimeError):
     """Raised when the process is not provably in subscription-billing mode."""
 
@@ -279,6 +317,46 @@ def load_api_key(env_path: Path | None = None) -> str | None:
     if key:
         os.environ[API_KEY_VAR] = key
     return key or None
+
+
+def assert_codex_api_key_mode(env_path: Path | None = None) -> ScrubReport:
+    """Enforce BYO-API-key billing for the Codex coding backend.
+
+    Called ONLY when ``worker.backend`` is ``"codex"``, and IN ADDITION to
+    :func:`assert_subscription_mode` — not instead of it. That is deliberate and
+    is the one place the "a run bills exactly one path" rule needed restating
+    for a two-vendor world: with Codex selected, the CODER bills OpenAI and the
+    reviewer, planner, supervisor and utility tiers still bill Anthropic,
+    because the review gate and the four model tiers are pinned to Claude by
+    constraint. So the invariant is
+    per-vendor: exactly one Anthropic credential and exactly one OpenAI
+    credential, each the one the operator chose, with every alternate routing
+    for both scrubbed. Two vendors, two bills, no third path.
+
+    Raises :class:`AuthError` when no ``OPENAI_API_KEY`` resolves. Never echoes
+    the key.
+    """
+    env_path = ENV_PATH if env_path is None else env_path
+    key = _read_env_file(env_path).get(CODEX_API_KEY_VAR) or os.environ.get(
+        CODEX_API_KEY_VAR)
+    report = ScrubReport()
+    for var in CODEX_ALTERNATE_ROUTING_VARS:
+        if os.environ.get(var):
+            report.removed.append(var)
+            del os.environ[var]
+    if not key:
+        raise AuthError(
+            "worker.backend is 'codex' but no OPENAI_API_KEY was found. The "
+            "Codex backend runs on YOUR OWN OpenAI API key — there is no "
+            "subscription path, because OpenAI's terms prohibit using ChatGPT "
+            "to power third-party services.\n"
+            f"Add the key to {env_path} (chmod 600):\n"
+            "  echo 'OPENAI_API_KEY=sk-...' >> ~/.no_human/.env\n"
+            "It must never go in config.yaml. To go back to Claude, set "
+            "worker.backend: claude."
+        )
+    os.environ[CODEX_API_KEY_VAR] = key
+    return report
 
 
 def load_env_var(name: str, env_path: Path | None = None) -> str | None:
@@ -603,8 +681,17 @@ def assert_subscription_mode(
 DEFAULT_CONFIG: dict[str, Any] = {
     "server": {"host": "127.0.0.1", "port": 8420},
     "worker": {
-        # Single in-process backend: the Claude Agent SDK. No alternate
-        # backend abstraction (lean-stack).
+        # WHICH CODING BACKEND THE IMPLEMENTER RUNS ON. "claude" (the default)
+        # is the Claude Agent SDK path and is unchanged in every respect — an
+        # operator who edits nothing sees no behavioural difference from before
+        # this key meant anything. "codex" routes the CODER, and only the coder,
+        # to the OpenAI Codex CLI on the operator's own OPENAI_API_KEY.
+        #
+        # Reviewer, planner, supervisor and utility stay on Claude regardless:
+        # the review gate and all four model tiers are pinned by ID in the
+        # project's non-negotiable constraints, and the 2026-08-01 amendment
+        # that sanctioned a second backend moved neither. See
+        # `agent.backend.CLAUDE_PINNED_ROLES`.
         "backend": "claude",
     },
     "llm": {
@@ -638,6 +725,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # hint, never a verdict. It is never the implementer, planner, reviewer
         # or supervisor — those four tiers are fixed above.
         "utility_model": "claude-haiku-4-5",
+        # --- OpenAI Codex backend (only read when worker.backend == "codex") ---
+        # Chosen EXPLICITLY rather than derived from a Claude tier: the four
+        # Claude IDs above are fixed by constraint and mean nothing to Codex,
+        # so the Codex model gets its own key and its own default. Overriding
+        # this is the supported way to move the Codex tier; nothing else here
+        # changes when it does.
+        "codex_model": "gpt-5-codex",
+        # Codex's `model_reasoning_effort`. None ⇒ let the CLI use its own
+        # default. The orchestrator's `effort=` ("low"/"medium"/"high") is
+        # mapped onto this per call and takes precedence when it is set.
+        "codex_reasoning_effort": None,
+        # Absolute path to the `codex` binary, for installs where it is not on
+        # PATH. None ⇒ resolve it the way the CLI itself is normally found.
+        "codex_cli_path": None,
         # MoA (Mixture-of-Agents) planning fan-out — on by default. Runs N
         # independent plan proposals from different angles, then ONE
         # aggregator call synthesizes a single plan (evidence-based synthesis,
@@ -998,6 +1099,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
             # never in this world-readable file.
             "intake": False,
         },
+        "teams": {
+            # Microsoft Teams notify-OUT (notify/teams.py), the write-only
+            # sibling of notify/slack.py. Until this block existed, Teams was
+            # the one integration in the registry (integrations/__init__.py
+            # `_ORDER`) with NO config block at all, so nothing could offer it
+            # to a user and it could only be reached by hand-editing YAML.
+            #
+            # The webhook URL is deliberately NOT duplicated here: it stays at
+            # `notifications.teams_webhook_url`, where notify.build_notifier
+            # already reads it — one source of truth per setting. That URL
+            # carries its own SAS credential (`sp`/`sv`/`sig`) in the query
+            # string, so it is a SECRET and is never collected by onboarding.
+            #
+            # `enabled` is a mute switch: it turns the channel off without
+            # making the operator delete a webhook they pasted. Honoured by
+            # notify.build_notifier. Default True, so an install that already
+            # has a webhook keeps delivering byte-for-byte as before — a False
+            # default here would silently stop existing Teams alerts.
+            "enabled": True,
+        },
     },
     "ci_gate": {
         # M6: post-PR CI_GATE integration validation, run as a WakeWatcher rung
@@ -1332,14 +1453,22 @@ def set_auth_profile(profile: str, config_path: Path = CONFIG_PATH) -> str:
 
 
 def _reject_api_key_in_config(data: dict[str, Any]) -> None:
-    """Fail loudly if a metered API key was placed in config (it never should)."""
+    """Fail loudly if a metered API key was placed in config (it never should).
+
+    Covers BOTH vendors' keys. The rule is not "Anthropic's key is special" —
+    it is that config.yaml is a plain, world-readable, frequently-copied file
+    and no credential belongs in one. Adding the second coding backend added a
+    second key that could be put there, so it is named here in the same breath;
+    a guard that enumerates one vendor is a guard that misses the next one.
+    """
+    banned = {API_KEY_VAR, CODEX_API_KEY_VAR}
 
     def walk(node: Any) -> None:
         if isinstance(node, dict):
             for key, value in node.items():
-                if isinstance(key, str) and key.upper() == "ANTHROPIC_API_KEY":
+                if isinstance(key, str) and key.upper() in banned:
                     raise AuthError(
-                        "ANTHROPIC_API_KEY must never appear in config.yaml. "
+                        f"{key.upper()} must never appear in config.yaml. "
                         "The auth *mode* may live in config; the key itself "
                         "belongs only in ~/.no_human/.env (chmod 600) or the "
                         "process environment."

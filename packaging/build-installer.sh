@@ -29,6 +29,25 @@ mkdir -p "${BUNDLE}/web"
 cp -R "${ROOT}/web/dist" "${BUNDLE}/web/dist"
 cp -R "${ROOT}/migrations" "${BUNDLE}/migrations"
 
+echo "==> stripping build-machine provenance"
+# PyInstaller copies the installed distribution's .dist-info verbatim, and for an
+# EDITABLE install pip records the source checkout's ABSOLUTE PATH in
+# direct_url.json:
+#     {"url":"file:///Users/<user>/git/<employer>/.../no_human","dir_info":{"editable":true}}
+# That shipped inside the .app in the Mac DMG — the maintainer's home directory
+# and the employer-named parent directory, in an artifact handed to third
+# parties. It is exactly what P1 exists to prevent, and no export rule could
+# catch it: the DMG is BUILT, not exported, so EXPORT_CLASSIFICATION.txt never
+# sees this file. Found by an independent reviewer, not by a test.
+#
+# ONLY direct_url.json is removed, NOT the .dist-info directory. Deleting the
+# whole directory was tried first, on the assumption that a frozen app resolves
+# no distributions -- it does: `nh --version` then dies in
+# importlib/metadata/__init__.py:397 `from_name`. direct_url.json is the sole
+# file carrying the path (verified by grep over the built bundle), and it is
+# pip-install provenance that nothing reads at runtime.
+find "${BUNDLE}/_internal" -path "*.dist-info/direct_url.json" -print -delete || true
+
 echo "==> verifying"
 py_count="$(find "${BUNDLE}" -name '*.py' | wc -l | tr -d ' ')"
 if [ "${py_count}" != "0" ]; then
@@ -64,6 +83,24 @@ fi
 private_terms="$(grep -o 'no_human\.eval\._vendor_terms_private' "${pyz_toc}" | sort -u || true)"
 if [ -n "${private_terms}" ]; then
   echo "FAIL: no_human.eval._vendor_terms_private is frozen into the bundle (it must never ship)" >&2
+  exit 1
+fi
+
+# No absolute build path may survive anywhere in the bundle. This is the check
+# the DMG never had: the identity guard in the test suite SKIPS whenever
+# desktop/dist is absent, which is every clean clone and every CI run, so it was
+# dark exactly when it mattered. Checked here, where the artifact is made.
+# -a, and the bare path as well as the file:// form. The first version of this
+# gate used `grep -rl "file://${HOME}"` and a known-positive control exposed two
+# holes in it: grep SKIPS BINARY FILES without -a, so a path baked into the
+# frozen executable or a .so was invisible -- and PyInstaller is exactly the kind
+# of tool that bakes build paths into binaries. The file:// prefix is also only
+# how pip happens to write it; RECORD-style or compiled-in paths are bare.
+# Verified with planted controls in both forms before being trusted.
+leaked="$(grep -ral -e "file://${HOME}" -e "${HOME}/" "${BUNDLE}" 2>/dev/null || true)"
+if [ -n "${leaked}" ]; then
+  echo "FAIL: the bundle records this machine's build path (P1: no maintainer trace ships)" >&2
+  echo "${leaked}" >&2
   exit 1
 fi
 

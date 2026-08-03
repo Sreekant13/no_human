@@ -2,12 +2,22 @@ import React, { useEffect, useRef, useState } from "react";
 import {
   detectRepos, discoverRepos, onboardRepo, extractHistory, analyzeHistory,
   confirmRules, completeOnboarding, suggestPaths, createProject,
-  generateDocs, fetchIntegrations,
+  generateDocs, fetchIntegrationSetup, saveIntegrationSetup,
+  proveRepoSSE, confirmRepoProfile, fetchReadiness,
 } from "./api.js";
 import { repoBadges, discoveryMessage, fromDetectedRepo } from "./discoveredRepos.js";
 import { LegionLogo } from "./Logo.jsx";
-import { statusChip, KIND_LABEL, NAME_LABEL } from "./integrationChip.js";
+import { KIND_LABEL, NAME_LABEL } from "./integrationChip.js";
 import { IntegrationIcon } from "./integrationIcons.jsx";
+import {
+  draftFrom, changedValues, listToText, readiness, setupSummary, secretHint,
+  switchLabel,
+} from "./integrationSetup.js";
+import { backDisabled, backDisabledReason, forwardDisabled } from "./onboardingNav.js";
+import {
+  newProjectDef, toggleProjectRepo as bindProjectRepo, setPrimaryRepo,
+  dropRepoEverywhere, unboundProjects, unboundProjectsMessage, projectPayload,
+} from "./onboardingProjects.js";
 
 // "Building your validator agent" — a T-800-style head that assembles itself
 // while the (slow) history scan runs: the chrome skull draws in, plates snap on,
@@ -102,6 +112,8 @@ const STEPS = [
   { key: "summary",  title: "Launch" },
 ];
 
+export const repoName = (p) => (p || "").replace(/\/+$/, "").split("/").pop() || p;
+
 export default function Onboarding({ onComplete }) {
   const [i, setI] = useState(0);
   const [team, setTeam] = useState("");
@@ -113,7 +125,7 @@ export default function Onboarding({ onComplete }) {
   const [manualScan, setManualScan] = useState(false);
   const [selectedRepos, setSelectedRepos] = useState(new Set());
   const [onboarded, setOnboarded] = useState({});   // path -> {ecosystem,test_cmd,...} | "busy"
-  const [projectDefs, setProjectDefs] = useState([]);   // [{name, repos: Set}]
+  const [projectDefs, setProjectDefs] = useState([]);   // [{name, repos: Set, primary}]
   const [newProjName, setNewProjName] = useState("");
   const [docs, setDocs] = useState([""]);
   const [history, setHistory] = useState(null);     // {available, transcripts}
@@ -124,10 +136,39 @@ export default function Onboarding({ onComplete }) {
   const [err, setErr] = useState(null);
   const [wikiGen, setWikiGen] = useState({});  // repoPath -> "busy"|{ok,files}|{error}
   const [integrations, setIntegrations] = useState(null);   // null=unloaded
+  // Proving: path -> {status, lines[], elapsed, attempted, result, error}.
+  // "unproven" is not a cosmetic state — a repo without a proven test command
+  // still runs tasks, but its review gate has no test command to execute. So
+  // the wizard offers the proof rather than deferring it to a CLI command the
+  // user has no way to discover.
+  const [proveState, setProveState] = useState({});
+  const [proveCmd, setProveCmd] = useState({});   // path -> the human's corrected command
+  const [readiness, setReadiness] = useState(null);
+  const proveStreams = useRef({});
+
+  // Editable draft of the integrations step: {name: {field: value}}. Seeded
+  // from the server's spec (draftFrom) and diffed against it on save, so only
+  // what the user touched is written. A secret is never in here — the API
+  // never advertises a credential field.
+  const [intDraft, setIntDraft] = useState({});
+  const [intSaving, setIntSaving] = useState(null);   // integration name
+  const [intSaved, setIntSaved] = useState(null);     // integration name
+  const [intError, setIntError] = useState({});       // name -> message
 
   const step = STEPS[i];
+  // The repo to offer a first task in: the server's readiness answer, never a
+  // local guess — it is the same `is_usable` the orchestrator gates on.
+  const firstTaskRepo = readiness && !readiness.error ? readiness.first_usable : null;
+  // Which project definitions bind no repo. The summary used to count these in
+  // with the rest and the launch dropped them without a word — the "Projects 1"
+  // then "Projects 0" the first external tester saw. Named on the card, counted
+  // honestly here, and refused by finish().
+  const unbound = unboundProjects(projectDefs);
   const next = () => setI((n) => Math.min(n + 1, STEPS.length - 1));
   const back = () => setI((n) => Math.max(n - 1, 0));
+  // Everything the nav predicates in onboardingNav.js need. Kept as one object so
+  // the Back/Continue/launch controls cannot drift apart.
+  const navState = { index: i, lastIndex: STEPS.length - 1, busy };
 
   // Advancing a step swaps the whole card underneath the user, and nothing moved focus
   // with it. Measured on the pre-change build, not assumed: the Continue button lives in
@@ -179,17 +220,55 @@ export default function Onboarding({ onComplete }) {
       });
     }
     if (step.key === "integrations" && integrations === null) {
-      fetchIntegrations().then((r) => setIntegrations(r.integrations || [])).catch(() => setIntegrations([]));
+      fetchIntegrationSetup()
+        .then((r) => {
+          const specs = r.integrations || [];
+          setIntegrations(specs);
+          setIntDraft(draftFrom(specs));
+        })
+        .catch(() => setIntegrations([]));
     }
     // deps intentionally partial (was: eslint-disable react-hooks/exhaustive-deps — plugin never loaded here)
   }, [step.key]);
 
+  function setIntField(name, field, value) {
+    setIntDraft((d) => ({ ...d, [name]: { ...(d[name] || {}), [field]: value } }));
+    setIntSaved((s) => (s === name ? null : s));
+  }
+
+  // Save ONE integration's non-secret settings. The response is the refreshed
+  // spec, so the card's state (on/off, "needs LINEAR_API_KEY", "Ready") comes
+  // straight from what actually landed in config.yaml — not from what was
+  // typed.
+  async function saveIntegration(spec) {
+    const values = changedValues(spec, intDraft);
+    if (Object.keys(values).length === 0) return;
+    setIntSaving(spec.name);
+    setIntError((e) => ({ ...e, [spec.name]: null }));
+    try {
+      const refreshed = await saveIntegrationSetup(spec.name, values);
+      setIntegrations((all) => (all || []).map((s) => (s.name === spec.name ? refreshed : s)));
+      setIntDraft((d) => ({ ...d, [spec.name]: draftFrom([refreshed])[spec.name] }));
+      setIntSaved(spec.name);
+    } catch (e) {
+      setIntError((er) => ({ ...er, [spec.name]: e.message }));
+    } finally {
+      setIntSaving(null);
+    }
+  }
+
   function toggleRepo(path) {
+    const removing = selectedRepos.has(path);
     setSelectedRepos((s) => {
       const n = new Set(s);
       n.has(path) ? n.delete(path) : n.add(path);
       return n;
     });
+    // Deselecting a repo also unbinds it from every project. The projects step
+    // renders a checkbox only for the repos still selected here, so a binding
+    // left behind is one nothing on screen can show or undo — and it would
+    // still be POSTed at launch.
+    if (removing) setProjectDefs((d) => dropRepoEverywhere(d, path));
   }
 
   async function onboardSelected() {
@@ -201,6 +280,89 @@ export default function Onboarding({ onComplete }) {
       }
     });
   }
+
+  // Abort any live prove stream when the wizard unmounts. The server-side run
+  // is bounded independently; this only stops us reading it.
+  useEffect(() => () => {
+    Object.values(proveStreams.current).forEach((s) => { try { s.close(); } catch { /* already gone */ } });
+  }, []);
+
+  function patchProve(path, patch) {
+    setProveState((s) => {
+      const cur = s[path] || { lines: [], status: "idle" };
+      return { ...s, [path]: { ...cur, ...(typeof patch === "function" ? patch(cur) : patch) } };
+    });
+  }
+
+  // Run the repo's test command for real and stream what it prints. `testCmd`
+  // is the human's correction after a failure — it is sent verbatim and the
+  // server proves that exact string, never a tidied-up version of it.
+  function startProve(path, testCmd) {
+    const prev = proveStreams.current[path];
+    if (prev) { try { prev.close(); } catch { /* already gone */ } }
+    setProveState((s) => ({
+      ...s,
+      [path]: { status: "running", lines: [], elapsed: 0, attempted: testCmd || "" },
+    }));
+    // Tracked in the closure, not in state: the `done` frame needs the command
+    // that was actually attempted, and reading state there would read a stale
+    // render's copy of it.
+    let attempted = testCmd || "";
+    proveStreams.current[path] = proveRepoSSE(
+      { repo_path: path, test_cmd: testCmd || undefined },
+      (f) => {
+        if (f.kind === "output") {
+          patchProve(path, (cur) => ({ lines: [...cur.lines.slice(-300), f.line] }));
+        } else if (f.kind === "heartbeat") {
+          patchProve(path, { elapsed: f.elapsed });
+        } else if (f.kind === "prove_start") {
+          if (f.cmd_kind === "test") attempted = f.command;
+          patchProve(path, (cur) => ({
+            lines: [...cur.lines, `$ ${f.command}`],
+            attempted: f.cmd_kind === "test" ? f.command : cur.attempted,
+          }));
+        } else if (f.kind === "rewritten") {
+          // Honesty: run_tests has a bounded self-correcting retry. If the
+          // string that actually exited clean differs, say so rather than let
+          // the user confirm against a command they never saw run.
+          patchProve(path, (cur) => ({
+            lines: [...cur.lines, `note: the runner retried this as: ${f.actual_command}`],
+          }));
+        } else if (f.kind === "prove_result") {
+          patchProve(path, (cur) => ({
+            lines: [...cur.lines, `→ ${f.command} exited ${f.exit_code}`],
+          }));
+        } else if (f.kind === "done") {
+          patchProve(path, { status: f.test_proven ? "proven" : "failed", result: f });
+          setOnboarded((o) => ({ ...o, [path]: { ...(o[path] || {}), ...f } }));
+          if (!f.test_proven) {
+            setProveCmd((c) => ({ ...c, [path]: c[path] ?? attempted }));
+          }
+        }
+      },
+      (e) => patchProve(path, { status: "error", error: e.message }),
+    );
+  }
+
+  async function confirmProved(path) {
+    await guard(async () => {
+      const res = await confirmRepoProfile(path);
+      setOnboarded((o) => ({ ...o, [path]: { ...(o[path] || {}), ...res } }));
+      patchProve(path, { status: "confirmed", result: res });
+    });
+  }
+
+  // The summary reads readiness from the server, not from local state, so it
+  // cannot claim "Ready." on the strength of a click that did not stick.
+  useEffect(() => {
+    if (step.key !== "summary") return;
+    let cancelled = false;
+    fetchReadiness()
+      .then((r) => { if (!cancelled) setReadiness(r); })
+      .catch(() => { if (!cancelled) setReadiness({ error: true }); });
+    return () => { cancelled = true; };
+    // deps intentionally partial (matches this file's existing convention)
+  }, [step.key]);
 
   async function scanHistory() {
     setErr(null);
@@ -214,7 +376,13 @@ export default function Onboarding({ onComplete }) {
         setScanPhase("analyzing");
         const an = await analyzeHistory(30);
         setProposals(an.proposals || []);
-        setChosenRules(new Set((an.proposals || []).map((p) => p.id)));
+        // Confirmation is OPT-IN per memory. Nothing is pre-ticked: a real user
+        // was shown their own home address and phone number already checked,
+        // one click from becoming standing guidance. The server sends
+        // `selected: false` on every proposal and `default_selected: false`;
+        // honour it rather than deciding here, and default to unticked if an
+        // older server omits the field.
+        setChosenRules(new Set((an.proposals || []).filter((p) => p.selected === true).map((p) => p.id)));
         setScanPhase("done");
       } else {
         setScanPhase("unavailable");
@@ -237,17 +405,22 @@ export default function Onboarding({ onComplete }) {
   function addProject() {
     const name = newProjName.trim();
     if (!name || projectDefs.some((p) => p.name === name)) return;
-    setProjectDefs([...projectDefs, { name, repos: new Set() }]);
+    // Seeded with the repos onboarded on the previous step, not with nothing:
+    // an empty-by-construction definition is what the wizard then discarded in
+    // silence (see onboardingProjects.js). The seeding is visible — the boxes
+    // are ticked and the header counts them — so it can be undone.
+    setProjectDefs([...projectDefs, newProjectDef(name, selectedRepos)]);
     setNewProjName("");
   }
 
   function toggleProjectRepo(projIdx, repoPath) {
-    setProjectDefs(projectDefs.map((p, i) => {
-      if (i !== projIdx) return p;
-      const next = new Set(p.repos);
-      next.has(repoPath) ? next.delete(repoPath) : next.add(repoPath);
-      return { ...p, repos: next };
-    }));
+    setProjectDefs(projectDefs.map(
+      (p, i) => (i === projIdx ? bindProjectRepo(p, repoPath) : p)));
+  }
+
+  function chooseProjectPrimary(projIdx, repoPath) {
+    setProjectDefs(projectDefs.map(
+      (p, i) => (i === projIdx ? setPrimaryRepo(p, repoPath) : p)));
   }
 
   function removeProject(projIdx) {
@@ -256,17 +429,21 @@ export default function Onboarding({ onComplete }) {
 
   async function finish() {
     await guard(async () => {
+      // A project that binds no repo used to be dropped here silently, while
+      // the summary above went on counting it. Refuse, by name, before anything
+      // is written — so nothing is half-created and the user is told which
+      // definition is the problem.
+      if (unbound.length) throw new Error(unboundProjectsMessage(unbound));
       if (chosenRules.size) await confirmRules([...chosenRules]);
-      // Create projects via API.
+      // Create projects via API. primary_repo travels with the payload: it is
+      // the project's default repo in the composer, and without it the server
+      // falls back to whichever repo was ticked first.
       for (const pd of projectDefs) {
-        const repoPaths = [...pd.repos];
-        if (repoPaths.length > 0) {
-          try {
-            await createProject({ name: pd.name, repo_paths: repoPaths });
-          } catch (e) {
-            // 409 = already exists, skip.
-            if (!e.message.includes("already exists")) throw e;
-          }
+        try {
+          await createProject(projectPayload(pd));
+        } catch (e) {
+          // 409 = already exists, skip.
+          if (!e.message.includes("already exists")) throw e;
         }
       }
       await completeOnboarding({
@@ -274,7 +451,9 @@ export default function Onboarding({ onComplete }) {
         repos: [...selectedRepos],
         docs: docs.map((d) => d.trim()).filter(Boolean),
       });
-      onComplete();
+      // Hand the ready repo up so the app can open the composer on it instead
+      // of dropping the user onto an empty board.
+      onComplete(firstTaskRepo ? { firstTaskRepo } : {});
     });
   }
 
@@ -445,8 +624,10 @@ export default function Onboarding({ onComplete }) {
                 {detected.length === 0 && <div className="ob-empty">{busy ? <><span className="grill-spinner" style={{ width: 16, height: 16, verticalAlign: 'middle', marginRight: 8 }} />Looking for your repositories…</> : "No repositories found. Search another folder above."}</div>}
                 {detected.map((r) => {
                   const st = onboarded[r.path];
+                  const pv = proveState[r.path];
                   return (
-                    <label key={r.path} className={`ob-repo${selectedRepos.has(r.path) ? " sel" : ""}`}>
+                    <div key={r.path} className="ob-repo-row">
+                    <label className={`ob-repo${selectedRepos.has(r.path) ? " sel" : ""}`}>
                       <input type="checkbox" checked={selectedRepos.has(r.path)} onChange={() => toggleRepo(r.path)} />
                       <span className="ob-repo-name">{r.name}</span>
                       {repoBadges(r).map((b) => (
@@ -457,11 +638,28 @@ export default function Onboarding({ onComplete }) {
                       ))}
                       {st === "busy" && <span className="ob-repo-status"><span className="grill-spinner" style={{ width: 12, height: 12, verticalAlign: 'middle', marginRight: 4 }} />profiling…</span>}
                       {st && st !== "busy" && (
-                        <span className="ob-repo-status ok">
-                          {st.ecosystem || "?"}{st.test_cmd ? ` · ${st.test_cmd}` : ""} · unproven
+                        <span className={`ob-repo-status ${st.is_usable ? "ok" : "warn"}`}>
+                          {st.ecosystem || "unknown"}{st.test_cmd ? ` · ${st.test_cmd}` : ""}
+                          {" · "}
+                          {st.is_usable ? "proven & confirmed"
+                            : st.test_proven ? "proven — confirm to use"
+                            : "not proven yet"}
                         </span>
                       )}
                     </label>
+                    {st && st !== "busy" && (
+                      <ProvePanel
+                        repoPath={r.path}
+                        profile={st}
+                        prove={pv}
+                        editedCmd={proveCmd[r.path]}
+                        onEditCmd={(v) => setProveCmd((c) => ({ ...c, [r.path]: v }))}
+                        onProve={(cmd) => startProve(r.path, cmd)}
+                        onConfirm={() => confirmProved(r.path)}
+                        busy={busy}
+                      />
+                    )}
+                    </div>
                   );
                 })}
               </div>
@@ -473,7 +671,13 @@ export default function Onboarding({ onComplete }) {
                   {busy ? "Profiling…" : `Profile ${selectedRepos.size} repo${selectedRepos.size > 1 ? "s" : ""}`}
                 </button>
               )}
-              <p className="ob-note">Profiling derives install/test/lint from each repo's own declarations. Proving (running the tests) happens later via <code>nh onboard</code> — never trusted until proven.</p>
+              <p className="ob-note">
+                Profiling reads each repo's own declarations to find its install/test/lint
+                commands. Proving RUNS the test command here and shows you the output —
+                nothing is trusted until it exits clean. You can skip proving and come back
+                to it from the board, but until a repo is proven its tasks run with no test
+                command, so the review gate has no tests to execute.
+              </p>
             </Stagger>
           )}
 
@@ -501,6 +705,31 @@ export default function Onboarding({ onComplete }) {
                       </label>
                     ))}
                   </div>
+                  {/* Said here, next to the empty tick-list that causes it, and
+                      again as a refusal at launch. The wizard used to print
+                      "Projects 1" on the summary and create none. */}
+                  {pd.repos.size === 0 && (
+                    <div className="ob-empty" style={{ marginTop: '0.4rem' }}>
+                      No repos ticked — {pd.name} cannot be created until at least one is.
+                    </div>
+                  )}
+                  {/* "One repo should be the default but configurable" — the
+                      default is the project's primary_repo, which becomes the
+                      repo a task on this project runs in. */}
+                  {pd.repos.size > 1 && (
+                    <label className="ob-faint" style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginTop: '0.4rem', fontSize: '0.8rem' }}>
+                      Default repo
+                      <select
+                        className="ob-input" style={{ flex: 1, padding: '0.2rem 0.4rem', fontSize: '0.8rem' }}
+                        value={pd.primary || ""}
+                        onChange={(e) => chooseProjectPrimary(pi, e.target.value)}
+                      >
+                        {[...pd.repos].map((rp) => (
+                          <option key={rp} value={rp}>{rp.split("/").pop()}</option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
                 </div>
               ))}
               <p className="ob-note">You can add or edit projects later in Settings. Repos not assigned to any project can still be used via the "other" option when creating a task.</p>
@@ -551,25 +780,28 @@ export default function Onboarding({ onComplete }) {
           {step.key === "integrations" && (
             <Stagger>
               <h2 className="ob-h2">Connect your tools <span className="ob-faint">(optional)</span></h2>
-              <p className="ob-sub">no_human works with your issue tracker, CI, and notifications. Here's what it detects now — set any of these up later in Settings → Integrations. You can skip this and keep going.</p>
+              <p className="ob-sub">Turn on the ones you use and fill in their settings — this writes straight to your config. <strong>Keys and tokens are never taken here:</strong> each card names the <code>~/.no_human/.env</code> variable its credential belongs in, because config.yaml is world-readable. You can skip this and keep going.</p>
               {integrations === null ? (
                 <div className="ob-empty">Checking integrations…</div>
+              ) : integrations.length === 0 ? (
+                <div className="ob-empty">No integrations available.</div>
               ) : (
                 <div className="ob-integrations">
-                  {integrations.map((it) => {
-                    const chip = statusChip(it);
-                    return (
-                      <div key={it.name} className="ob-integration">
-                        <span className="ob-integration-mark"><IntegrationIcon name={it.name} size={20} /></span>
-                        <span className="ob-integration-name">{NAME_LABEL[it.name] || it.name}</span>
-                        <span className="ob-integration-kind">{KIND_LABEL[it.kind] || it.kind}</span>
-                        <span className={`integration-chip tone-${chip.tone}`}>{chip.label}</span>
-                      </div>
-                    );
-                  })}
+                  {integrations.map((spec) => (
+                    <IntegrationSetupCard
+                      key={spec.name}
+                      spec={spec}
+                      draft={intDraft}
+                      saving={intSaving === spec.name}
+                      saved={intSaved === spec.name}
+                      error={intError[spec.name]}
+                      onField={setIntField}
+                      onSave={() => saveIntegration(spec)}
+                    />
+                  ))}
                 </div>
               )}
-              <p className="ob-note">Configure these anytime in Settings → Integrations — set values in config.yaml and tokens in ~/.no_human/.env.</p>
+              <p className="ob-note">Everything here is also in Settings → Integrations, which additionally handles credentials and can test a live connection.</p>
             </Stagger>
           )}
 
@@ -628,7 +860,7 @@ export default function Onboarding({ onComplete }) {
           {step.key === "rules" && (
             <Stagger>
               <h2 className="ob-h2">Review the rules we found</h2>
-              <p className="ob-sub">Confirmed rules become standing guidance the Supervisor enforces. Nothing is active until you confirm it.</p>
+              <p className="ob-sub">Nothing is ticked and nothing is active. Tick only the ones you want — confirmed rules become standing guidance the Supervisor enforces.</p>
               {proposals.length === 0 ? (
                 <div className="ob-empty">No proposals — nothing extracted, or you skipped the scan. You can add rules anytime in Settings.</div>
               ) : (
@@ -652,14 +884,56 @@ export default function Onboarding({ onComplete }) {
 
           {step.key === "summary" && (
             <Stagger>
-              <h2 className="ob-h2">Ready.</h2>
+              {/* The headline states what is TRUE, not what we hope. "Ready."
+                  used to print regardless of whether a single repo had a test
+                  command anything could run. */}
+              <h2 className="ob-h2">
+                {readiness === null ? "Checking…"
+                  : readiness.usable > 0 ? "Ready."
+                  : "Almost ready."}
+              </h2>
               <ul className="ob-summary">
                 <li><span>Team</span><b>{team || "—"}</b></li>
-                <li><span>Projects</span><b>{projectDefs.length}</b></li>
+                <li>
+                  <span>Projects</span>
+                  <b>{projectDefs.length}{unbound.length ? ` · ${unbound.length} with no repos` : ""}</b>
+                </li>
                 <li><span>Repos</span><b>{selectedRepos.size}</b></li>
                 <li><span>Docs</span><b>{docs.filter((d) => d.trim()).length}</b></li>
                 <li><span>Rules confirmed</span><b>{chosenRules.size}</b></li>
+                <li>
+                  <span>Repos with a proven test command</span>
+                  <b>{readiness === null ? "…" : `${readiness.usable} of ${readiness.total}`}</b>
+                </li>
+                {/* Counted from the SERVER's refreshed specs, so this line
+                    agrees with what is actually in config.yaml — "on" is the
+                    switch, "ready" additionally has its credential and its
+                    settings. Never claims more than the config supports. */}
+                <li>
+                  <span>Integrations on</span>
+                  <b>{integrations === null
+                    ? "—"
+                    : `${setupSummary(integrations).on} of ${setupSummary(integrations).total}` +
+                      (setupSummary(integrations).ready < setupSummary(integrations).on
+                        ? ` · ${setupSummary(integrations).ready} ready`
+                        : "")}</b>
+                </li>
               </ul>
+              {readiness && !readiness.error && readiness.usable === 0 && (
+                <p className="ob-prove-verdict bad">
+                  No repo has a proven test command yet. Your tasks will still run — but
+                  their review gate will have no tests to execute, which is most of what
+                  makes a result trustworthy. Go back to Repositories and hit
+                  “Prove test command”, or do it any time from the board.
+                </p>
+              )}
+              {readiness && !readiness.error && readiness.usable > 0
+                && readiness.needs_proving.length > 0 && (
+                <p className="ob-note">
+                  {readiness.needs_proving.length} other {readiness.needs_proving.length === 1 ? "repo" : "repos"} still
+                  {" "}{readiness.needs_proving.length === 1 ? "has no" : "have no"} proven test command — the board will show you.
+                </p>
+              )}
               <p className="ob-note">You can change any of this later in Settings.</p>
             </Stagger>
           )}
@@ -668,17 +942,224 @@ export default function Onboarding({ onComplete }) {
         </div>
 
         <div className="ob-nav">
-          <button className="ob-btn-ghost" onClick={back} disabled={i === 0 || busy}>Back</button>
+          {/* `busy` is one flag for every awaited call in the wizard, so gating Back
+              on it made Back dead for the whole background repo scan that starts the
+              instant the repos step opens — the defect the first external tester
+              reported. onboardingNav.js explains why leaving that scan is free and
+              why only the terminal launch keeps the lock. */}
+          <button className="ob-btn-ghost" onClick={back}
+                  disabled={backDisabled(navState)}
+                  title={backDisabledReason(navState) || undefined}>Back</button>
+          {/* Visible, not just a title= — browsers suppress tooltips on disabled
+              controls, so a title alone would be an explanation nobody ever sees. */}
+          {backDisabledReason(navState) && (
+            <span className="ob-nav-note" role="status">{backDisabledReason(navState)}</span>
+          )}
           <div className="ob-nav-spacer" />
           {i < STEPS.length - 1 ? (
-            <button className="ob-btn" onClick={next} disabled={busy}>Continue</button>
+            <button className="ob-btn" onClick={next} disabled={forwardDisabled(navState)}>Continue</button>
           ) : (
-            <button className="ob-btn ob-btn-go" onClick={finish} disabled={busy}>
-              {busy ? "Launching…" : "Enter no_human"}
+            // Onboarding used to end on an empty board. When a repo is actually
+            // ready, end on the thing the whole setup was for.
+            <button className="ob-btn ob-btn-go" onClick={finish} disabled={forwardDisabled(navState)}>
+              {busy ? "Launching…"
+                : firstTaskRepo ? `Create your first task in ${repoName(firstTaskRepo)}`
+                : "Enter no_human"}
             </button>
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Prove one repo's test command, live.
+ *
+ * Three outcomes, all of them dead ends before this existed:
+ *  - passes  -> "Use this repo" (the human gate; the server still re-checks)
+ *  - fails   -> the output IS the explanation, and the command is editable so
+ *               the user can correct it and retry instead of being stuck
+ *  - skipped -> allowed, but the board says so afterwards (see UnprovenBanner)
+ */
+export function ProvePanel({ repoPath, profile, prove, editedCmd, onEditCmd,
+                             onProve, onConfirm, busy }) {
+  const logRef = useRef(null);
+  const status = prove?.status || "idle";
+  const lines = prove?.lines || [];
+
+  // Follow the tail as output arrives; a log that does not scroll reads as hung.
+  useEffect(() => {
+    const el = logRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [lines.length]);
+
+  if (profile?.is_usable) {
+    return (
+      <div className="ob-prove ok">
+        <span className="ob-prove-verdict ok">✓ Proven and confirmed</span>
+        <code className="ob-prove-cmd">{profile.test_cmd}</code>
+        <span className="ob-note"> — this command really ran and exited clean, so the review gate can run it.</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`ob-prove ${status}`}>
+      <div className="ob-row">
+        {status !== "running" && (
+          <button className="ob-btn-ghost" type="button" disabled={busy}
+                  onClick={() => onProve(editedCmd || undefined)}>
+            {status === "idle" ? "Prove test command" : "Retry"}
+          </button>
+        )}
+        {status === "running" && (
+          <span className="ob-prove-verdict">
+            <span className="grill-spinner" style={{ width: 12, height: 12, verticalAlign: "middle", marginRight: 6 }} />
+            Running the tests…{prove?.elapsed ? ` ${prove.elapsed}s` : ""}
+          </span>
+        )}
+        {status === "proven" && (
+          <button className="ob-btn" type="button" disabled={busy} onClick={onConfirm}>
+            Use this repo
+          </button>
+        )}
+        {status === "idle" && (
+          <span className="ob-note">Runs {profile?.test_cmd ? <code>{profile.test_cmd}</code> : "the derived test command"} for real. This can take a few minutes.</span>
+        )}
+      </div>
+
+      {lines.length > 0 && (
+        <pre className="ob-prove-log" ref={logRef} aria-label="Test output"
+             aria-live="polite" aria-busy={status === "running"}>
+          {lines.join("\n")}
+        </pre>
+      )}
+
+      {status === "proven" && (
+        <p className="ob-prove-verdict ok">
+          ✓ Passed. Confirm to let this command back the review gate.
+        </p>
+      )}
+
+      {status === "failed" && (
+        <>
+          <p className="ob-prove-verdict bad">
+            ✗ That command did not exit clean, so it is not proven. Nothing was faked —
+            fix the command (or the repo) and retry.
+          </p>
+          <div className="ob-row">
+            <input className="ob-input" value={editedCmd || ""}
+                   aria-label="Test command to prove"
+                   placeholder="the command that runs this repo's tests"
+                   onChange={(e) => onEditCmd(e.target.value)} />
+            <button className="ob-btn-ghost" type="button"
+                    disabled={busy || !(editedCmd || "").trim()}
+                    onClick={() => onProve(editedCmd.trim())}>
+              Run this command
+            </button>
+          </div>
+          <p className="ob-note">
+            The exact string you type is what gets run and what gets recorded — it is
+            never adjusted for you. You can also skip and continue; the board will
+            remind you.
+          </p>
+        </>
+      )}
+
+      {status === "error" && (
+        <p className="ob-prove-verdict bad">Could not run the proof: {prove.error}</p>
+      )}
+    </div>
+  );
+}
+
+// One integration's card in the "Connect your tools" step.
+//
+// Entirely generated from the server's spec: the on/off switch is whatever
+// `enable_field` names, and every other control comes from `fields`, whose
+// `kind` (bool | text | list) decides the input. Nothing here names an
+// integration, so a new config block renders with no edit to this file.
+//
+// The credential rule is structural, not a convention: there is no branch
+// that renders an input for a secret, because the API never describes one.
+// Credentials are stated as env-var NAMES via secretHint().
+function IntegrationSetupCard({ spec, draft, saving, saved, error, onField, onSave }) {
+  const values = draft[spec.name] || {};
+  const ready = readiness(spec);
+  const enableField = spec.enable_field;
+  const isOn = enableField ? values[enableField] !== false : true;
+  const dirty = Object.keys(changedValues(spec, draft)).length > 0;
+  const settings = (spec.fields || []).filter((f) => f.name !== enableField);
+  const label = NAME_LABEL[spec.name] || spec.name;
+
+  return (
+    <div className={`ob-integration-card${isOn ? " on" : ""}`}>
+      <div className="ob-integration">
+        <span className="ob-integration-mark"><IntegrationIcon name={spec.name} size={20} /></span>
+        <span className="ob-integration-name">{label}</span>
+        <span className="ob-integration-kind">{KIND_LABEL[spec.kind] || spec.kind}</span>
+        <span className={`integration-chip tone-${ready.tone}`}>{ready.label}</span>
+        {enableField && (
+          <label className="ob-integration-switch">
+            <input
+              type="checkbox"
+              checked={values[enableField] !== false}
+              onChange={(e) => onField(spec.name, enableField, e.target.checked)}
+            />
+            <span>{switchLabel(spec, label)}</span>
+          </label>
+        )}
+      </div>
+
+      {isOn && (
+        <div className="ob-integration-body">
+          {settings.length > 0 && (
+            <div className="ob-integration-fields">
+              {settings.map((f) => {
+                const id = `ob-int-${spec.name}-${f.name}`;
+                if (f.kind === "bool") {
+                  return (
+                    <label className="ob-integration-check" key={f.name} htmlFor={id}>
+                      <input id={id} type="checkbox"
+                             checked={values[f.name] === true}
+                             onChange={(e) => onField(spec.name, f.name, e.target.checked)} />
+                      <span>{f.label}</span>
+                    </label>
+                  );
+                }
+                return (
+                  <div className="ob-integration-field" key={f.name}>
+                    <label className="ob-integration-label" htmlFor={id}>{f.label}</label>
+                    <input
+                      id={id}
+                      className="ob-input"
+                      type="text"
+                      spellCheck={false}
+                      // No password input exists on this card by construction:
+                      // the API never advertises a credential field here.
+                      autoComplete="off"
+                      value={f.kind === "list" ? listToText(values[f.name]) : (values[f.name] ?? "")}
+                      onChange={(e) => onField(spec.name, f.name, e.target.value)}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <p className="ob-integration-secret">
+            <span aria-hidden="true">🔑</span> {secretHint(spec)}
+          </p>
+
+          <div className="ob-integration-actions">
+            <button className="ob-btn" disabled={saving || !dirty} onClick={onSave}>
+              {saving ? "Saving…" : "Save"}
+            </button>
+            {saved && !error && <span className="ob-integration-ok">✓ Saved to config.yaml</span>}
+            {error && <span className="ob-integration-err">Couldn't save — {error}</span>}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

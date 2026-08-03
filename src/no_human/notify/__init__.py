@@ -100,11 +100,26 @@ def build_notifier(config: dict[str, Any] | None) -> MultiNotifier:
     shadowing trap). Channels with no URL are still constructed — they report
     ``enabled=False`` and log instead of sending, which is the documented
     "runs without Slack/Teams set up" behaviour.
+
+    ``integrations.teams.enabled`` is a MUTE SWITCH over the Teams channel:
+    False builds the notifier with no URL, so it logs instead of sending and
+    the operator keeps the webhook they pasted. It defaults to True (and to
+    True when the section is missing or shadowed to null), so an install that
+    predates the key behaves byte-for-byte as before.
     """
     from .slack import SlackNotifier
     from .teams import TeamsNotifier
 
     notifications = (config or {}).get("notifications") or {}
+    integrations = (config or {}).get("integrations") or {}
+    teams_cfg = integrations.get("teams") or {}
+    teams_url = notifications.get("teams_webhook_url")
+    # `is False`, not falsy: only an explicit `false` mutes. A missing key and
+    # a null one (`teams:` with nothing under it — the deep-merge shadowing
+    # trap) both leave the channel alone, because the failure mode of guessing
+    # wrong here is an alert that silently never arrives.
+    if teams_cfg.get("enabled", True) is False:
+        teams_url = None
     return MultiNotifier([
         ("slack", SlackNotifier(notifications.get("slack_webhook_url"))),
         # `board_url` is what turns the Adaptive Card's Action.OpenUrl button
@@ -113,7 +128,7 @@ def build_notifier(config: dict[str, Any] | None) -> MultiNotifier:
         # could never render. Still None by default — an operator whose board
         # is not reachable from a phone leaves it unset and the payload is
         # byte-for-byte what it was.
-        ("teams", TeamsNotifier(notifications.get("teams_webhook_url"),
+        ("teams", TeamsNotifier(teams_url,
                                 board_url=notifications.get("board_url"))),
     ])
 

@@ -479,6 +479,25 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
             _ON + "runs from `nh doctor` and at task start"),
     },
 
+    # -- Off unless you switch backends: prompts to OpenAI -------------------
+    # The SECOND coding backend. Same payload as the Claude line above (source,
+    # diffs, test output, ticket text) to a different vendor, and it exists
+    # only when the operator sets `worker.backend: codex` AND supplies their own
+    # key. Both conditions are load-bearing: the backend REFUSES to start
+    # without OPENAI_API_KEY rather than finding some other credential, because
+    # BYO-API-key is the only sanctioned path (OpenAI prohibits using ChatGPT to
+    # power third-party services).
+    #
+    # The channel is `<dynamic>` because argv is assembled at runtime — the
+    # binary is `codex`, resolved by `find_codex_cli`.
+    "agent/codex_backend.py": {
+        "exec:<dynamic>": Allowed(
+            "OpenAI, on your own API key, via the `codex` CLI — the coder "
+            "session: source, diffs, test output, ticket text",
+            "env: OPENAI_API_KEY — and only when worker.backend is 'codex'; "
+            "the default is 'claude' and this module is never constructed"),
+    },
+
     # -- On by default: the PR is the deliverable ---------------------------
     # There is no key that turns these off. docs/security.md §7 says so in the
     # same words; if that ever stops being true, this block is where it shows.

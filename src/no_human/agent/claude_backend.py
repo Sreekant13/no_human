@@ -1,4 +1,11 @@
-"""The single coding backend: a thin wrapper over the Claude Agent SDK.
+"""The incumbent coding backend: a thin wrapper over the Claude Agent SDK.
+
+It is no longer the ONLY one — the operator struck the "single Claude backend"
+clause on 2026-08-01 to add OpenAI Codex — but it is still the DEFAULT and its
+behaviour is unchanged by that work. The vendor-independent contract now lives
+in ``agent/backend.py``; ``AgentEvent`` and ``AgentResult`` moved there and are
+re-exported below, so every existing ``from ...claude_backend import AgentEvent``
+still resolves to the same class object.
 
 Constraints honoured here:
   - Auth is set up by config.assert_subscription_mode() before we ever run: the
@@ -14,7 +21,6 @@ Constraints honoured here:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -37,8 +43,26 @@ from claude_agent_sdk import (
 )
 
 from . import guard
+from .backend import AgentEvent, AgentResult, BackendCapabilities
 from .supervisor import SupervisorHook
 from .tool_result_cap import make_tool_result_cap_hook
+
+#: What this backend can do, for the seam. Every field is True except the two
+#: that describe a thing Claude genuinely does not have, and there are none —
+#: the Claude path is the reference implementation of the contract, which is
+#: exactly why the contract was read off it.
+CLAUDE_CAPABILITIES = BackendCapabilities(
+    name="claude",
+    blocks_tool_calls=True,
+    post_tool_hooks=True,
+    session_resume=True,
+    subagents=True,
+    skills=True,
+    thinking_budget=True,
+    incremental_usage=True,
+    cache_creation_accounting=True,
+    native_max_turns=True,
+)
 
 # Phase 7c: explicit cap for tool-result display. Silent truncation makes the
 # model treat a partial as complete; the marker + retrieval hint prevent that.
@@ -102,67 +126,6 @@ def _result_size(content: Any) -> dict[str, Any]:
         # threshold read off the Bash slice is unaffected, since Bash is text-only.
         "non_text_blocks": non_text,
     }
-
-
-@dataclass
-class AgentEvent:
-    """A normalized streaming event for the TUI / logs."""
-
-    kind: str            # thinking | text | tool_use | tool_result | result | denied
-    text: str = ""
-    tool_name: str | None = None
-    tool_input: dict[str, Any] | None = None
-    meta: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class AgentResult:
-    """The outcome of one agent run."""
-
-    final_text: str
-    num_turns: int
-    is_error: bool
-    tokens_used: int
-    session_id: str | None
-    stop_reason: str | None
-    denials: list[str] = field(default_factory=list)
-    cache_read_tokens: int = 0
-    cache_creation_tokens: int = 0
-    # The OUTPUT share of `tokens_used` above, which is input+output. Output
-    # bills ~5x input, and `_usage_quad` has always returned the number — this
-    # dataclass was where it got thrown away, so no cost surface downstream
-    # could price it. `tokens_used` is unchanged and still means the total;
-    # input is `tokens_used - output_tokens`.
-    #
-    # `None`, not 0, and that distinction is load-bearing all the way to the
-    # DB column: 0 asserts "this run emitted no output tokens", which is true
-    # of almost no run, whereas None says the usage block never arrived (an
-    # errored result, a session that produced no ResultMessage). It is
-    # persisted as SQL NULL and priced at the old input rate — an under-count
-    # that is at least visible as unknown rather than asserted as free.
-    output_tokens: int | None = None
-    # HTTP status of the failing API call (429/529/500...). The SDK sets it on
-    # the result event precisely when is_error is true and the subtype is
-    # "success" — i.e. THIS incident's shape. It was captured on the event but
-    # never reached here, so `_classify_error`'s 429/529 branch could not fire:
-    # `getattr(result, "api_error_status", None)` was permanently None. The
-    # structured twin of the free-text reason this change surfaces.
-    api_error_status: int | None = None
-    # The subagent (Task tool) share of the three totals above, which INCLUDE
-    # it. Broken out so a reader can see the ledger grew for a reason. These
-    # ride the "result" AgentEvent into the orchestrator's event stream; no
-    # surface reads them back out of the DB yet, so the audit trail is the
-    # event log, not a column.
-    subagent_tokens_used: int = 0
-    subagent_cache_read_tokens: int = 0
-    subagent_cache_creation_tokens: int = 0
-    subagent_count: int = 0
-    # How many of `subagent_count` contributed a FLOOR rather than a
-    # measurement — subagents that streamed no assistant message at all, whose
-    # only signal is the CLI's context-size gauge (7-17% of real spend). A
-    # datum, not a comment: any surface that reports subagent spend can say
-    # "N of M are floors" instead of presenting an undercount as a total.
-    subagent_floored_count: int = 0
 
 
 def _usage_quad(usage: dict[str, Any] | None) -> tuple[int, int, int, int]:
@@ -347,6 +310,12 @@ class ClaudeBackend:
             ({} if readonly else _TOOL_RESULT_CAPS)
             if tool_result_caps is None else tool_result_caps
         )
+
+    @property
+    def capabilities(self) -> BackendCapabilities:
+        """Satisfies the seam's ``CodingBackend`` protocol. See
+        :data:`CLAUDE_CAPABILITIES`."""
+        return CLAUDE_CAPABILITIES
 
     def _options(
         self, cwd: Path, max_turns: int, *, effort: str | None = None,
@@ -865,3 +834,8 @@ class ClaudeBackend:
                         m.get("subagent_floored_count", 0)),
                 )
         return final
+
+
+# Re-exported for the ~50 sites that import these from here. They now live in
+# ``agent/backend.py`` (the vendor-independent seam) but are the same objects.
+__all__ = ["AgentEvent", "AgentResult", "CLAUDE_CAPABILITIES", "ClaudeBackend"]
