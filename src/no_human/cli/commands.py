@@ -4298,6 +4298,9 @@ def bench():
     run    → replay through the real pipeline in push-proof sandboxes,
              recording <label>-<stamp>.json — publishing nothing;
     publish→ promote one results file to the baseline + the committed report;
+    compare→ PAIR two results files spec by spec (flips both ways, McNemar on
+             the discordant pairs, flaky-canary over a longer history) —
+             a report only: it writes nothing and never exits non-zero;
     report → re-render docs/NORTH_STAR_BENCH.md from results/latest.json, the
              LATEST SAVED RESULTS — NOT the published baseline, which is a
              separate file only a clean publish writes.
@@ -4948,6 +4951,144 @@ def bench_publish(results_file: str, force: bool):
         f"success {escape(success_headline(card))} · "
         f"median cost ratio {agg['median_cost_ratio']} · "
         f"{agg['total_nh_tokens']:,} tokens → docs/NORTH_STAR_BENCH.md")
+
+
+def _load_results_json(name: str) -> tuple[dict, Path]:
+    """Load a results file by path or by bare filename inside RESULTS_DIR.
+
+    Same resolution `bench publish` uses, so `nh bench compare v13.json
+    v14.json` works from anywhere in the repo. Exits 1 on an unreadable file:
+    that is a USAGE failure, not a verdict — the comparison itself never exits
+    non-zero (see the command docstring).
+    """
+    from ..eval.northstar_card import RESULTS_DIR
+    path = Path(name)
+    if not path.exists():
+        path = RESULTS_DIR / name
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        console.print(f"[red]not a readable results file:[/] "
+                      f"{escape(str(path))} — {escape(str(exc))}")
+        sys.exit(1)
+    if not isinstance(data, dict):
+        console.print(f"[red]not a results card:[/] {escape(str(path))}")
+        sys.exit(1)
+    return data, path
+
+
+def _compare_side(label: str, created: str, rate: float, specs: int) -> str:
+    """One run's headline line, built as plain text so the caller can escape it
+    whole — the label comes out of a results FILE and can hold `[/x]`."""
+    return (f"{label or '(unlabelled)'} · {created or 'undated'} · "
+            f"{rate:.1%} of {specs} measured spec(s)")
+
+
+@bench.command("compare")
+@click.argument("run_a")
+@click.argument("run_b")
+@click.option("--canary", "canary_files", multiple=True, type=click.Path(),
+              help="Extra results file(s) to fold into the flaky-canary scan. "
+                   "The canary runs over RUN_A, RUN_B and these, sorted by "
+                   "created_at, and lists specs whose verdict flipped across "
+                   "2+ consecutive run-pairs. Repeatable; needs 3+ files total "
+                   "to say anything the flip list does not.")
+def bench_compare(run_a: str, run_b: str, canary_files):
+    """Compare two runs PAIRED per spec — RUN_A is the baseline, RUN_B the change.
+
+    Two headline numbers cannot tell you whether a change helped: "90.7% →
+    90.7%" is the same string whether nothing moved or five specs broke while
+    five others got fixed. This pairs on task_id, prints the flips in both
+    directions with their notes, names every spec that could NOT be paired, and
+    runs McNemar's exact test on the discordant pairs — beside the counts,
+    because below 6 discordant pairs that test cannot reach p<0.05 at all.
+
+    A REPORT, NOT A GATE: it writes nothing and always exits 0. The regression
+    gate is `nh bench run --gate`; the publish refusals are in `bench publish`.
+    """
+    from ..eval.bench_compare import (
+        MIN_DISCORDANT_FOR_POWER, compare_runs, flaky_canary, headline_caveat,
+        interpretation)
+
+    card_a, path_a = _load_results_json(run_a)
+    card_b, path_b = _load_results_json(run_b)
+    cmp = compare_runs(card_a, card_b)
+
+    console.print("[bold]paired per-spec comparison[/] "
+                  f"({escape(path_a.name)} → {escape(path_b.name)})")
+    console.print(f"  A (baseline) {escape(_compare_side(cmp.label_a, cmp.created_a, cmp.rate_a, cmp.specs_a))}")
+    console.print(f"  B (change)   {escape(_compare_side(cmp.label_b, cmp.created_b, cmp.rate_b, cmp.specs_b))}")
+    console.print(f"  [dim]{escape(headline_caveat())}[/]")
+    console.print("")
+
+    console.print(f"  paired specs: {int(cmp.paired)}  ·  "
+                  f"both pass {int(cmp.both_pass)}  ·  "
+                  f"both fail {int(cmp.both_fail)}")
+    console.print(f"  [red]regressed (A✓→B✗) b={int(cmp.b_regressed)}[/]  ·  "
+                  f"[green]fixed (A✗→B✓) c={int(cmp.c_fixed)}[/]")
+    # Formatted OUTSIDE the print: an `escape(f"{x:.4f}")` nested inside the
+    # print's own f-string still contains an un-escaped interpolation node, and
+    # the AST guard in tests/_bench_ast_guard.py reads nodes, not intent.
+    p_str = f"{cmp.p_value:.4f}"
+    console.print(f"  McNemar exact, two-sided: p = {escape(p_str)} on "
+                  f"{int(cmp.discordant)} discordant pair(s) "
+                  f"(power floor: {int(MIN_DISCORDANT_FOR_POWER)})")
+    console.print(f"  [yellow]{escape(interpretation(cmp))}[/]")
+
+    # UNPAIRED SPECS ARE NAMED, not just counted. A spec present in one run and
+    # not the other contributes to neither cell of the 2x2 and would otherwise
+    # vanish into "no change" — which is exactly how a corpus that half stopped
+    # resolving reads as a clean comparison.
+    for title, ids in (("only in A", cmp.only_in_a), ("only in B", cmp.only_in_b),
+                       ("unmeasured in A (all trials skipped)", cmp.unmeasured_a),
+                       ("unmeasured in B (all trials skipped)", cmp.unmeasured_b)):
+        if ids:
+            console.print(f"  [dim]{escape(title)}: {int(len(ids))} — "
+                          f"{escape(', '.join(ids))}[/]")
+
+    flips = cmp.regressions + cmp.fixes
+    if flips:
+        console.print("")
+        console.print("  | task | title | direction | A | B | trials flipped "
+                      "| notes |")
+        console.print("  |---|---|---|---|---|---|---|")
+        for f in flips:
+            # A spec's TITLE is the only cell a reader recognises a task by —
+            # `ns-cbb81747` names nothing on its own. It is also the field that
+            # produced the v11 MarkupError (one real title begins `@[/Users/…]`),
+            # so it is truncated and escaped like every other file-authored cell.
+            title = (f.title or "")[:40].replace("|", "/")
+            cell_a = f"{f.a.outcome_status} {f.a.passes}/{f.a.trials}"
+            cell_b = f"{f.b.outcome_status} {f.b.passes}/{f.b.trials}"
+            note = (f.b.notes or f.a.notes or "")[:70].replace("|", "/")
+            console.print(
+                f"  | {escape(f.task_id)} | {escape(title)} | "
+                f"{escape(f.direction)} | "
+                f"{escape(cell_a)} | {escape(cell_b)} | "
+                f"{int(f.trial_flips)}/{int(f.trials_paired)} | "
+                f"{escape(note)} |")
+    else:
+        console.print("  [dim]no spec changed verdict between these two runs[/]")
+
+    if canary_files:
+        history = [card_a, card_b]
+        for extra in canary_files:
+            data, _ = _load_results_json(str(extra))
+            history.append(data)
+        canaries = flaky_canary(history)
+        console.print("")
+        console.print(f"  [bold]flaky canary[/] over {int(len(history))} run(s), "
+                      "ordered by created_at — a spec that flips across 2+ "
+                      "consecutive run-pairs is noise, not a result "
+                      "(repetition, not isolation, decides)")
+        if not canaries:
+            console.print("  [dim]no spec flipped in 2+ consecutive run-pairs[/]")
+        for c in canaries:
+            c_title = (c.title or "")[:40]
+            console.print(f"  ⚠ {escape(c.task_id)} {escape(c_title)} — "
+                          f"{int(c.flips)} flip(s) over {int(c.pairs)} "
+                          f"pair(s): {escape(' '.join(c.history))}")
+    # No sys.exit: a report never decides anything. The gate is `run --gate`.
 
 
 def _load_reviewer_recall_runner():

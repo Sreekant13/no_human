@@ -129,6 +129,46 @@ def intracluster_correlation(per_spec: dict[str, tuple[int, int]]) -> float:
     return min(1.0, max(0.0, (msb - msw) / denom))
 
 
+# --------------------------------------------------------------------------- #
+# THE SUCCESS PREDICATE — one definition, every consumer.
+#
+# `NorthStarCard` counts scores it holds as `BenchScore` objects; the paired
+# comparison in `bench_compare` reads the SAME rows straight out of a results
+# JSON, as dicts. Two readers of one fact is exactly how a second, subtly
+# different rule gets written — so both call the functions below and neither
+# spells the rule out again. They accept either shape deliberately: a shared
+# predicate that only one of its two callers can call is not shared.
+#
+# THE RULE IS `goal_satisfied`, AND THAT ALREADY COVERS ESCALATION. For a spec
+# whose only correct outcome is an honest stop, the runner assigns
+# `score.goal_satisfied = score.escalated_honestly` (northstar.py, the
+# `spec.expect_escalation` branch) BEFORE the score is ever written. So an
+# expect-escalation spec that stopped honestly arrives here already carrying
+# goal_satisfied=True, and re-deriving "success = escalated_honestly if
+# expected_escalation else goal_satisfied" downstream would be a SECOND rule
+# that happens to agree today — including on the case where the judge was
+# skipped (goal_satisfied None) and the second rule would silently disagree.
+SKIPPED_STATUS = "skipped"
+
+
+def _score_field(score: Any, name: str) -> Any:
+    """One field off a `BenchScore` or off a raw results-file score dict."""
+    if isinstance(score, dict):
+        return score.get(name)
+    return getattr(score, name)
+
+
+def score_ran(score: Any) -> bool:
+    """Did this row produce a measurement at all? A skip is not a failure —
+    it never ran, so it belongs in no numerator and no denominator."""
+    return _score_field(score, "outcome_status") != SKIPPED_STATUS
+
+
+def score_succeeded(score: Any) -> bool:
+    """Did this ONE trial of ONE spec succeed? See the block comment above."""
+    return bool(_score_field(score, "goal_satisfied"))
+
+
 def published_file() -> Path:
     """`latest.json` records the last `bench publish` CALL, clean or
     `--force`d over refusals. This file records only the last CLEAN one
@@ -180,7 +220,7 @@ class NorthStarCard:
 
     @property
     def ran(self) -> list[BenchScore]:
-        return [s for s in self.scores if s.outcome_status != "skipped"]
+        return [s for s in self.scores if score_ran(s)]
 
     @property
     def skipped(self) -> int:
@@ -188,7 +228,7 @@ class NorthStarCard:
 
     @property
     def satisfied(self) -> int:
-        return sum(1 for s in self.ran if s.goal_satisfied)
+        return sum(1 for s in self.ran if score_succeeded(s))
 
     @property
     def success_rate(self) -> float:
@@ -218,7 +258,7 @@ class NorthStarCard:
         out: dict[str, list[int]] = {}
         for s in self.ran:
             row = out.setdefault(s.task_id, [0, 0])
-            row[0] += 1 if s.goal_satisfied else 0
+            row[0] += 1 if score_succeeded(s) else 0
             row[1] += 1
         return {k: (v[0], v[1]) for k, v in out.items()}
 
