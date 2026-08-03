@@ -359,6 +359,20 @@ class BenchTask:
     runnable: bool = True
     skip_reason: str = ""
     expect_escalation: bool = False
+    #: WHY this spec is expected to stop and escalate rather than deliver.
+    #:
+    #: Without it a miss cannot be adjudicated from the data: "the agent did not
+    #: escalate here" and "this spec should never have been gated" are the same
+    #: row, and every honest-escalation figure needs a caveat nobody can settle.
+    #: `skip_reason` beside it is the same idea for `runnable: false`; this is
+    #: that idiom applied to the gate.
+    #:
+    #: Specs that predate this field carry an `unrecorded: …` sentinel in the
+    #: YAML itself and NOT a reconstructed reason. Their request text does hint at one —
+    #: external systems a replay cannot reach, or local files that no longer
+    #: exist — but that is inference, and an inference written into a corpus is
+    #: indistinguishable from a record the moment the next reader arrives.
+    escalation_reason: str = ""
     path: Path | None = None
     # The repo path exactly as the SPEC FILE carries it, before any local
     # translation. Reporting derives the project name from this, never from the
@@ -384,6 +398,7 @@ class BenchTask:
             runnable=bool(data.get("runnable", True)),
             skip_reason=data.get("skip_reason", "") or "",
             expect_escalation=bool(data.get("expect_escalation", False)),
+            escalation_reason=data.get("escalation_reason", "") or "",
             path=path,
         )
 
@@ -393,7 +408,7 @@ class BenchTask:
             "source": self.source, "repo": self.repo, "original": self.original,
             "acceptance_criteria": self.acceptance_criteria,
             "holdout": self.holdout, "subset": self.subset,
-            "runnable": self.runnable, "skip_reason": self.skip_reason,
+            "runnable": self.runnable, "skip_reason": self.skip_reason, "escalation_reason": self.escalation_reason,
             "expect_escalation": self.expect_escalation,
         }
 
