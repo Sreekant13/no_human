@@ -2,10 +2,12 @@
 
 ## Installed the Mac app? Start here instead
 
-**If you opened a `.dmg` and dragged no_human to Applications, sections 1 and 2
+**If you opened a `.dmg` and dragged no_human to Applications, sections 1–3
 below are NOT for you.** The app carries its own Python, its own server and its
 own dependencies — there is nothing to `brew install`, nothing to clone, and no
-`uv sync` to run. Doing any of it would set up a *second*, unrelated copy.
+`uv sync` to run. Doing any of it would set up a *second*, unrelated copy. The
+Connect Claude screen below does what `nh init` (section 3) does for a source
+install: it writes your credential to `~/.no_human/`.
 
 What you actually do:
 
@@ -18,7 +20,7 @@ What you actually do:
 If you ever need that screen again — a revoked or mistyped token strands the
 app otherwise — it is **File → Re-enter Claude Token…**.
 
-Everything from section 3 onward applies to you too, EXCEPT that commands are
+Everything from section 4 onward applies to you too, EXCEPT that commands are
 written as `uv run nh …` for the source install. The packaged app runs the same
 server internally, so use the board rather than the CLI unless you have also
 installed from source.
