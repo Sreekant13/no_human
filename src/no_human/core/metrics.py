@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .db import Store
+from .db import USAGE_ROLES, Store, usage_columns_for
 
 
 async def compute_metrics(store: Store) -> dict[str, Any]:
@@ -145,19 +145,44 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
                   COALESCE(SUM(COALESCE(review_cache_read_tokens, 0)), 0)
            FROM attempts""")
     rev_used, rev_creation, rev_read = rows[0]
-    # B2 #5/#6 (review #2): planning + utility burn ran on separate backends
-    # and now has its own columns. Surface it here too, or /api/metrics
-    # under-counts by the whole planning slice while the bench counts it —
-    # the surfaces-disagree class this cost work exists to kill.
+    # B2 #5/#6 (review #2): the roles that are neither the coder nor the
+    # reviewer ran on separate backends and have their own columns. Surface
+    # them here too, or /api/metrics under-counts by whole roles while the
+    # bench counts them — the surfaces-disagree class this cost work exists to
+    # kill. A5: derived from `USAGE_ROLES` rather than naming plan_/utility_,
+    # because the last two roles to be added (supervisor, distill) would
+    # otherwise have been invisible on this endpoint on the day they landed.
+    aux_tiers = [t for t in USAGE_ROLES if t not in ("", "review_")]
+    aux_cols = [usage_columns_for(t) for t in aux_tiers]
     rows = await store.query(
-        """SELECT COALESCE(SUM(COALESCE(plan_tokens_used, 0)
-                             + COALESCE(utility_tokens_used, 0)), 0),
-                  COALESCE(SUM(COALESCE(plan_cache_read_tokens, 0)
-                             + COALESCE(utility_cache_read_tokens, 0)), 0),
-                  COALESCE(SUM(COALESCE(plan_cache_creation_tokens, 0)
-                             + COALESCE(utility_cache_creation_tokens, 0)), 0)
-           FROM attempts""")
+        "SELECT " + ", ".join(
+            "COALESCE(SUM({}), 0)".format(
+                " + ".join(f"COALESCE({c[i]}, 0)" for c in aux_cols))
+            for i in (0, 1, 2))
+        + " FROM attempts")
     aux_used, aux_read, aux_creation = rows[0]
+    # Per-ROLE cost, whole-install. The three aggregate keys above collapse
+    # four roles into one "aux" number, which is enough to price a run and
+    # useless for deciding which role to optimise — the question this
+    # endpoint is read to answer. One row per registered role, always
+    # present, zeros included, so a consumer can render a stable breakdown
+    # and can see that a role cost nothing rather than guessing whether it
+    # was measured at all.
+    role_cols = {role: usage_columns_for(tier)
+                 for tier, role in USAGE_ROLES.items()}
+    rows = await store.query(
+        "SELECT " + ", ".join(
+            f"COALESCE(SUM(COALESCE({c}, 0)), 0)"
+            for cols in role_cols.values() for c in cols)
+        + " FROM attempts")
+    flat = list(rows[0]) if rows else [0] * (3 * len(role_cols))
+    by_role = {}
+    for idx, role in enumerate(role_cols):
+        used, read, creation = (int(v or 0) for v in flat[idx * 3:idx * 3 + 3])
+        by_role[role] = {
+            "tokens_used": used, "cache_read": read,
+            "cache_creation": creation, "total": used + read + creation,
+        }
     return {
         "prs_opened": prs_opened or 0,
         "prs_merged": prs_merged or 0,
@@ -176,6 +201,11 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
         "aux_tokens_used_total": aux_used or 0,
         "aux_cache_read_total": aux_read or 0,
         "aux_cache_creation_total": aux_creation or 0,
+        # Per-role burn across the whole install. `by_tier` beside it answers
+        # a different question (which MODEL ran, from `attempts.models`); this
+        # one answers which ROLE spent, which is what a cost target is set
+        # against.
+        "by_role": by_role,
         "by_auth_profile": by_profile,
         "by_tier": by_tier,
         "review_pass": review_pass or 0,

@@ -236,12 +236,13 @@ def weighted_tokens(
     ``model`` is the id that SPENT these tokens, as recorded in
     ``attempts.models`` — it selects the output premium (see
     ``output_extra_weight``). It is optional and defaults to ``None`` because
-    the classes are summed across four tiers on almost every call site, and one
-    id cannot describe four tiers; ``None`` takes the conservative fallback,
-    which is what every one of those call sites got before this parameter
-    existed. Pass it only where a single tier's spend is being priced on its
-    own. Note that ``None`` here does NOT mean "free" — it means "unknown",
-    and unknown prices at the highest published premium.
+    the classes are summed across every role in ``db.USAGE_ROLES`` (six: coder,
+    reviewer, planner, utility, supervisor, distill) on almost every call site,
+    and one id cannot describe six roles; ``None`` takes the conservative
+    fallback, which is what every one of those call sites got before this
+    parameter existed. Pass it only where a single role's spend is being
+    priced on its own. Note that ``None`` here does NOT mean "free" — it
+    means "unknown", and unknown prices at the highest published premium.
 
     Floored to an int so the caps stay integer comparisons end to end.
     """

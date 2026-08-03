@@ -69,7 +69,7 @@ from ..vcs import GitError, GitRepo, ProtectedBranch, open_pr
 from ..vcs.receipts import verify_pr_receipt
 from . import plan_gate
 from .bounds import Bounds, QuotaExhausted, StuckDetector
-from .db import Store
+from .db import AUX_USAGE_TIERS, Store
 from .pricing import class_breakdown as _class_breakdown
 from .pricing import config_is_weighted, raw_cap_as_weighted
 from .pricing import weighted_tokens as _weighted_tokens
@@ -338,8 +338,10 @@ def _accumulate_output(bucket: dict, result) -> None:
     """Fold one session's output-token count into a tier accumulator.
 
     Its own function because the None handling is the whole point and it is
-    needed identically by the planner and utility tiers. `output_tokens` stays
-    None until some session actually reports a split; only then does it start
+    needed identically by every out-of-band role — it is reached once, from
+    `_note_tier_usage`, which serves all of `db.AUX_USAGE_TIERS` (planner,
+    utility, supervisor, distill). `output_tokens` stays None until some
+    session actually reports a split; only then does it start
     summing. A tier that never reported one persists SQL NULL — "unknown" —
     rather than a 0 that would assert the tier emitted no output tokens.
     """
@@ -1035,11 +1037,12 @@ class Orchestrator:
         # `_cancel_reason` is.
         #
         # PARTIAL by construction, and knowingly so: the `role != CODER_ROLE`
-        # return above means this watch never sees reviewer, planner or utility
-        # usage, while its ceiling now nets all four tiers out of the lifetime
-        # ledger. So the watch trails the persisted gate — it can only fire
-        # late, never early. The persisted gate at the top of each attempt is
-        # what actually bounds those three tiers; widening the watch to cover
+        # return above means this watch never sees reviewer, planner, utility,
+        # supervisor or distill usage, while its ceiling nets all six
+        # registered roles (`db.USAGE_ROLES`) out of the lifetime ledger. So
+        # the watch trails the persisted gate — it can only fire late, never
+        # early. The persisted gate at the top of each attempt is what
+        # actually bounds those five roles; widening the watch to cover
         # them is a behaviour change, not a comment fix, and is left out here.
         if event.kind == "usage":
             ceiling = getattr(self, "_token_ceiling", None)
@@ -1282,7 +1285,12 @@ class Orchestrator:
             await self._flush_orphaned_aux_usage(task)
 
     async def _flush_orphaned_aux_usage(self, task: Task) -> None:
-        """Book planning/utility spend that no attempt row ever drained.
+        """Book out-of-band role spend that no attempt row ever drained.
+
+        One ledger row PER ROLE (``site="orphaned_<role>_usage"``), so the
+        residual keeps the same per-role resolution the attempt row has and a
+        reader can still tell planner spend from supervisor spend after the
+        fact.
 
         ``_pop_aux_usage`` runs only on attempt EXITS, so anything spent before
         the first attempt exists — the intake evaluator, the intake grill, the
@@ -1312,10 +1320,25 @@ class Orchestrator:
         if not leftover:
             return
         try:
-            for tier in ("plan_", "utility_"):
+            # Every out-of-band role, from the registry — not a literal pair.
+            # A role whose accumulator `_pop_aux_usage` drains but which is
+            # missing from this loop is spend that reaches neither the attempt
+            # row nor the ledger, i.e. money erased on the exact code path
+            # this method exists to stop erasing it on.
+            models = {
+                "utility_": self._utility_model(),
+                # The distiller runs on the utility model (D21); the
+                # supervisor has had its own key since the tier split, and
+                # stamping the utility id on its rows would re-create in the
+                # ledger exactly the confusion the columns just removed.
+                "distill_": self._utility_model(),
+                "supervisor_": self.config.get("llm", {}).get(
+                    "supervisor_model", "claude-sonnet-5"),
+            }
+            for tier in AUX_USAGE_TIERS:
                 await self.store.record_unattributed_usage(
                     site=f"orphaned_{tier}usage",
-                    model=self._utility_model() if tier == "utility_" else None,
+                    model=models.get(tier),
                     task_id=task.id,
                     tokens_used=leftover.get(f"{tier}tokens_used", 0),
                     cache_read_tokens=leftover.get(f"{tier}cache_read_tokens", 0),
@@ -3649,57 +3672,92 @@ class Orchestrator:
 
 
     def _pop_aux_usage(self) -> dict:
-        """Pop planning + utility burn into update_attempt kwargs — ONCE, so a
-        retry never double-books. Called from EVERY attempt-exit path
-        (completion AND the stuck/budget/cancel aborts) or the burn for the
-        highest-cost tasks would silently vanish (review #3)."""
-        plan_usage = self.__dict__.pop("_plan_usage", None) or {}
-        util_usage = self.__dict__.pop("_utility_usage", None) or {}
+        """Pop every out-of-band role's burn into update_attempt kwargs —
+        ONCE, so a retry never double-books. Called from EVERY attempt-exit
+        path (completion AND the stuck/budget/cancel aborts) or the burn for
+        the highest-cost tasks would silently vanish (review #3).
+
+        Drains the roles in ``db.AUX_USAGE_TIERS`` rather than a hand-written
+        pair, so registering a role cannot leave its accumulator undrained —
+        which is exactly the failure mode that hid the supervisor's and the
+        distiller's spend inside ``utility_`` in the first place.
+        """
         kw = {}
-        kw.update({f"plan_{k}": v for k, v in plan_usage.items()})
-        kw.update({f"utility_{k}": v for k, v in util_usage.items()})
+        for tier in AUX_USAGE_TIERS:
+            usage = self.__dict__.pop(f"_{tier}usage", None) or {}
+            kw.update({f"{tier}{k}": v for k, v in usage.items()})
         return kw
+
+    def _note_tier_usage(self, tier: str, result) -> None:
+        """Accumulate one backend call's burn against one named role.
+
+        ``tier`` is a column PREFIX from ``db.USAGE_ROLES`` (``"plan_"``,
+        ``"utility_"``, ``"supervisor_"``, ``"distill_"``); the accumulator
+        lives on ``self._<tier>usage`` and is drained by ``_pop_aux_usage``.
+        The named wrappers below are the API — they exist so a call site reads
+        as the role it is billing and so a dropped sink is greppable.
+        """
+        attr = f"_{tier}usage"
+        u = getattr(self, attr, None)
+        if u is None:
+            u = {"tokens_used": 0, "cache_read_tokens": 0,
+                 "cache_creation_tokens": 0, "output_tokens": None}
+            setattr(self, attr, u)
+        u["tokens_used"] += int(getattr(result, "tokens_used", 0) or 0)
+        u["cache_read_tokens"] += int(getattr(result, "cache_read_tokens", 0) or 0)
+        u["cache_creation_tokens"] += int(
+            getattr(result, "cache_creation_tokens", 0) or 0)
+        _accumulate_output(u, result)
 
     def _note_plan_usage(self, result) -> None:
         """Accumulate planning-session burn (single planner, each MoA
         proposer, the aggregator) for the attempt row (B2 #5 — this spend was
         persisted nowhere while the docs claimed otherwise)."""
-        u = getattr(self, "_plan_usage", None)
-        if u is None:
-            u = {"tokens_used": 0, "cache_read_tokens": 0,
-                 "cache_creation_tokens": 0, "output_tokens": None}
-            self._plan_usage = u
-        u["tokens_used"] += int(getattr(result, "tokens_used", 0) or 0)
-        u["cache_read_tokens"] += int(getattr(result, "cache_read_tokens", 0) or 0)
-        u["cache_creation_tokens"] += int(
-            getattr(result, "cache_creation_tokens", 0) or 0)
-        _accumulate_output(u, result)
+        self._note_tier_usage("plan_", result)
 
     def _note_utility_usage(self, result) -> None:
-        """Accumulate utility-tier burn for the attempt row.
+        """Accumulate UTILITY-tier burn for the attempt row.
 
-        Covers the supervisor checks, context distillation and the stuck
-        hypothesis (B2 #6: these readonly sessions discarded their usage
-        entirely) AND the intake tier that used to be structurally invisible:
-        the spec evaluator, the assumption pass, both halves of the intake
-        grill, and the split-proposal drafter. Those five return verdicts and
-        text, never an ``AgentResult``, so they are handed this method as a
-        ``usage_sink`` and book each backend call — including the parse retries
-        and the tool-less answering fallback — as it happens.
+        The intake/advisory tier that used to be structurally invisible: the
+        spec evaluator, the assumption pass, both halves of the intake grill,
+        the split-proposal drafter and the stuck hypothesis. All but the last
+        return verdicts, assumptions, Q&A and prose — never an
+        ``AgentResult`` — so they are handed this method as a ``usage_sink``
+        and book each backend call, including the parse retries and the
+        tool-less answering fallback, as it happens.
 
-        Same accumulator, same ``_pop_aux_usage`` drain: intake lands in
-        ``attempts.utility_*`` beside the tiers already there rather than in a
-        second ledger nothing sums."""
-        u = getattr(self, "_utility_usage", None)
-        if u is None:
-            u = {"tokens_used": 0, "cache_read_tokens": 0,
-                 "cache_creation_tokens": 0, "output_tokens": None}
-            self._utility_usage = u
-        u["tokens_used"] += int(getattr(result, "tokens_used", 0) or 0)
-        u["cache_read_tokens"] += int(getattr(result, "cache_read_tokens", 0) or 0)
-        u["cache_creation_tokens"] += int(
-            getattr(result, "cache_creation_tokens", 0) or 0)
-        _accumulate_output(u, result)
+        NO LONGER the supervisor or the distiller (A5). Those two used to bill
+        here as well, which made ``utility_`` a residual rather than a role:
+        one column mixed a one-shot spec evaluator with a course-corrector
+        that fires every few tool calls for the whole length of a session, so
+        neither could be read, budgeted or optimised on its own. They have
+        ``supervisor_``/``distill_`` columns now. The grand total is
+        unchanged — the spend moved bucket, it did not appear.
+
+        Same accumulator shape, same ``_pop_aux_usage`` drain: this lands in
+        ``attempts.utility_*`` beside the other roles rather than in a second
+        ledger nothing sums."""
+        self._note_tier_usage("utility_", result)
+
+    def _note_supervisor_usage(self, result) -> None:
+        """Accumulate SUPERVISOR burn (``agent/supervisor.py``'s every-N-tool-
+        calls check, on ``llm.supervisor_model``) for the attempt row.
+
+        Its own role because its cost is driven by attempt LENGTH and by the
+        ``check_every`` knob, not by intake: the only lever anyone can pull on
+        it is invisible while it is averaged in with one-shot intake calls."""
+        self._note_tier_usage("supervisor_", result)
+
+    def _note_distill_usage(self, result) -> None:
+        """Accumulate CONTEXT-DISTILLATION burn (one utility-model session per
+        oversized gathered chunk, ``_distill_large_chunks``) for the attempt
+        row.
+
+        Its own role because it is the one aux cost that claims to PAY for
+        itself — a smaller coder prompt in exchange for N summarizer sessions
+        — and that trade cannot be measured, let alone tested, while the two
+        sides of it are not separately recorded."""
+        self._note_tier_usage("distill_", result)
 
     def _repo_relative_edits(self, repo) -> set[str]:
         """Coder-touched paths as repo-relative strings (receipt input);
@@ -5481,7 +5539,11 @@ class Orchestrator:
                     prompt, cwd=Path(task.repo_path or "."),
                     max_turns=1, effort="low",
                 )
-                self._note_utility_usage(result)
+                # DISTILL, not utility. One session per oversized chunk,
+                # unbounded in the number of chunks — the claim that
+                # distillation pays for itself is a comparison against the
+                # coder's column and needs this one to be its own.
+                self._note_distill_usage(result)
                 summary = (result.final_text or "").strip()
                 if summary and len(summary) < len(chunk.content):
                     chunk.content = f"[distilled] {summary}"
@@ -6297,8 +6359,9 @@ class Orchestrator:
                 # The raw class split, so the operator can reconcile the gated
                 # number against a bill or against `nh logs` instead of taking
                 # it on trust — the classes bill at 1.0 / 1.25 / 0.1 relative
-                # to fresh input, summed over the coder, reviewer, planner and
-                # utility tiers.
+                # to fresh input, summed over every role registered in
+                # `db.USAGE_ROLES` (coder, reviewer, planner, utility,
+                # supervisor, distill).
                 f"By class: {breakdown}"
                 + self._spend_shape_note(task)
             ),
@@ -6542,7 +6605,11 @@ class Orchestrator:
                 prompt, cwd=Path(work_dir or task.repo_path or "."),
                 max_turns=1, effort="low",
             )
-            self._note_utility_usage(result)
+            # SUPERVISOR, not utility. This fires once per `check_every` tool
+            # calls for the whole length of a session, so averaging it into a
+            # bucket of one-shot intake calls hid the only supervisor cost
+            # anyone can actually tune.
+            self._note_supervisor_usage(result)
             return result.final_text or ""
 
         def on_decision(decision):

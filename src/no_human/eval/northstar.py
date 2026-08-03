@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from ..core.db import Store
+from ..core.db import USAGE_ROLES, usage_columns_for, Store
 from ..core.pricing import CACHE_CREATION_WEIGHT, CACHE_READ_WEIGHT
 from ..core.events import EventPersister
 from ..core.orchestrator import Orchestrator
@@ -496,23 +496,20 @@ class NorthStarRunner:
                      elapsed: float,
                      events: list[dict] | None = None) -> BenchScore:
         status = outcome.status
-        # Coder + reviewer buckets (angle-4 finding: coder-only summation
-        # rigged the north-star ratio; planner/supervisor columns pending B2).
-        nh_tokens = sum(int(a.get("tokens_used") or 0)
-                        + int(a.get("review_tokens_used") or 0)
-                        + int(a.get("plan_tokens_used") or 0)
-                        + int(a.get("utility_tokens_used") or 0)
-                        for a in attempts)
-        nh_cache = sum(int(a.get("cache_read_tokens") or 0)
-                       + int(a.get("review_cache_read_tokens") or 0)
-                       + int(a.get("plan_cache_read_tokens") or 0)
-                       + int(a.get("utility_cache_read_tokens") or 0)
-                       for a in attempts)
-        nh_creation = sum(int(a.get("cache_creation_tokens") or 0)
-                          + int(a.get("review_cache_creation_tokens") or 0)
-                          + int(a.get("plan_cache_creation_tokens") or 0)
-                          + int(a.get("utility_cache_creation_tokens") or 0)
-                          for a in attempts)
+        # EVERY registered role, per price class (angle-4 finding: coder-only
+        # summation rigged the north-star ratio). The role list is imported,
+        # never enumerated here: this comment used to end "planner/supervisor
+        # columns pending B2" while the code summed exactly four literals, and
+        # the 10%-of-cost target the card publishes is only as honest as the
+        # longest of those lists. A role that exists in the schema but not in
+        # this sum is spend the benchmark hands the product for free.
+        def _class_total(idx: int) -> int:
+            keys = [usage_columns_for(t)[idx] for t in USAGE_ROLES]
+            return sum(int(a.get(k) or 0) for a in attempts for k in keys)
+
+        nh_tokens = _class_total(0)
+        nh_cache = _class_total(1)
+        nh_creation = _class_total(2)
         turns = sum(int(a.get("turns_used") or 0) for a in attempts)
         orig = spec.original or {}
         toks = orig.get("tokens", {}) or {}

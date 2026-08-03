@@ -82,7 +82,8 @@ export function taskBurn(task) {
 }
 
 /**
- * One task's cost: coder + reviewer + aux (planning/utility) — the per-task twin of
+ * One task's cost: coder + reviewer + aux (every other named role: planner, utility,
+ * supervisor, distill) — the per-task twin of
  * {@link lifetimeCost}, which prices the same nine buckets from the metrics payload. All
  * nine that TaskSummaryOut sends, because the API sends them so "the task row prices the
  * WHOLE run, not just coder+review" (models.py). If you add a bucket to one of these, add it

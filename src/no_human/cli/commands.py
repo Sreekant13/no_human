@@ -32,7 +32,7 @@ from ..config import (
     load_config,
 )
 from ..context import ContextGatherer, build_default_sources
-from ..core.db import Store
+from ..core.db import USAGE_ROLES, Store
 from ..core.events import EventPersister
 from ..core.orchestrator import CODER_ROLE, Orchestrator, is_agent_session
 from ..core.task import Task, TaskStatus
@@ -2837,11 +2837,32 @@ def recall(query, limit, include_pending):
     asyncio.run(_go())
 
 
-# The FOUR token groups an attempt records — coder, review, plan, utility —
-# each with (used, cache_read, cache_creation). `Store.list_attempts` is
-# SELECT *, so every one is already in hand.
-_TOKEN_GROUPS = ("", "review_", "plan_", "utility_")
+# The token groups an attempt records — one per NAMED ROLE, each with
+# (used, cache_read, cache_creation). `Store.list_attempts` is SELECT *, so
+# every one is already in hand.
+#
+# IMPORTED, not re-typed. This was a four-literal tuple beside four more
+# literal tuples in metrics.py, api/models.py, eval/northstar.py and
+# eval/replay.py, and the burn figure this file prints is only as complete as
+# the shortest of them. Registering a role in `db.USAGE_ROLES` now widens all
+# five together.
+_TOKEN_GROUPS = tuple(USAGE_ROLES)
 _TOKEN_KINDS = ("tokens_used", "cache_read_tokens", "cache_creation_tokens")
+
+
+def _attempt_role_burn(a: dict) -> "dict[str, int]":
+    """``{role: burn}`` for one attempt row — the same columns
+    ``_attempt_tokens``'s ``burn`` adds up, kept apart instead of summed.
+
+    The partition is exact by construction: every column in ``burn`` belongs
+    to exactly one role here, so ``sum(_attempt_role_burn(a).values())``
+    equals that ``burn`` for every row. Nothing chooses which roles are
+    "interesting"; the caller decides what to print.
+    """
+    return {
+        role: sum(int(a.get(f"{tier}{k}") or 0) for k in _TOKEN_KINDS)
+        for tier, role in USAGE_ROLES.items()
+    }
 
 
 def _attempt_tokens(a: dict) -> "tuple[int | None, int | None]":
@@ -2862,14 +2883,14 @@ def _attempt_tokens(a: dict) -> "tuple[int | None, int | None]":
             NO LONGER what the budget guard enforces, and this docstring said
             it was until 2026-07-31. The guard now compares a COST-WEIGHTED
             sum (fresh x1.0, cache write x1.25, cache read x0.1 —
-            ``core.pricing``) across all four model tiers, cache creation
+            ``core.pricing``) across every registered role, cache creation
             included, so this number and the cap are different quantities in
             different units: on the attempt that killed task d6e4b72a, this
             prints 6,591,126 where the blocker says 877,127. Neither is wrong;
             they answer different questions. Print it as RAW coder spend and
             never as "how much of the budget is gone" — for that, read the
             ``lifetime_budget`` event's ``tokens_weighted`` field.
-    burn  — every token the attempt actually consumed: all four groups, all
+    burn  — every token the attempt actually consumed: every role, all
             three buckets. This is what ``web/src/cost.js`` ``taskBurn`` sums,
             so the CLI and the board cannot disagree.
 
@@ -3377,7 +3398,7 @@ def logs(task_id):
                 #
                 # These are RAW token counts. They are no longer the quantity
                 # the budget guard compares — since 2026-07-31 that is a
-                # cost-weighted sum over all four tiers (`core.pricing`), and
+                # cost-weighted sum over every role (`core.pricing`), and
                 # is ~5x smaller. See `_attempt_tokens`.
                 # TWO numbers, because they answer different questions and
                 # collapsing them lies about one of them. See _attempt_tokens.
@@ -3403,6 +3424,19 @@ def logs(task_id):
                     # fix. It is now counted at 1.25x, the dearest of the three.
                     f"{a.get('cache_creation_tokens') or 0:,}[/]"
                 )
+                # WHERE the burn went, by named role. The line above breaks
+                # out the coder alone, which answers "how much" and never
+                # "which role" — and the roles are the only handle anyone has
+                # on cost. Every role with a non-zero figure is listed and the
+                # figures add up to `burn` exactly, so this is a
+                # decomposition, not a selection: a role missing from the line
+                # cost nothing, it was not judged uninteresting.
+                _roles = {r: v for r, v in _attempt_role_burn(a).items() if v}
+                if _roles:
+                    console.print(
+                        "    [dim]roles: "
+                        + " · ".join(f"{r} {v:,}" for r, v in _roles.items())
+                        + "[/]")
                 if a.get("branch_name"):
                     console.print(f"    branch: {a['branch_name']}")
                 if a.get("resume_checkpoint_lost"):

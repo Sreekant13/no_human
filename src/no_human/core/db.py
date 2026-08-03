@@ -22,6 +22,67 @@ from .task import Task, TaskStatus, assert_transition
 log = logging.getLogger("no_human.db")
 
 
+# --------------------------------------------------------------------------- #
+# The role registry: WHICH NAMED ROLE each family of attempt token columns
+# bills to. THE one list — every cost surface derives its column set from here
+# rather than re-typing it, because this repo has already shipped the drift
+# this prevents twice (the coder-only sum that rigged the north-star ratio,
+# then the four-tier sums that quietly excluded planning).
+#
+# Keyed by COLUMN PREFIX, valued by the role's human name. The coder's prefix
+# is the empty string: its columns are the unprefixed originals
+# (`tokens_used`, `cache_read_tokens`, …) and renaming them would rewrite 50+
+# call sites for no gain.
+#
+# Adding a role means: one entry here, three `*_tokens`/`*_cache_*` columns
+# plus one `*_output_tokens` column in `_migrate`, and a sink that fills them.
+# `test_role_token_accounting.py` fails on the first without the second, which
+# is the only reason this is a registry and not six literals.
+#
+# Ordered coder-first because that is the order every human-facing breakdown
+# prints in; nothing else depends on it.
+USAGE_ROLES: dict[str, str] = {
+    "": "coder",
+    "review_": "reviewer",
+    "plan_": "planner",
+    "utility_": "utility",
+    "supervisor_": "supervisor",
+    "distill_": "distill",
+}
+
+# The roles that are NOT the coder's own session — i.e. the ones accumulated
+# out-of-band during a task and drained onto the attempt row at exit
+# (`Orchestrator._pop_aux_usage`) or to the unattributed ledger when no
+# attempt ever claims them (`_flush_orphaned_aux_usage`). The reviewer is
+# absent on purpose: its burn is written by the review path directly onto the
+# attempt row it just judged, never through the aux accumulator.
+#
+# DERIVED from `USAGE_ROLES` by naming the two EXCLUSIONS rather than by
+# re-typing the four members. A hand-written list here would have to be
+# widened by hand every time a role is registered, and the failure mode is
+# silent: an undrained accumulator loses that role's burn without raising.
+# Stating the exclusions instead means a new role is aux BY DEFAULT — the
+# safe direction, since a drained role that had nothing to drain is a no-op
+# while an undrained one is missing spend.
+AUX_USAGE_TIERS: tuple[str, ...] = tuple(
+    t for t in USAGE_ROLES if t not in ("", "review_"))
+
+
+def usage_columns_for(tier: str) -> tuple[str, ...]:
+    """The three ADDEND token columns for one role prefix.
+
+    Deliberately excludes ``{tier}output_tokens``: that is a SLICE of
+    ``{tier}tokens_used``, already inside it, and summing it as a fourth
+    addend double-counts every output token. See
+    ``Store._output_columns_by_class``.
+    """
+    return (
+        "tokens_used" if tier == "" else f"{tier}tokens_used",
+        f"{tier}cache_read_tokens",
+        f"{tier}cache_creation_tokens",
+    )
+
+
 def _resolve_migrations_dir() -> Path:
     """Locate the schema migrations across the ways this code ships.
 
@@ -797,11 +858,39 @@ class Store:
             "plan_tokens_used": "INTEGER DEFAULT 0",
             "plan_cache_read_tokens": "INTEGER DEFAULT 0",
             "plan_cache_creation_tokens": "INTEGER DEFAULT 0",
-            # UTILITY-tier burn (supervisor checks, distillation,
-            # stuck-hypothesis) — discarded entirely before B2 #6.
+            # UTILITY-tier burn — discarded entirely before B2 #6. It used to
+            # mean "everything that is not coder/reviewer/planner", which is a
+            # residual and not a role: the supervisor and the context
+            # distiller billed into it alongside the stuck hypothesis, the
+            # spec evaluator, the assumption pass, both grill halves and the
+            # split drafter. Since A5 those first two have columns of their
+            # own (below) and this column means the INTAKE/advisory utility
+            # tier only. Historical rows keep whatever they were written with;
+            # nothing is moved, and the grand total is unchanged either way.
             "utility_tokens_used": "INTEGER DEFAULT 0",
             "utility_cache_read_tokens": "INTEGER DEFAULT 0",
             "utility_cache_creation_tokens": "INTEGER DEFAULT 0",
+            # SUPERVISOR burn: the every-`check_every`-tool-calls course
+            # corrector (`agent/supervisor.py`, `llm.supervisor_model`). It
+            # runs once per N tool calls for the whole length of an
+            # implementation session, so it is the one aux role whose cost
+            # scales with attempt LENGTH rather than with intake — exactly the
+            # thing a cost optimiser needs to see on its own before it starts
+            # tuning `check_every`. Folded into `utility_` it was
+            # indistinguishable from a one-shot spec evaluator.
+            "supervisor_tokens_used": "INTEGER DEFAULT 0",
+            "supervisor_cache_read_tokens": "INTEGER DEFAULT 0",
+            "supervisor_cache_creation_tokens": "INTEGER DEFAULT 0",
+            # CONTEXT-DISTILLATION burn: one utility-model session per
+            # oversized gathered chunk (`_distill_large_chunks`). Unbounded in
+            # the number of chunks and paid BEFORE the coder writes a line, so
+            # it is the other half of the old `utility_` residual that has to
+            # be separable — "distillation pays for itself" is a claim about
+            # this column against the coder's, and it could not be stated,
+            # let alone tested, while the two aux roles shared one bucket.
+            "distill_tokens_used": "INTEGER DEFAULT 0",
+            "distill_cache_read_tokens": "INTEGER DEFAULT 0",
+            "distill_cache_creation_tokens": "INTEGER DEFAULT 0",
             # The OUTPUT share of the `*tokens_used` column beside each one.
             # `_usage_quad` in the backend always had this number and the
             # backend summed it away (`input_tokens + output_tokens`) before
@@ -828,6 +917,8 @@ class Store:
             "review_output_tokens": "INTEGER",
             "plan_output_tokens": "INTEGER",
             "utility_output_tokens": "INTEGER",
+            "supervisor_output_tokens": "INTEGER",
+            "distill_output_tokens": "INTEGER",
             # Which model actually ran which role on this attempt. Nothing
             # recorded it, which is how a frozen config.yaml silently inverted
             # coder and reviewer for a week.
@@ -1340,20 +1431,29 @@ class Store:
         )
         return int(row["n"]) if row else 0
 
-    # The four model tiers the attempts table meters, and the three token
-    # columns each one carries. `eval/northstar.py` already sums exactly this
-    # set to report cost; the budget gate below now matches it, so the two can
-    # no longer disagree about what a task spent.
-    _USAGE_TIERS = ("", "review_", "plan_", "utility_")
+    # The named roles the attempts table meters, and the three token columns
+    # each one carries. `eval/northstar.py` already sums exactly this set to
+    # report cost; the budget gate below matches it, so the two can no longer
+    # disagree about what a task spent.
+    #
+    # DERIVED from the module-level `USAGE_ROLES` registry, never re-typed:
+    # this list was four literals in six different files, and the last time a
+    # role was added (planning) four of the six kept summing three. Adding a
+    # role to the registry now widens every one of them at once.
+    _USAGE_TIERS = tuple(USAGE_ROLES)
 
     @classmethod
     def _usage_columns_by_class(cls) -> dict[str, tuple[str, ...]]:
-        """The same twelve columns, grouped by PRICE CLASS rather than by tier.
+        """The same addend columns, grouped by PRICE CLASS rather than by role.
 
-        The four tiers all bill at the same three rates, so the classes — not
-        the tiers — are what a cost-weighted budget has to keep apart
+        Every role bills at the same three rates, so the classes — not the
+        roles — are what a cost-weighted budget has to keep apart
         (``core.pricing``). Keyed by the coder-tier column name so a caller can
         splat the result straight into ``pricing.weighted_tokens``.
+
+        Three classes x ``len(USAGE_ROLES)`` roles; the count moves when a
+        role is registered, which is why nothing here or downstream states it
+        as a literal any more.
         """
         return {
             "tokens_used": tuple(
@@ -1406,7 +1506,7 @@ class Store:
         """(attempts, {tokens_used, cache_read_tokens, cache_creation_tokens,
         output_tokens}).
 
-        The same rows and the same twelve columns ``lifetime_usage`` sums, kept
+        The same rows and the same addend columns ``lifetime_usage`` sums, kept
         in their three price classes so the budget gate can weight them
         (``core.pricing.weighted_tokens``), plus a FOURTH key that is not a
         fourth class: ``output_tokens`` is the output slice of ``tokens_used``,
@@ -1414,8 +1514,11 @@ class Store:
         output premium. It is deliberately absent from ``lifetime_usage``'s
         raw total, which would otherwise count it twice. The classes are
         summed across all
-        four model tiers — coder, reviewer, planner, utility — because they all
-        bill at the same three rates.
+        registered roles (``USAGE_ROLES``: coder, reviewer, planner,
+        utility, supervisor, distill) because they all bill at the same three
+        rates. For the same numbers cut by ROLE instead, see
+        ``lifetime_usage_by_role`` — it partitions the identical column set,
+        so the two always agree on the total.
         """
         # The three raw classes PLUS the output share, which is a slice of the
         # first of them rather than a fourth class — see
@@ -1442,11 +1545,11 @@ class Store:
         """(attempts, tokens) spent over the task's WHOLE life, resumes included.
 
         Tokens = everything the attempt metered: in/out, cache reads AND cache
-        creation, across all four model tiers (coder, reviewer, planner,
-        utility). Cache reads are where the bulk of the burn lives (~83%), but
+        creation, across every registered role (``USAGE_ROLES``: coder,
+        reviewer, planner, utility, supervisor, distill). Cache reads are where the bulk of the burn lives (~83%), but
         this used to sum ONLY the coder's ``tokens_used + cache_read_tokens``
-        — 2 of 12 columns. The gate was therefore blind to every reviewer,
-        planner and utility token, and to cache creation everywhere. Measured
+        — 2 columns out of the whole grid. The gate was therefore blind to every
+        reviewer, planner and utility token, and to cache creation everywhere. Measured
         over 574 real attempt rows that blind spot is 16.2% of true spend, and
         a task whose burn was mostly reviewer or utility could never trip the
         cap at all. Cache creation is billed, so a spend gate must count it.
@@ -1472,6 +1575,64 @@ class Store:
             by_class[name] for name in self._usage_columns_by_class()
         )
 
+    async def lifetime_usage_by_role(
+        self, task_id: str
+    ) -> dict[str, dict[str, int]]:
+        """``{role: {tokens_used, cache_read_tokens, cache_creation_tokens,
+        output_tokens, total}}`` over the task's whole life.
+
+        The SAME rows and the SAME columns ``lifetime_usage`` sums, cut by
+        NAMED ROLE instead of by price class. That is the whole point and the
+        one invariant to preserve when editing either: both partition
+        ``_usage_columns()``, so
+
+            sum(r["total"] for r in by_role.values()) == lifetime_usage()[1]
+
+        exactly, for every task, with no residual — a role's spend can move
+        between buckets but can never leave the total.
+        ``test_role_token_accounting.py`` asserts both halves (structurally,
+        over the column sets, and on real rows).
+
+        What that identity does NOT catch, stated so nobody reads more safety
+        into it than is there: both sides of it derive from ``USAGE_ROLES``,
+        so they narrow TOGETHER. A metered column added to the `attempts`
+        schema under a prefix no role registers is unclaimed by this method
+        AND absent from ``_usage_columns()``, and the sum still reconciles
+        while the spend is silently uncounted. The only guard that sees that
+        is one anchored to the SCHEMA rather than to the registry —
+        ``test_no_metered_column_in_the_schema_is_unclaimed``, which reads
+        `PRAGMA table_info(attempts)`.
+
+        ``total`` is the three ADDENDS only. ``output_tokens`` rides along as
+        a fifth key because callers pricing a role need it, but it is a SLICE
+        of ``tokens_used``, not a fourth addend — adding it in would
+        double-count output and break the identity above.
+
+        Roles are reported even at zero, so a caller rendering a breakdown
+        gets a stable shape and an operator can see that the supervisor cost
+        nothing rather than wondering whether it was measured.
+        """
+        cols: dict[str, tuple[str, ...]] = {}
+        for tier in USAGE_ROLES:
+            cols[tier] = usage_columns_for(tier) + (
+                "output_tokens" if tier == "" else f"{tier}output_tokens",)
+        selects = ", ".join(
+            f"COALESCE(SUM(COALESCE({col}, 0)), 0) AS {col}"
+            for tier_cols in cols.values() for col in tier_cols
+        )
+        row = await self._fetchone(
+            f"SELECT {selects} FROM attempts WHERE task_id = ?", (task_id,))
+        out: dict[str, dict[str, int]] = {}
+        for tier, role in USAGE_ROLES.items():
+            used, read, creation, output = (
+                int(row[c]) if row else 0 for c in cols[tier])
+            out[role] = {
+                "tokens_used": used, "cache_read_tokens": read,
+                "cache_creation_tokens": creation, "output_tokens": output,
+                "total": used + read + creation,
+            }
+        return out
+
     # ---------------------- unattributed usage ledger ----------------------- #
 
     @serialized_write
@@ -1484,8 +1645,12 @@ class Store:
 
         ``site`` names WHERE it was spent — the live values are ``"api.grill"``,
         ``"api.grill_stream"``, ``"api.grill_stream.evaluate_spec"``,
-        ``"cli.task_add.grill"``, ``"orphaned_utility_usage"`` and
-        ``"orphaned_plan_usage"`` — so the residual stays diagnosable rather
+        ``"cli.task_add.grill"``, and one ``"orphaned_<tier>usage"`` per
+        registered aux role (``orphaned_plan_usage``,
+        ``orphaned_utility_usage``, ``orphaned_supervisor_usage``,
+        ``orphaned_distill_usage``; the set is generated from
+        ``AUX_USAGE_TIERS`` by ``_flush_orphaned_aux_usage``, so it widens
+        with the registry) — so the residual stays diagnosable rather
         than being one anonymous number.
         Returns the row id, or None when there was nothing to record — a call
         that reports zero across all three figures writes no row, so the table

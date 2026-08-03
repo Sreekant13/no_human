@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from ..core.db import Store
+from ..core.db import USAGE_ROLES, Store
 from ..core.orchestrator import Orchestrator
 from ..core.task import Task, TaskStatus
 from ..notify.slack import SlackNotifier
@@ -148,13 +148,15 @@ class ReplayRunner:
         status = outcome.status
         tamper_free = self._tamper_free(outcome, attempts)
         turns = sum(int(a.get("turns_used") or 0) for a in attempts)
-        # Full burn — all four session groups x three buckets, matching
+        # Full burn — every registered role x three buckets, matching
         # `_attempt_tokens` (#210) and cost.js taskBurn. `tokens_used` alone
         # under-reported the golden eval's cost: cache reads dominate, and the
         # coder group alone omits the plan/utility/review sessions the same way
         # the tier-up defect did. `list_attempts` is SELECT *, so the aux
-        # columns are in hand (0 when a session did not run).
-        _groups = ("", "review_", "plan_", "utility_")
+        # columns are in hand (0 when a session did not run). Imported from
+        # `db.USAGE_ROLES` so a role added to the schema cannot be missing
+        # from this sum — the same four literals lived in five files.
+        _groups = tuple(USAGE_ROLES)
         _kinds = ("tokens_used", "cache_read_tokens", "cache_creation_tokens")
         tokens = sum(int(a.get(f"{g}{k}") or 0)
                      for a in attempts for g in _groups for k in _kinds)
