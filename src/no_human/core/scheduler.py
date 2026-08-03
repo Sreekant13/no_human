@@ -27,6 +27,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
+from ..agent.worker_context import WorkerContext, set_worker_context
 from ..config import parallelism_enabled, worktree_isolation_enabled
 from .db import Store
 from . import plan_gate
@@ -701,6 +702,24 @@ class Scheduler:
         return list(self._event_log.get(task_id, []))
 
     async def _run(self, task) -> None:
+        # Bind this worker's identity + the concurrency it was dispatched into,
+        # BEFORE anything can fail. A nested Agent SDK session that dies in the
+        # transport reads this to say which worker died and how many peers were
+        # live (see agent/worker_context.py); with nothing bound it can only
+        # say "unknown", which is how the 2026-07-11 "Stream closed" incident
+        # ended up un-attributable.
+        #
+        # Set INSIDE the coroutine, not at the `ensure_future` call site:
+        # `ensure_future` copies the current context into the new task, so a
+        # set() in here is private to this task and cannot be clobbered by the
+        # next worker the same tick dispatches.
+        set_worker_context(WorkerContext(
+            worker=task.id[:8],
+            # `_inflight` already contains this task — `tick()` reserves the id
+            # synchronously before scheduling — so a lone worker reads 1 of 1.
+            inflight=len(self._inflight),
+            max_workers=self.max_workers,
+        ))
         # Set up per-task event capture.
         buf = deque(maxlen=self._MAX_EVENTS)
         self._event_log[task.id] = buf

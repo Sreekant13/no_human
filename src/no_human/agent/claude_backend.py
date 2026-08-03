@@ -21,6 +21,7 @@ Constraints honoured here:
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -46,6 +47,89 @@ from . import guard
 from .backend import AgentEvent, AgentResult, BackendCapabilities
 from .supervisor import SupervisorHook
 from .tool_result_cap import make_tool_result_cap_hook
+from .worker_context import describe_concurrency
+
+# Substrings that mean THE TRANSPORT DIED, not "the task failed". A session
+# that ends this way produced no verdict and no diff — there is nothing to
+# learn from it and nothing to blame the task for.
+#
+# Scoped to what has actually been OBSERVED, not to everything that could
+# plausibly be transport-shaped. "Stream closed" is the CLI's own wording
+# (the bundled binary's Bun runtime raises `Stream closed by consumer`, code
+# 138, and the CLI surfaces it as an errored result) and is the string the
+# 2026-07-11 parallel-run incident was recorded under. "Connection error" rides
+# along because `orchestrator._classify_error` has always treated the two
+# identically as `infra`, and splitting them here would mean this retry and
+# that classifier disagreed about the same failure.
+#
+# DELIBERATELY ABSENT: "timed out". A hang is already handled, twice, by
+# `asyncio.wait_for` in `review/reviewer.py`, and retrying a hang inside the
+# backend would silently double the wall-clock a task spends wedged — the exact
+# regression `_agent_review`'s halving comment describes.
+_TRANSPORT_FAILURE_MARKERS = ("stream closed", "connection error")
+
+# One retry. Not two, not "until it works". A stream closure under a saturated
+# shared subscription is the failure this exists for, and the honest response
+# to it recurring is to escalate as infra, not to keep spending.
+_TRANSPORT_RETRIES = 1
+
+# A pause before the retry, because the observed cause is SATURATION and an
+# immediate retry re-enters the same instant it just lost. Small on purpose:
+# long enough that the condition can clear, short enough that it is never a
+# hidden contributor to a review timeout.
+_TRANSPORT_RETRY_DELAY_S = 5.0
+
+# The token a downstream reader matches on to route this failure as infra
+# rather than as a task defect (`orchestrator._escalate_reviewer_unavailable`).
+# A constant, exported and imported, so the producer and the consumer cannot
+# drift apart the way a literal repeated in two files always eventually does.
+TRANSPORT_DIAGNOSIS_MARKER = "[transport]"
+
+
+def is_transport_failure(result: "AgentResult") -> bool:
+    """Did this run die in the transport rather than fail as a task?
+
+    ``is_error`` alone does not license a substring search over the whole text.
+    The SDK's *errored-with-subtype-success* shape — ``is_error=True`` on a
+    ``ResultMessage`` whose ``subtype`` is still ``"success"`` — carries **the
+    model's own prose** in ``result``, and that prose is what lands in
+    ``final_text``. In THIS codebase, which is full of stream- and
+    connection-handling code, a run that errored while summarising "added
+    connection error handling" would have matched, been retried at full cost,
+    and then been routed to the human as an infrastructure incident. The exact
+    same over-match in ``_quota_signal`` once parked healthy tasks as
+    PAUSED_QUOTA; the lesson is already paid for.
+
+    So a match has to be CORROBORATED, by one of two independent signals:
+
+    * a structured error signal — ``api_error_status`` (the SDK sets it on the
+      failing API call) or ``stop_reason == "error"`` (the terminal-exception
+      path in ``_run_once``). Either means the failure is the SESSION's, not
+      something the model wrote, so the marker may match anywhere in the text
+      (the traceback the exception path appends is several lines down); or
+    * the marker is on the **first line**. ``_run_once`` leads with what the
+      CLI itself said (``last_result_text`` is prepended before the traceback,
+      and is only ever captured from an errored result), and the observed
+      incident's text is literally ``Stream closed unexpectedly``. Model prose
+      that merely mentions the phrase does not open with it.
+
+    Neither signal alone would do. Requiring the structured one would miss the
+    observed shape outright — the recorded incident arrives as ``is_error=True,
+    subtype="success", stop_reason=None, api_error_status=None`` (see the stub
+    in ``tests/test_stream_closure_retry.py``, which reproduces it over a real
+    subprocess). Requiring only the first line would miss the exception path
+    when the CLI said nothing and the traceback is all there is.
+    """
+    if not result.is_error:
+        return False
+    text = (result.final_text or "").strip().lower()
+    if not text:
+        return False
+    structured = bool(getattr(result, "api_error_status", None)) or (
+        (result.stop_reason or "") == "error")
+    haystack = text if structured else text.splitlines()[0]
+    return any(m in haystack for m in _TRANSPORT_FAILURE_MARKERS)
+
 
 #: What this backend can do, for the seam. Every field is True except the two
 #: that describe a thing Claude genuinely does not have, and there are none —
@@ -126,6 +210,36 @@ def _result_size(content: Any) -> dict[str, Any]:
         # threshold read off the Bash slice is unaffected, since Bash is text-only.
         "non_text_blocks": non_text,
     }
+
+
+def _fold_spend(prior: AgentResult, *, into: AgentResult) -> None:
+    """Add a dead session's BILL — and only its bill — to the one that replaced it.
+
+    A retried run is two sessions and two bills, but it is one `AgentResult`,
+    and that single object is what reaches `attempts.tokens_used`. Without this
+    the retry would look free while the real spend doubled.
+
+    THE LINE, drawn deliberately: the returned result *describes the surviving
+    session* — its text, turns, session_id and stop_reason all come from the
+    retry. Only the money is run-wide, because money is the one quantity that
+    accumulates across a discarded attempt. Structural counts
+    (`num_turns`, `subagent_count`, `subagent_floored_count`) are NOT folded:
+    they label the session whose verdict is being returned, and a combined
+    cardinality would describe a session that never existed. The discarded
+    session's structure is not lost — it rides the `transport_retry` event.
+
+    `output_tokens` keeps its None-vs-0 distinction all the way to the SQL
+    column: None means "no usage block was ever seen", and adding 0 to it would
+    assert a measurement nobody made.
+    """
+    into.tokens_used += prior.tokens_used
+    into.cache_read_tokens += prior.cache_read_tokens
+    into.cache_creation_tokens += prior.cache_creation_tokens
+    into.subagent_tokens_used += prior.subagent_tokens_used
+    into.subagent_cache_read_tokens += prior.subagent_cache_read_tokens
+    into.subagent_cache_creation_tokens += prior.subagent_cache_creation_tokens
+    if prior.output_tokens is not None:
+        into.output_tokens = (into.output_tokens or 0) + prior.output_tokens
 
 
 def _usage_quad(usage: dict[str, Any] | None) -> tuple[int, int, int, int]:
@@ -791,7 +905,142 @@ class ClaudeBackend:
         agents: dict[str, AgentDefinition] | None = None,
         on_compact: Callable[[str], None] | None = None,
     ) -> AgentResult:
-        """Run to completion, optionally forwarding each event, return the result."""
+        """Run to completion, retrying ONCE if the transport died, not the task.
+
+        The failure this guards is the 2026-07-11 parallel-run incident: three
+        workers plus the operator's own outer agent session, and the REVIEWER's
+        nested Agent-SDK subprocess came back "Stream closed". The pool was
+        dropped to one worker and has stayed there.
+
+        Three properties, each of which was missing:
+
+        1. **Bounded.** Exactly one retry (`_TRANSPORT_RETRIES`), after a short
+           pause, and only for `_TRANSPORT_FAILURE_MARKERS`. A task failure —
+           wrong code, failing tests, a refusal — is returned untouched on the
+           first pass, as before.
+        2. **Never silent.** Both the retry and the give-up emit an event
+           through the caller's `on_event`, so `nh watch`, the event log and
+           the DB all show that a second session was spent. A retry nobody can
+           see is indistinguishable from a flaky product.
+        3. **Attributable.** The give-up text names the worker and the
+           concurrency it was dispatched into. Nothing in the database recorded
+           that before, which is precisely why the incident could only ever be
+           *asserted* to be a concurrency problem.
+
+        The first attempt's spend is folded into the returned result. It was
+        really burned, and a retry that silently reset the ledger would make
+        this change look free while making the bill go up.
+
+        **THE MULTIPLIER, stated because it is not obvious from here.** This
+        retry is not the only one in the review path, and the two COMPOSE.
+        ``review/reviewer.py:_agent_review`` already runs its own bounded
+        infra retry (``_REVIEW_INFRA_RETRIES = 1``, so 2 rounds), and every one
+        of those rounds calls this method, which may spend 2 sessions. The
+        worst case for ONE review gate is therefore:
+
+            2 reviewer rounds x (1 session + 1 transport retry) = **4 sessions**
+
+        and across a task's bounded loop (constraint #5, ``max_attempts=3``,
+        one gate per attempt):
+
+            3 attempts x 4 = **<=12 reviewer sessions per task**
+
+        Before this change the same numbers were 2 and 6. Nothing here is
+        unbounded — every factor is a named constant — but a reader pricing a
+        review gate must multiply by 2, not assume it. The wall-clock half of
+        the same bound is documented on ``_agent_review``.
+        """
+        first = await self._run_once(
+            prompt, cwd=cwd, max_turns=max_turns, effort=effort, resume=resume,
+            on_event=on_event, supervisor_hook=supervisor_hook,
+            lint_hook=lint_hook, skills=skills, thinking=thinking,
+            max_thinking_tokens=max_thinking_tokens, agents=agents,
+            on_compact=on_compact,
+        )
+        if not is_transport_failure(first):
+            return first
+
+        where = describe_concurrency()
+        reason = (first.final_text or "").strip().splitlines()[0][:200]
+        for attempt in range(_TRANSPORT_RETRIES):
+            if on_event is not None:
+                on_event(AgentEvent(
+                    "transport_retry",
+                    text=(
+                        f"nested Agent SDK session died in the transport "
+                        f"({reason}) — {where}; retrying once in "
+                        f"{_TRANSPORT_RETRY_DELAY_S:g}s"
+                    ),
+                    meta={
+                        "attempt": attempt + 1,
+                        "of": _TRANSPORT_RETRIES,
+                        "concurrency": where,
+                        "reason": reason,
+                        # The discarded session's own shape. `_fold_spend`
+                        # deliberately does NOT merge these into the returned
+                        # result (that would describe a session that never
+                        # existed), so this event is where they survive.
+                        "discarded_turns": first.num_turns,
+                        "discarded_tokens": first.tokens_used,
+                        "discarded_subagents": first.subagent_count,
+                    },
+                ))
+            await asyncio.sleep(_TRANSPORT_RETRY_DELAY_S)
+            again = await self._run_once(
+                prompt, cwd=cwd, max_turns=max_turns, effort=effort,
+                resume=resume, on_event=on_event,
+                supervisor_hook=supervisor_hook, lint_hook=lint_hook,
+                skills=skills, thinking=thinking,
+                max_thinking_tokens=max_thinking_tokens, agents=agents,
+                on_compact=on_compact,
+            )
+            _fold_spend(first, into=again)
+            if not is_transport_failure(again):
+                return again
+            first = again
+
+        # Out of retries. The text keeps the CLI's own wording FIRST and
+        # unaltered, because `orchestrator._classify_error` reads it and must
+        # still answer "infra" — the diagnosis is appended, never substituted.
+        first.final_text = (
+            f"{first.final_text}\n\n"
+            f"{TRANSPORT_DIAGNOSIS_MARKER} this nested Agent SDK session died "
+            f"in the transport "
+            f"and was retried {_TRANSPORT_RETRIES} time(s); every attempt died "
+            f"the same way. {where}. This is an infrastructure failure of the "
+            f"session, not a defect in the task or its diff — nothing was "
+            f"reviewed and nothing should be blamed on the change. If the "
+            f"concurrency above is greater than 1, suspect the shared "
+            f"subscription before suspecting the code: every pool worker "
+            f"spends one token against one rate-limit bucket."
+        )
+        if on_event is not None:
+            on_event(AgentEvent(
+                "transport_failed",
+                text=first.final_text,
+                meta={"concurrency": where, "retries": _TRANSPORT_RETRIES,
+                      "reason": reason},
+            ))
+        return first
+
+    async def _run_once(
+        self,
+        prompt: str,
+        *,
+        cwd: Path,
+        max_turns: int,
+        effort: str | None = None,
+        resume: str | None = None,
+        on_event: Callable[[AgentEvent], None] | None = None,
+        supervisor_hook: SupervisorHook | None = None,
+        lint_hook: Any | None = None,
+        skills: list[str] | None = None,
+        thinking: bool = False,
+        max_thinking_tokens: int | None = None,
+        agents: dict[str, AgentDefinition] | None = None,
+        on_compact: Callable[[str], None] | None = None,
+    ) -> AgentResult:
+        """One session: consume the stream, keep the LAST result event."""
         final = AgentResult(
             final_text="", num_turns=0, is_error=False, tokens_used=0,
             session_id=None, stop_reason=None,

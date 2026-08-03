@@ -26,7 +26,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from ..agent.claude_backend import AgentResult
+from ..agent.claude_backend import (
+    TRANSPORT_DIAGNOSIS_MARKER,
+    AgentResult,
+    is_transport_failure,
+)
 from ..review.selfcheck import ChecklistItem
 from ..review.lint_evidence import collect_lint_evidence, format_lint_evidence
 from ..core.jsonparse import loads_lenient
@@ -51,6 +55,14 @@ _REVIEW_INFRA_RETRIES = 1
 # won't clear in a second full window, it just doubles how long a task sits
 # blocked in review. Floored so the retry still gets a fair chance.
 _REVIEW_MIN_RETRY_TIMEOUT = 120
+# ONE extra window, granted only after the backend has ANNOUNCED a transport
+# retry on the event stream, and never otherwise. See `_run_bounded`: without
+# it `asyncio.wait_for` cancels the backend mid-retry and destroys both halves
+# of what the retry exists to produce — the folded spend and the `[transport]`
+# diagnosis — leaving a generic "timed out", which routes as a task problem.
+# Sized like the halving above (and floored the same way) rather than as
+# another full window, so the wall-clock stays bounded at 1.5x the round.
+_TRANSPORT_GRACE_DIVISOR = 2
 # The sentinel `_parse_review_output` returns when no REVIEW_JSON block was found.
 _NO_VERDICT_LABEL = "structured output present"
 _DIFF_CAP = 60_000  # chars — ~15K tokens, fits in 200K context alongside test output
@@ -59,6 +71,32 @@ _CODE_REVIEW_DIFF_CAP = 120_000  # code_review tasks: ~30K tokens, fits in 200K 
 _CODE_REVIEW_TURNS = 15
 _CODE_REVIEW_TIMEOUT = 600  # seconds — larger diffs need more time
 _OUTPUT_CAP = 4000
+
+
+async def _cancel_and_reap(fut: "asyncio.Future") -> None:
+    """End a shielded backend run this reviewer has given up on, and WAIT for it.
+
+    ``asyncio.shield`` deliberately keeps the inner task alive when the awaiting
+    ``wait_for`` gives up, which is the whole point when we intend to await it
+    again — and a leak the moment we do not: an abandoned reviewer session would
+    outlive the gate that stopped reading it and keep spending against the
+    subscription.
+
+    The await is not optional politeness. ``Task.cancel()`` only *schedules* the
+    cancellation, so returning immediately would let this method's caller move
+    on while the dead session's own ``except CancelledError`` cleanup had not
+    run yet — a plain ``asyncio.wait_for`` awaited it, and code (and tests) that
+    observe the cancellation would silently start seeing it late, or not at all.
+    Awaiting it also retrieves the outcome, so a discarded task cannot print
+    "Task exception was never retrieved" at GC time into the operator's log.
+    """
+    fut.cancel()
+    try:
+        await fut
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # noqa: BLE001 — a discarded run's failure is not ours
+        pass
 
 
 class ReviewerUnavailable(RuntimeError):
@@ -1176,22 +1214,18 @@ class AdversarialReviewer:
     async def _fast_review(self, prompt: str, repo_path: Path,
                            *, before_ref: str = "HEAD~1") -> ReviewDecision:
         """Single-turn review — diff already in prompt, no tools needed."""
-        try:
-            result: AgentResult = await asyncio.wait_for(
-                self._backend.run(
-                    prompt,
-                    cwd=repo_path,
-                    max_turns=1,
-                    effort="medium",
-                    on_event=self._on_event,
-                ),
-                timeout=180,
-            )
-        except asyncio.TimeoutError:
+        result, timed_out = await self._run_bounded(
+            prompt, repo_path, max_turns=1, timeout=180,
+            on_event=self._on_event,
+        )
+        if result is None:
+            # Still fails closed. The reason now says WHETHER a transport retry
+            # was in flight when the window ran out, which is the difference
+            # between "the reviewer is slow" and "the session died twice".
             return ReviewDecision(
                 passed=False,
                 checklist=[ChecklistItem("timeout", False,
-                    "reviewer timed out after 180s — fail closed")],
+                    f"reviewer {timed_out} — fail closed")],
             )
         decision = _parse_review_output(result.final_text or "",
                                         repo_path=repo_path, before_ref=before_ref)
@@ -1220,6 +1254,21 @@ class AdversarialReviewer:
         So: retry once with a larger budget (constraint #4 — infra-only, bounded),
         then raise :class:`ReviewerUnavailable` so the task escalates honestly.
         No path here ever turns a missing verdict into a pass.
+
+        **THE BOUND, in full, because two retries now compose here.** Each of
+        these ``_REVIEW_INFRA_RETRIES + 1 = 2`` rounds calls ``_run_bounded``,
+        which calls ``ClaudeBackend.run``, which may itself spend a second
+        session on a dead transport (see its docstring for the session count:
+        4 per gate, <=12 per task at ``max_attempts=3``). The wall-clock half:
+
+            round 1: 600s + 300s grace  = 900s
+            round 2: 300s + 150s grace  = 450s   (window halved on a timeout)
+            ------------------------------------------------------------------
+            worst case per review gate   1350s = 22.5 min
+
+        The grace is granted at most once per round and only to a round that
+        actually entered a transport retry, so the common path is unchanged at
+        600s + 300s. Every factor is a named constant; none of it is unbounded.
         """
         last_reason = "unknown"
         round_timeout = timeout
@@ -1252,6 +1301,100 @@ class AdversarialReviewer:
             "coder for a finding that was never made."
         )
 
+    async def _run_bounded(
+        self, prompt: str, repo_path: Path, *, max_turns: int,
+        timeout: float, on_event: Callable[[Any], None] | None,
+    ) -> tuple[AgentResult | None, str]:
+        """One backend session under a wall-clock bound that the backend's own
+        transport retry cannot be silently eaten by.
+
+        THE BUG THIS EXISTS FOR. ``ClaudeBackend.run`` retries a dead transport
+        once, in-line: it sleeps ``_TRANSPORT_RETRY_DELAY_S``, spends a second
+        session, folds the dead session's spend into the survivor and — if that
+        one dies too — appends the ``[transport]`` diagnosis that
+        ``orchestrator._escalate_reviewer_unavailable`` routes on. ALL of that
+        happens *inside* the awaited coroutine. A plain
+        ``asyncio.wait_for(backend.run(...), timeout)`` therefore cancels the
+        retry mid-flight whenever the two sessions together outlast the window,
+        and every product of the retry dies with it:
+
+        * the folded spend never reaches ``attempts.tokens_used`` — the review
+          gate bills two sessions and reports none of them;
+        * the ``[transport]`` marker is never appended, so the escalation says
+          "timed out", the blocker is not TRANSIENT_INFRA, and the incident is
+          filed against the diff instead of against the infrastructure;
+        * the failure is indistinguishable from a reviewer that was merely slow.
+
+        THE FIX, and why it is a grace window rather than hoisting the retry up
+        here. Hoisting would mean re-implementing the backend's retry — its
+        bound, its pause, its spend fold, its diagnosis — in a second place, and
+        the two copies would drift (constraint #6's "no re-implemented tools",
+        in miniature). Instead the backend keeps its retry and ANNOUNCES it:
+        ``transport_retry`` is already emitted on the caller's own event stream
+        before the pause. So this method watches that stream and grants exactly
+        one extra window, and only to a run that has demonstrably entered its
+        retry. A merely-slow reviewer sees the old behaviour, to the second.
+
+        The bound stays finite and is stated in the constant: one grace, sized
+        ``timeout // _TRANSPORT_GRACE_DIVISOR`` and floored at
+        ``_REVIEW_MIN_RETRY_TIMEOUT``, so the worst case is 1.5x the round, once.
+        If even the grace runs out, the returned reason still starts with
+        "timed out" (``_agent_review`` halves the next round on that prefix) AND
+        still carries the marker, so the human is told a transport death
+        happened even though no ``AgentResult`` survived to say so.
+
+        Returns ``(result, "")`` or ``(None, reason)``.
+        """
+        retry_seen: list[str] = []
+
+        def _watch(event: Any) -> None:
+            if getattr(event, "kind", "") == "transport_retry":
+                meta = getattr(event, "meta", None) or {}
+                retry_seen.append(
+                    str(meta.get("concurrency") or "concurrency not recorded"))
+            if on_event is not None:
+                on_event(event)
+
+        run = asyncio.ensure_future(self._backend.run(
+            prompt, cwd=repo_path, max_turns=max_turns, effort="medium",
+            on_event=_watch,
+        ))
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(run), timeout=timeout), ""
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            # An OUTER cancellation (the task was paused, the loop is shutting
+            # down). `shield` would otherwise leave the session running and
+            # spending with nobody left to read it. Cancel without awaiting —
+            # this coroutine is itself dying and must not block the unwind.
+            run.cancel()
+            raise
+
+        if not retry_seen:
+            await _cancel_and_reap(run)
+            return None, f"timed out after {timeout:g}s"
+
+        grace = max(_REVIEW_MIN_RETRY_TIMEOUT,
+                    timeout // _TRANSPORT_GRACE_DIVISOR)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(run), timeout=grace), ""
+        except asyncio.TimeoutError:
+            await _cancel_and_reap(run)
+        except asyncio.CancelledError:
+            run.cancel()
+            raise
+        return None, (
+            f"timed out after {timeout:g}s + {grace:g}s of transport-retry "
+            f"grace — the nested Agent SDK session died in the transport and "
+            f"the retry that replaced it never returned either "
+            f"({retry_seen[-1]}). Nothing about the diff was reviewed. "
+            f"{TRANSPORT_DIAGNOSIS_MARKER} an infrastructure failure of the "
+            f"reviewer's session, not a defect in the change."
+        )
+
     async def _review_once(
         self, prompt: str, repo_path: Path, *, max_turns: int, timeout: int,
         before_ref: str = "HEAD~1", verify_citations: bool = True,
@@ -1270,19 +1413,12 @@ class AdversarialReviewer:
             if original_on_event:
                 original_on_event(event)
 
-        try:
-            result: AgentResult = await asyncio.wait_for(
-                self._backend.run(
-                    prompt,
-                    cwd=repo_path,
-                    max_turns=max_turns,
-                    effort="medium",
-                    on_event=_capture_event,
-                ),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            return None, f"timed out after {timeout}s"
+        result, timed_out = await self._run_bounded(
+            prompt, repo_path, max_turns=max_turns, timeout=timeout,
+            on_event=_capture_event,
+        )
+        if result is None:
+            return None, timed_out
 
         # Try final_text first, then all captured text. `verify_citations`
         # gates the demotion rule: claim mode must keep a refutation that names
@@ -1296,7 +1432,20 @@ class AdversarialReviewer:
         if _reached_no_verdict(decision):
             reason = result.stop_reason or "no REVIEW_JSON block"
             if getattr(result, "is_error", False):
-                reason = f"reviewer session error ({reason})"
+                # A transport death and a reviewer that argued itself into no
+                # verdict are the same shape here — `(None, reason)` — and used
+                # to read identically downstream: "reviewer session error
+                # (error)". That string names no cause, and it is what the
+                # escalation, the blocker category and the human all inherit.
+                # The backend has already retried a transport failure once and
+                # appended its own diagnosis (worker, concurrency, and the
+                # CLI's own wording); carry that through verbatim instead of
+                # flattening it, so the blocker below can route it as infra.
+                if is_transport_failure(result):
+                    tail = (result.final_text or "").strip()[-600:]
+                    reason = f"reviewer session transport failure — {tail}"
+                else:
+                    reason = f"reviewer session error ({reason})"
             return None, reason
         decision.tokens_used = result.tokens_used
         decision.cache_read_tokens = getattr(result, "cache_read_tokens", 0)

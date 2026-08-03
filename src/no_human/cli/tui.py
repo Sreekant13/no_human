@@ -86,6 +86,17 @@ class WatchApp(App):
             elif kind == "result":
                 self._turns = event.get("num_turns", self._turns)
                 self._tokens = _event_burn(event) or self._tokens
+            elif text.strip():
+                # Everything else an agent session emits. This used to be the
+                # end of the chain, so any kind not named above was silently
+                # DROPPED — and `transport_retry` / `transport_failed` (a dead
+                # nested SDK session being retried, at full cost) landed in
+                # exactly that hole: the backend went to the trouble of saying
+                # "I am spending a second session because the first one died"
+                # and `nh watch` showed a gap. A catch-all rather than two more
+                # names, so the next kind added to `AgentEvent` is visible on
+                # the day it is added instead of the day someone notices.
+                log.write(f"  [yellow]! {kind}[/] {text.strip()[:400]}")
         else:
             if "status" in event:
                 self._step = event["status"]

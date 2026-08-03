@@ -31,6 +31,11 @@ from typing import Any, Callable, Literal
 
 from ..agent.backend import AgentEvent, CodingBackend
 from ..agent.claude_backend import ClaudeBackend
+from ..agent.claude_backend import (
+    TRANSPORT_DIAGNOSIS_MARKER as _TRANSPORT_BLOCKER_MARKER,
+    AgentEvent,
+    ClaudeBackend,
+)
 from ..agent.scope_guard import SCRATCH_DIR, is_agent_owned
 from ..agent.supervisor import SupervisorHook
 from ..blockers import (
@@ -416,6 +421,19 @@ _ATTEMPT_TIMEOUT_DETAIL = "attempt timed out after"
 #: matches on the PREFIX because the specific reason (empty / placeholder / too
 #: short) is appended and belongs on the board; only the class drives the loop.
 _INADEQUATE_REPORT_DETAIL = "report deliverable inadequate"
+
+#: How long a task parked on a dead BACKEND SESSION waits before the wake
+#: watcher resumes it. This is the whole of what makes `TRANSIENT_INFRA`
+#: "auto-retrying" — `Route.auto_retry` is a label no code reads, and a blocker
+#: with no `wake_condition` never self-fires (`blockers/wake.py`), so without a
+#: condition these park silently until `max_park` (48h) times them out.
+#:
+#: 30 minutes, chosen against the two failures it sits between: the observed
+#: cause is subscription saturation, which a 5-second in-backend retry is by
+#: definition too early to outlast, while a wait long enough to matter to a
+#: human is the 48h it replaces. It is only ever a floor — the watcher polls,
+#: and a human can `nh reply` sooner.
+_INFRA_SESSION_WAKE_AFTER = "30m"
 
 
 #: One claim line: "CRITERION: <text> — MET — evidence: <nonempty>". The
@@ -3317,8 +3335,8 @@ class Orchestrator:
                 draft_pr_absent=getattr(self, "_draft_pr_absent", ""))
         except ReviewerUnavailable as exc:
             # Fail closed: a missing gate is an operator problem, not a pass.
-            return await self._escalate(
-                task, str(exc), repo=repo, branch=branch, goal=task.title
+            return await self._escalate_reviewer_unavailable(
+                task, str(exc), repo=repo, branch=branch
             )
         # The reviewer's burn was discarded after the verdict, so the DB held the coder's tokens
         # only and every cost surface under-reported the run by the whole gate (Opus-4-8 over the
@@ -3958,6 +3976,82 @@ class Orchestrator:
         blocker = fallback_blocker(detail, goal=goal or task.title)
         return await self._raise_blocker(task, blocker, repo=repo, branch=branch)
 
+    async def _escalate_reviewer_unavailable(
+        self, task: Task, detail: str, *, repo: GitRepo | None = None,
+        branch: str | None = None,
+    ) -> TaskOutcome:
+        """The review gate could not run — escalate it as what it actually was.
+
+        Two different failures arrive here and used to be indistinguishable:
+
+        * The reviewer ran and never produced a verdict (turn-starved, argued
+          itself in circles, no reviewer configured). That is NOVEL_UNKNOWN:
+          non-transient, a human has to look.
+        * The reviewer's nested Agent SDK session **died in the transport** —
+          the 2026-07-11 "Stream closed" shape. The backend has already retried
+          it once (see `agent/claude_backend.run`) and it died again.
+
+        The second was being reported as the first, and it mattered:
+        `NOVEL_UNKNOWN` is not in `learning.queue.NON_LEARNABLE_CATEGORIES`, so
+        an infra flake proposed itself as a durable code lesson into the human's
+        confirm queue. `TRANSIENT_INFRA` is non-learnable, which is what a dead
+        socket deserves.
+
+        **WHAT THE CATEGORY DOES NOT BUY, and what this had to add.** An earlier
+        version of this docstring also said TRANSIENT_INFRA is "auto-retrying".
+        It is not — not by itself. `Route.auto_retry=True` on that category
+        (`blockers/taxonomy.py`) is read NOWHERE in `src/`; it is a label, and
+        the thing that actually re-runs a parked task is the wake watcher, which
+        fires only on a `wake_condition` — and `condition_satisfied` returns
+        False immediately for a null one (`blockers/wake.py`, "Unknown / null
+        conditions never self-fire"). So a blocker with the right category and
+        no condition parks SILENTLY (`notify_now=False`) for `max_park` (48h)
+        and only then escalates on timeout. Routing the dead review gate here
+        without the two additions below would have been a REGRESSION on
+        NOVEL_UNKNOWN, which at least notified a human the same minute.
+
+        Hence both halves, each using a mechanism that already exists:
+
+        * `wake_condition="after:..."` — the one time-based condition
+          `condition_satisfied` implements. It makes the auto-retry real: the
+          watcher resumes the task and the review gate runs again. A dead
+          socket is exactly the failure a later retry can clear.
+        * `notify_override=True` on `_raise_blocker` — its documented purpose
+          is "a heads-up on a *parked* task they must still act on, which
+          otherwise parks silently" (`_park_human_gated_ci` uses it the same
+          way). The human hears about an unreviewed diff immediately, as they
+          did before, while the task still self-heals in the background.
+
+        Detection is on the marker the backend itself writes, not on a guess
+        about the prose: nothing else in the codebase emits `[transport]`.
+        """
+        if _TRANSPORT_BLOCKER_MARKER in detail:
+            blocker = Blocker(
+                category=BlockerCategory.TRANSIENT_INFRA,
+                transient=True,
+                confidence=0.7,
+                wake_condition=f"after:{_INFRA_SESSION_WAKE_AFTER}",
+                goal=task.title,
+                root_cause_hypothesis=(
+                    "The reviewer's nested Agent SDK session died in the "
+                    "transport and died again on its one retry, so the review "
+                    "gate never ran. Nothing about the diff was judged."
+                ),
+                tried=["reviewer session", "reviewer session (retried once)"],
+                evidence=detail,
+                question=(
+                    "Check whether more than one agent session was running "
+                    "against this subscription at the time — every pool worker "
+                    "spends one token against one rate-limit bucket. The "
+                    "evidence above names the worker and the concurrency it "
+                    "was dispatched into."
+                ),
+            )
+            return await self._raise_blocker(
+                task, blocker, repo=repo, branch=branch, notify_override=True)
+        return await self._escalate(
+            task, detail, repo=repo, branch=branch, goal=task.title)
+
     async def _escalate_exhausted(
         self, task: Task, repo: GitRepo, branch: str | None
     ) -> TaskOutcome:
@@ -3992,13 +4086,31 @@ class Orchestrator:
 
         TRANSIENT_INFRA, not AMBIGUITY: nothing about the SPEC failed — the
         backend session hung twice (auth/quota/network stall, a wedged SDK
-        subprocess). The route parks with auto-retry, so a transient wedge
-        self-heals, while the question tells the human what to actually check.
+        subprocess).
+
+        This docstring used to end "the route parks with auto-retry, so a
+        transient wedge self-heals", and that was FALSE in exactly the way
+        `_escalate_reviewer_unavailable` documents at length:
+        `Route.auto_retry` is read nowhere, and a blocker with no
+        `wake_condition` never self-fires — the sentence described a behaviour
+        no code implemented, and the task sat silently for the full 48h
+        `max_park` instead.
+
+        JUDGEMENT, since the two siblings are not treated identically. The
+        mechanism is fixed in both — this now carries the same
+        `after:` condition, which is what makes the promised self-healing real,
+        and it is the honest fix rather than deleting the promise. The
+        NOTIFICATION is not: `_escalate_reviewer_unavailable` overrides it
+        because routing there was a regression against NOVEL_UNKNOWN, which
+        notified immediately. This path has always been "parked, silent" by
+        design (22.6) and nothing regressed it, so it stays silent and simply
+        starts actually waking up.
         """
         blocker = Blocker(
             category=BlockerCategory.TRANSIENT_INFRA,
             transient=True,
             confidence=0.7,
+            wake_condition=f"after:{_INFRA_SESSION_WAKE_AFTER}",
             goal=task.title,
             tried=list((task.context or {}).get("attempt_log") or []),
             root_cause_hypothesis=(
@@ -4188,8 +4300,8 @@ class Orchestrator:
                     confirmed_rules=self._format_active_memories() or "",
                 )
             except ReviewerUnavailable as exc:
-                return await self._escalate(
-                    task, str(exc), repo=repo, branch=branch, goal=task.title)
+                return await self._escalate_reviewer_unavailable(
+                    task, str(exc), repo=repo, branch=branch)
             except Exception as exc:  # noqa: BLE001 — fail closed, never pass on error
                 from ..review.selfcheck import ChecklistItem
                 self._emit_review("review_error", str(exc))
