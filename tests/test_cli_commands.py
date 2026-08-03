@@ -1974,3 +1974,21 @@ def test_task_show_says_nothing_when_no_code_was_recorded(tmp_path, monkeypatch)
 
     assert result.exit_code == 0, result.output
     assert "code:" not in result.output, result.output
+
+
+# --------------------------------------------------------------------------- #
+# nh --help — the epilog that names the docs                                   #
+# --------------------------------------------------------------------------- #
+
+def test_root_help_names_the_docs_url():
+    """`nh --help` is the whole manual a bundle ships, so it must name /docs.
+
+    Pinned because this exact string has already regressed once on this
+    branch: it landed as /docs.html, which only reaches the page through a
+    307. Assert the canonical URL, not a substring of the host, so that
+    swapping it back for a redirect fails here instead of in a user's shell.
+    """
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--help"])
+    assert result.exit_code == 0, result.output
+    assert "Docs: https://getnohuman.com/docs" in result.output, result.output
