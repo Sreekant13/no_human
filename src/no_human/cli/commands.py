@@ -4974,6 +4974,83 @@ def _render_report_or_refuse(card) -> str:
     return md
 
 
+@bench.command("startup")
+@click.option("--scenario", "scenario_path", default=None,
+              type=click.Path(path_type=Path),
+              help="Scenario file (default: eval/startup_scenario/parcelo.yaml).")
+@click.option("--out", "out_dir", default=None, type=click.Path(path_type=Path),
+              help="Where to build the sprint (default: a fresh temp dir). The "
+                   "codebase is fictional and disposable — rebuild it per run.")
+@click.option("--verdict", "verdict_file", default=None, type=click.Path(),
+              help="Grade a finished run instead of building one: pass the "
+                   "results JSON `nh bench run` wrote.")
+def bench_startup(scenario_path, out_dir, verdict_file):
+    """Build the startup-company sprint, or grade a finished run of it.
+
+    The scenario is one fictional company's codebase and an ORDERED sprint of
+    related tickets. Building it writes the git history and one ordinary bench
+    spec per ticket, each PINNED to the commit where the preceding tickets are
+    merged — so `nh bench run --specs-dir` replays a sprint with no second
+    runner and no special-casing.
+
+    Ticket order is load-bearing, so run it with `--parallel 1`.
+    """
+    import tempfile
+
+    from ..eval.northstar_card import NorthStarCard
+    from ..eval.startup import (
+        DEFAULT_SCENARIO,
+        load_scenario,
+        materialise,
+        render_sprint_verdict,
+        sprint_verdict,
+        validate_scenario,
+    )
+
+    scenario = load_scenario(Path(scenario_path) if scenario_path
+                             else DEFAULT_SCENARIO)
+    problems = validate_scenario(scenario)
+    if problems:
+        console.print(f"[red]{escape(str(scenario.path))}: scenario is malformed[/]")
+        for line in problems:
+            console.print(f"  ⛔ {escape(line)}")
+        sys.exit(1)
+
+    if verdict_file:
+        card = NorthStarCard.load(Path(verdict_file))
+        if card is None:
+            console.print(f"[red]no results at {escape(str(verdict_file))}[/]")
+            sys.exit(1)
+        verdict = sprint_verdict(card.scores, scenario)
+        console.print(escape(render_sprint_verdict(verdict, scenario)))
+        sys.exit(0 if verdict.passed else 1)
+
+    dest = Path(out_dir) if out_dir else Path(
+        tempfile.mkdtemp(prefix="nh-startup-"))
+    if dest.exists() and any(dest.iterdir()):
+        console.print(f"[red]{escape(str(dest))} is not empty — the sprint "
+                      "history must be built from scratch, or the pins would "
+                      "describe a tree that is not there[/]")
+        sys.exit(1)
+    sprint = materialise(scenario, dest)
+    console.print(f"[green]{scenario.name}[/] — {len(sprint.specs)} ticket(s)")
+    for position, spec in enumerate(sprint.specs, start=1):
+        tag = " [yellow](must escalate)[/]" if spec.expect_escalation else ""
+        console.print(f"  {position}. {escape(spec.id)} @ "
+                      f"{sprint.pins[spec.id][:8]}{tag}")
+    console.print(f"[dim]repo  → {escape(str(sprint.repo))}[/]")
+    console.print(f"[dim]specs → {escape(str(sprint.specs_dir))}[/]")
+    console.print("\nrun the sprint:")
+    console.print(f"  nh bench run --specs-dir {escape(str(sprint.specs_dir))} "
+                  f"--parallel 1 --label startup-{scenario.id}")
+    console.print("then grade it:")
+    console.print("  nh bench startup --verdict "
+                  "eval/results/northstar/<the-results-file>.json")
+    console.print("[dim]--gate is not meaningful here: it grades coverage "
+                  "against the curated north-star corpus, which a scenario run "
+                  "is deliberately not part of.[/]")
+
+
 @bench.command("publish")
 @click.argument("results_file")
 @click.option("--force", is_flag=True,
