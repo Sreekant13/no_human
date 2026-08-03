@@ -1,5 +1,30 @@
 # Quickstart — from zero to first task in 5 minutes
 
+## Installed the Mac app? Start here instead
+
+**If you opened a `.dmg` and dragged no_human to Applications, sections 1 and 2
+below are NOT for you.** The app carries its own Python, its own server and its
+own dependencies — there is nothing to `brew install`, nothing to clone, and no
+`uv sync` to run. Doing any of it would set up a *second*, unrelated copy.
+
+What you actually do:
+
+1. Open **no_human** from Applications.
+2. It shows **Connect Claude** and asks for a credential — either a Claude
+   subscription token (it looks like `sk-ant-oat…`) or an Anthropic API key.
+   Paste one and continue.
+3. The board opens. Create your first task there.
+
+If you ever need that screen again — a revoked or mistyped token strands the
+app otherwise — it is **File → Re-enter Claude Token…**.
+
+Everything from section 3 onward applies to you too, EXCEPT that commands are
+written as `uv run nh …` for the source install. The packaged app runs the same
+server internally, so use the board rather than the CLI unless you have also
+installed from source.
+
+---
+
 ## 1. Install prerequisites
 
 ```bash

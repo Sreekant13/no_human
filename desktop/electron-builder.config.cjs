@@ -65,6 +65,27 @@ module.exports = {
   asar: true,
   extraResources: [
     { from: "../packaging/dist/nh-server", to: "nh-server" },
+    // THE DOCUMENTATION, shipped rather than linked. This was argued the other
+    // way first and the argument was wrong, so the reasoning is recorded here.
+    //
+    // The case for linking only was (a) files in Contents/Resources are
+    // reachable only via Show Package Contents, and (b) a bundled copy drifts
+    // from the live docs. (a) is true and is why the Help menu opens this file
+    // rather than expecting anyone to find it. (b) is BACKWARDS: these files
+    // are pinned to the code by `tests/test_readme_claims.py` and ship from the
+    // same commit as the binary, so they cannot drift FROM that binary. The
+    // artefact that drifts is the SITE, on its own release cadence.
+    //
+    // And the site is already wrong for exactly this audience: getnohuman.com's
+    // docs page contains no occurrence of "dmg", ".app", "Applications folder"
+    // or "installer", and its Before-you-start section requires Python, uv, git
+    // and a checkout. The Help menu exists only in the packaged app, so linking
+    // alone sent its only readers to instructions for a different install.
+    //
+    // Cost measured: 7 KB of quickstart against a ~148 MB DMG. It also gives
+    // the app an OFFLINE documentation route, which a URL cannot.
+    { from: "../docs/quickstart.md", to: "docs/quickstart.md" },
+    { from: "../docs/configuration.md", to: "docs/configuration.md" },
     // MIT asks for the licence text to travel with substantial copies; the DMG
     // carries only the .app, so the text rides inside Contents/Resources.
     { from: "../LICENSE", to: "LICENSE" },

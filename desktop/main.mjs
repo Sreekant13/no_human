@@ -183,6 +183,33 @@ async function checkForUpdates({ manual = false } = {}) {
   });
 }
 
+// The SECOND route to documentation, not the only one: the bundle ships its
+// own docs as `extraResources` (`../docs/quickstart.md` and
+// `../docs/configuration.md` → `Contents/Resources/docs/`, declared in
+// electron-builder.config.cjs), and `bundledDoc()` below resolves them under
+// `process.resourcesPath` with a repo-relative fallback for dev runs. Help
+// offers the bundled copy first and this URL second — see menu.mjs.
+//
+// CANONICAL, not `/docs.html` — that form only reaches the page through a 307,
+// and the site's own markup links `/docs` in all five places. A redirect is a
+// thing someone eventually retires.
+const DOCS_URL = "https://getnohuman.com/docs";
+
+/** Absolute path to a doc shipped inside the bundle, or null when unpackaged.
+ *
+ * `extraResources` land in `Contents/Resources`, which is `process.resourcesPath`
+ * in a packaged app. In a dev run there is no bundle, so the repo's own `docs/`
+ * is used — otherwise the menu item would be dead for every developer and the
+ * one person able to notice it broken would never see it.
+ */
+function bundledDoc(name) {
+  const base = app.isPackaged
+    ? path.join(process.resourcesPath, "docs")
+    : path.join(__dirname, "..", "docs");
+  const p = path.join(base, `${name}.md`);
+  return fs.existsSync(p) ? p : null;
+}
+
 function buildAppMenu() {
   const template = buildMenuTemplate({
     isMac: process.platform === "darwin",
@@ -199,6 +226,22 @@ function buildAppMenu() {
         await openSetup(win).catch((err) =>
           console.error("setup screen failed:", err));
       }
+    },
+    // Routed through openExternallyIfWeb, NOT shell.openExternal directly. That
+    // helper is the one place this process hands a URL to the OS, and it
+    // refuses anything that is not http(s); going around it for a URL that
+    // "is obviously fine" is how that guard stops being the one place.
+    //
+    // It points at the site rather than the GitHub repository on purpose: the
+    // repository is private until the operator makes it public, and a link that
+    // 404s for every user is worse than no link at all. Revisit when it opens.
+    onOpenDocs: (which) => {
+      if (which === "site") return openExternallyIfWeb(DOCS_URL);
+      // Falls back to the site when the bundled copy is missing rather than
+      // doing nothing: a Help item that silently no-ops is worse than one that
+      // opens the wrong-ish page, because the user cannot tell it tried.
+      const p = bundledDoc("quickstart");
+      return p ? shell.openPath(p) : openExternallyIfWeb(DOCS_URL);
     },
   });
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));

@@ -97,3 +97,39 @@ test("the update item is omitted when no handler is supplied", () => {
   const file = t.find((m) => m.label === "File");
   assert.equal(file.submenu.some((i) => i.label === "Check for Updates…"), false);
 });
+
+// The bundle previously carried NO user documentation and the app had no route
+// to any. Both halves are now addressed: the docs ship as extraResources, and
+// Help opens the bundled copy first.
+//
+// CORRECTION, recorded because it was asserted as fact in four places: "zero
+// .md files in the bundle" is FALSE as written. `app.asar` carries two
+// (`ms/license.md`, `sax/LICENSE.md`). Both are licences, so "no user
+// documentation" stood — but `find` over the mounted volume CANNOT see inside
+// an asar, so the instrument that produced that claim could never have found
+// its own counterexample.
+test("buildMenuTemplate: Help offers the BUNDLED quickstart first, then the site", () => {
+  const opened = [];
+  const t = buildMenuTemplate({
+    isMac: true, isDev: false, onNavigate: () => {}, onNewTask: () => {},
+    onOpenDocs: (which) => { opened.push(which); },
+  });
+  const help = t.find((m) => m.role === "help");
+  assert.ok(help, "a Help menu exists");
+  const items = (help.submenu || []).filter((i) => i.label);
+  assert.equal(items[0].label, "no_human Quickstart",
+    "the OFFLINE copy must come first — the site's docs assume a git checkout " +
+    "and never mention a .dmg, so they describe a different install");
+  assert.equal(items[1].label, "Documentation (Online)");
+  items[0].click(); items[1].click();
+  assert.deepEqual(opened, ["quickstart", "site"],
+    "each item must ask for its own target, not share one handler");
+});
+
+test("buildMenuTemplate: no Help menu when no docs handler is supplied", () => {
+  const t = buildMenuTemplate({
+    isMac: true, isDev: false, onNavigate: () => {}, onNewTask: () => {},
+  });
+  assert.equal(t.find((m) => m.role === "help"), undefined,
+    "an unwired build gets no empty Help menu");
+});

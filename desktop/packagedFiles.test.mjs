@@ -345,3 +345,57 @@ test("the app ships the brand icon, not Electron's stock atom", () => {
   const head = fs.readFileSync(icns).subarray(0, 4).toString("latin1");
   assert.equal(head, "icns", "desktop/build/icon.icns is not an icns file");
 });
+
+
+// ---------------------------- the shipped documentation -------------------- #
+//
+// The bundle carried no user documentation at all, and the app's only route to
+// any was a URL. That URL points at a page whose "Before you start" requires
+// Python, uv, git and a checkout, and which never mentions a .dmg or the
+// Applications folder — so for the packaged-app user, who is the ONLY person
+// who can reach the Help menu, it documents a different install.
+//
+// These pin the config, not the built artefact: a build takes ~minutes and
+// needs a full npm/electron install, so asserting the DECLARATION is what a
+// unit test can honestly do. The artefact-level check is mounting the DMG.
+
+test("the shipped docs are extraResources, not merely linked", () => {
+  const extras = (builderConfig.mac?.extraResources
+    || builderConfig.extraResources || []);
+  const froms = extras.map((e) => (typeof e === "string" ? e : e.from));
+  const quick = froms.find((f) => String(f).includes("docs/quickstart.md"));
+  assert.ok(quick,
+    `the quickstart is not in extraResources: ${JSON.stringify(froms)}. `
+    + "Without it the Help menu has nothing offline to open and falls back to a "
+    + "page written for a git checkout.");
+  // EVERY doc the bundle ships, not just the one Help opens by default:
+  // checking the quickstart alone let the second entry be dropped or misspelled
+  // with the suite still green.
+  const docs = froms.filter((f) => String(f).includes("/docs/"));
+  for (const want of ["docs/quickstart.md", "docs/configuration.md"]) {
+    assert.ok(docs.some((f) => String(f).endsWith(want)),
+      `${want} is not in extraResources: ${JSON.stringify(froms)}`);
+  }
+  // The PATH must resolve, not merely be listed. A typo passes a
+  // string-contains check and fails only at build time, on a machine that may
+  // not be the one that made the typo. Only checked for docs/, which is always
+  // in the repo — the other extraResources are build outputs (the frozen
+  // server, electron's licences) and are legitimately absent in a worktree.
+  for (const doc of docs) {
+    assert.ok(fs.existsSync(path.resolve(here, doc)),
+      `extraResources names ${doc}, which does not exist relative to desktop/`);
+  }
+});
+
+test("main.mjs wires the Help handler and names the CANONICAL docs URL", () => {
+  const src = fs.readFileSync(path.join(here, "main.mjs"), "utf8");
+  // F5 from review: nothing asserted this wiring at all — misspelling DOCS_URL
+  // or dropping onOpenDocs left every test green while the menu item died.
+  assert.match(src, /onOpenDocs\s*:/,
+    "buildAppMenu no longer passes onOpenDocs, so the Help menu is not built");
+  assert.match(src, /getnohuman\.com\/docs(?!\.html)/,
+    "the docs URL must be the canonical /docs — /docs.html only reaches it "
+    + "through a 307, and the site's own markup links /docs everywhere");
+  assert.doesNotMatch(src, /getnohuman\.com\/docs\.html/,
+    "the non-canonical /docs.html form is back; it pins a redirect");
+});

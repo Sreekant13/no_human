@@ -9,7 +9,8 @@
 // the Edit menu (copy/paste/select-all) must be included explicitly or text
 // inputs lose it.
 export function buildMenuTemplate({ isMac, isDev, onNavigate, onNewTask,
-                                    onReenterToken, onCheckForUpdates }) {
+                                    onReenterToken, onCheckForUpdates,
+                                    onOpenDocs }) {
   const nav = (label, page, accelerator) => ({
     label, accelerator, click: () => onNavigate(page),
   });
@@ -55,5 +56,62 @@ export function buildMenuTemplate({ isMac, isDev, onNavigate, onNewTask,
     ],
   });
   template.push({ role: "windowMenu" });
+  // WITHOUT THIS MENU THE INSTALLED APP HAS NO ROUTE TO DOCUMENTATION AT ALL.
+  // That was established by mounting the round-3 DMG: the only documents under
+  // Contents/Resources were LICENSE, LICENSE.electron.txt and
+  // LICENSES.chromium.html — redistribution notices, not something a user reads
+  // to learn the product.
+  //
+  // THE ORIGINAL ARGUMENT HERE WAS LINK-ONLY, AND IT WAS REVERSED. It ran:
+  // shipping a README inside the bundle answers nobody, because it lands in
+  // Contents/Resources, which a user reaches only via right-click → Show
+  // Package Contents; and a copy of the docs that ships on a build cadence
+  // drifts from the docs that do not. It is kept here because both halves were
+  // wrong in instructive ways, and the reversal is the current design: the
+  // bundle now ships `docs/quickstart.md` and `docs/configuration.md` as
+  // extraResources, and this Help menu opens the BUNDLED copy first and the
+  // live site second.
+  //
+  // Why the argument failed. The reachability half is real but is an argument
+  // for THIS MENU ITEM, not against shipping the file — the app opens it, so
+  // nobody has to find it. The drift half is backwards: the shipped copy leaves
+  // on the same commit as the binary and is pinned to the code by
+  // tests/test_readme_claims.py, while the SITE moves on its own cadence and
+  // already describes a git checkout with Python and uv, which is not the
+  // install a packaged-app user has. And a link is worth nothing to a first-run
+  // user with no network, which is exactly when a quickstart is read.
+  //
+  // The premise underneath it was also false as asserted: "zero .md files in
+  // the bundle" was measured with `find` over the mounted volume, which cannot
+  // see inside an asar — app.asar carried two all along (both licences, so "no
+  // user documentation" survived, but the instrument could never have found its
+  // own counterexample). menu.test.mjs records this as a CORRECTION block.
+  //
+  // `role: "help"` rather than a plain label: macOS gives the Help role its
+  // conventional position and its searchable Help field, and a custom
+  // application menu replaces the platform default, so nothing supplies it
+  // otherwise.
+  //
+  // Conditional, like Re-enter Token and Check for Updates above: a caller that
+  // passes no handler gets a byte-identical menu to before, so this cannot
+  // perturb the existing wiring or its tests.
+  if (onOpenDocs) {
+    template.push({
+      role: "help",
+      submenu: [
+        // The BUNDLED quickstart first, and it is the default for two reasons:
+        // it works offline, and it describes THIS install. The live site's docs
+        // page assumes a git checkout with Python, uv and the CLI — it never
+        // mentions a .dmg or the Applications folder — so for a packaged-app
+        // user it is documentation for a different product.
+        { label: "no_human Quickstart", click: () => onOpenDocs("quickstart") },
+        { type: "separator" },
+        // Secondary, and honestly labelled as the online one: it is the copy
+        // that gains new material between releases, and the copy that can be
+        // wrong about the version actually installed.
+        { label: "Documentation (Online)", click: () => onOpenDocs("site") },
+      ],
+    });
+  }
   return template;
 }
