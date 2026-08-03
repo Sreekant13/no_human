@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -42,8 +43,58 @@ log = logging.getLogger("no_human.scheduler")
 _CLAIMABLE = (TaskStatus.IMPLEMENTING, TaskStatus.PENDING)
 
 
+def pool_width_ceiling(cpu_count: int | None = None) -> int:
+    """The widest pool this machine is allowed to run: ``cpu_count // 3``,
+    never below 2.
+
+    Why a third of the cores and not half: a worker is not one process. Each
+    one drives a nested Agent-SDK subprocess (coder, then reviewer) *and* a
+    test run, and ``bounded_xdist_workers`` below hands that test run
+    ``cpu // max_workers`` pytest workers — so past cpu//2 every task's test
+    phase is structurally starved. The floor of 2 keeps the shipped default
+    (2) reachable on a small machine rather than silently serialising it.
+    """
+    cpus = cpu_count if cpu_count is not None else (os.cpu_count() or 4)
+    return max(2, int(cpus) // 3)
+
+
+def clamp_pool_width(
+    requested: int, *, cpu_count: int | None = None,
+) -> tuple[int, str | None]:
+    """``(width, reason)`` — the width to actually run, and why it is not the
+    width that was asked for.
+
+    ``nh start --workers 64`` used to be accepted in full: both resolvers
+    bounded the pool from below (``max(1, ...)``) and not from above, so the
+    only CPU-aware bound in the system was on the *children*
+    (``bounded_xdist_workers``, added after 3 tasks × ``pytest -n auto`` on 12
+    cores timed every run out) and nothing at all bounded the *parents*. The
+    ceiling is loud rather than silent for the same reason the isolation
+    refusal below is: an operator who asked for a width and got a different one
+    must be told which one is running, and why.
+
+    ``cpu_count`` is injectable so the boundary is testable on any machine.
+    """
+    ceiling = pool_width_ceiling(cpu_count)
+    if requested <= ceiling:
+        return requested, None
+    cpus = cpu_count if cpu_count is not None else (os.cpu_count() or 4)
+    return ceiling, (
+        f"{requested} workers is above this machine's ceiling of {ceiling} "
+        f"({cpus} cores // 3, floor 2) - running {ceiling}, not {requested}. "
+        "This is a sanity ceiling against absurd widths, not a tuned optimum: "
+        "every worker drives its own nested agent subprocesses AND its own "
+        "pytest -n run, whose width is already cpu//workers, so a third of the "
+        "cores is where the test phase starts starving itself. It is not a "
+        "stability guarantee - nested-subprocess instability at even small "
+        "widths is a known separate issue, tracked and fixed on its own "
+        f"branch. Ask for {ceiling} or fewer, or raise the ceiling only after "
+        "re-measuring on this machine."
+    )
+
+
 def resolve_max_workers(
-    config: dict, *, override: int | None = None,
+    config: dict, *, override: int | None = None, cpu_count: int | None = None,
 ) -> tuple[int, str | None]:
     """Effective pool size, plus a warning when a request for >1 is refused.
 
@@ -60,6 +111,11 @@ def resolve_max_workers(
     index. The CLI and the server lifespan both resolve the width here; they
     used to compute it separately, which is how the announcement and the real
     pool were free to disagree.
+
+    The width is bounded from ABOVE too (``clamp_pool_width``): the isolation
+    and concurrency switches decide whether a pool is allowed at all, and the
+    ceiling decides how wide this machine can carry it. The two are checked in
+    that order, so a downgrade to 1 still reports the switch that caused it.
     """
     conc = config.get("concurrency", {}) or {}
     requested = max(1, int(override or conc.get("max_workers", 1) or 1))
@@ -76,11 +132,11 @@ def resolve_max_workers(
                 f"concurrency.enabled is false - running 1 worker, not {requested}. "
                 "Set concurrency.enabled: true to run them in parallel."
             )
-    return requested, None
+    return clamp_pool_width(requested, cpu_count=cpu_count)
 
 
 def resolve_serve_pool(
-    config: dict, *, cli_workers: int | None,
+    config: dict, *, cli_workers: int | None, cpu_count: int | None = None,
 ) -> tuple[int, bool, str | None]:
     """``nh serve``'s decision: an explicit ``--max-workers`` enables the pool
     for THIS invocation only (the config default on disk stays whatever it was).
@@ -101,6 +157,12 @@ def resolve_serve_pool(
     wider than one worker is refused outright when ``isolation.enabled`` is
     false, rather than quietly downgraded, because N workers in one checkout
     is the exact collision the isolation exists to prevent.
+
+    Both widths are then bounded from above by ``clamp_pool_width``. The
+    clamp is a downgrade, not a refusal, so it does NOT travel in ``error``
+    (which means "do not serve"): ``serve()`` re-derives the one-line reason
+    from the width that was asked for and prints it, the same way ``nh start``
+    prints ``resolve_max_workers``'s warning.
     """
     conc = config.get("concurrency", {}) or {}
     isolated = worktree_isolation_enabled(config)
@@ -120,7 +182,7 @@ def resolve_serve_pool(
             )
         if cli_workers > 1 and not isolated:
             return 0, False, _no_isolation(cli_workers)
-        return cli_workers, True, None
+        return clamp_pool_width(cli_workers, cpu_count=cpu_count)[0], True, None
 
     if not parallelism_enabled(config):
         return 0, False, (
@@ -130,8 +192,10 @@ def resolve_serve_pool(
         )
     workers = int(conc.get("max_workers", 2) or 2)
     if workers > 1 and not isolated:
+        # The refusal quotes the width the operator configured, not the
+        # clamped one: they need to recognise the number they wrote.
         return 0, False, _no_isolation(workers)
-    return workers, True, None
+    return clamp_pool_width(workers, cpu_count=cpu_count)[0], True, None
 
 
 def bounded_xdist_workers(

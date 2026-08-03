@@ -84,6 +84,50 @@ def _server_owns_worker(config) -> bool:
         return False
 
 
+def _running_pool_width(config) -> int | None:
+    """The width of the pool that is actually draining the queue, or None.
+
+    `nh status` used to print `working N/{config max_workers}`. Under
+    `nh start --workers N` — a flag that deliberately leaves the config on disk
+    untouched — that denominator was the number nobody was running, and
+    saturation is the one thing an operator reads this line for.
+
+    `/api/queue/health` reports the live `Scheduler.max_workers`, so it is the
+    only honest source while a server is up. Same discipline as
+    `_server_owns_worker` above: any failure to reach it, any non-JSON answer,
+    and a reported width below 1 (a server with no scheduler attached, which
+    is not a running pool) all mean "no live width" — the caller then says so
+    instead of passing a config number off as an observation.
+
+    KNOWN GAP — this covers the app/api server case only. `nh start` is what
+    puts a scheduler behind an HTTP server; `serve()` below runs the scheduler
+    in a bare asyncio loop and binds NO socket, so under `nh serve
+    --max-workers N` there is nothing to ask and status falls back to the
+    config number. The fallback is labelled, not silent, but it is blind: it
+    can print an impossible-looking ratio such as `working 3/2 (configured;
+    server not running)` while a 3-wide serve pool is in fact draining. Fixing
+    that needs `serve` to expose the width somewhere a second process can read
+    (a status endpoint or a pid-file field), which is not this change.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    srv = config.get("server", {}) or {}
+    host = srv.get("host", "127.0.0.1")
+    port = srv.get("port", 8420)
+    try:
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/api/queue/health", timeout=1.5
+        ) as resp:
+            if resp.status != 200:
+                return None
+            width = int((_json.loads(resp.read() or b"{}") or {}).get("max_workers", 0))
+            return width if width >= 1 else None
+    except (urllib.error.URLError, OSError, ValueError, TypeError, TimeoutError):
+        return None
+
+
 def _bootstrap(*, require_auth: bool = True):
     """Load config + enforce subscription mode. Returns (config, scrub_report)."""
     config = load_config()
@@ -2488,13 +2532,22 @@ def serve(max_workers):
     config, _ = _bootstrap()
     _assert_backend_usable()
     from ..blockers import WakeWatcher, parse_duration
-    from ..core.scheduler import Scheduler, resolve_serve_pool
+    from ..core.scheduler import Scheduler, clamp_pool_width, resolve_serve_pool
 
     conc = config.data.setdefault("concurrency", {})
     workers, enabled, error = resolve_serve_pool(config.data, cli_workers=max_workers)
     if error:
         console.print(f"[yellow]{error}[/]")
         sys.exit(1)
+    # `resolve_serve_pool` has already applied the machine ceiling; the reason
+    # is re-derived here from the width that was ASKED for, because a clamp is
+    # a downgrade and `error` means "do not serve". Silently serving a narrower
+    # pool than requested is the failure this prints away.
+    _asked = max_workers if max_workers is not None else int(
+        conc.get("max_workers", 2) or 2)
+    _, _clamp_reason = clamp_pool_width(_asked)
+    if _clamp_reason:
+        console.print(f"[yellow]⚠ {_clamp_reason}[/]")
     if max_workers is not None:
         # An explicit flag enables the pool + worktree isolation for this
         # invocation only — the config default on disk is left untouched.
@@ -2691,11 +2744,21 @@ def status(as_json):
                 # it is NOT summed into any per-task figure.
                 click.echo(json.dumps({**buckets, "unattributed_usage": resid}))
                 return
-            mw = config.data.get("concurrency", {}).get("max_workers", 1)
+            # The denominator is the RUNNING pool when one is reachable —
+            # `nh start --workers N` overrides the config without writing it,
+            # so the config number is a guess about a process this command can
+            # simply ask. When it can't ask — including under `nh serve`, which
+            # binds no socket at all (see `_running_pool_width`'s KNOWN GAP) —
+            # it says which number it is printing rather than implying it
+            # observed one.
+            live = _running_pool_width(config)
+            mw = live if live is not None else config.data.get(
+                "concurrency", {}).get("max_workers", 1)
+            mw_note = "" if live is not None else " [dim](configured; server not running)[/]"
             console.print(
                 f"[yellow]needs you[/] {buckets['needs you']}  "
                 f"[dim]queued[/] {buckets['queued']}  "
-                f"[bold]working[/] {buckets['working']}/{mw}  "
+                f"[bold]working[/] {buckets['working']}/{mw}{mw_note}  "
                 f"[blue]waiting[/] {buckets['waiting']}  "
                 f"[red]failed[/] {buckets['failed']}  "
                 f"[green]done[/] {buckets['done']}")

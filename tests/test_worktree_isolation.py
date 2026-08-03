@@ -86,7 +86,9 @@ def test_an_existing_concurrency_enabled_config_is_unaffected(tmp_path):
         tmp_path, {"concurrency": {"enabled": True, "max_workers": 3}})
     assert parallelism_enabled(cfg.data) is True
     assert worktree_isolation_enabled(cfg.data) is True
-    assert resolve_max_workers(cfg.data) == (3, None)
+    # `cpu_count` pinned: the width also has a machine ceiling (cpu_count//3)
+    # now, and this test is about the migration, not about the test machine.
+    assert resolve_max_workers(cfg.data, cpu_count=12) == (3, None)
 
 
 def test_the_legacy_worktree_root_key_is_still_honoured(tmp_path):

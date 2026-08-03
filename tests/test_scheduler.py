@@ -668,9 +668,15 @@ def test_an_explicit_worker_flag_is_clamped_too():
 def test_concurrency_enabled_honours_the_configured_width():
     from no_human.core.scheduler import resolve_max_workers
 
-    assert resolve_max_workers({"concurrency": {"enabled": True, "max_workers": 3}}) == (3, None)
+    # `cpu_count` is pinned so this asserts the honouring, not the machine:
+    # the width is now also bounded from above by cpu_count//3, so on a small
+    # box an unpinned 3 or 4 would be clamped and this test would report a
+    # machine size as a regression.
     assert resolve_max_workers(
-        {"concurrency": {"enabled": True, "max_workers": 1}}, override=4) == (4, None)
+        {"concurrency": {"enabled": True, "max_workers": 3}}, cpu_count=12) == (3, None)
+    assert resolve_max_workers(
+        {"concurrency": {"enabled": True, "max_workers": 1}},
+        override=4, cpu_count=12) == (4, None)
 
 
 def test_resolve_max_workers_defaults_are_serial_and_silent():
@@ -739,6 +745,104 @@ def test_serve_flag_rejects_non_positive():
     workers, enabled, error = resolve_serve_pool({}, cli_workers=-1)
     assert error is not None
     assert workers == 0
+
+
+# --------------------------------------------------------------------------- #
+# ... and never wider than the machine can carry                               #
+# --------------------------------------------------------------------------- #
+
+def test_the_ceiling_is_a_third_of_the_cores_with_a_floor_of_two():
+    from no_human.core.scheduler import pool_width_ceiling
+
+    assert pool_width_ceiling(12) == 4
+    assert pool_width_ceiling(9) == 3
+    # The floor keeps the shipped default (2) reachable on a small machine
+    # instead of silently serialising it.
+    assert pool_width_ceiling(6) == 2
+    assert pool_width_ceiling(1) == 2
+
+
+def test_a_width_above_the_ceiling_is_clamped_with_a_stated_reason():
+    """`nh start --workers 64` was accepted in full: both resolvers bounded
+    the pool from below only."""
+    from no_human.core.scheduler import clamp_pool_width
+
+    width, reason = clamp_pool_width(64, cpu_count=12)
+    assert width == 4
+    assert reason, "a clamp the operator cannot see is the silent accept again"
+    # It says which width is running, which was asked for, and why.
+    assert "64" in reason and "4" in reason
+    # The why is what this ceiling actually is — a sanity bound on absurd
+    # widths, derived from each worker owning a nested subprocess tree and a
+    # pytest -n run. It must NOT be sold as a stability guarantee: crashes at
+    # small widths are a separate, known issue and this does not fix them.
+    assert "sanity ceiling" in reason
+    assert "nested agent subprocesses" in reason and "pytest -n" in reason
+    assert "known separate issue" in reason
+    # And it cites no particular machine's saved config as its evidence.
+    assert "this install" not in reason and "config records" not in reason
+
+
+def test_a_width_at_or_below_the_ceiling_is_untouched_and_silent():
+    from no_human.core.scheduler import clamp_pool_width
+
+    assert clamp_pool_width(4, cpu_count=12) == (4, None)   # exactly at it
+    assert clamp_pool_width(3, cpu_count=12) == (3, None)
+    assert clamp_pool_width(1, cpu_count=12) == (1, None)
+    assert clamp_pool_width(2, cpu_count=1) == (2, None)    # the floor
+
+
+def test_resolve_max_workers_clamps_the_flag_and_the_config():
+    from no_human.core.scheduler import resolve_max_workers
+
+    # The flag path (`nh start --workers 64`).
+    workers, warning = resolve_max_workers(
+        {"concurrency": {"enabled": True, "max_workers": 2}},
+        override=64, cpu_count=12)
+    assert workers == 4
+    assert warning and "ceiling" in warning
+
+    # The config path (`concurrency.max_workers: 64` on disk).
+    workers, warning = resolve_max_workers(
+        {"concurrency": {"enabled": True, "max_workers": 64}}, cpu_count=12)
+    assert workers == 4
+    assert warning and "ceiling" in warning
+
+
+def test_the_isolation_downgrade_still_wins_over_the_ceiling():
+    """Order matters: an over-wide request with isolation off must still be
+    told about ISOLATION — that is the switch it has to fix, and the operator
+    only gets one warning per run."""
+    from no_human.core.scheduler import resolve_max_workers
+
+    workers, warning = resolve_max_workers(
+        {"concurrency": {"enabled": True, "max_workers": 64},
+         "isolation": {"enabled": False}}, cpu_count=12)
+    assert workers == 1
+    assert warning and "isolation.enabled is false" in warning
+    assert "ceiling" not in warning
+    # ...and it quotes the width the operator ASKED for. This is what pins the
+    # order: clamping first and then reporting the isolation refusal leaves
+    # every assertion above true while the message reads "not 4" — a number the
+    # operator never typed, about a limit that is not their problem here.
+    assert "not 64" in warning, warning
+
+
+def test_resolve_serve_pool_clamps_the_flag_and_the_config():
+    from no_human.core.scheduler import resolve_serve_pool
+
+    assert resolve_serve_pool(
+        {}, cli_workers=64, cpu_count=12) == (4, True, None)
+    assert resolve_serve_pool(
+        {"concurrency": {"enabled": True, "max_workers": 64}},
+        cli_workers=None, cpu_count=12) == (4, True, None)
+    # Below the ceiling nothing moves — the flag still buys the pool it asked
+    # for, and serve's historical no-flag default of 2 is untouched.
+    assert resolve_serve_pool(
+        {}, cli_workers=3, cpu_count=12) == (3, True, None)
+    assert resolve_serve_pool(
+        {"concurrency": {"enabled": True}}, cli_workers=None,
+        cpu_count=12) == (2, True, None)
 
 
 def test_bounded_xdist_workers():

@@ -102,6 +102,12 @@ def _make_runner(path: Path, monkeypatch) -> CliRunner:
     # Patch where the names are USED (commands.py has `from ..config import load_config`)
     monkeypatch.setattr(cmd_mod, "load_config", lambda: _Cfg())
     monkeypatch.setattr(cmd_mod, "assert_subscription_mode", lambda **kw: None)
+    # `nh status` asks the running server for the real pool width, which is a
+    # socket to 127.0.0.1:8420 — the operator's own install answers it on a dev
+    # box. Default it to "no server" so these tests read a fixed number; the
+    # tests that are ABOUT that width stub the HTTP call itself. Same reason
+    # test_task_lifecycle stubs `_server_owns_worker`.
+    monkeypatch.setattr(cmd_mod, "_running_pool_width", lambda _cfg: None)
     return CliRunner()
 
 
@@ -824,6 +830,123 @@ def test_status_counts_pending_as_queued_not_working(tmp_path, monkeypatch):
     assert "queued" in text and "5" in text
 
 
+# --------------------------------------------------------------------------- #
+# nh status — the denominator is the RUNNING pool, or says it isn't            #
+# --------------------------------------------------------------------------- #
+
+def _status_runner_with_config_width(db: Path, monkeypatch, width: int) -> CliRunner:
+    """A `nh status` runner whose CONFIG says `width` workers, so the printed
+    denominator can be told apart from the configured one."""
+    import no_human.cli.commands as cmd_mod
+
+    class _Cfg:
+        primary_model = "claude-sonnet-4-6"
+        review_model = "claude-sonnet-4-6"
+        data = {"concurrency": {"enabled": True, "max_workers": width}}
+
+        def get(self, key, default=None):
+            return self.data.get(key, default)
+
+        def __getitem__(self, key):
+            return self.data[key]
+
+    _Cfg.db_path = db
+    monkeypatch.setattr(cmd_mod, "load_config", lambda: _Cfg())
+    monkeypatch.setattr(cmd_mod, "assert_subscription_mode", lambda **kw: None)
+    return CliRunner()
+
+
+def _stub_health(monkeypatch, payload, *, status: int = 200):
+    """Stub the queue-health HTTP call at the socket boundary, so the CLI's own
+    parsing of the endpoint is exercised rather than mocked away. `payload` of
+    None raises, standing in for "no server listening"."""
+    import urllib.error
+    import urllib.request
+
+    class _Resp:
+        def __init__(self):
+            self.status = status
+
+        def read(self):
+            return json.dumps(payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _fake_urlopen(url, timeout=None):
+        assert "/api/queue/health" in url, f"status must read the live pool: {url}"
+        if payload is None:
+            raise urllib.error.URLError("connection refused")
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+
+
+def test_status_prints_the_running_pool_width_not_the_configured_one(tmp_path, monkeypatch):
+    """`nh start --workers 8` deliberately leaves config on disk alone, so a
+    config-sourced denominator printed `working N/2` while 8 workers ran —
+    wrong for exactly the override a saturation question depends on. `nh start`
+    is the path this fixes: it is the one that puts the pool behind an HTTP
+    server there is something to ask. `nh serve` binds no socket, so it stays
+    on the labelled config fallback (known gap, see `_running_pool_width`)."""
+    db = tmp_path / "test.db"
+    _seed_task(db, TaskStatus.IMPLEMENTING)
+    runner = _status_runner_with_config_width(db, monkeypatch, 2)
+    _stub_health(monkeypatch, {"max_workers": 8, "queue_depth": 0})
+
+    out = " ".join(runner.invoke(cli, ["status"]).output.split())
+
+    assert "working 1/8" in out, out
+    assert "configured" not in out, "the width was observed, not guessed"
+
+
+def test_status_falls_back_to_config_and_says_so_when_no_server(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    _seed_task(db, TaskStatus.IMPLEMENTING)
+    runner = _status_runner_with_config_width(db, monkeypatch, 2)
+    _stub_health(monkeypatch, None)          # nothing listening
+
+    result = runner.invoke(cli, ["status"])
+    out = " ".join(result.output.split())
+
+    assert result.exit_code == 0, result.output
+    assert "working 1/2" in out, out
+    assert "(configured; server not running)" in out, out
+
+
+def test_status_does_not_trust_a_zero_width_pool(tmp_path, monkeypatch):
+    """A reachable server with no scheduler attached reports max_workers 0.
+    Printing `working 1/0` would be an impossible ratio, and treating 0 as an
+    observation would be a claim about a pool that isn't draining anything."""
+    db = tmp_path / "test.db"
+    _seed_task(db, TaskStatus.IMPLEMENTING)
+    runner = _status_runner_with_config_width(db, monkeypatch, 2)
+    _stub_health(monkeypatch, {"max_workers": 0})
+
+    out = " ".join(runner.invoke(cli, ["status"]).output.split())
+
+    assert "working 1/2" in out, out
+    assert "(configured; server not running)" in out, out
+
+
+def test_status_json_is_unchanged_by_the_live_width(tmp_path, monkeypatch):
+    """The --json shape is a consumer contract: the honest denominator is a
+    human-readable-line change only."""
+    db = tmp_path / "test.db"
+    _seed_task(db, TaskStatus.IMPLEMENTING)
+    runner = _status_runner_with_config_width(db, monkeypatch, 2)
+    _stub_health(monkeypatch, {"max_workers": 8})
+
+    out = json.loads(runner.invoke(cli, ["status", "--json"]).output)
+
+    assert set(out) == {"needs you", "queued", "working", "waiting", "failed",
+                        "done", "unattributed_usage"}
+    assert out["working"] == 1
+
+
 def test_status_json_bucket_counts(tmp_path, monkeypatch):
     db = tmp_path / "test.db"
     _seed_task(db, TaskStatus.AWAITING_APPROVAL)
@@ -1309,6 +1432,133 @@ def test_start_skips_linear_poller_when_disabled(tmp_path, monkeypatch):
     mock_poller_cls.assert_not_called()
     mock_poll_loop.assert_not_called()
     assert "linear" not in result.output.lower()
+
+
+# --------------------------------------------------------------------------- #
+# nh start --workers N — the machine ceiling is printed, not silent            #
+# --------------------------------------------------------------------------- #
+
+def _make_start_cfg_concurrent(db_path: Path):
+    """`nh start` scaffolding config with the pool switched ON, so the width
+    reaches the ceiling instead of being downgraded by a switch first."""
+    class _Cfg:
+        primary_model = "claude-sonnet-4-6"
+        review_model = "claude-sonnet-4-6"
+        data = {
+            "server": {"port": 8420},
+            "concurrency": {"enabled": True, "max_workers": 2},
+            "integrations": {"jira": {"enabled": False},
+                             "linear": {"enabled": False}},
+        }
+
+        def get(self, key, default=None):
+            return self.data.get(key, default)
+
+        def __getitem__(self, key):
+            return self.data[key]
+
+    _Cfg.db_path = db_path
+    return _Cfg()
+
+
+def test_start_prints_the_reason_when_it_clamps_the_worker_flag(tmp_path, monkeypatch):
+    """`nh start --workers 64` was accepted in full and in silence. The clamp
+    is only a guard if the operator is told the pool is not the width they
+    asked for — otherwise the number they read back is their own flag."""
+    import os as _os
+
+    cfg = _make_start_cfg_concurrent(tmp_path / "test.db")
+    _patch_start_scaffolding(monkeypatch, cfg)
+    monkeypatch.setattr(_os, "cpu_count", lambda: 12)  # pin the ceiling at 4
+
+    result = CliRunner().invoke(
+        cli, ["start", "--no-open", "--port", "8420", "--workers", "64"])
+    out = " ".join(result.output.split())
+
+    assert result.exit_code == 0, result.output
+    assert "ceiling" in out, out
+    assert "64" in out and "sanity ceiling" in out, out
+    # And the pool it announces is the clamped one, not the requested one.
+    assert "4 worker(s)" in out, out
+
+
+def test_start_does_not_clamp_or_warn_below_the_ceiling(tmp_path, monkeypatch):
+    import os as _os
+
+    cfg = _make_start_cfg_concurrent(tmp_path / "test.db")
+    _patch_start_scaffolding(monkeypatch, cfg)
+    monkeypatch.setattr(_os, "cpu_count", lambda: 12)
+
+    result = CliRunner().invoke(
+        cli, ["start", "--no-open", "--port", "8420", "--workers", "3"])
+    out = " ".join(result.output.split())
+
+    assert result.exit_code == 0, result.output
+    assert "ceiling" not in out, out
+    assert "3 worker(s)" in out, out
+
+
+# --------------------------------------------------------------------------- #
+# nh serve --max-workers N — the ceiling is printed on THIS path too           #
+# --------------------------------------------------------------------------- #
+
+def _patch_serve_scaffolding(monkeypatch, cfg):
+    """`nh serve` up to the point it would start draining: config, the backend
+    probe, and the event loop. `serve` builds its coroutine and hands it to
+    `asyncio.run` — closing it instead runs the whole synchronous prelude (the
+    resolve + the clamp print) and nothing after it."""
+    import no_human.cli.commands as cmd_mod
+
+    monkeypatch.setattr(cmd_mod, "load_config", lambda: cfg)
+    monkeypatch.setattr(cmd_mod, "assert_subscription_mode", lambda **kw: None)
+    monkeypatch.setattr(cmd_mod, "_assert_backend_usable", lambda: None)
+
+    def _dont_run(coro):
+        coro.close()          # no "never awaited" warning, no scheduler, no DB
+
+    monkeypatch.setattr(asyncio, "run", _dont_run)
+    return cmd_mod
+
+
+def test_serve_prints_the_reason_when_it_clamps_the_worker_flag(tmp_path, monkeypatch):
+    """`resolve_serve_pool` clamps `nh serve --max-workers 64` silently — the
+    clamp is a downgrade, so it deliberately does NOT travel in `error` (which
+    means "do not serve"), and `serve` prints the reason itself. Without an
+    assertion on THAT print, `if _clamp_reason:` can be `if False:` and the
+    operator is back to a 64-wide request quietly served 4 wide."""
+    import os as _os
+
+    cfg = _make_start_cfg_concurrent(tmp_path / "test.db")
+    _patch_serve_scaffolding(monkeypatch, cfg)
+    monkeypatch.setattr(_os, "cpu_count", lambda: 12)  # pin the ceiling at 4
+
+    result = CliRunner().invoke(cli, ["serve", "--max-workers", "64"])
+    out = " ".join(result.output.split())
+
+    assert result.exit_code == 0, result.output
+    assert "ceiling" in out, out
+    assert "64" in out and "not 64" in out, out
+    assert "sanity ceiling" in out, out
+    # The pool serve is left holding is the clamped one, and the flag's
+    # for-this-run-only override was written with THAT number, not 64.
+    assert cfg.data["concurrency"]["max_workers"] == 4, cfg.data
+
+
+def test_serve_does_not_warn_below_the_ceiling(tmp_path, monkeypatch):
+    """The control: the reason is absent when nothing was clamped, so the
+    assertion above is about the clamp and not about `serve` printing at all."""
+    import os as _os
+
+    cfg = _make_start_cfg_concurrent(tmp_path / "test.db")
+    _patch_serve_scaffolding(monkeypatch, cfg)
+    monkeypatch.setattr(_os, "cpu_count", lambda: 12)
+
+    result = CliRunner().invoke(cli, ["serve", "--max-workers", "3"])
+    out = " ".join(result.output.split())
+
+    assert result.exit_code == 0, result.output
+    assert "ceiling" not in out, out
+    assert cfg.data["concurrency"]["max_workers"] == 3, cfg.data
 
 
 # --------------------------------------------------------------------------- #
