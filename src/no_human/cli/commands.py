@@ -4564,16 +4564,30 @@ def _render_report_or_refuse(card) -> str:
                 if _dirty(s.notes or "") or _dirty(s.project or "")]
         if _dirty(card.label or ""):
             rows.append(f"(run label {card.label!r})")
+        # NO SQUARE BRACKETS around `where`. They were literals in the format
+        # string, but rich reads `[f*(13)]` as a markup tag and DELETES it —
+        # and `where` is always lowercase-initial (every banned term is), so
+        # the locator was eaten on every real refusal without exception. The
+        # locator is the whole reason `where` exists: without it the operator
+        # is told a term was found and never which one. Escaping the brackets
+        # would also work; dropping them removes the class instead of patching
+        # this instance, and `where` itself is a redacted shape with no
+        # brackets of its own.
         console.print(
             f"[bold red]refusing to publish:[/] the rendered report would "
-            f"contain {len(found)} disallowed string(s) [{where}]")
+            f"contain {len(found)} disallowed string(s): {where}")
         if rows:
-            # escape LAST, over the joined string: `rows` carries `card.label!r`,
-            # and this line runs precisely WHEN the label holds a `/Users/` path
-            # — the same substring that makes it hostile to rich. Unescaped it
-            # was a guaranteed crash on the exact input its own guard exists to
-            # report, swallowing both the locator and the "edit the results
-            # JSON" guidance underneath it.
+            # escape LAST, over the joined string. Two branches arrived at
+            # this same line independently, for two real failure modes of the
+            # same class: `rows` carries `(run label {card.label!r})`, and a
+            # label is free operator text. A label holding a `/Users/` path is
+            # hostile rich markup — unescaped, a guaranteed crash on the exact
+            # input this guard exists to report, swallowing the locator and
+            # the "edit the results JSON" guidance underneath. A lowercase
+            # bracketed span like `probe [rerun]` is read by rich as a markup
+            # tag and DELETED, so the row names a label the operator never
+            # wrote and cannot search for. escape() the interpolated content
+            # only — `[dim]...[/]` stays outside it and still styles.
             console.print(
                 f"[dim]offending row(s): {escape(', '.join(rows[:8]))}[/]")
         console.print(
