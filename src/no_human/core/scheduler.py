@@ -51,9 +51,14 @@ def pool_width_ceiling(cpu_count: int | None = None) -> int:
     Why a third of the cores and not half: a worker is not one process. Each
     one drives a nested Agent-SDK subprocess (coder, then reviewer) *and* a
     test run, and ``bounded_xdist_workers`` below hands that test run
-    ``cpu // max_workers`` pytest workers — so past cpu//2 every task's test
-    phase is structurally starved. The floor of 2 keeps the shipped default
-    (2) reachable on a small machine rather than silently serialising it.
+    ``cpu // max_workers`` pytest workers — so a pool's real CPU demand is
+    several times its width. A third is a sanity margin against that
+    arithmetic, not a measured optimum: the one measurement behind any of it
+    is the incident ``bounded_xdist_workers`` was added for (3 tasks ×
+    ``pytest -n auto`` on 12 cores timed every run out). Nothing here has
+    been measured at cpu//2, so nothing here claims anything about it. The
+    floor of 2 keeps the shipped default (2) reachable on a small machine
+    rather than silently serialising it.
     """
     cpus = cpu_count if cpu_count is not None else (os.cpu_count() or 4)
     return max(2, int(cpus) // 3)
