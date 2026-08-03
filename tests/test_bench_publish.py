@@ -408,6 +408,82 @@ def test_a_forced_publish_survives_re_rendering(bench_env):
         "re-rendering laundered a forced publish into a clean report"
 
 
+def test_report_refuses_a_card_no_human_ever_blessed(bench_env):
+    """`bench report` is the second of the two write paths into the tracked
+    report (`--force` is a flag on the first, not a third writer), and the only
+    one that never consulted `publish_refusals`.
+
+    `bench publish` refuses a probe, and this file asserts that. But `bench
+    report` renders straight from latest.json and writes unconditionally — so
+    the same card publish rejects, report installs. This is not hypothetical:
+    the real results dir holds `latest.json` labelled "v14-health-probe" with
+    ONE spec, for which `publish_refusals` returns three reasons (zero-token
+    fraction, unmeasured fraction, and "only 1 spec(s) ran (minimum 10)").
+    Running `nh bench report` there replaced a 53-spec 47%-success report with
+    a 1-spec 0% one, exit 0, printing "report rendered".
+
+    The distinguishing signal is `override_reasons`, not the refusals alone: a
+    card that was force-published carries them and MUST still re-render, or a
+    forced baseline becomes impossible to regenerate (the sibling test above
+    pins that). A card with refusals and no override record never passed a
+    human at all, and is the one to refuse.
+    """
+    results, report = bench_env
+    _card([_score("ns-0", nh_tokens=0)], label="v14-health-probe").save(
+        results / "latest.json")
+    assert publish_refusals(
+        _card([_score("ns-0", nh_tokens=0)], label="v14-health-probe")), \
+        "precondition: this shape must be refusable, or the test proves nothing"
+
+    res = CliRunner().invoke(cli, ["bench", "report"])
+
+    assert res.exit_code == 1, res.output
+    # Assert the REASON, not just the code: exit 1 is also what "no results yet"
+    # and the banned-term refusal return, so a bare code check would keep passing
+    # if this guard were replaced by an unrelated failure.
+    assert "refusing to re-render" in res.output, res.output
+    assert "minimum 10" in res.output, res.output
+    assert report.read_text() == "ORIGINAL REPORT\n", \
+        "`bench report` overwrote the tracked benchmark with an unblessed card"
+
+
+def test_report_refusal_survives_a_hostile_label(bench_env):
+    """A refusal that crashes is not a refusal.
+
+    `card.label` is file-authored and is printed into rich markup. The shape
+    `@[/Users/dev/probe]` reads to rich as a closing tag and raises MarkupError,
+    turning a clean "here is why I refused" into a traceback. The write is
+    guarded either way — the print precedes it — but an independent reviewer
+    found this by crashing the command, and the sibling guard
+    (tests/test_bench_print_escape.py) could not see it because it asserted on
+    the FIRST reason line only.
+    """
+    results, report = bench_env
+    _card([_score("ns-0", nh_tokens=0)], label="@[/Users/dev/probe]").save(
+        results / "latest.json")
+
+    res = CliRunner().invoke(cli, ["bench", "report"])
+
+    assert res.exit_code == 1, res.output
+    assert res.exception is None or isinstance(res.exception, SystemExit), \
+        f"refusal raised instead of refusing: {res.exception!r}"
+    assert "refusing to re-render" in res.output, res.output
+    assert report.read_text() == "ORIGINAL REPORT\n"
+
+
+def test_report_still_renders_a_clean_card(bench_env):
+    """The positive control for the guard above. A refusal-free baseline must
+    keep re-rendering, otherwise the fix trades a silent overwrite for a
+    command that can never regenerate the tracked file."""
+    results, report = bench_env
+    _healthy(30).save(results / "latest.json")
+
+    res = CliRunner().invoke(cli, ["bench", "report"])
+
+    assert res.exit_code == 0, res.output
+    assert "North-star benchmark" in report.read_text()
+
+
 # --------------------- the banned-term publish guard ----------------------- #
 # Same convention as the refusals above: the predicate being right is worthless
 # if the command ignores it. Neutering the guard must fail these.

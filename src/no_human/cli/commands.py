@@ -3536,7 +3536,7 @@ def history(days, output, analyze, json_out, roots):
     try:
         transcripts += extract_transcripts(days=days)
     except (IDENotRunningError, ImportError) as exc:
-        status_console.print(f"[dim]windsurf: skipped ({exc})[/]")  # term-ok: real IDE names
+        status_console.print(f"[dim]windsurf: skipped ({escape(str(exc))})[/]")  # term-ok: real IDE names
 
     try:
         transcripts += extract_claude_code_transcripts(
@@ -4159,7 +4159,7 @@ def bench_build(days, roots, out_dir):
     try:
         transcripts += extract_transcripts(days=days)
     except (IDENotRunningError, ImportError) as exc:
-        console.print(f"[dim]windsurf: skipped ({exc})[/]")  # term-ok: real IDE names
+        console.print(f"[dim]windsurf: skipped ({escape(str(exc))})[/]")  # term-ok: real IDE names
     # min_user_msgs=1: a one-shot request is a real task for the bench corpus.
     transcripts += extract_claude_code_transcripts(
         days=days, limit=10_000, roots=list(roots) or None, min_user_msgs=1)
@@ -4167,7 +4167,7 @@ def bench_build(days, roots, out_dir):
     target = Path(out_dir) if out_dir else GENERATED_DIR
     written = build_bench_tasks(transcripts, out_dir=target)
     runnable = sum(1 for _ in written)  # count; runnable split shown by report
-    console.print(f"[green]{runnable} specs written[/] → {target}")
+    console.print(f"[green]{runnable} specs written[/] → {escape(str(target))}")
     console.print("[dim]curate the core subset by copying reviewed specs up "
                   "into eval/northstar_tasks/ and setting subset: core[/]")
 
@@ -4310,7 +4310,7 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
             console.print(f"  [dim]… and {len(unresolved) - 10} more[/]")
         if not REPO_MAP_PATH.exists():
             console.print(
-                f"[dim]no repo map at {REPO_MAP_PATH} — see "
+                f"[dim]no repo map at {escape(str(REPO_MAP_PATH))} — see "
                 f"eval/repo_map.example.yaml[/]")
     if not specs:
         console.print("[yellow]no specs found — run `nh bench build` and curate "
@@ -4375,9 +4375,9 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
                 shutil.copy2(legacy_ckpt, ckpt)
             elif legacy_ids:
                 console.print(
-                    f"[yellow]not resuming from {legacy_ckpt.name}: it holds "
+                    f"[yellow]not resuming from {escape(legacy_ckpt.name)}: it holds "
                     f"{len(legacy_ids)} spec(s) from run "
-                    f"'{legacy.label or 'unlabelled'}' — left untouched[/]")
+                    f"'{escape(legacy.label or 'unlabelled')}' — left untouched[/]")
         scores = []
         done_ids: set = set()
         if resume and ckpt.exists():
@@ -4501,17 +4501,18 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
         if refusals:
             console.print("[yellow]not publishable as the baseline:[/]")
             for r in refusals:
-                console.print(f"  ⚠ {r}")
+                console.print(f"  ⚠ {escape(str(r))}")
         else:
-            console.print(f"[dim]publish it with:  nh bench publish {out.name}[/]")
+            console.print(f"[dim]publish it with:  nh bench publish {escape(out.name)}[/]")
         if not result.passed:
             console.print("[bold red]north-star gate FAILED:[/]")
             for r in result.reasons:
-                console.print(f"  ⛔ {r}")
+                console.print(f"  ⛔ {escape(str(r))}")
             if gate:
                 sys.exit(1)
         else:
-            console.print(f"[bold green]north-star gate: {result.reasons[0]}[/]")
+            console.print(
+                f"[bold green]north-star gate: {escape(str(result.reasons[0]))}[/]")
 
     asyncio.run(_go())
 
@@ -4564,7 +4565,14 @@ def _render_report_or_refuse(card) -> str:
             f"[bold red]refusing to publish:[/] the rendered report would "
             f"contain {len(found)} disallowed string(s) [{where}]")
         if rows:
-            console.print(f"[dim]offending row(s): {', '.join(rows[:8])}[/]")
+            # escape LAST, over the joined string: `rows` carries `card.label!r`,
+            # and this line runs precisely WHEN the label holds a `/Users/` path
+            # — the same substring that makes it hostile to rich. Unescaped it
+            # was a guaranteed crash on the exact input its own guard exists to
+            # report, swallowing both the locator and the "edit the results
+            # JSON" guidance underneath it.
+            console.print(
+                f"[dim]offending row(s): {escape(', '.join(rows[:8]))}[/]")
         console.print(
             "[dim]the per-task notes are judge-authored free text quoting real "
             "repo contents. Edit the results JSON's `notes` for those rows and "
@@ -4593,15 +4601,18 @@ def bench_publish(results_file: str, force: bool):
         path = RESULTS_DIR / results_file
     card = NorthStarCard.load(path)
     if card is None:
-        console.print(f"[red]not a readable results file: {path}[/]")
+        console.print(f"[red]not a readable results file: {escape(str(path))}[/]")
         sys.exit(1)
 
     previous = NorthStarCard.load(RESULTS_DIR / "latest.json")
     refusals = publish_refusals(card, previous)
     if refusals and not force:
-        console.print(f"[bold red]refusing to publish {path.name}:[/]")
+        console.print(f"[bold red]refusing to publish {escape(path.name)}:[/]")
         for r in refusals:
-            console.print(f"  ⛔ {r}")
+            # The narrowing refusal embeds `previous.label`, which is card-
+            # authored — so this line was a live MarkupError, not a theoretical
+            # one. Proven by seeding a baseline labelled `@[/Users/dev/base]`.
+            console.print(f"  ⛔ {escape(str(r))}")
         console.print(
             "\n[dim]If you have judged this run publishable anyway, re-run with "
             "--force; the reasons are recorded in the report.[/]")
@@ -4628,9 +4639,14 @@ def bench_publish(results_file: str, force: bool):
     if refusals:
         console.print("[bold yellow]published WITH --force over:[/]")
         for r in refusals:
-            console.print(f"  ⚠ {r}")
+            console.print(f"  ⚠ {escape(str(r))}")
     console.print(
-        f"[green]published[/] {card.label or path.name} — "
+        # This line runs AFTER latest.json, published_baseline and the report are
+        # all written. Unescaped, a hostile label turned a completed publish into
+        # a traceback with no "published" line — the operator sees exit 1 and a
+        # crash while the tracked report has already been replaced. A post-write
+        # crash is strictly worse than the pre-write one this branch set out to fix.
+        f"[green]published[/] {escape(card.label or path.name)} — "
         f"success {agg['success_rate']:.0%} · "
         f"median cost ratio {agg['median_cost_ratio']} · "
         f"{agg['total_nh_tokens']:,} tokens → docs/NORTH_STAR_BENCH.md")
@@ -4650,7 +4666,7 @@ def _load_reviewer_recall_runner():
     repo_root = Path(__file__).resolve().parents[3]
     runner_path = repo_root / "eval" / "reviewer_recall" / "runner.py"
     if not runner_path.exists():
-        console.print(f"[red]reviewer-recall runner not found at {runner_path}[/]")
+        console.print(f"[red]reviewer-recall runner not found at {escape(str(runner_path))}[/]")
         sys.exit(1)
     spec = importlib.util.spec_from_file_location(
         "nh_eval_reviewer_recall_runner", runner_path)
@@ -4680,18 +4696,51 @@ def bench_report(reviewer_recall: bool):
         except module.HeadlineRefusedError as exc:
             # SCRUM-47's refusal is the correct outcome for a broken checkout —
             # surface it as a clean refusal, not a traceback.
-            console.print(f"[red]recall headline refused:[/] {exc}")
+            console.print(f"[red]recall headline refused:[/] {escape(str(exc))}")
             sys.exit(1)
         console.print(text, markup=False)
         return
 
     from ..eval.northstar_card import (
-        REPORT_MD, RESULTS_DIR, NorthStarCard, render_northstar_md)
+        REPORT_MD, RESULTS_DIR, NorthStarCard, publish_refusals,
+        render_northstar_md)
 
     card = NorthStarCard.load(RESULTS_DIR / "latest.json")
     if card is None:
         console.print("[yellow]no results yet — run `nh bench run` first[/]")
         sys.exit(1)
+
+    # The SECOND of the two write paths into the tracked report (the other is
+    # bench_publish), and it used to be the one that never asked whether the
+    # card deserved to be there. Two paths, two commands — `--force` is a flag
+    # on the first, not a third writer.
+    # `bench publish` refuses a probe; `bench report` rendered the same card and
+    # wrote it, so the refusal was one command away from irrelevant.
+    #
+    # The test is `override_reasons`, NOT the refusals alone. A force-published
+    # card carries them and must keep re-rendering — otherwise a forced baseline
+    # can never be regenerated, which is the failure the publish path's own
+    # write-ordering comment warns about. A card carrying refusals and NO
+    # override record never passed a human, so it is the one to refuse.
+    refusals = publish_refusals(card)
+    if refusals and not card.override_reasons:
+        # escape(): the label is model- and file-authored, and a refusal that
+        # crashes is not a refusal. `@[/Users/dev/probe]` reads to rich as a
+        # closing tag and raises MarkupError — the v11 crash class
+        # tests/test_bench_print_escape.py exists for. The write is guarded
+        # either way (the print precedes it), but a traceback in place of a
+        # clean "here is why I refused" is how a guard stops being read.
+        console.print(
+            f"[bold red]refusing to re-render from "
+            f"{escape(card.label or 'latest.json')}:[/]")
+        for r in refusals:
+            console.print(f"  ⛔ {escape(str(r))}")
+        console.print(
+            "\n[dim]latest.json holds a run that was never published — nothing "
+            "here was overwritten. To publish it anyway, and record why in the "
+            "report itself, use `nh bench publish <results-file> --force`.[/]")
+        sys.exit(1)
+
     REPORT_MD.write_text(_render_report_or_refuse(card))
     console.print(f"[green]report rendered[/] → {REPORT_MD}")
 
