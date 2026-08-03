@@ -119,7 +119,7 @@ test("the switch label names what it actually switches", () => {
   // Slack's switch is `intake` (the Socket-Mode worker), NOT its
   // notifications — calling it "Enable Slack" would promise the wrong thing.
   const slack = { name: "slack", enable_field: "intake", fields: [], secrets: [] };
-  assert.equal(switchLabel(slack, "Slack"), "Enable Slack intake");
+  assert.equal(switchLabel(slack, "Slack"), "Enable Slack worker (connect only)");
   assert.equal(switchLabel({ enable_field: null }, "GitHub"), "");
   assert.equal(humanizeField("poll_interval"), "poll interval");
 });

@@ -2672,7 +2672,19 @@ def serve(max_workers):
                         config.data,
                         on_event=lambda k, t: console.print(f"[cyan]◆ {k}[/] {t}"))
                     await asyncio.to_thread(slack_worker.start)
-                    console.print("[green]Slack intake[/] socket mode connected")
+                    # NOT "connected" in green. The socket connects, but no
+                    # handler is registered on it: AppMentionHandler.register()
+                    # has zero callers outside tests, so SlackWorker._dispatch
+                    # iterates an empty list and every @mention is acked and
+                    # DROPPED. A green success line for a channel that silently
+                    # discards its input is worse than no line — the operator
+                    # turns it on, sees it "work", and waits for tasks that will
+                    # never arrive. Say what actually happens instead.
+                    console.print(
+                        "[yellow]Slack intake[/] socket connected, but NO "
+                        "@mention handler is attached — messages will be "
+                        "received and discarded. This is foundation only; "
+                        "mentions do not create tasks yet.")
                 except Exception as exc:  # noqa: BLE001 — optional integration, never break `serve`
                     console.print(f"[yellow]Slack intake failed to start[/] {exc}")
                     slack_worker = None

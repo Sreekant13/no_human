@@ -54,7 +54,7 @@ credential at runtime, no_human escalates a `MISSING_ACCESS` blocker naming the
 | `CIRCLECI_TOKEN` | `ci.backend: circleci`. A CircleCI personal API token; sent as the `Circle-Token` header. |
 | `GITLAB_TOKEN` | Repos whose CI backend is GitLab, or whose VCS host is a GitLab. |
 | `GH_ENTERPRISE_TOKEN` | Opening PRs against a GitHub-Enterprise host (e.g. `code.example.com`). Public `github.com` uses `gh auth login` instead. |
-| `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` | Only for the opt-in Slack Socket-Mode **intake** worker (`integrations.slack.intake`). Unrelated to notify-out. |
+| `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` | Only for the opt-in Slack Socket-Mode worker (`integrations.slack.intake`). **The worker connects but does not yet create tasks from mentions — the intake handler is not wired in `nh serve`.** Unrelated to notify-out. |
 
 > **The notify-out webhooks are NOT `.env` keys.** Slack's and Teams' webhook
 > URLs live in `config.yaml` under `notifications.slack_webhook_url` and
@@ -120,8 +120,9 @@ integrations:
     org_slug: ""                  # e.g. gh/your-org
     project: ""
   slack:
-    intake: false                 # opt-in Socket-Mode intake worker; needs
-                                  # SLACK_BOT_TOKEN + SLACK_APP_TOKEN in .env
+    intake: false                 # opt-in Socket-Mode worker; needs SLACK_BOT_TOKEN
+                                  # + SLACK_APP_TOKEN in .env. NOTE: connects only —
+                                  # mention-to-task intake is not yet wired in serve
   teams:
     enabled: true                 # mute switch over the notify-OUT channel.
                                   # The webhook URL itself is NOT here — it
@@ -134,7 +135,8 @@ The first-run wizard's **Connect your tools** step edits everything in this
 takes a credential: every token stays in `~/.no_human/.env`, and the wizard
 names the variable rather than accepting a value — `config.yaml` is
 world-readable. `enabled` (and Slack's `intake`) is what actually starts a
-poller or a worker, so an integration with every setting filled in but
+poller or a worker (for Slack: the connection only — mention intake is not yet
+wired), so an integration with every setting filled in but
 `enabled: false` does nothing, and both UIs say so rather than reporting it as
 configured.
 

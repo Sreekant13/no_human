@@ -69,10 +69,16 @@ export function humanizeField(field) {
 
 // What the on/off switch says. `enabled` is the ordinary case and reads
 // "Enable Linear". Slack's switch is `intake` — it starts the Socket-Mode
-// intake worker and has nothing to do with Slack notifications — so naming it
-// "Enable Slack" would promise the wrong thing; it reads "Enable Slack intake".
+// worker, which today CONNECTS ONLY: the mention-to-task intake handler is not
+// wired in `nh serve`, so "Enable Slack intake" would promise the wrong thing
+// in the opposite direction. It reads "Enable Slack worker (connect only)"
+// until the handler is wired.
 export function switchLabel(spec, name) {
   if (!spec.enable_field) return "";
+  if (spec.enable_field === "intake")
+    // Connect-only until the mention-to-task handler is wired in `nh serve` —
+    // see the comment above; the label must not promise intake.
+    return `Enable ${name} worker (connect only)`;
   return spec.enable_field === "enabled"
     ? `Enable ${name}`
     : `Enable ${name} ${humanizeField(spec.enable_field)}`;
@@ -92,7 +98,7 @@ export function switchLabel(spec, name) {
 // predicate for the integration as a whole, which for Slack means "a notify
 // webhook is set" — not "the intake worker can run". So Slack with `intake` on
 // and both Socket-Mode tokens in .env, but no notify webhook, reads
-// "On — needs settings" when intake would in fact work. It under-reports
+// "On — needs settings" when the worker would in fact connect. It under-reports
 // readiness; it can never report ready for something that is not, which is the
 // direction that matters when the whole point of this step is to stop the UI
 // claiming an integration is live while nothing runs.

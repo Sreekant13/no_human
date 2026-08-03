@@ -370,7 +370,9 @@ def test_prepared_case_repo_matches_the_pinned_base_content():
     # only the live tree, saw every gate go green, and shipped all of it
     # unchanged in the frozen twins. The gates check pins and terms; neither
     # asks "did my edit survive materialisation". Verify on the BUILT EXPORT.
-    assert scrubbed == 29, scrubbed
+    # 29 -> 31 on 2026-08-03: the private-doc-name sweep scrubbed the two
+    # models.py base fixtures (orphan-rescue-v2, d44c4377 follow-up).
+    assert scrubbed == 31, scrubbed
 
 
 @pytest.mark.asyncio
