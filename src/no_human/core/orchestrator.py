@@ -999,8 +999,69 @@ class Orchestrator:
 
         Extracted out of the attempt body so the Claude-SDK-only
         ``AgentDefinition`` import is not evaluated on a code path a
-        backend without subagents takes. Content is byte-identical to
-        what was inlined before; only its location changed.
+        backend without subagents takes.
+
+        R10 — the researcher's read-only-ness used to be RHETORICAL. The only
+        thing standing between it and an edit was the sentence "NEVER edit
+        files" in its own prompt, next to ``permissionMode="bypassPermissions"``
+        and no tool restriction of any kind. The fields below make the same
+        claim mechanically:
+
+        * ``disallowedTools`` names the write tools explicitly. The SDK forwards
+          every non-None ``AgentDefinition`` field to the CLI verbatim
+          (``_internal/client.py``: ``asdict(agent_def)`` minus Nones), so this
+          is honored rather than decorative. ``tools=[...]`` is an allow-list and
+          already omits them; the deny-list is the half that keeps holding if a
+          future edit widens the allow-list.
+        * There is no read-only ``PermissionMode`` in this SDK — the literal is
+          ``default | acceptEdits | plan | bypassPermissions | dontAsk | auto``
+          (``claude_agent_sdk/types.py``). ``bypassPermissions`` stays because
+          every no_human session is headless: any prompting mode hangs, and
+          ``plan`` would change what the subagent *does*, not just what it may
+          touch. The restriction therefore lives in ``disallowedTools``.
+        * ``model``/``effort`` were unset, so the researcher silently inherited
+          whatever the calling session ran on. Pinned now: a grep-and-report job
+          does not need the implementer's reasoning budget, and pinning means a
+          future Opus-tier session cannot quietly start paying Opus rates for
+          file lookups. Kept at the sonnet tier rather than dropped to the
+          utility tier — a researcher that misses a file makes the *coder*
+          wrong, which is not the advisory-only failure mode the utility tier
+          is scoped to. Dropping it further is a separate, measured decision.
+          ``model="sonnet"`` is an ALIAS, and the only bare alias in ``src/``.
+          Deliberate, and exempt from the four-tier rule for three reasons: this
+          is a ``@staticmethod`` with no config handle, so routing it through
+          config would mean inventing an ``llm.researcher_model`` surface for
+          one advisory subagent; an alias resolves to whatever the SDK currently
+          calls that tier, so unlike a pinned ID it cannot go stale into a
+          model that no longer exists; and the four tiers this rule protects —
+          implementer, planner/reviewer, supervisor, utility — are the ones
+          whose choice changes a VERDICT. This one changes how a file lookup is
+          answered, and the coder verifies what it returns.
+
+        WHAT THIS DOES AND DOES NOT CLOSE — measured, not assumed. The
+        deny-list closes the WRITE TOOLS: ``Write``/``Edit``/``MultiEdit``/
+        ``NotebookEdit`` are named here and absent from ``tools``. It does NOT
+        close ``Bash``, which stays because a researcher without it cannot run
+        the greps it exists to run. ``guard.evaluate`` allows every ordinary
+        shell write — ``echo x > src/f.py``, ``sed -i``, ``>>``, ``tee``,
+        ``python -c "open(...,'w')"`` all return ALLOW in both the coder and
+        the read-only mode; what it denies is its ENUMERATED list (``rm -rf``,
+        deleting test files, destructive git, forge merge, protected-branch
+        push, writes to ``.no_human.yml``, and in a read-only session any
+        git/forge write). So this subagent is read-only by TOOL SURFACE, and
+        Bash remains an open write path by design. Say so plainly rather than
+        inheriting a comfortable belief: an earlier draft of this docstring
+        claimed the guard caught what a Bash redirect reaches around, and that
+        was simply false.
+
+        The rule this obeys, stated in full rather than by reference so it
+        cannot be read without its content: **a tool deny-list is an
+        optimization, never the security boundary.** ``disallowedTools`` is a
+        request to the CLI, in the same process the agent drives.
+        ``agent/guard.py`` is the boundary — applied as a PreToolUse hook by
+        ``claude_backend._make_guard_hook`` to every tool call in the session,
+        this subagent's included. Never move a rule out of the guard on the
+        strength of a field here.
         """
         from claude_agent_sdk import AgentDefinition
 
@@ -1022,8 +1083,11 @@ class Orchestrator:
                     "- If you cannot find what was asked for, say so explicitly."
                 ),
                 tools=["Read", "Grep", "Glob", "Bash"],
+                disallowedTools=["Write", "Edit", "MultiEdit", "NotebookEdit"],
                 permissionMode="bypassPermissions",
                 maxTurns=10,
+                model="sonnet",
+                effort="low",
             ),
         }
 
@@ -7566,6 +7630,16 @@ class Orchestrator:
           - ``no_human_researcher``: read-only codebase exploration (grep, read),
             no edits. Used automatically by the SDK when the agent decides it
             needs focused investigation.
+
+        THIS FILE IS THE SECOND COPY, NOT THE AUTHORITY. The same researcher is
+        also passed programmatically as an ``AgentDefinition`` in
+        ``_subagent_definitions``, and when both exist the SDK-side definition
+        is what the session resolves — so the restrictions that matter
+        (``disallowedTools``, ``model``, ``effort``) live there and are not
+        restated here. The frontmatter key is ``tools:``, which is the key the
+        agent-file format actually reads; it previously said ``allowed_tools:``,
+        a key nothing consumes, which is a tool restriction that only LOOKS like
+        one — the same failure mode one directory over that R10 was about.
         """
         agents_dir = repo_path / ".claude" / "agents"
 
@@ -7588,7 +7662,7 @@ class Orchestrator:
                     "- Return a concise summary of what you found.\n"
                     "- If you cannot find what was asked for, say so explicitly."
                 ),
-                "allowed_tools": ["Read", "Grep", "Glob", "Bash"],
+                "tools": ["Read", "Grep", "Glob", "Bash"],
             },
         ]
 
@@ -7598,11 +7672,11 @@ class Orchestrator:
                 continue
             try:
                 agents_dir.mkdir(parents=True, exist_ok=True)
-                tools_line = ", ".join(agent["allowed_tools"])
+                tools_line = ", ".join(agent["tools"])
                 agent_path.write_text(
                     f"---\nname: {agent['name']}\n"
                     f"description: {agent['description']}\n"
-                    f"allowed_tools: [{tools_line}]\n---\n\n"
+                    f"tools: [{tools_line}]\n---\n\n"
                     f"{agent['instructions']}\n",
                     encoding="utf-8",
                 )

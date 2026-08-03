@@ -3886,8 +3886,118 @@ async def test_subagents_materialized_before_agent_run(bare_repo, tmp_path, stor
     researcher_md = agents_dir_existed["md"]
     assert "name: no_human_researcher" in researcher_md
     assert "NEVER edit files" in researcher_md
+    # The frontmatter key the agent-file format actually reads. This said
+    # `allowed_tools:` for months — a key nothing consumes, i.e. a restriction
+    # that only looks like one. The SDK-side AgentDefinition is authoritative
+    # when both exist, which is why the deny-list lives there and not here.
+    assert "tools: [Read, Grep, Glob, Bash]" in researcher_md, researcher_md
+    assert "allowed_tools:" not in researcher_md
     # The operator's checkout is not where agent tooling gets dropped.
     assert not (bare_repo / ".claude" / "agents").exists()
+
+
+def test_researcher_subagent_is_read_only_structurally_not_rhetorically():
+    """R10: "NEVER edit files" in a prompt is a request, not a restriction.
+
+    Pins the mechanical half — the allow-list, the write-tool deny-list, and
+    the model/effort that used to be inherited from whatever session happened
+    to spawn the subagent. The deny-list is anchored to ``guard.WRITE_TOOLS``
+    rather than to a hand-copied list, so adding a write tool to the guard and
+    not to the subagent fails here.
+    """
+    from no_human.agent import guard
+
+    defs = Orchestrator._subagent_definitions()
+    researcher = defs["no_human_researcher"]
+
+    assert set(researcher.tools) == {"Read", "Grep", "Glob", "Bash"}
+    assert guard.WRITE_TOOLS <= set(researcher.disallowedTools or []), (
+        "every tool the guard classifies as a write must also be denied to "
+        f"the researcher: guard={sorted(guard.WRITE_TOOLS)} "
+        f"subagent={sorted(researcher.disallowedTools or [])}"
+    )
+    # Not inherited: a grep-and-report job pinned to its own tier and effort.
+    assert researcher.model == "sonnet"
+    assert researcher.effort == "low"
+    assert researcher.maxTurns == 10
+    # No read-only PermissionMode exists in this SDK; headless sessions cannot
+    # prompt, so the mode stays and the restriction lives in disallowedTools.
+    assert researcher.permissionMode == "bypassPermissions"
+
+
+def test_researcher_restrictions_survive_sdk_serialization():
+    """Non-vacuity: the fields above must reach the CLI, not just the dataclass.
+
+    ``claude_agent_sdk/_internal/client.py`` sends agents as
+    ``{k: v for k, v in asdict(agent_def).items() if v is not None}``. This
+    reproduces that exact transform — a field the SDK drops (renamed, or set to
+    None) would pass the field assertions above and change nothing at runtime.
+    """
+    from dataclasses import asdict
+
+    researcher = Orchestrator._subagent_definitions()["no_human_researcher"]
+    payload = {k: v for k, v in asdict(researcher).items() if v is not None}
+
+    assert "disallowedTools" in payload, (
+        "the write deny-list is dropped before it reaches the CLI: "
+        f"sent keys={sorted(payload)}"
+    )
+    assert "Write" in payload["disallowedTools"]
+    assert payload["model"] == "sonnet"
+    assert payload["effort"] == "low"
+
+
+def test_guard_still_blocks_a_researcher_write_that_slips_the_deny_list():
+    """A tool deny-list is the optimization; the guard is the boundary. If the
+    deny-list were dropped tomorrow, this is what still holds — so the guard
+    rule may never be retired on the strength of the field above."""
+    from no_human.agent import guard
+
+    decision = guard.evaluate(
+        "Write",
+        {"file_path": ".env", "content": "x"},
+        forbidden_paths=[".env", "secrets/", "*.key", "*.pem"],
+        never_push_to=["main", "master", "release/*"],
+    )
+    assert not decision.allow, decision.reason
+
+
+def test_bash_is_an_open_write_path_and_the_docstring_must_keep_saying_so():
+    """Characterization, not endorsement — and the correction of a false claim.
+
+    An earlier draft of ``_subagent_definitions``' docstring said the guard
+    caught what a Bash redirect reaches around a tool deny-list with. It does
+    not: ``guard.evaluate`` denies an ENUMERATED list of destructive commands
+    and allows every ordinary shell write, in both the coder and the read-only
+    mode. The researcher keeps ``Bash`` because a researcher that cannot grep is
+    not a researcher, so the honest statement is "read-only by tool surface,
+    with Bash open" — and this test is what makes that statement falsifiable.
+
+    If someone later closes the shell write path, this test fails, and the fix
+    is to update the docstring to match — not to delete the test.
+    """
+    from no_human.agent import guard
+
+    kw = dict(forbidden_paths=[".env", "secrets/", "*.key", "*.pem"],
+              never_push_to=["main", "master", "release/*"])
+    open_writes = [
+        "echo x > src/foo.py",
+        "sed -i '' s/a/b/ src/foo.py",
+        "cat a >> src/foo.py",
+        "printf 'x' | tee src/foo.py",
+    ]
+    for cmd in open_writes:
+        for readonly in (False, True):
+            d = guard.evaluate("Bash", {"command": cmd}, readonly=readonly, **kw)
+            assert d.allow, (
+                f"the guard now denies {cmd!r} (readonly={readonly}). That is a "
+                "real tightening — update the 'Bash remains an open write path' "
+                "paragraph in Orchestrator._subagent_definitions to match."
+            )
+    # Non-vacuity: the same call path DOES deny its enumerated patterns, so the
+    # allows above are a policy result and not a broken invocation.
+    for cmd in ("rm -rf /tmp/x", "rm tests/test_foo.py"):
+        assert not guard.evaluate("Bash", {"command": cmd}, **kw).allow, cmd
 
 
 # --------------------------------------------------------------------------- #
