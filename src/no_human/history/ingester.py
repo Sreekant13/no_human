@@ -29,7 +29,7 @@ from .analyzer import (
     analyze_transcript,
     analyze_transcript_llm,
 )
-from .extractor import Transcript, extract_transcripts
+from .extractor import IDENotRunningError, Transcript, extract_transcripts
 
 log = logging.getLogger("no_human.history")
 
@@ -214,6 +214,20 @@ class TranscriptIngester:
 
     async def ingest(self, *, days: int = 30, use_llm: bool = False) -> IngestResult:
         """End-to-end: extract recent transcripts, analyze, ingest. The single
-        entry point the CLI / onboarding / periodic re-analysis call."""
-        transcripts = extract_transcripts(days=days)
+        entry point the CLI / onboarding / periodic re-analysis call.
+
+        No IDE running is the ORDINARY case, not a failure — every other
+        caller of ``extract_transcripts`` (``nh history``, ``nh bench build``,
+        the onboarding history scan) already catches ``IDENotRunningError``
+        and degrades to "no Windsurf transcripts" instead of raising. This was
+        the one caller that did not, so the periodic re-analysis job (due
+        immediately on every fresh boot — see ``ReanalysisJob.due``) let it
+        propagate up to ``Scheduler.tick``'s generic handler, which logged it
+        as a "re-analysis failed" WARNING on every single startup.
+        """
+        try:
+            transcripts = extract_transcripts(days=days)
+        except (IDENotRunningError, ImportError) as exc:
+            log.debug("windsurf transcripts skipped: %s", exc)
+            transcripts = []
         return await self.ingest_transcripts(transcripts, use_llm=use_llm)

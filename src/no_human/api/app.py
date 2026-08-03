@@ -118,7 +118,18 @@ async def lifespan(app: FastAPI):
     _startup_stale = await asyncio.to_thread(staleness_note, code)
     if _startup_stale:
         log.warning("%s", _startup_stale)
-    store = await Store(config.db_path).connect()
+    # `nh start` may already have connected a shared Store to hand to its
+    # Jira/Linear intake pollers (started before uvicorn's ASGI lifespan
+    # fires) — reuse it instead of opening a SECOND aiosqlite connection to
+    # the same file. Two connections racing this lifespan's own connect+
+    # migrate, with no busy_timeout set, is what flooded a clean `nh start`
+    # with `sqlite3.OperationalError: database is locked` (KI, 2026-08-01).
+    # One-shot handoff (popped, not just read) so a later lifespan cycle in
+    # the same process never reuses an already-closed store.
+    external_store = getattr(app.state, "_external_store", None)
+    if external_store is not None:
+        del app.state._external_store
+    store = external_store or await Store(config.db_path).connect()
     app.state.store = store
     app.state.config = config
 
@@ -282,7 +293,11 @@ async def lifespan(app: FastAPI):
             await asyncio.wait_for(worker_task, timeout=30)
         except asyncio.TimeoutError:
             log.warning("worker drain timed out after 30s")
-    await store.close()
+    # An externally-supplied store is owned by whoever connected it (`nh
+    # start`'s `_go()`) — it closes it, not us, or `start()`'s own use of the
+    # connection after `server.serve()` returns would hit a closed store.
+    if external_store is None:
+        await store.close()
 
 
 app = FastAPI(title="no_human board", version="0.1.0", lifespan=lifespan)

@@ -343,6 +343,45 @@ async def test_reanalysis_dedup_across_runs(store, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reanalysis_survives_no_ide_running(store, monkeypatch, caplog):
+    """No IDE running is the ORDINARY case on a clean install, not a failure.
+
+    ``ReanalysisJob`` is due immediately on every fresh boot (``_last_run=0``),
+    and ``TranscriptIngester.ingest`` was the one caller of
+    ``extract_transcripts`` that did not catch ``IDENotRunningError`` the way
+    ``nh history``/``nh bench build``/the onboarding scan already do — so it
+    propagated out of ``maybe_run`` and, via ``Scheduler.tick``, became a
+    "re-analysis failed: No Windsurf language server found. Is the IDE
+    running?" WARNING on every single startup. This must degrade silently to
+    zero Windsurf transcripts instead.
+    """
+    import logging
+
+    from no_human.history.extractor import IDENotRunningError
+
+    def _raise(**kw):
+        raise IDENotRunningError("No Windsurf language server found. Is the IDE running?")
+
+    monkeypatch.setattr("no_human.history.ingester.extract_transcripts", _raise)
+    job = ReanalysisJob(store, interval_seconds=60, days=1)
+
+    with caplog.at_level(logging.WARNING):
+        result = job.due()
+        assert result
+        out = await job.maybe_run()
+
+    assert out is not None, "a missing IDE must not raise out of maybe_run"
+    assert out["transcripts"] == 0
+    assert not any(
+        "re-analysis failed" in r.message for r in caplog.records
+    ), f"missing-IDE degraded to a boot warning: {[r.message for r in caplog.records]}"
+    assert not any(
+        "No Windsurf language server found" in r.message for r in caplog.records
+        if r.levelno >= logging.WARNING
+    )
+
+
+@pytest.mark.asyncio
 async def test_scheduler_tick_triggers_reanalysis(store):
     """Scheduler.tick() triggers the re-analysis job when it's due."""
     events = []

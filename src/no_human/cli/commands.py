@@ -4079,6 +4079,22 @@ def start(host, port, workers, no_open):
     server = uvicorn.Server(uvicorn.Config(_app, host=host, port=port, log_level="warning"))
 
     async def _go():
+        # One aiosqlite connection for the whole `nh start` process. Jira and
+        # Linear intake used to each open their OWN `Store(config.db_path)`
+        # here — a second (and third) connection to the SAME file, started
+        # concurrently with the app lifespan's own connect+migrate (fired
+        # inside `server.serve()` below) and with no `busy_timeout` set, so
+        # the loser of any write race failed immediately instead of waiting.
+        # That is what flooded a clean startup with 216 lines of
+        # `sqlite3.OperationalError: database is locked` — two CONNECTIONS in
+        # one process, not two servers (`lsof` still shows a single pid).
+        # `nh serve` already shares one `store` across the scheduler and both
+        # intakes; this makes `start()` do the same, handing the connection to
+        # the app via `app.state._external_store` so `lifespan` (api/app.py)
+        # reuses it instead of opening its own.
+        store = await Store(config.db_path).connect()
+        _app.state._external_store = store
+
         # Jira intake (SCRUM-21): write-back parity with `nh serve` — same
         # opt-in flag, cadence parsing, and on_event print as the poller
         # block there (reused verbatim, not extracted into a shared helper).
@@ -4086,7 +4102,6 @@ def start(host, port, workers, no_open):
         # breaks `nh start`: it's opt-in and must degrade gracefully.
         jira_task = None
         jira_stop = None
-        jira_store = None
         jira_cfg = (config.data.get("integrations") or {}).get("jira") or {}
         if jira_cfg.get("enabled"):
             try:
@@ -4096,9 +4111,8 @@ def start(host, port, workers, no_open):
                 load_env_var("JIRA_API_TOKEN")  # from ~/.no_human/.env into the process env
                 jira_secs = max(60, int((parse_duration(str(jira_cfg.get("poll_interval", "5m")))
                                          or parse_duration("5m")).total_seconds()))
-                jira_store = await Store(config.db_path).connect()
                 poller = JiraPoller(
-                    JiraAdapter(config.data), jira_store, config=config.data,
+                    JiraAdapter(config.data), store, config=config.data,
                     on_event=lambda k, t: console.print(f"[cyan]◆ {k}[/] {t}"))
                 console.print(f"[green]Jira intake[/] project={jira_cfg.get('project_key') or '?'} "
                               f"poll={jira_secs}s")
@@ -4107,15 +4121,12 @@ def start(host, port, workers, no_open):
             except Exception as exc:  # noqa: BLE001 — optional integration, never break `start`
                 console.print(f"[yellow]Jira intake failed to start[/] {exc}")
                 jira_task = jira_stop = None
-                if jira_store is not None:
-                    await jira_store.close()
-                    jira_store = None
 
-        # Linear intake: same shape, same opt-in discipline, its own store and
-        # stop event so neither tracker's failure can take the other down.
+        # Linear intake: same shape, same opt-in discipline, sharing the same
+        # store — its own stop event so neither tracker's failure can take the
+        # other down.
         linear_task = None
         linear_stop = None
-        linear_store = None
         linear_cfg = (config.data.get("integrations") or {}).get("linear") or {}
         if linear_cfg.get("enabled"):
             try:
@@ -4125,9 +4136,8 @@ def start(host, port, workers, no_open):
                 load_env_var("LINEAR_API_KEY")  # from ~/.no_human/.env into the process env
                 linear_secs = max(60, int((parse_duration(str(linear_cfg.get("poll_interval", "5m")))
                                            or parse_duration("5m")).total_seconds()))
-                linear_store = await Store(config.db_path).connect()
                 linear_poller = LinearPoller(
-                    LinearAdapter(config.data), linear_store, config=config.data,
+                    LinearAdapter(config.data), store, config=config.data,
                     on_event=lambda k, t: console.print(f"[cyan]◆ {k}[/] {t}"))
                 console.print(f"[green]Linear intake[/] team={linear_cfg.get('team_key') or '?'} "
                               f"poll={linear_secs}s")
@@ -4137,9 +4147,6 @@ def start(host, port, workers, no_open):
             except Exception as exc:  # noqa: BLE001 — optional integration, never break `start`
                 console.print(f"[yellow]Linear intake failed to start[/] {exc}")
                 linear_task = linear_stop = None
-                if linear_store is not None:
-                    await linear_store.close()
-                    linear_store = None
 
         try:
             await server.serve()
@@ -4150,16 +4157,17 @@ def start(host, port, workers, no_open):
                     await asyncio.wait_for(jira_task, timeout=10)
                 except asyncio.TimeoutError:
                     jira_task.cancel()
-            if jira_store is not None:
-                await jira_store.close()
             if linear_task is not None:
                 linear_stop.set()
                 try:
                     await asyncio.wait_for(linear_task, timeout=10)
                 except asyncio.TimeoutError:
                     linear_task.cancel()
-            if linear_store is not None:
-                await linear_store.close()
+            # Ownership: this store was handed to the app via
+            # `_external_store`; `lifespan` (api/app.py) skips closing it for
+            # exactly this reason, so `start()` — the one that opened it — is
+            # the one that closes it.
+            await store.close()
 
     try:
         asyncio.run(_go())

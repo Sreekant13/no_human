@@ -254,7 +254,7 @@ async def test_two_stores_in_one_task_do_not_self_deadlock(store, observer):
 
     Two (now three) Stores in one process is this product's normal shape —
     `nh start` runs the pool's Store plus the Jira poller's and the Linear
-    poller's (`cli/commands.py::start._go`, locals `jira_store`/`linear_store`)
+    poller's — one shared Store since 2026-08-03 (`start._go`, `app.state._external_store`)
     — so an
     ``A -> B -> A`` call chain is reachable as soon as any code path touches
     both. With a single slot, entering B overwrote the record that A was held,
@@ -341,7 +341,7 @@ async def test_every_committing_store_method_is_serialized():
 #
 # A SECOND connection to the same file is normal for this product: `nh start`
 # opens one for the Jira poller and a third for the Linear poller
-# (`cli/commands.py::start._go`, locals `jira_store`/`linear_store`) beside the
+# (`cli/commands.py::start._go`, ONE shared Store via `app.state._external_store`) beside the
 # pool's own, and every `nh` CLI command opens another in its own process. `Store.connect()` itself WRITES (migration
 # 0009 drops and recreates the FTS trigger on every connect), so a bare
 # `connect()` + `close()` is enough — every `nh` invocation is a qualifying
@@ -715,9 +715,13 @@ def test_the_cited_peer_store_symbols_exist():
               for t in n.targets if isinstance(t, ast.Name)
               and isinstance(n.value, ast.Await)
               and "Store(" in ast.unparse(n.value)}
-    assert {"jira_store", "linear_store"} <= opened, (
-        "the cited peer Stores are no longer opened in start._go; found "
-        f"{sorted(opened)} — the docstrings in db.py name these by hand")
+    # Since the 2026-08-03 single-store rescue, start._go opens exactly ONE
+    # Store and shares it (app.state._external_store); the old jira_store/
+    # linear_store peers were the lock-flood defect. The guard keeps citing by
+    # hand so the docstrings and the code cannot drift apart silently.
+    assert opened == {"store"}, (
+        "start._go must open exactly the one shared Store named `store`; found "
+        f"{sorted(opened)} — update the db.py docstrings AND this guard together")
 
 
 def test_the_tree_guards_scan_the_tree_under_test():

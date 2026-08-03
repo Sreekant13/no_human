@@ -232,9 +232,9 @@ def serialized_write(
     parent commit under the two-Store storm below: time to failure 0.6–1.8 ms
     against a 5000 ms timeout, three orders of magnitude short of ever
     consulting it. There is normally a peer to lose to: `nh start` opens a
-    second Store in the SAME process for the Jira poller and a third for the
-    Linear poller (`cli/commands.py::start._go`, locals `jira_store` and
-    `linear_store`, under `integrations.*.enabled`), and every `nh` CLI
+    single shared Store that `nh start` hands to both its intake pollers and
+    the app lifespan (`cli/commands.py::start._go`, `app.state._external_store`
+    — one connection since the 2026-08-03 rescue), and every `nh` CLI
     invocation opens one more in another process. This lock, being per-Store, spans none of them.
 
     So the boundary above is real, and crossing it safely takes two things, both
@@ -643,8 +643,9 @@ class Store:
     # holds a read transaction has to upgrade it, and SQLite will not run the
     # busy handler for an upgrade — waiting on one can only deadlock — so it
     # fails AT ONCE instead of after `busy_timeout`. Peers are guaranteed: `nh
-    # start` opens a second Store for the Jira poller and a third for the Linear
-    # poller (`cli/commands.py::start._go`, locals `jira_store`/`linear_store`),
+    # start` shares ONE Store across its pollers and the app lifespan
+    # (`app.state._external_store` — the second/third connections were the 2026-08
+    # lock-flood defect and are gone),
     # every `nh` CLI command opens one in another process, and `Store.connect()`
     # itself WRITES — migration 0009
     # drops and recreates the FTS trigger on every connect — so a bare
