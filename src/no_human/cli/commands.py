@@ -430,7 +430,10 @@ def _schedule_update_notice(ctx: click.Context) -> None:
     # It points at the SITE, deliberately, and not at the GitHub repo: the
     # repository is private until the operator makes it public, and a link that
     # 404s for every user is worse than no link. Revisit once it is public.
-    epilog="Docs: https://getnohuman.com/docs.html",
+    # CANONICAL /docs, not /docs.html — the latter only reaches the page
+    # through a 307, and the site's own markup links /docs in all five
+    # places. A redirect is a thing someone eventually retires.
+    epilog="Docs: https://getnohuman.com/docs",
 )
 @click.version_option(__version__, prog_name="nh")
 @click.option("--repo", default=None, type=click.Path(),
