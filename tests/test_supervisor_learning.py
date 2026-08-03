@@ -223,7 +223,12 @@ async def test_the_proposal_carries_trigger_tags(store):
         _cluster([_MSG_A, _MSG_B]), distill=_distiller())
     tags = (await q.pending())[0]["tags"]
     assert "supervisor" in tags               # filterable by where it came from
-    assert "venv" in tags and "pytest" in tags
+    # B3: the model's free TAGS line ("pytest, venv, interpreter") is reduced
+    # to the reviewed vocabulary before it becomes stored data — free tags rot
+    # (learning/vocab.py). Triggering on the specific words is not lost:
+    # `triggers.py` matches a canonical tag on its whole alias family.
+    assert "test" in tags and "environment" in tags
+    assert "pytest" not in tags and "venv" not in tags
 
 
 @pytest.mark.asyncio
@@ -619,7 +624,9 @@ async def test_clean_tags_are_not_swallowed_by_the_widened_gate(store):
     q = LearningQueue(store)
     assert await q.propose_from_corrections(
         _cluster([_MSG_A, _MSG_B]), distill=_distiller()) is not None
-    assert "venv" in (await q.pending())[0]["tags"]
+    # "venv" arrives free from the distiller and is stored as its canonical
+    # vocabulary tag (B3).
+    assert "environment" in (await q.pending())[0]["tags"]
 
 
 # ── origin round-trips, and distinguishes the two producers ───────────────── #

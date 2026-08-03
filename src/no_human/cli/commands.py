@@ -2845,7 +2845,13 @@ def autonomy(days):
                    "`nh recall` from Bash, and an unconfirmed proposal reaching it "
                    "that way would be a rule no human ever confirmed. For an "
                    "operator triaging the queue by hand, not for a run.")
-def recall(query, limit, include_pending):
+@click.option("--all-projects", is_flag=True,
+              help="Search memories from EVERY project. By default, when run "
+                   "inside a git checkout, memories are scoped to that "
+                   "project (by remote identity) plus globals — the B4 "
+                   "boundary: one repo's lessons do not surface in another. "
+                   "For an operator browsing the whole store, not for a run.")
+def recall(query, limit, include_pending, all_projects):
     """Search past tasks, attempts, memories, and ingested history for prior
     work similar to QUERY — so the agent (via Bash: `nh recall <query>`) or a
     human can find how something like this was solved before.
@@ -2884,8 +2890,21 @@ def recall(query, limit, include_pending):
                     summary += f"  {pr}"
                 rows.append(("task", task.id[:8], escape(summary)))
 
+            # B4: run from inside a checkout, memories are scoped to THAT
+            # project (remote identity first, checkout path for legacy rows)
+            # plus explicit globals — this command is named in the coder's own
+            # instructions, so an unscoped search would be another project's
+            # lessons reaching a run through a search box. Outside any git
+            # repo (an operator's shell), or with --all-projects, no scoping.
+            mem_scope: dict = {}
+            if not all_projects:
+                from ..learning.scope import repo_root, resolve_project_scope
+                root = repo_root(os.getcwd())
+                if root:
+                    mem_scope = {"project": root,
+                                 "scope": resolve_project_scope(root)}
             for mem in await store.list_memories(
-                    confirmed=None if include_pending else True):
+                    confirmed=None if include_pending else True, **mem_scope):
                 if not _hit(mem.get("title"), mem.get("content")):
                     continue
                 kind = "memory" if mem.get("confirmed") else "memory (pending)"
@@ -3617,6 +3636,41 @@ def learnings_curate(apply_llm):
     asyncio.run(_go())
 
 
+def _learning_evidence_line(raw) -> str | None:
+    """One dim line summarizing a lesson's B3 structured evidence — what
+    happened, in which task(s), citing the event — or None for rows written
+    before the column (NULL reads "unrecorded", and printing nothing is
+    honest where guessing is not). Every interpolated value is escaped: the
+    evidence quotes model/repo text verbatim."""
+    if not raw:
+        return None
+    try:
+        ev = json.loads(raw) if isinstance(raw, str) else raw
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(ev, dict):
+        return None
+    kind = str(ev.get("kind") or "")
+    if kind == "supervisor_correction":
+        tasks = [str(t)[:8] for t in (ev.get("task_ids") or [])[:4]]
+        return escape(
+            f"supervisor correction x{ev.get('count', '?')}"
+            + (f" · task(s) {', '.join(tasks)}" if tasks else ""))
+    if kind == "review_finding":
+        n = len(ev.get("findings") or [])
+        return escape(
+            f"review finding · task {str(ev.get('task_id') or '?')[:8]}"
+            f" · attempt {ev.get('attempt') if ev.get('attempt') is not None else '?'}"
+            f" · round {ev.get('review_round') or '?'}"
+            + (f" · {n} finding(s)" if n else ""))
+    if kind == "task_outcome":
+        return escape(
+            f"task outcome · task {str(ev.get('task_id') or '?')[:8]}"
+            f" · {ev.get('status') or '?'}")
+    what = str(ev.get("what") or "")
+    return escape(f"{kind or 'recorded'}: {what}"[:120]) if (kind or what) else None
+
+
 @cli.command("learnings")
 @click.option("--confirm", "confirm_id", default=None, help="Confirm a proposal by id.")
 @click.option("--reject", "reject_id", default=None, help="Reject/delete a proposal by id.")
@@ -3727,10 +3781,27 @@ def learnings(confirm_id, reject_id, active, harvest, harvest_project):
                 # deciding. B2 refuses to CREATE global rows from corrections;
                 # this is so the human can see the ones that already exist.
                 scope = (m.get("project") or "").strip()
-                console.print(
-                    f"  [dim]scope:[/] {escape(scope)}" if scope else
-                    "  [yellow]scope: GLOBAL — applies to every project[/]",
-                    emoji=False)
+                # B4: the checkout path is the readable half; the remote-hash
+                # identity (`project_scope`) is what recall actually matches
+                # on, shown truncated so two checkouts of one repo are
+                # visibly ONE scope. A row with neither is GLOBAL.
+                scope_id = (m.get("project_scope") or "").strip()
+                if scope or scope_id:
+                    line = f"  [dim]scope:[/] {escape(scope or '(by remote identity)')}"
+                    if scope_id:
+                        line += f" [dim]· {escape(scope_id[:16])}[/]"
+                    console.print(line, emoji=False)
+                else:
+                    console.print(
+                        "  [yellow]scope: GLOBAL — applies to every project[/]",
+                        emoji=False)
+                # B3: the structured evidence, one line — what happened, in
+                # which task, citing the event — beside the prose that
+                # narrates it. Absent (honestly) on rows that predate it.
+                ev_line = _learning_evidence_line(m.get("evidence"))
+                if ev_line:
+                    console.print(f"  [dim]evidence:[/] [dim]{ev_line}[/]",
+                                  emoji=False)
                 for line in (m["content"] or "").splitlines():
                     if line.strip():
                         console.print(f"  [dim]{line}[/]")

@@ -984,6 +984,25 @@ class Store:
         if "origin" not in mem_existing:
             await self.db.execute(
                 "ALTER TABLE memories ADD COLUMN origin TEXT")
+        # B3: STRUCTURED EVIDENCE — what happened, in which task, citing the
+        # correction/review event — as JSON, beside the human-prose `content`
+        # that already narrates it. NO DEFAULT, same reasoning as `origin`:
+        # rows written before the column genuinely did not record structured
+        # evidence, and NULL says so honestly.
+        if "evidence" not in mem_existing:
+            await self.db.execute(
+                "ALTER TABLE memories ADD COLUMN evidence TEXT")
+        # B4: the PROJECT SCOPE — "prj:" + sha256 of the normalized git remote
+        # URL (learning/scope.py) — so the same repository cloned at two paths
+        # is one project. `project` keeps the checkout path (the human-readable
+        # blast-radius line in `nh learnings`); this column is the identity
+        # recall matches on. NULL = legacy row or a repo with no remote; those
+        # keep matching by path, and `stamp_project_scope` upgrades them the
+        # next time their repo is actually seen — the only moment the
+        # path→remote mapping is knowable.
+        if "project_scope" not in mem_existing:
+            await self.db.execute(
+                "ALTER TABLE memories ADD COLUMN project_scope TEXT")
 
         # Phase 6a: test_layers column on projects (JSON-encoded TestPlan layers).
         proj_existing = {row["name"]
@@ -1734,6 +1753,8 @@ class Store:
         tags: list[str] | None = None, project: str | None = None,
         source: str = "proposed", confirmed: bool = False,
         dedupe_key: str | None = None, origin: str | None = None,
+        evidence: dict[str, Any] | None = None,
+        project_scope: str | None = None,
     ) -> str | None:
         """Insert a memory. If ``dedupe_key`` matches an existing memory's
         signature (stored in file_path), skip and return None.
@@ -1741,6 +1762,11 @@ class Store:
         ``origin`` records WHICH SIGNAL produced the proposal (``learning.queue``'s
         ``ORIGIN_REVIEW`` / ``ORIGIN_SUPERVISOR``); it is not ``source``, which is
         the queue-visibility contract. NULL where unrecorded.
+
+        ``evidence`` is the B3 structured record (what happened, in which
+        task, citing the correction/review event) — stored as JSON, NULL where
+        unrecorded. ``project_scope`` is the B4 project identity
+        (``learning/scope.py``); NULL keeps the row on legacy path matching.
         """
         if dedupe_key is not None:
             if await self._fetchone(
@@ -1751,11 +1777,12 @@ class Store:
         await self.db.execute(
             """INSERT INTO memories
                  (id, type, title, content, file_path, tags, project, source,
-                  confirmed, origin)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  confirmed, origin, evidence, project_scope)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (mem_id, mem_type, title, content, dedupe_key,
              json.dumps(tags or []), project, source, 1 if confirmed else 0,
-             origin),
+             origin, json.dumps(evidence) if evidence is not None else None,
+             project_scope),
         )
         await self.db.commit()
         return mem_id
@@ -1783,13 +1810,23 @@ class Store:
     async def list_memories(
         self, *, confirmed: bool | None = None, source: str | None = None,
         mem_type: str | None = None, project: str | None = None,
+        scope: str | None = None,
         include_global: bool = True, include_archived: bool = False,
     ) -> list[dict[str, Any]]:
         """List memories, optionally scoped to a project.
 
-        When ``project`` is given, only rules/skills attached to that project are
-        returned, plus globals (``project IS NULL``) unless ``include_global`` is
-        False. When ``project`` is None, no project filter is applied (all rows).
+        When ``project`` and/or ``scope`` is given, only rules/skills attached
+        to that project are returned, plus globals unless ``include_global``
+        is False. When both are None, no project filter is applied (all rows).
+
+        ``scope`` is the B4 project identity (``learning/scope.py``: sha256 of
+        the normalized remote URL) and ``project`` the checkout path. A row
+        matches on EITHER — scope for rows that carry one (the same repo
+        cloned at two paths is one project), path for legacy rows written
+        before the column or for repos with no remote. A GLOBAL row is one
+        with neither key (``project IS NULL AND project_scope IS NULL``) —
+        exactly the pre-B4 rows the old ``project IS NULL`` clause matched,
+        since no row had a scope before the column existed.
         """
         clauses, params = [], []
         if not include_archived:
@@ -1804,17 +1841,35 @@ class Store:
         if mem_type is not None:
             clauses.append("type = ?")
             params.append(mem_type)
-        if project is not None:
+        if project is not None or scope is not None:
+            scoped = []
+            if scope is not None:
+                scoped.append("project_scope = ?")
+                params.append(scope)
+            if project is not None:
+                scoped.append("project = ?")
+                params.append(project)
             if include_global:
-                clauses.append("(project = ? OR project IS NULL)")
-            else:
-                clauses.append("project = ?")
-            params.append(project)
+                scoped.append("(project IS NULL AND project_scope IS NULL)")
+            clauses.append("(" + " OR ".join(scoped) + ")")
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         rows = await self._fetchall(
             f"SELECT * FROM memories{where} ORDER BY created_at DESC", params
         )
         return [dict(r) for r in rows]
+
+    @serialized_write
+    async def stamp_project_scope(self, project: str, scope: str) -> int:
+        """Attach the B4 scope identity to legacy path-keyed rows (B4's online
+        migration). Runs when a repo is actually SEEN — the only moment the
+        path→remote mapping is knowable, since the migration itself cannot run
+        git in checkouts that may no longer exist. Only rows still without a
+        scope are touched; returns how many were stamped."""
+        cur = await self.db.execute(
+            "UPDATE memories SET project_scope = ? "
+            "WHERE project = ? AND project_scope IS NULL", (scope, project))
+        await self.db.commit()
+        return cur.rowcount
 
     # ----------------------------- playbooks ------------------------------ #
 

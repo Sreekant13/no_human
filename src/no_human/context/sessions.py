@@ -41,6 +41,19 @@ class SessionsSource:
         self.store = store
         self.limit = limit
 
+    @staticmethod
+    async def _scope_of(repo_path: str) -> str | None:
+        """B4 scope identity for the task's checkout, off-thread (it shells
+        out to git). None — no remote, no repo, git failing — is always safe:
+        the query falls back to path matching."""
+        import asyncio
+
+        from ..learning.scope import resolve_project_scope
+        try:
+            return await asyncio.to_thread(resolve_project_scope, repo_path)
+        except Exception:  # noqa: BLE001 — advisory context, never the failure
+            return None
+
     async def gather(self, task: Task) -> list[ContextChunk]:
         terms = keywords(task, limit=6)
         if not terms:
@@ -54,9 +67,29 @@ class SessionsSource:
         # `archived` is honoured here the way `Store.list_memories` honours it.
         # This source queries `memories` directly, so an operator who archived a
         # rule was still getting it back through this path.
+        #
+        # B4 PROJECT SCOPING, for the same bypass reason: this is a second,
+        # independent route from the learning store into a prompt, so it must
+        # honour the same boundary `list_memories(project=…, scope=…)` draws —
+        # this task's project (by remote identity, then by checkout path for
+        # legacy rows) plus explicit globals. A keyword match is not a licence
+        # for one repo's lessons to reach another repo's prompt. A task with
+        # no repo at all gets globals only.
+        scope_clause = "(project IS NULL AND project_scope IS NULL)"
+        if task.repo_path:
+            scope = await self._scope_of(task.repo_path)
+            if scope is not None:
+                scope_clause = ("(project_scope = ? OR project = ? "
+                                "OR (project IS NULL AND project_scope IS NULL))")
+                params += [scope, task.repo_path]
+            else:
+                scope_clause = ("(project = ? "
+                                "OR (project IS NULL AND project_scope IS NULL))")
+                params.append(task.repo_path)
         rows = await self.store.query(
             f"SELECT type, title, content FROM memories WHERE confirmed = 1 AND "
-            f"(archived IS NULL OR archived = 0) AND ({clauses}) LIMIT ?",
+            f"(archived IS NULL OR archived = 0) AND ({clauses}) AND "
+            f"{scope_clause} LIMIT ?",
             (*params, self.limit),
         )
         chunks = [

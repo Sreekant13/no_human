@@ -130,7 +130,13 @@ async def test_proposal_carries_trigger_tags_from_the_finding(store):
     o = _orch(store)
     await o._record_review_feedback(await _task(store), _items(), attempt_n=1)
     tags = (await o.learning_queue.pending())[0]["tags"]
-    assert "images" in tags and "digest" in tags
+    # B3: the distiller's free TAGS line ("images, ci, digest") is reduced to
+    # the reviewed vocabulary (learning/vocab.py) before it becomes stored
+    # data, and the provenance tag now rides on EVERY review proposal, not
+    # only the degraded ones.
+    assert "review" in tags
+    assert "container" in tags and "pipeline" in tags
+    assert "digest" not in tags               # free tags are not stored
 
 
 # ── (b) the same finding twice does not spam the queue ────────────────────── #

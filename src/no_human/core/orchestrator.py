@@ -1866,8 +1866,12 @@ class Orchestrator:
         # Pre-fetch confirmed rules + skills for prompt injection (Phase G).
         # Scope to this task's repo plus globals, so a rule learned for one
         # project never leaks into (or pollutes the context of) another.
+        # B4: "this repo" means the remote identity, not the checkout path —
+        # the same repo cloned (or worktree'd) elsewhere is the SAME project,
+        # and only its lessons plus explicit globals may surface here.
         _all_memories = await self.store.list_memories(
-            confirmed=True, project=task.repo_path
+            confirmed=True, project=task.repo_path,
+            scope=await self._project_scope(task.repo_path),
         )
         # W3.4 knowledge triggers: a tagged memory injects only when its
         # trigger matches this task; untagged memories always inject. Emit an
@@ -5359,6 +5363,42 @@ class Orchestrator:
         self._note_utility_usage(result)
         return (result.final_text or "")[:600]
 
+    async def _project_scope(self, repo_path: str | None) -> str | None:
+        """The B4 project identity for a checkout path (sha256 of the
+        normalized remote URL — ``learning/scope.py``), or None for a repo
+        with no remote. Cached per path for the orchestrator's lifetime: it
+        shells out to git, and a run resolves the same repo repeatedly.
+
+        SIDE EFFECT, and the point of doing it here: the first resolution of
+        a path also STAMPS the scope onto legacy path-keyed memory rows
+        (``Store.stamp_project_scope``) — B4's online migration, run at the
+        only moment the path→remote mapping is knowable at all. Never raises:
+        scoping is advisory, and None falls back to path matching."""
+        path = (repo_path or "").strip()
+        if not path:
+            return None
+        cache = getattr(self, "_scope_cache", None)
+        if cache is None:
+            cache = self._scope_cache = {}
+        if path in cache:
+            return cache[path]
+        from ..learning.scope import resolve_project_scope
+        try:
+            scope = await asyncio.to_thread(resolve_project_scope, path)
+        except Exception:  # noqa: BLE001 — advisory; path matching still works
+            scope = None
+        cache[path] = scope
+        if scope:
+            try:
+                stamped = await self.store.stamp_project_scope(path, scope)
+                if stamped:
+                    self.emit("learning_scope",
+                              f"scoped {stamped} legacy lesson(s) to this "
+                              "repo's remote identity")
+            except Exception:  # noqa: BLE001
+                pass
+        return scope
+
     @staticmethod
     def _over_lifetime_caps(
         used_attempts: int, cap_attempts: int, used_tokens: int, cap_tokens: int,
@@ -5881,7 +5921,9 @@ class Orchestrator:
         self._active_profile = prof
         from ..learning.triggers import filter_triggered
         self._active_memories = (filter_triggered(
-            await self.store.list_memories(confirmed=True, project=task.repo_path),
+            await self.store.list_memories(
+                confirmed=True, project=task.repo_path,
+                scope=await self._project_scope(task.repo_path)),
             f"{task.title} {task.description or ''} "
             f"{' '.join(task.acceptance_criteria or [])}"))
 

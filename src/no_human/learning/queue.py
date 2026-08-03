@@ -13,11 +13,12 @@ are inert until promoted.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..core.db import Store
@@ -31,6 +32,8 @@ from .corrections import (
     is_project_scoped,
 )
 from .pii import contains_pii
+from .scope import resolve_project_scope
+from .vocab import sanitize_tags
 
 log = logging.getLogger("no_human.learning")
 
@@ -221,6 +224,50 @@ class Proposal:
     # Which signal produced it (ORIGIN_*), or None for the outcome-derived
     # proposals that predate the column.
     origin: str | None = None
+    # B3: the structured record of what happened — which task, which
+    # correction/review event — stored beside the prose `content` that
+    # narrates the same facts for the confirming human. A dict so a consumer
+    # reads fields instead of re-parsing prose; None only where a path has
+    # nothing structured to say.
+    evidence: dict[str, Any] | None = None
+    # The free tags BEFORE vocabulary sanitation (learning/vocab.py), kept for
+    # the PII gate and never stored. Sanitation must not double as redaction:
+    # a distiller reply carrying a personal email in its TAGS line is
+    # contaminated output, and the whole proposal is dropped — silently
+    # laundering the tag and storing the rest would be exactly the
+    # redact-instead-of-drop behaviour learning/pii.py refuses.
+    raw_tags: list[str] = field(default_factory=list)
+
+
+def _evidence_strings(evidence: dict[str, Any] | None) -> list[str]:
+    """Every string value inside an evidence dict, flattened — so the PII gate
+    reads the WHOLE row it is guarding. Evidence quotes corrections and cited
+    finding text verbatim, and `content` truncates where evidence does not:
+    gating title/content/tags but not this field would be a fourth door into
+    the same table."""
+    out: list[str] = []
+    stack: list[Any] = [evidence]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            out.append(node)
+        elif isinstance(node, dict):
+            stack.extend(node.values())
+        elif isinstance(node, (list, tuple)):
+            stack.extend(node)
+    return out
+
+
+async def _project_scope_of(path: str | None) -> str | None:
+    """The B4 scope identity for a checkout path, off-thread (it shells out to
+    git), or None — a repo with no remote, a path that is gone, git failing.
+    None is always safe: the row stays on legacy path matching."""
+    if not (path or "").strip():
+        return None
+    try:
+        return await asyncio.to_thread(resolve_project_scope, path)
+    except Exception:  # noqa: BLE001 — scoping is never worth losing a lesson
+        return None
 
 
 class LearningQueue:
@@ -245,8 +292,10 @@ class LearningQueue:
             return None
         # Personal data is never a durable engineering lesson. A task title or a
         # blocker's root-cause text can quote a user's data verbatim; drop the
-        # whole proposal rather than redact it (see learning/pii.py).
-        pii = contains_pii(proposal.title, proposal.content)
+        # whole proposal rather than redact it (see learning/pii.py). Evidence
+        # is inside the gate too (B3): it quotes the same task text.
+        pii = contains_pii(proposal.title, proposal.content,
+                           *_evidence_strings(proposal.evidence))
         if pii is not None:
             log.info("refused a proposed learning carrying personal data (%s)",
                      pii.kind)
@@ -260,6 +309,8 @@ class LearningQueue:
             source="proposed",
             confirmed=False,
             dedupe_key=proposal.dedupe_key,
+            evidence=proposal.evidence,
+            project_scope=await _project_scope_of(task.repo_path),
         )
 
     def _build(
@@ -276,7 +327,15 @@ class LearningQueue:
             return Proposal(
                 TYPE_SKILL, title, content,
                 _sig("skill", task.title, task.repo_path or ""),
+                # Enum-derived, not free text — outside the B3 vocabulary on
+                # purpose (see learning/vocab.py: it governs free tags).
                 tags=["success", task.source],
+                evidence={
+                    "kind": "task_outcome",
+                    "what": f"task completed to a reviewable PR ({status.value})",
+                    "task_id": task.id,
+                    "status": status.value,
+                },
             )
 
         # Failure / structural blocker → anti-pattern (22.8).
@@ -299,7 +358,16 @@ class LearningQueue:
             return Proposal(
                 TYPE_ANTI_PATTERN, title, content,
                 _sig("anti", cat, cause or task.title, task.repo_path or ""),
+                # Enum-derived (blocker category), outside the B3 vocabulary
+                # on purpose — see learning/vocab.py.
                 tags=["blocker", cat],
+                evidence={
+                    "kind": "task_outcome",
+                    "what": f"task blocked ({cat}): {str(cause)[:200]}",
+                    "task_id": task.id,
+                    "status": status.value,
+                    "category": str(cat),
+                },
             )
         return None
 
@@ -353,8 +421,15 @@ class LearningQueue:
         # arrive as a "keyword" while title and content are clean. Tags are
         # persisted to the same row, rendered in the same queue, and matched
         # against future task text by `learning/triggers.py`. Gating two of the
-        # three stored fields is not a gate.
-        pii = contains_pii(proposal.title, proposal.content, *proposal.tags)
+        # three stored fields is not a gate. The B3 evidence field quotes the
+        # findings verbatim WITHOUT `content`'s truncation, so it is inside
+        # the gate too (`_evidence_strings`) — as are the RAW pre-vocabulary
+        # tags: sanitation must not double as redaction, so a distiller reply
+        # carrying personal data in its TAGS line still drops the whole
+        # proposal even though the offending tag would never be stored.
+        pii = contains_pii(proposal.title, proposal.content, *proposal.tags,
+                           *proposal.raw_tags,
+                           *_evidence_strings(proposal.evidence))
         if pii is not None:
             log.info("refused a proposed learning carrying personal data (%s)",
                      pii.kind)
@@ -370,21 +445,24 @@ class LearningQueue:
             title=proposal.title,
             content=proposal.content,
             tags=proposal.tags,
-            # Repo-scoped exactly as every other proposal is today. The absolute
-            # path is a poor key (B4 replaces it with a remote hash); changing
-            # it HERE only would split one repo's rows across two conventions.
+            # The human-readable checkout path, kept for `nh learnings`' scope
+            # line. The IDENTITY recall matches on is `project_scope` below —
+            # B4's remote hash, the same for every checkout of this repo, so
+            # one repo's rows are one scope even across worktrees.
             project=task.repo_path,
+            project_scope=await _project_scope_of(task.repo_path),
             # NOT the provenance string. `source` is the queue-visibility
             # contract — `pending()`, `nh learnings`, the API and the ingester
             # all select `source="proposed"`, so a proposal that named its task
             # here would be invisible to the human gate it exists for. The
             # task/attempt/round provenance rides in the content, where the
-            # human reading the confirm queue actually sees it (B3 formalises
-            # it into a structured evidence field).
+            # human reading the confirm queue actually sees it — and, since
+            # B3, in the structured `evidence` field beside it.
             source="proposed",
             confirmed=False,
             dedupe_key=proposal.dedupe_key,
             origin=proposal.origin,
+            evidence=proposal.evidence,
         )
         # A dedupe hit is the queue working as designed — but it is ALSO the
         # only evidence that this wall was hit twice, and `add_memory` returns a
@@ -422,6 +500,15 @@ class LearningQueue:
                 str(f.get("label") or "") for f in learnable)
         if not tags:
             tags = _tags_from_findings(learnable)
+        # B3: only vocabulary tags are stored — free tags rot (learning/
+        # vocab.py); the raw ones survive on the proposal for the PII gate
+        # only. And the provenance tag is now UNCONDITIONAL, closing the gap
+        # B2 had to note: it used to arrive only on the degraded path, so a
+        # proposal the distiller answered for could not be filtered by where
+        # it came from.
+        raw_tags = list(tags)
+        tags = [ORIGIN_REVIEW,
+                *(t for t in sanitize_tags(tags) if t != ORIGIN_REVIEW)]
 
         provenance = "task {} · attempt {} · review round {}".format(
             task.id[:8], attempt if attempt is not None else "?", review_round)
@@ -448,7 +535,27 @@ class LearningQueue:
                 str(f.get("label") or "") for f in learnable
             ), task.repo_path or ""),
             tags=tags,
+            raw_tags=raw_tags,
             origin=ORIGIN_REVIEW,
+            # B3: the same provenance the prose narrates, as fields — what
+            # happened, in which task, citing each blocking finding.
+            evidence={
+                "kind": "review_finding",
+                "what": ("the review gate blocked the change "
+                         f"({len(learnable)} finding(s))"),
+                "task_id": task.id,
+                "attempt": attempt,
+                "review_round": review_round,
+                "findings": [
+                    {
+                        "label": str(f.get("label") or ""),
+                        "file": f.get("file"),
+                        "line": f.get("line"),
+                        "evidence": str(f.get("evidence") or "")[:_MAX_EVIDENCE],
+                    }
+                    for f in learnable
+                ],
+            },
         )
 
     # ------------- supervisor corrections (B2) ----------------------------- #
@@ -490,7 +597,12 @@ class LearningQueue:
         # reason B1 includes them: on the distilled path they are the utility
         # model's own words, written after it read the raw corrections, so they
         # are an unwatched third field into the same row.
-        pii = contains_pii(proposal.title, proposal.content, *proposal.tags)
+        # The B3 evidence field carries the corrections verbatim, so it is
+        # inside the same gate — as are the RAW pre-vocabulary tags, so
+        # sanitation cannot double as redaction (see the review path).
+        pii = contains_pii(proposal.title, proposal.content, *proposal.tags,
+                           *proposal.raw_tags,
+                           *_evidence_strings(proposal.evidence))
         if pii is not None:
             log.info("refused a proposed learning carrying personal data (%s)",
                      pii.kind)
@@ -508,6 +620,12 @@ class LearningQueue:
             confirmed=False,
             dedupe_key=proposal.dedupe_key,
             origin=proposal.origin,
+            evidence=proposal.evidence,
+            # B4: the identity recall matches on. The cluster's repo may no
+            # longer exist on disk (the harvest reads history) — then this is
+            # None and the row stays on path matching, which is what it would
+            # have been anyway.
+            project_scope=await _project_scope_of(cluster.project),
         )
         # Idempotence is the design, not an accident: the dedupe key is
         # ``(gist, project)`` and the gist is a pure function of ONE message
@@ -545,13 +663,16 @@ class LearningQueue:
             lesson = "(not distilled) " + (examples[0] if examples else cluster.gist)
         if not tags:
             tags = _tags_from_gist(cluster.gist)
-        # The provenance tag is UNCONDITIONAL here, unlike B1's — where the
-        # `review` tag is only added on the degraded path, so a proposal the
-        # distiller answered for cannot be filtered by where it came from. The
-        # queue now has two producers and a human triaging it needs "show me
+        # The provenance tag is UNCONDITIONAL here (B1 matched this in B3):
+        # the queue has two producers and a human triaging it needs "show me
         # the supervisor ones" to work on every row, not on the subset the
-        # utility tier happened to fail.
-        tags = [ORIGIN_SUPERVISOR, *(t for t in tags if t != ORIGIN_SUPERVISOR)]
+        # utility tier happened to fail. B3: the free tags behind it — an
+        # LLM's TAGS line, gist words — are reduced to the reviewed
+        # vocabulary before they become stored data (learning/vocab.py); the
+        # raw ones survive on the proposal for the PII gate only.
+        raw_tags = list(tags)
+        tags = [ORIGIN_SUPERVISOR,
+                *(t for t in sanitize_tags(tags) if t != ORIGIN_SUPERVISOR)]
 
         tasks = cluster.task_ids
         provenance = "{}x across {} task(s): {}".format(
@@ -568,7 +689,27 @@ class LearningQueue:
             mem_type, title[:120], content,
             correction_dedupe_key(cluster),
             tags=tags,
+            raw_tags=raw_tags,
             origin=ORIGIN_SUPERVISOR,
+            # B3: what happened, in which tasks, citing the correction events
+            # themselves — (task_id, ts) is exactly the key that finds each
+            # `supervisor_decision` row in `task_events` again.
+            evidence={
+                "kind": "supervisor_correction",
+                "what": (f"the supervisor issued the same correction "
+                         f"{cluster.count}x across {len(tasks)} task(s)"),
+                "gist": cluster.gist,
+                "count": cluster.count,
+                "task_ids": tasks[:8],
+                "corrections": [
+                    {
+                        "task_id": r.task_id,
+                        "ts": r.ts,
+                        "message": " ".join((r.message or "").split())[:_MAX_EVIDENCE],
+                    }
+                    for r in cluster.records[:_MAX_FINDINGS]
+                ],
+            },
         )
 
     async def harvest_supervisor_corrections(
