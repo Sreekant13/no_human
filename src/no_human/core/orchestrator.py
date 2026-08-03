@@ -4442,19 +4442,24 @@ class Orchestrator:
 
     @staticmethod
     def _worktree_state(repo: GitRepo) -> dict[str, str]:
-        """``{path: porcelain status code}`` for the whole tree, untracked
-        files included and listed individually (``--untracked-files=all``, so a
-        new file inside an existing directory is a path and not a bare ``dir/``
+        """``{path: porcelain status code}`` for the tree, untracked files
+        included and listed individually (``--untracked-files=all``, so a new
+        file inside an existing directory is a path and not a bare ``dir/``
         that names nothing revertible).
 
-        Deliberately WITHOUT `GitRepo`'s ephemeral excludes: this is a
-        before/after comparison, and excluding a class of path here would be
-        excluding it from the revert. The excludes stay where they belong — in
-        `stage_all`, which is why an ephemeral path cannot reach a commit even
-        if this misses it.
+        Scoped with ``GitRepo._EPHEMERAL`` — the SAME exclusion `has_changes`
+        and `stage_all` use — because the revert built on this must cover
+        exactly the paths that could otherwise reach a commit, and nothing
+        else. Ignoring the excludes looked more thorough and was worse in both
+        directions: an ephemeral path can never be committed (`stage_all` drops
+        it), so reverting one buys nothing, while the orchestrator's OWN
+        scaffolding lives under `.claude/` — a nudge that runs `git add -A`
+        moves those paths' status, and an unscoped revert then deletes the
+        product's copied skills and instructions out from under it. Observed in
+        the staged-write test, not theorised.
         """
         out = repo._run("status", "--porcelain", "--untracked-files=all",
-                        check=False)
+                        "--", ".", *GitRepo._EPHEMERAL, check=False)
         state: dict[str, str] = {}
         for line in out.splitlines():
             if len(line) < 4:
@@ -4475,15 +4480,35 @@ class Orchestrator:
 
         Scoped to exactly the paths whose status changed since *before* — never
         a whole-tree `reset --hard`, `checkout -- .` or `clean -fd`, whose blast
-        radius includes work this method has no business touching. A path that
-        is newly untracked is deleted; anything else is restored from the index.
+        radius includes work this method has no business touching.
 
-        Honest limit: this compares STATUS CODES, so a nudge that edited a file
-        which was ALREADY dirty before it ran is not detected. That case cannot
-        exist on this path — the branch only runs when `has_changes()` is false
-        — except for the ephemeral paths `has_changes()` excludes (`.env`,
-        `.idea/`, `.vscode/`), and `stage_all` excludes those from every commit,
-        so they cannot reach a PR either way.
+        WHAT DECIDES A PATH'S FATE is whether it exists at HEAD, NOT its status
+        code. Both halves of that were learned from a wrong version of this
+        code:
+
+        * keying "new file" on ``"??"`` missed a nudge that wrote AND STAGED
+          one — that reads ``A `` and fell into the restore branch, where
+          `git checkout -- <p>` is a silent NO-OP on a staged-new file. The
+          file survived, the next attempt committed it, and the advisory said
+          "reverted 1 path(s)" about a file that shipped.
+        * keying it on "absent from *before*" instead fixes that case and
+          introduces a worse one: a nudge that stages a MODIFICATION of a
+          tracked file is also absent from *before*, so `git rm --cached` +
+          unlink would DELETE a real source file outright. Measured, not
+          reasoned: the probe left `D  calc.py` staged and the file gone.
+
+        Existence at HEAD answers the question both of those were proxies for,
+        and covers all four shapes — staged/unstaged new file (removed),
+        staged/unstaged modification or deletion of a tracked file (restored
+        from HEAD, index included).
+
+        Honest limit: this compares STATUS CODES to decide WHICH paths to look
+        at, so a nudge that edited a file already dirty before it ran is not
+        detected. That cannot happen on this path — the branch only runs when
+        `has_changes()` is false over exactly the set `_worktree_state` reads,
+        which is the same set (`GitRepo._EPHEMERAL` excluded) that `stage_all`
+        will later commit. Read that tuple rather than any summary of it; it is
+        ~25 patterns, not the three obvious ones.
 
         TOTAL by construction, because it is called from a ``finally``: an
         exception escaping here would REPLACE an in-flight CancelRequested /
@@ -4501,6 +4526,23 @@ class Orchestrator:
                 f"({exc}) — a file it wrote may survive into the next attempt")
             return []
 
+    @staticmethod
+    def _paths_at_head(repo: GitRepo, paths: list[str]) -> set[str]:
+        """Which of *paths* exist as files in the HEAD COMMIT — the one question
+        that decides whether a path the nudge touched is RESTORED or REMOVED.
+
+        Read from the commit, deliberately, never from the index: the index is
+        exactly what a staging nudge has already rewritten, so any answer
+        derived from it is the nudge's own claim about itself. One `ls-tree`
+        for the whole set; it prints the subset that exists and stays silent
+        (rc 0) about the rest.
+        """
+        if not paths:
+            return set()
+        out = repo._run("ls-tree", "--name-only", "-z", "HEAD", "--", *paths,
+                        check=False)
+        return {p for p in out.split("\0") if p}
+
     def _revert_worktree_writes_unguarded(
         self, repo: GitRepo, before: dict[str, str],
     ) -> list[str]:
@@ -4508,16 +4550,26 @@ class Orchestrator:
         changed = sorted(p for p, code in after.items() if before.get(p) != code)
         if not changed:
             return []
-        fresh = [p for p in changed
-                 if p not in before and after[p].strip() == "??"]
-        tracked = [p for p in changed if p not in fresh]
-        for rel in fresh:
+        known = self._paths_at_head(repo, changed)
+        at_head = [p for p in changed if p in known]
+        created = [p for p in changed if p not in known]
+        for rel in created:
+            # `rm --cached` FIRST: an `A ` entry is in the index, and unlinking
+            # alone would leave a staged addition of a file that no longer
+            # exists — which `stage_all` + `commit_all` would still commit.
+            # Ignores its own failure by design (the path may never have been
+            # staged, which is not an error here).
+            repo._run("rm", "--cached", "--force", "--", rel, check=False)
             try:
                 (repo.path / rel).unlink()
             except OSError as exc:  # noqa: PERF203 — per-path, best effort
                 log.warning("could not remove nudge-written %s: %s", rel, exc)
-        if tracked:
-            repo._run("checkout", "--", *tracked, check=False)
+        if at_head:
+            # `checkout HEAD --`, not `checkout --`: the latter restores from
+            # the INDEX, which a staging nudge has already rewritten, so it
+            # would "restore" the nudge's own content. From HEAD it resets the
+            # index and the worktree together.
+            repo._run("checkout", "HEAD", "--", *at_head, check=False)
         # An advisory, not a log line: `nh doctor` counts these, and a nudge
         # that writes files is a prompt that is not being obeyed — somebody
         # should see it accumulate.
@@ -4607,6 +4659,20 @@ class Orchestrator:
             "the report in the required format",
         )
         before = self._worktree_state(repo)
+        # A nudge that COMMITS leaves a CLEAN status, so the snapshot above sees
+        # nothing to revert — the one shape it cannot catch. HEAD is therefore
+        # snapshotted too, and a moved HEAD is treated as a failed nudge: no
+        # claim is parsed from it and the attempt fails as it would have without
+        # the nudge. The commit itself is deliberately LEFT ALONE rather than
+        # reset: it sits on this attempt's own branch, every attempt branches
+        # afresh, and nothing downstream reads it — whereas a `reset` here would
+        # be this method rewriting history on a branch it does not own.
+        # Latent chain worth naming rather than discovering later: on the
+        # CancelRequested path `_honor_cancel` checkpoints the tree, so a
+        # nudge-made commit would end up underneath that checkpoint. It is
+        # unreachable today for the same branch-per-attempt reason; if attempts
+        # ever share a branch, this is where it starts.
+        head_before = repo.head_sha()
         # The sink's running totals as they stand BEFORE this turn. An abort
         # has no AgentResult to bill, so the only measurement of what the nudge
         # fed is how far these move while it runs — and the coder turn's own
@@ -4663,6 +4729,14 @@ class Orchestrator:
         finally:
             self._revert_worktree_writes(repo, before)
         if nudge is None:
+            return None
+        head_after = repo.head_sha()
+        if head_after != head_before:
+            self._advisory(
+                "the reformat nudge COMMITTED to the worktree despite being "
+                f"told not to ({head_before[:8]} → {head_after[:8]}); its "
+                "report is discarded and the attempt fails as a zero diff — "
+                "the commit is left orphaned on this attempt's branch")
             return None
         # The nudge is a turn of the CODER's session, so it bills where the
         # coder's turns bill. `update_attempt` SETS these columns and the row

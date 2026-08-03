@@ -3721,32 +3721,79 @@ class SneakyNudgeBackend(WrongShapeBackend):
     Not a hypothetical: a review probe drove exactly this and watched the stray
     file get committed by the NEXT attempt and opened in a PR, because the
     nudge runs after `has_changes()` has already been read.
+
+    ``stage`` decides whether it also `git add`s what it wrote. That is not a
+    detail: a staged new file reads ``A `` rather than ``??``, which is how the
+    first fix for this missed it — and `git checkout -- <p>` is a silent no-op
+    on a staged addition, so the file survived and shipped while the advisory
+    claimed it had been reverted.
     """
 
     STRAY = "sneaky.py"
 
+    def __init__(self, restated=WrongShapeBackend.CONTRACT, *, stage=False,
+                 mutate_tracked=False):
+        super().__init__(restated=restated)
+        self._stage = stage
+        self._mutate_tracked = mutate_tracked
+        #: What each CODER call found when it STARTED — the only place the
+        #: invariant can be observed honestly. Asserting on `bare_repo` after
+        #: `run_task` returns proves nothing twice over: the agent works in an
+        #: isolated worktree (so the operator's checkout was never touched),
+        #: and that worktree is torn down in `run_task`'s `finally` (so a
+        #: missing file is "the directory is gone", not "the revert worked").
+        #: A first draft of this test asserted exactly that and passed against
+        #: BOTH broken classification rules.
+        self.tree_seen: list[dict] = []
+
     async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
                   on_event=None, supervisor_hook=None, **kwargs):
-        if resume is not None:
+        if resume is None:
+            from no_human.vcs import GitRepo as _GitRepo
+            self.tree_seen.append({
+                "stray": (Path(cwd) / self.STRAY).exists(),
+                "calc": (Path(cwd) / "calc.py").read_text()
+                        if (Path(cwd) / "calc.py").exists() else None,
+                # The COMMITTABLE view — `has_changes()`/`stage_all`'s own
+                # exclusions. The raw porcelain is not it: the orchestrator
+                # stages its copied skills and instructions under `.claude/`,
+                # so a raw read is never empty in normal operation and an
+                # assertion on it would fail on healthy runs.
+                "dirty": _git_out(cwd, "status", "--porcelain",
+                                  "--untracked-files=all", "--", ".",
+                                  *_GitRepo._EPHEMERAL),
+            })
+        else:
             (Path(cwd) / self.STRAY).write_text("# no coder wrote this\n")
+            if self._mutate_tracked:
+                (Path(cwd) / "calc.py").write_text("# clobbered by the nudge\n")
+            if self._stage:
+                _git(cwd, "add", "-A")
         return await super().run(
             prompt, cwd=cwd, max_turns=max_turns, effort=effort, resume=resume,
             on_event=on_event, supervisor_hook=supervisor_hook, **kwargs)
 
 
+@pytest.mark.parametrize("stage", [False, True], ids=["unstaged", "staged"])
 async def test_a_nudge_that_writes_files_is_reverted_before_the_next_attempt(
-    bare_repo, tmp_path, store
+    bare_repo, tmp_path, store, stage
 ):
     """🔴 The regression the review proved. The nudge is a WRITE-CAPABLE turn
     running after `has_changes()` was evaluated, so a file it drops is invisible
     to this attempt and gets committed by the next one — a PR carrying a file no
     coder produced, and a deleted two-zero-diff escalation because attempt 2 no
     longer looked unproductive. The tree must be restored before the nudge
-    returns."""
+    returns.
+
+    Both parametrisations matter and the SECOND is the one that regressed: a
+    nudge that stages what it writes reads ``A `` instead of ``??``, and the
+    first fix routed that to a restore-from-index that does nothing at all.
+    """
     from no_human.core.orchestrator import _NO_CHANGES_DETAIL
 
     cfg = _config(tmp_path)
-    backend = SneakyNudgeBackend(restated="Still prose. Also I wrote a file.")
+    backend = SneakyNudgeBackend(
+        restated="Still prose. Also I wrote a file.", stage=stage)
     events: list = []
     orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None),
                         event_sink=events.append)
@@ -3763,6 +3810,9 @@ async def test_a_nudge_that_writes_files_is_reverted_before_the_next_attempt(
     reverts = [e for e in events if e.get("kind") == "advisory"
                and SneakyNudgeBackend.STRAY in (e.get("text") or "")]
     assert reverts, [e for e in events if e.get("kind") == "advisory"]
+    # The advisory must be TRUE, not merely present: "reverted" is a claim
+    # about the tree, and the staged case is exactly where it used to be a lie.
+    assert "reverted" in (reverts[0].get("text") or "")
     # Both attempts still fail as zero-diff — the stray file never made one of
     # them look productive.
     attempts = await store.list_attempts(t.id)
@@ -3772,17 +3822,111 @@ async def test_a_nudge_that_writes_files_is_reverted_before_the_next_attempt(
     # …so the two-consecutive-zero-diff escalation still fires, and no PR opened.
     assert outcome.status is TaskStatus.ESCALATED, outcome
     assert outcome.pr_url is None
-    # Nothing committed the stray file, on any branch, ever.
-    committed = subprocess.run(
-        ["git", "log", "--all", "--name-only", "--format="],
-        cwd=bare_repo, capture_output=True, text=True).stdout
-    assert SneakyNudgeBackend.STRAY not in committed, committed
-    assert not (Path(bare_repo) / SneakyNudgeBackend.STRAY).exists()
+    # 🔴 THE INVARIANT, observed where it lives: what attempt 2's coder found
+    # when it started. Not a post-hoc look at `bare_repo` — the agent works in
+    # an isolated worktree that is deleted afterwards, so that look is vacuous.
+    assert len(backend.tree_seen) == 2, backend.tree_seen
+    second = backend.tree_seen[1]
+    assert second["stray"] is False, "the stray file survived into attempt 2"
+    assert second["dirty"] == "", second["dirty"]
+
+
+async def test_the_revert_restores_a_tracked_file_instead_of_deleting_it(
+    bare_repo, tmp_path, store
+):
+    """The revert must not become its own data loss. A nudge that STAGES a
+    change to an existing tracked file is, like a staged new file, absent from
+    the before-snapshot — so a revert keyed on "absent ⇒ created" would
+    `rm --cached` + unlink a real source file. Measured before it was written:
+    the probe left a staged deletion and no file on disk.
+
+    The rule is existence at HEAD, so this path is restored to its committed
+    content and the stray beside it is removed."""
+    cfg = _config(tmp_path)
+    backend = SneakyNudgeBackend(restated="prose", stage=True,
+                                 mutate_tracked=True)
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None))
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+    original = (Path(bare_repo) / "calc.py").read_text()
+
+    await orch.run_task(t)
+
+    assert len(backend.nudges) >= 1
+    # Again read from what attempt 2 SAW, not from the operator's checkout —
+    # which the agent never touches, and which therefore "passes" no matter
+    # how badly the revert behaves.
+    assert len(backend.tree_seen) == 2, backend.tree_seen
+    second = backend.tree_seen[1]
+    assert second["calc"] is not None, "the revert DELETED a tracked source file"
+    assert second["calc"] == original, second["calc"]
+    assert second["stray"] is False
+    assert second["dirty"] == "", second["dirty"]
+
+
+class CommittingNudgeBackend(WrongShapeBackend):
+    """The nudge turn commits. A commit leaves a CLEAN status, so the
+    snapshot/revert cannot see it at all — the one shape that needs HEAD."""
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        if resume is not None:
+            (Path(cwd) / "committed_by_nudge.py").write_text("# not the coder\n")
+            _git(cwd, "add", "-A")
+            _git(cwd, "commit", "-m", "nudge did this")
+        return await super().run(
+            prompt, cwd=cwd, max_turns=max_turns, effort=effort, resume=resume,
+            on_event=on_event, supervisor_hook=supervisor_hook, **kwargs)
+
+
+async def test_a_nudge_that_commits_is_advertised_and_its_claim_discarded(
+    bare_repo, tmp_path, store
+):
+    """A committing nudge is invisible to a status-based revert, so HEAD is
+    snapshotted too. The claim it returns is thrown away even though it PARSES
+    — a report from a turn that just rewrote the branch is not evidence — and
+    the attempt fails as the zero diff it was."""
+    from no_human.core.orchestrator import _NO_CHANGES_DETAIL
+
+    cfg = _config(tmp_path)
+    # The restatement is a PERFECTLY VALID claim: this test is about the commit
+    # being disqualifying on its own, not about the format.
+    backend = CommittingNudgeBackend()
+    events: list = []
+    orch = Orchestrator(store, cfg.data, backend, SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+
+    await orch.run_task(t)
+
+    assert len(backend.nudges) >= 1
+    committed = [e for e in events if e.get("kind") == "advisory"
+                 and "COMMITTED" in (e.get("text") or "")]
+    assert committed, [e for e in events if e.get("kind") == "advisory"]
+    attempts = await store.list_attempts(t.id)
+    assert all(a["failure_reason"] == _NO_CHANGES_DETAIL for a in attempts), \
+        [a["failure_reason"] for a in attempts]
+    # The parsing claim never reached the reviewer gate.
+    refreshed = await store.find_task(t.id)
+    assert "already_satisfied_report" not in (refreshed.context or {})
+
+
+#: What the aborting nudge below feeds before it is stopped. Named because the
+#: assertions are arithmetic on it: an abort must bill the coder turn's own
+#: total PLUS this, and billing only the coder's total is the bug that hides
+#: here (it passes any "> 0" assertion).
+NUDGE_FED_TOKENS = 7
 
 
 class _AbortingNudgeBackend(WrongShapeBackend):
-    """The nudge turn raises one of the sink's three controls mid-flight, the
-    way `_agent_sink` does when a pause / budget cross / doom-loop is seen."""
+    """The nudge turn feeds some tokens, then raises one of the sink's three
+    controls — the way a real turn does when a pause / budget cross / doom-loop
+    is seen partway through."""
 
     def __init__(self, exc):
         super().__init__()
@@ -3793,6 +3937,12 @@ class _AbortingNudgeBackend(WrongShapeBackend):
         if resume is not None:
             self.calls.append({"prompt": prompt, "resume": resume,
                                "max_turns": max_turns, "effort": effort})
+            # Spend REACHES the sink before the abort, exactly as a real
+            # partial turn's does — otherwise "the spend was billed" is a
+            # claim about zero tokens.
+            if on_event is not None:
+                on_event(AgentEvent(kind="usage", meta={
+                    "tokens_used": NUDGE_FED_TOKENS}))
             raise self._exc
         return await super().run(
             prompt, cwd=cwd, max_turns=max_turns, effort=effort, resume=resume,
@@ -3814,11 +3964,13 @@ async def test_a_budget_abort_in_the_nudge_still_parks_and_still_bills(
     t = Task.new("add mul()", repo_path=str(bare_repo), kind="feature")
     t.acceptance_criteria = ["mul(a,b) returns product"]
     t.context = {"eval_result": {"verdict": "accept"}}
-    # Lifetime ceiling under this attempt's own spend, so the ledger read that
-    # follows the abort is unambiguously over it. (`budget_unit: weighted`
-    # marks the number as already being in the current unit — an unmarked cap
-    # is migrated, which would silently multiply it.)
-    t.config = {"lifetime_tokens": 1, "budget_unit": "weighted"}
+    # Chosen to sit BETWEEN the two numbers, so the test can tell them apart:
+    # above what the nudge feeds (or the sink would abort on its own message
+    # before the backend does) and below the attempt's total spend (or the
+    # lifetime read after the abort would not cross and nothing would park).
+    # `budget_unit: weighted` marks the number as already being in the current
+    # unit — an unmarked cap is migrated, which would silently multiply it.
+    t.config = {"lifetime_tokens": 50, "budget_unit": "weighted"}
     await store.create_task(t)
 
     outcome = await orch.run_task(t)
@@ -3833,8 +3985,12 @@ async def test_a_budget_abort_in_the_nudge_still_parks_and_still_bills(
     assert "budget-abort" in (attempts[-1]["failure_reason"] or ""), attempts[-1]
     # The reason survived — not "agent produced no file changes".
     assert "crossed the cap" in (attempts[-1]["failure_reason"] or "")
-    # The spend reached the ledger rather than being dropped with the exception.
-    assert (attempts[-1]["tokens_used"] or 0) > 0, attempts[-1]
+    # The NUDGE's spend reached the ledger, not just the coder turn's. `> 0`
+    # would pass on the coder's 100 alone and prove nothing about the delta,
+    # which is the number that used to be dropped with the exception.
+    coder_tokens = 100                      # WrongShapeBackend's own result
+    assert attempts[-1]["tokens_used"] == coder_tokens + NUDGE_FED_TOKENS, \
+        attempts[-1]["tokens_used"]
     # And the lifetime cross parked instead of quietly failing an attempt.
     fresh = await store.find_task(t.id)
     assert (fresh.blocker or {}).get("category") == "BUDGET_EXHAUSTED", \
@@ -3863,7 +4019,8 @@ async def test_a_stuck_abort_in_the_nudge_fails_the_attempt_with_its_reason(
     attempts = await store.list_attempts(t.id)
     assert attempts[0]["status"] == "failed"
     assert "stuck-abort: identical tool call x3" == attempts[0]["failure_reason"]
-    assert (attempts[0]["tokens_used"] or 0) > 0, attempts[0]
+    # Coder turn + the partial the nudge fed before it was stopped.
+    assert attempts[0]["tokens_used"] == 100 + NUDGE_FED_TOKENS, attempts[0]
 
 
 async def test_an_unexpected_nudge_error_falls_back_to_the_zero_diff_failure(
