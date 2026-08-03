@@ -12,9 +12,10 @@ shell and the voice stay in step by construction.
 What the clip shows, beat by beat:
 
     hook      the quiet shell — one leftover task in its Review lane
-    handoff   five tasks fill the lanes as the tracker sync lands them
-    parallel  the webhook task is selected; its live event stream fills the
-              detail pane — models, plan, edits, tests
+    handoff   five tasks fill the lanes as the tracker sync lands them; the
+              webhook task is selected before its stream opens (SELECT_AT)
+    parallel  its live event stream fills the detail pane one frame at a
+              time — models, plan, edits, tests
     gate      `/diff` prints the same bytes the board's Diff section shows;
               the lanes behind it show the refactor bouncing back
     payoff    `/logs` replays the evidence trail; `/approve` is typed and
@@ -39,6 +40,20 @@ DIFF_SCROLL_Y = 4
 
 #: Typing cadence for slash commands — cli_frames' own, unchanged.
 CMD_CPS = 11.3
+
+#: When the shell starts following the hero, and therefore when
+#: `SprintClient.stream_events` opens.
+#:
+#: DERIVED, and that is the fix. It was `sp.PARALLEL + 1.0` — a hand-written
+#: 18.00 that sat AFTER the first three frames of the trail were already due.
+#: `stream_events` awaits `FrameClock.until(due)` per frame, and `until` returns
+#: immediately for anything already past, so every backlogged frame was yielded
+#: into the SAME captured frame: three lines appearing at once in a pane whose
+#: whole claim is "watch it think". Opening the stream before its first frame
+#: means the backlog is empty by construction, so the pane can only ever fill
+#: one frame at a time. `test_the_cli_stream_opens_before_its_first_frame`
+#: holds it there.
+SELECT_AT = round(sp.TRAIL_START - 0.30, 2)
 
 
 class SprintClient:
@@ -90,7 +105,7 @@ def build_script() -> list[tuple[float, str, str]]:
     # --- parallel: follow the hero -----------------------------------------#
     # Selection is the shell's own affordance (j/k step it); the recorder
     # selects the hero directly so the detail pane follows its event stream.
-    script.append((sp.PARALLEL + 1.0, "select", sp.HERO_ID))
+    script.append((SELECT_AT, "select", sp.HERO_ID))
     # --- gate: the diff, in the terminal ------------------------------------#
     script += [(44.50 + i / CMD_CPS, "key", ch)
                for i, ch in enumerate("/diff")]

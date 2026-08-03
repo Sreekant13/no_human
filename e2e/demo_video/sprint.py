@@ -435,54 +435,154 @@ TEST_RESULTS = {
 
 BRANCH = f"no-human/{HERO_ID[:8]}"
 
-#: The hero's event trail — every frame clears the same serialiser allow-list
-#: fixture.py documents (sources: orchestrator / agent / planner:* /
-#: aggregator; the reviewer's verdict is structurally absent, see fixture.py's
-#: NOTE — it lives in `review_checklist`, which is where the board reads it).
-#: The trail ENDS at 42.40: beats 4-5 of the shell are `/diff` and `/logs`
-#: reading the detail pane, and a live frame would scroll them off camera.
-_TRAIL: tuple[tuple[float, dict], ...] = (
-    (17.30, fx._ev("kind", "task kind: bugfix", task_kind="bugfix")),
-    (17.60, fx._ev("models", fx.MODELS_TEXT, models=dict(fx.MODELS))),
-    (17.90, fx._ev("state", "context")),
-    (18.65, fx._ev("state", "planning")),
-    (19.00, fx._ev("tool_use", "Read webhooks.py", "planner:test-first")),
-    (19.40, fx._ev("tool_use", 'Grep "delivery_id"', "planner:risk")),
-    (20.00, fx._ev("subagent_start", "map the webhook retry path",
-                   "planner:test-first", task_id="sub-plan-1",
-                   task_type="general-purpose")),
-    (20.60, fx._ev("subagent_done", "gateway retries any non-2xx",
-                   "planner:test-first", task_id="sub-plan-1",
-                   status="completed")),
-    (20.90, fx._ev("agent_text", "one plan from three proposals",
-                   "aggregator")),
-    (21.10, fx._ev("models", fx.MODELS_TEXT, models=dict(fx.MODELS))),
-    (21.30, fx._ev("state", "implementing")),
-    (21.80, fx._ev("tool_use", "Read webhooks.py", "agent")),
-    (22.60, fx._ev("tool_use", "Edit webhooks.py", "agent")),
-    (26.00, fx._ev("subagent_start", "find every caller of handle()",
-                   "agent", task_id="sub-code-1",
-                   task_type="general-purpose")),
-    (27.20, fx._ev("subagent_done", "3 callers, none re-enter",
-                   "agent", task_id="sub-code-1", status="completed")),
-    (29.00, fx._ev("tool_use", "Edit test_webhooks.py", "agent")),
-    (31.00, fx._ev("supervisor_decision", "continue - on plan")),
-    (33.10, fx._ev("tool_use", "Run `pytest -q`", "agent")),
-    (33.90, fx._ev("tests", "5 passed in 1.72s")),
-    (38.45, fx._ev("state", "reviewing")),
-    (39.60, fx._ev("tamper", "none - 61 assertions, +2")),
-    (40.80, fx._ev("lint", "clean")),
-    (41.60, fx._ev("commit", f"{BRANCH} 2 files")),
-    (42.40, fx._ev("pr_open", PR_URLS[HERO_KEY])),
+#: The stage statuses the agent announces as a `state` frame on its event
+#: stream. `pending` is the queue, not the agent, and nothing emits it;
+#: `awaiting_approval` is the orchestrator parking a finished attempt, and the
+#: frame that says so on the stream is `pr_open`, not a state change. Both
+#: exemptions are asserted rather than assumed — see
+#: `test_narrated_demo.test_the_trail_never_contradicts_the_card_behind_it`.
+STREAMED_STATES = ("context", "planning", "implementing", "testing",
+                   "reviewing")
+
+#: When the worker picks the hero up: the first stage that is not `pending`.
+#: Everything in the trail is measured from a stage of `STAGES[HERO_KEY]`, so
+#: this is derived and not written down twice.
+RUN_START = next(start for start, status, *_ in STAGES[HERO_KEY]
+                 if status != "pending")
+
+#: The stage starts of the hero, by status. The hero's pipeline visits every
+#: status once (it does not bounce — ORD-2187 is the one that does), which is
+#: what makes a status a usable anchor here; `test_the_hero_visits_each_stage
+#: _once` pins that so a future re-author cannot quietly make it ambiguous.
+_HERO_STAGE_START: dict[str, float] = {
+    status: start for start, status, *_ in STAGES[HERO_KEY]}
+
+#: The two frames the worker emits as it CLAIMS the task — the classifier's
+#: verdict and the model line — measured BACK from `RUN_START`, because that is
+#: what they mean: they land in the last moment of the queue, just before the
+#: first state change. (`fixture.py`'s 26 s trail has the same kind -> models ->
+#: state order.)
+_CLAIM_FRAMES: tuple[tuple[float, dict], ...] = (
+    (-1.10, fx._ev("kind", "task kind: bugfix", task_kind="bugfix")),
+    (-0.80, fx._ev("models", fx.MODELS_TEXT, models=dict(fx.MODELS))),
 )
+
+#: Everything the agent says INSIDE a stage: (status, seconds into that stage,
+#: frame). Offsets, not absolute seconds — that is the whole fix.
+#:
+#: WHAT WAS WRONG, so the shape is not undone by the next re-author. These times
+#: were absolute, and they were written against an OLDER `STAGES` and never
+#: retimed when it moved. Two contradictions shipped: `state context` sat at
+#: 17.90 while the card had been reading "gathering context" since 16.40, and
+#: there was NO `state testing` frame at all — so from 33.00 to 38.45 the card's
+#: chip read "Run `pytest -q`" while the agent board behind it still said
+#: `implementing`. The drawer shows both at once; a viewer reads both.
+#:
+#: Now every frame hangs off `STAGES[HERO_KEY]`: the `state` frames ARE the
+#: stage starts (generated below, one per `STREAMED_STATES` entry, so one can
+#: neither be forgotten nor drift), and every other frame is an offset into the
+#: stage it belongs to. Move a stage and the whole trail moves with it.
+#:
+#: Every frame clears the same serialiser allow-list `fixture.py` documents
+#: (sources: orchestrator / agent / planner:* / aggregator; the reviewer's
+#: verdict is structurally absent — it lives in `review_checklist`, which is
+#: where the board reads it). The trail ENDS inside `reviewing`, before the
+#: shell types `/diff`: a live frame after that scrolls the diff off camera.
+_STAGE_FRAMES: tuple[tuple[str, float, dict], ...] = (
+    ("planning", 0.40, fx._ev("tool_use", "Read webhooks.py",
+                              "planner:test-first")),
+    ("planning", 0.80, fx._ev("tool_use", 'Grep "delivery_id"',
+                              "planner:risk")),
+    ("planning", 1.40, fx._ev("subagent_start", "map the webhook retry path",
+                              "planner:test-first", task_id="sub-plan-1",
+                              task_type="general-purpose")),
+    ("planning", 2.00, fx._ev("subagent_done", "gateway retries any non-2xx",
+                              "planner:test-first", task_id="sub-plan-1",
+                              status="completed")),
+    ("planning", 2.15, fx._ev("agent_text", "one plan from three proposals",
+                              "aggregator")),
+    # The coder's model line, re-announced as the hand-over happens — last
+    # frame of `planning`, immediately before `state implementing`.
+    ("planning", 2.35, fx._ev("models", fx.MODELS_TEXT,
+                              models=dict(fx.MODELS))),
+    ("implementing", 0.80, fx._ev("tool_use", "Read webhooks.py", "agent")),
+    ("implementing", 1.60, fx._ev("tool_use", "Edit webhooks.py", "agent")),
+    ("implementing", 5.00, fx._ev("subagent_start",
+                                  "find every caller of handle()", "agent",
+                                  task_id="sub-code-1",
+                                  task_type="general-purpose")),
+    ("implementing", 6.20, fx._ev("subagent_done", "3 callers, none re-enter",
+                                  "agent", task_id="sub-code-1",
+                                  status="completed")),
+    ("implementing", 8.00, fx._ev("tool_use", "Edit test_webhooks.py",
+                                  "agent")),
+    ("implementing", 10.00, fx._ev("supervisor_decision", "continue - on plan")),
+    ("testing", 0.10, fx._ev("tool_use", "Run `pytest -q`", "agent")),
+    ("testing", 0.90, fx._ev("tests", "5 passed in 1.72s")),
+    ("reviewing", 1.20, fx._ev("tamper", "none - 61 assertions, +2")),
+    ("reviewing", 2.40, fx._ev("lint", "clean")),
+    ("reviewing", 3.20, fx._ev("commit", f"{BRANCH} 2 files")),
+    ("reviewing", 4.00, fx._ev("pr_open", PR_URLS[HERO_KEY])),
+)
+
+
+def _build_trail(stage_start: dict[str, float] | None = None,
+                 run_start: float | None = None
+                 ) -> tuple[tuple[float, dict], ...]:
+    """The hero's trail, in seconds, derived from `STAGES[HERO_KEY]`.
+
+    Sorted by time; a `state` frame wins a tie, so a stage frame written at
+    offset 0.00 lands AFTER the state change it belongs to rather than before
+    it. Python's sort is stable, so everything else keeps the order it is
+    written in above.
+
+    The two anchors are ARGUMENTS with the module's own values as defaults,
+    only so a test can feed it a shifted stage table and prove the trail moves
+    with it. Nothing in the recorders passes them.
+    """
+    starts = _HERO_STAGE_START if stage_start is None else stage_start
+    zero = RUN_START if run_start is None else run_start
+    plan: list[tuple[float, dict]] = [
+        (round(zero + offset, 2), frame) for offset, frame in _CLAIM_FRAMES]
+    plan += [(starts[status], fx._ev("state", status))
+             for status in STREAMED_STATES]
+    plan += [(round(starts[status] + offset, 2), frame)
+             for status, offset, frame in _STAGE_FRAMES]
+    plan.sort(key=lambda row: (row[0], row[1]["kind"] != "state"))
+    return tuple(plan)
+
+
+_TRAIL: tuple[tuple[float, dict], ...] = _build_trail()
 
 EVENT_TRAIL: tuple[tuple[float, dict], ...] = tuple(
     (due, dict(frame, ts=round(due, 2))) for due, frame in _TRAIL
 )
 
+#: The first frame the stream carries. Anything that opens the stream LATER
+#: gets every frame already due delivered in one captured frame — a dump, not a
+#: stream — so the recorders derive their "start following" time from this.
+TRAIL_START = EVENT_TRAIL[0][0]
+
 
 def events_at(t: float) -> list[dict]:
     return [dict(frame) for due, frame in EVENT_TRAIL if t >= due]
+
+
+def trail_state_at(t: float) -> str | None:
+    """The state the EVENT STREAM claims at ``t`` — the last `state` frame at
+    or before it, or None before the first one.
+
+    This is what the drawer's System board and the shell's detail pane render.
+    The card's chip beside them renders `stage_at`. They are two readouts of
+    one quantity and the tests hold them to being equal.
+    """
+    state = None
+    for due, frame in EVENT_TRAIL:
+        if due > t:
+            break
+        if frame["kind"] == "state":
+            state = frame["text"]
+    return state
 
 
 def hero_detail(t: float) -> dict:

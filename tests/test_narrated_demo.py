@@ -895,6 +895,132 @@ def test_every_detail_pane_line_fits_or_wraps_deliberately():
         assert len(rendered) <= 50, (len(rendered), rendered)
 
 
+def test_the_hero_visits_each_stage_once():
+    """The trail anchors every frame to a stage BY STATUS, which is only a
+    usable address while the hero's pipeline visits each status once. ORD-2187
+    is the ticket that bounces; the hero must not become a second one without
+    someone re-reading `_build_trail`."""
+    statuses = [status for _t, status, *_ in sp.STAGES[sp.HERO_KEY]]
+    assert len(statuses) == len(set(statuses)), statuses
+    assert set(sp.STREAMED_STATES) <= set(statuses)
+    assert sp.RUN_START == sp.STAGES[sp.HERO_KEY][1][0]
+
+
+def test_the_trail_is_rebuilt_from_the_stage_table_not_written_beside_it():
+    """The defect this file now guards: `_TRAIL` held ABSOLUTE seconds, written
+    against an older `STAGES` and never retimed when it moved.
+
+    Re-deriving the anchors from `STAGES[HERO_KEY]` here — rather than reading
+    `sp._HERO_STAGE_START`, which would compare a value to itself — and
+    rebuilding the trail from them must reproduce the shipped trail exactly. A
+    hand-typed second anywhere in it fails this.
+    """
+    starts = {status: t for t, status, *_ in sp.STAGES[sp.HERO_KEY]}
+    run_start = next(t for t, status, *_ in sp.STAGES[sp.HERO_KEY]
+                     if status != "pending")
+    assert sp._build_trail(starts, run_start) == sp._TRAIL
+
+
+def test_the_trail_moves_when_the_stage_table_moves():
+    """The mutation the test above cannot make on its own: shift every stage of
+    the hero by a constant and every frame of the trail must shift with it.
+
+    Without this, a trail that happened to agree with today's `STAGES` by
+    coincidence — the exact state the file shipped in — passes.
+    """
+    shift = 5.0
+    starts = {status: t + shift for t, status, *_ in sp.STAGES[sp.HERO_KEY]}
+    run_start = sp.RUN_START + shift
+    moved = sp._build_trail(starts, run_start)
+    assert len(moved) == len(sp._TRAIL)
+    for (was, a), (now, b) in zip(sp._TRAIL, moved):
+        assert a == b, (a, b)
+        assert round(now - was, 2) == shift, (was, now)
+
+
+def test_the_trail_never_contradicts_the_card_behind_it():
+    """THE defect. The drawer puts the event stream and the card's own status
+    chip on screen together, and they are two readouts of one quantity.
+
+    They disagreed twice in the shipped cut: `state context` was emitted at
+    17.90 while the chip had read "gathering context" since 16.40, and there
+    was NO `state testing` frame at all — so for the 5.4 s from 33.00 to 38.45
+    the chip said "Run `pytest -q`" over an agent board still showing
+    `implementing`.
+
+    Checked on EVERY FRAME of the clip, not at the beats, with the two
+    exemptions named rather than assumed:
+      * while the fixture says `pending`, the agent has said nothing yet, so
+        the stream must carry no state at all;
+      * `awaiting_approval` is the orchestrator parking a finished attempt and
+        is not a state the agent announces — the stream must by then say
+        `reviewing` AND have carried the `pr_open` frame that ends the run.
+    """
+    seen_states, seen_awaiting = set(), 0
+    for frame in range(nr.N_FRAMES):
+        t = nr.t_of(frame)
+        stage = sp.stage_at(sp.HERO_KEY, t)
+        status = stage[0] if stage else None
+        streamed = sp.trail_state_at(t)
+        if status in (None, "pending"):
+            assert streamed is None, (t, status, streamed)
+        elif status == "awaiting_approval":
+            seen_awaiting += 1
+            assert streamed == "reviewing", (t, streamed)
+            assert any(f["kind"] == "pr_open" for f in sp.events_at(t)), t
+        else:
+            seen_states.add(status)
+            assert streamed == status, (t, status, streamed)
+    # Non-vacuity: the loop must actually have exercised all three arms.
+    assert seen_states == set(sp.STREAMED_STATES), seen_states
+    assert seen_awaiting > 0
+
+
+def test_every_trail_frame_lands_inside_the_stage_it_was_written_for():
+    """The per-frame version of the check above: a tool call attributed to
+    `planning` must be ON SCREEN during planning. An offset that overruns its
+    stage puts the planner's Grep under the coder's banner."""
+    starts = {status: t for t, status, *_ in sp.STAGES[sp.HERO_KEY]}
+    for status, offset, frame in sp._STAGE_FRAMES:
+        assert offset >= 0, (status, offset)
+        due = round(starts[status] + offset, 2)
+        assert sp.stage_at(sp.HERO_KEY, due)[0] == status, (
+            frame["kind"], frame["text"], due, status)
+    # The claim frames are the other side of it: they belong to the last moment
+    # of the QUEUE, before the worker has announced anything.
+    for offset, frame in sp._CLAIM_FRAMES:
+        due = round(sp.RUN_START + offset, 2)
+        assert offset < 0, (frame["kind"], offset)
+        assert sp.stage_at(sp.HERO_KEY, due)[0] == "pending", (frame, due)
+
+
+def test_the_cli_stream_opens_before_its_first_frame():
+    """The second half of the same defect, on the shell.
+
+    `SprintClient.stream_events` awaits `FrameClock.until(due)` per frame and
+    `until` returns immediately for anything already past — so a stream opened
+    late yields its whole backlog into ONE captured frame. Opening it before
+    the first frame is due makes the backlog empty by construction.
+    """
+    assert sprint_cli.SELECT_AT < sp.TRAIL_START
+    assert sp.TRAIL_START == min(due for due, _e in sp.EVENT_TRAIL)
+    script = sprint_cli.build_script()
+    selects = [(t, p) for t, k, p in script if k == "select"]
+    assert selects == [(sprint_cli.SELECT_AT, sp.HERO_ID)]
+    # The hero card has to exist before the shell can follow it.
+    assert sp.STAGES[sp.HERO_KEY][0][0] < sprint_cli.SELECT_AT
+
+
+def test_no_two_trail_frames_land_on_the_same_captured_frame():
+    """The other way a stream becomes a dump: two frames closer together than
+    one frame of video. `FrameClock.until` rounds to a frame index, so two
+    frames that round to the same index are delivered together no matter when
+    the stream opened."""
+    indexes = [int(round(due * nr.FPS)) for due, _e in sp.EVENT_TRAIL]
+    assert len(indexes) == len(set(indexes)), [
+        (due, e["kind"]) for due, e in sp.EVENT_TRAIL]
+
+
 def test_the_trail_is_quiet_before_the_shell_reads_its_own_pane():
     """`/diff` is typed at 44.50; a trail frame after that scrolls the diff
     (then the logs) off camera — the exact hazard fixture.py documents."""
@@ -955,7 +1081,11 @@ def test_the_cli_script_repaints_on_every_fixture_change():
 def test_the_cli_selects_the_hero_before_the_gate_needs_its_pane():
     script = sprint_cli.build_script()
     selects = [(t, p) for t, k, p in script if k == "select"]
-    assert selects == [(sp.PARALLEL + 1.0, sp.HERO_ID)]
+    # WHICH task and HOW MANY times; WHEN is
+    # `test_the_cli_stream_opens_before_its_first_frame`'s, and is derived from
+    # the trail rather than written down here as a second copy of it.
+    assert [p for _t, p in selects] == [sp.HERO_ID]
+    assert selects[0][0] < sp.PARALLEL, selects
     # /diff is typed after the trail has gone quiet, /approve lands on the
     # fixture's approval second.
     diff_keys = [t for t, k, p in script if k == "key" and p == "/"[0]]
