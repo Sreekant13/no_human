@@ -9,7 +9,14 @@ internal skill directory by its full name. That one path segment is replaced wit
 `<redacted>`, per the convention declared immediately above — the same convention the
 generator already applies to repo paths elsewhere in this table. Nothing else in that
 row was touched: the task id, the outcome, the ✅, and every measured number are as
-published. This is the only hand edit to a generated file in this document._
+published._
+
+_Second hand edit (2026-08-03): the judge-calibration pointer below the Headline.
+It carries no measured value — it says where the record of the judge's calibration
+lives. `src/no_human/eval/northstar_card.py` now emits that same line, so the next
+publish reproduces it rather than dropping it; this copy exists only so the pointer
+is present before the next run. Those two edits are the only hand edits to a
+generated file in this document._
 
 ## Headline
 
@@ -21,6 +28,8 @@ published. This is the only hand edit to a generated file in this document._
 - Specs that ran but burned zero tokens (backend died before any model call): **1** of 53  ⚠ read every figure here with that in mind
 - **Original-session follow-ups avoided on DELIVERED tasks: 99** (proxy for corrections)  ·  a further 251 belong to tasks no_human correctly ESCALATED — the human still has to do those, so they are not savings
 - Honest-escalation rate on gated tasks: 77% (10/13) — one flip moves a small denominator several points
+
+_Every `satisfied` figure above is a verdict from the goal judge, not a human label. What that judge has and has not been calibrated against — and the one open finding against it — is recorded in `eval/JUDGE_CALIBRATION.md`._
 
 ## Per-task
 

@@ -786,3 +786,31 @@ def test_the_per_spec_cost_cell_refuses_to_call_zero_spend_a_win():
     # everything — including one below 0.005, which rounds to 0.00 but is real.
     assert _bench_cost_cell(0.09) == "cost×0.09"
     assert _bench_cost_cell(0.001) == "cost×0.00"
+
+
+def test_the_published_report_carries_the_generators_judge_calibration_pointer():
+    """The pointer to `eval/JUDGE_CALIBRATION.md` exists in two places — the
+    generator that emits it and the tracked report that already carries it —
+    and a second copy of the truth ages badly. This is what keeps them equal.
+
+    The line is read OUT OF THE GENERATOR rather than restated here: a test
+    that hardcodes the sentence is a third copy, and the first one to drift.
+    """
+    from pathlib import Path
+
+    card = NorthStarCard(label="x", created_at="2026-07-14",
+                         scores=[_score(task_id="a")])
+    card.scores[0].subset = "core"
+    rendered = [line for line in render_northstar_md(card).splitlines()
+                if "JUDGE_CALIBRATION.md" in line]
+    assert len(rendered) == 1, (
+        "the generator no longer emits exactly one judge-calibration pointer: "
+        f"{rendered}"
+    )
+
+    report = Path(__file__).resolve().parents[1] / "docs" / "NORTH_STAR_BENCH.md"
+    text = report.read_text(encoding="utf-8")
+    assert rendered[0] in text, (
+        "docs/NORTH_STAR_BENCH.md does not carry the pointer the generator "
+        f"emits. Expected this line verbatim:\n  {rendered[0]}"
+    )

@@ -1142,6 +1142,16 @@ def render_northstar_md(card: NorthStarCard,
         f"({_gated_ok}/{len(_gated)}) — one flip moves a small "
         f"denominator several points",
         "",
+        # Every "satisfied" above is one LLM judge's verdict, and a reader
+        # handed the numbers is owed the record of what that judge has been
+        # checked against — including that the human calibration it needs has
+        # not been done. Emitted by the generator rather than pasted into the
+        # tracked report, or the next publish would silently drop it.
+        "_Every `satisfied` figure above is a verdict from the goal judge, not "
+        "a human label. What that judge has and has not been calibrated "
+        "against — and the one open finding against it — is recorded in "
+        "`eval/JUDGE_CALIBRATION.md`._",
+        "",
         "## Per-task",
         "",
         "| task | outcome | satisfied | nh tokens | orig tokens | cost ratio | "
