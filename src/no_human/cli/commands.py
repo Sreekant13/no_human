@@ -5033,16 +5033,16 @@ def bench_startup(scenario_path, out_dir, verdict_file):
                       "describe a tree that is not there[/]")
         sys.exit(1)
     sprint = materialise(scenario, dest)
-    console.print(f"[green]{scenario.name}[/] — {len(sprint.specs)} ticket(s)")
+    console.print(f"[green]{escape(scenario.name)}[/] — {len(sprint.specs)} ticket(s)")
     for position, spec in enumerate(sprint.specs, start=1):
         tag = " [yellow](must escalate)[/]" if spec.expect_escalation else ""
         console.print(f"  {position}. {escape(spec.id)} @ "
-                      f"{sprint.pins[spec.id][:8]}{tag}")
+                      f"{escape(sprint.pins[spec.id][:8])}{tag}")
     console.print(f"[dim]repo  → {escape(str(sprint.repo))}[/]")
     console.print(f"[dim]specs → {escape(str(sprint.specs_dir))}[/]")
     console.print("\nrun the sprint:")
     console.print(f"  nh bench run --specs-dir {escape(str(sprint.specs_dir))} "
-                  f"--parallel 1 --label startup-{scenario.id}")
+                  f"--parallel 1 --label startup-{escape(scenario.id)}")
     console.print("then grade it:")
     console.print("  nh bench startup --verdict "
                   "eval/results/northstar/<the-results-file>.json")

@@ -80,6 +80,13 @@ _PROVABLY_SAFE = {
     "score.outcome_status",
     # ✅/❌ glyph and a formatted ratio, both built literally a few lines above
     "mark", "ratio",
+    # int from enumerate() in the startup-sprint listing — escape() would raise
+    "position",
+    # either "" or a literal built two lines above that deliberately CARRIES
+    # markup (" [yellow](must escalate)[/]"); escape() would print it raw.
+    # Scope caveat from the header applies: any other `tag` in the scanned
+    # region inherits this exemption and must be re-justified.
+    "tag",
     # module-level Path constants, not user input
     "REPORT_MD",
     # already-redacted term SHAPES ("f*(13)"), built by the refusal itself
