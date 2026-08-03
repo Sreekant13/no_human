@@ -696,8 +696,12 @@ def test_explicit_serve_flag_enables_isolated_pool():
     flag itself is what turns isolation on for this invocation."""
     from no_human.core.scheduler import resolve_serve_pool
 
+    # cpu_count pinned: on a 4-core CI runner the sanity ceiling is
+    # max(2, 4//3) == 2 and this test would fail for machine size, not
+    # behavior — the exact class the clamp change pinned everywhere else.
     workers, enabled, error = resolve_serve_pool(
-        {"concurrency": {"enabled": False, "max_workers": 1}}, cli_workers=3)
+        {"concurrency": {"enabled": False, "max_workers": 1}}, cli_workers=3,
+        cpu_count=12)
     assert (workers, enabled, error) == (3, True, None)
 
 
