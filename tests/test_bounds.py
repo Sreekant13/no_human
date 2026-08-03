@@ -225,12 +225,14 @@ def test_attempt_tokens_default_and_override():
     and stay well under the lifetime cap so the bounded loop keeps at least two
     real attempts.
 
-    Both caps are COST-WEIGHTED tokens since 2026-07-31 (core.pricing): the old
-    raw 4M/8M converted at the measured 0.1985 weighted/raw ratio. The floor
-    below is the SAME measured attempt as before, converted the same way — the
-    headroom is not quietly relaxed, it is 2.6x here against 1.3x before."""
+    Both caps are COST-WEIGHTED tokens since 2026-07-31 (core.pricing). Raised
+    2026-08-03 (800k -> 2M with lifetime 1.6M -> 4M) from the honest-ledger
+    sweep: the converted caps were calibrated on the pre-fix ledger whose
+    subagent spend was under-counted — against honest numbers the old lifetime
+    cap parked 52.9% of real tasks and the old attempt cap ended 31% of real
+    attempts. Derivation and the re-sweep obligation live on core.bounds.Bounds."""
     b = Bounds()
-    assert b.attempt_tokens == 800_000
+    assert b.attempt_tokens == 2_000_000
     # The measured complex attempt (3.06M raw, ~all cache-read) in the cap's
     # own unit: 3_060_000 x CACHE_READ_WEIGHT.
     assert b.attempt_tokens > weighted_tokens(cache_read_tokens=3_060_000)

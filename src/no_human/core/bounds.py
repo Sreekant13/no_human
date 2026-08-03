@@ -83,7 +83,33 @@ class Bounds:
     # it; only a config carrying `budget_unit: "weighted"` (stamped by every
     # write in blockers/actions.py) is taken at face value.
     lifetime_attempts: int = 9
-    lifetime_tokens: int = 1_600_000
+    # RAISE, 2026-08-03: 1.6M -> 4M, derived from the honest ledger. The 1.6M
+    # above was derived honestly — but in a unit that no longer exists: its
+    # ledger recorded subagent spend through a gauge later measured at ~17% of
+    # the bill (fixed by the four-tier accounting change), and the three
+    # non-coder tiers are 37-40% of real weighted spend, so honest accounting
+    # reads ~1.5-1.6x the old numbers on accounting alone. On top of that,
+    # runs also changed shape (turn-count ratios 0.57-2.53x across the 10
+    # same-spec trials vs 7-26 — most grew, one spec shrank; per-turn spend
+    # only ~1.2x) — behavior change, not artifact, and the cap must fit what
+    # the product now does.
+    # THE DERIVATION (independent review, 2026-08-03, this install's ledger at
+    # 221 tasks / 690 attempts, four-tier weighted): 1.6M parks 117/221 tasks
+    # (52.9%) — half of all real work; 4.0M parks 15/221 (6.8%) and sits at
+    # the knee of the curve (3.5M: 10.4%, 4.5M: 5.0%); the attempt-17 runaway
+    # this cap exists for reads 9,127,714 weighted and still parks with 2.3x
+    # margin. Corroborating, July's run distribution: p95 = 1.66M, and the
+    # 1.6M cap already parked ~10% of those rows AS UNDER-counted.
+    # First-look claims corrected by that review, kept so they are not
+    # re-derived: only 1 of the first 4 baseline specs budget-parked (3/3
+    # trials, ns-02fbd7b8), not 3 of 4 — the others escalated for non-budget
+    # reasons; and the early "2.0-2.4x multiplier (n=4)" required dropping a
+    # spec that got CHEAPER (per-spec medians 0.68/1.43/2.39/2.67 over 10
+    # trials). The ledger sweep above replaces both as the basis.
+    # Re-sweep after the batch-3 baseline completes under this cap; margins
+    # are thinner now (runaway margin 2.3x, was ~5.7x) — a further raise
+    # needs a new sweep, not a multiplier.
+    lifetime_tokens: int = 4_000_000
     # Per-ATTEMPT spend cap (v6 taxonomy, 2026-07-16): four live specs burned
     # the entire 8M lifetime budget in attempt #1 — the mid-attempt watch was
     # armed with the remaining LIFETIME budget, so the bounded loop never got a
@@ -101,7 +127,14 @@ class Bounds:
     # attempt rows pile up exactly AT the cap that truncated them, so the
     # rounder number is taken). The measured complex-tier attempt this cap has
     # to clear — 3.06M raw, almost all cache-read — is 306,000 weighted.
-    attempt_tokens: int = 800_000
+    # Raised with the lifetime cap, from the same ledger sweep: 800k fired on
+    # 215/690 real attempts (31%) — a cap that ends a third of all attempts is
+    # not bounding runaways, it is the workload; 2M fires on 4/690 (0.6%).
+    # Keeps the 2:1 lifetime:attempt shape (now at exact equality with the
+    # `attempt <= lifetime // 2` invariant — deliberate, the loop keeps two
+    # real attempts) and clears the largest measured successful attempt (306k
+    # weighted) by 6.5x.
+    attempt_tokens: int = 2_000_000
 
     @staticmethod
     def from_config(cfg: dict | None) -> "Bounds":

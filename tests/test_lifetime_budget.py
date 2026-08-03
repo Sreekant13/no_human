@@ -88,12 +88,15 @@ async def test_default_token_cap_parks_a_9M_burn(store):
     parked CI_GATE/metrics-core runaways (20.8M, 61.5M) sat above 8M. A ~9M raw task
     must park under the DEFAULT — it would NOT have parked at the old 25M cap.
 
-    The cap is COST-WEIGHTED since 2026-07-31 and the default is the same real
-    spend re-expressed (8M x the ledger-measured 0.1985 weighted/raw ratio); this
-    9M-raw burn is 4.95M weighted and still parks, by a wider margin because it
-    is half FRESH tokens, which is where the money actually goes."""
+    The cap is COST-WEIGHTED since 2026-07-31, and RAISED to 4M on 2026-08-03
+    from the honest-ledger sweep (the 1.6M conversion was calibrated on the
+    pre-fix ledger whose subagent spend was under-counted; derivation on
+    core.bounds.Bounds).
+    This test's 9M-raw burn is 4.95M weighted and must STILL park under the
+    raised default — it is the smallest runaway class the cap exists for, and
+    a raise that spares it has gone too far."""
     from no_human.core.bounds import Bounds
-    assert Bounds().lifetime_tokens == 1_600_000
+    assert Bounds().lifetime_tokens == 4_000_000
 
     t = Task.new("nine-million", repo_path="/tmp/x")
     await store.create_task(t)
@@ -192,13 +195,13 @@ async def test_a_task_whose_spend_is_all_reviewer_is_not_invisible(store):
     await store.create_task(t)
     aid = await store.create_attempt(t.id, 1)
     await store.update_attempt(
-        aid, review_tokens_used=1_000_000,
-        review_cache_read_tokens=8_000_000,
-        review_cache_creation_tokens=500_000,
+        aid, review_tokens_used=2_000_000,
+        review_cache_read_tokens=16_000_000,
+        review_cache_creation_tokens=1_000_000,
     )
 
     _, tokens = await store.lifetime_usage(t.id)
-    assert tokens == 9_500_000
+    assert tokens == 19_000_000
 
     b = await _orch(store)._check_lifetime_budget(t)
     assert b is not None and b.category is BlockerCategory.BUDGET_EXHAUSTED
@@ -423,7 +426,7 @@ async def test_the_under_budget_event_carries_both_numbers(store):
     assert ev["raw_fresh"] == 1_697
     assert ev["raw_cache_read"] == 6_589_429
     assert ev["raw_cache_creation"] == 173_190
-    assert "877,127" in ev["text"] and "1,600,000" in ev["text"]
+    assert "877,127" in ev["text"] and "4,000,000" in ev["text"]
     # web/src/summaries.js clips this text to 60 chars for the Activity
     # header's "Budget" fact. Anything longer renders truncated mid-number,
     # which is why the class split lives in the fields above and not in here.

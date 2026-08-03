@@ -988,17 +988,18 @@ def repo_config(repo_path, assignments):
     UNIT — RAW tokens, which is NOT the unit the caps themselves are in.
     Since 2026-07-31 `bounds.attempt_tokens` / `bounds.lifetime_tokens` are
     cost-weighted (fresh in/out x1.0, cache write x1.25, cache read x0.1 —
-    core.pricing) and default to 800,000 / 1,600,000. A value set here reaches
+    core.pricing) and default to 2,000,000 / 4,000,000 (raised 2026-08-03 —
+    the converted caps were calibrated on the pre-fix ledger that under-counted
+    subagent spend; rationale on core.bounds.Bounds). A value set here reaches
     task.config carrying no `budget_unit` marker, so the orchestrator reads it
     as a pre-cutover raw number and converts it (x0.1985). That is deliberate
     and fail-closed: it is the only safe reading of a value that may have been
     written before the cutover.
 
     So type raw tokens. The weighted defaults above correspond to roughly
-    4,000,000 (attempt) and 8,000,000 (lifetime) in this field — the same
-    numbers that were the defaults before the unit changed. To set a
-    per-task budget in weighted tokens directly, use `nh task config`, which
-    stamps the unit and is read at face value.
+    10,100,000 (attempt) and 20,200,000 (lifetime) in this field at the
+    0.1985 conversion. To set a per-task budget in weighted tokens directly,
+    use `nh task config`, which stamps the unit and is read at face value.
     """
     from ..profile import ProjectProfile
 

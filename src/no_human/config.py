@@ -872,16 +872,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Both are per-task overridable via task.config (the option's action).
         "lifetime_attempts": 9,
         # COST-WEIGHTED tokens, not raw ones: fresh in/out x1.0, cache write
-        # x1.25, cache read x0.1 (core.pricing). 1.6M weighted is the old raw
-        # 8M converted at this install's measured 0.1985 weighted/raw ratio —
-        # the same real spend, now bounded the same way for every task rather
-        # than 5.7x looser for a cache-heavy one. Measured rationale and the
-        # migration note live on core.bounds.Bounds; kept in step with it.
-        "lifetime_tokens": 1_600_000,
+        # x1.25, cache read x0.1 (core.pricing). 4M replaces the converted
+        # 1.6M cap, which was calibrated on a ledger whose subagent spend was
+        # under-counted (~17%-visible gauge, since fixed) — against honest
+        # numbers 1.6M parks 117/221 real tasks (52.9%); 4M parks 6.8% and
+        # sits at the knee. Full derivation and the post-baseline re-sweep
+        # obligation live on core.bounds.Bounds; kept in step with it.
+        "lifetime_tokens": 4_000_000,
         # Per-attempt spend cap — ends the ATTEMPT (bounded loop retries),
-        # never parks the task. Also cost-weighted (old raw 4M converted).
+        # never parks the task. Raised with the lifetime cap (2:1 shape).
         # Rationale on core.bounds.Bounds.attempt_tokens.
-        "attempt_tokens": 800_000,
+        "attempt_tokens": 2_000_000,
     },
     "bounds_investigation": {
         "max_attempts": 8,
