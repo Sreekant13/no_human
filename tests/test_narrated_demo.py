@@ -1643,6 +1643,18 @@ def test_the_resolution_band_is_the_measured_limit_not_a_claim():
 def test_the_band_is_printed_as_a_range_a_reader_can_act_on():
     assert vs._band_str((0.0,)) == "+0.0"
     assert vs._band_str((-2.0, 0.0, 6.0)) == "-2.0..+6.0"
+    # An EMPTY band means nothing was measured and must SAY so. `min()` on it
+    # raised ValueError and took the whole gate down mid-run — measured on a
+    # real proof render. A crash reports neither pass nor failure, which in a
+    # module whose whole stance is fail-closed is worse than either.
+    assert "nothing measured" in vs._band_str(())
+
+
+def test_the_app_check_given_nothing_to_sample_says_so(tmp_path):
+    """A check that looked at nothing must never be why a build is green."""
+    problems = vs.check_app_area(Path("/x/demo.mp4"), tmp_path,
+                                 vs.PANES["gui"], ())
+    assert len(problems) == 1 and "proved nothing" in problems[0]
 
 
 def test_the_app_check_cannot_be_skipped_by_omission():

@@ -543,6 +543,15 @@ def offset_scan(sample: bytes, refs: dict[float, bytes], t: float,
 
 
 def _band_str(band: tuple[float, ...]) -> str:
+    """The resolution band as a range a reader can act on.
+
+    An EMPTY band is "nothing was measured", and it must say so rather than
+    raise: `min()` on it threw `ValueError` and took the whole gate down mid-
+    run — a check that crashes reports neither a pass nor a failure, which in a
+    module whose entire stance is fail-closed is the worst of the three.
+    """
+    if not band:
+        return "n/a — nothing measured"
     if len(band) == 1:
         return f"{band[0]:+.1f}"
     return f"{min(band):+.1f}..{max(band):+.1f}"
@@ -565,6 +574,13 @@ def check_app_area(mp4: Path, work: Path, panes: tuple[tuple[str, int], ...],
     the measured resolution rather than this paragraph's adjective.
     """
     problems: list[str] = []
+    if not sample_at:
+        # NOT PROVED, not "fine". An empty grid means this check looked at
+        # nothing, and a check that looked at nothing must never be the reason
+        # a build is green.
+        print("    app area: NOT PROVED — no sampled instants")
+        return [f"{mp4.name}: the app-area check was given no instants to "
+                f"sample, so it proved nothing"]
     for pane, x in panes:
         frames = work / f"frames-{pane}"
         if not frames.is_dir():
