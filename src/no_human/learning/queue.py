@@ -22,9 +22,28 @@ from typing import Any
 
 from ..core.db import Store
 from ..core.task import Task, TaskStatus
+from .corrections import (
+    MIN_OCCURRENCES,
+    CorrectionCluster,
+    CorrectionRecord,
+    build_correction_distill_prompt,
+    cluster_corrections,
+)
 from .pii import contains_pii
 
 log = logging.getLogger("no_human.learning")
+
+
+# WHICH SIGNAL A PROPOSAL CAME FROM — the `memories.origin` column.
+#
+# NOT `source`. `source` is the queue-VISIBILITY contract: `pending()`, `nh
+# learnings`, the API and the ingester all select `source="proposed"`, so a
+# proposal that named its provenance there would be invisible to the human gate
+# it exists for (B1 already had to write that comment once). `origin` is a
+# second column for a second question, and NULL on every row written before it
+# existed — which is honest, not a gap: those rows genuinely do not record it.
+ORIGIN_REVIEW = "review"          # B1: a reviewer FAIL round's blocking findings
+ORIGIN_SUPERVISOR = "supervisor"  # B2: a recurring supervisor `correct` decision
 
 
 # Memory types (matches the migrations schema CHECK-free `type` column).
@@ -116,6 +135,31 @@ def _tags_from_findings(findings: list[dict[str, Any]]) -> list[str]:
     return ["review", *words[:4]]
 
 
+def correction_dedupe_key(cluster: CorrectionCluster) -> str:
+    """The dedupe signature for a correction cluster.
+
+    Keyed on the GIST and the project — never on the distilled text or on the
+    example messages. The gist is a pure function of one message
+    (``corrections.normalize_gist``), so the key is stable when the cluster
+    grows and when the store is re-harvested; an LLM's phrasing is not stable
+    enough to dedupe on.
+
+    A module-level function rather than a method because BOTH the builder and
+    the batch harvest need it, and the harvest needs it BEFORE the distillation
+    it would otherwise pay for.
+    """
+    return _sig("supervisor", cluster.gist, cluster.project or "")
+
+
+def _tags_from_gist(gist: str) -> list[str]:
+    """Trigger keywords for a correction cluster, from its gist. Same contract
+    as `_tags_from_findings` — a leading provenance tag so the queue can be
+    filtered by where a lesson came from, then keywords `learning/triggers.py`
+    can match as substrings of a future task's text."""
+    words = [w for w in gist.split() if w not in _STOP_TAGS]
+    return ["supervisor", *words[:4]]
+
+
 def build_review_distill_prompt(task: Task, findings: list[dict[str, Any]]) -> str:
     """The bounded, single-turn prompt handed to the utility tier."""
     return (
@@ -173,6 +217,9 @@ class Proposal:
     content: str
     dedupe_key: str
     tags: list[str]
+    # Which signal produced it (ORIGIN_*), or None for the outcome-derived
+    # proposals that predate the column.
+    origin: str | None = None
 
 
 class LearningQueue:
@@ -328,6 +375,7 @@ class LearningQueue:
             source="proposed",
             confirmed=False,
             dedupe_key=proposal.dedupe_key,
+            origin=proposal.origin,
         )
         # A dedupe hit is the queue working as designed — but it is ALSO the
         # only evidence that this wall was hit twice, and `add_memory` returns a
@@ -391,7 +439,176 @@ class LearningQueue:
                 str(f.get("label") or "") for f in learnable
             ), task.repo_path or ""),
             tags=tags,
+            origin=ORIGIN_REVIEW,
         )
+
+    # ------------- supervisor corrections (B2) ----------------------------- #
+
+    async def propose_from_corrections(
+        self, cluster: CorrectionCluster, *,
+        distill: DistillFn | None = None, note: NoteFn | None = None,
+    ) -> str | None:
+        """Queue ONE proposal distilled from a RECURRING supervisor correction.
+
+        *cluster* is a ``(project, gist)`` group produced by
+        ``learning.corrections.cluster_corrections``, which has already applied
+        the >=2-occurrence rule — a one-off correction is noise and never
+        reaches here. Returns the new memory id, or None (personal data, or
+        deduped against a cluster already proposed).
+
+        Everything below this line is B1's machinery, deliberately: the same
+        ``DistillFn`` injection, the same four-line reply parser, the same
+        ``contains_pii`` gate, the same ``_sig`` dedupe, the same
+        ``add_memory(source="proposed", confirmed=False)`` write, the same
+        ``NoteFn`` sink for the two silent-None cases. The only thing B2 adds
+        is what the input is and how it was aggregated.
+
+        GATE INDEPENDENCE (design principle 6) holds for exactly the reason it
+        holds for B1, and it matters MORE here: the supervisor's corrections
+        are injected into the coder's own context at runtime, so a correction
+        that became an active rule with no human in between would be the agent
+        writing its own standing instructions from its own supervisor's
+        opinions. It is written ``confirmed=0``; the rules block every agent
+        reads is built from ``list_memories(confirmed=True, …)``.
+        """
+        proposal = await self._build_from_corrections(cluster, distill=distill)
+        if proposal is None:
+            return None
+        # The evidence here is the supervisor's correction text VERBATIM, and a
+        # correction quotes whatever the agent was looking at — a fixture, a
+        # seed file, a support thread. Same door, same gate; dropped whole
+        # rather than redacted (learning/pii.py).
+        pii = contains_pii(proposal.title, proposal.content)
+        if pii is not None:
+            log.info("refused a proposed learning carrying personal data (%s)",
+                     pii.kind)
+            if note is not None:
+                note("supervisor correction learning refused: the correction "
+                     f"carries personal data ({pii.kind})")
+            return None
+        mem_id = await self.store.add_memory(
+            mem_type=proposal.mem_type,
+            title=proposal.title,
+            content=proposal.content,
+            tags=proposal.tags,
+            project=cluster.project,
+            source="proposed",
+            confirmed=False,
+            dedupe_key=proposal.dedupe_key,
+            origin=proposal.origin,
+        )
+        # Idempotence is the design, not an accident: the dedupe key is
+        # ``(gist, project)`` and the gist is a pure function of ONE message
+        # (corrections.normalize_gist), so re-harvesting the same store — or a
+        # store that has grown — collapses onto the same row instead of
+        # queueing the lesson twice. Say so rather than return a bare None.
+        if mem_id is None and note is not None:
+            note(f"recurring supervisor correction ({cluster.count}x), deduped "
+                 f"to {proposal.dedupe_key}")
+        return mem_id
+
+    async def _build_from_corrections(
+        self, cluster: CorrectionCluster, *, distill: DistillFn | None,
+    ) -> Proposal | None:
+        if cluster.count < 2 or not cluster.gist:
+            # Defence in depth. `cluster_corrections` already enforces this;
+            # a caller assembling a cluster by hand must not be the way round
+            # the rule that makes 257 corrections into a handful of lessons.
+            return None
+        examples = cluster.examples()
+        evidence = "\n".join(f"  - {e}" for e in examples)
+
+        mem_type, title, lesson, tags = TYPE_ANTI_PATTERN, "", "", []
+        if distill is not None:
+            parsed = parse_review_lesson(
+                await distill(build_correction_distill_prompt(cluster))
+            )
+            if parsed is not None:
+                mem_type, title, lesson, tags = parsed
+        if not title:
+            title = f"Repeated supervisor correction: {cluster.gist}"
+        if not lesson:
+            # Degraded but honest, exactly as B1 degrades: the corrections ARE
+            # the lesson, unpolished.
+            lesson = "(not distilled) " + (examples[0] if examples else cluster.gist)
+        if not tags:
+            tags = _tags_from_gist(cluster.gist)
+        # The provenance tag is UNCONDITIONAL here, unlike B1's — where the
+        # `review` tag is only added on the degraded path, so a proposal the
+        # distiller answered for cannot be filtered by where it came from. The
+        # queue now has two producers and a human triaging it needs "show me
+        # the supervisor ones" to work on every row, not on the subset the
+        # utility tier happened to fail.
+        tags = [ORIGIN_SUPERVISOR, *(t for t in tags if t != ORIGIN_SUPERVISOR)]
+
+        tasks = cluster.task_ids
+        provenance = "{}x across {} task(s): {}".format(
+            cluster.count, len(tasks),
+            ", ".join(t[:8] for t in tasks[:4]) or "?")
+        # Same ordering rule B1 had to learn: the lesson is what the utility
+        # call was spent on, so it goes FIRST and whole; the verbatim
+        # corrections get the room that is left.
+        head = f"Corrected repeatedly by the supervisor ({provenance}).\nLesson: {lesson}\n"
+        label = "What the supervisor kept saying:\n"
+        room = _MAX_CONTENT - len(head) - len(label)
+        content = (head + label + evidence[:room]) if room > 0 else head[:_MAX_CONTENT]
+        return Proposal(
+            mem_type, title[:120], content,
+            correction_dedupe_key(cluster),
+            tags=tags,
+            origin=ORIGIN_SUPERVISOR,
+        )
+
+    async def harvest_supervisor_corrections(
+        self, *, project: str | None = None,
+        min_occurrences: int = MIN_OCCURRENCES,
+        distill: DistillFn | None = None, note: NoteFn | None = None,
+        limit: int = 5000,
+    ) -> list[str]:
+        """Read every persisted supervisor ``correct`` decision, cluster them,
+        and queue one proposal per RECURRING cluster. Returns the ids written
+        (deduped clusters contribute nothing, which is what makes a re-run a
+        no-op).
+
+        A batch pass rather than an orchestrator hook, and deliberately: a
+        single correction cannot know whether it recurs, so there is no point
+        in the task's own run at which the >=2 rule can be evaluated. It is
+        driven by ``nh learnings --harvest``.
+        """
+        rows = await self.store.list_supervisor_corrections(
+            project=project, limit=limit)
+        clusters = cluster_corrections(
+            [
+                CorrectionRecord(
+                    task_id=str(r.get("task_id") or ""),
+                    project=r.get("project"),
+                    message=str(r.get("message") or ""),
+                    ts=float(r.get("ts") or 0.0),
+                )
+                for r in rows
+            ],
+            min_occurrences=min_occurrences,
+        )
+        written: list[str] = []
+        for cluster in clusters:
+            # SPEND GUARD, and the reason `correction_dedupe_key` is a
+            # standalone function: this pass re-reads the whole correction
+            # history every time it runs, so most clusters on any run after the
+            # first are already queued. Letting `add_memory` discover that
+            # would mean paying for a distillation per already-known lesson and
+            # writing nothing — the same reasoning as B1's `_at_lifetime_ceiling`
+            # guard, one layer out.
+            key = correction_dedupe_key(cluster)
+            if await self.store.memory_dedupe_key_exists(key):
+                if note is not None:
+                    note(f"recurring supervisor correction ({cluster.count}x), "
+                         f"deduped to {key}")
+                continue
+            mem_id = await self.propose_from_corrections(
+                cluster, distill=distill, note=note)
+            if mem_id:
+                written.append(mem_id)
+        return written
 
     # --------------------------- confirm / list ---------------------------- #
 

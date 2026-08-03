@@ -966,6 +966,23 @@ class Store:
         if "archived" not in mem_existing:
             await self.db.execute(
                 "ALTER TABLE memories ADD COLUMN archived INTEGER DEFAULT 0")
+        # B2: WHICH SIGNAL produced a proposal — "review" (a reviewer FAIL
+        # round's findings, B1) or "supervisor" (a recurring supervisor
+        # `correct` decision). A SECOND column rather than reusing `source`,
+        # for the same reason `brain_watermark` is not folded into
+        # `auth_profile`: they answer different questions. `source` is the
+        # queue-VISIBILITY contract — `pending()`, `nh learnings`, the API and
+        # the ingester all select `source="proposed"` — so a proposal that
+        # named its provenance there would be invisible to the human gate it
+        # exists for.
+        #
+        # NO DEFAULT, deliberately. ADD COLUMN backfills the declared default,
+        # and stamping "review" (or any other value) onto every pre-existing
+        # row would be inventing provenance for rows that genuinely do not
+        # record it. NULL reads "unknown", which is the truth.
+        if "origin" not in mem_existing:
+            await self.db.execute(
+                "ALTER TABLE memories ADD COLUMN origin TEXT")
 
         # Phase 6a: test_layers column on projects (JSON-encoded TestPlan layers).
         proj_existing = {row["name"]
@@ -1715,10 +1732,15 @@ class Store:
         self, *, mem_type: str, title: str, content: str,
         tags: list[str] | None = None, project: str | None = None,
         source: str = "proposed", confirmed: bool = False,
-        dedupe_key: str | None = None,
+        dedupe_key: str | None = None, origin: str | None = None,
     ) -> str | None:
         """Insert a memory. If ``dedupe_key`` matches an existing memory's
-        signature (stored in file_path), skip and return None."""
+        signature (stored in file_path), skip and return None.
+
+        ``origin`` records WHICH SIGNAL produced the proposal (``learning.queue``'s
+        ``ORIGIN_REVIEW`` / ``ORIGIN_SUPERVISOR``); it is not ``source``, which is
+        the queue-visibility contract. NULL where unrecorded.
+        """
         if dedupe_key is not None:
             if await self._fetchone(
                 "SELECT id FROM memories WHERE file_path = ? LIMIT 1", (dedupe_key,)
@@ -1727,13 +1749,29 @@ class Store:
         mem_id = uuid.uuid4().hex
         await self.db.execute(
             """INSERT INTO memories
-                 (id, type, title, content, file_path, tags, project, source, confirmed)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 (id, type, title, content, file_path, tags, project, source,
+                  confirmed, origin)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (mem_id, mem_type, title, content, dedupe_key,
-             json.dumps(tags or []), project, source, 1 if confirmed else 0),
+             json.dumps(tags or []), project, source, 1 if confirmed else 0,
+             origin),
         )
         await self.db.commit()
         return mem_id
+
+    async def memory_dedupe_key_exists(self, dedupe_key: str) -> bool:
+        """True when some memory already carries this dedupe signature (stored
+        in ``file_path``).
+
+        ``add_memory`` runs the same check — but only once it has been handed a
+        finished proposal, which for a BATCH caller means after the utility
+        call that built it was already paid for. B2's harvest re-reads the
+        whole correction history on every run, so without this it would spend
+        one distillation per already-queued cluster and write nothing.
+        """
+        return await self._fetchone(
+            "SELECT id FROM memories WHERE file_path = ? LIMIT 1", (dedupe_key,)
+        ) is not None
 
     async def list_memories(
         self, *, confirmed: bool | None = None, source: str | None = None,
@@ -1908,6 +1946,41 @@ class Store:
             (task_id,),
         )
         return [json.loads(r["data"]) for r in rows]
+
+    async def list_supervisor_corrections(
+        self, *, project: str | None = None, limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        """Every persisted supervisor ``correct`` decision, oldest first (B2).
+
+        The supervisor emits its verdict as a ``supervisor_decision`` event
+        whose ``text`` is the action and whose ``message`` is the correction —
+        already truncated to 200 chars by ``Orchestrator.emit``'s call site,
+        which is the only form that was ever stored. The project is the task's
+        ``repo_path``, joined here so the caller clusters per repo without a
+        second query per task.
+
+        ``e.task_id`` is the indexed COLUMN, not ``json_extract(data,
+        '$.task_id')`` — both are populated and they agree, but only one of
+        them can use ``idx_task_events_task_id``.
+        """
+        clauses = [
+            "json_extract(e.data, '$.kind') = 'supervisor_decision'",
+            "json_extract(e.data, '$.text') = 'correct'",
+        ]
+        params: list[Any] = []
+        if project is not None:
+            clauses.append("t.repo_path = ?")
+            params.append(project)
+        params.append(int(limit))
+        rows = await self._fetchall(
+            "SELECT e.task_id AS task_id, t.repo_path AS project, e.ts AS ts, "
+            "       json_extract(e.data, '$.message') AS message "
+            "FROM task_events e LEFT JOIN tasks t ON t.id = e.task_id "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY e.ts ASC LIMIT ?",
+            params,
+        )
+        return [dict(r) for r in rows]
 
     async def last_event_ts(self, task_id: str) -> float | None:
         """Epoch seconds of the newest persisted event, or None if none. Used

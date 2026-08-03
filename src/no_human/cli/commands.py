@@ -3609,17 +3609,62 @@ def learnings_curate(apply_llm):
 @click.option("--confirm", "confirm_id", default=None, help="Confirm a proposal by id.")
 @click.option("--reject", "reject_id", default=None, help="Reject/delete a proposal by id.")
 @click.option("--active", is_flag=True, help="Show the confirmed active rule set instead.")
-def learnings(confirm_id, reject_id, active):
+@click.option("--harvest", is_flag=True,
+              help="Aggregate recurring supervisor corrections into proposals "
+                   "(B2), then show the queue.")
+@click.option("--harvest-project", default=None,
+              help="Limit --harvest to one repo path (default: every project).")
+def learnings(confirm_id, reject_id, active, harvest, harvest_project):
     """Review the human-confirmed learning queue; confirm or reject proposals.
 
     Nothing enters the active rule set without your one-click confirm.
+
+    ``--harvest`` runs the B2 pass: every persisted supervisor ``correct``
+    decision is clustered by (project, normalized gist) and a cluster seen
+    twice or more becomes ONE proposal. A single correction is a one-off nudge
+    and is never proposed — repetition, not isolation, is what marks a durable
+    lesson. Harvesting is idempotent: the dedupe key is the gist, so re-running
+    it queues nothing new.
     """
     config, _ = _bootstrap(require_auth=False)
     from ..learning import LearningQueue
 
+    async def _distill(prompt: str) -> str:
+        """The utility tier — advisory, single-turn, exactly as B1 distils a
+        review finding. A failure here degrades the lesson to the verbatim
+        corrections; it never loses the cluster, which is why the exception is
+        swallowed HERE rather than allowed to abandon the rest of the harvest.
+        `nh learnings` runs with `require_auth=False`, so "no credential
+        configured" is an ordinary way to reach this."""
+        from ..agent.claude_backend import ClaudeBackend
+        try:
+            backend = ClaudeBackend(model=config.utility_model, readonly=True)
+            result = await backend.run(prompt, cwd=Path("."), max_turns=1,
+                                       effort="low")
+            return (result.final_text or "")[:600]
+        except Exception as exc:  # noqa: BLE001 — advisory tier, never fatal
+            console.print(f"  [yellow]distillation unavailable[/] ({exc}) — "
+                          "proposing the corrections undistilled",
+                          emoji=False)
+            return ""
+
     async def _go():
         async with Store(config.db_path) as store:
             q = LearningQueue(store)
+            if harvest:
+                notes: list[str] = []
+                written = await q.harvest_supervisor_corrections(
+                    project=harvest_project, distill=_distill,
+                    note=notes.append,
+                )
+                for n in notes:
+                    console.print(f"  [dim]{escape(n)}[/]", emoji=False)
+                console.print(
+                    f"[green]{len(written)} supervisor-correction proposal(s) "
+                    f"queued[/] — nothing is active until you confirm it below"
+                    if written else
+                    "[green]no new supervisor-correction proposals[/] — either "
+                    "no correction recurred, or they are already queued")
             if confirm_id:
                 mem = await store.find_memory(confirm_id)
                 if not mem:
@@ -3644,8 +3689,17 @@ def learnings(confirm_id, reject_id, active):
             label = "active rule set" if active else "pending proposals (one-click confirm)"
             console.rule(f"[bold]{label}")
             for m in rows:
+                # WHICH SIGNAL proposed it. A human confirming a queue that
+                # now mixes two producers needs to know whether they are
+                # looking at a reviewer's blocking finding or a supervisor
+                # correction that fired N times — the confidence in each is
+                # different. NULL on every row written before the column, and
+                # printed as nothing rather than guessed at.
+                origin = m.get("origin") or ""
+                origin_tag = f" [cyan]({origin})[/]" if origin else ""
                 console.print(
-                    f"[bold]{m['id'][:8]}[/] [magenta]{m['type']}[/] {m['title']}"
+                    f"[bold]{m['id'][:8]}[/] [magenta]{m['type']}[/]"
+                    f"{origin_tag} {m['title']}"
                 )
                 for line in (m["content"] or "").splitlines():
                     if line.strip():
