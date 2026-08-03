@@ -3,7 +3,8 @@ import { fetchMetrics, fetchBenchLatest, fetchRepos, fetchRepoUnderstanding, sea
 import { fmtCost, fmtTokens, lifetimeCost, taskBurn } from "./cost.js";
 import { northStarTiles } from "./northStar.js";
 import { selectBenchHeadline, footnoteLabel } from "./benchHeadline.js";
-import { selectPublishedRun, publishedEscalationPct, formatSuccessFraction } from "./benchPublished.js";
+import { selectPublishedRun, publishedEscalationPct, benchSpecCounts,
+         benchSuccessText, benchSuccessDenominator } from "./benchPublished.js";
 import TaskTable from "./TaskTable.jsx";
 import { isRealFailure } from "./boardLanes.js";
 import { profileRows, profileStatus } from "./repoView.js";
@@ -567,10 +568,11 @@ function BenchTrust({ bench }) {
     bench.published ? [bench] : [], bench.latest_run);
   const card = headline || bench;
 
-  const total = Number(card.total) || 0;
-  const skipped = Number(card.skipped) || 0;
-  const dead = Number(card.dead_specs) || 0;
-  const unmeasured = skipped + dead;
+  // SPEC counts, not row counts. `total`/`skipped`/`dead_specs` are recorded
+  // ROWS — one per (spec, trial) — so every "of the corpus" reading built on
+  // them is wrong by a factor of --trials. See benchSpecCounts.
+  const { specs: total, skippedSpecs: skipped, deadSpecs: dead,
+          unmeasured } = benchSpecCounts(card);
   const corpus = Number(card.corpus_available) || 0; // 0 = unknown (older card / pre-#197)
   const refusals = Array.isArray(card.refusals) ? card.refusals : [];
   const overrides = Array.isArray(card.override_reasons) ? card.override_reasons : [];
@@ -620,7 +622,11 @@ function BenchTrust({ bench }) {
       <dl className="bench-stats">
         <div>
           <dt>Success</dt>
-          <dd>{pct(card.success_rate)}{formatSuccessFraction(card.satisfied, total, skipped)}</dd>
+          {/* The percentage NEVER without its interval when the card records
+              one, and both halves from the SAME estimator (bench-v2 V1) — a
+              pooled `success_rate` beside a spec-mean interval is the pair
+              that printed 91.7% next to 97.5–99.9. */}
+          <dd>{benchSuccessText(card)}{benchSuccessDenominator(card)}</dd>
         </div>
         <div>
           <dt>Honest escalation</dt>
@@ -664,7 +670,6 @@ function BenchTrust({ bench }) {
 function BenchPublishedRow({ bench }) {
   if (bench === undefined || bench === null) return null; // loading / endpoint absent -> hide, same as BenchTrust
   const row = selectPublishedRun(bench);
-  const pct = (x) => (Number.isFinite(x) ? `${Math.round(x * 100)}%` : "—");
 
   if (!row) {
     return (
@@ -682,8 +687,8 @@ function BenchPublishedRow({ bench }) {
       {row.created_at && <span className="bench-published-item">{formatBenchDate(row.created_at)}</span>}
       <span className="bench-published-item">
         <span className="bench-published-dt">Success</span>{" "}
-        {pct(row.success_rate)}
-        {formatSuccessFraction(row.satisfied, row.total, row.skipped)}
+        {benchSuccessText(row)}
+        {benchSuccessDenominator(row)}
       </span>
       <span className="bench-published-item">
         <span className="bench-published-dt">Honest escalation</span>{" "}

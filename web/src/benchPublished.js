@@ -18,6 +18,19 @@ export function selectPublishedRun(bench) {
     satisfied: bench.satisfied,
     total: bench.total,
     skipped: bench.skipped,
+    // bench-v2 V1. Carried through explicitly because this projection is a
+    // WHITELIST: a field the backend publishes but this list omits is silently
+    // absent downstream, and `benchSuccessText` would then fall back to the
+    // pooled rate with no interval — publishing the exact bare percentage the
+    // interval exists to replace, on the one row labelled "trusted".
+    spec_mean_success_rate: bench.spec_mean_success_rate,
+    success_ci_low: bench.success_ci_low,
+    success_ci_high: bench.success_ci_high,
+    trials: bench.trials,
+    specs: bench.specs,
+    ran_specs: bench.ran_specs,
+    dead_specs: bench.dead_specs,
+    dead_spec_count: bench.dead_spec_count,
     honest_escalations: bench.honest_escalations,
     escalation_specs: bench.escalation_specs,
     honest_escalation_rate: bench.honest_escalation_rate,
@@ -54,4 +67,86 @@ export function publishedEscalationPct(row) {
     ? `${Math.round(row.honest_escalation_rate * 100)}%`
     : "—";
   return `${fallback} (denominator unknown)`;
+}
+
+// --------------------------------------------------------------------------
+// bench-v2 V1 review (SHOULD 4). Two defects, one root cause: this panel read
+// the card's aggregate as if every field were counted in SPECS. Two are not.
+// --------------------------------------------------------------------------
+
+const fin = (v) => typeof v === "number" && Number.isFinite(v);
+
+// `total`, `skipped` and `dead_specs` count recorded ROWS — one per
+// (spec, trial). Under `--trials 3` that is 3x the spec count, so a run that
+// loaded 20 specs of a 55-spec corpus rendered "Corpus coverage: 60 of 55
+// loaded": a filtered slice reading as MORE than the whole corpus, in the one
+// widget that exists to make under-coverage visible. `specs`, `ran_specs` and
+// `dead_spec_count` are the spec-wise counts the backend publishes for exactly
+// this comparison. The row fields stay as the fallback for a card written
+// before they existed — where rows and specs are the same number anyway, so
+// the fallback is not an approximation, it is the identity.
+export function benchSpecCounts(card) {
+  const rows = fin(card?.total) ? card.total : 0;
+  const skippedRows = fin(card?.skipped) ? card.skipped : 0;
+  const specs = fin(card?.specs) ? card.specs : rows;
+  const ranSpecs = fin(card?.ran_specs)
+    ? card.ran_specs
+    : Math.max(0, rows - skippedRows);
+  // A spec that died in one trial and ran in another is ONE dead spec, not
+  // three; `dead_specs` counts the rows. Same fallback rule.
+  const deadSpecs = fin(card?.dead_spec_count)
+    ? card.dead_spec_count
+    : (fin(card?.dead_specs) ? card.dead_specs : 0);
+  const neverRan = Math.max(0, specs - ranSpecs);
+  const trials = fin(card?.trials) && card.trials >= 1 ? card.trials : 1;
+  return {
+    specs, ranSpecs, deadSpecs, trials,
+    skippedSpecs: neverRan,
+    // Specs that yielded no measurement: never ran, or ran and burned nothing.
+    unmeasured: neverRan + deadSpecs,
+  };
+}
+
+// The headline percentage AND its interval, from ONE estimator.
+//
+// The backend's `success_headline` publishes the mean of per-spec means with a
+// Wilson interval carried onto the clustering-adjusted effective n. A panel
+// that prints `success_rate` (the pooled ROW rate) next to that interval
+// re-creates the exact defect the interval was added to fix — on a resumed
+// 12-spec run the two differ by eight points and the interval excludes the
+// percentage in front of it. Prefer `spec_mean_success_rate`; fall back to
+// `success_rate` only for a card written before it existed, where the two are
+// equal by construction.
+//
+// A card with no interval renders as a bare percentage and that is correct:
+// it never measured one, and inventing a range for it would be worse than
+// omitting it. `nh bench publish` refuses such a file separately.
+export function benchSuccessText(card) {
+  const rate = fin(card?.spec_mean_success_rate)
+    ? card.spec_mean_success_rate
+    : (fin(card?.success_rate) ? card.success_rate : null);
+  const base = rate === null ? "—" : `${Math.round(rate * 100)}%`;
+  const lo = card?.success_ci_low;
+  const hi = card?.success_ci_high;
+  if (!fin(lo) || !fin(hi)) return base;
+  return `${base} (95% CI ${(lo * 100).toFixed(1)}–${(hi * 100).toFixed(1)})`;
+}
+
+// What the percentage was measured over. At one trial per spec this is the
+// familiar `(satisfied/ran)` pair, now with the SPEC count as its denominator
+// rather than `total - skipped` in rows — identical at one trial, right at N.
+// Above one trial there is no honest integer numerator to print: `satisfied`
+// counts passing TRIALS (220 of 221) while the percentage in front is a mean
+// of per-spec means (91.7%), and rendering "220/12" or "220/221" beside it
+// invites the reader to check an arithmetic that does not hold. So the shape
+// of the sample is stated instead of a fraction that would not reduce to it.
+export function benchSuccessDenominator(card) {
+  const { specs, ranSpecs, skippedSpecs, trials } = benchSpecCounts(card);
+  if (!ranSpecs) return "";
+  if (trials > 1) return ` (over ${ranSpecs} specs × ${trials} trials)`;
+  // Through `formatSuccessFraction`, not a second copy of `${a}/${b}`: it owns
+  // the rule that the denominator is RAN (total minus skipped) and the rule
+  // that a non-finite input omits the fraction rather than printing a wrong
+  // one. What changes here is only the unit fed to it — specs, not rows.
+  return formatSuccessFraction(card?.satisfied, specs, skippedSpecs);
 }

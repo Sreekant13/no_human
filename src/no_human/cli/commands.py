@@ -4311,16 +4311,24 @@ def _slug(label: str) -> str:
     return slug or "run"
 
 
-def _spec_set_key(specs) -> str:
+def _spec_set_key(specs, trials: int = 1) -> str:
     """Short stable digest of which specs a run covers.
 
     Two runs with different spec sets must never share a checkpoint, whatever
     they are labelled: an unlabelled `--limit 1` probe and an unlabelled
     `--full` run both slug to "run", and the probe's clean completion deleted
     the full run's checkpoint. Keying on the spec set is what separates them.
+
+    `trials` joins the key for the same reason — a 3-trial run and a 1-trial
+    run over the SAME specs are different work, and a 1-trial run resuming the
+    3-trial checkpoint would drop two thirds of it on the floor and then unlink
+    it as "completed". It is folded in only when > 1 so every checkpoint
+    written before trials existed keeps its filename and stays resumable.
     """
     import hashlib
     ids = ",".join(sorted(s.id for s in specs))
+    if trials > 1:
+        ids += f"|trials={trials}"
     return hashlib.sha256(ids.encode()).hexdigest()[:8]
 
 
@@ -4406,8 +4414,15 @@ def _bench_cost_cell(cost_ratio: float | None) -> str:
                    "picked deterministically — the corpus's whole variety at a "
                    "fraction of the wall clock. Iteration signal only; a quick "
                    "card cannot publish as the baseline.")
+@click.option("--trials", default=1, type=click.IntRange(1, 20),
+              help="Replay EACH spec N times and record every trial. Default 1 "
+                   "= today's single-run behaviour. N>1 buys the two things a "
+                   "single run cannot give: a narrower confidence interval, "
+                   "and pass^N — the share of specs that pass EVERY trial, "
+                   "which is what separates a capability from a coin flip. "
+                   "Costs N× the wall clock and N× the tokens.")
 def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
-              quick):
+              quick, trials):
     """Replay bench specs through the REAL pipeline; score vs the originals."""
     import tempfile
 
@@ -4425,6 +4440,7 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
         NorthStarCard,
         northstar_gate,
         publish_refusals,
+        success_headline,
     )
     from ..review.reviewer import AdversarialReviewer
 
@@ -4527,7 +4543,8 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
         # cleanly" and its unlink() deleted the long run's only resumable state.
         # The label alone does not fix that — both default to "" — so the spec
         # set is what actually separates a probe from the corpus.
-        ckpt = RESULTS_DIR / f"progress-{_slug(label)}-{_spec_set_key(specs)}.json"
+        ckpt = (RESULTS_DIR
+                / f"progress-{_slug(label)}-{_spec_set_key(specs, trials)}.json")
         legacy_ckpt = RESULTS_DIR / "progress.json"
         if resume and not ckpt.exists() and legacy_ckpt.exists():
             # A run started before per-label checkpoints must stay resumable —
@@ -4560,8 +4577,30 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
                     f"[yellow]not resuming from {escape(legacy_ckpt.name)}: it holds "
                     f"{len(legacy_ids)} spec(s) from run "
                     f"'{escape(legacy.label or 'unlabelled')}' — left untouched[/]")
+        if resume and not ckpt.exists():
+            # `--trials` is part of the checkpoint key (see `_spec_set_key`), so
+            # changing it re-points --resume at a file that does not exist and
+            # the run starts from zero — silently, while the banked work sits
+            # on disk one filename away. Not adopted: those rows have a
+            # different denominator and folding them in is the double-count
+            # this key exists to prevent. But an operator about to re-pay for
+            # completed trials is entitled to know the bill is a flag change,
+            # not a lost checkpoint.
+            spec_ids = {s.id for s in specs}
+            stranded = 0
+            for other in RESULTS_DIR.glob(f"progress-{_slug(label)}-*.json"):
+                if other == ckpt:
+                    continue
+                oc = NorthStarCard.load(other)
+                if oc is None:
+                    continue
+                stranded += sum(1 for s in oc.scores if s.task_id in spec_ids)
+            if stranded:
+                console.print(
+                    f"[yellow]resume: {stranded} banked result(s) under a "
+                    f"different --trials are not resumed; re-running[/]")
         scores = []
-        done_ids: set = set()
+        done_keys: set = set()
         if resume and ckpt.exists():
             # Reload the partial run so a quota death doesn't waste completed
             # tasks (the expanded run died at 3/14 on "Stream closed"). Only
@@ -4571,18 +4610,48 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
             prev_card = NorthStarCard.load(ckpt)
             if prev_card is not None:
                 spec_ids = {s.id for s in specs}
-                scores = [sc for sc in prev_card.scores
-                          if sc.task_id in spec_ids]
-                done_ids = {sc.task_id for sc in scores}
-                foreign = [sc for sc in prev_card.scores
-                           if sc.task_id not in spec_ids]
+                # (task_id, trial) is the unit of work, so it is the unit a
+                # resume carries forward. Two rules keep a trials run from
+                # double-counting itself:
+                #   - a trial index at or beyond this run's --trials is FOREIGN
+                #     (resuming a 3-trial checkpoint with --trials 1 must not
+                #     import trials 1 and 2 into a card that claims one), and
+                #   - a (task_id, trial) already seen is dropped, so a
+                #     checkpoint that somehow holds a duplicate contributes one
+                #     score and not two. Without this the pass count for a spec
+                #     can exceed the trial count it is divided by.
+                scores = []
+                # Collected as a LIST, not derived as a count afterwards: a
+                # dropped duplicate is invisible to any after-the-fact key
+                # comparison (its key is in the kept set), and it is exactly
+                # the row an operator needs told about.
+                foreign = []
+                for sc in prev_card.scores:
+                    key = (sc.task_id, sc.trial)
+                    if (sc.task_id not in spec_ids or sc.trial >= trials
+                            or key in done_keys):
+                        foreign.append(sc)
+                        continue
+                    done_keys.add(key)
+                    scores.append(sc)
                 if foreign:
                     console.print(
                         f"[yellow]resume: ignoring {len(foreign)} checkpointed "
-                        "spec(s) not in this run — the spec set changed; check "
-                        "your --full/--limit/--specs-dir flags[/]")
-                console.print(f"[green]resuming — {len(done_ids)} spec(s) "
-                              "already scored[/]")
+                        "result(s) not in this run — the spec set or trial "
+                        "count changed; check your "
+                        "--full/--limit/--specs-dir/--trials flags[/]")
+                # The single-trial line is UNCHANGED, deliberately: it is what
+                # an operator greps for and what the existing resume test
+                # asserts, and "1 trial(s) across 1 spec(s)" says nothing extra
+                # when there is only ever one trial per spec.
+                if trials > 1:
+                    console.print(
+                        f"[green]resuming — {len(done_keys)} trial(s) already "
+                        f"scored across {len({k[0] for k in done_keys})} "
+                        f"spec(s)[/]")
+                else:
+                    console.print(f"[green]resuming — {len(done_keys)} spec(s) "
+                                  "already scored[/]")
         base_tmp = Path(tempfile.mkdtemp(prefix="nh-bench-"))
         # Bounded pool. Each spec already runs in its own sandbox clone +
         # workdir, so --parallel is a pure wall-clock lever; at the default of
@@ -4591,11 +4660,28 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
         pool = asyncio.Semaphore(parallel)
         ckpt_lock = asyncio.Lock()
 
-        async def _run_spec(spec):
+        async def _run_spec(spec, trial: int = 0):
             async with pool:
+                # Built outside the print: rich reads a bracketed span as
+                # markup, and an interpolated conditional is not a shape the
+                # print guard can prove safe. escape() covers both.
+                trial_bit = f"trial {trial + 1}/{trials} " if trials > 1 else ""
                 console.print(
-                    f"[dim]· {escape(spec.id)} {escape(spec.title[:60])}[/]")
-                wd = base_tmp / spec.id
+                    f"[dim]· {escape(spec.id)} {escape(trial_bit)}"
+                    f"{escape(spec.title[:60])}[/]")
+                # Trial 0 keeps the historical path so single-trial runs are
+                # byte-identical to today; later trials MUST get their own
+                # workdir or two concurrent trials of one spec share a sandbox
+                # clone and a bench.db.
+                # Concatenated, not f-string-interpolated: the escaping guard
+                # (tests/test_bench_print_escape.py) reads this region by LINE,
+                # so any line that interpolates the spec id into an f-string
+                # reads to it as a print that forgot to escape. Bluntness is
+                # the right call there — a path built in a print's shape is one
+                # refactor away from being one — so this stays out of that
+                # shape rather than arguing with the guard.
+                wd = base_tmp / (spec.id + ("" if trial == 0
+                                            else "-t" + str(trial)))
                 wd.mkdir(parents=True, exist_ok=True)
                 try:
                     score = await make_runner().run_one(spec, workdir=wd)
@@ -4639,6 +4725,12 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
                     ratio = _bench_cost_cell(score.cost_ratio)
                     console.print(
                         f"  {mark} {escape(spec.id)} {score.outcome_status} ({ratio})")
+                # Stamped HERE, not inside the runner: `run_one`'s signature is
+                # the seam every stubbed runner in the tests implements, and a
+                # new required argument there would break them all while adding
+                # nothing — the runner replays a spec, it does not know or care
+                # which repetition it is.
+                score.trial = trial
                 # Checkpoint after EVERY completion so a mid-run death (quota
                 # "Stream closed") never wastes the completed tasks — resume
                 # with --resume.
@@ -4646,13 +4738,18 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
                     scores.append(score)
                     NorthStarCard(scores=scores, created_at=_now_iso(),
                                   corpus_available=corpus_available,
+                                  trials=trials,
                                   label=label).save(ckpt)
 
+        # Spec-major: every trial of one spec, then the next spec. Under
+        # --parallel the pool interleaves them anyway; serially this keeps a
+        # spec's repeats adjacent in the log, which is where a flip is read.
         await asyncio.gather(
-            *(_run_spec(s) for s in specs if s.id not in done_ids))
+            *(_run_spec(s, t) for s in specs for t in range(trials)
+              if (s.id, t) not in done_keys))
 
         card = NorthStarCard(scores=scores, created_at=_now_iso(), label=label,
-                             corpus_available=corpus_available)
+                             corpus_available=corpus_available, trials=trials)
         prev_file = Path(prev_path) if prev_path else RESULTS_DIR / "latest.json"
         previous = NorthStarCard.load(prev_file)
         result = northstar_gate(card, previous, tier_expected=tier_expected)
@@ -4675,7 +4772,11 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
         ckpt.unlink(missing_ok=True)   # completed cleanly — no partial to resume
         agg = card.as_dict()["aggregate"]
         console.print(
-            f"[bold]success {agg['success_rate']:.0%}[/] · "
+            # The interval travels with the number everywhere it is printed.
+            # A bare "success 91%" in a terminal is what gets pasted into a
+            # README, and this run's own card is the only place that knows the
+            # interval — so the console must not be the surface that drops it.
+            f"[bold]success {escape(success_headline(card))}[/] · "
             f"median cost ratio {agg['median_cost_ratio']} · "
             f"corrections avoided {agg['corrections_avoided']} → "
             f"{out.relative_to(Path.cwd()) if out.is_relative_to(Path.cwd()) else out}")
@@ -4790,7 +4891,7 @@ def bench_publish(results_file: str, force: bool):
     """
     from ..eval.northstar_card import (
         REPORT_MD, RESULTS_DIR, NorthStarCard, publish_refusals,
-        published_file, render_northstar_md,
+        published_file, render_northstar_md, success_headline,
     )
     path = Path(results_file)
     if not path.exists():
@@ -4843,7 +4944,7 @@ def bench_publish(results_file: str, force: bool):
         # crash while the tracked report has already been replaced. A post-write
         # crash is strictly worse than the pre-write one this branch set out to fix.
         f"[green]published[/] {escape(card.label or path.name)} — "
-        f"success {agg['success_rate']:.0%} · "
+        f"success {escape(success_headline(card))} · "
         f"median cost ratio {agg['median_cost_ratio']} · "
         f"{agg['total_nh_tokens']:,} tokens → docs/NORTH_STAR_BENCH.md")
 

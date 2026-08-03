@@ -85,6 +85,12 @@ class BenchScore:
     expected_escalation: bool = False   # spec said: correct = honest stop
     subset: str = "full"                # "core" = hand-curated, PR-reviewed
     project: str = ""                   # repo basename — per-project payoff view
+    # Which repetition of this spec produced this score (0-based). A run with
+    # `--trials N` records N scores per spec, all sharing `task_id` and
+    # differing only here — so (task_id, trial) is the identity a checkpoint
+    # resumes on, and a single-trial run is exactly today's shape with every
+    # trial == 0.
+    trial: int = 0
     notes: str = ""
     # Capped digest of the run's event stream. bench.db dies with the
     # sandbox cleanup; the digest rides the score into progress.json /
@@ -150,6 +156,7 @@ class BenchScore:
             "expected_escalation": self.expected_escalation,
             "subset": self.subset,
             "project": self.project,
+            "trial": self.trial,
             "token_ratio": (round(self.token_ratio, 3)
                             if self.token_ratio is not None else None),
             "cost_ratio": (round(self.cost_ratio, 3)

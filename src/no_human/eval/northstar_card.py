@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from .vendor_terms import redact_for_publish
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +25,108 @@ from .northstar import BenchScore
 
 RESULTS_DIR = Path(__file__).resolve().parents[3] / "eval" / "results" / "northstar"
 REPORT_MD = Path(__file__).resolve().parents[3] / "docs" / "NORTH_STAR_BENCH.md"
+
+# Two-sided normal quantile for 95%. A literal, not scipy: the lean-stack rule
+# forbids adding a dependency for one number, and this one is fixed forever.
+WILSON_Z_95 = 1.959963984540054
+
+
+def wilson_interval(successes: int, n: int,
+                    z: float = WILSON_Z_95) -> tuple[float, float] | None:
+    """Wilson score interval for a binomial proportion, pure stdlib.
+
+    WHY WILSON AND NOT ±1.96·sqrt(p(1-p)/n): the normal (Wald) interval is the
+    one everybody writes and it is wrong exactly where this benchmark lives —
+    small n and a proportion near 1.0. At 49/54 Wald gives [0.83, 0.98], an
+    interval that runs off the end of the scale at 54/54 (width zero) and can
+    include values above 1. Wilson gives [0.80, 0.96], stays inside [0,1] by
+    construction, and never collapses to a point.
+
+        centre = (p̂ + z²/2n) / (1 + z²/n)
+        half   = z·sqrt(p̂(1-p̂)/n + z²/4n²) / (1 + z²/n)
+
+    Returns ``None`` for n == 0 — no observations is not a 0-width interval at
+    zero, and every caller must render "n/a" rather than a number it did not
+    measure.
+
+    VALIDATION RUNS FIRST (review C6). The n<=0 early return used to swallow a
+    NEGATIVE n as "nothing ran", so an n computed wrong — a subtraction that
+    went the wrong way, a count read from a field that was not there — returned
+    the same ``None`` as an honest empty run and was rendered as "n/a". A
+    negative count is not an absence of observations, it is a broken caller,
+    and it now says so where it happens rather than three surfaces downstream.
+    """
+    if n < 0:
+        raise ValueError(f"n {n} is negative — a count, not an absence")
+    if successes < 0 or successes > n:
+        raise ValueError(f"successes {successes} outside 0..{n}")
+    if n == 0:
+        return None
+    p = successes / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    centre = (p + z2 / (2 * n)) / denom
+    half = (z * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n))) / denom
+    # Clamp: the algebra keeps the interval inside [0,1] for every valid input,
+    # so this only bounds float error at the extremes (0/n and n/n).
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def intracluster_correlation(per_spec: dict[str, tuple[int, int]]) -> float:
+    """ρ̂ — how much of a trial's outcome is decided by WHICH SPEC it is.
+
+    Trials of one spec are not independent observations. A spec the agent can
+    do passes every trial; a spec it cannot fails every trial; and both are one
+    fact repeated N times, not N facts. Pooling them and handing the total to a
+    binomial interval is the "clustered data, unclustered interval" error, and
+    it is not a rounding-level one: a reviewer measured the pooled Wilson
+    interval covering the true corpus rate **49.6% of the time** at a nominal
+    95% — a coin flip wearing a confidence level.
+
+    ρ̂ is the ANOVA (one-way random effects) intraclass correlation, computed
+    from the per-spec pass counts in pure stdlib::
+
+        MSB = Σ nᵢ(ȳᵢ - ȳ)² / (k-1)          between specs
+        MSW = Σ nᵢȳᵢ(1-ȳᵢ) / (N-k)           within specs (binary shortcut)
+        m₀  = (N - Σnᵢ²/N) / (k-1)            trials per spec, size-adjusted
+        ρ̂   = (MSB - MSW) / (MSB + (m₀-1)MSW)
+
+    Clamped to [0, 1]: the estimator is unbiased and can therefore land
+    negative when specs vary LESS than chance, which is a sampling artefact and
+    not a reason to claim more information than there are observations.
+
+    THE TWO DEGENERATE CASES, and why each answers as it does:
+
+    - **fewer than two specs, or one trial each (N == k).** There is no
+      within-spec variation to measure, so ρ̂ is undefined. Returns 0.0 —
+      and the design effect it feeds is 1 + (m̄-1)·ρ̂, which is exactly 1
+      at one trial per spec whatever ρ̂ is, so the value is not load-bearing
+      there. This is what makes the single-trial reduction exact.
+    - **MSW == 0: every spec's trials agree unanimously.** Undefined by the
+      formula (0/0 once MSB is also 0), maximal clustering by inspection —
+      every repeat of a spec reproduced the first one. Returns 1.0, the
+      CONSERVATIVE answer: the trials are treated as adding no independent
+      information at all, which collapses the effective n back to one per
+      spec. Returning 0.0 here would hand a perfectly-repeatable corpus the
+      full row count and produce the tightest interval on the least
+      informative data — the exact inversion this function exists to stop.
+    """
+    groups = [(p, n) for p, n in per_spec.values() if n > 0]
+    k = len(groups)
+    total = sum(n for _, n in groups)
+    if k < 2 or total <= k:
+        return 0.0
+    grand = sum(p for p, _ in groups) / total
+    msb = sum(n * (p / n - grand) ** 2 for p, n in groups) / (k - 1)
+    # Σⱼ(yᵢⱼ - ȳᵢ)² == nᵢȳᵢ(1-ȳᵢ) == pᵢ(1 - pᵢ/nᵢ) for 0/1 outcomes.
+    msw = sum(p * (1 - p / n) for p, n in groups) / (total - k)
+    if msw <= 0:
+        return 1.0
+    m0 = (total - sum(n * n for _, n in groups) / total) / (k - 1)
+    denom = msb + (m0 - 1) * msw
+    if denom <= 0:
+        return 1.0
+    return min(1.0, max(0.0, (msb - msw) / denom))
 
 
 def published_file() -> Path:
@@ -56,6 +159,18 @@ class NorthStarCard:
     # the saved card and rendered at the top of the report: a forced publish is
     # allowed, but it must never be able to look like a clean one.
     override_reasons: list[str] = field(default_factory=list)
+    # How many times `nh bench run` replayed EACH spec (V1). 1 = today's
+    # single-run shape. 0 means UNKNOWN — set only by `load()` when the file on
+    # disk records no trials at all, i.e. it was written by a build that could
+    # not measure repeat variance. A card constructed in memory declares 1
+    # because that is what its scores are: one observation per spec.
+    trials: int = 1
+    # Did the file this card came from record a confidence interval? True for
+    # any card built in memory (the interval is computed from the scores on
+    # demand); False for a loaded file whose aggregate has no CI fields. A
+    # published number without an interval is the thing V1 exists to stop, and
+    # "the file said so" is the only way to tell after a round-trip.
+    ci_recorded: bool = True
 
     # ------------------------------ counts --------------------------------- #
 
@@ -78,6 +193,132 @@ class NorthStarCard:
     @property
     def success_rate(self) -> float:
         return self.satisfied / len(self.ran) if self.ran else 0.0
+
+    # ------------------------- trials (V1) ---------------------------------- #
+    # Every count above is over SCORES — one row per (spec, trial). With
+    # `--trials 3` that is three rows per spec, so a rule written against
+    # `len(ran)` silently triples its own denominator. The properties below
+    # count SPECS instead, and every floor/comparison that is about "how much
+    # of the corpus did we look at" uses them. For a single-trial run the two
+    # are identical, so nothing existing changes meaning.
+
+    @property
+    def spec_count(self) -> int:
+        """Distinct specs this card covers, however many trials each ran."""
+        return len({s.task_id for s in self.scores})
+
+    @property
+    def ran_spec_count(self) -> int:
+        """Distinct specs with at least one trial that was not skipped."""
+        return len({s.task_id for s in self.ran})
+
+    @property
+    def per_spec_passes(self) -> dict[str, tuple[int, int]]:
+        """``{task_id: (passes, trials_that_ran)}`` over non-skipped scores."""
+        out: dict[str, list[int]] = {}
+        for s in self.ran:
+            row = out.setdefault(s.task_id, [0, 0])
+            row[0] += 1 if s.goal_satisfied else 0
+            row[1] += 1
+        return {k: (v[0], v[1]) for k, v in out.items()}
+
+    @property
+    def spec_mean_success_rate(self) -> float:
+        """Corpus mean of PER-SPEC means — the headline under trials.
+
+        Differs from ``success_rate`` (which pools every trial) only when specs
+        ran unequal numbers of trials, e.g. a resumed run that died partway:
+        pooling then weights the specs that happened to run more often. With
+        balanced trials the two are identical, which is why the single-trial
+        number published so far does not move.
+        """
+        per = self.per_spec_passes
+        if not per:
+            return 0.0
+        return sum(p / n for p, n in per.values()) / len(per)
+
+    @property
+    def intracluster_correlation(self) -> float:
+        """ρ̂ over this card's specs — see the module function."""
+        return intracluster_correlation(self.per_spec_passes)
+
+    @property
+    def effective_n(self) -> float:
+        """The number of INDEPENDENT observations behind the headline.
+
+            m̄     = rows / S            trials per spec, actual
+            DEFF  = 1 + (m̄ - 1)·ρ̂       Kish's design effect
+            n_eff = max(S, rows / DEFF)
+
+        Rows, divided by how much each spec's trials duplicate one another.
+        The floor at S is not a fudge: at ρ̂ = 1 the algebra already gives
+        rows/m̄ = S exactly, so it only bounds float error and the ragged case
+        where m̄ is an average over unequal group sizes.
+
+        **REDUCTION AT ONE TRIAL, exactly.** With one trial per spec, rows == S,
+        so m̄ == 1 and DEFF == 1 + 0·ρ̂ == 1 IDENTICALLY — no dependence on ρ̂,
+        no floating-point path through it. n_eff == rows == S, the same
+        denominator the pooled interval used before this change, and
+        ``spec_mean_success_rate * S`` is ``satisfied`` because each per-spec
+        mean is 0 or 1. Every single-trial card therefore prints the interval
+        it printed before, to the bit.
+        """
+        specs = self.ran_spec_count
+        rows = len(self.ran)
+        if specs <= 0:
+            return 0.0
+        deff = 1.0 + (rows / specs - 1.0) * self.intracluster_correlation
+        if deff <= 0:
+            return float(specs)
+        return max(float(specs), rows / deff)
+
+    @property
+    def success_ci(self) -> tuple[float, float] | None:
+        """Wilson 95% interval on the SAME estimator the headline reports.
+
+        Point and interval must come from one estimator or the pair is not a
+        measurement — the headline is ``spec_mean_success_rate`` (the mean of
+        per-spec means, which is what survives uneven trials), so the interval
+        is that rate carried onto ``effective_n``, the row count discounted by
+        how much the trials of a spec repeat each other.
+
+        THIS USED TO BE THE POOLED PAIR — ``wilson_interval(satisfied, rows)``
+        — beside a spec-mean point estimate. Two defects in one line, both
+        measured: the interval was centred on a different number than the one
+        printed in front of it (a 12-spec resumed run printed 91.7% with an
+        interval of 97.5–99.9, which EXCLUDES its own point estimate), and
+        treating specs×trials rows as independent gave a nominal 95% interval
+        49.6% real coverage under clustering.
+        """
+        n = int(round(self.effective_n))
+        if n <= 0:
+            return None
+        # Clamped against float error only: the rate is a mean of per-spec
+        # means and so is already in [0, 1].
+        k = min(n, max(0, int(round(self.spec_mean_success_rate * n))))
+        return wilson_interval(k, n)
+
+    @property
+    def pass_k_rate(self) -> float | None:
+        """Fraction of specs that passed EVERY trial — reliability, not
+        capability. A corpus can score 90% mean and 60% pass^3: two thirds of
+        the specs are dependable and the rest are coin flips, and only this
+        number tells them apart. ``None`` when nothing ran."""
+        per = self.per_spec_passes
+        if not per:
+            return None
+        return sum(1 for p, n in per.values() if p == n) / len(per)
+
+    @property
+    def has_trials_metadata(self) -> bool:
+        """Does this card state how many times each spec was run? False only
+        for a file written before trials existed."""
+        return self.trials >= 1
+
+    @property
+    def has_ci(self) -> bool:
+        """Is there an interval to publish alongside the headline?"""
+        return self.ci_recorded and self.success_ci is not None
 
     # ------------------------------- cost ----------------------------------- #
 
@@ -113,6 +354,17 @@ class NorthStarCard:
         """Specs that ran but burned zero tokens — the SDK died before any model
         call. A skip is a decision and is excluded; this counts deaths only."""
         return sum(1 for s in self.ran if not s.nh_tokens)
+
+    @property
+    def dead_spec_count(self) -> int:
+        """Distinct SPECS with at least one dead trial.
+
+        ``dead_specs`` above counts ROWS, so under ``--trials 3`` one spec that
+        died every time reads as three. Any surface phrasing a count "of the
+        corpus" needs this one; the refusal fraction deliberately keeps using
+        the row count, because there it is rows ÷ rows and asking a different
+        question (how saturated was the backend, per attempt)."""
+        return len({s.task_id for s in self.ran if not s.nh_tokens})
 
     @property
     def total_nh_tokens(self) -> int:
@@ -177,6 +429,7 @@ class NorthStarCard:
     # ---------------------------- persistence ------------------------------- #
 
     def as_dict(self) -> dict[str, Any]:
+        ci = self.success_ci
         return {
             "created_at": self.created_at,
             "label": self.label,
@@ -184,6 +437,27 @@ class NorthStarCard:
                 "total": self.total, "skipped": self.skipped,
                 "satisfied": self.satisfied,
                 "success_rate": round(self.success_rate, 4),
+                # --- V1: trials & intervals -------------------------------- #
+                # ADDITIVE. Every field above keeps its meaning, so a card
+                # written here still loads into a reader that knows nothing of
+                # trials: a single-trial run has trials=1, spec_count==total
+                # and spec_mean_success_rate == success_rate.
+                "trials": self.trials,
+                "specs": self.spec_count,
+                "ran_specs": self.ran_spec_count,
+                "spec_mean_success_rate": round(self.spec_mean_success_rate, 4),
+                "success_ci_low": round(ci[0], 4) if ci else None,
+                "success_ci_high": round(ci[1], 4) if ci else None,
+                # The interval's own basis, recorded rather than left to be
+                # re-derived: a reader (or the web panel) cannot tell a tight
+                # interval earned by many independent specs from one asserted
+                # over rows that repeat each other, and n_eff is the whole
+                # difference. Equals `ran_specs` for every single-trial card.
+                "success_n_eff": round(self.effective_n, 2),
+                "intracluster_correlation": round(
+                    self.intracluster_correlation, 4),
+                "pass_k_rate": (round(self.pass_k_rate, 4)
+                                if self.pass_k_rate is not None else None),
                 "median_token_ratio": (round(self.median_token_ratio, 4)
                                        if self.median_token_ratio is not None
                                        else None),
@@ -196,6 +470,9 @@ class NorthStarCard:
                 # threshold saturation legible instead of leaving a reader to
                 # scan the per-task table for zeroes.
                 "dead_specs": self.dead_specs,
+                # Spec-wise companion to the row count above — what a "N of the
+                # corpus went unmeasured" sentence has to be counted in.
+                "dead_spec_count": self.dead_spec_count,
                 "total_nh_tokens": self.total_nh_tokens,
                 "total_orig_tokens": self.total_orig_tokens,
                 "corpus_available": self.corpus_available,
@@ -250,16 +527,92 @@ class NorthStarCard:
             expected_escalation=bool(s.get("expected_escalation", False)),
             subset=s.get("subset", "full"),
             project=s.get("project", ""),
+            trial=int(s.get("trial") or 0),
             notes=s.get("notes", ""),
             events=s.get("events") or [],
         ) for s in data.get("scores", [])]
+        agg = data.get("aggregate") or {}
         return NorthStarCard(scores=scores,
-                             corpus_available=int((data.get('aggregate') or {})
-                                                 .get('corpus_available') or 0),
+                             corpus_available=int(
+                                 agg.get('corpus_available') or 0),
+                             # 0 = the FILE said nothing about trials. Not
+                             # defaulted to 1: "we ran each spec once" and "we
+                             # have no idea how many times we ran each spec"
+                             # are different claims, and only the first may be
+                             # published. See `publish_refusals`.
+                             trials=int(agg.get("trials") or 0),
+                             # Presence, not truthiness: a legitimately null CI
+                             # (nothing ran) still means the writer recorded
+                             # one, and that card is refused for other reasons.
+                             ci_recorded="success_ci_low" in agg,
                              created_at=data.get("created_at", ""),
                              label=data.get("label", ""),
                              override_reasons=list(
                                  data.get("override_reasons") or []))
+
+
+def sample_phrase(card: NorthStarCard) -> str:
+    """The ``n=`` clause — a sentence about the run that is ARITHMETICALLY TRUE.
+
+    Three shapes, because a run has three, and the one string that used to
+    cover all of them told two lies:
+
+    - **balanced** — every ran spec got the same number of trials, and that
+      number is the one the card declares: ``n=54×3=162``. The multiplication
+      is checkable and it checks out.
+    - **uneven** — a resumed run, where specs carry different trial counts:
+      ``n=221 trials over 12 specs``. The old form printed ``n=12×20=221``,
+      whose left side is arithmetically false (12×20 is 240) and whose middle
+      term asserts every spec ran twenty times when one of them ran once. A
+      product is not available here, so none is printed.
+    - **trials unrecorded** — a file written before ``--trials`` existed:
+      ``n=3 specs (trials unrecorded)``. This used to print ``n=3×1=3``,
+      which states a trial count that nothing on the card measured. The one
+      thing such a file does know is how many specs it covered.
+    """
+    specs = card.ran_spec_count
+    rows = len(card.ran)
+    if card.trials < 1:
+        return f"n={specs} specs (trials unrecorded)"
+    counts = {n for _, n in card.per_spec_passes.values()}
+    if len(counts) == 1 and counts == {card.trials}:
+        return f"n={specs}×{card.trials}={rows}"
+    return f"n={rows} trials over {specs} specs"
+
+
+def success_headline(card: NorthStarCard) -> str:
+    """The success figure, NEVER as a bare percentage.
+
+    ``90.7% (95% CI 80.1–96.0, n=54×3=162) · pass^3 63.0%``
+
+    One function so the console line, the report and anything added later
+    cannot print three different headline numbers from the same card — the
+    single-run "≥90%" claim this replaces was quoted in four places and
+    measured in none of them. The interval is always shown: a percentage with
+    no interval is the failure mode, and 54 specs run once has an interval too
+    (it is just embarrassingly wide, which is the point).
+
+    ONE ESTIMATOR, both halves. The percentage is the mean of per-spec means
+    and so is the interval's centre (``success_ci`` carries it onto the
+    clustering-adjusted effective n). They were briefly different estimators —
+    a spec-mean point beside a pooled-row interval — which on a resumed
+    12-spec run printed ``91.7% (95% CI 97.5–99.9)``: an interval that does
+    not contain the number standing in front of it. Never derive either half
+    anywhere else.
+
+    pass^k is appended only when k > 1 — with one trial per spec it is
+    arithmetically identical to the mean and would read as corroboration it is
+    not.
+    """
+    pct = card.spec_mean_success_rate
+    ci = card.success_ci
+    if ci is None:
+        return f"{pct:.1%} (no interval — nothing ran)"
+    out = (f"{pct:.1%} (95% CI {ci[0] * 100:.1f}–{ci[1] * 100:.1f}, "
+           f"{sample_phrase(card)})")
+    if card.trials > 1 and card.pass_k_rate is not None:
+        out += f" · pass^{card.trials} {card.pass_k_rate:.1%}"
+    return out
 
 
 # A run must clear these before it may become the published baseline. They are
@@ -319,11 +672,16 @@ def corpus_shortfall(card: NorthStarCard, available_override: int = 0) -> str:
     a quick card structurally unpublishable as the baseline.
     """
     available = available_override or card.corpus_available
-    if not available or card.total >= available * MIN_CORPUS_LOADED_FRACTION:
+    # SPECS, not scores. `--trials 3` writes three scores per spec, so `total`
+    # would report a 19-spec slice of a 55-spec corpus as 57 loaded and this
+    # rule — the one that catches filtering to the specs that still resolve —
+    # would wave it through. Identical to `total` for a single-trial run.
+    loaded = card.spec_count
+    if not available or loaded >= available * MIN_CORPUS_LOADED_FRACTION:
         return ""
     return (
-        f"this run loaded {card.total} of {available} available spec(s) "
-        f"({card.total / available:.0%} < {MIN_CORPUS_LOADED_FRACTION:.0%}) — "
+        f"this run loaded {loaded} of {available} available spec(s) "
+        f"({loaded / available:.0%} < {MIN_CORPUS_LOADED_FRACTION:.0%}) — "
         f"a filtered slice cannot stand for the corpus, and filtering to the "
         f"specs that still resolve is exactly how a broken corpus reads as a "
         f"perfect one")
@@ -395,21 +753,50 @@ def publish_refusals(card: NorthStarCard,
             f"skipped or dead; too little of the benchmark was measured for "
             f"this run to be the baseline every later run is compared against")
 
-    if len(ran) < MIN_PUBLISHABLE_SPECS:
+    # SPECS, not scores: `--limit 3 --trials 4` measures 3 specs and would
+    # otherwise clear a 10-spec floor with 12 rows drawn from a probe.
+    if card.ran_spec_count < MIN_PUBLISHABLE_SPECS:
         reasons.append(
-            f"only {len(ran)} spec(s) ran (minimum {MIN_PUBLISHABLE_SPECS}) — "
-            f"a probe or a capped run is a slice, not the corpus")
+            f"only {card.ran_spec_count} spec(s) ran (minimum "
+            f"{MIN_PUBLISHABLE_SPECS}) — a probe or a capped run is a slice, "
+            f"not the corpus")
 
     # Compared on RAN, not total. Every headline — success_rate,
     # honest_escalation_rate, median_cost_ratio — is computed over ran, and
     # skipping is the documented dominant failure mode (the specs pin to local
     # repo paths). A run that loads 56 specs and skips 40 has the same `total`
     # as the baseline and would publish "100% success" measured over 16.
-    if previous is not None and len(ran) < len(previous.ran):
+    # Distinct specs on BOTH sides, so raising --trials cannot buy its way past
+    # a broader baseline (3 trials over 20 specs is 60 scores against a 55-spec
+    # baseline's 55 — narrower, and it would have read as broader).
+    if previous is not None and card.ran_spec_count < previous.ran_spec_count:
         reasons.append(
-            f"this run ran {len(ran)} spec(s) but the current baseline "
-            f"'{previous.label or 'unlabelled'}' ran {len(previous.ran)} — "
-            f"publishing would narrow what every later regression gate checks")
+            f"this run ran {card.ran_spec_count} spec(s) but the current "
+            f"baseline '{previous.label or 'unlabelled'}' ran "
+            f"{previous.ran_spec_count} — publishing would narrow what every "
+            f"later regression gate checks")
+
+    # V1. A published headline with no interval is the defect this whole
+    # mechanism exists to remove: "90.7%" from 54 single runs is [80%, 96%],
+    # and nothing on the card said so. These two refusals are what make the
+    # missing metadata visible instead of assumed.
+    #
+    # They fire on a card whose FILE recorded neither (written by a build that
+    # predates trials). `--force` still publishes it, and — as with every other
+    # refusal here — the reason is recorded in `override_reasons` and rendered
+    # in the report's warning banner, so a run published without an interval
+    # can never look like one that had it.
+    if not card.has_trials_metadata:
+        reasons.append(
+            "this results file records no trial count — it predates "
+            "`--trials`, so nothing here states how many times each spec was "
+            "run and the headline cannot be read as a measurement; re-run it "
+            "with `nh bench run --trials N`")
+    if not card.has_ci:
+        reasons.append(
+            "this results file carries no confidence interval on the success "
+            "rate — a bare percentage over a corpus this size is not a claim "
+            "anyone can check; re-run it so the card records its own interval")
 
     return reasons
 
@@ -510,9 +897,11 @@ def northstar_gate(current: NorthStarCard,
         # which is why the corpus_shortfall check above exists and this one is
         # not load-bearing for that case. Kept because a first run has no
         # baseline to be narrower than, so nothing else bounds a tiny one.
-        if len(current.ran) < MIN_PUBLISHABLE_SPECS:
+        # Distinct specs — see publish_refusals: trials multiply scores, and a
+        # floor counted on scores is bought by repeating a probe.
+        if current.ran_spec_count < MIN_PUBLISHABLE_SPECS:
             reasons.append(
-                f"only {len(current.ran)} spec(s) ran and there is no baseline "
+                f"only {current.ran_spec_count} spec(s) ran and there is no baseline "
                 f"to compare against (minimum {MIN_PUBLISHABLE_SPECS}) — a "
                 f"slice cannot become the reference for every later run")
         if reasons:
@@ -533,17 +922,26 @@ def northstar_gate(current: NorthStarCard,
         reasons.append(
             f"the baseline '{previous.label or 'unlabelled'}' measured no "
             f"specs — there is nothing to compare against")
-    if len(current.ran) < len(previous.ran):
+    if current.ran_spec_count < previous.ran_spec_count:
         reasons.append(
-            f"this run measured {len(current.ran)} spec(s) but the baseline "
-            f"'{previous.label or 'unlabelled'}' measured {len(previous.ran)} "
-            f"— a narrower run cannot establish 'no regression'")
+            f"this run measured {current.ran_spec_count} spec(s) but the "
+            f"baseline '{previous.label or 'unlabelled'}' measured "
+            f"{previous.ran_spec_count} — a narrower run cannot establish "
+            f"'no regression'")
 
-    drop = previous.success_rate - current.success_rate
+    # SPEC-MEAN, not the pooled row rate — the SAME estimator `success_headline`
+    # publishes, so the gate cannot pass a run whose published number dropped.
+    # They differ only when trials are uneven (a resumed run), and there the
+    # pooled rate weights whichever specs happened to run most often: 10 solid
+    # specs replayed 10× beside 10 broken ones replayed once pools to 91% —
+    # above a 90% baseline, gate green — while half the corpus is failing and
+    # the number the report prints is 50%. Gating on a figure no surface
+    # publishes is how a regression clears a regression gate.
+    drop = previous.spec_mean_success_rate - current.spec_mean_success_rate
     if drop > max_success_drop + 1e-9:
         reasons.append(
-            f"success rate dropped {previous.success_rate:.0%} → "
-            f"{current.success_rate:.0%}")
+            f"success rate dropped {previous.spec_mean_success_rate:.0%} → "
+            f"{current.spec_mean_success_rate:.0%}")
     for label, prev_r, cur_r in (
         ("token", previous.median_token_ratio, current.median_token_ratio),
         ("cost", previous.median_cost_ratio, current.median_cost_ratio),
@@ -590,6 +988,25 @@ def render_northstar_md(card: NorthStarCard,
     _gated_ok = sum(1 for s in _gated if s.goal_satisfied)
     _delivered = agg['satisfied'] - _gated_ok
     ratio = agg["median_token_ratio"]
+    # Three states, not two: a card can also record NO trial count (a file
+    # written before `--trials` existed). Saying "replayed once" there would be
+    # an assertion nothing measured — the same made-up precision this whole
+    # mechanism removes.
+    if card.trials > 1:
+        _trials_note = (
+            f"each spec was replayed {card.trials}× — the headline is the mean "
+            f"of the per-spec means, and **pass^{card.trials}** is the share of "
+            f"specs that passed EVERY trial (capability vs reliability); a spec "
+            f"that flips between trials is not one the agent can do")
+    elif card.trials == 1:
+        _trials_note = (
+            "each spec was replayed ONCE: the interval above is the whole of "
+            "what a single pass over this corpus supports, and it cannot tell "
+            "a spec the agent does reliably from one it got right this time")
+    else:
+        _trials_note = (
+            "**this run does not record how many times each spec was replayed** "
+            "— it predates `--trials`; read the headline as unverified")
     lines = [
         "# North-star benchmark — no_human vs the operator's real sessions",
         "",
@@ -629,8 +1046,19 @@ def render_northstar_md(card: NorthStarCard,
         "",
         "## Headline",
         "",
+        # The headline is the CI string, never a bare percentage (V1). The raw
+        # satisfied/ran pair stays in front of it — an interval is not a
+        # substitute for the counts it was computed from — but the number a
+        # reader quotes is now inseparable from its precision.
+        #
+        # The UNIT is named above one trial. That pair counts ROWS, so under
+        # `--trials 20` it reads "220/221" — 99.5% — beside a headline of
+        # 91.7%, and a reader with no unit on either has no way to tell that
+        # they are answering different questions (how many replays passed, vs
+        # how much of the corpus the agent can do). Naming it costs a word.
         f"- **Success (goal satisfied, unattended): {agg['satisfied']}/"
-        f"{agg['total'] - agg['skipped']} ran ({agg['success_rate']:.0%})**"
+        f"{agg['total'] - agg['skipped']}"
+        f"{' trials' if card.trials > 1 else ''} ran — {success_headline(card)}**"
         # "non-runnable" was true when EVERY skip came from spec.runnable=False,
         # decided at generation time. The dominant skip is now "repo missing at
         # run time" — the instrument breaking, not a spec that was never
@@ -641,6 +1069,7 @@ def render_northstar_md(card: NorthStarCard,
         f"  - of which {_delivered} DELIVERED a change and {_gated_ok} correctly "
         f"ESCALATED — 'satisfied' counts an honest refusal as the right outcome, "
         f"which it is, but only the first group shipped anything",
+        f"  - {_trials_note}",
         f"- **Median COST ratio (price-weighted, cache-aware): "
         f"{agg['median_cost_ratio'] if agg['median_cost_ratio'] is not None else 'n/a'}**"
         f" — over the {_priced} of {agg['total'] - agg['skipped']} ran spec(s) "
@@ -687,12 +1116,39 @@ def render_northstar_md(card: NorthStarCard,
     for s in core_scores:
         ratio_s = (f"{s.cost_ratio:.2f}" if s.cost_ratio else "—")
         sat = {True: "✅", False: "❌", None: "—"}[s.goal_satisfied]
+        # One row per TRIAL under --trials, so the trial has to be in the cell
+        # or the table reads as N duplicate rows of the same spec disagreeing
+        # with themselves.
+        task_cell = (f"{s.task_id} #{s.trial + 1}" if card.trials > 1
+                     else s.task_id)
         lines.append(
-            f"| {s.task_id} | {s.outcome_status} | {sat} | {s.nh_tokens:,} | "
+            f"| {task_cell} | {s.outcome_status} | {sat} | {s.nh_tokens:,} | "
             f"{s.orig_tokens:,} | {ratio_s} | {s.orig_corrections} | "
             f"{redact_for_publish(s.notes or '')[:80].replace('|', '/')} |")
     if hidden:
         lines.append(f"\n_{hidden} non-core task(s) included in the aggregates only (privacy: raw corpus rows never enter git)._")
+
+    # Per-spec pass counts — the reliability view the pass^k headline is a
+    # summary OF. Core specs only, same privacy rule as the table above.
+    if card.trials > 1:
+        per = card.per_spec_passes
+        core_ids = sorted({s.task_id for s in core_scores})
+        if core_ids:
+            lines += ["", f"## Per-spec reliability ({card.trials} trials)", "",
+                      "A spec at 1/3 or 2/3 is not a capability, it is a coin "
+                      "flip; only n/n is something the agent can be relied on "
+                      "to do.", "",
+                      "| task | passed | flaky |", "|---|---|---|"]
+            for tid in core_ids:
+                passes, ran_n = per.get(tid, (0, 0))
+                # A spec skipped in every trial has no row in `per_spec_passes`
+                # at all, and "0/0" renders it as a spec that ran and failed —
+                # a measured zero, which is the opposite of what happened. The
+                # dominant skip cause here is a repo missing at run time, so
+                # this cell is common, not exotic.
+                cell = f"{passes}/{ran_n}" if ran_n else "— (not measured)"
+                flaky = "⚠ flips" if 0 < passes < ran_n else ""
+                lines.append(f"| {tid} | {cell} | {flaky} |")
 
     # Per-project view (the operator's suite spans multiple real repos — show
     # cost/quality by project). Aggregate-only (repo name + counts + median

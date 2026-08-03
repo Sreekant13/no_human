@@ -116,7 +116,28 @@ hour to review.
   local repo paths, so `nh bench run` skips them on your machine. The harness is
   reusable, the corpus is not. Success rate also moves several points between
   runs on identical specs because the coder is non-deterministic, so treat any
-  single figure as a point estimate rather than a score.
+  single figure as a point estimate rather than a score. The card now says so
+  in its own numbers: `nh bench run --trials N` replays each spec N times, and
+  the three surfaces that print the headline in this repo — the `bench run`
+  console line, the `bench publish` console line and the published report —
+  take it from one function (`success_headline` in
+  [`eval/northstar_card.py`](../src/no_human/eval/northstar_card.py)), so none
+  of them can print the percentage without its Wilson 95% interval and its `n`.
+  The web Stats panel is the one surface that does NOT call it — it renders the
+  interval the card recorded, over the API — so it agrees by carrying the same
+  fields rather than by construction.
+  `pass^N` — the share of specs that passed EVERY trial, which is what
+  separates a capability from a coin flip — rides with it above one trial.
+  A results file that records neither is refused by `nh bench publish` unless a
+  human overrides it, and the override is printed at the top of the report.
+  Two honest limits on that interval, because it is easy to over-read:
+  it is computed on the **effective** n, not the row count — trials of one spec
+  are correlated, so `specs × trials` rows are worth somewhere between `specs`
+  and `specs × trials` independent observations and the card discounts them by
+  the measured intracluster correlation (a nominal 95% interval over pooled
+  rows covered the true rate about half the time). And it bounds SAMPLING error
+  only: it says nothing about whether this corpus resembles your work, which is
+  the limit the first three sentences of this bullet are about.
 - **No dollar figure is a billed number.** Every task carries an enforced spend
   cap, and the cap is denominated in **cost-weighted** tokens, not raw ones: a
   cache read counts 0.1 of a fresh input token and a cache write 1.25

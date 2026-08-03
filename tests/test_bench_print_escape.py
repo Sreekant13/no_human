@@ -14,7 +14,13 @@ SRC = Path(__file__).resolve().parents[1] / "src/no_human/cli/commands.py"
 def _bench_loop_region(text: str) -> str:
     # The bench loop body now lives in `_run_spec` (the --parallel pool
     # worker); same prints, same escaping obligations.
-    start = text.index("async def _run_spec(spec):")
+    # Anchored on the `def` line, not on its parameter list: `_run_spec` gained a
+    # `trial` argument for `--trials`, and an anchor that spelled out the old
+    # signature took the whole region with it — every test in this file died
+    # with ValueError instead of checking a single print. A guard that a
+    # routine signature change can silence is a guard that will be silent when
+    # it matters.
+    start = text.index("async def _run_spec(")
     end = text.index("def bench_report", start)
     return text[start:end]
 
@@ -65,7 +71,8 @@ def test_spec_id_prints_are_escaped():
 #: scope to get wrong.
 _PROVABLY_SAFE = {
     # ints — counts computed in this module, never model- or file-authored
-    "runnable", "loaded",
+    # (`stranded`: rows counted out of checkpoint cards by this function)
+    "runnable", "loaded", "stranded",
     # aggregate metrics: floats/ints out of card.as_dict()["aggregate"]
     "agg['success_rate']", "agg['median_cost_ratio']",
     "agg['total_nh_tokens']", "agg['corrections_avoided']",

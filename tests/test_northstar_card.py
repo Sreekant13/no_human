@@ -578,8 +578,13 @@ def test_the_report_discloses_that_corpus_resolution_is_MACHINE_LOCAL():
     # is real, not hypothetical.
     # Locate by the LABEL, not the bullet's prose: rewording "Success (goal
     # satisfied, unattended)" is harmless and must not fail this test.
+    # `" ran "`, not `"ran ("`: the success figure is no longer a bare
+    # percentage in parentheses — it is `N/M ran — 91.7% (95% CI …, n=…)` — and
+    # the old locator was matching the punctuation of that percentage rather
+    # than the label it claims to anchor on. The two assertions below still
+    # bind the label itself, so this stays non-vacuous.
     headline = [ln for ln in md.split("\n")
-                if "skipped (" in ln and "ran (" in ln]
+                if "skipped (" in ln and " ran " in ln]
     assert headline, md[:400]
     assert "skipped (not measured)" in headline[0], headline[0]
     assert "skipped (not measured)" in block, (

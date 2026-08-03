@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { selectPublishedRun, publishedEscalationPct, formatSuccessFraction } from "./benchPublished.js";
+import { selectPublishedRun, publishedEscalationPct, formatSuccessFraction,
+         benchSpecCounts, benchSuccessText, benchSuccessDenominator } from "./benchPublished.js";
 
 const publishedBaseline = {
   published: true,
@@ -23,6 +24,19 @@ test("published baseline yields the trusted figures", () => {
     escalation_specs: 15,
     honest_escalation_rate: 0.77,
     median_cost_ratio: 0.107,
+    // bench-v2 V1 fields. `undefined` here because this fixture is a
+    // pre-trials card — the point of the deepEqual is that the projection is
+    // an exhaustive whitelist, so a new field the backend publishes and this
+    // list forgets shows up as a FAILURE here rather than as a silently bare
+    // percentage in the panel.
+    spec_mean_success_rate: undefined,
+    success_ci_low: undefined,
+    success_ci_high: undefined,
+    trials: undefined,
+    specs: undefined,
+    ran_specs: undefined,
+    dead_specs: undefined,
+    dead_spec_count: undefined,
   });
   assert.equal(publishedEscalationPct(row), "87% (13/15)");
 });
@@ -82,4 +96,116 @@ test("escalation with zero denominator does not fake 100%", () => {
   assert.equal(publishedEscalationPct(row2), "— (denominator unknown)");
 
   assert.equal(publishedEscalationPct(null), "—");
+});
+
+// ---------------------------------------------------------------------------
+// bench-v2 V1 review (SHOULD 4): the panel read ROW counts as SPEC counts, and
+// printed a percentage with no interval beside a card that records one.
+// ---------------------------------------------------------------------------
+
+// 20 specs of a 55-spec corpus, replayed 3x. `total` is 60 ROWS.
+const trialsRun = {
+  published: true,
+  label: "v16", created_at: "2026-08-03T00:00:00+00:00",
+  total: 60, skipped: 0, satisfied: 44, dead_specs: 3, dead_spec_count: 1,
+  trials: 3, specs: 20, ran_specs: 20, corpus_available: 55,
+  success_rate: 0.7333, spec_mean_success_rate: 0.7333,
+  success_ci_low: 0.5089, success_ci_high: 0.8781,
+};
+
+test("corpus coverage is counted in SPECS: 20 of 55, never 60 of 55", () => {
+  const { specs } = benchSpecCounts(trialsRun);
+  assert.equal(specs, 20);
+  assert.equal(`${specs} of ${trialsRun.corpus_available} loaded`, "20 of 55 loaded");
+  // The bug: `total` is rows, so the panel rendered a filtered 20-spec slice
+  // as MORE than the whole 55-spec corpus — and `total < corpus` (the
+  // under-coverage alarm) was false, so it alarmed on nothing.
+  assert.ok(trialsRun.total > trialsRun.corpus_available, "precondition: rows exceed the corpus");
+  assert.ok(specs < trialsRun.corpus_available, "specs must trip the under-coverage alarm");
+});
+
+test("a dead spec is one spec, not one per trial", () => {
+  const { deadSpecs, unmeasured } = benchSpecCounts(trialsRun);
+  assert.equal(deadSpecs, 1, "3 dead ROWS are one spec that died in all three trials");
+  assert.equal(unmeasured, 1);
+});
+
+test("a pre-trials card falls back to the row fields, which ARE its spec counts", () => {
+  // Not an approximation: at one trial per spec, rows and specs are the same
+  // number, so the fallback is exact and today's rendering does not move.
+  const { specs, ranSpecs, deadSpecs, unmeasured, trials } = benchSpecCounts(publishedBaseline);
+  assert.equal(specs, 57);
+  assert.equal(ranSpecs, 57);
+  assert.equal(deadSpecs, 0);
+  assert.equal(unmeasured, 0);
+  assert.equal(trials, 1);
+});
+
+test("benchSpecCounts on an absent/empty card never throws and never invents", () => {
+  assert.deepEqual(benchSpecCounts(null),
+    { specs: 0, ranSpecs: 0, deadSpecs: 0, trials: 1, skippedSpecs: 0, unmeasured: 0 });
+  assert.deepEqual(benchSpecCounts({}),
+    { specs: 0, ranSpecs: 0, deadSpecs: 0, trials: 1, skippedSpecs: 0, unmeasured: 0 });
+});
+
+test("skipped specs count as unmeasured, in specs", () => {
+  const partly = { total: 30, skipped: 12, specs: 10, ran_specs: 6, trials: 3,
+                   dead_spec_count: 1 };
+  const { specs, ranSpecs, skippedSpecs, unmeasured } = benchSpecCounts(partly);
+  assert.equal(specs, 10);
+  assert.equal(ranSpecs, 6);
+  assert.equal(skippedSpecs, 4);
+  assert.equal(unmeasured, 5, "4 never ran + 1 ran and burned nothing");
+});
+
+test("the success figure carries its interval when the card records one", () => {
+  assert.equal(benchSuccessText(trialsRun), "73% (95% CI 50.9–87.8)");
+});
+
+test("point estimate and interval come from the SAME estimator", () => {
+  // The defect, as the reviewer drove it: 11 specs x 20 passing trials plus one
+  // spec that got a single failing trial. The pooled ROW rate is 99.5%; the
+  // published figure is the mean of per-spec means, 91.7%, and the interval
+  // belongs to THAT. A panel reading `success_rate` would print 100% beside an
+  // interval computed for 91.7%.
+  const resumed = {
+    total: 221, skipped: 0, satisfied: 220, specs: 12, ran_specs: 12, trials: 20,
+    success_rate: 0.9955, spec_mean_success_rate: 0.9167,
+    success_ci_low: 0.6461, success_ci_high: 0.9851,
+  };
+  assert.equal(benchSuccessText(resumed), "92% (95% CI 64.6–98.5)");
+  assert.notEqual(Math.round(resumed.success_rate * 100), Math.round(resumed.spec_mean_success_rate * 100));
+});
+
+test("a card with no interval renders a bare percentage rather than an invented range", () => {
+  assert.equal(benchSuccessText(publishedBaseline), "46%");
+  assert.equal(benchSuccessText({ success_ci_low: 0.5 }), "—", "half an interval is no interval");
+  assert.equal(benchSuccessText(null), "—");
+});
+
+test("the denominator is stated in SPECS, and states the sample shape under trials", () => {
+  // One trial per spec: the familiar pair, with `ran_specs` as its denominator
+  // instead of `total - skipped` in rows. Identical here, right under --trials.
+  assert.equal(benchSuccessDenominator(publishedBaseline), " (26/57)");
+  // Above one trial `satisfied` counts passing TRIALS (220 of 221) while the
+  // percentage in front is a mean of per-spec means — no fraction between them
+  // reduces, so none is printed.
+  assert.equal(benchSuccessDenominator(trialsRun), " (over 20 specs × 3 trials)");
+  assert.equal(benchSuccessDenominator({}), "");
+});
+
+test("the published row carries the interval fields through the whitelist", () => {
+  // selectPublishedRun projects a fixed key list; a field it forgets is absent
+  // downstream and benchSuccessText silently falls back to a bare pooled
+  // percentage — on the one row labelled "last published run".
+  const row = selectPublishedRun(trialsRun);
+  assert.equal(row.spec_mean_success_rate, 0.7333);
+  assert.equal(row.success_ci_low, 0.5089);
+  assert.equal(row.success_ci_high, 0.8781);
+  assert.equal(row.specs, 20);
+  assert.equal(row.ran_specs, 20);
+  assert.equal(row.trials, 3);
+  assert.equal(row.dead_spec_count, 1);
+  assert.equal(benchSuccessText(row), "73% (95% CI 50.9–87.8)");
+  assert.equal(benchSuccessDenominator(row), " (over 20 specs × 3 trials)");
 });
