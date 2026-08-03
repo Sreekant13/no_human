@@ -1669,6 +1669,126 @@ def test_a_missing_reference_capture_fails_closed(tmp_path):
     assert any("frames-cli" in p for p in problems)
 
 
+# --------------------------------------------------------------------------- #
+# verify_sync — the freeze gate                                                #
+# --------------------------------------------------------------------------- #
+
+#: freezedetect's real output shape. The LAST freeze deliberately has no
+#: `freeze_end`: a hold that runs to end-of-stream is never closed, and that is
+#: the hold a cut is most likely to have.
+FREEZE_LOG = """\
+[Parsed_freezedetect_0 @ 0x1] lavfi.freezedetect.freeze_start: 12.5
+[Parsed_freezedetect_0 @ 0x1] lavfi.freezedetect.freeze_duration: 3.2
+[Parsed_freezedetect_0 @ 0x1] lavfi.freezedetect.freeze_end: 15.7
+[Parsed_freezedetect_0 @ 0x1] lavfi.freezedetect.freeze_start: 70
+"""
+
+
+def test_the_freeze_probe_does_not_silence_the_thing_it_reads():
+    """Same defect `silence_args` documents, same shape of fix: freezedetect
+    reports at INFO level, so `-v error` returns an empty log — which this
+    module would read as "nothing was frozen" and, one-way, as a pass."""
+    args = vs.freeze_args(Path("/x/demo.mp4"))
+    assert "error" not in args, args
+    assert "-hide_banner" in args and "-nostats" in args
+    joined = " ".join(args)
+    assert f"freezedetect=n={vs.FREEZE_NOISE}:d={vs.FREEZE_MIN}" in joined
+    assert "-map 0:v" in joined and "-f null" in joined
+    # The opening pass is the same filter at a shorter minimum hold.
+    opening = " ".join(vs.freeze_args(Path("/x/demo.mp4"),
+                                      min_dur=vs.FREEZE_OPENING_MIN))
+    assert f"d={vs.FREEZE_OPENING_MIN}" in opening
+
+
+def test_a_freeze_that_runs_to_the_end_of_the_stream_is_still_a_freeze():
+    """The one freezedetect never closes. Dropping it is how this gate would
+    have passed the very file it exists to refuse — a cut whose last shot is
+    held dead to the fade."""
+    found = vs.freezes(FREEZE_LOG, duration=81.0)
+    assert found == ((12.5, 3.2), (70.0, 11.0)), found
+    # A log with nothing in it means nothing was frozen, not a parse failure.
+    assert vs.freezes("", 81.0) == ()
+
+
+def test_the_opening_rule_can_actually_fire():
+    """A rule that cannot fire is not a rule.
+
+    With a single detection pass at `FREEZE_MIN`, "any freeze in the first ten
+    seconds" could never catch anything "any freeze >= 2 s" had not already
+    caught — it would be dead code that reads like a guarantee. The opening
+    pass exists to make it real, so its minimum must be strictly shorter.
+    """
+    assert vs.FREEZE_OPENING_MIN < vs.FREEZE_MIN
+    assert vs.FREEZE_OPENING > 0
+    # A 0.8 s hold at 3 s: invisible to the main pass, caught by the opening.
+    assert vs.freezes("freeze_start: 3.0\nfreeze_duration: 0.8\n"
+                      "freeze_end: 3.8\n", 81.0) == ((3.0, 0.8),)
+
+
+def test_localized_motion_and_a_global_shift_are_told_apart():
+    """`drift_share` is the whole reason the freeze verdict means anything.
+
+    Two frames, 4 pixels each. Localized: one pixel changes a lot. Global: all
+    four change by the same small amount — which is what a push-in, a pan or a
+    luma ramp does, and what silences freezedetect while nothing happens.
+    """
+    base = bytes([100, 100, 100] * 4)
+    local = bytes([100, 100, 100] * 3 + [200, 200, 200])
+    mean, moved = vs.drift_share(base, local)
+    assert moved == 0.25
+    assert mean == pytest.approx(100 * 3 / 12)
+
+    drift = bytes([112, 112, 112] * 4)
+    mean, moved = vs.drift_share(base, drift)
+    assert moved == 1.0, "every pixel moved — that is a transform, not a UI"
+    assert mean == pytest.approx(12.0)
+
+    # THE CHEAP DRIFT, which is the case the first draft of this check got
+    # wrong: one level per frame silences freezedetect (its floor is
+    # FREEZE_NOISE, ~0.8/255) while moving NO pixel by `LOCAL_DELTA`. It must
+    # land under the floor, not be mistaken for real motion.
+    cheap = bytes([101, 101, 101] * 4)
+    mean, moved = vs.drift_share(base, cheap)
+    assert mean > vs.FREEZE_NOISE * 255, "it does silence freezedetect"
+    assert moved < vs.MIN_MOVED_SHARE, "and it moves nothing a viewer sees"
+
+    assert vs.drift_share(base, base) == (0.0, 0.0)
+    with pytest.raises(ValueError):
+        vs.drift_share(b"\x00", b"\x00\x00")
+    with pytest.raises(ValueError):
+        vs.drift_share(b"", b"")
+
+
+def test_the_motion_thresholds_leave_room_between_real_and_manufactured():
+    """The two arms must not overlap, or a frame is both dead and global."""
+    assert 0 < vs.MIN_MOVED_SHARE < vs.DRIFT_MOVED_MAX < 1.0
+    assert vs.LOCAL_DELTA > vs.FREEZE_NOISE * 255, (
+        "a pixel must have to move MORE than freezedetect's own floor to "
+        "count as moved, or the two instruments are measuring one thing")
+    # The window is long enough that a legitimate hold between two UI changes
+    # is not read as a dead frame — measured: judging a single consecutive
+    # pair failed a genuinely moving clip 5 times in 6.
+    assert vs.FREEZE_WINDOW >= 10.0 / nr.FPS
+
+
+def test_the_freeze_gate_reads_two_frames_a_window_apart_not_one():
+    a = " ".join(vs.frame_at_args(Path("/x.mp4"), 10.0))
+    b = " ".join(vs.frame_at_args(Path("/x.mp4"), 10.0 + vs.FREEZE_WINDOW))
+    assert "-ss 10.000" in a and f"-ss {10.0 + vs.FREEZE_WINDOW:.3f}" in b
+    assert f"scale={vs.THUMB_W}:{vs.THUMB_H}" in a
+    assert "-frames:v 1" in a and "-pix_fmt rgb24" in a
+
+
+def test_the_freeze_gate_runs_on_every_verified_clip():
+    """It is wired into `verify`, not left as a function nobody calls. The
+    published cut was 94% frozen with every other check in this module green;
+    a freeze gate that exists and is not invoked would reproduce that exactly.
+    """
+    import inspect
+    src = inspect.getsource(vs.verify)
+    assert "check_freeze(" in src, "verify does not run the freeze gate"
+
+
 def test_the_shipping_cut_refuses_the_fallback_voice(tmp_path, monkeypatch):
     """`say` may RUN the recorder on a bare checkout; it may not PUBLISH.
 
