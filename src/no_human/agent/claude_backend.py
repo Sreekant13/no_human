@@ -86,6 +86,21 @@ _TRANSPORT_RETRY_DELAY_S = 5.0
 TRANSPORT_DIAGNOSIS_MARKER = "[transport]"
 
 
+def dewrap(text: str) -> str:
+    """Every run of whitespace collapsed to a single space.
+
+    Exported, not private, because TWO modules must agree about it: this
+    backend decides whether to RETRY a transport death, and
+    ``orchestrator._classify_error`` decides what to CALL it. The comment on
+    ``_TRANSPORT_FAILURE_MARKERS`` above says those two must not disagree
+    about the same failure — and they did, the moment one of them started
+    reading ``Stream\\nclosed`` as the message it plainly is and the other
+    still read it literally. One function, imported by both, is the only
+    version of that agreement that cannot drift.
+    """
+    return " ".join(text.split())
+
+
 def _opening_span(text: str) -> tuple[str, int]:
     """``(haystack, opening_len)`` — the text's opening, de-wrapped.
 
@@ -111,9 +126,8 @@ def _opening_span(text: str) -> tuple[str, int]:
         start += 1
     if start >= len(lines):
         return "", 0
-    opening = " ".join(lines[start].split())
-    following = (
-        " ".join(lines[start + 1].split()) if start + 1 < len(lines) else "")
+    opening = dewrap(lines[start])
+    following = dewrap(lines[start + 1]) if start + 1 < len(lines) else ""
     return f"{opening} {following}".strip(), len(opening)
 
 
@@ -1002,7 +1016,11 @@ class ClaudeBackend:
             return first
 
         where = describe_concurrency()
-        reason = (first.final_text or "").strip().splitlines()[0][:200]
+        # The de-wrapped opening, not `splitlines()[0]`: the shape that made
+        # this retry fire may be a message a terminal broke in half, and
+        # "nested Agent SDK session died in the transport (Stream)" tells the
+        # operator nothing about which death it was.
+        reason = _opening_span((first.final_text or "").strip())[0][:200]
         for attempt in range(_TRANSPORT_RETRIES):
             if on_event is not None:
                 on_event(AgentEvent(

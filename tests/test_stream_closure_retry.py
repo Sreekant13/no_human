@@ -311,6 +311,30 @@ async def test_the_retry_is_never_silent(tmp_path, monkeypatch):
         retry.meta["concurrency"]
 
 
+async def test_the_retry_reason_survives_a_wrapped_first_line(
+        tmp_path, monkeypatch):
+    """The operator-visible half of the de-wrapping fix.
+
+    The reason was `splitlines()[0]`, so the very shape the retry now catches
+    rendered as `died in the transport (Stream)` — a word, not a cause. It
+    goes into the event text, the event meta, and from there into `nh watch`
+    and the event log, which is where someone reconstructs an incident.
+    """
+    q, _ = _query_yielding(_rm(True, "Stream\nclosed unexpectedly by consumer"))
+    monkeypatch.setattr(claude_backend, "query", q)
+    monkeypatch.setattr(claude_backend, "_TRANSPORT_RETRY_DELAY_S", 0.0)
+    seen = []
+
+    await ClaudeBackend(model="m").run(
+        "go", cwd=tmp_path, max_turns=3, on_event=seen.append)
+
+    retry = next(e for e in seen if e.kind == "transport_retry")
+    assert retry.meta["reason"] == "Stream closed unexpectedly by consumer"
+    assert "Stream closed unexpectedly by consumer" in retry.text
+    # The control on the control: not merely "longer than one word".
+    assert retry.meta["reason"] != "Stream"
+
+
 async def test_the_dead_sessions_spend_is_not_lost(tmp_path, monkeypatch):
     """A retried run is TWO bills. `run()` returns one AgentResult and that is
     what reaches `attempts.tokens_used`, so a retry that reset the ledger would

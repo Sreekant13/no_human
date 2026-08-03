@@ -35,6 +35,7 @@ from ..agent.claude_backend import (
     TRANSPORT_DIAGNOSIS_MARKER as _TRANSPORT_BLOCKER_MARKER,
     AgentEvent,
     ClaudeBackend,
+    dewrap as _dewrap,
 )
 from ..agent.scope_guard import SCRATCH_DIR, is_agent_owned
 from ..agent.supervisor import SupervisorHook
@@ -591,7 +592,13 @@ def _classify_error(stop_reason: str | None, text: str,
         return "rate_limited"
     if stop == "max_turns" or "maximum number of turns" in t:
         return "max_turns"
-    if "stream closed" in t or "connection error" in t or "timed out" in t:
+    # De-wrapped, because `claude_backend.is_transport_failure` is: a break or
+    # a doubled space inside "Stream closed" must not make the retry loop and
+    # this classifier disagree about the same failure (the reason
+    # `_TRANSPORT_FAILURE_MARKERS` carries "connection error" at all).
+    flat = _dewrap(t)
+    if ("stream closed" in flat or "connection error" in flat
+            or "timed out" in flat):
         return "infra"
     return "error"
 
