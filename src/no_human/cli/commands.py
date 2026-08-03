@@ -4113,11 +4113,14 @@ def eval_cmd(prev_path, out_path, gate):
 def bench():
     """North-star benchmark: replay the operator's REAL historical tasks.
 
+    \b
     build  → specs from conversation history (no-cheat: initial request only);
     run    → replay through the real pipeline in push-proof sandboxes,
              recording <label>-<stamp>.json — publishing nothing;
     publish→ promote one results file to the baseline + the committed report;
-    report → re-render docs/NORTH_STAR_BENCH.md from the published baseline.
+    report → re-render docs/NORTH_STAR_BENCH.md from results/latest.json, the
+             LATEST SAVED RESULTS — NOT the published baseline, which is a
+             separate file only a clean publish writes.
     """
 
 
