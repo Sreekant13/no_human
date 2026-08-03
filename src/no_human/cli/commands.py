@@ -2763,13 +2763,27 @@ def autonomy(days):
 @cli.command("recall")
 @click.argument("query")
 @click.option("--limit", default=8, help="Max matches to show.")
-def recall(query, limit):
+@click.option("--include-pending", is_flag=True,
+              help="Also search UNCONFIRMED memory proposals (the `nh learnings` "
+                   "queue). Excluded by default because the coder is told to run "
+                   "`nh recall` from Bash, and an unconfirmed proposal reaching it "
+                   "that way would be a rule no human ever confirmed. For an "
+                   "operator triaging the queue by hand, not for a run.")
+def recall(query, limit, include_pending):
     """Search past tasks, attempts, memories, and ingested history for prior
     work similar to QUERY — so the agent (via Bash: `nh recall <query>`) or a
     human can find how something like this was solved before.
 
     Plain keyword substring matching over what's already stored — agentic
     grep, not RAG (no embeddings, no new dependency, no index to keep fresh).
+
+    MEMORIES ARE CONFIRMED-ONLY BY DEFAULT. `learning/queue.py` and
+    `brain/store.py` both treat the human confirm step as load-bearing: a
+    proposal is inert until a human confirms it in `nh learnings`. This command
+    is named in the coder's own instructions as a Bash command it may run, so
+    listing memories unfiltered here would hand the queue's unconfirmed
+    proposals straight to a run — the confirm gate, bypassed by a search box.
+    `--include-pending` is the operator's opt-in, and labels what it adds.
     """
     config, _ = _bootstrap(require_auth=False)
     terms = [t.lower() for t in query.split() if t]
@@ -2794,10 +2808,12 @@ def recall(query, limit):
                     summary += f"  {pr}"
                 rows.append(("task", task.id[:8], escape(summary)))
 
-            for mem in await store.list_memories():
+            for mem in await store.list_memories(
+                    confirmed=None if include_pending else True):
                 if not _hit(mem.get("title"), mem.get("content")):
                     continue
-                rows.append(("memory", mem["id"][:8],
+                kind = "memory" if mem.get("confirmed") else "memory (pending)"
+                rows.append((kind, mem["id"][:8],
                             escape(f"({mem.get('type')}) {mem.get('content', '')[:100]}")))
 
             for h in await store.list_history_cache():

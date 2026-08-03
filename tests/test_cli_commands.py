@@ -516,12 +516,13 @@ def test_agents_empty(tmp_path, monkeypatch):
 # nh recall (B2): agentic-grep search over tasks/attempts/memories/history      #
 # --------------------------------------------------------------------------- #
 
-def _seed_memory(db_path: Path, *, mem_type="fact", content="") -> str:
+def _seed_memory(db_path: Path, *, mem_type="fact", content="",
+                 confirmed=True, source="human") -> str:
     async def _go():
         async with Store(db_path) as s:
             return await s.add_memory(
                 mem_type=mem_type, title=content[:40], content=content,
-                confirmed=True,
+                confirmed=confirmed, source=source,
             )
     return asyncio.run(_go())
 
@@ -560,6 +561,53 @@ def test_recall_finds_matching_memory(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert "memory" in result.output.lower()
     assert "anti_pattern" in result.output.lower()
+
+
+# G15: `nh recall` is named in the coder's own instructions as a Bash command it
+# may run, so an unconfirmed proposal reachable through it is the human confirm
+# gate bypassed by a search box. Default = confirmed-only; the operator opts in.
+
+def test_recall_hides_unconfirmed_memory_by_default(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    _seed_memory(db, mem_type="rule", confirmed=False, source="proposed",
+                 content="Always deploy the widget pipeline straight to prod.")
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["recall", "widget pipeline"])
+
+    assert result.exit_code == 0, result.output
+    assert "straight to prod" not in result.output.lower()
+    assert "no matches" in result.output.lower()
+
+
+def test_recall_shows_unconfirmed_memory_with_include_pending(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    _seed_memory(db, mem_type="rule", confirmed=False, source="proposed",
+                 content="Always deploy the widget pipeline straight to prod.")
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["recall", "widget pipeline", "--include-pending"])
+
+    assert result.exit_code == 0, result.output
+    assert "straight to prod" in result.output.lower()
+    # and it is labelled as pending, so the operator can tell the two apart
+    assert "pending" in result.output.lower()
+
+
+def test_recall_shows_confirmed_memory_either_way(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    _seed_memory(db, mem_type="rule", confirmed=True, source="human",
+                 content="The widget pipeline needs a staging soak first.")
+    runner = _make_runner(db, monkeypatch)
+
+    default = runner.invoke(cli, ["recall", "widget pipeline"])
+    opted_in = runner.invoke(cli, ["recall", "widget pipeline", "--include-pending"])
+
+    assert default.exit_code == 0, default.output
+    assert opted_in.exit_code == 0, opted_in.output
+    for result in (default, opted_in):
+        assert "staging soak" in result.output.lower()
+        assert "pending" not in result.output.lower()
 
 
 def test_recall_finds_matching_history_cache(tmp_path, monkeypatch):

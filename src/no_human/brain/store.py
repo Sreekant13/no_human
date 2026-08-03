@@ -11,8 +11,10 @@ three things a remote author must not reach:
     this product's trustworthiness rests on;
   * ``learning/triggers.py`` injects an UNTAGGED memory unconditionally, and a
     malformed tag list degrades to untagged;
-  * the coder is told it may run ``nh recall`` from Bash, and ``nh recall``
-    lists memories without a ``confirmed=`` filter.
+  * the coder is told it may run ``nh recall`` from Bash. ``nh recall`` now
+    lists CONFIRMED memories only (``--include-pending`` is an operator opt-in),
+    so reaching a run through it still costs a human confirmation — but the
+    write is what decides that, and this table is not ``memories``.
 
 Writing remote rules into a table of their own makes every one of those an
 explicit act somebody has to write, rather than a default nobody noticed.
