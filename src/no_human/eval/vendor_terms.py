@@ -13,26 +13,24 @@ vendor-neutral sweep is in progress, so it reports success either way.
 
 The test imports this list, so there is exactly one definition.
 
-WHY THE LIST IS SPLIT IN TWO (public export, 2026-07-30)
---------------------------------------------------------
+WHY THE LIST IS SPLIT IN TWO
+----------------------------
 This module SHIPS: `cli/commands.py` and `eval/northstar_card.py` import it, so
-dropping it from the public export breaks `nh bench publish`. But the operator's
-former-employer terms are the one thing that must not appear in the public repo
-in ANY form — and a hex-encoded inventory of exactly what was scrubbed, sitting
-in a file whose docstring explains the encoding, is a labelled index, not a
-redaction. Hex is only unreadable to grep; it is not unreadable.
+`nh bench publish` depends on it wherever no_human runs. But some terms in the
+inventory are deployment-specific and are withheld from this distribution — and
+keeping them here, encoded or not, would defeat the point: hex is only
+unreadable to grep, it is not unreadable, and an encoded inventory in a file
+whose docstring explains the encoding is a labelled index, not a redaction.
 
-So the employer half lives in `_vendor_terms_private.py`, which is classified
-`drop` in `EXPORT_CLASSIFICATION.txt` and is deleted from the public export. This file carries
-only the competitor/model half, which is not employer-identifying.
+So the withheld half lives in `_vendor_terms_private.py`, which is not
+distributed, and this file carries only the general half.
 
-The import is optional on purpose. In the private repo the supplement is present
-and the guard behaves exactly as before — the employer terms are still detected
-and still redacted out of a publish, which is where they were most likely to
-leak. In the public export the supplement is absent, `EXTRA_HEX` is empty, and
-the guard keeps working on the terms that remain. Removing the employer entries
-outright would have disarmed the private repo's publish guard, which is the copy
-that actually has employer content to redact.
+The import is optional on purpose. Where the supplement is present, the guard
+behaves exactly as before — its terms are still detected and still redacted out
+of a publish, which is where they are most likely to leak. Where it is absent,
+`EXTRA_HEX` is empty and the guard keeps working on the terms that remain.
+Removing the withheld entries outright would have disarmed the guard in
+precisely the deployments that have that content to redact.
 """
 
 from __future__ import annotations
@@ -41,22 +39,24 @@ import re
 
 _t = lambda h: bytes.fromhex(h).decode()  # noqa: E731
 
-# Competitor products and model names. Not employer-identifying — these ship.
+# Competitor products and model names — the general half, present everywhere.
 _BANNED_HEX = [
     "646576696e", "77696e6473757266", "636f70696c6f74", "636f676e6974696f6e",
     "6169646572", "6f70656e6169", "6770742d34", "6770742d35",
 ]
 
-# The employer half, absent from the public export. Never spell these here.
+# The deployment-specific half, withheld from this distribution. Never spell
+# these here.
 #
 # FAILS CLOSED, deliberately. A bare `except ImportError` also swallows an
 # ImportError raised from INSIDE the supplement for any unrelated reason — a bad
-# import, a typo, a half-finished edit — and then the private repo's publish
-# guard silently drops from 18 terms to 8 with the whole suite still green. That
-# is the failure that matters, because the private repo is the copy that has
-# employer content to redact. `e.name` distinguishes "this module is not here"
-# (the export, the only sanctioned case) from "this module is here and broken"
-# (a bug, which must be loud). `test_private_terms.py` pins the count at 18.
+# import, a typo, a half-finished edit — and then the publish guard silently
+# drops from 18 terms to 8 with the whole suite still green. That is the failure
+# that matters, because a deployment that carries the supplement is exactly the
+# one with content to redact. `e.name` distinguishes "this module is not here"
+# (a distribution without the supplement, the only sanctioned case) from "this
+# module is here and broken" (a bug, which must be loud). The supplement's own
+# test pins the count at 18.
 try:
     from ._vendor_terms_private import EXTRA_HEX as _EXTRA_HEX
 except ImportError as e:
