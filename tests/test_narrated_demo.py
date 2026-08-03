@@ -232,6 +232,47 @@ def test_the_doc_claims_no_line_the_map_does_not_schedule():
         f"blockquote; text with no timestamp gets read anyway.")
 
 
+#: HOW A TIMING GATE NAMES THE LINE IT IS ABOUT — the one pattern, used by
+#: every gate below, because three different ways of pointing at a sentence had
+#: three different silent failure modes.
+#:
+#:   `beat.lines[0]`   POSITIONAL, and the defect this pair of helpers replaces.
+#:       "the ramp must finish before the line that counts five" was written as
+#:       `parallel.lines[0]`. Insert one sentence at the top of that beat — a
+#:       perfectly ordinary copy edit — and the assertion silently re-points at
+#:       a different claim and keeps passing. It never goes red; it just stops
+#:       being about the thing it is named for.
+#:   `next(... if fragment in ln.text)`   raises StopIteration on a copy edit,
+#:       which reads as a broken test rather than as "the line this gate guards
+#:       is gone", and quietly takes the FIRST of several matches if the phrase
+#:       is ever repeated.
+#:   `next(... if abs(ln.start - 17.60) < 0.01)`   the same, keyed on a
+#:       hand-written second that the map is free to move.
+#:
+#: Both helpers below assert a COUNT. Exactly one line may answer, so a gate
+#: whose subject has been edited away, or duplicated, fails NAMING ITS SUBJECT
+#: instead of dying on an iterator.
+
+def _line_saying(fragment: str) -> nr.Line:
+    """The one narration line whose text contains ``fragment``."""
+    hits = [ln for ln in nr.LINES if fragment.lower() in ln.text.lower()]
+    assert len(hits) == 1, (
+        f"{len(hits)} narration line(s) say {fragment!r}; a timing gate is "
+        f"anchored on there being exactly one. Matches: "
+        f"{[ln.text for ln in hits]}")
+    return hits[0]
+
+
+def _line_at(second: float) -> nr.Line:
+    """The one narration line that starts at ``second``."""
+    hits = [ln for ln in nr.LINES if abs(ln.start - second) < 0.01]
+    assert len(hits) == 1, (
+        f"{len(hits)} narration line(s) start at {second:.2f}s; a timing gate "
+        f"is anchored on there being exactly one. Lines: "
+        f"{[(ln.start, ln.text) for ln in hits]}")
+    return hits[0]
+
+
 def _ramp_window() -> tuple[float, float]:
     """When the five actually start running, computed from `STAGES`.
 
@@ -261,9 +302,99 @@ def test_the_doc_states_the_ramp_the_fixture_actually_runs():
         f"the synchronised-moments table must say {row} — the ramp computed "
         f"from STAGES. A hand-written window here is a claim about timing "
         f"that no longer has to be true.")
-    # The reason the window matters: it finishes before the line that counts.
+    # The reason the window matters: the ramp finishes before the sentence that
+    # claims every ticket already has agents on it. Anchored on THAT SENTENCE,
+    # with a count assertion — see `_line_saying`. It used to be
+    # `parallel.lines[0]`, so one inserted line would have re-pointed this at a
+    # different claim without anything going red.
+    claim = _line_saying("Each one gets a team of agents")
+    assert end < claim.start, (end, claim.start, claim.text)
+    # ...and that sentence is genuinely the parallel beat's opener, which is
+    # the property `lines[0]` was standing in for. Stated separately so the two
+    # cannot be confused again: this one is about STRUCTURE, the one above is
+    # about TIMING.
     parallel = next(b for b in nr.BEATS if b.name == "parallel")
-    assert end < parallel.lines[0].start, (end, parallel.lines[0].start)
+    assert claim in parallel.lines, claim.text
+    assert claim.start == min(ln.start for ln in parallel.lines)
+
+
+def test_an_anchor_refuses_to_be_ambiguous_instead_of_taking_the_first(
+        monkeypatch):
+    """The helpers every timing gate points through, checked rather than
+    assumed — a gate is only as good as its ability to say what it is about.
+
+    Both directions: nothing answering, and more than one answering. The second
+    is the one `next(...)` got wrong silently — it takes the first match and
+    the gate quietly becomes about a different sentence.
+    """
+    with pytest.raises(AssertionError) as err:
+        _line_saying("a sentence this script does not contain")
+    assert "0 narration line(s)" in str(err.value)
+    with pytest.raises(AssertionError) as err:
+        _line_at(99.99)
+    assert "0 narration line(s)" in str(err.value)
+
+    real = _line_saying("did not pass")
+    dup = nr.Line(99.00, real.text + " (a duplicate)")
+    monkeypatch.setattr(nr, "LINES", nr.LINES + (dup,))
+    with pytest.raises(AssertionError) as err:
+        _line_saying("did not pass")
+    assert "2 narration line(s)" in str(err.value)
+    monkeypatch.setattr(nr, "LINES", nr.LINES + (nr.Line(real.start, "x"),))
+    with pytest.raises(AssertionError) as err:
+        _line_at(real.start)
+    assert "2 narration line(s)" in str(err.value)
+
+
+def test_the_ramp_gate_is_anchored_on_its_sentence_not_on_a_position(
+        monkeypatch):
+    """The defect, reproduced: a positional anchor survives a copy edit by
+    silently changing what it is about.
+
+    `test_the_doc_states_the_ramp_the_fixture_actually_runs` asserted
+    `end < parallel.lines[0].start`. Prepend one ordinary sentence to the
+    parallel beat and `lines[0]` is a DIFFERENT line — the gate keeps passing
+    and has stopped guarding the claim it is named for. Anchored on the
+    sentence, the same edit leaves the gate pointing where it always did.
+    """
+    parallel = next(b for b in nr.BEATS if b.name == "parallel")
+    claim = _line_saying("Each one gets a team of agents")
+    assert parallel.lines[0] is claim, "the precondition the old gate relied on"
+
+    # Placed BETWEEN the ramp's end and the claim, which is what makes the
+    # re-point silent: the positional comparison still holds against it.
+    intruder = nr.Line(round((_ramp_window()[1] + claim.start) / 2, 2),
+                       "First, about branches.")
+    assert parallel.start <= intruder.start < claim.start
+    edited = nr.Beat(parallel.name, parallel.start, parallel.caption,
+                     parallel.gui, parallel.cli, (intruder,) + parallel.lines)
+    beats = tuple(edited if b.name == "parallel" else b for b in nr.BEATS)
+    monkeypatch.setattr(nr, "BEATS", beats)
+    monkeypatch.setattr(nr, "LINES",
+                        tuple(ln for b in beats for ln in b.lines))
+
+    # The intruder is now `lines[0]`, and a POSITIONAL gate's comparison still
+    # holds against it — which is precisely why the re-point was silent.
+    moved = next(b for b in nr.BEATS if b.name == "parallel")
+    assert moved.lines[0] is intruder
+    assert _ramp_window()[1] < moved.lines[0].start
+
+    # So RUN THE REAL GATE under the edited map and require it to go red.
+    #
+    # Calling the shipped test function is the whole point: a version of this
+    # that re-checked the comparison inline was written first and MEASURED —
+    # reverting the gate to `parallel.lines[0]` left it green, because it was
+    # observing its own copy of the logic and not the gate. A check nothing
+    # observes is not a check.
+    with pytest.raises(AssertionError):
+        test_the_doc_states_the_ramp_the_fixture_actually_runs()
+
+    # And what it goes red ABOUT: the sentence is still found, unmoved — the
+    # gate fails on the STRUCTURAL claim (this sentence opens the beat), which
+    # is a real editorial change a human should look at, not on a broken
+    # iterator or a silently different subject.
+    assert _line_saying("Each one gets a team of agents") is claim
+    assert claim.start != min(ln.start for ln in moved.lines)
 
 
 def test_the_document_names_no_real_company_either():
@@ -672,8 +803,9 @@ def test_the_five_are_all_running_before_the_voice_says_five():
     # is that the ramp has finished before the beat that announces five, and the
     # beat is defined by its second on the map. Keying it to wording made a copy
     # edit throw StopIteration here — a test coupled to the thing it is not
-    # about.
-    line = next(ln for ln in nr.LINES if abs(ln.start - 17.60) < 0.01)
+    # about. `_line_at` keeps the time anchor and adds the count assertion, so
+    # moving the map fails saying WHICH second lost its line.
+    line = _line_at(17.60)
     assert sp.inflight_at(line.start) == 5, sp.queue_health_at(line.start)
     assert sp.queued_at(line.start) == 0
     # And it holds for the whole line, not just its first frame.
@@ -747,7 +879,7 @@ def test_exactly_one_task_bounces_off_review_and_still_lands():
 def test_the_bounce_is_on_camera_when_it_is_narrated():
     """"The refactor did not pass. It went back…" starts at 50.60 — by
     then ORD-2187 must be visibly on its second round, and not yet done."""
-    line = next(ln for ln in nr.LINES if "did not pass" in ln.text)
+    line = _line_saying("did not pass")
     status, _live, _burn, _turns, attempt = sp.stage_at("ORD-2187", line.start)
     assert attempt == 2
     assert status in ("implementing", "testing", "reviewing"), status
@@ -1124,9 +1256,8 @@ def test_the_gui_schedule_is_ordered_and_anchored():
     assert sp.stage_at(sp.HERO_KEY, sprint_gui.REVIEW_AT)[0] == \
         "awaiting_approval"
     # The drawer is closed while the bounce and the five PRs are narrated.
-    bounce_line = next(ln for ln in nr.LINES if "did not pass" in ln.text)
-    five_prs_line = next(ln for ln in nr.LINES
-                         if "five pull requests" in ln.text.lower())
+    bounce_line = _line_saying("did not pass")
+    five_prs_line = _line_saying("five pull requests")
     for t in (bounce_line.start, five_prs_line.start):
         assert sprint_gui.CLOSE_DRAWER_AT <= t < sprint_gui.REOPEN_DRAWER_AT
 
