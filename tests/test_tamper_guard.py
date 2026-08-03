@@ -890,3 +890,43 @@ def test_count_faking_fixtures_cannot_see_a_skip_only_kill_switch():
         '    monkeypatch.setattr("mypkg.parse", lambda s: {"a": 1})\n'
     )
     assert tamper_guard.count_faking_fixtures(patching) == 1
+
+
+def test_consolidating_tests_is_tampering_even_when_assertions_hold():
+    """The one shape that ONLY the net test-count term can catch.
+
+    `check()` fires on any of: a deleted file, a net TEST-count drop (`ta < tb`),
+    a net ASSERTION drop (`aa < ab`), added skips, added tautologies, or added
+    faking fixtures. In ordinary tampering the test and assertion counts fall
+    together, so `aa < ab` fires and `ta < tb` is redundant — which is why, until
+    this test, `ta < tb` could be DELETED and the whole suite stayed green
+    (measured: 1223 passed across all 27 tamper-referencing files with the term
+    removed).
+
+    That made a load-bearing term unobserved. The shape that separates the two is
+    CONSOLIDATION: fold three one-assert tests into one three-assert test. Test
+    count drops 3 -> 1 while assertion count holds at 3, so `aa < ab` is False and
+    `ta < tb` is the only thing standing between that diff and a clean verdict.
+
+    Assertion count is held CONSTANT on purpose. If a future edit changes these
+    fixtures so assertions also drop, this test keeps passing for the wrong
+    reason — so the second assertion below pins the counts themselves.
+    """
+    before = {"tests/test_c.py": (
+        "def test_a():\n    assert 1\n"
+        "def test_b():\n    assert 2\n"
+        "def test_c():\n    assert 3\n")}
+    after = {"tests/test_c.py": (
+        "def test_a():\n    assert 1\n    assert 2\n    assert 3\n")}
+
+    # The premise, pinned: tests fall, assertions do not. Without this a later
+    # fixture edit could make the case pass via `aa < ab` and prove nothing.
+    b, a = before["tests/test_c.py"], after["tests/test_c.py"]
+    assert tamper_guard.count_tests(b) == 3 and tamper_guard.count_tests(a) == 1
+    assert tamper_guard.count_assertions(b) == tamper_guard.count_assertions(a) == 3
+
+    r = tamper_guard.check(before, after)
+    assert r.tampered, (
+        f"consolidating 3 tests into 1 was called clean: {r.summary}. Only the "
+        "net test-count term can see this; if it was removed as redundant, this "
+        "is the case that proves it is not.")
