@@ -740,8 +740,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "bounds": {
         # Must stay in step with core.bounds.Bounds' field defaults — the one
-        # place the rationale for each number lives. tests/test_bounds.py fails
-        # if they drift.
+        # place the rationale for each number lives. The guard that catches drift
+        # is
+        #   tests/test_run_84251cb2_regressions.py
+        #     ::test_bounds_defaults_have_exactly_one_source_of_truth
+        # which iterates DEFAULT_CONFIG["bounds"] and asserts each key equals
+        # getattr(Bounds(), key) — except max_correction_rounds, which the test
+        # exempts (WAKE_ONLY) because Bounds carries no such field, and which
+        # blockers/wake.py duplicates as a hardcoded fallback, so THAT number is
+        # guarded by nothing and drifts silently.
+        #
+        # It is NOT tests/test_bounds.py, which this comment used to name and
+        # which never reads DEFAULT_CONFIG at all. That mattered: changing
+        # max_attempts here and running the named file gives 28 passed, so an
+        # editor who does exactly what the comment says learns nothing. A pointer
+        # to a guard is itself an unguarded claim — verify by breaking the value
+        # and seeing which test dies, not by reading.
         "max_attempts": 3,
         "max_turns_per_attempt": 500,
         "max_correction_rounds": 2,
