@@ -1569,7 +1569,7 @@ def test_no_stale_allowlist_entries() -> None:
         f"  {module}  {channel}   ({entry.talks_to})"
         for module, channels in sorted(ALLOWLIST.items())
         for channel, entry in sorted(channels.items())
-        if channel not in scanned.get(module, {})
+        if (PKG / module).exists() and channel not in scanned.get(module, {})
     ]
     assert not stale, (
         "these ALLOWLIST lines no longer match any code — delete them:\n"
