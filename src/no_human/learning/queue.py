@@ -28,6 +28,7 @@ from .corrections import (
     CorrectionRecord,
     build_correction_distill_prompt,
     cluster_corrections,
+    is_project_scoped,
 )
 from .pii import contains_pii
 
@@ -345,7 +346,15 @@ class LearningQueue:
         # address in a fixture, a personal email in a test — arrives here inside
         # `evidence` and would be persisted to `memories` and shown back to the
         # user. Drop the whole proposal rather than redact it (learning/pii.py).
-        pii = contains_pii(proposal.title, proposal.content)
+        #
+        # TAGS ARE GATED TOO. They are not derived text: on the distilled path
+        # they come verbatim from the utility model's TAGS line, and that model
+        # was shown the raw findings — so a surname or a personal email can
+        # arrive as a "keyword" while title and content are clean. Tags are
+        # persisted to the same row, rendered in the same queue, and matched
+        # against future task text by `learning/triggers.py`. Gating two of the
+        # three stored fields is not a gate.
+        pii = contains_pii(proposal.title, proposal.content, *proposal.tags)
         if pii is not None:
             log.info("refused a proposed learning carrying personal data (%s)",
                      pii.kind)
@@ -477,8 +486,11 @@ class LearningQueue:
         # The evidence here is the supervisor's correction text VERBATIM, and a
         # correction quotes whatever the agent was looking at — a fixture, a
         # seed file, a support thread. Same door, same gate; dropped whole
-        # rather than redacted (learning/pii.py).
-        pii = contains_pii(proposal.title, proposal.content)
+        # rather than redacted (learning/pii.py). TAGS included for the same
+        # reason B1 includes them: on the distilled path they are the utility
+        # model's own words, written after it read the raw corrections, so they
+        # are an unwatched third field into the same row.
+        pii = contains_pii(proposal.title, proposal.content, *proposal.tags)
         if pii is not None:
             log.info("refused a proposed learning carrying personal data (%s)",
                      pii.kind)
@@ -574,21 +586,38 @@ class LearningQueue:
         single correction cannot know whether it recurs, so there is no point
         in the task's own run at which the >=2 rule can be evaluated. It is
         driven by ``nh learnings --harvest``.
+
+        RE-RUNNING IS A NO-OP, including after triage. A cluster already
+        queued is skipped by its dedupe key before anything is spent, and a
+        cluster a human REJECTED is skipped too — `reject` archives
+        supervisor-origin rows rather than deleting them, so the key survives
+        the "no". Confirming a proposal likewise leaves the row and its key in
+        place. The one thing that does re-queue a lesson is deleting its row
+        out of the database by hand.
         """
         rows = await self.store.list_supervisor_corrections(
             project=project, limit=limit)
-        clusters = cluster_corrections(
-            [
-                CorrectionRecord(
-                    task_id=str(r.get("task_id") or ""),
-                    project=r.get("project"),
-                    message=str(r.get("message") or ""),
-                    ts=float(r.get("ts") or 0.0),
-                )
-                for r in rows
-            ],
-            min_occurrences=min_occurrences,
-        )
+        records = [
+            CorrectionRecord(
+                task_id=str(r.get("task_id") or ""),
+                project=r.get("project"),
+                message=str(r.get("message") or ""),
+                ts=float(r.get("ts") or 0.0),
+            )
+            for r in rows
+        ]
+        # Counted, not silently capped: a correction from a task with no
+        # `repo_path` cannot be scoped to a repository, and a proposal written
+        # with `project=None` is a GLOBAL rule injected into every project
+        # (`is_project_scoped` explains the whole case). Excluding them is the
+        # conservative call, so the human is told how many went unlearned
+        # rather than left to infer it from a number that does not add up.
+        unscoped = sum(1 for r in records if not is_project_scoped(r))
+        if unscoped and note is not None:
+            note(f"{unscoped} supervisor correction(s) skipped: their task has "
+                 "no repo_path, and a repo-less lesson would become a rule in "
+                 "every project")
+        clusters = cluster_corrections(records, min_occurrences=min_occurrences)
         written: list[str] = []
         for cluster in clusters:
             # SPEND GUARD, and the reason `correction_dedupe_key` is a
@@ -624,4 +653,31 @@ class LearningQueue:
         return await self.store.confirm_memory(mem_id)
 
     async def reject(self, mem_id: str) -> bool:
+        """A human's "no".
+
+        SUPERVISOR-origin proposals are ARCHIVED, not deleted. Every other
+        origin keeps the delete this method has always done — B1's semantics
+        are unchanged, and the asymmetry is deliberate rather than an
+        oversight, so it is written down here.
+
+        WHY THEY DIFFER. Delete removes the row AND the dedupe key it carries
+        in ``file_path``. For B1 that is harmless: `propose_from_review` is
+        driven by a FAIL round, so a deleted proposal only returns if the
+        reviewer raises that finding AGAIN — which is new evidence, and worth
+        re-asking about. B2 is driven by a BATCH that re-reads the whole
+        correction history on every run, so for it a delete is a treadmill: the
+        next `nh learnings --harvest` finds the same cluster, pays a utility
+        call to re-distil it, and re-queues the exact lesson the human just
+        rejected. The queue's two "no" verbs would then behave oppositely —
+        archive sticks, reject does not — and the idempotence this feature
+        claims would be false on any queue anyone had actually triaged.
+
+        Archiving keeps the row (``confirmed=0``, ``archived=1``), so it leaves
+        `pending()` exactly as a delete did, and `memory_dedupe_key_exists`
+        still sees its key. That is what makes the "no" stick.
+        """
+        row = await self.store.find_memory(mem_id)
+        if row is not None and row.get("origin") == ORIGIN_SUPERVISOR:
+            return await self.store.archive_memory(
+                row["id"], "rejected at the human confirm gate")
         return await self.store.delete_memory(mem_id)

@@ -1768,6 +1768,12 @@ class Store:
         call that built it was already paid for. B2's harvest re-reads the
         whole correction history on every run, so without this it would spend
         one distillation per already-queued cluster and write nothing.
+
+        ARCHIVED ROWS COUNT, and that is load-bearing rather than an oversight
+        in the WHERE clause: an archived proposal is how a human's "no" is
+        recorded (``LearningQueue.reject`` archives supervisor-origin rows).
+        Skipping archived rows here would make every rejected lesson come back
+        on the next harvest, re-distilled at the utility tier.
         """
         return await self._fetchone(
             "SELECT id FROM memories WHERE file_path = ? LIMIT 1", (dedupe_key,)

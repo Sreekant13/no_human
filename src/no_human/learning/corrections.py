@@ -54,13 +54,17 @@ recurring mistake — against how many lessons are found at all.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
+
+log = logging.getLogger("no_human.learning")
 
 __all__ = [
     "CorrectionRecord",
     "CorrectionCluster",
     "normalize_gist",
+    "is_project_scoped",
     "cluster_corrections",
     "build_correction_distill_prompt",
     "MIN_OCCURRENCES",
@@ -173,26 +177,62 @@ class CorrectionCluster:
         return out
 
 
+def is_project_scoped(record: CorrectionRecord) -> bool:
+    """True when this correction can be attributed to a repository.
+
+    A task with no ``repo_path`` produces corrections with ``project=None``,
+    and a proposal written with ``project=None`` is a GLOBAL memory:
+    ``Store.list_memories`` matches it with ``(project = ? OR project IS
+    NULL)``, so it is injected into EVERY project's rules. Two unrelated
+    repo-less tasks could also merge into one cluster under the ``(None, gist)``
+    key, inventing a recurrence that never happened in any single repo —
+    something B1 cannot do, because its proposals are keyed on a task's own
+    ``repo_path``.
+
+    So repo-less corrections are excluded rather than clustered. The
+    conservative direction: the cost of excluding them is a lesson nobody
+    learns, and the cost of including them is a rule nobody asked for applying
+    everywhere, shown to the confirming human without its blast radius.
+    """
+    return bool((record.project or "").strip())
+
+
 def cluster_corrections(
     records: list[CorrectionRecord], *, min_occurrences: int = MIN_OCCURRENCES,
 ) -> list[CorrectionCluster]:
     """Group corrections by ``(project, gist)`` and keep only the recurring ones.
 
     Returns clusters sorted by size (largest first), then by gist so the order
-    is deterministic for equal sizes. A record whose gist is empty is dropped:
-    it has no content to cluster ON, and a key of ``""`` would collapse every
-    such correction in a project into one meaningless "cluster".
+    is deterministic for equal sizes.
+
+    Two kinds of record are dropped before grouping, both counted and logged
+    rather than silently capped:
+
+    * an empty gist — nothing to cluster ON, and a key of ``""`` would collapse
+      every such correction into one meaningless "cluster";
+    * an unattributable project (:func:`is_project_scoped`) — a proposal with
+      ``project=None`` is a GLOBAL rule injected into every repository.
     """
     buckets: dict[tuple[str | None, str], CorrectionCluster] = {}
+    dropped_global = dropped_empty = 0
     for rec in records or []:
+        if not is_project_scoped(rec):
+            dropped_global += 1
+            continue
         gist = normalize_gist(rec.message)
         if not gist:
+            dropped_empty += 1
             continue
         key = (rec.project, gist)
         cluster = buckets.get(key)
         if cluster is None:
             cluster = buckets[key] = CorrectionCluster(rec.project, gist)
         cluster.records.append(rec)
+    if dropped_global or dropped_empty:
+        log.info(
+            "supervisor corrections not clustered: %d unattributable to a "
+            "repository (would become a global rule), %d with no significant "
+            "content", dropped_global, dropped_empty)
     return sorted(
         (c for c in buckets.values() if c.count >= min_occurrences),
         key=lambda c: (-c.count, c.gist),

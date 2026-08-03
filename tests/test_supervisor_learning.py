@@ -34,6 +34,7 @@ from no_human.learning.corrections import (
     CorrectionRecord,
     build_correction_distill_prompt,
     cluster_corrections,
+    is_project_scoped,
     normalize_gist,
 )
 
@@ -114,7 +115,7 @@ async def _seed_corrections(store, messages, *, repo=REPO, task_id=None,
     """Persist supervisor `correct` decisions the way production does: a task
     row, then `supervisor_decision` events whose `text` is the action and whose
     `message` is the correction (Orchestrator.emit's shape)."""
-    t = Task.new(title, repo_path=repo)
+    t = Task.new(title, repo_path=repo)  # repo=None → a repo-less task
     if task_id:
         t.id = task_id
     await store.create_task(t)
@@ -400,6 +401,225 @@ async def test_harvest_can_be_scoped_to_one_project(store):
     assert len(await q.harvest_supervisor_corrections(
         project=OTHER_REPO, distill=_distiller())) == 1
     assert [m["project"] for m in await q.pending()] == [OTHER_REPO]
+
+
+# ── a human's "no" sticks against the next harvest ────────────────────────── #
+
+@pytest.mark.asyncio
+async def test_a_rejected_proposal_is_not_re_queued_by_the_next_harvest(store):
+    """THE REJECT TREADMILL. `reject` used to delete the row — and the row
+    carries the dedupe key, so the next harvest re-read the same history,
+    re-distilled the same cluster and re-queued the exact lesson the human had
+    just turned down. The queue's two "no" verbs behaved oppositely: archive
+    stuck, reject did not."""
+    q = LearningQueue(store)
+    await _seed_corrections(store, [_MSG_A, _MSG_B])
+    assert len(await q.harvest_supervisor_corrections(distill=_distiller())) == 1
+    proposal = (await q.pending())[0]
+
+    assert await q.reject(proposal["id"])
+    assert await q.pending() == [], "a rejected proposal must leave the queue"
+
+    calls = []
+    assert await q.harvest_supervisor_corrections(
+        distill=_distiller(calls=calls)) == []
+    assert calls == [], "paid the utility tier to re-distil a rejected lesson"
+    assert await q.pending() == []
+
+
+@pytest.mark.asyncio
+async def test_rejecting_archives_the_row_rather_than_destroying_it(store):
+    """What makes the "no" stick: the row survives with confirmed=0 and
+    archived=1, so it is out of the queue but its dedupe key is still there.
+    Recoverable, and auditable — the curator's invariant, applied to the one
+    path that has a re-proposing batch behind it."""
+    q = LearningQueue(store)
+    await q.propose_from_corrections(
+        _cluster([_MSG_A, _MSG_B]), distill=_distiller())
+    proposal = (await q.pending())[0]
+    await q.reject(proposal["id"])
+
+    archived = await store.list_memories(include_archived=True)
+    assert [m["id"] for m in archived] == [proposal["id"]]
+    assert archived[0]["archived"] == 1
+    assert archived[0]["confirmed"] == 0
+    assert "rejected" in archived[0]["content"]
+    assert await store.memory_dedupe_key_exists(archived[0]["file_path"])
+
+
+@pytest.mark.asyncio
+async def test_rejecting_a_review_proposal_still_deletes_it(store):
+    """B1's semantics are UNCHANGED, and the asymmetry is deliberate:
+    `propose_from_review` fires on a FAIL round, so a deleted proposal only
+    returns when the reviewer raises that finding again — new evidence, worth
+    re-asking about. Only B2 has a batch behind it that re-reads all history."""
+    q = LearningQueue(store)
+    t = Task.new("Pin the images", repo_path=REPO)
+    await store.create_task(t)
+    await q.propose_from_review(t, findings=[{
+        "label": "image pinning",
+        "evidence": "ci/images.yaml:12 pins `latest`, not a digest"}],
+        attempt=1, review_round=1)
+    proposal = (await q.pending())[0]
+    assert proposal["origin"] == ORIGIN_REVIEW
+
+    assert await q.reject(proposal["id"])
+    assert await store.list_memories(include_archived=True) == []
+
+
+# ── repo-less corrections never become rules for every project ────────────── #
+
+@pytest.mark.asyncio
+async def test_corrections_from_a_repo_less_task_are_never_proposed(store):
+    """A task with no `repo_path` yields corrections with project=None, and a
+    memory with project=NULL is GLOBAL: `list_memories` matches it with
+    `(project = ? OR project IS NULL)`, so confirming one injects it into
+    EVERY project's rules. Worse, two unrelated repo-less tasks would merge
+    under the same `(None, gist)` key and invent a recurrence that happened in
+    no single repo — something B1 structurally cannot do."""
+    q = LearningQueue(store)
+    await _seed_corrections(store, [_MSG_A, _MSG_B], repo=None)
+
+    notes = []
+    assert await q.harvest_supervisor_corrections(
+        distill=_distiller(), note=notes.append) == []
+    assert await q.pending() == []
+    # Counted and said out loud, not silently capped.
+    assert any("2 supervisor correction(s) skipped" in n for n in notes), notes
+    assert any("repo_path" in n for n in notes), notes
+
+
+def test_two_unrelated_repo_less_tasks_do_not_merge_into_one_cluster():
+    assert is_project_scoped(_rec(_MSG_A, project=REPO)) is True
+    assert is_project_scoped(_rec(_MSG_A, project=None)) is False
+    assert is_project_scoped(_rec(_MSG_A, project="   ")) is False
+    assert cluster_corrections([_rec(_MSG_A, project=None, task_id="t1"),
+                                _rec(_MSG_B, project=None, task_id="t2")]) == []
+
+
+@pytest.mark.asyncio
+async def test_a_repo_less_task_does_not_suppress_the_repo_scoped_ones(store):
+    """Non-vacuity: the exclusion drops exactly the unattributable records and
+    leaves the rest of the harvest working."""
+    q = LearningQueue(store)
+    await _seed_corrections(store, [_MSG_A, _MSG_B], repo=None)
+    await _seed_corrections(store, [_MSG_A, _MSG_B], repo=REPO,
+                            title="Wire the importer")
+
+    assert len(await q.harvest_supervisor_corrections(distill=_distiller())) == 1
+    assert [m["project"] for m in await q.pending()] == [REPO]
+
+
+def test_the_listing_shows_scope_and_flags_a_global_row(tmp_path, monkeypatch):
+    """The confirming human sees the blast radius on the same screen as the
+    confirm command. A project=NULL row is GLOBAL — `list_memories` matches it
+    with `(project = ? OR project IS NULL)` — and it used to render exactly
+    like a repo-scoped one.
+
+    Points `load_config` at a tmp_path DB the same way the other CLI tests do
+    (`tests/test_rules_skills.py::_make_runner`); this must never read the
+    operator's real store.
+    """
+    import asyncio
+
+    from click.testing import CliRunner
+
+    import no_human.cli.commands as cmd_mod
+    from no_human.cli.commands import cli
+
+    db = tmp_path / "learn.db"
+
+    async def _seed():
+        s = await Store(db).connect()
+        await s.add_memory(mem_type=TYPE_RULE, title="scoped rule",
+                           content="x", project=REPO)
+        await s.add_memory(mem_type=TYPE_RULE, title="global rule", content="y")
+        await s.close()
+
+    asyncio.run(_seed())
+
+    class _Cfg:
+        db_path = db
+        data: dict = {}
+
+        def get(self, key, default=None):
+            return self.data.get(key, default)
+
+    monkeypatch.setattr(cmd_mod, "load_config", lambda: _Cfg())
+    monkeypatch.setattr(cmd_mod, "assert_subscription_mode", lambda **kw: None)
+
+    result = CliRunner().invoke(cli, ["learnings"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert "scoped rule" in result.output and "global rule" in result.output
+    assert f"scope: {REPO}" in result.output
+    assert "GLOBAL — applies to every project" in result.output
+
+
+# ── the tags field is inside the gate, not beside it ──────────────────────── #
+
+# A distiller reply whose TITLE and LESSON are clean engineering prose and
+# whose TAGS carry a consumer-mailbox email. The tags come verbatim from the
+# utility model, which read the raw corrections — so this is the shape the gap
+# had.
+#
+# The local part is DELIBERATELY not `first.last`: this file ships, and
+# `tests/test_identity_scrub_guard.py`'s `personal-email` shape rule fails the
+# build on a name-shaped address anywhere on the export surface — including one
+# written as a fixture for a test about dropping personal data. A separator-free
+# placeholder still trips `learning/pii.py`'s consumer-domain detector, which is
+# the thing under test here.
+_PII_IN_TAGS = (
+    "TYPE: rule\n"
+    "TITLE: Build fixtures from a factory\n"
+    "LESSON: Fixtures in this repo are built from a factory, never hardcoded.\n"
+    "TAGS: fixtures, factory, placeholder99@gmail.com\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_personal_data_confined_to_the_tags_drops_the_proposal(store):
+    q = LearningQueue(store)
+    notes = []
+    mem_id = await q.propose_from_corrections(
+        _cluster([_MSG_A, _MSG_B]),
+        distill=_distiller(_PII_IN_TAGS), note=notes.append)
+
+    assert mem_id is None
+    assert await q.pending() == [], "PII reached the memories table via tags"
+    assert any("personal_email" in n for n in notes), notes
+    assert not any("gmail" in n for n in notes), notes
+
+
+@pytest.mark.asyncio
+async def test_the_same_tags_hole_is_closed_on_the_review_path(store):
+    """Inherited from B1, and fixed there too: the identical one-line guard
+    protects the identical field on the identical table. Fixing only B2 would
+    leave the hole open next door."""
+    q = LearningQueue(store)
+    t = Task.new("Pin the images", repo_path=REPO)
+    await store.create_task(t)
+    notes = []
+
+    async def _distill(_prompt):
+        return _PII_IN_TAGS
+
+    mem_id = await q.propose_from_review(
+        t, findings=[{"label": "hardcoded fixture",
+                      "evidence": "tests/fixtures/order.json:4 hardcodes it"}],
+        attempt=1, review_round=1, distill=_distill, note=notes.append)
+    assert mem_id is None
+    assert await q.pending() == []
+    assert any("personal_email" in n for n in notes), notes
+    assert not any("gmail" in n for n in notes), notes
+
+
+@pytest.mark.asyncio
+async def test_clean_tags_are_not_swallowed_by_the_widened_gate(store):
+    """Non-vacuity for both tests above: ordinary keyword tags still pass."""
+    q = LearningQueue(store)
+    assert await q.propose_from_corrections(
+        _cluster([_MSG_A, _MSG_B]), distill=_distiller()) is not None
+    assert "venv" in (await q.pending())[0]["tags"]
 
 
 # ── origin round-trips, and distinguishes the two producers ───────────────── #

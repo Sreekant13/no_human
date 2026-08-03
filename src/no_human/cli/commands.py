@@ -3623,8 +3623,13 @@ def learnings(confirm_id, reject_id, active, harvest, harvest_project):
     decision is clustered by (project, normalized gist) and a cluster seen
     twice or more becomes ONE proposal. A single correction is a one-off nudge
     and is never proposed — repetition, not isolation, is what marks a durable
-    lesson. Harvesting is idempotent: the dedupe key is the gist, so re-running
-    it queues nothing new.
+    lesson. Corrections from a task with no repo_path are skipped and counted:
+    a repo-less lesson would become a rule in EVERY project.
+
+    Re-running is a no-op, and stays one after you have triaged: a cluster
+    already queued is skipped by its dedupe key, and so is one you REJECTED —
+    rejecting a supervisor proposal archives it rather than deleting it, so
+    your "no" survives the next harvest.
     """
     config, _ = _bootstrap(require_auth=False)
     from ..learning import LearningQueue
@@ -3701,6 +3706,19 @@ def learnings(confirm_id, reject_id, active, harvest, harvest_project):
                     f"[bold]{m['id'][:8]}[/] [magenta]{m['type']}[/]"
                     f"{origin_tag} {m['title']}"
                 )
+                # BLAST RADIUS, on the same screen as the confirm command.
+                # A memory with project=NULL is GLOBAL — `list_memories`
+                # matches it with `(project = ? OR project IS NULL)`, so
+                # confirming it injects it into every project's rules. The
+                # queue used to print no scope at all, which made a global
+                # rule and a repo-scoped one look identical at the moment of
+                # deciding. B2 refuses to CREATE global rows from corrections;
+                # this is so the human can see the ones that already exist.
+                scope = (m.get("project") or "").strip()
+                console.print(
+                    f"  [dim]scope:[/] {escape(scope)}" if scope else
+                    "  [yellow]scope: GLOBAL — applies to every project[/]",
+                    emoji=False)
                 for line in (m["content"] or "").splitlines():
                     if line.strip():
                         console.print(f"  [dim]{line}[/]")
