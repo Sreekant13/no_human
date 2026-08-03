@@ -83,38 +83,35 @@ async def store(tmp_path):
 
 
 async def test_two_independent_connections_race_on_the_same_file(tmp_path):
-    """Known positive: proves two real connections to a fresh db DO produce
-    'database is locked' under concurrent migrate+write — the exact failure
+    """Known positive: proves two real connections to the same fresh db DO
+    produce 'database is locked' when their writes collide — the exact failure
     mode `nh start` used to trigger by opening a second Store for Jira/Linear.
     Without this, the fix test below would prove nothing (it could pass
-    because the scenario never actually raced anything)."""
+    because the scenario never actually raced anything).
+
+    The collision is STAGED, not raced. The first version of this control
+    threw six concurrent writers at the file and asserted at least one lock:
+    ~5/6 reproduction locally, and the very first public CI run rolled the
+    1/6 — zero collisions on the shared runner, red gate, premise reported
+    as stale when it wasn't. A known positive that depends on scheduler
+    interleaving is a coin flip wearing a lab coat. Here the first
+    connection holds the write lock in the open (BEGIN IMMEDIATE) while the
+    second — busy_timeout=0, the binding's 5000ms default would mask the
+    collision, not the defect; db.py:227 records that measurement — attempts
+    a real write through the same Store.create_task path the product uses.
+    SQLite must refuse it, on every runner, every time."""
     db = tmp_path / "no_human.db"
-
-    async def open_and_write(n):
-        s = await Store(db).connect()
-        # busy_timeout=0 is NOT the pre-fix state — the sqlite3/aiosqlite
-        # binding defaults to 5000 (measured; db.py:227 says so), and the real
-        # defect was the SECOND CONNECTION, not a timeout. At the binding's
-        # default the race still reproduces but only ~1/6 runs (measured);
-        # forcing 0 makes the same race deterministic enough to assert on
-        # (~5/6) without flaking. The variable being controlled is connection
-        # count; this line is instrument stabilization, not the fix's inverse.
-        await s._db.execute("PRAGMA busy_timeout = 0")
-        try:
-            for i in range(30):
-                await s.create_task(Task.new(f"t{n}-{i}", repo_path="/tmp/r"))
-        finally:
-            await s.close()
-
-    results = await asyncio.gather(
-        *[open_and_write(n) for n in range(6)], return_exceptions=True
-    )
-    locked = [r for r in results if isinstance(r, Exception) and "locked" in str(r).lower()]
-    assert locked, (
-        "expected at least one 'database is locked' from racing independent "
-        "connections to the same fresh db — if this no longer reproduces, "
-        "the known-positive premise behind the fix test is stale"
-    )
+    s1 = await Store(db).connect()
+    s2 = await Store(db).connect()
+    try:
+        await s2._db.execute("PRAGMA busy_timeout = 0")
+        await s1._db.execute("BEGIN IMMEDIATE")  # holds RESERVED until rollback
+        with pytest.raises(Exception, match="(?i)locked"):
+            await s2.create_task(Task.new("t-collide", repo_path="/tmp/r"))
+    finally:
+        await s1._db.execute("ROLLBACK")
+        await s1.close()
+        await s2.close()
 
 
 def test_lifespan_reuses_external_store_no_second_connection():
