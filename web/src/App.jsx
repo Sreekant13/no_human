@@ -26,15 +26,30 @@ import { useEscapeKey } from "./useEscapeKey.js";
 
 
 // Header brand: logo + wordmark + tagline. Used in the main and error headers.
-function Brand() {
+// The mark is the way home, the way it is on every other product: clicking it
+// returns to the board. A real <button> rather than a click handler on a div,
+// so it is reachable by keyboard and announced as a control.
+function Brand({ onHome }) {
+  if (!onHome) {
+    return (
+      <div className="legion-brand">
+        <LegionLogo size={32} />
+        <div className="legion-wordmark">
+          <span className="legion-name">no_human</span>
+          <span className="legion-tag">get the max out of Claude</span>
+        </div>
+      </div>
+    );
+  }
   return (
-    <div className="legion-brand">
+    <button type="button" className="legion-brand legion-brand-home" onClick={onHome}
+            title="Back to work in progress" aria-label="Back to work in progress">
       <LegionLogo size={32} />
       <div className="legion-wordmark">
         <span className="legion-name">no_human</span>
         <span className="legion-tag">get the max out of Claude</span>
       </div>
-    </div>
+    </button>
   );
 }
 
@@ -434,11 +449,11 @@ function NewTaskModal({ onClose, onCreated }) {
     return (
       // No backdrop-click close — see the Refined Spec branch above.
       <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
-        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Intake grill" tabIndex={-1} ref={grillRef}>
-          <div className="sendback-label">Intake Grill</div>
+        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Twenty questions" tabIndex={-1} ref={grillRef}>
+          <div className="sendback-label">Twenty Questions</div>
           <div className="grill-loading">
             <Spinner />
-            <div className="grill-loading-text">Exploring the codebase...</div>
+            <div className="grill-loading-text">Reading your code so the questions are worth asking...</div>
             {grillEvents.length > 0 && (
               <div className="grill-explore-log">
                 {grillEvents.map((ev, i) => (
@@ -466,9 +481,9 @@ function NewTaskModal({ onClose, onCreated }) {
     if (busy) {
       return (
         <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
-          <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Intake grill" tabIndex={-1} ref={grillRef}>
+          <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Twenty questions" tabIndex={-1} ref={grillRef}>
             <div className="grill-header">
-              <div className="sendback-label">Intake Grill</div>
+              <div className="sendback-label">Twenty Questions</div>
               <span className="grill-round-badge">Round {grillQuestion.round}/{maxRounds}</span>
             </div>
             <div className="grill-progress-bar">
@@ -476,7 +491,7 @@ function NewTaskModal({ onClose, onCreated }) {
             </div>
             <div className="grill-loading">
               <Spinner />
-              <div className="grill-loading-text">Processing your answer...</div>
+              <div className="grill-loading-text">Thinking about that...</div>
               <div className="grill-loading-hint">Refining the next question based on your input</div>
             </div>
             {error && <div className="new-task-error">{error}</div>}
@@ -491,9 +506,9 @@ function NewTaskModal({ onClose, onCreated }) {
       // No backdrop-click close — a stray click mid-grill discarded every answer
       // the operator had already given. See the Refined Spec branch above.
       <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
-        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Intake grill" tabIndex={-1} ref={grillRef}>
+        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Twenty questions" tabIndex={-1} ref={grillRef}>
           <div className="grill-header">
-            <div className="sendback-label">Intake Grill</div>
+            <div className="sendback-label">Twenty Questions</div>
             <span className="grill-round-badge">Round {grillQuestion.round}/{maxRounds}</span>
           </div>
           <div className="grill-progress-bar">
@@ -798,7 +813,7 @@ export default function App() {
   return (
     <div className="nh-shell nh-shell-cc">
       <aside className="nh-sidebar">
-        <div className="nh-sidebar-brand"><Brand /></div>
+        <div className="nh-sidebar-brand"><Brand onHome={() => setPage("board")} /></div>
         {/* 1.5: grouped nav, Claude-app style — muted uppercase group headers over
             icon+label rows. Same destinations/handlers as before (Board/Done/Failed/
             Stats all still call setPage); this is visual grouping only. Done/Failed
@@ -807,7 +822,7 @@ export default function App() {
           <NavGroup title="Work">
             <NavRow
               icon={<IconBoard />}
-              label="Board"
+              label="In progress"
               active={page === "board"}
               current={page === "board"}
               onClick={() => setPage("board")}

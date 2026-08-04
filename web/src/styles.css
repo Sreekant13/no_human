@@ -542,6 +542,29 @@ html, body, #root {
   align-items: center;
   gap: 12px;
 }
+/* The brand is a <button> when it navigates home. Tailwind preflight is OFF in
+   this app, so a button keeps the UA's background, border, font and centring
+   unless every one of them is reset here — a bare rule would paint a grey
+   system chrome box around the logo. Text stays left-aligned because the
+   wordmark is a two-line block, not a label. */
+.legion-brand-home {
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 8px;
+}
+.legion-brand-home:hover .legion-name { color: var(--accent-500); }
+.legion-brand-home:focus-visible {
+  outline: 2px solid var(--accent-500);
+  outline-offset: 3px;
+}
 .legion-logo {
   /* No border-radius or box-shadow: the brand mark is a transparent
      monogram, not the opaque square badge this rule was written for. A
