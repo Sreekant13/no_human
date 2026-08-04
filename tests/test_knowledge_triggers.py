@@ -58,3 +58,33 @@ def test_filter_triggered_partitions_the_set():
     out = filter_triggered(mems, "debug the kafka consumer lag")
     titles = {m["title"] for m in out}
     assert titles == {"global", "kafka"}  # clickhouse held back
+
+
+def test_provenance_tags_are_filter_only_not_triggers():
+    # vocab.py: ORIGIN_* tags name where a lesson came from, not what it is
+    # about — "address the review comments" must not summon every
+    # review-origin lesson in the store.
+    m = {"title": "digest pinning", "tags": '["review", "container"]'}
+    assert memory_is_triggered(m, "address the review comments on the docs") is False
+    assert memory_is_triggered(m, "pin the docker image digest") is True
+
+
+def test_a_provenance_only_memory_never_auto_injects():
+    # No topical tag = nothing to match a task against. It stays visible in
+    # `nh learnings` (filterable by producer); it does not ride every prompt.
+    m = {"title": "origin only", "tags": '["review"]'}
+    assert memory_is_triggered(m, "review the code") is False
+    assert memory_is_triggered(m, "anything else") is False
+    sup = {"title": "sup only", "tags": '["supervisor"]'}
+    assert memory_is_triggered(sup, "the supervisor said so") is False
+
+
+def test_generic_aliases_do_not_trigger():
+    # "path"/"env"/"json"/"request" appear in half the queue's task text; a
+    # lesson tagged environment/api fires on its specific terms, not those.
+    env_lesson = {"title": "venv trap", "tags": '["environment"]'}
+    assert memory_is_triggered(env_lesson, "update the api request path handling") is False
+    assert memory_is_triggered(env_lesson, "the venv was built against main") is True
+    api_lesson = {"title": "endpoint 500", "tags": '["api"]'}
+    assert memory_is_triggered(api_lesson, "fix the json parsing in the config loader") is False
+    assert memory_is_triggered(api_lesson, "the endpoint returns 500") is True

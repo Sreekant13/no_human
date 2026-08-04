@@ -39,10 +39,12 @@ def memory_is_triggered(memory: dict[str, Any], haystack: str) -> bool:
     appears (case-insensitive substring) in the task text.
 
     A CANONICAL vocabulary tag (B3, ``learning/vocab.py``) triggers on its
-    whole alias family, not just its own value — a lesson stored under
-    ``environment`` must still fire for a task that says "venv". A tag from
-    outside the vocabulary (pre-B3 rows, outcome-path enum tags) matches on
-    its literal value exactly as before."""
+    alias family (minus the deliberately generic ``NON_TRIGGER_ALIASES``),
+    not just its own value — a lesson stored under ``environment`` must still
+    fire for a task that says "venv". A PROVENANCE tag contributes no trigger
+    terms at all, so a memory tagged only with provenance never auto-injects.
+    A tag from outside the vocabulary (pre-B3 rows, outcome-path enum tags)
+    matches on its literal value exactly as before."""
     from .vocab import trigger_terms
     tags = [t for t in _tags_of(memory) if t.strip()]
     if not tags:

@@ -387,3 +387,26 @@ async def test_end_to_end_a_stored_lesson_fires_for_the_aliased_task_text(store)
     assert [m["id"] for m in hit] == [row["id"]]
     miss = filter_triggered(active, "rewrite the readme intro")
     assert miss == []
+
+
+def test_generic_aliases_still_sanitize_but_never_trigger():
+    # TAG_VOCABULARY serves two mechanisms with different risk profiles:
+    # sanitize matches raw tags EXACTLY (an LLM tag "env" is unambiguous),
+    # triggers match task text by SUBSTRING (where "env"/"path"/"json"/
+    # "request" ride in unrelated tasks). The generic aliases must keep
+    # mapping on the sanitize side and vanish from the trigger side.
+    from no_human.learning.vocab import sanitize_tags, trigger_terms
+
+    assert sanitize_tags(["env"]) == ["environment"]
+    assert sanitize_tags(["path"]) == ["environment"]
+    assert sanitize_tags(["request"]) == ["api"]
+    assert sanitize_tags(["json"]) == ["api"]
+    for generic in ("env", "path"):
+        assert generic not in trigger_terms("environment")
+    for generic in ("json", "request", "requests"):
+        assert generic not in trigger_terms("api")
+    assert "venv" in trigger_terms("environment")
+    assert "endpoint" in trigger_terms("api")
+    # Provenance tags contribute no trigger surface at all.
+    assert trigger_terms("review") == frozenset()
+    assert trigger_terms("supervisor") == frozenset()

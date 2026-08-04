@@ -34,7 +34,8 @@ TRIGGERS STILL FIRE ON THE SPECIFIC WORD. Storing ``environment`` instead of
 ``venv`` would lose the trigger match on a future task that says "venv" — so
 ``learning/triggers.py`` expands a canonical tag to this module's alias set
 when matching. The stored value is controlled; the trigger surface is the
-whole alias family.
+alias family minus ``NON_TRIGGER_ALIASES`` (words too generic to match task
+text by substring), and provenance tags contribute no trigger surface at all.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ from collections.abc import Iterable
 __all__ = [
     "TAG_VOCABULARY",
     "PROVENANCE_TAGS",
+    "NON_TRIGGER_ALIASES",
     "sanitize_tags",
     "trigger_terms",
 ]
@@ -132,8 +134,23 @@ TAG_VOCABULARY: dict[str, frozenset[str]] = {
 # The two queue-provenance tags (`learning/queue.py`'s ORIGIN_* values ride in
 # tags so `nh learnings` can be filtered by producer). Part of the vocabulary —
 # a sanitized tag list may carry them — but they alias nothing: they name where
-# a lesson came from, not what it is about.
+# a lesson came from, not what it is about. For the same reason they contribute
+# NO trigger terms (`trigger_terms` returns the empty set for them): every
+# review-origin lesson carries `review`, and task text saying "address the
+# review comments" is routine, so letting the tag match would make the entire
+# review-origin shelf near-unconditional injection. A lesson tagged ONLY with
+# provenance therefore never auto-injects — it has no topical trigger
+# condition; it stays reachable through `nh learnings`.
 PROVENANCE_TAGS: frozenset[str] = frozenset({"review", "supervisor"})
+
+# Aliases that stay valid for `sanitize_tags` (raw tags match EXACTLY, so an
+# LLM tag "env" unambiguously means environment) but are removed from the
+# TRIGGER surface (task text matches by SUBSTRING, and these words ride in
+# unrelated tasks constantly — "path", "env", "json", "request" would make
+# their canonical tags fire on half the queue).
+NON_TRIGGER_ALIASES: frozenset[str] = frozenset({
+    "env", "path", "json", "request", "requests",
+})
 
 
 def _alias_index() -> dict[str, str]:
@@ -179,9 +196,15 @@ def sanitize_tags(raw: Iterable[str]) -> list[str]:
 
 def trigger_terms(tag: str) -> frozenset[str]:
     """Every term a stored tag should trigger on: the tag itself plus, for a
-    canonical vocabulary tag, its whole alias family. A tag from outside the
-    vocabulary (pre-B3 rows, outcome-path enum tags) triggers on its own value
-    exactly as it always did."""
+    canonical vocabulary tag, its alias family minus `NON_TRIGGER_ALIASES`.
+    A PROVENANCE tag contributes nothing — it names a producer, not a topic
+    (see `PROVENANCE_TAGS`). A tag from outside the vocabulary (pre-B3 rows,
+    outcome-path enum tags) triggers on its own value exactly as it always
+    did."""
     low = (tag or "").strip().lower()
+    if low in PROVENANCE_TAGS:
+        return frozenset()
     aliases = TAG_VOCABULARY.get(low)
-    return frozenset({low, *aliases}) if aliases else frozenset({low})
+    if aliases is None:
+        return frozenset({low})
+    return frozenset({low, *aliases}) - NON_TRIGGER_ALIASES

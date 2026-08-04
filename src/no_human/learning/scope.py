@@ -7,7 +7,10 @@ product's OWN isolation mechanism) reads as two unrelated projects: lessons
 learned in one checkout never surface in the other, and B2's clustering
 counts "the same correction in two checkouts" as two one-offs instead of one
 recurrence. The thing a lesson is ABOUT is the repository, and the stable
-name of a repository is its remote.
+name of a repository is its remote. (This module fixes STORAGE and RECALL;
+`corrections.py` still clusters on the checkout path — unifying that on the
+scope is deliberately left for a follow-up, so cross-checkout recurrence
+counting remains split for now.)
 
 THE IDENTITY: ``"prj:" + sha256(normalized remote URL)``. Normalization
 (:func:`normalize_remote_url`): credentials (any userinfo) stripped, scheme
