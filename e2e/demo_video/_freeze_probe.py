@@ -28,6 +28,8 @@ one of them wrong.
 import subprocess
 from pathlib import Path
 
+from . import verify_sync as vs
+
 FFMPEG = "/opt/homebrew/bin/ffmpeg"
 W, H, FPS = 640, 360, 30
 DUR = 8.0
@@ -102,30 +104,33 @@ def build(kind: str) -> Path:
     return dst
 
 
-OUT.mkdir(exist_ok=True)
-clips = [("A moving", build("moving"), False),
-         ("B frozen", build("frozen"), True),
-         ("C rampmask", build("rampmask"), True),
-         ("D driftmask", build("driftmask"), True)]
+def main() -> None:
+    OUT.mkdir(exist_ok=True)
+    clips = [("A moving", build("moving"), False),
+             ("B frozen", build("frozen"), True),
+             ("C rampmask", build("rampmask"), True),
+             ("D driftmask", build("driftmask"), True)]
 
-from . import verify_sync as vs  # noqa: E402
+    samples = tuple(float(i) for i in range(1, int(DUR) - 2))
+    rows = []
+    for label, mp4, want_fail in clips:
+        print(f"\n=== {label}  ({mp4.name})")
+        problems = vs.check_freeze(mp4, DUR, samples)
+        failed = bool(problems)
+        ok = failed == want_fail
+        print(f"  VERDICT: {'FAIL' if failed else 'PASS'}   "
+              f"(wanted {'FAIL' if want_fail else 'PASS'})  -> "
+              f"{'correct' if ok else '*** WRONG ***'}")
+        for p in problems[:2]:
+            print(f"    - {p}")
+        rows.append((label, failed, want_fail, ok))
 
-samples = tuple(float(i) for i in range(1, int(DUR) - 2))
-rows = []
-for label, mp4, want_fail in clips:
-    print(f"\n=== {label}  ({mp4.name})")
-    problems = vs.check_freeze(mp4, DUR, samples)
-    failed = bool(problems)
-    ok = failed == want_fail
-    print(f"  VERDICT: {'FAIL' if failed else 'PASS'}   "
-          f"(wanted {'FAIL' if want_fail else 'PASS'})  -> "
-          f"{'correct' if ok else '*** WRONG ***'}")
-    for p in problems[:2]:
-        print(f"    - {p}")
-    rows.append((label, failed, want_fail, ok))
+    print("\n---- summary ----")
+    for label, failed, want, ok in rows:
+        print(f"  {label:12s} got {'FAIL' if failed else 'PASS'}  "
+              f"want {'FAIL' if want else 'PASS'}  {'OK' if ok else 'WRONG'}")
+    print("ALL CORRECT" if all(r[3] for r in rows) else "SOME WRONG")
 
-print("\n---- summary ----")
-for label, failed, want, ok in rows:
-    print(f"  {label:12s} got {'FAIL' if failed else 'PASS'}  "
-          f"want {'FAIL' if want else 'PASS'}  {'OK' if ok else 'WRONG'}")
-print("ALL CORRECT" if all(r[3] for r in rows) else "SOME WRONG")
+
+if __name__ == "__main__":
+    main()

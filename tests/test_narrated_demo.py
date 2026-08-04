@@ -31,6 +31,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from e2e.demo_video import _freeze_probe as fp  # noqa: E402
 from e2e.demo_video import compose, narration as nr  # noqa: E402
 from e2e.demo_video import fixture as fx  # noqa: E402
 from e2e.demo_video import sprint as sp  # noqa: E402
@@ -1781,6 +1782,72 @@ def test_the_motion_thresholds_leave_room_between_real_and_manufactured():
     # is not read as a dead frame — measured: judging a single consecutive
     # pair failed a genuinely moving clip 5 times in 6.
     assert vs.FREEZE_WINDOW >= 10.0 / nr.FPS
+
+
+def test_min_moved_share_is_pinned_to_the_probe_s_measured_motion_floor():
+    """MIN_MOVED_SHARE=0.001 was "measured, not reasoned" (`_freeze_probe`'s
+    own module docstring) but nothing tied it to that measurement: a review
+    found that retuning it 500x (to 0.5) still left all 241 demo tests, and
+    freezedetect itself, green — only a manual run of `_freeze_probe` (a
+    minute-long script nothing runs in CI) caught it, because clip A
+    ("moving": a 56px block stepping to a new 32-cell-grid position every 6
+    frames — LOCALIZED motion, the shape a real UI change has) started
+    reading as "dead" instead of "local":
+
+        MIN_MOVED_SHARE = 0.5  ->  `_freeze_probe`'s own summary:
+        A moving     got FAIL  want PASS  WRONG   (verified by hand, see PR)
+
+    This reproduces that measurement in-process, at the SAME geometry
+    `check_freeze`'s localization pass uses on every real render — frames
+    `FREEZE_WINDOW` apart, `drift_share` at `LOCAL_DELTA` — on the SAME
+    frames `_freeze_probe.with_block` generates for clip A (imported
+    directly: one source of the adversary, not a copy that can drift out of
+    sync with it). It skips `_freeze_probe.build`'s ffmpeg encode: encoding
+    is orthogonal to the pixel-level share this constant has to respect, and
+    skipping it keeps this test ffmpeg-free like the rest of this file.
+    (Checked by hand against a real encode: the post-encode floor for this
+    same clip is ~3.9%, WIDER than the ~2.7% measured here — the encoder
+    only makes the floor more forgiving, never less, so measuring pre-encode
+    is the conservative choice.)
+
+    Only the first 30 frames (one second, spanning ten of the block's 6-frame
+    cell transitions) are scanned — confirmed by hand against a full
+    240-frame scan of the whole 8 s clip, which lands on the exact same
+    minimum, because the moved share this comparison produces turns out to be
+    constant across the whole clip: a structural property of the block size
+    and grid spacing, not a per-instant fluke a short scan could miss.
+
+    THE ASSERTION: MIN_MOVED_SHARE must be a small, comfortable fraction of
+    that measured floor — currently ~3.7% of it. Retuning it "significantly"
+    — the ticket's own examples, 500x to 0.5 or 10x to 0.01 — both push that
+    ratio far outside a generous [1%, 15%] band and fail here, long before
+    anyone has to run `_freeze_probe` by hand to find out.
+    """
+    window = round(vs.FREEZE_WINDOW * fp.FPS)
+    assert window > 0
+    scan = min(30, fp.N - window)
+    floor = min(
+        vs.drift_share(bytes(fp.with_block(i)), bytes(fp.with_block(i + window)))[1]
+        for i in range(scan))
+    assert floor > 0, (
+        "the 'moving' probe clip must contain real motion over the window "
+        "for this measurement to mean anything")
+
+    ratio_low, ratio_high = 0.01, 0.15
+    ratio = vs.MIN_MOVED_SHARE / floor
+    assert ratio_low <= ratio <= ratio_high, (
+        f"MIN_MOVED_SHARE ({vs.MIN_MOVED_SHARE}) is {ratio:.1%} of the "
+        f"measured local-motion floor ({floor:.4f}) from _freeze_probe's "
+        f"'moving' clip — outside the [{ratio_low:.0%}, {ratio_high:.0%}] "
+        f"band a silent retune must not leave")
+
+    # The ticket's own examples, made concrete against the same measurement:
+    # both retunes must land outside the band above, not just in theory.
+    assert not (ratio_low <= 0.5 / floor <= ratio_high), (
+        "a 500x retune to 0.5 must fail this pin — it is the exact defect "
+        "this test exists to catch")
+    assert not (ratio_low <= 0.01 / floor <= ratio_high), (
+        "a 10x retune to 0.01 must fail this pin too")
 
 
 def test_the_freeze_gate_reads_two_frames_a_window_apart_not_one():
