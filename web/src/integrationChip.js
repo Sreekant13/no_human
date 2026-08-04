@@ -53,8 +53,14 @@ export const KIND_LABEL = {
   notifications: "Notifications",
 };
 
-// Brand accent per integration (the mark's fill). Fixed hex — theme-independent,
-// so the same recognizable color reads in both light and dark.
+// Each vendor's own published brand colour, kept as a record.
+//
+// NOTHING RENDERS WITH THIS ANY MORE, and that is deliberate rather than an
+// oversight. It used to fill the integration glyphs in integrationIcons.jsx; a
+// generic glyph painted in a vendor's registered colour, right beside that vendor's
+// name, is what turns a neutral shape into a claim about a specific company. The
+// glyphs now paint in one neutral app accent instead. Do not wire this back into
+// anything that renders a vendor's mark or a stand-in for one — see TRADEMARK.md.
 export const BRAND_COLOR = {
   jira: "#2684FF",
   linear: "#5E6AD2",

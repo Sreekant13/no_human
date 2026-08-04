@@ -97,17 +97,30 @@ are **required** by the owner rather than offered as a courtesy — GitLab's Tra
 Guidelines §1.2.2 and the Jenkins project's trademark policy each prescribe a
 statement — and the rest are the forms the owners publish.
 
+This is the single place in this repository that records who owns which mark.
+`TRADEMARK.md` states the nominative-use and no-affiliation position and points here
+rather than repeating the list, so there is one copy to keep right.
+
 - Jira is a trademark of Atlassian Pty Ltd.
-- GITLAB is a trademark of GitLab Inc. in the United States and other countries and
+- GITLAB™ is a trademark of GitLab Inc. in the United States and other countries and
   regions.
 - GitHub is a trademark of GitHub, Inc.
+- Linear is a trademark of Linear Orbit, Inc.
 - Slack is a trademark and service mark of Slack Technologies, Inc., registered in
   the U.S. and in other countries.
+- Microsoft and Microsoft Teams are trademarks of the Microsoft group of companies.
 - Jenkins® is a registered trademark of LF Charities Inc.
 - CircleCI is a trademark or registered trademark of Circle Internet Services, Inc.
 - Claude and Anthropic are trademarks of Anthropic PBC.
 
 All other trademarks are the property of their respective owners.
+
+Two notes on the list itself, because getting an owner wrong is its own kind of
+misuse. The **™ on the first GitLab mention** is not decoration: GitLab's Trademark
+Guidelines require the symbol at the first or most prominent mention, in the same
+breath as the proprietorship sentence, so the two travel together. And **Jenkins
+belongs to LF Charities Inc.**, per jenkins.io's own trademark page — not to the
+Continuous Delivery Foundation, which hosts the project but is not the registrant.
 
 **no_human is an independent product. It is not affiliated with, endorsed, sponsored
 or approved by any of these companies, and nothing in this repository or in its
@@ -124,8 +137,9 @@ rather than being a formality:
 2. **Do not describe no_human as a partner, an official integration, or as certified
    by anyone.** It is none of those things.
 
-The reasoning, the clauses these lines come from, and what still needs a lawyer are
-in [`docs/INTEGRATIONS_LEGAL.md`](docs/INTEGRATIONS_LEGAL.md). The strings above were
-transcribed from vendor pages read on 2026-08-01 and should be re-checked against the
-live pages before a public release — a paraphrase in a trademark notice is worse than
-no notice.
+The strings above were transcribed from the owners' own published pages, read on
+2026-08-01, and **should be re-checked against the live pages before a public
+release** — a paraphrase in a trademark notice is worse than no notice, and at least
+one of these pages renders only under JavaScript and so cannot be diffed
+mechanically. See [`TRADEMARK.md`](TRADEMARK.md) for this project's position on
+using other people's marks, and on using ours.

@@ -69,6 +69,39 @@ are filing, and it is confusing to the maintainer for the same reason. Pick your
 own name, and say plainly in your README that it began as a fork of no_human.
 That is better for you as well: your fork gets to be its own thing.
 
+## Other people's marks
+
+This project names a lot of software it works with, and those names belong to
+other people.
+
+**Who owns what is recorded in one place — [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md),
+under "Third-party trademarks" — and deliberately not repeated here.** A list kept
+in two files goes wrong in one of them, and an attribution that names the wrong
+owner is itself a misuse of the mark. One copy, one place to fix.
+
+Every one of those names is used **nominatively** — to say truthfully what this
+software runs on or talks to. That is what the names are for, and it is the same
+courtesy this project asks for its own name, above.
+
+None of it implies affiliation, sponsorship, partnership, certification, or
+endorsement by any of those companies. There is none. Where this project runs on
+a third party's model or connects to a third party's service, you bring your own
+account and your own credentials, and your relationship with that company is
+yours and governed by their terms, not by anything here.
+
+Two rules follow, and they bind this project as much as anyone forking it:
+
+- **Their logos are not ours to ship.** This project displays no vendor's logo,
+  official or redrawn. Redrawing a mark is not the cautious option — it adds a
+  modification breach, and often a copyright claim, on top of the trademark
+  question. Several of these owners forbid third-party logo use outright or require
+  written permission. Names in text are what nominative use covers; artwork is not.
+- **No claim of endorsement.** This project is not a partner, an official
+  integration, or certified by anyone.
+
+If you own one of these marks and something here misuses it, open an issue and it
+will be fixed.
+
 ## Asking
 
 Anything not covered above, or anything you are unsure about: open an issue and

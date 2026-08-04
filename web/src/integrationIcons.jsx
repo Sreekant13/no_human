@@ -6,16 +6,34 @@
 // hand-drawn approximations of the real ones (an octocat silhouette, the Slack
 // octothorpe, the tanuki, the Atlassian chevrons), which is a trademark problem and
 // not a small one: every vendor here publishes a no-modification rule, a redraw is a
-// modification however good the likeness, and this file ships inside the DMG. GitHub
-// and GitLab answer the redraw question by name — "You may not use an octocat,
-// created by GitHub or by you", and "Can I create my own version of the tanuki? No."
-// GitLab forbids third-party logo use outright. See docs/INTEGRATIONS_LEGAL.md §4.3.
+// modification however good the likeness, and this file ships inside the DMG.
+//
+// GitHub and GitLab answer the redraw question by name. GitHub's Octodex FAQ, quoted
+// in FULL because the tail of the sentence is doing real work: "You may not use an
+// octocat, created by GitHub or by you, for products or merchandise without written
+// permission from GitHub." That is a permission requirement scoped to product use,
+// not a blanket ban on octocats — but we are a product and we have no such
+// permission, so it lands on us either way. Do not quote it truncated at "or by you";
+// that states GitHub's rule as stricter than GitHub wrote it. GitLab's brand FAQ:
+// "Can I create my own version of the tanuki?" — "No." GitLab forbids third-party
+// logo use outright.
+//
+// COLOUR IS PART OF THE FIX, not a detail. These glyphs used to be painted in each
+// vendor's exact brand hex (BRAND_COLOR). A generic shape rendered in the vendor's
+// registered colour, directly beside the vendor's name, is exactly the context that
+// turns "a gear" into a claim about a specific company — so shape alone was only half
+// a cure. Every glyph now paints in ONE neutral app accent (--accent-500, the same
+// token the rest of the UI uses), which belongs to us and to nobody else.
 //
 // A generic glyph beside the vendor's NAME says what the row is without claiming to
 // be anyone's mark, and it needs nobody's permission. Do not "improve" these back
-// toward the real logos; if official marks are ever wanted here they are the official
-// asset files, unmodified, with permission where the vendor requires it.
-import { BRAND_COLOR } from "./integrationChip.js";
+// toward the real logos, and do not re-introduce per-vendor colour; if official marks
+// are ever wanted here they are the official asset files, unmodified, with permission
+// where the vendor requires it. See TRADEMARK.md and THIRD-PARTY-NOTICES.md.
+
+// The single neutral accent every integration glyph paints in. An existing palette
+// token from web/src/styles.css — not a per-vendor colour, and not a new one.
+const GLYPH_ACCENT = "var(--accent-500)";
 
 const MARKS = {
   // Issue tracker — a ticket with a torn stub.
@@ -71,17 +89,22 @@ export const ICON_NAMES = Object.keys(MARKS);
 
 export function IntegrationIcon({ name, size = 22 }) {
   const draw = MARKS[name];
-  const color = BRAND_COLOR[name] || "currentColor";
+  // Every glyph, every integration, one colour. The svg sets its own `color` so the
+  // accent is the same wherever the icon is mounted (the Integrations panel and the
+  // onboarding cards set different inherited colours on their wrappers), and the
+  // paths draw with currentColor.
   if (!draw) {
     return (
-      <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true">
+      <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true"
+           style={{ color: GLYPH_ACCENT }}>
         <circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" strokeWidth="2" />
       </svg>
     );
   }
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" role="img" aria-label={name}>
-      {draw(color)}
+    <svg width={size} height={size} viewBox="0 0 24 24" role="img" aria-label={name}
+         style={{ color: GLYPH_ACCENT }}>
+      {draw("currentColor")}
     </svg>
   );
 }

@@ -1,6 +1,6 @@
 @import "./assets/fonts/fonts.css";
-/* ── no_human board — dark-first, Atlassian blue accent ─────────────────── */
-/* Dark base surface, elevated cards, Atlassian blue accent, status lozenges.
+/* ── no_human board — dark-first, blue accent ───────────────────────────── */
+/* Dark base surface, elevated cards, a single blue accent, status lozenges.
    DM Sans (geometric, distinctive) + IBM Plex Mono (code). Tokens cascade
    app-wide; dark theme is default, light available via [data-theme="light"]. */
 
