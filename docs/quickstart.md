@@ -20,6 +20,18 @@ What you actually do:
 If you ever need that screen again — a revoked or mistyped token strands the
 app otherwise — it is **File → Re-enter Claude Token…**.
 
+Then confirm the install is actually working — the same liveness check
+section 3 points source installs to, reachable without one:
+
+```bash
+/Applications/no_human.app/Contents/Resources/nh-server/nh doctor
+```
+
+`nh doctor` is a subcommand of the binary the app already bundles, not
+something the source install adds — see
+[INSTALLER.md#verify-your-install-is-real](INSTALLER.md#verify-your-install-is-real)
+for expected output (both a healthy and a failing run) and troubleshooting.
+
 Everything from section 4 onward applies to you too, EXCEPT that commands are
 written as `uv run nh …` for the source install. The packaged app runs the same
 server internally, so use the board rather than the CLI unless you have also

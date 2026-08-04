@@ -59,6 +59,84 @@ only, and a run bills exactly the one configured path: a key pasted into the
 subscription field is rejected, and stray billing variables are scrubbed at
 startup.
 
+## Verify your install is real
+
+**Decision (F6):** the DMG reader's install-health check is `nh doctor` — path
+A (a real command reachable from the installed build), not path B (new prose
+instructions in place of a command). It needed **no new code**: `doctor` is
+already a `@cli.command` in `src/no_human/cli/commands.py`, and
+`packaging/nh_entry.py` statically imports `no_human.cli.commands` as a
+PyInstaller analysis anchor, so every subcommand — `doctor` included — is
+already in the frozen `nh` binary the app ships. The gap `docs/quickstart.md`
+had was pointing at it only through `nh init` in section 3, which it tells
+`.dmg` readers to skip; the fix is routing them to the command directly
+instead of building a second one.
+
+Run it from a Terminal, using the binary the app already bundles — no source
+checkout, no `uv run`:
+
+```bash
+/Applications/no_human.app/Contents/Resources/nh-server/nh doctor
+```
+
+What you should see: a `coding backend — claude CLI: <path>` line, then a
+mechanism-liveness table, ending either `no contradictions, no evidence gaps`
+(exit 0) or a red `contradictions` block naming what's wrong (exit 1).
+
+**Real output**, captured by building the frozen bundle in this environment
+(`bash packaging/build-installer.sh`, then running
+`packaging/dist/nh-server/nh doctor` directly — the same binary that lands at
+`no_human.app/Contents/Resources/nh-server/nh`) and running it both with and
+without the `claude` CLI on `PATH`:
+
+Healthy (exit 0):
+
+```
+coding backend — claude CLI: ~/.local/bin/claude
+mechanism liveness (lifetime firings)
+  planning                0  last: never  zero = planning disabled or no task got past intake
+  ...
+no contradictions, no evidence gaps
+```
+
+Unhealthy (exit 1) — `claude` CLI not on `PATH`, the single most common friend
+failure (see "What a friend does" above):
+
+```
+coding backend — claude CLI: not found
+mechanism liveness (lifetime firings)
+  ...
+contradictions — evidence of activity without evidence of the mechanism:
+  ✗ CODING BACKEND UNUSABLE: the `claude` CLI is not installed or not on PATH —
+the Claude Agent SDK shells out to it for every task, so every task would fail
+at launch. Install it with: npm install -g @anthropic-ai/claude-code
+```
+
+On a brand-new install every mechanism reads `0  last: never` — expected,
+nothing has run yet. Re-run `nh doctor` after your first task to see counters
+move, and whenever something behaves oddly.
+
+**Scope of this evidence:** the two transcripts above are real, run against
+the actual frozen PyInstaller bundle (`packaging/nh-server.spec` /
+`packaging/build-installer.sh`), not inferred from source. What was **not**
+run in this environment: `electron-builder --mac` and `make-dmg.sh` — no
+`electron-builder` was installed here, and installing new packages is out of
+scope for a docs-only change. So the exact path
+`no_human.app/Contents/Resources/nh-server/nh` is confirmed by
+`electron-builder.config.cjs`'s `extraResources` mapping and by "Verifying a
+build" below (which does mount and run a built DMG this way), but was not
+re-mounted from a freshly-built signed DMG for this change.
+
+**Gatekeeper on the nested binary, not just the app.** If you extract or
+`open` the `nh` binary directly instead of running it from a Terminal path,
+Gatekeeper can refuse *it* independently of the app's own right-click-Open
+step: a quarantined copy gives `spctl -a -t exec` a `rejected` verdict and
+`open` fails with error `-128`. Invoking the identical binary as a shell
+command (`.../nh doctor`, as documented above) is unaffected by that check —
+verified on a deliberately quarantined copy of the frozen binary built here,
+which still ran and exited 0 as a shell command. Always run it as a path in
+Terminal; don't double-click or `open` the nested binary.
+
 ## Why the packaging looks the way it does
 
 Three constraints drove the design, each found by measuring a real build:
