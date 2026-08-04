@@ -328,10 +328,22 @@ def test_env_file_round_trips_non_ascii(tmp_path):
     assert env.read_bytes().decode("utf-8")
 
 
-def test_scope_guard_compares_posix_separators(tmp_path):
+def test_scope_guard_compares_posix_separators(tmp_path, monkeypatch):
     """Plan files are `/`-separated (they come from the plan text and from
     git). `str(WindowsPath)` yields backslashes, so the membership test never
-    matched and EVERY edit was reported out of scope."""
+    matched and EVERY edit was reported out of scope.
+
+    The POSIX half below cannot fail: `str()` and `as_posix()` agree on a
+    PosixPath, so it passed with the defect still in place (measured by
+    reverting the fix). The discriminating half swaps `scope_guard.Path` for
+    `PureWindowsPath` so the separator logic runs as it would on Windows, and
+    it reads the separator out of the WARNING TEXT rather than out of an
+    in-scope verdict: a plan file whose full path matches always has a
+    matching basename too, so the fuzzy fallback returns None either way and
+    no in-scope assertion can tell the fix from the defect.
+    """
+    from pathlib import PureWindowsPath
+
     sg = importlib.import_module("no_human.agent.scope_guard")
 
     root = tmp_path / "repo"
@@ -339,3 +351,10 @@ def test_scope_guard_compares_posix_separators(tmp_path):
     edited = root / "src" / "app.py"
     edited.write_text("x", encoding="utf-8")
     assert sg.check_scope(str(edited), {"src/app.py"}, repo_root=str(root)) is None
+
+    monkeypatch.setattr(sg, "Path", PureWindowsPath)
+    warning = sg.check_scope("C:\\repo\\src\\other.py", {"src/app.py"},
+                             repo_root="C:\\repo")
+    assert warning is not None
+    assert "'src/other.py'" in warning
+    assert "\\" not in warning
