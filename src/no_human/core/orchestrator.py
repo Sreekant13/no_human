@@ -23,6 +23,7 @@ import os
 import re
 import unicodedata
 import shutil
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -53,11 +54,14 @@ from ..blockers import (
 )
 from ..ci.base import CIResult, HumanGatedCI
 from ..config import active_auth_profile
+from ..history.skills import discover_skills
 from ..intake.split_proposal import generate_split_proposal
 from ..intake.surface_advisory import surface_advisory
+from ..learning.triggers import filter_triggered
 from ..notify.slack import SlackNotifier
 from ..review import selfcheck
 from ..review.reviewer import AdversarialReviewer, ReviewDecision, ReviewerUnavailable
+from ..review.selfcheck import ChecklistItem
 from ..testing import runner
 from ..testing.repro_gate import MANIFEST as REPRO_MANIFEST
 from ..testing.repro_gate import run_repro_gate
@@ -73,6 +77,7 @@ from .prompt_blocks import (
 from ..project_config import apply_repo_config, load_repo_config
 from .report_quality import report_inadequacy
 from ..vcs import GitError, GitRepo, ProtectedBranch, open_pr
+from ..vcs import pr_watcher
 from ..vcs.receipts import verify_pr_receipt
 from . import plan_gate
 from .bounds import Bounds, QuotaExhausted, StuckDetector
@@ -1876,7 +1881,6 @@ class Orchestrator:
         # W3.4 knowledge triggers: a tagged memory injects only when its
         # trigger matches this task; untagged memories always inject. Emit an
         # audit line (agent-a's "Accessed Knowledge") naming injected vs held.
-        from ..learning.triggers import filter_triggered
         _haystack = (f"{task.title} {task.description or ''} "
                      f"{' '.join(task.acceptance_criteria or [])}")
         _triggered = filter_triggered(_all_memories, _haystack)
@@ -1916,7 +1920,6 @@ class Orchestrator:
         self._discovered_skills_info: list = []  # SkillInfo objects for compact instructions
         self._copied_skill_dirs: list[Path] = []  # user-skill copies to clean up
         if task.repo_path:
-            from ..history.skills import discover_skills
             extra_roots = [Path(task.repo_path) / ".claude" / "skills"]
             disk_skills = await asyncio.to_thread(
                 discover_skills, extra_roots=extra_roots,
@@ -2633,7 +2636,6 @@ class Orchestrator:
             supervisor = None
             self._active_supervisor = None
         if _can_hooks and (lint_hook is not None or scope_hook is not None):
-            from ..agent.lint_hook import LintFeedbackHook as _LFH  # noqa: F811
             # Combine lint + scope into a single composite PostToolUse hook
             # since ClaudeBackend only accepts one lint_hook.
             hooks = [h for h in (lint_hook, scope_hook) if h is not None]
@@ -2678,9 +2680,8 @@ class Orchestrator:
 
         # C7: refresh remote refs so the agent doesn't work on stale branches.
         try:
-            import subprocess as _sp_fetch
             await asyncio.to_thread(
-                _sp_fetch.run,
+                subprocess.run,
                 ["git", "fetch", "origin"],
                 cwd=str(repo.path), capture_output=True, timeout=30,
             )
@@ -2697,12 +2698,11 @@ class Orchestrator:
         teardown_cmds = (task.config or {}).get("env_teardown", [])
         saved_env: dict[str, str | None] = {}
         if setup_cmds:
-            import subprocess as _sp
             self.emit("env_setup", f"running {len(setup_cmds)} setup command(s)")
             for cmd in setup_cmds:
                 try:
                     # Run with env-export wrapper so we can capture exported vars.
-                    proc = _sp.run(
+                    proc = subprocess.run(
                         cmd, shell=True, capture_output=True, text=True,
                         timeout=120, cwd=str(repo.path),
                     )
@@ -2715,7 +2715,7 @@ class Orchestrator:
                         self._cleanup_copied_skills()
                         return TaskOutcome(
                             task, status=TaskStatus.FAILED, detail=detail)
-                except _sp.TimeoutExpired:
+                except subprocess.TimeoutExpired:
                     detail = f"env_setup timed out (120s): {cmd[:80]}"
                     self.emit("env_setup_failed", detail)
                     await self.store.update_attempt(
@@ -2800,12 +2800,11 @@ class Orchestrator:
                     else:
                         os.environ[k] = orig
                 if teardown_cmds:
-                    import subprocess as _sp
                     self.emit("env_teardown", f"running {len(teardown_cmds)} teardown command(s)")
                     for cmd in teardown_cmds:
                         try:
-                            _sp.run(cmd, shell=True, capture_output=True,
-                                    timeout=60, cwd=str(repo.path))
+                            subprocess.run(cmd, shell=True, capture_output=True,
+                                           timeout=60, cwd=str(repo.path))
                         except Exception:  # noqa: BLE001 — teardown is best-effort
                             log.warning("env_teardown command failed: %s", cmd[:80])
         except (asyncio.TimeoutError, TimeoutError):
@@ -4793,7 +4792,6 @@ class Orchestrator:
                     "the claim — the gate cannot run (fail closed)",
                     repo=repo, branch=branch, goal=task.title,
                 )
-            from ..review.selfcheck import ChecklistItem
             self.emit(
                 "review_advisory",
                 "REVIEW GATE SKIPPED — already-satisfied claim NOT verified "
@@ -4823,7 +4821,6 @@ class Orchestrator:
                 return await self._escalate_reviewer_unavailable(
                     task, str(exc), repo=repo, branch=branch)
             except Exception as exc:  # noqa: BLE001 — fail closed, never pass on error
-                from ..review.selfcheck import ChecklistItem
                 self._emit_review("review_error", str(exc))
                 decision = ReviewDecision(passed=False, checklist=[ChecklistItem(
                     "reviewer run", False, f"reviewer crashed: {exc}")])
@@ -5714,7 +5711,6 @@ class Orchestrator:
             held_result = await asyncio.to_thread(
                 runner.run_held_out_tests, repo.path)
         if held_result is not None and held_result.ran and not held_result.ok:
-            from ..review.selfcheck import ChecklistItem
             self._emit_review(
                 "review_holdout",
                 f"held-out suite failed — deterministic FAIL before any "
@@ -5737,7 +5733,6 @@ class Orchestrator:
                     "stamp. Wire a reviewer, or set reviewer.allow_advisory=true "
                     "for eval/replay flows that skip the gate on purpose."
                 )
-            from ..review.selfcheck import ChecklistItem
             self.emit(
                 "review_advisory",
                 "REVIEW GATE SKIPPED — no reviewer configured and "
@@ -5794,7 +5789,6 @@ class Orchestrator:
             raise
         except Exception as exc:  # noqa: BLE001
             # Reviewer crash → fail closed (never pass-through on error).
-            from ..review.selfcheck import ChecklistItem
             self._emit_review("review_error", str(exc))
             return ReviewDecision(
                 passed=False,
@@ -5919,7 +5913,6 @@ class Orchestrator:
         # Build profile + rules context for the staff-level reviewer.
         prof = await self._usable_profile(repo.path)
         self._active_profile = prof
-        from ..learning.triggers import filter_triggered
         self._active_memories = (filter_triggered(
             await self.store.list_memories(
                 confirmed=True, project=task.repo_path,
@@ -6095,21 +6088,15 @@ class Orchestrator:
         ``code.example.com``, the self-hosted-forge case) are actually retrieved
         instead of silently querying github.com and coming back empty.
         """
-        from ..vcs.pr_watcher import (
-            fetch_github_pr_comments,
-            fetch_gitlab_mr_comments,
-            parse_pr_url,
-        )
-
-        parsed = parse_pr_url(pr_url)
+        parsed = pr_watcher.parse_pr_url(pr_url)
         if not parsed:
             return ""
 
         forge_type, host, repo_slug, number = parsed
         if forge_type == 'github':
-            comments = await fetch_github_pr_comments(repo_slug, number, host=host)
+            comments = await pr_watcher.fetch_github_pr_comments(repo_slug, number, host=host)
         elif forge_type == 'gitlab':
-            comments = await fetch_gitlab_mr_comments(repo_slug, number)
+            comments = await pr_watcher.fetch_gitlab_mr_comments(repo_slug, number)
         else:
             return ""
 
@@ -6141,7 +6128,6 @@ class Orchestrator:
         ``pull/N/head`` refs (C4).
         """
         import re
-        import subprocess
 
         # GitHub pattern: .../pull/123
         gh_match = re.search(r'/pull/(\d+)', pr_url)
@@ -6193,11 +6179,8 @@ class Orchestrator:
         a unified diff so the reviewer and ``files_in_diff`` see standard headers.
         Forwards the per-host glab auth (gitlab.acme.net etc.)."""
         import json as _json
-        import subprocess
 
-        from ..vcs.pr_watcher import parse_pr_url
-
-        parsed = parse_pr_url(pr_url)
+        parsed = pr_watcher.parse_pr_url(pr_url)
         if not parsed:
             return ""
         forge, host, slug, number = parsed
@@ -6231,11 +6214,7 @@ class Orchestrator:
         without it, ``gh api`` defaults to github.com and a GHE PR 404s — the
         exact reason the acme-test cross-repo review returned an empty diff.
         """
-        import subprocess
-
-        from ..vcs.pr_watcher import parse_pr_url
-
-        parsed = parse_pr_url(pr_url)
+        parsed = pr_watcher.parse_pr_url(pr_url)
         if not parsed:
             return ""
         forge, host, slug, number = parsed
@@ -6512,7 +6491,6 @@ class Orchestrator:
         task that looks itself up by its worktree path finds nothing — which
         is how all three tasks of the first parallel run (2026-07-11) lost
         their proven test command and burned max_attempts on the fallback."""
-        import subprocess
         try:
             proc = subprocess.run(
                 ["git", "-C", str(repo_path), "rev-parse",
@@ -7518,7 +7496,6 @@ class Orchestrator:
         # invisible to the CLI. Copies are tracked and removed after the
         # attempt so a primary checkout never accumulates them (they are
         # already excluded from commits via _EPHEMERAL).
-        import shutil
         from ..history.skills import USER_SKILLS
         info_by_name = {
             s.name: s for s in (getattr(self, "_discovered_skills_info", None) or [])
@@ -7568,7 +7545,6 @@ class Orchestrator:
         attempt. Runs in the attempt's finally: the working tree must not
         accumulate the operator's skills between tasks (they would then be
         rediscovered as project skills and bypass the relevance filter)."""
-        import shutil
         for d in getattr(self, "_copied_skill_dirs", []):
             try:
                 shutil.rmtree(d, ignore_errors=True)
@@ -7932,7 +7908,6 @@ class Orchestrator:
         skills = getattr(self, "_discovered_skills_info", None)
         if not skills:
             try:
-                from ..history.skills import discover_skills
                 extra = [repo_path / ".claude" / "skills"] if repo_path else []
                 skills = discover_skills(extra_roots=extra)
             except Exception:  # noqa: BLE001
