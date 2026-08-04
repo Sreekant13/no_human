@@ -252,6 +252,28 @@ def _setup_sandbox(spec: BenchTask, workdir: Path) -> Path:
             f"push-proofing failed: origin {origin} escapes sandbox {workdir}")
 
     _git(work, "push", "origin", "HEAD")
+
+    # Dirty-tree seed — AFTER the commit+push above, so the seeded files are
+    # exactly what they claim to be: uncommitted, unpushed working-tree state.
+    # The reset+clean+push sequence otherwise PRE-SATISFIES any "make sure
+    # everything is committed and pushed, no garbage" request — the harness
+    # destroyed the task's own precondition and the row became a guaranteed
+    # pass (V3 corpus audit, 2026-08-04; ns-90b6ff3c). Append-when-tracked /
+    # create-when-not gives a spec both a genuine modified entry and genuine
+    # untracked junk without wholesale overwriting a real file.
+    for rel, content in (getattr(spec, "dirty_seed", None) or {}).items():
+        target = work / rel
+        # The seed writes INSIDE the sandbox only — a spec file is curator
+        # data, but "../" would put an uncommitted file on the real machine.
+        if not str(target.resolve()).startswith(str(work.resolve())):
+            raise RuntimeError(
+                f"dirty_seed entry escapes the sandbox: {rel!r}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            with target.open("a") as fh:
+                fh.write(content)
+        else:
+            target.write_text(content)
     return work
 
 

@@ -125,6 +125,13 @@ class ReplayRunner:
                 SlackNotifier(None), reviewer=self.reviewer,
                 event_sink=self._on_event,
             )
+            # CODER-VISIBLE SURFACE — title, description, acceptance_criteria
+            # only. `golden.adjudication` (the curator's why-the-verdict-is-
+            # what-it-is) must NEVER be passed here: the orchestrator renders
+            # the description into the coder's prompt, and when the red-team
+            # adjudications lived inside description the trap specs handed the
+            # agent its own grading rubric (V3 corpus audit, 2026-08-04).
+            # test_eval.py pins this wiring.
             task = Task.new(golden.title, repo_path=str(work),
                             description=golden.description)
             task.acceptance_criteria = list(golden.acceptance_criteria)

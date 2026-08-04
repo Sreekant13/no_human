@@ -743,6 +743,71 @@ def test_sandbox_copy_is_instant_isolated_and_survives_a_dirty_source(tmp_path):
     assert (src / "a.txt").read_text() == "DIRTY"
 
 
+def test_sandbox_dirty_seed_restores_a_real_dirty_tree(tmp_path):
+    """V3 corpus audit (2026-08-04): the reset+clean+push in _setup_sandbox
+    PRE-SATISFIES any "make sure everything is committed and pushed" request —
+    ns-90b6ff3c was a guaranteed pass because the harness destroyed the task's
+    own precondition. A spec with `dirty_seed` must come up with a genuinely
+    dirty tree (a MODIFIED tracked entry via append + an UNTRACKED junk file),
+    written AFTER the initial push, so nothing seeded is on the remote."""
+    repo = _src_repo(tmp_path)
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    spec = _spec(repo, dirty_seed={
+        "app.py": "# WIP uncommitted edit\n",
+        "debug.log": "junk line\n",
+    })
+    work = _setup_sandbox(spec, workdir)
+
+    porcelain = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=work,
+        capture_output=True, text=True).stdout
+    assert porcelain.strip(), "dirty_seed produced a clean tree — seed not applied"
+    codes = {line[:2].strip(): line[3:].strip()
+             for line in porcelain.splitlines()}
+    assert codes.get("M") == "app.py", (
+        f"expected app.py MODIFIED (tracked file appended), got: {porcelain!r}")
+    assert codes.get("??") == "debug.log", (
+        f"expected debug.log UNTRACKED, got: {porcelain!r}")
+    # Append, not overwrite: the tracked file keeps its real content.
+    assert (work / "app.py").read_text().startswith("def f():"), (
+        "the seed OVERWROTE the tracked file instead of appending")
+    # Seeded after the push: the remote carries the CLEAN tree only.
+    bare = workdir / "remote.git"
+    remote_app = subprocess.run(
+        ["git", "--git-dir", str(bare), "show", "HEAD:app.py"],
+        capture_output=True, text=True).stdout
+    assert "WIP uncommitted edit" not in remote_app, (
+        "the seed was committed/pushed — it must stay working-tree-only")
+
+
+def test_sandbox_without_dirty_seed_stays_pristine(tmp_path):
+    """The control for the seed test: a spec with no dirty_seed must keep the
+    exact clean-at-the-pin sandbox every other spec has always had — empty
+    porcelain, nothing appended anywhere."""
+    repo = _src_repo(tmp_path)
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    work = _setup_sandbox(_spec(repo), workdir)
+    porcelain = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=work,
+        capture_output=True, text=True).stdout
+    assert porcelain.strip() == "", (
+        f"a seedless spec's sandbox is dirty: {porcelain!r}")
+
+
+def test_sandbox_dirty_seed_cannot_escape_the_sandbox(tmp_path):
+    """A dirty_seed path is curator data, but '../' must never write onto the
+    real machine — the whole sandbox contract is that spec content stays in."""
+    repo = _src_repo(tmp_path)
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    spec = _spec(repo, dirty_seed={"../escape.txt": "out\n"})
+    with pytest.raises(RuntimeError, match="escapes the sandbox"):
+        _setup_sandbox(spec, workdir)
+    assert not (workdir / "escape.txt").exists()
+
+
 def test_sandbox_copy_strips_source_hooks(tmp_path):
     """Clone parity: a file copy carries ACTIVE hooks (a real work repo did
     ship a pre-push) that would execute foreign code on sandbox pushes —

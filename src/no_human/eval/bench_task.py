@@ -355,9 +355,22 @@ class BenchTask:
     original: dict[str, Any] = field(default_factory=dict)
     acceptance_criteria: list[str] = field(default_factory=list)
     holdout: str = ""
-    subset: str = "full"               # "core" | "full"
+    # "core" (scored, hand-curated) | "full" (generated) | "canary" (kept in
+    # the corpus but excluded from the scored core denominator — e.g. a pure
+    # chat-knowledge row that measures the base model, not the product).
+    # `startup.py` emits its own "startup" subset for the same reason: a
+    # different measurement must not share the core denominator.
+    subset: str = "full"
     runnable: bool = True
     skip_reason: str = ""
+    #: Files the sandbox writes AFTER the initial commit+push and leaves
+    #: UNCOMMITTED (path → content; appended when the path is tracked, created
+    #: otherwise). The sandbox reset+clean+push otherwise pre-satisfies any
+    #: "make sure everything is committed/pushed, no garbage" request — the
+    #: harness itself destroyed that task's precondition, making the row a
+    #: guaranteed pass (V3 corpus audit, 2026-08-04). A seed restores a real
+    #: dirty tree so the demand is real again. Empty = untouched sandbox.
+    dirty_seed: dict[str, str] = field(default_factory=dict)
     expect_escalation: bool = False
     #: WHY this spec is expected to stop and escalate rather than deliver.
     #:
@@ -397,6 +410,7 @@ class BenchTask:
             subset=data.get("subset", "full"),
             runnable=bool(data.get("runnable", True)),
             skip_reason=data.get("skip_reason", "") or "",
+            dirty_seed=dict(data.get("dirty_seed", {}) or {}),
             expect_escalation=bool(data.get("expect_escalation", False)),
             escalation_reason=data.get("escalation_reason", "") or "",
             path=path,
@@ -409,6 +423,7 @@ class BenchTask:
             "acceptance_criteria": self.acceptance_criteria,
             "holdout": self.holdout, "subset": self.subset,
             "runnable": self.runnable, "skip_reason": self.skip_reason, "escalation_reason": self.escalation_reason,
+            "dirty_seed": self.dirty_seed,
             "expect_escalation": self.expect_escalation,
         }
 
