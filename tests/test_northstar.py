@@ -199,6 +199,55 @@ def test_skipped_spec_scores_zero_cost(tmp_path):
     assert "credential-gated" in score.notes
 
 
+@pytest.mark.asyncio
+async def test_judge_rubric_reaches_the_judge_but_never_the_coder_task(tmp_path):
+    """Review D1: acceptance_criteria is DUAL-AUDIENCE — `_bench_task` copies
+    it onto the coder's Task and the orchestrator renders it into the implement
+    prompt, so grading guidance written there hands the agent its own key (the
+    golden-set adjudication leak through a second channel). `judge_rubric` is
+    the judge-only lane: this pins BOTH directions of the wiring — the rubric
+    text appears in the judge's criteria input, and appears NOWHERE on the
+    coder-visible Task."""
+    from no_human.core.task import TaskStatus
+    from no_human.eval.judge import GoalVerdict
+    from no_human.eval.northstar import _bench_task
+
+    rubric = "RUBRIC-ONLY: the answer must state the apply-first ordering"
+    repo = _src_repo(tmp_path)
+    spec = _spec(repo, acceptance_criteria=["visible criterion"],
+                 judge_rubric=[rubric])
+
+    # Coder direction: the Task the orchestrator gets must not carry the rubric.
+    task = _bench_task(spec, repo)
+    coder_view = "\n".join([task.title or "", task.description or "",
+                            *(task.acceptance_criteria or [])])
+    assert "visible criterion" in coder_view  # criteria still flow (control)
+    assert rubric not in coder_view, (
+        "judge_rubric leaked onto the coder-visible Task — the dual-audience "
+        "channel review D1 flagged is open again")
+
+    # Judge direction: _score's judge call must include the rubric.
+    captured: dict = {}
+
+    class _CapturingJudge:
+        async def judge(self, *, request, criteria, agent_diff,
+                        outcome_status, repo_path, report=""):
+            captured["criteria"] = list(criteria)
+            return GoalVerdict(satisfied=True, evidence="stub")
+
+    runner = NorthStarRunner({}, backend_factory=lambda s: None,
+                             goal_judge=_CapturingJudge())
+    await runner._score(
+        spec, _FakeOutcome(TaskStatus.DONE), repo, "HEAD",
+        attempts=[{"tokens_used": 10, "cache_read_tokens": 0, "turns_used": 1}],
+        elapsed=1.0)
+    assert "criteria" in captured, "the judge was never called — vacuous test"
+    assert rubric in captured["criteria"], (
+        "judge_rubric never reached the judge — the rubric lane is dark and "
+        "sanctioned specs silently grade on the raw request again")
+    assert "visible criterion" in captured["criteria"]  # criteria also flow
+
+
 # ------------------------- run_one integration ----------------------------- #
 
 class _FixBackend:
@@ -798,14 +847,23 @@ def test_sandbox_without_dirty_seed_stays_pristine(tmp_path):
 
 def test_sandbox_dirty_seed_cannot_escape_the_sandbox(tmp_path):
     """A dirty_seed path is curator data, but '../' must never write onto the
-    real machine — the whole sandbox contract is that spec content stays in."""
+    real machine — the whole sandbox contract is that spec content stays in.
+
+    The sibling payload is review D2's PROVEN BYPASS of the first guard: the
+    sandbox checkout is `<workdir>/work`, so `../work-evil/pwned.txt` resolves
+    to `<workdir>/work-evil/…`, whose STRING starts with `…/work` — a
+    startswith() prefix check waves it through while it lands outside the
+    repo. The guard must compare path components, not characters."""
     repo = _src_repo(tmp_path)
-    workdir = tmp_path / "wd"
-    workdir.mkdir()
-    spec = _spec(repo, dirty_seed={"../escape.txt": "out\n"})
-    with pytest.raises(RuntimeError, match="escapes the sandbox"):
-        _setup_sandbox(spec, workdir)
-    assert not (workdir / "escape.txt").exists()
+    for payload in ("../escape.txt", "../work-evil/pwned.txt"):
+        workdir = tmp_path / f"wd-{abs(hash(payload))}"
+        workdir.mkdir()
+        spec = _spec(repo, dirty_seed={payload: "out\n"})
+        with pytest.raises(RuntimeError, match="escapes the sandbox"):
+            _setup_sandbox(spec, workdir)
+        assert not (workdir / "escape.txt").exists()
+        assert not (workdir / "work-evil").exists(), (
+            "the sibling-directory payload was WRITTEN before the guard fired")
 
 
 def test_sandbox_copy_strips_source_hooks(tmp_path):

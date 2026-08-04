@@ -265,7 +265,11 @@ def _setup_sandbox(spec: BenchTask, workdir: Path) -> Path:
         target = work / rel
         # The seed writes INSIDE the sandbox only — a spec file is curator
         # data, but "../" would put an uncommitted file on the real machine.
-        if not str(target.resolve()).startswith(str(work.resolve())):
+        # Path-aware containment, NOT a string prefix: startswith() let a
+        # SIBLING with a shared name prefix through ("../work-evil/pwned.txt"
+        # resolves to a path that string-starts with ".../work" — review D2's
+        # proven bypass). is_relative_to compares path components.
+        if not target.resolve().is_relative_to(work.resolve()):
             raise RuntimeError(
                 f"dirty_seed entry escapes the sandbox: {rel!r}")
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -312,6 +316,13 @@ def _bench_task(spec: BenchTask, work: Path) -> Task:
     from ..intake.classify import classify_kind
 
     task = Task.new(spec.title, repo_path=str(work), description=spec.request)
+    # CODER-VISIBLE SURFACE — title, request, acceptance_criteria only.
+    # `spec.judge_rubric` must NEVER be copied here: the orchestrator renders
+    # the Task's criteria into the coder's implement prompt, so a rubric
+    # criterion naming the expected insight would hand the agent its own
+    # grading key (the dual-audience leak the 2026-08-04 release closed for
+    # golden descriptions; review D1 caught it reopening through this field).
+    # The rubric joins the criteria only in the judge call in `_score`.
     task.acceptance_criteria = list(spec.acceptance_criteria)
     task.kind = classify_kind(task).kind.value
     return task
@@ -609,8 +620,13 @@ class NorthStarRunner:
                 subprocess.run,
                 ["git", "diff", base_sha, diff_ref], cwd=work,
                 capture_output=True, text=True)).stdout
+            # The judge grades on criteria PLUS the judge-only rubric. The
+            # rubric exists precisely because acceptance_criteria is dual-
+            # audience (it is copied onto the coder's Task in `_bench_task`);
+            # this judge call is the ONLY place judge_rubric may be rendered.
             verdict = await self.goal_judge.judge(
-                request=spec.request, criteria=spec.acceptance_criteria,
+                request=spec.request,
+                criteria=[*spec.acceptance_criteria, *spec.judge_rubric],
                 agent_diff=agent_diff, outcome_status=status.value,
                 report=(getattr(outcome, "report", "") or getattr(outcome, "detail", "") or ""),
                 repo_path=str(work))

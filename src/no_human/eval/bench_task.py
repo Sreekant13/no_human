@@ -354,6 +354,16 @@ class BenchTask:
     repo: dict[str, Any] = field(default_factory=dict)   # {path, pin, branch}
     original: dict[str, Any] = field(default_factory=dict)
     acceptance_criteria: list[str] = field(default_factory=list)
+    #: JUDGE-ONLY grading rubric. `acceptance_criteria` is DUAL-AUDIENCE: the
+    #: runner copies it onto the coder's Task (`_bench_task`) and the judge
+    #: receives it too — so a criterion that names the expected insight hands
+    #: the agent under test its own grading key (the exact leak the golden-set
+    #: `adjudication` field fixed on 2026-08-04; ns-600d7a02's criteria briefly
+    #: reopened it through this second channel). `judge_rubric` is rendered
+    #: ONLY into the judge's evaluation input; it must NEVER be placed on the
+    #: Task or any coder/reviewer-visible surface. tests/test_northstar.py
+    #: pins that wiring.
+    judge_rubric: list[str] = field(default_factory=list)
     holdout: str = ""
     # "core" (scored, hand-curated) | "full" (generated) | "canary" (kept in
     # the corpus but excluded from the scored core denominator — e.g. a pure
@@ -406,6 +416,7 @@ class BenchTask:
             repo=dict(data.get("repo", {}) or {}),
             original=dict(data.get("original", {}) or {}),
             acceptance_criteria=list(data.get("acceptance_criteria", []) or []),
+            judge_rubric=list(data.get("judge_rubric", []) or []),
             holdout=data.get("holdout", "") or "",
             subset=data.get("subset", "full"),
             runnable=bool(data.get("runnable", True)),
@@ -421,6 +432,7 @@ class BenchTask:
             "id": self.id, "title": self.title, "request": self.request,
             "source": self.source, "repo": self.repo, "original": self.original,
             "acceptance_criteria": self.acceptance_criteria,
+            "judge_rubric": self.judge_rubric,
             "holdout": self.holdout, "subset": self.subset,
             "runnable": self.runnable, "skip_reason": self.skip_reason, "escalation_reason": self.escalation_reason,
             "dirty_seed": self.dirty_seed,
