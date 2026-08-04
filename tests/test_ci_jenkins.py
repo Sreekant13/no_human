@@ -515,6 +515,125 @@ def test_get_session_cookies_refreshes_when_empty(tmp_path, monkeypatch):
     assert ck == {"a": "b"}
 
 
+class _FakePlaywright:
+    """The smallest Playwright that `refresh` can drive: it writes a
+    storage_state file where it is told to, and records nothing else."""
+
+    def __init__(self, state_json: str):
+        self._state = state_json
+
+    # sync_playwright() -> context manager -> the `p` handle
+    def __call__(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    # p.chromium.launch(...) -> browser
+    @property
+    def chromium(self):
+        return self
+
+    def launch(self, **_kw):
+        return self
+
+    def new_context(self):
+        return self
+
+    def new_page(self):
+        return self
+
+    def close(self):
+        pass
+
+    # page
+    def goto(self, *_a, **_kw):
+        pass
+
+    def wait_for_selector(self, *_a, **_kw):
+        pass
+
+    def fill(self, *_a, **_kw):
+        pass
+
+    def click(self, *_a, **_kw):
+        pass
+
+    def wait_for_load_state(self, *_a, **_kw):
+        pass
+
+    # ctx.storage_state(path=...)
+    def storage_state(self, path):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(self._state)
+
+
+def _install_fake_playwright(monkeypatch, state_json):
+    """Put a fake `playwright.sync_api` on sys.modules so `refresh` imports it
+    instead of the optional real dependency (pruned by `uv sync`)."""
+    import sys
+    import types
+
+    fake = _FakePlaywright(state_json)
+    mod = types.ModuleType("playwright.sync_api")
+    mod.sync_playwright = fake
+    pkg = types.ModuleType("playwright")
+    pkg.sync_api = mod
+    monkeypatch.setitem(sys.modules, "playwright", pkg)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", mod)
+
+
+_STATE_JSON = json.dumps({"cookies": [
+    {"name": "JSESSIONID.x", "value": "v",
+     "domain": "build.example.com", "path": "/cjoc"},
+]})
+
+
+def test_refresh_secures_the_cookie_jar_through_the_shared_helper(
+    tmp_path, monkeypatch
+):
+    """The storage_state is a credential, and `os.chmod(.., 0o600)` on it is a
+    SILENT NO-OP on Windows. This pins the WIRING — that the file is handed to
+    `config.secure_credential_file`, the one place that knows to use an ACL
+    there — not the helper's own logic, which config's tests cover."""
+    from pathlib import Path
+
+    from no_human import config as cfg
+    from no_human.ci import jenkins_session as js
+
+    _install_fake_playwright(monkeypatch, _STATE_JSON)
+    secured: list[Path] = []
+    monkeypatch.setattr(cfg, "secure_credential_file", secured.append)
+
+    state = tmp_path / "jenkins_storage_state.json"
+    assert js.refresh("https://build.example.com", str(state),
+                      username="u", password="p") is True
+    assert secured == [state]
+
+
+def test_refresh_deletes_the_cookie_jar_it_could_not_secure(tmp_path, monkeypatch):
+    """A session it cannot restrict must not be left on disk: the caller
+    degrades to "refresh failed", which is the access wall, not a session any
+    account on the machine could read."""
+    from no_human import config as cfg
+    from no_human.ci import jenkins_session as js
+
+    _install_fake_playwright(monkeypatch, _STATE_JSON)
+
+    def _refuse(_path):
+        raise cfg.CredentialPermissionError("icacls is not on PATH")
+
+    monkeypatch.setattr(cfg, "secure_credential_file", _refuse)
+
+    state = tmp_path / "jenkins_storage_state.json"
+    assert js.refresh("https://build.example.com", str(state),
+                      username="u", password="p") is False
+    assert not state.exists()
+
+
 # --------------------------------------------------------------------------- #
 # factory wiring for cookie auth                                               #
 # --------------------------------------------------------------------------- #
