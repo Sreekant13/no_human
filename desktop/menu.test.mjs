@@ -14,19 +14,35 @@ function submenu(template, label) {
   return (template.find((t) => t.label === label) || {}).submenu || [];
 }
 
-test("buildMenuTemplate: View has Board/Stats/Settings nav with Cmd 1/2/3", () => {
+test("buildMenuTemplate: View has Board/Backlog/Stats/Settings nav with Cmd 1/2/3/4", () => {
   const nav = [];
   const t = buildMenuTemplate({ isMac: true, isDev: false, onNavigate: (p) => nav.push(p), onNewTask: () => {} });
   const view = submenu(t, "View");
   const board = view.find((i) => i.label === "In progress");
+  const backlog = view.find((i) => i.label === "Backlog");
   const stats = view.find((i) => i.label === "Stats");
   const settings = view.find((i) => i.label === "Settings");
-  assert.ok(board && stats && settings, "View has all three nav items");
+  assert.ok(board && backlog && stats && settings, "View has all four nav items");
   assert.equal(board.accelerator, "CmdOrCtrl+1");
-  assert.equal(stats.accelerator, "CmdOrCtrl+2");
-  assert.equal(settings.accelerator, "CmdOrCtrl+3");
-  board.click(); settings.click();
-  assert.deepEqual(nav, ["board", "settings"], "clicks route to the renderer with the page id");
+  assert.equal(backlog.accelerator, "CmdOrCtrl+2");
+  assert.equal(stats.accelerator, "CmdOrCtrl+3");
+  assert.equal(settings.accelerator, "CmdOrCtrl+4");
+  board.click(); backlog.click(); settings.click();
+  assert.deepEqual(nav, ["board", "backlog", "settings"], "clicks route to the renderer with the page id");
+});
+
+// The desktop menu is only a real route if the renderer acts on the page id it
+// posts. App.jsx's "nh:menu" handler enumerates the pages it accepts, so a menu
+// entry naming a page the handler drops is a dead menu item.
+test("the renderer's menu handler accepts the backlog page id the View menu sends", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const appJsx = readFileSync(
+    fileURLToPath(new URL("../web/src/App.jsx", import.meta.url)), "utf8");
+  const handler = appJsx.match(/window\.nhDesktop\?\.onMenu[\s\S]*?\}\);/)?.[0];
+  assert.ok(handler, "App.jsx must wire window.nhDesktop.onMenu");
+  assert.match(handler, /action === ["']backlog["']/,
+    "the nh:menu handler must route the backlog page id, not silently drop it");
 });
 
 test("buildMenuTemplate: New Task uses CmdOrCtrl+N — never bare 'n' (renderer owns that)", () => {

@@ -19,9 +19,10 @@ test("the sidebar nav is grouped under muted uppercase group headers: Work and I
   assert.match(appJsx, /function NavGroup[^]*?nh-navgroup-title[^]*?\{title\}/);
 });
 
-test("Board, Done and Failed are grouped under Work; Stats under Insights, keeping the same handlers", () => {
+test("Board, Backlog, Done and Failed are grouped under Work; Stats under Insights, keeping the same handlers", () => {
   // Same destinations/handlers as before — visual grouping only, no nav-model change.
   assert.match(appJsx, /setPage\(\s*["']board["']\s*\)/);
+  assert.match(appJsx, /setPage\(\s*["']backlog["']\s*\)/);
   assert.match(appJsx, /setPage\(\s*["']done["']\s*\)/);
   assert.match(appJsx, /setPage\(\s*["']failed["']\s*\)/);
   assert.match(appJsx, /setPage\(\s*["']stats["']\s*\)/);
@@ -44,7 +45,29 @@ test("group headers resolve to --text-muted specifically, not --text-dim (contra
   assert.doesNotMatch(m[1], /color:\s*var\(--text-dim\)/, ".nh-navgroup-title must not regress back to --text-dim");
 });
 
-test("every sidebar nav row (Board/Done/Failed/Stats/Settings) pairs an inline-SVG icon with a text label — never icon-only", () => {
+// The Backlog row lives in the Work group WITH Done and Failed, and it is a
+// page like they are (not an overlay), so it must route and be announced as
+// the current page the same way.
+test("Backlog is a Work-group nav row that routes to its own page and is rendered", () => {
+  const work = appJsx.match(/<NavGroup title="Work">[\s\S]*?<\/NavGroup>/)?.[0];
+  assert.ok(work, "the Work group must be found");
+  assert.match(work, /label="Backlog"/, "Backlog must sit in the Work group, beside Done and Failed");
+  // Ordering: Backlog is the work that hasn't started; the two OUTCOME lists
+  // follow it.
+  assert.ok(work.indexOf('label="Backlog"') < work.indexOf('label="Done"'));
+  assert.ok(work.indexOf('label="Done"') < work.indexOf('label="Failed"'));
+  // aria-current is what marks the current PAGE for a screen reader; a row
+  // that sets `active` but not `current` claims a pill without claiming a page.
+  const row = work.match(/<NavRow\s+icon=\{<IconBacklog \/>\}[\s\S]*?\/>/)?.[0];
+  assert.ok(row, "the Backlog NavRow must be found");
+  assert.match(row, /active=\{page === "backlog"\}/);
+  assert.match(row, /current=\{page === "backlog"\}/);
+  // …and the page it routes to must actually render something.
+  assert.match(appJsx, /\{page === "backlog" && \(\s*\n\s*<Backlog/);
+  assert.match(appJsx, /page === "backlog" \? "Backlog"/, "the sr-only h1 must name the page");
+});
+
+test("every sidebar nav row (Board/Backlog/Done/Failed/Stats/Settings) pairs an inline-SVG icon with a text label — never icon-only", () => {
   const rowFn = appJsx.match(/function NavRow\([^)]*\)\s*\{[^]*?\n\}/);
   assert.ok(rowFn, "a shared NavRow component must exist");
   assert.match(rowFn[0], /nh-navrow-icon["'][^]*?\{icon\}/, "NavRow must render the icon prop inside an icon wrapper");

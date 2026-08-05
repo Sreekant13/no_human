@@ -1,6 +1,7 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { connectWS, createTask, uploadAttachment, fetchTasks, fetchWorkerStatus, fetchQueueHealth, fetchOnboardingStatus, fetchAuthStatus, grillStep, grillStepSSE } from "./api.js";
+import { connectWS, createTask, uploadAttachment, fetchTasks, fetchWorkerStatus, fetchQueueHealth, fetchOnboardingStatus, fetchAuthStatus, fetchJiraIssue, grillStep, grillStepSSE } from "./api.js";
 import Board from "./Board.jsx";
+import Backlog from "./Backlog.jsx";
 import SettingsOverlay from "./Settings.jsx";
 import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
@@ -22,6 +23,8 @@ import { tasksReducer } from "./tasksReducer.js";
 import { drainChip } from "./drainChip.js";
 import { initialDrainReadout, nextDrainReadout, readoutPayload } from "./drainReadout.js";
 import { useEscapeKey } from "./useEscapeKey.js";
+import { promptFromIssue, externalIdFromIssue } from "./jiraImport.js";
+import { queueProgress } from "./backlogSelection.js";
 
 
 // Header brand: logo + wordmark + tagline. Used in the main and error headers.
@@ -79,6 +82,19 @@ function IconFailed() {
       <path d="M8 1.6l6.7 11.6a1 1 0 0 1-.86 1.5H2.16a1 1 0 0 1-.86-1.5L8 1.6z" />
       <path d="M8 6.2v3.1" />
       <circle cx="8" cy="11.5" r="0.9" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+// Backlog: a stack of tickets waiting to be picked up — three lines with a
+// leading tick mark, the "inbox list" reading, distinct from IconBoard's
+// three vertical lanes at a glance.
+function IconBacklog() {
+  return (
+    <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="1.5" y="2.4" width="3" height="3" rx="0.8" />
+      <rect x="1.5" y="10.5" width="3" height="3" rx="0.8" />
+      <path d="M1.5 8h3" />
+      <path d="M7 3.9h7.5M7 8h7.5M7 12h7.5" />
     </svg>
   );
 }
@@ -240,10 +256,17 @@ function Spinner() {
   return <span className="grill-spinner" />;
 }
 
-function NewTaskModal({ onClose, onCreated }) {
+function NewTaskModal({ onClose, onCreated, initial = null, notice = null, onOpenBacklog = null }) {
   // The composed spec, handed over by TaskComposer when the operator hits Next.
   // Null until then — the composer owns its own field state (see TaskComposer.jsx).
-  const [fields, setFields] = useState(null);
+  //
+  // `initial` seeds it for a ticket started from the Backlog page: the composer
+  // opens with the ticket's prompt (and the hidden source/external_id markers)
+  // already filled, and from there this is the SAME flow a typed task runs —
+  // composer → grill → createTask. There is no second create path. Note the
+  // seed never reaches handleSubmit directly: that branch is reachable only
+  // after startGrill, which overwrites `fields` with the composer's own spec.
+  const [fields, setFields] = useState(initial);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   // B2: grill state
@@ -558,6 +581,8 @@ function NewTaskModal({ onClose, onCreated }) {
       // duration, so without `initial` the operator would come back to an empty
       // composer with their prompt, attachments and kind gone.
       initial={fields}
+      notice={notice}
+      onOpenBacklog={onOpenBacklog}
       onStart={startGrill}
       onClose={onClose}
     />
@@ -571,6 +596,28 @@ export default function App() {
   const [fetchError, setFetchError] = useState(null);
   const [showNewTask, setShowNewTask] = useState(false);
   const [page, setPage] = useState("board");
+  // ── Backlog → intake queue ────────────────────────────────────────────────
+  // The tickets the operator selected on the Backlog page, still to be started.
+  // The intake flow is interactive and PER TASK (five questions about THIS
+  // spec), so N selected tickets are not a batch: they run through the same
+  // composer→grill→create flow one at a time, head of the queue first. The
+  // Backlog page says so before the first question is asked
+  // (backlogSelection.js: multiStartNotice). Cancelling drops the rest of the
+  // queue rather than silently continuing into the next ticket's questions.
+  const [backlogQueue, setBacklogQueue] = useState([]);
+  const [backlogTotal, setBacklogTotal] = useState(0);
+  // The head ticket resolved to a composer seed. null while the full issue is
+  // being fetched: the browse list truncates description at 2000 chars, and a
+  // task must carry the whole spec, so the detail GET happens BEFORE the
+  // composer mounts (its `initial` is read once, at mount — upgrading it after
+  // would either be ignored or clobber what the operator had started typing).
+  const [backlogSeed, setBacklogSeed] = useState(null);
+  // Bumped after each created task so the Backlog page re-reads its list and
+  // the ticket it just started shows its "imported" chip.
+  const [backlogNonce, setBacklogNonce] = useState(0);
+  // The ticket currently being started (queue head), or null when the queue is
+  // empty. Declared here, above every effect that reads it.
+  const backlogHeadKey = backlogQueue[0]?.key ?? null;
   // Settings is an overlay dialog (Claude macOS desktop app model), not a
   // routed page — it can open on top of whatever page is showing.
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -616,6 +663,11 @@ export default function App() {
   // missing/old endpoint never blocks an existing user at the board.
   const [onboarded, setOnboarded] = useState(null);
   const wsRef = useRef(null);
+  // NewTaskModal fires onCreated() and then onClose() on success, and onClose()
+  // alone on cancel. The queue must tell those apart: a success dequeues the
+  // head and moves to the next ticket, a cancel drops the whole rest of the
+  // queue (never silently walks the operator into the next ticket's questions).
+  const backlogAdvanceRef = useRef(false);
 
   // onboarding gate
   useEffect(() => {
@@ -701,7 +753,9 @@ export default function App() {
       // this the "n" shortcut opened the composer *behind* the open drawer (z-50 under the
       // drawer's 101), where it held focus invisibly and one Escape then closed both.
       const drawerOpen = Boolean(document.querySelector(".slideover"));
-      if (shouldTriggerNewTask(e, { modalOpen: showNewTask || drawerOpen })) {
+      // A backlog-started ticket has its own modal open — "n" must not stack a
+      // second composer behind it (same trap the drawer check above closed).
+      if (shouldTriggerNewTask(e, { modalOpen: showNewTask || drawerOpen || Boolean(backlogHeadKey) })) {
         // Swallow the keystroke: the composer autofocuses its textarea, so an
         // un-prevented "n" types itself into the prompt it just opened.
         e.preventDefault();
@@ -710,7 +764,7 @@ export default function App() {
     }
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [showNewTask]);
+  }, [showNewTask, backlogHeadKey]);
 
   // Desktop application menu → the board's own navigation. The Electron shell
   // (main process) posts "nh:menu"; drive the SAME page state the tab bar does,
@@ -719,10 +773,37 @@ export default function App() {
     const off = window.nhDesktop?.onMenu?.((action) => {
       if (action === "new-task") setShowNewTask(true);
       else if (action === "settings") setSettingsOpen(true);
-      else if (action === "board" || action === "stats") setPage(action);
+      else if (action === "board" || action === "backlog" || action === "stats") setPage(action);
     });
     return off;
   }, []);
+
+  // Resolve the head of the backlog queue into a composer seed. The FULL issue
+  // is fetched first (the browse list truncates description at 2000 chars);
+  // if that fetch fails the list brief already in hand stands — a truncated
+  // spec beats a dead end, and the operator can still edit it in the composer.
+  useEffect(() => {
+    if (!backlogHeadKey) { setBacklogSeed(null); return undefined; }
+    const head = backlogQueue[0];
+    let ignore = false;
+    setBacklogSeed(null);
+    const seedFrom = (issue) => ({
+      prompt: promptFromIssue(issue),
+      // The hidden markers a Jira-sourced task carries — identical to what the
+      // composer's own picker used to set, so the dedup key reaching the
+      // backend is unchanged.
+      source: "jira",
+      externalId: externalIdFromIssue(issue),
+    });
+    fetchJiraIssue(head.key)
+      .then((full) => { if (!ignore) setBacklogSeed(seedFrom(full)); })
+      .catch(() => { if (!ignore) setBacklogSeed(seedFrom(head)); });
+    return () => { ignore = true; };
+    // Keyed on the head KEY, not the array: the queue re-renders on every
+    // dequeue, and re-running this on identity alone would re-fetch the same
+    // ticket. `backlogQueue[0]` is read inside and is always the row that key
+    // belongs to.
+  }, [backlogHeadKey]);
 
   // WebSocket
   useEffect(() => {
@@ -828,6 +909,17 @@ export default function App() {
               badge={needYou > 0 ? needYou : null}
               badgeVariant="alert"
               title={needYou > 0 ? `${needYou} need you` : undefined}
+            />
+            {/* The tracker's open tickets — the work that hasn't started yet,
+                one row above the two outcome lists. This is where a ticket is
+                picked up; the composer no longer hides a Jira picker inside it. */}
+            <NavRow
+              icon={<IconBacklog />}
+              label="Backlog"
+              active={page === "backlog"}
+              current={page === "backlog"}
+              onClick={() => setPage("backlog")}
+              title="Open tickets from your tracker"
             />
             <NavRow
               icon={<IconDone />}
@@ -943,6 +1035,7 @@ export default function App() {
       <main className="nh-main">
         <h1 className="sr-only">
           {page === "board" ? "Task board"
+            : page === "backlog" ? "Backlog"
             : page === "done" ? "Done tasks"
             : page === "failed" ? "Failed tasks"
             : page === "stats" ? "Performance"
@@ -956,6 +1049,12 @@ export default function App() {
           </div>
         )}
         {page === "board" && <Board tasks={tasks} pendingOpenId={pendingOpenId} onPendingOpenHandled={() => setPendingOpenId(null)} />}
+        {page === "backlog" && (
+          <Backlog
+            refreshNonce={backlogNonce}
+            onStart={(list) => { setBacklogTotal(list.length); setBacklogQueue(list); }}
+          />
+        )}
         {page === "done" && <Outcomes tasks={tasks} lane="done" />}
         {page === "failed" && <Outcomes tasks={tasks} lane="failed" />}
         {page === "stats" && <Stats tasks={tasks} />}
@@ -964,7 +1063,42 @@ export default function App() {
         <NewTaskModal
           onClose={() => setShowNewTask(false)}
           onCreated={() => fetchTasks().then((ts) => dispatch({ type: "set", tasks: ts }))}
+          onOpenBacklog={() => { setShowNewTask(false); setPage("backlog"); }}
         />
+      )}
+      {/* A ticket started from the Backlog page runs the SAME modal — composer
+          (pre-filled from the ticket) → five questions → createTask. `key`
+          remounts it per ticket so nothing of the previous one leaks in. */}
+      {backlogHeadKey && backlogSeed && (
+        <NewTaskModal
+          key={backlogHeadKey}
+          initial={backlogSeed}
+          notice={queueProgress(backlogTotal - backlogQueue.length, backlogTotal, backlogHeadKey)}
+          onCreated={() => {
+            backlogAdvanceRef.current = true;
+            setBacklogNonce((n) => n + 1);
+            fetchTasks().then((ts) => dispatch({ type: "set", tasks: ts }));
+          }}
+          onClose={() => {
+            if (backlogAdvanceRef.current) {
+              backlogAdvanceRef.current = false;
+              setBacklogQueue((q) => q.slice(1));
+            } else {
+              setBacklogQueue([]);
+              setBacklogTotal(0);
+            }
+          }}
+        />
+      )}
+      {backlogHeadKey && !backlogSeed && (
+        <div className="sendback-overlay">
+          <div className="new-task-modal" role="status" aria-live="polite">
+            <div className="grill-loading">
+              <Spinner />
+              <div className="grill-loading-text">Reading {backlogHeadKey} from Jira…</div>
+            </div>
+          </div>
+        </div>
       )}
       {settingsOpen && <SettingsOverlay onClose={() => setSettingsOpen(false)} />}
     </div>

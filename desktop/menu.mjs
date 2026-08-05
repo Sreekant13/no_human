@@ -45,8 +45,13 @@ export function buildMenuTemplate({ isMac, isDev, onNavigate, onNewTask,
     label: "View",
     submenu: [
       nav("In progress", "board", "CmdOrCtrl+1"),
-      nav("Stats", "stats", "CmdOrCtrl+2"),
-      nav("Settings", "settings", "CmdOrCtrl+3"),
+      // Backlog sits directly under In progress here for the same reason it
+      // sits under it in the sidebar's Work group: it is the list work is
+      // picked up FROM. Stats/Settings shift down a number accordingly — the
+      // accelerators follow menu order, they are not stable identifiers.
+      nav("Backlog", "backlog", "CmdOrCtrl+2"),
+      nav("Stats", "stats", "CmdOrCtrl+3"),
+      nav("Settings", "settings", "CmdOrCtrl+4"),
       { type: "separator" },
       { role: "reload" },
       { role: "resetZoom" },
