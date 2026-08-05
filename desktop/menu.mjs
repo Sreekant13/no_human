@@ -44,7 +44,7 @@ export function buildMenuTemplate({ isMac, isDev, onNavigate, onNewTask,
   template.push({
     label: "View",
     submenu: [
-      nav("Board", "board", "CmdOrCtrl+1"),
+      nav("In progress", "board", "CmdOrCtrl+1"),
       nav("Stats", "stats", "CmdOrCtrl+2"),
       nav("Settings", "settings", "CmdOrCtrl+3"),
       { type: "separator" },

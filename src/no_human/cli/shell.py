@@ -155,7 +155,7 @@ class ShellApp(App):
 
     def on_mount(self) -> None:
         self._say("[b]no_human[/] - say what you want done, in plain English.")
-        self._say("[dim]It goes to the same intake grill the board uses. "
+        self._say("[dim]It asks the same five questions the board does. "
                   "/help for the slash commands.[/]")
         self.query_one("#prompt", Input).focus()
         self.run_worker(self._refresh(), group="board")

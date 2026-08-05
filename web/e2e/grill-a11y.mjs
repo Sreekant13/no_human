@@ -71,7 +71,7 @@ const dialog = page.locator('.new-task-modal[role="dialog"]');
 await page.getByPlaceholder(/Your answer/i).waitFor({ state: "visible", timeout: 6000 }).catch(() => {});
 check("intake grill QUESTION modal is a dialog", await dialog.count() >= 1);
 const name = await dialog.getAttribute("aria-label").catch(() => null);
-check("the dialog has an accessible name", name === "Intake grill", `aria-label=${name}`);
+check("the dialog has an accessible name", name === "no_human — five questions", `aria-label=${name}`);
 check("aria-modal is set", (await dialog.getAttribute("aria-modal").catch(() => null)) === "true");
 
 // Focus was pulled into the dialog on open.

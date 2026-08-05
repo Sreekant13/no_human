@@ -281,7 +281,7 @@ async def _run_cli_grill(config, task: Task, store=None) -> Task:
         readonly=True,
     )
     qa_history: list[dict] = []
-    console.rule("[bold blue]intake grill — refining your task spec")
+    console.rule("[bold blue]five questions — refining your task spec")
     console.print("[dim]The grill explores the repo and asks clarifying questions.[/]\n")
 
     while True:
@@ -733,7 +733,7 @@ def task() -> None:
 @click.option("--run/--no-run", default=True, help="Run immediately (default) or just stage.")
 @click.option("-v", "--verbose", is_flag=True, help="Show full tool-call log (default: compact progress).")
 @click.option("--grill/--no-grill", default=True,
-              help="Run the intake grill to refine the spec (default: on; --no-grill to skip).")
+              help="Ask a few questions to refine the spec (default: on; --no-grill to skip).")
 @click.option("--backend", default=None, type=click.Choice(["claude"]),
               help="Override the worker backend for this task (default: from config; "
                    "single in-process Claude Agent SDK backend).")

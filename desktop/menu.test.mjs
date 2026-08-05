@@ -18,7 +18,7 @@ test("buildMenuTemplate: View has Board/Stats/Settings nav with Cmd 1/2/3", () =
   const nav = [];
   const t = buildMenuTemplate({ isMac: true, isDev: false, onNavigate: (p) => nav.push(p), onNewTask: () => {} });
   const view = submenu(t, "View");
-  const board = view.find((i) => i.label === "Board");
+  const board = view.find((i) => i.label === "In progress");
   const stats = view.find((i) => i.label === "Stats");
   const settings = view.find((i) => i.label === "Settings");
   assert.ok(board && stats && settings, "View has all three nav items");

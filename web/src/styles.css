@@ -560,10 +560,9 @@ html, body, #root {
   cursor: pointer;
   border-radius: 8px;
 }
-.legion-brand-home:hover .legion-name { color: var(--accent-500); }
-.legion-brand-home:focus-visible {
-  outline: 2px solid var(--accent-500);
-  outline-offset: 3px;
+.legion-brand-home:hover .legion-name {
+  color: var(--accent-500);
+  transition: color var(--dur-fast) ease;
 }
 .legion-logo {
   /* No border-radius or box-shadow: the brand mark is a transparent
@@ -1516,6 +1515,7 @@ a.card-pr-badge:hover, a.card-pr-badge:focus-visible { text-decoration: underlin
    is Chrome's light-mode blue on both themes: 2.81:1 against --bg-card #1A1D27, under the
    3:1 that WCAG 1.4.11 wants. This gives it the app's token instead. */
 .memory-card-header:focus-visible,
+.legion-brand-home:focus-visible,
 .nh-nav-btn:focus-visible,
 .nh-navrow:focus-visible,
 .lane-stale-divider:focus-visible,

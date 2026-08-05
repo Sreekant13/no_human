@@ -48,7 +48,7 @@ for (const theme of ["dark", "light"]) {
   await setTheme(theme);
   await escAll();
   // Board
-  await nav("Board"); await shot(`board-${theme}`);
+  await nav("In progress"); await shot(`board-${theme}`);
   // A task's drawer via the Done table — SYSTEM tab (+ expand an agent) + tabs
   if (await click("button:has-text('Done')")) {
     await shot(`done-${theme}`);

@@ -198,7 +198,7 @@ def reflowed(rows: list[str]) -> str:
 
 
 MOUNT_SENTENCE = (
-    "It goes to the same intake grill the board uses. "
+    "It asks the same five questions the board does. "
     "/help for the slash commands."
 )
 

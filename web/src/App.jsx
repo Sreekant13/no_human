@@ -43,12 +43,12 @@ function Brand({ onHome }) {
   }
   return (
     <button type="button" className="legion-brand legion-brand-home" onClick={onHome}
-            title="Back to work in progress" aria-label="Back to work in progress">
+            title="Back to work in progress" aria-label="no_human — back to work in progress">
       <LegionLogo size={32} />
-      <div className="legion-wordmark">
+      <span className="legion-wordmark">
         <span className="legion-name">no_human</span>
         <span className="legion-tag">get the max out of Claude</span>
-      </div>
+      </span>
     </button>
   );
 }
@@ -449,8 +449,8 @@ function NewTaskModal({ onClose, onCreated }) {
     return (
       // No backdrop-click close — see the Refined Spec branch above.
       <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
-        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Twenty questions" tabIndex={-1} ref={grillRef}>
-          <div className="sendback-label">Twenty Questions</div>
+        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="no_human — five questions" tabIndex={-1} ref={grillRef}>
+          <div className="sendback-label">Five Questions</div>
           <div className="grill-loading">
             <Spinner />
             <div className="grill-loading-text">Reading your code so the questions are worth asking...</div>
@@ -481,9 +481,9 @@ function NewTaskModal({ onClose, onCreated }) {
     if (busy) {
       return (
         <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
-          <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Twenty questions" tabIndex={-1} ref={grillRef}>
+          <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="no_human — five questions" tabIndex={-1} ref={grillRef}>
             <div className="grill-header">
-              <div className="sendback-label">Twenty Questions</div>
+              <div className="sendback-label">Five Questions</div>
               <span className="grill-round-badge">Round {grillQuestion.round}/{maxRounds}</span>
             </div>
             <div className="grill-progress-bar">
@@ -506,9 +506,9 @@ function NewTaskModal({ onClose, onCreated }) {
       // No backdrop-click close — a stray click mid-grill discarded every answer
       // the operator had already given. See the Refined Spec branch above.
       <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
-        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Twenty questions" tabIndex={-1} ref={grillRef}>
+        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="no_human — five questions" tabIndex={-1} ref={grillRef}>
           <div className="grill-header">
-            <div className="sendback-label">Twenty Questions</div>
+            <div className="sendback-label">Five Questions</div>
             <span className="grill-round-badge">Round {grillQuestion.round}/{maxRounds}</span>
           </div>
           <div className="grill-progress-bar">
