@@ -5,7 +5,6 @@ import SettingsOverlay from "./Settings.jsx";
 import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
 import TaskComposer from "./TaskComposer.jsx";
-import UnprovenBanner from "./UnprovenBanner.jsx";
 import Outcomes from "./Outcomes.jsx";
 import { keepFocusInDialog } from "./keepFocusInDialog.js";
 import { LegionLogo } from "./Logo.jsx";
@@ -956,7 +955,6 @@ export default function App() {
             <button className="btn btn-new-task" aria-haspopup="dialog" aria-expanded={showNewTask} onClick={() => setShowNewTask(true)}>+ New Task</button>
           </div>
         )}
-        {page === "board" && <UnprovenBanner />}
         {page === "board" && <Board tasks={tasks} pendingOpenId={pendingOpenId} onPendingOpenHandled={() => setPendingOpenId(null)} />}
         {page === "done" && <Outcomes tasks={tasks} lane="done" />}
         {page === "failed" && <Outcomes tasks={tasks} lane="failed" />}

@@ -979,7 +979,8 @@ export default function Onboarding({ onComplete }) {
  *  - passes  -> "Use this repo" (the human gate; the server still re-checks)
  *  - fails   -> the output IS the explanation, and the command is editable so
  *               the user can correct it and retry instead of being stuck
- *  - skipped -> allowed, but the board says so afterwards (see UnprovenBanner)
+ *  - skipped -> allowed; the repo simply runs without a proven test command
+ *               until it is proved here or via `nh onboard <repo> --confirm`
  */
 export function ProvePanel({ repoPath, profile, prove, editedCmd, onEditCmd,
                              onProve, onConfirm, busy }) {

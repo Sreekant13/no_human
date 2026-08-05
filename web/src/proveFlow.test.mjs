@@ -16,7 +16,6 @@ import * as api from "./api.js";
 
 const SRC = dirname(fileURLToPath(import.meta.url));
 const onboarding = readFileSync(join(SRC, "Onboarding.jsx"), "utf8");
-const banner = readFileSync(join(SRC, "UnprovenBanner.jsx"), "utf8");
 const app = readFileSync(join(SRC, "App.jsx"), "utf8");
 const css = readFileSync(join(SRC, "styles.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
 
@@ -127,24 +126,16 @@ test("the summary explains the consequence rather than just flagging a state", (
     "the user must be told what an unproven repo actually costs them");
 });
 
-// ── the board gives every unproven repo a clickable remedy ─────────────────
+// ── the board carries no standing nag ──────────────────────────────────────
+//
+// A board-level banner listing every unproven repo was removed on 2026-08-05:
+// it enumerated the user's local repos by name on each visit, which is both a
+// nag and an unnecessary disclosure. Proving still lives where the user asked
+// for it — the onboarding wizard (covered above) and `nh onboard <repo>`.
 
-test("the board banner names the repo and offers to prove it", () => {
-  assert.match(banner, /needs its test command proven/);
-  assert.match(banner, /Prove now/);
-  assert.match(banner, /proveRepoSSE/);
-  assert.match(banner, /confirmRepoProfile/);
-  assert.match(banner, /fetchReadiness/);
-});
-
-test("the banner is mounted on the board", () => {
-  assert.match(app, /import UnprovenBanner from "\.\/UnprovenBanner\.jsx"/);
-  assert.match(app, /page === "board" && <UnprovenBanner \/>/);
-});
-
-test("the banner hides itself when nothing needs proving", () => {
-  assert.match(banner, /if \(pending\.length === 0\) return null/,
-    "a satisfied banner must disappear, not nag");
+test("no standing unproven banner is mounted on the board", () => {
+  assert.ok(!app.includes("UnprovenBanner"),
+    "the board must not re-acquire a standing banner that lists local repos");
 });
 
 // ── onboarding ends on a first task ────────────────────────────────────────
@@ -160,8 +151,7 @@ test("onboarding ends on a first task when a repo is actually ready", () => {
 // ── styling exists for every class the new UI renders ──────────────────────
 
 test("the prove UI has styles in both themes", () => {
-  for (const cls of [".ob-prove", ".ob-prove-log", ".ob-prove-verdict",
-                     ".unproven-banner", ".unproven-log", ".btn-prove"]) {
+  for (const cls of [".ob-prove", ".ob-prove-log", ".ob-prove-verdict"]) {
     assert.ok(css.includes(cls), `${cls} is rendered but never styled`);
   }
 });

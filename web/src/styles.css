@@ -6064,7 +6064,7 @@ textarea:disabled {
   pointer-events: none;
 }
 
-/* ── Proving a repo's test command (onboarding wizard + board banner) ─────────
+/* ── Proving a repo's test command (onboarding wizard) ───────────────────────
    The "unproven" state used to be a grey chip with no remedy. These styles back
    the affordance that replaced it: run the command, show the real output, and
    either confirm it or correct it. Muted-but-visible, never an error red for the
@@ -6085,7 +6085,7 @@ textarea:disabled {
   font-family: var(--font-mono);
   font-size: 11px;
 }
-.ob-prove-log, .unproven-log {
+.ob-prove-log {
   max-height: 220px;
   overflow: auto;
   background: var(--bg-panel);
@@ -6098,28 +6098,5 @@ textarea:disabled {
   color: var(--text-muted);
 }
 .ob-prove-verdict { font-size: 12px; line-height: 1.6; }
-.ob-prove-verdict.ok, .unproven-panel-head .ok { color: var(--state-done); }
-.ob-prove-verdict.bad, .unproven-panel-head .bad { color: var(--state-failed); }
-
-.unproven-banner {
-  margin: 0 0 14px;
-  padding: 10px 14px;
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--state-waiting);
-  border-radius: 8px;
-  background: var(--bg-raised);
-}
-.unproven-head {
-  display: flex;
-  gap: 14px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-.unproven-text { flex: 1; min-width: 240px; font-size: 13px; }
-.unproven-why { color: var(--text-muted); font-size: 12px; }
-.unproven-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-.unproven-panel { margin-top: 10px; }
-.unproven-panel-head { font-size: 12px; margin-bottom: 4px; }
-.unproven-retry { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-.unproven-retry .ob-input { flex: 1; min-width: 220px; }
-.btn-prove { background: var(--accent-500); color: var(--bg); font-weight: 600; }
+.ob-prove-verdict.ok { color: var(--state-done); }
+.ob-prove-verdict.bad { color: var(--state-failed); }
