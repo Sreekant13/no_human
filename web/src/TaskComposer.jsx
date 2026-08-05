@@ -10,6 +10,7 @@ import { formatBytes } from "./formatBytes.js";
 import { pluralize } from "./pluralize.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 import PathInput from "./PathInput.jsx";
+import QueueNotice from "./QueueNotice.jsx";
 
 // The new-task composer (Task 5A) — one prompt, kind chips, inline controls.
 //
@@ -77,7 +78,7 @@ function SelectPill({ children, onPanel = false, grow = false, ...rest }) {
   );
 }
 
-export default function TaskComposer({ busy, error, initial, notice, onOpenBacklog, onStart, onClose }) {
+export default function TaskComposer({ busy, error, initial, notice, queueRemaining = 0, onStopQueue = null, onOpenBacklog, onStart, onClose }) {
   // Seeded from `initial`: the parent unmounts this component for the duration of
   // the grill, so a grill that FAILS would otherwise drop the operator back into an
   // empty composer — prompt, attachments, kind and PR URL all gone.
@@ -363,10 +364,10 @@ export default function TaskComposer({ busy, error, initial, notice, onOpenBackl
         )}
 
         {/* Queue position when several tickets were started at once — the
-            operator is told WHICH ticket this is, not left guessing. */}
-        {notice && (
-          <p className="mb-4 text-center font-ui text-xs text-text-muted">{notice}</p>
-        )}
+            operator is told WHICH ticket this is, not left guessing, and the
+            only way to abandon the REST of the run sits next to it (Escape
+            cancels this ticket alone; see backlogSelection.js). */}
+        <QueueNotice notice={notice} remaining={queueRemaining} onStopAll={onStopQueue} />
 
         <div className="mb-9 text-center">
           <h2 className="font-display text-4xl font-semibold tracking-tight text-text-hi sm:text-5xl">

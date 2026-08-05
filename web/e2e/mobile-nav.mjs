@@ -60,6 +60,14 @@ for (const [label, viewport] of [
           active: b.classList.contains("active"),
         };
       });
+      // The nav strip itself: does its content fit the box it is drawn in?
+      // `overflow-x: auto` + a hidden scrollbar means an overflowing strip
+      // looks IDENTICAL to a fitting one — the rows just stop, with no edge,
+      // no bar and no fade. Every rect below would still read "on screen" for
+      // the rows that happen to be scrolled into view, so this is the check
+      // that catches a hidden overflow rather than its visible symptom.
+      const nav = document.querySelector(".nh-sidenav");
+      const navOverflow = nav ? nav.scrollWidth - nav.clientWidth : 0;
       const toggle = document.querySelector(".nh-theme-toggle");
       const tr = toggle?.getBoundingClientRect();
       const tag = document.querySelector(".legion-tag");
@@ -69,6 +77,7 @@ for (const [label, viewport] of [
       return {
         vw,
         btns,
+        navOverflow,
         toggleOnScreen: tr ? tr.right <= vw && tr.left >= 0 : null,
         tagVisible: tag ? getComputedStyle(tag).display !== "none" : false,
         pageOverflowX: document.documentElement.scrollWidth > vw + 1,
@@ -89,6 +98,11 @@ for (const [label, viewport] of [
       `[${label}/${theme}] every nav item is on screen`,
       off.length === 0,
       off.length ? off.map((b) => `${b.label}@${b.left}-${b.right} of ${geom.vw}`).join(", ") : `${geom.btns.length} items`,
+    );
+    check(
+      `[${label}/${theme}] the nav strip does not overflow its own box (nothing hidden behind a scrollbar-less scroll)`,
+      geom.navOverflow <= 1,
+      `scrollWidth - clientWidth = ${geom.navOverflow}px`,
     );
     check(`[${label}/${theme}] theme toggle is on screen`, geom.toggleOnScreen !== false);
     check(`[${label}/${theme}] no horizontal page overflow`, !geom.pageOverflowX);

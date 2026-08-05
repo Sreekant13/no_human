@@ -117,3 +117,87 @@ export function queueProgress(index, total, key) {
   if (!total || total < 2) return null;
   return `Ticket ${index + 1} of ${total}${key ? ` · ${key}` : ""}`;
 }
+
+/* ─────────────────────────── the queue itself ──────────────────────────────
+ * Everything above is the SELECTION algebra — which tickets a start includes.
+ * Everything below is what happens AFTER the start: the queue that walks those
+ * tickets through the intake flow one at a time.
+ *
+ * It lives here, pure, for one reason: it used to live inline in App.jsx as a
+ * ref flipped between two branches of an `onClose` handler, and inverting that
+ * flag turned "start 10 tickets" into "start 1, silently drop 9" with all 875
+ * tests still green. A queue that can lose nine of an operator's tickets is not
+ * something a renderer should own privately.
+ *
+ * THE CANCEL RULE (the second reason it was rewritten). The old handler cleared
+ * the whole queue on ANY close that was not a create — and TaskComposer binds
+ * Escape to that close. One Escape on ticket 2 of 10 threw the other 8 away,
+ * after the Backlog page had already cleared the checkboxes, so the only way
+ * back was to re-tick every ticket from memory. Cancelling is now scoped to
+ * what the operator was actually looking at: `next` drops the CURRENT ticket
+ * and continues with the rest, whether that ticket was created or abandoned.
+ * Abandoning the whole run is still one action — but an EXPLICIT one (`stop`,
+ * behind the "Stop the rest" button the queue notice carries), never the
+ * side-effect of a keystroke that means "close this dialog".
+ */
+
+/** No queue running. The only way to build an empty one. */
+export function initialQueue() {
+  return { queue: [], total: 0 };
+}
+
+/** Begin a run over `issues` (already filtered by `startIssues`). */
+export function startQueue(issues) {
+  const q = (issues || []).filter((i) => i && i.key);
+  return q.length ? { queue: q, total: q.length } : initialQueue();
+}
+
+/**
+ * The queue's whole state machine. `state` is `{queue, total}`.
+ *
+ *   start → begin a run over action.issues
+ *   next  → this ticket is finished with (CREATED **or** CANCELLED): drop it,
+ *           keep going. The two cases are deliberately one transition — the
+ *           bug was that they were two, and the cancel one threw the rest away.
+ *   stop  → the operator explicitly abandoned the whole run.
+ *
+ * An unrecognized action returns the state untouched.
+ */
+export function backlogQueueReducer(state, action) {
+  const cur = state && Array.isArray(state.queue) ? state : initialQueue();
+  switch (action && action.type) {
+    case "start":
+      return startQueue(action.issues);
+    case "next": {
+      const rest = cur.queue.slice(1);
+      // `total` is the size of the run IN PROGRESS: once the last ticket is
+      // done the run is over, so it goes back to zero rather than leaving a
+      // stale "of 10" behind for the next run to inherit.
+      return rest.length ? { queue: rest, total: cur.total } : initialQueue();
+    }
+    case "stop":
+      return initialQueue();
+    default:
+      return cur;
+  }
+}
+
+/** The ticket being started right now, or null when nothing is running. */
+export function queueHead(state) {
+  return (state && state.queue && state.queue[0]) || null;
+}
+
+/** The queue's position readout for the CURRENT head, or null when a run of
+ * one (or none) makes it noise. */
+export function queueNotice(state) {
+  const s = state || initialQueue();
+  const head = queueHead(s);
+  return queueProgress(s.total - s.queue.length, s.total, head ? head.key : null);
+}
+
+/** How many tickets would be thrown away by `stop` right now — the number the
+ * "Stop the rest" button must name, so abandoning a run is never a guess. */
+export function queueRemaining(state) {
+  const s = state || initialQueue();
+  return Math.max(0, s.queue.length - 1);
+}

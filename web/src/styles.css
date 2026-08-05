@@ -391,34 +391,54 @@ html, body, #root {
   .nh-status-label {
     min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  /* N16 — the nav gets its OWN full-width line.
+     Sharing line 1 with the brand, the status chips, the theme toggle and
+     Settings left the nav ~160px on a 360-390px phone. That was survivable at
+     five rows and stopped being survivable at six: adding Backlog pushed
+     "Failed" and "Stats" past the right edge (measured: rows ran to 464px of a
+     390px viewport), and the only affordance saying the strip scrolled was a
+     fade mask scoped to `max-width: 359px` — so at exactly the two widths that
+     broke, 360px and 390px, two pages were unreachable with no hint they
+     existed. The fade is gone with the overflow it hinted at: wrapping hands
+     the nav the whole viewport width and `flex: 1 1 0` divides it into equal
+     columns, so a row can never be pushed off-screen again — at any width, by
+     any future row (an extra row narrows every column instead).
+     `order` is load-bearing: without it the 100%-basis nav would wrap the FOOT
+     down onto a third line instead of staying beside the brand. */
+  .nh-sidebar { flex-wrap: wrap; align-content: center; }
+  .nh-sidebar-brand { order: 0; }
+  .nh-sidebar-foot { order: 1; }
   .nh-sidenav {
+    order: 2;
+    flex: 1 0 100%; min-width: 0;
     flex-direction: row; gap: 2px;
-    flex: 1 1 auto; min-width: 0;
-    /* Belt and braces: if a fourth page is ever added, the nav scrolls instead of
-       silently pushing an item off-screen again. */
+    /* Belt and braces only — equal columns cannot overflow. e2e/mobile-nav.mjs
+       asserts scrollWidth <= clientWidth so a change that reintroduces overflow
+       fails loudly instead of hiding rows behind a scroll nobody can see. */
     overflow-x: auto;
     scrollbar-width: none;
   }
-  /* N13: at 320px (iPhone SE 1) the row nav genuinely overflows and the
-     suppressed scrollbar left NO affordance. A right-edge fade signals
-     "more content this way" — masks are theme-neutral. 360px+ fits clean,
-     so the fade only exists where the overflow does. */
-  @media (max-width: 359px) {
-    .nh-sidenav {
-      -webkit-mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 20px), transparent);
-      mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 20px), transparent);
-    }
-  }
   .nh-sidenav::-webkit-scrollbar { display: none; }
-  /* Tighter than the desktop rail so the row fits a 360px phone without scrolling
-     — a scroll that has to be discovered is a worse affordance than a smaller label.
-     The group wrapper collapses to `contents` so Work/Insights lay out as ONE flat
-     row of buttons (matching the pre-1.5 flat nav) instead of stacking two group
-     blocks; the now-redundant uppercase headers hide (their info — which page a
-     row goes to — is still carried by the icon+label itself). */
+  /* The group wrapper collapses to `contents` so Work/Insights lay out as ONE
+     flat row of buttons (matching the pre-1.5 flat nav) instead of stacking two
+     group blocks; the now-redundant uppercase headers hide (their info — which
+     page a row goes to — is still carried by the icon+label itself). */
   .nh-navgroup, .nh-navgroup-rows { display: contents; }
   .nh-navgroup-title { display: none; }
-  .nh-navrow { flex: 0 0 auto; width: auto; padding: 8px 7px; gap: 5px; font-size: 13px; }
+  /* Equal columns, icon over label — the phone tab-bar shape. `flex: 1 1 0` +
+     `min-width: 0` is what guarantees the fit: the rows always divide the line,
+     and a long label ellipsises inside its own column instead of widening the
+     strip. The label is never dropped — an icon-only nav row is not a thing
+     this product renders (see NavRow in App.jsx). */
+  .nh-navrow {
+    flex: 1 1 0; min-width: 0; width: auto;
+    flex-direction: column; align-items: center; justify-content: center;
+    gap: 2px; padding: 6px 2px;
+    font-size: 11px; letter-spacing: 0; text-align: center;
+  }
+  /* The base rule's `flex: 1` stretches the label VERTICALLY once the row is a
+     column — it must size to its text and truncate horizontally instead. */
+  .nh-navrow-label { flex: 0 0 auto; max-width: 100%; }
   /* Row counts are secondary on a phone-width nav — they're still visible on
      the Board/Done/Failed pages themselves once tapped in. Dropping them here
      is what makes the (now 2-row-bigger) grouped nav fit a 360-390px rail
@@ -429,11 +449,14 @@ html, body, #root {
   .nh-sidebar-foot .nh-status-label { display: none; }
   /* Settings moves from a bottom-pinned, divider-topped row (vertical rail
      layout) to just another item in the row-layout foot — a left hairline
-     reads as the equivalent separator once the sidebar itself is a row. */
+     reads as the equivalent separator once the sidebar itself is a row. It
+     sits in the FOOT, not the nav strip, so it keeps the horizontal icon+label
+     shape the column rule above gives the nav rows. */
   .nh-settings-row {
     border-top: none; border-left: 1px solid var(--border);
     padding: 8px 7px; margin-top: 0; margin-left: 4px;
     flex: 0 0 auto; width: auto; gap: 5px; font-size: 13px;
+    flex-direction: row; align-items: center; text-align: left;
   }
 }
 
@@ -3590,6 +3613,27 @@ a.so-chip-value:hover { color: var(--accent-300); }
   padding: 3px 10px;
   border-radius: var(--r-pill);
 }
+
+/* The multi-ticket queue readout (QueueNotice.jsx) — rendered at the top of
+   EVERY step of the intake flow, not just the composer, so "Ticket 2 of 10"
+   never disappears for the five questions. */
+.queue-notice {
+  display: flex; align-items: center; justify-content: center;
+  flex-wrap: wrap; gap: 10px;
+  margin-bottom: 14px;
+}
+.queue-notice-text { font-size: 12px; color: var(--text-muted); }
+/* `border-style` is stated: Preflight is off, so `border-width` alone paints
+   nothing and a <button> falls back to the UA bevel. */
+.queue-notice-stop {
+  border: 1px solid var(--border); border-style: solid;
+  border-radius: var(--r-pill);
+  background: var(--bg-panel); color: var(--text-muted);
+  font: inherit; font-size: 11px; font-weight: 600;
+  padding: 3px 10px; cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
+}
+.queue-notice-stop:hover { background: var(--surface-2); color: var(--text-hi); }
 
 /* ── Grill: suggestion buttons ── */
 .grill-suggestion {

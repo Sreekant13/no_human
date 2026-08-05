@@ -24,7 +24,10 @@ import { drainChip } from "./drainChip.js";
 import { initialDrainReadout, nextDrainReadout, readoutPayload } from "./drainReadout.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 import { promptFromIssue, externalIdFromIssue } from "./jiraImport.js";
-import { queueProgress } from "./backlogSelection.js";
+import {
+  backlogQueueReducer, initialQueue, queueHead, queueNotice, queueRemaining,
+} from "./backlogSelection.js";
+import QueueNotice from "./QueueNotice.jsx";
 
 
 // Header brand: logo + wordmark + tagline. Used in the main and error headers.
@@ -256,7 +259,11 @@ function Spinner() {
   return <span className="grill-spinner" />;
 }
 
-function NewTaskModal({ onClose, onCreated, initial = null, notice = null, onOpenBacklog = null }) {
+function NewTaskModal({
+  onClose, onCreated, initial = null,
+  notice = null, queueLeft = 0, onStopQueue = null,
+  onOpenBacklog = null,
+}) {
   // The composed spec, handed over by TaskComposer when the operator hits Next.
   // Null until then — the composer owns its own field state (see TaskComposer.jsx).
   //
@@ -423,6 +430,7 @@ function NewTaskModal({ onClose, onCreated, initial = null, notice = null, onOpe
     return (
       <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
         <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Refined spec" tabIndex={-1} ref={grillRef}>
+          <QueueNotice notice={notice} remaining={queueLeft} onStopAll={onStopQueue} />
           <div className="sendback-label">Refined Spec</div>
           <div className="grill-spec">
             <div className="grill-spec-title">{grillResult.title}</div>
@@ -472,6 +480,7 @@ function NewTaskModal({ onClose, onCreated, initial = null, notice = null, onOpe
       // No backdrop-click close — see the Refined Spec branch above.
       <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
         <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="no_human — five questions" tabIndex={-1} ref={grillRef}>
+          <QueueNotice notice={notice} remaining={queueLeft} onStopAll={onStopQueue} />
           <div className="sendback-label">Five Questions</div>
           <div className="grill-loading">
             <Spinner />
@@ -504,6 +513,7 @@ function NewTaskModal({ onClose, onCreated, initial = null, notice = null, onOpe
       return (
         <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
           <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="no_human — five questions" tabIndex={-1} ref={grillRef}>
+            <QueueNotice notice={notice} remaining={queueLeft} onStopAll={onStopQueue} />
             <div className="grill-header">
               <div className="sendback-label">Five Questions</div>
               <span className="grill-round-badge">Round {grillQuestion.round}/{maxRounds}</span>
@@ -529,6 +539,7 @@ function NewTaskModal({ onClose, onCreated, initial = null, notice = null, onOpe
       // the operator had already given. See the Refined Spec branch above.
       <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
         <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="no_human — five questions" tabIndex={-1} ref={grillRef}>
+          <QueueNotice notice={notice} remaining={queueLeft} onStopAll={onStopQueue} />
           <div className="grill-header">
             <div className="sendback-label">Five Questions</div>
             <span className="grill-round-badge">Round {grillQuestion.round}/{maxRounds}</span>
@@ -582,10 +593,48 @@ function NewTaskModal({ onClose, onCreated, initial = null, notice = null, onOpe
       // composer with their prompt, attachments and kind gone.
       initial={fields}
       notice={notice}
+      queueRemaining={queueLeft}
+      onStopQueue={onStopQueue}
       onOpenBacklog={onOpenBacklog}
       onStart={startGrill}
       onClose={onClose}
     />
+  );
+}
+
+// The window between "the operator started a ticket" and "the composer has its
+// full spec": one detail GET, up to 30s if the tracker is slow.
+//
+// It used to be a bare spinner. Every OTHER branch of this flow has a way out —
+// Cancel buttons on all four grill steps, Escape on the composer — and this one
+// had neither, so a slow Jira held the whole screen with no key and no control
+// that did anything. It gets the same two exits as its neighbours, and they mean
+// what Cancel means everywhere else in the queue: skip THIS ticket, keep the
+// rest (backlogSelection.js).
+function BacklogSeedOverlay({ issueKey, notice, queueLeft, onSkip, onStopQueue }) {
+  const ref = useRef(null);
+  useEscapeKey(onSkip, true);
+  useEffect(() => { ref.current?.focus(); }, []);
+  return (
+    <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
+      <div
+        className="new-task-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Reading ${issueKey}`}
+        tabIndex={-1}
+        ref={ref}
+      >
+        <QueueNotice notice={notice} remaining={queueLeft} onStopAll={onStopQueue} />
+        <div className="grill-loading" role="status" aria-live="polite">
+          <Spinner />
+          <div className="grill-loading-text">Reading {issueKey} from Jira…</div>
+        </div>
+        <div className="sendback-actions">
+          <button type="button" className="btn btn-sendback" onClick={onSkip}>Cancel</button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -602,10 +651,14 @@ export default function App() {
   // spec), so N selected tickets are not a batch: they run through the same
   // composer→grill→create flow one at a time, head of the queue first. The
   // Backlog page says so before the first question is asked
-  // (backlogSelection.js: multiStartNotice). Cancelling drops the rest of the
-  // queue rather than silently continuing into the next ticket's questions.
-  const [backlogQueue, setBacklogQueue] = useState([]);
-  const [backlogTotal, setBacklogTotal] = useState(0);
+  // (backlogSelection.js: multiStartNotice).
+  //
+  // The transitions live in backlogSelection.js as a pure reducer, NOT inline
+  // here — read the "the queue itself" block there for why (this handler is
+  // where nine of ten tickets could go missing without a test noticing, and
+  // where one Escape used to discard the whole run).
+  const [backlog, setBacklog] = useState(initialQueue);
+  const backlogQueue = backlog.queue;
   // The head ticket resolved to a composer seed. null while the full issue is
   // being fetched: the browse list truncates description at 2000 chars, and a
   // task must carry the whole spec, so the detail GET happens BEFORE the
@@ -617,7 +670,12 @@ export default function App() {
   const [backlogNonce, setBacklogNonce] = useState(0);
   // The ticket currently being started (queue head), or null when the queue is
   // empty. Declared here, above every effect that reads it.
-  const backlogHeadKey = backlogQueue[0]?.key ?? null;
+  const backlogHeadKey = queueHead(backlog)?.key ?? null;
+  // ONE ticket is finished with — created or cancelled, the queue does not care
+  // which — so move to the next. The whole run is abandoned only by `stopQueue`,
+  // which is reachable solely from the "Stop the rest" button.
+  const nextTicket = () => setBacklog((s) => backlogQueueReducer(s, { type: "next" }));
+  const stopQueue = () => setBacklog((s) => backlogQueueReducer(s, { type: "stop" }));
   // Settings is an overlay dialog (Claude macOS desktop app model), not a
   // routed page — it can open on top of whatever page is showing.
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -663,11 +721,6 @@ export default function App() {
   // missing/old endpoint never blocks an existing user at the board.
   const [onboarded, setOnboarded] = useState(null);
   const wsRef = useRef(null);
-  // NewTaskModal fires onCreated() and then onClose() on success, and onClose()
-  // alone on cancel. The queue must tell those apart: a success dequeues the
-  // head and moves to the next ticket, a cancel drops the whole rest of the
-  // queue (never silently walks the operator into the next ticket's questions).
-  const backlogAdvanceRef = useRef(false);
 
   // onboarding gate
   useEffect(() => {
@@ -1052,7 +1105,7 @@ export default function App() {
         {page === "backlog" && (
           <Backlog
             refreshNonce={backlogNonce}
-            onStart={(list) => { setBacklogTotal(list.length); setBacklogQueue(list); }}
+            onStart={(list) => setBacklog((s) => backlogQueueReducer(s, { type: "start", issues: list }))}
           />
         )}
         {page === "done" && <Outcomes tasks={tasks} lane="done" />}
@@ -1073,32 +1126,28 @@ export default function App() {
         <NewTaskModal
           key={backlogHeadKey}
           initial={backlogSeed}
-          notice={queueProgress(backlogTotal - backlogQueue.length, backlogTotal, backlogHeadKey)}
+          notice={queueNotice(backlog)}
+          queueLeft={queueRemaining(backlog)}
+          onStopQueue={stopQueue}
           onCreated={() => {
-            backlogAdvanceRef.current = true;
             setBacklogNonce((n) => n + 1);
             fetchTasks().then((ts) => dispatch({ type: "set", tasks: ts }));
           }}
-          onClose={() => {
-            if (backlogAdvanceRef.current) {
-              backlogAdvanceRef.current = false;
-              setBacklogQueue((q) => q.slice(1));
-            } else {
-              setBacklogQueue([]);
-              setBacklogTotal(0);
-            }
-          }}
+          // Created and cancelled are the SAME queue transition on purpose:
+          // whichever it was, this ticket is done with and the ones behind it
+          // are not. (onCreated fires first on the create path; it only
+          // refreshes the board.)
+          onClose={nextTicket}
         />
       )}
       {backlogHeadKey && !backlogSeed && (
-        <div className="sendback-overlay">
-          <div className="new-task-modal" role="status" aria-live="polite">
-            <div className="grill-loading">
-              <Spinner />
-              <div className="grill-loading-text">Reading {backlogHeadKey} from Jira…</div>
-            </div>
-          </div>
-        </div>
+        <BacklogSeedOverlay
+          issueKey={backlogHeadKey}
+          notice={queueNotice(backlog)}
+          queueLeft={queueRemaining(backlog)}
+          onSkip={nextTicket}
+          onStopQueue={stopQueue}
+        />
       )}
       {settingsOpen && <SettingsOverlay onClose={() => setSettingsOpen(false)} />}
     </div>
