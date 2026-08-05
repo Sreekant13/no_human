@@ -568,7 +568,7 @@ def shell_cmd(ctx: click.Context, repo: str | None) -> None:
     """The conversational shell — the same thing bare `nh` opens.
 
     Talks to the running server over HTTP (start it with `nh start`), shows
-    the board's lanes, and takes plain English through the same intake grill
+    the board's lanes, and takes plain English through the same five questions
     the web composer uses.
     """
     sys.exit(_launch_shell(repo or (ctx.obj or {}).get("repo")))

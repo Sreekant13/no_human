@@ -182,7 +182,7 @@ def run() -> int:
         page.screenshot(path=f"{SHOTS}/nh_e2e_7_settings_rules.png", full_page=True)
 
         # Back to board
-        page.locator(".nh-nav-btn", has_text="Board").click()
+        page.locator(".nh-navrow", has_text="In progress").click()
         page.wait_for_timeout(300)
         check("back to board works", page.locator(".lane").count() >= 1)
 

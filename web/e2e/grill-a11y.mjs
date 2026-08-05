@@ -111,7 +111,7 @@ check("Shift+Tab at the start wraps to the end (trap holds)",
 
 // H3: the grill overlays had ZERO coverage — restoring `onClick={onClose}` on
 // them left this suite green.
-// ⚠️ SCOPE: this suite drives the three `aria-label="Intake grill"` branches.
+// ⚠️ SCOPE: this suite drives the three `aria-label="no_human — five questions"` branches.
 // The fourth overlay — `aria-label="Refined spec"`, the one the operator sees
 // when the grill finishes — is reached by NO suite, so its backdrop and caret
 // behaviour are still unpinned. Covering it needs a harness that drives the

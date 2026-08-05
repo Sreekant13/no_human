@@ -560,10 +560,7 @@ html, body, #root {
   cursor: pointer;
   border-radius: 8px;
 }
-.legion-brand-home:hover .legion-name {
-  color: var(--accent-500);
-  transition: color var(--dur-fast) ease;
-}
+.legion-brand-home:hover .legion-name { color: var(--accent-500); }
 .legion-logo {
   /* No border-radius or box-shadow: the brand mark is a transparent
      monogram, not the opaque square badge this rule was written for. A
@@ -577,6 +574,7 @@ html, body, #root {
   line-height: 1.05;
 }
 .legion-name {
+  transition: color var(--dur-fast) ease;
   font-family: var(--font-ui);
   font-size: 26px;
   font-weight: 800;
