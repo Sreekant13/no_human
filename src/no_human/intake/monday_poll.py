@@ -140,6 +140,18 @@ class MondayPoller:
                            self._log_transport("poll", exc))
             return result
 
+        # A pull that stopped at the adapter's page bound is a PARTIAL board,
+        # and it otherwise looks exactly like a complete one: tasks get created,
+        # nothing errors, and the items past the bound simply never arrive. Say
+        # so on the operator's own channel, not only in the adapter's log.
+        if getattr(self.adapter, "last_search_truncated", False):
+            self._on_event(
+                "monday_poll_truncated",
+                f"monday board pull hit its page bound — this poll saw only a "
+                f"PARTIAL board ({len(items)} item(s) in scope); items past the "
+                f"bound were not read. Narrow integrations.monday.todo_labels "
+                f"or raise integrations.monday.page_size.")
+
         existing = await self._existing_ids()
         for item in items:
             item_id = str(item.get("id") or "")

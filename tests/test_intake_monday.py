@@ -23,6 +23,7 @@ from no_human.intake.monday import (
     API_URL,
     API_VERSION,
     MAX_PAGE_SIZE,
+    MAX_PAGES,
     STATE_MEANINGS,
     MondayAdapter,
     MondayAuthError,
@@ -112,6 +113,27 @@ def _columns_payload():
     ]}]}}
 
 
+def _serving(items_post):
+    """Answer the board's COLUMNS query, and delegate the items query.
+
+    ``search()`` checks its config against the board before it filters, so a
+    realistic board answers TWO distinct queries. Routing on the operation name
+    keeps each test's item-query assertions (cursors, limits, call counts)
+    about the item query alone.
+    """
+    def fake_post(url, headers=None, timeout=None, json=None):
+        if "NoHumanColumns" in json["query"]:
+            return _Resp(_columns_payload())
+        return items_post(url, headers=headers, timeout=timeout, json=json)
+
+    return fake_post
+
+
+def _constant(payload):
+    """An items responder that answers the same payload every time."""
+    return lambda *a, **k: _Resp(payload)
+
+
 @pytest.fixture
 def token(monkeypatch):
     monkeypatch.setenv("MONDAY_API_TOKEN", "eyJhbGciOiJIUzI1NiJ9.SEKRET.sig")
@@ -182,7 +204,7 @@ def test_auth_header_is_the_raw_token_not_bearer(token, monkeypatch):
         seen.update(url=url, headers=headers, json=json)
         return _Resp(_items_payload([]))
 
-    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "post", _serving(fake_post))
     MondayAdapter(_cfg()).search()
     assert seen["url"] == API_URL
     assert seen["headers"]["Authorization"] == "eyJhbGciOiJIUzI1NiJ9.SEKRET.sig"
@@ -318,7 +340,7 @@ def test_search_follows_the_cursor_so_a_second_page_is_not_dropped(token, monkey
         cursors.append(json["variables"]["cursor"])
         return pages.pop(0)
 
-    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "post", _serving(fake_post))
     items = MondayAdapter(_cfg()).search()
     assert [i["id"] for i in items] == ["1", "2"]
     assert cursors == [None, "CUR1"]      # the cursor was actually passed through
@@ -334,15 +356,16 @@ def test_search_stops_when_the_cursor_is_null(token, monkeypatch):
         calls.append(1)
         return _Resp(_items_payload([_item()], cursor=None))
 
-    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "post", _serving(fake_post))
     assert len(MondayAdapter(_cfg()).search()) == 1
-    assert len(calls) == 1
+    assert len(calls) == 1      # ITEM queries only — the columns query is routed away
 
 
 def test_page_size_is_clamped_to_mondays_own_cap(token, monkeypatch):
     seen = {}
-    monkeypatch.setattr(httpx, "post", lambda url, headers=None, timeout=None, json=None:
-                        seen.update(json=json) or _Resp(_items_payload([])))
+    monkeypatch.setattr(httpx, "post", _serving(
+        lambda url, headers=None, timeout=None, json=None:
+        seen.update(json=json) or _Resp(_items_payload([]))))
     MondayAdapter(_cfg(page_size=100_000)).search()
     assert seen["json"]["variables"]["limit"] == MAX_PAGE_SIZE == 500
 
@@ -360,26 +383,31 @@ def test_todo_labels_filter_the_board_down_to_the_operators_own_labels(
         _item("4", "triage", status="Awaiting Review"),
         _item("5", "blank", status=""),        # the real board has an EMPTY label
     ]
-    monkeypatch.setattr(httpx, "post",
-                        lambda *a, **k: _Resp(_items_payload(board)))
+    monkeypatch.setattr(httpx, "post", _serving(_constant(_items_payload(board))))
     got = MondayAdapter(_cfg(todo_labels=["Ready for Dev", "Awaiting Review"])).search()
     assert [i["id"] for i in got] == ["1", "4"]
 
 
 def test_the_label_filter_is_exact_not_a_substring_match(token, monkeypatch):
-    """"Fixed" contains "Fix" and "Fixing" starts with it. A substring or
-    prefix match would pull work that is already done."""
-    board = [_item("1", "a", status="Fixed"), _item("2", "b", status="Fixing")]
-    monkeypatch.setattr(httpx, "post",
-                        lambda *a, **k: _Resp(_items_payload(board)))
-    assert MondayAdapter(_cfg(todo_labels=["Fix"])).search() == []
+    """The board's EMPTY label is the sharpest probe there is: `"" in "Fixed"`
+    is True, so a substring filter configured with it would take the whole
+    board rather than the one item that actually carries it. It is also a REAL
+    label on this board, so it survives the config check and reaches the
+    filter — a made-up near-miss like "Fix" is now refused before it gets
+    there, which is the defect above, not this one.
+    """
+    board = [_item("1", "a", status="Fixed"), _item("2", "b", status="Fixing"),
+             _item("3", "c", status="")]
+    monkeypatch.setattr(httpx, "post", _serving(_constant(_items_payload(board))))
+    got = MondayAdapter(_cfg(todo_labels=[""])).search()
+    assert [i["id"] for i in got] == ["3"]
+    assert len(got) == 1
 
 
 def test_an_empty_todo_labels_list_takes_the_whole_board_and_says_so(
         token, monkeypatch, caplog):
     board = [_item("1", "a", status="Fixed"), _item("2", "b", status="Ready for Dev")]
-    monkeypatch.setattr(httpx, "post",
-                        lambda *a, **k: _Resp(_items_payload(board)))
+    monkeypatch.setattr(httpx, "post", _serving(_constant(_items_payload(board))))
     with caplog.at_level(logging.INFO, logger="no_human.intake.monday"):
         got = MondayAdapter(_cfg(todo_labels=[])).search()
     assert [i["id"] for i in got] == ["1", "2"]
@@ -392,12 +420,168 @@ def test_updated_since_drops_items_that_have_not_moved(token, monkeypatch):
         _item("2", "new", updated_at="2026-08-05T07:48:14Z"),
         _item("3", "undated", updated_at=None),
     ]
-    monkeypatch.setattr(httpx, "post",
-                        lambda *a, **k: _Resp(_items_payload(board)))
+    monkeypatch.setattr(httpx, "post", _serving(_constant(_items_payload(board))))
     got = MondayAdapter(_cfg()).search(updated_since="2026-08-02T00:00:00Z")
     # The undated item is KEPT: dropping work because a field was absent is the
     # worse of the two failures.
     assert [i["id"] for i in got] == ["2", "3"]
+
+
+# --------------------------------------------------------------------------- #
+# Search: config that is WRONG, not merely absent                              #
+# --------------------------------------------------------------------------- #
+#
+# ABSENT config was always loud — it cannot even reach the API. WRONG config
+# used to sail straight through: it matched nothing, returned [], logged
+# nothing and raised nothing, so a board full of work read as an empty one.
+# The write path checked the column, but write-back is opt-in and off by
+# default, so on the SHIPPED default the column was never validated at all.
+
+
+def test_a_column_title_where_an_id_belongs_fails_loudly_and_hands_back_the_id(
+        token, monkeypatch):
+    """The mistake operators actually make, and the one that hid best.
+
+    `status_column: Status` is the column's TITLE. It matches no column id, so
+    every item's status read as "" and the filter dropped the entire board —
+    no exception, no log line. A tracker integration that silently shows zero
+    tickets is worse than one that refuses to start.
+    """
+    monkeypatch.setattr(httpx, "post", _serving(_constant(_items_payload([_item()]))))
+    with pytest.raises(MondayConfigError) as exc:
+        MondayAdapter(_cfg(status_column="Status")).search()
+    msg = str(exc.value)
+    assert "integrations.monday.status_column" in msg
+    assert "TITLE" in msg                     # it names the actual mistake ...
+    assert f"'{STATUS_COL}'" in msg           # ... and hands back the id to use
+    assert "long_text" in msg                 # ... and lists the real ids
+
+
+def test_a_status_column_that_matches_nothing_at_all_lists_the_real_ids(
+        token, monkeypatch):
+    """No column and no title matches, so there is no id to hand back — but
+    the real ids still have to be listed, and no title hint may be invented."""
+    monkeypatch.setattr(httpx, "post", _serving(_constant(_items_payload([_item()]))))
+    with pytest.raises(MondayConfigError) as exc:
+        MondayAdapter(_cfg(status_column="statuses")).search()
+    msg = str(exc.value)
+    assert "'statuses'" in msg
+    assert "TITLE" not in msg                 # nothing matched: no false hint
+    assert STATUS_COL in msg and "long_text" in msg
+
+
+def test_a_non_status_column_is_refused_on_the_READ_path_too(token, monkeypatch):
+    """`status_labels` already refused a non-status column — but its only
+    callers were `status_labels` and `resolve_state`, i.e. the WRITE path. On
+    the shipped default (write_back off) this check was never reached."""
+    monkeypatch.setattr(httpx, "post", _serving(_constant(_items_payload([_item()]))))
+    with pytest.raises(MondayConfigError, match="not 'status'"):
+        MondayAdapter(_cfg(status_column="long_text")).search()
+
+
+def test_a_todo_label_the_board_does_not_have_fails_instead_of_matching_nothing(
+        token, monkeypatch):
+    """"Fix" is not a label on this board — "Fixing" and "Fixed" are. Matching
+    nothing and returning [] is indistinguishable from an empty board, so the
+    error has to name the bad label AND list what the board really has."""
+    monkeypatch.setattr(httpx, "post", _serving(_constant(_items_payload([_item()]))))
+    with pytest.raises(MondayConfigError) as exc:
+        MondayAdapter(_cfg(todo_labels=["Fix"])).search()
+    msg = str(exc.value)
+    assert "integrations.monday.todo_labels" in msg
+    assert "'Fix'" in msg                        # the bad label, named
+    assert "'Fixing'" in msg and "'Ready for Dev'" in msg   # what IS on the board
+
+
+def test_one_bad_label_among_valid_ones_fails_the_whole_call(token, monkeypatch):
+    """The decision, tested: a partial config is a STOP, not a footnote.
+
+    Continuing on the valid labels would narrow intake to a scope the operator
+    never chose, and the work that stops arriving is indistinguishable from
+    work nobody filed — the exact confusion this adapter refuses everywhere
+    else. Only the BAD label is blamed, so the fix needs no diffing.
+    """
+    board = [_item("1", "a", status="Ready for Dev")]
+    monkeypatch.setattr(httpx, "post", _serving(_constant(_items_payload(board))))
+    adapter = MondayAdapter(_cfg(todo_labels=["Ready for Dev", "Redy for Dev"]))
+    with pytest.raises(MondayConfigError) as exc:
+        adapter.search()
+    blamed = str(exc.value).split("which column")[0]
+    assert "'Redy for Dev'" in blamed
+    assert "'Ready for Dev'" not in blamed       # the valid one is not blamed
+
+
+def test_an_empty_todo_labels_list_still_validates_the_status_column(
+        token, monkeypatch):
+    """Two independent checks. Skipping the column check when there are no
+    labels to check would leave whole-board mode — the mode that pulls
+    EVERYTHING — running on a column that may not exist."""
+    monkeypatch.setattr(httpx, "post", _serving(_constant(_items_payload([_item()]))))
+    with pytest.raises(MondayConfigError, match="TITLE"):
+        MondayAdapter(_cfg(status_column="Status", todo_labels=[])).search()
+
+
+def test_the_config_check_costs_one_cached_request_not_one_per_page_or_item(
+        token, monkeypatch):
+    """It reuses `board_columns()`'s cache: ONE request per adapter, for any
+    number of searches, pages or items. A per-item round-trip would make the
+    fix cost more than the bug it closes."""
+    kinds = []
+    pages = [_Resp(_items_payload([_item("1"), _item("2")], cursor="C1")),
+             _Resp(_items_payload([_item("3")], cursor=None)),
+             _Resp(_items_payload([_item("4")], cursor=None))]
+
+    def fake_post(url, headers=None, timeout=None, json=None):
+        if "NoHumanColumns" in json["query"]:
+            kinds.append("columns")
+            return _Resp(_columns_payload())
+        kinds.append("items")
+        return pages.pop(0)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    adapter = MondayAdapter(_cfg())
+    assert len(adapter.search()) == 3        # 3 items over 2 pages
+    assert len(adapter.search()) == 1        # a second search, same adapter
+    assert kinds == ["columns", "items", "items", "items"]
+    assert kinds.count("columns") == 1
+
+
+# --------------------------------------------------------------------------- #
+# Search: the page bound is a partial answer, and says so                      #
+# --------------------------------------------------------------------------- #
+
+def test_stopping_at_the_page_bound_reports_the_result_as_partial(
+        token, monkeypatch, caplog):
+    """The same failure class at the other end: a board that always hands back
+    a cursor stops at the bound, and the short list used to be returned as if
+    it were the whole board — 20 pages, 2000 items, zero log records."""
+    calls = []
+
+    def items_post(url, headers=None, timeout=None, json=None):
+        calls.append(1)
+        return _Resp(_items_payload([_item(str(len(calls)))], cursor="MORE"))
+
+    monkeypatch.setattr(httpx, "post", _serving(items_post))
+    adapter = MondayAdapter(_cfg())
+    with caplog.at_level(logging.WARNING, logger="no_human.intake.monday"):
+        got = adapter.search()
+    assert len(calls) == MAX_PAGES == 20      # the bound itself still holds
+    assert len(got) == MAX_PAGES
+    assert adapter.last_search_truncated is True
+    assert "PARTIAL" in caplog.text
+    assert str(MAX_PAGES) in caplog.text      # it says WHERE it stopped
+
+
+def test_a_complete_pull_is_not_reported_as_partial(token, monkeypatch, caplog):
+    """The flag has to be cleared by a complete pull, or every later poll on a
+    board that fits in one page would cry truncation for ever."""
+    monkeypatch.setattr(httpx, "post", _serving(_constant(_items_payload([_item()]))))
+    adapter = MondayAdapter(_cfg())
+    adapter.last_search_truncated = True      # as if an earlier pull was short
+    with caplog.at_level(logging.WARNING, logger="no_human.intake.monday"):
+        assert len(adapter.search()) == 1
+    assert adapter.last_search_truncated is False
+    assert "PARTIAL" not in caplog.text
 
 
 # --------------------------------------------------------------------------- #
@@ -660,6 +844,32 @@ async def test_poll_creates_one_task_per_new_item_and_dedupes(store):
     assert sorted(r1.numbers) == ["1", "2"]
     r2 = await poller.poll_once()
     assert (r2.created, r2.skipped) == (0, 2)   # deduped by (source, external_id)
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_pull_is_reported_on_the_operators_own_channel(store):
+    """The adapter's log line alone is not enough: the poll otherwise SUCCEEDS
+    — tasks are created, nothing errors, the event stream says "created N" —
+    so a partial board reads as a complete one everywhere an operator looks."""
+    events = []
+    adapter = _FakeAdapter([_item()])
+    adapter.last_search_truncated = True
+    poller = MondayPoller(adapter, store, config=_cfg(),
+                          on_event=lambda k, t: events.append((k, t)))
+    await poller.poll_once()
+    assert "monday_poll_truncated" in [k for k, _ in events]
+    (text,) = [t for k, t in events if k == "monday_poll_truncated"]
+    assert "PARTIAL" in text
+
+
+@pytest.mark.asyncio
+async def test_a_complete_pull_reports_no_truncation(store):
+    events = []
+    poller = MondayPoller(_FakeAdapter([_item()]), store, config=_cfg(),
+                          on_event=lambda k, t: events.append((k, t)))
+    await poller.poll_once()
+    assert "monday_poll_truncated" not in [k for k, _ in events]
+    assert events                              # ... but the poll DID report
 
 
 @pytest.mark.asyncio

@@ -134,6 +134,24 @@ returning an empty list: an empty result is indistinguishable from an empty
 board, so a typo'd install would look like a working one with no work in it.
 The error names the exact config key and the query that discovers the value.
 
+**Config that is wrong is refused on the same terms as config that is absent.**
+Before it filters anything, every pull checks `status_column` and `todo_labels`
+against the board's real columns and labels:
+
+- a `status_column` that is not a column **id** raises, lists the ids that do
+  exist, and — when the value is actually a column's *title* — says so and
+  hands back the id to use, because that is the mistake people actually make;
+- a `todo_labels` entry the board does not have raises, names the bad label and
+  lists the board's real ones. **One bad label fails the whole pull**, not just
+  its own share of it: continuing on the remaining labels would quietly narrow
+  intake to a scope nobody chose, and work that stops arriving looks exactly
+  like work nobody filed.
+
+Both checks reuse the cached columns lookup — one request per adapter, never
+one per item. A pull that stops at the 20-page bound is likewise reported as
+**partial**, in the log and on the poller's event channel, rather than handed
+back as if it were the whole board.
+
 Discover the ids with the columns query — `status_column` takes the column's
 **id** (`bug_status`), never its title (`Status`):
 

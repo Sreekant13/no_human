@@ -61,6 +61,18 @@ RAISES :class:`MondayConfigError` — it never returns an empty list, because a
 silent empty result is indistinguishable from "the board is empty" and would
 park a misconfigured integration in permanent quiet.
 
+**Config that is WRONG is refused on the same terms as config that is absent.**
+Absent config cannot reach the API at all, so it was always loud; wrong config
+— ``status_column`` holding a column's *title* instead of its id, or
+``todo_labels`` naming a label the board does not have — sails through, matches
+nothing, and returns ``[]``. That is the same lie with a longer fuse, and the
+id/title mix-up is the one operators actually make. So :meth:`search` validates
+both against the board's real columns before it filters
+(:meth:`MondayAdapter._validate_intake_config`), reusing the cached
+``board_columns()`` — one request per adapter, not one per item. The other end
+of the same failure is a pull that stops at the :data:`MAX_PAGES` bound: it is
+flagged and logged as PARTIAL rather than returned as if it were the board.
+
 Write-back is opt-in (``integrations.monday.write_back``, default false) and
 mirrors the Linear adapter: updates (comments) plus label moves resolved at
 runtime against the board's OWN labels, never a label this code invented.
@@ -91,6 +103,14 @@ API_VERSION = "2025-07"
 
 #: monday's own cap on ``items_page(limit:)``.
 MAX_PAGE_SIZE = 500
+
+#: How many pages one :meth:`MondayAdapter.search` will follow before it stops.
+#: A bound is needed so a board that always hands back a cursor cannot spin the
+#: poll tick forever — but hitting it means the result is PARTIAL, which is
+#: exactly the kind of quiet half-answer this adapter refuses to give, so
+#: reaching it is logged and flagged on the adapter rather than passed off as a
+#: complete board.
+MAX_PAGES = 20
 
 #: The three meanings the poller may ask for. Deliberately NOT monday labels —
 #: labels are per-board and live in config. This tuple is the whole vocabulary
@@ -272,8 +292,15 @@ class MondayAdapter:
         self.api_token = os.environ.get("MONDAY_API_TOKEN")
         # Per-instance cache of the board's columns. They are stable (an
         # operator edits them rarely) and every write-back would otherwise
-        # spend a request re-fetching them.
+        # spend a request re-fetching them. The read path's config check reuses
+        # this same cache, so validating intake costs one request per adapter,
+        # never one per page and never one per item.
         self._columns_cache: list[dict[str, Any]] | None = None
+        #: True when the last :meth:`search` stopped at :data:`MAX_PAGES` with
+        #: monday still offering a cursor — i.e. the list it returned is a
+        #: PARTIAL view of the board. Read by the poller so the operator is
+        #: told, instead of a truncated pull reading as a complete one.
+        self.last_search_truncated = False
 
     @property
     def configured(self) -> bool:
@@ -388,15 +415,23 @@ class MondayAdapter:
         is a real choice an operator can make (a board that IS the queue), so
         it is honoured rather than treated as "match nothing" — but it is
         logged, because it is also what an unfinished config looks like.
+
+        The config is checked against the BOARD before any filtering
+        (:meth:`_validate_intake_config`): absent config was already loud, but
+        *wrong* config used to be silent, and a silently-empty tracker is worse
+        than one that refuses to start.
         """
         self._require_config()
+        self._validate_intake_config()
         if not self.todo_labels:
             log.info(
                 "monday board %s: integrations.monday.todo_labels is empty — "
                 "every item on the board is in intake scope", self.board_id)
         out: list[dict[str, Any]] = []
         cursor: str | None = None
-        for _ in range(20):
+        fetched = 0
+        truncated = True
+        for _ in range(MAX_PAGES):
             data = self._post(_ITEMS_QUERY, {
                 "boardId": self.board_id,
                 "limit": self.page_size,
@@ -404,13 +439,64 @@ class MondayAdapter:
             })
             page = self._board(data).get("items_page") or {}
             for item in page.get("items") or []:
+                fetched += 1
                 if not self._in_scope(item, updated_since):
                     continue
                 out.append(item)
             cursor = page.get("cursor")
             if not cursor:
+                truncated = False
                 break
+        self.last_search_truncated = truncated
+        if truncated:
+            # Same failure class as a wrong-config empty result, at the other
+            # end: a short answer that looks like a whole one. Say it is short.
+            log.warning(
+                "monday board %s: stopped at the %d-page bound with monday still "
+                "offering a cursor — THIS RESULT IS PARTIAL (%d item(s) read, %d "
+                "in scope); items past the bound were never fetched. Narrow the "
+                "pull with integrations.monday.todo_labels, or raise "
+                "integrations.monday.page_size (max %d).",
+                self.board_id, MAX_PAGES, fetched, len(out), MAX_PAGE_SIZE)
         return out
+
+    def _validate_intake_config(self) -> None:
+        """Check ``status_column`` and ``todo_labels`` against the board ITSELF.
+
+        THE read path's config check, and the hole it closes:
+        :meth:`_require_config` catches config that is ABSENT. Config that is
+        WRONG — a column *title* where an id belongs, or a label this board does
+        not have — used to match nothing and return an empty list, which is
+        indistinguishable from an empty board. That is the exact silence the
+        absent-config check exists to prevent, arriving through the other door,
+        and it is the failure an operator is *most* likely to hit: the id/title
+        mix-up is the one the docs warn about twice.
+
+        Costs at most ONE request per adapter — :meth:`board_columns` caches,
+        and every later search reads the cache. Never per page, never per item.
+
+        **ONE bad label fails the WHOLE call**, deliberately. Warn-and-continue
+        would silently narrow intake to a subset the operator never chose, and
+        the work that stops arriving looks exactly like work nobody filed —
+        this integration has no way to tell those apart, which is the whole
+        reason the rest of the module refuses to answer quietly. A label typo
+        is also permanent: no number of poll ticks fixes it, so degrading it to
+        a warning only buries it in tick noise.
+        """
+        labels = self.status_labels()      # raises on an unknown/non-status column
+        if not self.todo_labels:
+            return
+        known = set(labels.values())
+        unknown = [lbl for lbl in self.todo_labels if lbl not in known]
+        if unknown:
+            raise MondayConfigError(
+                f"monday board {self.board_id}: integrations.monday.todo_labels "
+                f"names {', '.join(repr(u) for u in unknown)}, which column "
+                f"{self.status_column!r} does not have. Labels on this column: "
+                f"{', '.join(repr(x) for x in sorted(known)) or '(none)'}. "
+                "Every item would be filtered out and the board would read as "
+                "empty, so intake refuses to run instead of returning nothing."
+            )
 
     def _in_scope(self, item: dict[str, Any], updated_since: str | None) -> bool:
         """Client-side intake filter: configured todo label, and recency."""
@@ -465,10 +551,25 @@ class MondayAdapter:
                     "integrations.monday.status_column must name a status column"
                 )
             return _status_labels_from_settings(col.get("settings_str"))
+        # The id/title mix-up is the mistake people actually make — `docs/
+        # adapters.md` warns about it twice — so when the value IS a real
+        # column's title, the error hands back the id instead of leaving the
+        # operator to diff two lists.
+        by_title: dict[str, str] = {}
+        for col in columns:
+            by_title.setdefault(str(col.get("title") or "").casefold(),
+                                str(col.get("id") or ""))
+        actual_id = by_title.get(wanted.casefold())
+        hint = (
+            f" {wanted!r} is the TITLE of the column whose id is {actual_id!r} — "
+            f"set integrations.monday.status_column to {actual_id!r}."
+            if actual_id else ""
+        )
         known = ", ".join(sorted(str(c.get("id")) for c in columns)) or "(none)"
         raise MondayConfigError(
-            f"monday board {self.board_id} has no column {wanted!r}. "
-            f"Columns on this board: {known}"
+            f"monday board {self.board_id} has no column with the id {wanted!r}, "
+            "and integrations.monday.status_column must be a column ID, not a "
+            f"title.{hint} Column ids on this board: {known}"
         )
 
     def item_status(self, item_id: str) -> str:
