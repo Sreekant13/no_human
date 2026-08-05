@@ -11,6 +11,32 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${ROOT}/packaging/dist"
 BUNDLE="${OUT}/nh-server"
 
+# The board is always rebuilt below, so it matches ROOT's SOURCE — but nothing
+# checked that ROOT's source was current. On 2026-08-05 a signed, notarized DMG
+# was found to contain none of the UI shipped that week: it had been built from
+# a checkout sitting 44 commits behind main on an old branch. Every step
+# "succeeded"; the artefact was simply built from the wrong commit, and the only
+# way to discover it was to mount the DMG and grep the bundle.
+#
+# This cannot be a soft warning. A release build is exactly the moment nobody
+# re-reads the log, and the failure is invisible in the output — it looks like a
+# clean build, because it IS a clean build of the wrong tree.
+if git -C "${ROOT}" rev-parse --git-dir >/dev/null 2>&1; then
+  git -C "${ROOT}" fetch -q origin main 2>/dev/null || true
+  _ref="$(git -C "${ROOT}" rev-parse --verify -q origin/main || git -C "${ROOT}" rev-parse --verify -q main || true)"
+  if [ -n "${_ref}" ]; then
+    _behind="$(git -C "${ROOT}" rev-list --count HEAD.."${_ref}" 2>/dev/null || echo 0)"
+    if [ "${_behind}" -gt 0 ]; then
+      echo "FAIL: ${ROOT} is ${_behind} commit(s) behind ${_ref} — this build would" >&2
+      echo "      ship stale code. Update the checkout, or set NH_ALLOW_STALE_BUILD=1" >&2
+      echo "      to build a deliberate point-in-time artefact." >&2
+      echo "      HEAD: $(git -C "${ROOT}" rev-parse --abbrev-ref HEAD) $(git -C "${ROOT}" rev-parse --short HEAD)" >&2
+      [ "${NH_ALLOW_STALE_BUILD:-0}" = "1" ] || exit 1
+      echo "      (NH_ALLOW_STALE_BUILD=1 — proceeding anyway)" >&2
+    fi
+  fi
+fi
+
 echo "==> building the board (web/dist is gitignored, so always rebuild)"
 (cd "${ROOT}/web" && npm run build)
 
