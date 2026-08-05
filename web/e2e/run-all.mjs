@@ -27,6 +27,7 @@ const SUITES = [
   ["board", "board.mjs"],
   ["drawer", "drawer.mjs"],
   ["composer", "composer.mjs"],
+  ["backlog queue", "backlog-queue.mjs"],
   ["form order", "form-order.mjs"],
   ["outcomes (3-lane board)", "outcomes.mjs"],
   ["mobile nav", "mobile-nav.mjs"],

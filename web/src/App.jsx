@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { connectWS, createTask, uploadAttachment, fetchTasks, fetchWorkerStatus, fetchQueueHealth, fetchOnboardingStatus, fetchAuthStatus, fetchJiraIssue, grillStep, grillStepSSE } from "./api.js";
+import { connectWS, createTask, uploadAttachment, fetchTasks, fetchWorkerStatus, fetchQueueHealth, fetchOnboardingStatus, fetchAuthStatus, fetchTrackerIssue, grillStep, grillStepSSE } from "./api.js";
 import Board from "./Board.jsx";
 import Backlog from "./Backlog.jsx";
 import SettingsOverlay from "./Settings.jsx";
@@ -611,7 +611,7 @@ function NewTaskModal({
 // that did anything. It gets the same two exits as its neighbours, and they mean
 // what Cancel means everywhere else in the queue: skip THIS ticket, keep the
 // rest (backlogSelection.js).
-function BacklogSeedOverlay({ issueKey, notice, queueLeft, onSkip, onStopQueue }) {
+function BacklogSeedOverlay({ issueKey, tracker, notice, queueLeft, onSkip, onStopQueue }) {
   const ref = useRef(null);
   useEscapeKey(onSkip, true);
   useEffect(() => { ref.current?.focus(); }, []);
@@ -628,7 +628,7 @@ function BacklogSeedOverlay({ issueKey, notice, queueLeft, onSkip, onStopQueue }
         <QueueNotice notice={notice} remaining={queueLeft} onStopAll={onStopQueue} />
         <div className="grill-loading" role="status" aria-live="polite">
           <Spinner />
-          <div className="grill-loading-text">Reading {issueKey} from Jira…</div>
+          <div className="grill-loading-text">Reading {issueKey} from {tracker === "linear" ? "Linear" : "Jira"}…</div>
         </div>
         <div className="sendback-actions">
           <button type="button" className="btn btn-sendback" onClick={onSkip}>Cancel</button>
@@ -837,18 +837,23 @@ export default function App() {
   // spec beats a dead end, and the operator can still edit it in the composer.
   useEffect(() => {
     if (!backlogHeadKey) { setBacklogSeed(null); return undefined; }
-    const head = backlogQueue[0];
+    const head = queueHead(backlog);
+    // Which tracker the row came from. It decides the detail endpoint AND the
+    // task's `source`, and the two must agree: dedupe keys on
+    // (source, external_id), so stamping a Linear ticket "jira" would let it
+    // collide with a Jira ticket of the same key.
+    const tracker = head.tracker === "linear" ? "linear" : "jira";
     let ignore = false;
     setBacklogSeed(null);
     const seedFrom = (issue) => ({
       prompt: promptFromIssue(issue),
-      // The hidden markers a Jira-sourced task carries — identical to what the
-      // composer's own picker used to set, so the dedup key reaching the
+      // The hidden markers a tracker-sourced task carries — identical to what
+      // the composer's own picker used to set, so the dedup key reaching the
       // backend is unchanged.
-      source: "jira",
+      source: tracker,
       externalId: externalIdFromIssue(issue),
     });
-    fetchJiraIssue(head.key)
+    fetchTrackerIssue(tracker, head.key)
       .then((full) => { if (!ignore) setBacklogSeed(seedFrom(full)); })
       .catch(() => { if (!ignore) setBacklogSeed(seedFrom(head)); });
     return () => { ignore = true; };
@@ -1143,6 +1148,7 @@ export default function App() {
       {backlogHeadKey && !backlogSeed && (
         <BacklogSeedOverlay
           issueKey={backlogHeadKey}
+          tracker={queueHead(backlog)?.tracker}
           notice={queueNotice(backlog)}
           queueLeft={queueRemaining(backlog)}
           onSkip={nextTicket}

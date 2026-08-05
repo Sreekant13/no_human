@@ -583,9 +583,31 @@ export const completeOnboarding = (payload) => _post("/api/onboarding/complete",
 export const generateDocs      = (repo_path) => _post("/api/onboarding/docs/generate", { repo_path });
 
 // ── Integrations (status registry; secrets never returned) ──────────────────
+/**
+ * The configured-integrations registry.
+ *
+ * THROWS on a failed request. It used to swallow every non-ok response into
+ * `{integrations: []}`, which is indistinguishable from a healthy server
+ * answering "nothing is configured" — so a 500, a dead server or a proxy error
+ * all rendered as "Jira is not configured", sending the operator to Settings to
+ * fix a token that was never the problem. "I could not ask" and "the answer is
+ * none" are different facts and the caller has to be able to tell them apart.
+ *
+ * The callers that genuinely don't care (the composer's optional Backlog
+ * pointer, the settings list) keep their own `.catch`.
+ */
 export async function fetchIntegrations() {
-  const r = await fetch(`${BASE}/api/integrations`);
-  if (!r.ok) return { integrations: [] };
+  let r;
+  try {
+    r = await fetch(`${BASE}/api/integrations`);
+  } catch {
+    // fetch() rejects only when the request never got an answer at all.
+    throw new Error("the no_human server did not answer");
+  }
+  if (!r.ok) {
+    const detail = await r.json().catch(() => ({}));
+    throw new Error(detailMessage(detail, `GET /api/integrations → ${r.status}`));
+  }
   return _jsonSafe(r, { integrations: [] });
 }
 // Run a live health check for one integration; returns the updated status.
@@ -611,17 +633,38 @@ export async function fetchIntegrationSetup() {
 export const saveIntegrationSetup = (name, values) =>
   _put(`/api/integrations/${encodeURIComponent(name)}/setup`, { values });
 
-// Task 1.6: browse/pick a configured Jira project's tickets (Import from
-// Jira). Throws with the server's 503 (unconfigured) / 502 (upstream error)
-// `detail` message — the composer surfaces that text as-is.
-export async function searchJiraIssues(q, limit = 50) {
+// Task 1.6: browse/pick a configured tracker's tickets for the Backlog page.
+// Throws with the server's 503 (unconfigured) / 502 (upstream error) `detail`
+// message — the page surfaces that text as-is.
+//
+// ONE implementation for both trackers: /api/integrations/{tracker}/issues have
+// the same contract and return the same row shape (TrackerIssueOut), so the
+// page has one code path per row whichever tracker it came from.
+async function _trackerIssues(tracker, q, limit) {
   const params = new URLSearchParams({ q: q || "", limit: String(limit) });
-  const r = await fetch(`${BASE}/api/integrations/jira/issues?${params}`);
+  const r = await fetch(`${BASE}/api/integrations/${tracker}/issues?${params}`);
   if (!r.ok) {
     const detail = await r.json().catch(() => ({}));
-    throw new Error(detailMessage(detail, `GET jira/issues → ${r.status}`));
+    throw new Error(detailMessage(detail, `GET ${tracker}/issues → ${r.status}`));
   }
   return r.json();
+}
+
+async function _trackerIssue(tracker, key) {
+  const r = await fetch(
+    `${BASE}/api/integrations/${tracker}/issues/${encodeURIComponent(key)}`);
+  if (!r.ok) {
+    const detail = await r.json().catch(() => ({}));
+    throw new Error(detailMessage(detail, `GET ${tracker}/issues/${key} → ${r.status}`));
+  }
+  return r.json();
+}
+
+export async function searchJiraIssues(q, limit = 50) {
+  return _trackerIssues("jira", q, limit);
+}
+export async function searchLinearIssues(q, limit = 50) {
+  return _trackerIssues("linear", q, limit);
 }
 
 // SCRUM-9: fetch ONE issue in full when it's picked — the browse list above
@@ -629,12 +672,19 @@ export async function searchJiraIssues(q, limit = 50) {
 // must not be built from that brief alone. Throws with the server's 503/502
 // `detail`, same convention as searchJiraIssues.
 export async function fetchJiraIssue(key) {
-  const r = await fetch(`${BASE}/api/integrations/jira/issues/${encodeURIComponent(key)}`);
-  if (!r.ok) {
-    const detail = await r.json().catch(() => ({}));
-    throw new Error(detailMessage(detail, `GET jira/issues/${key} → ${r.status}`));
-  }
-  return r.json();
+  return _trackerIssue("jira", key);
+}
+export async function fetchLinearIssue(key) {
+  return _trackerIssue("linear", key);
+}
+
+/** Browse both trackers, or whichever ones are configured. `trackers` is the
+ * list of names from the integrations registry. */
+export function searchTrackerIssues(tracker, q, limit = 50) {
+  return tracker === "linear" ? searchLinearIssues(q, limit) : searchJiraIssues(q, limit);
+}
+export function fetchTrackerIssue(tracker, key) {
+  return tracker === "linear" ? fetchLinearIssue(key) : fetchJiraIssue(key);
 }
 
 export async function suggestPaths(path) {

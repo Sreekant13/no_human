@@ -16,7 +16,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   uploadAttachment, finishReview, replyTask, chooseBlockerOption, sendBack,
-  approveTask, createTask,
+  approveTask, createTask, fetchIntegrations,
 } from "./api.js";
 
 /** Make the next fetch answer with `status` and the given JSON body. */
@@ -91,4 +91,60 @@ for (const [name, invoke, reason] of MUTATORS) {
 test("a successful mutating call resolves with the server's JSON, not an error", async () => {
   stubFetch({ status: 200, body: { ok: true, message: "Feedback stored." } });
   assert.deepEqual(await sendBack("t1", "redo"), { ok: true, message: "Feedback stored." });
+});
+
+
+// ── fetchIntegrations: "I could not ask" is not "the answer is none" ───────
+//
+// It used to fold EVERY non-ok response into `{integrations: []}`, which is
+// byte-identical to a healthy server reporting nothing configured. The Backlog
+// page reads that registry to choose between "not connected, here is how" and
+// "the tracker is down", so a 500 rendered "Jira is not configured" and sent
+// the operator to fix a token that was never the problem.
+//
+// Asserted on the value a CALLER receives, not on the text of api.js — the
+// source-text version of this guard passes against the old swallowing code as
+// long as the word `throw` appears anywhere in the function.
+
+test("fetchIntegrations REJECTS on a failed request rather than reporting an empty registry", async () => {
+  stubFetch({ status: 500, body: { detail: "database is locked" } });
+  const err = await fetchIntegrations().then((v) => v, (e) => e);
+  assert.ok(err instanceof Error,
+    `a 500 must not resolve — it resolved with ${JSON.stringify(err)}`);
+  assert.match(err.message, /database is locked/, "the server's own reason must survive");
+});
+
+test("fetchIntegrations rejects on 503 too, with the status when there is no detail", async () => {
+  stubFetch({ status: 503, body: {} });
+  const err = await fetchIntegrations().then((v) => v, (e) => e);
+  assert.ok(err instanceof Error);
+  assert.match(err.message, /503/);
+});
+
+test("fetchIntegrations rejects when the request never got an answer at all", async () => {
+  globalThis.fetch = async () => { throw new TypeError("Failed to fetch"); };
+  const err = await fetchIntegrations().then((v) => v, (e) => e);
+  assert.ok(err instanceof Error);
+  assert.match(err.message, /did not answer/);
+});
+
+test("fetchIntegrations resolves with the registry on success", async () => {
+  const registry = { integrations: [{ name: "jira", configured: true }] };
+  // The success path runs through _jsonSafe, which reads the content type (the
+  // SPA catch-all can answer HTML at 200) — so this stub carries headers.
+  globalThis.fetch = async () => ({
+    ok: true, status: 200,
+    headers: { get: () => "application/json" },
+    json: async () => registry,
+  });
+  assert.deepEqual(await fetchIntegrations(), registry);
+});
+
+test("fetchIntegrations does not mistake an HTML 200 from the SPA catch-all for a registry", async () => {
+  globalThis.fetch = async () => ({
+    ok: true, status: 200,
+    headers: { get: () => "text/html" },
+    json: async () => { throw new SyntaxError("Unexpected token <"); },
+  });
+  assert.deepEqual(await fetchIntegrations(), { integrations: [] });
 });

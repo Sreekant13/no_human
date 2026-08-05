@@ -51,9 +51,9 @@ from ..core.task import Task, TaskStatus
 from .models import (
     AttemptOut, BoardPayload, CreateProjectRequest, CreateTaskRequest,
     GrillQuestionOut, GrillResultOut, GrillStepRequest, IntegrationSetupRequest,
-    JiraImportedInfo,
-    JiraIssueOut, ProjectOut, ReplyRequest, SaveIntegrationConfigRequest,
-    SendBackRequest, ShippedRequest, TaskOut, TaskSummaryOut, UpdateProjectRequest,
+    ImportedInfo, ProjectOut, ReplyRequest, SaveIntegrationConfigRequest,
+    SendBackRequest, ShippedRequest, TaskOut, TaskSummaryOut, TrackerIssueOut,
+    UpdateProjectRequest,
 )
 
 import logging
@@ -2950,10 +2950,47 @@ async def save_integration_config_endpoint(
     return out
 
 
-@app.get("/api/integrations/jira/issues", response_model=list[JiraIssueOut])
+async def _attach_imported(
+    request: Request, source: str, briefs: list[dict[str, Any]]
+) -> list[TrackerIssueOut]:
+    """SCRUM-18 — the accidental re-import trap, for either tracker.
+
+    ONE local-store read (never a per-row store or tracker call) building an
+    external_id -> [tasks] index, then an `imported` block on any row that
+    already has a board task. A deleted board task simply isn't in the
+    projection any more, so its ticket goes back to showing no chip — no stale
+    reference is fabricated.
+
+    `source` scopes the read, and that scoping is load-bearing now that two
+    trackers are listed: dedupe keys on (source, external_id), so a Jira NO-1
+    and a Linear NO-1 are different tickets and neither may claim the other's
+    task. SCRUM-54: the narrow (external_id, id, status, created_at) projection,
+    not a full `list_tasks()` hydration of every task just to read four fields.
+    """
+    imported_rows = await _store(request).list_imported_tasks(source)
+    by_ext: dict[str, list] = {}
+    for t in imported_rows:
+        by_ext.setdefault(t.external_id, []).append(t)
+    out = []
+    for brief in briefs:
+        row = TrackerIssueOut(**brief)
+        matches = by_ext.get(brief.get("key"))
+        if matches:
+            # Same "latest task per external_id" definition as the sync
+            # (jira_poll.sync_statuses): newest (created_at, id) — an older
+            # import merely touched later must not win the chip.
+            latest = max(matches, key=lambda t: (t.created_at, t.id))
+            row.imported = ImportedInfo(
+                task_id=latest.id, status=latest.status, count=len(matches),
+            )
+        out.append(row)
+    return out
+
+
+@app.get("/api/integrations/jira/issues", response_model=list[TrackerIssueOut])
 async def jira_issues_endpoint(
     q: str = "", limit: int = 20, request: Request = None
-) -> list[JiraIssueOut]:
+) -> list[TrackerIssueOut]:
     """Free-text browse/pick over the configured Jira project — the read side
     of Task 1.6's "Import from Jira" affordance. This never creates a task;
     POST /api/tasks (with source="jira") stays the one create path. Reuses
@@ -3000,28 +3037,12 @@ async def jira_issues_endpoint(
     # SCRUM-54: a narrow (external_id, id, status, created_at) projection —
     # filtered to source='jira' AND external_id IS NOT NULL in SQL — replaces
     # the old list_tasks() full-Task hydration of every task in the store.
-    imported_rows = await _store(request).list_jira_imported_tasks()
-    by_ext: dict[str, list] = {}
-    for t in imported_rows:
-        by_ext.setdefault(t.external_id, []).append(t)
-    out = []
-    for issue in issues:
-        row = JiraIssueOut(**adapter.issue_brief(issue))
-        matches = by_ext.get(issue.get("key"))
-        if matches:
-            # Same "latest task per external_id" definition as the sync
-            # (jira_poll.sync_statuses): newest (created_at, id) — an older
-            # import merely touched later must not win the chip.
-            latest = max(matches, key=lambda t: (t.created_at, t.id))
-            row.imported = JiraImportedInfo(
-                task_id=latest.id, status=latest.status, count=len(matches),
-            )
-        out.append(row)
-    return out
+    return await _attach_imported(
+        request, "jira", [adapter.issue_brief(i) for i in issues])
 
 
-@app.get("/api/integrations/jira/issues/{key}", response_model=JiraIssueOut)
-async def jira_issue_detail_endpoint(key: str, request: Request) -> JiraIssueOut:
+@app.get("/api/integrations/jira/issues/{key}", response_model=TrackerIssueOut)
+async def jira_issue_detail_endpoint(key: str, request: Request) -> TrackerIssueOut:
     """Fetch ONE issue in full (SCRUM-9) — the detail GET behind the picker's
     "pick" action. ``/api/integrations/jira/issues`` (the browse list, above)
     truncates each description to 2000 chars for a small list payload; that
@@ -3049,7 +3070,103 @@ async def jira_issue_detail_endpoint(key: str, request: Request) -> JiraIssueOut
             status_code=502,
             detail="Jira lookup failed — check the site/project configuration.",
         )
-    return JiraIssueOut(**adapter.issue_detail(issue))
+    return TrackerIssueOut(**adapter.issue_detail(issue))
+
+
+# --------------------------------------------------------------------------- #
+# Linear — the SAME two routes, against the SAME adapter the poller uses.       #
+#                                                                              #
+# These did not exist, and the Backlog page told the operator why in a sentence #
+# that was not true: "the Linear side has no issue listing yet". It has had one #
+# the whole time — `LinearAdapter.search()` is a paginating GraphQL listing     #
+# with a Relay cursor and a page bound. What was missing was only the HTTP      #
+# route between it and the page. A UI that explains a gap with a fact about the #
+# code has to be right about the code, so this closes the gap rather than       #
+# rewording the sentence.                                                       #
+# --------------------------------------------------------------------------- #
+
+def _linear_adapter(request: Request):
+    """The configured adapter, or a 503 that says what to fix.
+
+    LINEAR_API_KEY is loaded from ~/.no_human/.env on demand — the B1 pattern
+    the Jira routes above use, and for the same reason: only `nh serve`'s poller
+    loads it at startup, so under `nh start` (the board) a perfectly configured
+    integration reported "not configured" until the key was read here.
+    """
+    from ..config import load_env_var
+    from ..intake.linear import LinearAdapter
+
+    load_env_var("LINEAR_API_KEY")
+    adapter = LinearAdapter(request.app.state.config.data)
+    if not adapter.configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Linear is not configured — add it under Settings > Integrations.",
+        )
+    return adapter
+
+
+def _linear_failure(exc: Exception, what: str) -> HTTPException:
+    """One 502 for every Linear failure mode, with a tokenless detail.
+
+    Linear does not classify by HTTP status — field errors arrive at 200, auth
+    failure at 401, throttling at 400 — so the adapter's exception TYPE is the
+    classification, not the status code. Only the exception's type name is ever
+    logged: the message can quote the request, which carries the API key.
+    """
+    from ..intake.linear import LinearAuthError, LinearRateLimited
+
+    log.warning("linear %s failed: %s", what, type(exc).__name__)
+    if isinstance(exc, LinearAuthError):
+        detail = (
+            "Linear API key rejected. Verify or rotate the key under "
+            "Settings > Integrations."
+        )
+    elif isinstance(exc, LinearRateLimited):
+        detail = "Linear is rate-limiting this workspace — try again in a minute."
+    else:
+        detail = "Linear lookup failed — check the team key and state types."
+    return HTTPException(status_code=502, detail=detail)
+
+
+@app.get("/api/integrations/linear/issues", response_model=list[TrackerIssueOut])
+async def linear_issues_endpoint(
+    q: str = "", limit: int = 20, request: Request = None
+) -> list[TrackerIssueOut]:
+    """Browse/pick over the configured Linear team's intake scope — the Linear
+    half of the Backlog page's list. Never creates a task; POST /api/tasks
+    (with source="linear") stays the one create path."""
+    from ..intake.linear import LinearError
+
+    adapter = _linear_adapter(request)
+    limit = max(1, min(limit, 50))
+    try:
+        issues = await asyncio.to_thread(adapter.search_text, q, limit)
+    except (LinearError, httpx.HTTPError) as exc:
+        raise _linear_failure(exc, "issue search")
+    return await _attach_imported(
+        request, "linear", [adapter.issue_brief(i) for i in issues])
+
+
+@app.get("/api/integrations/linear/issues/{key}", response_model=TrackerIssueOut)
+async def linear_issue_detail_endpoint(key: str, request: Request) -> TrackerIssueOut:
+    """ONE issue by its identifier ("NO-1"). Same contract as the Jira detail
+    route so the page has one code path per row, whichever tracker it came
+    from. 404 when the identifier is not in the configured intake scope —
+    saying "not found" is honest; inventing an empty row is not."""
+    from ..intake.linear import LinearError
+
+    adapter = _linear_adapter(request)
+    try:
+        issue = await asyncio.to_thread(adapter.get_issue, key)
+    except (LinearError, httpx.HTTPError) as exc:
+        raise _linear_failure(exc, "issue detail fetch")
+    if issue is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{key} is not in the configured Linear team's open issues.",
+        )
+    return TrackerIssueOut(**adapter.issue_detail(issue))
 
 
 # --------------------------------------------------------------------------- #

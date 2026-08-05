@@ -39,20 +39,40 @@ const stripJsComments = (src) =>
 const css = readFileSync(join(SRC, "styles.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
 const jsx = stripJsComments(readAllJsx(SRC));
 
-test("no .blocker-* rule outlives the JSX that used it", () => {
-  const classes = [...new Set([...css.matchAll(/\.(blocker-[a-zA-Z0-9-]+)/g)].map((m) => m[1]))];
+// `(?![\w-])` not `\b`: a word boundary is hyphen-permeable, so a mention of
+// `blocker-wake-extra` would read as a reference to `blocker-wake` and keep a dead rule
+// alive. The trailing guard has to exclude the hyphen the class names are built from.
+const orphansOf = (prefix, minimum) => {
+  const classes = [...new Set(
+    [...css.matchAll(new RegExp(`\\.(${prefix}-[a-zA-Z0-9-]+)`, "g"))].map((m) => m[1]),
+  )];
   assert.ok(
-    classes.length > 5,
-    `expected the blocker panel's classes, found ${classes.length} — did the family get ` +
-      `renamed? If so, retarget this test rather than deleting it.`,
+    classes.length >= minimum,
+    `expected the .${prefix}-* family, found ${classes.length} — did it get renamed? ` +
+      `If so, retarget this test rather than deleting it.`,
   );
-  // `(?![\w-])` not `\b`: a word boundary is hyphen-permeable, so a mention of
-  // `blocker-wake-extra` would read as a reference to `blocker-wake` and keep a dead rule
-  // alive. The trailing guard has to exclude the hyphen the class names are built from.
-  const orphans = classes.filter((c) => !new RegExp(`${c}(?![a-zA-Z0-9_-])`).test(jsx));
+  return classes.filter((c) => !new RegExp(`${c}(?![a-zA-Z0-9_-])`).test(jsx));
+};
+
+test("no .blocker-* rule outlives the JSX that used it", () => {
+  const orphans = orphansOf("blocker", 6);
   assert.deepEqual(
     orphans,
     [],
     `dead CSS — these .blocker-* rules are referenced by no .jsx: ${orphans.join(", ")}`,
+  );
+});
+
+// The same rule, applied to the tracker-import family. It is the family that
+// just lost a consumer: the composer's inline "Import from Jira" panel became
+// the Backlog page, and `.jira-panel-enter` stayed behind styling nothing. Same
+// static, hand-written shape as .blocker-* — no class here is built from a .js
+// map or a template string — so the check cries wolf here no more than there.
+test("no .jira-* rule outlives the JSX that used it", () => {
+  const orphans = orphansOf("jira", 1);
+  assert.deepEqual(
+    orphans,
+    [],
+    `dead CSS — these .jira-* rules are referenced by no .jsx: ${orphans.join(", ")}`,
   );
 });

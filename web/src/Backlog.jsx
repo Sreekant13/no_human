@@ -1,9 +1,12 @@
 import { useState, useEffect } from "react";
-import { fetchIntegrations, searchJiraIssues } from "./api.js";
+import { fetchIntegrations, searchTrackerIssues } from "./api.js";
 import {
-  initialSelection, toggleKey, selectAll, clearSelection,
-  startKeys, startIssues, selectionState, startLabel, multiStartNotice,
+  initialSelection, toggleId, selectAll, clearSelection, rowId,
+  startIds, startIssues, selectionState, startLabel, multiStartNotice,
 } from "./backlogSelection.js";
+import {
+  configuredTrackers, mergeTrackerResults, sourcesLine, noTrackerMessage,
+} from "./backlogSources.js";
 import {
   jiraStatusChipStyle, importedChip, jiraResultHeader, jiraEmptyMessage, formatIssueUpdated,
 } from "./jiraImport.js";
@@ -21,8 +24,13 @@ import {
 // backlogSelection.js and the queue in App.jsx. Two creation paths drift; this
 // page deliberately has none of its own.
 //
+// It lists Jira AND Linear. Which trackers it asks, how the answers combine and
+// what it may SAY about a tracker it is not showing all live in
+// backlogSources.js — read the note there for why that last one is not a
+// cosmetic concern.
+//
 // The display limit for the "Showing first N open tickets" header — must match
-// api.js's searchJiraIssues default so truncation is never a lie.
+// api.js's per-tracker default so truncation is never a lie.
 const JIRA_LIMIT = 50;
 
 const CTL =
@@ -47,62 +55,78 @@ export default function Backlog({ onStart, refreshNonce = 0 }) {
   // describe the rows on screen, not the keystrokes typed since.
   const [shownQuery, setShownQuery] = useState("");
   const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState(null);
+  // Per-tracker failures from the LAST list fetch. One tracker being down does
+  // not hide the other's tickets — it is reported beside them.
+  const [listErrors, setListErrors] = useState([]);
   const [nonce, setNonce] = useState(0); // bumped by "Try again"
-  // undefined = still asking · false = Jira not configured · true = configured.
-  const [configured, setConfigured] = useState(undefined);
+  // undefined = still asking · [] = nothing configured · [names] = configured.
+  const [trackers, setTrackers] = useState(undefined);
+  // Set when the REGISTRY itself could not be read. Distinct from `trackers`
+  // being empty — see the note on the branch below.
+  const [registryError, setRegistryError] = useState(null);
   // NOTHING is pre-checked, ever. initialSelection() is the only seed.
   const [selected, setSelected] = useState(initialSelection);
 
-  // Is Jira configured at all? One fetch at mount — this decides between the
+  // Which trackers are configured? One fetch at mount. This decides between the
   // "not connected, here is how" state and a real upstream error, so a missing
-  // integration is never reported as "the tracker is down".
+  // integration is never reported as "the tracker is down" — nor the reverse.
   useEffect(() => {
     let ignore = false;
     fetchIntegrations()
       .then((r) => {
         if (ignore) return;
-        const jira = (r.integrations || []).find((i) => i.name === "jira");
-        setConfigured(Boolean(jira && jira.configured));
+        setRegistryError(null);
+        setTrackers(configuredTrackers(r));
       })
-      .catch(() => { if (!ignore) setConfigured(false); });
+      .catch((err) => {
+        if (ignore) return;
+        // fetchIntegrations THROWS on a failed request (api.js). It used to
+        // swallow every non-ok response into `{integrations: []}`, which is
+        // indistinguishable from a healthy server saying "nothing configured" —
+        // so a 500 rendered "Jira is not configured" and sent the operator to
+        // Settings to fix a token that was never the problem.
+        setRegistryError(err.message || "the no_human server did not answer");
+        setTrackers(undefined);
+      });
     return () => { ignore = true; };
-  }, []);
+  }, [nonce]);
 
-  // The ticket list. Typing is debounced 300ms; the initial browse-all loads
-  // immediately. The visible rows are NOT torn down while a refresh is in
-  // flight (that made every keystroke flash a skeleton) — only the error path
-  // may clear them, since a stale list beside an error banner is a lie.
+  // The ticket list, from every configured tracker at once. Typing is debounced
+  // 300ms; the initial browse-all loads immediately. The visible rows are NOT
+  // torn down while a refresh is in flight (that made every keystroke flash a
+  // skeleton) — only a total failure may clear them, since a stale list beside
+  // an error banner is a lie.
   useEffect(() => {
-    if (configured !== true) return undefined;
+    if (!trackers || !trackers.length) return undefined;
     const q = query.trim();
     setRefreshing(true);
-    setError(null);
     let ignore = false;
     const h = setTimeout(() => {
-      searchJiraIssues(q, JIRA_LIMIT)
-        .then((list) => {
+      Promise.all(trackers.map((t) => searchTrackerIssues(t, q, JIRA_LIMIT)
+        .then((list) => ({ tracker: t, issues: list }))
+        .catch((err) => ({ tracker: t, error: err.message }))))
+        .then((results) => {
           if (ignore) return;
-          setIssues(list);
+          const { issues: merged, errors } = mergeTrackerResults(results);
+          setListErrors(errors);
+          // EVERY tracker failed: there is nothing truthful to show, so the
+          // rows go rather than sit under a banner contradicting them. One of
+          // two failing still lists the other one's tickets.
+          setIssues(errors.length === results.length ? undefined : merged);
           setShownQuery(q);
-          setRefreshing(false);
-        })
-        .catch((err) => {
-          if (ignore) return;
-          setError(err.message);
-          setIssues(undefined);
           setRefreshing(false);
         });
     }, q ? 300 : 0);
     return () => { ignore = true; clearTimeout(h); };
-  }, [query, configured, nonce, refreshNonce]);
+  }, [query, trackers, nonce, refreshNonce]);
 
   // Everything on screen is derived from the CURRENT list, so a selection
-  // holding a key that is no longer listed (closed ticket, narrowed search)
+  // holding an id that is no longer listed (closed ticket, narrowed search)
   // can neither inflate the count nor smuggle a ticket into the start.
-  const toStart = startKeys(selected, issues);
+  const toStart = startIds(selected, issues);
   const state = selectionState(selected, issues);
   const notice = multiStartNotice(toStart.length);
+  const allFailed = listErrors.length > 0 && !issues;
 
   function start(list) {
     if (!list.length) return;
@@ -112,28 +136,49 @@ export default function Backlog({ onStart, refreshNonce = 0 }) {
 
   // ── States that must never be confused with each other ────────────────────
 
-  if (configured === false) {
+  // 1. The server did not answer. NOT "nothing is configured": the difference
+  //    between "I could not ask" and "the answer is none" is the difference
+  //    between restarting no_human and going to hunt for an API token.
+  if (registryError) {
+    return (
+      <div className="outcome-page">
+        <h2 className="outcome-title">Backlog</h2>
+        <div className="outcome-sub">Couldn&apos;t reach the no_human server</div>
+        <div className="mt-6 max-w-2xl rounded-2xl border border-solid border-line bg-panel p-6 font-ui text-sm text-text-muted">
+          <p className="text-text">Your trackers could not be checked.</p>
+          <p className="mt-2">{registryError}</p>
+          <p className="mt-2">
+            This says nothing about your integrations — no_human could not ask. Whether Jira or
+            Linear is connected is still unknown.
+          </p>
+          <button type="button" className={`${GHOST_BTN} mt-4`} onClick={() => setNonce((n) => n + 1)}>
+            Try again
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // 2. The server answered, and no tracker is connected.
+  if (trackers && trackers.length === 0) {
     return (
       <div className="outcome-page">
         <h2 className="outcome-title">Backlog</h2>
         <div className="outcome-sub">Not connected to a tracker</div>
         <div className="mt-6 max-w-2xl rounded-2xl border border-solid border-line bg-panel p-6 font-ui text-sm text-text-muted">
-          <p className="text-text">Jira is not configured.</p>
+          <p className="text-text">{noTrackerMessage()}</p>
           <p className="mt-2">
-            Open <b>Settings ▸ Integrations</b>, fill in your Jira site URL and project key, and
-            put a <code>JIRA_API_TOKEN</code> in <code>~/.no_human/.env</code>. Reload this page
-            once it saves and your open tickets will be listed here.
-          </p>
-          <p className="mt-4 text-text-dim">
-            Linear is not connected either — no_human can read Jira today; the Linear side has no
-            issue listing yet, so this page does not offer one.
+            Open <b>Settings ▸ Integrations</b> and connect either one. Jira needs its site URL
+            and project key plus a <code>JIRA_API_TOKEN</code> in <code>~/.no_human/.env</code>;
+            Linear needs its team key plus a <code>LINEAR_API_KEY</code> in the same file.
+            Reload this page once it saves and your open tickets will be listed here.
           </p>
         </div>
       </div>
     );
   }
 
-  const header = !error && issues && issues.length > 0
+  const header = !allFailed && issues && issues.length > 0
     ? jiraResultHeader(shownQuery, issues.length, JIRA_LIMIT)
     : null;
 
@@ -141,7 +186,7 @@ export default function Backlog({ onStart, refreshNonce = 0 }) {
     <div className="outcome-page">
       <h2 className="outcome-title">Backlog</h2>
       <div className="outcome-sub">
-        {header || (configured === undefined || (refreshing && !issues) ? "Loading your tickets…" : "Open tickets from Jira")}
+        {header || (trackers === undefined || (refreshing && !issues) ? "Loading your tickets…" : "Open tickets")}
         {header && refreshing ? " · Updating…" : ""}
       </div>
 
@@ -171,16 +216,16 @@ export default function Backlog({ onStart, refreshNonce = 0 }) {
         </button>
       </div>
 
-      {/* Linear: stated, not offered. There is no Linear issue-listing endpoint
-          in this product, so a Linear tab would be an affordance that cannot
-          load — the page says where it stands instead of implying a choice. */}
-      <p className="mt-2 font-ui text-xs text-text-dim">
-        Jira only for now — Linear is not connected.
-      </p>
+      {/* Which trackers these rows came from — DERIVED from what the server
+          said is configured, never a hand-written claim about what this product
+          can read. The line this replaced said Linear had no issue listing;
+          it had one all along. See backlogSources.js. */}
+      <p className="mt-2 font-ui text-xs text-text-dim">{sourcesLine(trackers)}</p>
 
       <div className="mt-4 flex flex-col gap-2" aria-live="polite">
-        {!refreshing && error && (
+        {!refreshing && listErrors.map((e) => (
           <div
+            key={e.tracker}
             role="alert"
             className="flex items-center justify-between gap-3 rounded-xl px-4 py-3 font-ui text-sm"
             style={{ color: "var(--red)", background: "var(--red-dim)" }}
@@ -189,15 +234,16 @@ export default function Backlog({ onStart, refreshNonce = 0 }) {
                 says which (expired token vs. site/project config); it is shown
                 verbatim under a heading that never claims "no tickets". */}
             <span>
-              <b>Couldn&apos;t reach Jira.</b> {error} Your backlog is not empty — it could not be read.
+              <b>Couldn&apos;t reach {e.label}.</b> {e.message} Your backlog is not empty — it
+              could not be read.
             </span>
             <button type="button" className={GHOST_BTN} onClick={() => setNonce((n) => n + 1)}>
               Try again
             </button>
           </div>
-        )}
+        ))}
 
-        {(!issues || issues.length === 0) && refreshing && !error && (
+        {(!issues || issues.length === 0) && refreshing && !allFailed && (
           <>
             <div className="skeleton h-16 w-full rounded-xl" aria-hidden="true" />
             <div className="skeleton h-16 w-full rounded-xl" aria-hidden="true" />
@@ -205,24 +251,27 @@ export default function Backlog({ onStart, refreshNonce = 0 }) {
           </>
         )}
 
-        {!refreshing && !error && issues && issues.length === 0 && (
+        {!refreshing && !allFailed && issues && issues.length === 0 && (
           <p className="px-2 py-8 text-center font-ui text-sm text-text-muted">
             {jiraEmptyMessage(shownQuery)}
           </p>
         )}
 
-        {!error && issues && issues.map((issue, i) => {
+        {issues && issues.map((issue, i) => {
           const chipStyle = jiraStatusChipStyle(issue.status);
           // The ticket already has a board task: say so, and take it out of
           // every bulk affordance. Starting it again stays possible, but only
           // via the explicit per-row button below.
           const imp = importedChip(issue.imported);
           const updatedText = formatIssueUpdated(issue.updated);
-          const checked = selected.includes(issue.key);
+          // tracker + key, never the key alone: two trackers mint keys of the
+          // same shape and this list holds both (backlogSelection.js: rowId).
+          const id = rowId(issue);
+          const checked = selected.includes(id);
           const disabled = Boolean(issue.imported);
           return (
             <div
-              key={issue.key}
+              key={id}
               style={{ animationDelay: `${Math.min(i, 8) * 40}ms` }}
               className={
                 "jira-result-enter flex items-center gap-3 rounded-xl border border-solid bg-card px-4 py-3 transition-colors " +
@@ -236,7 +285,7 @@ export default function Backlog({ onStart, refreshNonce = 0 }) {
                   style={{ accentColor: "var(--accent)" }}
                   checked={checked}
                   disabled={disabled}
-                  onChange={() => setSelected((s) => toggleKey(s, issue.key, issues))}
+                  onChange={() => setSelected((s) => toggleId(s, id, issues))}
                   aria-label={`Select ${issue.key}: ${issue.summary}`}
                   title={disabled ? "Already started as a task — use Start again to create a second one" : undefined}
                 />
@@ -251,6 +300,14 @@ export default function Backlog({ onStart, refreshNonce = 0 }) {
                 </span>
               </label>
               <span className="flex shrink-0 items-center gap-1.5">
+                {/* Which tracker this row came from. Once two lists are merged
+                    the key alone does not say, and both trackers mint keys of
+                    the same shape. Only shown when there IS a choice. */}
+                {trackers && trackers.length > 1 && (
+                  <span className="shrink-0 rounded-full border border-solid border-line bg-panel px-2.5 py-0.5 font-ui text-xs text-text-muted">
+                    {issue.tracker === "linear" ? "Linear" : "Jira"}
+                  </span>
+                )}
                 {issue.status && (
                   <span
                     className={

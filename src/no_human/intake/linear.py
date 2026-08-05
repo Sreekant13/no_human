@@ -282,6 +282,79 @@ class LinearAdapter:
                 break
         return out
 
+    def search_text(self, q: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Issue browse/pick for the Backlog page — the Linear half of what
+        ``JiraAdapter.search_text`` does, and deliberately the same shape.
+
+        The SCOPE is :meth:`search`'s: the operator-authored intake filter
+        (team + state types + optional label), so the picker lists exactly the
+        tickets the poller would consider and never a closed one. An empty
+        query browses that scope; a non-empty query narrows it.
+
+        The narrowing happens HERE, over the fetched nodes, rather than inside
+        the GraphQL filter. That is a deliberate constraint, not laziness: this
+        module only sends API shapes its docstring records as verified, and
+        Linear's free-text filter fields are not among them — a guessed filter
+        key fails at runtime as an opaque 400 (see the module docstring on
+        ``WorkflowState.type``, the last time an unverified literal was used
+        here). The intake scope is one team's unstarted work, which is the
+        page-bounded set ``search`` already pages through in full.
+        """
+        issues = self.search()
+        needle = (q or "").strip().lower()
+        if needle:
+            issues = [
+                i for i in issues
+                if needle in " ".join([
+                    str(i.get("identifier") or ""),
+                    str(i.get("title") or ""),
+                    str(i.get("description") or ""),
+                ]).lower()
+            ]
+        return issues[: max(1, limit)]
+
+    def get_issue(self, key: str) -> dict[str, Any] | None:
+        """ONE issue by its human identifier ("NO-1"), or None.
+
+        Resolved by scanning the intake scope rather than by
+        ``issue(id: "NO-1")``: the API's ``id`` argument is documented for the
+        UUID, and the identifier is documented only for display (same reason
+        :meth:`normalize` keeps the UUID in ``context``). ``_SEARCH_QUERY``
+        already returns the FULL, untruncated description, so unlike Jira there
+        is no second, richer fetch to make — the detail route exists to give
+        the page a per-ticket call with the same contract, not to un-truncate.
+        """
+        wanted = (key or "").strip().lower()
+        if not wanted:
+            return None
+        for issue in self.search():
+            if str(issue.get("identifier") or "").lower() == wanted:
+                return issue
+        return None
+
+    def issue_brief(self, issue: dict[str, Any]) -> dict[str, Any]:
+        """Shape one issue for the browse list — never the full Task shape
+        ``normalize`` builds. Description truncated for the list payload,
+        exactly like the Jira adapter's brief."""
+        out = self.issue_detail(issue)
+        out["description"] = out["description"][:2000]
+        return out
+
+    def issue_detail(self, issue: dict[str, Any]) -> dict[str, Any]:
+        """The same row with the description whole."""
+        ident = issue.get("identifier") or ""
+        assignee = issue.get("assignee") or {}
+        return {
+            "tracker": "linear",
+            "key": ident,
+            "summary": issue.get("title") or ident or "Linear issue",
+            "status": (issue.get("state") or {}).get("name"),
+            "assignee": assignee.get("displayName") or assignee.get("name"),
+            "updated": issue.get("updatedAt"),
+            "url": issue.get("url") or "",
+            "description": issue.get("description") or "",
+        }
+
     def workflow_states(self, *, refresh: bool = False) -> list[dict[str, Any]]:
         """The configured team's workflow states (cached per adapter)."""
         if self._states_cache is None or refresh:

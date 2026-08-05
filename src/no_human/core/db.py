@@ -363,9 +363,9 @@ class StalenessProbe(NamedTuple):
                 f"fresh={tuple(self.fresh)}, reason={self.reason!r})")
 
 
-class JiraImportedTaskRow(NamedTuple):
-    """One row of the Jira-picker imported-chip projection (SCRUM-54) — only
-    the four columns the chip lookup needs, never a full Task hydration."""
+class ImportedTaskRow(NamedTuple):
+    """One row of the backlog picker's imported-chip projection (SCRUM-54) —
+    only the four columns the chip lookup needs, never a full Task hydration."""
 
     external_id: str
     id: str
@@ -1112,18 +1112,24 @@ class Store:
         )
         return Task.from_row(dict(row)) if row else None
 
-    async def list_jira_imported_tasks(self) -> list[JiraImportedTaskRow]:
-        """Narrow projection for the Jira picker's imported-chip lookup
-        (SCRUM-54): only (external_id, id, status, created_at) for
-        jira-sourced tasks with a linked external_id, via one filtered SQL
-        query — never a full `list_tasks()` hydration of every task's every
-        column just to read four fields."""
+    async def list_imported_tasks(self, source: str) -> list[ImportedTaskRow]:
+        """Narrow projection for the backlog picker's imported-chip lookup
+        (SCRUM-54): only (external_id, id, status, created_at) for tasks from
+        ONE tracker with a linked external_id, via one filtered SQL query —
+        never a full `list_tasks()` hydration of every task's every column just
+        to read four fields.
+
+        `source` is a parameter, not a literal, because the picker now lists
+        two trackers: dedupe keys on (source, external_id), so a Jira NO-1 must
+        not make a Linear NO-1 look already-imported. Bound as a SQL parameter
+        like every other value here — never interpolated."""
         rows = await self._fetchall(
             "SELECT external_id, id, status, created_at FROM tasks "
-            "WHERE source = 'jira' AND external_id IS NOT NULL"
+            "WHERE source = ? AND external_id IS NOT NULL",
+            (source,),
         )
         return [
-            JiraImportedTaskRow(
+            ImportedTaskRow(
                 external_id=r["external_id"], id=r["id"],
                 status=r["status"], created_at=r["created_at"],
             )

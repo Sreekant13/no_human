@@ -148,6 +148,10 @@ class JiraAdapter:
         assignee = fields.get("assignee") or {}
         description = _adf_text(fields.get("description"))
         return {
+            # Which tracker the row came from. The Backlog page lists Jira and
+            # Linear together, and a row has to say which one it is: the detail
+            # fetch, the created task's `source`, and the dedupe key all differ.
+            "tracker": "jira",
             "key": key,
             "summary": fields.get("summary") or key or "Jira issue",
             "status": (fields.get("status") or {}).get("name"),

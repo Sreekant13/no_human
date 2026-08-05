@@ -200,7 +200,7 @@ async def test_list_by_status(store):
     assert {t.id for t in pend} == {a.id}
 
 
-async def test_list_jira_imported_tasks_filters_source_and_external_id(store):
+async def test_list_imported_tasks_filters_source_and_external_id(store):
     """SCRUM-54: the picker projection returns only (external_id, id, status,
     created_at) for jira-sourced tasks with a linked external_id — never
     freeform tasks, never jira tasks still missing an external_id."""
@@ -212,12 +212,22 @@ async def test_list_jira_imported_tasks_filters_source_and_external_id(store):
     unlinked_jira_task = Task.new("jira but not yet linked", source="jira")
     await store.create_task(unlinked_jira_task)
 
-    rows = await store.list_jira_imported_tasks()
+    # A Linear task carrying the SAME external_id: the projection is scoped by
+    # SOURCE, so it must not leak into the Jira read (dedupe keys on the pair,
+    # and the Backlog page now lists both trackers side by side).
+    linear_collider = Task.new("NO-1 on Linear", source="linear",
+                               external_id="SCRUM-1")
+    await store.create_task(linear_collider)
+
+    rows = await store.list_imported_tasks("jira")
     assert {r.id for r in rows} == {jira_task.id}
     row = rows[0]
     assert row.external_id == "SCRUM-1"
     assert row.status == jira_task.status.value
     assert row.created_at == jira_task.created_at
+
+    linear_rows = await store.list_imported_tasks("linear")
+    assert {r.id for r in linear_rows} == {linear_collider.id}
 
 
 async def test_list_memories_project_scoped(store):

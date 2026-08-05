@@ -130,7 +130,7 @@ test("App.jsx seeds the SAME NewTaskModal from a backlog ticket — no second cr
     "there must be exactly ONE createTask call site in App.jsx");
   assert.match(appJsx, /initial=\{backlogSeed\}/,
     "a backlog ticket must be started by seeding NewTaskModal, not by its own create call");
-  assert.match(appJsx, /source: "jira"/);
+  assert.match(appJsx, /source: tracker,/);
   assert.match(appJsx, /externalId: externalIdFromIssue\(issue\)/);
   assert.doesNotMatch(backlogJsx, /createTask/,
     "the Backlog page must never create a task itself");
@@ -138,9 +138,14 @@ test("App.jsx seeds the SAME NewTaskModal from a backlog ticket — no second cr
 
 // ── api.js — the new read call + source passthrough ────────────────────────
 
-test("searchJiraIssues hits the new read endpoint with q + limit", () => {
+test("the issue-browse call hits /api/integrations/{tracker}/issues with q + limit", () => {
   assert.match(apiJs, /export async function searchJiraIssues\(q, limit = 50\)/);
-  assert.match(apiJs, /\/api\/integrations\/jira\/issues\?\$\{params\}/);
+  assert.match(apiJs, /export async function searchLinearIssues\(q, limit = 50\)/);
+  // ONE implementation for both: the two endpoints have the same contract and
+  // return the same row shape, so a per-tracker copy could only drift.
+  assert.match(apiJs, /\/api\/integrations\/\$\{tracker\}\/issues\?\$\{params\}/);
+  assert.equal((apiJs.match(/issues\?\$\{params\}/g) || []).length, 1,
+    "there must be exactly one browse implementation, not one per tracker");
 });
 
 // SCRUM-3: the client used to request only 20 while the backend clamp allows
@@ -170,19 +175,19 @@ test("the composer's ticket affordance is now a pointer to the Backlog page, gat
   assert.match(appJsx, /onOpenBacklog=\{\(\) => \{ setShowNewTask\(false\); setPage\("backlog"\); \}\}/);
 });
 
-test("jiraConfigured is derived from a one-time fetchIntegrations call, never a raw config poke", () => {
-  for (const src of [composerJsx, backlogJsx]) {
-    assert.match(src, /fetchIntegrations\(\)/);
-    assert.match(src, /\.find\(\(i\)\s*=>\s*i\.name\s*===\s*["']jira["']\)/);
-    // Fetched once at mount ([] deps), not on every render.
-    assert.match(src, /fetchIntegrations\(\)[\s\S]{0,500}\}, \[\]\);/);
-  }
+test("which trackers are configured comes from fetchIntegrations, never a raw config poke", () => {
+  assert.match(composerJsx, /fetchIntegrations\(\)/);
+  assert.match(composerJsx, /\.find\(\(i\)\s*=>\s*i\.name\s*===\s*["']jira["']\)/);
+  assert.match(composerJsx, /fetchIntegrations\(\)[\s\S]{0,500}\}, \[\]\);/);
   assert.match(composerJsx, /setJiraConfigured\(Boolean\(jira\?\.configured\)\)/);
-  assert.match(backlogJsx, /setConfigured\(Boolean\(jira && jira\.configured\)\)/);
+  // The Backlog page reads the whole registry, not one named integration —
+  // it lists every configured tracker.
+  assert.match(backlogJsx, /fetchIntegrations\(\)/);
+  assert.match(backlogJsx, /setTrackers\(configuredTrackers\(r\)\)/);
 });
 
 test("typing is debounced 300ms; the empty browse loads immediately", () => {
-  assert.match(backlogJsx, /setTimeout\(\(\) => \{[\s\S]*?searchJiraIssues\(q, JIRA_LIMIT\)/);
+  assert.match(backlogJsx, /setTimeout\(\(\) => \{[\s\S]*?searchTrackerIssues\(t, q, JIRA_LIMIT\)/);
   // Typing waits 300ms; an empty query (browse-all on open) loads with no delay.
   assert.match(backlogJsx, /\}, q \? 300 : 0\);/);
 });
@@ -196,7 +201,11 @@ test("starting a ticket prefills the prompt via promptFromIssue and sets the hid
   const fn = appJsx.match(/const seedFrom = \(issue\) => \(\{[\s\S]*?\}\);/)?.[0];
   assert.ok(fn, "the backlog seed builder must be found");
   assert.match(fn, /prompt: promptFromIssue\(issue\)/);
-  assert.match(fn, /source: "jira"/);
+  // The source is the ROW'S TRACKER, not a hardcoded "jira" — dedupe keys on
+  // (source, external_id), so stamping a Linear ticket "jira" would let it
+  // collide with a Jira ticket that happens to share its key.
+  assert.match(fn, /source: tracker,/);
+  assert.match(appJsx, /const tracker = head\.tracker === "linear" \? "linear" : "jira";/);
   assert.match(fn, /externalId: externalIdFromIssue\(issue\)/);
 });
 
@@ -204,13 +213,13 @@ test("starting a ticket prefills the prompt via promptFromIssue and sets the hid
 // (the browse list's brief truncates description to 2000 chars — the created
 // task must carry the whole spec, not that cut-off list-view text).
 
-test("the backlog start path re-fetches the picked issue in full via fetchJiraIssue", () => {
-  // The import list may carry more names; the pin is that fetchJiraIssue is
+test("the backlog start path re-fetches the picked issue in full, from ITS tracker", () => {
+  // The import list may carry more names; the pin is that the detail fetch is
   // imported from api.js, not the exact roster.
-  assert.match(appJsx, /import \{[^}]*\bfetchJiraIssue\b[^}]*\} from ["']\.\/api\.js["']/);
+  assert.match(appJsx, /import \{[^}]*\bfetchTrackerIssue\b[^}]*\} from ["']\.\/api\.js["']/);
   const effect = appJsx.match(/if \(!backlogHeadKey\)[\s\S]*?\}, \[backlogHeadKey\]\);/)?.[0];
   assert.ok(effect, "the backlog seed effect must be found");
-  assert.match(effect, /fetchJiraIssue\(head\.key\)/);
+  assert.match(effect, /fetchTrackerIssue\(tracker, head\.key\)/);
   assert.match(effect, /\.then\(\(full\) => \{ if \(!ignore\) setBacklogSeed\(seedFrom\(full\)\); \}\)/);
   // A failed detail fetch falls back to the list brief rather than dead-ending.
   assert.match(effect, /\.catch\(\(\) => \{ if \(!ignore\) setBacklogSeed\(seedFrom\(head\)\); \}\)/);
@@ -219,9 +228,10 @@ test("the backlog start path re-fetches the picked issue in full via fetchJiraIs
   assert.match(appJsx, /\{backlogHeadKey && backlogSeed && \(/);
 });
 
-test("api.js exposes fetchJiraIssue hitting the single-issue detail endpoint", () => {
+test("api.js exposes a single-issue detail fetch for BOTH trackers", () => {
   assert.match(apiJs, /export async function fetchJiraIssue\(key\)/);
-  assert.match(apiJs, /\/api\/integrations\/jira\/issues\/\$\{encodeURIComponent\(key\)\}/);
+  assert.match(apiJs, /export async function fetchLinearIssue\(key\)/);
+  assert.match(apiJs, /\/api\/integrations\/\$\{tracker\}\/issues\/\$\{encodeURIComponent\(key\)\}/);
 });
 
 test("source defaults to 'board' and survives a re-seeded composer (grill-fail echo)", () => {
@@ -236,7 +246,7 @@ test("source rides along in the onStart payload alongside the other echoed field
 // browse gets its own, honest copy) rather than being hardcoded inline in the
 // component — assert the wiring here, and the literal copy in jiraImport.js.
 test("empty, loading and error states use the design-direction copy/patterns", () => {
-  assert.match(backlogJsx, /\{!refreshing && !error && issues && issues\.length === 0 &&/);
+  assert.match(backlogJsx, /\{!refreshing && !allFailed && issues && issues\.length === 0 &&/);
   assert.match(backlogJsx, /jiraEmptyMessage\(shownQuery\)/);
   assert.match(jiraImportJs, /No matching tickets\./);
   assert.match(backlogJsx, /className="skeleton /, "must use the shared shimmer skeleton, not a spinner");
@@ -249,27 +259,68 @@ test("empty, loading and error states use the design-direction copy/patterns", (
 // integration is a third. Reporting any of them as another is the exact class
 // of lie this page must not tell.
 test("a 503-unconfigured tracker gets its own state, with the configuration steps", () => {
-  const branch = backlogJsx.match(/if \(configured === false\) \{[\s\S]*?\n  \}/)?.[0];
+  const branch = backlogJsx.match(/if \(trackers && trackers\.length === 0\) \{[\s\S]*?\n  \}/)?.[0];
   assert.ok(branch, "the not-configured branch must exist");
-  assert.match(branch, /Jira is not configured/);
+  assert.match(branch, /noTrackerMessage\(\)/);
   assert.match(branch, /Settings ▸ Integrations/, "it must say WHERE to configure it");
-  assert.match(branch, /JIRA_API_TOKEN/, "…and which credential is needed");
+  // BOTH credentials are named — the page offers both trackers now, so telling
+  // the operator about only one of them is a half-truth.
+  assert.match(branch, /JIRA_API_TOKEN/);
+  assert.match(branch, /LINEAR_API_KEY/);
   assert.doesNotMatch(branch, /No open tickets/, "an unconfigured tracker is not an empty backlog");
+});
+
+// P1-5: a dead server is not an unconfigured integration. fetchIntegrations
+// used to fold every non-ok response into `{integrations: []}`, so a 500
+// rendered "Jira is not configured" — the exact inverse of the rule this page
+// states — and sent the operator to fix a token that was never the problem.
+test("an unreachable server gets its OWN state, never the not-configured one", () => {
+  // fetchIntegrations' own contract is exercised for real in api.test.mjs
+  // (stubbed fetch, thrown value read) — a regex here would pass against the
+  // old swallowing code as long as the word `throw` appeared in the function.
+  const branch = backlogJsx.match(/if \(registryError\) \{[\s\S]*?\n  \}/)?.[0];
+  assert.ok(branch, "the unreachable-server branch must exist");
+  assert.match(branch, /Couldn&apos;t reach the no_human server/);
+  assert.match(branch, /\{registryError\}/, "the reason must be shown verbatim");
+  assert.doesNotMatch(branch, /not configured/,
+    "an unreachable server must never be reported as a missing integration");
+  assert.match(branch, /Try again/);
 });
 
 test("a 502 upstream failure says the tracker could not be READ, never 'no tickets'", () => {
   const alert = backlogJsx.match(/role="alert"[\s\S]*?<\/div>/)?.[0];
   assert.ok(alert, "the error alert must exist");
-  assert.match(alert, /Couldn&apos;t reach Jira/);
-  assert.match(alert, /\{error\}/, "the server's own detail must be shown verbatim");
+  // Named per tracker: with two lists merged, "couldn't reach Jira" said over a
+  // page full of Linear tickets would be unreadable.
+  assert.match(alert, /Couldn&apos;t reach \{e\.label\}/);
+  assert.match(alert, /\{e\.message\}/, "the server's own detail must be shown verbatim");
   assert.match(alert, /not empty/, "it must deny the empty-backlog reading explicitly");
 });
 
-test("Linear is named as NOT connected — never rendered as a tab that cannot load", () => {
-  assert.match(backlogJsx, /Linear is not connected/);
-  // No Linear fetch exists in this product; a Linear affordance would be a
-  // claim with nothing behind it.
-  assert.doesNotMatch(backlogJsx, /fetchLinear|searchLinear|linearIssues/);
+// P1-4. The page used to explain Linear's absence with "the Linear side has no
+// issue listing yet". That was false: LinearAdapter.search() has been a working
+// paginating GraphQL listing all along and only the HTTP route was missing. A
+// UI explanation that states a fact about the code is a claim, and this one was
+// wrong — so the fix is the route, and the rule is that the line is DERIVED.
+test("Linear tickets are listed, and no hand-written claim about Linear survives", () => {
+  assert.match(backlogJsx, /searchTrackerIssues/,
+    "the page must fetch every configured tracker, not Jira alone");
+  assert.match(backlogJsx, /sourcesLine\(trackers\)/,
+    "the which-trackers line must be derived from what the server reported");
+  for (const lie of [
+    /the Linear side has no issue listing/,
+    /Linear is not connected/,
+    /Jira only for now/,
+    /no Linear issue-listing endpoint/,
+  ]) {
+    assert.doesNotMatch(backlogJsx, lie,
+      `a hand-written claim about Linear must not survive: ${lie}`);
+  }
+});
+
+test("api.js and the server agree that the Linear listing exists", () => {
+  assert.match(apiJs, /export async function searchLinearIssues/);
+  assert.match(apiJs, /export async function fetchLinearIssue/);
 });
 
 // ── Grill flow stays untouched ───────────────────────────────────────────
@@ -461,18 +512,14 @@ test("a `refreshing` flag exists and does NOT drive the list's visibility", () =
 
 test("the search effect never clears the rows on the loading path — only the error path may", () => {
   const effect = backlogJsx.match(
-    /useEffect\(\(\) => \{\n\s*if \(configured !== true\) return undefined;[\s\S]*?\}, \[query, configured, nonce, refreshNonce\]\);/,
+    /useEffect\(\(\) => \{\n\s*if \(!trackers \|\| !trackers\.length\) return undefined;[\s\S]*?\}, \[query, trackers, nonce, refreshNonce\]\);/,
   )?.[0];
   assert.ok(effect, "the ticket search effect must be found");
   assert.match(effect, /setRefreshing\(true\);/);
-  const successBlock = effect.match(/\.then\(\(list\) => \{[\s\S]*?\}\)/)?.[0];
-  assert.ok(successBlock, "the success handler must be found");
-  assert.doesNotMatch(successBlock, /setIssues\(undefined\)/);
-  // The error path is allowed to clear the rows — it can't show a stale list
-  // next to an error banner.
-  const errorBlock = effect.match(/\.catch\(\(err\) => \{[\s\S]*?\}\)/)?.[0];
-  assert.ok(errorBlock, "the error handler must be found");
-  assert.match(errorBlock, /setIssues\(undefined\)/);
+  // Rows are cleared ONLY when every tracker failed — there is nothing
+  // truthful left to show. One of two failing still lists the other's tickets
+  // beside a banner naming the one that did not answer.
+  assert.match(effect, /setIssues\(errors\.length === results\.length \? undefined : merged\)/);
 });
 
 test("skeletons render only when there is nothing to show yet, not on every refresh", () => {
@@ -480,7 +527,7 @@ test("skeletons render only when there is nothing to show yet, not on every refr
 });
 
 test("the row list is not gated on the refreshing flag — it stays mounted in flight", () => {
-  assert.match(backlogJsx, /!error && issues && issues\.map/);
+  assert.match(backlogJsx, /\{issues && issues\.map/);
 });
 
 test("a subtle in-flight hint ('Updating…') is shown near the header while a refresh is in flight", () => {
@@ -500,7 +547,7 @@ test("jiraEmptyMessage: a non-empty query with zero results keeps the existing m
 });
 
 test("Backlog.jsx wires the empty state through jiraEmptyMessage, not a hardcoded string", () => {
-  assert.match(backlogJsx, /\{!refreshing && !error && issues && issues\.length === 0 &&/);
+  assert.match(backlogJsx, /\{!refreshing && !allFailed && issues && issues\.length === 0 &&/);
   assert.match(backlogJsx, /jiraEmptyMessage\(shownQuery\)/);
 });
 

@@ -513,19 +513,28 @@ class CreateTaskRequest(BaseModel):
     plan_approval: bool = False
 
 
-class JiraImportedInfo(BaseModel):
+class ImportedInfo(BaseModel):
     """SCRUM-18 — the accidental-re-import trap. A tiny board-side lookup
     attached to a browse row when the ticket already has a board task,
-    matched by external_id/key against the local tasks store. Never the
+    matched by (source, external_id) against the local tasks store. Never the
     full Task shape (models.py's own TaskOut/TaskSummaryOut), no secrets."""
     task_id: str        # the board task id, for binding — never the full task shape
     status: str          # board task status value (e.g. "done", "implementing")
     count: int = 1        # >1 signals duplicate external_ids (data-integrity warning)
 
 
-class JiraIssueOut(BaseModel):
-    """One row in the Import-from-Jira browse/pick list — never the full Task
-    shape ``JiraAdapter.normalize`` builds, and never a secret."""
+class TrackerIssueOut(BaseModel):
+    """One row in the Backlog page's ticket list — never the full Task shape
+    the adapters' ``normalize`` builds, and never a secret.
+
+    ONE shape for both trackers. The page lists Jira and Linear side by side,
+    and the two rows differ in nothing a reader of this list cares about, so a
+    second near-identical model would only be a way for them to drift."""
+    # Which tracker this row came from: "jira" or "linear". The page needs it
+    # to route the detail fetch and to stamp the created task's `source`, and
+    # dedupe keys on (source, external_id) — so a Jira NO-1 and a Linear NO-1
+    # are two different tickets and must not claim each other's board task.
+    tracker: str = "jira"
     key: str
     summary: str
     status: str | None = None
@@ -534,7 +543,7 @@ class JiraIssueOut(BaseModel):
     url: str
     description: str = ""
     # SCRUM-18: set when a board task already exists for this issue's key.
-    imported: JiraImportedInfo | None = None
+    imported: ImportedInfo | None = None
 
 
 class SendBackRequest(BaseModel):
