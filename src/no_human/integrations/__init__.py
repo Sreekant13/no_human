@@ -32,6 +32,7 @@ _IS_WINDOWS = os.name == "nt"
 KIND_BY_NAME = {
     "jira": "issue_tracker",
     "linear": "issue_tracker",
+    "monday": "issue_tracker",
     "github": "vcs",
     "gitlab": "vcs",
     "jenkins": "ci",
@@ -41,7 +42,8 @@ KIND_BY_NAME = {
 }
 
 # The order the UI lists them (issue tracker → VCS → CI → notifications).
-_ORDER = ["jira", "linear", "github", "gitlab", "jenkins", "circleci", "slack", "teams"]
+_ORDER = ["jira", "linear", "monday", "github", "gitlab", "jenkins", "circleci",
+          "slack", "teams"]
 
 
 @dataclass
@@ -112,6 +114,16 @@ FIELD_SPECS: dict[str, list[FieldSpec]] = {
         FieldSpec("team_key", "Team key", False, config_path="integrations.linear.team_key"),
         FieldSpec("label", "Label filter", False, config_path="integrations.linear.label"),
         FieldSpec("api_key", "API key", True, env_var="LINEAR_API_KEY"),
+    ],
+    # intake/monday.py reads integrations.monday.* / MONDAY_API_TOKEN. The
+    # header is the RAW token (`Authorization: <token>`), not `Bearer <token>`
+    # — same as Linear. `status_column` is the column's ID ("bug_status"), not
+    # its title, because monday's mutations address columns by id.
+    "monday": [
+        FieldSpec("board_id", "Board id", False, config_path="integrations.monday.board_id"),
+        FieldSpec("status_column", "Status column id", False,
+                  config_path="integrations.monday.status_column"),
+        FieldSpec("api_token", "API token", True, env_var="MONDAY_API_TOKEN"),
     ],
     # ci/circleci.py reads CIRCLECI_TOKEN; integrations.circleci.* is the
     # first-class config section (see _circleci_status above).
@@ -184,6 +196,30 @@ def _linear_status(config: dict) -> IntegrationStatus:
                               status=_status_str(configured))
 
 
+def _monday_status(config: dict) -> IntegrationStatus:
+    """monday needs BOTH a board and a status column to be usable.
+
+    Reporting "configured" on a board id alone would be a lie: without
+    `status_column` the adapter cannot filter intake at all and raises, so the
+    integration card would show green next to an integration that cannot run.
+    """
+    mon = _sect(config, "integrations").get("monday") or {}
+    board = mon.get("board_id")
+    column = mon.get("status_column")
+    configured = bool(board and column)
+    if configured:
+        labels = mon.get("todo_labels") or []
+        detail = f"board {board} · {column}"
+        if labels:
+            detail += " · " + ", ".join(str(x) for x in labels)
+    elif board:
+        detail = "board set, but integrations.monday.status_column is unset"
+    else:
+        detail = "not configured"
+    return IntegrationStatus("monday", "issue_tracker", configured, None, detail,
+                              status=_status_str(configured))
+
+
 def _teams_status(config: dict) -> IntegrationStatus:
     # The webhook is a secret — report only that one is set, never the URL.
     # A RETIRED Office 365 connector URL is reported as configured-but-broken
@@ -243,7 +279,8 @@ def _slack_status(config: dict) -> IntegrationStatus:
 
 
 _STATUS = {
-    "jira": _jira_status, "linear": _linear_status, "github": _github_status,
+    "jira": _jira_status, "linear": _linear_status, "monday": _monday_status,
+    "github": _github_status,
     "gitlab": _gitlab_status, "jenkins": _jenkins_status,
     "circleci": _circleci_status, "slack": _slack_status, "teams": _teams_status,
 }
@@ -682,6 +719,7 @@ def save_integration_config(name: str, fields: dict[str, str]) -> IntegrationSta
 SETUP_SECRET_ENV: dict[str, tuple[str, ...]] = {
     "jira": ("JIRA_API_TOKEN",),                       # intake/jira.py
     "linear": ("LINEAR_API_KEY",),                     # intake/linear.py
+    "monday": ("MONDAY_API_TOKEN",),                   # intake/monday.py
     "circleci": ("CIRCLECI_TOKEN",),                   # ci/circleci.py
     # integrations/slack/worker.py — Socket Mode needs both.
     "slack": ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"),
@@ -1061,6 +1099,55 @@ async def _check_linear(config: dict) -> IntegrationStatus:
     return replace(base, healthy=False, detail=f"HTTP {r.status_code}")
 
 
+async def _check_monday(config: dict) -> IntegrationStatus:
+    base = _monday_status(config)
+    if not base.configured:
+        return replace(base, healthy=False, detail=base.detail)
+    token = os.environ.get("MONDAY_API_TOKEN")
+    if not token:
+        return replace(base, healthy=False,
+                       detail="MONDAY_API_TOKEN not set in ~/.no_human/.env")
+    from ..intake.monday import API_URL, API_VERSION
+    try:
+        r = await _http_post(
+            API_URL,
+            # RAW token, not Bearer. API-Version pinned so the account's
+            # default moving cannot change what this check exercises.
+            headers={"Authorization": token, "Content-Type": "application/json",
+                     "API-Version": API_VERSION},
+            json={"query": "{ me { id name } }"}, timeout=10.0)
+    except Exception as exc:  # noqa: BLE001 — a health check never raises
+        return replace(base, healthy=False, detail=f"connection failed: {type(exc).__name__}")
+    # Throttling FIRST: monday answers 429 with an HTML body, so parsing before
+    # classifying would report a retryable throttle as a broken API.
+    if r.status_code == 429:
+        return replace(base, healthy=False,
+                       detail="rate limited (monday reports this as HTTP 429)")
+    body: Any = {}
+    try:
+        body = r.json() or {}
+    except Exception:  # noqa: BLE001
+        body = {}
+    errors = body.get("errors") if isinstance(body, dict) else None
+    if errors:
+        first = errors[0] if isinstance(errors, list) and errors else {}
+        # A monday validation error carries no `extensions` at all, so the code
+        # may legitimately be absent — fall back to the message, never crash.
+        code = ""
+        if isinstance(first, dict):
+            ext = first.get("extensions") or {}
+            code = (ext.get("code") or "") if isinstance(ext, dict) else ""
+            code = code or str(first.get("message") or "")
+        return replace(base, healthy=False, detail=f"API error: {code or 'unknown'}")
+    if r.status_code == 200:
+        who = ""
+        if isinstance(body, dict):
+            who = ((body.get("data") or {}).get("me") or {}).get("name", "")
+        return replace(base, healthy=True,
+                       detail=f"authenticated as {who}" if who else "authenticated")
+    return replace(base, healthy=False, detail=f"HTTP {r.status_code}")
+
+
 async def _check_teams(config: dict) -> IntegrationStatus:
     """Teams is a status view, not a ping.
 
@@ -1127,6 +1214,7 @@ async def _check_view(status_fn, name: str, config: dict) -> IntegrationStatus:
 _CHECKERS = {
     "jira": _check_jira,
     "linear": _check_linear,
+    "monday": _check_monday,
     "teams": _check_teams,
     "circleci": _check_circleci,
     "github": lambda c: _check_view(_github_status, "github", c),

@@ -180,11 +180,16 @@ config key that turns it on and the default that keeps it off.
     `"ghe_checkruns"`) read status via `gh` and never write
     (`ci/ghe_checkruns.py`, `ci/github_actions.py`).
 - **Ticket trackers**, for intake and optional write-back:
-  `integrations.jira.enabled` and `integrations.linear.enabled` both default to
-  **`false`** and hold no credential (`intake/jira.py`, `intake/linear.py` →
-  `https://api.linear.app/graphql`). GitHub/GitLab issue intake goes out over
-  `gh` / `glab` and only runs for a ticket ref you hand it
-  (`intake/github_issues.py`, `intake/gitlab_issues.py`).
+  `integrations.jira.enabled`, `integrations.linear.enabled` and
+  `integrations.monday.enabled` all default to **`false`** and hold no
+  credential (`intake/jira.py`, `intake/linear.py` →
+  `https://api.linear.app/graphql`, `intake/monday.py` →
+  `https://api.monday.com/v2`). monday intake additionally needs
+  `integrations.monday.board_id` and `.status_column`, both empty by default —
+  with either unset the adapter raises rather than calling out. Write-back on
+  every tracker is separately opt-in (`write_back`, also `false`). GitHub/GitLab
+  issue intake goes out over `gh` / `glab` and only runs for a ticket ref you
+  hand it (`intake/github_issues.py`, `intake/gitlab_issues.py`).
 - **Microsoft Graph (Teams + Outlook context).** If you configure
   `context.m365.token`, your query text is sent to Microsoft Graph — a POST to
   `https://graph.microsoft.com/v1.0/search/query` carrying the task's external
@@ -226,7 +231,7 @@ machine, and `server.host` defaults to `127.0.0.1`.
 | Whether a CI run is *triggered* rather than watched | `ci.mode` (Jenkins, CircleCI); GitLab always triggers |
 | Whether your query text reaches Microsoft | `context.m365.token` (**unset** by default) |
 | Whether notifications leave the machine | `notifications.*_webhook_url` (**null** by default) |
-| Whether a ticket tracker is contacted | `integrations.jira.enabled`, `integrations.linear.enabled` (**off**) |
+| Whether a ticket tracker is contacted | `integrations.jira.enabled`, `integrations.linear.enabled`, `integrations.monday.enabled` (**off**) |
 | Whether a PR is pushed at all | **nothing — it always is** |
 | Whether the desktop app checks for updates | **nothing — don't run it** |
 | What else the coder session may reach | **nothing in-process — use the OS** |

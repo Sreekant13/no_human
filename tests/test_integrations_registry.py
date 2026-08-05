@@ -608,7 +608,7 @@ def test_ambient_unknown_provider_is_never_ambient(mock_ambient_probes):
 def test_list_all_unconfigured():
     st = list_integrations({"integrations": {}, "ci": {}, "notifications": {}})
     # Listing order is issue tracker → VCS → CI → notifications.
-    assert [s.name for s in st] == ["jira", "linear", "github", "gitlab",
+    assert [s.name for s in st] == ["jira", "linear", "monday", "github", "gitlab",
                                     "jenkins", "circleci", "slack", "teams"]
     assert all(isinstance(s, IntegrationStatus) for s in st)
     assert all(s.configured is False for s in st)
@@ -616,6 +616,7 @@ def test_list_all_unconfigured():
     kinds = {s.name: s.kind for s in st}
     assert kinds == {
         "jira": "issue_tracker", "linear": "issue_tracker",
+        "monday": "issue_tracker",
         "github": "vcs", "gitlab": "vcs",
         "jenkins": "ci", "circleci": "ci",
         "slack": "notifications", "teams": "notifications",
@@ -644,7 +645,7 @@ def test_null_sections_are_safe():
     # Config deep-merge shadowing trap: a user setting `integrations:` (or ci /
     # notifications) to null must not crash the registry.
     st = list_integrations({"integrations": None, "ci": None, "notifications": None})
-    assert len(st) == 8
+    assert len(st) == 9
     assert all(s.configured is False for s in st)
 
 

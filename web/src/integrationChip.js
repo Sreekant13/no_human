@@ -31,6 +31,9 @@ export const NAME_LABEL = {
   jira: "Jira", linear: "Linear", github: "GitHub", gitlab: "GitLab",
   jenkins: "Jenkins", circleci: "CircleCI", slack: "Slack",
   teams: "Microsoft Teams",
+  // Lowercase on purpose — the vendor styles its own name that way, and the
+  // generated fallback ("Monday") would be a different word.
+  monday: "monday.com",
 };
 
 // Where each integration is configured (shown in the expand, so the operator
@@ -38,6 +41,7 @@ export const NAME_LABEL = {
 export const CONFIG_HINT = {
   jira: "config.yaml → integrations.jira",
   linear: "config.yaml → integrations.linear",
+  monday: "config.yaml → integrations.monday (board_id + status_column)",
   circleci: "config.yaml → ci (backend: circleci) + integrations.circleci",
   github: "config.yaml → ci (backend: github_actions)",
   gitlab: "config.yaml → ci (backend: gitlab)",
@@ -77,6 +81,7 @@ export const BRAND_COLOR = {
 export const SECRET_ENV_KEY = {
   jira: "JIRA_API_TOKEN",
   linear: "LINEAR_API_KEY",
+  monday: "MONDAY_API_TOKEN",
   circleci: "CIRCLECI_TOKEN",
   // Both notify-out webhook URLs live in config.yaml, not .env — that is where
   // notify/build_notifier reads them from. They are still secrets (never

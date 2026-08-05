@@ -36,16 +36,17 @@ names what IS accepted, because typing the key is the first thing a developer
 tries. Pinned by
 `tests/test_intake.py::test_a_bare_tracker_key_is_rejected_not_ingested_as_freeform`.
 
-**2. Polled trackers.** Jira and Linear are *not* `nh task add` arguments.
-They are server-side pollers that `nh serve` / `nh start` tick on their own
-cadence, creating one task per new issue matching an **operator-authored**
-filter. Both are opt-in and off by default, both dedupe on
-`(source, external_id)`, and both have opt-in write-back.
+**2. Polled trackers.** Jira, Linear and monday.com are *not* `nh task add`
+arguments. They are server-side pollers that `nh serve` / `nh start` tick on
+their own cadence, creating one task per new issue matching an
+**operator-authored** filter. All are opt-in and off by default, all dedupe on
+`(source, external_id)`, and all have opt-in write-back.
 
 | Tracker | Module | API | Credential | Filter |
 |---|---|---|---|---|
 | **Jira Cloud** | `intake/jira.py` + `jira_poll.py` | REST `/rest/api/3/search/jql`, HTTP Basic `email:token` | `JIRA_API_TOKEN` | `integrations.jira.jql` |
 | **Linear** | `intake/linear.py` + `linear_poll.py` | GraphQL `https://api.linear.app/graphql` | `LINEAR_API_KEY` | `integrations.linear.team_key` + `state_types` + `label` |
+| **monday.com** | `intake/monday.py` + `monday_poll.py` | GraphQL `https://api.monday.com/v2` | `MONDAY_API_TOKEN` | `integrations.monday.board_id` + `status_column` + `todo_labels` |
 
 A tracker's filter is never built from a task's own text. A transport error
 logs and is retried on the next tick; it never crashes the pool and never
@@ -105,6 +106,69 @@ Polling, not webhooks: Linear does offer webhooks with HMAC-SHA256
 `Linear-Signature` verification, but they need a publicly reachable HTTPS
 endpoint, and no_human binds to `127.0.0.1`. Polling costs ~60 requests/hour at
 the 60s floor against a 2,500/hour personal-key budget.
+
+### monday.com specifics
+
+**monday has no typed workflow state, and that is the whole design of this
+adapter.** Jira exposes a status *category* and Linear a `WorkflowState.type`,
+so "pull the backlog" means the same thing on any workspace. A monday status
+column is a bag of user-defined labels — `Ready for Dev`, `Fixing`,
+`Awaiting Review`, `Known Bug`, and often a blank one — that differs on every
+board, and nothing in the API says which of them means "not started". Guessing
+from label text, colour or `done_colors` would be wrong on the next board.
+
+So the mapping is **explicit config**, and nothing is inferred:
+
+```yaml
+integrations:
+  monday:
+    board_id: "1234567890"
+    status_column: bug_status        # the column's ID, not its title
+    todo_labels: ["Ready for Dev"]   # what to pull
+    in_progress_label: "Fixing"      # optional: where to move it on first claim
+    done_label: "Fixed"              # optional: where to move it on completion
+```
+
+With `board_id` or `status_column` unset the adapter **raises** rather than
+returning an empty list: an empty result is indistinguishable from an empty
+board, so a typo'd install would look like a working one with no work in it.
+The error names the exact config key and the query that discovers the value.
+
+Discover the ids with the columns query — `status_column` takes the column's
+**id** (`bug_status`), never its title (`Status`):
+
+```graphql
+{ boards(ids: [1234567890]) { columns { id title type settings_str } } }
+```
+
+For a `type == "status"` column, `json.loads(settings_str)["labels"]` is an
+`{index: label}` dict — sparse indices, and one label is often the empty
+string.
+
+Three API facts the adapter is built around:
+
+- **The auth header is the raw token** — `Authorization: <token>`, *not*
+  `Bearer <token>`, the same as Linear. The wrong form is a 401 that looks like
+  a bad token.
+- **Rate limiting is HTTP 429 with an HTML body, not JSON.** This is the
+  inverse of Linear's trap and it bites harder: there is no error code to
+  branch on, so 429 is classified from the status *before* the body is parsed.
+  A client that parses first reports its most common transient failure as
+  "non-JSON response" and never retries it as throttling.
+- **Status alone does not classify the rest.** A validation error arrives at
+  200 with an `errors` array and **no `extensions` key at all**; a bad cursor
+  arrives at 200 with `extensions.code == "CursorException"` *and* a populated
+  `data`; auth failure at 401; a malformed request at 400. So `errors` is
+  parsed on every response, and a missing `extensions` must not throw.
+
+Paging is a cursor on `items_page` itself, with `cursor: null` marking the last
+page (`limit` caps at 500). Write-back resolves the operator's configured label
+against the board's **real** labels before writing, and never sends
+`create_labels_if_missing` — so a typo'd config fails loudly instead of
+silently adding a new status to the operator's board.
+
+Polling, not webhooks, for the same reason as Linear: a receiver needs a
+publicly reachable HTTPS endpoint and no_human binds to `127.0.0.1`.
 
 ## Context (`no_human/context/`)
 

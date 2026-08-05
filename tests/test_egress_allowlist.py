@@ -705,6 +705,10 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
         "http:httpx": Allowed("https://api.linear.app/graphql",
                               _CFG + "integrations.linear.enabled"),
     },
+    "intake/monday.py": {
+        "http:httpx": Allowed("https://api.monday.com/v2",
+                              _CFG + "integrations.monday.enabled"),
+    },
     "notify/slack.py": {
         "http:httpx": Allowed("the Slack webhook URL you set — a task-status line",
                               _CFG + "notifications.slack_webhook_url"),

@@ -1278,6 +1278,34 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "write_back": False,      # opt-in: comment + type-matched state move
             "poll_interval": "5m",    # floor 60s enforced at the serve hook
         },
+        "monday": {
+            # Polled item intake, same role as `jira`/`linear` above.
+            # MONDAY_API_TOKEN lives in ~/.no_human/.env, never in this
+            # world-readable file.
+            #
+            # THE ONE REAL DIFFERENCE FROM JIRA AND LINEAR, and why this block
+            # looks nothing like the one above it: Jira and Linear expose a
+            # TYPED workflow state, so "pull the backlog" means the same thing
+            # on every workspace. monday does not — a status column is a bag of
+            # user-defined labels ("Ready for Dev", "Fixing", "Known Bug", ...)
+            # that differs per board, and nothing in the API says which of them
+            # means "not started yet". So the label→meaning mapping is stated
+            # HERE, explicitly, and is never inferred from label text or colour.
+            # With board_id/status_column unset the adapter RAISES rather than
+            # returning nothing, because a silent empty result is
+            # indistinguishable from an empty board.
+            "enabled": False,
+            "board_id": "",           # which board to pull from (numeric id, as a string)
+            "status_column": "",      # the status column's ID, e.g. "bug_status" —
+                                      # NOT its title. Discover with:
+                                      #   boards { columns { id title type } }
+            "todo_labels": [],        # labels meaning "not started yet", e.g. ["Ready for Dev"]
+            "in_progress_label": "",  # optional: label to move to when work starts
+            "done_label": "",         # optional: label to move to on completion
+            "default_repo": "",       # where polled-in tasks run
+            "write_back": False,      # opt-in: update (comment) + status-label move
+            "poll_interval": "5m",    # floor 60s enforced at the serve hook
+        },
         "circleci": {
             "enabled": False, "org_slug": "", "project": "",
             # CIRCLECI_TOKEN in ~/.no_human/.env

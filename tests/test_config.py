@@ -108,7 +108,7 @@ def test_load_config_null_integrations_section_does_not_crash(tmp_path):
     cfg = load_config(cfg_path)
     assert cfg.data.get("integrations") is None  # shadowed to null, as documented
     from no_human.integrations import list_integrations
-    assert len(list_integrations(cfg.data)) == 8  # registry tolerates it
+    assert len(list_integrations(cfg.data)) == 9  # registry tolerates it
 
 
 def test_load_config_rejects_api_key(tmp_path):

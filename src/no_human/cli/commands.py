@@ -2520,6 +2520,22 @@ async def _linear_poll_loop(poller, stop, poll_interval: int) -> None:
             pass
 
 
+async def _monday_poll_loop(poller, stop, poll_interval: int) -> None:
+    """Tick the monday poller every ``poll_interval`` seconds until ``stop`` is
+    set. A sibling of ``_jira_poll_loop``/``_linear_poll_loop`` rather than a
+    shared helper, matching the precedent those two already set: each tracker
+    keeps its own patchable seam and its own log label."""
+    while not stop.is_set():
+        try:
+            await poller.tick()
+        except Exception as exc:  # noqa: BLE001 — never kill serve on a monday hiccup
+            console.print(f"[red]monday poll error[/] {exc}")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=poll_interval)
+        except asyncio.TimeoutError:
+            pass
+
+
 @cli.command("serve")
 @click.option("--max-workers", type=int, default=None,
               help="Run the pool with this many workers for this invocation, "
@@ -2662,6 +2678,27 @@ def serve(max_workers):
                 console.print(f"[green]Linear intake[/] team={linear_cfg.get('team_key') or '?'} "
                               f"poll={linear_secs}s")
                 coros.append(_linear_poll_loop(linear_poller, stop, linear_secs))
+
+            # monday.com intake: same role again. The console line names the
+            # BOARD and the STATUS COLUMN rather than a team key, because those
+            # two are what monday intake actually depends on — it has no typed
+            # workflow state, so an unset status column means it cannot run.
+            monday_cfg = (config.data.get("integrations") or {}).get("monday") or {}
+            if monday_cfg.get("enabled"):
+                from ..config import load_env_var
+                from ..intake.monday import MondayAdapter
+                from ..intake.monday_poll import MondayPoller
+                load_env_var("MONDAY_API_TOKEN")  # from ~/.no_human/.env into the process env
+                monday_secs = max(60, int((parse_duration(str(monday_cfg.get("poll_interval", "5m")))
+                                           or parse_duration("5m")).total_seconds()))
+                monday_poller = MondayPoller(
+                    MondayAdapter(config.data), store, config=config.data,
+                    on_event=lambda k, t: console.print(f"[cyan]◆ {k}[/] {t}"))
+                console.print(
+                    f"[green]monday intake[/] board={monday_cfg.get('board_id') or '?'} "
+                    f"status_column={monday_cfg.get('status_column') or '?'} "
+                    f"poll={monday_secs}s")
+                coros.append(_monday_poll_loop(monday_poller, stop, monday_secs))
 
             # Slack intake (SCRUM-60, foundation only — no @mention handlers
             # attached yet, that's SCRUM-61/62): Socket-Mode worker, opt-in via
@@ -4228,6 +4265,34 @@ def start(host, port, workers, no_open):
                 console.print(f"[yellow]Linear intake failed to start[/] {exc}")
                 linear_task = linear_stop = None
 
+        # monday.com intake: same shape, same opt-in discipline, sharing the
+        # same store — its own stop event so no tracker's failure can take
+        # another down.
+        monday_task = None
+        monday_stop = None
+        monday_cfg = (config.data.get("integrations") or {}).get("monday") or {}
+        if monday_cfg.get("enabled"):
+            try:
+                from ..config import load_env_var
+                from ..intake.monday import MondayAdapter
+                from ..intake.monday_poll import MondayPoller
+                load_env_var("MONDAY_API_TOKEN")  # from ~/.no_human/.env into the process env
+                monday_secs = max(60, int((parse_duration(str(monday_cfg.get("poll_interval", "5m")))
+                                           or parse_duration("5m")).total_seconds()))
+                monday_poller = MondayPoller(
+                    MondayAdapter(config.data), store, config=config.data,
+                    on_event=lambda k, t: console.print(f"[cyan]◆ {k}[/] {t}"))
+                console.print(
+                    f"[green]monday intake[/] board={monday_cfg.get('board_id') or '?'} "
+                    f"status_column={monday_cfg.get('status_column') or '?'} "
+                    f"poll={monday_secs}s")
+                monday_stop = asyncio.Event()
+                monday_task = asyncio.create_task(
+                    _monday_poll_loop(monday_poller, monday_stop, monday_secs))
+            except Exception as exc:  # noqa: BLE001 — optional integration, never break `start`
+                console.print(f"[yellow]monday intake failed to start[/] {exc}")
+                monday_task = monday_stop = None
+
         try:
             await server.serve()
         finally:
@@ -4243,6 +4308,12 @@ def start(host, port, workers, no_open):
                     await asyncio.wait_for(linear_task, timeout=10)
                 except asyncio.TimeoutError:
                     linear_task.cancel()
+            if monday_task is not None:
+                monday_stop.set()
+                try:
+                    await asyncio.wait_for(monday_task, timeout=10)
+                except asyncio.TimeoutError:
+                    monday_task.cancel()
             # Ownership: this store was handed to the app via
             # `_external_store`; `lifespan` (api/app.py) skips closing it for
             # exactly this reason, so `start()` — the one that opened it — is

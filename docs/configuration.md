@@ -49,6 +49,7 @@ credential at runtime, no_human escalates a `MISSING_ACCESS` blocker naming the
 | `ANTHROPIC_API_KEY` | Only when `llm.auth_mode: api_key` — the operator's own metered key, BYO-API-key billing (see below). Never set otherwise. |
 | `JIRA_API_TOKEN` | Jira intake (`integrations.jira.enabled: true`). An Atlassian Cloud API token; auth is HTTP Basic `integrations.jira.email` + this token. See [adapters.md](adapters.md#jira). |
 | `LINEAR_API_KEY` | Linear intake (`integrations.linear.enabled`). Create at Linear → Security & access settings. |
+| `MONDAY_API_TOKEN` | monday.com intake (`integrations.monday.enabled`). Create at monday.com → Administration → Connections → API. Sent raw as `Authorization`, not `Bearer`. See [adapters.md](adapters.md#mondaycom-specifics). |
 | `JENKINS_USER`, `JENKINS_API_TOKEN` | Repos whose CI is Jenkins (`build.example.com`) or human-gated on a `Jenkinsfile`. Basic auth — the default `ci.auth: token` mode. |
 | `SSO_USERNAME`, `SSO_PASSWORD` | Jenkins controllers that reject API-token basic auth, i.e. `ci.auth: cookie`. Used once to capture a session cookie. |
 | `CIRCLECI_TOKEN` | `ci.backend: circleci`. A CircleCI personal API token; sent as the `Circle-Token` header. |
@@ -114,6 +115,20 @@ integrations:
     label: ""                     # optional: only issues carrying this label
     default_repo: ""
     write_back: false             # opt-in: comment + type-matched state move
+    poll_interval: 5m             # floor 60s
+  monday:                         # polled intake; off by default
+    # monday has NO typed workflow state — a status column is user-defined
+    # labels that differ per board — so the label→meaning mapping is stated
+    # here explicitly and is never inferred. With board_id/status_column unset
+    # the adapter RAISES rather than silently returning nothing.
+    enabled: false
+    board_id: ""                  # numeric board id, as a string
+    status_column: ""             # the column's ID (e.g. bug_status), NOT its title
+    todo_labels: []               # labels meaning "not started", e.g. ["Ready for Dev"]
+    in_progress_label: ""         # optional: label to move to when work starts
+    done_label: ""                # optional: label to move to on completion
+    default_repo: ""
+    write_back: false             # opt-in: update (comment) + status-label move
     poll_interval: 5m             # floor 60s
   circleci:                       # CI status source; off by default
     enabled: false

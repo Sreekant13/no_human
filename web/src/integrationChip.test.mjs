@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { statusChip, KIND_LABEL, BRAND_COLOR, NAME_LABEL, CONFIG_HINT } from "./integrationChip.js";
 
 // Must match integrations/__init__.py `_ORDER`.
-const ALL = ["jira", "linear", "github", "gitlab", "jenkins", "circleci",
-             "slack", "teams"];
+const ALL = ["jira", "linear", "monday", "github", "gitlab", "jenkins",
+             "circleci", "slack", "teams"];
 
 test("statusChip maps the four non-ambient states", () => {
   assert.deepEqual(statusChip({ configured: false }), { label: "Unconfigured", tone: "neutral" });
@@ -86,12 +86,31 @@ test("KIND_LABEL covers every integration kind", () => {
   }
 });
 
-test("BRAND_COLOR / NAME_LABEL / CONFIG_HINT cover every integration", () => {
+test("NAME_LABEL / CONFIG_HINT cover every integration", () => {
   for (const name of ALL) {
-    assert.match(BRAND_COLOR[name], /^#[0-9A-Fa-f]{6}$/, `brand color: ${name}`);
     assert.ok(NAME_LABEL[name], `name label: ${name}`);
     assert.ok(CONFIG_HINT[name], `config hint: ${name}`);
   }
   assert.equal(NAME_LABEL.circleci, "CircleCI");   // proper casing, not "Circleci"
   assert.equal(NAME_LABEL.teams, "Microsoft Teams");
+  // Lowercase, because that is how the vendor writes it — and because the
+  // `NAME_LABEL[name] || name` fallback would render "monday" anyway, so an
+  // entry that merely capitalised it would be a change, not a label.
+  assert.equal(NAME_LABEL.monday, "monday.com");
+});
+
+// BRAND_COLOR is deliberately NOT required to cover ALL. It renders nothing —
+// integrationIcons.jsx paints every glyph in one neutral app accent, precisely
+// so a generic shape in a vendor's registered colour beside that vendor's name
+// stops being a claim about that company (TRADEMARK.md). Growing it with each
+// new integration would re-establish the habit the removal was meant to end.
+// What still has to hold is that every entry it DOES carry is a well-formed
+// hex, so the dead record cannot rot into something that renders wrong if it
+// is ever revived.
+test("every BRAND_COLOR entry is a well-formed hex", () => {
+  const entries = Object.entries(BRAND_COLOR);
+  assert.ok(entries.length > 0);
+  for (const [name, hex] of entries) {
+    assert.match(hex, /^#[0-9A-Fa-f]{6}$/, `brand color: ${name}`);
+  }
 });

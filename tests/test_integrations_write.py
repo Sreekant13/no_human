@@ -178,8 +178,8 @@ def test_config_yaml_nonsecret_round_trip_preserves_unrelated_keys(tmp_path):
 
 
 def test_field_specs_cover_every_integration():
-    assert set(FIELD_SPECS) == {"jira", "linear", "github", "gitlab", "jenkins",
-                                "circleci", "slack", "teams"}
+    assert set(FIELD_SPECS) == {"jira", "linear", "monday", "github", "gitlab",
+                                "jenkins", "circleci", "slack", "teams"}
     for name, specs in FIELD_SPECS.items():
         for spec in specs:
             assert bool(spec.env_var) != bool(spec.config_path), name
