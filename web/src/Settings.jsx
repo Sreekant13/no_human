@@ -86,7 +86,7 @@ function UpdatesPanel() {
     if (action === "install") return run(() => desktop?.installUpdate?.());
     if (action === "later") return run(() => desktop?.deferUpdate?.(update?.latest));
     if (action === "download-page") {
-      window.open("https://github.com/eyalgolan/no_human/releases", "_blank",
+      window.open("https://github.com/no-human-ai/no_human/releases", "_blank",
         "noopener,noreferrer");
       return undefined;
     }
