@@ -165,5 +165,5 @@ module.exports = {
   // Generates latest-mac.yml locally. `--publish never` on every script means
   // nothing is ever uploaded; this block only tells the updater where to LOOK
   // once a release exists.
-  publish: [{ provider: "github", owner: "eyalgolan", repo: "no_human" }],
+  publish: [{ provider: "github", owner: "no-human-ai", repo: "no_human" }],
 };
