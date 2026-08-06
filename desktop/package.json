@@ -34,6 +34,7 @@
       "updater.mjs",
       "updatePolicy.mjs",
       "updateState.mjs",
+      "themeState.mjs",
       "error.html",
       "token.html",
       "package.json"

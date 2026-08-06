@@ -86,6 +86,10 @@ export function BrowserWindow(opts) {
     onceHandlers: {},
     shown: 0,
     on() {}, show() { win.shown += 1; }, focus() {}, hide() {},
+    // RECORDS: a no-op double would let the live theme re-colour be deleted
+    // with the suite green, and the win32 title-bar controls would silently
+    // keep the previous theme's colours until the app restarted.
+    setTitleBarOverlay(o) { win.overlay = o; },
     isDestroyed: () => false, isMinimized: () => false, restore() {},
   };
   win.opts = opts || {};

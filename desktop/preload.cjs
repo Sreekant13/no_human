@@ -53,4 +53,10 @@ contextBridge.exposeInMainWorld("nhDesktop", {
   downloadUpdate: () => ipcRenderer.invoke("nh:update-download"),
   installUpdate: () => ipcRenderer.invoke("nh:update-install"),
   deferUpdate: (version) => ipcRenderer.invoke("nh:update-defer", version),
+  // The board's light/dark choice, mirrored to the main process. It is the
+  // renderer that owns the theme (localStorage), but only the main process can
+  // colour the window frame and the Windows title-bar controls — and it has to
+  // do that before any renderer exists, so it needs its own copy. One-way: the
+  // main side accepts "dark" or "light" and returns nothing but {ok}.
+  setTheme: (theme) => ipcRenderer.invoke("nh:set-theme", theme),
 });

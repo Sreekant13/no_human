@@ -21,6 +21,7 @@ import { buildMenuTemplate } from "./menu.mjs";
 import { createUpdater } from "./updater.mjs";
 import { updateMessage } from "./updatePolicy.mjs";
 import { readUpdateState, writeUpdateState } from "./updateState.mjs";
+import { normalizeTheme, readTheme, themeColors, writeTheme } from "./themeState.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -571,11 +572,66 @@ ipcMain.handle("nh:update-defer", async (_event, version) => {
   return u.defer(version);
 });
 
+/**
+ * The win32 title-bar overlay for a theme. On win32 `hiddenInset` degrades to a
+ * frameless window with NO controls, so this overlay IS the minimise/maximise/
+ * close buttons: its colour has to track the window's and its symbolColor has to
+ * stay legible against it. The height is what the board reserves for its drag
+ * region — moving it here alone leaves a dead or undraggable strip.
+ */
+function overlayFor(theme) {
+  const { bg, symbol } = themeColors(theme);
+  return { color: bg, symbolColor: symbol, height: 40 };
+}
+
+// The board's light/dark choice, mirrored where the MAIN process can read it —
+// see createWindow for why a copy has to exist at all. Board-driven like the
+// update handlers above, and safe there for the same reason, held to a stricter
+// line: the only values that reach disk are the two literals normalizeTheme
+// admits, so no path, URL or credential can pass through this channel whatever
+// the page sends.
+ipcMain.handle("nh:set-theme", (_event, value) => {
+  const theme = normalizeTheme(value);
+  if (!theme) return { ok: false };
+  const saved = writeTheme(app.getPath("userData"), theme);
+  // The live window, not only the next one. themeSource re-colours Electron's
+  // own chrome immediately; the win32 overlay is fixed at creation, so without
+  // this the title bar keeps the old theme until the app restarts.
+  nativeTheme.themeSource = theme;
+  if (process.platform === "win32" && win && !win.isDestroyed()) {
+    // Throws if the window was not created with a titleBarOverlay. Losing the
+    // recolour is cosmetic and self-corrects next launch; throwing out of an
+    // IPC handler is not.
+    try { win.setTitleBarOverlay(overlayFor(theme)); } catch { /* next launch */ }
+  }
+  return { ok: true, saved };
+});
+
 async function createWindow() {
-  const dark = nativeTheme.shouldUseDarkColors;
-  // Pre-paint color follows the OS theme — a light-mode launch used to flash
-  // dark before first paint (shell audit, 2026-07-17).
-  const bg = dark ? "#0F1117" : "#F4F5F7";
+  // THE SHELL FOLLOWS THE APP, NOT THE OS.
+  //
+  // This read used to be `nativeTheme.shouldUseDarkColors`, with a comment
+  // saying the OS-following colour was there because a light-mode launch flashed
+  // dark before first paint (shell audit, 2026-07-17). That was only ever true
+  // while the CONTENT followed the OS too. It does not: web/src/App.jsx defaults
+  // "nh-theme" to "dark" whatever the OS says. So on a light-mode Mac or PC the
+  // OS-following colour produced the mismatch it was written to prevent — a
+  // light window frame and light title-bar controls around a dark board.
+  //
+  // The honest trade-off, since a default cannot be right for everyone: a user
+  // who has toggled the board to LIGHT holds that in renderer localStorage,
+  // which nothing here can read before a window exists. Rather than hand that
+  // user the dark flash we just took away from the majority, the renderer
+  // mirrors every choice into theme.json (nh:set-theme, above) and startup reads
+  // it back. RESIDUAL, stated so nobody rediscovers it as a bug: the first
+  // launch after upgrading, for a user who had already chosen light, has no file
+  // yet and pre-paints dark once. Every launch after that is correct.
+  const theme = readTheme(app.getPath("userData"));
+  // Also drives Electron's OWN surfaces — traffic lights, native menus, and the
+  // `prefers-color-scheme` that this shell's token.html and error.html read.
+  // Left at "system" those stay light on a light-mode OS while the board is dark.
+  nativeTheme.themeSource = theme;
+  const { bg } = themeColors(theme);
   win = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -596,8 +652,7 @@ async function createWindow() {
       ? { titleBarStyle: "hiddenInset", trafficLightPosition: { x: 18, y: 18 } }
       : {}),
     ...(process.platform === "win32"
-      ? { titleBarStyle: "hidden",
-          titleBarOverlay: { color: bg, symbolColor: dark ? "#E6E8EC" : "#1A1D23", height: 40 } }
+      ? { titleBarStyle: "hidden", titleBarOverlay: overlayFor(theme) }
       : {}),
     webPreferences: {
       contextIsolation: true,

@@ -60,6 +60,10 @@ const EXPECTED = {
                // every packaged build read as unsigned and silently disable
                // updates, which is a failure nothing else would catch.
                "updater.mjs", "updatePolicy.mjs", "updateState.mjs", "package.json",
+               // The persisted light/dark choice. An undeclared themeState.mjs
+               // is ERR_MODULE_NOT_FOUND at launch in the packaged app, because
+               // main.mjs imports it statically for the pre-paint colour.
+               "themeState.mjs",
                "server.mjs", "error.html", "token.html"],
   // preload.cjs requires package.json for the app version it hands the board.
   "preload.cjs": ["package.json"],

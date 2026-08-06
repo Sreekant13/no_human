@@ -709,6 +709,11 @@ export default function App() {
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
     localStorage.setItem("nh-theme", theme);
+    // Desktop shell only. The main process paints the window frame (and, on
+    // Windows, the min/max/close buttons) before any renderer exists, so it
+    // cannot read the line above — it keeps its own copy and uses it on the
+    // NEXT launch. A browser has no bridge and skips this.
+    window.nhDesktop?.setTheme?.(theme);
   }, [theme]);
   // Desktop shell (Electron) marks itself via the preload bridge; the class
   // gates the inset-title-bar accommodations (drag region + traffic-light
