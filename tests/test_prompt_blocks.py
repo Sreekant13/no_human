@@ -34,7 +34,7 @@ def test_rules_block_core_discipline_always_present():
     r = build_rules_block("", "", None)
     assert "NEVER SKIP A TASK" in r
     assert "SMALLEST change" in r
-    assert "Rank every decision 1–10" in r
+    assert "An unresolved gap is a" in r
     # No test command → the generic fallback line, not the EARLY VERIFICATION one.
     assert "Run the project's test suite" in r
     assert "EARLY VERIFICATION" not in r
