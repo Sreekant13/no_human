@@ -2128,8 +2128,19 @@ async def test_the_escalating_route_fixtures_are_not_attributed_either(
 # built one. It was true: `grep -n "assumptions\|intake_qa"` over this file
 # returned nothing, while `_assumptions_section` interpolated five model- or
 # tracker-authored values raw, each of which rendered a live <h1> on GitHub.
+#
+# 🔴 `How I verified this` JOINED THE SET WHEN THE RECEIPTS SECTION LANDED, AND
+# IT IS A TEMPLATE HEADING FOR THE SAME REASON THE OTHERS ARE: `_pr_body`
+# emits the literal string `## How I verified this` itself (`orchestrator.py`,
+# `_verification_section`), on EVERY body, including the empty-receipts case
+# this file drives. It is not a value any channel of the body can author — the
+# command lines and their output are neutralised into inline code / fences
+# inside it, which is what `tests/test_verification_receipts.py` pins. Adding
+# it here widens the ALLOWED set by exactly one string the renderer hardcodes;
+# every coder-authored channel is still asserted to produce nothing outside it.
 _TEMPLATE_H2 = {"Task", "Acceptance criteria", "Implementation summary",
-                "Test evidence", "Review evidence", "Superseded PRs", "Stats",
+                "Test evidence", "How I verified this", "Review evidence",
+                "Superseded PRs", "Stats",
                 "⚠️ Assumptions & Open Questions"}
 
 

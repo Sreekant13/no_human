@@ -40,6 +40,7 @@ from ..agent.claude_backend import (
 )
 from ..agent.scope_guard import SCRATCH_DIR, is_agent_owned
 from ..agent.supervisor import SupervisorHook
+from ..agent.verification_receipts import KINDS
 from ..blockers import (
     Blocker,
     BlockerCategory,
@@ -2629,25 +2630,26 @@ class Orchestrator:
             )
             supervisor = None
             self._active_supervisor = None
-        if _can_hooks and (lint_hook is not None or scope_hook is not None):
-            # Combine lint + scope into a single composite PostToolUse hook
-            # since ClaudeBackend only accepts one lint_hook.
-            hooks = [h for h in (lint_hook, scope_hook) if h is not None]
-            if len(hooks) == 1:
-                extra["lint_hook"] = hooks[0]
-            elif hooks:
-                # Wrap multiple hooks into a composite
-                async def _composite_hook(
-                    input_data, tool_use_id, context, _hooks=hooks
-                ):
-                    for h in _hooks:
-                        result = await h.hook(input_data, tool_use_id, context)
-                        if result:
-                            return result
-                    return {}
-                class _CompositeHook:
-                    hook = staticmethod(_composite_hook)
-                extra["lint_hook"] = _CompositeHook()
+        # Verification receipts: a deterministic PostToolUse observer that
+        # records the command lines the session submitted to check itself, and
+        # what came back, so the PR can show a human evidence the model did not
+        # author. It records SUBMISSION, not execution of the check named in the
+        # line — see `_VERIFICATION_LIMITS`. Pure observer — it
+        # always returns {} and never touches the session.
+        receipt_hook = None
+        if _can_hooks:
+            from ..agent.verification_receipts import VerificationReceiptHook
+            receipt_hook = VerificationReceiptHook(
+                attempt_id=attempt_id,
+                persist=self.store.add_verification_receipt,
+                on_event=self.emit,
+            )
+
+        if _can_hooks:
+            composed = self._compose_post_tool_hooks(
+                receipt_hook, lint_hook, scope_hook)
+            if composed is not None:
+                extra["lint_hook"] = composed
 
         # PR-D: True skills delivery — materialize confirmed DB skills to
         # .claude/skills/<name>/SKILL.md so the SDK can load them. The VCS
@@ -3973,7 +3975,18 @@ class Orchestrator:
                     break
         except Exception as exc:  # noqa: BLE001 — evidence never blocks the PR
             self._advisory(f"test evidence missing from PR body: {exc}")
+        # "How I verified this": the receipts the PostToolUse observer captured
+        # while this attempt ran. Best-effort like the block above — evidence
+        # never blocks delivery — but note that an EMPTY list is not the same as
+        # a failed read: `_verification_section` renders the empty case loudly,
+        # which is the outcome a reviewer most needs to see.
+        receipts: list[dict] = []
+        try:
+            receipts = await self.store.list_verification_receipts(attempt_id)
+        except Exception as exc:  # noqa: BLE001
+            self._advisory(f"verification receipts missing from PR body: {exc}")
         body = self._pr_body(task, commit, result, test_evidence=test_evidence,
+                             receipts=receipts,
                              repo=repo, base=base, branch=branch,
                              attempt_n=attempt_n)
         # Labels are a per-repo concern, so a task may override the global
@@ -4064,6 +4077,12 @@ class Orchestrator:
             review_passed=1,
         )
 
+        # The same evidence, posted as a PR COMMENT. The body is what a reviewer
+        # reads on arrival; the comment is what reaches everyone already
+        # subscribed to the PR and what survives a later body rewrite.
+        await self._post_verification_comment(task, pr.url, receipts,
+                                              test_evidence=test_evidence)
+
         # PR-F Gate 3: open PRs for linked repos that had changes committed.
         linked_pr_urls: list[str] = []
         gh_hosts = self.config.get("git", {}).get("github_hosts")
@@ -4116,6 +4135,53 @@ class Orchestrator:
         return TaskOutcome(task, pr_url=pr.url, status=TaskStatus.AWAITING_APPROVAL,
                            detail="PR opened; awaiting human approval",
                            report=(result.final_text or "").strip())
+
+    #: Idempotency marker for the verification comment. An HTML comment: invisible
+    #: in the rendered PR, greppable in the raw body. Same discipline as
+    #: `jira_poll`'s `nh_synced_status` — a marker that is checked before the
+    #: write and set by the write itself — except that the marker lives ON THE
+    #: FORGE rather than in `task.context`, because that is the copy a resumed
+    #: task, a fresh database and a second process all agree on.
+    VERIFICATION_COMMENT_MARKER = "<!-- no_human:verification-receipts -->"
+
+    async def _post_verification_comment(
+        self, task: Task, pr_url: str, receipts: list[dict] | None,
+        *, test_evidence: dict | None = None,
+    ) -> bool:
+        """Post "How I verified this" as a PR comment. Never raises.
+
+        OUTBOUND ONLY. This writes to the forge and reads back nothing but the
+        marker — the existing comment bodies are compared against a constant and
+        then discarded. No forge text reaches a prompt, so the prompt-injection
+        boundary is unchanged: a PR comment still cannot become reviewer or
+        coder context through this path.
+        """
+        if not pr_url:
+            return False
+        from ..vcs.comment_poster import post_to_pr_once
+        try:
+            # Rendering is INSIDE the try: it walks coder-controlled text, and a
+            # raise here would escape after the PR is already open, turning a
+            # cosmetic failure into a failed delivery.
+            section = self._verification_section(
+                receipts, test_evidence=test_evidence,
+                observable=self._backend_is_observable())
+            body = f"{self.VERIFICATION_COMMENT_MARKER}\n{section}"
+            res = await asyncio.to_thread(
+                post_to_pr_once, pr_url, body, self.VERIFICATION_COMMENT_MARKER)
+        except Exception as exc:  # noqa: BLE001 — a comment never blocks delivery
+            self._advisory(f"verification comment not posted: {exc}")
+            return False
+        mode = res.get("mode")
+        if res.get("ok") and mode == "skipped_duplicate":
+            self.emit("verification_comment",
+                      f"already present on {pr_url}", status="skipped")
+        elif res.get("ok"):
+            self.emit("verification_comment", f"posted to {pr_url}", status="posted")
+        else:
+            self._advisory(
+                f"verification comment not posted ({mode}): {res.get('error', '')}")
+        return bool(res.get("ok"))
 
     # --------------------------- off-ramps --------------------------------- #
 
@@ -5950,7 +6016,24 @@ class Orchestrator:
             # 🔴 THE REAL commit AND result, not None. My first version passed None and
             # `_pr_body` does `result.final_text` — AttributeError, 75 tests. Both are in
             # scope by the time the gate runs.
+            # 🔴 RECEIPTS, NOT None. This body is the one the INDEPENDENT
+            # REVIEWER reads, and with `receipts=None` it always asserted "No
+            # verification evidence was captured ... treat every acceptance
+            # criterion as unverified" — a false statement fed straight to the
+            # gate, on every attempt, precisely where the evidence was worth
+            # most. `attempt_id` is in scope and the receipts are already stored
+            # by the time this runs. Best-effort like `_finalize`'s read: an
+            # empty list still renders loudly and honestly, so a store failure
+            # degrades to the old (safe) text rather than costing the draft.
+            draft_receipts: list[dict] = []
+            try:
+                draft_receipts = await self.store.list_verification_receipts(
+                    attempt_id)
+            except Exception as exc:  # noqa: BLE001
+                self._advisory(
+                    f"verification receipts missing from draft PR body: {exc}")
             body = self._pr_body(task, commit, result, test_evidence=None,
+                                 receipts=draft_receipts,
                                  repo=repo, base=base, branch=branch)
             # Ask the forge whether a PR is ALREADY open for this branch. If one is, this
             # run is not its author and must never rewrite its body (see below). The extra
@@ -11277,8 +11360,64 @@ SIX of them read a checkpoint and TWO do not — but do
             return self._NO_SUMMARY_BLOCK
         return self._reformat_summary_markdown(cleaned)
 
+    @staticmethod
+    def _ordered_post_tool_hooks(receipt_hook, lint_hook, scope_hook) -> list:
+        """The PostToolUse hooks, in the order they must run.
+
+        🔴 ORDER IS LOAD-BEARING, AND IT IS TESTED HERE RATHER THAN ASSERTED IN
+        A COMMENT. `_compose_post_tool_hooks` short-circuits on the first hook
+        that returns anything (that is how a single lint message reaches the
+        model instead of three). The receipt observer therefore has to be FIRST:
+        behind lint or scope it would stop running the moment either fired, and
+        receipts would go missing precisely on the attempts that had the most to
+        report. Moving it last leaves every other test in the suite passing,
+        which is why the property has its own.
+        """
+        return [h for h in (receipt_hook, lint_hook, scope_hook) if h is not None]
+
+    @classmethod
+    def _compose_post_tool_hooks(cls, receipt_hook, lint_hook, scope_hook):
+        """One PostToolUse callable for the backend, or None when there are no
+        hooks to install. ClaudeBackend accepts a single `lint_hook`."""
+        hooks = cls._ordered_post_tool_hooks(receipt_hook, lint_hook, scope_hook)
+        if not hooks:
+            return None
+        if len(hooks) == 1:
+            return hooks[0]
+
+        async def _composite_hook(input_data, tool_use_id, context, _hooks=hooks):
+            for h in _hooks:
+                result = await h.hook(input_data, tool_use_id, context)
+                if result:
+                    return result
+            return {}
+
+        class _CompositeHook:
+            hook = staticmethod(_composite_hook)
+
+        return _CompositeHook()
+
+    def _backend_is_observable(self) -> bool:
+        """Whether this run's coding backend exposes the per-tool-call hook that
+        receipts are captured through.
+
+        Derived from the live backend rather than persisted, so it cannot drift
+        from the object that actually ran. `codex_backend` sets
+        `post_tool_hooks=False`; absent `capabilities` (a test double) means the
+        Claude contract, which is what every pre-existing double assumes.
+
+        🔴 THIS MUST NOT RAISE. It is reached from `_pr_body`, which the DRAFT
+        PR path also builds — and that path swallows exceptions into an advisory.
+        Reading `self.backend` directly turned a missing attribute into "draft PR
+        not opened": an evidence feature silently costing a delivery. Every
+        lookup here is defensive for that reason, not for tidiness.
+        """
+        caps = getattr(getattr(self, "backend", None), "capabilities", None)
+        return bool(getattr(caps, "post_tool_hooks", True))
+
     def _pr_body(
         self, task: Task, commit, result, *, test_evidence: dict | None = None,
+        receipts: list[dict] | None = None,
         repo: "GitRepo | None" = None, base: str | None = None,
         branch: str | None = None, attempt_n: int | None = None,
     ) -> str:
@@ -11322,6 +11461,7 @@ SIX of them read a checkpoint and TWO do not — but do
             f"{self._superseded_section(task)}"
             f"## Implementation summary\n{self._summary_section(result)}\n\n"
             f"{self._test_evidence_section(test_evidence)}"
+            f"{self._verification_section(receipts, test_evidence=test_evidence, observable=self._backend_is_observable())}"
             f"{self._review_evidence_section(task, head_sha=head_sha, repo=repo)}"
             f"## Stats\n{stats['files_changed']} files, "
             f"+{stats['insertions']}/-{stats['deletions']}, {result.num_turns} turns."
@@ -11539,6 +11679,350 @@ SIX of them read a checkpoint and TWO do not — but do
             lines.append("- findings raised and addressed across rounds:")
             lines += [f"  - {a}" for a in addressed[:8]]
         return "## Review evidence\n" + "\n".join(lines) + "\n\n"
+
+    #: How many recorded commands are shown WITH their captured output, and how
+    #: many are listed at all. Both are needed: 200 receipts x a 1,200-character
+    #: excerpt does not fit in a PR body.
+    #:
+    #: THE OLD CAP BUCKETED BY VERDICT - all failures and unknowns, then passes
+    #: up to a limit - and that bucketing is gone with the verdict. What replaces
+    #: it hides nothing it does not name: the MOST RECENT commands are kept
+    #: (a coder's last runs are the ones that describe the final tree), and the
+    #: section states how many were dropped from each cap and what was dropped
+    #: from them. A command that is not shown with its output is still LISTED, so
+    #: the human always sees the full command line of the most recent
+    #: `_VERIFICATION_MAX_ENTRIES`.
+    _VERIFICATION_MAX_OUTPUTS = 12
+    _VERIFICATION_MAX_ENTRIES = 40
+
+    #: EVERYTHING this section cannot tell a reader, rendered IN FULL and
+    #: UNCONDITIONALLY. An independent review found 7 of 12 known limitations
+    #: were reachable only by reading the source, and two more only fired on
+    #: particular runs. A limitation the human cannot see is not disclosed, so
+    #: nothing here is conditional on the shape of a given attempt.
+    #:
+    #: MOST OF THE OLD LIST CAVEATED THE VERDICT and went with it. Five review
+    #: rounds shipped false prose here, so every sentence below is a statement
+    #: about the code as it now stands, and `test_the_limits_list_describes_the_
+    #: code_that_exists` holds each one against the module.
+    _VERIFICATION_LIMITS: tuple[str, ...] = (
+        "no interactive UI check was performed. no_human never drives a browser "
+        "at your change: the only page it drives is a CI server's login form, "
+        "and the only other browser it touches it hands a URL to (the local "
+        "board, a login link) without driving. So any `e2e` entry above is "
+        "the project's own harness printing its own result, not a "
+        "human-style walkthrough",
+        "an entry shows that a command LINE was submitted to the shell and what "
+        "came back - never that the check recognised inside it RAN, and never "
+        "that it was the RIGHT command. `pytest -k test_nothing` selects no "
+        "tests and prints a clean run; a type check over one file says nothing "
+        "about the rest",
+        "the text is the coder's. The session chose the command string, and "
+        "through `echo`/`printf` it can choose the output too. Both are shown as "
+        "inert text: what is attested is that this command line was submitted "
+        "to the shell and that this is what came back, not that any of it is "
+        "true",
+        "no entry ASSERTS a pass, a fail, or an exit status, and that is "
+        "deliberate. Deciding whether a zero exit belongs to the checked program "
+        "means parsing bash - `pytest -q | tail -3` exits with `tail`'s status - "
+        "and six independent reviews found a new way past every attempt. Where "
+        "the captured text below reads `Error: Exit code 1`, that is a line "
+        "IN THE OUTPUT and not a judgement this section made - and nothing "
+        "here can tell you whether the harness wrote it or the checked "
+        "program did. Read the output",
+        "nothing here checks that these commands exercise the diff; a suite that "
+        "never touches the changed files reads exactly the same, and no receipt "
+        "is compared against the files this PR changes",
+        "commands run inside a spawned subagent are deliberately excluded, so "
+        "work the coder delegated leaves no receipt here",
+        "only a command the HARNESS backgrounded leaves no receipt at all - it "
+        "hands back a task id instead of output, so there was nothing to "
+        "record. A trailing `&` YOU wrote is NOT that and is NOT excluded: "
+        "`pytest -q &` is recognised, recorded and headed `test` like any "
+        "other line, and bash forks it, so that entry names a check that may "
+        "still have been running when the harness returned",
+        "a command the harness refused to run (blocked, or permission denied) "
+        "leaves no receipt, because it never ran",
+        "only commands recognised as checks are recorded, and recognition reads "
+        "the command line ONLY - it never looks inside what a command runs. So "
+        "`bash -c 'uv run pytest -q'` leaves no receipt at all while `make test` "
+        "leaves one that names `make` and not the recipe it ran",
+        "recognition is also textual the other way: a check merely NAMED in a "
+        "heredoc body, or in a quoted string that happens to spell a shell "
+        "separator, can be recorded as though it ran",
+        "recognition cannot see CONTROL FLOW either: a recorded command line "
+        "may name a check the shell never reached, and it is still recorded, "
+        "still headed by that check's kind, and still counted as a recorded "
+        "command everywhere above. TEN SHAPES WERE DRIVEN against bash 3.2.57 "
+        "with the check replaced by a marker-printing stub, and the marker was "
+        "absent in every one: a failed `&&`, a taken `||`, an `exit`, an "
+        "`exec`, an `exit` inside a `source`d script, a syntax error that "
+        "aborts the REST of the line (what came BEFORE it does run), a "
+        "multi-line `if false`, a `case` that matches nothing, `set -e` "
+        "aborting an earlier command, and `set -u` on an unset variable. That "
+        "list is MEASURED, NOT EXHAUSTIVE - recognising any of it means parsing "
+        "bash, and this module is not bash. So a kind this section does NOT "
+        "list as missing is a kind some recorded line named, which is not the "
+        "same as a kind that ran",
+        "where the harness reported something instead of output - a timeout, an "
+        "interruption, its own wording of a non-zero exit - that report is "
+        "appended to the captured text in square brackets; the coder's own "
+        "output can spell the same thing, so it is text like everything else here",
+        "the COMMAND and the output are both redacted and bounded before they "
+        "are stored, so an excerpt is not the full log, a credential-shaped "
+        "string may have been masked out of either, and a command over 400 "
+        "characters is shortened in the middle",
+        "each command is displayed on ONE line: a multi-line command has its "
+        "newlines folded to spaces, so the string shown may not re-run as "
+        "written",
+        "invisible and direction-changing characters are stripped from the "
+        "command and the output before display, so what is shown can differ by "
+        "those characters from what ran; look-alike letters are NOT detected",
+        "no_human's own test run, CI, and the independent review are separate "
+        "signals - this section covers only the coder session's own commands",
+    )
+
+    @staticmethod
+    def _verification_section(
+        receipts: list[dict] | None, *, test_evidence: dict | None = None,
+        observable: bool = True,
+    ) -> str:
+        """"How I verified this" - rendered MECHANICALLY from captured receipts.
+
+        WHAT THIS SECTION IS. Every entry is a command LINE a PostToolUse
+        observer saw SUBMITTED to the shell, and the text the harness returned
+        for it. The model does not author an entry and cannot edit one after
+        the fact.
+
+        SUBMITTED, NOT EXECUTED, and this docstring said "confirms was
+        executed" for one round after the module itself was corrected. The
+        observer sees a tool call and its result; it does not see what bash
+        did with the line. The check `classify` recognised in the line may
+        never have been reached - `agent/verification_receipts.py` names ten
+        driven shapes, and the CONTROL FLOW entry of `_VERIFICATION_LIMITS`
+        prints them to the human.
+
+        WHAT IT DELIBERATELY IS NOT: a judgement. There is no PASS/FAIL/UNKNOWN
+        badge and no exit status, because the badge could not be made honest -
+        see `agent/verification_receipts.py` for the six review rounds and the
+        2.1% measurement that ended it. The human reads `1 failed, 42 passed`.
+
+        WHAT STILL HOLDS:
+
+        * The model CHOOSES the command string, and via `echo` it chooses the
+          output too, so both are rendered as untrusted text (`md_inline_code` /
+          `md_fence`). A review demonstrated the alternative: a command that
+          really ran emitted a fake `### Manual UI verification` heading with
+          hand-written PASS lines, inside the very section whose premise is that
+          the model did not write it. Neutralisation is what makes the premise
+          true; do not render a receipt field raw.
+        * An entry CAN be absent. HARNESS-backgrounded commands (the payload
+          carries a `backgroundTaskId` instead of output), unrecognised
+          commands, subagent commands and blocked commands all leave no
+          receipt. A trailing `&` YOU wrote is none of those: it is recorded
+          like any other line.
+          `_VERIFICATION_LIMITS` is the full list and it is rendered every time,
+          because a limitation only the source discloses is not disclosed.
+
+        UNLIKE every other section builder here, this one NEVER returns "".
+        An absent section reads as "nothing to report"; a present one that says
+        no evidence was captured reads as "nothing was checked". Those are
+        different facts, and the second is the one a reviewer needs.
+
+        ``observable=False`` says the backend cannot be watched at all (no
+        PostToolUse hooks), which is a third fact again - not "nothing ran".
+        """
+        from ..agent.verification_receipts import (
+            RECEIPT_CAP, kinds_in, md_fence, md_inline_code)
+
+        rows = [r for r in (receipts or []) if isinstance(r, dict)]
+        header = "## How I verified this\n"
+
+        if not observable and not rows:
+            return (
+                header
+                + "**This run's coding backend cannot be observed, so no "
+                  "verification evidence could be captured.** The backend "
+                  "exposes no per-tool-call hook, so no_human cannot see what "
+                  "the session ran. This is NOT a report that nothing was "
+                  "checked - it is a report that nothing could be recorded.\n\n"
+            )
+        if not rows:
+            return (
+                header
+                + "**No verification evidence was captured for this change.**\n"
+                  "Nothing was recorded as having been run to check it - treat "
+                  "every acceptance criterion as unverified and check it "
+                  "yourself.\n\n"
+            )
+
+        # THE TWO CAPS, applied to the tail. `rows` arrives in recorded order
+        # (`ORDER BY seq`), so the most recent entries are at the end - a
+        # coder's last runs are the ones that describe the tree it committed.
+        # Nothing selected away is silent: both counts are stated below.
+        def _cmds(n: int) -> str:
+            """`3 commands` / `1 command`. The `(s)` hedge was defensible
+            and inconsistent: one sentence agreed with its own count and
+            three beside it did not."""
+            return f"{n} command{'' if n == 1 else 's'}"
+
+        def _verb(n: int) -> str:
+            return "is" if n == 1 else "are"
+
+        def _poss(n: int) -> str:
+            return "its" if n == 1 else "their"
+
+        n_entries = Orchestrator._VERIFICATION_MAX_ENTRIES
+        n_outputs = Orchestrator._VERIFICATION_MAX_OUTPUTS
+        listed = rows[-n_entries:] if len(rows) > n_entries else list(rows)
+        unlisted = len(rows) - len(listed)
+        with_output = listed[-n_outputs:] if len(listed) > n_outputs else list(listed)
+        # Identity, not equality: two receipts can carry the same command and the
+        # same output, and `in` on dicts would then promote both.
+        shown_ids = {id(r) for r in with_output}
+        command_only = len(listed) - len(with_output)
+
+        lines: list[str] = [
+            f"{len(rows)} verification command(s) were recorded during this "
+            f"attempt. Each entry is the command AS RECORDED and the text the "
+            f"harness returned for it - \"as recorded\" and not \"exact\", "
+            f"because a long command is shortened and a multi-line one is "
+            f"folded onto a single line (see **Not verified**). **No entry "
+            f"ASSERTS a pass or a fail:** read the output. This is not "
+            f"necessarily everything the session ran.\n"
+        ]
+        # The observer stops recording at RECEIPT_CAP. Silence past the cap read
+        # as "that is everything". `>=` rather than `>` because the row count is
+        # all we have - exactly-at-the-cap and over-the-cap are indistinguishable
+        # here, and the honest reading of an ambiguous count is the cautious one.
+        if len(rows) >= RECEIPT_CAP:
+            lines.append(
+                f"**The per-attempt limit of {RECEIPT_CAP} recorded receipts "
+                f"was reached.** Any verification command after the "
+                f"{RECEIPT_CAP}th ran WITHOUT being recorded and is not "
+                f"represented anywhere below.\n")
+        if unlisted or command_only:
+            what: list[str] = []
+            if unlisted:
+                what.append(
+                    f"the {len(listed)} most recent are listed below and the "
+                    f"earliest {_cmds(unlisted)} recorded "
+                    f"{_verb(unlisted)} not listed at all")
+            if command_only:
+                what.append(
+                    f"the {len(with_output)} most recent of those listed are "
+                    f"shown with their captured output, and the other "
+                    f"{_cmds(command_only)} "
+                    f"{_verb(command_only)} shown as a command line only")
+            lines.append(f"**Not everything recorded is shown:** "
+                         f"{'; '.join(what)}.\n")
+
+        def _emit(heading: str, group: list[dict]) -> None:
+            lines.append(f"### {heading}")
+            for r in group:
+                lines.append(f"- {md_inline_code(str(r.get('command', '')))}")
+                if id(r) not in shown_ids:
+                    lines.append("  _output not shown - see the note above._")
+                    continue
+                excerpt = str(r.get("output_excerpt") or "").strip()
+                if not excerpt:
+                    lines.append("  _nothing was captured on stdout or stderr "
+                                 "for this command._")
+                    continue
+                tail = ""
+                if r.get("truncated"):
+                    tail = (f"  \n  _excerpt - {r.get('output_bytes', 0):,} "
+                            f"characters of output in total_")
+                lines.append(f"\n{md_fence(excerpt)}{tail}\n")
+            lines.append("")
+
+        for kind in KINDS:
+            group = [r for r in listed if str(r.get("kind")) == kind]
+            if not group:
+                # No heading for an empty group. An empty `### lint` reads as
+                # "lint ran and had nothing to say", which is a lie.
+                continue
+            _emit(kind, group)
+        # A row whose `kind` is outside KINDS was COUNTED in the header and
+        # rendered nowhere. `classify` cannot produce one, but the rows come from
+        # the database, and a count that nothing accounts for is the failure mode
+        # this section exists to avoid.
+        stray = [r for r in listed if str(r.get("kind")) not in KINDS]
+        if stray:
+            _emit("other", stray)
+
+        # THE GAPS. A reviewer's time is saved as much by knowing what was NOT
+        # checked as by what was. The first ones are computed from this attempt;
+        # everything after them is `_VERIFICATION_LIMITS`, rendered in full and
+        # unconditionally - see the note there.
+        # A kind counts as RECORDED when any recorded command line NAMES it, not
+        # merely when a receipt is labelled with it. One line yields one receipt,
+        # labelled by its first recognised check, so
+        # `uv run pytest -q\nuv run ruff check src/` is a single `test` receipt -
+        # and this list used to print "no ... `lint` ... command was recorded"
+        # directly beneath an entry showing `ruff check src/`.
+        # NAMES, not RUNS, and the difference is not pedantic: `kinds_in` reads
+        # the text of the line and models no control flow, so `pytest -q ||
+        # ruff check src/` names a lint bash only reaches when pytest FAILS.
+        # This list said "a recorded command line also RUNS lint" for it -
+        # driven against bash, pytest passing, ruff never executed. The claim
+        # this list may make is about the text; the limits list says the rest.
+        labelled = {str(r.get("kind")) for r in rows}
+        ran = set(labelled)
+        for r in rows:
+            ran |= kinds_in(str(r.get("command") or ""))
+        # A command over 400 characters is STORED with its middle omitted, so a
+        # check in the omitted part cannot be ruled out. Claiming it was never
+        # recorded would be the same false claim in a rarer shape.
+        elided = any("omitted from the middle" in str(r.get("command") or "")
+                     for r in rows)
+        gaps: list[str] = []
+        missing = [k for k in KINDS if k not in ran]
+        if missing and elided:
+            gaps.append(
+                "no command recognised as " + ", ".join(missing) + " was "
+                "recorded - and a recorded command is shown with its middle "
+                "omitted, so a check inside the omitted part cannot be ruled out")
+        elif missing:
+            gaps.append("no command recognised as " + ", ".join(missing)
+                        + " was recorded")
+        # The other half of the same fact: a check that shares its command line
+        # with another gets no entry of its own, and silence about that reads as
+        # "it was not run".
+        unlabelled = [k for k in KINDS if k in ran and k not in labelled]
+        if unlabelled:
+            gaps.append(
+                "a recorded command line also NAMES a check recognised as "
+                + ", ".join(unlabelled)
+                + ", but one command line yields ONE receipt - labelled by the "
+                  "first recognised check - so that check has no entry of its "
+                  "own above")
+        if unlisted:
+            gaps.append(f"the earliest {_cmds(unlisted)} recorded "
+                        f"{_verb(unlisted)} not listed above at all: only "
+                        f"the {len(listed)} most recent are listed")
+        if command_only:
+            gaps.append(f"{_cmds(command_only)} listed above "
+                        f"{_verb(command_only)} shown without "
+                        f"{_poss(command_only)} captured output: only the "
+                        f"{len(with_output)} most recent carry it")
+        gaps.extend(Orchestrator._VERIFICATION_LIMITS)
+        gaps.append(
+            f"at most {RECEIPT_CAP} receipts are recorded per attempt; past "
+            f"that the observer stops recording, and this section says so above "
+            f"when the limit was reached")
+        lines.append("**Not verified:** everything below is a limit of this "
+                     "section, listed whether or not it bit this attempt.\n")
+        lines.extend(f"- {g}" for g in gaps)
+        lines.append("")
+
+        if isinstance(test_evidence, dict) and (
+            test_evidence.get("ran") or test_evidence.get("layers")
+        ):
+            lines.append("See **Test evidence** above for the orchestrator's own "
+                         "test run.\n")
+
+        return header + "\n".join(lines) + "\n"
 
     @staticmethod
     def _test_evidence_section(test_evidence: dict | None) -> str:

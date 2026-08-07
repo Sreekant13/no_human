@@ -502,7 +502,11 @@ def test_pr_body_truncation_respects_the_cap_even_with_a_fence(store, tmp_path):
     result.final_text = "Intro.\n\n```python\n" + ("padding line here 1234\n" * 400)
     body = orch._pr_body(Task.new("t", repo_path="/r"), _Commit(), result)
     summary = body.split("## Implementation summary\n", 1)[1]
-    summary = summary.split("\n\n## Stats", 1)[0]
+    # Bounded by the NEXT heading, whichever it is. Splitting on "## Stats"
+    # specifically was only correct while nothing sat between the summary and
+    # the stats line; the evidence sections do, and the slice then measured
+    # them as if they were summary text.
+    summary = re.split(r"\n\n## ", summary, maxsplit=1)[0]
     assert len(summary) <= Orchestrator._SUMMARY_MAX_CHARS, (
         f"summary is {len(summary)} chars for a stated cap of "
         f"{Orchestrator._SUMMARY_MAX_CHARS}")

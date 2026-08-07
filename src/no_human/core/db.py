@@ -1499,6 +1499,44 @@ class Store:
         )
         return [dict(r) for r in rows]
 
+    @serialized_write
+    async def add_verification_receipt(self, attempt_id: str, receipt: Any) -> None:
+        """Append one verification receipt to *attempt_id*.
+
+        DELIBERATELY AN INSERT, not a field on the attempt row. `update_attempt`
+        writes `SET <col> = :<col>` — a whole-column REPLACE with no merge — so
+        a JSON column of receipts would have to be read-modify-written on every
+        captured tool call while `test_results`, the token counters and
+        `ci_status` are being written to the same row. Appending sidesteps that
+        race entirely: nothing this method writes can be clobbered by a later
+        update to a different column.
+        """
+        await self.db.execute(
+            "INSERT INTO verification_receipts (id, attempt_id, seq, kind, "
+            "command, output_excerpt, output_bytes, truncated) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                uuid.uuid4().hex,
+                attempt_id,
+                int(getattr(receipt, "seq", 0)),
+                str(receipt.kind),
+                str(receipt.command),
+                str(receipt.output_excerpt),
+                int(getattr(receipt, "output_bytes", 0)),
+                1 if getattr(receipt, "truncated", False) else 0,
+            ),
+        )
+        await self.db.commit()
+
+    async def list_verification_receipts(self, attempt_id: str) -> list[dict[str, Any]]:
+        """Every receipt for *attempt_id*, in execution order."""
+        rows = await self._fetchall(
+            "SELECT * FROM verification_receipts WHERE attempt_id = ? "
+            "ORDER BY seq, created_at",
+            (attempt_id,),
+        )
+        return [dict(r) for r in rows]
+
     async def attempts_by_task(self) -> dict[str, list[dict[str, Any]]]:
         """All attempts, grouped by task — ONE query.
 

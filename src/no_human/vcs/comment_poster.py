@@ -137,6 +137,70 @@ def set_pr_title(url: str, title: str) -> dict:
     return {"ok": ok, "error": err}
 
 
+def marker_present_on_pr(url: str, marker: str) -> tuple[bool, bool]:
+    """``(could_read, marker_found)`` for the comments already on *url*.
+
+    The first element is not decoration: a forge read that FAILED must not look
+    like "no comments there", or a transient error would licence a duplicate
+    post on every retry. Callers treat "could not read" as "do not post".
+
+    **Paginated.** A first version fetched `per_page=100` with no `--paginate`,
+    so on a PR with more than 100 comments the marker fell off page 1 and the
+    evidence comment was posted again on every delivery — the exact failure the
+    marker exists to prevent, appearing only on the busiest PRs.
+
+    The response is searched AS RAW TEXT rather than parsed into comment bodies.
+    That is deliberate on two counts: it is immune to how each forge nests a
+    body, and it means no third-party comment text is ever materialised in this
+    process. The only thing that crosses back is one boolean.
+    """
+    parsed = parse_pr_url(url)
+    if not parsed:
+        return False, False
+    forge, host, slug, number = parsed
+    if forge == "gitlab":
+        argv = ["glab", "api", "--hostname", host, "--paginate",
+                f"projects/{slug}/merge_requests/{number}/notes?per_page=100"]
+    else:
+        argv = ["gh", "api", "--hostname", host, "--paginate",
+                f"repos/{slug}/issues/{number}/comments?per_page=100"]
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        if p.returncode != 0:
+            return False, False
+    except Exception:  # noqa: BLE001 — unreadable is not empty
+        return False, False
+    # A marker embedded in a JSON string survives verbatim: it contains no
+    # character JSON escapes. Compare, then discard.
+    return True, (marker in (p.stdout or ""))
+
+
+def post_to_pr_once(url: str, body: str, marker: str) -> dict:
+    """Post *body* to *url* unless a comment carrying *marker* is already there.
+
+    ``marker`` is an HTML comment the caller embeds in *body* — invisible in the
+    rendered PR, greppable in the raw text. The forge is the source of truth
+    rather than a local flag: a resumed task, a re-run against a fresh database
+    or a second process all see the same posted comment, whereas a flag in
+    `task.context` only knows about the run that set it.
+
+    Returns the `post_to_pr` shape plus ``mode="skipped_duplicate"`` when the
+    marker was already present, and ``mode="unverifiable"`` when the existing
+    comments could not be read — in which case NOTHING is posted, because a
+    duplicated wall of evidence on every retry is worse than a missing one.
+    """
+    if marker and marker not in body:
+        return {"ok": False, "mode": None,
+                "error": "marker must be embedded in the body it guards"}
+    could_read, found = marker_present_on_pr(url, marker)
+    if not could_read:
+        return {"ok": False, "mode": "unverifiable",
+                "error": f"could not read existing comments on {url}; not posting"}
+    if found:
+        return {"ok": True, "mode": "skipped_duplicate", "error": ""}
+    return post_to_pr(url, body)
+
+
 def _gitlab_diff_refs(host: str, slug: str, number: int) -> dict | None:
     """The MR's {base_sha, start_sha, head_sha} — required to anchor an inline
     discussion to a diff line."""
