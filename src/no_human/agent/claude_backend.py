@@ -390,8 +390,14 @@ def _rollup_subagents(
 
 def _make_guard_hook(
     forbidden_paths: list[str], never_push_to: list[str], *, readonly: bool = False,
+    cwd: str | None = None,
 ) -> Callable[..., Awaitable[dict]]:
-    """Build a PreToolUse hook callback that applies the pure guard policy."""
+    """Build a PreToolUse hook callback that applies the pure guard policy.
+
+    ``cwd`` is the session's worktree (the SDK subprocess cwd) — the guard
+    resolves file-existence questions against it, never against the
+    orchestrator process's own cwd.
+    """
 
     async def hook(input_data: dict, tool_use_id: str | None, context: HookContext):
         decision = guard.evaluate(
@@ -400,6 +406,7 @@ def _make_guard_hook(
             forbidden_paths=forbidden_paths,
             never_push_to=never_push_to,
             readonly=readonly,
+            cwd=cwd,
         )
         if decision.allow:
             return {}
@@ -506,6 +513,7 @@ class ClaudeBackend:
                             self.forbidden_paths,
                             self.never_push_to,
                             readonly=self.readonly,
+                            cwd=str(cwd),
                         )
                     ],
                 )

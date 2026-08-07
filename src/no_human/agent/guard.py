@@ -11,6 +11,9 @@ Blocks, before execution:
     which is not how a PR gets merged.
   - destructive shell (`rm -rf`, history rewrites) — a circuit breaker that
     fires even under bypass permissions
+  - git that overwrites or discards WORKING-TREE content the agent did not
+    create (`git stash`, `git restore`, `git checkout -- <path>`, `git clean
+    -fd`, `git checkout-index -f`, ...) — in every session, coder included
   - interactive prompts (`AskUserQuestion`) — nobody is at the keyboard (§22)
   - background polling (`Monitor`, `TaskStop`, `ToolSearch`) in a read-only
     session — a planner does not need to busy-wait on its own subagents
@@ -239,12 +242,39 @@ def _looks_like_git_push(text: str) -> bool:
     return bool(re.search(r"\bgit\b.*\bpush\b", text, re.DOTALL))
 
 
+def _strip_wrappers(tokens: list[str]) -> list[str]:
+    """argv with leading `VAR=value` assignments and `_WRAPPERS` words removed.
+
+    A wrapper may carry its own flags and flag VALUES (`env -i`, `sudo -u me`),
+    and their option grammars differ per tool, so no attempt is made to parse
+    them: when what follows a wrapper still starts with a flag, the argv is
+    taken from the first token that names `git` or a shell runner — the only
+    argv[0] values any caller of this function acts on. Skipping the unparsed
+    middle can only widen what is analysed, never allow more.
+    """
+    i = 0
+    saw_wrapper = False
+    while i < len(tokens) and (
+        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[i])
+        or tokens[i] in _WRAPPERS
+    ):
+        saw_wrapper = saw_wrapper or tokens[i] in _WRAPPERS
+        i += 1
+    argv = tokens[i:]
+    if saw_wrapper and argv and argv[0].startswith("-"):
+        for j, tok in enumerate(argv):
+            name = PurePosixPath(tok).name
+            if name == "git" or name in _SHELL_RUNNERS:
+                return argv[j:]
+    return argv
+
+
 def _git_push_invocations(cmd: str, _depth: int = 0) -> list[tuple[str, list[str]]]:
     """Every `git ... push ...` invocation in ``cmd``, as (segment, argv).
 
-    Recurses one level into quoted arguments so `sh -c "git push origin $B"`
-    is analysed rather than dismissed because argv[0] is `sh`. Bounded depth —
-    a guard must not become a parser with unbounded work.
+    Recurses up to two levels into quoted arguments so `sh -c "git push origin
+    $B"` is analysed rather than dismissed because argv[0] is `sh`. Bounded
+    depth — a guard must not become a parser with unbounded work.
     """
     found: list[tuple[str, list[str]]] = []
     for seg in _CMD_SEP.split(cmd):
@@ -255,14 +285,7 @@ def _git_push_invocations(cmd: str, _depth: int = 0) -> list[tuple[str, list[str
             tokens = shlex.split(seg)
         except ValueError:
             tokens = seg.split()
-        # strip `VAR=value` assignments and wrapper words off the front
-        i = 0
-        while i < len(tokens) and (
-            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[i])
-            or tokens[i] in _WRAPPERS
-        ):
-            i += 1
-        argv = tokens[i:]
+        argv = _strip_wrappers(tokens)
         if argv and PurePosixPath(argv[0]).name == "git" and "push" in argv:
             found.append((seg, argv))
             continue
@@ -302,6 +325,331 @@ def _push_denial_reason(cmd: str, never_push_to: list[str]) -> str | None:
     return None
 
 
+# --------------------------------------------------------------------------- #
+# Destructive WORKING-TREE git — denied in EVERY session, the coder included.
+#
+# `_GIT_WRITE` above is applied only when `readonly` is set, so until now the
+# CODER could run `git stash`, `git restore`, `git checkout -- <path>` and
+# `git clean -fd` with nothing between it and the working tree but a sentence
+# in its prompt. Observed 2026-08-06, benchmark spec ns-1746bea3: the coder was
+# told "Do NOT run any git command", ran `git stash` then `git stash pop`,
+# popped a PRE-EXISTING unrelated stash, and left 1041 lines of a foreign app
+# in the working tree; its own `git reset -- <paths>` remediation only unstaged
+# them. The independent judge failed the spec. The guard never fired.
+#
+# THE PROPERTY ENCODED HERE — not a list of the six verbs that happened to hurt:
+#   never let git overwrite or discard working-tree content the agent did not
+#   create in this session.
+# A denylist of names cannot hold that property: the seventh spelling
+# (`git checkout-index -f`, `git read-tree -u`, `git sparse-checkout set`,
+# `git submodule update --force`, and whatever git adds next) is destructive on
+# arrival and unlisted by construction. So the polarity is INVERTED. A git
+# subcommand runs only if it is on `_GIT_WORKTREE_SAFE` — the subcommands that
+# *cannot* clobber the tree, because they only read, only touch the index/refs,
+# or only ADD content. Anything else is denied, including subcommands nobody
+# here has heard of. A missing entry costs the agent one denial with a stated
+# alternative; a missing DENYLIST entry costs a wiped working tree.
+#
+# That default-deny covers every git SUBCOMMAND — but only for invocations this
+# analysis can SEE, and the analysis is lexical, with the same limits as the
+# `git push` section above. What it follows: compound commands, `VAR=x` and
+# wrapper prefixes (wrapper FLAGS included — `env -i git stash`,
+# `sudo -u me git stash`), absolute paths to git, git's own global options, and
+# nested shell runners (`sh -c "git stash"`, `xargs git restore`) two levels
+# deep. What it cannot follow: an argv[0] the shell assembles at run time —
+# `g=git; $g stash`, `$(which git) stash`, a shell alias/function, or an
+# interpreter (`python -c "shutil.rmtree(...)"`, which needs no git at all).
+# A SUBCOMMAND produced by expansion (`git $(echo stash)`) IS refused, because
+# default-deny finds no safe subcommand to allow; a laundered argv[0] is out of
+# scope here, exactly as it is for push, where the pre-push hook is the
+# post-resolution backstop. This rule's backstop is narrower: the session's
+# worktree is disposable and the PR diff is reviewed, so what a laundered
+# invocation can destroy is bounded to the session's own copy.
+#
+# A dozen subcommands are genuinely dual-purpose — the same name is the coder's
+# legitimate workflow AND the destructive operation — so they get a form rule
+# rather than a verdict (`_GIT_DUAL_RULES`):
+#   checkout   `-b feature/x`, `feature/x`  ALLOWED · `-- path`, `.`, `-f`  DENIED
+#   switch     `-c x`, `x`                  ALLOWED · `--discard-changes`   DENIED
+#   reset      (no flag)/`--soft`/`--mixed` ALLOWED · `--hard/--merge/--keep` DENIED
+#   clean      `-n`/`--dry-run`             ALLOWED · every deleting form    DENIED
+#   worktree   `list`                       ALLOWED · add/remove/move        DENIED
+#   apply      a patch                      ALLOWED · `-R`/`--reverse`       DENIED
+#   merge / rebase / cherry-pick / revert / am / pull
+#              the operation, `--continue`  ALLOWED · `--abort`/`--skip`/
+#                                                     `--autostash`          DENIED
+# --------------------------------------------------------------------------- #
+
+#: git's OWN options, which sit before the subcommand. `git -C /repo stash` and
+#: `git --git-dir=x stash` must resolve to the subcommand `stash`, not to `-C`.
+#: These take a separate value word, so the word after them is skipped too.
+_GIT_GLOBAL_OPT_WITH_ARG = frozenset({
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path",
+    "--super-prefix", "--config-env", "--attr-source",
+})
+
+#: Subcommands that cannot overwrite or discard working-tree content: they read
+#: (status/log/diff/...), or they write only the index, refs or objects
+#: (add/commit/push/tag/...), or they add content that did not exist.
+#: merge/rebase/cherry-pick/revert/am/pull are NOT here: the operations refuse
+#: to START on a dirty tree, but their `--abort`/`--skip` forms restore the
+#: pre-operation state with `reset --hard` semantics — PROVEN destructive:
+#: after a conflicted merge, `git add survivor.txt; git merge --abort` deletes
+#: survivor.txt from disk — and `--autostash` stash-pops around the operation,
+#: which can drop or conflict uncommitted work. They carry a form rule in
+#: `_GIT_DUAL_RULES` instead. `rm`/`mv` delete or move files, but that is a
+#: deliberate authored edit — the same act as Write/Edit — and it is fenced
+#: separately by `_RM_TESTS` and `_RM_RF`.
+_GIT_WORKTREE_SAFE = frozenset({
+    # inspection
+    "status", "log", "diff", "show", "blame", "annotate", "describe",
+    "shortlog", "whatchanged", "reflog", "rev-parse", "rev-list", "ls-files",
+    "ls-tree", "ls-remote", "cat-file", "for-each-ref", "symbolic-ref",
+    "name-rev", "merge-base", "diff-tree", "diff-files", "diff-index", "grep",
+    "help", "version", "var", "count-objects", "check-ignore", "check-attr",
+    "check-ref-format", "verify-commit", "verify-tag", "verify-pack",
+    "patch-id", "range-diff", "cherry", "shortlog", "request-pull",
+    # index / refs / objects only
+    "add", "stage", "commit", "push", "branch", "tag", "fetch",
+    "mv", "rm", "notes",
+    "config", "remote", "init", "clone", "update-index", "update-ref",
+    "hash-object", "mktree", "commit-tree", "write-tree", "format-patch",
+    "bundle", "archive", "gc", "maintenance", "repack", "fsck", "stripspace",
+    "interpret-trailers", "column", "mailinfo", "send-email",
+})
+
+#: Leading words of a nested shell we look INSIDE, so `sh -c "git stash"` is
+#: analysed. Deliberately NOT "any token that mentions git" — that would deny
+#: `echo "never run git stash"` and `git commit -m "revert the git stash"`,
+#: which change nothing. argv[0] must actually be a runner.
+_SHELL_RUNNERS = frozenset({
+    "sh", "bash", "zsh", "dash", "ksh", "eval", "xargs", "timeout", "nice",
+    "stdbuf", "script", "watch", "flock",
+})
+
+#: A checkout/switch/restore operand that names FILES rather than a ref. The
+#: last clause is the load-bearing one: an operand that exists on disk is a
+#: path, whatever it looks like — which is exactly the case that destroys work.
+_PATHSPEC_GLOB = re.compile(r"[*?\[]")
+_HAS_EXTENSION = re.compile(r"\.[A-Za-z0-9_]+$")
+
+
+def _looks_like_pathspec(operand: str, cwd: str | None) -> bool:
+    if operand in (".", "..", "*") or operand.startswith(("./", "../", "/")):
+        return True
+    if operand.endswith("/") or _PATHSPEC_GLOB.search(operand):
+        return True
+    if _HAS_EXTENSION.search(operand.rsplit("/", 1)[-1]):
+        return True
+    # Existence must be resolved in the SESSION'S WORKTREE — the cwd the
+    # backend runs the command in — not this process's cwd, which is the
+    # orchestrator's checkout and shares nothing with the session. When no cwd
+    # is known, being wrong in one direction destroys work and in the other
+    # costs one denial with a stated alternative, so: assume it is a path.
+    if cwd is None:
+        return True
+    try:
+        return os.path.exists(os.path.join(cwd, operand))
+    except (OSError, ValueError):  # pragma: no cover - defensive
+        return False
+
+
+def _git_subcommand(argv: list[str]) -> tuple[str, list[str]]:
+    """(subcommand, remaining args) for a `git ...` argv, skipping git's own
+    global options and their values. ("", []) when there is no subcommand."""
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if not tok.startswith("-"):
+            return tok, argv[i + 1:]
+        if tok in _GIT_GLOBAL_OPT_WITH_ARG:
+            i += 2
+            continue
+        i += 1
+    return "", []
+
+
+def _git_invocations(cmd: str, _depth: int = 0) -> list[tuple[str, list[str]]]:
+    """Every `git ...` invocation in ``cmd``, as (segment, argv).
+
+    Splits on shell separators so `cd /x && git stash` and `false || git reset
+    --hard` are seen; strips `VAR=value` assignments and `_WRAPPERS` (their
+    flags included) so `X=1 env git stash` and `env -i git stash` are seen;
+    recurses up to two levels into nested shell runners so `sh -c "git stash"`
+    is seen. Bounded depth — a guard must not become a parser with unbounded
+    work.
+    """
+    found: list[tuple[str, list[str]]] = []
+    for seg in _CMD_SEP.split(cmd):
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            tokens = shlex.split(seg)
+        except ValueError:
+            tokens = seg.split()
+        argv = _strip_wrappers(tokens)
+        if not argv:
+            continue
+        name = PurePosixPath(argv[0]).name
+        if name == "git":
+            found.append((seg, argv))
+        elif name in _SHELL_RUNNERS and _depth < 2:
+            for j, tok in enumerate(argv[1:], start=1):
+                # `sh -c "git stash"` — the command is one quoted token.
+                if re.search(r"\bgit\s+\S", tok):
+                    found.extend(_git_invocations(tok, _depth + 1))
+                # `xargs git restore` / `timeout 30 git restore .` — the
+                # command is the rest of THIS argv, already tokenised.
+                elif PurePosixPath(tok).name == "git":
+                    found.append((seg, argv[j:]))
+                    break
+    return found
+
+
+def _checkout_clobbers(rest: list[str], cwd: str | None) -> bool:
+    """`git checkout` in its overwrite-the-working-tree form.
+
+    git's grammar is `checkout [<tree-ish>] [--] <pathspec>...` for the
+    destructive form and `checkout [-b <new>] <branch>` for the one the coder
+    needs. The discriminators, in order: a force/patch flag discards local
+    modifications whatever the operands are; a `--` or `--pathspec-from-file`
+    is the pathspec form by definition; a branch-creating flag is conclusively
+    the safe form; two bare operands are `<tree-ish> <pathspec>`; one bare
+    operand is destructive only if it names files rather than a ref — resolved
+    against ``cwd``, the session's worktree.
+    """
+    flags = [t for t in rest if t.startswith("-")]
+    if any(f in ("-f", "--force", "-p", "--patch", "--ours", "--theirs",
+                 "--overlay", "--no-overlay", "--overwrite-ignore")
+           or f.startswith("--pathspec-from-file")
+           for f in flags):
+        return True
+    if "--" in rest:
+        return True
+    if any(f in ("-b", "-B", "--orphan", "-t", "--track") for f in flags):
+        return False
+    operands = [t for t in rest if not t.startswith("-")]
+    if len(operands) >= 2:
+        return True
+    return bool(operands) and _looks_like_pathspec(operands[0], cwd)
+
+
+def _switch_clobbers(rest: list[str], cwd: str | None) -> bool:
+    return any(f in ("-f", "--force", "--discard-changes") for f in rest)
+
+
+def _reset_clobbers(rest: list[str], cwd: str | None) -> bool:
+    # --soft and --mixed (the default) never touch tracked files on disk;
+    # --hard, --merge and --keep all write the working tree from a commit.
+    return any(f in ("--hard", "--merge", "--keep") for f in rest)
+
+
+def _clean_clobbers(rest: list[str], cwd: str | None) -> bool:
+    # Only the dry run is not a deletion. `-n` may be bundled: `-nd`, `-ndx`.
+    return not any(
+        t == "--dry-run" or (t.startswith("-") and not t.startswith("--")
+                             and "n" in t)
+        for t in rest
+    )
+
+
+def _worktree_clobbers(rest: list[str], cwd: str | None) -> bool:
+    operands = [t for t in rest if not t.startswith("-")]
+    return not operands or operands[0] != "list"
+
+
+def _apply_clobbers(rest: list[str], cwd: str | None) -> bool:
+    # Applying a patch adds content; reversing one discards it.
+    return any(f in ("-R", "--reverse") for f in rest)
+
+
+def _sequencer_clobbers(rest: list[str], cwd: str | None) -> bool:
+    """merge/rebase/cherry-pick/revert/am/pull. The OPERATION refuses to start
+    on a dirty tree; what discards work is winding it back or wrapping it:
+    `--abort`/`--skip` restore the pre-operation state with `reset --hard`
+    semantics — after a conflicted merge, `git add survivor.txt; git merge
+    --abort` deletes survivor.txt from disk — and `--autostash` (a flag on
+    rebase, merge and pull) stash-pops around the operation, which can drop or
+    conflict uncommitted work. `--continue`/`--quit` leave the tree alone.
+
+    Matched as PREFIXES, not exact words: git's parse-options accepts any
+    unique abbreviation, so `git merge --abor` performs the same destruction
+    one character shorter. Every `--`-token at least three characters long
+    that is a prefix of a denied option is denied too; git itself rejects the
+    ambiguous ones, so the extra denials cost nothing. The CONFIG spelling of
+    autostash (`-c rebase.autostash=true`, or `git config` then a plain
+    `git rebase`) is not caught here — that is the config-side leg of the
+    same behavior, out of this lexical rule's reach like every other
+    non-argv spelling.
+    """
+    denied = ("--abort", "--skip", "--autostash")
+    for f in rest:
+        word = f.split("=", 1)[0]
+        if word.startswith("--") and len(word) >= 3 and any(
+                d.startswith(word) for d in denied):
+            return True
+    return False
+
+
+#: subcommand -> predicate saying whether THIS invocation clobbers the tree.
+_GIT_DUAL_RULES = {
+    "checkout": _checkout_clobbers,
+    "switch": _switch_clobbers,
+    "reset": _reset_clobbers,
+    "clean": _clean_clobbers,
+    "worktree": _worktree_clobbers,
+    "apply": _apply_clobbers,
+    "merge": _sequencer_clobbers,
+    "rebase": _sequencer_clobbers,
+    "cherry-pick": _sequencer_clobbers,
+    "revert": _sequencer_clobbers,
+    "am": _sequencer_clobbers,
+    "pull": _sequencer_clobbers,
+}
+
+_WORKTREE_ADVICE = (
+    "You may not overwrite or discard working-tree content you did not create "
+    "in this session. Leave other people's files alone: make your edits with "
+    "Write/Edit, and if a change of yours is wrong, edit it back. Branching, "
+    "committing, pushing and opening the PR are handled for you — you do not "
+    "need git for them. If you genuinely cannot proceed without this, stop and "
+    "emit a structured blocker report instead of running it."
+)
+
+
+def _git_worktree_denial(cmd: str, cwd: str | None = None) -> str | None:
+    """Why this command's git invocation must be denied, or None to allow it.
+
+    ``cwd`` is the SESSION's worktree — the directory the backend actually
+    runs the command in — used to resolve whether a bare checkout operand
+    names a file. This process's own cwd is the orchestrator's checkout and
+    is never consulted.
+    """
+    for seg, argv in _git_invocations(cmd):
+        sub, rest = _git_subcommand(argv)
+        if not sub:
+            continue
+        rule = _GIT_DUAL_RULES.get(sub)
+        if rule is not None:
+            if rule(rest, cwd):
+                return (
+                    f"destructive working-tree git blocked: {seg}. "
+                    f"`git {sub}` is allowed, but not in this form — this one "
+                    f"writes over or throws away files in the working tree. "
+                    + _WORKTREE_ADVICE
+                )
+            continue
+        if sub not in _GIT_WORKTREE_SAFE:
+            return (
+                f"working-tree-unsafe git blocked: {seg}. `git {sub}` is not "
+                f"one of the subcommands that provably cannot overwrite or "
+                f"discard working-tree content, so it is denied by default "
+                f"rather than allowed by omission. " + _WORKTREE_ADVICE
+            )
+    return None
+
+
 def _line_count(path: str) -> int:
     """Lines in a file, or 0 when unknowable (missing/binary/unreadable) —
     the guard must never fail a tool call because it could not stat a file."""
@@ -319,8 +667,15 @@ def evaluate(
     forbidden_paths: list[str],
     never_push_to: list[str],
     readonly: bool = False,
+    cwd: str | None = None,
 ) -> GuardDecision:
-    """Return allow/deny for a single proposed tool call."""
+    """Return allow/deny for a single proposed tool call.
+
+    ``cwd`` is the session's worktree — where the backend will actually run
+    the command — so file-existence questions (is `git checkout notes` a
+    branch switch or a wipe?) are answered about the right directory. Without
+    it the guard answers those questions conservatively (deny).
+    """
     # 0. Interactive prompts — denied in every role, readonly or not.
     if tool_name in INTERACTIVE_TOOLS:
         return GuardDecision(False, _NO_HUMAN_REASON.format(tool=tool_name))
@@ -392,6 +747,11 @@ def evaluate(
             return GuardDecision(False, f"destructive command blocked (rm -rf): {cmd}")
         if _GIT_DESTRUCTIVE.search(cmd):
             return GuardDecision(False, f"destructive git command blocked: {cmd}")
+        # Applies to EVERY session, coder included — see the block comment on
+        # `_git_worktree_denial`. `_GIT_WRITE` above only ever ran for readonly.
+        worktree_reason = _git_worktree_denial(cmd, cwd)
+        if worktree_reason:
+            return GuardDecision(False, worktree_reason)
         if _FORGE_MERGE.search(cmd):
             return GuardDecision(
                 False,

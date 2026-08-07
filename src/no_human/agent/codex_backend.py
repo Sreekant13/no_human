@@ -290,18 +290,21 @@ class CodexBackend:
 
     # ------------------------------------------------------------- events --
 
-    def _guard_events(self, tool_name: str, tool_input: dict) -> str | None:
+    def _guard_events(self, tool_name: str, tool_input: dict,
+                      cwd: str | None = None) -> str | None:
         """The guard's verdict on an ALREADY-EXECUTED tool call, or None.
 
         Same pure policy as the Claude path (``agent.guard.evaluate``) — the
         difference is entirely in the timing, and the caller acts on it by
-        killing the session rather than by denying the call.
+        killing the session rather than by denying the call. ``cwd`` is the
+        session's worktree, for the guard's file-existence questions.
         """
         decision = guard.evaluate(
             tool_name, tool_input,
             forbidden_paths=self.forbidden_paths,
             never_push_to=self.never_push_to,
             readonly=self.readonly,
+            cwd=cwd,
         )
         return None if decision.allow else decision.reason
 
@@ -560,7 +563,8 @@ class CodexBackend:
                     if event.kind == "tool_use":
                         turns += 1
                         reason = self._guard_events(
-                            event.tool_name or "", event.tool_input or {})
+                            event.tool_name or "", event.tool_input or {},
+                            cwd=str(cwd))
                         if reason:
                             denials.append(reason)
                             yield AgentEvent(

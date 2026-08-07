@@ -1,13 +1,22 @@
 """PreToolUse safety guard policy (PLAN.md Part 10)."""
 
+import os
+import tempfile
+
 from no_human.agent import guard
 
 FORBIDDEN = [".env", "secrets/", "*.key", "*.pem"]
 PROTECTED = ["main", "master", "release/*"]
 
+#: An empty stand-in for the session's worktree. In production the backend
+#: always passes the worktree it runs commands in; `_ev` mirrors that. Tests
+#: about the no-cwd conservative path call `guard.evaluate` directly.
+_WT = tempfile.mkdtemp(prefix="guard-session-wt-")
+
 
 def _ev(tool, inp):
-    return guard.evaluate(tool, inp, forbidden_paths=FORBIDDEN, never_push_to=PROTECTED)
+    return guard.evaluate(tool, inp, forbidden_paths=FORBIDDEN,
+                          never_push_to=PROTECTED, cwd=_WT)
 
 
 def test_allows_normal_edit():
@@ -330,3 +339,340 @@ def test_live_product_server_is_blocked_in_agent_sessions():
         # pattern requires nh at a command position. Assert help stays allowed.
         if cmd == "nh --help":
             assert d.allow, d.reason
+
+
+# --------------------------------------------------------------------------- #
+# Destructive WORKING-TREE git, for the CODER (not just readonly sessions).
+#
+# Observed 2026-08-06, benchmark spec ns-1746bea3: the coder — told "Do NOT run
+# any git command" — ran `git stash` then `git stash pop`, popped a PRE-EXISTING
+# unrelated stash, and left 1041 lines of a foreign Jira Forge app in the
+# working tree. Its `git reset -- <paths>` only unstaged them. The judge failed
+# the spec; the guard never fired, because `_GIT_WRITE` is applied only when
+# `readonly` is set and the coder is not readonly.
+#
+# `security/round6` regressed this same guard by testing ONE direction: a rule
+# added to kill false positives turned a total rule into a positional one and 8
+# previously-denied commands began to allow. So every case below is stated as a
+# PAIR — the destructive form must be denied AND the legitimate form of the same
+# subcommand must still run, since a guard that breaks `git commit` breaks the
+# product.
+# --------------------------------------------------------------------------- #
+
+#: (destructive form, legitimate form of the SAME subcommand)
+_WORKTREE_PAIRS = [
+    # the incident itself: every spelling of stash, none of which the coder needs
+    ("git stash", "git status"),
+    ("git stash pop", "git status --porcelain"),
+    ("git stash push -u", "git diff"),
+    ("git stash apply", "git diff --stat"),
+    ("git stash drop", "git log --oneline -5"),
+    ("git stash save wip", "git show HEAD"),
+    # reset: --hard/--merge/--keep write the tree, --soft/--mixed do not.
+    # NOTE `git reset --hard` with no argument escaped the pre-existing
+    # `_GIT_DESTRUCTIVE` regex, which requires a `\S` after `--hard`.
+    ("git reset --hard", "git reset"),
+    ("git reset --hard HEAD~3", "git reset --soft HEAD~1"),
+    ("git reset --merge", "git reset --mixed"),
+    ("git reset --keep origin/main", "git reset HEAD -- src/index.js"),
+    # checkout: the pathspec/force forms vs the branch forms
+    ("git checkout -- src/index.js", "git checkout -b feature/x"),
+    ("git checkout .", "git checkout feature/x"),
+    ("git checkout HEAD -- tests/", "git checkout -b x origin/main"),
+    ("git checkout main src/label.js", "git checkout main"),
+    ("git checkout -f feature/x", "git checkout -"),
+    ("git checkout -p", "git checkout --detach"),
+    ("git checkout --ours src/a.py", "git checkout --orphan gh-pages"),
+    ("git checkout src/index.js", "git checkout --track origin/topic"),
+    ("git checkout --pathspec-from-file=list.txt", "git checkout -B x"),
+    # switch has no pathspec form; only the discard flags are destructive
+    ("git switch --discard-changes", "git switch main"),
+    ("git switch -f main", "git switch -c feature/x"),
+    # restore is denied in every form (see the module's rule) — `git reset`
+    # unstages without touching the tree, so the coder loses nothing
+    ("git restore src/index.js", "git reset -- src/index.js"),
+    ("git restore --staged --worktree .", "git reset HEAD -- ."),
+    ("git restore .", "git status"),
+    # clean: only the dry run is not a deletion
+    ("git clean -fd", "git clean -n"),
+    ("git clean -fdx", "git clean --dry-run"),
+    ("git clean -d", "git clean -nd"),
+    # worktree: listing is a read, everything else moves trees around
+    ("git worktree remove ../wt", "git worktree list"),
+    ("git worktree add ../wt main", "git worktree list --porcelain"),
+    # apply adds content; reversing a patch discards it
+    ("git apply -R fix.patch", "git apply fix.patch"),
+]
+
+
+def test_destructive_worktree_git_blocked_and_legitimate_form_allowed():
+    for bad, good in _WORKTREE_PAIRS:
+        d = _ev("Bash", {"command": bad})
+        assert not d.allow, f"must be blocked: {bad}"
+        # Pin the NEW rule, not whichever check happens to fire first: a couple
+        # of these (`reset --hard <sha>`, `clean -fd`) are also caught by the
+        # older `_GIT_DESTRUCTIVE` regex, and a pair that passes only because of
+        # the old rule would prove nothing about this one.
+        assert guard._git_worktree_denial(bad, _WT) is not None, f"new rule missed: {bad}"
+        assert "working-tree" in guard._git_worktree_denial(bad, _WT)
+        g = _ev("Bash", {"command": good})
+        assert g.allow, f"must stay allowed: {good} — {g.reason}"
+        assert guard._git_worktree_denial(good, _WT) is None, \
+            f"new rule over-blocks: {good}"
+
+
+def test_worktree_rule_is_default_deny_not_a_name_list():
+    """The point of the rule: a spelling nobody enumerated is still denied.
+
+    None of these six appear in the incident report or in any denylist here.
+    They are refused because they are not on the list of subcommands that
+    provably CANNOT clobber the tree — which is the only shape of rule that
+    can catch the seventh spelling.
+    """
+    for cmd in (
+        "git checkout-index -f -a",
+        "git read-tree -u -m HEAD",
+        "git sparse-checkout set src",
+        "git submodule update --force",
+        "git rerere forget .",
+        "git mergetool",
+    ):
+        d = _ev("Bash", {"command": cmd})
+        assert not d.allow, f"must be blocked: {cmd}"
+        assert "not one of the subcommands" in d.reason, d.reason
+
+
+def test_worktree_rule_survives_wrappers_and_prefixes():
+    """`_WRAPPERS` and `VAR=value` prefixes must not launder the command."""
+    for cmd in (
+        "env git stash",
+        "X=1 git stash",
+        "X=1 env git restore .",
+        "sudo git clean -fd",
+        # wrapper FLAGS must not launder it either: `env -i` and `sudo -u me`
+        # once defeated the wrapper skip, which only advanced over exact words
+        "env -i git stash",
+        "sudo -n git reset --hard",
+        "sudo -u me git stash",
+        "env -i PATH=/usr/bin git restore .",
+        "nohup git stash pop",
+        "command git stash",
+        "exec git reset --hard",
+        "time git stash",
+        "builtin git stash",
+        "/usr/bin/git stash",
+        "/opt/homebrew/bin/git restore .",
+        # git's OWN global options sit before the subcommand
+        "git -C /repo stash",
+        "git --git-dir=/r/.git stash",
+        "git -c user.name=x stash pop",
+        # a nested shell, and a runner that takes the argv directly
+        "sh -c 'git stash'",
+        'bash -lc "git checkout -- ."',
+        "xargs git restore",
+        "timeout 30 git restore .",
+        'eval "git stash"',
+        "eval git stash",
+        # a subcommand produced by shell expansion is unreadable here, so
+        # default-deny refuses it rather than guessing it is harmless
+        "git $(echo stash)",
+        "git `echo stash`",
+    ):
+        assert not _ev("Bash", {"command": cmd}).allow, f"must be blocked: {cmd}"
+
+
+def test_worktree_rule_survives_compound_commands():
+    for cmd in (
+        "cd /x && git stash",
+        "git stash; git pull",
+        "false || git reset --hard",
+        "git status && git stash",
+        "make test | git stash",
+        "echo hi\ngit clean -fd",
+    ):
+        assert not _ev("Bash", {"command": cmd}).allow, f"must be blocked: {cmd}"
+
+
+def test_worktree_rule_does_not_break_the_coder_or_fire_on_prose():
+    """The other direction, at width. Applying `_GIT_WRITE` wholesale to the
+    coder would deny every one of these, which is why the narrow rule exists.
+    """
+    for cmd in (
+        "git commit -m 'fix'", "git commit --amend --no-edit",
+        "git push -u origin no-human/abc123", "git merge origin/dev",
+        "git add -A", "git add src/index.js", "git mv a.py b.py",
+        "git branch -a", "git branch feature/x", "git branch -d old",
+        "git rebase origin/main", "git cherry-pick abc123",
+        "git revert abc123", "git tag v1", "git fetch origin",
+        "git pull --rebase", "git am < patch",
+        "git blame src/x.py", "git rev-parse HEAD", "git ls-files",
+        "git grep TODO", "git describe --tags", "git merge-base main HEAD",
+        "git config user.name", "git remote -v", "git reflog",
+        "git shortlog -sn", "git for-each-ref refs/heads",
+        "git cat-file -p HEAD", "git format-patch -1",
+        # the guard reads argv, so git words inside a MESSAGE are just text
+        "git commit -m 'never run git stash again'",
+        "echo 'do not run git stash'",
+        "grep -rn 'git checkout --' docs/",
+        # and it must ignore anything that is not git at all
+        "pytest -q", "ls -la", "python3 -m pytest tests/test_guard.py",
+    ):
+        d = _ev("Bash", {"command": cmd})
+        assert d.allow, f"must stay allowed: {cmd} — {d.reason}"
+
+
+def test_worktree_denial_tells_the_agent_what_to_do_instead():
+    """A denial with no alternative is retried until the attempt dies."""
+    d = _ev("Bash", {"command": "git stash"})
+    # the property, stated to the agent in the words it must act on
+    assert "overwrite or discard working-tree content you did not create" in d.reason
+    assert "Write/Edit" in d.reason
+    assert "blocker report" in d.reason
+
+
+def test_checkout_operand_that_exists_on_disk_is_a_pathspec(tmp_path):
+    """The load-bearing half of pathspec detection, and the one a lexical rule
+    cannot get right from spelling alone: `git checkout notes` is a branch
+    switch if `notes` is a ref and a WIPE if `notes` is a file on disk. An
+    operand with no slash and no extension is treated as a ref UNLESS it exists
+    — which is exactly the case where being wrong destroys work.
+
+    Existence is resolved against the ``cwd`` the caller passes (the session's
+    worktree, in production) — deliberately NO chdir here: the guard runs in
+    the orchestrator process, whose own cwd is a different repo entirely.
+    """
+    (tmp_path / "notes").write_text("someone else's work\n")
+    (tmp_path / "vendored").mkdir()
+
+    def ev(cmd):
+        return guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                              never_push_to=PROTECTED, cwd=str(tmp_path))
+
+    for cmd in ("git checkout notes", "git checkout vendored"):
+        d = ev(cmd)
+        assert not d.allow, f"must be blocked, it exists on disk: {cmd}"
+        assert "working-tree" in d.reason
+
+    # Same spelling, nothing of that name in the worktree: a ref, and it runs.
+    for cmd in ("git checkout release-notes", "git checkout topic"):
+        assert ev(cmd).allow, cmd
+
+
+def test_checkout_existence_resolves_against_worktree_not_orchestrator_cwd(
+        tmp_path, monkeypatch):
+    """`evaluate` runs in the ORCHESTRATOR process; the command runs in the
+    SESSION's worktree (the SDK subprocess cwd). A check against the
+    orchestrator's cwd is inert in production — it answers about the wrong
+    directory in both directions. Here the two disagree both ways and the
+    verdict must follow the worktree every time.
+    """
+    worktree = tmp_path / "session-wt"
+    worktree.mkdir()
+    (worktree / "vendored").mkdir()
+    orch = tmp_path / "orchestrator-cwd"
+    orch.mkdir()
+    (orch / "notes").write_text("exists only where the command does NOT run\n")
+    monkeypatch.chdir(orch)  # the orchestrator's cwd, which must NOT matter
+
+    def ev(cmd):
+        return guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                              never_push_to=PROTECTED, cwd=str(worktree))
+
+    # Exists in the worktree, absent from the orchestrator cwd: a WIPE — deny.
+    assert not os.path.exists("vendored")
+    d = ev("git checkout vendored")
+    assert not d.allow, "worktree file invisible: existence resolved in wrong cwd"
+    assert "working-tree" in d.reason
+
+    # Exists only in the orchestrator cwd, absent from the worktree: a ref.
+    assert os.path.exists("notes")
+    assert ev("git checkout notes").allow, \
+        "orchestrator-cwd file leaked into the session's verdict"
+
+
+def test_bare_checkout_without_a_known_cwd_is_conservatively_denied():
+    """No ``cwd``, no existence answer — and a wrong 'it's a ref' answer
+    destroys work while a wrong 'it's a path' answer costs one denial. So a
+    bare operand is denied, and the forms that are safe by GRAMMAR (branch
+    creation, detach) stay allowed without any cwd at all.
+    """
+    def ev(cmd):
+        return guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                              never_push_to=PROTECTED)  # no cwd
+
+    for cmd in ("git checkout notes", "git checkout feature/x"):
+        d = ev(cmd)
+        assert not d.allow, f"must be denied without a cwd to resolve it: {cmd}"
+        assert "working-tree" in d.reason
+    for cmd in ("git checkout -b feature/x", "git checkout --detach",
+                "git checkout --track origin/topic"):
+        assert ev(cmd).allow, cmd
+
+
+# --------------------------------------------------------------------------- #
+# merge/rebase/cherry-pick/revert/am/pull — the resume/abort machinery.
+#
+# These five verbs (plus pull, which drives merge or rebase) were first put on
+# `_GIT_WORKTREE_SAFE` wholesale, justified as "refuse to run on a dirty tree".
+# PROVEN false for their wind-back forms: after a conflicted merge,
+#   git add survivor.txt && git merge --abort
+# deletes survivor.txt from disk — `--abort` restores the pre-merge state with
+# `reset --hard` semantics, staged uncommitted files included. Same class:
+# `rebase --abort/--skip`, `cherry-pick --abort/--skip`, `revert --abort`,
+# `am --abort/--skip`, and `--autostash` (rebase/merge/pull), whose stash-pop
+# can drop or conflict uncommitted work. Asserted as PAIRS like everything
+# else here: the wind-back form denied, the operation itself still allowed.
+# --------------------------------------------------------------------------- #
+
+_SEQUENCER_PAIRS = [
+    # the proven counterexample first
+    ("git merge --abort", "git merge origin/dev"),
+    ("git merge --autostash origin/dev", "git merge --no-ff origin/dev"),
+    ("git rebase --abort", "git rebase origin/main"),
+    ("git rebase --skip", "git rebase --continue"),
+    ("git rebase --autostash origin/main", "git rebase main"),
+    ("git cherry-pick --abort", "git cherry-pick abc123"),
+    ("git cherry-pick --skip", "git cherry-pick --continue"),
+    ("git revert --abort", "git revert abc123"),
+    ("git revert --skip", "git revert --continue"),
+    ("git am --abort", "git am --continue"),
+    ("git am --skip", "git am patch.mbox"),
+    ("git pull --rebase --autostash", "git pull --rebase"),
+    ("git pull --autostash", "git pull origin dev"),
+    # git accepts unique option abbreviations, so the denial must be a prefix
+    # match: `--abor` performs the proven counterexample one character shorter.
+    ("git merge --abor", "git merge origin/dev"),
+    ("git rebase --sk", "git rebase --strategy=ours origin/main"),
+    ("git rebase --au origin/main", "git rebase --autosquash origin/main"),
+    ("git cherry-pick --ab", "git cherry-pick abc123"),
+]
+
+
+def test_sequencer_abort_skip_autostash_denied_and_plain_forms_allowed():
+    for bad, good in _SEQUENCER_PAIRS:
+        d = _ev("Bash", {"command": bad})
+        assert not d.allow, f"must be blocked: {bad}"
+        assert guard._git_worktree_denial(bad, _WT) is not None, \
+            f"new rule missed: {bad}"
+        assert "working-tree" in d.reason
+        g = _ev("Bash", {"command": good})
+        assert g.allow, f"must stay allowed: {good} — {g.reason}"
+        assert guard._git_worktree_denial(good, _WT) is None, \
+            f"new rule over-blocks: {good}"
+
+
+def test_gits_own_global_options_do_not_break_legitimate_commands():
+    """`-C <dir>` / `-c k=v` are git's options, not the subcommand. Failing to
+    skip them makes the rule read `/repo` as the subcommand — which default-deny
+    then refuses, so this misreading is invisible in the deny direction and
+    only shows up as the coder's own reads being blocked.
+    """
+    for cmd in ("git -C /repo status", "git -C /repo log --oneline",
+                "git -c user.name=x commit -m y", "git --git-dir=/r/.git log",
+                "git --work-tree=/r status", "git -c core.pager=cat diff"):
+        d = _ev("Bash", {"command": cmd})
+        assert d.allow, f"must stay allowed: {cmd} — {d.reason}"
+    # ...and the same options must not launder the destructive form either.
+    for cmd in ("git -C /repo stash", "git -c user.name=x stash pop",
+                "git --git-dir=/r/.git restore ."):
+        assert not _ev("Bash", {"command": cmd}).allow, cmd
