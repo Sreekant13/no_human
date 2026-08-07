@@ -359,8 +359,41 @@ test("the app ships the brand icon, not Electron's stock atom", () => {
   const icns = path.join(here, "build", "icon.icns");
   assert.ok(fs.existsSync(icns), "desktop/build/icon.icns is missing");
   // icns magic bytes, so a truncated or mislabeled file cannot pass.
-  const head = fs.readFileSync(icns).subarray(0, 4).toString("latin1");
-  assert.equal(head, "icns", "desktop/build/icon.icns is not an icns file");
+  const buf = fs.readFileSync(icns);
+  assert.equal(buf.subarray(0, 4).toString("latin1"), "icns",
+    "desktop/build/icon.icns is not an icns file");
+
+  // ...and the SIZE TABLE, because magic bytes alone are blind to appearance.
+  // The mark that shipped until 2026-08-07 carried NINE variants and no 1024
+  // (`ic10`); macOS uses that one for Finder's largest preview and Quick Look,
+  // and an icns without it silently upscales the 512. Walking the TOC costs
+  // nothing and turns "is this an icns" into "is this OUR icns, at every size
+  // the platform asks for". It is deliberately a table of OSTypes rather than a
+  // pixel assertion: this file has no image decoder and must not grow one.
+  //
+  // It does NOT stand alone. `RELEASE_MANIFEST.txt` pins this file's sha256 and
+  // `scripts/export_guard.py verify` runs per-PR and on every push to main, so
+  // swapping in a different app's icon already fails there (measured: reverting
+  // to main's icon makes that gate exit 1). This assertion catches the case the
+  // hash pin cannot — a revert that also re-derives the manifest.
+  const REQUIRED = ["ic04", "ic05", "ic07", "ic08", "ic09",
+                    "ic10", "ic11", "ic12", "ic13", "ic14"];
+  const present = [];
+  let off = 8;
+  const total = buf.readUInt32BE(4);
+  while (off + 8 <= Math.min(total, buf.length)) {
+    const type = buf.toString("ascii", off, off + 4);
+    const len = buf.readUInt32BE(off + 4);
+    if (len < 8 || off + len > buf.length) break;
+    present.push(type);
+    off += len;
+  }
+  assert.ok(present.length >= 10,
+    `the icns TOC walk found only ${present.length} entries - it did not parse`);
+  const missing = REQUIRED.filter((t) => !present.includes(t));
+  assert.deepEqual(missing, [],
+    `desktop/build/icon.icns is missing size variant(s) ${missing.join(", ")}; ` +
+    "the brand mark ships every size the platform asks for");
 });
 
 
