@@ -4092,6 +4092,17 @@ class Orchestrator:
         task.context = ctx
         await self.store.update_task(task)
 
+        # PR OUTCOME telemetry (migration 0010). "Success" here has only ever
+        # meant "reached AWAITING_APPROVAL/DONE" — i.e. a PR EXISTED — and
+        # nothing asked what became of it. Record the PRs now, at the one
+        # instant their existence is certain; `wake.py`'s awaiting-approval
+        # ladder and `nh pr-outcomes refresh` update the outcome later, because
+        # a PR merges hours after the run that opened it has ended.
+        # `record_pr_opened` never raises: telemetry may not fail a delivery.
+        from ..vcs.pr_outcome import record_pr_opened
+        for _url in (pr.url, *linked_pr_urls):
+            await record_pr_opened(self.store, task.id, _url)
+
         await self.store.set_status(task, TaskStatus.AWAITING_APPROVAL)
         self.emit("pr_open", pr.url, pr_kind=pr.kind, status="awaiting_approval")
         self.notifier.notify(

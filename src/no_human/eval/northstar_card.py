@@ -1109,6 +1109,21 @@ def render_northstar_md(card: NorthStarCard,
         f"  - of which {_delivered} DELIVERED a change and {_gated_ok} correctly "
         f"ESCALATED — 'satisfied' counts an honest refusal as the right outcome, "
         f"which it is, but only the first group shipped anything",
+        # DELIVERED IS NOT MERGED, and this corpus structurally cannot tell you
+        # whether anything merged: bench specs push to a local bare repo (the
+        # `local-pr://` path in vcs/__init__.py), so there is no forge to ask
+        # and no merge to observe. Stated here, in the tracked report, because
+        # this is the file the headline percentage is read from — and the
+        # defect being guarded against is precisely a number that measured what
+        # was easy to compute being read as the thing that was asked. The real
+        # merge figures come from `nh pr-outcomes show` over actual runs; no
+        # number from that population is copied into this file, because this
+        # file must stay reproducible from `latest.json` alone.
+        "  - ⚠️ **`DELIVERED` means a change was produced, NOT that it merged.** "
+        "These specs run against a local bare-repo remote with no forge, so "
+        "this corpus can never show a merge rate — do not read the headline as "
+        "one. For what actually landed, and what that does and does not "
+        "establish, run `nh pr-outcomes show` (real runs only).",
         f"  - {_trials_note}",
         f"- **Median COST ratio (price-weighted, cache-aware): "
         f"{agg['median_cost_ratio'] if agg['median_cost_ratio'] is not None else 'n/a'}**"

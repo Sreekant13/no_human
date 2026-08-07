@@ -686,6 +686,36 @@ async def _git_rc(repo_path: str, *args: str) -> tuple[int, str]:
     return proc.returncode, out.decode("utf-8", "replace").strip()
 
 
+async def refs_resolvable(repo_path: str, *refs: str) -> bool:
+    """Whether every ``ref`` names something git can resolve in ``repo_path``.
+
+    A PRECONDITION probe, not a fate probe. ``default_branch_shipped`` below
+    deliberately collapses "the content is not on base" and "the check could
+    not run" into a single ``False``, because its one production caller must
+    never see a false "shipped". That is the right default for a caller that
+    ACTS on the answer, and the wrong one for a caller that RECORDS it: a
+    merged PR whose head branch was deleted afterwards — the common case, since
+    a squash-merged branch has no further use — makes ``merge-base`` fail, and
+    a recorder that trusted the resulting ``False`` would write "closed without
+    merging" as a settled verdict about a PR that in fact landed.
+
+    So telemetry asks this first and treats an unresolvable ref as "cannot
+    tell" (``None``) rather than as evidence of absence. Uses ``rev-parse
+    --verify`` with a trailing ``^{commit}`` so a ref that exists but does not
+    name a commit is not mistaken for one.
+    """
+    if not repo_path:
+        return False
+    for ref in refs:
+        if not ref:
+            return False
+        rc, _ = await _git_rc(repo_path, "rev-parse", "--verify", "--quiet",
+                              f"{ref}^{{commit}}")
+        if rc != 0:
+            return False
+    return True
+
+
 async def default_branch_shipped(repo_path: str, branch: str, base: str = "main") -> bool:
     """Whether ``branch``'s changes are actually present in ``base``, checked
     by tree CONTENT rather than commit ancestry.

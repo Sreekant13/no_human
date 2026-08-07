@@ -25,6 +25,7 @@ from typing import Any, Awaitable, Callable
 
 from ..core.db import Store
 from ..core.task import Task, TaskStatus
+from ..vcs.pr_outcome import observe_pr
 from .taxonomy import Blocker, resume_checkpoint, resume_provenance
 
 log = logging.getLogger("no_human.wake")
@@ -622,6 +623,7 @@ class WakeWatcher:
         if await self._is_terminal(task):
             return None
         if state == "MERGED":
+            await observe_pr(self.store, task.id, url, forge_state=state)
             await self.store.set_status(task, TaskStatus.DONE, validate=False)
             await self._emit(task, "merged", f"{task.id[:8]} PR merged by a human: {url}")
             return "merged"
@@ -635,6 +637,33 @@ class WakeWatcher:
             # escalating, ask git (not GitHub) whether the branch's content is
             # actually present on its base — that's true regardless of how
             # the commit graph got there.
+            # FOR THE PR-OUTCOME RECORD ONLY — the escalation behaviour below is
+            # deliberately unchanged.
+            #
+            # `observed_shipped` is True or None, NEVER False, and that is not
+            # an oversight. `default_branch_shipped` is documented to return
+            # False for BOTH "the content is not on base" and "the check could
+            # not run" (missing repo, deleted branch, unrelated histories) —
+            # "callers must treat False as 'can't tell'". That collapse is
+            # correct for the escalation decision, which only needs to never
+            # see a false "shipped" and has a human on the other end of it.
+            #
+            # It is wrong for a RECORD. `closed_unmerged` is a SETTLED outcome,
+            # so it is never re-polled; writing one from an ambiguous False
+            # would permanently file a PR as "closed without merging" on the
+            # strength of a git command that failed. The likeliest cause of
+            # that failure is the branch being gone — which is what happens
+            # AFTER a successful squash merge, and after the task's temporary
+            # worktree is cleaned up. The mistake would therefore land hardest
+            # on exactly the PRs that did merge, i.e. it would invert the
+            # number this table exists to produce.
+            #
+            # So the watcher records only what it is certain of. A False leaves
+            # the row `unknown`, which is UNSETTLED, so `nh pr-outcomes refresh`
+            # re-polls it later with a probe that can tell the two cases apart
+            # (`pr_outcome.probe_shipped`). Nothing is lost, and nothing is
+            # asserted that was not observed.
+            observed_shipped: bool | None = None
             if self._pr_shipped is not None:
                 ctx = task.context or {}
                 branch = ctx.get("pr_branch")
@@ -642,6 +671,7 @@ class WakeWatcher:
                 if task.repo_path and branch:
                     try:
                         shipped = await self._pr_shipped(task.repo_path, branch, base)
+                        observed_shipped = True if shipped else None
                     except Exception as exc:  # noqa: BLE001 — a checker error must not crash the watcher
                         log.warning("pr_shipped check failed for %s: %s", task.id[:8], exc)
                         shipped = False
@@ -652,6 +682,8 @@ class WakeWatcher:
                     if await self._is_terminal(task):
                         return None
                     if shipped:
+                        await observe_pr(self.store, task.id, url,
+                                         forge_state=state, shipped=True)
                         await self.store.set_status(task, TaskStatus.DONE, validate=False)
                         await self._emit(
                             task, "shipped",
@@ -659,6 +691,8 @@ class WakeWatcher:
                             f"{base} (squash-merged): {url}",
                         )
                         return "shipped_pr_closed"
+            await observe_pr(self.store, task.id, url, forge_state=state,
+                             shipped=observed_shipped)
             data = task.blocker or {}
             data["category"] = "AMBIGUITY"
             data["question"] = (
@@ -671,6 +705,14 @@ class WakeWatcher:
             await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
             await self._emit(task, "pr_closed", f"{task.id[:8]} PR closed unmerged: {url}")
             return "escalated_pr_closed"
+
+        # Neither merged nor closed: the PR is OPEN, or its state could not be
+        # read at all. Record that too — an `open` that is genuinely open and an
+        # `unknown` the poll could not resolve are different facts, and the
+        # whole point of this table is that the second one never counts as the
+        # first. `checks=None`: this rung did not fetch CI, so whatever a
+        # previous refresh measured stays.
+        await observe_pr(self.store, task.id, url, forge_state=state)
 
         acted = await self._check_pr_conflict(task, url)
         if acted:

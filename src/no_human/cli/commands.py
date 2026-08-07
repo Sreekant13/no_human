@@ -2887,6 +2887,97 @@ def autonomy(days):
     asyncio.run(_go())
 
 
+@cli.group("pr-outcomes")
+def pr_outcomes_group():
+    """What actually happened to the PRs (migration 0010).
+
+    `nh autonomy` counts tasks that reached a reviewable state. It never asks
+    whether the PR merged. These two commands do.
+    """
+
+
+@pr_outcomes_group.command("show")
+@click.option("--days", default=None, type=int,
+              help="Only include tasks created in the last N days.")
+def pr_outcomes_show(days):
+    """Delivered vs merged vs unknown, as separate figures.
+
+    Reads only what has been recorded — it never contacts the forge, so it is
+    safe and instant offline. Run `nh pr-outcomes refresh` to update the
+    recorded outcomes first.
+    """
+    config, _ = _bootstrap(require_auth=False)
+    from ..core.autonomy import compute_pr_outcome_metrics, render_pr_outcome_lines
+
+    async def _go():
+        async with Store(config.db_path) as store:
+            rep = await compute_pr_outcome_metrics(store, days=days)
+            console.rule(f"[bold]pr outcomes — {f'last {days}d' if days else 'all time'}")
+            for line in render_pr_outcome_lines(rep):
+                console.print(escape(line), markup=False)
+
+    asyncio.run(_go())
+
+
+@pr_outcomes_group.command("refresh")
+@click.option("--limit", default=200, type=int, show_default=True,
+              help="Maximum rows to re-poll in one invocation.")
+def pr_outcomes_refresh(limit):
+    """Re-poll every UNSETTLED recorded PR against the forge.
+
+    THIS IS THE MANUAL REFRESH TRIGGER. A PR merges hours or days after the run
+    that opened it ended, so the outcome written at PR-open time is a snapshot
+    of "open" and nothing else. Two things update it:
+
+    \b
+      * the wake watcher, automatically, while `nh serve` is running and the
+        task is still AWAITING_APPROVAL;
+      * this command, for everything the watcher cannot see — tasks that have
+        already gone terminal (DONE/ESCALATED/FAILED), and rows recorded while
+        the machine was offline.
+
+    If NEITHER ever runs, recorded outcomes simply stay as they were: mostly
+    `open` or `unknown`. Nothing decays into a success — `unknown` is never
+    counted as merged — so a stale table under-reports merges and never
+    over-reports them.
+
+    Needs `gh` and network. Without them every poll returns "unknown", which is
+    recorded as unknown and leaves any already-known outcome untouched.
+    """
+    config, _ = _bootstrap(require_auth=False)
+    from ..vcs.pr_outcome import UNKNOWN, refresh_outcomes
+    from ..vcs.pr_watcher import default_pr_checks, default_pr_state
+
+    async def _go():
+        async with Store(config.db_path) as store:
+            async def _shipped(pr_url: str, task_id: str):
+                # Resolve the CLOSED ambiguity the only way that is honest: ask
+                # git about the task's OWN repo and branch, and return None
+                # (not False) whenever that cannot be done. See
+                # `pr_outcome.probe_shipped`.
+                from ..vcs.pr_outcome import probe_shipped
+                task = await store.get_task(task_id)
+                if task is None:
+                    return None
+                ctx = task.context or {}
+                return await probe_shipped(task.repo_path, ctx.get("pr_branch"),
+                                           ctx.get("base_branch") or "main")
+
+            tally = await refresh_outcomes(
+                store, pr_state=default_pr_state, pr_checks=default_pr_checks,
+                shipped_probe=_shipped, limit=limit)
+            total = sum(tally.values())
+            console.print(f"[green]re-polled[/] {total} unsettled PR row(s)")
+            for name, n in tally.items():
+                console.print(f"  {escape(name):<18} {n}")
+            if tally.get(UNKNOWN):
+                console.print(
+                    "[dim]`unknown` rows stay unsettled and will be re-polled "
+                    "next time; they are never counted as merged.[/]")
+
+    asyncio.run(_go())
+
+
 @cli.command("recall")
 @click.argument("query")
 @click.option("--limit", default=8, help="Max matches to show.")
@@ -5643,6 +5734,7 @@ def bench_report(reviewer_recall: bool):
     card = NorthStarCard.load(RESULTS_DIR / "latest.json")
     if card is None:
         console.print("[yellow]no results yet — run `nh bench run` first[/]")
+        _print_pr_outcome_block()
         sys.exit(1)
 
     # The SECOND of the two write paths into the tracked report (the other is
@@ -5674,10 +5766,60 @@ def bench_report(reviewer_recall: bool):
             "\n[dim]latest.json holds a run that was never published — nothing "
             "here was overwritten. To publish it anyway, and record why in the "
             "report itself, use `nh bench publish <results-file> --force`.[/]")
+        # The PR-outcome block is printed on the REFUSAL path too, and that is
+        # deliberate. It reads a different population (real tasks) from a
+        # different source (the `pr_outcomes` table) than the card being
+        # refused, so the card's verdict says nothing about whether these
+        # figures are sound. Gating it behind a successful render would hide
+        # the honest number behind an unrelated guard — and in practice every
+        # results file currently on disk is refused by the checks above, so it
+        # would almost never print at all. The refusal text stays first and
+        # intact, and the exit code is unchanged.
+        _print_pr_outcome_block()
         sys.exit(1)
 
     REPORT_MD.write_text(_render_report_or_refuse(card))
     console.print(f"[green]report rendered[/] → {REPORT_MD}")
+    _print_pr_outcome_block()
+
+
+def _print_pr_outcome_block() -> None:
+    """Print delivered/merged/unknown beside the bench report — never inside it.
+
+    TWO POPULATIONS, AND THEY MUST NOT BE ADDED UP. The card above scores the
+    bench corpus, whose specs run in a sandbox that pushes to a LOCAL BARE REPO
+    (`vcs/__init__.py` hands those a `local-pr://` marker). There is no forge in
+    that path, so no bench spec can ever merge, and a "merge rate" computed over
+    the corpus would be a structural zero dressed as a finding. `delivered` is
+    the most the corpus can show.
+
+    The block below is therefore drawn from the REAL task database instead, and
+    it is printed to the console rather than written into
+    `docs/NORTH_STAR_BENCH.md`: that file is tracked and must stay reproducible
+    from `latest.json`, and these numbers are machine-local. Writing them in
+    would make a committed artefact depend on whose laptop rendered it.
+    """
+    from ..core.autonomy import compute_pr_outcome_metrics, render_pr_outcome_lines
+
+    try:
+        config, _ = _bootstrap(require_auth=False)
+
+        async def _go():
+            async with Store(config.db_path) as store:
+                return await compute_pr_outcome_metrics(store)
+
+        rep = asyncio.run(_go())
+    except Exception as exc:  # noqa: BLE001 — a telemetry block must not fail `bench report`
+        console.print(f"[dim]pr-outcome block unavailable: {escape(str(exc))}[/]")
+        return
+
+    console.rule("[bold]PR outcome — the REAL task database, not the bench corpus")
+    console.print(
+        "[dim]Separate population from the card above. Bench specs push to a "
+        "local bare repo and can never merge, so 'delivered' is the ceiling "
+        "there; these figures come from real runs.[/]")
+    for line in render_pr_outcome_lines(rep):
+        console.print(escape(line), markup=False)
 
 
 @cli.command("shadow")

@@ -50,6 +50,18 @@ USAGE_ROLES: dict[str, str] = {
     "distill_": "distill",
 }
 
+#: The `pr_outcomes.outcome` values that are FINAL (migration 0010). See the
+#: "PR outcomes" section of `Store` for why one constant and not two literals.
+#: Mirrors `vcs.pr_outcome.MERGED` / `CLOSED_UNMERGED`; `core` may not import
+#: `vcs`, so `tests/test_pr_outcome.py` pins the two spellings equal instead.
+SETTLED_PR_OUTCOMES: tuple[str, ...] = ("merged", "closed_unmerged")
+
+#: The same tuple as a SQL `IN (...)` list. Built from the tuple rather than
+#: written out again, so a value added above cannot be missed below. Safe to
+#: interpolate: the members are module-level literals, never caller input.
+_SETTLED_OUTCOMES_SQL = "({})".format(
+    ", ".join(f"'{o}'" for o in SETTLED_PR_OUTCOMES))
+
 # The roles that are NOT the coder's own session — i.e. the ones accumulated
 # out-of-band during a task and drained onto the attempt row at exit
 # (`Orchestrator._pop_aux_usage`) or to the unattributed ledger when no
@@ -2073,6 +2085,128 @@ class Store:
             "DELETE FROM pr_edges WHERE child_pr = ? OR parent_pr = ?", (pr, pr))
         await self.db.commit()
         return cur.rowcount
+
+    # --------------------------- PR outcomes (0010) ------------------------ #
+    #
+    # A PR's fate is SETTLED once it merged or was closed without merging;
+    # `open` and `unknown` are still in flight. Two behaviours key off this one
+    # set — the no-downgrade rule in `record_pr_outcome` and the re-poll
+    # selection in `list_pr_outcomes` — and they were separate string literals
+    # until they were folded into this constant, which is the shape where one
+    # can be widened and the other quietly left behind.
+    #
+    # It restates `vcs.pr_outcome.MERGED`/`CLOSED_UNMERGED` because `core` must
+    # not import `vcs`. That duplication is deliberate and it is PINNED:
+    # `tests/test_pr_outcome.py::test_db_and_vcs_agree_on_which_outcomes_are_settled`
+    # fails if the two spellings ever diverge.
+
+    @serialized_write
+    async def record_pr_outcome(
+        self, *, task_id: str, pr_url: str,
+        outcome: str, outcome_evidence: str = "", ci_status: str | None = None,
+        observed_source: str = "live",
+        forge: str = "", forge_host: str = "", repo_slug: str = "",
+        pr_number: int | None = None,
+        opened_at: str | None = None, checked_at: str | None = None,
+        attributes: str | None = None,
+    ) -> None:
+        """Upsert one PR's recorded outcome (migration 0010).
+
+        UPSERT rather than INSERT OR REPLACE: a REPLACE deletes the old row
+        first, so every column the refresh path does not pass — notably
+        ``opened_at``, which only the PR-open path knows — would be silently
+        reset to its default on the first refresh. The excluded-or-keep
+        expressions below preserve a value already on the row whenever the
+        caller passes None.
+
+        ``ci_status=None`` means "this observation did not look at CI" and KEEPS
+        whatever the row already had. That is not the same as ``"unknown"``,
+        which means "we looked and could not tell": the wake watcher's state
+        rung polls the PR's state without fetching its checks, and writing
+        ``unknown`` from it would erase a real ``fail`` that the previous
+        refresh had measured.
+
+        THE NO-DOWNGRADE RULE, and why it is in the SQL rather than in a caller.
+        A row that has reached a SETTLED outcome (``merged``/``closed_unmerged``)
+        is never overwritten by an UNSETTLED one (``open``/``unknown``). A PR
+        does not un-merge, so an observation that says it did is not news — it
+        is an instrument failure (``gh`` uninstalled, token expired, laptop
+        offline), and letting it land would delete the one fact this table
+        exists to hold. The old expression was a plain ``outcome =
+        excluded.outcome``: every settled row was one broken poll away from
+        reverting to ``unknown``, which is the precise failure the caller-side
+        ``COALESCE`` on ``ci_status`` was already written to prevent one column
+        over. It lives here, in the single statement every writer goes through,
+        because a rule enforced in one caller is a rule the next caller does not
+        have; ``evidence``/``checked_at``/``observed_source`` move in lockstep
+        with ``outcome`` so a kept verdict never ends up wearing the rejected
+        observation's justification.
+
+        Settled → settled IS allowed: that is a correction from a better probe
+        (a ship check that could not resolve the branch the first time), not a
+        regression.
+        """
+        # `_SETTLED_OUTCOMES` is duplicated from `vcs.pr_outcome` on purpose —
+        # `core` must not import `vcs`. `tests/test_pr_outcome.py` pins the two
+        # spellings equal, so the duplication cannot drift silently.
+        keep = (
+            "CASE WHEN pr_outcomes.outcome IN {s} AND excluded.outcome NOT IN {s} "
+            "THEN 1 ELSE 0 END"
+        ).format(s=_SETTLED_OUTCOMES_SQL)
+        await self.db.execute(
+            "INSERT INTO pr_outcomes (task_id, pr_url, forge, forge_host, "
+            "  repo_slug, pr_number, outcome, outcome_evidence, ci_status, "
+            "  observed_source, opened_at, checked_at, attributes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'unknown'), ?, ?, ?, "
+            "        COALESCE(?, '{}')) "
+            "ON CONFLICT(task_id, pr_url) DO UPDATE SET "
+            "  forge = excluded.forge, forge_host = excluded.forge_host, "
+            "  repo_slug = excluded.repo_slug, pr_number = excluded.pr_number, "
+            f"  outcome = CASE WHEN {keep} = 1 THEN pr_outcomes.outcome "
+            "                 ELSE excluded.outcome END, "
+            f"  outcome_evidence = CASE WHEN {keep} = 1 "
+            "                     THEN pr_outcomes.outcome_evidence "
+            "                     ELSE excluded.outcome_evidence END, "
+            "  ci_status = COALESCE(?, pr_outcomes.ci_status), "
+            f"  observed_source = CASE WHEN {keep} = 1 "
+            "                    THEN pr_outcomes.observed_source "
+            "                    ELSE excluded.observed_source END, "
+            "  opened_at = COALESCE(pr_outcomes.opened_at, excluded.opened_at), "
+            f"  checked_at = CASE WHEN {keep} = 1 THEN pr_outcomes.checked_at "
+            "               ELSE COALESCE(excluded.checked_at, "
+            "                             pr_outcomes.checked_at) END, "
+            "  attributes = COALESCE(?, pr_outcomes.attributes)",
+            (task_id, pr_url, forge, forge_host, repo_slug, pr_number,
+             outcome, outcome_evidence, ci_status, observed_source,
+             opened_at, checked_at, attributes, ci_status, attributes))
+        await self.db.commit()
+
+    async def list_pr_outcomes(
+        self, *, task_id: str | None = None, unsettled_only: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Recorded PR outcomes, newest-opened first.
+
+        ``unsettled_only`` selects the rows a refresh should re-poll — ``open``
+        and ``unknown``. It is spelled as a NEGATIVE (``NOT IN`` the settled
+        pair) rather than as a list of the two unsettled values on purpose: a
+        row carrying some fifth value written by a future build must be
+        re-polled, not silently skipped as if it were settled.
+        """
+        where, params = [], []
+        if task_id is not None:
+            where.append("task_id = ?")
+            params.append(task_id)
+        if unsettled_only:
+            where.append(f"outcome NOT IN {_SETTLED_OUTCOMES_SQL}")
+        sql = "SELECT * FROM pr_outcomes"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY COALESCE(opened_at, checked_at, '') DESC, pr_url"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [dict(r) for r in await self._fetchall(sql, tuple(params))]
 
     async def find_memory(self, prefix: str) -> dict[str, Any] | None:
         rows = await self._fetchall(
