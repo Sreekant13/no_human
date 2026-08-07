@@ -2841,9 +2841,19 @@ def status(as_json):
               help="Only include tasks created in the last N days.")
 def autonomy(days):
     """Autonomy telemetry (megaplan P0): how often a human is pulled in
-    mid-flight vs. tasks reaching a reviewable PR. The North Star is a
+    mid-flight vs. tasks reaching a SETTLED state. The North Star is a
     touchpoint rate near zero — the only human steps are starting the site
-    and reviewing/merging the final PR."""
+    and reviewing/merging the final PR.
+
+    `PR-reached` does NOT mean a pull request exists. It counts tasks whose
+    status is AWAITING_APPROVAL or DONE, and two of the three orchestrator
+    paths to AWAITING_APPROVAL open no PR at all — the "already satisfied, no
+    code change needed" path and the code-review path, which ends with draft
+    comments awaiting approval and none posted. This docstring previously said
+    "reaching a reviewable PR", which was wrong in both halves. For what the
+    forge actually reports about a PR — opened, merged, closed unmerged — use
+    `nh pr-outcomes`, which is a separate instrument over a separate
+    population and abstains rather than guessing."""
     config, _ = _bootstrap(require_auth=False)
     from ..core.autonomy import compute_autonomy_metrics
 
@@ -2863,6 +2873,13 @@ def autonomy(days):
                 f"({_pct(rep.pr_reached_rate)})   "
                 f"[yellow]mid-flight touchpoints[/] {rep.touchpoint_tasks}/"
                 f"{rep.settled_tasks} ({_pct(rep.touchpoint_rate)})")
+            # The caveat rides WITH the number, not in --help. A reader who
+            # sees "PR-reached 41/44" and no qualifier will read it as 44
+            # pull requests; two of the three paths to that state open none.
+            console.print(
+                "[dim]PR-reached counts settled tasks (awaiting-approval or "
+                "done), NOT pull requests that exist — see `nh pr-outcomes` "
+                "for what the forge reports.[/]")
             if rep.turn_exhaustion_empty:
                 console.print(
                     f"[red]turn-exhaustion empty-diff attempts[/] "
