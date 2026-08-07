@@ -1,2 +1,2 @@
-6196e6c78da8f3f769afe15f51733d742d61a4c0  src/no_human/cli/commands.py  66c76093ade6545ef11a0f943874875570ca54ce
+6196e6c78da8f3f769afe15f51733d742d61a4c0  src/no_human/cli/commands.py  scrubbed
 748e0098ee245e90f8743ee3e02722901f829c5c  tests/test_task_lifecycle.py

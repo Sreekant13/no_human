@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -248,93 +249,100 @@ def _load_materialize_base():
     return mod
 
 
-_scrub = _load_materialize_base().scrub
+_materialize_base = _load_materialize_base()
+_scrub = _materialize_base.scrub
+_SCRUBBED_MARKER = _materialize_base.SCRUBBED_MARKER
+
+# A run of hex long enough for `git rev-parse` to resolve. git's floor for an
+# abbreviated object id is 4, so that is the floor here: an independent review
+# verified that a FOUR-character prefix of one of the origin blobs this test
+# exists to keep out resolves in a real clone. The working prefix is not written
+# here — a comment explaining the guard must not itself be a pointer, and the
+# earlier draft of this comment shipped one. Use `ffff` if a literal is wanted
+# for shape; it resolved to nothing when checked. A 7 here (this repo's
+# `core.abbrev`) would have been a threshold set below its own stated rule and
+# above the real one.
+#
+# BOTH CASES. `git cat-file -t` resolves an uppercase or mixed-case object id
+# exactly as it resolves a lowercase one (verified 2026-08-02 on a real clone,
+# full id and 7-hex abbreviation, both cases), so a `[0-9a-f]`-only class let an
+# uppercase origin id sit in column 3 and pass. `[0-9a-fA-F]` closes that.
+#
+# Anchored on word boundaries, which is load-bearing in both directions: without
+# them `[0-9a-f]{4,}` matches `bbed` inside the marker `scrubbed` and the test
+# fails on clean manifests. (An earlier version of this comment said `cbbed`;
+# `'scrubbed'.find('cbbed')` is -1 — the run that actually matches is `bbed`.
+# The threshold was right, the stated reason was not.) With them, a path
+# component that happens to be four hex letters (`beef`) would false-positive —
+# deliberately tolerated, because a spurious failure is read by a human and a
+# missed object id is not.
+#
+# The anchors also mean word-ADJACENT forms (`_ffff…`, `blob_ffff…`) are not
+# matched. Left uncovered on purpose: neither resolves in git as written
+# (`git cat-file -t _ffff…` → "Not a valid object name"), so neither is a
+# working index, and dropping the anchors to catch them reintroduces the
+# `scrubbed` false positive the anchors exist to prevent. The guard covers what
+# git will actually dereference; the docstring below says exactly that.
+_OBJECT_ID_RUN = re.compile(r"\b[0-9a-fA-F]{4,}\b")
+
+
+def _read_manifest(case) -> dict[str, tuple[str, str | None]]:
+    """`{path: (column-1 blob id, column-3 marker or None)}` for one case."""
+    manifest: dict[str, tuple[str, str | None]] = {}
+    for line in (case.dir / "base.manifest").read_text().splitlines():
+        fields = line.split("  ")
+        assert len(fields) in (2, 3), f"{case.case_id}: bad manifest line: {line!r}"
+        manifest[fields[1]] = (fields[0], fields[2] if len(fields) == 3 else None)
+    return manifest
+
+
+def _cases_whose_base_ref_is_missing() -> list[str]:
+    """Case ids whose `base.ref` commit this checkout cannot resolve."""
+    missing = []
+    for case in rr.load_cases():
+        resolved = subprocess.run(
+            ["git", "cat-file", "-e", f"{case.base_ref}^{{commit}}"],
+            cwd=REPO_ROOT, capture_output=True,
+        ).returncode == 0
+        if not resolved:
+            missing.append(case.case_id)
+    return missing
 
 
 def test_prepared_case_repo_matches_the_pinned_base_content():
     """Materialising must not have altered what the case measures: every file
-    under `base/` has to still be the bytes the manifest pins, and those bytes
-    have to still trace to `base.ref`.
+    under `base/` has to still be the bytes the manifest pins.
 
     This runs ALWAYS, including after the export. Column 1 of `base.manifest` is
     the git blob id of the file ON DISK, so the byte-identity pin survives a repo
     where `base.ref` resolves nothing — which is the environment this whole
     change exists to serve, and exactly where a skip would have switched it off.
 
-    Where the history IS still present, provenance is re-derived from git so the
-    recorded ids cannot drift from their source. A file with no third column must
-    equal its blob at `base.ref` byte for byte, as before. A file WITH a third
-    column was de-identified after extraction (see
-    `materialize_base.py::scrub`), so it must NOT equal that blob — and the blob
-    must hash to the recorded origin id. Both directions are asserted: an
-    undeclared edit to a fixture fails, and so does a stale `scrubbed-from`
-    column on a file that is no longer scrubbed. The scrub itself only ever
-    rewrites a vendor term inside a comment or a string, never a line the case's
-    `change.diff` quotes as context — `test_every_case_prepares_with_no_repo_history_at_all`
-    is what proves that, by applying all 20 diffs.
+    Provenance — that the bytes are their pre-scrub original put through
+    `scrub()` — needs the history, so it lives in
+    `test_scrubbed_fixtures_are_their_origin_blob_put_through_scrub`, which
+    SKIPS with a reason where the history is absent instead of quietly
+    evaporating inside this one.
     """
-    have_history = subprocess.run(
-        ["git", "cat-file", "-e", "58e3c7d18644306d0dc11da47e2aae7accdae892"],
-        cwd=REPO_ROOT, capture_output=True,
-    ).returncode == 0
     checked = scrubbed = 0
     for case in rr.load_cases():
         base_dir = case.dir / rr.BASE_DIR_NAME
-        manifest = {}
-        for line in (case.dir / "base.manifest").read_text().splitlines():
-            fields = line.split("  ")
-            assert len(fields) in (2, 3), f"{case.case_id}: bad manifest line: {line!r}"
-            sha, rel = fields[0], fields[1]
-            manifest[rel] = (sha, fields[2] if len(fields) == 3 else None)
+        manifest = _read_manifest(case)
         on_disk = sorted(
             p.relative_to(base_dir).as_posix()
             for p in base_dir.rglob("*") if p.is_file()
         )
         assert on_disk == sorted(manifest), (
             f"{case.case_id}: base/ and base.manifest disagree on which files exist")
-        for rel, (sha, origin) in manifest.items():
+        for rel, (sha, marker) in manifest.items():
             data = (base_dir / rel).read_bytes()
             assert _blob_sha1(data) == sha, (
                 f"{case.case_id}:{rel} no longer matches its manifest blob id")
-            if origin is not None:
+            if marker is not None:
+                assert marker == _SCRUBBED_MARKER, (
+                    f"{case.case_id}:{rel} column 3 is {marker!r}, expected "
+                    f"{_SCRUBBED_MARKER!r}")
                 scrubbed += 1
-            if have_history:
-                blob = subprocess.run(
-                    ["git", "cat-file", "blob", f"{case.base_ref}:{rel}"],
-                    cwd=REPO_ROOT, capture_output=True,
-                )
-                assert blob.returncode == 0, f"{case.case_id}:{rel} not at base.ref"
-                if origin is None:
-                    assert blob.stdout == data, (
-                        f"{case.case_id}:{rel} differs from the blob at "
-                        f"{case.base_ref} with no 'scrubbed-from' column to say so")
-                else:
-                    assert _blob_sha1(blob.stdout) == origin, (
-                        f"{case.case_id}:{rel} does not descend from manifest "
-                        f"origin {origin} at {case.base_ref}")
-                    assert blob.stdout != data, (
-                        f"{case.case_id}:{rel} carries a 'scrubbed-from' column "
-                        "but is byte-identical to base.ref — stale declaration")
-                    # …and the difference is EXACTLY the scrub, nothing else.
-                    #
-                    # Without this line the three assertions above are
-                    # self-referential on the scrubbed files: column 1 is
-                    # recomputed from disk, column 3 from the origin blob, and
-                    # "they differ" is satisfied by ANY difference. An
-                    # independent review demonstrated it on 2026-07-31 — append
-                    # a payload line to a scrubbed fixture, recompute column 1,
-                    # leave column 3 alone, and this test passed. The pin said
-                    # where the bytes came from and that they had been changed;
-                    # it never said HOW, so it permitted any change at all.
-                    #
-                    # Only reachable where history is present. In the export
-                    # `have_history` is False and `scrub` has no rules anyway —
-                    # column 1 is the pin that survives out there.
-                    assert _scrub(blob.stdout) == data, (
-                        f"{case.case_id}:{rel} is not its origin blob put "
-                        "through scrub() — the fixture carries an edit that "
-                        "the de-identification substitutions do not account "
-                        "for. Re-run materialize_base.py.")
             checked += 1
     assert checked == 70, checked
     # 12 -> 17 on 2026-07-31: five more fixtures now carry a scrub, four of them
@@ -373,6 +381,296 @@ def test_prepared_case_repo_matches_the_pinned_base_content():
     # 29 -> 31 on 2026-08-03: the private-doc-name sweep scrubbed the two
     # models.py base fixtures (orphan-rescue-v2, d44c4377 follow-up).
     assert scrubbed == 31, scrubbed
+
+
+def test_manifest_declares_the_scrub_without_indexing_the_original():
+    """`base.manifest` ships. It must not point at PRE-scrub content.
+
+    Column 3 used to hold the ORIGIN blob id — the git object id of the bytes
+    as they were BEFORE de-identification. All 31 of those ids were reachable
+    from `main`, so anyone with the published history could `git cat-file` the
+    un-de-identified original straight out of a shipped fixture. The count is
+    not fixed: it was 20 when this guard landed and is 31 at `main` 9198adf1,
+    because it rises with every substitution rule added.
+
+    A history rewrite does not close that. Blobs are CONTENT-addressed, so
+    rewriting the commits changes every commit id and no blob id; only rewriting
+    a blob's content retires its id. And a rewrite retracts nothing from clones,
+    forks and mirrors already taken. (Being *flagged* is also not being
+    *rewritten*: the 102-term scanner flags all 31 of these blobs, but its term
+    list and the materialiser's 51 substitution rules are different sets.)
+
+    So the rule is structural, not a spot fix. Stated as what it enforces, not
+    as more: **no field after column 1 may contain a standalone run of four or
+    more hex characters, in either case** — that is the form `git rev-parse`
+    will dereference, and 4 is git's own floor for an abbreviation. It is not
+    the broader claim "nothing after column 1 may be an object id": a hex run
+    glued to a word character (`blob_ffff…`) is not matched, and deliberately so
+    — git does not resolve that form either, so it is not a working index, and
+    widening to catch it would flag the marker `scrubbed` on every clean
+    manifest. See the comment on `_OBJECT_ID_RUN` for both measurements.
+
+    Column 1 is exempt because it hashes the SHIPPED bytes — its pre-image is
+    the file sitting next to it, so it indexes nothing that is not already
+    published.
+
+    Removing the column removed a redundant path rather than the content: all 31
+    ids it held are also reachable from the `change.diff` shipped in the same
+    case directory, so what fell is the number of pointers to those bytes, not
+    the bytes' recoverability *in a clone*. It is NOT redundant for a reader who
+    has no clone: `change.diff` abbreviates to 7 hex, and GitHub's blob API
+    refuses anything short of 40 (422), so the manifest was the only shipped
+    source of an id you can look up remotely. What closes the rest is the
+    publish target — see the corpus README.
+    """
+    offenders = []
+    for case in rr.load_cases():
+        for line in (case.dir / "base.manifest").read_text().splitlines():
+            fields = line.split("  ")
+            for column, value in enumerate(fields[1:], start=2):
+                if _OBJECT_ID_RUN.search(value):
+                    offenders.append(f"{case.case_id}: column {column}: {line!r}")
+    assert offenders == [], (
+        "base.manifest carries what looks like a git object id outside column 1 "
+        "— a shipped index into pre-scrub content:\n" + "\n".join(offenders))
+
+
+@pytest.mark.parametrize("value, why", [
+    ("ffff0f1a2b3c4d5e6f708192a3b4c5d6e7f80912", "full-length lowercase"),
+    ("FFFF0F1A2B3C4D5E6F708192A3B4C5D6E7F80912",
+     "full-length UPPERCASE — `git cat-file -t` dereferences an uppercase "
+     "object id exactly as it dereferences the lowercase one (verified "
+     "2026-08-02 on a real clone against a real id), so a `[0-9a-f]`-only "
+     "class let this shape through"),
+    ("FFFF0f1a2b3c4d5e6f708192a3b4c5d6e7f80912", "mixed case, also dereferenced"),
+    ("ffff", "4 hex — git's own floor for an abbreviation"),
+    ("FFFF", "4 hex, uppercase"),
+])
+def test_object_id_matcher_sees_every_form_git_will_resolve(value, why):
+    """The matcher's positives, pinned against the class it is built from.
+
+    Written after an independent review found the uppercase bypass: the guard
+    above asserted "nothing after column 1 may be an object id" while matching
+    only `[0-9a-f]`, so an uppercase origin id in column 3 passed a test whose
+    docstring said it could not.
+
+    THE LITERALS HERE DEREFERENCE TO NOTHING, deliberately. What is under test
+    is the matcher's treatment of a SHAPE, and the shape is all the matcher can
+    see — so pinning it needs no live id, and using one would make this file the
+    thing it exists to forbid. The first draft of this test did exactly that: it
+    pinned a real 40-hex id in five case variants, and that id was one of the
+    pre-scrub origin blobs. `ffff…` was checked to resolve in neither the
+    published clone nor the full local repo, at 4 hex and at 40, in both cases.
+    The claim that git dereferences the uppercase form was verified separately,
+    against a real id, and is not re-verified by these fixtures.
+    """
+    assert _OBJECT_ID_RUN.search(value), why
+
+
+@pytest.mark.parametrize("value, why", [
+    ("scrubbed",
+     "the marker itself. The run `bbed` is four hex characters, so this is a "
+     "hit WITHOUT the word-boundary anchors — which is the entire reason they "
+     "are there. (An earlier comment blamed `cbbed`; that substring does not "
+     "occur in `scrubbed` at all.)"),
+    ("blob_ffff0f1a2b3c4d5e6f708192a3b4c5d6e7f80912",
+     "word-ADJACENT hex, uncovered on purpose. Checked against a REAL id, not "
+     "this inert one: `git cat-file -t blob_<real id>` answers `Not a valid "
+     "object name`, so the form is not a working index — and matching it means "
+     "dropping the anchors, which turns every clean manifest red on `scrubbed`"),
+    ("src/no_human/api/app.py", "an ordinary shipped path"),
+])
+def test_object_id_matcher_suppresses_what_it_must_not_flag(value, why):
+    """The matcher's negatives — held, so widening the class cannot silently
+    take the anchors with it and turn every clean manifest red.
+
+    Same rule as the positives: the literals dereference to nothing. These pin
+    what the matcher does with a shape, not what git does with an object."""
+    assert not _OBJECT_ID_RUN.search(value), why
+
+
+def test_every_base_ref_is_a_full_commit_id():
+    """`base.ref` must be 40 hex, not an abbreviation.
+
+    This is the claim the manifest's marker rests on: dropping the origin blob
+    id costs nothing *because* `<base.ref>:<path>` already determines that blob,
+    and it only determines it if `base.ref` names exactly one commit. An
+    abbreviation resolves against whatever object store happens to be present,
+    so it is repo-local — the same 7 characters can be unique here, ambiguous in
+    a fork, and unresolvable in a clone that lacks the object.
+
+    It was not true when the marker landed: 4 of the 20 cases held 7-hex
+    abbreviations, and an independent review found that the one abbreviated case
+    carrying a scrubbed file was exactly the case where the claim was
+    load-bearing. They were expanded rather than the claim being softened. This
+    test is here so the justification cannot quietly stop holding again.
+    """
+    bad = []
+    for case in rr.load_cases():
+        ref = (case.dir / "base.ref").read_text().strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", ref):
+            bad.append(f"{case.case_id}: {ref!r} ({len(ref)} chars)")
+    assert bad == [], (
+        "base.ref must be a full 40-hex commit id — an abbreviation is "
+        "repo-local and does not determine the origin blob:\n" + "\n".join(bad))
+
+
+def test_scrubbed_fixtures_are_their_origin_blob_put_through_scrub():
+    """Provenance, re-derived from git rather than read back off the manifest.
+
+    A file with no column-3 marker must equal its blob at `base.ref` byte for
+    byte. A file WITH the marker was de-identified after extraction (see
+    `materialize_base.py::scrub`), so it must NOT equal that blob, and the
+    difference must be EXACTLY the scrub and nothing else. Both directions are
+    asserted: an undeclared edit to a fixture fails, and so does a stale
+    `scrubbed` marker on a file that is no longer scrubbed.
+
+    Without the last assertion the checks are self-referential: column 1 is
+    recomputed from disk and "they differ" is satisfied by ANY difference. An
+    independent review demonstrated it on 2026-07-31 — append a payload line to
+    a scrubbed fixture, recompute column 1, and the test passed.
+
+    This is also the check that replaced the manifest's origin-id column
+    (`test_manifest_declares_the_scrub_without_indexing_the_original`). Nothing
+    was lost with it: `base.ref` is a full commit id, and a commit id fixes its
+    whole tree, so `<base.ref>:<path>` already determines the origin blob and
+    therefore its hash. The deleted assertion re-checked a value it could
+    derive; this one constrains the origin blob's CONTENT, which is strictly
+    stronger.
+
+    WHY THIS SKIPS RATHER THAN DEGRADES. It used to live inside the byte-pin
+    test behind a bare `if have_history:` keyed on one hardcoded commit — and
+    that commit is reachable from no branch, so it exists only in the
+    maintainer's local object store. On a fresh clone the flag went False, this
+    entire block vanished, and the suite went green with only the byte pin
+    having run and nothing on screen to say so. Demonstrated on a real
+    `git clone`: append a payload line to a scrubbed fixture, recompute column
+    1, and the old test passed there while failing in the maintainer's
+    checkout. A guard that quietly downgrades on a clean checkout is not a
+    guard.
+
+    The precondition is now read off the corpus itself rather than a hardcoded
+    sha, and a partial history SKIPS rather than half-running: measured on a real
+    default clone 2026-08-04, 4 of the 20 base.ref commits are reachable from a
+    branch and the other 16 are not, so a fresh clone can verify a subset — and a
+    subset cannot assert the 70/31 totals below, which is exactly how a run that
+    checks less than it claims stays invisible.
+    """
+    cases = rr.load_cases()
+    missing = _cases_whose_base_ref_is_missing()
+    if missing:
+        pytest.skip(
+            f"{len(missing)} of {len(cases)} base.ref commits do not resolve in "
+            f"{REPO_ROOT}, so provenance cannot be re-derived for the corpus as "
+            "a whole and only the column-1 byte pin ran.\n"
+            "EXPECTED in the public export (none of the pre-scrub history) and "
+            "on any fresh clone: 16 of the 20 "
+            "base.ref commits are reachable from no branch, so `git clone` never "
+            "fetches them. NOT expected in the maintainer's checkout — seeing "
+            "this skip there means those objects have been gc'd and the fixtures "
+            "can no longer be verified against their source.\n"
+            f"Unresolvable: {', '.join(missing)}")
+
+    checked = scrubbed = 0
+    for case in cases:
+        base_dir = case.dir / rr.BASE_DIR_NAME
+        for rel, (sha, marker) in _read_manifest(case).items():
+            data = (base_dir / rel).read_bytes()
+            blob = subprocess.run(
+                ["git", "cat-file", "blob", f"{case.base_ref}:{rel}"],
+                cwd=REPO_ROOT, capture_output=True,
+            )
+            assert blob.returncode == 0, f"{case.case_id}:{rel} not at base.ref"
+            if marker is None:
+                assert blob.stdout == data, (
+                    f"{case.case_id}:{rel} differs from the blob at "
+                    f"{case.base_ref} with no {_SCRUBBED_MARKER!r} column to say so")
+            else:
+                assert blob.stdout != data, (
+                    f"{case.case_id}:{rel} carries the {_SCRUBBED_MARKER!r} "
+                    "column but is byte-identical to base.ref — stale declaration")
+                assert _scrub(blob.stdout) == data, (
+                    f"{case.case_id}:{rel} is not its origin blob put "
+                    "through scrub() — the fixture carries an edit that "
+                    "the de-identification substitutions do not account "
+                    "for. Re-run materialize_base.py.")
+                scrubbed += 1
+            checked += 1
+    # Same literals as the byte-pin test, for the same reason: a count derived
+    # from the manifests would agree with the manifests by construction. Here
+    # they also prove the loop did not silently check nothing.
+    assert checked == 70, checked
+    assert scrubbed == 31, scrubbed
+
+
+def test_materialiser_refuses_to_run_with_no_de_identification_rules(
+        monkeypatch, tmp_path):
+    """A de-identification path must never silently become a no-op.
+
+    `_load_scrub` returns an empty list when the private supplement is absent.
+    That used to mean `scrub()` returned its input unchanged, so a re-materialise
+    on a checkout that had lost the supplement would write every base fixture
+    UNSCRUBBED and regenerate the manifests to agree with the result — the term
+    scanners would then be reading a tree that had never been de-identified. The
+    only thing standing in the way was a hardcoded count in another test.
+
+    The legitimate absence is the public export, where the supplement is gone
+    AND the script cannot run at all because the pre-scrub history is not there
+    either. Those two must not be reported as each other, so `materialise`
+    probes the history FIRST and raises `HistoryUnavailable` for it —
+    `test_materialiser_names_the_right_reason_when_it_cannot_run` is that half.
+    An earlier version of this guard checked the rules first, and an
+    independent review caught it firing in the built export with a message
+    asserting the checkout could run the materialiser.
+
+    Importing the module must keep working in the export — the byte-pin test
+    imports it — which is why the refusal is at the point of USE, not at import.
+    """
+    mod = _load_materialize_base()
+    monkeypatch.setattr(mod, "PRIVATE_TERMS_PATH", tmp_path / "not-a-supplement.py")
+    monkeypatch.setattr(mod, "SCRUB", mod._load_scrub())
+    assert mod.SCRUB == [], "a missing supplement must load no substitutions"
+
+    with pytest.raises(mod.ScrubRulesUnavailable):
+        mod.scrub(b"pre-scrub bytes that must not reach disk")
+
+    # A case whose base.ref DOES resolve, so the history probe passes and the
+    # scrub-rules guard is what refuses.
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    (case_dir / "base.ref").write_text(
+        subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT,
+                       check=True, capture_output=True, text=True).stdout.strip())
+    with pytest.raises(mod.ScrubRulesUnavailable):
+        mod.materialise(case_dir, repo_root=REPO_ROOT)
+    assert sorted(p.name for p in case_dir.iterdir()) == ["base.ref"], (
+        "materialise refused but had already written to the case directory")
+
+
+def test_materialiser_names_the_right_reason_when_it_cannot_run(
+        monkeypatch, tmp_path):
+    """"No history" and "no scrub rules" must not be reported as each other.
+
+    The public export has neither, so a materialiser that checks the rules
+    first tells the export its supplement is missing — true, expected, and
+    entirely the wrong diagnosis, because that checkout could never have run
+    the script at all. The history is therefore probed first.
+
+    Checked with the scrub rules ALSO absent, which is the export's real
+    configuration and the only arrangement where the wrong answer is available
+    to give.
+    """
+    mod = _load_materialize_base()
+    monkeypatch.setattr(mod, "PRIVATE_TERMS_PATH", tmp_path / "not-a-supplement.py")
+    monkeypatch.setattr(mod, "SCRUB", mod._load_scrub())
+    assert mod.SCRUB == []
+
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    # Well-formed and resolvable nowhere — an export's base.ref, in effect.
+    (case_dir / "base.ref").write_text("0" * 39 + "1")
+    with pytest.raises(mod.HistoryUnavailable):
+        mod.materialise(case_dir, repo_root=REPO_ROOT)
 
 
 @pytest.mark.asyncio
