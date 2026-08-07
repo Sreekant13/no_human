@@ -57,14 +57,28 @@ def _load_export_script():
     return module
 
 
-_export = _load_export_script()
+# The classifier is WITHHELD from the public export, and this file ships. In
+# the private repo the classifier exists and defines the ship set; in the
+# public tree there is nothing to classify away — every tracked file IS the
+# ship set, by construction of the export that produced the tree. So the guard
+# runs in both places over the corpus each place actually publishes, and no
+# skip marker is needed (the first public CI run collected this file against
+# the missing script and errored — that is the case this branch exists for).
+_export = _load_export_script() if _EXPORT_SCRIPT.exists() else None
 
 
 def _shipped() -> list[str]:
-    """The ship set, from the repo's own classifier — never from a literal list."""
+    """The ship set, from the repo's own classifier — never from a literal list.
+
+    Without the classifier (the public tree), the tracked set is returned
+    whole: the export already applied the classification when it built the
+    tree, so tracked == shipped there.
+    """
     out = subprocess.check_output(["git", "ls-files", "-z"], cwd=REPO_ROOT,
                                   text=True)
     tracked = sorted(p for p in out.split("\0") if p)
+    if _export is None:
+        return tracked
     rules = _export.parse_classification(
         (REPO_ROOT / _export.CLASSIFICATION_NAME).read_text(encoding="utf-8"))
     return _export.classify(rules, tracked).shipped
