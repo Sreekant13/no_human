@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { ROLE_LABEL, discoverSubagents, eventLens, eventSource, modelsByNode } from "./eventRoles.js";
+import { ROLE_LABEL, SOURCE_BY_KIND, discoverSubagents, eventLens, eventSource, modelsByNode } from "./eventRoles.js";
 
 test("planner lenses and the aggregator fold onto one Planner node", () => {
   assert.equal(eventSource({ source: "planner" }), "planner");
@@ -176,4 +176,50 @@ test("the Orchestrator does not take credit for the roles it emits for", () => {
   assert.equal(eventSource({ source: "orchestrator", kind: "state" }), "worker");
   assert.equal(eventSource({ source: "orchestrator", kind: "commit" }), "worker");
   assert.equal(eventSource({ source: "orchestrator", kind: "stuck" }), "worker");
+});
+
+// ── knowledge_accessed: which role, and why NOT via SOURCE_BY_KIND ───────── //
+
+test("a knowledge_accessed event is the Orchestrator's, and already was", () => {
+  // The shape as persisted in the live database (391 rows): emit() stamps
+  // source:"orchestrator" on everything it sends.
+  const real = { kind: "knowledge_accessed", source: "orchestrator", injected: [] };
+  assert.equal(eventSource(real), "worker");
+  assert.ok(ROLE_LABEL.worker, "and 'worker' is a role that has a label");
+});
+
+test("SOURCE_BY_KIND cannot change an orchestrator-emitted event's role", () => {
+  // Recorded because "add knowledge_accessed to SOURCE_BY_KIND" is the obvious
+  // fix and it is INERT: `e.source` short-circuits the map, and emit() always
+  // sets source. Adding an entry would look like a fix and do nothing.
+  //
+  // KNOWN-POSITIVE CONTROL, so this is not an argument from absence: tool_use
+  // HAS an entry, and the map demonstrably works when `source` is missing...
+  assert.equal(SOURCE_BY_KIND.tool_use, "agent");
+  assert.equal(eventSource({ kind: "tool_use" }), "agent");
+  // ...and is demonstrably bypassed the moment `source` is present.
+  assert.equal(eventSource({ kind: "tool_use", source: "orchestrator" }), "worker");
+  assert.equal(SOURCE_BY_KIND.knowledge_accessed, undefined,
+    "no entry, because an entry would be a comment that looks like code");
+});
+
+test("the team-brain knowledge event no longer renders a blank role", () => {
+  // `_team_brain_block()` overrides emit()'s source with "team_brain". That
+  // fell through to a role id ROLE_LABEL has no entry for, so the event's role
+  // line rendered empty and its colour fell back to a hardcoded literal.
+  const before = "team_brain";
+  assert.equal(ROLE_LABEL[before], undefined, "precondition: not a known role");
+  const role = eventSource({ kind: "knowledge_accessed", source: "team_brain" });
+  assert.equal(role, "worker");
+  assert.ok(ROLE_LABEL[role], "the role it maps to must have a label");
+});
+
+test("the six-role roster is unchanged — a knowledge source is not an agent", () => {
+  // themeVars.test.mjs requires three --role-color rules per ROLE_LABEL entry
+  // and onboardingRoster.test.mjs pins the roster at six. This asserts the fix
+  // above stayed out of that contract rather than quietly widening it.
+  assert.deepEqual(
+    Object.keys(ROLE_LABEL).sort(),
+    ["agent", "planner", "reviewer", "supervisor", "watcher", "worker"],
+  );
 });

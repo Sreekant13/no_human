@@ -143,6 +143,28 @@
   /* Semantic status */
   --success: #4ADE80;
   --danger:  #EF6B6B;
+  /* WARNING — "this is safe to do, and you should look at it first". The gap
+     between --success and --danger was filled by `--amber`, and --amber is a
+     LEGACY ACCENT ALIAS: it is byte-identical to --accent-500 in both themes
+     (#4C9AFF dark, #0C66E4 light). Anything painted "amber" therefore rendered
+     in the ordinary chrome blue, which is fine for a hover tint and wrong for
+     the one badge whose whole job is to be noticed — see
+     `.learning-scope.global`. This token is the real warning hue, and it is a
+     colour the palette already uses for exactly this meaning (--state-waiting,
+     --agent-supervisor, --c-answer), so nothing new is invented here.
+     Measured against the surfaces the badge is actually painted on — the card
+     fill, and the translucent fill a SELECTED card swaps in, composited over
+     the worst ambient surface it can land on:
+       dark  #E8A04F → 7.66:1 on --bg-card, 4.84:1 selected (--green-dim over
+                       --surface-3 → #2D4242, the worst of the ambient set)
+       light #974F0C → 6.11:1 on --bg-card, 5.70:1 selected (#DCFFF1, opaque)
+     all AA for small text. Distance from --accent-500 is asserted by test, on
+     the RESOLVED hex, never on the token's name — the name proves nothing, and
+     `--amber` resolving to blue is the standing proof of that: it is already
+     that way on main, where 43 lines paint something with it. This token does
+     not fix those; it stops the ONE badge added on this branch from joining
+     them, which it did for exactly one commit before this correction. */
+  --warn:    #E8A04F;
   --fg-dim:  var(--text-dim);
 }
 
@@ -221,6 +243,7 @@
   --glass-border: rgba(9,30,66,0.08);
   --success: #216E4E;
   --danger:  #C9372C;
+  --warn:    #974F0C;
 }
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1776,6 +1799,36 @@ a.card-pr-badge:hover, a.card-pr-badge:focus-visible { text-decoration: underlin
   cursor: pointer;
 }
 .rich-thinking-toggle:hover { color: var(--text); }
+/* "Knowledge applied" — the injected rule titles behind the count line. Shares
+   .rich-thinking-toggle so the disclosure looks like every other one in the
+   timeline; a <button> rather than <details>/<summary> because this drawer's
+   focus trap has neither the `summary` selector nor the collapsed-details
+   filter the Settings overlay had to grow after exactly that markup leaked
+   Tab out of a dialog. */
+.rich-knowledge { margin: 2px 0; }
+.rich-knowledge-body {
+  margin-top: 4px;
+  padding: 6px 12px;
+  border-left: 3px solid var(--purple);
+  background: var(--surface-2);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  font-size: 12px;
+}
+.rich-knowledge-item {
+  color: var(--text);
+  padding: 2px 0;
+  line-height: 1.5;
+}
+/* Held-for-terms is a rule the operator needs to clean, not a rule that simply
+   did not match. The backend distinguishes them; so does this. */
+.rich-knowledge-item.held { color: var(--text-muted); }
+.rich-knowledge-why {
+  font-size: 10px;
+  color: var(--amber);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 .rich-thinking-body {
   margin-top: 4px;
   padding: 6px 12px;
@@ -4621,6 +4674,96 @@ a.so-chip-value:hover { color: var(--accent-300); }
   display: flex;
   gap: 8px;
   margin-top: 12px;
+}
+
+/* Card parity with `nh learnings`: the terminal has always shown origin, scope
+   and evidence at the moment of deciding; the web card showed id/type/title/
+   content and dropped the rest. The scope line is the one that matters — see
+   .learning-scope.global. */
+.learning-origin {
+  font-size: 10px;
+  color: var(--cyan);
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--border);
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+}
+
+.learning-scope {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  margin-bottom: 6px;
+  word-break: break-all;
+}
+
+/* BLAST RADIUS. A rule with no project and no project_scope injects into every
+   project the moment it is confirmed, and Confirm is one click away on this
+   very card. The CLI prints this line in yellow; so does this.
+   `var(--amber)`, which this rule was first written with, did NOT do that.
+   --amber is a legacy alias of --accent-500 and resolves to the same bytes in
+   both themes, so the badge rendered in the app's ordinary chrome blue —
+   indistinguishable from every other accented label on the page, which is the
+   one thing a blast-radius warning cannot be. Caught inside this branch: the
+   selector does not exist at main, so no user ever saw the blue one.
+   --warn is the real warning hue; see its definition for the measured ratios.
+   `contrast.test.mjs` resolves what this line ACTUALLY renders and refuses it
+   if it lands on the accent again. */
+.learning-scope.global {
+  color: var(--warn);
+  font-weight: 600;
+  font-family: inherit;
+}
+
+.learning-scope-id { color: var(--text-muted); }
+
+.learning-evidence {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.learning-select {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+.learning-card.selected {
+  border-left-color: var(--green);
+  background: var(--green-dim);
+}
+
+.learning-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.learning-filter {
+  flex: 1 1 220px;
+  padding: 8px 12px;
+  background: var(--bg-card);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.learning-filter-count {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+
+.learning-cap-note {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin: -6px 0 12px;
 }
 
 .btn-sm {

@@ -1874,17 +1874,10 @@ class Orchestrator:
         # B4: "this repo" means the remote identity, not the checkout path —
         # the same repo cloned (or worktree'd) elsewhere is the SAME project,
         # and only its lessons plus explicit globals may surface here.
-        _all_memories = await self.store.list_memories(
-            confirmed=True, project=task.repo_path,
-            scope=await self._project_scope(task.repo_path),
-        )
         # W3.4 knowledge triggers: a tagged memory injects only when its
         # trigger matches this task; untagged memories always inject. Emit an
         # audit line (agent-a's "Accessed Knowledge") naming injected vs held.
-        _haystack = (f"{task.title} {task.description or ''} "
-                     f"{' '.join(task.acceptance_criteria or [])}")
-        _triggered = filter_triggered(_all_memories, _haystack)
-        self._active_memories = _triggered
+        _all_memories, _triggered = await self._load_active_memories(task)
         _held_terms = getattr(self, "_memories_held_for_terms", [])
         _held = len(_all_memories) - len(_triggered)
         if _all_memories:
@@ -1907,7 +1900,8 @@ class Orchestrator:
         # _build_implement_prompt via build_playbook_block(self._active_playbook).
         from ..learning.triggers import select_playbook
         _playbooks = await self.store.list_playbooks(project=task.repo_path)
-        self._active_playbook = select_playbook(_playbooks, _haystack)
+        self._active_playbook = select_playbook(
+            _playbooks, self._trigger_haystack(task))
         if self._active_playbook:
             self.emit("playbook_accessed",
                       f"applying playbook: {self._active_playbook.get('title', '?')}")
@@ -5913,12 +5907,14 @@ class Orchestrator:
         # Build profile + rules context for the staff-level reviewer.
         prof = await self._usable_profile(repo.path)
         self._active_profile = prof
-        self._active_memories = (filter_triggered(
-            await self.store.list_memories(
-                confirmed=True, project=task.repo_path,
-                scope=await self._project_scope(task.repo_path)),
-            f"{task.title} {task.description or ''} "
-            f"{' '.join(task.acceptance_criteria or [])}"))
+        # Same load as the implement path, through the one helper — this site
+        # is the reason the helper exists. It used to be an inline copy of the
+        # fetch/filter/assign, so a `last_used_at` stamped at the other call
+        # site alone would have reported every rule the REVIEWER used, and only
+        # the reviewer, as never used. Nothing is emitted here: the review path
+        # has never carried a `knowledge_accessed` line and adding one is not
+        # this change's business.
+        await self._load_active_memories(task)
 
         profile_ctx = ""
         if prof:
@@ -8913,6 +8909,62 @@ class Orchestrator:
     # be silently exceeded.
     _RULES_CRITICAL_CAP = 8000   # chars for high-importance rules (full content)
     _RULES_RELEVANT_CAP = 4000   # chars for med-importance rules (compact)
+
+    @staticmethod
+    def _trigger_haystack(task: Task) -> str:
+        """The task text a memory's or a playbook's trigger is matched against.
+
+        One definition, because there were two identical copies and a playbook
+        must not start matching on different text from a rule — "this task is
+        about kafka" has to mean the same thing to both or the audit line and
+        the injected procedure disagree about the same task.
+        """
+        return (f"{task.title} {task.description or ''} "
+                f"{' '.join(task.acceptance_criteria or [])}")
+
+    async def _load_active_memories(
+        self, task: Task,
+    ) -> tuple[list[dict], list[dict]]:
+        """Fetch this task's confirmed rules, trigger-filter them, install them
+        as `_active_memories`, and stamp `last_used_at` on the ones that
+        actually reach a prompt. Returns ``(all_scoped, triggered)``.
+
+        THE ONE PLACE a task becomes an active rule set. There were two, byte-
+        identical, and that is precisely the bug this guards: `filter_triggered`
+        had two callers — the implement path and the review path — so a stamp
+        added at either one alone yields a "never used" report that is wrong for
+        every rule the other one used. Centralising is the fix; a third caller
+        that wants active memories has one obvious thing to call.
+
+        WHAT COUNTS AS "USED" is the post-screen list, read back off the
+        property rather than taken from `filter_triggered`'s return. A memory
+        held by `_screen_memories_for_terms` was fetched and matched but never
+        reached a prompt, and stamping it would record a use that did not
+        happen — the same rule would then look healthy in `--stale` forever
+        while being silently withheld from every task. The property is the only
+        thing that knows what survived.
+
+        Emits NOTHING. The implement path's `knowledge_accessed` audit line
+        stays at its call site because only that path has ever had one, and
+        moving it here would start emitting it on the review path too.
+        """
+        all_scoped = await self.store.list_memories(
+            confirmed=True, project=task.repo_path,
+            scope=await self._project_scope(task.repo_path),
+        )
+        triggered = filter_triggered(all_scoped, self._trigger_haystack(task))
+        self._active_memories = triggered
+        injected_ids = [m["id"] for m in self._active_memories if m.get("id")]
+        if injected_ids:
+            # Batched, and never allowed to take the run down with it: this is
+            # bookkeeping for a staleness REPORT. A locked database or a store
+            # opened read-only must not stop a task from starting because the
+            # usage counter could not be written.
+            try:
+                await self.store.touch_memories_used(injected_ids)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not stamp memory use: %s", exc)
+        return all_scoped, triggered
 
     # `_active_memories` is a PROPERTY, not a plain attribute, and the screen
     # lives on the READ side.

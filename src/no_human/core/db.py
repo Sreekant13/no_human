@@ -9,7 +9,7 @@ import logging
 import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import (
     Any, AsyncIterator, Awaitable, Callable, NamedTuple, TypeVar,
@@ -153,6 +153,24 @@ _in_critical: ContextVar["frozenset[tuple[Store, Any]]"] = ContextVar(
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# THE QUEUE-VISIBILITY CONTRACT, as a symbol rather than a literal repeated in
+# five files. `LearningQueue.pending()`, `nh learnings`, `GET /api/learnings`
+# and the transcript ingester all select `source = "proposed"`, so an
+# unconfirmed memory written under ANY other `source` is invisible to the human
+# gate it exists for — it is not queued, it is lost.
+#
+# Two docstrings already stated this invariant (the `origin` column comment
+# above `add_memory`, and `learning/queue.py`'s ORIGIN_* block) and NOTHING
+# enforced it. Three separate call sites then broke it — `nh history --analyze`
+# (`source="history"`), `nh reply`'s mined learnings (`source="reply"`, which
+# lost two real rows from the operator's own review replies) and the curator's
+# consolidation pass (`source="curator"`, which archives the proposals it
+# consolidates, so a broken write there DESTROYS queue entries). A comment is
+# not a constraint; `add_memory` refuses the shape now. Provenance belongs in
+# `origin`, which is a second column for exactly this reason.
+SOURCE_PROPOSED = "proposed"
 
 
 def read_file_marker(path: Path) -> "SnapshotMarker":
@@ -1003,6 +1021,21 @@ class Store:
         if "project_scope" not in mem_existing:
             await self.db.execute(
                 "ALTER TABLE memories ADD COLUMN project_scope TEXT")
+        # S2: WHEN this memory was last INJECTED into a prompt — stamped by
+        # `Orchestrator._load_active_memories`, the one place a task turns into
+        # an active rule set. It answers the question the confirm queue cannot:
+        # of the rules a human already confirmed, which have ever done anything?
+        #
+        # NO DEFAULT, same reasoning as `origin` and `evidence`: a row written
+        # before the column genuinely has no usage history, and backfilling
+        # `datetime('now')` would stamp every legacy rule as freshly used —
+        # inventing the exact fact `nh learnings --stale` exists to report.
+        # NULL reads "never seen used", which is the truth for a legacy row and
+        # for a rule that has genuinely never triggered; `--stale` says which
+        # of the two it cannot tell apart rather than guessing.
+        if "last_used_at" not in mem_existing:
+            await self.db.execute(
+                "ALTER TABLE memories ADD COLUMN last_used_at TEXT")
 
         # Phase 6a: test_layers column on projects (JSON-encoded TestPlan layers).
         proj_existing = {row["name"]
@@ -1773,7 +1806,89 @@ class Store:
         task, citing the correction/review event) — stored as JSON, NULL where
         unrecorded. ``project_scope`` is the B4 project identity
         (``learning/scope.py``); NULL keeps the row on legacy path matching.
+
+        RAISES ``ValueError`` for an unconfirmed memory whose ``source`` is not
+        ``SOURCE_PROPOSED`` — see that constant for the three call sites that
+        wrote one anyway. Deliberately loud rather than silently normalised: a
+        guard that quietly repairs its input is a guard nobody ever notices is
+        being hit, and every `source` in this repo is a literal at the call
+        site, so no runtime data can reach this branch. It is a programming
+        error, and it fires before any write, so a caller that trips it leaves
+        the database untouched.
+
+        THE ROWS THAT ARE ALREADY LIKE THAT. This guard closes the door; it
+        does not go back for what walked through it. See the block below.
         """
+        # ── STRANDED ROWS, and what this change does NOT do to them ────────
+        #
+        # Measured 2026-08-07 against a `cp` of the operator's live database —
+        # never the live file, which a running server holds open — so the
+        # numbers below are a snapshot of one install, not a property of the
+        # schema. 20 rows have `confirmed = 0` and a `source` that `pending()`
+        # does not select, in two shapes:
+        #
+        #   18 rows  source='confirmed', confirmed=0
+        #            created_at  2026-07-01 13:40:03 (all 18, identical)
+        #            updated_at  2026-07-01T13:40:39.458782+00:00
+        #                     …  2026-07-01T13:40:39.467533+00:00
+        #            origin NULL, archived 0
+        #    2 rows  source='reply', confirmed=0
+        #            created 2026-07-26 23:53:41 and 2026-07-27 00:14:28
+        #
+        # The 2 reply rows have a known producer: `nh reply`'s mined learning
+        # passed source="reply", which is the bug this guard exists for.
+        #
+        # The 18 do not, and the honest claim is narrower than it is tempting to
+        # make. `confirm_memory` DOES write source='confirmed' — it is the only
+        # writer of that literal anywhere in this repo's history (`git log --all
+        # -S"source = 'confirmed'" -- src` returns exactly one commit, the one
+        # that introduced the method) — and it has always set `confirmed = 1` in
+        # the SAME UPDATE. So it is the COMBINATION that has no producer either
+        # this session or the review before it could find. Not "no code path can
+        # produce it": nothing here rules out a hand-run UPDATE, an older tree,
+        # or a path we did not think to look at. One more clue, recorded rather
+        # than interpreted: `created_at` on all 18 is in the column DEFAULT's
+        # format (`datetime('now')` — space separator, no offset) while
+        # `updated_at` is Python `_now()`'s ISO-8601 with microseconds, so the
+        # rows were inserted with the default and updated 36 seconds later by
+        # something in Python. Which thing, we could not establish.
+        #
+        # WHAT "STRANDED" MEANS HERE, precisely — the first draft of this said
+        # "no code path will ever surface them again", and that is false:
+        #   · NOT reachable: `LearningQueue.pending()` (source='proposed'),
+        #     `active()` and `GET /api/learnings` (confirmed=1), prompt
+        #     injection via `list_memories(confirmed=True, …)`, and
+        #     `context/sessions.py`'s recall (`WHERE confirmed = 1`). So they
+        #     can never become an active rule, and can never reach the human
+        #     confirm gate — the two paths that decide anything.
+        #   · STILL reachable: `learning/curator.py`'s `curate()` reads
+        #     `list_memories(confirmed=False)` with no source filter, so its
+        #     dedupe pass can archive one as a duplicate and its LLM pass can
+        #     propose archiving or consolidating it; and `nh recall <q>
+        #     --include-pending` lists them as "memory (pending)".
+        #
+        # THIS BRANCH RUNS NOTHING AGAINST THEM. There is no migration here and
+        # no write to the operator's database. The options are the operator's:
+        #   1. Leave them. Nothing injects them into any prompt. The only cost
+        #      is that an ad-hoc count of "pending learnings" disagrees with the
+        #      queue by 20.
+        #   2. Re-queue them — `UPDATE memories SET source='proposed' WHERE
+        #      confirmed=0 AND source<>'proposed'` — which is the only option
+        #      that hands the decision back, at the cost of 20 more rows on a
+        #      queue already holding 329.
+        #   3. Archive them (`archived=1`), keeping the rows and their dedupe
+        #      keys while removing them from the curator's input.
+        # Deleting them is not on the list: the row carries the dedupe key, and
+        # their content is environment notes about the operator's own machine
+        # and workplace — not quoted here, because this file ships.
+        if not confirmed and source != SOURCE_PROPOSED:
+            raise ValueError(
+                f"add_memory(confirmed=False, source={source!r}) would write a "
+                f"proposal that `pending()` cannot see — unconfirmed memories "
+                f"must use source={SOURCE_PROPOSED!r}. Record the provenance "
+                f"in `origin=` instead, which is a second column for exactly "
+                f"this question."
+            )
         if dedupe_key is not None:
             if await self._fetchone(
                 "SELECT id FROM memories WHERE file_path = ? LIMIT 1", (dedupe_key,)
@@ -1976,6 +2091,66 @@ class Store:
             "WHERE id = ? AND archived = 0", (suffix, mem_id))
         await self.db.commit()
         return cur.rowcount > 0
+
+    @serialized_write
+    async def touch_memories_used(self, mem_ids: list[str]) -> int:
+        """Stamp ``last_used_at`` on every memory in *mem_ids*. Returns the
+        number of rows updated.
+
+        ONE statement per chunk, not one per id. This runs on the per-attempt
+        hot path (every task start, every review round) with an active set that
+        is 71 rows in the operator's own install, and every write here queues
+        behind `serialized_write`'s single connection lock — N awaited UPDATEs
+        would be N lock acquisitions on the critical path between a task being
+        picked up and the coder starting.
+
+        Chunked at 400 ids because `IN (?, ?, …)` is one bind parameter per id
+        and SQLite has a variable ceiling (999 on older builds). The active set
+        is far below that today; the chunking is here so a future store that is
+        not stays correct rather than raising at the worst possible moment.
+
+        ``updated_at`` is deliberately NOT touched. It records when the memory's
+        CONTENT last changed — a human confirming or editing it — and injecting
+        a rule changes nothing about the rule. Overloading it would erase the
+        only timestamp that says when the operator last had an opinion.
+        """
+        ids = [i for i in (mem_ids or []) if i]
+        if not ids:
+            return 0
+        now = _now()
+        total = 0
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            marks = ", ".join("?" for _ in chunk)
+            cur = await self.db.execute(
+                f"UPDATE memories SET last_used_at = ? WHERE id IN ({marks})",
+                (now, *chunk),
+            )
+            total += cur.rowcount
+        await self.db.commit()
+        return total
+
+    async def stale_memories(
+        self, *, days: int, project: str | None = None,
+        scope: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Confirmed, unarchived memories not injected into a prompt in *days*.
+
+        A NULL ``last_used_at`` counts as stale — but it is genuinely ambiguous
+        (never triggered, or written before the column existed), and the caller
+        is expected to say so rather than report both as "never used". The
+        cutoff and the stored stamps are both `_now()`-format ISO-8601 UTC, so
+        the string comparison is a real chronological one.
+
+        READ-ONLY. Nothing here archives or deletes: these are CONFIRMED rows,
+        which `learning/curator.py` calls "the operator's — never touched", and
+        an unused rule is not a wrong rule. It is a report.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        rows = await self.list_memories(
+            confirmed=True, project=project, scope=scope)
+        return [r for r in rows
+                if not r.get("last_used_at") or r["last_used_at"] < cutoff]
 
     @serialized_write
     async def confirm_memory(self, mem_id: str) -> bool:

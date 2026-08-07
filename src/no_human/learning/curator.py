@@ -142,11 +142,19 @@ async def curate(
             members = [x for x in members if x]
             if len(members) < 2 or not c.get("title"):
                 continue
+            # source="proposed" — the queue-visibility contract. This wrote
+            # source="curator" and then ARCHIVED the members it consolidated,
+            # so a consolidation removed N rows from the human's confirm queue
+            # and replaced them with one row `pending()` could not see. That is
+            # the module docstring's "the human gate stands" failing on its own
+            # terms: a consolidated learning could never reach the gate. The
+            # curator names itself in `origin`, like every other producer.
+            from .queue import ORIGIN_CURATOR
             new_id = await store.add_memory(
                 mem_type="rule", title=str(c["title"])[:120],
                 content=str(c.get("content", ""))[:2000]
                 + f"\n\n[consolidated from {len(members)} proposals]",
-                source="curator", confirmed=False,
+                source="proposed", origin=ORIGIN_CURATOR, confirmed=False,
             )
             if new_id:
                 for mid in members:

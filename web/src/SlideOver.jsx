@@ -992,6 +992,64 @@ function ThinkingBlock({ text, elapsed }) {
   );
 }
 
+// "What knowledge was applied to this task" — the learning loop's only visible
+// output while a task is running.
+//
+// The orchestrator has emitted `knowledge_accessed` all along, carrying the
+// TITLES of the rules it injected (`injected`), and the timeline rendered it
+// through the catch-all branch: one line of counts, titles discarded. So the
+// product could say "44 rule(s) injected" and could not say which 44 — which
+// is the question an operator asks when the coder does something surprising.
+//
+// A button and a conditional body, NOT <details>/<summary>. The Settings
+// overlay's focus trap had to grow a `summary` selector and a collapsed-details
+// filter after exactly that markup leaked Tab out of the dialog; this drawer's
+// trap (see keepFocusInDialog) still has neither, so a <summary> here would
+// reintroduce a fixed bug in a component that never fixed it. `ThinkingBlock`
+// above is the same shape for the same reason.
+function KnowledgeApplied({ event }) {
+  const [expanded, setExpanded] = useState(false);
+  const injected = Array.isArray(event.injected) ? event.injected : [];
+  const held = Array.isArray(event.held_for_terms) ? event.held_for_terms : [];
+  const text = event.text || "";
+  if (!injected.length && !held.length) {
+    // "0 rule(s) injected, 71 held (trigger not matched)" is the honest and
+    // common case. It gets the plain line it always had — a disclosure control
+    // that opens onto nothing is worse than no control.
+    return <span className="rich-body">{text}</span>;
+  }
+  return (
+    <div className="rich-knowledge">
+      <button
+        type="button"
+        className="rich-thinking-toggle"
+        onClick={() => setExpanded(!expanded)}
+        aria-expanded={expanded}
+      >
+        {expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+        <span>{text}</span>
+      </button>
+      {expanded && (
+        <div className="rich-knowledge-body">
+          {injected.map((title, i) => (
+            <div className="rich-knowledge-item" key={`i${i}`}>{title}</div>
+          ))}
+          {/* Held-for-terms is named separately and looks different on
+              purpose: one is the trigger filter working, the other is a rule
+              the operator needs to clean. The backend has always distinguished
+              them in the count line; discarding the distinction here would
+              make a screened rule look like it simply did not match. */}
+          {held.map((title, i) => (
+            <div className="rich-knowledge-item held" key={`h${i}`}>
+              {title} <span className="rich-knowledge-why">held — banned term</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Render a single event with rich formatting
 function RichEvent({ event, elapsed, role }) {
   const kind = event.kind;
@@ -1066,6 +1124,8 @@ function RichEvent({ event, elapsed, role }) {
     body = <div className="rich-agent-prose"><Markdown>{text}</Markdown></div>;
   } else if (kind === "thinking") {
     body = <ThinkingBlock text={text} elapsed={elapsed} />;
+  } else if (kind === "knowledge_accessed") {
+    body = <KnowledgeApplied event={event} />;
   } else if (kind === "supervisor_decision") {
     // `text` is only the verdict word; the guidance lives in `message`.
     // Rendering just the word made 33 real corrections look like noise.
@@ -1736,6 +1796,8 @@ const EVENT_LABELS = {
   env_setup: "Env setup",
   env_setup_failed: "Env setup failed",
   env_teardown: "Env teardown",
+  // the learning loop, applied (S3-B2)
+  knowledge_accessed: "Knowledge applied",
   // skills & subagents (Items 3, 4)
   skills_materialized: "Skills loaded",
   skills_loaded: "Skills",

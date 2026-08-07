@@ -284,3 +284,107 @@ test('"Stop this task" stays legible on the panel it sits in', () => {
   }
   assert.ok(seen >= 1, "no .decision-btn-quiet colour rule found — has it been renamed?");
 });
+
+test("the GLOBAL blast-radius badge is not painted in the accent colour", () => {
+  // THE DEFECT THIS EXISTS FOR. `.learning-scope.global` is the badge that
+  // tells a human a proposed learning will be injected into EVERY repo rather
+  // than one, with Confirm one click away on the same card. It was written
+  // `color: var(--amber)` — and --amber is a legacy ALIAS of --accent-500,
+  // byte-identical in both themes (#4C9AFF / #0C66E4). The warning rendered in
+  // the app's ordinary chrome blue, which is the one thing it must not be.
+  //
+  // WHAT DID AND DID NOT SHIP, stated exactly, because the difference matters.
+  // `.learning-scope.global` does not exist at main (c0daad33): the selector,
+  // the blue rendering and this test all arrived on the same branch, the badge
+  // was introduced blue by its first commit and corrected by its second, and
+  // nothing blue ever reached a user. What DID ship, long before this work, is
+  // the misnamed token itself — main already resolves `--amber` to the accent
+  // hex and 43 of its lines paint something with it. Fixing those 43 is not
+  // this branch's job and is not attempted here; the point kept is narrower
+  // and survives either way: a token's NAME proves nothing about its value.
+  //
+  // Everything below is RESOLVED, never named. The sibling test in
+  // learningCard.test.mjs asserted that the rule declares *a* colour, and it
+  // passed on the defect for as long as the defect existed; asserting the
+  // token is called `--warn` would pass on the identical defect again. So:
+  // read the token out of the rule, resolve it per theme, and compare HEXES.
+  //
+  // THE BOUNDARY, so nobody mistakes this for more than it is. What follows
+  // checks two properties — distance from the accent ramp, and AA on both
+  // fills the badge can sit on. It does NOT check that the hue MEANS "warning".
+  // A legible non-accent green (#7DD87D, say) passes every assertion below and
+  // would still be the wrong colour for a blast-radius badge. That is accepted,
+  // not overlooked: "warning-ness" is a judgement about a palette, and encoding
+  // it here would mean naming an allowed hue range, which is the same
+  // trust-the-name failure this test exists to avoid, one level up. (Worded
+  // around the obvious phrase on purpose: `tamper_guard._ASSERT` matches that
+  // keyword inside a COMMENT, and the first draft of this paragraph inflated
+  // the suite's assertion total by one.) The colour a human
+  // chose is reviewed by a human; what is mechanised is that it cannot silently
+  // collapse back into the chrome, or become unreadable.
+  const rule = RULES.find((r) => r.selector === ".learning-scope.global");
+  assert.ok(rule, ".learning-scope.global must exist — if it was renamed, retarget this test");
+  const token = (decl(rule.body, "color") ?? "").match(/var\(\s*(--[a-zA-Z0-9-]+)/)?.[1];
+  assert.ok(token, ".learning-scope.global must colour itself with a theme token");
+
+  // Its two real backdrops, DERIVED from the rules that paint them rather than
+  // typed in: the card fill, and the fill a SELECTED card swaps in (a global
+  // rule is exactly the kind an operator ticks in a bulk confirm, and
+  // `.learning-card.selected` outranks `.memory-card` on specificity, so it
+  // really does replace the fill). Both go through `surfacesFor`, which is the
+  // same derivation the sweep above uses — a translucent fill like --green-dim
+  // is composited over every ambient surface and the worst case has to pass.
+  // Naming one base by hand is how the first version of this file measured
+  // against a backdrop the element never had.
+  const bodyOf = (selector) => {
+    const r = RULES.find((x) => x.selector === selector);
+    assert.ok(r, `${selector} must exist — it is where this badge's background comes from`);
+    assert.ok(decl(r.body, "background") ?? decl(r.body, "background-color"),
+      `${selector} must declare the background this badge sits on`);
+    return r.body;
+  };
+  const cardBody = bodyOf(".memory-card");            // .learning-card extends it
+  const selectedBody = bodyOf(".learning-card.selected");
+
+  for (const theme of ["dark", "light"]) {
+    // A token defined only in :root makes the light theme silently reuse the
+    // dark hue — deadCss.test.mjs's case (b), and a warning colour tuned for
+    // one theme is a warning in one theme.
+    assert.ok(THEME[theme].has(token),
+      `${token} is not defined in the ${theme} theme block — ${theme} would inherit the other theme's hue`);
+
+    const fg = resolveToken(token, theme);
+    assert.ok(fg, `${token} does not resolve in ${theme}`);
+
+    // Distinct from the whole accent ramp, discovered from the theme block so a
+    // sixth accent token joins the check by itself.
+    const accents = [...THEME[theme].keys()].filter((t) => /^--(accent|blue)/.test(t));
+    assert.ok(accents.includes("--accent-500"), `${theme}: --accent-500 must be in the accent ramp`);
+    for (const a of accents) {
+      const c = resolveToken(a, theme);
+      if (!c) continue;
+      assert.notEqual(show(fg), show(c),
+        `${theme}: the blast-radius badge resolves to ${show(fg)} via ${token}, which IS ${a}. `
+        + "A warning drawn in the accent colour does not warn.");
+      const distance = Math.hypot(...fg.slice(0, 3).map((v, i) => v - c[i]));
+      assert.ok(distance >= 100,
+        `${theme}: ${token} ${show(fg)} is only ${distance.toFixed(0)} apart in RGB from ${a} `
+        + `${show(c)} — too close to read as a different kind of thing`);
+    }
+
+    // …and legible on every backdrop either fill can produce. 11px/600 is small
+    // text, so AA is 4.5:1.
+    let measured = 0;
+    for (const [label, body] of [["card", cardBody], ["selected card", selectedBody]]) {
+      for (const surface of surfacesFor(body, theme)) {
+        measured += 1;
+        const ratio = contrast(fg, surface.color);
+        assert.ok(ratio >= AA_SMALL,
+          `${theme}: ${token} ${show(fg)} on the ${label} fill (${surface.label}) `
+          + `is ${ratio.toFixed(2)}:1 < ${AA_SMALL}:1`);
+      }
+    }
+    assert.ok(measured >= 2,
+      `${theme}: only ${measured} backdrop(s) measured — the fills stopped resolving`);
+  }
+});

@@ -88,3 +88,261 @@ def test_generic_aliases_do_not_trigger():
     api_lesson = {"title": "endpoint 500", "tags": '["api"]'}
     assert memory_is_triggered(api_lesson, "fix the json parsing in the config loader") is False
     assert memory_is_triggered(api_lesson, "the endpoint returns 500") is True
+
+
+# --------------------------------------------------------------------------- #
+# S2. `last_used_at` — which confirmed rules have ever actually done anything   #
+#                                                                              #
+# The confirm queue can say what a human approved. Nothing could say what any   #
+# of it ever DID: 53 confirmed rules in the operator's own install, no record   #
+# of a single injection. These tests pin the stamp and, more importantly, the   #
+# trap that makes a naive version of it lie.                                    #
+# --------------------------------------------------------------------------- #
+
+import ast
+import textwrap
+from pathlib import Path
+
+import pytest
+
+from no_human.core.db import Store
+from no_human.core.orchestrator import Orchestrator
+from no_human.core.task import Task
+
+_ORCH_SRC = (
+    Path(__file__).resolve().parents[1]
+    / "src" / "no_human" / "core" / "orchestrator.py"
+).read_text()
+
+
+def _bare_orchestrator(store):
+    """An Orchestrator with only what `_load_active_memories` touches.
+
+    `__new__` rather than `__init__` on purpose: booting a real one needs a
+    config, a backend and a repo, none of which this behaviour depends on, and
+    a test that drags all three in stops being run.
+    """
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.store = store
+    return orch
+
+
+async def test_injecting_a_rule_stamps_last_used_at(tmp_path):
+    """The stamp exists at all, and only lands on rules that actually fired."""
+    async with Store(tmp_path / "nh.db") as store:
+        fires = await store.add_memory(
+            mem_type="rule", title="kafka topic rule", content="x",
+            tags=["kafka"], confirmed=True)
+        holds = await store.add_memory(
+            mem_type="rule", title="css rule", content="x",
+            tags=["css"], confirmed=True)
+
+        task = Task.new("Fix the kafka topic creation", repo_path="")
+        all_scoped, triggered = await _bare_orchestrator(store)._load_active_memories(task)
+
+        assert {m["id"] for m in all_scoped} == {fires, holds}, (
+            "control: both rules must be FETCHED, or the trigger filter is "
+            "not what is being measured here")
+        assert [m["id"] for m in triggered] == [fires]
+
+        rows = {m["id"]: m for m in await store.list_memories(confirmed=True)}
+        assert rows[fires]["last_used_at"], "the injected rule was never stamped"
+        assert rows[holds]["last_used_at"] is None, (
+            "a rule that was fetched but did NOT trigger has not been used")
+
+
+async def test_a_rule_held_by_the_term_screen_is_not_recorded_as_used(tmp_path):
+    """The subtle half. `filter_triggered` returns matches; the term screen
+    then withholds some of them from every prompt. Stamping the FILTER's output
+    records a use that never happened — and the symptom is invisible, because a
+    rule silently withheld from every task would read as healthy in `--stale`
+    forever. The stamp comes off the property, which is the only thing that
+    knows what survived.
+    """
+    from no_human.eval.vendor_terms import BANNED_TERMS
+
+    term = BANNED_TERMS[0]
+    async with Store(tmp_path / "nh.db") as store:
+        held = await store.add_memory(
+            mem_type="rule", title=f"The {term} deployment runner",
+            content="Drain the queue before deploying.", confirmed=True)
+        clean = await store.add_memory(
+            mem_type="rule", title="Deployment runner conventions",
+            content="Drain the queue before deploying.", confirmed=True)
+
+        task = Task.new("fix the deployment runner", repo_path="")
+        orch = _bare_orchestrator(store)
+        _, triggered = await orch._load_active_memories(task)
+
+        assert {m["id"] for m in triggered} == {held, clean}, (
+            "control: BOTH rules must pass the trigger filter, or this test "
+            "is not exercising the screen at all")
+        assert [m["id"] for m in orch._active_memories] == [clean], (
+            "control: the screen must actually hold the banned-term rule")
+
+        rows = {m["id"]: m for m in await store.list_memories(confirmed=True)}
+        assert rows[clean]["last_used_at"], "the injected rule was never stamped"
+        assert rows[held]["last_used_at"] is None, (
+            "a rule the term screen withheld from every prompt was recorded "
+            "as USED — `nh learnings --stale` would call it healthy forever")
+
+
+def _install_sites(source: str) -> list[int]:
+    """Line numbers in *source* that install a new active rule set.
+
+    SCANNED BY ASSIGNMENT, not by the name of the function on the right-hand
+    side. The first version of this guard counted `filter_triggered(` calls and
+    a mutation defeated it in one line — `from ..learning.triggers import
+    filter_triggered as _ft` — which is not an exotic form, it is what anyone
+    avoiding a name collision writes. Whatever a path calls the filter, it must
+    end up ASSIGNING `self._active_memories` for the rules to reach a prompt at
+    all, so that is where the tripwire belongs.
+
+    Parsed, not regex'd over text. This module's own prose discusses the
+    attribute at length and a guard its own docstrings can trip is a guard that
+    gets loosened until it stops working; `ast` cannot see inside a string or a
+    comment at all. It also picks up tuple targets and `+=` for free, two of the
+    nine forms that defeated the sibling guard in
+    `test_active_memories_mutation_guard.py`.
+
+    STILL NOT A PROOF. `setattr(self, "_active_memories", x)` and a `__dict__`
+    write are assignments this cannot see, and that sibling's docstring is the
+    record of someone actually doing it. What makes the behaviour safe is the
+    two tests above, which MEASURE the stamp; this catches the ordinary
+    regression early and by name.
+    """
+    tree = ast.parse(textwrap.dedent(source))
+    hits: list[int] = []
+    for node in ast.walk(tree):
+        targets = list(getattr(node, "targets", []))
+        if isinstance(node, ast.AugAssign):
+            targets = [node.target]
+        for t in targets:
+            for leaf in ([*t.elts] if isinstance(t, (ast.Tuple, ast.List))
+                         else [t]):
+                if (isinstance(leaf, ast.Attribute)
+                        and leaf.attr == "_active_memories"
+                        and isinstance(leaf.value, ast.Name)
+                        and leaf.value.id == "self"):
+                    hits.append(node.lineno)
+    return sorted(hits)
+
+
+def test_only_one_place_turns_a_task_into_an_active_rule_set():
+    """The trap that motivated the helper. `filter_triggered` had TWO callers —
+    the implement path and the review path — so a stamp added at one of them
+    reports "never used" for every rule the OTHER one used, and it is wrong in
+    the direction that gets a working rule deleted.
+    """
+    sites = _install_sites(_ORCH_SRC)
+    assert len(sites) == 1, (
+        f"orchestrator.py installs an active rule set at {len(sites)} sites "
+        f"(orchestrator.py lines {sites}). Every one must go through "
+        f"`_load_active_memories`, or `last_used_at` under-reports for "
+        f"whichever path skipped it."
+    )
+    # ...and that ONE site is inside the helper, not somewhere that skips the
+    # stamp. Compared by line RANGE off the same parse rather than by slicing
+    # the text: a source fragment is not valid Python and the split-and-reparse
+    # version of this raised SyntaxError instead of asserting anything.
+    helpers = [n for n in ast.walk(ast.parse(_ORCH_SRC))
+               if isinstance(n, ast.AsyncFunctionDef)
+               and n.name == "_load_active_memories"]
+    assert len(helpers) == 1, "the helper was renamed — retarget this test"
+    helper = helpers[0]
+    assert helper.lineno <= sites[0] <= (helper.end_lineno or helper.lineno), (
+        f"the single install site (line {sites[0]}) is outside "
+        f"`_load_active_memories` (lines {helper.lineno}-{helper.end_lineno}) "
+        f"— it installs rules without stamping them")
+
+
+def test_the_single_install_site_scan_can_actually_fail():
+    """Known-positive control. A guard whose detector has never been shown to
+    fire is a guard that might be matching nothing — and this one's FIRST
+    version matched nothing on the mutation it exists for, which is how it was
+    found. Both forms below are real: the second is the exact aliased-import
+    mutant that survived the call-counting version.
+    """
+    assert len(_install_sites(
+        "self._active_memories = a\n"
+        "self._active_memories = b\n")) == 2
+    assert len(_install_sites(
+        "self._active_memories = (_ft(rows, haystack))\n")) == 1
+    # Two of the forms that defeated the sibling guard, caught here for free
+    # by parsing rather than pattern-matching a line.
+    assert len(_install_sites("self._active_memories, x = a, b\n")) == 1
+    assert len(_install_sites("self._active_memories += [m]\n")) == 1
+    # The property's own decorator and the setter's `object.__setattr__` are
+    # NOT installs and must not be counted, or the guard fires on the very
+    # mechanism it protects.
+    assert _install_sites(
+        "@_active_memories.setter\n"
+        "def _active_memories(self, mems):\n"
+        "    object.__setattr__(self, self._ACTIVE_MEMORIES_RAW, mems)\n") == []
+    # A comparison, a read, and the attribute on something that is not `self`
+    # are all not installs.
+    assert _install_sites("if self._active_memories == x:\n    pass\n") == []
+    assert _install_sites("y = self._active_memories\n") == []
+    assert _install_sites("other._active_memories = a\n") == []
+
+
+async def test_stale_reports_never_used_and_never_archives(tmp_path):
+    """`--stale`'s query: NULL counts as stale, a fresh stamp does not, and
+    nothing is mutated. Confirmed rows are the operator's — `curator.py` exempts
+    them from every automatic action, and this report must not be the exception.
+    """
+    from no_human.learning import LearningQueue
+
+    async with Store(tmp_path / "nh.db") as store:
+        never = await store.add_memory(
+            mem_type="rule", title="never used", content="x", confirmed=True)
+        used = await store.add_memory(
+            mem_type="rule", title="just used", content="x", confirmed=True)
+        pending = await store.add_memory(
+            mem_type="rule", title="not confirmed", content="x")
+        assert await store.touch_memories_used([used]) == 1
+
+        stale = await LearningQueue(store).stale(days=30)
+        assert [m["id"] for m in stale] == [never]
+        assert pending not in {m["id"] for m in stale}, (
+            "an unconfirmed proposal is not a stale rule — it has never been "
+            "eligible to be used")
+
+        # days=0 makes even the just-used row stale; the cutoff is real and
+        # not an accidental always-true string comparison.
+        assert {m["id"] for m in await LearningQueue(store).stale(days=0)} == {
+            never, used}
+
+        # READ-ONLY: same rows, same archived flags, afterwards.
+        after = await store.list_memories(confirmed=True)
+        assert {m["id"] for m in after} == {never, used}
+        assert all(not m["archived"] for m in after)
+
+
+async def test_touch_is_one_statement_per_chunk_not_one_per_id(tmp_path):
+    """It runs on the per-attempt hot path behind a serialized write lock, so
+    N awaited UPDATEs would be N lock acquisitions between a task being picked
+    up and the coder starting. Counted, because "batched" is otherwise a claim
+    in a docstring."""
+    async with Store(tmp_path / "nh.db") as store:
+        ids = [await store.add_memory(mem_type="rule", title=f"r{i}",
+                                      content="x", confirmed=True)
+               for i in range(25)]
+        executed: list[str] = []
+        real = store.db.execute
+
+        async def counting(sql, *a, **kw):
+            executed.append(sql)
+            return await real(sql, *a, **kw)
+
+        store.db.execute = counting
+        try:
+            assert await store.touch_memories_used(ids) == 25
+        finally:
+            store.db.execute = real
+
+        updates = [s for s in executed if "last_used_at" in s]
+        assert len(updates) == 1, (
+            f"{len(updates)} statements for 25 ids — the batch collapsed into "
+            f"a per-id loop on a hot path")
+        assert await store.touch_memories_used([]) == 0

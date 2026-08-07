@@ -22,11 +22,13 @@ content still gets through.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
-from no_human.core.db import Store
+from no_human.core.db import SOURCE_PROPOSED, Store
+from no_human.learning import ORIGIN_HISTORY, LearningQueue
 from no_human.history.analyzer import (
     _is_noise_message,
     analyze_transcript,
@@ -456,6 +458,92 @@ def test_cli_history_analyze_drops_personal_data(tmp_path, monkeypatch):
     blob = " ".join(f"{t} {c}" for t, c in rows)
     assert "Herzl" not in blob
     assert "run the tests before pushing" in blob
+
+    # THE ROW MUST BE IN THE QUEUE THE COMMAND NAMES. Everything above this
+    # line reads the table with raw SQL, which is why it stayed green while
+    # `nh history --analyze` wrote source="history" and `pending()` — the query
+    # behind the "review with: nh learnings" the command prints two lines
+    # earlier — selects source="proposed". Every proposal this command has ever
+    # made was counted, printed, and invisible. A check that reads around the
+    # component under test is not observing it.
+    assert "1 proposals queued" in result.output
+    assert "review with: nh learnings" in result.output
+
+    async def _queued():
+        async with Store(tmp_path / "cli.db") as store:
+            return await LearningQueue(store).pending()
+
+    pending = asyncio.run(_queued())
+    assert [p["title"] for p in pending] and any(
+        "run the tests before pushing" in (p["content"] or "") for p in pending
+    ), (
+        "the mined rule reached the database but not `nh learnings` — "
+        f"pending() returned {len(pending)} row(s)"
+    )
+    # And it says WHICH producer made it, in the column that exists for that
+    # question rather than in the one that decides visibility.
+    assert {p["origin"] for p in pending} == {ORIGIN_HISTORY}
+    assert {p["source"] for p in pending} == {SOURCE_PROPOSED}
+
+
+def test_the_reply_path_lands_in_the_queue_it_promises(tmp_path):
+    """`nh reply`'s mined learnings had the SAME defect (source="reply") and it
+    had already cost two real rows in the operator's own database, created
+    2026-07-26 and 2026-07-27 from their own review replies. The CLI prints
+    "confirm with `nh learnings`"; this asserts that command can see it.
+
+    Driven at the store boundary rather than through `nh reply`, which needs a
+    parked task with a blocker to reach the mining branch. The defect was the
+    add_memory kwargs, and those are what this pins.
+    """
+    from no_human.learning import ORIGIN_REPLY
+
+    async def _go():
+        async with Store(tmp_path / "reply.db") as store:
+            mined = mine_reply("always run the tests before pushing")
+            assert mined is not None, "precondition: this reply mines a rule"
+            category, desc = mined
+            mem_id = await store.add_memory(
+                mem_type=category,
+                title=f"{desc} (from a review reply)"[:120],
+                content="always run the tests before pushing",
+                source=SOURCE_PROPOSED, confirmed=False, origin=ORIGIN_REPLY,
+                tags=["reply", category, "user_correction"],
+                dedupe_key="reply:always run the tests before pushing",
+            )
+            assert mem_id
+            return mem_id, await LearningQueue(store).pending()
+
+    mem_id, pending = asyncio.run(_go())
+    assert [p["id"] for p in pending] == [mem_id]
+    assert pending[0]["origin"] == ORIGIN_REPLY
+
+
+def test_an_unconfirmed_memory_cannot_be_written_outside_the_queue(tmp_path):
+    """The STRUCTURAL half. Fixing the two call sites leaves the invariant
+    enforced by nothing — it was already stated in two docstrings and three
+    call sites broke it anyway. `Store.add_memory` refuses the shape, so a
+    fourth door fails loudly instead of silently dropping the operator's
+    learnings.
+
+    The refusal is scoped: a CONFIRMED row may carry any source (the board
+    writes "board", `nh rules add` writes "manual"), because a confirmed row is
+    already active and never depended on `pending()` to be seen.
+    """
+    async def _go():
+        async with Store(tmp_path / "guard.db") as store:
+            with pytest.raises(ValueError, match=r"`pending\(\)` cannot see"):
+                await store.add_memory(
+                    mem_type="rule", title="invisible", content="x",
+                    source="history", confirmed=False)
+            # ... and it refused BEFORE writing anything.
+            assert await store.list_memories(include_archived=True) == []
+            # A confirmed row with a non-proposed source is still legal.
+            assert await store.add_memory(
+                mem_type="rule", title="board rule", content="x",
+                source="board", confirmed=True) is not None
+
+    asyncio.run(_go())
 
 
 def test_mine_reply_refuses_personal_data():

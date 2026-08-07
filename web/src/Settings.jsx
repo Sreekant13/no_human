@@ -11,6 +11,14 @@ import {
 import { capName, PROFILE_CAP, TOKENVAR_CAP } from "./capName.js";
 import { authPanelView } from "./authPanelView.js";
 import { groupLearningsByProject } from "./learningGroups.js";
+import {
+  BULK_CONFIRM_CAP,
+  bulkConfirmIds,
+  filterLearnings,
+  learningEvidence,
+  learningOrigin,
+  learningScope,
+} from "./learningCard.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 import { pluralize } from "./pluralize.js";
 import { updateNotice } from "./updateNotice.js";
@@ -590,6 +598,9 @@ function LearningsPanel() {
   const [view, setView] = useState("pending");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [query, setQuery] = useState("");
+  const [selected, setSelected] = useState(() => new Set());
+  const [bulk, setBulk] = useState(null);   // {done, total} while confirming
 
   const load = useCallback(() => {
     setLoading(true);
@@ -608,13 +619,52 @@ function LearningsPanel() {
     try {
       if (action === "confirm") await confirmLearning(id);
       else await rejectLearning(id);
+      setSelected((s) => { const n = new Set(s); n.delete(id); return n; });
       load();
     } catch (e) {
       setError(e.message);
     }
   }
 
+  function toggleSelect(id) {
+    setSelected((s) => {
+      const n = new Set(s);
+      n.has(id) ? n.delete(id) : n.add(id);
+      return n;
+    });
+  }
+
   const items = view === "pending" ? pending : active;
+  const visible = filterLearnings(items, query);
+  // Only what is on screen can be confirmed in bulk — see bulkConfirmIds: a
+  // selection survives a filter change, and confirming a rule the operator
+  // cannot see is exactly the blast-radius problem the card warns about.
+  const batch = view === "pending" ? bulkConfirmIds(visible, selected) : [];
+
+  async function confirmSelected() {
+    if (!batch.length || bulk) return;
+    setBulk({ done: 0, total: batch.length });
+    // SEQUENTIAL, not Promise.all. Every confirm is a write against a store
+    // that serialises writes behind one connection, and a running task needs
+    // that connection too; firing 50 at once queues 50 deep in front of it.
+    // The first failure stops the batch and says how far it got, rather than
+    // reporting one error for an unknown amount of applied change.
+    let done = 0;
+    try {
+      for (const id of batch) {
+        await confirmLearning(id);
+        done += 1;
+        setBulk({ done, total: batch.length });
+      }
+      setError(null);
+    } catch (e) {
+      setError(`${e.message} — ${done} of ${batch.length} confirmed`);
+    } finally {
+      setBulk(null);
+      setSelected(new Set());
+      load();
+    }
+  }
 
   return (
     <div className="memory-panel">
@@ -651,6 +701,45 @@ function LearningsPanel() {
         </div>
       </div>
       {error && <div className="settings-error">{error}</div>}
+      {/* 329 pending rows are not triageable one click at a time, and not by
+          scrolling either. The filter narrows; the bulk bar acts on what the
+          filter left on screen. */}
+      {!loading && items.length > 0 && (
+        <div className="learning-toolbar">
+          <input
+            type="search"
+            className="learning-filter"
+            placeholder="Filter by title, content, type, origin or project…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            aria-label="Filter learnings"
+          />
+          <span className="learning-filter-count">
+            {visible.length === items.length
+              ? `${items.length}`
+              : `${visible.length} of ${items.length}`}
+          </span>
+          {view === "pending" && (
+            <button
+              className="btn btn-approve btn-sm"
+              disabled={!batch.length || !!bulk}
+              onClick={confirmSelected}
+            >
+              {bulk
+                ? `Confirming ${bulk.done}/${bulk.total}…`
+                : `Confirm selected${batch.length ? ` (${batch.length})` : ""}`}
+            </button>
+          )}
+        </div>
+      )}
+      {/* Said out loud rather than silently truncating: the batch is capped
+          and the operator would otherwise believe a click applied all of a
+          larger selection. */}
+      {view === "pending" && batch.length >= BULK_CONFIRM_CAP && (
+        <div className="learning-cap-note">
+          {BULK_CONFIRM_CAP} at a time — click again for the rest.
+        </div>
+      )}
       {loading ? (
         <div className="settings-empty">Loading…</div>
       ) : items.length === 0 ? (
@@ -659,9 +748,13 @@ function LearningsPanel() {
             ? "No pending proposals. The agent hasn't proposed new learnings yet."
             : "No active learnings. Confirm pending proposals to activate them."}
         </div>
+      ) : visible.length === 0 ? (
+        <div className="settings-empty">
+          No learning matches “{query}”.
+        </div>
       ) : (
         <div className="learning-groups">
-          {groupLearningsByProject(items).map((group) => (
+          {groupLearningsByProject(visible).map((group) => (
             <details key={group.key} className="learning-group" open>
               <summary className="learning-group-header">
                 <span className="learning-group-label">{group.label}</span>
@@ -674,6 +767,8 @@ function LearningsPanel() {
                     item={item}
                     isPending={view === "pending"}
                     onAction={handleAction}
+                    selected={selected.has(item.id)}
+                    onToggleSelect={toggleSelect}
                   />
                 ))}
               </div>
@@ -685,14 +780,45 @@ function LearningsPanel() {
   );
 }
 
-function LearningCard({ item, isPending, onAction }) {
+function LearningCard({ item, isPending, onAction, selected, onToggleSelect }) {
+  // BLAST RADIUS, on the same card as the Confirm button. `GET /api/learnings`
+  // has always returned every column; this card rendered four of them and
+  // dropped the rest, so a one-click confirm of a GLOBAL rule — one that
+  // injects into every project, forever — looked exactly like confirming a
+  // rule scoped to one repo. `nh learnings` has printed that warning in yellow
+  // since B2; the two surfaces asked for the same decision with different
+  // facts on screen. Logic in learningCard.js, tested next to it.
+  const scope = learningScope(item);
+  const origin = learningOrigin(item);
+  const evidence = learningEvidence(item.evidence);
   return (
-    <div className="memory-card learning-card">
+    <div className={`memory-card learning-card${selected ? " selected" : ""}`}>
       <div className="memory-card-header">
+        {isPending && (
+          // NEVER pre-ticked. The server sends `selected: false` on every
+          // proposal and says why (a real user was shown their own home
+          // address already checked, one click from standing guidance); this
+          // is the same stance for the same reason.
+          <label className="learning-select">
+            <input
+              type="checkbox"
+              checked={selected}
+              onChange={() => onToggleSelect(item.id)}
+            />
+            <span className="sr-only">Select {item.title}</span>
+          </label>
+        )}
         <span className="memory-card-id">{(item.id || "").slice(0, 8)}</span>
         <span className="memory-card-type">{item.type}</span>
+        {origin && <span className="learning-origin">{origin}</span>}
       </div>
       <div className="memory-card-title">{item.title}</div>
+      <div className={`learning-scope ${scope.kind}`}>
+        {scope.kind === "global" ? "scope: " : "scope: "}
+        {scope.label}
+        {scope.detail && <span className="learning-scope-id"> · {scope.detail}</span>}
+      </div>
+      {evidence && <div className="learning-evidence">evidence: {evidence}</div>}
       {item.content && <div className="memory-card-content">{item.content}</div>}
       {isPending && (
         <div className="learning-actions">

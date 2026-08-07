@@ -21,7 +21,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..core.db import Store
+from ..core.db import SOURCE_PROPOSED, Store
 from ..core.task import Task, TaskStatus
 from .corrections import (
     MIN_OCCURRENCES,
@@ -48,6 +48,28 @@ log = logging.getLogger("no_human.learning")
 # existed — which is honest, not a gap: those rows genuinely do not record it.
 ORIGIN_REVIEW = "review"          # B1: a reviewer FAIL round's blocking findings
 ORIGIN_SUPERVISOR = "supervisor"  # B2: a recurring supervisor `correct` decision
+# S1: the three producers that used to name themselves in `source` and were
+# therefore never queued at all. Their proposals now write source="proposed"
+# like everyone else and say what they are HERE, which is where the human
+# reading `nh learnings` actually sees it.
+ORIGIN_HISTORY = "history"        # `nh history --analyze`, mining past transcripts
+ORIGIN_REPLY = "reply"            # a rule mined from the operator's own `nh reply`
+ORIGIN_CURATOR = "curator"        # curator.py's consolidation of N proposals into 1
+
+# Origins whose "no" must ARCHIVE rather than delete — the same treadmill
+# argument `reject()`'s docstring makes for ORIGIN_SUPERVISOR, applied to the
+# rest of the batch-driven producers. A delete drops the row AND the dedupe key
+# it carries in `file_path`, so for any producer that RE-READS its whole input
+# on every run the rejected lesson comes straight back on the next pass.
+#
+# `history` re-reads every transcript on each `--analyze`; `curator` re-reads
+# every surviving proposal on each `--curate`. Both are treadmills. `review`
+# and `reply` are event-driven — a deleted one returns only when the reviewer
+# raises that finding again, or the operator says the same thing again, which
+# is new evidence and worth re-asking about. That asymmetry is the rule, not
+# the list: the question is "can this producer regenerate the proposal without
+# new evidence?", and the answer decides the verb.
+ARCHIVE_ON_REJECT = frozenset({ORIGIN_SUPERVISOR, ORIGIN_HISTORY, ORIGIN_CURATOR})
 
 
 # Memory types (matches the migrations schema CHECK-free `type` column).
@@ -783,12 +805,25 @@ class LearningQueue:
     # --------------------------- confirm / list ---------------------------- #
 
     async def pending(self) -> list[dict[str, Any]]:
-        """Proposals awaiting human confirmation."""
-        return await self.store.list_memories(confirmed=False, source="proposed")
+        """Proposals awaiting human confirmation.
+
+        The `source` filter here IS the visibility contract, which is why it
+        reads `SOURCE_PROPOSED` and not a fifth copy of the string literal —
+        `Store.add_memory` refuses any other value on an unconfirmed row
+        against the same symbol, so this query and that guard cannot drift.
+        """
+        return await self.store.list_memories(
+            confirmed=False, source=SOURCE_PROPOSED)
 
     async def active(self) -> list[dict[str, Any]]:
         """The confirmed, active rule/skill set later tasks consult."""
         return await self.store.list_memories(confirmed=True)
+
+    async def stale(self, *, days: int) -> list[dict[str, Any]]:
+        """Confirmed rules not injected into a prompt in *days* — a report, and
+        only a report. See `Store.stale_memories`: nothing here archives or
+        deletes a confirmed row."""
+        return await self.store.stale_memories(days=days)
 
     async def confirm(self, mem_id: str) -> bool:
         return await self.store.confirm_memory(mem_id)
@@ -796,10 +831,30 @@ class LearningQueue:
     async def reject(self, mem_id: str) -> bool:
         """A human's "no".
 
-        SUPERVISOR-origin proposals are ARCHIVED, not deleted. Every other
+        Proposals from a BATCH-REGENERATED producer (`ARCHIVE_ON_REJECT`:
+        supervisor, history, curator) are ARCHIVED, not deleted. Every other
         origin keeps the delete this method has always done — B1's semantics
         are unchanged, and the asymmetry is deliberate rather than an
         oversight, so it is written down here.
+
+        "EVERY OTHER ORIGIN" INCLUDES NULL, AND NULL IS THE COMMON CASE.
+        `propose_from_outcome` does not pass `origin`, so an outcome-derived
+        proposal is stored with NULL, which is not in the frozenset and takes
+        the delete branch. That is the whole of the live data, not an edge:
+        measured 2026-08-07 against a copy of the operator's database, 329 of
+        329 pending proposals and 402 of 402 rows overall carry NULL, and the
+        five named origins have produced none. Delete is the right verb for it
+        by the same criterion the list uses — the only production caller is
+        `orchestrator._propose_learning`, one call per terminal task outcome,
+        and nothing re-reads finished tasks to re-propose, so a deleted lesson
+        returns only when another task genuinely ends the same way. It is
+        pinned behaviourally in tests/test_learning.py alongside the five.
+
+        S1 widened that set from the single supervisor origin to three. It is
+        not a new rule: `history` and `curator` proposals only became
+        REACHABLE by this method when S1 stopped them writing an unqueueable
+        `source`, and both re-read their whole input on every run, so the
+        argument below applied to them from the moment they became rejectable.
 
         WHY THEY DIFFER. Delete removes the row AND the dedupe key it carries
         in ``file_path``. For B1 that is harmless: `propose_from_review` is
@@ -818,7 +873,7 @@ class LearningQueue:
         still sees its key. That is what makes the "no" stick.
         """
         row = await self.store.find_memory(mem_id)
-        if row is not None and row.get("origin") == ORIGIN_SUPERVISOR:
+        if row is not None and row.get("origin") in ARCHIVE_ON_REJECT:
             return await self.store.archive_memory(
                 row["id"], "rejected at the human confirm gate")
         return await self.store.delete_memory(mem_id)

@@ -152,3 +152,117 @@ def test_mine_reply_captures_reusable_rules_only():
     assert mine_reply("yes, proceed with that") is None
     assert mine_reply("<bash-stdout>never add x</bash-stdout>") is None
     assert mine_reply("") is None
+
+
+# ── which verb a "no" uses, per producer (ARCHIVE_ON_REJECT) ──────────────── #
+#
+# `reject()` dispatches on `origin`: ARCHIVE keeps the row (confirmed=0,
+# archived=1) and therefore keeps its dedupe key, so the "no" sticks against a
+# producer that re-reads its whole input on every run; DELETE drops row and key,
+# so an event-driven producer can re-propose when the event happens again.
+#
+# The set had exactly ONE origin under test (supervisor→archive, review→delete
+# in test_supervisor_learning.py). `history` and `curator` were added to it by
+# the same change that made them rejectable at all, and nothing observed them:
+# an edit that dropped either one from the frozenset changed a human's "no"
+# from durable to a treadmill, and the suite stayed green.
+#
+# The table below is the DECISION, restated independently of the code's own
+# frozenset, and `test_every_origin_declares_a_reject_verb` refuses to run on a
+# module that has grown a sixth origin nobody has classified. That is the part a
+# hand-written list normally gets wrong: a new producer would otherwise inherit
+# `delete` by falling off the end of the set, silently.
+_REJECT_VERB = {
+    "review": "delete",       # a FAIL round; it returns only on new evidence
+    "supervisor": "archive",  # re-reads the whole correction history each run
+    "history": "archive",     # re-reads every transcript each `--analyze`
+    "reply": "delete",        # the operator saying it again IS new evidence
+    "curator": "archive",     # re-reads every surviving proposal each `--curate`
+}
+
+
+def test_every_origin_declares_a_reject_verb():
+    """A sixth producer must choose archive or delete, not inherit one."""
+    from no_human.learning import queue as queue_mod
+    origins = {v for k, v in vars(queue_mod).items()
+               if k.startswith("ORIGIN_") and isinstance(v, str)}
+    assert origins == set(_REJECT_VERB), (
+        "learning/queue.py's ORIGIN_* set no longer matches the reject-verb "
+        "table. A new origin defaults to DELETE by omission from "
+        "ARCHIVE_ON_REJECT — decide, then record it here."
+    )
+
+
+# THE CASE THE TABLE ABOVE CANNOT HOLD: `origin` IS NULL.
+#
+# `propose_from_outcome` never passes `origin` (learning/queue.py, the
+# `add_memory` call in that method lists everything it does pass and `origin` is
+# not among them), so every proposal derived from a terminal task outcome is
+# written with SQL NULL. NULL is not in ARCHIVE_ON_REJECT, so `reject()` falls
+# through to DELETE.
+#
+# That is not a corner. Measured against a `cp` of the operator's live database
+# on 2026-08-07 (never the live file — a running server holds it open):
+# 329 of 329 pending proposals carry `origin` NULL, spanning 2026-06-29 to
+# 2026-08-03, and so do all 402 rows in the table. The five named producers
+# above have written none of them yet; they are proven by these tests and by
+# nothing else. So the untested case was the ONLY case that occurs.
+#
+# Nothing above sees it, for two structural reasons rather than an oversight:
+# `test_every_origin_declares_a_reject_verb` enumerates `vars(queue_mod)` for
+# `ORIGIN_*` NAMES, and NULL has no name, so no edit can make it notice one;
+# and `test_reject_removes_proposal` further up does drive a NULL-origin row
+# through `reject()`, but asserts only that it left `pending()` and `active()`
+# — which an ARCHIVE satisfies too. Adding None to the frozenset left the whole
+# file green.
+#
+# DELETE IS THE RIGHT VERB, by the frozenset's own criterion — "can this
+# producer regenerate the proposal without new evidence?". The only production
+# caller is `orchestrator._propose_learning`, fired once per terminal task
+# outcome; nothing re-reads finished tasks and re-proposes from them, so there
+# is no batch to treadmill. A rejected outcome lesson comes back only when
+# another task actually ends the same way, which is a fresh event and worth
+# re-asking about — the same argument `review` and `reply` get. The case below
+# therefore pins the behaviour that was chosen, not a default nobody chose.
+#
+# It is NOT in `_REJECT_VERB`: that table is the ORIGIN_* completeness contract
+# and adding a nameless key to it would break the test that guards it.
+_REJECT_VERB_CASES = [*sorted(_REJECT_VERB.items()), (None, "delete")]
+
+
+@pytest.mark.parametrize("origin,verb", _REJECT_VERB_CASES)
+@pytest.mark.asyncio
+async def test_reject_uses_the_right_verb_for_each_origin(queue, store, origin, verb):
+    """Behavioural, not a restatement: the row is written with an origin and put
+    through `reject()`, and what survives is inspected. A mutant that edits
+    ARCHIVE_ON_REJECT flips the outcome for that origin and fails here — and
+    `origin=None` is in the sweep because it is what every live row carries."""
+    mem_id = await store.add_memory(
+        mem_type="rule", title=f"rule from {origin}", content="do the thing",
+        source="proposed", confirmed=False, origin=origin,
+        dedupe_key=f"key:{origin}",
+    )
+    assert mem_id is not None
+    assert [m["id"] for m in await queue.pending()] == [mem_id]
+
+    assert await queue.reject(mem_id) is True
+    assert await queue.pending() == [], "a rejected proposal must leave the queue"
+
+    rows = await store.list_memories(include_archived=True)
+    if verb == "archive":
+        assert [m["id"] for m in rows] == [mem_id], (
+            f"origin={origin!r} must ARCHIVE — the row is gone, so its dedupe "
+            "key is gone with it and the next batch re-proposes the lesson the "
+            "human just turned down"
+        )
+        assert rows[0]["archived"] == 1
+        assert rows[0]["confirmed"] == 0
+        assert "rejected" in rows[0]["content"]
+        assert await store.memory_dedupe_key_exists(f"key:{origin}")
+    else:
+        assert rows == [], (
+            f"origin={origin!r} must DELETE — archiving it keeps the dedupe key, "
+            "and an event-driven producer could then never re-propose the lesson "
+            "when the event genuinely recurs"
+        )
+        assert not await store.memory_dedupe_key_exists(f"key:{origin}")

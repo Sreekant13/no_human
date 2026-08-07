@@ -2364,10 +2364,19 @@ def reply(task_id, answer, choose, run):
                 mined = mine_reply(answer)
                 if mined:
                     category, desc = mined
+                    # `source` is the queue-VISIBILITY contract, not a place to
+                    # name the producer — this call passed source="reply" and
+                    # so wrote rows `pending()` selects past. Two real ones
+                    # (2026-07-26/27, from the operator's own review replies)
+                    # were sitting unqueueable in the live database when this
+                    # was found. The provenance goes in `origin`, and
+                    # `Store.add_memory` now refuses the old shape outright.
+                    from ..learning import ORIGIN_REPLY
                     proposed = await store.add_memory(
                         mem_type=category,
                         title=f"{desc} (from a review reply)"[:120],
-                        content=answer, source="reply", confirmed=False,
+                        content=answer, source="proposed", confirmed=False,
+                        origin=ORIGIN_REPLY,
                         project=t.repo_path,
                         tags=["reply", category, "user_correction"],
                         dedupe_key=f"reply:{answer[:80]}",
@@ -3722,10 +3731,25 @@ def _learning_evidence_line(raw) -> str | None:
                    "(B2), then show the queue.")
 @click.option("--harvest-project", default=None,
               help="Limit --harvest to one repo path (default: every project).")
-def learnings(confirm_id, reject_id, active, harvest, harvest_project):
+@click.option("--stale", is_flag=True,
+              help="Report confirmed rules not injected into a prompt lately. "
+                   "Read-only — it never archives or deletes.")
+@click.option("--days", default=30, show_default=True,
+              help="How many days without a use makes a rule stale (--stale).")
+def learnings(confirm_id, reject_id, active, harvest, harvest_project,
+              stale, days):
     """Review the human-confirmed learning queue; confirm or reject proposals.
 
     Nothing enters the active rule set without your one-click confirm.
+
+    ``--stale`` answers the question the confirm queue cannot: of the rules you
+    already confirmed, which have ever actually reached a prompt? A rule is
+    stamped when `Orchestrator._load_active_memories` injects it, so "stale"
+    means fetched-and-not-triggered, or never fetched at all. It PRINTS, and
+    only prints: confirmed memories are yours, `learning/curator.py` exempts
+    them from every automatic action, and an unused rule is not a wrong rule —
+    a repo you have not touched this month makes its rules briefly "stale"
+    without making them bad. Use `--reject` if you actually want one gone.
 
     ``--harvest`` runs the B2 pass: every persisted supervisor ``correct``
     decision is clustered by (project, normalized gist) and a cluster seen
@@ -3778,6 +3802,33 @@ def learnings(confirm_id, reject_id, active, harvest, harvest_project):
                     if written else
                     "[green]no new supervisor-correction proposals[/] — either "
                     "no correction recurred, or they are already queued")
+            if stale:
+                rows = await q.stale(days=days)
+                total = len(await q.active())
+                if not rows:
+                    console.print(
+                        f"[green]every one of the {total} active rule(s) has "
+                        f"been used in the last {days} day(s)[/]")
+                    return
+                console.rule(f"[bold]{len(rows)} of {total} active rule(s) "
+                             f"unused for {days}+ day(s)")
+                for m in rows:
+                    used = (m.get("last_used_at") or "")[:19]
+                    # "never" here means NO RECORD, which is two different
+                    # things — a rule that has genuinely never triggered, and
+                    # one confirmed before `last_used_at` existed. Saying which
+                    # is impossible from the row, so it says neither.
+                    when = (f"[dim]last used {used}[/]" if used
+                            else "[yellow]no recorded use[/]")
+                    console.print(
+                        f"[bold]{m['id'][:8]}[/] [magenta]{m['type']}[/] "
+                        f"{escape(m['title'])} — {when}", emoji=False)
+                console.print(
+                    "\n[dim]Nothing was changed. These are your confirmed "
+                    "rules; a rule can be unused simply because you have not "
+                    "worked in its project. Remove one with: "
+                    "nh learnings --reject <id>[/]", emoji=False)
+                return
             if confirm_id:
                 mem = await store.find_memory(confirm_id)
                 if not mem:
@@ -3950,7 +4001,7 @@ def history(days, output, analyze, json_out, roots):
         console.print(f"\n[bold]{len(findings)} user corrections detected[/]")
 
         config, _ = _bootstrap(require_auth=False)
-        from ..learning import LearningQueue
+        from ..learning import ORIGIN_HISTORY, LearningQueue
 
         async def _propose():
             from ..learning.pii import contains_pii
@@ -3967,13 +4018,19 @@ def history(days, output, analyze, json_out, roots):
                     if pii is not None:
                         dropped_pii += 1
                         continue
+                    # source="proposed", NOT "history". `pending()` — the queue
+                    # the success line below tells you to review with — selects
+                    # source="proposed", so every proposal this command ever
+                    # made was counted, printed, and then invisible to
+                    # `nh learnings`. The producer's name belongs in `origin`.
                     mid = await store.add_memory(
                         mem_type=f.category,
                         title=f.title,
                         content=f.content,
                         tags=f.tags,
                         project=f.source_transcript,
-                        source="history",
+                        source="proposed",
+                        origin=ORIGIN_HISTORY,
                         confirmed=False,
                         dedupe_key=f"history:{f.category}:{f.title}",
                     )

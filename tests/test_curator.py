@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from no_human.core.db import Store
+from no_human.core.db import SOURCE_PROPOSED, Store
+from no_human.learning import ORIGIN_CURATOR, LearningQueue
 from no_human.learning.curator import build_curate_prompt, curate, parse_curation
 
 
@@ -81,9 +82,22 @@ async def test_llm_archive_and_consolidate_apply_with_flag(store):
     r2 = await curate(store, llm_call=llm, apply=True)
     live = await store.list_memories(confirmed=False)
     assert len(live) == 1
-    assert live[0]["source"] == "curator"
     assert live[0]["confirmed"] == 0
     assert "consolidated from 2" in live[0]["content"]
+    # THE HUMAN GATE ACTUALLY STANDS. This line used to read
+    # `live[0]["source"] == "curator"` — it asserted, and so protected, the
+    # bug: `source` is the queue-VISIBILITY contract and `pending()` selects
+    # source="proposed", so a consolidation archived TWO rows the human could
+    # confirm and produced one they could not see. `list_memories(confirmed=
+    # False)` above could not catch it because it does not filter on source,
+    # which is exactly why the assertion is on `pending()` now — the query the
+    # human's confirm queue really runs. The curator names itself in `origin`.
+    assert live[0]["source"] == SOURCE_PROPOSED
+    assert live[0]["origin"] == ORIGIN_CURATOR
+    pending_ids = {m["id"] for m in await LearningQueue(store).pending()}
+    assert live[0]["id"] in pending_ids, (
+        "a consolidated learning must reach the confirm queue, or the "
+        "curator has destroyed two proposals to create an invisible one")
 
 
 def test_parse_curation_fail_closed_shapes():

@@ -36,6 +36,17 @@ export function eventSource(e) {
   const src = e.source || SOURCE_BY_KIND[e.kind] || "worker";
   // Backend emits source:"orchestrator" but the Orchestrator node id is "worker".
   if (src === "orchestrator") return ORCHESTRATOR_EMITS_FOR[e.kind] || "worker";
+  // `_team_brain_block()` is the one emitter that overrides emit()'s
+  // source:"orchestrator", with source:"team_brain" — a knowledge source, not
+  // an agent. It fell through to a role id nothing knows: ROLE_LABEL has no
+  // entry, so the event's role line rendered EMPTY, and styles.css has no
+  // `.role-team_brain` rule so it fell back to a hardcoded literal colour.
+  // It is the Orchestrator that emits it, from its own method, so it is
+  // credited to the Orchestrator. Deliberately NOT a seventh ROLE_LABEL entry:
+  // the roster is exactly six roles (onboardingRoster.test.mjs) and every one
+  // of them needs three `--role-color` rules (themeVars.test.mjs). A knowledge
+  // source is not a seventh agent.
+  if (src === "team_brain") return "worker";
   // MoA proposers are stamped `planner:<lens>` and the synthesis step
   // `aggregator`. They are all the planning phase, so they share one node; the
   // raw source stays on the event, and the per-lens split shows up as separate
