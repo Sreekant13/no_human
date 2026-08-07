@@ -25,21 +25,52 @@ import { fileURLToPath } from "node:url";
 // the day it is written, by nobody remembering anything.
 //
 // WHAT IT CANNOT SEE. Only App.jsx, only the `sendback-label` convention, and
-// only literal JSX text — a label built from a variable or an i18n call is
-// invisible here, as is any dialog whose visible heading uses a different
-// class. It reads source, not a render: it proves the two strings agree in the
-// file, not that the browser exposes them that way. A `role="dialog"` written
-// inside a JSX comment is counted as a dialog, so a comment can pad the
-// non-vacuity floor below — it cannot, however, hide a real mismatch.
+// only literal JSX text — a label built from a variable, an i18n call, or a
+// `role={"dialog"}` expression is invisible here, as is any dialog whose
+// visible heading uses a different class. It reads source, not a render: it
+// proves the two strings agree in the file, not that the browser exposes them
+// that way.
 //
-// Attribute ORDER used to matter and no longer does; see the note in dialogs().
-// That was a real hole found by review, not a hypothetical, which is why the
-// paragraph you are reading now lists what remains rather than claiming none.
+// A `role="dialog"` written inside a JSX comment IS counted as a dialog. That
+// cuts both ways and the earlier version of this paragraph got it wrong in both
+// directions: a comment can pad the non-vacuity floor below, AND a commented
+// mismatched pair can invent a violation that does not ship.
+//
+// TWO CORRECTIONS ARE RECORDED HERE RATHER THAN QUIETLY FIXED, because each was
+// a claim this file made about itself that was false when written:
+//   * v1 read only attributes written AFTER role=, so reordering hid a pair.
+//   * v2 said it read "the whole opening tag" and did not — it stopped at the
+//     nearest `>`, which is not the tag's end when a prop contains one. Two
+//     review mutants survived on that, and with one more legitimate dialog
+//     padding the >= 4 floor, a real WCAG violation shipped green.
+// Both are closed by tagEnd() above. State what the scanner does, not what it
+// was meant to do.
 
 const APP = readFileSync(
   fileURLToPath(new URL("./App.jsx", import.meta.url)), "utf8");
 
 const DIALOG = /role="dialog"/g;
+
+/** Index just past the `>` that really closes the JSX tag opening at `from`.
+ *
+ *  `indexOf(">")` is wrong: a `>` inside a quoted attribute value
+ *  (`aria-label="a > b"`) or inside a JSX expression (`onClick={() => f()}`)
+ *  closes nothing. Truncating there loses the rest of the attributes, and the
+ *  guard then reports the dialog as UNLABELLED and skips it — which is
+ *  indistinguishable from "there is no dialog here", the silent failure this
+ *  whole file exists to prevent. So track quotes and brace depth. */
+function tagEnd(src, from) {
+  let quote = null, depth = 0;
+  for (let i = from; i < src.length; i++) {
+    const c = src[i];
+    if (quote) { if (c === quote) quote = null; continue; }
+    if (c === '"' || c === "'") { quote = c; continue; }
+    if (c === "{") { depth++; continue; }
+    if (c === "}") { if (depth > 0) depth--; continue; }
+    if (c === ">" && depth === 0) return i;
+  }
+  return src.length;
+}
 const ARIA = /aria-label="([^"]+)"/;
 const VISIBLE = /className="sendback-label"\s*>\s*([^<]+?)\s*</;
 
@@ -52,20 +83,28 @@ function dialogs() {
     const end = i + 1 < starts.length ? starts[i + 1] : APP.length;
     const segment = APP.slice(start, end);
     // The accessible name sits on the SAME element as role="dialog", so read
-    // the element's whole opening tag — from the `<` that opens it to the `>`
-    // that closes it — and not merely the part that follows role=.
+    // the element's whole opening tag and not merely the part that follows
+    // role=. Two corrections are baked in here, both from real review findings:
     //
-    // The first version of this scanned only `segment[0..indexOf(">")]`, i.e.
-    // only attributes written AFTER role="dialog". A review demonstrated the
-    // hole by moving aria-label BEFORE role= on the same element: the pair was
-    // reported as unlabelled and silently skipped, while the non-vacuity count
-    // below still passed on the four dialogs that happened to be ordered the
-    // other way. JSX attribute order is arbitrary, so that was a coin flip.
+    // 1. The FIRST version scanned only `segment[0..indexOf(">")]` — attributes
+    //    written AFTER role="dialog". Moving aria-label BEFORE role= made the
+    //    pair read as unlabelled and SILENTLY SKIPPED, while the non-vacuity
+    //    floor still passed on the dialogs ordered the other way.
+    // 2. The SECOND version claimed to read "from the `<` that opens it to the
+    //    `>` that closes it" and did not: it took the nearest following `>`,
+    //    which is NOT the tag's end whenever a JSX expression in the same tag
+    //    contains one — `onClick={() => f()}` is idiomatic React and App.jsx
+    //    holds 86 arrow functions. The tag was truncated mid-attribute, aria
+    //    came back null, and the pair was skipped again. Today's dialogs merely
+    //    happen to put aria-label before any such prop; that is an accident,
+    //    not a property.
+    //
+    // So find the tag's real end: the first `>` that is not inside a quoted
+    // attribute value and not inside a `{…}` expression. A skipped pair is the
+    // dangerous failure here, because it looks identical to "no dialog".
     const tagOpen = APP.lastIndexOf("<", start);
-    const tagClose = APP.indexOf(">", start);
-    const tag = (tagOpen !== -1 && tagClose !== -1 && tagClose > tagOpen)
-      ? APP.slice(tagOpen, tagClose)
-      : segment.slice(0, 300);
+    const tag = tagOpen === -1 ? segment.slice(0, 300)
+      : APP.slice(tagOpen, tagEnd(APP, tagOpen));
     const aria = ARIA.exec(tag);
     const visible = VISIBLE.exec(segment);
     return {
