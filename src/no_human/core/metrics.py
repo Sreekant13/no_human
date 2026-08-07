@@ -143,8 +143,8 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
         """SELECT COALESCE(json_extract(data, '$.outcome'), 'unclassified'),
                   COUNT(*)
            FROM task_events
-           WHERE json_extract(data, '$.kind') = 'grill_answering'
-           GROUP BY 1""")
+           WHERE json_extract(data, '$.kind') = ?
+           GROUP BY 1""", ("grill_answering",))
     grill_answering = {r[0]: r[1] for r in rows}
 
     # The split above is a PARSE rate, not an ANSWER rate — and the live
@@ -190,9 +190,10 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
                        WHEN json_extract(data, '$.answers_applied') = 0
                        THEN 1 ELSE 0 END), 0)
             FROM task_events
-            WHERE json_extract(data, '$.kind') = 'grill_answering'
+            WHERE json_extract(data, '$.kind') = ?
               AND json_extract(data, '$.outcome')
-                  IN ({','.join('?' * len(parsed))})""", tuple(parsed))
+                  IN ({','.join('?' * len(parsed))})""",
+        ("grill_answering", *parsed))
     n_parsed, measured, applied, answerable, zero_applied = (
         row or (0, 0, 0, 0, 0))
     grill_answers = {
@@ -215,8 +216,8 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
         """SELECT COALESCE(json_extract(data, '$.outcome'), 'unclassified'),
                   COUNT(*)
            FROM task_events
-           WHERE json_extract(data, '$.kind') = 'grill_questions'
-           GROUP BY 1""")
+           WHERE json_extract(data, '$.kind') = ?
+           GROUP BY 1""", ("grill_questions",))
     grill_questions = {r[0]: r[1] for r in rows}
 
     total_cache_read = sum(p["cache_read"] for p in by_profile)

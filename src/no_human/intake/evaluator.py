@@ -772,12 +772,15 @@ async def grill_spec(
                 log.warning("grill answering %s; retrying tool-less",
                             "emitted no block" if why == "no_block"
                             else "block did not parse")
-                lead = ("your previous reply's GRILL_ANSWERS block was not "
-                        "valid JSON" if why == "unparseable"
-                        else "your previous session ran out of turns exploring")
+                # A prompt fragment, not operator-facing text: it is spliced
+                # into the fallback prompt below and read only by the model.
+                prompt_lead = (
+                    "your previous reply's GRILL_ANSWERS block was not "
+                    "valid JSON" if why == "unparseable"
+                    else "your previous session ran out of turns exploring")
                 fallback = (
                     prompt
-                    + f"\n\nFINAL ATTEMPT — {lead}. Do NOT use tools now. "
+                    + f"\n\nFINAL ATTEMPT — {prompt_lead}. Do NOT use tools now. "
                     "Emit the "
                     "GRILL_ANSWERS block IMMEDIATELY in your first reply, as "
                     "STRICT JSON with no commentary inside the block; "

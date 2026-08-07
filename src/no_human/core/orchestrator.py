@@ -6905,7 +6905,7 @@ class Orchestrator:
                 """
                 self.emit(
                     "grill_answering",
-                    f"intake grill answering pass: {outcome}",
+                    f"intake scoping answering pass: {outcome}",
                     outcome=outcome,
                     answers_applied=fields.get("answers_applied"),
                     answerable=fields.get("answerable"),
@@ -6927,7 +6927,7 @@ class Orchestrator:
                 """
                 self.emit(
                     "grill_questions",
-                    f"intake grill question pass: {outcome}",
+                    f"intake scoping question pass: {outcome}",
                     outcome=outcome,
                     questions=fields.get("questions"),
                     timed_out=fields.get("timed_out"),

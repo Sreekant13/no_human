@@ -287,6 +287,35 @@ def find_banned_terms(text: str) -> list[str]:
 # whitespace, or closing bracket/paren so it does not eat the rest of a note.
 _HOME_PATH_RE = re.compile(r"/(?:Users|home)/[^\s|)\]]*")
 
+# The suffix a home-path run is allowed to carry before the stop characters —
+# shared with `_HOME_PATH_RE` above so both redactions cut at the same places.
+_PATH_RUN = r"[^\s|)\]]*"
+
+
+def _home_path_pattern() -> re.Pattern | None:
+    """A pattern for the PROCESS'S OWN home directory, or None.
+
+    `_HOME_PATH_RE` covers the conventional prefixes (`/Users/`, `/home/`), but
+    the publish guard in `cli/commands.py` refuses on `str(Path.home())` too —
+    and a home that lives anywhere else (containers, CI, a temp `$HOME`) was
+    detected by the guard while being invisible to this redactor: the exact
+    mismatch that turned a publishable card into a hard refusal with no
+    override. Computed per call, not at import, because `$HOME` can change
+    under test and the pattern must follow the same value the guard reads.
+    Degenerate homes (`/`, empty) are skipped: substituting them would eat
+    every path in the note, and the guard's own membership test is equally
+    meaningless for them.
+    """
+    from pathlib import Path
+
+    home = str(Path.home())
+    if len(home.rstrip("/")) <= 1:
+        return None
+    # The lookahead stops a sibling directory (`<home>2/...`) from matching;
+    # the run then swallows the rest of the path up to the usual stops.
+    return re.compile(
+        re.escape(home.rstrip("/")) + r"(?=[/\s|)\]]|$)" + _PATH_RUN)
+
 
 def _redact_split_forms(text: str) -> str:
     """Remove terms that only the NORMALISED pass of `find_banned_terms` sees.
@@ -362,6 +391,12 @@ def redact_for_publish(text: str) -> str:
     if not text:
         return text
     out = _HOME_PATH_RE.sub("<path>", text)
+    # The process's own home, wherever it lives — the publish guard refuses on
+    # `str(Path.home())` as well as on `/Users/`, and the redactor must clean
+    # at least everything the guard refuses on or a clean card cannot publish.
+    own_home = _home_path_pattern()
+    if own_home is not None:
+        out = own_home.sub("<path>", out)
     for _ in range(len(BANNED_TERMS) + 1):
         before = out
         # The detector's own four rules, in its own order. Rules (2) and (3) use

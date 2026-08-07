@@ -1,4 +1,5 @@
-"""CLAUDE.md constraint #3 forbids a numeric self-score ('score 1-10, continue
+"""The project's standing review constraint — evidence-based review, never
+numeric self-scoring — forbids a numeric self-score ('score 1-10, continue
 if 10' gate). The hardcoded standing rules injected into every coder session
 used to say exactly that -- on TWO independent sites that both reach the coder:
 

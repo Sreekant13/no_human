@@ -68,13 +68,13 @@ MECHANISMS: list[tuple[str, tuple[str, ...], str]] = [
     # runs on EVERY task (operator directive 2026-07-17), so zero of either
     # while tasks have run is not "plausible", it is the pass being dead.
     ("grill_questions", ("grill_questions",),
-     "zero while tasks have run = the intake grill's question pass never "
+     "zero while tasks have run = the intake scoping question pass never "
      "reported — it is dead, or running uninstrumented (it was, until "
      "2026-08-07: an unparseable block emitted no event at all)"),
     ("grill_answering", ("grill_answering",),
-     "zero while grill_questions fired = the answering pass never ran; see "
-     "metrics.grill_answering_answers for whether the passes that DID run "
-     "actually applied any answers"),
+     "zero while the question pass fired = the answering pass never ran; see "
+     "the answering-pass keys under /api/metrics for whether the passes that "
+     "DID run actually applied any answers"),
 ]
 
 # A parked task whose newest watcher evidence is older than this is unshepherded.
