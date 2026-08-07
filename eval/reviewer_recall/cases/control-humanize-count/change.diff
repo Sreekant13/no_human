@@ -1,0 +1,49 @@
+diff --git a/src/no_human/core/humanize.py b/src/no_human/core/humanize.py
+new file mode 100644
+index 00000000..11918ad1
+--- /dev/null
++++ b/src/no_human/core/humanize.py
+@@ -0,0 +1,12 @@
++"""Compact human-readable number formatting (pure helper)."""
++from __future__ import annotations
++
++
++def humanize_count(n: int) -> str:
++    """Compact number display: 999 -> '999', 1500 -> '1.5k', 2_500_000 -> '2.5M'."""
++    if n < 1000:
++        return str(n)
++    elif n < 1_000_000:
++        return f"{n / 1000:.1f}k"
++    else:
++        return f"{n / 1_000_000:.1f}M"
+diff --git a/tests/test_humanize.py b/tests/test_humanize.py
+new file mode 100644
+index 00000000..b134052a
+--- /dev/null
++++ b/tests/test_humanize.py
+@@ -0,0 +1,25 @@
++"""Compact number formatting (humanize_count)."""
++
++from no_human.core.humanize import humanize_count
++
++
++def test_below_thousand():
++    assert humanize_count(0) == "0"
++    assert humanize_count(999) == "999"
++
++
++def test_k_range():
++    assert humanize_count(1000) == "1.0k"
++    assert humanize_count(1500) == "1.5k"
++
++
++def test_just_under_million():
++    assert humanize_count(999_999) == "1000.0k"
++
++
++def test_million_boundary():
++    assert humanize_count(1_000_000) == "1.0M"
++
++
++def test_m_range():
++    assert humanize_count(2_500_000) == "2.5M"

@@ -1,0 +1,222 @@
+diff --git a/src/no_human/agent/verification_receipts.py b/src/no_human/agent/verification_receipts.py
+index 84f2b40d..2c870814 100644
+--- a/src/no_human/agent/verification_receipts.py
++++ b/src/no_human/agent/verification_receipts.py
+@@ -185,6 +185,16 @@ def _join_continuations(text: str) -> str:
+     because bash keeps them there; the same holds for ``$'...'``, which this
+     scanner sees as a single-quoted run and therefore gets right for free.
+ 
++    NEWLINE HERE MEANS LF AND ONLY LF. A backslash before a CARRIAGE RETURN is
++    an escaped CR — an ordinary character in the word — and the LF that follows
++    it is a plain command separator, so `\\<CR><LF>` is TWO commands to bash
++    where `\\<LF>` is one. `_segments` used to fold `\\r\\n` to `\\n` before
++    calling this, which manufactured a continuation bash does not have: it
++    folded `mvn -B \\<CR><LF> test` into the single argv `mvn -B test` and
++    emitted a `test` receipt for a maven run that never got a test goal. A
++    receipt is a claim that something ran, so a false one is worse than a
++    missing one; the fold is gone and this function now sees the raw bytes.
++
+     This runs BEFORE the newline -> `;` substitution in `_segments`, and it has
+     to: without it, `mvn -B \\<newline> test` reached `shlex` as ``mvn -B \\; test``,
+     `shlex` un-escaped ``\\;`` to a bare `;`, and `;` is in `_PUNCTUATION`, so a
+@@ -207,6 +217,17 @@ def _join_continuations(text: str) -> str:
+                                                    SEPARATE command `test`
+         \\'mvn -B \\<newline> test                   -> argc 3: 'mvn -B test
+ 
++    and the CARRIAGE-RETURN family, driven the same way (`bash` 3.2.57, argv via
++    a shim, quoted words via ``printf %q``):
++
++        mvn -B \\<CR><LF> test                 -> argc 2: mvn -B $'\\r'  + a
++                                                SEPARATE command `test`
++        mvn -B \\<CR>test                      -> argc 2: mvn -B $'\\rtest'
++        mvn -B te<CR>st                      -> argc 2: mvn -B $'te\\rst'
++        "py\\<CR><LF>test"                     -> argc 1: $'py\\\\\\r\\ntest'
++                                                (both bytes kept; NOT `pytest`)
++        "py\\<LF>test"                         -> argc 1: pytest
++
+     WHERE THIS SCANNER IS APPROXIMATE. It reads quotes and backslash escapes and
+     nothing else, so a heredoc body is treated as unquoted text: `<<EOF` matches
+     bash (the body IS continued), `<<'EOF'` does not (bash keeps the two
+@@ -285,23 +306,46 @@ def _segments(command: str) -> list[list[str]]:
+     the FIRST segment and survives any split, which is why a pytest-shaped test
+     corpus could not see the class at all. `_join_continuations` now removes
+     continuations before the substitution runs, matching bash in and out of
+-    quotes; `tests/agent/test_verification_receipts.py` pins the family.
++    quotes; `tests/test_verification_receipts.py` pins the family.
++
++    THEN THE FIX OVER-CORRECTED, IN THE ONE DIRECTION THAT MATTERS. The round-6
++    version folded `\\r\\n` (and a lone `\\r`) to `\\n` BEFORE looking for
++    continuations, so a CARRIAGE RETURN manufactured a continuation bash does not
++    have. `mvn -B \\<CR><LF> test` is TWO commands to bash — the backslash escapes
++    the CR into an ordinary argument character and the LF then terminates the
++    command, giving `mvn` argc 2 (`-B`, `$'\\r'`) and a separate `test` — and it
++    arrived here as the single argv `mvn -B test`, so the module wrote a `test`
++    receipt for a maven run that never had a test goal. Round 6 cost a receipt;
++    this cost the truth of one, which is the worse trade for a section whose
++    whole claim is that the model did not author it. Both halves of the fold are
++    gone: the raw bytes reach `_join_continuations`, and `\\r` is removed from
++    `shlex.whitespace` so a CR no longer breaks a word bash keeps whole
++    (`mvn -B te<CR>st` is ONE goal to bash, and splitting it invented `st`).
+ 
+     SO STATE THE RISK IN THE DIRECTION IT ACTUALLY RUNS. The substitution is a
+-    source of BOTH over- and under-recognition, and the under-recognition case is
+-    the one that costs a receipt. What is checked, not assumed: with
+-    continuations removed, the only text that can still become a segment-splitting
+-    `;` is a newline `shlex` sees outside quotes — where bash separates commands
+-    too — or one in a heredoc body, which splits a body into extra unclassified
+-    segments AFTER the command that owns them and so cannot displace it. A
+-    newline inside quotes becomes a literal `;` in the token and does not split.
+-    Every rule that inspects token CONTENT was re-checked against the same
+-    hazard: `_SCRIPT_KIND`, `_PROGRAM_KIND`, `_SUBCOMMAND_KIND` and `_DURATION`
+-    are anchored matches over alternatives containing neither `;` nor a newline,
+-    `_skip_options` and `_has_flag` test only `-` and `=`, and
+-    `os.path.basename` splits on `/`. That is a statement about the shapes
+-    enumerated here, not a proof over all of bash — the module is not bash, and a
+-    reviewer who finds a shape this list missed should expect it to be real.
++    source of BOTH over- and under-recognition, and either direction can be the
++    costly one: a lost receipt understates the work, a wrongly joined one
++    misstates it. What is checked, not assumed: with continuations removed and
++    the CR fold gone, the only text that can still become a segment-splitting
++    `;` is a LINE FEED `shlex` sees outside quotes — where bash separates
++    commands too — or one in a heredoc body, which splits a body into extra
++    unclassified segments AFTER the command that owns them and so cannot
++    displace it. A newline inside quotes becomes a literal `;` in the token and
++    does not split. Every rule that inspects token CONTENT was re-checked
++    against the same hazard, and again for the CR that now stays inside a word:
++    `_SCRIPT_KIND`, `_PROGRAM_KIND`, `_SUBCOMMAND_KIND` and `_DURATION` are
++    anchored matches over alternatives containing none of `;`, `\\n` or `\\r`, so
++    a CR in the token can only make them MISS; `_skip_options` and `_has_flag`
++    test only `-` and `=`; `os.path.basename` splits on `/`; and the
++    env-assignment strip in `_strip_wrappers` matches `\\r` inside its `.*`
++    value, which is what bash does with it too. That is a statement about the
++    shapes enumerated here, not a proof over all of bash — the module is not
++    bash, and a reviewer who finds a shape this list missed should expect it to
++    be real. One is already known and left alone: a CRLF that turns a valid line
++    into a bash SYNTAX ERROR (`cd repo \\<CR><LF> && mvn -B test`) makes bash run
++    nothing at all, while this still finds `mvn -B test` after the separator.
++    Detecting that means parsing bash; what the human sees in that receipt is
++    the command and the shell's own syntax error, which is the disclosure.
+ 
+     WHERE IT IS APPROXIMATE, in both directions, stated because the rendered
+     limits list has to be true of this code:
+@@ -321,10 +365,15 @@ def _segments(command: str) -> list[list[str]]:
+     human reads it. An unlexable line (an unbalanced quote) falls back to a
+     whitespace split, because a best-effort argv is better than no receipt.
+     """
+-    text = (command or "").replace("\r\n", "\n").replace("\r", "\n")
+-    text = _join_continuations(text)
++    text = _join_continuations(command or "")
+     lex = shlex.shlex(text.replace("\n", ";"), posix=True, punctuation_chars=True)
+     lex.whitespace_split = True
++    # A CARRIAGE RETURN IS AN ORDINARY CHARACTER TO BASH — not whitespace, not a
++    # newline, not a separator. `shlex.whitespace` contains `\r` by default,
++    # which would break a word bash keeps whole: `mvn -B te<CR>st` is one goal
++    # to bash, and splitting it invented the word `st`. Dropping `\r` here is
++    # the second half of the same rule the CR-folding above used to break.
++    lex.whitespace = " \t\n"
+     try:
+         tokens = list(lex)
+     except ValueError:
+diff --git a/tests/test_verification_receipts.py b/tests/test_verification_receipts.py
+index 46bb4aa4..c68164f3 100644
+--- a/tests/test_verification_receipts.py
++++ b/tests/test_verification_receipts.py
+@@ -318,10 +318,94 @@ def test_a_trailing_backslash_at_end_of_input_does_not_raise():
+     assert classify("uv run pytest -q \\") == "test"
+ 
+ 
+-def test_a_crlf_continuation_is_joined_too():
+-    """Windows-authored command strings reach `_segments` as CRLF; the CR is
+-    normalised first, so the continuation still has to be seen."""
+-    assert classify("mvn -B \\\r\n  test") == "test"
++# -- CR IS NOT A NEWLINE, and a CRLF "continuation" is not one -------------- #
++#
++# The round-7 defect, and the mirror image of the round-6 one. `_segments` used
++# to fold CR into LF before looking for continuations, which MANUFACTURED a
++# continuation bash does not have. Driven against `bash` 3.2.57 with argv-
++# printing shims on PATH, the same bytes:
++#
++#     mvn -B \<CR><LF> test   -> [mvn] argc 2: -B  $'\r'      <- no `test` goal
++#                                [test] ran as a SEPARATE command
++#     mvn -B \<LF> test       -> [mvn] argc 2: -B  test       <- one command
++#
++# because `\` escapes the CR into an ordinary argument character, and the LF
++# that follows then TERMINATES the command. The module reported a `test` receipt
++# for a maven run that never had a test goal. A receipt is a claim that
++# something ran; a FALSE one is worse than a missing one, so the CRLF family is
++# pinned here as a family, on the RECEIPT, exactly like `_CONTINUED` above.
++
++#: (label, the CRLF form, the LF form that IS a continuation, that form's kind)
++_CRLF_NOT_CONTINUED = [
++    ("mvn", "mvn -B \\\r\n test", "mvn -B \\\n test", "test"),
++    ("gradle", "gradle \\\r\n test", "gradle \\\n test", "test"),
++    ("black", "black \\\r\n --check \\\r\n src/", "black \\\n --check \\\n src/",
++     "lint"),
++    ("npm", "npm run \\\r\n test:e2e", "npm run \\\n test:e2e", "e2e"),
++    ("cargo", "cargo \\\r\n test", "cargo \\\n test", "test"),
++    ("go", "go \\\r\n test \\\r\n ./...", "go \\\n test \\\n ./...", "test"),
++    ("dotnet", "dotnet \\\r\n build \\\r\n -c Release",
++     "dotnet \\\n build \\\n -c Release", "build"),
++    ("make", "make \\\r\n typecheck", "make \\\n typecheck", "typecheck"),
++]
++
++
++@pytest.mark.parametrize("label,crlf,lf,kind", _CRLF_NOT_CONTINUED,
++                         ids=[c[0] for c in _CRLF_NOT_CONTINUED])
++def test_a_crlf_is_not_a_continuation_and_leaves_no_receipt(label, crlf, lf, kind):
++    """The LF column is the control and must keep working; the CRLF column is
++    two commands to bash, neither of which is the check, so it must record
++    NOTHING rather than a receipt for a check that never ran."""
++    assert classify(lf) == kind, f"{label}: the LF control regressed"
++    assert classify(crlf) is None, f"{label}: a FALSE receipt for a CRLF split"
++    assert build_receipt("Bash", {"command": crlf}, _ok("42 passed")) is None
++
++
++def test_a_backslash_before_a_CR_is_an_escaped_CR_not_a_continuation():
++    """The rule, below the family. `\\` + CR is an escaped CR — an ordinary
++    character in the word — so `_join_continuations` must leave both bytes
++    alone, and the LF after it is a plain command separator."""
++    assert _join_continuations("mvn -B \\\r\n test") == "mvn -B \\\r\n test"
++    assert _join_continuations("mvn -B \\\rtest") == "mvn -B \\\rtest"
++    # `\` + LF, the real continuation, is still removed.
++    assert _join_continuations("mvn -B \\\n test") == "mvn -B  test"
++    # bash: `mvn -B $'\rtest'` — one command, and `\rtest` is not a test goal.
++    assert classify("mvn -B \\\rtest") is None
++
++
++def test_a_bare_CR_is_an_ordinary_character_not_a_separator():
++    """bash does not split on CR, and neither may this. Measured on the bytes:
++
++        mvn -B te<CR>st              -> [mvn] argc 2: -B  $'te\\rst'
++        mvn -B test<CR>black --check -> [mvn] argc 4, goal $'test\\rblack'
++
++    Both are one command whose goal is NOT `test`, so both must classify as
++    nothing. Folding the CR to a newline split the word and invented the goal.
++    """
++    assert classify("mvn -B te\rst") is None
++    assert classify("mvn -B test\rblack --check src/") is None
++    assert classify("mvn -B foo\rtest") is None
++
++
++def test_a_CRLF_line_ending_still_separates_the_commands_it_ends():
++    """The other direction, so the fix is not a blanket "ignore CR". bash runs
++    both lines of a Windows-authored string; the CR merely rides along in the
++    last word of each. Measured: `mvn -B $'test\\r'` (goal `test\\r`, which maven
++    does not have) then `black --check $'src/\\r'` — so the recognised check on
++    that string is the LINT, not the test."""
++    both = "mvn -B test\r\nblack --check src/\r\n"
++    assert classify(both) == "lint"
++    assert kinds_in("uv run pytest -q\r\nruff check .\r\n") == {"test", "lint"}
++
++
++def test_a_double_quoted_CRLF_is_not_joined_either():
++    """The quoting mirror image of the CRLF case, and bash's answer, not ours.
++    Inside double quotes `\\` is special only before ``$ ` " \\`` and a newline —
++    NOT before a CR — so `"py\\<CR><LF>test"` stays a program name containing a
++    backslash, a CR and a newline. bash: `py\\<newline>test: command not found`.
++    `"py\\<LF>test"` IS `pytest` and must keep classifying."""
++    assert classify('"py\\\ntest" -q') == "test"
++    assert classify('"py\\\r\ntest" -q') is None
+ 
+ 
+ def test_an_unlexable_line_falls_back_instead_of_raising():

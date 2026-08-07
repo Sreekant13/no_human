@@ -33,6 +33,10 @@ from ..agent.claude_backend import (
 )
 from ..review.selfcheck import ChecklistItem
 from ..review.lint_evidence import collect_lint_evidence, format_lint_evidence
+from ..review.wiring_evidence import (
+    collect_wiring_evidence,
+    format_wiring_evidence,
+)
 from ..core.jsonparse import loads_lenient
 from ..core.task import Task
 
@@ -143,6 +147,13 @@ class ReviewDecision:
     tokens_used: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    # The gate-mode verdict's top-level "goal" block, parsed as-is:
+    # {"reachable": bool, "entry_point": str, "evidence": str}, plus
+    # "demoted": True when reachable was false but the entry_point citation
+    # did not check out (see `_goal_entry_citation_fails`). None when the
+    # reviewer emitted no goal block at all — the orchestrator announces that
+    # absence (`review_goal_missing`) rather than failing closed on it.
+    goal: dict[str, Any] | None = None
     # The output SLICE of `tokens_used`, which is input+output. The reviewer
     # is the most output-heavy tier in the system — it reads a diff once and
     # writes a whole checklist — and output bills ~5x input, so pricing its
@@ -185,6 +196,8 @@ class ReviewDecision:
             d["stages"] = self.stages
         if self.suggested_next:
             d["suggested_next"] = self.suggested_next
+        if self.goal is not None:
+            d["goal"] = self.goal
         return d
 
 
@@ -303,6 +316,10 @@ _VERDICT_FORMAT = (
     ' "stages": {"spec_compliance": {"passed": true_or_false},\n'
     '            "code_quality": {"passed": true_or_false}},\n'
     ' "suggested_next": "one-sentence hint for the next attempt" or null,\n'
+    ' "goal": {"reachable": true_or_false,\n'
+    '          "entry_point": "file:line of the production caller through which'
+    ' the requested outcome occurs, or where the chain breaks",\n'
+    '          "evidence": "the traced call chain"},\n'
     ' "items": [\n'
     '  {"label": "short label", "passed": true_or_false,\n'
     '   "severity": "critical|high|medium|low|nit",\n'
@@ -322,7 +339,10 @@ _VERDICT_FORMAT = (
     "    Don't start with 'This', 'The', or 'I noticed'. Just say what's wrong\n"
     "    and what you'd do instead, the way you'd talk to a colleague.\n"
     "  - For general observations with no specific line, set file to '' and line to 0\n"
-    "  - 'suggested_next' helps the implementing agent focus its retry — set to null if passed\n\n"
+    "  - 'suggested_next' helps the implementing agent focus its retry — set to null if passed\n"
+    "  - 'goal' is judged separately from item severities. 'goal.entry_point'\n"
+    "    must be a real file:line; a 'reachable': false whose entry_point does\n"
+    "    not exist in the repo is demoted to advisory and does not block\n\n"
 )
 
 
@@ -369,10 +389,22 @@ def _build_review_prompt(
     omitted_files: list[str] | None = None,
     allow_tools: bool = True,
     lint_evidence: str = "",
+    wiring_evidence: str = "",
     draft_pr: str = "",
     draft_pr_absent: str = "",
 ) -> str:
     criteria = "\n".join(f"  - {c}" for c in task.acceptance_criteria) or "  (none stated)"
+    # The goal-reachability judgment needs the OUTCOME the ticket asks for, and
+    # the title + acceptance criteria often carry only the mechanism. Rendered
+    # verbatim (capped) so the reviewer judges the request, not a paraphrase.
+    desc = (getattr(task, "description", None) or "").strip()
+    request_section = ""
+    if desc:
+        truncated_note = "\n… (request truncated)" if len(desc) > 2000 else ""
+        request_section = (
+            f"Task request (verbatim from the ticket):\n{desc[:2000]}"
+            f"{truncated_note}\n\n"
+        )
     # 0a / PR-021: the gate used to run BEFORE the PR existed, so a criterion of the
     # form "the PR body contains X" was unsatisfiable — the reviewer said so and then
     # asked the coder to open a PR, which only the loop can do. A draft PR is now opened
@@ -493,6 +525,9 @@ def _build_review_prompt(
     # apart from its own judgment. Only attached when non-empty — a repo with
     # no ruff config gets no lint section at all (SCRUM-64).
     lint_section = f"\n{lint_evidence}\n\n" if lint_evidence else ""
+    # Same contract as lint: deterministic, labeled, absent when empty. Feeds
+    # the GOAL REACHABILITY judgment; never a verdict by itself.
+    wiring_section = f"\n{wiring_evidence}\n\n" if wiring_evidence else ""
 
     next_pass = 4
     rules_pass = ""
@@ -531,7 +566,17 @@ def _build_review_prompt(
         "  Are the tests real (not asserting trivia)?\n"
         "  SCOPE CHECK: does the diff address EXACTLY what the task asked, or\n"
         "  did the implementer do something different (easier, tangential, or\n"
-        "  over-engineered)? Flag any drift from the stated acceptance criteria.\n\n"
+        "  over-engineered)? Flag any drift from the stated acceptance criteria.\n"
+        "  GOAL REACHABILITY (fill the top-level \"goal\" key of the verdict):\n"
+        "  separately from per-finding severity, decide whether the outcome the\n"
+        "  task request describes actually occurs through the caller(s)\n"
+        "  production ships — not the tests. Trace the chain from a production\n"
+        "  entry point to the changed code. A feature implemented but never\n"
+        "  called by any production path is NOT reachable, however correct in\n"
+        "  isolation. If the request explicitly asks for an artifact nothing\n"
+        "  calls yet (a pure helper/library function plus its test), reachable\n"
+        "  means that artifact exists as requested. Cite the entry point as\n"
+        "  file:line — where the outcome occurs, or where the chain breaks.\n\n"
         "STAGE 2 — CODE QUALITY:\n"
         "  ARCHITECTURE — is this the right approach or a workaround? Does it\n"
         "  follow the existing patterns/conventions shown in the profile? Any\n"
@@ -577,10 +622,12 @@ def _build_review_prompt(
         # ── volatile task-specific content ──
         f"{pr_section}"
         f"Task: {task.title}\n"
-        f"Acceptance criteria:\n{criteria}\n\n"
+        + request_section
+        + f"Acceptance criteria:\n{criteria}\n\n"
         + diff_section
         + files_section
         + lint_section
+        + wiring_section
         + _annotated_test_output(test_output)
         + f"{held_section}"
         + rules_pass
@@ -974,6 +1021,30 @@ def _verify_citations(
     return demoted
 
 
+def _goal_entry_citation_fails(
+    goal: dict[str, Any], repo_path: Path, before_ref: str
+) -> str | None:
+    """Why the goal block's entry_point does not check out, or None.
+
+    Same hallucination guard as `_citation_fails`, with one deliberate
+    difference: an ABSENT entry_point fails here. `reachable: false` is a
+    blocking claim, and a blocking claim with no verifiable location is
+    exactly the channel the citation rule exists to close — a finding merely
+    lacking a citation stays advisory-shaped, a goal veto never is.
+    """
+    raw = str(goal.get("entry_point") or "").strip()
+    if not raw:
+        return "no entry_point cited"
+    path, line = raw, 0
+    head, sep, tail = raw.rpartition(":")
+    if sep:
+        num = tail.split("-")[0].strip()  # tolerate "file.py:12-20"
+        if head and num.isdigit():
+            path, line = head, int(num)
+    probe = ChecklistItem("goal", False, "", file=path, line=line)
+    return _citation_fails(probe, repo_path, before_ref)
+
+
 def _parse_review_output(
     text: str, repo_path: Path | None = None, before_ref: str = "HEAD~1",
 ) -> ReviewDecision:
@@ -1011,18 +1082,29 @@ def _parse_review_output(
     # The citation rule runs BEFORE the verdict: a blocking finding whose
     # cited location does not exist is advisory, and must not fail the gate.
     demoted = _verify_citations(items, repo_path, before_ref) if repo_path else []
+    # The goal block gets the same treatment: a `reachable: false` whose
+    # entry_point does not check out is marked demoted — it is surfaced on the
+    # demoted-citations channel and never fails the gate (hallucination guard).
+    goal = data.get("goal") if isinstance(data.get("goal"), dict) else None
+    if (goal is not None and goal.get("reachable") is False
+            and repo_path is not None):
+        reason = _goal_entry_citation_fails(goal, repo_path, before_ref)
+        if reason:
+            goal = {**goal, "demoted": True}
+            demoted.append(f"goal reachability: {reason}")
     stages = data.get("stages") if isinstance(data.get("stages"), dict) else None
     suggested_next = data.get("suggested_next") if isinstance(data.get("suggested_next"), str) else None
     return ReviewDecision(
-        passed=_gate_verdict(items, data, stages),
+        passed=_gate_verdict(items, data, stages, goal=goal),
         checklist=items, raw_output=text,
         suggested_next=suggested_next, stages=stages,
-        demoted_citations=demoted,
+        demoted_citations=demoted, goal=goal,
     )
 
 
 def _gate_verdict(
-    items: list[ChecklistItem], data: dict[str, Any], stages: dict | None
+    items: list[ChecklistItem], data: dict[str, Any], stages: dict | None,
+    goal: dict[str, Any] | None = None,
 ) -> bool:
     """Decide the gate deterministically from the reviewer's own evidence.
 
@@ -1037,12 +1119,24 @@ def _gate_verdict(
     human, and never block. Every other way out fails closed:
       - no items at all: absence of evidence is not evidence of passing;
       - `spec_compliance` false: a missed acceptance criterion is never a nit;
+      - `goal.reachable` false (and not citation-demoted): the ticket's
+        outcome does not happen through any production caller. This is a
+        binary verdict the gate consumes mechanically, NEVER a severity — a
+        live run found the fatal "built in the rate engine, never wired
+        through the sole production caller" defect, graded it low, and
+        passed. Severity words cannot wave this one through. An entry_point
+        that fails the citation check demotes the veto instead of blocking
+        (`_parse_review_output` marks it `demoted`), and an absent goal block
+        changes nothing here — absence is announced upstream, not punished;
       - reviewer says `passed: false` while flagging nothing: it disagrees with
         its own checklist, so trust the "no".
     """
     if not items:
         return False
     if stages and stages.get("spec_compliance", {}).get("passed") is False:
+        return False
+    if (goal is not None and goal.get("reachable") is False
+            and not goal.get("demoted")):
         return False
     if any(_is_blocking(i) for i in items):
         return False
@@ -1130,6 +1224,7 @@ class AdversarialReviewer:
         # Gate mode (default): original adversarial review.
         full_files, omitted_files = "", []
         lint_evidence = ""
+        wiring_evidence = ""
         if diff_override:
             # Caller supplied the diff; there are no refs to read files from, and
             # _fast_review runs single-turn with no tools.
@@ -1154,6 +1249,14 @@ class AdversarialReviewer:
                 )
             except Exception:  # noqa: BLE001 — advisory, never blocks review
                 lint_evidence = ""
+            # Same advisory contract for wiring evidence: it feeds the
+            # GOAL REACHABILITY judgment and never blocks by itself.
+            try:
+                wiring_evidence = format_wiring_evidence(
+                    collect_wiring_evidence(repo_path, before_ref, after_ref)
+                )
+            except Exception:  # noqa: BLE001 — advisory, never blocks review
+                wiring_evidence = ""
         prompt = _build_review_prompt(
             task,
             diff,
@@ -1166,6 +1269,7 @@ class AdversarialReviewer:
             full_files=full_files,
             omitted_files=omitted_files,
             lint_evidence=lint_evidence,
+            wiring_evidence=wiring_evidence,
             allow_tools=not diff_override,
             draft_pr=draft_pr,
             draft_pr_absent=draft_pr_absent,

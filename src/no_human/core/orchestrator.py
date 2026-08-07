@@ -260,7 +260,8 @@ def is_narration(source: str | None, kind: str = "") -> bool:
     gate narrates under the same name its SDK session logs under, so the source
     alone genuinely cannot answer. The gate's narration is the `review*` ladder
     (`review`, `review_start`, `review_error`, `review_holdout`,
-    `review_advisory_findings`, `review_citation_demoted`); SDK kinds are a
+    `review_advisory_findings`, `review_citation_demoted`,
+    `review_goal_missing`, `review_goal_unreachable`); SDK kinds are a
     closed vocabulary (tool_use / tool_result / text / thinking / result /
     usage / subagent_*) and none of them starts with "review".
     """
@@ -6247,6 +6248,25 @@ class Orchestrator:
                 f"{len(decision.demoted_citations)} blocking finding(s) demoted "
                 "— cited locations do not exist: "
                 + "; ".join(decision.demoted_citations),
+            )
+        # Goal reachability — loud in both directions. Absent means the
+        # reviewer emitted no goal block, so this round gated on
+        # severity-classified findings alone, exactly as before the goal
+        # field existed; that fallback must be visible, never silent.
+        goal = getattr(decision, "goal", None)
+        if goal is None:
+            self._emit_review(
+                "review_goal_missing",
+                "reviewer verdict carried no goal block — goal reachability "
+                "was not judged this round; the gate fell back to "
+                "severity-classified findings only",
+            )
+        elif goal.get("reachable") is False and not goal.get("demoted"):
+            self._emit_review(
+                "review_goal_unreachable",
+                "the requested outcome does not occur through any production "
+                "caller — entry point: "
+                f"{goal.get('entry_point') or '(none cited)'}",
             )
         self._emit_review("review",
                          review_verdict_text(decision.passed,

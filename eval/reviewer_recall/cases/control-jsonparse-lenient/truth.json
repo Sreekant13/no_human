@@ -1,0 +1,9 @@
+{
+  "class": "control",
+  "file": null,
+  "hunk_lines": null,
+  "description": "Defect-free control: a real merged diff, unmodified \u2014 a lenient JSON parsing module plus its test and nothing else. The ticket text (request.txt) requests exactly that uncalled artifact; adopting it at call sites is scoped out. A goal-reachability veto here is a false alarm. A clean pass is the correct outcome.",
+  "keywords": [],
+  "planted_by": "supervising-session",
+  "date": "2026-08-07"
+}

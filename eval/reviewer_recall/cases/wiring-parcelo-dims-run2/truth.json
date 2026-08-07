@@ -1,0 +1,22 @@
+{
+  "class": "wiring",
+  "file": "parcelo/rates.py",
+  "hunk_lines": [
+    5,
+    47
+  ],
+  "caller_file": "parcelo/api.py",
+  "external_base_ref": true,
+  "description": "Recorded replay defect, cut unmodified from a recorded startup-scenario run (artifact: eval/results/northstar/startup-parcelo-run2-20260807T163921.json, ticket startup-01-volumetric-weight, goal_satisfied false). The coder added dimension handling to quote() in parcelo/rates.py with green tests, but parcelo/api.py \u2014 whose module docstring says the HTTP shim only calls handle(), and whose two quote() call sites are the only production callers \u2014 forwards only weight_kg/origin/destination/express, silently discarding any dimensions in the request. Through the only production entry point, large light boxes still bill on actual weight \u2014 the precise outcome the ticket exists to fix. base.ref names the scratch repo's sprint-base commit (provenance only, not resolvable here); base/ additionally carries parcelo/api.py, the untouched production caller the reachability question is about, so an entry_point citing it verifies.",
+  "keywords": [
+    "handle",
+    "api.py",
+    "caller",
+    "wired",
+    "forward",
+    "discard",
+    "reach"
+  ],
+  "planted_by": "recorded-replay (selected by supervising-session)",
+  "date": "2026-08-07"
+}

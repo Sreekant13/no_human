@@ -1,0 +1,9 @@
+PAR-11 Bill bulky parcels on volumetric weight
+
+Our carrier bills us on volumetric weight for bulky parcels and we only ever bill the customer on actual weight, so every large light box loses us money. Quoting needs to charge on whichever is greater. Volumetric weight in kg is length x width x height in centimetres divided by 5000. Callers should be able to pass the parcel's dimensions to quote(); when they don't, nothing about the price may change.
+
+Acceptance criteria:
+- quote() accepts optional parcel dimensions in centimetres
+- the billed weight is the greater of actual and volumetric weight
+- a quote with no dimensions returns exactly the price it does today
+- the new behaviour is covered by a test

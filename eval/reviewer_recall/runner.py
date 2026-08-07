@@ -64,6 +64,11 @@ class ReviewOutcome:
 
     status: str  # "PASS" | "FAIL"
     findings: list[Finding] = field(default_factory=list)
+    # The verdict's goal-reachability block (``ReviewDecision.goal``), as-is:
+    # {"reachable": bool, "entry_point": str, "evidence": str, +"demoted" when
+    # the entry_point citation failed}. None when the reviewer emitted none —
+    # the pre-goal-field behaviour, scored exactly as before.
+    goal: dict[str, Any] | None = None
     # Blocking findings the reviewer's citation rule demoted to advisory
     # ("label: reason" strings, from ``ReviewDecision.demoted_citations``).
     #
@@ -85,6 +90,12 @@ class CaseSpec:
     base_ref: str
     diff_text: str
     truth: dict[str, Any]
+    # Optional ticket text (``request.txt``), passed to the reviewer as the
+    # task description. Wiring-class cases need it: "the outcome never happens
+    # through the production caller" is only judgeable against the outcome the
+    # ticket asked for. Benign-unwired controls carry it for the same reason —
+    # their ticket explicitly requests an artifact nothing calls yet.
+    request: str = ""
 
     @property
     def is_control(self) -> bool:
@@ -159,9 +170,11 @@ def load_cases(cases_dir: Path = CASES_DIR) -> list[CaseSpec]:
         base_ref = (entry / "base.ref").read_text().strip()
         diff_text = (entry / "change.diff").read_text()
         truth = json.loads((entry / "truth.json").read_text())
+        request_file = entry / "request.txt"
+        request = request_file.read_text() if request_file.is_file() else ""
         cases.append(CaseSpec(
             case_id=entry.name, dir=entry, base_ref=base_ref,
-            diff_text=diff_text, truth=truth,
+            diff_text=diff_text, truth=truth, request=request,
         ))
     return cases
 
@@ -197,40 +210,75 @@ def prepare_case_repo(repo_root: Path, case: CaseSpec, workdir: Path) -> Path:
     implies.
     """
     base_src = case.dir / BASE_DIR_NAME
-    if not base_src.is_dir():
+    target = workdir / case.case_id
+    if base_src.is_dir():
+        shutil.copytree(base_src, target, dirs_exist_ok=True)
+    elif _diff_needs_base_content(case.diff_text):
         raise CasePrepError(
             f"{case.case_id}: no materialised base content at {base_src} — "
             f"run eval/reviewer_recall/materialize_base.py {case.case_id} from "
             f"a checkout that still resolves base.ref ({case.base_ref})"
         )
-    target = workdir / case.case_id
-    shutil.copytree(base_src, target, dirs_exist_ok=True)
+    else:
+        # A create-only diff (every pre-image is /dev/null) applies to an
+        # empty tree, and git cannot track an empty base/ directory — so its
+        # absence is the correct materialisation, not a broken case. This is
+        # the ns-1746bea3 ticket shape: "single new file plus its test".
+        target.mkdir(parents=True)
     _run(["git", "init", "-q"], cwd=target)
     _run(["git", "add", "-A"], cwd=target)
+    # --allow-empty carries the create-only case; every other case still
+    # commits its base files exactly as before.
     _run([
         "git", "-c", "user.email=reviewer-recall@no-human.local",
         "-c", "user.name=reviewer-recall", "commit", "-q", "-m", "base",
+        "--allow-empty",
     ], cwd=target)
     _run(["git", "apply", "--whitespace=nowarn"], cwd=target,
         input_bytes=case.diff_text.encode())
     return target
 
 
+def _diff_needs_base_content(diff_text: str) -> bool:
+    """True when any pre-image in the diff is a real file (not /dev/null).
+
+    Reads only `--- ` header lines. A CONTENT line starting with "--- " (an
+    added line whose text begins "-- ") is conceivable and would read as a
+    header here; the failure direction is safe — a false True demands base
+    content and raises loudly, never silently prepares a wrong tree.
+    """
+    for line in diff_text.splitlines():
+        if line.startswith("--- ") and line[4:].strip() != "/dev/null":
+            return True
+    return False
+
+
 def score_case(case: CaseSpec, outcome: ReviewOutcome) -> CaseResult:
     """Mechanical scoring per docs/REVIEWER_RECALL_METHOD.md, "Scoring".
 
-    Seeded case caught iff: verdict FAIL (or a blocking finding exists) +
-    a blocking finding names the planted file + that finding's cited line
-    falls within hunk_lines ±3 + the finding text contains >=1 truth.json
-    keyword. Control case is a clean pass iff verdict is PASS, or FAIL with
-    only non-blocking findings.
+    Seeded case caught iff EITHER:
+    - verdict FAIL (or a blocking finding exists) + a blocking finding names
+      the planted file + that finding's cited line falls within hunk_lines ±3
+      + the finding text contains >=1 truth.json keyword; OR
+    - the verdict's goal block says ``reachable: false`` (not demoted) and its
+      entry_point cites the ``caller_file`` truth.json names. No keywords, no
+      LLM judge — the goal rule stays as mechanical as the finding rule.
+    Control case is a clean pass iff verdict is PASS (or FAIL with only
+    non-blocking findings) AND the goal block did not veto — a
+    ``reachable: false`` on a defect-free diff is a false alarm even when no
+    blocking finding accompanies it, because the gate blocks on it alone.
     """
     cls = case.truth.get("class", "")
     blocking = [f for f in outcome.findings if f.blocking]
+    goal = outcome.goal or {}
+    goal_veto = goal.get("reachable") is False and not goal.get("demoted")
 
     if case.is_control:
-        clean = outcome.status == "PASS" or not blocking
-        if not clean:
+        clean = (outcome.status == "PASS" or not blocking) and not goal_veto
+        if goal_veto:
+            reason = ("false alarm: goal.reachable=false on a clean diff "
+                      f"(entry point: {goal.get('entry_point') or '(none)'})")
+        elif not clean:
             reason = (f"false alarm: blocking finding on a clean diff "
                       f"({blocking[0].file}:{blocking[0].line})")
         elif outcome.demoted_citations:
@@ -250,6 +298,19 @@ def score_case(case: CaseSpec, outcome: ReviewOutcome) -> CaseResult:
     hunk = truth.get("hunk_lines") or [None, None]
     hunk_lo, hunk_hi = hunk[0], hunk[1]
     keywords = [k.lower() for k in (truth.get("keywords") or [])]
+
+    # The goal-reachability rule: mechanical, like everything else here. The
+    # entry_point must cite the production caller truth.json names — a bare
+    # "reachable: false" pointing anywhere would let an unrelated veto score
+    # a wiring catch.
+    caller_file = str(truth.get("caller_file") or "")
+    if (goal_veto and caller_file
+            and caller_file in str(goal.get("entry_point") or "")):
+        return CaseResult(
+            case_id=case.case_id, cls=cls, is_control=False,
+            outcome=outcome, caught=True,
+            reason=("caught by goal.reachable=false citing "
+                    f"{goal.get('entry_point')}"))
 
     if outcome.status != "FAIL" and not blocking:
         return CaseResult(case_id=case.case_id, cls=cls, is_control=False,
@@ -314,7 +375,11 @@ def _default_reviewer_fn(model: str) -> ReviewerFn:
         from no_human.review.reviewer import AdversarialReviewer
 
         task = Task.new(f"reviewer-recall probe: {case.case_id}",
-                        repo_path=str(repo_path))
+                        repo_path=str(repo_path),
+                        # The case's ticket text, when it ships one — the gate
+                        # prompt renders it verbatim, which is what makes a
+                        # goal-reachability judgment possible at all.
+                        description=case.request or None)
         reviewer = AdversarialReviewer(model=model)
         decision = await reviewer.review(task, repo_path=repo_path,
                                          diff_override=diff_text, before_ref="HEAD")
@@ -332,6 +397,7 @@ def _default_reviewer_fn(model: str) -> ReviewerFn:
             # repo, a demotion here is what turns a control's false alarm into
             # a "clean pass".
             demoted_citations=list(decision.demoted_citations),
+            goal=getattr(decision, "goal", None),
         )
 
     return _fn
@@ -365,7 +431,7 @@ def write_transcripts(report: RecallReport, runs_dir: Path = RUNS_DIR) -> Path:
     docs/REVIEWER_RECALL_METHOD.md ("Borderline transcripts are kept").
 
     Schema: ``{case_name, status, caught, score, error_message_if_error,
-    demoted_citations, clean_pass_relied_on_demotion}``.
+    demoted_citations, clean_pass_relied_on_demotion, goal}``.
     ERROR cases omit ``caught`` (never measured — must not read as a miss)
     and get ``score=None``.
 
@@ -393,6 +459,9 @@ def write_transcripts(report: RecallReport, runs_dir: Path = RUNS_DIR) -> Path:
             data["score"] = 1.0 if r.caught else 0.0
         data["demoted_citations"] = list(r.demoted_citations)
         data["clean_pass_relied_on_demotion"] = r.clean_pass_relied_on_demotion
+        # The goal block, verbatim, so a wiring catch (or a goal false alarm
+        # on a control) can be audited without re-running anything.
+        data["goal"] = r.outcome.goal
         (out_dir / f"{r.case_id}.json").write_text(json.dumps(data, indent=2))
     return out_dir
 

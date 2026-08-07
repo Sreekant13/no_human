@@ -1,0 +1,9 @@
+{
+  "class": "control",
+  "file": null,
+  "hunk_lines": null,
+  "description": "Defect-free control: a real merged diff, unmodified. A clean pass (PASS verdict, or FAIL with only non-blocking findings) is the correct outcome.",
+  "keywords": [],
+  "planted_by": "supervising-session",
+  "date": "2026-08-07"
+}

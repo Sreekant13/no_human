@@ -7,7 +7,11 @@ from), `base/` (the base file content the diff applies to, materialised inside
 the case), `change.diff` (what the reviewer sees — for seeded cases the defect
 is planted, unmarked), `truth.json` (ground truth — never shown to the
 reviewer), and `base.manifest` (the git blob id of each `base/` file — a
-byte-identity pin that outlives the history).
+byte-identity pin that outlives the history). A case may also ship
+`request.txt` (the ticket text, passed to the reviewer as the task
+description — required for `wiring` cases and carried by the benign-unwired
+controls); see the method doc's "Spec shape" for the three shape variants
+added 2026-08-07 (create-only cases, context files, external-base cases).
 
 `base.manifest` lines are `<blob id>  <path>`, with an optional third column
 holding the marker `scrubbed`. Column 1 always hashes the bytes **on disk**. The
@@ -37,16 +41,21 @@ That pinned the corpus to this repo's history — and no_human ships as a fresh
 case with `python eval/reviewer_recall/materialize_base.py <case-id>`, run from
 a checkout that still has the commit.
 
-Only the files a case's `change.diff` touches are materialised (70 files,
-~4.7 MB across all 20 cases), each pinned by blob id in `base.manifest`. That
-side effect is worth naming: the old full-tree checkout also shipped every
+A case's `base/` holds the files its `change.diff` touches (83 files across
+the 29 cases as of 2026-08-07; it was 70 files across 20 cases when this
+section was written), each pinned by blob id in `base.manifest` — plus, for
+`wiring` cases only, the untouched production caller file the reachability
+question is about, pinned the same way. That
+narrowness is worth naming: the old full-tree checkout also shipped every
 OTHER case's `truth.json` into the reviewer's scratch repo — up to 16 of them,
-in 10 of the 20 cases. It carries none now. That is the full set the scratch repo is read
+in 10 of the then-20 cases. It carries none now. That is the full set the scratch repo is read
 for: the runner invokes the reviewer with `diff_override`, which puts it on the
 single-turn, no-tools path (`review/reviewer.py`, gate mode) — it never
 explores the tree, it only gets the diff. The one place the tree is read is
-`_verify_citations`, which demotes a blocking finding whose cited `file:line`
-does not exist.
+`_verify_citations` (and, since 2026-08-07, the same check over the goal
+block's `entry_point`), which demotes a blocking finding whose cited
+`file:line` does not exist — which is exactly why a wiring case materialises
+its caller file: a correct entry_point citing it must verify, not demote.
 
 **Behavioural delta, stated plainly:** under `git archive` the whole base tree
 was present, so a blocking finding citing a file *outside* the diff still
@@ -62,9 +71,10 @@ carries `ReviewDecision.demoted_citations` through scoring; a control that
 passed with demotions is marked `clean_pass_relied_on_demotion`, its `reason`
 names them, `render_report` prints a ⚠ line under the specificity number
 listing each one, and every `runs/<date>/<case>.json` transcript carries both
-fields. With 4 controls one flip is 25 points and published specificity has sat
-at 2/4 and 0/4, so a caveat nobody can act on is not good enough: read those
-lines before quoting a specificity number.
+fields. When this was written the corpus had 4 controls, so one flip was 25
+points, and published specificity had sat at 2/4 and 0/4; at 10 controls one
+flip is still 10 points. A caveat nobody can act on is not good enough: read
+those lines before quoting a specificity number.
 
 ## De-identification (2026-07-31)
 
@@ -280,8 +290,43 @@ Rules that keep the number honest:
 - Controls (`class: control`) are real merged diffs, unmodified; specificity
   over them is reported alongside recall, always.
 
-Current denominator: 16 seeded (4 logic, 4 security, 4 test-tamper,
-4 spec-miss) + 4 controls = 20 cases. Target per the method doc: 16–20 seeded,
-≥4 controls, ≥3 per class — met. (This line said "12 seeded (3/3/3/3)" until
-2026-07-30; it was stale, not a retirement. `load_cases` reports 20 and
-`render_report` breaks out 4/4/4/4.)
+## The 2026-08-07 expansion: the wiring class, and its controls
+
+Cut after the goal-reachability gate change (a reviewer twice found the
+"implemented in the rate engine, never wired through the sole production
+caller" defect, graded it `[low]`, and passed — the recorded artifacts are
+named in the wiring cases' `truth.json`):
+
+- **3 `wiring` seeded cases** — two cut unmodified from those recorded
+  replays (external base.ref; base pinned byte-for-byte to the startup
+  scenario definition by
+  `test_parcelo_wiring_bases_are_the_scenario_definition_verbatim`) and one
+  cut unmodified from real merged dogfood history (a verification module
+  landed invokable only by a documented manual command; a later one-line
+  commit wired it, which is the record that wiring was the missing piece).
+- **6 new controls** (4 → 10), all real merged diffs, unmodified. Two are
+  *benign-unwired*: their diff adds an artifact nothing calls and their
+  `request.txt` asks for exactly that — the canary shape that keeps the goal
+  rule from hardening into "unreached new code always blocks".
+- **Scoring** gained the goal rule and the control goal-veto false alarm;
+  see the method doc's "Scoring".
+
+**Residual-measurement staleness, stated before someone quotes the numbers
+above:** every figure in "The manifest must not index the original" and "What
+is still recoverable" (48 blobs, 132 index headers, 115 resolving, 4-of-20 /
+20-of-20 base.ref reachability) was measured 2026-08-04 **on the then-20-case
+corpus**. The 9 new `change.diff` files add index headers of their own, and
+the one whose base fixture carries a `scrubbed` marker
+(`wiring-demo-verify-sync`) names a pre-scrub blob by
+7-hex abbreviation exactly as the old diffs do — so the recoverable-blob
+counts are floors now, not totals. Nothing about the CONCLUSION moves: the
+mitigation was never those counts, it is the publish-target rule (zero
+`refs/pull/*`, `git ls-remote` before every publish), and that rule covers
+the new cases identically.
+
+Current denominator: 19 seeded (4 logic, 4 security, 4 test-tamper,
+4 spec-miss, 3 wiring) + 10 controls = 29 cases. Target per the method doc:
+≥3 per class, ≥4 controls — met. (Until 2026-08-07 this read "16 seeded +
+4 controls = 20"; before 2026-07-30 it said "12 seeded (3/3/3/3)" — stale,
+not a retirement. `load_cases` reports 29 and `render_report` breaks out
+4/4/4/4/3.)

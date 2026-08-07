@@ -1,0 +1,70 @@
+diff --git a/tests/test_pr_body_truthfulness.py b/tests/test_pr_body_truthfulness.py
+index 3807aed4..d4a3c3a8 100644
+--- a/tests/test_pr_body_truthfulness.py
++++ b/tests/test_pr_body_truthfulness.py
+@@ -3184,9 +3184,12 @@ def test_the_live_heading_scanner_sees_what_github_sees(
+     body = orch._pr_body(t, _Commit(), _said(lead + payload))
+     html = _render_on_github(body)
+ 
+-    rendered = [re.sub(r"<[^>]+>", "", m).strip()
+-                for m in re.findall(r"<h[12][^>]*>.*?</h[12]>", html, re.S)]
+-    assert [h for h in rendered if h not in _TEMPLATE_H2] == [], (
++    # `_headings_from_html`, not a private copy of it: the copy here had no
++    # `unescape` and no `re.I`, so GitHub's `&amp;` in the template's own
++    # `## ⚠️ Assumptions & Open Questions` would have read as a coder-authored
++    # intruder the moment a payload carried that section.
++    rendered = _headings_from_html(html)
++    assert _intruders(rendered) == [], (
+         f"GitHub rendered a coder-authored top-level section:\n{html}")
+     assert "Stats" in rendered, (
+         f"GitHub swallowed the sections after the summary:\n{html}")
+@@ -3197,6 +3200,49 @@ def test_the_live_heading_scanner_sees_what_github_sees(
+         f"github={sorted(rendered)}\nlocal={sorted(_live_headings(body))}")
+ 
+ 
++# 🔴 THE CARRIER CHANNELS, AGAINST THE RENDERER THEY ACTUALLY SHIP TO. The
++# hermetic matrix above is checked by this file's scanner and by pandoc, and
++# neither of those is GitHub — which is the authority, and which differs from
++# the spec in at least one measured place. Without this the eight carrier fixes
++# would rest on two offline parsers.
++#
++# IT SAMPLES, AND SAYS SO. The full matrix is 14 channels x 13 payloads = 182
++# renderer round trips. This drives every CHANNEL with one payload that
++# exercises all three of `_inline_cell`'s jobs at once, and every PAYLOAD
++# through `review_history.blocking` — the channel that is live on every
++# delivered PR and the one the incident was found on. A payload or channel that
++# only leaks in an untested pairing is not covered here; it is covered
++# hermetically, by two parsers, which is what the sampling trades against.
++
++@pytest.mark.slow
++@pytest.mark.skipif("not os.environ.get('NH_GITHUB_RENDERER')",
++                    reason="set NH_GITHUB_RENDERER=1 to verify against GitHub")
++@pytest.mark.parametrize("channel,payload", (
++    [(c, f"quoted:\n# {_MARKER}\n<h1>{_MARKER}</h1>")
++     for c in sorted(_carrier_channels("x"))]
++    + [("review_history.blocking", p.values[0]) for p in _CARRIER_PAYLOADS]
++))
++def test_github_agrees_no_channel_can_author_a_top_level_section(
++    store, tmp_path, channel, payload,
++):
++    orch = _orch(store, tmp_path)
++    task, evidence = _carrier_channels(payload)[channel]
++    body = orch._pr_body(task, _Commit(), _said("A normal summary."),
++                         test_evidence=evidence)
++    rendered = _headings_from_html(_render_on_github(body))
++
++    assert _intruders(rendered) == [], (
++        f"GitHub rendered a top-level section authored by `{channel}`: "
++        f"{_intruders(rendered)}\n--- body ---\n{body}")
++    assert "Stats" in rendered, (
++        f"`{channel}` swallowed the sections after it on GitHub:\n{body}")
++    # …and the offline pair agrees with GitHub, which is what lets the hermetic
++    # matrix stand in for this test the rest of the time.
++    assert sorted(rendered) == sorted(_live_headings(body)), (
++        f"`_live_headings` drifted from GitHub on `{channel}`:\n"
++        f"github={sorted(rendered)}\nlocal={sorted(_live_headings(body))}")
++
++
+ # 🔴 A FIXED UNIVERSE, NOT `_HTML_BLOCK_TAGS` ITSELF. The first version of the
+ # test below drove the code's own list, and that is fail-OPEN in the exact
+ # direction `source` failed in: delete a tag from the constant and it also

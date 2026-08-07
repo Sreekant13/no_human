@@ -1,0 +1,61 @@
+diff --git a/tests/test_northstar_corpus.py b/tests/test_northstar_corpus.py
+index 52b0adac..ba6f5300 100644
+--- a/tests/test_northstar_corpus.py
++++ b/tests/test_northstar_corpus.py
+@@ -90,3 +90,56 @@ def test_every_gated_spec_records_why_it_is_gated():
+         "system a replay cannot reach, a file that no longer exists, a decision "
+         "only a human can make. If the reason is genuinely unknown, say that "
+         "explicitly; do not reconstruct one from the request text.")
++
++
++#: The specs allowed to say their gate reason was never recorded. A CLOSED
++#: historical set: these predate the field, and the guard below asserts the set
++#: only ever SHRINKS. A new spec cannot join it, which is the property the
++#: reason-guard alone does not have.
++_SENTINEL_GRANDFATHERED = frozenset({
++    "ns-0bf1d2f2", "ns-10c30dec", "ns-3bc82bf4", "ns-49db751d", "ns-5c9e7420",
++    "ns-90b6ff3c", "ns-a219684e", "ns-ddd2aa59", "ns-e3966a9c",
++})
++
++
++def test_the_unrecorded_sentinel_cannot_spread_to_a_new_spec():
++    """A pasted sentinel must not pass for a spec that never predated the field.
++
++    The reason-guard above only rejects an EMPTY field, so copying
++    "unrecorded: …" into a brand-new gated spec satisfies it — proven by an
++    independent reviewer, who added exactly such a spec and watched the suite
++    stay green. "Joining the unadjudicable pile" was one copy-paste away and
++    undetectable, which is the opposite of what that guard's docstring claims.
++
++    An enumerated list is normally the wrong instrument here, and this file says
++    so elsewhere. It is right in THIS case for one reason: the set is closed by
++    construction. Nothing that happens later can legitimately add to it, because
++    a spec written after the field existed always had somewhere to record its
++    reason. So the assertion is one-directional — the list may shrink as reasons
++    are recovered, never grow.
++    """
++    from no_human.eval.bench_task import NORTHSTAR_DIR, load_bench_tasks
++
++    specs = load_bench_tasks(NORTHSTAR_DIR)
++    carrying = {s.id for s in specs if s.escalation_reason.strip().startswith("unrecorded")}
++    # Discovery that finds nothing passes vacuously; the sentinel has been in
++    # the corpus since the field landed, so zero means it was renamed.
++    assert carrying, (
++        "no spec carries the unrecorded sentinel at all — the string changed "
++        "and this guard is now measuring nothing")
++
++    intruders = sorted(carrying - _SENTINEL_GRANDFATHERED)
++    assert not intruders, (
++        f"{len(intruders)} spec(s) claim their gate reason was never recorded, but "
++        f"they postdate the field: {intruders}\n"
++        "The field existed when these were written, so there was somewhere to put "
++        "a reason. Record why the agent cannot proceed — a system it cannot reach, "
++        "a file that is absent, a decision only a human can make. Do NOT paste the "
++        "sentinel; it exists only for specs gated before there was anywhere to write.")
++
++    stale = sorted(_SENTINEL_GRANDFATHERED - carrying)
++    assert not stale, (
++        f"{len(stale)} id(s) are grandfathered but no longer carry the sentinel: "
++        f"{stale}. Good — a reason was recovered. Remove them from "
++        "_SENTINEL_GRANDFATHERED so the list keeps shrinking and cannot rot into "
++        "a permanent excuse.")

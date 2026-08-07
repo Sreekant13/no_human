@@ -1,0 +1,458 @@
+diff --git a/e2e/demo_video/compose.py b/e2e/demo_video/compose.py
+index 2ba3786a..84fd9051 100644
+--- a/e2e/demo_video/compose.py
++++ b/e2e/demo_video/compose.py
+@@ -22,6 +22,15 @@ the shared timing map" is enforced structurally: a frame count that is not
+ N_FRAMES refuses to encode, which is also what keeps the pair frame-locked to
+ each other and to the audio.
+ 
++Then check the result rather than assuming it:
++
++    PYTHONPATH=src python -m e2e.demo_video.verify_sync \
++        --out /tmp/nh-sprint-demo/out --work /tmp/nh-sprint-demo
++
++`verify_sync` reads the encoded files back and proves the narration lands
++where the map says — everything above this line is intent, and intent is what
++a muxer is free to ignore.
++
+ There is deliberately no spotlight here. The 26 s silent clips need one
+ because a silent full frame points at nothing; this cut has a narrator, and
+ the voice is the pointer. The caption bar stays: muted-autoplay embeds and
+diff --git a/e2e/demo_video/verify_sync.py b/e2e/demo_video/verify_sync.py
+new file mode 100644
+index 00000000..81a47732
+--- /dev/null
++++ b/e2e/demo_video/verify_sync.py
+@@ -0,0 +1,305 @@
++"""Prove — on the ENCODED mp4, not on the build inputs — that the narration
++lands where the timing map says it does.
++
++    PYTHONPATH=src python -m e2e.demo_video.verify_sync \\
++        --out /tmp/nh-sprint-demo/out --work /tmp/nh-sprint-demo
++
++Everything else in this package asserts intent: the map is self-consistent,
++the recorders derive their steps from it, the ffmpeg arguments name the right
++offsets. None of that survives contact with a muxer. A priming delay, an
++`-shortest` truncation, a stale audio file left in the work dir, an hstack fed
++yesterday's frames — every one of those ships an artifact whose audio and
++picture disagree while every unit test stays green. This module reads the
++finished file back and refuses that class of lie.
++
++Two independent proofs, both on the decoded artifact:
++
++AUDIO — where the voice actually starts
++    ffmpeg's `silencedetect` segments the muxed track; the end of each silence
++    is the second a sentence begins. The check is bidirectional, which is the
++    part that matters: every narration line must have an onset at its
++    `Line.start`, AND every onset must belong to a line. One-way would pass a
++    track with an extra sentence bleeding over the next beat.
++
++PICTURE — which beat is on screen
++    Each frame carries the beat's caption strip in its bottom `BAR_H` rows,
++    and `compose.render_bars` already wrote those strips to disk. So the beat
++    on camera is recoverable: crop the band, compare it to all six strips, and
++    take the nearest. Nearest — not equal — because H.264 at crf 24 does not
++    return the bytes it was given; the margin between the right strip and the
++    runner-up is reported so "nearest" cannot quietly degrade into "noise".
++
++For the side-by-side cut both panes are read separately and must name the same
++beat at the same second. That is the operator's third requirement — one audio
++track over both surfaces — checked as a property of the shipped file.
++
++Nothing here runs in CI: it needs ffmpeg and a rendered mp4. The pure pieces
++(argument builders, the log parser, the onset matcher, the image metric) are
++unit-tested; `main` is the thin runner that feeds them a real file.
++"""
++
++from __future__ import annotations
++
++import argparse
++import re
++import subprocess
++import sys
++from dataclasses import dataclass
++from pathlib import Path
++
++from . import narration as nr
++from .camera import APP_H, APP_W, BAR_H
++
++FFMPEG = "/opt/homebrew/bin/ffmpeg"
++FFPROBE = "/opt/homebrew/bin/ffprobe"
++
++#: silencedetect's floor. The track is `say` output mixed onto digital
++#: silence, so the gap between lines is true zero and the threshold only has
++#: to clear the AAC encoder's noise floor; -50 dBFS is far above it and far
++#: below speech.
++NOISE_DB = -50
++
++#: A gap must last this long to count as a gap. Below ~0.25 s it starts
++#: catching the stops inside a sentence ("Pick five. Hand them...") and every
++#: line reports several onsets. LINE_GAP (0.35) is the map's own minimum
++#: silence between lines, so anything shorter is by construction intra-line.
++MIN_SILENCE = 0.30
++
++#: How far an onset may sit from its line's start. The mixer places lines with
++#: `adelay` at millisecond resolution and AAC adds encoder delay, so a few tens
++#: of ms is expected; a tenth of a second is not, and would be audible against
++#: a cut.
++ONSET_TOL = 0.05
++
++#: An onset reported within this of the end of the stream is silencedetect
++#: closing its books at EOF, not a sentence starting.
++EOF_EPS = 0.05
++
++#: Where each surface's caption band lives in the frame. The side-by-side cut
++#: is two 1600-wide panes hstacked, so its panes are the same crop at two
++#: offsets — which is exactly why it can be checked for agreement.
++PANES: dict[str, tuple[tuple[str, int], ...]] = {
++    "gui": (("gui", 0),),
++    "cli": (("cli", 0),),
++    "sxs": (("gui", 0), ("cli", APP_W)),
++}
++
++
++# --------------------------------------------------------------------------- #
++# Audio: where the voice actually starts                                       #
++# --------------------------------------------------------------------------- #
++
++def silence_args(mp4: Path, noise_db: int = NOISE_DB,
++                 min_silence: float = MIN_SILENCE) -> list[str]:
++    """Decode the muxed audio through silencedetect and throw the samples away.
++
++    `-hide_banner -nostats` and NOT `-v error`: silencedetect reports at info
++    level, so quieting ffmpeg the usual way silently returns an empty log and
++    an empty log would read as "no speech anywhere" rather than as a mistake.
++    """
++    return [FFMPEG, "-hide_banner", "-nostats", "-i", str(mp4),
++            "-map", "0:a",
++            "-af", f"silencedetect=noise={noise_db}dB:d={min_silence}",
++            "-f", "null", "-"]
++
++
++_SILENCE_END = re.compile(r"silence_end:\s*([0-9.]+)")
++
++
++def speech_onsets(log: str, duration: float) -> tuple[float, ...]:
++    """Every second at which speech begins, read off silencedetect's log.
++
++    The end of a silence is the start of a sound. The final silence runs to
++    end-of-stream and its reported end is the stream duration, not a sentence
++    — that one is dropped, which is why `duration` is a parameter rather than
++    something inferred from the log.
++    """
++    ends = [float(m) for m in _SILENCE_END.findall(log)]
++    return tuple(t for t in ends if t < duration - EOF_EPS)
++
++
++@dataclass(frozen=True)
++class OnsetMatch:
++    line: nr.Line
++    onset: float | None
++
++    @property
++    def delta(self) -> float | None:
++        return None if self.onset is None else self.onset - self.line.start
++
++
++def match_onsets(onsets: tuple[float, ...], tol: float = ONSET_TOL
++                 ) -> tuple[tuple[OnsetMatch, ...], tuple[float, ...]]:
++    """Pair each narration line with the onset at its start.
++
++    Returns ``(matches, orphans)``: one match per line (``onset=None`` when
++    nothing started there) and every onset that belonged to no line. Both
++    halves are failures — a missing onset is a line that never got spoken, an
++    orphan is speech the map does not account for, which is how a line that
++    overruns into the next beat shows up.
++    """
++    unclaimed = list(onsets)
++    matches = []
++    for line in nr.LINES:
++        near = [t for t in unclaimed if abs(t - line.start) <= tol]
++        best = min(near, key=lambda t: abs(t - line.start)) if near else None
++        if best is not None:
++            unclaimed.remove(best)
++        matches.append(OnsetMatch(line, best))
++    return tuple(matches), tuple(unclaimed)
++
++
++# --------------------------------------------------------------------------- #
++# Picture: which beat is on screen                                             #
++# --------------------------------------------------------------------------- #
++
++def band_args(src: Path, t: float, x: int) -> list[str]:
++    """One frame's caption band at second ``t``, as raw RGB on stdout.
++
++    `-ss` before `-i` so ffmpeg seeks rather than decoding 57 seconds of video
++    to read 60 rows of it; it still lands on the exact timestamp.
++    """
++    return [FFMPEG, "-v", "error", "-ss", f"{t:.3f}", "-i", str(src),
++            "-vf", f"crop={APP_W}:{BAR_H}:{x}:{APP_H}",
++            "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
++
++
++def png_args(src: Path) -> list[str]:
++    """A caption strip PNG as raw RGB on stdout, same geometry as `band_args`
++    so the two are directly comparable."""
++    return [FFMPEG, "-v", "error", "-i", str(src),
++            "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
++
++
++def mean_abs_diff(a: bytes, b: bytes) -> float:
++    """Mean absolute per-channel difference, 0-255. Pure Python on ~288 KB is
++    a few milliseconds and costs no dependency; numpy would buy nothing here
++    and this package ships with none."""
++    if len(a) != len(b):
++        raise ValueError(f"size mismatch: {len(a)} vs {len(b)}")
++    if not a:
++        raise ValueError("empty image")
++    return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
++
++
++def best_bar(band: bytes, bars: list[bytes]) -> tuple[int, float, float]:
++    """Which caption strip this band is, plus ``(distance, margin)``.
++
++    The margin is the runner-up's distance minus the winner's. It is returned,
++    printed and asserted on because an argmin with no margin is a coin flip
++    wearing a verdict's clothes.
++    """
++    scored = sorted((mean_abs_diff(band, bar), i) for i, bar in enumerate(bars))
++    (best, idx), (second, _) = scored[0], scored[1]
++    return idx, best, second - best
++
++
++# --------------------------------------------------------------------------- #
++# Runner                                                                       #
++# --------------------------------------------------------------------------- #
++
++def _run(args: list[str]) -> bytes:
++    out = subprocess.run(args, check=True, capture_output=True)
++    return out.stdout
++
++
++def probe_duration(mp4: Path, stream: str) -> float:
++    out = subprocess.run(
++        [FFPROBE, "-v", "error", "-select_streams", stream,
++         "-show_entries", "stream=duration",
++         "-of", "default=nokey=1:noprint_wrappers=1", str(mp4)],
++        check=True, capture_output=True, text=True)
++    return float(out.stdout.strip())
++
++
++def verify(mp4: Path, bars_dir: Path, panes: tuple[tuple[str, int], ...],
++           min_margin: float = 2.0) -> list[str]:
++    """Check one encoded file. Returns the list of failures (empty is a pass)
++    and prints the measurements either way — a proof nobody can read the
++    numbers of is not a proof."""
++    problems: list[str] = []
++    print(f"\n=== {mp4.name}")
++
++    v_dur = probe_duration(mp4, "v:0")
++    a_dur = probe_duration(mp4, "a:0")
++    print(f"  video {v_dur:.3f}s  audio {a_dur:.3f}s  map {nr.DURATION:.3f}s")
++    for name, dur in (("video", v_dur), ("audio", a_dur)):
++        if abs(dur - nr.DURATION) > 0.05:
++            problems.append(f"{mp4.name}: {name} is {dur:.3f}s, "
++                            f"map says {nr.DURATION:.3f}s")
++
++    log = subprocess.run(silence_args(mp4), capture_output=True,
++                         text=True).stderr
++    onsets = speech_onsets(log, a_dur)
++    matches, orphans = match_onsets(onsets)
++    print(f"  {len(onsets)} speech onsets vs {len(nr.LINES)} narration lines")
++    worst = 0.0
++    for m in matches:
++        if m.onset is None:
++            problems.append(f"{mp4.name}: nothing spoken at "
++                            f"{m.line.start:.2f}s — {m.line.text[:48]!r}")
++            print(f"    {m.line.start:6.2f}s  MISSING")
++            continue
++        worst = max(worst, abs(m.delta))
++        print(f"    {m.line.start:6.2f}s  onset {m.onset:7.3f}s  "
++              f"delta {m.delta:+.3f}s  {m.line.text[:44]}")
++    for t in orphans:
++        problems.append(f"{mp4.name}: speech at {t:.3f}s belongs to no line")
++    print(f"  worst onset error {worst:+.3f}s (tolerance {ONSET_TOL}s)")
++
++    bars = [_run(png_args(bars_dir / f"bar{i}.png"))
++            for i in range(len(nr.BEATS))]
++    for i, beat in enumerate(nr.BEATS):
++        t = beat.start + 1.0
++        seen = []
++        for pane, x in panes:
++            idx, dist, margin = best_bar(_run(band_args(mp4, t, x)), bars)
++            seen.append(idx)
++            flag = "ok " if idx == i else "BAD"
++            print(f"    {t:6.2f}s  {pane:3s}  {flag} bar{idx} "
++                  f"(want bar{i}, dist {dist:.2f}, margin {margin:.2f})")
++            if idx != i:
++                problems.append(f"{mp4.name}: at {t:.2f}s the {pane} pane "
++                                f"shows bar{idx}, beat {beat.name} is bar{i}")
++            elif margin < min_margin:
++                problems.append(f"{mp4.name}: at {t:.2f}s the {pane} pane "
++                                f"matched bar{i} by only {margin:.2f}")
++        if len(set(seen)) > 1:
++            problems.append(f"{mp4.name}: at {t:.2f}s the panes disagree: "
++                            f"{seen} — the two surfaces are not frame-locked")
++    return problems
++
++
++def main(argv=None) -> int:
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--out", required=True, type=Path,
++                    help="directory holding demo-sprint-*.mp4")
++    ap.add_argument("--work", default=Path("/tmp/nh-sprint-demo"), type=Path,
++                    help="build dir holding bars/bar*.png")
++    args = ap.parse_args(argv)
++
++    problems: list[str] = []
++    checked = 0
++    for name, panes in PANES.items():
++        mp4 = args.out / f"demo-sprint-{name}.mp4"
++        if not mp4.is_file():
++            print(f"[skip] {mp4} not rendered")
++            continue
++        checked += 1
++        problems += verify(mp4, args.work / "bars", panes)
++    if not checked:
++        print("no rendered clips found — nothing was proved")
++        return 2
++    print()
++    if problems:
++        print(f"FAIL — {len(problems)} problem(s):")
++        for p in problems:
++            print(f"  - {p}")
++        return 1
++    print(f"PASS — {checked} clip(s): every narration line starts on its "
++          f"map second and every beat's caption is the one on screen")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv[1:]))
+diff --git a/tests/test_narrated_demo.py b/tests/test_narrated_demo.py
+index a1988fc0..b99ead3a 100644
+--- a/tests/test_narrated_demo.py
++++ b/tests/test_narrated_demo.py
+@@ -32,6 +32,7 @@ from e2e.demo_video import compose, narration as nr  # noqa: E402
+ from e2e.demo_video import fixture as fx  # noqa: E402
+ from e2e.demo_video import sprint as sp  # noqa: E402
+ from e2e.demo_video import sprint_cli, sprint_gui, voiceover  # noqa: E402
++from e2e.demo_video import verify_sync as vs  # noqa: E402
+ 
+ NARRATION_MD = Path(__file__).resolve().parents[1] / "e2e" / "demo_video" / \
+     "narration.md"
+@@ -252,7 +253,7 @@ def test_exactly_one_task_bounces_off_review_and_still_lands():
+ 
+ 
+ def test_the_bounce_is_on_camera_when_it_is_narrated():
+-    """"The refactor came back once. It went again." starts at 50.20 — by
++    """"The refactor came back once. It went again." starts at 50.60 — by
+     then ORD-2187 must be visibly on its second round, and not yet done."""
+     line = next(ln for ln in nr.LINES if "came back once" in ln.text)
+     status, _live, _burn, _turns, attempt = sp.stage_at("ORD-2187", line.start)
+@@ -618,3 +619,105 @@ def test_the_side_by_side_stacks_both_clips_under_one_track():
+     assert "hstack=inputs=2" in joined
+     assert joined.count("f%04d.png") == 2
+     assert "-map 2:a" in joined and "/a/narration.m4a" in joined
++
++
++# --------------------------------------------------------------------------- #
++# verify_sync — reading the finished mp4 back                                  #
++# --------------------------------------------------------------------------- #
++
++#: silencedetect's real output shape, trimmed. The last pair is the trailing
++#: silence, whose "end" is end-of-stream and not a sentence starting.
++SILENCE_LOG = """\
++[Parsed_silencedetect_0 @ 0x1] silence_start: 0
++[Parsed_silencedetect_0 @ 0x1] silence_end: 0.802268 | silence_duration: 0.802268
++[Parsed_silencedetect_0 @ 0x1] silence_start: 3.838503
++[Parsed_silencedetect_0 @ 0x1] silence_end: 4.401497 | silence_duration: 0.562993
++[Parsed_silencedetect_0 @ 0x1] silence_start: 74.806372
++[Parsed_silencedetect_0 @ 0x1] silence_end: 77.995828 | silence_duration: 3.189456
++"""
++
++
++def test_the_silence_probe_does_not_silence_the_thing_it_reads():
++    """silencedetect reports at INFO level. `-v error`, the reflex everywhere
++    else in this package, returns an empty log — which this module would read
++    as "no speech anywhere in the clip" and, one-way, as a pass. The absence
++    of that flag is the test."""
++    args = vs.silence_args(Path("/x/demo.mp4"))
++    assert "error" not in args, args
++    assert "-hide_banner" in args and "-nostats" in args
++    joined = " ".join(args)
++    assert f"silencedetect=noise={vs.NOISE_DB}dB:d={vs.MIN_SILENCE}" in joined
++    assert "-map 0:a" in joined and "-f null" in joined
++
++
++def test_speech_onsets_are_silence_ends_without_the_end_of_stream():
++    onsets = vs.speech_onsets(SILENCE_LOG, 77.996)
++    assert onsets == (0.802268, 4.401497)
++
++
++def test_a_line_that_never_gets_spoken_is_reported_missing():
++    starts = tuple(ln.start for ln in nr.LINES)
++    matches, orphans = vs.match_onsets(starts)
++    assert orphans == ()
++    assert all(m.onset is not None for m in matches)
++    assert max(abs(m.delta) for m in matches) == 0.0
++    # Drop the gate's first line from the track: only that line reports.
++    missing = tuple(t for t in starts if t != nr.LINES[8].start)
++    matches, orphans = vs.match_onsets(missing)
++    assert orphans == ()
++    assert [m.line.start for m in matches if m.onset is None] == \
++        [nr.LINES[8].start]
++
++
++def test_speech_the_map_does_not_account_for_is_an_orphan():
++    """The one-way version of this check — "every line has an onset" — passes
++    a track with an extra sentence bleeding into the next beat. This is the
++    other direction."""
++    starts = tuple(ln.start for ln in nr.LINES)
++    _matches, orphans = vs.match_onsets(starts + (33.0,))
++    assert orphans == (33.0,)
++
++
++def test_an_onset_outside_tolerance_does_not_count_as_on_time():
++    late = (nr.LINES[0].start + vs.ONSET_TOL * 2,) + \
++        tuple(ln.start for ln in nr.LINES[1:])
++    matches, orphans = vs.match_onsets(late)
++    assert matches[0].onset is None
++    assert orphans == (nr.LINES[0].start + vs.ONSET_TOL * 2,)
++    # Just inside the tolerance is on time, and the delta is reported signed.
++    near = (nr.LINES[0].start + vs.ONSET_TOL * 0.5,) + \
++        tuple(ln.start for ln in nr.LINES[1:])
++    matches, orphans = vs.match_onsets(near)
++    assert orphans == ()
++    assert matches[0].delta == pytest.approx(vs.ONSET_TOL * 0.5)
++
++
++def test_the_image_metric_is_zero_only_for_the_same_image():
++    assert vs.mean_abs_diff(b"\x10\x20", b"\x10\x20") == 0.0
++    assert vs.mean_abs_diff(b"\x00\x00", b"\x02\x04") == 3.0
++    with pytest.raises(ValueError):
++        vs.mean_abs_diff(b"\x00", b"\x00\x00")
++    with pytest.raises(ValueError):
++        vs.mean_abs_diff(b"", b"")
++
++
++def test_the_caption_match_names_the_nearest_strip_and_its_margin():
++    bars = [b"\x00\x00", b"\x10\x10", b"\x40\x40"]
++    idx, dist, margin = vs.best_bar(b"\x12\x12", bars)
++    assert idx == 1
++    assert dist == 2.0
++    assert margin == pytest.approx(16.0)     # runner-up (bar0) is 18 away
++
++
++def test_the_band_crop_reads_the_caption_strip_of_the_named_pane():
++    """The side-by-side is two panes hstacked, so the cli pane is the same
++    crop one app-width to the right — which is what makes "do both panes name
++    the same beat" a meaningful question to ask of one file."""
++    from e2e.demo_video.camera import APP_H, APP_W, BAR_H
++    gui = " ".join(vs.band_args(Path("/x.mp4"), 57.0, 0))
++    assert f"crop={APP_W}:{BAR_H}:0:{APP_H}" in gui
++    assert "-ss 57.000" in gui and "-pix_fmt rgb24" in gui
++    cli = " ".join(vs.band_args(Path("/x.mp4"), 57.0, APP_W))
++    assert f"crop={APP_W}:{BAR_H}:{APP_W}:{APP_H}" in cli
++    assert vs.PANES["sxs"] == (("gui", 0), ("cli", APP_W))
++    assert vs.PANES["gui"] == (("gui", 0),) and vs.PANES["cli"] == (("cli", 0),)

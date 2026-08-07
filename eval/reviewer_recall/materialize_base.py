@@ -268,11 +268,19 @@ def materialise(case_dir: Path, repo_root: Path = REPO_ROOT) -> list[str]:
         if clean != blob:
             line += f"  {SCRUBBED_MARKER}"
         manifest.append(line)
-    (case_dir / MANIFEST_NAME).write_text("\n".join(sorted(manifest)) + "\n")
+    # A create-only case (every pre-image /dev/null) has no base blobs: its
+    # manifest is EMPTY — written as the empty string, not a lone newline,
+    # so a manifest reader's line loop sees zero lines rather than one blank
+    # malformed one. No base/ directory is created for it either (git cannot
+    # track an empty directory, so one could never round-trip anyway).
+    text = "\n".join(sorted(manifest))
+    (case_dir / MANIFEST_NAME).write_text(text + "\n" if text else "")
     return written
 
 
 def main(argv: list[str]) -> int:
+    import json
+
     wanted = set(argv[1:])
     total = 0
     print(f"scrub rules loaded: {len(SCRUB)}")
@@ -280,6 +288,14 @@ def main(argv: list[str]) -> int:
         if not case_dir.is_dir():
             continue
         if wanted and case_dir.name not in wanted:
+            continue
+        truth = json.loads((case_dir / "truth.json").read_text())
+        if truth.get("external_base_ref"):
+            # base.ref names a commit in a recorded-replay scratch repo, not
+            # in this repository — there is no history here to extract from.
+            # Such a case's base/ and manifest are built when the case is cut
+            # and pinned by the same byte-identity test as every other case.
+            print(f"{case_dir.name}: skipped (external base.ref)")
             continue
         written = materialise(case_dir)
         total += len(written)

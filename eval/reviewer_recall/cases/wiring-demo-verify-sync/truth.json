@@ -1,0 +1,20 @@
+{
+  "class": "wiring",
+  "file": "e2e/demo_video/verify_sync.py",
+  "hunk_lines": [
+    1,
+    305
+  ],
+  "caller_file": "e2e/demo_video/compose.py",
+  "description": "Recorded dogfood defect, cut from real merged history unmodified: the commit adds a 305-line verify_sync module whose stated purpose is that the compose pipeline proves the shipped mp4's sync, but nothing in the compose path invokes it \u2014 the only production-file change is a docstring documenting a MANUAL command, and the only code references are tests. The goal (a desynced artifact cannot ship silently) therefore does not occur through the caller production ships. A later commit wired it with a one-line import into compose.py, which is the record that the wiring was the missing piece.",
+  "keywords": [
+    "invoked",
+    "called",
+    "wired",
+    "manual",
+    "never",
+    "compose"
+  ],
+  "planted_by": "recorded-dogfood-history (selected by supervising-session)",
+  "date": "2026-08-07"
+}

@@ -176,7 +176,25 @@ def test_load_cases_real_corpus():
     assert "logic-stale-renders-fresh" in ids
     assert "control-bench-baseline" in ids
     classes = {c.truth["class"] for c in cases}
-    assert classes == {"logic", "security", "spec-miss", "test-tamper", "control"}
+    assert classes == {"logic", "security", "spec-miss", "test-tamper",
+                       "wiring", "control"}
+    # 2026-08-07 expansion: the wiring class (>=3, two recorded-replay cuts +
+    # one recorded dogfood cut) and controls 4 -> 10, including >=2
+    # benign-unwired controls whose request.txt itself asks for an uncalled
+    # artifact — the canary shape that keeps "unreached new code" from ever
+    # hardening into "always blocks".
+    wiring = [c for c in cases if c.truth["class"] == "wiring"]
+    controls = [c for c in cases if c.is_control]
+    assert len(wiring) >= 3
+    assert len(controls) == 10
+    assert sum(1 for c in controls if c.request) >= 2
+    for c in wiring:
+        assert c.truth.get("caller_file"), (
+            f"{c.case_id}: a wiring case scores via an entry_point citing the "
+            "production caller, so truth.json must name caller_file")
+        assert c.request, (
+            f"{c.case_id}: goal reachability is judged against the ticket's "
+            "outcome, so a wiring case must ship request.txt")
 
 
 def test_prepare_case_repo_has_no_descendant_history(tmp_path):
@@ -297,9 +315,17 @@ def _read_manifest(case) -> dict[str, tuple[str, str | None]]:
 
 
 def _cases_whose_base_ref_is_missing() -> list[str]:
-    """Case ids whose `base.ref` commit this checkout cannot resolve."""
+    """INTERNAL case ids whose `base.ref` commit this checkout cannot resolve.
+
+    External-base cases (recorded-replay cuts, `truth.json:
+    external_base_ref`) are excluded by definition: their base.ref names a
+    replay scratch repo's commit, unresolvable in every checkout of this
+    repository — permanently, not as a gc accident.
+    """
     missing = []
     for case in rr.load_cases():
+        if case.truth.get("external_base_ref"):
+            continue
         resolved = subprocess.run(
             ["git", "cat-file", "-e", f"{case.base_ref}^{{commit}}"],
             cwd=REPO_ROOT, capture_output=True,
@@ -344,7 +370,11 @@ def test_prepared_case_repo_matches_the_pinned_base_content():
                     f"{_SCRUBBED_MARKER!r}")
                 scrubbed += 1
             checked += 1
-    assert checked == 70, checked
+    # 70 -> 83 on 2026-08-07: the wiring/controls expansion — 7 new base
+    # files materialised from this repo's history (two controls are
+    # create-only and have none), plus 3 per parcelo replay case
+    # (hand-pinned; their base.ref is external, see the provenance test).
+    assert checked == 83, checked
     # 12 -> 17 on 2026-07-31: five more fixtures now carry a scrub, four of them
     # for the two employer ticket ids that a term list could never have seen.
     # 17 -> 18 later the same day: `control-gate-excerpts/base/tests/test_runner.py`
@@ -380,7 +410,13 @@ def test_prepared_case_repo_matches_the_pinned_base_content():
     # asks "did my edit survive materialisation". Verify on the BUILT EXPORT.
     # 29 -> 31 on 2026-08-03: the private-doc-name sweep scrubbed the two
     # models.py base fixtures (orphan-rescue-v2, d44c4377 follow-up).
-    assert scrubbed == 31, scrubbed
+    # 31 -> 32 on 2026-08-07, with the wiring/controls corpus expansion
+    # (checked 70 -> 83): wiring-demo-verify-sync snapshots the pre-sweep
+    # test_narrated_demo.py whose then-current synthetic-namespace test
+    # carried the employer name as a plain denylist literal — live source
+    # deleted that whole test (8b564af1); the fixture takes a substitution
+    # instead, because a scrub rule cannot delete a test.
+    assert scrubbed == 32, scrubbed
 
 
 def test_manifest_declares_the_scrub_without_indexing_the_original():
@@ -551,21 +587,33 @@ def test_scrubbed_fixtures_are_their_origin_blob_put_through_scrub():
 
     The precondition is now read off the corpus itself rather than a hardcoded
     sha, and a partial history SKIPS rather than half-running: measured on a real
-    default clone 2026-08-04, 4 of the 20 base.ref commits are reachable from a
-    branch and the other 16 are not, so a fresh clone can verify a subset — and a
-    subset cannot assert the 70/31 totals below, which is exactly how a run that
-    checks less than it claims stays invisible.
+    default clone 2026-08-04 (on the then-20-case corpus), 4 of the 20 base.ref
+    commits were reachable from a branch and the other 16 were not, so a fresh
+    clone can verify a subset — and a subset cannot assert the totals below,
+    which is exactly how a run that checks less than it claims stays invisible.
+
+    EXTERNAL-BASE CASES ARE OUT OF THIS TEST'S SUBJECT, not skipped around.
+    The two recorded-replay wiring cases (`truth.json: external_base_ref`)
+    have a base.ref naming a commit in a replay scratch repo, which NO
+    checkout of this repository ever contained — for them "unresolvable" is
+    the permanent truth, not a gc symptom, so folding them into `missing`
+    would turn this test off forever, everywhere. Their base bytes are pinned
+    by the column-1 byte test like everyone's, and their provenance is
+    re-derived against the startup scenario definition instead
+    (`test_parcelo_wiring_bases_are_the_scenario_definition_verbatim`).
     """
-    cases = rr.load_cases()
+    cases = [c for c in rr.load_cases()
+             if not c.truth.get("external_base_ref")]
     missing = _cases_whose_base_ref_is_missing()
     if missing:
         pytest.skip(
-            f"{len(missing)} of {len(cases)} base.ref commits do not resolve in "
-            f"{REPO_ROOT}, so provenance cannot be re-derived for the corpus as "
-            "a whole and only the column-1 byte pin ran.\n"
+            f"{len(missing)} of {len(cases)} internal base.ref commits do not "
+            f"resolve in {REPO_ROOT}, so provenance cannot be re-derived for "
+            "the corpus as a whole and only the column-1 byte pin ran.\n"
             "EXPECTED in the public export (none of the pre-scrub history) and "
-            "on any fresh clone: 16 of the 20 "
-            "base.ref commits are reachable from no branch, so `git clone` never "
+            "on any fresh clone: most internal "
+            "base.ref commits are reachable from no branch (16 of 20 measured "
+            "2026-08-04), so `git clone` never "
             "fetches them. NOT expected in the maintainer's checkout — seeing "
             "this skip there means those objects have been gc'd and the fixtures "
             "can no longer be verified against their source.\n"
@@ -596,11 +644,13 @@ def test_scrubbed_fixtures_are_their_origin_blob_put_through_scrub():
                     "for. Re-run materialize_base.py.")
                 scrubbed += 1
             checked += 1
-    # Same literals as the byte-pin test, for the same reason: a count derived
-    # from the manifests would agree with the manifests by construction. Here
-    # they also prove the loop did not silently check nothing.
-    assert checked == 70, checked
-    assert scrubbed == 31, scrubbed
+    # Fixed literals like the byte-pin test, for the same reason: a count
+    # derived from the manifests would agree with the manifests by
+    # construction. Here they also prove the loop did not silently check
+    # nothing. 77 = the byte-pin test's 83 minus the 6 external-base parcelo
+    # files whose provenance lives in the scenario-definition test instead.
+    assert checked == 77, checked
+    assert scrubbed == 32, scrubbed
 
 
 def test_materialiser_refuses_to_run_with_no_de_identification_rules(
@@ -724,7 +774,7 @@ def test_load_cases_ignores_a_directory_that_is_not_a_case(tmp_path):
     cases_dir = _copy_corpus(tmp_path)
     (cases_dir / "__pycache__").mkdir()
     (cases_dir / "__pycache__" / "runner.cpython-312.pyc").write_bytes(b"\x00")
-    assert len(rr.load_cases(cases_dir)) == 20
+    assert len(rr.load_cases(cases_dir)) == 29
 
 
 def test_load_cases_raises_on_a_partial_case_instead_of_dropping_it(tmp_path):
@@ -899,3 +949,158 @@ def test_error_transcript_omits_caught(tmp_path):
     assert "caught" not in data
     assert data["score"] is None
     assert "case setup failed" in data["error_message_if_error"]
+
+
+# --- goal-reachability scoring (2026-08-07 wiring class) ---------------------
+#
+# The second caught-rule: `goal.reachable == false` (not demoted) whose
+# entry_point cites the caller_file truth.json names. Fully mechanical, like
+# the finding rule — no keywords, no judge.
+
+
+def _wiring_case() -> "rr.CaseSpec":
+    return rr.CaseSpec(
+        case_id="synthetic-wiring", dir=Path("/dev/null"), base_ref="deadbeef",
+        diff_text="diff --git a/rates.py b/rates.py\n",
+        truth=_truth(**{"class": "wiring", "file": "rates.py",
+                        "caller_file": "api.py",
+                        "keywords": ["handle", "caller"]}),
+        request="bill on volumetric weight through the API",
+    )
+
+
+def test_goal_veto_citing_the_caller_scores_a_wiring_catch():
+    outcome = rr.ReviewOutcome(status="FAIL", findings=[], goal={
+        "reachable": False, "entry_point": "api.py:15",
+        "evidence": "handle() never forwards dimensions"})
+    result = rr.score_case(_wiring_case(), outcome)
+    assert result.caught is True
+    assert "goal.reachable=false" in result.reason
+    assert "api.py:15" in result.reason
+
+
+def test_goal_veto_citing_somewhere_else_is_not_a_catch_by_itself():
+    """An unrelated veto must not score a wiring catch — the entry_point has
+    to cite the production caller the truth names."""
+    outcome = rr.ReviewOutcome(status="FAIL", findings=[], goal={
+        "reachable": False, "entry_point": "rates.py:3", "evidence": "x"})
+    result = rr.score_case(_wiring_case(), outcome)
+    assert result.caught is False
+
+
+def test_demoted_goal_veto_never_scores_a_catch():
+    """The citation rule already judged this veto hallucinated; scoring must
+    agree with the gate, which it would not have blocked."""
+    outcome = rr.ReviewOutcome(status="FAIL", findings=[], goal={
+        "reachable": False, "entry_point": "api.py:15", "evidence": "x",
+        "demoted": True})
+    result = rr.score_case(_wiring_case(), outcome)
+    assert result.caught is False
+
+
+def test_the_finding_rule_still_catches_a_wiring_case_without_a_goal_block():
+    """The goal rule is an OR, not a replacement — a blocking finding naming
+    the planted file inside the hunk with a keyword still counts."""
+    outcome = rr.ReviewOutcome(status="FAIL", findings=[
+        rr.Finding(file="rates.py", line=12,
+                   text="new params never forwarded by the handle caller",
+                   blocking=True)])
+    result = rr.score_case(_wiring_case(), outcome)
+    assert result.caught is True
+
+
+def test_goal_veto_on_a_control_is_a_false_alarm_even_with_no_findings():
+    """The gate blocks on the veto alone, so specificity must count it: a
+    clean diff vetoed as unreachable is exactly the benign-unwired false
+    positive the >=2 request-shaped controls exist to measure."""
+    outcome = rr.ReviewOutcome(status="FAIL", findings=[], goal={
+        "reachable": False, "entry_point": "app.py:1", "evidence": "x"})
+    result = rr.score_case(_control_case(), outcome)
+    assert result.clean_pass is False
+    assert "goal.reachable=false" in result.reason
+
+
+def test_demoted_goal_veto_on_a_control_stays_a_clean_pass():
+    outcome = rr.ReviewOutcome(status="PASS", findings=[], goal={
+        "reachable": False, "entry_point": "app.py:1", "evidence": "x",
+        "demoted": True})
+    result = rr.score_case(_control_case(), outcome)
+    assert result.clean_pass is True
+
+
+def test_transcript_carries_the_goal_block(tmp_path):
+    outcome = rr.ReviewOutcome(status="FAIL", findings=[], goal={
+        "reachable": False, "entry_point": "api.py:15", "evidence": "e"})
+    result = rr.score_case(_wiring_case(), outcome)
+    report = rr.RecallReport(results=[result], model="claude-opus-5",
+                             run_date="2026-08-07")
+    rr.write_transcripts(report, tmp_path)
+    data = json.loads(
+        (tmp_path / "2026-08-07" / "synthetic-wiring.json").read_text())
+    assert data["goal"]["entry_point"] == "api.py:15"
+
+
+# --- create-only cases prepare against an empty base -------------------------
+
+
+def test_a_create_only_case_prepares_without_a_base_directory(tmp_path):
+    """The ns-1746bea3 ticket shape ('single new file plus its test') has an
+    empty pre-image; git cannot track an empty base/, so its absence is the
+    correct materialisation and prepare must carry it."""
+    case = next(c for c in rr.load_cases()
+                if c.case_id == "control-humanize-count")
+    assert not (case.dir / rr.BASE_DIR_NAME).is_dir()
+    case_repo = rr.prepare_case_repo(REPO_ROOT, case, tmp_path)
+    shas = subprocess.run(["git", "rev-list", "--all"], cwd=case_repo,
+                          check=True, capture_output=True, text=True)
+    assert len(shas.stdout.split()) == 1
+    assert (case_repo / "src/no_human/core/humanize.py").is_file()
+
+
+def test_a_modifying_case_without_base_content_still_raises(tmp_path):
+    """Loosening prepare for create-only diffs must not have loosened it for
+    everyone: a diff with a real pre-image and no base/ is still broken."""
+    case = rr.CaseSpec(
+        case_id="broken-no-base", dir=tmp_path / "nowhere",
+        base_ref="deadbeef" * 5,
+        diff_text=("diff --git a/app.py b/app.py\n"
+                   "--- a/app.py\n+++ b/app.py\n"),
+        truth=_truth(),
+    )
+    with pytest.raises(rr.CasePrepError):
+        rr.prepare_case_repo(REPO_ROOT, case, tmp_path)
+
+
+# --- external-base provenance: pinned to the scenario definition -------------
+
+
+def test_parcelo_wiring_bases_are_the_scenario_definition_verbatim():
+    """The recorded-replay cases' provenance, re-derived from a source in this
+    repo. Their base.ref names a replay scratch repo's commit (unresolvable
+    here by construction), but that scratch repo was materialised from
+    eval/startup_scenario/parcelo.yaml, and startup-01 is the sprint's FIRST
+    ticket — so every base file must be byte-identical to the scenario's
+    `base:` block. This is the external-base counterpart of
+    `test_scrubbed_fixtures_are_their_origin_blob_put_through_scrub`.
+    """
+    import yaml
+
+    scenario = yaml.safe_load(
+        (REPO_ROOT / "eval/startup_scenario/parcelo.yaml").read_text())
+    external = [c for c in rr.load_cases()
+                if c.truth.get("external_base_ref")]
+    assert len(external) == 2
+    checked = 0
+    for case in external:
+        base_dir = case.dir / rr.BASE_DIR_NAME
+        for rel, (sha, marker) in _read_manifest(case).items():
+            assert marker is None, (
+                f"{case.case_id}:{rel} — scenario content is synthetic and "
+                "must never need a scrub marker")
+            want = scenario["base"].get(rel)
+            assert want is not None, (
+                f"{case.case_id}:{rel} is not a file the scenario defines")
+            assert want.encode() == (base_dir / rel).read_bytes(), (
+                f"{case.case_id}:{rel} differs from the scenario definition")
+            checked += 1
+    assert checked == 6, checked

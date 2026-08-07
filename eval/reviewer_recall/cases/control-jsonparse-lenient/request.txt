@@ -1,0 +1,1 @@
+Add src/no_human/core/jsonparse.py exporting loads_lenient(text): parse JSON strictly first, and on an invalid-escape failure repair stray backslash escapes inside string values and retry, raising json.JSONDecodeError when still unparseable. Add tests in tests/test_jsonparse.py. The new module plus its test only; switching the verdict parsers over to it is a separate change.

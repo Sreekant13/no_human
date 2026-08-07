@@ -1,0 +1,1 @@
+Add src/no_human/core/humanize.py, a pure helper exporting humanize_count(n: int) -> str for compact number display (999 -> '999', 1500 -> '1.5k', 2_500_000 -> '2.5M'), with pytest tests in tests/test_humanize.py. Single new file plus its test; no other changes — wiring call sites is out of scope for this ticket.
