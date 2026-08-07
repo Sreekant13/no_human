@@ -576,8 +576,12 @@ ipcMain.handle("nh:update-defer", async (_event, version) => {
  * The win32 title-bar overlay for a theme. On win32 `hiddenInset` degrades to a
  * frameless window with NO controls, so this overlay IS the minimise/maximise/
  * close buttons: its colour has to track the window's and its symbolColor has to
- * stay legible against it. The height is what the board reserves for its drag
- * region — moving it here alone leaves a dead or undraggable strip.
+ * stay legible against it. The height is carried over unchanged from the literal
+ * this function replaced and is NOT known to correspond to anything in the
+ * board's CSS: the shell block there reserves 34px of traffic-light clearance on
+ * `.nh-sidebar-brand` and makes `.nh-main-bar` draggable, and neither is 40.
+ * Treat it as the caption-button strip's height — changing it wants a look at a
+ * real Windows window, not at styles.css.
  */
 function overlayFor(theme) {
   const { bg, symbol } = themeColors(theme);
@@ -623,9 +627,28 @@ async function createWindow() {
   // which nothing here can read before a window exists. Rather than hand that
   // user the dark flash we just took away from the majority, the renderer
   // mirrors every choice into theme.json (nh:set-theme, above) and startup reads
-  // it back. RESIDUAL, stated so nobody rediscovers it as a bug: the first
-  // launch after upgrading, for a user who had already chosen light, has no file
-  // yet and pre-paints dark once. Every launch after that is correct.
+  // it back.
+  //
+  // RESIDUALS, stated so nobody rediscovers them as bugs. All three are one
+  // wrong-coloured FRAME, never wrong content — the board itself is always
+  // right, because localStorage is still the truth.
+  //  1. UPGRADE. The first launch after upgrading, for a user who had already
+  //     chosen light, has no file yet and pre-paints dark. Once — but only if
+  //     the write that follows lands. See 2.
+  //  2. THE WRITE CANNOT LAND (read-only userData, full disk). Then it is not
+  //     once: it is EVERY launch, for good, and silently. writeTheme swallows
+  //     the error and returns false, nh:set-theme reports that honestly as
+  //     `{ ok: true, saved: false }`, and the renderer discards the return
+  //     value. Driven on a `chmod 0555` userData: no theme.json appears and
+  //     relaunch after relaunch pre-paints #0F1117 for a user who chose light.
+  //     Nothing here can fix it — the shell cannot write — so it is written
+  //     down instead, here and in docs/desktop.md's release checklist.
+  //  3. THE INVERSE. theme.json says light while renderer localStorage has been
+  //     reset — a changed `NH_ORIGIN` or `server.port` is a supported knob and
+  //     moves the origin localStorage belongs to, and cleared site data does it
+  //     too. Then the shell pre-paints LIGHT around a board that boots dark.
+  //     This one self-corrects inside the launch: the effect in App.jsx runs on
+  //     mount and rewrites theme.json, so it costs a frame and nothing more.
   const theme = readTheme(app.getPath("userData"));
   // Also drives Electron's OWN surfaces — traffic lights, native menus, and the
   // `prefers-color-scheme` that this shell's token.html and error.html read.

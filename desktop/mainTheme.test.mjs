@@ -14,9 +14,21 @@
 // adds colour options (titleBarOverlay). darwin's branch carries no colours at
 // all (hiddenInset + a traffic-light position), so testing win32 covers both
 // and additionally covers the min/max/close buttons, which are the thing a
-// wrong overlay colour makes invisible. Forcing it here is safe because a test
-// FILE is its own process, and the other three process.platform reads in
-// main.mjs sit inside event handlers this file never dispatches.
+// wrong overlay colour makes invisible.
+//
+// WHY FORCING IT IS SAFE — and it is NOT "the other reads never run". main.mjs
+// reads process.platform six times; this file reaches four of them. Three are
+// the theme reads this file exists to drive. The fourth is buildAppMenu's
+// `isMac`, and stub.fireReady() below DOES dispatch it: app.whenReady calls
+// buildAppMenu before createWindow. So the guarantee is:
+//   1. a test FILE is its own process, so nothing outside this file ever sees
+//      win32 — the sibling desktop test files are unaffected; and
+//   2. the one non-theme read this file reaches only picks a MENU template,
+//      and nothing here asserts on the menu. Verified by pinning that read to
+//      darwin's value while the platform stayed win32: all assertions passed.
+// The remaining two reads (the window "close" handler and "window-all-closed")
+// are genuinely never dispatched here. If you add an assertion that depends on
+// the menu, or on either of those handlers, this forcing stops being free.
 import { register } from "node:module";
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -102,7 +114,9 @@ test("the Windows min/max/close buttons stay visible on the dark overlay", () =>
   assert.equal(titleBarOverlay.color, "#0F1117",
     "the overlay must match the window it sits on");
   assert.equal(titleBarOverlay.height, 40,
-    "the overlay height is what the board reserves for its drag region");
+    "the overlay height changed. It is the win32 caption-button strip, carried "
+    + "over unchanged from before this branch; nothing in the board's CSS pins "
+    + "it, so re-check it against a real Windows window, not styles.css");
   const r = ratio(titleBarOverlay.symbolColor, titleBarOverlay.color);
   assert.ok(r >= 3, `the control glyphs are ${r.toFixed(2)}:1 on the overlay, `
     + "below the 3:1 of WCAG 1.4.11 — minimise/maximise/close read as a blank strip");

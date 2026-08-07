@@ -9,11 +9,19 @@
 // startup reads it back.
 //
 // This is a CACHE, not the truth. localStorage still decides what the board
-// renders; losing this file costs exactly one wrong-coloured first frame, after
-// which the renderer rewrites it. That is why every operation swallows its own
-// errors — a read-only home or a hand-edited file must never fail a launch —
-// and why the file holds one field and can be deleted at any time. Same
-// contract, and the same reasoning, as updateState.mjs beside it.
+// renders, so a missing, stale or hand-edited file costs a wrong-coloured first
+// FRAME and never wrong content. That is why every operation swallows its own
+// errors — a read-only home must never fail a launch — and why the file holds
+// one field and can be deleted at any time. Same contract, and the same
+// reasoning, as updateState.mjs beside it.
+//
+// WHAT THE SWALLOWING COSTS, stated where the price is paid rather than left to
+// be rediscovered. LOSING the file is one wrong frame: the renderer rewrites it
+// on mount. Being unable to WRITE it is one wrong frame on EVERY launch, for
+// good — writeTheme returns false, its caller passes that on as
+// `{ ok: true, saved: false }`, and no caller today reads it, so the failure is
+// silent as well as permanent. The full residual list is in main.mjs's
+// createWindow; do not shorten either of them to "costs one frame".
 
 import fs from "node:fs";
 import path from "node:path";

@@ -39,6 +39,15 @@ login shell's PATH, or the usual install locations.
 - Theme choice persists across relaunch (Electron userData is a separate
   localStorage from the browser's — a one-time reset on first launch is
   expected).
+- Theme choice persists **only while userData is writable.** The window frame
+  and the Windows title-bar buttons are pre-painted from
+  `<userData>/theme.json`, which the board rewrites on every toggle. If that
+  write cannot land — read-only userData, full disk — the frame starts in the
+  DEFAULT dark on *every* launch, not once, and nothing says so: `nh:set-theme`
+  returns `{ ok: true, saved: false }` and no caller reads `saved`. Toggle the
+  theme and confirm `theme.json` appeared; its absence is the only signal.
+  (The board itself is always right either way — the cost is one wrong-coloured
+  frame per launch, never wrong content.)
 - Notifications fire while hidden to tray.
 - Second launch focuses the existing window (single-instance lock).
 - Board renders identically in Safari-free environments (the e2e gate's

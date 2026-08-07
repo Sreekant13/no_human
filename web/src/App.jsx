@@ -713,6 +713,9 @@ export default function App() {
     // Windows, the min/max/close buttons) before any renderer exists, so it
     // cannot read the line above — it keeps its own copy and uses it on the
     // NEXT launch. A browser has no bridge and skips this.
+    // Unawaited AND deliberately not `.catch(() => {})`-ed: the handler
+    // resolves for every theme and every write failure alike, so a rejection
+    // can only mean a broken bridge, and an empty catch would bury it.
     window.nhDesktop?.setTheme?.(theme);
   }, [theme]);
   // Desktop shell (Electron) marks itself via the preload bridge; the class

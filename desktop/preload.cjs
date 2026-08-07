@@ -56,7 +56,11 @@ contextBridge.exposeInMainWorld("nhDesktop", {
   // The board's light/dark choice, mirrored to the main process. It is the
   // renderer that owns the theme (localStorage), but only the main process can
   // colour the window frame and the Windows title-bar controls — and it has to
-  // do that before any renderer exists, so it needs its own copy. One-way: the
-  // main side accepts "dark" or "light" and returns nothing but {ok}.
+  // do that before any renderer exists, so it needs its own copy. Nothing flows
+  // back but a receipt: the main side accepts "dark" or "light" and returns
+  // `{ ok, saved }` — `ok` is "that was one of the two themes", `saved` is "it
+  // reached disk". They differ: a read-only userData gives `ok:true` with
+  // `saved:false`, and no caller reads `saved` today. See the residual list in
+  // main.mjs's createWindow before treating this as fire-and-forget.
   setTheme: (theme) => ipcRenderer.invoke("nh:set-theme", theme),
 });
