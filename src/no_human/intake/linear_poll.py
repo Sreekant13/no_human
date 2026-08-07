@@ -15,6 +15,13 @@ A Linear transport error logs and is retried next tick; it never crashes the
 pool. Throttling is called out by name in the log, because Linear reports it as
 HTTP 400 rather than 429 and would otherwise read as a permanent client error.
 
+A **config** error is the one exception to "log and retry" — the same exception
+``intake/monday_poll.py`` makes for the same reason. It is reported through its
+own event kind, because no number of ticks fixes a team key that names no team,
+and a poller that quietly retried forever is exactly the silent failure
+:class:`~no_human.intake.linear.LinearConfigError` exists to prevent. It is
+still CAUGHT: the tick returns an empty result and the pool keeps running.
+
 WHY POLLING AND NOT WEBHOOKS
 ----------------------------
 Linear does offer webhooks with HMAC-SHA256 ``Linear-Signature`` verification,
@@ -37,7 +44,7 @@ from dataclasses import dataclass, field
 from ..core.db import Store
 from ..core.task import Task, TaskStatus
 from ..profile import apply_default_task_config
-from .linear import LinearRateLimited
+from .linear import LinearConfigError, LinearRateLimited
 
 log = logging.getLogger("no_human.intake.linear_poll")
 
@@ -109,20 +116,30 @@ class LinearPoller:
     def _log_transport(self, what: str, exc: Exception) -> str:
         """One place that names throttling explicitly. Linear reports rate
         limiting as HTTP 400 + ``extensions.code == "RATELIMITED"``, so a log
-        line that only said "HTTP 400" would read as a permanent bad request."""
+        line that only said "HTTP 400" would read as a permanent bad request.
+        A config error is named separately because it is the one failure
+        ticking again will never fix."""
         if isinstance(exc, LinearRateLimited):
             detail = "rate limited (Linear reports this as HTTP 400, not 429) — retrying next tick"
+        elif isinstance(exc, LinearConfigError):
+            detail = f"not configured: {exc}"
         else:
             detail = f"{type(exc).__name__}: {exc}"
         log.warning("Linear %s failed: %s", what, detail)
         return detail
+
+    def _event_kind(self, base: str, exc: Exception) -> str:
+        """A config error gets its own event kind so the UI/console can say
+        "fix your config", not "the network flaked"."""
+        return "linear_config_error" if isinstance(exc, LinearConfigError) else base
 
     async def poll_once(self) -> PollResult:
         result = PollResult()
         try:
             issues = await asyncio.to_thread(self.adapter.search)
         except Exception as exc:  # noqa: BLE001 — transport error retried next tick
-            self._on_event("linear_poll_error", self._log_transport("poll", exc))
+            self._on_event(self._event_kind("linear_poll_error", exc),
+                           self._log_transport("poll", exc))
             return result
 
         existing = await self._existing_ids()

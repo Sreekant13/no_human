@@ -3114,9 +3114,16 @@ def _linear_failure(exc: Exception, what: str) -> HTTPException:
     classification, not the status code. Only the exception's type name is ever
     logged: the message can quote the request, which carries the API key.
     """
-    from ..intake.linear import LinearAuthError, LinearRateLimited
+    from ..intake.linear import LinearAuthError, LinearConfigError, LinearRateLimited
 
     log.warning("linear %s failed: %s", what, type(exc).__name__)
+    if isinstance(exc, LinearConfigError):
+        # The adapter builds this one itself, out of the operator's own config
+        # and names the API returned — never out of a request — so it is the
+        # one Linear failure whose message can be shown verbatim, and it is
+        # the only one that tells the operator what to change. 503, not 502:
+        # nothing is wrong upstream, the setting is wrong here.
+        return HTTPException(status_code=503, detail=str(exc))
     if isinstance(exc, LinearAuthError):
         detail = (
             "Linear API key rejected. Verify or rotate the key under "

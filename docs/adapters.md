@@ -102,6 +102,31 @@ the lowest-`position` state of that type, which is the order Linear itself
 displays them in. `canceled` and `duplicate` are refused outright: closing an
 issue is a human action (constraint #2).
 
+**Config that matches nothing is refused, on the same terms as monday's.**
+`team_key`, `state_types` and `label` are all server-side filters, and Linear
+answers a filter that matches nothing with an empty page and no error — so an
+unset team key, `N0` for `NO`, `Backlog` for `backlog`, or a label the
+workspace does not have all look exactly like a team with no open work.
+Measured against a real workspace: the correct config returned 4 issues and
+each of those four faults returned 0, silently. Every one of them now raises
+`LinearConfigError`, naming the setting:
+
+- `state_types` is checked **offline** against the seven values above — they
+  are a fixed documented list, so this costs no request and is also what the
+  Settings panel and the onboarding wizard refuse a typo with;
+- `team_key` and `label` are checked **against the workspace**, once per
+  adapter, from inside the poll that was already making requests. Never at
+  config load: no install should need Linear to be reachable to start.
+
+The online half **fails open** — a validation query that errors, is throttled,
+or comes back in an unrecognised shape leaves intake alone, because a check
+that turned an API outage into "your config is wrong" would be worse than the
+silence it replaces. A *correct* config that matches zero issues right now
+still returns nothing and says nothing: what is validated is that the config
+names real things, never that the result was non-empty. The poller reports a
+config error on its own event kind (`linear_config_error`, the same split
+monday's poller makes) and keeps ticking.
+
 Polling, not webhooks: Linear does offer webhooks with HMAC-SHA256
 `Linear-Signature` verification, but they need a publicly reachable HTTPS
 endpoint, and no_human binds to `127.0.0.1`. Polling costs ~60 requests/hour at

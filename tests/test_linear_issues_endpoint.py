@@ -207,8 +207,10 @@ async def test_scope_is_the_operator_authored_filter_never_the_query(client, mon
 
     r = await client.get("/api/integrations/linear/issues", params={"q": "number"})
     assert r.status_code == 200, r.text
-    variables = captured["calls"][0]["variables"]
-    flt = variables["filter"]
+    # The ISSUE search, not the intake-config check search() runs first.
+    searches = [c for c in captured["calls"] if "NoHumanIssues" in c["query"]]
+    assert len(searches) == 1
+    flt = searches[0]["variables"]["filter"]
     assert flt["team"] == {"key": {"eq": "NO"}}
     assert flt["state"] == {"type": {"in": ["triage", "backlog", "unstarted"]}}
     assert "number" not in str(flt), "the typed query must not reach the GraphQL filter"
@@ -295,6 +297,36 @@ async def test_connection_error_surfaces_as_502_and_never_logs_the_key(
     assert r.status_code == 502
     assert "SEKRET" not in r.text
     assert "SEKRET" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_misconfigured_team_key_is_a_503_that_says_what_to_change(
+        client, monkeypatch, caplog):
+    """The Backlog page listed nothing at all for a team key that names no
+    team, with a 200 and an empty array. The adapter builds this message out
+    of the operator's own config and the names the API returned — never out of
+    a request — so it is the one Linear failure whose text can be shown."""
+    import logging
+
+    monkeypatch.setenv("LINEAR_API_KEY", "SEKRET")
+
+    def fake_post(url, headers=None, timeout=None, json=None):
+        if "NoHumanTeams" in json["query"]:
+            return _Resp({"data": {"teams": {
+                "nodes": [{"id": "t1", "key": "NO"}],
+                "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
+        return _page([_issue(1)])
+
+    monkeypatch.setattr("no_human.intake.linear.httpx.post", fake_post)
+    import yaml
+    (nh_config.CONFIG_PATH).write_text(yaml.safe_dump(_cfg(team_key="N0")))
+    app.state.config = nh_config.load_config(nh_config.CONFIG_PATH)
+
+    with caplog.at_level(logging.DEBUG):
+        r = await client.get("/api/integrations/linear/issues")
+    assert r.status_code == 503
+    assert "integrations.linear.team_key" in r.json()["detail"]
+    assert "SEKRET" not in r.text and "SEKRET" not in caplog.text
 
 
 # ── the imported chip, and the cross-tracker guard ────────────────────────

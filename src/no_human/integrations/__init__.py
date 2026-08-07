@@ -203,12 +203,34 @@ def _jira_status(config: dict) -> IntegrationStatus:
 
 
 def _linear_status(config: dict) -> IntegrationStatus:
+    """Linear needs a team key AND state types that are really state types.
+
+    Reporting "configured" on the presence of a team key alone was a lie of
+    the same family ``_monday_status`` documents: ``state_types`` holding
+    anything outside Linear's seven ``WorkflowState.type`` strings matches no
+    issue at all, so the card showed green next to an integration that could
+    only ever poll nothing. The value is not checked against the API here —
+    this function is pure and is called on every settings render — but the type
+    strings are a fixed documented list, so THAT half costs nothing.
+    """
+    from ..intake.linear import state_type_problems
+
     lin = _sect(config, "integrations").get("linear") or {}
     team = lin.get("team_key")
-    configured = bool(team)
+    raw_types = lin.get("state_types")
+    # An UNSET value is the shipped default and is fine; a SET one must be
+    # real. `raw_types` is passed through untouched (never coerced with
+    # `list()`, which would silently turn the string "backlog" into six
+    # single-character "types" and report six problems for one mistake).
+    problems = state_type_problems(raw_types) if raw_types else []
+    configured = bool(team) and not problems
     if configured:
         label = lin.get("label")
         detail = f"team {team}" + (f" · label {label}" if label else "")
+    elif problems:
+        detail = ("integrations.linear.state_types is not usable: "
+                  + "; ".join(problems)
+                  + " — every poll would return nothing")
     else:
         detail = "not configured"
     return IntegrationStatus("linear", "issue_tracker", configured, None, detail,
@@ -1030,6 +1052,29 @@ def _coerce_setup_value(name: str, field: str, default: Any, value: Any) -> Any:
     raise ValueError(f"{name}.{field} is not settable here")
 
 
+def _assert_setup_values_usable(name: str, values: dict[str, Any]) -> None:
+    """Refuse a value that is the right TYPE but can never work.
+
+    :func:`_coerce_setup_value` answers "is this a list of strings?"; this
+    answers "are those strings ones the integration can actually use?". Only
+    checks that need NO network live here — the wizard runs before anything is
+    reachable, and an install must never depend on a vendor being up to save a
+    setting. Today that is Linear's ``state_types``, whose seven legal values
+    are a fixed documented list: anything else matches no issue at all, and
+    Linear reports that as an empty page rather than an error, so this is the
+    last place it can be caught cheaply.
+    """
+    if name == "linear" and "state_types" in values:
+        from ..intake.linear import STATE_TYPES, state_type_problems
+
+        problems = state_type_problems(values["state_types"])
+        if problems:
+            raise ValueError(
+                "linear.state_types: " + "; ".join(problems)
+                + ". The seven values are " + ", ".join(repr(t) for t in STATE_TYPES)
+            )
+
+
 def apply_setup(name: str, values: dict[str, Any]) -> dict[str, Any]:
     """Persist one integration's NON-SECRET settings to config.yaml and return
     its refreshed spec entry.
@@ -1045,10 +1090,12 @@ def apply_setup(name: str, values: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"unknown integration: {name!r}")
 
     updates: dict[str, Any] = {}
+    coerced: dict[str, Any] = {}
     for field, raw in values.items():
         assert_config_safe_field(name, field)
-        updates[f"integrations.{name}.{field}"] = _coerce_setup_value(
-            name, field, defaults[field], raw)
+        coerced[field] = _coerce_setup_value(name, field, defaults[field], raw)
+        updates[f"integrations.{name}.{field}"] = coerced[field]
+    _assert_setup_values_usable(name, coerced)
 
     if updates:
         _write_config_values(_config_mod.CONFIG_PATH, updates)
@@ -1107,9 +1154,24 @@ async def _http_post(url, headers=None, json=None, timeout=10.0):
 
 
 async def _check_linear(config: dict) -> IntegrationStatus:
+    """Live check: the key authenticates AND ``team_key`` names a real team.
+
+    The team check lives HERE, and in the adapter's own poll-time guard, and
+    nowhere else — this is a user-initiated action that is already making a
+    request, so it is the one place an online validation cannot hang a startup
+    or block an offline install. It is a SECOND request rather than extra
+    fields on the auth probe, deliberately: the auth probe's query is verified
+    and answers the question the operator pressed the button for, and a widened
+    query that Linear rejected would take the working half down with it. As a
+    separate request it can only ever ADD a verdict — any failure, or a body
+    without a `teams` connection, leaves the answer at "authenticated".
+    """
     base = _linear_status(config)
     if not base.configured:
-        return replace(base, healthy=False, detail="not configured")
+        # base.detail, not a fixed string: when state_types is the problem it
+        # names the setting, and flattening that to "not configured" would
+        # throw away the only thing that says what to fix.
+        return replace(base, healthy=False, detail=base.detail)
     key = os.environ.get("LINEAR_API_KEY")
     if not key:
         return replace(base, healthy=False,
@@ -1143,9 +1205,49 @@ async def _check_linear(config: dict) -> IntegrationStatus:
         who = ""
         if isinstance(body, dict):
             who = ((body.get("data") or {}).get("viewer") or {}).get("name", "")
+        lin = _sect(config, "integrations").get("linear") or {}
+        bad_team = await _linear_team_key_problem(key, str(lin.get("team_key") or ""))
+        if bad_team:
+            return replace(base, healthy=False, detail=bad_team)
         return replace(base, healthy=True,
                        detail=f"authenticated as {who}" if who else "authenticated")
     return replace(base, healthy=False, detail=f"HTTP {r.status_code}")
+
+
+async def _linear_team_key_problem(key: str, team_key: str) -> str:
+    """"``integrations.linear.team_key`` names no team" — or ``""``.
+
+    Fails OPEN on everything else: a transport failure, an errors array, a
+    non-200, a body with no ``teams`` connection, or a workspace that lists no
+    teams at all (an API key that cannot see them) all return ``""``. Only a
+    definitive answer — the workspace listed its teams and this key is not
+    among them — becomes a verdict, because a health check that invented a
+    config error would send an operator to fix a setting that was right.
+    """
+    from ..intake.linear import API_URL
+
+    if not team_key:
+        return ""
+    try:
+        r = await _http_post(
+            API_URL,
+            headers={"Authorization": key, "Content-Type": "application/json"},
+            json={"query": "{ teams(first: 250) { nodes { key } } }"}, timeout=10.0)
+        body = r.json() or {}
+    except Exception:  # noqa: BLE001 — a health check never raises
+        return ""
+    if not isinstance(body, dict) or body.get("errors") or r.status_code != 200:
+        return ""
+    conn = ((body.get("data") or {}).get("teams") or {})
+    if not isinstance(conn, dict) or not isinstance(conn.get("nodes"), list):
+        return ""
+    keys = [str(n.get("key")) for n in conn["nodes"]
+            if isinstance(n, dict) and n.get("key")]
+    if not keys or team_key in keys:
+        return ""
+    return (f"integrations.linear.team_key is {team_key!r}, which is not a team in "
+            f"this workspace — every poll would return nothing. Teams this key can "
+            f"see: {', '.join(repr(k) for k in sorted(keys))}")
 
 
 async def _check_monday(config: dict) -> IntegrationStatus:

@@ -29,6 +29,41 @@ API FACTS THIS MODULE DEPENDS ON (linear.app/developers, verified 2026-08-01)
   auth failure at 401, throttling at 400 — every one of them carries an
   ``errors`` array. So the ``errors`` array is parsed on *every* response.
 
+CONFIG THAT MATCHES NOTHING IS REFUSED, NOT ANSWERED WITH AN EMPTY LIST
+----------------------------------------------------------------------
+Every one of ``team_key``, ``state_types`` and ``label`` is a filter Linear
+applies server-side, and Linear answers a filter that matches nothing with
+``nodes: []`` and no error — an unset team key, a typo'd one (``N0`` for
+``NO``), a ``state.type`` that is not one of the seven (``Backlog`` for
+``backlog``, since the field is a plain String), and a label the workspace does
+not have ALL produce exactly the same empty page as a team that genuinely has
+no open work. Measured: each returned 0 issues, silently, where the correct
+config returned 4. That is the failure ``intake/monday.py`` refuses by name —
+"a silent empty result is indistinguishable from 'the board is empty' and would
+park a misconfigured integration in permanent quiet" — so this adapter now
+refuses it on the same terms, with :class:`LinearConfigError`.
+
+The check is SPLIT by what it costs, because the two halves are different
+animals:
+
+* **Offline** (:meth:`LinearAdapter._require_config`, pure): ``team_key`` is
+  set, and every ``state_types`` entry is one of :data:`STATE_TYPES`. No I/O,
+  so it is safe to run anywhere — including from the integrations registry's
+  pure status derivation and from the onboarding write path.
+* **Online** (:meth:`LinearAdapter._validate_intake_config`): does ``team_key``
+  name a team that exists, does ``label`` name a label that exists. Run only
+  from :meth:`search`, which is already making requests, and only ONCE per
+  adapter (the answers are cached, and a raised config error is remembered and
+  re-raised without a second request). Never at config load: an install must
+  not need Linear to be reachable to start.
+
+The online half FAILS OPEN. If the validation query itself errors, is throttled
+or comes back in a shape this module does not recognise, the check is skipped
+and the search proceeds — a config error is raised only on a definitive answer
+("the workspace lists these teams and yours is not among them"). A validation
+that turned an unrelated API failure into "your config is wrong" would be worse
+than the silence it replaces.
+
 Write-back is opt-in (``integrations.linear.write_back``, default false) and
 mirrors the Jira adapter: comments plus **type-matched state moves** resolved at
 runtime from the team's own workflow states, never a hardcoded state UUID (they
@@ -102,6 +137,31 @@ query NoHumanStates($teamKey: String!) {
 }
 """
 
+#: The workspace's teams, for validating ``team_key``. ``teams`` and
+#: ``issueLabels`` are Linear's documented root connections and are paged with
+#: the same Relay cursor every other query here uses. They were NOT re-verified
+#: against the live API when this was written — which is exactly why both
+#: callers fail OPEN: if either query is wrong, it errors, the check is skipped
+#: and intake continues, rather than a bad guess becoming a false accusation
+#: about the operator's config.
+_TEAMS_QUERY = """
+query NoHumanTeams($first: Int!, $after: String) {
+  teams(first: $first, after: $after) {
+    nodes { id key name }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+_LABELS_QUERY = """
+query NoHumanLabels($first: Int!, $after: String) {
+  issueLabels(first: $first, after: $after) {
+    nodes { id name }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
 _ISSUE_STATE_QUERY = """
 query NoHumanIssueState($id: String!) {
   issue(id: $id) { id identifier state { id name type } }
@@ -140,6 +200,47 @@ class LinearRateLimited(LinearError):
 
 class LinearAuthError(LinearError):
     """``extensions.code == "AUTHENTICATION_ERROR"`` — HTTP 401."""
+
+
+class LinearConfigError(LinearError):
+    """Operator config that is absent, or that cannot match anything.
+
+    Its own class because it is the one failure that is NOT the API's fault and
+    NOT retryable: no number of poll ticks fixes an unset ``team_key`` or a
+    ``state_types`` entry that is not one of the seven documented values.
+    Raised instead of returning an empty list, so a misconfigured integration
+    is loud rather than quietly idle. Carries no credential — every instance is
+    built from config the operator wrote and from names the API returned.
+    """
+
+
+def state_type_problems(state_types) -> list[str]:
+    """Offline validation of ``integrations.linear.state_types``.
+
+    A list of human-readable problems, empty when the value is usable. Pure and
+    import-cheap on purpose: the integrations registry's *synchronous* status
+    derivation and the onboarding write path both call it, and neither may make
+    a request. ``WorkflowState.type`` is a plain String in Linear's schema, so
+    this tuple is the only validation that exists anywhere — a typo is not a
+    query error, it is an empty result set.
+    """
+    problems: list[str] = []
+    if isinstance(state_types, str) or not isinstance(state_types, (list, tuple)):
+        return [f"must be a list of state types, not {type(state_types).__name__}"]
+    for raw in state_types:
+        if not isinstance(raw, str):
+            problems.append(f"{raw!r} is not a state type")
+            continue
+        if raw in STATE_TYPES:
+            continue
+        hint = ""
+        for known in STATE_TYPES:
+            if raw.strip().casefold() == known:
+                hint = f" (did you mean {known!r}? the values are lowercase)"
+                break
+        problems.append(f"{raw!r} is not one of Linear's seven "
+                        f"WorkflowState.type values{hint}")
+    return problems
 
 
 def _raise_for_graphql_errors(payload: Any, status: int) -> None:
@@ -194,6 +295,12 @@ class LinearAdapter:
         # (an operator edits them rarely) and every write-back would otherwise
         # spend a request re-fetching them.
         self._states_cache: list[dict[str, Any]] | None = None
+        # The ONLINE intake-config check runs at most once per adapter: the
+        # verdict is remembered, so a misconfigured install is loud on every
+        # tick without spending a request on every tick. `None` = not attempted
+        # yet; a stored error is re-raised as-is.
+        self._intake_checked = False
+        self._intake_config_error: LinearConfigError | None = None
 
     @property
     def configured(self) -> bool:
@@ -238,6 +345,116 @@ class LinearAdapter:
             )
         return data
 
+    # --------------------------- config guards ------------------------------ #
+
+    def _require_config(self) -> None:
+        """Fail loudly on config that cannot match, naming the exact key.
+
+        OFFLINE — no request is made, so this runs before anything is spent on
+        the wire and works on a machine with no network. Every entry point that
+        would otherwise degrade to an empty list calls it first.
+        """
+        if not self.team_key:
+            raise LinearConfigError(
+                "Linear intake is not configured: set integrations.linear.team_key "
+                "in ~/.no_human/config.yaml. It is the issue-id PREFIX — 'ENG' in "
+                "ENG-123 — not the team's display name."
+            )
+        problems = state_type_problems(list(self.state_types))
+        if problems:
+            raise LinearConfigError(
+                "integrations.linear.state_types is not usable: "
+                + "; ".join(problems)
+                + ". Linear's WorkflowState.type is a plain String, so a value "
+                "outside " + ", ".join(repr(t) for t in STATE_TYPES) + " matches "
+                "no issue and the team would read as empty — intake refuses to "
+                "run instead of returning nothing."
+            )
+
+    def _paged_field(self, query: str, root: str, field: str) -> tuple[list[str], bool]:
+        """Walk a Relay connection collecting one string field per node.
+
+        Returns ``(values, complete)``; ``complete`` is False when the walk
+        stopped at the page bound with more pages left, which is the one case a
+        membership test must NOT be run on — an incomplete list would accuse a
+        perfectly good config of naming something that does not exist.
+        """
+        values: list[str] = []
+        after: str | None = None
+        for _ in range(10):
+            data = self._post(query, {"first": 250, "after": after})
+            conn = data.get(root)
+            if not isinstance(conn, dict):
+                raise LinearError(f"Linear response had no {root} connection")
+            for node in conn.get("nodes") or []:
+                value = (node or {}).get(field)
+                if isinstance(value, str) and value:
+                    values.append(value)
+            page = conn.get("pageInfo") or {}
+            if not page.get("hasNextPage"):
+                return values, True
+            after = page.get("endCursor")
+            if not after:
+                return values, True
+        return values, False
+
+    def _probe_intake_config(self) -> LinearConfigError | None:
+        """The ONLINE half: is the configured team/label a thing that exists?
+
+        Returns the error to raise, or None. Never raises: a validation query
+        that fails, is throttled, or answers in an unexpected shape leaves
+        intake alone (logged at debug and skipped), because the cost of a wrong
+        accusation here is a working install that stops working, while the cost
+        of skipping is only the silence that already existed.
+        """
+        try:
+            keys, complete = self._paged_field(_TEAMS_QUERY, "teams", "key")
+        except LinearError as exc:
+            log.debug("Linear team_key check skipped: %s", type(exc).__name__)
+            return None
+        if complete and keys and self.team_key not in keys:
+            hint = ""
+            for key in keys:
+                if key.casefold() == self.team_key.casefold():
+                    hint = f" Did you mean {key!r}? (team keys are case-sensitive)"
+                    break
+            return LinearConfigError(
+                f"integrations.linear.team_key is {self.team_key!r}, which is not "
+                "a team in this workspace, so every poll would return nothing."
+                + hint
+                + " Teams this API key can see: "
+                + ", ".join(repr(k) for k in sorted(keys))
+            )
+        if not self.label:
+            return None
+        try:
+            labels, complete = self._paged_field(_LABELS_QUERY, "issueLabels", "name")
+        except LinearError as exc:
+            log.debug("Linear label check skipped: %s", type(exc).__name__)
+            return None
+        if complete and labels and self.label not in labels:
+            hint = ""
+            for name in labels:
+                if name.casefold() == self.label.casefold():
+                    hint = f" Did you mean {name!r}? (label names are case-sensitive)"
+                    break
+            return LinearConfigError(
+                f"integrations.linear.label is {self.label!r}, which is not a label "
+                "in this workspace, so every poll would filter every issue out."
+                + hint
+                + " Labels this API key can see: "
+                + ", ".join(repr(x) for x in sorted(set(labels)))
+            )
+        return None
+
+    def _validate_intake_config(self) -> None:
+        """Run the online check once per adapter and re-raise its verdict."""
+        if not self._intake_checked:
+            self._intake_config_error = self._probe_intake_config()
+            self._intake_checked = True
+        if self._intake_config_error is not None:
+            raise self._intake_config_error
+
     # ------------------------------- read ---------------------------------- #
 
     def _filter(self, updated_since: str | None = None) -> dict[str, Any]:
@@ -263,7 +480,18 @@ class LinearAdapter:
         ``endCursor``) so a backlog bigger than one page is not silently
         truncated. Bounded at 10 pages so a misconfigured filter cannot spin
         the poll tick forever.
+
+        The config is checked against the WORKSPACE before the first page is
+        fetched (:meth:`_require_config`, then :meth:`_validate_intake_config`)
+        — every filter this sends is one Linear answers with an empty page when
+        it names something that does not exist, and an empty page is exactly
+        what a team with no open work looks like. A correct config that matches
+        zero issues right now still returns ``[]`` and says nothing: what is
+        validated is that the config NAMES REAL THINGS, never that the result
+        was non-empty.
         """
+        self._require_config()
+        self._validate_intake_config()
         out: list[dict[str, Any]] = []
         after: str | None = None
         for _ in range(10):
@@ -356,7 +584,13 @@ class LinearAdapter:
         }
 
     def workflow_states(self, *, refresh: bool = False) -> list[dict[str, Any]]:
-        """The configured team's workflow states (cached per adapter)."""
+        """The configured team's workflow states (cached per adapter).
+
+        Guarded by the same offline check as :meth:`search`: with no team key
+        this query returns zero states, which makes every write-back a silent
+        no-op rather than a reported failure.
+        """
+        self._require_config()
         if self._states_cache is None or refresh:
             data = self._post(_STATES_QUERY, {"teamKey": self.team_key})
             self._states_cache = (data.get("workflowStates") or {}).get("nodes") or []

@@ -17,6 +17,7 @@ from no_human.intake.linear import (
     STATE_TYPES,
     LinearAdapter,
     LinearAuthError,
+    LinearConfigError,
     LinearError,
     LinearRateLimited,
 )
@@ -243,6 +244,11 @@ def test_search_follows_the_cursor_so_a_second_page_is_not_dropped(key, monkeypa
     afters = []
 
     def fake_post(url, headers=None, timeout=None, json=None):
+        # search() also runs the intake-config check (teams/labels). Answer
+        # those with a body that carries no such connection, which is the
+        # fail-open path, so this test measures ISSUE paging only.
+        if "NoHumanIssues" not in json["query"]:
+            return _Resp({"data": {}})
         afters.append(json["variables"]["after"])
         return pages.pop(0)
 
@@ -256,6 +262,8 @@ def test_search_stops_paging_when_the_cursor_is_missing(key, monkeypatch):
     calls = []
 
     def fake_post(url, headers=None, timeout=None, json=None):
+        if "NoHumanIssues" not in json["query"]:
+            return _Resp({"data": {}})     # config check: fail open, not counted
         calls.append(1)
         return _Resp({"data": {"issues": {
             "nodes": [_issue()],
@@ -402,6 +410,224 @@ def test_state_type_reads_the_current_state(key, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Config that matches nothing is REFUSED, not answered with an empty list.      #
+#                                                                              #
+# Measured against a real workspace before this was fixed: the correct config   #
+# returned 4 issues, and an unset team key, a typo'd team key, a typo'd         #
+# state_types and a label nothing carries each returned 0 — silently, with      #
+# nothing anywhere reporting a problem. Linear applies all four filters         #
+# server-side and answers a filter that matches nothing with an empty page and  #
+# no error, so an empty page is the same thing a team with no open work looks   #
+# like. Every test below pins one half of the distinction: a WRONG config       #
+# raises, and a RIGHT config that happens to match nothing stays quiet.         #
+# --------------------------------------------------------------------------- #
+
+_WORKSPACE_TEAMS = ["NO", "ENG"]
+_WORKSPACE_LABELS = ["Bug", "Feature"]
+
+
+def _fake_workspace(issues=None, *, teams=_WORKSPACE_TEAMS, labels=_WORKSPACE_LABELS,
+                    calls=None, teams_pages_forever=False, teams_error=False):
+    """A scripted Linear workspace: answers the issues/teams/labels queries the
+    way the real API does, including "a filter that matches nothing comes back
+    as an empty page, not an error"."""
+    nodes = [_issue("ENG-1")] if issues is None else issues
+
+    def fake_post(url, headers=None, timeout=None, json=None):
+        query = json["query"]
+        if calls is not None:
+            calls.append(query.strip().splitlines()[0])
+        if "NoHumanTeams" in query:
+            if teams_error:
+                return _Resp({"errors": [{"message": "boom"}]}, status_code=400)
+            return _Resp({"data": {"teams": {
+                "nodes": [{"id": f"t-{k}", "key": k, "name": k} for k in teams],
+                "pageInfo": {"hasNextPage": teams_pages_forever,
+                             "endCursor": "cur" if teams_pages_forever else None}}}})
+        if "NoHumanLabels" in query:
+            return _Resp({"data": {"issueLabels": {
+                "nodes": [{"id": f"l-{x}", "name": x} for x in labels],
+                "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
+        # The issues search: apply the operator's filter the way Linear does.
+        flt = json["variables"]["filter"]
+        team = flt["team"]["key"]["eq"]
+        types = flt["state"]["type"]["in"]
+        wanted_labels = (flt.get("labels") or {}).get("name", {}).get("in")
+        out = []
+        for issue in nodes:
+            if issue["team"]["key"] != team or issue["state"]["type"] not in types:
+                continue
+            if wanted_labels is not None:
+                have = [n["name"] for n in issue["labels"]["nodes"]]
+                if not any(x in have for x in wanted_labels):
+                    continue
+            out.append(issue)
+        return _Resp({"data": {"issues": {
+            "nodes": out, "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
+
+    return fake_post
+
+
+def test_the_control_a_correct_config_still_returns_its_issues(key, monkeypatch):
+    """The measurement every case below is read against. Without it, "0 issues"
+    proves nothing: a fake that returns nothing for everything would make the
+    whole section pass while the adapter did no work at all."""
+    monkeypatch.setattr(httpx, "post", _fake_workspace())
+    issues = LinearAdapter(_cfg()).search()
+    assert [i["identifier"] for i in issues] == ["ENG-1"]
+
+
+def test_an_unset_team_key_raises_instead_of_returning_nothing(key, monkeypatch):
+    monkeypatch.setattr(httpx, "post",
+                        lambda *a, **k: pytest.fail("must not reach the API"))
+    with pytest.raises(LinearConfigError) as exc:
+        LinearAdapter(_cfg(team_key="")).search()
+    assert "integrations.linear.team_key" in str(exc.value)
+
+
+def test_a_typod_team_key_is_refused_and_the_real_ones_are_named(key, monkeypatch):
+    """The fault nothing caught: 'N0' for 'NO' is a real team key's shape, so
+    the filter is well-formed and Linear answers it with an empty page."""
+    monkeypatch.setattr(httpx, "post", _fake_workspace())
+    with pytest.raises(LinearConfigError) as exc:
+        LinearAdapter(_cfg(team_key="N0")).search()
+    message = str(exc.value)
+    assert "integrations.linear.team_key" in message and "'N0'" in message
+    assert "'NO'" in message and "'ENG'" in message      # what it could have been
+
+
+def test_a_team_key_that_differs_only_in_case_gets_the_did_you_mean(key, monkeypatch):
+    monkeypatch.setattr(httpx, "post", _fake_workspace())
+    with pytest.raises(LinearConfigError, match="Did you mean 'NO'"):
+        LinearAdapter(_cfg(team_key="no")).search()
+
+
+@pytest.mark.parametrize("bad", [["Backlog"], ["todo"], ["backlog", "in_progress"], [7]])
+def test_a_state_type_outside_the_seven_is_refused_offline(key, monkeypatch, bad):
+    """WorkflowState.type is a plain String, so Linear validates nothing: a
+    typo is an empty result set, never a query error. This check costs no
+    request at all — the seven values are a fixed documented list."""
+    monkeypatch.setattr(httpx, "post",
+                        lambda *a, **k: pytest.fail("must not reach the API"))
+    with pytest.raises(LinearConfigError) as exc:
+        LinearAdapter(_cfg(state_types=bad)).search()
+    assert "integrations.linear.state_types" in str(exc.value)
+
+
+def test_the_state_type_error_names_the_lowercase_value_it_meant(key, monkeypatch):
+    monkeypatch.setattr(httpx, "post", _fake_workspace())
+    with pytest.raises(LinearConfigError, match="did you mean 'backlog'"):
+        LinearAdapter(_cfg(state_types=["Backlog"])).search()
+
+
+def test_a_label_the_workspace_does_not_have_is_refused(key, monkeypatch):
+    monkeypatch.setattr(httpx, "post", _fake_workspace())
+    with pytest.raises(LinearConfigError) as exc:
+        LinearAdapter(_cfg(label="nonexistent")).search()
+    assert "integrations.linear.label" in str(exc.value)
+    assert "'Bug'" in str(exc.value)
+
+
+def test_state_type_problems_accepts_every_documented_value():
+    from no_human.intake.linear import state_type_problems
+
+    assert state_type_problems(list(STATE_TYPES)) == []
+    assert state_type_problems(list(DEFAULT_STATE_TYPES)) == []
+    assert state_type_problems("backlog")          # a bare string is not a list
+    assert state_type_problems(["nope"])
+
+
+# --- the other half: a RIGHT config that matches nothing must stay quiet ---- #
+
+def test_a_correct_config_matching_zero_issues_does_not_raise(key, monkeypatch):
+    """The legitimate empty case. A team whose backlog is empty right now is
+    not a misconfiguration, and turning it into one would be a worse defect
+    than the silence this change removes."""
+    monkeypatch.setattr(httpx, "post", _fake_workspace(issues=[]))
+    assert LinearAdapter(_cfg(team_key="NO")).search() == []
+
+
+def test_a_real_label_that_nothing_currently_carries_does_not_raise(key, monkeypatch):
+    monkeypatch.setattr(httpx, "post", _fake_workspace(
+        issues=[_issue("ENG-1")], labels=["Bug", "Feature", "chore"]))
+    # "chore" exists in the workspace; no issue carries it today.
+    assert LinearAdapter(_cfg(label="chore")).search() == []
+
+
+def test_a_state_type_the_team_happens_not_to_use_does_not_raise(key, monkeypatch):
+    """'duplicate' is one of the seven and is therefore legal config, even on a
+    team with no issue in it. Validity is about the CONFIG naming real things,
+    never about the result being non-empty."""
+    monkeypatch.setattr(httpx, "post", _fake_workspace())
+    assert LinearAdapter(_cfg(state_types=["duplicate"])).search() == []
+
+
+# --- and it must not become a new way for intake to break ------------------ #
+
+def test_the_online_check_costs_one_pass_per_adapter_not_one_per_poll(key, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(httpx, "post", _fake_workspace(calls=calls))
+    adapter = LinearAdapter(_cfg())
+    adapter.search()
+    adapter.search()
+    adapter.search()
+    assert sum("NoHumanTeams" in c for c in calls) == 1
+    assert sum("NoHumanIssues" in c for c in calls) == 3
+
+
+def test_a_verdict_of_misconfigured_is_remembered_without_re_asking(key, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(httpx, "post", _fake_workspace(calls=calls))
+    adapter = LinearAdapter(_cfg(team_key="N0"))
+    for _ in range(3):
+        with pytest.raises(LinearConfigError):
+            adapter.search()
+    assert sum("NoHumanTeams" in c for c in calls) == 1
+    assert not any("NoHumanIssues" in c for c in calls)
+
+
+def test_a_failing_validation_query_never_becomes_a_config_error(key, monkeypatch):
+    """Fail OPEN. If the check itself errors — a throttle, an outage, a query
+    shape this workspace does not support — intake carries on. A validation
+    that turned an unrelated API failure into "your config is wrong" would be
+    worse than the silence it replaces."""
+    monkeypatch.setattr(httpx, "post", _fake_workspace(teams_error=True))
+    assert [i["identifier"] for i in LinearAdapter(_cfg()).search()] == ["ENG-1"]
+
+
+def test_an_unknown_response_shape_is_not_evidence_about_the_config(key, monkeypatch):
+    monkeypatch.setattr(httpx, "post", lambda url, headers=None, timeout=None, json=None:
+                        _Resp({"data": {"issues": {"nodes": [_issue("ENG-1")],
+                                                   "pageInfo": {}}}}))
+    # Every query gets an issues-shaped body; the teams check cannot conclude
+    # anything from it and must not try.
+    assert len(LinearAdapter(_cfg()).search()) == 1
+
+
+def test_a_team_list_that_never_ends_is_not_used_to_accuse_the_config(key, monkeypatch):
+    """A membership test on an INCOMPLETE list would fail a config that is
+    right, so the walk stopping at its bound skips the check."""
+    monkeypatch.setattr(httpx, "post", _fake_workspace(
+        teams=["OTHER"], teams_pages_forever=True))
+    assert [i["identifier"] for i in LinearAdapter(_cfg()).search()] == ["ENG-1"]
+
+
+def test_an_empty_team_list_is_not_used_to_accuse_the_config(key, monkeypatch):
+    monkeypatch.setattr(httpx, "post", _fake_workspace(teams=[]))
+    assert [i["identifier"] for i in LinearAdapter(_cfg()).search()] == ["ENG-1"]
+
+
+def test_write_back_state_lookup_refuses_an_unset_team_key(key, monkeypatch):
+    """The same silence through the other door: with no team key this query
+    returns zero states, so every transition became a no-op that reported
+    nothing."""
+    monkeypatch.setattr(httpx, "post",
+                        lambda *a, **k: pytest.fail("must not reach the API"))
+    with pytest.raises(LinearConfigError, match="team_key"):
+        LinearAdapter(_cfg(team_key="", write_back=True)).transition("uuid-1", "started")
+
+
+# --------------------------------------------------------------------------- #
 # Poller                                                                       #
 # --------------------------------------------------------------------------- #
 
@@ -477,6 +703,51 @@ async def test_throttling_is_named_as_such_not_reported_as_a_bad_request(store, 
         await poller.poll_once()
     assert "rate limited" in events[0][1]
     assert "not 429" in events[0][1]
+
+
+@pytest.mark.asyncio
+async def test_a_config_error_gets_its_own_event_kind_not_the_transport_one(store, caplog):
+    """"The network flaked" and "your team key names no team" need different
+    words: no number of ticks fixes the second. Same split monday's poller
+    already makes."""
+    events = []
+    poller = LinearPoller(
+        _FakeAdapter(raises=LinearConfigError(
+            "integrations.linear.team_key is 'N0', which is not a team")),
+        store, config=_cfg(), on_event=lambda k, t: events.append((k, t)))
+    with caplog.at_level(logging.WARNING, logger="no_human.intake.linear_poll"):
+        result = await poller.poll_once()
+    assert result.created == 0
+    assert events[0][0] == "linear_config_error"
+    assert "not configured" in events[0][1]
+    assert "integrations.linear.team_key" in events[0][1]
+    assert not await store.list_tasks()
+
+
+@pytest.mark.asyncio
+async def test_a_config_error_never_crashes_the_poll_pool(store):
+    """The poller must survive it exactly as it survives a transport error —
+    a raise here would take `nh serve`'s whole tick down."""
+    adapter = _FakeAdapter(raises=LinearConfigError("bad team key"))
+    poller = LinearPoller(adapter, store, config=_cfg())
+    assert (await poller.poll_once()).created == 0
+    assert (await poller.tick()).created == 0        # and the next tick still runs
+    # ...and it recovers by itself once the operator fixes the setting.
+    adapter.raises = None
+    adapter.issues = [_issue("ENG-1")]
+    assert (await poller.tick()).created == 1
+
+
+@pytest.mark.asyncio
+async def test_a_transport_error_still_reports_as_a_transport_error(store):
+    """The control for the two tests above: adding a config kind must not have
+    reclassified everything else into it."""
+    events = []
+    poller = LinearPoller(_FakeAdapter(raises=LinearError("connection reset")), store,
+                          config=_cfg(), on_event=lambda k, t: events.append((k, t)))
+    assert (await poller.poll_once()).created == 0
+    assert events[0][0] == "linear_poll_error"
+    assert "not configured" not in events[0][1]
 
 
 @pytest.mark.asyncio

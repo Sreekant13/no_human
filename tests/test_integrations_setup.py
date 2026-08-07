@@ -278,6 +278,45 @@ def test_a_new_block_that_ships_a_credential_key_is_refused_not_offered(monkeypa
     assert "SUPERSECRET" not in on_disk
 
 
+def test_the_wizard_offers_state_types_and_refuses_a_typod_one():
+    """`state_types` IS offered by the wizard (it is a key of the DEFAULT
+    block, so `_setup_fields` discovers it as a comma list) — what was missing
+    was any check that the strings typed into it are state types. Coercion
+    only ever asked "is this a list of strings?", and Linear answers a
+    nonexistent state type with an empty page rather than an error, so a typo
+    went to disk and polled nothing forever."""
+    linear = {s["name"]: s for s in reg.setup_specs({})}["linear"]
+    field = {f["name"]: f for f in linear["fields"]}["state_types"]
+    assert field["kind"] == "list"
+    assert field["value"] == ["triage", "backlog", "unstarted"]
+
+    with pytest.raises(ValueError, match="state_types"):
+        reg.apply_setup("linear", {"team_key": "NO", "state_types": ["Backlog"]})
+    assert not nh_config.CONFIG_PATH.exists(), (
+        "a refused value must leave config.yaml untouched — the whole call is "
+        "validated before anything is written")
+
+
+def test_the_wizard_still_accepts_every_real_state_type():
+    """The control: the guard must not block the values the product ships."""
+    from no_human.intake.linear import STATE_TYPES
+
+    reg.apply_setup("linear", {"enabled": True, "team_key": "NO",
+                               "state_types": list(STATE_TYPES)})
+    cfg = nh_config.load_config(nh_config.CONFIG_PATH).data
+    assert cfg["integrations"]["linear"]["state_types"] == list(STATE_TYPES)
+
+
+def test_a_typod_state_type_leaves_an_existing_config_byte_identical():
+    reg.apply_setup("linear", {"enabled": True, "team_key": "NO"})
+    before = nh_config.CONFIG_PATH.read_bytes()
+    with pytest.raises(ValueError, match="state_types"):
+        reg.apply_setup("linear", {"team_key": "OTHER", "state_types": ["nope"]})
+    assert nh_config.CONFIG_PATH.read_bytes() == before, (
+        "the team_key in the same call landed on disk while the state_types "
+        "beside it was refused")
+
+
 def test_apply_setup_refuses_an_unknown_field():
     with pytest.raises(ValueError):
         reg.apply_setup("linear", {"not_a_setting": "x"})

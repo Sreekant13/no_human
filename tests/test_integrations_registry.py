@@ -779,6 +779,42 @@ def test_linear_status_needs_a_team_key():
     assert st["linear"].configured is False
 
 
+def test_linear_status_refuses_state_types_that_are_not_state_types():
+    """A team key alone was enough to report "Configured", so an install whose
+    state_types could never match anything showed green. The seven
+    WorkflowState.type values are a fixed documented list, so this half of the
+    check costs no request and belongs in the pure status derivation."""
+    st = {s.name: s for s in list_integrations({"integrations": {"linear": {
+        "team_key": "NO", "state_types": ["Backlog"]}}})}
+    assert st["linear"].configured is False
+    assert "integrations.linear.state_types" in st["linear"].detail
+    assert "'Backlog'" in st["linear"].detail
+    assert "return nothing" in st["linear"].detail
+
+
+def test_linear_status_is_still_configured_with_real_state_types():
+    """The control: the check must not report every install as broken."""
+    for types in (["triage", "backlog", "unstarted"], ["completed"], None):
+        block = {"team_key": "NO"}
+        if types is not None:
+            block["state_types"] = types
+        st = {s.name: s for s in list_integrations({"integrations": {"linear": block}})}
+        assert st["linear"].configured is True, types
+        assert st["linear"].detail == "team NO"
+
+
+def test_linear_status_makes_no_request(monkeypatch):
+    """`list_integrations` is documented pure and runs on every settings
+    render — validating the team key against the API here would put a network
+    round-trip behind a page load."""
+    import httpx
+
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: pytest.fail("must not call the API"))
+    monkeypatch.setattr(reg, "_http_post", lambda *a, **k: pytest.fail("must not call the API"))
+    list_integrations({"integrations": {"linear": {"team_key": "NO",
+                                                   "state_types": ["Backlog"]}}})
+
+
 def test_linear_secret_lives_in_env_not_config():
     specs = {f.name: f for f in reg.FIELD_SPECS["linear"]}
     assert specs["api_key"].secret is True
@@ -866,6 +902,70 @@ async def test_test_integration_linear_names_throttling_at_http_400(monkeypatch)
     s = await reg.test_integration("linear", {"integrations": {"linear": {"team_key": "ENG"}}})
     assert s.healthy is False
     assert "rate limited" in s.detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_test_integration_linear_reports_a_team_key_that_names_no_team(monkeypatch):
+    """The live check is the one place an ONLINE validation is safe: the
+    operator pressed the button and is waiting for an answer. A key that
+    authenticates but names no team polls nothing forever, and said so
+    nowhere."""
+    monkeypatch.setenv("LINEAR_API_KEY", "k")
+    queries = []
+
+    async def fake_post(url, headers=None, json=None, timeout=None):
+        queries.append(json["query"])
+
+        class _R:
+            status_code = 200
+
+            def json(self):
+                if "teams" in queries[-1]:
+                    return {"data": {"teams": {"nodes": [{"key": "NO"}, {"key": "ENG"}]}}}
+                return {"data": {"viewer": {"id": "u1", "name": "Dana Lee"}}}
+        return _R()
+
+    monkeypatch.setattr(reg, "_http_post", fake_post)
+    s = await reg.test_integration("linear", {"integrations": {"linear": {"team_key": "N0"}}})
+    assert s.healthy is False
+    assert "integrations.linear.team_key" in s.detail
+    assert "'NO'" in s.detail and "'ENG'" in s.detail
+    # The control: the same workspace with the RIGHT key is healthy.
+    s = await reg.test_integration("linear", {"integrations": {"linear": {"team_key": "NO"}}})
+    assert s.healthy is True and "Dana Lee" in s.detail
+
+
+@pytest.mark.asyncio
+async def test_test_integration_linear_never_invents_a_team_problem(monkeypatch):
+    """Fail open: a body with no teams connection (the shape every existing
+    stub returns) must leave the verdict at "authenticated", not accuse a
+    config that may be perfectly right."""
+    monkeypatch.setenv("LINEAR_API_KEY", "k")
+
+    async def fake_post(url, headers=None, json=None, timeout=None):
+        class _R:
+            status_code = 200
+
+            def json(self):
+                return {"data": {"viewer": {"id": "u1", "name": "Dana Lee"}}}
+        return _R()
+
+    monkeypatch.setattr(reg, "_http_post", fake_post)
+    s = await reg.test_integration("linear", {"integrations": {"linear": {"team_key": "N0"}}})
+    assert s.healthy is True
+
+
+@pytest.mark.asyncio
+async def test_test_integration_linear_keeps_the_state_types_message(monkeypatch):
+    """An unconfigured verdict used to be flattened to the words "not
+    configured", which would have thrown away the only sentence that says what
+    to change."""
+    monkeypatch.setattr(reg, "_http_post",
+                        lambda *a, **k: pytest.fail("must not reach the API"))
+    s = await reg.test_integration("linear", {"integrations": {"linear": {
+        "team_key": "NO", "state_types": ["Backlog"]}}})
+    assert s.healthy is False
+    assert "integrations.linear.state_types" in s.detail
 
 
 @pytest.mark.asyncio
