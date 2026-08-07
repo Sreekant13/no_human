@@ -118,7 +118,7 @@ export function startLabel(count) {
 }
 
 /**
- * N > 1 is not a batch. The intake flow ("five questions") is interactive and
+ * N > 1 is not a batch. The intake flow ("Let's scope this") is interactive and
  * per-task, and queueing tickets past it would silently create tasks with no
  * refined spec — a different product than the one the composer implements.
  * So a multi-select starts the tickets ONE AT A TIME through the same flow,
@@ -131,7 +131,7 @@ export function multiStartNotice(count) {
   // cancel rule in the queue block below. It used to promise "Cancelling stops
   // the rest", which was both the old behaviour and a trap: the operator's only
   // way to close one ticket's dialog silently discarded every ticket behind it.
-  return `${count} tickets, one at a time — no_human asks its five questions for each before creating it. Cancelling one keeps the rest.`;
+  return `${count} tickets, one at a time — no_human scopes each one with you before creating it. Cancelling one keeps the rest.`;
 }
 
 /** Position readout while the queue drains, e.g. "Ticket 2 of 3 · PROJ-7". */

@@ -3669,7 +3669,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
 
 /* The multi-ticket queue readout (QueueNotice.jsx) — rendered at the top of
    EVERY step of the intake flow, not just the composer, so "Ticket 2 of 10"
-   never disappears for the five questions. */
+   never disappears while the task is being scoped. */
 .queue-notice {
   display: flex; align-items: center; justify-content: center;
   flex-wrap: wrap; gap: 10px;

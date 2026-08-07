@@ -206,7 +206,8 @@ test("multiStartNotice warns only when N > 1, and says what actually happens", (
   const n = multiStartNotice(3);
   assert.match(n, /^3 tickets/);
   assert.match(n, /one at a time/, "N>1 is a queue through the same flow, not a silent batch");
-  assert.match(n, /five questions/, "the intake flow must be named — it is interactive");
+  assert.match(n, /scopes each one with you/,
+    "the intake flow must be named as INTERACTIVE - a reader must not think N>1 is a silent batch");
   assert.match(n, /Cancelling one keeps the rest/,
     "the promise must match what cancelling does — it drops THIS ticket, not the run");
 });

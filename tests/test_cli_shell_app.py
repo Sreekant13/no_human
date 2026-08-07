@@ -198,7 +198,7 @@ def reflowed(rows: list[str]) -> str:
 
 
 MOUNT_SENTENCE = (
-    "It asks the same five questions the board does. "
+    "It asks the same scoping questions the board does. "
     "/help for the slash commands."
 )
 
@@ -913,3 +913,334 @@ def test_a_subcommand_still_runs_instead_of_the_shell(monkeypatch):
     result = CliRunner().invoke(cli, ["approve", "--help"])
     assert result.exit_code == 0
     assert "approve" in result.output
+
+
+# --- the flow has ONE name, anchored on DESTINATION rather than on location ---
+
+_RENDER_SINKS = {"print", "rule", "echo", "secho", "_say"}
+"""Attribute calls that put a string in front of the operator verbatim."""
+
+_CLICK_DECORATORS = {"command", "group"}
+"""Click's own decorators. Click renders the docstring of a function they wrap
+as the BODY of that command's ``--help`` (`nh shell --help` prints `shell_cmd`'s
+docstring word for word), so those docstrings are operator-facing text."""
+
+_LOG_LEVELS = {"debug", "info", "warning", "error", "exception", "critical", "log"}
+"""Logger method names. An argument of one of these goes to a log file, not to
+a screen - a STRUCTURAL exemption, not a list of tolerated sentences."""
+
+_PROMPTISH = re.compile(r"prompt", re.IGNORECASE)
+"""Names that mark LLM prompt text: text addressed to a model, not a human."""
+
+
+def _is_click_command(node) -> bool:
+    """True if `node` is a function Click turns into a command or a group."""
+    import ast
+
+    for dec in getattr(node, "decorator_list", []):
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        name = (target.attr if isinstance(target, ast.Attribute)
+                else target.id if isinstance(target, ast.Name) else "")
+        if name in _CLICK_DECORATORS:
+            return True
+    return False
+
+
+def _operator_text_fields() -> dict[str, set[str]]:
+    """Which fields of the intake payloads carry text a render loop prints,
+    read off THE CODE'S OWN TYPES rather than a list kept here.
+
+    `grill_step`'s return annotation names the payloads the CLI loop
+    (`commands.py::_run_cli_grill`), the shell TUI and the web composer all
+    render; every `str` / `list[str]` field of those dataclasses is text that
+    ends up on a screen. Add a field, or a third payload type to the union, and
+    it is covered without anyone editing this test.
+    """
+    import dataclasses
+    import typing
+
+    from no_human.intake.grill import grill_step
+
+    annotation = typing.get_type_hints(grill_step)["return"]
+    payloads = typing.get_args(annotation) or (annotation,)
+    out: dict[str, set[str]] = {}
+    for payload in payloads:
+        if not dataclasses.is_dataclass(payload):
+            continue
+        hints = typing.get_type_hints(payload)
+        names = set()
+        for f in dataclasses.fields(payload):
+            declared = hints.get(f.name, f.type)
+            if declared is str or (typing.get_origin(declared) is list
+                                   and str in typing.get_args(declared)):
+                names.add(f.name)
+        if names:
+            out[payload.__name__] = names
+    return out
+
+
+def _operator_strings() -> list[tuple[str, int, str, str]]:
+    """Every string literal in `no_human` classified by WHERE IT ENDS UP.
+
+    The previous three versions of this guard classified by LOCATION - first a
+    list of render sinks, then sinks unioned with prose-shape, then the `cli/`
+    directory - and each rebuild moved the enumeration to a new axis instead of
+    removing it. The `cli/` walk was `glob("*.py")`, so a `cli/panels/`
+    subpackage was invisible, and `intake/grill.py` builds the suggestion
+    buttons the CLI, the TUI and the web composer all print, from outside the
+    directory entirely. That is how "B: Skip the grill" shipped under a flow
+    called "Let's scope this".
+
+    So the universe is now the whole package - `src/no_human`, recursively, no
+    directory named anywhere - and each literal is admitted by its DESTINATION:
+
+    * ``sink``       - an argument of a render call (`print`/`rule`/`echo`/
+                       `secho`/`_say`), whatever the literal's shape. Catches a
+                       bare one-word string prose-shape would miss.
+    * ``click-help`` - a ``help=`` keyword: Click prints it under Options.
+    * ``click-doc``  - the docstring of a Click command or group: Click prints
+                       it as the ``--help`` body.
+    * ``payload``    - a value given to a text field of an intake payload
+                       (`_operator_text_fields`, discovered from the types), so
+                       a render loop somewhere prints it.
+    * ``prose``      - the literal holds a space, so it is a sentence and not an
+                       identifier, an endpoint or a worker-group name. The
+                       catch-all for text that reaches the operator by a route
+                       nobody enumerated - `shell_input.py::help_text` RETURNS
+                       its sentences rather than printing them, and a mutant
+                       reverting that line survived the sink-only version.
+
+    Two STRUCTURAL exemptions narrow ``prose`` only - never the four
+    destinations above, which win outright - and neither is a list of tolerated
+    sentences, so new text of the same shape is exempt without an edit here:
+
+    * ``log``    - the literal is an argument of a logger call. It reaches a log
+                   file; `nh doctor` and a maintainer read those, not a user
+                   mid-flow.
+    * ``prompt`` - the literal is assigned to a ``*prompt*`` name, or built into
+                   an expression that reads one. It is addressed to a model.
+
+    Docstrings are excluded EXCEPT Click's, which are rendered - the earlier
+    claim that docstrings are "never rendered to anyone running the program" was
+    simply false, and this branch edited `shell_cmd`'s docstring precisely
+    because it IS the ``--help`` body.
+
+    Returns (path, lineno, why, text); ``why`` in {sink, click-help, click-doc,
+    payload, prose} is in scope, {log, prompt} is exempted and returned so the
+    exemptions can be asserted live rather than trusted.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "src" / "no_human"
+    text_fields = _operator_text_fields()
+    found: list[tuple[str, int, str, str]] = []
+
+    def collect(nodes, into: set) -> None:
+        for n in nodes:
+            for sub in ast.walk(n):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    into.add(id(sub))
+
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        rel = str(path.relative_to(root.parent.parent))
+
+        plain_docs: set[int] = set()
+        click_docs: set[int] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Module, ast.FunctionDef,
+                                     ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            first = node.body[0] if node.body else None
+            if not (isinstance(first, ast.Expr)
+                    and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                continue
+            (click_docs if _is_click_command(node) else plain_docs).add(
+                id(first.value))
+
+        sinks: set[int] = set()
+        helps: set[int] = set()
+        payloads: set[int] = set()
+        logged: set[int] = set()
+        prompted: set[int] = set()
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                fn = node.func
+                name = (fn.attr if isinstance(fn, ast.Attribute)
+                        else fn.id if isinstance(fn, ast.Name) else "")
+                if isinstance(fn, ast.Attribute):
+                    if fn.attr in _RENDER_SINKS:
+                        collect(node.args, sinks)
+                    if fn.attr in _LOG_LEVELS:
+                        collect(node.args, logged)
+                collect([kw.value for kw in node.keywords if kw.arg == "help"],
+                        helps)
+                fields = text_fields.get(name)
+                if fields:
+                    collect([kw.value for kw in node.keywords
+                             if kw.arg in fields], payloads)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                value = node.value
+                if value is None:
+                    continue
+                targets = (node.targets if isinstance(node, ast.Assign)
+                           else [node.target])
+                names = [t.id for t in targets if isinstance(t, ast.Name)]
+                names += [n.id for n in ast.walk(value) if isinstance(n, ast.Name)]
+                names += [n.attr for n in ast.walk(value)
+                          if isinstance(n, ast.Attribute)]
+                if any(_PROMPTISH.search(n) for n in names):
+                    collect([value], prompted)
+
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                continue
+            if id(node) in plain_docs:
+                continue
+            if id(node) in sinks:
+                why = "sink"
+            elif id(node) in helps:
+                why = "click-help"
+            elif id(node) in click_docs:
+                why = "click-doc"
+            elif id(node) in payloads:
+                why = "payload"
+            elif " " in node.value.strip():
+                why = ("log" if id(node) in logged
+                       else "prompt" if id(node) in prompted else "prose")
+            else:
+                continue
+            found.append((rel, node.lineno, why, node.value))
+    return found
+
+
+_IN_SCOPE = ("sink", "click-help", "click-doc", "payload", "prose")
+_EXEMPT = ("log", "prompt")
+
+
+def test_the_intake_flow_has_one_name_in_everything_an_operator_reads():
+    """The operator renamed the intake flow to "Let's scope this". Every string
+    a person running no_human can read must call it that - wherever in the
+    package the string is written, and whichever surface prints it.
+
+    `--grill/--no-grill` is the ONE exemption and it is a TOKEN exemption, not a
+    string one: the flag token is deleted from the text and what is left still
+    has to be clean. The previous version searched the whole literal for the
+    flag and dropped the whole literal when it matched, so any sentence that
+    happened to mention `--no-grill` could say anything at all beside it.
+
+    The internal vocabulary is untouched on purpose - `grill_step`,
+    `GrillResult`, `/api/grill/stream` and `group="grill"` are identifiers, hold
+    no space and pass no render sink, so they are out of scope by shape rather
+    than by a list.
+
+    KNOWN RESIDUALS, measured and stated rather than implied shut. A single word
+    IS seen at a named render sink and IS seen in a payload field given by
+    keyword; what is not seen is:
+
+      * a single word reaching an operator by a route this guard does not name
+        (`self._advisory("grill")` - `_advisory` both logs AND emits an event
+        the shell's `_format_event` prints, so its PROSE is in scope, but one
+        bare word through it is not),
+      * a single word handed to an intake payload POSITIONALLY rather than by
+        keyword,
+      * text assembled at run time from pieces none of which reads "grill"
+        (`"gr" + "ill"`), which no static walk can see,
+      * anything outside Python: `web/`, the docs, the desktop app.
+
+    Closing the first two means rendering every command's real output, which
+    this file does for the shell TUI and which
+    `test_the_renamed_suggestion_reaches_the_operator` below does for the intake
+    loop, but which cannot be done for every surface.
+    """
+    import re
+
+    strings = _operator_strings()
+    in_scope = [s for s in strings if s[2] in _IN_SCOPE]
+
+    # Non-vacuity. A discovery scan that finds nothing passes for the same
+    # reason a correct one does, so every detector must be shown alive, both
+    # exemptions must be shown FIRING on the real tree, and the renamed rule
+    # must be among what the walk found - which is also what pins it.
+    assert len(in_scope) > 100, f"the AST walk found only {len(in_scope)} strings"
+    seen = {why for _, _, why, _ in strings}
+    for why in _IN_SCOPE:
+        assert why in seen, f"the {why!r} detector found nothing"
+    for why in _EXEMPT:
+        assert why in seen, f"the {why!r} exemption never fired, so it is dead"
+    assert any("Let's scope this" in text for _, _, _, text in in_scope), \
+        "the renamed intake rule is not among the strings the walk found"
+
+    # The exemption removes the FLAG TOKEN, then the rest of the sentence is
+    # judged on its own.
+    flag = re.compile(r"--(?:no-)?grill\b")
+    offenders = [
+        (name, line, why, text) for name, line, why, text in in_scope
+        if re.search(r"grill", flag.sub("", text), re.IGNORECASE)
+    ]
+    assert offenders == [], (
+        "no_human still calls the intake flow 'grill' in text an operator can "
+        f"read: {offenders}"
+    )
+
+    # The exemption is exercised rather than dead code: the flag's help IS found.
+    assert any(flag.search(text) for _, _, _, text in in_scope), \
+        "the walk never saw the --grill help text, so the exemption is untested"
+
+
+def test_the_renamed_suggestion_reaches_the_operator(monkeypatch):
+    """Anchor the guard above to the RENDERED artefact, not only to the source.
+
+    `grill_step`'s `except asyncio.TimeoutError` branch builds the A/B
+    suggestions and `commands.py::_run_cli_grill` prints them; this drives the
+    real branch (a backend whose call times out) through the real loop and
+    reads what the operator's terminal actually received. Nothing about the
+    branch, the payload or the printing is stubbed - only the paid backend.
+    """
+    import asyncio
+    import io
+
+    import click
+
+    from no_human.cli import commands as cmds
+
+    class _TimingOutBackend:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        async def run(self, *_a, **_kw):
+            raise asyncio.TimeoutError
+
+    class _Cfg:
+        primary_model = "claude-sonnet-5"
+        _d = {"safety": {"forbidden_paths": []}, "git": {"never_push_to": []}}
+
+        def __getitem__(self, key):
+            return self._d[key]
+
+    class _Task:
+        title = "Add a retry to the uploader"
+        description = None
+        repo_path = None
+        acceptance_criteria: list = []
+        context: dict = {}
+
+    monkeypatch.setattr(cmds, "ClaudeBackend", _TimingOutBackend)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))  # EOF ends the loop
+    # Rich's own capture, NOT `console.file = ...`: assigning `.file` pins the
+    # module-level Console to one stream for the rest of the process, and
+    # restoring it pins it to the pre-test stdout - which silently emptied
+    # `CliRunner(...).output` in 17 unrelated tests when I first wrote this.
+    with cmds.console.capture() as captured:
+        try:
+            asyncio.run(cmds._run_cli_grill(_Cfg(), _Task(), store=None))
+        except (click.exceptions.Abort, EOFError):
+            pass
+
+    rendered = captured.get()
+    assert "Let's scope this" in rendered, rendered
+    assert "A: Let me provide a more specific description" in rendered, rendered
+    assert "grill" not in rendered.lower(), rendered

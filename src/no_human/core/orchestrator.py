@@ -6806,7 +6806,7 @@ class Orchestrator:
             answerable = [q for q in qa if q.carve_out == "none"]
             if answerable and all(not q.answer for q in answerable):
                 self._advisory(
-                    f"intake grill: all {len(answerable)} answerable "
+                    f"intake scoping: all {len(answerable)} answerable "
                     "question(s) left unanswered — answering pass failed")
             self.emit(
                 "intake_grill",
@@ -6829,9 +6829,9 @@ class Orchestrator:
             # would make intake do nothing and say so only in a log line.
             log.error("intake grill WIRING error (signature drift — intake did "
                       "nothing this run): %s", exc)
-            self._advisory(f"intake grill skipped — wiring error: {exc}")
+            self._advisory(f"intake scoping skipped — wiring error: {exc}")
         except Exception as exc:  # noqa: BLE001 — advisory, never blocks
-            self._advisory(f"intake grill skipped: {exc}")
+            self._advisory(f"intake scoping skipped: {exc}")
 
     def _profile_usable_under_policy(self, prof: Any) -> bool:
         """A profile drives a task if a human confirmed it (``is_usable``), OR —

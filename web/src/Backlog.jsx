@@ -19,7 +19,7 @@ import {
 // Work group next to Done and Failed and can be read without opening anything.
 //
 // It never creates a task itself. "Start" hands the picked issues up to App,
-// which runs them through the SAME intake flow (five questions) the typed
+// which runs them through the SAME intake flow ("Let's scope this") the typed
 // composer path runs — see the N>1 note on multiStartNotice in
 // backlogSelection.js and the queue in App.jsx. Two creation paths drift; this
 // page deliberately has none of its own.

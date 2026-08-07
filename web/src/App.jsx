@@ -479,9 +479,9 @@ function NewTaskModal({
     return (
       // No backdrop-click close — see the Refined Spec branch above.
       <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
-        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="no_human — five questions" tabIndex={-1} ref={grillRef}>
+        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Let's scope this" tabIndex={-1} ref={grillRef}>
           <QueueNotice notice={notice} remaining={queueLeft} onStopAll={onStopQueue} />
-          <div className="sendback-label">Five Questions</div>
+          <div className="sendback-label">Let's scope this</div>
           <div className="grill-loading">
             <Spinner />
             <div className="grill-loading-text">Reading your code so the questions are worth asking...</div>
@@ -512,10 +512,10 @@ function NewTaskModal({
     if (busy) {
       return (
         <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
-          <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="no_human — five questions" tabIndex={-1} ref={grillRef}>
+          <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Let's scope this" tabIndex={-1} ref={grillRef}>
             <QueueNotice notice={notice} remaining={queueLeft} onStopAll={onStopQueue} />
             <div className="grill-header">
-              <div className="sendback-label">Five Questions</div>
+              <div className="sendback-label">Let's scope this</div>
               <span className="grill-round-badge">Round {grillQuestion.round}/{maxRounds}</span>
             </div>
             <div className="grill-progress-bar">
@@ -538,10 +538,10 @@ function NewTaskModal({
       // No backdrop-click close — a stray click mid-grill discarded every answer
       // the operator had already given. See the Refined Spec branch above.
       <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
-        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="no_human — five questions" tabIndex={-1} ref={grillRef}>
+        <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Let's scope this" tabIndex={-1} ref={grillRef}>
           <QueueNotice notice={notice} remaining={queueLeft} onStopAll={onStopQueue} />
           <div className="grill-header">
-            <div className="sendback-label">Five Questions</div>
+            <div className="sendback-label">Let's scope this</div>
             <span className="grill-round-badge">Round {grillQuestion.round}/{maxRounds}</span>
           </div>
           <div className="grill-progress-bar">
@@ -647,7 +647,7 @@ export default function App() {
   const [page, setPage] = useState("board");
   // ── Backlog → intake queue ────────────────────────────────────────────────
   // The tickets the operator selected on the Backlog page, still to be started.
-  // The intake flow is interactive and PER TASK (five questions about THIS
+  // The intake flow is interactive and PER TASK (scoping questions about THIS
   // spec), so N selected tickets are not a batch: they run through the same
   // composer→grill→create flow one at a time, head of the queue first. The
   // Backlog page says so before the first question is asked
@@ -1133,7 +1133,7 @@ export default function App() {
         />
       )}
       {/* A ticket started from the Backlog page runs the SAME modal — composer
-          (pre-filled from the ticket) → five questions → createTask. `key`
+          (pre-filled from the ticket) → "Let's scope this" → createTask. `key`
           remounts it per ticket so nothing of the previous one leaks in. */}
       {backlogHeadKey && backlogSeed && (
         <NewTaskModal

@@ -110,7 +110,7 @@ async function stubApi(page, state, opts = {}) {
     }
 
     if (u.includes("/api/grill/stream")) {
-      // One frame, straight to the refined spec — the five questions have their
+      // One frame, straight to the refined spec — the scoping questions have their
       // own suite (grill-a11y.mjs); what matters here is reaching the create.
       state.grills += 1;
       return route.fulfill({

@@ -71,7 +71,7 @@ const dialog = page.locator('.new-task-modal[role="dialog"]');
 await page.getByPlaceholder(/Your answer/i).waitFor({ state: "visible", timeout: 6000 }).catch(() => {});
 check("intake grill QUESTION modal is a dialog", await dialog.count() >= 1);
 const name = await dialog.getAttribute("aria-label").catch(() => null);
-check("the dialog has an accessible name", name === "no_human — five questions", `aria-label=${name}`);
+check("the dialog has an accessible name", name === "Let's scope this", `aria-label=${name}`);
 check("aria-modal is set", (await dialog.getAttribute("aria-modal").catch(() => null)) === "true");
 
 // Focus was pulled into the dialog on open.
@@ -111,7 +111,7 @@ check("Shift+Tab at the start wraps to the end (trap holds)",
 
 // H3: the grill overlays had ZERO coverage — restoring `onClick={onClose}` on
 // them left this suite green.
-// ⚠️ SCOPE: this suite drives the three `aria-label="no_human — five questions"` branches.
+// ⚠️ SCOPE: this suite drives the three `aria-label="Let's scope this"` branches.
 // The fourth overlay — `aria-label="Refined spec"`, the one the operator sees
 // when the grill finishes — is reached by NO suite, so its backdrop and caret
 // behaviour are still unpinned. Covering it needs a harness that drives the

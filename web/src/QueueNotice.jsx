@@ -3,7 +3,7 @@
 //
 // It is a shared component rather than a string rendered per branch because it
 // has to appear in EVERY step of the intake flow. It used to be handed to
-// TaskComposer alone, so the readout vanished the moment the five questions
+// TaskComposer alone, so the readout vanished the moment the scoping questions
 // started: the operator spent the longest part of the flow — five rounds of
 // questions, then the refined-spec review — with no idea which of their ten
 // tickets they were answering about, and no idea how many were left.

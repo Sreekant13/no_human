@@ -217,7 +217,7 @@ async def grill_step(
             question="The codebase exploration took too long. Can you describe the scope more narrowly?",
             suggestions=[
                 "A: Let me provide a more specific description",
-                "B: Skip the grill and create the task as-is",
+                "B: Skip scoping and create the task as-is",
             ],
             round=round_n,
         )

@@ -123,8 +123,8 @@ def parse_slash(text: str, selected_id: str | None) -> Slash | SlashError:
 
 def help_text() -> str:
     lines = [
-        "Type what you want in plain English - it goes to the same intake "
-        "grill the web composer uses, and an accepted spec becomes a task.",
+        "Type what you want in plain English - it goes to the same scoping "
+        "flow the web composer uses, and an accepted spec becomes a task.",
         "",
         "Slash commands (each one is an existing endpoint):",
     ]
@@ -191,7 +191,7 @@ class IntakeSession:
 
     def take_answer(self, answer: str) -> None:
         if not self.pending_question:
-            raise ValueError("no grill question is pending")
+            raise ValueError("no scoping question is pending")
         self.qa_history.append(
             {"question": self.pending_question, "answer": answer.strip()})
         self.pending_question = None
@@ -206,7 +206,7 @@ class IntakeSession:
         """What POST /api/tasks gets - the composer's create call, minus the
         fields a terminal has no picker for."""
         if self.result is None:
-            raise ValueError("the grill has not produced a spec yet")
+            raise ValueError("scoping has not produced a spec yet")
         criteria = self.result.get("acceptance_criteria")
         return {
             "title": str(self.result.get("title") or self.title),

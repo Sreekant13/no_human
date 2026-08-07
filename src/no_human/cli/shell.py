@@ -155,7 +155,7 @@ class ShellApp(App):
 
     def on_mount(self) -> None:
         self._say("[b]no_human[/] - say what you want done, in plain English.")
-        self._say("[dim]It asks the same five questions the board does. "
+        self._say("[dim]It asks the same scoping questions the board does. "
                   "/help for the slash commands.[/]")
         self.query_one("#prompt", Input).focus()
         self.run_worker(self._refresh(), group="board")
@@ -406,7 +406,7 @@ class ShellApp(App):
         if session is None:
             return
         self._grill_busy = True
-        self._say("[dim]grilling the spec...[/]")
+        self._say("[dim]scoping the spec...[/]")
         try:
             async for raw in self.client.grill_stream(**session.payload()):
                 self._render_grill_frame(session, raw)
@@ -427,7 +427,7 @@ class ShellApp(App):
             self._say(f"  [magenta]spec check: {verdict}[/] [dim]{rationale}[/]")
         elif kind == "question":
             session.take_question(frame)
-            self._say(f"[b yellow]grill:[/] {_escape(session.pending_question)}")
+            self._say(f"[b yellow]scope:[/] {_escape(session.pending_question)}")
             for suggestion in session.suggestions:
                 self._say(f"    [dim]- {_escape(suggestion)}[/]")
             self._say("[dim]answer in plain English.[/]")
@@ -435,7 +435,7 @@ class ShellApp(App):
             session.take_result(frame)
             self._render_spec(session)
         elif kind == "error":
-            self._say(f"[red]{text or 'the grill failed'}[/]")
+            self._say(f"[red]{text or 'scoping failed'}[/]")
 
     def _render_spec(self, session: IntakeSession) -> None:
         spec = session.result or {}

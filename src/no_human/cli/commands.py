@@ -281,8 +281,8 @@ async def _run_cli_grill(config, task: Task, store=None) -> Task:
         readonly=True,
     )
     qa_history: list[dict] = []
-    console.rule("[bold blue]five questions — refining your task spec")
-    console.print("[dim]The grill explores the repo and asks clarifying questions.[/]\n")
+    console.rule("[bold blue]Let's scope this — refining your task spec")
+    console.print("[dim]no_human explores the repo and asks clarifying questions.[/]\n")
 
     while True:
         console.print("[dim]thinking…[/]", end="")
@@ -311,7 +311,7 @@ async def _run_cli_grill(config, task: Task, store=None) -> Task:
             ctx["grill_complete"] = True
             task.context = ctx
             console.print()
-            console.rule("[bold green]grill complete")
+            console.rule("[bold green]scoping complete")
             console.print(f"  [bold]Title:[/] {task.title}")
             if task.description:
                 console.print(f"  [bold]Description:[/] {task.description[:200]}")
@@ -568,7 +568,7 @@ def shell_cmd(ctx: click.Context, repo: str | None) -> None:
     """The conversational shell — the same thing bare `nh` opens.
 
     Talks to the running server over HTTP (start it with `nh start`), shows
-    the board's lanes, and takes plain English through the same five questions
+    the board's lanes, and takes plain English through the same scoping questions
     the web composer uses.
     """
     sys.exit(_launch_shell(repo or (ctx.obj or {}).get("repo")))
