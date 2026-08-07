@@ -71,6 +71,22 @@ _CODE_REVIEW_DIFF_CAP = 120_000  # code_review tasks: ~30K tokens, fits in 200K 
 _CODE_REVIEW_TURNS = 15
 _CODE_REVIEW_TIMEOUT = 600  # seconds — larger diffs need more time
 _OUTPUT_CAP = 4000
+# 🔴 A CROSS-FILE COUPLING THAT WAS SAFE BY 96 CHARACTERS AND SAID SO NOWHERE.
+# This window is the tail of a dead reviewer session's `final_text` that
+# `_review_once` carries out as the escalation reason. `claude_backend` APPENDS
+# its transport diagnosis to that text, and the diagnosis OPENS with
+# `TRANSPORT_DIAGNOSIS_MARKER` — which `orchestrator._escalate_reviewer_
+# unavailable` matches to route the failure as TRANSIENT_INFRA. Measured, the
+# diagnosis is 504 characters with the concurrency phrase this machine
+# produces, so the marker clears this window by 96. If the diagnosis ever grows
+# past it the marker falls out of the slice, the escalation silently takes the
+# `_escalate` -> `fallback_blocker` branch instead, and `root_cause_hypothesis`
+# publishes 600 characters of the reviewer model's own `final_text` plain and
+# unattributed. Nothing observed the coupling: two files, no test, no comment.
+# `test_the_transport_marker_survives_the_reviewers_tail_window` is what
+# observes it now — it builds the diagnosis through the REAL backend path
+# rather than re-spelling it, so growing either side reddens a test.
+_TRANSPORT_TAIL_CHARS = 600
 
 
 async def _cancel_and_reap(fut: "asyncio.Future") -> None:
@@ -1442,7 +1458,8 @@ class AdversarialReviewer:
                 # CLI's own wording); carry that through verbatim instead of
                 # flattening it, so the blocker below can route it as infra.
                 if is_transport_failure(result):
-                    tail = (result.final_text or "").strip()[-600:]
+                    tail = (result.final_text or "").strip()[
+                        -_TRANSPORT_TAIL_CHARS:]
                     reason = f"reviewer session transport failure — {tail}"
                 else:
                     reason = f"reviewer session error ({reason})"

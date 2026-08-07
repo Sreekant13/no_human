@@ -542,6 +542,73 @@ async def test_a_dead_reviewer_transport_escalates_as_transient_infra():
     assert "worker w7" in blocker.evidence
 
 
+async def test_the_transport_marker_survives_the_reviewers_tail_window(
+        stub_cli, tmp_path, monkeypatch):
+    """🔴 TWO FILES, A NUMBER IN EACH, AND 96 CHARACTERS OF MARGIN BETWEEN THEM.
+
+    `claude_backend` APPENDS its transport diagnosis to the dead session's
+    `final_text`, opening with `TRANSPORT_DIAGNOSIS_MARKER`. `reviewer.py`
+    carries only the LAST `_TRANSPORT_TAIL_CHARS` of that text out as the
+    escalation reason. `orchestrator._escalate_reviewer_unavailable` then
+    matches the marker to route the failure as TRANSIENT_INFRA.
+
+    So the diagnosis must stay SHORTER than the window, and nothing said so:
+    no test, no comment, no shared constant. Measured here at 504 against 600.
+    If the diagnosis grows past the window the marker drops out of the slice in
+    silence — the escalation takes the `_escalate` -> `fallback_blocker` branch,
+    the dead socket is re-classified NOVEL_UNKNOWN (learnable, no auto-retry),
+    and `root_cause_hypothesis` publishes 600 characters of the reviewer
+    model's own `final_text`, plain and unattributed, to a human.
+
+    The diagnosis is built by the REAL backend path rather than re-spelled
+    here, because a re-spelling is a second copy that cannot go stale in step
+    with the first — which is the whole defect.
+    """
+    from no_human.blockers.taxonomy import BlockerCategory
+    from no_human.core.orchestrator import Orchestrator
+    from no_human.review.reviewer import _TRANSPORT_TAIL_CHARS
+
+    monkeypatch.setenv("STUB_FAIL_ALL", "1")
+    set_worker_context(WorkerContext(worker="a1b2c3d4", inflight=3,
+                                     max_workers=4))
+    result = await ClaudeBackend(model="stub", readonly=True).run(
+        "hello", cwd=tmp_path, max_turns=1)
+
+    # The producer's half, measured rather than asserted about: how far from
+    # the end of the text does the marker sit?
+    text = (result.final_text or "").strip()
+    assert TRANSPORT_DIAGNOSIS_MARKER in text
+    from_end = len(text) - text.index(TRANSPORT_DIAGNOSIS_MARKER)
+    assert from_end <= _TRANSPORT_TAIL_CHARS, (
+        f"the transport diagnosis is {from_end} characters, and the reviewer "
+        f"carries out only the last {_TRANSPORT_TAIL_CHARS} — the marker no "
+        f"longer survives the slice, so a dead socket now escalates as "
+        f"NOVEL_UNKNOWN and publishes the reviewer's raw text as a root cause")
+
+    # …and the consumer's, driven end to end through the real slice and the
+    # real escalation, so the pin is on the BEHAVIOUR and not on two numbers.
+    tail = text[-_TRANSPORT_TAIL_CHARS:]
+    raised = {}
+
+    class _Task:
+        id = "t1"
+        title = "do a thing"
+
+    orch = Orchestrator.__new__(Orchestrator)
+
+    async def _raise_blocker(task, blocker, **kwargs):
+        raised["blocker"] = blocker
+        return None
+
+    orch._raise_blocker = _raise_blocker
+    await orch._escalate_reviewer_unavailable(
+        _Task(), f"reviewer session transport failure — {tail}")
+
+    assert raised["blocker"].category == BlockerCategory.TRANSIENT_INFRA, (
+        "the marker fell out of the reviewer's tail window, so the dead "
+        "socket routed as a task failure")
+
+
 async def test_a_reviewer_that_merely_reached_no_verdict_stays_novel_unknown():
     """The control. Without it the test above passes for a function that routes
     EVERYTHING to TRANSIENT_INFRA — which would make a genuinely stuck reviewer

@@ -52,6 +52,14 @@ def parse_blocker(text: str) -> Blocker | None:
     # SCOPE_EXPLOSION, which routes to a human with the scope story intact.
     if blocker.category is BlockerCategory.BUDGET_EXHAUSTED:
         blocker.category = BlockerCategory.SCOPE_EXPLOSION
+    # Same boundary, third field. THIS is the one function in the codebase that
+    # produces a Blocker whose prose the MODEL wrote, so it is the one place
+    # that may set the flag — and it sets it unconditionally, AFTER `from_dict`,
+    # so an agent that emits `"reason_is_agent_authored": false` in its own JSON
+    # cannot strip the attribution off its own text and have `_abandon_draft_pr`
+    # publish it as no_human's own words. The flag only ever moves toward "the
+    # agent wrote this" here; nothing downstream may move it back.
+    blocker.reason_is_agent_authored = True
     return blocker
 
 

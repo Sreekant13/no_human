@@ -2,6 +2,8 @@
 title, and harness-to-coder dialogue paragraphs never leak into the PR body's
 implementation summary."""
 
+import re
+
 import pytest
 
 from no_human.config import load_config
@@ -114,9 +116,16 @@ def test_pr_body_keeps_harness_fixture_paragraph(store, tmp_path):
     assert "Extended the test harness fixture to cover the new case." in body
 
 
-def test_pr_body_all_filtered_emits_placeholder(store, tmp_path):
-    """When every paragraph is dropped, the section gets a placeholder
-    instead of rendering empty."""
+def test_pr_body_all_filtered_says_no_summary_was_produced(store, tmp_path):
+    """When every paragraph is dropped there is no summary, and the body must
+    say that in words.
+
+    UPDATED for C1. `_clean_summary` still returns its placeholder — that
+    contract is asserted directly below, so the filtering itself stays pinned —
+    but the placeholder was what a real PR (#104) actually shipped under
+    "## Implementation summary": a parenthetical a reader skims past. The body
+    now states the absence.
+    """
     orch = _orch(store, tmp_path)
     t = Task.new("t", repo_path="/r")
     result = _Result()
@@ -124,8 +133,12 @@ def test_pr_body_all_filtered_emits_placeholder(store, tmp_path):
         "That's expected — repro_tests.json is for the harness.\n\n"
         "See system instructions for details on the metadata file."
     )
+    # the helper's own contract, unchanged
+    assert orch._clean_summary(result.final_text) == \
+        "_(implementation summary was filtered — see commits)_"
     body = orch._pr_body(t, _Commit(), result)
-    assert "_(implementation summary was filtered — see commits)_" in body
+    assert "**No implementation summary was produced.**" in body
+    assert "was not a report of the work" in body
     assert "repro_tests.json" not in body
 
 
@@ -310,14 +323,30 @@ def test_pr_body_keeps_each_heading_at_the_start_of_a_line(store, tmp_path):
     """Kills M4 (`" ".join`). Joining with a space leaves the substrings present — so every
     substring assertion still passes — while GFM stops rendering them as headings. The
     motivating criterion asks for two named HEADINGS, so line position is the property.
+
+    UPDATED for H13: the coder's own headings are demoted so they nest UNDER
+    "## Implementation summary" instead of becoming siblings of
+    "## Test evidence" and "## Stats". Still headings, still at a line start —
+    the mutant this test exists to kill (`" ".join`) dies exactly as before.
+
+    UPDATED AGAIN (R7-B): the assertion pins the PROPERTY — a heading, at a line
+    start, strictly below the template's own `##` level — and not the exact
+    number of hashes. Demotion moved from +1 to +2 because +1 mapped the coder's
+    `#` onto `##`, the precise sibling of `## Task` and `## Stats` that this
+    whole mechanism exists to prevent; a test that pinned the literal `###`
+    would have had to be edited for that fix, which is the wrong way round.
     """
     orch = _orch(store, tmp_path)
     result = _Result()
     result.final_text = ("Fixed it.\n\n## Pre-fix failing run\n1 failed\n\n"
                          "## Post-fix run\n5 passed")
     body = orch._pr_body(Task.new("t", repo_path="/r"), _Commit(), result)
-    for heading in ("## Pre-fix failing run", "## Post-fix run"):
-        assert f"\n{heading}" in body, f"{heading!r} is not at a line start"
+    for heading in ("Pre-fix failing run", "Post-fix run"):
+        m = re.search(rf"^(#+) {re.escape(heading)}$", body, re.M)
+        assert m, f"{heading!r} is not a heading at the start of a line"
+        assert len(m.group(1)) >= 3, (
+            f"{heading!r} renders at h{len(m.group(1))} — a sibling of the "
+            f"template's own `## …` sections, not part of the summary")
 
 
 def test_pr_body_keeps_paragraphs_in_their_original_order(store, tmp_path):

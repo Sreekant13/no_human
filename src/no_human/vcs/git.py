@@ -364,6 +364,22 @@ class GitRepo:
                 deletions = int(part.split()[0])
         return {"files_changed": files, "insertions": insertions, "deletions": deletions}
 
+    def is_ancestor(self, sha: str, descendant: str) -> bool:
+        """True when *sha* is reachable from *descendant* (it is its own).
+
+        Used to tell a review verdict that judged THIS branch head from one
+        that judged another attempt's commit. An unknown/garbage ref is False,
+        never an exception: "cannot prove it" and "not an ancestor" are the
+        same answer for a claim we are deciding whether to print.
+        """
+        if not sha or not descendant:
+            return False
+        proc = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", sha, descendant],
+            cwd=self.path, capture_output=True, text=True,
+        )
+        return proc.returncode == 0
+
     def diff(self, ref: str = "HEAD~1") -> str:
         return self._run("diff", ref, "HEAD", check=False)
 

@@ -229,6 +229,28 @@ class Blocker:
     goal: str = ""                         # the step it was attempting (22.4 #1)
     evidence: str = ""                      # exact command + output (22.4 #2)
     raised_at: str = field(default_factory=_now)
+    # 🔴 PROVENANCE OF THE PROSE, DECIDED WHERE THE PROSE COMES FROM.
+    # `root_cause_hypothesis` and `question` have two completely different
+    # origins. `parse_blocker` lifts them verbatim out of the coder's
+    # `final_text`, so they are model-authored, unverified, and untrusted.
+    # Every OTHER Blocker in this codebase — the fourteen constructions in
+    # `orchestrator.py`, plus `fallback_blocker`, `missing_access`,
+    # `ci_misconfigured` and `plan_gate.build_blocker` — carries prose written
+    # as a source literal in no_human's own repo, which no_human demonstrably
+    # DID write and which is usually its own bookkeeping ("max_attempts (3)
+    # reached…" is not a hypothesis, it is a counter).
+    #
+    # Anything that republishes this prose has to know which it is holding.
+    # `_abandon_draft_pr` labels the agent-authored kind "in the coding agent's
+    # own words — no_human did not write this text and has not verified it";
+    # printing that over a harness literal is a FALSE provenance claim in both
+    # directions at once, and it tells the reader to distrust a fact the
+    # harness established. Defaulting to False is the direction that cannot
+    # lie by construction: a Blocker built by a constructor call IS
+    # harness-authored, and the one place that is not — `parse_blocker` — sets
+    # this True explicitly as a trust boundary, exactly like `options` and
+    # `category`.
+    reason_is_agent_authored: bool = False
 
     def __post_init__(self) -> None:
         # `options` is list[BlockerOption] unconditionally, whoever built it:
@@ -255,6 +277,7 @@ class Blocker:
             "goal": self.goal,
             "evidence": self.evidence,
             "raised_at": self.raised_at,
+            "reason_is_agent_authored": self.reason_is_agent_authored,
         }
 
     @classmethod
@@ -273,6 +296,12 @@ class Blocker:
             goal=data.get("goal", ""),
             evidence=data.get("evidence", ""),
             raised_at=data.get("raised_at", _now()),
+            # Round-trips so a blocker rehydrated from `task.blocker` keeps the
+            # provenance the run established. `parse_blocker` OVERWRITES this
+            # after calling here, so an agent that puts the key in its own JSON
+            # cannot clear it and get its prose published as no_human's.
+            reason_is_agent_authored=bool(
+                data.get("reason_is_agent_authored", False)),
         )
 
 

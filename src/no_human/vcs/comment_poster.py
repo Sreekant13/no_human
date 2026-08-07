@@ -112,6 +112,31 @@ def post_to_pr(url: str, body: str, file: str | None = None, line: int | None = 
     return {"ok": ok, "mode": "issue_comment", "error": err}
 
 
+def set_pr_title(url: str, title: str) -> dict:
+    """Retitle the PR/MR at *url* on its own forge.
+
+    Returns ``{"ok": bool, "error": str}``. Used to mark a draft that an
+    attempt abandoned, so a human scanning a repo's open PRs can tell the live
+    one from the corpses — three drafts from one task, all claiming their
+    criteria met, is a real thing this product shipped.
+
+    Retitling is not merging and not approving: it changes no code, no state
+    the forge gates on, and touches only a PR no_human itself opened.
+    """
+    parsed = parse_pr_url(url)
+    if not parsed:
+        return {"ok": False, "error": f"unparseable PR URL: {url}"}
+    forge, host, slug, number = parsed
+    if forge == "gitlab":
+        ok, err = _run(["glab", "api", "--hostname", host, "-X", "PUT",
+                        f"projects/{slug}/merge_requests/{number}",
+                        "-f", f"title={title}"])
+        return {"ok": ok, "error": err}
+    ok, err = _run(["gh", "api", "--hostname", host, "-X", "PATCH",
+                    f"repos/{slug}/pulls/{number}", "-f", f"title={title}"])
+    return {"ok": ok, "error": err}
+
+
 def _gitlab_diff_refs(host: str, slug: str, number: int) -> dict | None:
     """The MR's {base_sha, start_sha, head_sha} — required to anchor an inline
     discussion to a diff line."""

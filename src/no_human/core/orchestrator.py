@@ -24,7 +24,7 @@ import re
 import unicodedata
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -3676,6 +3676,18 @@ class Orchestrator:
                             "ran": test_result.ran, "ok": False,
                             "passed": test_result.passed, "failed": test_result.failed,
                             "errors": test_result.errors, "tamper_flag": False,
+                            # 🔴 CARRY THE NAMES. `update_attempt` REPLACES the
+                            # `test_results` column (db.py: `test_results =
+                            # :test_results`), it does not merge — so this dict
+                            # overwrote the one written above, which was the only
+                            # one holding `failing_tests`. The PR body's
+                            # "- failing tests:" block was therefore unreachable
+                            # on the one path that actually reaches it: a partial
+                            # run whose counts are real and whose invocation also
+                            # stumbled. Rendering a name list nothing can populate
+                            # is the same dead code as the `or counted` clause
+                            # deleted from `_test_evidence_section`.
+                            "failing_tests": failing_tests,
                             "invocation_error": True,
                             "reproduces_on_base": on_base,
                         },
@@ -3947,6 +3959,7 @@ class Orchestrator:
         # M-B: surface this attempt's test-layer evidence (incl. advisory /
         # integration layers) in the PR body. Read-only; best-effort.
         test_evidence: dict | None = None
+        attempt_n: int | None = None
         try:
             for a in await self.store.list_attempts(task.id):
                 if a.get("id") == attempt_id:
@@ -3954,10 +3967,15 @@ class Orchestrator:
                     if isinstance(tr, str):
                         tr = json.loads(tr) if tr else None
                     test_evidence = tr if isinstance(tr, dict) else None
+                    # H8: which attempt delivered this — the same row already
+                    # carries it, and no PR body has ever said.
+                    attempt_n = a.get("attempt_number")
                     break
         except Exception as exc:  # noqa: BLE001 — evidence never blocks the PR
             self._advisory(f"test evidence missing from PR body: {exc}")
-        body = self._pr_body(task, commit, result, test_evidence=test_evidence)
+        body = self._pr_body(task, commit, result, test_evidence=test_evidence,
+                             repo=repo, base=base, branch=branch,
+                             attempt_n=attempt_n)
         # Labels are a per-repo concern, so a task may override the global
         # default — including with an explicit [] to opt out of it entirely.
         task_labels = (task.config or {}).get("pr_labels")
@@ -4185,7 +4203,42 @@ class Orchestrator:
         self, task: Task, repo: GitRepo, branch: str | None
     ) -> TaskOutcome:
         """Bounds exhausted: build a blocker whose `tried` reflects each attempt's
-        failure reason (22.3 verifiable-progress trail)."""
+        failure reason (22.3 verifiable-progress trail).
+
+        🔴 `root_cause_hypothesis` IS A PURE SOURCE LITERAL, AND THAT IS
+        LOAD-BEARING — it is the ONE field of this blocker that gets published
+        to a forge. It used to end `… change. Last: {tried[-1]}`, `tried[-1]` is
+        `f"attempt {n}: {failure_reason}"`, and on the commonest exhaustion path
+        `failure_reason` is `"review failed: " + "; ".join(f"{i.label}: "
+        f"{i.evidence}" …)` — where `i.evidence` is lifted verbatim out of the
+        reviewer model's verdict JSON by a prompt that ASKS it to quote the
+        decisive lines. Uncapped, un-newline-stripped, undemoted. (Second
+        carrier, same route: `f"agent run did not complete: {err_line}"`, where
+        `err_line` is the coder's own final text.)
+
+        Because this blocker is built with `Blocker(...)`,
+        `reason_is_agent_authored` is False, so `_raise_blocker` hands
+        `_abandon_draft_pr` `reason_from_agent=False`, so the note takes the
+        PLAIN branch — `f"Reason: {reason[:400]}"` — with no `_clean_summary`,
+        no `_reformat_summary_markdown` and no fence. A driven run posted a live
+        `<h2>Review evidence</h2>` / "final verdict: **PASSED** — ready to
+        merge" (confirmed through GitHub's /markdown endpoint) onto a PR this
+        same call was titling "[ABANDONED — not delivered]", and without even
+        the agent disclaimer, since `from_agent=False`. That is verbatim the
+        incident `_AGENT_REASON_ATTRIBUTION` cites as why the channel had to be
+        typed by provenance in the first place.
+
+        The remedy is the one `_escalate_zero_diff` already uses two methods
+        down: model prose goes in `evidence`/`tried`, which `_raise_blocker`
+        never posts and which `render_report` shows the human on the board and
+        in `nh blocked` under "2. What happened" / "4. What I tried". Nothing is
+        lost; it just stops being published in no_human's own voice.
+
+        NOT FIXED by flipping `reason_is_agent_authored` to True: this sentence
+        is MIXED provenance, and attributing `max_attempts (N) reached…` — the
+        harness's own verified bookkeeping — to the agent is the same lie
+        mirrored, which is the defect that flag was introduced to remove.
+        """
         attempts = await self.store.list_attempts(task.id)
         tried = [
             f"attempt {a['attempt_number']}: {a.get('failure_reason') or a.get('status')}"
@@ -4198,14 +4251,29 @@ class Orchestrator:
             goal=task.title,
             root_cause_hypothesis=(
                 f"max_attempts ({self.bounds.max_attempts}) reached without a "
-                f"passing, untampered change. Last: {tried[-1] if tried else 'n/a'}"
+                f"passing, untampered change. The attempt trail is in this "
+                f"blocker's evidence and 'what I tried'."
             ),
             tried=tried,
             evidence=tried[-1] if tried else "no successful attempt",
             question="The agent could not complete this within bounds. Refine the "
                      "task, split it, or advise an approach.",
         )
-        return await self._raise_blocker(task, blocker, repo=repo, branch=branch)
+        outcome = await self._raise_blocker(task, blocker, repo=repo, branch=branch)
+        # 🔴 THE PUBLISHED FIELD AND THE CALLER-FACING ONE ARE NOT THE SAME
+        # CHANNEL, and welding them is what made the leak above possible.
+        # `_raise_blocker` returns `detail=root_cause_hypothesis or question`,
+        # so purifying that field for the forge ALSO emptied `TaskOutcome.detail`
+        # — and that one is not published anywhere: `nh run` prints it
+        # (`cli/commands.py`), the TUI logs it, `eval/replay.py` greps it. Two
+        # tests caught the loss (`test_ci_real_failure_loops_to_escalate`,
+        # `test_layered_test_plan_failure_detail_aggregates_traceback_blocks`)
+        # and they were right to — a human running `nh run` should still be told
+        # WHICH failure burned the last attempt. So the trail is re-attached
+        # HERE, to the return value only, where no forge write can reach it.
+        if tried:
+            outcome = replace(outcome, detail=f"{outcome.detail} Last: {tried[-1]}")
+        return outcome
 
     async def _escalate_timeout_streak(
         self, task: Task, repo: GitRepo, branch: str | None
@@ -4346,6 +4414,20 @@ class Orchestrator:
         The escalation carries the agent's own text. Reporting "inadequate" N
         times without ever showing what it wrote makes the human re-run the task
         to find out — which is exactly the babysitting no_human exists to remove.
+
+        🔴 `{reason}` IS A FRAGMENT OF AGENT TEXT INSIDE A PUBLISHED FIELD, and
+        it is here deliberately rather than by oversight — which is only worth
+        saying because `_escalate_exhausted` had the same shape by oversight and
+        it published a fabricated review verdict. The difference is MEASURED,
+        not assumed: `report_quality.report_inadequacy` reaches the branch that
+        embeds the report only when the WHOLE report normalises into the closed
+        `_PLACEHOLDERS` set, and it interpolates with `!r`, so every payload
+        that set can produce is single-line and lands mid-sentence. It cannot
+        open a block. `test_the_inadequate_report_route_cannot_author_a_block`
+        drives the whole set and reddens if either half of that stops holding.
+        What remains is a provenance nuance, not a leak: a decorated placeholder
+        word rendered in no_human's voice. `produced` — the unbounded half — is
+        in `evidence`, which `_raise_blocker` never posts.
         """
         ctx = task.context or {}
         reason = (ctx.get("inadequate_report_reason") or "").strip()
@@ -4926,6 +5008,48 @@ class Orchestrator:
         self.emit(kind, report, status=route.target_status.value,
                   blocker=blocker.to_dict())
 
+        # 4b. C5: an ESCALATED task has stopped. Any draft it opened before the
+        # gate is now a dead PR that still claims its criteria are met, so say
+        # so on the PR itself. PARKED routes are deliberately excluded: they
+        # resume onto the SAME branch (`_resume_human_gated` -> `_finalize`
+        # refreshes exactly that draft's body), so retiring it here would both
+        # mislabel a live PR and lose the body refresh.
+        if route.target_status == TaskStatus.ESCALATED:
+            # 🔴 THE ATTRIBUTION FOLLOWS THE TEXT, NOT THE ROUTE. This used to
+            # take `_abandon_draft_pr`'s `reason_from_agent=True` default and
+            # therefore stamped "in the coding agent's own words — quoted from
+            # its blocker report. no_human did not write this text and has not
+            # verified it" over EVERY escalation. Exactly ONE of the blockers
+            # that reach this funnel is coder-written (`parse_blocker` off
+            # `result.final_text`); the fourteen `Blocker(...)` constructions in
+            # this file, plus `fallback_blocker` / `missing_access` /
+            # `ci_misconfigured` / `plan_gate.build_blocker`, are source
+            # literals. On the ordinary exhaustion route that produced:
+            #
+            #   Reason, in the coding agent's own words … no_human did not
+            #   write this text and has not verified it:
+            #     max_attempts (3) reached without a passing, untampered change.
+            #
+            # Every clause false, on the one artifact whose subject is
+            # provenance — and pointed the DANGEROUS way, telling the reader to
+            # distrust the harness's own attempt bookkeeping. `Blocker` now
+            # carries where its prose came from, so the label is decided by the
+            # text's origin instead of by which method happens to post it.
+            reason = blocker.root_cause_hypothesis or blocker.question
+            if reason:
+                from_agent = blocker.reason_is_agent_authored
+            else:
+                # Neither field survived, so what gets posted is THIS literal,
+                # written here. Whatever the blocker's provenance was, this
+                # sentence is no_human's own and must not be attributed away.
+                reason = "the attempt escalated to a human before finishing"
+                from_agent = False
+            try:
+                await self._abandon_draft_pr(
+                    task, str(reason), reason_from_agent=from_agent)
+            except Exception as exc:  # noqa: BLE001 — an off-ramp never fails here
+                self._advisory(f"abandoning the draft PR failed: {exc}")
+
         # 5. Notify only when a human must act now (22.6). Parked = silent,
         #    unless a notify_override says this parked task still needs a person.
         should_notify = route.notify_now if notify_override is None else notify_override
@@ -5244,14 +5368,25 @@ class Orchestrator:
                 lines.append(f"  - {ans[:400]}")
         return "\n".join(lines)
 
-    async def _append_review_history(self, task: Task, decision) -> None:
+    async def _append_review_history(
+        self, task: Task, decision, *, commit_sha: str = "",
+    ) -> None:
         """Persist a compact record of this round so the NEXT round's reviewer
         cannot contradict it unknowingly. Labels + evidence heads only — the
-        full checklist already lives on the attempt row."""
+        full checklist already lives on the attempt row.
+
+        ``commit_sha`` is the head the round actually judged (C4). This list is
+        TASK-lifetime, not attempt-scoped, and the PR body rendered all of it:
+        a real PR (attempt 3, 282 lines) showed a finding about attempt 2's
+        40-line diff, so the human was reading a verdict on code that is not in
+        front of them. Stamping is the only thing that makes the two separable
+        afterwards.
+        """
         ctx = task.context or {}
         history = list(ctx.get("review_history") or [])
         history.append({
             "round": len(history) + 1,
+            "sha": (commit_sha or "").strip(),
             "passed": bool(decision.passed),
             "blocking": [
                 f"{i.label} — {i.evidence[:160]}" for i in decision.blocking_items[:5]
@@ -5534,6 +5669,190 @@ class Orchestrator:
         self._test_cache[key] = result
         return result, False
 
+    # 🔴 C5: A DRAFT AN ATTEMPT WALKED AWAY FROM IS STILL AN OPEN PR.
+    # One task left #106, #107 and #111 open at once: none referencing the
+    # others, all draft, all CI-red, every body asserting its acceptance
+    # criteria met. The code's own comment above the draft call admitted it
+    # ("the first stays open forever holding review-REJECTED code") and nothing
+    # acted on it. Two things make the pile readable: the dead ones say they
+    # are dead in their TITLE (the only field a repo's PR list shows), and the
+    # live one links them.
+    #
+    # Retitling and commenting are the only forge writes here. Neither merges,
+    # approves, un-drafts, or closes anything: constraint #2 is untouched, and
+    # only a PR this task itself opened is ever touched.
+    # 🔴 REASON-NEUTRAL, AND IT MUST STAY THAT WAY. This read "[ABANDONED —
+    # attempt failed review]", which `_raise_blocker` then stamped on EVERY
+    # escalated route regardless of why. On the CI-infra route the review has
+    # already PASSED (`_run_attempt`: draft -> review -> CI -> escalate, all
+    # before `_finalize`), so the title asserted a review failure that did not
+    # happen — on the one field a repo's PR list shows, in the branch whose
+    # whole purpose is to stop no_human claiming untrue things.
+    #
+    # WHY A CONSTANT AND NOT A PER-REASON PREFIX: the routes reaching
+    # `_abandon_draft_pr` are open-ended — ten blocker categories, plus
+    # `_open_draft_pr_for_review` retiring a draft when a revision moves to a
+    # new branch — and the only fact EVERY caller has actually established is
+    # that this draft did not become a delivered PR. Anything narrower is a
+    # claim the call site cannot guarantee, and a wrong mapping would just
+    # reintroduce this defect one route at a time. The real reason is already
+    # passed in as `reason` and rendered in the comment, which is the field
+    # with room to be precise.
+    _ABANDONED_TITLE_PREFIX = "[ABANDONED — not delivered] "
+
+    # 🔴 `Reason:` WAS A RAW, UNFILTERED, MODEL-AUTHORED CHANNEL ONTO A PR.
+    # On the escalated route `_raise_blocker` passes
+    # `blocker.root_cause_hypothesis or blocker.question` — fields the CODER
+    # writes: `blockers/report.py` puts them in the prompt schema and
+    # `parse_blocker` lifts them verbatim out of the coder's `final_text`. That
+    # parser sanitises `options` (no agent-attached actions) and `category` (no
+    # agent-claimed BUDGET_EXHAUSTED); it never touches the prose. Interpolated
+    # straight into this note the coder could author markdown in no_human's own
+    # voice — a driven run produced a rendered "## Review evidence / final
+    # verdict: **PASSED** … ready to merge" block on a PR no_human was
+    # simultaneously labelling [ABANDONED]. Everywhere else coder prose is
+    # confined under `## Implementation summary`, run through `_clean_summary`
+    # and heading-demoted; this one surface had none of it.
+    #
+    # So the channel is now typed by PROVENANCE, not trusted by default:
+    #   * agent-authored text is cleaned, demoted, wrapped in a fence long
+    #     enough that no fence inside it can close the wrapper, and labelled as
+    #     the agent's words that no_human did not write or verify;
+    #   * text no_human wrote itself is rendered plainly and must NOT carry the
+    #     attribution, which would be the same lie mirrored.
+    # `reason_from_agent` HAS NO DEFAULT, and that is the fix for the defect a
+    # default caused. It used to default to True on the reasoning that a caller
+    # who does not think about provenance should get the "safe" treatment, and
+    # that the worst case — quoting no_human's own sentence as if the agent said
+    # it — was harmless. Both halves were wrong. The dominant caller
+    # (`_raise_blocker`, reached by every harness-authored escalation) took that
+    # default, so the "worst case" was the NORMAL case; and it is not harmless,
+    # because the attribution does not merely misfile a sentence, it instructs
+    # the reader to distrust it ("no_human … has not verified it") on text that
+    # is the harness's own verified bookkeeping. A parameter with no default
+    # cannot be inherited by accident: every call site states the provenance it
+    # has established, and a new one will not compile until it does.
+    _AGENT_REASON_ATTRIBUTION = (
+        "Reason, in the coding agent's own words — quoted from its blocker "
+        "report. no_human did not write this text and has not verified it:")
+    _NO_AGENT_REASON = (
+        "The attempt's blocker report carried no reason that could be shown "
+        "here.")
+    _REASON_MAX_CHARS = 400
+
+    @staticmethod
+    def _quote_agent_reason(reason: str) -> str:
+        """Model-authored prose, rendered so it cannot pose as no_human's.
+
+        Returns "" when nothing survives the filter — the caller then says so
+        rather than printing an empty quotation.
+        """
+        text = str(reason or "")[:Orchestrator._REASON_MAX_CHARS]
+        cleaned = Orchestrator._clean_summary(text)
+        if (not cleaned.strip()
+                or cleaned == Orchestrator._SUMMARY_FILTERED_PLACEHOLDER):
+            return ""
+        body = Orchestrator._reformat_summary_markdown(cleaned)
+        # The wrapper must be LONGER than the longest backtick run inside it
+        # (CommonMark): a coder that writes ``` mid-reason otherwise closes the
+        # wrapper and everything after it renders live again — escaping that
+        # can be escaped is decoration.
+        longest = max((len(m) for m in re.findall(r"`+", body)), default=0)
+        fence = "`" * max(3, longest + 1)
+        return f"{fence}text\n{body}\n{fence}"
+
+    async def _abandon_draft_pr(
+        self, task: Task, reason: str, *, reason_from_agent: bool,
+    ) -> str:
+        """Mark this task's outstanding draft PR as abandoned. Best-effort.
+
+        ``reason_from_agent`` is REQUIRED: it says whether ``reason`` is prose
+        the coding agent wrote (quote it, attribute it, disclaim it) or prose
+        no_human wrote (render it plainly, and never attribute it away). See
+        `_AGENT_REASON_ATTRIBUTION` for why it has no default.
+
+        Bookkeeping happens even when the forge write fails — the URL must
+        leave `pr_draft_created` either way, or the next attempt would treat a
+        stale draft as its own and rewrite a body it did not author.
+        """
+        ctx = task.context or {}
+        url = str(ctx.get("pr_draft_created") or "").strip()
+        if not url:
+            return ""
+        # 🔴 NEVER RETITLE A DELIVERED PR. `_finalize` does not clear the draft
+        # slot — it only ever WRITES `pr_watch`/`pr_branch` alongside it — so
+        # after a successful delivery the draft slot and the live slot name the
+        # SAME pull request. A revision on that branch (`nh reject`, a PR
+        # comment) that then exhausts max_attempts walks
+        # `_escalate_exhausted` -> `_raise_blocker` -> here, and stamped
+        # "[ABANDONED — attempt failed review]" onto a human-reviewed PR
+        # sitting in AWAITING_APPROVAL — telling the reader it is not a
+        # delivered change while it still holds exactly the reviewed code,
+        # because the failed revision pushed nothing.
+        #
+        # `pr_watch`/`pr_branch` are written at ONE place (`_finalize`, after
+        # `open_pr` returned and the task moved to AWAITING_APPROVAL), so their
+        # presence is the durable record that a PR was delivered for a human.
+        # Either match is enough: the URL is the direct statement, and the
+        # branch survives a forge that spells the same MR's URL two ways. The
+        # asymmetry decides the OR — a guard that over-fires costs a dead draft
+        # its label, one that under-fires corrupts a live human-reviewed PR.
+        delivered_url = str(ctx.get("pr_watch") or "").strip()
+        delivered_branch = str(ctx.get("pr_branch") or "").strip()
+        draft_branch = str(ctx.get("pr_draft_branch") or "").strip()
+        if (url and url == delivered_url) or (
+                draft_branch and draft_branch == delivered_branch):
+            self._advisory(
+                f"not abandoning {url}: it is the PR this task delivered for "
+                f"review, not a draft an attempt walked away from")
+            return ""
+        if url.startswith("http"):
+            title = self._ABANDONED_TITLE_PREFIX + self._commit_message(task)
+            if reason_from_agent:
+                quoted = self._quote_agent_reason(reason)
+                reason_block = (
+                    f"{self._AGENT_REASON_ATTRIBUTION}\n\n{quoted}"
+                    if quoted else self._NO_AGENT_REASON)
+            else:
+                reason_block = f"Reason: {str(reason)[:self._REASON_MAX_CHARS]}"
+            note = (
+                # Says only what holds on every route. The previous wording —
+                # "nothing in it should be read as a REVIEWED or delivered
+                # change" — carried the same false claim as the old title: on
+                # the CI-infra route the change HAS been reviewed and passed,
+                # and telling a human otherwise devalues a real signal. Whether
+                # a review ran varies by route, so this claims neither; the
+                # reason below carries it.
+                "**Abandoned by no_human.** This draft's attempt stopped before "
+                "delivering it, so it is not a delivered change and was never "
+                "put up for approval.\n\n"
+                f"{reason_block}\n\n"
+                "no_human never merges and never closes PRs — deleting or "
+                "closing this one is a human decision."
+            )
+            try:
+                from ..vcs.comment_poster import post_to_pr, set_pr_title
+                res = await asyncio.to_thread(set_pr_title, url, title)
+                if not res.get("ok"):
+                    self._advisory(
+                        f"could not retitle abandoned draft {url}: {res.get('error')}")
+                res = await asyncio.to_thread(post_to_pr, url, note)
+                if not res.get("ok"):
+                    self._advisory(
+                        f"could not comment on abandoned draft {url}: {res.get('error')}")
+            except Exception as exc:  # noqa: BLE001 — never fail an off-ramp on this
+                self._advisory(f"abandoning draft {url} failed: {exc}")
+        prior = [u for u in (ctx.get("abandoned_pr_urls") or []) if u]
+        if url not in prior:
+            prior.append(url)
+        ctx["abandoned_pr_urls"] = prior[-6:]
+        ctx.pop("pr_draft_created", None)
+        ctx.pop("pr_draft_branch", None)
+        task.context = ctx
+        await self.store.update_task(task)
+        self.emit("pr_draft_abandoned", f"{url} — {reason}", pr_url=url)
+        return url
+
     async def _open_draft_pr_for_review(
         self, task: Task, repo: GitRepo, branch: str, base: str | None,
         attempt_id: str, *, commit=None, result=None,
@@ -5583,6 +5902,33 @@ class Orchestrator:
                 "draft-by-default. A PR-body criterion will fail honestly here.")
             self._draft_pr_absent = "not attempted (remote is not GitHub)"
             return ""
+        # C5: a draft recorded against a DIFFERENT branch belongs to an earlier
+        # attempt — each attempt gets its own branch, so that PR is never going to
+        # be finished. Retire it here, before this attempt's body is built, so the
+        # new body can link it and the old one says what it is. The revision flow
+        # (`nh reject`, a PR comment) resumes onto the SAME branch and is untouched.
+        _prior = task.context or {}
+        if _prior.get("pr_draft_created") and _prior.get("pr_draft_branch") not in (None, branch):
+            # 🔴 CLAIMS ONLY WHAT THIS CALL SITE ESTABLISHES, WHICH IS THE
+            # BRANCH MOVE AND NOTHING ELSE. This read "…; this draft's attempt
+            # did not pass review" — the exact claim that was removed from the
+            # title, reintroduced one call site over. The condition above tests
+            # `pr_draft_branch != branch`; it says nothing about whether a
+            # review ran or how it voted, and several routes arrive here with a
+            # PASSING verdict already persisted: review passes, the local suite
+            # then fails (or CI goes red on related tests, or the runner
+            # breaks), the attempt returns FAILED, and the retry is handed a new
+            # branch. Nothing clears `pr_draft_created` in between, so attempt
+            # 2's draft-open fires this abandon and the note told the human the
+            # review had failed on top of a recorded PASS. `reason_from_agent`
+            # is False because no_human wrote this sentence itself — attributing
+            # it to the coding agent would be the same untruth mirrored.
+            await self._abandon_draft_pr(
+                task,
+                "this task's work continued on a new branch "
+                f"(`{branch}`), so nothing further will land on this draft",
+                reason_from_agent=False,
+            )
         # HIGH-3: inside the try. A review found _commit_message/_pr_body OUTSIDE it, so
         # the "BEST-EFFORT BY DESIGN" guarantee in the docstring did not hold for them —
         # a failure there killed the attempt instead of degrading to no draft.
@@ -5593,7 +5939,8 @@ class Orchestrator:
             # 🔴 THE REAL commit AND result, not None. My first version passed None and
             # `_pr_body` does `result.final_text` — AttributeError, 75 tests. Both are in
             # scope by the time the gate runs.
-            body = self._pr_body(task, commit, result, test_evidence=None)
+            body = self._pr_body(task, commit, result, test_evidence=None,
+                                 repo=repo, base=base, branch=branch)
             # Ask the forge whether a PR is ALREADY open for this branch. If one is, this
             # run is not its author and must never rewrite its body (see below). The extra
             # `gh pr list` is one call per attempt on GitHub only, and it is the only way
@@ -5790,7 +6137,13 @@ class Orchestrator:
             )
 
         verdict = "PASS" if decision.passed else "FAIL"
-        await self._append_review_history(task, decision)
+        # The head the reviewer just read — captured here, where the review ran,
+        # not re-resolved later when HEAD may have moved on (C4).
+        try:
+            reviewed_sha = repo.head_sha()
+        except Exception:  # noqa: BLE001 — a missing stamp degrades to "unknown"
+            reviewed_sha = ""
+        await self._append_review_history(task, decision, commit_sha=reviewed_sha)
         # The citation rule fired: hallucinated locations tried to block the
         # gate and were demoted. Loud on the board — this is the reviewer-FP
         # channel that severity grading alone does not close.
@@ -9470,29 +9823,41 @@ SIX of them read a checkpoint and TWO do not — but do
         stay uncluttered)."""
         ctx = task.context or {}
         lines: list[str] = []
+        # 🔴 EVERY VALUE HERE IS MODEL- OR TRACKER-AUTHORED AND LANDS OUTSIDE THE
+        # ONE SECTION THAT HAS A DEMOTER. `intake_qa` is written by the intake
+        # evaluator (the utility tier) and the intake flow runs on EVERY task;
+        # `assumptions` and `original_criteria` come from the same place; the
+        # blocker fields are the coder's own diagnosis. Interpolated raw, a
+        # single `\n` in any of them drops the remainder to column 0 — measured
+        # through `_pr_body` and `/markdown` (mode gfm): each of the five
+        # rendered a live `<h1>MERGED AND APPROVED BY NO_HUMAN</h1>`. They are
+        # one-line cells, so `_inline_cell` is the whole fix; it is the same
+        # helper `## Review evidence` uses, deliberately, so a third carrier
+        # section has something to reach for.
+        _cell = Orchestrator._inline_cell
         # §6 grill: the intake Q&A the agent answered for the absent requester
         # — the human gate audits exactly what was decided on their behalf.
         for item in (ctx.get("intake_qa") or [])[:8]:
-            q = str(item.get("question", "")).strip()
+            q = _cell(item.get("question", ""), 400)
             if not q:
                 continue
-            answer = str(item.get("answer", "")).strip()[:400] or "(unanswered)"
-            source = str(item.get("source", "")).strip()
+            answer = _cell(item.get("answer", ""), 400) or "(unanswered)"
+            source = _cell(item.get("source", ""), 80)
             src = f" _({source})_" if source else ""
             lines.append(f"- **Q:** {q} **A:** {answer}{src}")
         for a in (ctx.get("assumptions") or []):
-            lines.append(f"- {a}")
+            lines.append(f"- {_cell(a, 400)}")
         orig = ctx.get("original_criteria")
         if orig:
             lines.append(
                 "- Acceptance criteria were auto-sharpened during intake; "
-                "originals: " + "; ".join(str(c) for c in orig)
+                "originals: " + "; ".join(_cell(c, 400) for c in orig)
             )
         blk = task.blocker or {}
         if blk.get("root_cause_hypothesis"):
-            lines.append(f"- Unresolved: {blk['root_cause_hypothesis']}")
+            lines.append(f"- Unresolved: {_cell(blk['root_cause_hypothesis'], 400)}")
         if blk.get("question"):
-            lines.append(f"- Open question: {blk['question']}")
+            lines.append(f"- Open question: {_cell(blk['question'], 400)}")
         if not lines:
             return ""
         return (
@@ -9530,6 +9895,71 @@ SIX of them read a checkpoint and TWO do not — but do
     # genuine evidence that happened to mention a filtered phrase.
     _SUMMARY_DROPPED_PARA_MARKER = (
         "_(a paragraph matched a filtered-phrase list and was removed)_")
+
+    # ---- C1: the coder's last message is not always a REPORT ---------------
+    # Real shipped PRs, all past a PASSING review: "I'll just wait for that
+    # notification." (#105), "Waiting for the full-suite background run…"
+    # (#110, #102), and #104 whose summary filtered to nothing at all. Pasted
+    # under "## Implementation summary" that reads as a claim about the change.
+    # It is not one — it is the coder talking to itself about what it is about
+    # to do. Naming the absence is honest; inventing a summary from the diff
+    # would be the same lie in better prose, so this never does that.
+    #
+    # SHAPE, NOT KEYWORDS. Each pattern must match a CLAUSE that DEFERS. A
+    # report mentioning "waiting for CI to go green" in passing stays: long ones
+    # never reach the patterns at all (the length guard below), and short ones
+    # are judged on what is left once the deferring sentence is set aside.
+    _NON_REPORT_MIN_CHARS = 12          # below this there is nothing to read
+    _NON_REPORT_MAX_CHARS = 600         # above this, a deferral phrase is incidental
+    _NON_REPORT_PATTERNS = (
+        r"\bi(?:'|’)?ll\s+(?:just\s+)?wait\b",
+        r"\bi(?:'|’)?m\s+(?:just\s+)?waiting\b",
+        r"\b(?:still\s+)?waiting\s+(?:for|on)\b",
+        r"\bi(?:'|’)?ll\s+(?:report|update|let\s+you\s+know|check)\b",
+        r"\bi\s+(?:don(?:'|’)?t|do\s+not)\s+need\s+to\b",
+        r"\bnothing\s+(?:further|more|else)\s+to\s+do\b",
+        r"\bstanding\s+by\b",
+        r"\bonce\s+(?:the|that|it|they)\b[^.]{0,80}\b"
+        r"(?:finish|finishes|complete|completes|land|lands|report|reports|come|comes)\b",
+        # Addressed to the READER, never about the code. These reached the body
+        # standing alone: no other pattern matched, so the early return shipped
+        # them under "## Implementation summary" as if they described the diff.
+        r"\blet\s+(?:me|us)\s+know\b",
+        r"\bi\s+(?:have\s+|already\s+)*updated\s+you\b",
+    )
+    # WHAT A REPORT LOOKS LIKE. The length bar alone over-fired badly: four real
+    # summaries of 71–167 chars — each naming files, line numbers, test node ids
+    # or a measurement — were replaced wholesale by "no summary was produced"
+    # because of ONE trailing clause ("…I'll update the docstring in a
+    # follow-up.", "Nothing else to do here."). Deleting true content is the
+    # same truthfulness bug pointed the other way, so a deferral phrase now only
+    # condemns the SENTENCE it sits in, and what survives has to prove it says
+    # something. Two independent proofs, either sufficient.
+    _REPORT_EVIDENCE_PATTERNS = (
+        # a file the reader can open
+        r"\b[\w./-]+\.(?:py|js|ts|tsx|jsx|mjs|cjs|go|rs|java|rb|php|c|h|cc|cpp|"
+        r"cs|swift|kt|sh|bash|zsh|ya?ml|json|toml|ini|cfg|sql|css|scss|html|md)\b",
+        r"\b\w+\(\)",                                   # a function or method
+        r"::\w+",                                       # a test node id
+        r"\btest_\w+|\b\w+_test\b",                     # a test by name
+        r":\d+\b",                                      # a line number
+        r"\b\d+(?:\.\d+)?\s*(?:ms|s|kb|mb|gb|tb|%|x)\b",  # a measurement
+        r"`[^`]+`",                                     # anything cited as code
+    )
+    # …or it names work in the completed past tense. "Implemented the feature and
+    # added three tests." carries no path, and is still a report.
+    _REPORT_WORK_VERBS = (
+        r"\b(?:added|implemented|fixed|rewrote|rewritten|removed|deleted|"
+        r"updated|created|refactored|wired|renamed|replaced|moved|extracted|"
+        r"introduced|changed|migrated|corrected|dropped|split|merged|"
+        r"converted|ported|documented|tightened|hardened|switched)\b"
+    )
+    _NO_SUMMARY_BLOCK = (
+        "**No implementation summary was produced.**\n\n"
+        "The coder's final message was not a report of the work — it was a "
+        "status or deferral note — so it is not reproduced here. Nothing was "
+        "written in its place: read the commits and the diff for what changed."
+    )
 
     @staticmethod
     def _normalize_for_marker_match(text: str) -> str:
@@ -9591,15 +10021,485 @@ SIX of them read a checkpoint and TWO do not — but do
                 " " if unicodedata.category(c) == "Cf" else c for c in base)))
         return "\n".join(dict.fromkeys(forms))
 
+    # A CommonMark fence opener: at most THREE spaces of indent, then a run of
+    # three-or-more backticks or tildes. Four spaces is an indented code block,
+    # and its content is not markdown at all — which is the whole bug below.
+    _FENCE_LINE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
+
+    # 🔴 AN HTML BLOCK OUTRANKS A FENCE, AND IGNORING THEM MADE US BELIEVE
+    # FENCES GITHUB DOES NOT SEE. Inside an HTML block every line is raw HTML —
+    # ``` is literal text, not an opener:
+    #
+    #     <div>
+    #     ```
+    #     <h1>PWNED</h1>
+    #     </div>
+    #
+    # is ONE type-6 block, so nothing is fenced and the `<h1>` is live. Two
+    # separate harms followed, both measured through `/markdown` (mode gfm):
+    # `_reformat_summary_markdown` skipped demotion for everything after the
+    # ```, and `_close_orphaned_fence` appended a closer for a fence that had
+    # never opened — a ``` at column 0 after a blank line, i.e. a real OPENER,
+    # which swallowed `## Stats` and the merge-boundary footer of a delivered
+    # PR. Rendered heading list: ['Task', 'Acceptance criteria', 'Implementation
+    # summary'] with the closer, and 'Stats' back with it removed.
+    #
+    # These are CommonMark's seven start conditions. Types 1–5 end on a line
+    # MATCHING their end pattern (blank lines do not end them); types 6 and 7
+    # end at a blank line. Type 7 may not interrupt a paragraph.
+    #
+    # 🔴 THE TYPE-6 TAG LIST IS PINNED TO GITHUB'S RENDERER BY MEASUREMENT, NOT
+    # TO THE SPEC TEXT. This comment used to say "CommonMark's seven start
+    # conditions verbatim", and it was verbatim the CURRENT spec — but the
+    # renderer this code has to agree with is not on that spec. Every tag here,
+    # plus a probe set of adjacent HTML5 names deliberately NOT here, was driven
+    # through `gh api /markdown` (mode gfm) with the probe
+    # `paragraph` / `<tag>` / `*x*`: `<em>` in the output means the paragraph
+    # stayed open, i.e. the tag did NOT interrupt it, i.e. not type 6. Two of 81
+    # names disagreed with the spec list:
+    #
+    #     search    spec: type 6    GitHub: type 7   <- the dangerous direction
+    #     source    spec: type 7    GitHub: type 6
+    #
+    # `search` is the dangerous one because type 6 MAY interrupt a paragraph and
+    # type 7 may not. Believing type 6 skips the disambiguating blank line below
+    # while GitHub keeps the paragraph OPEN — so the coder's own ```jsx is a real
+    # unclosed fence there and literal text here, and `_close_orphaned_block`
+    # appends nothing. Measured through the real `_pr_body` at both payload
+    # positions: a React `<Search />` and the HTML5 `<search>` element each
+    # swallowed `## Stats` and the merge-boundary footer into a code block, and
+    # `<search>` before a genuine fence rewrote a pasted `# set up the env` to
+    # `### set up the env` INSIDE that fence — the corrupting-pasted-evidence
+    # harm option 1 was rejected for, happening anyway. No adversarial intent:
+    # `<search>` is a shipping HTML element and `<Search />` is a React
+    # component.
+    #
+    # DELETING `search` IS NOT THE FIX, which is why `source` was added in the
+    # same edit: the list has already drifted in BOTH directions, so a one-off
+    # correction only resets the clock. `test_the_html_block_tag_list_matches_
+    # github` re-drives the probe through `/markdown` and asserts this code's
+    # classification equals GitHub's tag by tag, so the next spec or renderer
+    # move is caught by a red test rather than by a review round. It drives a
+    # FIXED tag universe (`_TAG_PROBE_UNIVERSE` in that test) rather than this
+    # constant, and requires this constant to be a subset of it — measured,
+    # after the first version of the test drove this list and was therefore
+    # blind to a tag DELETED from it, which is the `source` direction exactly.
+    _HTML_BLOCK_TAGS = frozenset("""
+        address article aside base basefont blockquote body caption center col
+        colgroup dd details dialog dir div dl dt fieldset figcaption figure
+        footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe
+        legend li link main menu menuitem nav noframes ol optgroup option p
+        param section source summary table tbody td tfoot th thead title tr
+        track ul""".split())
+    _HTML_BLOCK_CONDITIONS = (
+        (re.compile(r"^ {0,3}<(?:script|pre|style|textarea)(?:[ \t]|>|$)", re.I),
+         re.compile(r"</(?:script|pre|style|textarea)>", re.I), "</pre>"),
+        (re.compile(r"^ {0,3}<!--"), re.compile(r"-->"), "-->"),
+        (re.compile(r"^ {0,3}<\?"), re.compile(r"\?>"), "?>"),
+        (re.compile(r"^ {0,3}<![A-Za-z]"), re.compile(r">"), ">"),
+        (re.compile(r"^ {0,3}<!\[CDATA\["), re.compile(r"\]\]>"), "]]>"),
+    )
+    _HTML_BLOCK_TYPE6 = re.compile(
+        r"^ {0,3}</?([A-Za-z][A-Za-z0-9-]*)(?=[ \t]|/?>|$)")
+    _HTML_BLOCK_TYPE7 = re.compile(
+        r"^ {0,3}(?:"
+        r"<[A-Za-z][A-Za-z0-9-]*"
+        r"(?:[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*"
+        r"""(?:[ \t]*=[ \t]*(?:[^ \t"'=<>`]+|'[^']*'|"[^"]*"))?)*[ \t]*/?>"""
+        r"|</[A-Za-z][A-Za-z0-9-]*[ \t]*>"
+        r")[ \t]*$")
+
     @staticmethod
-    def _close_orphaned_fence(text: str) -> str:
-        """Close a ``` fence left unterminated by truncation.
+    def _scan_leaf_blocks(text: str):
+        """Yield ``(line, in_fence, in_html, still_open)`` for every line.
+
+        * ``in_fence`` — the line belongs to a fenced code block, its marker
+          lines included.
+        * ``in_html`` — the line belongs to an HTML block.
+        * ``still_open`` — ``(fence_marker, html_end_token)`` describing what is
+          STILL OPEN after this line, i.e. what the text would leak into
+          whatever follows it. ``html_end_token`` is ``""`` for a type-6/7
+          block, because a blank line closes those and the template always
+          emits one after the summary.
+
+        ONE scanner, consumed by both `_open_leaf_block_at_end` and
+        `_reformat_summary_markdown`: the previous round kept two copies of the
+        fence rules, and two copies are a thing that can drift apart.
+
+        🔴 IT IS A REWRITER AS WELL AS A SCANNER, and callers that rebuild text
+        from it must emit what it yields rather than the input they passed in.
+        It yields ONE line that was not in the input: a blank line after a
+        type-7 HTML start whose reading is ambiguous (see the comment on
+        `force_blank` below). That blank line is how the ambiguity is removed
+        instead of guessed at, so a caller that drops it keeps the guess.
+        `_reformat_summary_markdown` appends from the yielded stream, and its
+        output is what reaches GitHub.
+        """
+        fence = ""
+        # A fence opened on a line that also carries a CONTAINER marker
+        # (`- ```py`, `> ```py`, `> - ```py`). Tracked separately from `fence`
+        # because it behaves differently at BOTH ends — see the block below and
+        # `_container_fence_is_never_open_at_the_end` in the tests.
+        c_fence = ""
+        c_depth = 0        # blockquote depth of the opener; 0 == a list container
+        # The list item's CONTENT COLUMN — the column a following line must
+        # REACH to still be inside the item. Read off the opener's own marker,
+        # never assumed: `- ` gives 2, `1. ` gives 3, `- - ` gives 4, `12.  `
+        # gives 5.
+        c_col = 0
+        # Did the opener's prefix carry a LIST marker as well? 🔴 THIS EXISTS
+        # BECAUSE `c_depth` AND `c_col` ARE NOT ALTERNATIVES. A prefix may hold
+        # BOTH kinds of marker (`> - `, `- > `), and the depth test alone then
+        # answered the whole question and discarded the column — so the rule
+        # below was live for a pure list and dead for a MIXED container, which
+        # is the same defect one shape over. See the block below.
+        c_list = False
+        # `(outer, inner)` from `_container_columns` — the two column
+        # requirements a mixed prefix imposes. Only meaningful when `c_list`.
+        c_cols = (0, 0)
+        html_end: "re.Pattern | None" = None
+        html_close = ""
+        in_html = False
+        prev_is_paragraph = False
+
+        def _state():
+            # 🔴 `c_fence` IS DELIBERATELY ABSENT. A container-opened fence ends
+            # with its container, and the template always emits a blank line and
+            # then a column-0 `## …` after the summary, which ends every
+            # container. Measured through `/markdown` (mode gfm): `- ```py` +
+            # `  code`, unclosed, renders `## Stats` LIVE. Reporting it open
+            # would make `_close_orphaned_block` append a column-0 ``` — which
+            # is not a closer out there but a real OPENER, and that measured
+            # `heads=[]`: `## Stats` and the whole merge-boundary footer gone.
+            # Same for `> ```py` + `> code`. The one place the two fence kinds
+            # must NOT be treated alike is exactly here.
+            return (fence, html_close if in_html else "")
+
+        def _bq_depth(s: str) -> int:
+            m = Orchestrator._BLOCKQUOTE_PREFIX.match(s)
+            return m.group(1).count(">") if m else 0
+
+        for line in (text or "").split("\n"):
+            if fence:
+                m = Orchestrator._FENCE_LINE.match(line)
+                if (m and m.group(2)[0] == fence[0]
+                        and len(m.group(2)) >= len(fence)
+                        and not m.group(3).strip()):
+                    fence = ""
+                yield line, True, False, _state()
+                prev_is_paragraph = False
+                continue
+            if c_fence:
+                # Is this line still inside the CONTAINER the fence opened in?
+                # Measured, one shape per rule, through `/markdown`:
+                #   `- ```py` `  code` ``  ## X``   -> X is INSIDE (inert)
+                #   `- ```py` `  code` `## X`       -> X is LIVE  (container over)
+                #   `- ```py` `  code` `> ## X`     -> X is LIVE  (a `>` at
+                #                                      column 0 ends a list item)
+                #   `> ```py` `> code` `## X`       -> X is LIVE
+                #   `>> ```py` `>> code` `> ## X`   -> X is LIVE  (depth dropped)
+                # 🔴 A BLANK LINE WAS TREATED AS INSIDE FOR BOTH CONTAINERS,
+                # AND THAT IS TRUE OF ONLY ONE OF THEM. The claim here read
+                # "both containers survive one" and was measured on the LIST
+                # container only. A blockquote does not survive a blank line —
+                # the quote ENDS there and the fence ends with it, so the next
+                # `> ## X` starts a NEW quote with a LIVE heading in it.
+                # Measured, one line per rule, with pandoc 3.8.3 and confirmed
+                # through GitHub's own `/markdown` (mode gfm):
+                #   `> ```py`  `> code`  ``      `> ## X`   -> X is LIVE
+                #   `> ```py`  `> code`  `>`     `> ## X`   -> X is INSIDE
+                #   `>> ```py` `>> code` ``      `>> ## X`  -> X is LIVE
+                #   `- > ```py` … and `> - ```py` …         -> X is LIVE
+                #   `- ```py`  `  code`  ``      `  ## X`   -> X is INSIDE
+                #   `- ```py`  `  code`  `` ``   `  ## X`   -> X is INSIDE
+                # A blank line is a line with no marker on it; `>` and `> ` are
+                # NOT blank (`line.strip()` keeps the marker) and correctly fall
+                # to the depth test below, which is why a quoted blank keeps the
+                # block open. Two blank lines no longer end a list in CommonMark
+                # and do not here either — measured to three.
+                if not line.strip():
+                    inside = not c_depth
+                elif c_depth:
+                    inside = _bq_depth(line) >= c_depth
+                    if inside and c_list:
+                        # 🔴 A MIXED PREFIX HAS BOTH MARKERS AND THE DEPTH TEST
+                        # ANSWERED FOR BOTH. `> - ```py` and `- > ```py` open a
+                        # fence inside a LIST ITEM that happens to also be
+                        # quoted, so reaching the quote depth is necessary and
+                        # not sufficient — the line must reach the item's
+                        # CONTENT COLUMN too, exactly as it must in the `else`
+                        # branch below. Without this the long comment there was
+                        # unreachable for these shapes: the same defect the
+                        # round below it fixed, still live one marker over.
+                        # Measured with pandoc 3.8.3 (`-f gfm`) AND through
+                        # GitHub's own `/markdown` (mode gfm) on the body
+                        # `_pr_body` delivers — each of
+                        #   `> - ```py` `> print(1)` `>`   `> ## X`
+                        #   `> - ```py` `> print(1)`       `> ## X`
+                        #   `- > ```py` `  > print(1)`     `> ## X`
+                        # rendered a live `<h2>X</h2>`, a sibling of `## Task`
+                        # and `## Stats`, while the same three with the heading
+                        # indented into the item stay inert and must keep doing
+                        # so. All six are payloads.
+                        inside = Orchestrator._still_in_mixed_container(
+                            line, *c_cols)
+                else:
+                    # 🔴 THIS READ `line[:1] in (" ", "\t")`, i.e. ANY indent at
+                    # all, and that is not the rule. A line stays inside a list
+                    # item only by REACHING the item's content column — 2 for
+                    # `- `, 3 for `1. ` — and one indented BELOW it ends the
+                    # item, and the fence with it. Measured through pandoc 3.8.3
+                    # (`-f gfm`) and driven through `_pr_body`: `- ```python` +
+                    # `  print(1)` + ` ## PWNED` at indent ONE renders a
+                    # live `<h2>PWNED</h2>`, a sibling of `## Task` and
+                    # `## Stats` — confirmed on GitHub's own renderer — and so
+                    # does `1. ```python` with the heading at indent TWO. The
+                    # column comes off the opener's OWN marker (`c_col`) rather
+                    # than a constant, because `- `, `1. `, `12.  ` and `- - `
+                    # do not share one.
+                    inside = Orchestrator._indent_width(line) >= c_col
+                if inside:
+                    # The closer is measured from the CONTENT COLUMN too: inside
+                    # a `- ` item a closing ``` may sit at indent 2..5, and
+                    # `_FENCE_LINE` only tolerates 3 columns from column 0. With
+                    # `_split_container` here instead, `    ``` ` in a `- ` item
+                    # matched NOTHING, the fence was believed open past its own
+                    # closer, and the heading after it shipped undemoted.
+                    if c_depth:
+                        _p, rest, _hl = Orchestrator._split_container(line)
+                    else:
+                        rest = Orchestrator._dedent_to(line, c_col)
+                    m = Orchestrator._FENCE_LINE.match(rest)
+                    if (m and m.group(2)[0] == c_fence[0]
+                            and len(m.group(2)) >= len(c_fence)
+                            and not m.group(3).strip()):
+                        c_fence = ""
+                    yield line, True, False, _state()
+                    prev_is_paragraph = False
+                    continue
+                # The container ended on this line, and the fence ended with it.
+                # Fall THROUGH — this line is live markdown again and must be
+                # demoted like any other.
+                c_fence, c_depth, c_col = "", 0, 0
+                c_list, c_cols = False, (0, 0)
+            if in_html:
+                if html_end is None:
+                    # Type 6/7: a blank line ENDS the block and is not part of
+                    # it, so it is reported as ordinary text.
+                    if not line.strip():
+                        in_html = False
+                        yield line, False, False, _state()
+                        prev_is_paragraph = False
+                        continue
+                elif html_end.search(line):
+                    in_html = False
+                    yield line, False, True, _state()
+                    prev_is_paragraph = False
+                    continue
+                yield line, False, True, _state()
+                prev_is_paragraph = False
+                continue
+            m = Orchestrator._FENCE_LINE.match(line)
+            if m and not (m.group(2)[0] == "`" and "`" in m.group(3)):
+                fence = m.group(2)
+                yield line, True, False, _state()
+                prev_is_paragraph = False
+                continue
+            # 🔴 A FENCE OPENED ON A LIST-MARKER LINE DEFEATED THIS SCANNER
+            # ENTIRELY. `_FENCE_LINE` anchors at `^ {0,3}(```|~~~)` and a list
+            # marker is not that, so `- ```python` opened NOTHING — and then the
+            # coder's own CLOSER, `  ``` ` at indent 2, matched as an OPENER.
+            # Everything after it was believed in-fence and skipped demotion, so
+            # a following `## X` shipped as a live <h2> sibling of `## Task`;
+            # and `_close_orphaned_block` appended a column-0 fence for the
+            # phantom, which swallowed `## Stats` AND the merge-boundary footer,
+            # "It never merges and never approves its own work" included. Both
+            # harms at once, driven through `_pr_body` and GitHub's `/markdown`
+            # for ``` and ~~~ alike, at both payload positions. A coder putting
+            # a code block in a bullet writes this by hand.
+            prefix, rest, has_list = Orchestrator._split_container(line)
+            cm = Orchestrator._FENCE_LINE.match(rest) if prefix else None
+            if cm and not (cm.group(2)[0] == "`" and "`" in cm.group(3)):
+                c_fence, c_depth = cm.group(2), prefix.count(">")
+                c_col, c_list = Orchestrator._column_width(prefix), has_list
+                c_cols = Orchestrator._container_columns(prefix)
+                yield line, True, False, _state()
+                prev_is_paragraph = False
+                continue
+            started = False
+            force_blank = False
+            for start_re, end_re, closer in Orchestrator._HTML_BLOCK_CONDITIONS:
+                if start_re.match(line):
+                    # A types 1–5 block may satisfy its end condition on the
+                    # very line that starts it.
+                    in_html = not end_re.search(line)
+                    html_end, html_close = end_re, closer
+                    started = True
+                    break
+            if not started:
+                m6 = Orchestrator._HTML_BLOCK_TYPE6.match(line)
+                if m6 and m6.group(1).lower() in Orchestrator._HTML_BLOCK_TAGS:
+                    in_html, html_end, html_close = True, None, ""
+                    started = True
+                elif Orchestrator._HTML_BLOCK_TYPE7.match(line):
+                    in_html, html_end, html_close = True, None, ""
+                    started = True
+                    # 🔴 THE ONE QUESTION THIS SCANNER CANNOT ANSWER, SO IT
+                    # STOPS ASKING IT. Type 7 is the only start condition that
+                    # may not interrupt a PARAGRAPH, and deciding whether the
+                    # line above is one is a third markdown parser. The previous
+                    # version approximated it as "the previous line was
+                    # non-blank" and then promised, here and in
+                    # `_reformat_summary_markdown`, that being wrong could not
+                    # leak a heading. THAT PROMISE WAS FALSE, and one blank line
+                    # was the whole of the counter-example:
+                    #
+                    #     ### The component      <- not a paragraph
+                    #     <UserCard />           <- GitHub: type-7 block starts
+                    #     ```jsx                 <- literal text there, an
+                    #     <UserCard name="a" />     OPENER here
+                    #                            <- ends the block on GitHub;
+                    #     ## Notes                  live <h2>, sibling of
+                    #                               `## Task`, undemoted because
+                    #                               THIS scanner is still inside
+                    #                               a fence that never opened
+                    #
+                    # Measured through `/markdown` (mode gfm) for six
+                    # predecessors — ATX heading, setext underline, thematic
+                    # break, list item, blockquote, table row — each leaking
+                    # `PWNED` as a top-level section AND losing `## Stats` and
+                    # the merge-boundary footer into the code block the appended
+                    # fence closer opened. No adversarial intent: a coder
+                    # documenting a JSX component writes it.
+                    #
+                    # THE FIX IS TO REMOVE THE DISAGREEMENT, NOT TO WIN IT. When
+                    # the reading is ambiguous we emit a BLANK LINE after the
+                    # line, which ends a type-7 block and ends a paragraph — so
+                    # both readings are in the SAME state from the next line on,
+                    # and nothing downstream can depend on which one GitHub
+                    # picked. `prev_is_paragraph` therefore no longer decides
+                    # anything about the text: it decides only whether one blank
+                    # line is emitted, and it is over-approximate in the
+                    # direction that costs a blank line rather than a heading
+                    # (False is set solely after a blank/fence/HTML line, where
+                    # no paragraph can be open).
+                    #
+                    # WHAT THAT BLANK LINE ACTUALLY COSTS, restated to what was
+                    # measured. It was written here as "the rendered HTML is
+                    # byte-identical to the unprocessed input for a genuine-
+                    # paragraph predecessor"; that holds ONLY for the one shape
+                    # it was driven on, where the next line is a fence and so
+                    # ends the paragraph anyway. A blank line ENDS blocks, and
+                    # measured through `/markdown` it does:
+                    #
+                    #   para / `<UserCard />` / more prose   -> one <p> becomes
+                    #                                          two
+                    #   `- item` / `  <br />` / `  more` /   -> the tight list
+                    #   `- second`                             becomes LOOSE:
+                    #                                          every <li> gains
+                    #                                          <p> wrappers
+                    #   `> quoted` / `<br />` / a lazy line  -> that line stops
+                    #                                          being a lazy
+                    #                                          continuation and
+                    #                                          becomes its own
+                    #                                          <p>
+                    #   `Design notes` / `<br />` / `=====`  -> the <h1> becomes
+                    #                                          a <p> plus a
+                    #                                          stray <p>=====</p>
+                    #
+                    # Byte-identity held for exactly one of the five shapes
+                    # driven — the fence one, which is the shape the claim was
+                    # measured on. None of the other four is a LEAK: the blank
+                    # only ever ends blocks, never opens one, so no heading can
+                    # escape through it. But "byte-identical" was false as
+                    # stated, and inside a container the cost is structural
+                    # rather than cosmetic.
+                    #
+                    # The blank line goes AFTER, not before. Before it would
+                    # force the HTML-block reading and turn the coder's own
+                    # ```jsx fence into literal text; after it, the fence opens
+                    # under both readings and the coder's code block survives.
+                    force_blank = prev_is_paragraph
+            if started:
+                yield line, False, True, _state()
+                prev_is_paragraph = False
+                if force_blank:
+                    in_html, html_end, html_close = False, None, ""
+                    yield "", False, False, _state()
+                continue
+            yield line, False, False, _state()
+            prev_is_paragraph = bool(line.strip())
+
+    @staticmethod
+    def _open_leaf_block_at_end(text: str) -> tuple[str, str]:
+        """``(fence marker, HTML end token)`` still open at the end of *text*.
+
+        Either one leaks into whatever the template renders after the summary,
+        and both have been measured doing it on GitHub.
+        """
+        state = ("", "")
+        for _line, _f, _h, state in Orchestrator._scan_leaf_blocks(text):
+            pass
+        return state
+
+    @staticmethod
+    def _open_fence_at_end(text: str) -> str:
+        """The fence marker still holding a code block open at the end of *text*,
+        or "" if none is.
+
+        🔴 THIS REPLACES `text.count("```") % 2`, WHICH COUNTED SUBSTRINGS AND
+        NOT FENCES, and got the answer wrong in both directions:
+
+        * an INDENTED ``` — which `_clean_summary` deliberately preserves,
+          because "an indented block is how captured command output arrives" —
+          is indented-code CONTENT, not a fence. Counting it made the parity
+          odd, so a closer was appended at column 0, where it was not a closer
+          at all but a real OPENER. Driven through GitHub's own renderer that
+          swallowed `## Stats` and the entire merge-boundary footer — including
+          "It never merges and never approves its own work" — into a code block
+          on a delivered PR. No adversarial intent required: a coder pasting
+          pytest output does it.
+        * a ```` ```` ```` opener needs a closer at least as long. A bare ```
+          does not close it, so the "fix" left the block open anyway.
+
+        Implements the rules the renderer actually uses: 0–3 spaces of indent,
+        a closer of the same character and at least the opener's length with
+        nothing but whitespace after it, and (backtick fences only) no backtick
+        in the opener's info string — and, since an HTML block outranks a fence,
+        no fence at all inside one (`_scan_leaf_blocks`).
+        """
+        return Orchestrator._open_leaf_block_at_end(text)[0]
+
+    @staticmethod
+    def _close_orphaned_block(text: str) -> str:
+        """Close a fence — or an HTML block — left open at the end of *text*.
 
         The summary renders BEFORE ## Test evidence, ## Review evidence and ## Stats, so an
-        odd fence count swallows all three reviewer-facing sections — and the truncation
+        unterminated fence swallows all three reviewer-facing sections — and the truncation
         notice itself — into a code block. Found by a review, in the artifact.
+
+        The closer MATCHES the opener (same character, same length): appending a
+        fixed ``` closed neither a ```` block nor a ~~~ one.
+
+        🔴 AND IT CLOSES AT MOST ONE THING, WHICH IS WHY THE ORDER IS NOT A
+        CHOICE. `_scan_leaf_blocks` can only ever have one leaf block open — a
+        fence inside an HTML block is not a fence and an HTML block inside a
+        fence is not a block — so the fence and the HTML token are mutually
+        exclusive and the `elif` is the scanner's invariant, not a preference.
+
+        An unterminated types-1–5 HTML block (`<pre>`, `<!--`, `<?`, `<!X`,
+        `<![CDATA[`) is the same harm by a different route: blank lines do NOT
+        end those, so it eats every section after the summary. Measured — a
+        summary of `<pre>` + one line renders ['Task', 'Acceptance criteria',
+        'Implementation summary'] and nothing else. Types 6 and 7 need nothing
+        appended: a blank line closes them and the template always emits one.
         """
-        return text + _FENCE_CLOSE if text.count("```") % 2 else text
+        fence, html = Orchestrator._open_leaf_block_at_end(text)
+        if fence:
+            return f"{text}\n{fence}"
+        if html:
+            return f"{text}\n{html}"
+        return text
 
     @staticmethod
     def _clean_summary(summary: str) -> str:
@@ -9650,43 +10550,943 @@ SIX of them read a checkpoint and TWO do not — but do
         # paragraph can orphan a fence with no truncation at all (pytest output routinely
         # contains a blank line), and a review proved ## Test evidence and ## Stats then
         # render inside a code block — so the length test happens AFTER it.
-        closed = Orchestrator._close_orphaned_fence(body)
+        closed = Orchestrator._close_orphaned_block(body)
         if len(closed) <= Orchestrator._SUMMARY_MAX_CHARS:
             return closed
         marker = Orchestrator._SUMMARY_TRUNCATED_MARKER.format(
             n=Orchestrator._SUMMARY_MAX_CHARS)
-        # Marker and a possible closing fence are both counted inside the budget; fence
-        # parity is re-checked on the truncated slice, whose own count can differ from
-        # the full body's.
-        room = Orchestrator._SUMMARY_MAX_CHARS - len(marker) - len(_FENCE_CLOSE)
+        # Marker and a possible closing fence are both counted inside the budget; the
+        # open fence is re-scanned on the truncated slice, whose own state can differ
+        # from the full body's.
+        #
+        # The reservation is the LONGEST fence marker anywhere in the body, plus its
+        # newline — not a fixed 4. A closer must be at least as long as its opener, so
+        # a body containing a ```` (or the 50-backtick payload the hostile-input harness
+        # drives) needs more than ``` reserved, and the old constant let the returned
+        # text exceed the declared cap by exactly the difference.
+        #
+        # `_close_orphaned_block` can now also append an HTML end token, so the
+        # reservation takes the LONGER of the two candidates — the longest token
+        # it can emit is `</pre>`. Taking the max rather than the exact one
+        # keeps the budget independent of which block the truncated slice
+        # happens to leave open, which is re-scanned after the cut and need not
+        # match the full body's.
+        longest_fence = max(
+            (len(m.group(2)) for m in (
+                Orchestrator._FENCE_LINE.match(ln) for ln in body.split("\n"))
+             if m),
+            default=len(_FENCE_CLOSE) - 1)
+        reserve = max(longest_fence,
+                      max(len(c) for _s, _e, c in
+                          Orchestrator._HTML_BLOCK_CONDITIONS))
+        room = Orchestrator._SUMMARY_MAX_CHARS - len(marker) - reserve - 1
         body = body[:room].rstrip() + marker
-        return Orchestrator._close_orphaned_fence(body)
+        return Orchestrator._close_orphaned_block(body)
 
-    def _pr_body(self, task: Task, commit, result, *, test_evidence: dict | None = None) -> str:
+    @staticmethod
+    def _reads_as_a_report(text: str) -> bool:
+        """Does this text carry report SIGNAL — something concrete to look at,
+        or work named in the completed past tense?
+
+        SCOPE, STATED EXACTLY, because an earlier version of this docstring
+        claimed a property of the whole classifier that only holds of this
+        helper. `_is_non_report_summary` consults this ONLY to judge the residue
+        left after deferring sentences are set aside; a summary that trips no
+        deferral pattern at all never reaches here and is kept regardless of
+        what this would say about it. That asymmetry is deliberate — requiring
+        report signal from every summary would delete true short ones like "The
+        bug was in the cache layer; it now expires on write.", which names no
+        path, no test and no verb in this list, and is a perfectly good report.
+        The cost of the asymmetry is that a courtesy line has to be caught as a
+        DEFERRAL to be caught at all, which is why `_NON_REPORT_PATTERNS` carries
+        the reader-addressed shapes ("let me know", "I already updated you").
+        A vague-but-genuine "I changed my approach." still ships, and should:
+        it reports on the work, badly, and deleting it is the D4 bug again.
+        """
+        low = (text or "").lower()
+        bare = re.sub(r"[*_`~#>\-\s]+", "", text or "")
+        if len(bare) < Orchestrator._NON_REPORT_MIN_CHARS:
+            return False
+        if re.search(Orchestrator._REPORT_WORK_VERBS, low):
+            return True
+        return any(re.search(p, low)
+                   for p in Orchestrator._REPORT_EVIDENCE_PATTERNS)
+
+    @staticmethod
+    def _is_non_report_summary(cleaned: str) -> bool:
+        """C1: is this text a REPORT of the work, or the coder deferring?
+
+        Two ways to fail: there is nothing left to read (empty, or the
+        everything-was-filtered placeholder), or — after the clauses that DEFER
+        are set aside — nothing that reads as a report remains.
+
+        A deferral phrase condemns only the sentence it sits in. It used to
+        condemn the whole message, which discarded four real summaries of
+        71–167 chars over a single trailing sign-off; the sub-600 band is
+        exactly where real reports live, so the length bar was never the
+        protection it was documented to be. Judging the RESIDUE keeps both
+        directions honest: a message that is nothing but deferral leaves
+        nothing behind, and a report with a deferral tacked on survives on the
+        part that reports.
+        """
+        text = (cleaned or "").strip()
+        if text == Orchestrator._SUMMARY_FILTERED_PLACEHOLDER:
+            return True
+        # Strip markdown furniture before measuring: "**_ _**" is not content.
+        bare = re.sub(r"[*_`~#>\-\s]+", "", text)
+        if len(bare) < Orchestrator._NON_REPORT_MIN_CHARS:
+            return True
+        if len(text) > Orchestrator._NON_REPORT_MAX_CHARS:
+            return False
+        low = text.lower()
+        if not any(re.search(p, low) for p in Orchestrator._NON_REPORT_PATTERNS):
+            return False
+        # Split on sentence ends only where punctuation is followed by space or a
+        # line break, so "fetcher.py:88" and "tests/test_date.py::test_leap"
+        # survive intact — splitting those apart is how evidence goes missing.
+        kept = [
+            s for s in re.split(r"(?<=[.!?;])\s+|\n+", text)
+            if s.strip() and not any(
+                re.search(p, s.lower())
+                for p in Orchestrator._NON_REPORT_PATTERNS)
+        ]
+        return not Orchestrator._reads_as_a_report(" ".join(kept))
+
+    # 🔴 A HEADING INSIDE A CONTAINER IS STILL A HEADING. `> ## X`, `- ## X`,
+    # `1. ## X`, `>> ## X` and `> - ## X` all render as a live <h2> on GitHub —
+    # the blockquote or list wraps it, it does not defuse it. Demotion therefore
+    # strips the container prefix, demotes what is left, and puts the prefix
+    # back: `- ### X` and `> ### X` render as <h3>, which is what we want.
+    _BLOCKQUOTE_PREFIX = re.compile(r"^((?: {0,3}>)+ ?)")
+    _LIST_PREFIX = re.compile(r"^( {0,3}(?:[-*+]|\d{1,9}[.)])[ \t]+)")
+    # A setext underline: `===` (h1) or `---` (h2) under a paragraph line.
+    _SETEXT_UNDERLINE = re.compile(r"^( *)(=+|-+)[ \t]*$")
+    # Lines that are NOT a paragraph, so a `===`/`---` under one is not a setext
+    # heading: list items, blockquotes, ATX headings, fences, and blanks. (After
+    # a blank, `---` is a thematic break; after a list item it is one too.)
+    _NOT_A_PARAGRAPH = re.compile(
+        r"^\s*$|^ {0,3}(?:[-*+>]|\d{1,9}[.)])(?:\s|$)|^ {0,3}#|^ {0,3}(?:`{3,}|~{3,})")
+    # Raw HTML headings. GitHub renders these in a PR body, so `<h2>x</h2>` from
+    # the coder is a live sibling of the template's `##` sections.
+    _HTML_HEADING = re.compile(r"<(/?)[hH]([12])\b")
+
+    # 🔴 THE ONE CELL `_inline_cell` CANNOT GUARD. A markdown link DESTINATION
+    # is not text: `_inline_cell` escapes leading block markers and folds line
+    # breaks, which is right for a cell a reader sees and wrong for a URL —
+    # running it here would corrupt good links and still not make a bad one
+    # safe. So the destination is an ALLOWLIST of the characters a tracker URL
+    # is made of, and anything else is not emitted as a link at all.
+    #
+    # WHITESPACE IS NOT THE WHOLE OF IT, and assuming it was would have left the
+    # channel open. Both of these were driven through `_pr_body` and pandoc
+    # 3.8.3 against the raw interpolation, and both rendered live:
+    #   `http://t/x\n\n## PWNED\n\n[y](http://z`  -> <h2 id="pwned">PWNED</h2>
+    #   `http://t/x)<h1>PWNED</h1>(`              -> <h1>PWNED</h1>, no
+    #                                                whitespace anywhere in it
+    # The second closes the destination with `)` and then writes INLINE raw
+    # HTML, which GitHub renders inside the paragraph. `(`, `)`, `<` and `>` are
+    # therefore out along with whitespace; real Jira and Linear URLs
+    # (`https://acme.atlassian.net/browse/NH-1`,
+    # `https://linear.app/acme/issue/NH-1/add-the-thing`) contain none of them.
+    #
+    # EXPLOITABILITY IS LOW AND IS NOT THE ARGUMENT: this URL is written by the
+    # tracker's own API through intake, not by the coder, so nothing routine
+    # reaches it. It is fixed because the method above it states that EVERY cell
+    # goes through `_inline_cell`, and this one did not — an absolute that is
+    # false is worse than a hole that is documented.
+    _SAFE_LINK_DEST = re.compile(r"^https?://[A-Za-z0-9\-._~:/?#@!$&*+,;=%]*$")
+
+    # A tab advances to the next 4-column stop; CommonMark measures list-item
+    # indentation in COLUMNS, not characters, and so must anything comparing a
+    # line's indent against an item's content column.
+    _TAB_STOP = 4
+
+    @staticmethod
+    def _column_width(s: str) -> int:
+        """The column *s* ends at, tabs advancing to the next 4-column stop."""
+        col = 0
+        for ch in s:
+            col = (col + Orchestrator._TAB_STOP - col % Orchestrator._TAB_STOP
+                   if ch == "\t" else col + 1)
+        return col
+
+    @staticmethod
+    def _indent_width(line: str) -> int:
+        """The column *line*'s first non-whitespace character sits at."""
+        i = 0
+        while i < len(line) and line[i] in " \t":
+            i += 1
+        return Orchestrator._column_width(line[:i])
+
+    @staticmethod
+    def _container_columns(prefix: str) -> "tuple[int, int]":
+        """The two column requirements a MIXED container *prefix* imposes.
+
+        `(outer, inner)`, and there are two of them because a list marker and a
+        blockquote marker are not measured on the same ruler:
+
+        * `outer` — the ABSOLUTE column a line must reach before its own first
+          marker, from the list markers that come BEFORE every quote marker.
+          `- > ` gives 2: `> ## X` at column 0 has left the item.
+        * `inner` — the column a line must reach after its OWN quote markers,
+          measured from the end of them, from the list markers that come after
+          the last quote marker. `> - ` gives 2: `> ## X` reaches 0 there and
+          `>   ## X` reaches 2.
+
+        🔴 ONE ABSOLUTE COLUMN FOR BOTH WAS WRONG, AND THE SWEEP CAUGHT IT
+        INTRODUCING LEAKS. `> - ```py` and `  > ## X` both end at column 4, so
+        an absolute comparison calls the heading INSIDE the item — while a
+        renderer strips `  > ` first and then finds the heading at column 0 of
+        the quote, two columns short. Measured with pandoc 3.8.3 on a
+        14,196-shape sweep: the absolute form added 16 leaks that the tree
+        before it did not have. Relative is also why nothing here has to
+        special-case `>x` versus `> x`: the marker's optional space is consumed
+        by the marker on both sides of the comparison.
+
+        LIMIT, stated rather than found later: list markers BETWEEN two quote
+        markers (`- > - > `) contribute to neither requirement, which is the
+        permissive direction — the same direction the code had for every mixed
+        prefix before this.
+        """
+        pos = outer = inner = col = 0
+        seen_quote = False
+        while pos < len(prefix):
+            m = Orchestrator._BLOCKQUOTE_PREFIX.match(prefix[pos:])
+            if m:
+                seen_quote, col, inner = True, 0, 0
+                pos += len(m.group(1))
+                continue
+            m = Orchestrator._LIST_PREFIX.match(prefix[pos:])
+            if not m:
+                break
+            col += Orchestrator._column_width(m.group(1))
+            if seen_quote:
+                inner = col
+            else:
+                outer = col
+            pos += len(m.group(1))
+        return outer, inner
+
+    @staticmethod
+    def _still_in_mixed_container(line: str, outer: int, inner: int) -> bool:
+        """Does *line* still satisfy both requirements from `_container_columns`?
+
+        A line with nothing past its quote markers (`>`, `  >  `) is a BLANK
+        LINE inside the quote, and a blank line does not end a list item — so
+        the inner requirement does not apply to it. The pandoc pin rejected the
+        first version of this rule, which ended `> - ```py` on its own `>`.
+        """
+        m = Orchestrator._BLOCKQUOTE_PREFIX.match(line)
+        if outer:
+            j = len(line) - len(line.lstrip(" \t"))
+            if Orchestrator._column_width(line[:j]) < outer:
+                return False
+        if inner:
+            tail = line[len(m.group(1)):] if m else line
+            if not tail.strip():
+                return True
+            pad = len(tail) - len(tail.lstrip(" \t"))
+            if Orchestrator._column_width(tail[:pad]) < inner:
+                return False
+        return True
+
+    @staticmethod
+    def _dedent_to(line: str, col: int) -> str:
+        """*line* with its first *col* COLUMNS of leading whitespace removed.
+
+        A tab that straddles the boundary is re-emitted as the spaces that fall
+        past it, which is what a renderer does with a partially consumed tab.
+        """
+        i = seen = 0
+        while i < len(line) and seen < col and line[i] in " \t":
+            seen = (seen + Orchestrator._TAB_STOP - seen % Orchestrator._TAB_STOP
+                    if line[i] == "\t" else seen + 1)
+            i += 1
+        return " " * max(0, seen - col) + line[i:]
+
+    @staticmethod
+    def _split_container(line: str) -> tuple[str, str, bool]:
+        """Split a line into (container prefix, remainder, prefix_has_list_marker).
+
+        The prefix is EVERY container marker a renderer strips before deciding
+        whether what follows is a heading — blockquote markers and list markers,
+        in whatever order and however many. Re-emitting it verbatim keeps the
+        coder's structure intact while the heading inside it gets demoted.
+
+        🔴 IT USED TO STRIP AT MOST ONE LIST MARKER, AND THAT WAS A LEAK. A
+        renderer nests containers; this stripped one blockquote run and one list
+        marker and stopped, so the remainder handed to the ATX regex STILL began
+        with a marker and never matched:
+
+            `_split_container('- - ## X') -> ('- ', '- ## X', True)`
+
+        Driven through `_pr_body` and GitHub's `/markdown` (mode gfm),
+        `- - ## PWNED`, `- > ## PWNED` and `- - PWNED` + an indented `====` each
+        rendered a live `<h2>PWNED</h2>`, a sibling of `## Task` and `## Stats`.
+        The setext case failed by a second route as well: the one-marker
+        remainder `- PWNED` matches `_NOT_A_PARAGRAPH`, so the underline was
+        read as not binding to a paragraph and the demotion branch was skipped
+        entirely. Looping fixes both, because after the loop the remainder is
+        what the renderer actually tests. A coder writing a nested bullet list
+        with a heading in it does this with no adversarial intent.
+        """
+        prefix = ""
+        has_list = False
+        while True:
+            m = Orchestrator._BLOCKQUOTE_PREFIX.match(line)
+            if m:
+                prefix, line = prefix + m.group(1), line[len(m.group(1)):]
+                continue
+            m = Orchestrator._LIST_PREFIX.match(line)
+            if m:
+                prefix, line = prefix + m.group(1), line[len(m.group(1)):]
+                has_list = True
+                continue
+            return prefix, line, has_list
+
+    # Everything a renderer treats as a LINE ENDING. CommonMark names only
+    # `\n`/`\r`/`\r\n`; the rest are folded to a space anyway because they are
+    # whitespace either way and folding them cannot change what renders.
+    _LINE_BREAKS = re.compile(r"[\r\n\v\f  ]+")
+    # What a renderer gives BLOCK meaning to at the START of a line's content:
+    # ATX hashes, a blockquote marker, a bullet or ordered list marker, a fence,
+    # a thematic break or a setext underline. Each alternative carries the
+    # renderer's OWN follow condition, so ordinary prose is not escaped: `*x*`
+    # keeps its emphasis and `-1 regression` keeps its minus, because neither
+    # starts a block. A backslash escapes ASCII punctuation in CommonMark; an
+    # ordered marker starts with a DIGIT, which cannot be escaped, so its
+    # delimiter is escaped instead (`1\. x`).
+    _LEADING_BLOCK = re.compile(
+        r"^(?:\d{1,9}(?P<delim>[.)])(?=[ \t]|$)"
+        r"|#{1,6}(?=[ \t]|$)"
+        r"|[-*+](?=[ \t]|$)"
+        r"|>"
+        r"|`{3,}|~{3,}"
+        r"|[-=_*]{2,}[ \t]*$)")
+
+    @staticmethod
+    def _inline_cell(value, limit: "int | None" = 160) -> str:
+        """*value* rendered onto exactly ONE line of the PR body, ``limit`` chars
+        (``None`` = do not truncate, for the cells a reviewer must read whole).
+
+        🔴 THE SECTIONS OUTSIDE THE SUMMARY HAVE NO DEMOTER, AND THEY CARRY
+        MODEL TEXT. `_reformat_summary_markdown` guards `## Implementation
+        summary` and nothing else, so every value interpolated into
+        `## Review evidence` or `## ⚠️ Assumptions & Open Questions` reaches
+        GitHub verbatim. A single `\\n` inside one drops the remainder to column
+        0, where `#` is a real ATX heading — driven through `_pr_body` and
+        `/markdown` (mode gfm), a reviewer verdict whose ``evidence`` field
+        contained a newline rendered a live `<h1>MERGED AND APPROVED BY
+        NO_HUMAN</h1>` INSIDE the section headed `## Review evidence`. The
+        reviewer prompt asks the model to QUOTE decisive lines, so multi-line
+        evidence is the expected shape, not a hostile one.
+
+        Three things happen here, and each was measured to be necessary on its
+        own through GitHub's renderer:
+
+        * line breaks fold to spaces — nothing can reach column 0;
+        * a leading block marker is backslash-escaped — flattening alone still
+          left `  - # x` rendering as a live heading, because the value sits at
+          the START of a list item's content, which is a line start too. `\\#`
+          renders as a plain `#`, so a finding that genuinely begins with one
+          still reads correctly;
+        * `<h1>`/`<h2>` are demoted — raw HTML inline in a list item is live
+          (`- text <h1>PWNED</h1>` renders `<h1>`, measured).
+
+        Demotion is length-preserving (`<h1` -> `<h3`), so the slice is applied
+        last and `limit` is exact.
+        """
+        text = Orchestrator._LINE_BREAKS.sub(" ", str(value)).strip()
+        m = Orchestrator._LEADING_BLOCK.match(text)
+        if m:
+            cut = m.end("delim") - 1 if m.group("delim") else 0
+            text = text[:cut] + "\\" + text[cut:]
+        text = Orchestrator._demote_html_headings(text)
+        return text if limit is None else text[:limit]
+
+    @staticmethod
+    def _demote_html_headings(line: str) -> str:
+        """`<h1>`/`<h2>` -> `<h3>`/`<h4>`, everywhere in *line*, with no
+        exemption for anything.
+
+        🔴 THERE USED TO BE A CODE-SPAN EXEMPTION, AND IT WAS A LEAK. It split
+        the line on ``_CODE_SPAN = r"(`+[^`]*?`+)"`` and left the odd parts
+        alone, so a coder writing about `` `<h2>` `` was not misquoted. But that
+        pattern does not require the closing backtick run to be the same length
+        as the opening one and CommonMark does, so ``` ``<h1>PWNED</h1>` ```
+        was a code span HERE and not a code span on GITHUB: the `<h1>` was
+        parked in the exempt partition and rendered live, above every template
+        section, on the every-delivered-PR channel. Confirmed through
+        `/markdown` (mode gfm) at both payload positions, for `<h1>` and `<h2>`.
+
+        The exemption is gone rather than repaired. Any parser here is a SECOND
+        implementation of CommonMark's code-span rule, and every place the two
+        disagree in the permissive direction is this bug again; deleting it
+        leaves nothing to disagree with. The price is stated plainly, because it
+        is now a real behaviour: a coder writing about `` `<h2>` `` sees
+        `` `<h4>` `` in the PR body — a misquote inside a code span, where the
+        text is display either way.
+        """
+        return Orchestrator._HTML_HEADING.sub(
+            lambda m: f"<{m.group(1)}h{int(m.group(2)) + 2}", line)
+
+    @staticmethod
+    def _reformat_summary_markdown(text: str) -> str:
+        """H13: make the coder's own markdown survive being embedded in ours.
+
+        THE GUARANTEE, stated so it can be tested: nothing the coder writes may
+        render as an `<h1>` or an `<h2>`. The template's own sections (`## Task`,
+        `## Test evidence`, `## Stats`) are `<h2>`, so a coder heading at that
+        level or above stops being part of the summary and becomes a top-level
+        section of the PR — the outline then lies about what no_human is
+        asserting. Consecutive `CRITERION: …` lines are the second collision:
+        they are lines of one markdown paragraph and render as one run-on line.
+
+        🔴 FOUR WAYS THE PREVIOUS VERSION DID NOT HOLD ITS OWN DOCSTRING, all
+        four confirmed by driving `_pr_body` through GitHub's `/markdown`:
+
+        * `Heading\\n====` and `Heading\\n----` are SETEXT headings and became a
+          live `<h1>` and `<h2>`. The old code only ever looked for `#`.
+        * `<h2>Heading</h2>` is raw HTML, which GitHub renders, and passed
+          through untouched.
+        * `# Heading` was demoted by exactly one, to `## Heading` — the precise
+          sibling of `## Task` and `## Stats` the docstring promised to prevent.
+          Demotion is now by TWO, so the coder's top level lands at `###`, one
+          below `## Implementation summary`, and every relative level the coder
+          used is preserved rather than collapsed.
+        * a FOUR-SPACE-INDENTED ``` desynced the tracker: `line.lstrip()` treats
+          indented-code CONTENT as a fence, so everything after it was believed
+          to be inside a code block and escaped demotion. `_clean_summary`
+          preserves that indentation on purpose ("an indented block is how
+          captured command output arrives"), so pasted pytest output triggers it
+          with no adversarial intent at all.
+
+        🔴 AND THE PREVIOUS VERSION'S DOCSTRING DID NOT HOLD EITHER. It claimed
+        the fence tracking could only ever differ from the renderer "SAFELY …
+        at worst `### x` inside a code block, never a heading escaping". That
+        was a guarantee about a belief, and the belief could be wrong in the
+        other direction:
+
+            <div>
+            ```
+            <h1>PWNED</h1>
+            </div>
+
+        GitHub reads all four lines as ONE HTML block — a type-6 block ends only
+        at a blank line — so the ``` is literal text, no fence ever opens, and
+        the `<h1>` is live. This code read the ``` as an opener and skipped
+        demotion for everything after it. OVER-detecting a fence is therefore a
+        leak too, and no amount of agreeing with CommonMark's *fence* rules
+        fixes it, because the disagreement is about a construct that outranks
+        fences entirely.
+
+        🔴 AND THAT DOCSTRING WAS WRONG TOO — THIS PARAGRAPH REPLACES IT. It
+        said ATX and setext could keep depending on the fence belief because
+        "markdown is not parsed inside a fence, and it is not parsed inside an
+        HTML block either", so a fence believed where GitHub saw an HTML block
+        was harmless. The payload it was measured on kept the heading INSIDE the
+        misdetected block. One blank line moves it OUT:
+
+            ### The component      <- not a paragraph, so on GitHub…
+            <UserCard />           <- …a type-7 HTML block starts here
+            ```jsx                 <- literal text there, an OPENER here
+            <UserCard name="a" />
+                                   <- ENDS the block on GitHub. Markdown is live
+            ## Notes                  again — a coder <h2> sibling of `## Task`,
+                                      undemoted, because THIS code is still
+            renders fine.             inside a fence that never opened.
+
+        Both harms at once: the heading escaped, and the closer appended for the
+        phantom fence was a real opener that swallowed `## Stats` and the merge-
+        boundary footer. Measured for six predecessors (ATX heading, setext
+        underline, thematic break, list item, blockquote, table row).
+
+        WHAT IS ACTUALLY GUARANTEED NOW, and why the two halves are asymmetric:
+
+        * RAW HTML HEADINGS: `_demote_html_headings` runs on EVERY line, with no
+          fence condition at all — see the loop below. So `<h1>`/`<h2>` cannot
+          survive anywhere in the summary, whatever this function believes about
+          fences, HTML blocks, or containers. The cost is a cosmetic misquote: a
+          raw `<h1>` inside a genuine fence prints as `<h3>`, and it was display
+          text either way.
+          MEASURED HONESTLY, because "load-bearing" was claimed here before it
+          was checked. Against `tests/test_pr_body_truthfulness.py` plus
+          `tests/test_pr_hygiene.py` — the count is deliberately NOT quoted
+          here, because a copied number ages out of step with the suite and one
+          did: this bullet read "(257 tests)" long after the suite had grown
+          past it, so the citation named a measurement no tree could reproduce
+          while the conclusion below stayed true. Re-derive with
+          `pytest tests/test_pr_body_truthfulness.py tests/test_pr_hygiene.py`.
+          Gating this on `not in_fence`
+          leaves ALL of them green — after the fix below there is no measured
+          input where this code believes a fence GitHub does not see, so that
+          half of the layer has no live payload. Gating it additionally on
+          `not in_html` reddens 10. The unconditional form is kept as the layer
+          that depends on no belief at all: a choice about the shapes nobody has
+          driven yet, NOT a claim about a shape that has been.
+        * ATX AND SETEXT: still skipped inside a believed fence, because a `#`
+          comment in pasted shell output is not a heading and must not grow
+          hashes. Demoting them unconditionally was the other candidate fix and
+          it was measured before being rejected: it does not cost only
+          cosmetics. On pasted evidence it rewrites `# set up the env` to
+          `### set up the env`, and on a coverage table or a YAML document it
+          DELETES a line — `Name  Stmts  Miss` + `--------` becomes
+          `#### Name  Stmts  Miss` with the rule consumed as a setext underline.
+          Corrupting pasted output is the same class of harm this function
+          exists to prevent, so the dependency is kept and the belief is made
+          exact instead.
+        * THE BELIEF ITSELF: the one question `_scan_leaf_blocks` could not
+          answer — may a type-7 HTML block start here, or is the line above it a
+          paragraph? — is no longer answered. It is removed: an ambiguous type-7
+          start is followed by a synthetic BLANK LINE, which ends a type-7 block
+          and ends a paragraph, so both readings are in the same state from the
+          next line on. The scanner yields that blank line and this loop emits
+          it, so the text GitHub renders is the disambiguated one.
+
+        Fence tracking follows the renderer's own rules via
+        `_FENCE_LINE`/`_open_fence_at_end`. THE LIMITS THAT REMAIN, stated as
+        limits and not promised away — there are FOUR, and an earlier version
+        of this paragraph named only the first while the second was the one
+        actually leaking:
+
+        1. A fence indented into a list item or a blockquote (`    ``` ` under
+           `- item`, `> ``` `) reads here as not-a-fence. That is the direction
+           where GitHub has a fence and this code does not, so an unclosed one
+           would not get its closer. Driven at both payload positions, the shape
+           did NOT leak — `- I ran it:` plus a four-space-indented, unclosed ```
+           renders `## Stats` and the merge-boundary footer live on GitHub — and
+           16 further shapes (`[]` intruders, `Stats` present in all 16) agree.
+           That is a measurement of those inputs and nothing more.
+        2. `_HTML_BLOCK_TAGS` has to equal GitHub's type-6 list, and GitHub's
+           list is not the spec's. Two names diverged when it was last measured
+           (`search`, `source` — see the comment on the constant), and the
+           `search` direction WAS a live leak: it skipped the disambiguating
+           blank line while GitHub kept the paragraph open. The list is now
+           pinned by `test_the_html_block_tag_list_matches_github`, which is
+           network-gated like every other renderer test here — so a renderer or
+           spec move is caught the next time that test is RUN, not the next time
+           the code is imported. Nothing hermetic can catch it: an offline
+           oracle for "what does GitHub do" is a third markdown parser. And the
+           probe universe is 81 NAMES, not every tag: a name outside it that
+           GitHub starts a block for and this list omits is the `source` defect
+           again, narrowed rather than eliminated. It is closed the same way a
+           new payload is — by adding the name to `_TAG_PROBE_UNIVERSE`.
+        3. AN ATX HEADING INDENTED FOUR OR MORE COLUMNS, INSIDE AN OPEN LIST
+           ITEM, IS NOT DEMOTED — AND IT IS LIVE. This is a KNOWN OPEN HOLE, not
+           a shape nobody has driven. `atx` below anchors at `^( {0,3})(#{1,6})`
+           and four columns is right for the top level, where indent 4 is an
+           indented CODE block and `## X` is inert (measured). It is wrong
+           inside a list item, where the four columns are counted from the
+           item's content column: `- item` + a blank + `    ## PWNED` renders
+           `<h2 id="pwned">PWNED</h2>` inside the `<li>` — measured through
+           `_pr_body` and pandoc 3.8.3, with no fence involved anywhere. Every
+           shape at indent 1-3 is demoted.
+           🔴 THE SENTENCE THAT USED TO BE HERE WAS FALSE, AND FALSE IN THE WAY
+           A SCOPE CLAIM USUALLY IS. It read: "a 5472-shape sweep put the leak
+           count at 2070 before this round and 460 after, and ALL 460 ARE THIS
+           ONE SHAPE." The count was real; the quantifier was not. It was a
+           residue measured on one sweep, restated as a statement about every
+           shape — on a branch whose whole subject is not asserting more than
+           was measured. A 14,196-shape sweep of the same family (opener x
+           code-line prefix x heading-line prefix x separator x closed/unclosed,
+           EVERY combination, each driven through `_pr_body` and read by pandoc
+           3.8.3) says otherwise: 793 residues on the tree before this commit,
+           of which 649 are NOT this shape. What that sweep measures now, after
+           the mixed-container fix above, is 299 residues, 155 of them outside
+           this limit and every one of those 155 the shape named in limit 4.
+           The residue IS a strict subset of what leaked before — 0 shapes leak
+           that did not leak before — and that half of the old claim survives
+           re-measurement.
+           Pinned by `test_the_indent_four_hole_in_the_demoter_is_exactly_where_it_is_documented`,
+           which asserts the CURRENT behaviour so that closing this — or
+           widening it — is a red test and not a silent change.
+           WHY IT IS NOT FIXED HERE: closing it needs this function to carry
+           LIST-ITEM state across lines — an open item's content column, its
+           blank-line and lazy-continuation rules — which is a list parser, not
+           a line rule, and the one cheap alternative (demote any indented `#`)
+           would corrupt the indented command output `_clean_summary` exists to
+           preserve. It is a residual gap in a NEW guard, not a regression:
+           before this guard existed nothing was demoted at all.
+        4. THE CODER'S OWN FENCE CLOSER, LEFT BEHIND WHEN ITS CONTAINER ENDS,
+           IS RE-READ AS A FRESH OPENER. When a container fence's item ends —
+           because a line failed the content-column or the quote-depth test —
+           the scanner falls through and re-scans that line as ordinary
+           markdown. A closing ``` written at columns 0-3 then matches
+           `_FENCE_LINE` as an OPENER, and everything after it is believed
+           in-fence and skips demotion:
+
+               - > ```python      <- container fence opens
+                 print(1)         <- no `>`: the quote ended, and the fence
+                 ```                 with it — but this line opens a NEW one
+               ## PWNED           <- believed in-fence; live <h2> on GitHub
+
+           Measured through `_pr_body`, pandoc 3.8.3 AND GitHub's `/markdown`:
+           `<h2>PWNED</h2>` renders as a sibling of `## Task` and `## Stats`,
+           and for 195 of the 14,196 shapes the same phantom fence swallows
+           `## Stats` and the merge-boundary footer as well. This is the WHOLE
+           of the residue outside limit 3 — 155 shapes, every one of them a
+           payload that writes a closer — and it is unchanged by the
+           mixed-container fix above, which is why it is disclosed rather than
+           bundled into it: it is a different mechanism (the fall-through
+           re-scan, not the container rule) and closing it is its own change
+           with its own over-correction direction to measure. Pinned by
+           `test_the_orphaned_closer_hole_is_exactly_where_it_is_documented`,
+           which asserts the CURRENT behaviour, so closing it is a red test.
+
+        No claim is made about the shapes nobody has driven; the paragraph below
+        says how they get covered.
+
+        NOT IDEMPOTENT, said rather than left unsaid, and measured: a second
+        pass over this function's own output emits a SECOND blank line. The
+        disambiguation looks at the line ABOVE the tag, which the first pass did
+        not touch, so it is still a paragraph and the blank fires again — on top
+        of the one already there. `'…\\n<UserCard />\\n\\nand it renders fine.'`
+        becomes `'…\\n<UserCard />\\n\\n\\nand it renders fine.'`, for all five
+        shapes driven. It changes nothing that renders (two blank lines end the
+        same blocks one does) and it is harmless in BOTH call graphs there are —
+        `_summary_section` and `_quote_agent_reason` each call it exactly once,
+        on `_clean_summary`'s output — but it is recorded here so a future
+        caller does not discover it by shipping it. ("the only call graph there
+        is" is what this said while the second caller was already in the tree,
+        four hundred lines up: a docstring asserting a whole-file property that
+        nothing in the file establishes. `grep -n _reformat_summary_markdown
+        src/no_human/core/orchestrator.py` is the check, and it is why the
+        sentence now names the callers instead of counting them.)
+
+        WHAT THE EVIDENCE ACTUALLY IS, because three rounds were lost to a
+        docstring claiming more than had been driven: the two bullets of "WHAT
+        IS ACTUALLY GUARANTEED NOW" are reasoning plus a measurement of the
+        specific payloads named in them, and the two numbered limits are
+        measurements of the specific inputs named in them.
+        The GUARANTEE in the first paragraph is a property under test, not a
+        proof — it is asserted against GitHub's own renderer for every payload
+        in `_HEADING_PAYLOADS`, at BOTH positions in the summary, and the same
+        payloads run hermetically against a scanner the same test pins to
+        GitHub's answer. A shape nobody has thought of is not covered by any of
+        that, and adding one to `_HEADING_PAYLOADS` is how it becomes covered —
+        with one exception now recorded rather than assumed: a payload whose
+        harm is NOT a leaked heading (the tag-list defect corrupted pasted
+        evidence and leaked nothing) passes every heading assertion, so it needs
+        its own artifact test —
+        `test_pasted_evidence_is_not_rewritten_behind_a_diverging_tag` is the
+        one that exists.
+        """
+        out: list[str] = []
+        for original, in_fence, _in_html, _open in (
+                Orchestrator._scan_leaf_blocks(text)):
+            # 🔴 UNCONDITIONAL, AND OUTSIDE EVERY BRANCH BELOW — including the
+            # fence marker lines and the lines of an HTML block. This is the
+            # whole of the raw-HTML guarantee: there is no path through this
+            # loop that can park an `<h1>` somewhere the rewrite does not reach,
+            # so it does not matter whether the block state above is right.
+            line = Orchestrator._demote_html_headings(original)
+            # ATX and setext, by contrast, ARE skipped inside a fence: `#` in
+            # pasted shell output is a comment, not a heading, and must not grow
+            # hashes — and demoting them anyway deletes lines from pasted
+            # coverage tables and YAML, which is measured in the docstring. That
+            # asymmetry was once justified here as "safe in both directions of a
+            # wrong belief"; IT IS NOT, and one blank line was the counter-
+            # example (docstring again). What makes it sound is that the belief
+            # no longer has an unanswerable question in it: `_scan_leaf_blocks`
+            # disambiguates a type-7 start instead of guessing at it.
+            # `_in_html` is deliberately NOT
+            # honoured here: demoting an inert `#` inside an HTML block costs a
+            # cosmetic misquote, and not demoting one would put the belief back
+            # on the leak path.
+            if in_fence:
+                out.append(line)
+                continue
+            prefix, rest, _has_list = Orchestrator._split_container(line)
+            # 🔴 UP TO THREE SPACES OF INDENT IS STILL AN ATX HEADING. The
+            # anchor used to be `^(#{1,6})`, so `   # Heading` was not demoted at
+            # all and GitHub rendered it as a live <h1>. It looked covered
+            # because `_summary_section` does `final_text.strip()`, which removes
+            # the indent from the FIRST line only — a payload placed at the top
+            # of the summary passed for a reason that has nothing to do with this
+            # function. Anywhere below line one it leaked, and a coder indenting
+            # a heading inside a numbered write-up does it by accident.
+            # The tail alternation is CommonMark's: a space/tab then content, or
+            # nothing at all. `#{1,6}\s+\S` missed the EMPTY heading — a bare `#`
+            # one paragraph down renders `<h1></h1>`, verified through
+            # `/markdown`. No coder text escapes through it (there is none), so
+            # it is outline pollution rather than a leak, but the outline is the
+            # thing this function protects. `#foo` still matches neither branch,
+            # which is also CommonMark: without the space it is not a heading.
+            atx = re.match(r"^( {0,3})(#{1,6})(\s+\S|[ \t]*$)", rest)
+            if atx:
+                indent, hashes = atx.group(1), atx.group(2)
+                out.append(prefix + indent + "#" * min(6, len(hashes) + 2)
+                           + rest[len(indent) + len(hashes):])
+                continue
+            # A setext underline turns the line ABOVE into a heading, so rewrite
+            # that line as an already-demoted ATX heading and drop the underline.
+            # `=` is h1 and `-` is h2, so they become `###` and `####` — the same
+            # +2 the ATX branch applies.
+            #
+            # The underline only binds when it sits in the SAME container as the
+            # paragraph above it, and GitHub is the authority on that:
+            #   `- item` + `---` at column 0   -> a thematic break, NOT a heading
+            #   `- PWNED` + `  ====` (indented) -> a heading inside the list item
+            #   `> PWNED` + `> ====`            -> a heading inside the quote
+            # so the blockquote markers must match, and an underline under a list
+            # item must be indented into that item's content.
+            setext = Orchestrator._SETEXT_UNDERLINE.match(rest)
+            if setext and out and not _has_list:
+                prev_prefix, prev_rest, prev_has_list = (
+                    Orchestrator._split_container(out[-1]))
+
+                def _bq(s: str) -> str:
+                    m = Orchestrator._BLOCKQUOTE_PREFIX.match(s)
+                    return m.group(1) if m else ""
+
+                indent = len(setext.group(1))
+                binds = (indent >= 1) if prev_has_list else (indent <= 3)
+                if (_bq(line) == _bq(out[-1]) and binds and prev_rest.strip()
+                        and not Orchestrator._NOT_A_PARAGRAPH.match(prev_rest)):
+                    out.pop()
+                    level = "###" if setext.group(2)[0] == "=" else "####"
+                    # `out[-1]` was demoted on its own pass, so `prev_rest`
+                    # carries no `<h1>`/`<h2>` and re-demoting it here would be
+                    # a no-op that reads like a second guarantee.
+                    out.append(prev_prefix + level + " " + prev_rest.strip())
+                    continue
+            if re.match(r"^\s*criterion\b\s*\d*\s*[:\-–]", line, re.I):
+                out.append("- " + line.lstrip())
+                continue
+            # `line` is the demoted form; every `out.append` in this loop, in
+            # every branch including the two fence ones above, appends it or
+            # something derived from it.
+            out.append(line)
+        return "\n".join(out)
+
+    def _summary_section(self, result) -> str:
+        """The rendered body of `## Implementation summary` (C1 + H13)."""
+        cleaned = self._clean_summary((getattr(result, "final_text", "") or "").strip())
+        if self._is_non_report_summary(cleaned):
+            return self._NO_SUMMARY_BLOCK
+        return self._reformat_summary_markdown(cleaned)
+
+    def _pr_body(
+        self, task: Task, commit, result, *, test_evidence: dict | None = None,
+        repo: "GitRepo | None" = None, base: str | None = None,
+        branch: str | None = None, attempt_n: int | None = None,
+    ) -> str:
         # Short and to the point: no boilerplate, no product name, no verbose
         # dump. The title is the PR title; the body is criteria + a brief summary
         # + the evidence a reviewer actually needs.
-        criteria = "\n".join(f"- {c}" for c in task.acceptance_criteria) or "- (none stated)"
-        summary = (result.final_text or "").strip()
-        summary_short = self._clean_summary(summary)
+        #
+        # ``repo``/``base`` are what make the Stats line true for a MULTI-COMMIT
+        # branch (C2) and what let the review-evidence section prove its rounds
+        # judged THIS head (C4). Both are optional and every use of them is
+        # guarded: a body must still render with neither.
+        #
+        # 🔴 EVERY TEXT CELL BELOW GOES THROUGH `_inline_cell`, AND THE REVIEW
+        # THAT FOUND TWO OF THEM LISTED ONLY TWO. Driven through `/markdown`
+        # (mode gfm) after the two named ones were fixed, the SIX remaining raw
+        # carriers in this method each still rendered a live
+        # `<h1>MERGED AND APPROVED BY NO_HUMAN</h1>`: `task.title`, each
+        # acceptance criterion, `task.external_id`, each abandoned-PR URL, and
+        # both `test_evidence` channels. Title and criteria are model-authored
+        # outright — intake auto-sharpens them, which is why
+        # `original_criteria` exists at all — so fixing the two named sites and
+        # leaving these would have closed a quarter of one defect. `limit=None`
+        # where a reviewer must read the cell whole; nothing here is truncated
+        # that was not truncated before.
+        #
+        # THE ONE EXCEPTION, NAMED RATHER THAN LEFT TO CONTRADICT THE SENTENCE
+        # ABOVE: the ticket LINK DESTINATION in `_ticket_line`. A URL is not a
+        # text cell and `_inline_cell` would corrupt a good one, so it is guarded
+        # by `_SAFE_LINK_DEST` instead — a different mechanism, for a different
+        # kind of value. It was raw until this round, and it leaked.
+        criteria = "\n".join(
+            f"- {self._inline_cell(c, None)}" for c in task.acceptance_criteria
+        ) or "- (none stated)"
+        stats = self._branch_stats(repo, base, commit)
+        head_sha = (getattr(commit, "sha", "") or "").strip()
         return (
-            f"## Task\n{task.title}\n\n"
+            f"{self._ticket_line(task)}"
+            f"## Task\n{self._inline_cell(task.title, None)}\n\n"
             f"## Acceptance criteria\n{criteria}\n\n"
             f"{self._assumptions_section(task)}"
-            f"## Implementation summary\n{summary_short}\n\n"
+            f"{self._superseded_section(task)}"
+            f"## Implementation summary\n{self._summary_section(result)}\n\n"
             f"{self._test_evidence_section(test_evidence)}"
-            f"{self._review_evidence_section(task)}"
-            f"## Stats\n{commit.files_changed} files, "
-            f"+{commit.insertions}/-{commit.deletions}, {result.num_turns} turns."
+            f"{self._review_evidence_section(task, head_sha=head_sha, repo=repo)}"
+            f"## Stats\n{stats['files_changed']} files, "
+            f"+{stats['insertions']}/-{stats['deletions']}, {result.num_turns} turns."
+            f"{self._merge_boundary_footer(task, branch=branch, base=base, attempt_n=attempt_n)}"
+        )
+
+    # ------------------------- PR body: the pieces ------------------------- #
+
+    def _ticket_line(self, task: Task) -> str:
+        """H9: name the tracker issue this PR answers, on line one.
+
+        A reviewer landing on the PR from the forge had no way back to the
+        ticket — the body never mentioned it even though `task.external_id`
+        was set. Linked when intake recorded a URL for it (jira/linear context),
+        plain text otherwise: a fabricated link is worse than none.
+
+        THE OTHER HALF — telling the TICKET about the PR — is already wired, and
+        NOT here. `jira_poll.sync_statuses` / `linear_poll.sync_statuses` post
+        the PR URL on AWAITING_APPROVAL (`intake/jira_poll.py`'s `_pr_url_for` +
+        `adapter.comment`), gated on `write_back` and made idempotent by the
+        `nh_synced_status` marker. An audit read `comment()` as having no
+        non-test caller — it is called through `asyncio.to_thread`, so a
+        `.comment(` grep misses it. Do not add a second call from `_finalize`:
+        it would be keyed differently from that marker and double-post.
+        """
+        key = self._inline_cell(task.external_id or "", None)
+        if not key:
+            return ""
+        ctx = task.context or {}
+        url = ""
+        for source in ("jira", "linear"):
+            block = ctx.get(source)
+            if isinstance(block, dict) and str(block.get("url") or "").startswith("http"):
+                url = str(block["url"])
+                break
+        if not url:
+            return f"**Ticket:** {key}\n\n"
+        if Orchestrator._SAFE_LINK_DEST.match(url):
+            return f"**Ticket:** [{key}]({url})\n\n"
+        # Not a link destination we are willing to emit raw — say so, and put
+        # the value through the same neutraliser as every other cell. Dropping
+        # it silently would hide a tracker record that is already malformed.
+        return (f"**Ticket:** {key} (unlinkable tracker URL: "
+                f"{self._inline_cell(url, None)})\n\n")
+
+    def _branch_stats(self, repo, base: str | None, commit) -> dict:
+        """C2: the diff a reviewer will actually see — branch vs the review base.
+
+        ``commit`` describes ONE commit. On a resumed or multi-commit attempt
+        that is a fraction of the PR: a real body read "1 files, +0/-1" for a
+        PR of 4 files and +166/-6, off by two orders of magnitude, and the
+        human-gated-CI resume path fabricates a zeroed commit outright. The
+        review base is the same merge-base the reviewer read and the same range
+        the forge renders, so the three finally agree.
+
+        Best-effort: any git trouble falls back to the commit's own numbers
+        (the previous behaviour) rather than blocking the PR.
+        """
+        fallback = {
+            "files_changed": getattr(commit, "files_changed", 0),
+            "insertions": getattr(commit, "insertions", 0),
+            "deletions": getattr(commit, "deletions", 0),
+        }
+        if repo is None:
+            return fallback
+        try:
+            whole = repo.head_commit(self._review_base(repo, base))
+            return {
+                "files_changed": whole.files_changed,
+                "insertions": whole.insertions,
+                "deletions": whole.deletions,
+            }
+        except Exception as exc:  # noqa: BLE001 — stats never block a PR
+            log.warning("branch-vs-base stats failed (%s); using the last commit's", exc)
+            return fallback
+
+    def _superseded_section(self, task: Task) -> str:
+        """C5: link the drafts earlier attempts abandoned.
+
+        One task produced three open draft PRs, none referencing the others,
+        each body asserting its criteria met. The live one now says which
+        corpses are its own.
+        """
+        urls = [u for u in ((task.context or {}).get("abandoned_pr_urls") or []) if u]
+        if not urls:
+            return ""
+        lines = "\n".join(f"- {self._inline_cell(u, None)} — earlier attempt, abandoned"
+                          for u in urls[:6])
+        return ("## Superseded PRs\nEarlier attempts on this task opened these "
+                "drafts and did not finish them:\n" + lines + "\n\n")
+
+    def _merge_boundary_footer(
+        self, task: Task, *, branch: str | None = None, base: str | None = None,
+        attempt_n: int | None = None,
+    ) -> str:
+        """H8: state the never-merge boundary on the artifact that asserts it.
+
+        The boundary is enforced in code — `gh pr merge` is denied by the tool
+        guard, `--draft` is hardcoded, GitLab gets `--no-merge` — but ten real
+        PR bodies contained the words merge, approve and draft exactly zero
+        times, so the human reading one had to already know. Also carries the
+        attempt counter and the branch pair, which nothing else on the PR says.
+        """
+        bits: list[str] = []
+        if attempt_n:
+            # 🔴 THE TWO NUMBERS COUNT DIFFERENT THINGS. `attempt_number` is
+            # numbered across the task's WHOLE LIFE (`_run_attempt`: it is
+            # `len(list_attempts) + 1`, deliberately, so a resumed task never
+            # reuses a branch name and resets a [WIP-BLOCKED] checkpoint), while
+            # `max_attempts` bounds ONE bounded loop. Every `nh reply` resume
+            # therefore starts a fresh loop with the lifetime counter already
+            # past the bound, and this printed "attempt 5 of 3" — an incoherent
+            # claim on the one body whose entire subject is not asserting what
+            # it cannot support. Past the bound the ratio means nothing, so only
+            # the number that is true is printed.
+            bits.append(f"attempt {attempt_n} of {self.bounds.max_attempts}"
+                        if attempt_n <= self.bounds.max_attempts
+                        else f"attempt {attempt_n}")
+        if branch:
+            bits.append(f"`{branch}` → `{base or 'the default branch'}`")
+        where = f" ({', '.join(bits)})" if bits else ""
+        return (
+            "\n\n---\n"
+            f"_Opened by no_human{where}. It never merges and never approves its own "
+            f"work: review this yourself and merge it, or run `nh approve "
+            f"{task.id[:8]}`._"
         )
 
     @staticmethod
-    def _review_evidence_section(task: Task) -> str:
+    def _rounds_for_head(history: list, *, head_sha: str = "", repo=None) -> list:
+        """The rounds that judged a commit reachable from ``head_sha`` (C4).
+
+        Undeterminable in, unchanged out: with no head or no repo there is
+        nothing to check against, so the caller gets what it gave (the
+        behaviour before stamping existed). With both, a round must prove
+        itself — an unstamped round predates stamping and cannot, and a round
+        stamped with a commit off this branch judged something else.
+        """
+        if not head_sha or repo is None:
+            return list(history)
+        kept: list = []
+        for rec in history:
+            if not isinstance(rec, dict):
+                continue
+            sha = str(rec.get("sha") or "").strip()
+            if not sha:
+                continue
+            try:
+                if repo.is_ancestor(sha, head_sha):
+                    kept.append(rec)
+            except Exception:  # noqa: BLE001 — unresolvable == not proven
+                continue
+        return kept
+
+    @staticmethod
+    def _review_evidence_section(
+        task: Task, *, head_sha: str = "", repo=None,
+    ) -> str:
         """W1.6: the reviewer's verdict trail on the PR itself — the tokens
         that buy the human a 5-minute review instead of a transcript dig.
         Renders the review_history rounds (independent fresh-context reviewer,
         evidence-based pass/fail) and, when present, the resolved blocking
-        findings of the final round. Returns "" when no review ran."""
+        findings of the final round. Returns "" when no review ran.
+
+        C4: `review_history` is TASK-lifetime, so a later attempt's PR used to
+        render an earlier attempt's verdict against a diff the human cannot
+        see. Rounds stamped with a commit that is NOT an ancestor of this PR's
+        head are dropped, and if that leaves nothing the section says so out
+        loud rather than vanishing — "no review evidence" and "no section" look
+        identical to a reader, and only one of them is a warning.
+
+        Data flows review -> body here, and only here. Nothing in this method
+        may ever flow the other way: the body carries coder-authored text, and
+        feeding it to the gate that decides merges is a prompt-injection
+        channel (see the reverted `fix/pr-body-head-before-review` step 2).
+        """
         history = (task.context or {}).get("review_history")
         if isinstance(history, str):
             try:
@@ -9696,6 +11496,11 @@ SIX of them read a checkpoint and TWO do not — but do
                 history = None
         if not isinstance(history, list) or not history:
             return ""
+        history = Orchestrator._rounds_for_head(history, head_sha=head_sha, repo=repo)
+        if not history:
+            return ("## Review evidence\n- (no review has run against this "
+                    "commit yet — the rounds on record judged a different "
+                    "commit of this task)\n\n")
         rounds = len(history)
         last = history[-1] if isinstance(history[-1], dict) else {}
         verdict = "PASSED" if last.get("passed") else "not passed"
@@ -9706,7 +11511,19 @@ SIX of them read a checkpoint and TWO do not — but do
         addressed: list[str] = []
         for r in history[:-1] if last.get("passed") else history:
             for b in (r.get("blocking") or [])[:4]:
-                addressed.append(str(b)[:160])
+                # 🔴 `str(b)[:160]` WAS A HEADING CHANNEL ON EVERY DELIVERED PR.
+                # `b` is `f"{label} — {evidence}"` (`orchestrator.py`'s
+                # `_review_dossier`), and `evidence` is the reviewer verdict
+                # JSON's own field (`review/reviewer.py`), which the reviewer
+                # prompt tells the model to fill with QUOTED decisive lines.
+                # Nothing between there and here demotes anything: this section
+                # is outside `## Implementation summary`, the only place
+                # `_reformat_summary_markdown` runs. One `\n` in that field put
+                # the rest at column 0 — driven through `_pr_body` and
+                # `/markdown`, a live `<h1>MERGED AND APPROVED BY NO_HUMAN</h1>`
+                # rendered INSIDE the section headed `## Review evidence`, which
+                # is the exact fabrication this branch exists to stop.
+                addressed.append(Orchestrator._inline_cell(b))
         if addressed:
             lines.append("- findings raised and addressed across rounds:")
             lines += [f"  - {a}" for a in addressed[:8]]
@@ -9723,16 +11540,79 @@ SIX of them read a checkpoint and TWO do not — but do
         """
         if not isinstance(test_evidence, dict):
             return ""
+        lines: list[str] = []
         layers = test_evidence.get("layers")
+
+        def _n(key: str) -> int:
+            try:
+                return int(test_evidence.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        # Did the run produce ANY result? `_is_invocation_error` deliberately
+        # flags a module-resolution failure even when the output carries real
+        # counts ("2335 passed, 1 failed" from a worktree with no
+        # `node_modules`), and `_run_attempt` persists `invocation_error: True`
+        # next to those counts. Checking the flag before the counts therefore
+        # printed "NOT RUN" — and dropped the counts AND the failing test names
+        # — for a suite of 2336 tests with one genuine failure.
+        counted = _n("passed") + _n("failed") + _n("errors")
+
         if isinstance(layers, list) and layers:
-            lines = "\n".join(f"- {str(s)}" for s in layers)
-            return f"## Test evidence\n{lines}\n\n"
-        if test_evidence.get("ran"):
-            verdict = "PASS" if test_evidence.get("ok") else "FAIL"
-            return (
-                f"## Test evidence\n- tests: {verdict} — "
-                f"{test_evidence.get('passed', 0)} passed, "
-                f"{test_evidence.get('failed', 0)} failed, "
-                f"{test_evidence.get('errors', 0)} errors\n\n"
-            )
-        return ""
+            lines = [f"- {Orchestrator._inline_cell(s, None)}" for s in layers]
+        elif test_evidence.get("invocation_error") and not counted:
+            # C3: THE RUNNER NEVER STARTED. This used to render as
+            # "FAIL — 0 passed, 0 failed, 0 errors", which a human reads as a
+            # suite that ran and found nothing wrong-ish. It is the opposite:
+            # there is no test signal at all. `_run_attempt` already persisted
+            # both the flag and the base-tree verdict that says whether the
+            # change caused it; the body simply never read them.
+            on_base = test_evidence.get("reproduces_on_base")
+            says = {True: "yes", False: "no"}.get(on_base, "could not be checked")
+            lines = [
+                "- tests: **NOT RUN — test invocation failed** "
+                f"(environmental; reproduces on base: {says})",
+                "- this change carries NO test evidence — do not read the "
+                "absence of failures as a pass",
+            ]
+        # `ran` alone is the right condition and `or counted` would be dead code:
+        # the runner only ever builds `ran=False` for "no test command detected",
+        # which carries no counts, and the layered writer always sets `layers`
+        # (first branch). A mutation run proved no test could tell the two apart.
+        elif test_evidence.get("ran"):
+            if test_evidence.get("ok"):
+                lines = [f"- tests: PASS — {test_evidence.get('passed', 0)} passed, "
+                         f"{test_evidence.get('failed', 0)} failed, "
+                         f"{test_evidence.get('errors', 0)} errors"]
+            else:
+                lines = [f"- tests: FAIL — {test_evidence.get('passed', 0)} passed, "
+                         f"{test_evidence.get('failed', 0)} failed, "
+                         f"{test_evidence.get('errors', 0)} errors"]
+                # The names are stored on the attempt row and were invisible on
+                # the artifact — a reviewer had a count and no way to act on it.
+                failing = [Orchestrator._inline_cell(f, None)
+                           for f in (test_evidence.get("failing_tests") or []) if f]
+                if failing:
+                    lines.append("- failing tests:")
+                    lines += [f"  - `{f}`" for f in failing[:10]]
+                    if len(failing) > 10:
+                        lines.append(f"  - …and {len(failing) - 10} more")
+            if test_evidence.get("invocation_error"):
+                # The counts above are real and stay. But the runner ALSO hit a
+                # module-resolution/import failure, so the suite may be partial
+                # — say both rather than silently choosing one.
+                on_base = test_evidence.get("reproduces_on_base")
+                says = {True: "yes", False: "no"}.get(on_base, "could not be checked")
+                lines.append(
+                    "- ⚠️ the runner also reported an invocation error "
+                    "(import/module resolution), so this run may be PARTIAL "
+                    f"— reproduces on base: {says}")
+        if test_evidence.get("tamper_flag"):
+            # Never silent: a net reduction in tests/assertions is the one
+            # signal the whole gate exists to catch (constraint #4).
+            lines.append("- ⚠️ **tamper guard fired** on this attempt — test "
+                         "count or assertions dropped; check the diff for "
+                         "deleted or weakened tests")
+        if not lines:
+            return ""
+        return "## Test evidence\n" + "\n".join(lines) + "\n\n"

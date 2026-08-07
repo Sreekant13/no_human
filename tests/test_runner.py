@@ -1057,3 +1057,98 @@ def test_invocation_retry_timeout_is_not_an_invocation_error(tmp_path, monkeypat
     assert result.ok is False
     assert "timed out" in result.output
     assert result.invocation_error is False
+
+
+def test_teardown_race_retry_that_hits_an_invocation_error_keeps_the_names(tmp_path):
+    """The teardown-race RETRY has its own `invocation_error` return, and it
+    dropped `failing_tests` — so a retry that both stumbled on module
+    resolution AND named real failures reached the PR body with an empty
+    "- failing tests:" list it had promised to fill.
+
+    Reachable exactly as written: call 1 is the race (clean summary, non-zero
+    exit, OSError signature), call 2 produces real counts, named failures and a
+    ModuleNotFoundError, which `_is_invocation_error` flags DESPITE the counts.
+    """
+    counter = tmp_path / "count"
+    script = tmp_path / "fake_pytest.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        f"n=$(cat {counter} 2>/dev/null || echo 0)\n"
+        "n=$((n+1))\n"
+        f"echo $n > {counter}\n"
+        'if [ "$n" = "1" ]; then\n'
+        "  echo '5 passed in 1.02s'\n"
+        "  echo \"OSError: [Errno 66] Directory not empty: "
+        "'/tmp/pytest-of-dev/garbage-0/popen-gw3'\" 1>&2\n"
+        "  exit 1\n"
+        "fi\n"
+        "echo 'FAILED test_alpha.py::test_needs_the_dep - ModuleNotFoundError'\n"
+        "echo '1 failed, 4 passed in 0.90s'\n"
+        "echo \"ModuleNotFoundError: No module named 'left_pad'\" 1>&2\n"
+        "exit 1\n"
+    )
+    script.chmod(0o755)
+
+    result = run_tests(tmp_path, str(script))
+
+    assert counter.read_text().strip() == "2", "expected exactly one retry"
+    assert result.invocation_error is True, "not the invocation-error retry path"
+    assert result.passed + result.failed + result.errors > 0, (
+        "not the partial-run shape — this retry produced no counts")
+    assert result.failing_tests, (
+        "the teardown-race retry dropped the failing test names, so the PR "
+        "body's '- failing tests:' block cannot render for this run")
+    assert any("test_needs_the_dep" in f for f in result.failing_tests), (
+        result.failing_tests)
+
+
+def test_fixable_retry_that_hits_an_invocation_error_keeps_the_names(
+    tmp_path, monkeypatch,
+):
+    """The THIRD `invocation_error=True` return, and the one nothing covered.
+
+    `run_tests` has three of them and all three gained `failing_tests=` in the
+    same change. Dropping it from the teardown-race return reddens
+    `test_teardown_race_retry_that_hits_an_invocation_error_keeps_the_names`;
+    dropping it from the no-fixable-retry return reddens
+    `test_a_partial_run_reaches_the_body_with_its_failing_test_names`. Dropping
+    it from THIS one — the `_fix_invocation` retry whose corrected command still
+    trips `_is_invocation_error` — was green across the runner and PR-body
+    suites. An unobserved write path, not a covered one.
+
+    Reachable exactly as production reaches it: call 1 is `pytest` with a flag
+    its addopts rejects (`_fix_invocation`'s second rule, so the retry command
+    really is different), and call 2 runs the corrected command, names a real
+    failure, and still prints a ModuleNotFoundError — which
+    `_is_invocation_error` flags DESPITE the non-zero counts, because
+    `_INVOCATION_ERROR_PATTERNS` matches whenever the run is non-zero.
+    """
+    import no_human.testing.runner as runner_mod
+
+    calls = []
+
+    def fake_run_shell(cmd, work_dir, timeout, env):
+        calls.append(cmd)
+        if len(calls) == 1:
+            return 4, "ERROR: usage: pytest\nunrecognized arguments: --nope", False
+        return 1, (
+            "FAILED tests/test_alpha.py::test_needs_the_dep - ModuleNotFoundError\n"
+            "ModuleNotFoundError: No module named 'left_pad'\n"
+            "1 failed, 4 passed in 0.90s\n"
+        ), False
+
+    monkeypatch.setattr(runner_mod, "_run_shell", fake_run_shell)
+
+    result = runner_mod.run_tests(tmp_path, "pytest -q --nope", timeout=3)
+
+    assert len(calls) == 2, ("expected exactly one fixed-command retry", calls)
+    assert calls[1] != calls[0], "the retry ran the same command — path not taken"
+    assert result.invocation_error is True, (
+        "not the retry-still-broken path", result)
+    assert result.passed + result.failed + result.errors > 0, (
+        "not the partial-run shape — this retry produced no counts")
+    assert result.failing_tests, (
+        "the fixable retry dropped the failing test names, so the PR body's "
+        "'- failing tests:' block cannot render for this run")
+    assert any("test_needs_the_dep" in f for f in result.failing_tests), (
+        result.failing_tests)

@@ -854,8 +854,14 @@ def run_tests(
                                  f"timed out after {timeout}s")
         passed_r, failed_r, errors_r = _parse_test_output(cmd, output_r)
         if rc_r != 0 and _is_invocation_error(rc_r, output_r, passed_r, failed_r, errors_r):
+            # KEEP THE NAMES. `_is_invocation_error` returns True even with real
+            # counts (the "2335 passed, 1 failed" node case just above), so this
+            # result can describe a suite that RAN and named its failures. The PR
+            # body renders those names; dropping them here left it promising a
+            # list nothing could fill.
             return TestRunResult(True, False, passed_r, failed_r, errors_r,
-                                 cmd, output_r[-8000:], invocation_error=True)
+                                 cmd, output_r[-8000:], invocation_error=True,
+                                 failing_tests=_pytest_failing_tests(output_r))
         failing_tests_r = _pytest_failing_tests(output_r)
         return TestRunResult(True, rc_r == 0, passed_r, failed_r, errors_r,
                              cmd, output_r[-8000:], failing_tests=failing_tests_r,
@@ -877,7 +883,8 @@ def run_tests(
             if _is_invocation_error(rc2, output2, passed2, failed2, errors2):
                 return TestRunResult(True, False, passed2, failed2, errors2,
                                      retry_cmd, output2[-8000:],
-                                     invocation_error=True)
+                                     invocation_error=True,
+                                     failing_tests=_pytest_failing_tests(output2))
             failing_tests2 = _pytest_failing_tests(output2)
             return TestRunResult(True, ok2, passed2, failed2, errors2,
                                  retry_cmd, output2[-8000:],
@@ -885,7 +892,8 @@ def run_tests(
                                  traceback_excerpts=_pytest_traceback_excerpts(output2, failing_tests2))
         # No fixable retry — mark as invocation error
         return TestRunResult(True, False, passed, failed, errors,
-                             cmd, output[-8000:], invocation_error=True)
+                             cmd, output[-8000:], invocation_error=True,
+                             failing_tests=failing_tests)
     return TestRunResult(True, ok, passed, failed, errors, cmd, output[-8000:],
                          failing_tests=failing_tests,
                          traceback_excerpts=_pytest_traceback_excerpts(output, failing_tests))
