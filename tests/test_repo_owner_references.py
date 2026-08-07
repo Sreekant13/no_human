@@ -23,11 +23,17 @@ own files and required to AGREE. Neither is the authority; the disagreement is
 the defect. If someone changes the feed, this goes red until the page that
 discloses it says the same thing.
 
-WHAT THIS CANNOT SEE. Only text files in the ship set, and only the two
-reference shapes below (a repo URL, and an `owner:`/`owner=` assignment). A
-reference built at runtime by concatenation, or one living in a binary asset, is
-invisible here. It also cannot tell you whether the CURRENT owner's repo exists
-or is reachable — that needs the network, and this suite does not use it.
+WHAT THIS CANNOT SEE. Only text files in the ship set, and only the three
+reference shapes below — a bare `<owner>/` slug (which subsumes a repo URL), an
+owner-only profile URL, and an `owner:`/`owner=` assignment. A reference built
+at runtime by concatenation, spelled across a line break, or living in a binary
+asset is invisible here. It also cannot tell you whether the CURRENT owner's
+repo exists or is reachable — that needs the network, and this suite does not
+use it.
+
+The count of shapes has now been wrong TWICE, in the same direction each time,
+so treat "three" as the current state and not as complete. If a fourth spelling
+turns up, widen the pattern rather than exempting the file that carries it.
 """
 
 from __future__ import annotations
@@ -40,7 +46,6 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _EXPORT_SCRIPT = REPO_ROOT / "scripts" / "build_public_export.py"
-_SELF = Path(__file__).resolve().relative_to(REPO_ROOT).as_posix()
 
 
 def _load_export_script():
@@ -109,9 +114,30 @@ def test_the_disclosed_update_feed_is_the_configured_update_feed():
 
 # Two reference shapes: a repo URL, and an owner assignment. The `_` in the
 # lookbehind matters — without it this pattern fires on its own constants.
+# The owner is ASSEMBLED rather than written, so this file does not itself
+# contain the text it hunts. That is what lets the scan below cover its own
+# source instead of skipping it — a guard with a permanent hole in one shipped
+# file is a guard someone can hide a reference in, forever.
+_RETIRED = "eyal" + "golan"
+
+# THREE shapes, because two was not enough — twice now. The branch that
+# triggered this file grepped for `<owner>/` and missed `owner: <owner>`, an
+# assignment. This file then matched a URL and an assignment and missed the
+# BARE SLUG: `gh repo clone <owner>/<repo>`, `repo_slug = "<owner>/<repo>"`,
+# and the owner-only profile URL `github.com/<owner>?tab=repositories`, all of
+# which an independent review demonstrated surviving. The lesson is not "add a
+# third pattern and stop" — it is that a reference has no canonical spelling,
+# so the slug shape below is deliberately the BROAD one and the narrow shapes
+# only extend it. Measured on the real ship set: zero matches, so widening
+# costs no false positives today.
 _RETIRED_OWNER_REFS = re.compile(
-    r"github\.com/eyalgolan/"
-    r"|(?<![A-Za-z_])owner\s*[:=]\s*[\"']?eyalgolan(?![A-Za-z0-9._-])",
+    # bare slug — covers `github.com/<owner>/`, `gh repo clone <owner>/x`,
+    # `"<owner>/no_human"`, and anything else that names a repo path
+    rf"(?<![A-Za-z0-9._-]){_RETIRED}/"
+    # owner-only URL, which has no trailing slash to catch
+    rf"|github\.com/{_RETIRED}(?![A-Za-z0-9._-])"
+    # an assignment: `owner: <owner>`, `owner="<owner>"`
+    rf"|(?<![A-Za-z_])owner\s*[:=]\s*[\"']?{_RETIRED}(?![A-Za-z0-9._-])",
     re.IGNORECASE)
 
 
@@ -132,8 +158,9 @@ def test_no_shipped_file_points_at_the_retired_personal_owner():
     offenders: list[str] = []
     scanned = 0
     for rel in shipped:
-        if rel == _SELF:                      # the guard states the pattern it hunts
-            continue
+        # NO self-exemption. This file assembles the owner from fragments and
+        # writes the literal nowhere, so it can be held to its own rule — an
+        # exempted file is a place a real reference could sit forever.
         try:
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):

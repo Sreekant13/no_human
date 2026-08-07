@@ -1,10 +1,21 @@
 """What actually HAPPENED to the PR — the question the success metric never asked.
 
-A task that reached ``AWAITING_APPROVAL``/``DONE`` opened a pull request. That
-is all "success" has ever meant here (``core/autonomy.py``: ``_PR_REACHED_STATUSES``
-is the whole predicate, and it contains no forge query). This module records the
-forge's answer to the next question — did the PR merge, was it closed unmerged,
-is it still open, or does nobody know — into the ``pr_outcomes`` table.
+A task reached ``AWAITING_APPROVAL``/``DONE``. That is all "success" has ever
+meant here (``core/autonomy.py``: ``_PR_REACHED_STATUSES`` is the whole
+predicate, and it contains no forge query). This module records the forge's
+answer to the next question — did the PR merge, was it closed unmerged, is it
+still open, or does nobody know — into the ``pr_outcomes`` table.
+
+AND IT DOES NOT EVEN IMPLY A PR EXISTS. The first version of this sentence said
+"A task that reached AWAITING_APPROVAL/DONE opened a pull request", which is
+false and was the very claim this work was commissioned to retire — stated here
+as a flat premise while the same change corrected it in ``core/autonomy.py`` and
+on ``nh autonomy``. Three orchestrator paths reach ``AWAITING_APPROVAL`` and
+only one of them opens a PR; the "already satisfied, no code change needed" path
+and the code-review path (which ends with draft comments awaiting approval, none
+posted) both reach it with no pull request at all. So this module's population
+is "tasks the pipeline settled", not "pull requests", and the two denominators
+must never be blended.
 
 WHAT "MERGED" DOES AND DOES NOT ESTABLISH
 -----------------------------------------
