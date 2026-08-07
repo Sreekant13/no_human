@@ -134,6 +134,91 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
            GROUP BY 1""")
     error_breakdown = {r[0]: r[1] for r in rows}
 
+    # Intake-grill answering pass: how often it actually answers. The pass is
+    # advisory by contract (every branch is wrapped in `except`), so before this
+    # split existed a 0% answer rate and a 100% answer rate produced identical,
+    # fully-green signals. Keys are evaluator.GRILL_ANSWERING_OUTCOMES; the
+    # health number is parsed_* over the total.
+    rows = await store.query(
+        """SELECT COALESCE(json_extract(data, '$.outcome'), 'unclassified'),
+                  COUNT(*)
+           FROM task_events
+           WHERE json_extract(data, '$.kind') = 'grill_answering'
+           GROUP BY 1""")
+    grill_answering = {r[0]: r[1] for r in rows}
+
+    # The split above is a PARSE rate, not an ANSWER rate — and the live
+    # symptom the instrumentation exists for is a pass that PARSES and applies
+    # ZERO answers ("all N answerable question(s) left unanswered",
+    # 2026-08-06). That records as `parsed_first_try` and, until this key
+    # existed, was indistinguishable at /api/metrics from a healthy pass:
+    # `answers_applied` was written on every row and read by nothing.
+    #
+    # So: of the passes that PARSED, how many answers did they actually apply.
+    # Restricted to the parsed outcomes because a pass that never parsed has
+    # no answers to apply — counting its zero would blame the wrong stage.
+    # The subset is a DECLARED constant next to the enum. It used to be
+    # computed here as `o.startswith("parsed")`, described as "derived from the
+    # enum, so an outcome added later cannot silently fall out": that was
+    # overstated — a prefix is a NAMING CONVENTION, not a property of the enum,
+    # and a future parsing outcome spelled any other way would have dropped out
+    # exactly as silently. The declaration cannot force a new member into
+    # itself either, so both of its failure modes are pinned by
+    # test_the_parsed_subset_is_declared_and_agrees_with_the_enum instead.
+    from ..intake.evaluator import GRILL_ANSWERING_PARSED_OUTCOMES as parsed
+    # No empty-subset guard here, and the `or [""]` that used to stand in for
+    # one is gone: SQLite ACCEPTS `IN ()` — an SQLite extension most other
+    # engines reject — and matches nothing, so an emptied subset reports zeros
+    # rather than raising. Checked on sqlite 3.40.1 and 3.51.0 and through
+    # compute_metrics itself, which returns the same all-zeros payload with the
+    # guard present and absent. The comment that used to sit here called it a
+    # syntax error and a 500; it is neither, and the guard it justified was
+    # inert.
+    # `answers_applied IS NULL` is a row written before the field existed. It
+    # is EXCLUDED from the zero-applied count rather than COALESCEd to 0: an
+    # unrecorded number is not a zero, and folding the two would have this key
+    # invent exactly the failure it was added to detect.
+    row = await store.query_one(
+        f"""SELECT COUNT(*),
+                   COALESCE(SUM(json_extract(data, '$.answers_applied')
+                                IS NOT NULL), 0),
+                   COALESCE(SUM(COALESCE(
+                       json_extract(data, '$.answers_applied'), 0)), 0),
+                   COALESCE(SUM(COALESCE(
+                       json_extract(data, '$.answerable'), 0)), 0),
+                   COALESCE(SUM(CASE
+                       WHEN json_extract(data, '$.answers_applied') = 0
+                       THEN 1 ELSE 0 END), 0)
+            FROM task_events
+            WHERE json_extract(data, '$.kind') = 'grill_answering'
+              AND json_extract(data, '$.outcome')
+                  IN ({','.join('?' * len(parsed))})""", tuple(parsed))
+    n_parsed, measured, applied, answerable, zero_applied = (
+        row or (0, 0, 0, 0, 0))
+    grill_answers = {
+        "parsed_passes": n_parsed,
+        "measured_passes": measured,
+        "answers_applied": applied,
+        "answerable": answerable,
+        # The number this key exists for: passes that parsed and answered
+        # NOTHING. Nonzero here with a healthy-looking outcome split is the
+        # failure that used to be invisible.
+        "parsed_but_zero_applied": zero_applied,
+        "answer_rate": round(applied / answerable, 4) if answerable else None,
+    }
+
+    # The QUESTIONS pass, same shape. It ran uninstrumented until 2026-08-07:
+    # a malformed block returned None, `grill_spec` returned None, and the
+    # orchestrator's `if not qa: return` fired before its own advisory — the
+    # whole grill vanished with ZERO events of any kind.
+    rows = await store.query(
+        """SELECT COALESCE(json_extract(data, '$.outcome'), 'unclassified'),
+                  COUNT(*)
+           FROM task_events
+           WHERE json_extract(data, '$.kind') = 'grill_questions'
+           GROUP BY 1""")
+    grill_questions = {r[0]: r[1] for r in rows}
+
     total_cache_read = sum(p["cache_read"] for p in by_profile)
     total_tokens = sum(p["tokens"] for p in by_profile)
 
@@ -215,6 +300,9 @@ async def compute_metrics(store: Store) -> dict[str, Any]:
         "ci_gate": ci_gate,
         "cache_economics": cache_economics,
         "error_breakdown": error_breakdown,
+        "grill_answering_outcomes": grill_answering,
+        "grill_answering_answers": grill_answers,
+        "grill_questions_outcomes": grill_questions,
     }
 
 async def playbook_outcomes(store) -> list[dict]:

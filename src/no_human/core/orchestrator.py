@@ -6871,11 +6871,56 @@ class Orchestrator:
             # Late-bound module attribute (not a from-import) so tests and
             # callers patch one seam — the same pattern _act_on_eval uses.
             from ..intake import evaluator as _ev
+
+            def _grill_outcome(outcome: str, fields: dict) -> None:
+                """One event per answering pass that RUNS, whatever it did.
+
+                Without this the pass was uncountable: every branch of it sits
+                under an advisory `except`, so the suite was equally green at a
+                100% and a 0% answer rate. Emitted under its own
+                ``grill_answering`` kind rather than ``"advisory"`` — a
+                SUCCEEDED pass is not a degradation, and doctor.py counts every
+                ``advisory`` event as a dead subsystem. Read the rate back from
+                ``metrics.grill_answering_outcomes`` (/api/metrics).
+                """
+                self.emit(
+                    "grill_answering",
+                    f"intake grill answering pass: {outcome}",
+                    outcome=outcome,
+                    answers_applied=fields.get("answers_applied"),
+                    answerable=fields.get("answerable"),
+                    timed_out=fields.get("timed_out"),
+                    error=fields.get("error"),
+                )
+
+            def _grill_questions_outcome(outcome: str, fields: dict) -> None:
+                """One event per QUESTIONS pass that runs — the half of the
+                defect class that stayed open when the answering half was
+                instrumented.
+
+                A malformed questions block used to produce NO event of any
+                kind: the pass returned None, `grill_spec` returned None, and
+                the `if not qa: return` below fired before the advisory that
+                would otherwise have flagged it. The whole grill disappeared
+                and the only trace was a log line. Its own kind, for the same
+                reason as above: a succeeded pass is not a degradation.
+                """
+                self.emit(
+                    "grill_questions",
+                    f"intake grill question pass: {outcome}",
+                    outcome=outcome,
+                    questions=fields.get("questions"),
+                    timed_out=fields.get("timed_out"),
+                    error=fields.get("error"),
+                )
+
             qa = await _ev.grill_spec(
                 task.title, task.description or "",
                 task.acceptance_criteria or [], task.repo_path,
                 model=self._utility_model(),
                 usage_sink=self._note_utility_usage,
+                outcome_sink=_grill_outcome,
+                questions_outcome_sink=_grill_questions_outcome,
             )
             if not qa:
                 return

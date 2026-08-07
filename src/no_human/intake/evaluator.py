@@ -64,6 +64,115 @@ def _record_usage(usage_sink: UsageSink | None, result: Any) -> None:
         log.warning("utility usage sink failed (spend unrecorded): %s", exc)
 
 
+# The answering pass fails OFTEN and used to fail INVISIBLY: every branch below
+# is wrapped by an advisory `except` (correct — the grill may never block a
+# task), so the suite was equally green whether the pass succeeded 100% or 0% of
+# the time. Live evidence, two independent runs on 2026-08-06: "grill answering
+# emitted no block", "grill answering failed ... Expecting value: line 1 column
+# 1", "all N answerable question(s) left unanswered". None of it was countable.
+#
+# So the pass now classifies its own outcome and hands it to an ``outcome_sink``
+# — the same shape as ``usage_sink`` above, and for the same reason: the caller
+# owns the recording mechanism, this module owns the classification. The
+# orchestrator's sink emits a ``grill_answering`` task event (and a
+# ``grill_questions`` one for the pass before it), which ``core/metrics.py``
+# groups into ``grill_answering_outcomes`` / ``grill_questions_outcomes`` and
+# ``doctor.MECHANISMS`` lists by kind. No new telemetry subsystem, no new
+# dependency.
+OutcomeSink = Any  # Callable[[str, dict[str, Any]], None]
+
+#: Every value ``grill_spec`` can report for one answering pass. Exhaustive by
+#: construction — a pass that runs reports exactly one of these.
+#:
+#: The comments below are load-bearing: this tuple is what the metric's readers
+#: read to know what the buckets MEAN, and one of them was wrong. ``error`` was
+#: documented as covering a timeout. It does not, and the mislabelled case is
+#: the most expensive one there is (``max_turns=8``, spend unrecoverable): on
+#: timeout ``_bounded_run`` swallows the ``TimeoutError`` and returns a
+#: ``final_text=""`` sentinel, so the pass sees an empty reply, retries, and —
+#: if the retry also times out — books ``no_block_after_retry``. Fixed here by
+#: correcting the DOCUMENTATION rather than the classification: a timed-out
+#: session genuinely emitted no block, so that bucket is the truthful one, and
+#: re-routing it to ``error`` would merge a silent-model failure with an
+#: infrastructure failure under a name that means neither. The timeout stays
+#: separately countable through the ``timed_out`` FIELD on the event, which is
+#: what ``_bounded_run``'s sentinel now carries.
+GRILL_ANSWERING_OUTCOMES: tuple[str, ...] = (
+    "parsed_first_try",              # block found and parsed, no retry
+    "parsed_after_tool_less_retry",  # recovered by the bounded second call
+    "no_block_after_retry",          # never emitted a block — INCLUDING a
+                                     # timed-out session (empty sentinel); see
+                                     # the `timed_out` field to tell them apart
+    "unparseable_after_retry",       # emitted a block that was not JSON
+    "error",                         # the pass RAISED (backend/wiring error);
+                                     # a timeout does NOT reach here
+)
+
+#: The members of the tuple above that mean THE PASS PARSED A BLOCK — the
+#: denominator ``metrics.grill_answering_answers`` divides by, because a pass
+#: that never parsed has no answers to apply and counting its zero would blame
+#: the wrong stage.
+#:
+#: DECLARED here rather than inferred at the reader. metrics.py used to compute
+#: it as ``o.startswith("parsed")`` under the claim that it was "derived from
+#: the enum, so an outcome added later cannot silently fall out of the
+#: denominator". A prefix is a naming convention, not a property of the enum:
+#: a future parsing outcome spelled ``recovered_*`` would have fallen out just
+#: as silently, and nothing pinned the convention. This constant does not fix
+#: that by itself — nothing can make a new member enrol automatically — so the
+#: two ways it drifts are pinned by
+#: ``test_the_parsed_subset_is_declared_and_agrees_with_the_enum`` instead: it
+#: must be a SUBSET of the tuple above (a rename that breaks the link fails),
+#: and it must agree EXACTLY with the ``parsed`` prefix in BOTH directions (a
+#: ``parsed_*`` member added to the enum and forgotten here fails; a member
+#: added here without the prefix fails, forcing the convention to be faced
+#: rather than quietly abandoned).
+GRILL_ANSWERING_PARSED_OUTCOMES: tuple[str, ...] = (
+    "parsed_first_try",
+    "parsed_after_tool_less_retry",
+)
+
+#: The same, for the QUESTIONS pass — which ran uninstrumented until 2026-08-07
+#: and carried the identical unguarded-parse bug this module fixed for the
+#: answers pass: a matched-but-invalid block went straight to ``loads_lenient``
+#: outside any try, and ``data.get("questions")`` on a non-object raised one
+#: line later. Both landed in the function's blanket handler, which returned
+#: ``None``; ``grill_spec`` then returned ``None``, the orchestrator's
+#: ``if not qa: return`` fired before its own advisory, and the whole grill
+#: vanished WITHOUT A SINGLE EVENT. The live line "grill produced no parseable
+#: GRILL_JSON block; retrying once" comes from this pass.
+#:
+#: ``empty_after_parse`` has no analogue in the answering tuple because the
+#: failure is particular to this pass: a well-formed block whose ``questions``
+#: list is absent, empty, or entirely unusable items. It parsed and produced
+#: nothing, which is not the same failure as never parsing.
+GRILL_QUESTIONS_OUTCOMES: tuple[str, ...] = (
+    "parsed_first_try",        # block found and parsed, no retry
+    "parsed_after_retry",      # recovered by the bounded second call
+    "no_block_after_retry",    # never emitted a block (incl. a timed-out one)
+    "unparseable_after_retry", # emitted a block that was not JSON/not an object
+    "empty_after_parse",       # parsed, but yielded zero usable questions
+    "error",                   # the pass RAISED (backend/wiring error)
+)
+
+
+def _record_outcome(
+    sink: OutcomeSink | None, outcome: str, **fields: Any,
+) -> None:
+    """Hand one classified answering-pass outcome to the caller's sink.
+
+    Never raises, for the same reason ``_record_usage`` never raises:
+    instrumentation may degrade the record, it may not change what an advisory
+    call DOES.
+    """
+    if sink is None:
+        return
+    try:
+        sink(outcome, dict(fields))
+    except Exception as exc:  # noqa: BLE001 — instrumentation never blocks
+        log.warning("grill outcome sink failed (outcome unrecorded): %s", exc)
+
+
 async def _bounded_run(be, *args, usage_sink: UsageSink | None = None, **kwargs):
     """be.run() with a hard timeout; on timeout return an empty error-result
     sentinel so `result.final_text or ""` still works and the grill proceeds.
@@ -91,7 +200,14 @@ async def _bounded_run(be, *args, usage_sink: UsageSink | None = None, **kwargs)
         log.warning("grill/intake backend.run timed out after %ss — proceeding "
                     "without it (advisory); its spend is unrecoverable",
                     _LLM_TIMEOUT_S)
-        return SimpleNamespace(final_text="", is_error=True)
+        # `timed_out` so the caller's outcome record can name this case. The
+        # sentinel is indistinguishable from "the model replied with nothing"
+        # by its text alone, and the two have opposite fixes (raise the
+        # timeout vs fix the prompt) at very different costs — this one has
+        # already burned a full max_turns=8 session. It is a FIELD, not an
+        # outcome: see GRILL_ANSWERING_OUTCOMES for why the bucket stays
+        # `no_block_after_retry`.
+        return SimpleNamespace(final_text="", is_error=True, timed_out=True)
     _record_usage(usage_sink, result)
     return result
 
@@ -384,8 +500,19 @@ async def generate_grill_questions(
     backend: Any | None = None,
     model: str | None = None,
     usage_sink: UsageSink | None = None,
+    outcome_sink: OutcomeSink | None = None,
 ) -> list[GrillQA] | None:
-    """Generate the intake grill's questions. None on failure (advisory)."""
+    """Generate the intake grill's questions. None on failure (advisory).
+
+    ``outcome_sink`` is called EXACTLY ONCE per call, with one of
+    ``GRILL_QUESTIONS_OUTCOMES`` and a fields dict (``questions``, the number
+    produced; ``timed_out``; ``error`` on the raise path). Same shape and same
+    never-raises contract as ``grill_spec``'s. Unconditional on purpose: unlike
+    the answering pass there is no "did not run" case to keep out of the
+    denominator — reaching this function IS the pass running, and its silent
+    failure is what left the whole grill emitting zero events.
+    """
+    outcome, timed_out = "error", False
     try:
         import tempfile
         from pathlib import Path
@@ -403,23 +530,45 @@ async def generate_grill_questions(
         result = await _bounded_run(be, prompt, max_turns=1, effort="low",
                               cwd=Path(tempfile.gettempdir()),
                               usage_sink=usage_sink)
-        m = _GRILL_JSON.search(result.final_text or "")
-        if not m:
+        timed_out = bool(getattr(result, "timed_out", False))
+        data, why = _parse_questions_block(result.final_text or "")
+        if data is None:
             # Same silent single-emit failure class #125 fixed for the
             # ANSWERS pass (v10: 6/6 lethal there) — retry ONCE. The retry is
             # a SECOND billed call; _bounded_run books it too.
-            log.warning("grill produced no parseable GRILL_JSON block; "
-                        "retrying once")
+            #
+            # The retry used to trigger on "no block" ONLY. A block that
+            # matched but was not JSON, or parsed to a list, skipped it and
+            # raised out of the unguarded parse below into the blanket
+            # handler — the identical defect fixed for the answers pass on
+            # 2026-08-06, still live in this one. Both classes now retry, and
+            # the ceiling is unchanged at two calls.
+            log.warning("grill produced %s; retrying once",
+                        "no GRILL_JSON block" if why == "no_block"
+                        else "a GRILL_JSON block that did not parse")
             result = await _bounded_run(be, prompt, max_turns=1, effort="low",
                                   cwd=Path(tempfile.gettempdir()),
                                   usage_sink=usage_sink)
-            m = _GRILL_JSON.search(result.final_text or "")
-        if not m:
-            log.warning("grill produced no parseable GRILL_JSON block")
+            timed_out = timed_out or bool(getattr(result, "timed_out", False))
+            data, why2 = _parse_questions_block(result.final_text or "")
+            if data is not None:
+                outcome = "parsed_after_retry"
+            elif why2 == "unparseable" or why == "unparseable":
+                outcome = "unparseable_after_retry"
+            else:
+                outcome = "no_block_after_retry"
+        else:
+            outcome = "parsed_first_try"
+        if data is None:
+            log.warning("grill produced no usable GRILL_JSON block (%s)",
+                        outcome)
+            _record_outcome(outcome_sink, outcome, questions=0,
+                            timed_out=timed_out)
             return None
-        data = loads_lenient(m.group(1))
         items = data.get("questions")
         if not isinstance(items, list) or not items:
+            _record_outcome(outcome_sink, "empty_after_parse", questions=0,
+                            timed_out=timed_out)
             return None
         out: list[GrillQA] = []
         for item in items[:8]:
@@ -432,9 +581,17 @@ async def generate_grill_questions(
                 carve_out=carve if carve in ("none", "access", "destructive")
                 else "none",
             ))
+        # A block full of unusable items parsed and produced nothing, exactly
+        # like an absent `questions` key — same bucket, or the two shapes of
+        # the same failure would land in different halves of the metric.
+        _record_outcome(outcome_sink,
+                        outcome if out else "empty_after_parse",
+                        questions=len(out), timed_out=timed_out)
         return out or None
     except Exception as exc:  # noqa: BLE001 — advisory, never blocks
         log.warning("grill question generation failed (proceeding): %s", exc)
+        _record_outcome(outcome_sink, "error", questions=0,
+                        timed_out=timed_out, error=type(exc).__name__)
         return None
 
 
@@ -466,6 +623,57 @@ _GRILL_ANSWERS_PROMPT = (
 )
 
 
+def _parse_answers_block(text: str) -> tuple[dict[str, Any] | None, str]:
+    """Split "did the model emit a block?" from "was the block usable?".
+
+    Returns ``(data, why)`` — ``data`` is the parsed object on success, else
+    ``None`` with ``why`` in ``{"no_block", "unparseable"}``. The two are
+    separate failures with separate fixes, and conflating them is exactly how
+    the unparseable case shipped with no recovery: the old code branched on
+    ``if not m`` only, so a matched-but-invalid block skipped the retry and
+    raised out of ``loads_lenient`` into the advisory handler.
+
+    A block that parses to something that is not a dict counts as unparseable:
+    ``data.get("answers")`` on a list would AttributeError one line later, and
+    "the model emitted the wrong shape" is the same failure as "the model
+    emitted invalid JSON".
+    """
+    return _parse_grill_block(_GRILL_ANSWERS, text, "answers")
+
+
+def _parse_questions_block(text: str) -> tuple[dict[str, Any] | None, str]:
+    """``_parse_answers_block`` for the QUESTIONS block.
+
+    Its own existence is the fix: this pass used to call ``loads_lenient``
+    outside any try and then ``data.get("questions")`` on whatever came back,
+    so a matched-but-invalid block and a block that parsed to a list both
+    raised into the function's blanket advisory handler — no retry, no event,
+    no way to tell either from a backend outage.
+    """
+    return _parse_grill_block(_GRILL_JSON, text, "questions")
+
+
+def _parse_grill_block(
+    pattern: re.Pattern[str], text: str, what: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """The shared body of the two above. One implementation, because the two
+    passes had the same three failure modes and only one of them was guarded.
+    """
+    m = pattern.search(text or "")
+    if not m:
+        return None, "no_block"
+    try:
+        data = loads_lenient(m.group(1))
+    except Exception as exc:  # noqa: BLE001 — a bad block is data, not a crash
+        log.warning("grill %s block matched but did not parse: %s", what, exc)
+        return None, "unparseable"
+    if not isinstance(data, dict):
+        log.warning("grill %s block parsed to %s, expected an object",
+                    what, type(data).__name__)
+        return None, "unparseable"
+    return data, ""
+
+
 async def grill_spec(
     title: str,
     description: str,
@@ -476,16 +684,33 @@ async def grill_spec(
     model: str | None = None,
     questions: list[GrillQA] | None = None,
     usage_sink: UsageSink | None = None,
+    outcome_sink: OutcomeSink | None = None,
+    questions_outcome_sink: OutcomeSink | None = None,
 ) -> list[GrillQA] | None:
     """The full unattended grill: generate questions, answer the answerable
     ones FROM THE REPO (the answering session's cwd is the task's repo — the
     pre-existing resolve_assumptions path is repo-blind), and hard-gate the
     carve-outs for a human. Never raises; a failed answering pass returns the
-    questions unanswered rather than fabricating."""
+    questions unanswered rather than fabricating.
+
+    ``outcome_sink`` is called exactly once per answering pass that RUNS, with
+    one of ``GRILL_ANSWERING_OUTCOMES`` and a small fields dict
+    (``answers_applied``, ``answerable``, ``timed_out``, and ``error`` on the
+    error path). A pass that never runs (no questions, or every question
+    carved out) reports nothing — an absent pass is not a failed one, and
+    folding the two together would poison the denominator.
+
+    ``questions_outcome_sink`` is the same for the QUESTIONS pass, and is
+    forwarded rather than merged: the two passes fail for different reasons at
+    different prices (1 turn vs 8), and a single mixed bucket could not tell
+    "we never got questions" from "we got questions and could not answer
+    them". It fires whenever that pass runs — i.e. not when ``questions=`` was
+    supplied by the caller, because then it did not run."""
     try:
         qs = questions or await generate_grill_questions(
             title, description, acceptance_criteria,
             backend=backend, model=model, usage_sink=usage_sink,
+            outcome_sink=questions_outcome_sink,
         )
         if not qs:
             return None
@@ -496,6 +721,10 @@ async def grill_spec(
         answerable = [(i, q) for i, q in enumerate(qs) if q.carve_out == "none"]
         if not answerable:
             return qs
+        # Bound BEFORE the try — the error path below records it, and every
+        # line in there (the imports, the backend ctor, _render, a
+        # _bounded_run re-raising a non-timeout) can raise ahead of the call.
+        timed_out = False
         try:
             import tempfile
             from pathlib import Path
@@ -517,34 +746,59 @@ async def grill_spec(
             )
             cwd = Path(repo_path) if repo_path else Path(tempfile.gettempdir())
             fallback_used = False
+            outcome = "parsed_first_try"
             # The expensive one: max_turns=8, and it explores a real repo.
             result = await _bounded_run(be, prompt, max_turns=8, effort="low",
                                         cwd=cwd, usage_sink=usage_sink)
-            m = _GRILL_ANSWERS.search(result.final_text or "")
-            if not m:
-                # v11 live root cause: in content-rich repos the 8-turn
-                # session exhausts ALL turns exploring and the SDK returns an
-                # error result — a blind resample fails deterministically
-                # (0/6 recovery in v11). The retry changes STRATEGY: no
-                # tools, tiny budget, emit-now; assumption-grade answers
-                # beat empty ones (the grill is advisory by contract).
-                log.warning("grill answering emitted no block; retrying "
-                            "tool-less")
+            timed_out = bool(getattr(result, "timed_out", False))
+            data, why = _parse_answers_block(result.final_text or "")
+            if data is None:
+                # TWO distinct first-pass failures reach here, and until
+                # 2026-08-06 only the first had any recovery at all:
+                #  * why == "no_block": v11 live root cause — in content-rich
+                #    repos the 8-turn session exhausts ALL turns exploring and
+                #    the SDK returns an error result. A blind resample fails
+                #    deterministically (0/6 recovery in v11), so the retry
+                #    changes STRATEGY: no tools, tiny budget, emit-now;
+                #    assumption-grade answers beat empty ones.
+                #  * why == "unparseable": the regex DID match but the block
+                #    was not JSON ("Expecting value: line 1 column 1 (char 0)",
+                #    live 2026-08-06). This fell straight through to the outer
+                #    handler with ZERO recovery attempts. It gets the same
+                #    cheap tool-less re-emit, told what was actually wrong.
+                # Bounded: ONE recovery call, whichever branch triggered it —
+                # the answering pass still bills at most two sessions, exactly
+                # as before.
+                log.warning("grill answering %s; retrying tool-less",
+                            "emitted no block" if why == "no_block"
+                            else "block did not parse")
+                lead = ("your previous reply's GRILL_ANSWERS block was not "
+                        "valid JSON" if why == "unparseable"
+                        else "your previous session ran out of turns exploring")
                 fallback = (
                     prompt
-                    + "\n\nFINAL ATTEMPT — your previous session ran out "
-                    "of turns exploring. Do NOT use tools now. Emit the "
-                    "GRILL_ANSWERS block IMMEDIATELY in your first reply; "
+                    + f"\n\nFINAL ATTEMPT — {lead}. Do NOT use tools now. "
+                    "Emit the "
+                    "GRILL_ANSWERS block IMMEDIATELY in your first reply, as "
+                    "STRICT JSON with no commentary inside the block; "
                     "answers from general knowledge with source "
                     '"assumption" are fine. Do NOT cite file paths or line '
                     "numbers you have not read in THIS session; "
                     "plain-language assumptions only.")
                 result = await _bounded_run(be, fallback, max_turns=2, effort="low",
                                       cwd=cwd, usage_sink=usage_sink)
-                m = _GRILL_ANSWERS.search(result.final_text or "")
                 fallback_used = True
-            if m:
-                data = loads_lenient(m.group(1))
+                timed_out = timed_out or bool(
+                    getattr(result, "timed_out", False))
+                data, why2 = _parse_answers_block(result.final_text or "")
+                if data is not None:
+                    outcome = "parsed_after_tool_less_retry"
+                elif why2 == "unparseable" or why == "unparseable":
+                    outcome = "unparseable_after_retry"
+                else:
+                    outcome = "no_block_after_retry"
+            applied = 0
+            if data is not None:
                 answerable_idx = {i for i, _ in answerable}
                 for item in data.get("answers", []) or []:
                     if not isinstance(item, dict):
@@ -557,18 +811,27 @@ async def grill_spec(
                     # a carve-out index in its output is ignored.
                     if i in answerable_idx and item.get("answer"):
                         qs[i].answer = str(item["answer"])[:400]
+                        applied += 1
                         # r1 blocking finding: the tool-less fallback session
                         # has read NOTHING — it must never stamp
                         # "repo-evidence" (false verifiability makes the
                         # human auditor skip exactly the check the PR-body
-                        # section exists to trigger).
+                        # section exists to trigger). Unchanged by the
+                        # unparseable-block recovery above: that recovery IS a
+                        # fallback session, so it sets fallback_used too.
                         src = ("assumption" if fallback_used
                                else str(item.get("source", "assumption")))
                         qs[i].source = (src if src in
                                         ("repo-evidence", "assumption")
                                         else "assumption")
+            _record_outcome(outcome_sink, outcome, answers_applied=applied,
+                            answerable=len(answerable), timed_out=timed_out)
         except Exception as exc:  # noqa: BLE001 — unanswered beats broken
             log.warning("grill answering failed (questions unanswered): %s", exc)
+            _record_outcome(outcome_sink, "error", answers_applied=0,
+                            answerable=len(answerable),
+                            timed_out=timed_out,
+                            error=type(exc).__name__)
         return qs
     except Exception as exc:  # noqa: BLE001 — advisory, never blocks
         log.warning("grill failed entirely (proceeding without): %s", exc)

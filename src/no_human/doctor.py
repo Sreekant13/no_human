@@ -60,6 +60,21 @@ MECHANISMS: list[tuple[str, tuple[str, ...], str]] = [
     ("ci_gate_integration", ("ci_gate_trigger", "ci_gate_pass", "ci_gate_fail"),
      "zero = the post-PR CI_GATE gate never ran — fine while ci_gate.enabled "
      "is off, dead if a governed PR sat green without a run"),
+    # The intake grill's two LLM passes. Added 2026-08-07 to make a claim
+    # TRUE: the commit that instrumented the answering pass said `nh doctor`
+    # "picks it up by kind for free", and it did not — this list is hardcoded
+    # and neither kind was in it, so the new events were counted by nothing
+    # here. Their zero-hints are the point of the instrumentation: the grill
+    # runs on EVERY task (operator directive 2026-07-17), so zero of either
+    # while tasks have run is not "plausible", it is the pass being dead.
+    ("grill_questions", ("grill_questions",),
+     "zero while tasks have run = the intake grill's question pass never "
+     "reported — it is dead, or running uninstrumented (it was, until "
+     "2026-08-07: an unparseable block emitted no event at all)"),
+    ("grill_answering", ("grill_answering",),
+     "zero while grill_questions fired = the answering pass never ran; see "
+     "metrics.grill_answering_answers for whether the passes that DID run "
+     "actually applied any answers"),
 ]
 
 # A parked task whose newest watcher evidence is older than this is unshepherded.

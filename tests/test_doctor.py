@@ -456,3 +456,29 @@ def _mktmp(tmp_path: Path) -> Path:
     d = tmp_path / "tmp"
     d.mkdir(exist_ok=True)
     return d
+
+
+async def test_the_intake_grill_passes_are_listed_mechanisms(store):
+    """A claim in evaluator.py said `nh doctor` picked the grill's outcome
+    events up "by kind for free". It did not — MECHANISMS is a hardcoded list
+    and neither kind was in it, so the events were counted by nothing here and
+    a dead grill stayed a dead grill silently. This test is what makes the
+    sentence true: break the entry and the claim fails out loud.
+    """
+    names = {n for n, _, _ in MECHANISMS}
+    assert {"grill_questions", "grill_answering"} <= names
+
+    t = Task.new("x", repo_path="/tmp/x")
+    await store.create_task(t)
+    await store.save_events(t.id, [
+        _ev("grill_questions", outcome="parsed_first_try"),
+        _ev("grill_answering", outcome="parsed_first_try"),
+        _ev("grill_answering", outcome="no_block_after_retry"),
+    ])
+    d = await diagnose(store)
+    counts = {m["name"]: m["count"] for m in d.mechanisms}
+    assert counts["grill_questions"] == 1
+    assert counts["grill_answering"] == 2
+    # A mechanism that HAS fired carries no zero-hint.
+    assert all(not m["hint"] for m in d.mechanisms
+               if m["name"].startswith("grill_"))
