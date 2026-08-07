@@ -51,8 +51,66 @@ test("client-side no-newline validation mirrors the server rule", () => {
   assert.match(src, /\/\[\\n\\r\]\//, "must check for newline/carriage-return characters");
 });
 
-test("the CI auto-pin note appears for github/gitlab/jenkins/circleci and uses plain, active-voice copy", () => {
-  assert.match(src, /CI_AUTOPIN\s*=\s*new Set\(\["github",\s*"gitlab",\s*"jenkins",\s*"circleci"\]\)/);
+// The note this panel renders is a CLAIM about what the backend does:
+// "Saving here makes X your active CI backend and turns CI on for this
+// workspace." The only thing that makes it true is `_CI_BACKEND_BY_NAME` in
+// no_human/integrations/__init__.py, which is what `save_integration_config`
+// consults before pinning ci.backend + ci.enabled.
+//
+// This test used to assert `CI_AUTOPIN` contained exactly
+// ["github","gitlab","jenkins","circleci"] — a hardcoded second copy of the
+// truth. It was green for months while the Python map omitted circleci, so it
+// guarded the sentence and not the behaviour: an operator who configured
+// CircleCI was told the gate was on, and no `ci:` block was ever written.
+// Read the real map instead, so the two cannot drift again.
+const pySrc = readFileSync(here + "../../src/no_human/integrations/__init__.py", "utf8");
+
+function pythonCiAutopinNames() {
+  const m = pySrc.match(/_CI_BACKEND_BY_NAME\s*=\s*\{([\s\S]*?)\}/);
+  assert.ok(m, "could not find _CI_BACKEND_BY_NAME in integrations/__init__.py");
+  const names = [...m[1].matchAll(/"([a-z_]+)"\s*:/g)].map((x) => x[1]);
+  assert.ok(names.length >= 3, `parsed only ${names.length} names — the scan broke`);
+  return new Set(names);
+}
+
+function jsxCiAutopinNames() {
+  const m = src.match(/CI_AUTOPIN\s*=\s*new Set\(\[([^\]]*)\]\)/);
+  assert.ok(m, "could not find CI_AUTOPIN in Integrations.jsx");
+  const names = [...m[1].matchAll(/"([a-z_]+)"/g)].map((x) => x[1]);
+  assert.ok(names.length >= 3, `parsed only ${names.length} names — the scan broke`);
+  return new Set(names);
+}
+
+test("the CI auto-pin note is shown for exactly the integrations the backend really auto-pins", () => {
+  const py = pythonCiAutopinNames();
+  const jsx = jsxCiAutopinNames();
+  assert.deepEqual(
+    [...jsx].sort(), [...py].sort(),
+    "the panel promises 'active CI backend' for a set that differs from " +
+    "_CI_BACKEND_BY_NAME — one of the two is lying to the operator",
+  );
+  assert.ok(py.has("circleci"),
+    "circleci must be auto-pinned: its form writes ci.project, so without a " +
+    "map entry it saves settings and selects no backend at all");
+});
+
+test("every auto-pinned integration's form actually writes into ci.*", () => {
+  // The other half of the same claim: a name in the map whose FIELD_SPECS
+  // write somewhere else pins a backend with no pipeline target.
+  const py = pythonCiAutopinNames();
+  const specs = pySrc.match(/FIELD_SPECS[\s\S]*?\n\}\n/);
+  assert.ok(specs, "could not find FIELD_SPECS");
+  for (const name of py) {
+    const block = specs[0].match(
+      new RegExp(`"${name}":\\s*\\[([\\s\\S]*?)\\]`),
+    );
+    assert.ok(block, `no FIELD_SPECS entry for auto-pinned '${name}'`);
+    assert.match(block[1], /config_path="ci\./,
+      `'${name}' is auto-pinned but no field writes into ci.*`);
+  }
+});
+
+test("the CI auto-pin note uses plain, active-voice copy", () => {
   assert.match(src, /active CI\s*\n?\s*.*backend/, "must state it becomes the active CI backend");
   assert.match(src, /turns CI on/i, "must state CI gets enabled, in plain language");
   // No raw config-key jargon in the visible copy string itself.
@@ -60,8 +118,8 @@ test("the CI auto-pin note appears for github/gitlab/jenkins/circleci and uses p
     "the visible note text must not contain raw config keys like ci.backend/ci.enabled");
 });
 
-test("a helper hint exists for jargon field names, e.g. org_slug", () => {
-  assert.match(src, /org_slug:\s*"/);
+test("a helper hint exists for jargon field names, e.g. the CircleCI project slug", () => {
+  assert.match(src, /project_slug:\s*"/);
   assert.match(src, /FIELD_HELP\[f\.name\]/);
 });
 

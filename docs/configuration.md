@@ -130,10 +130,11 @@ integrations:
     default_repo: ""
     write_back: false             # opt-in: update (comment) + status-label move
     poll_interval: 5m             # floor 60s
-  circleci:                       # CI status source; off by default
-    enabled: false
-    org_slug: ""                  # e.g. gh/your-org
-    project: ""
+  # No circleci block: like github_actions / gitlab / jenkins, CircleCI is
+  # configured in the `ci:` block — set backend: circleci and project to the
+  # API v2 project slug "<vcs>/<org>/<repo>" (e.g. gh/your-org/your-repo), with
+  # CIRCLECI_TOKEN in ~/.no_human/.env. It used to live here as
+  # org_slug + project + enabled, and nothing read any of the three.
   slack:
     intake: false                 # opt-in Socket-Mode worker; needs SLACK_BOT_TOKEN
                                   # + SLACK_APP_TOKEN in .env. NOTE: connects only —

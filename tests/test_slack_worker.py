@@ -14,6 +14,14 @@ import pytest
 from no_human.config import DEFAULT_CONFIG
 from no_human.integrations.slack.worker import SlackWorker
 
+# Tests here reach ``config.load_env_var``, which reads the operator's real
+# ``~/.no_human/.env`` BEFORE the process env — so `monkeypatch.setenv` LOSES
+# to a configured machine and three of these fail with the operator's own
+# token. Requested by NAME through `usefixtures`, never an autouse marker:
+# this removes an ambient input, it does not stub the SlackWorker under test,
+# so the module docstring's rule above still holds. See tests/conftest.py.
+pytestmark = pytest.mark.usefixtures("isolated_env_file")
+
 
 class _FakeRequest:
     def __init__(self, type_, envelope_id, payload):

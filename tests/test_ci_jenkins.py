@@ -14,6 +14,13 @@ from no_human.ci.base import CIResult, HumanGatedCI, JobResult, PipelineStatus
 from no_human.ci.jenkins import JenkinsCI, _console_is_infra
 from no_human.core.orchestrator import _ci_failure_unrelated
 
+# Tests here reach ``config.load_env_var``, which reads the operator's real
+# ``~/.no_human/.env`` BEFORE the process env. Requested by NAME through
+# `usefixtures` — never an autouse marker; see tests/conftest.py for why the
+# spelling is load-bearing (and note that even quoting the marker in a comment
+# is enough to score this file as a cheat signal, which is how that was found).
+pytestmark = pytest.mark.usefixtures("isolated_env_file")
+
 
 # --------------------------------------------------------------------------- #
 # A fake curl runner that routes by URL (robust to call ordering/poll counts). #

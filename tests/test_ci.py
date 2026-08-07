@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 import pytest
 
@@ -490,7 +491,7 @@ def test_ci_from_config_github_actions_readonly():
     assert ci.max_infra_retries == 0
 
 
-def test_ci_from_config_jenkins_defaults_to_watch():
+def test_ci_from_config_jenkins_defaults_to_watch(isolated_env_file):
     # Phase 6: Jenkins is now a real backend. The default mode is read-only
     # `watch` (poll the PR-triggered build); it is NOT human-gated by default.
     from no_human.ci import JenkinsCI
@@ -500,7 +501,7 @@ def test_ci_from_config_jenkins_defaults_to_watch():
     assert ci.mode == "watch"
 
 
-def test_ci_jenkins_human_gated_mode_still_parks():
+def test_ci_jenkins_human_gated_mode_still_parks(isolated_env_file):
     # The image-build prerequisite is preserved as an OPT-IN mode that parks the
     # task with a wake hint rather than faking the step (constraint §3.4).
     from no_human.ci import HumanGatedCI, JenkinsCI
@@ -518,7 +519,7 @@ def test_ci_from_config_unknown_backend_raises():
         ci_from_config({"ci": {"enabled": True, "backend": "bamboo"}})
 
 
-def test_all_backends_expose_max_infra_retries():
+def test_all_backends_expose_max_infra_retries(isolated_env_file):
     # The orchestrator reads ci_runner.max_infra_retries unconditionally; every
     # backend must have it (constraint #5: never crash). Jenkins is now a real
     # backend that retries infra failures like the others.
@@ -1290,3 +1291,332 @@ def test_resolver_reports_no_reason_when_a_later_source_recovers():
         prof_ci={"backend": "travis", "project": "p/r"},
     )
     assert reason is None
+
+
+# --------------------------------------------------------------------------- #
+# GitLab: a permissions wall is NOT a network blip                             #
+#                                                                              #
+# Every sibling backend (base/circleci/ghe_checkruns/github_actions/jenkins)   #
+# distinguishes the two; gitlab.py had zero `access_failure` paths, so a 401   #
+# was retried twice at 120 s and then escalated as "infra" — the one wording   #
+# that does NOT tell the operator which key to set.                            #
+#                                                                              #
+# The stderr strings below are VERBATIM from a real `glab` 1.92.1 against      #
+# gitlab.com (bad token / no credential / unresolvable host), not invented.    #
+# --------------------------------------------------------------------------- #
+
+GLAB_401 = "glab: 401 Unauthorized (HTTP 401)\n"
+GLAB_UNAUTHENTICATED = "          \n   ERROR  \n          \n  Unauthenticated.    \n\n"
+GLAB_DNS = ('          \n   ERROR  \n          \n  Get "https://h/api/v4/projects/1": '
+            'dial tcp: lookup h: no such    \n  host.    \n\n')
+
+
+def _fake_proc(returncode: int, stdout: str = "", stderr: str = ""):
+    from types import SimpleNamespace
+    return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+#: A DNS failure is a blip and must be retried. `glab` reports one by echoing
+#: the whole request URL back, which carries two pieces of OPERATOR-CHOSEN
+#: text — the project path and the hostname. Substring-matching auth signals
+#: over that text let the operator's own naming decide the verdict: these
+#: parked as MISSING_ACCESS and summoned a human for a failure that would have
+#: healed itself, which is the precise harm the auth-wall split exists to stop.
+GLAB_DNS_AUTH_WORD_IN_PROJECT = (
+    '          \n   ERROR  \n          \n  Get "https://gitlab.acme.net/api/v4/'
+    'projects/grp%2Funauthenticated-proxy/pipeline": dial tcp: lookup '
+    'gitlab.acme.net: no such    \n  host.    \n\n')
+GLAB_DNS_AUTH_WORD_IN_HOST = (
+    '          \n   ERROR  \n          \n  Get "https://unauthenticated.acme.net'
+    '/api/v4/projects/grp%2Fsvc/pipeline": dial tcp: lookup '
+    'unauthenticated.acme.net: no such    \n  host.    \n\n')
+#: The signal legitimately lives inside quotes here, which is why the redaction
+#: strips URL SPANS and not "anything quoted" — this must stay a true positive.
+GLAB_OAUTH_CHALLENGE = 'Bearer realm="gitlab", error="insufficient_scope"\n'
+#: The hardest case: the redaction must not blind us. The project is named
+#: `unauthenticated` AND the wall is real.
+GLAB_401_AUTH_WORD_IN_PROJECT = "glab: 401 Unauthorized (HTTP 401)\n"
+
+#: argv as `GitLabCI` really builds it (see `_trigger_pipeline`), so the
+#: redaction is exercised against the tokens glab actually echoes.
+def _glab_argv(project: str = "grp%2Fsvc", host: str = "gitlab.acme.net"):
+    return ["glab", "api", "--hostname", host, "--method", "POST",
+            f"projects/{project}/pipeline", "--input", "/tmp/body.json"]
+
+
+@pytest.mark.parametrize("stderr,expect_access", [
+    (GLAB_401, True),
+    (GLAB_UNAUTHENTICATED, True),
+    (GLAB_DNS, False),          # control: a network failure must stay infra
+])
+def test_glab_nonzero_exit_separates_an_auth_wall_from_a_network_failure(
+    monkeypatch, isolated_env_file, stderr, expect_access,
+):
+    """`_subprocess_run` discarded stderr entirely and returned "" for every
+    nonzero exit, so no caller could ever tell the two apart."""
+    from no_human.ci import gitlab as glmod
+
+    monkeypatch.setattr(
+        glmod.subprocess, "run",
+        lambda *a, **k: _fake_proc(1, stdout="", stderr=stderr),
+    )
+    if expect_access:
+        with pytest.raises(glmod.GitLabAccessError) as exc:
+            glmod._subprocess_run(["glab", "api", "x"])
+        assert "401" in str(exc.value) or "nauthenticated" in str(exc.value)
+    else:
+        assert glmod._subprocess_run(["glab", "api", "x"]) == ""
+
+
+@pytest.mark.parametrize("label,argv,stderr", [
+    ("project named unauthenticated-proxy",
+     _glab_argv("grp%2Funauthenticated-proxy"), GLAB_DNS_AUTH_WORD_IN_PROJECT),
+    ("host named unauthenticated.acme.net",
+     _glab_argv(host="unauthenticated.acme.net"), GLAB_DNS_AUTH_WORD_IN_HOST),
+])
+def test_a_network_failure_stays_infra_even_when_the_operators_own_names_read_as_auth(
+    monkeypatch, isolated_env_file, label, argv, stderr,
+):
+    """The operator's naming must never be able to synthesize an auth verdict.
+
+    Both of these are DNS failures. Before the redaction they raised
+    GitLabAccessError purely because the project path (or hostname) glab echoed
+    back contained the substring "unauthenticated" — so the task parked on a
+    human instead of retrying, for a blip. `GLAB_DNS` above is the control:
+    same failure, ordinary names, correctly infra.
+    """
+    from no_human.ci import gitlab as glmod
+
+    monkeypatch.setattr(glmod.subprocess, "run",
+                        lambda *a, **k: _fake_proc(1, stdout="", stderr=stderr))
+    assert glmod._subprocess_run(argv) == "", (
+        f"a DNS failure with an auth word in the {label} must retry as infra")
+
+
+@pytest.mark.parametrize("stderr", [GLAB_OAUTH_CHALLENGE, GLAB_401_AUTH_WORD_IN_PROJECT])
+def test_redacting_the_echoed_url_does_not_blind_the_auth_wall(
+    monkeypatch, isolated_env_file, stderr,
+):
+    """Non-vacuity for the test above: a test that just stopped raising would
+    pass it. These two are the cases the redaction could plausibly break — a
+    signal that lives INSIDE quotes, and a real 401 on a project whose name is
+    itself an auth word (so the redaction is actively removing that word from
+    the text while the verdict must still be "wall")."""
+    from no_human.ci import gitlab as glmod
+
+    monkeypatch.setattr(glmod.subprocess, "run",
+                        lambda *a, **k: _fake_proc(1, stdout="", stderr=stderr))
+    with pytest.raises(glmod.GitLabAccessError):
+        glmod._subprocess_run(_glab_argv("grp%2Funauthenticated"))
+
+
+def test_an_auth_word_inside_a_url_is_ignored_with_no_argv_context_at_all():
+    """The URL strip is a SECOND, independent defense and needs its own pin.
+
+    `_is_access_error`'s `echoed` argument defaults to empty, so any caller
+    without an argv to offer relies on the URL strip alone. Deleting the strip
+    left every test above green — `_subprocess_run` always supplies argv, so
+    those tests cannot tell the two defenses apart, and the strip would have
+    rotted unobserved.
+
+    Only the in-URL case is asserted. In `GLAB_DNS_AUTH_WORD_IN_HOST` the host
+    is also echoed BARE ("lookup unauthenticated.acme.net: no such host"),
+    outside any URL — that one genuinely needs the argv redaction, which is
+    what `test_a_network_failure_stays_infra_...` covers.
+    """
+    from no_human.ci.gitlab import _is_access_error
+
+    assert not _is_access_error(GLAB_DNS_AUTH_WORD_IN_PROJECT), (
+        "the project path appears ONLY inside the echoed URL here")
+    # Non-vacuity: a function that had simply stopped returning True passes the
+    # line above. A real wall, through the same no-argv call, must still fire.
+    assert _is_access_error(GLAB_401)
+
+
+def test_the_quoted_blocker_line_names_the_real_wall_not_the_echoed_url(
+    monkeypatch, isolated_env_file,
+):
+    """`_access_reason` picks the line to show the human, and it must agree
+    with `_is_access_error` about WHICH line is the wall.
+
+    Here the first line matches only because the operator's project is called
+    `unauthenticated-proxy`; the actual 401 is on the second. Matching on the
+    raw line would quote the URL line — so the operator opens a MISSING_ACCESS
+    blocker and reads a network error, for a genuine credentials problem. That
+    is the same "the product said something untrue" class as the rest of this
+    branch, one layer further out.
+    """
+    from no_human.ci import gitlab as glmod
+
+    stderr = (
+        '  Get "https://gitlab.acme.net/api/v4/projects/'
+        'grp%2Funauthenticated-proxy/pipeline": retrying\n'
+        "  glab: 401 Unauthorized (HTTP 401)\n"
+    )
+    monkeypatch.setattr(glmod.subprocess, "run",
+                        lambda *a, **k: _fake_proc(1, stdout="", stderr=stderr))
+    with pytest.raises(glmod.GitLabAccessError) as exc:
+        glmod._subprocess_run(_glab_argv("grp%2Funauthenticated-proxy"))
+    assert "401 Unauthorized" in str(exc.value), str(exc.value)
+    assert "Get \"https" not in str(exc.value), (
+        f"quoted the echoed URL instead of the wall: {exc.value}")
+
+
+def test_argv_that_is_part_of_a_signals_wording_is_never_redacted():
+    """`glab` is argv[0] AND a substring of the `glab auth login` signal.
+    Redacting every argv token blindly would delete the signal from the text
+    and turn a genuine "you are not logged in" into an infra retry."""
+    from no_human.ci.gitlab import _is_access_error, _operator_echoes
+
+    echoes = _operator_echoes(_glab_argv())
+    assert "glab" not in echoes, f"argv[0] must survive redaction: {echoes}"
+    assert "gitlab.acme.net" in echoes, f"the hostname must be redacted: {echoes}"
+    assert _is_access_error("  run glab auth login to authenticate\n", echoes)
+
+
+def test_the_percent_decoded_spelling_of_a_signal_is_never_redacted_either():
+    """The same guard, on the SECOND echo `_operator_echoes` emits.
+
+    Each argv token contributes two echoes — itself and `unquote(itself)` —
+    and the signal-wording clause used to be applied only to the first. So a
+    token that carries no signal RAW can manufacture one when decoded:
+    `glab%20auth%20login` is not a substring of any signal, passes the raw
+    check, and decodes to the whole of `glab auth login`. Measured before the
+    fix: echoes `('glab%20auth%20login', 'glab auth login')`, and a real
+    `run glab auth login` wall then classified False — an infra retry, twice,
+    for a credentials problem no retry can clear. That is the exact harm the
+    redaction exists to prevent, running in the other direction.
+
+    Driven through `_operator_echoes` directly, not `_subprocess_run`, because
+    today's argv cannot carry it: `_glab_argv` above is the whole shape, a
+    project path is `[A-Za-z0-9_.-]` joined by `/` and reaches argv only as
+    `%2F`, and hostnames cannot hold `%`. This pins the property so a future
+    caller that does put operator text on the command line cannot reopen it.
+    """
+    from no_human.ci.gitlab import _is_access_error, _operator_echoes
+
+    echoes = _operator_echoes(["glab", "api", "glab%20auth%20login"])
+    assert "glab auth login" not in echoes, (
+        f"the decoded spelling of a signal must survive redaction: {echoes}")
+    assert _is_access_error("  run glab auth login to authenticate\n", echoes)
+
+    # Non-vacuity: the decode itself is untouched for ordinary operator text,
+    # so this is a carve-out and not a deletion of the second echo.
+    ordinary = _operator_echoes(["glab", "api", "grp%2Fsvc"])
+    assert "grp/svc" in ordinary, ordinary
+
+
+def test_glab_zero_exit_is_unchanged(monkeypatch, isolated_env_file):
+    """Non-vacuity control: the success path must still return the output."""
+    from no_human.ci import gitlab as glmod
+
+    monkeypatch.setattr(glmod.subprocess, "run",
+                        lambda *a, **k: _fake_proc(0, stdout='{"id": 1}', stderr=""))
+    assert glmod._subprocess_run(["glab", "api", "x"]) == '{"id": 1}'
+
+
+def test_gitlab_token_already_in_the_environment_is_not_overwritten(
+    tmp_path, monkeypatch,
+):
+    """An exported GITLAB_TOKEN beats the .env file — the operator's shell wins.
+
+    `config.load_env_var` overwrites unconditionally (`if value:
+    os.environ[name] = value`), so the early return in `_load_gitlab_token` is
+    the ONLY thing that makes the shell authoritative. That guard was
+    unguarded: deleting it left the whole of tests/test_ci.py green at 97
+    passed, so an upgrade could have silently started billing a run against a
+    stale on-disk token while the operator watched their exported one.
+    """
+    import no_human.config as nh_config
+    from no_human.ci import gitlab as glmod
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("GITLAB_TOKEN=glpat-STALE-from-the-file\n")
+    env_path.chmod(0o600)
+    monkeypatch.setattr(nh_config, "ENV_PATH", env_path)
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-LIVE-from-the-shell")
+    monkeypatch.setattr(glmod.subprocess, "run",
+                        lambda *a, **k: _fake_proc(0, stdout="{}", stderr=""))
+
+    glmod._subprocess_run(["glab", "api", "x"])
+    assert os.environ["GITLAB_TOKEN"] == "glpat-LIVE-from-the-shell"
+
+
+def test_gitlab_poll_auth_wall_is_access_failure_naming_the_env_key():
+    from no_human.ci.gitlab import GitLabAccessError, _ACCESS_ENV_KEY
+
+    def fake(cmd):
+        raise GitLabAccessError("401 Unauthorized (HTTP 401)")
+
+    ci = GitLabCI("g/p", hostname="gitlab.acme.net", poll_interval=0, _run_cmd=fake)
+    result = ci._check_pipeline("42")
+    assert result.access_failure is True, "a 401 must park, not retry"
+    assert result.infra_failure is False, "an auth wall is not an infra blip"
+    assert result.access_env_key == _ACCESS_ENV_KEY == "GITLAB_TOKEN"
+    assert not result.passed
+    assert "GITLAB_TOKEN" in result.parsed_output
+
+
+def test_gitlab_trigger_auth_wall_is_access_failure_not_infra():
+    from no_human.ci.gitlab import GitLabAccessError
+
+    def fake(cmd):
+        raise GitLabAccessError("401 Unauthorized (HTTP 401)")
+
+    ci = GitLabCI("g/p", hostname="gitlab.acme.net", poll_interval=0, _run_cmd=fake)
+    result = ci._trigger_and_wait("branch", {})
+    assert result.access_failure is True
+    assert result.infra_failure is False
+
+
+async def test_gitlab_access_failure_is_never_retried_on_the_120s_backoff():
+    """`trigger` retries `infra_failure` up to max_infra_retries with a 120 s
+    sleep between attempts. An access wall must exit on the FIRST attempt —
+    retrying a 401 only delays the human who has to fix it."""
+    from no_human.ci.gitlab import GitLabAccessError
+
+    calls = []
+
+    def fake(cmd):
+        calls.append(cmd)
+        raise GitLabAccessError("401 Unauthorized (HTTP 401)")
+
+    slept = []
+
+    async def no_sleep(seconds):
+        slept.append(seconds)
+
+    ci = GitLabCI("g/p", hostname="gitlab.acme.net", poll_interval=0,
+                  max_infra_retries=2, _run_cmd=fake)
+    import no_human.ci.gitlab as glmod
+    orig = glmod.asyncio.sleep
+    glmod.asyncio.sleep = no_sleep
+    try:
+        result = await ci.trigger("branch")
+    finally:
+        glmod.asyncio.sleep = orig
+    assert result.access_failure is True
+    assert slept == [], f"an auth wall must not sleep on the infra backoff: {slept}"
+    assert len(calls) == 1, f"one attempt only, got {len(calls)}"
+
+
+def test_gitlab_token_is_loaded_from_the_env_file_so_the_named_key_is_actionable(
+    tmp_path, monkeypatch,
+):
+    """The MISSING_ACCESS ask says "set GITLAB_TOKEN in ~/.no_human/.env".
+    Nothing in the package loaded that key, so following the instruction would
+    have changed nothing: `glab` reads GITLAB_TOKEN from the PROCESS env.
+    """
+    import no_human.config as nh_config
+    from no_human.ci import gitlab as glmod
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("GITLAB_TOKEN=glpat-from-the-env-file\n")
+    env_path.chmod(0o600)
+    monkeypatch.setattr(nh_config, "ENV_PATH", env_path)
+    monkeypatch.delenv("GITLAB_TOKEN", raising=False)
+    monkeypatch.setattr(glmod.subprocess, "run",
+                        lambda *a, **k: _fake_proc(0, stdout="{}", stderr=""))
+
+    glmod._subprocess_run(["glab", "api", "x"])
+    assert os.environ.get("GITLAB_TOKEN") == "glpat-from-the-env-file"

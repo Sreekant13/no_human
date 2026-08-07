@@ -42,7 +42,7 @@ export const CONFIG_HINT = {
   jira: "config.yaml → integrations.jira",
   linear: "config.yaml → integrations.linear",
   monday: "config.yaml → integrations.monday (board_id + status_column)",
-  circleci: "config.yaml → ci (backend: circleci) + integrations.circleci",
+  circleci: "config.yaml → ci (backend: circleci)",
   github: "config.yaml → ci (backend: github_actions)",
   gitlab: "config.yaml → ci (backend: gitlab)",
   jenkins: "config.yaml → ci (backend: jenkins)",

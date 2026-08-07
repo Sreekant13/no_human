@@ -96,7 +96,16 @@ def test_load_config_has_integrations_defaults(tmp_path):
     cfg = load_config(tmp_path / "config.yaml")
     assert cfg["integrations"]["jira"]["enabled"] is False
     assert "project_key" in cfg["integrations"]["jira"]
-    assert cfg["integrations"]["circleci"]["enabled"] is False
+    # CircleCI is a view over `ci.*`, like github_actions/gitlab/jenkins — it
+    # has no `integrations.circleci` block. It used to, holding `enabled` +
+    # `org_slug` + `project`, and NOTHING read any of the three: the block
+    # rendered an on/off toggle and an onboarding form that governed nothing
+    # while the panel claimed CircleCI was the active CI backend.
+    assert "circleci" not in cfg["integrations"]
+    # ...and the block it moved to exists, off by default, with the key the
+    # CircleCI backend is built from.
+    assert cfg["ci"]["enabled"] is False
+    assert cfg["ci"]["project"] == ""
 
 
 def test_load_config_null_integrations_section_does_not_crash(tmp_path):

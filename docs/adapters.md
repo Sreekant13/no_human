@@ -267,6 +267,32 @@ by remote:
 Guards: `never_push_to`, protected-branch refusal, `git merge` / force-push
 blocked by the PreToolUse hook.
 
+### What resolves for GitLab, and what does not
+
+`vcs/pr_watcher.py` is only partly forge-neutral, and the difference is silent
+in both directions — every unsupported call returns an EMPTY value, which is
+also what "no data yet" looks like. A GitLab operator therefore has no way to
+tell "this MR has no failing checks" from "checks are never read here".
+
+| function | GitHub / GHE | GitLab |
+|---|---|---|
+| `default_pr_state` / `default_pr_merged` | `gh pr view` | `glab api` — supported |
+| `check_pr_comments` / `post_reply_comment` / `upsert_agent_comment` | `gh` | `glab` — supported |
+| `default_pr_checks` | `gh` statusCheckRollup | **not implemented** — always `[]` |
+| `default_pr_head` | `gh pr view --json headRefOid` | **not implemented** — always `""` |
+| `default_pr_mergeable` | `gh pr view --json mergeable` | **not implemented** — always `{"mergeable": "", "mergeStateStatus": ""}` |
+| `default_pr_files` | `gh pr view --json files` | **not implemented** — always `[]` |
+
+The four unimplemented ones early-return on `shutil.which("gh")` and then parse
+the ref through a GitHub-only helper, so a `project!iid` or a GitLab MR URL
+never reaches a query. This bounds the awaiting-approval watcher: on GitLab it
+wakes on merge and on comments, but it cannot see a red pipeline on the MR.
+Use the `ci.*` gate (below) for that — it is `glab`-native and does resolve.
+
+MR refs accept GitLab's own `group/project!7` as well as the pre-encoded
+`group%2Fproject!7`; both are normalized by `gitlab_project_path` before the
+API call, because GitLab 404s on a raw slash in the project path.
+
 ## CI (`no_human/ci/`)
 
 Opt-in per project (`ci.enabled`). Five backends, selected by `ci.backend`.
@@ -313,13 +339,20 @@ coder's problem:
 | `access_failure` | park with a `MISSING_ACCESS` blocker naming the exact `.env` key |
 | `HumanGatedCI` | park with a wake condition — a human must start this pipeline |
 
-**A misconfigured CI does not currently escalate.** If `ci.enabled` is true but
-the backend cannot be built — a missing required key, or a misspelled
-`ci.backend` — the run proceeds with the local suite as the only gate. It is
-not silent about it: an `advisory` event names the source and the reason, and
-`nh doctor` reports `CI BACKEND UNUSABLE`. But it does not stop, so the PR is
-opened ungated. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) KI-5 before relying on
-the gate.
+**A misconfigured CI escalates before the first metered call** (closed
+2026-08-02; [KNOWN_ISSUES.md](KNOWN_ISSUES.md) KI-5). If `ci.enabled` is true
+but no backend can be built — a missing required key, or a misspelled
+`ci.backend` — `ci_from_config` raises `CIMisconfigured` rather than returning
+`None` (`ci/__init__.py`), and `Orchestrator._drive` raises an `IMPOSSIBLE`
+blocker (`blockers.ci_misconfigured`) that routes to ESCALATED + notify. The
+run stops; it does not open an ungated PR. The `advisory` event naming the
+source and the reason, and `nh doctor`'s `CI BACKEND UNUSABLE`, are still
+emitted alongside it.
+
+Two cases deliberately do NOT escalate, because neither asks for a gate:
+`ci.enabled: false` (and no `ci:` block at all) proceeds on the local suite,
+and a task kind that cannot open a PR — a standalone code review, an
+investigation — is not parked for a gate it was never going to reach.
 
 ### GitLab backend detail
 
@@ -330,7 +363,25 @@ the gate.
 - **poll** `glab api projects/{enc}/pipelines/{id}` + `.../jobs`
 - **infra vs real** failure discrimination → infra auto-retries (120 s, max 2),
   real failures loop back to implement within `max_attempts`.
+- **auth wall vs infra**: `glab`'s stderr is classified only after every echoed
+  URL span and every argv token is blanked, so an operator's own project or
+  host name can never synthesize a wall out of a network blip.
 - **result parsers**: `pytest` summary, Maven `surefire` (`Tests run: X, …`).
+
+**Known gap, unproven in either direction: a 403 arrives as a 404.** GitLab
+hides the existence of a project a token cannot see, so an insufficiently
+scoped `GITLAB_TOKEN` is reported as `glab: 404 Not Found (HTTP 404)`. That
+matches none of the auth signals, so it is classified as infra: the run waits
+out both 120 s retries and then parks as `TRANSIENT_INFRA` — a "retry later"
+that will never clear — instead of a `MISSING_ACCESS` blocker naming
+`GITLAB_TOKEN`. Treating 404 as a wall was considered and rejected: it is also
+what a typo'd `ci.project` returns, and that would park a human on a config
+error the retry loop otherwise surfaces plainly. **Neither half of this has
+been reproduced against a live GitLab** — no valid token was available and
+every probe returned 401 before reaching a 404 — so read it as the documented
+consequence of the classification rules, not as an observed failure. If you
+hit `TRANSIENT_INFRA` on a GitLab pipeline that never starts, check the token's
+scope on the project before anything else.
 
 Add a backend by implementing the `ci/base.py` contract and wiring it in
 `ci/__init__.py:ci_from_config`.

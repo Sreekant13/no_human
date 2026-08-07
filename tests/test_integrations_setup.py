@@ -77,7 +77,31 @@ def test_every_registry_notification_integration_now_has_a_block():
     """slack and teams are both notify-side registry entries; before this
     change only slack had a config block."""
     blocks = nh_config.DEFAULT_CONFIG["integrations"]
-    assert {"jira", "linear", "circleci", "slack", "teams"} <= set(blocks)
+    assert {"jira", "linear", "slack", "teams"} <= set(blocks)
+
+
+def test_the_ci_backends_have_no_integrations_block_so_the_wizard_cannot_lie():
+    """github / gitlab / jenkins / circleci are views over the single `ci.*`
+    section, so none of them may own an `integrations.<name>` block.
+
+    `setup_specs` discovers the wizard's forms from these blocks and
+    `enable_field` derives an on/off toggle from them. CircleCI had one holding
+    `enabled` + `org_slug` + `project` that nothing read: the wizard rendered a
+    form and a switch that changed nothing, while the Settings panel told the
+    operator CircleCI was their active CI backend and no gate ran. A block here
+    for any of the four is that defect coming back.
+    """
+    from no_human.integrations import _CI_BACKEND_BY_NAME, enable_field
+
+    blocks = set(nh_config.DEFAULT_CONFIG["integrations"])
+    assert _CI_BACKEND_BY_NAME, "non-vacuity: the CI backend map is empty"
+    assert not (set(_CI_BACKEND_BY_NAME) & blocks), (
+        f"CI backends own an integrations block: "
+        f"{sorted(set(_CI_BACKEND_BY_NAME) & blocks)}")
+    for name in _CI_BACKEND_BY_NAME:
+        assert enable_field(name) is None, (
+            f"{name} renders an on/off switch that governs nothing — "
+            "`ci.enabled` is the only switch a CI backend has")
 
 
 @pytest.mark.parametrize("enabled,expect", [(True, True), (False, False), (None, True)])

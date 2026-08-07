@@ -22,6 +22,11 @@ from no_human.integrations.slack.intake import (
 from no_human.integrations.slack.worker import SlackWorker
 from no_human.project_model import Project
 
+# Tests here reach ``config.load_env_var``, which reads the operator's real
+# ``~/.no_human/.env`` BEFORE the process env. Requested by NAME through
+# `usefixtures` — never an autouse marker; see tests/conftest.py.
+pytestmark = pytest.mark.usefixtures("isolated_env_file")
+
 
 class _FakeSocketModeClient:
     def __init__(self, app_token=None, web_client=None):

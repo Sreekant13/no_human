@@ -1217,6 +1217,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Opt-in per project. Set enabled=true and provide project path.
         "enabled": False,
         "backend": "gitlab",      # gitlab | github_actions | jenkins | circleci
+        # The pipeline target, read by every backend: "namespace/repo"
+        # (gitlab), "owner/repo" (github_actions / ghe_checkruns) or the
+        # CircleCI API v2 project slug "<vcs>/<org>/<repo>", e.g. "gh/acme/svc".
         "project": "",
         "hostname": "gitlab.acme.net",
         "variables": {},          # extra pipeline variables (sent as the POST body's variables array)
@@ -1306,10 +1309,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "write_back": False,      # opt-in: update (comment) + status-label move
             "poll_interval": "5m",    # floor 60s enforced at the serve hook
         },
-        "circleci": {
-            "enabled": False, "org_slug": "", "project": "",
-            # CIRCLECI_TOKEN in ~/.no_human/.env
-        },
+        # No `circleci` block. It held `enabled` + `org_slug` + `project` and
+        # NOTHING read any of the three: the CI layer builds CircleCICI from
+        # `ci.project` (the API v2 project slug), and `ci.enabled` is the only
+        # switch that turns a CI gate on. So the block rendered an onboarding
+        # form and an on/off toggle that governed nothing, while the panel told
+        # the operator CircleCI was their active CI backend and no gate ran.
+        # CircleCI is configured in the `ci:` block above, exactly like
+        # github_actions / gitlab / jenkins. An older config that still carries
+        # this block loads fine (unknown keys are merged, not rejected) and is
+        # reported unconfigured with a re-save nudge — see
+        # `integrations._CIRCLECI_LEGACY_DETAIL` for why it is NOT auto-promoted.
         "slack": {
             # Opt-in Socket-Mode intake worker (SCRUM-60/61/62 split). Default
             # OFF: no worker starts and no import-time side effects occur.

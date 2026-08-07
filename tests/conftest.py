@@ -46,6 +46,95 @@ def mock_ambient_probes(monkeypatch):
     return reg
 
 
+@pytest.fixture
+def isolated_env_file(tmp_path, monkeypatch):
+    """Point ``config.ENV_PATH`` at an empty temp file for this test.
+
+    Stubbing the transport does NOT stop a test reading the operator's real
+    ``~/.no_human/.env``. `config.load_env_var` reads the FILE FIRST and only
+    then falls back to the process env (".env wins over an inherited token: it
+    is the curated source", config.py), and the call sites reach it before any
+    seam a test can patch — `gitlab._subprocess_run` calls
+    `_load_gitlab_token()` on entry; `SlackWorker.__init__` resolves
+    `SLACK_BOT_TOKEN`/`SLACK_APP_TOKEN` before it constructs a client;
+    `jenkins`/`jenkins_session` resolve `JENKINS_USER`, `JENKINS_API_TOKEN`,
+    `SSO_USERNAME`, `SSO_PASSWORD`; `api/app.py` and the intake CLI verbs
+    resolve `JIRA_API_TOKEN` / `LINEAR_API_KEY` / `MONDAY_API_TOKEN`. Whatever
+    it finds it also EXPORTS into `os.environ`.
+
+    This is not hygiene alone. `monkeypatch.setenv` LOSES to a populated file,
+    so on an operator's machine that has configured Slack the suite reads
+    their token instead of the test's and asserts `'xoxb-…' == 'B1'` — the
+    tests are green only while the operator happens to have no such key on
+    disk. Request this wherever a test can reach `config._read_env_file`, so
+    the suite's verdict stops depending on the operator's `.env`. Read the last
+    paragraph before reading that as "on nothing outside the repo": HOME is a
+    bigger hole than `.env` and this fixture does not close it.
+
+    Requested BY NAME — as a test argument, or `pytestmark =
+    pytest.mark.usefixtures("isolated_env_file")` at the top of a module where
+    every test can reach one of those call sites — and NEVER autouse.
+    `tamper_guard.count_faking_fixtures` is `min(autouse markers, faking-patch
+    calls)` per file, and it is right to score that shape: an autouse fixture
+    that monkeypatches is the single highest-leverage way to make a suite lie.
+
+    WHAT THE SPELLING COSTS, MEASURED — an earlier draft of this paragraph
+    cited a number that cannot be reproduced. It said the requesting modules
+    "score 0 and would score 1", which is arithmetically true and is not
+    evidence of anything: a module carrying no autouse marker scores 0 whatever
+    else it does, because `count_faking_fixtures` returns before it counts
+    anything if its autouse search does not match. tests/test_cli_commands.py
+    holds 67 faking-patch calls and scores 0, on main and here alike. The
+    reproducible figures come from `runner.tamper_check_between(repo,
+    "c0daad33", <tip>)` over the whole tree, and they are:
+
+      · as written here — fake-fixtures 15 -> 15, clean, and no autouse reason
+        in the report;
+      · the identical isolation re-spelled as an autouse wrapper in the same
+        six modules — fake-fixtures 15 -> 21, TAMPERED, six named reasons, one
+        per module.
+
+    Per file, tests/conftest.py scores 2 both before and after: its two
+    long-standing autouse fixtures, which this change neither adds to nor
+    disturbs. So the spelling IS load-bearing, and what makes it so is the +6
+    the other spelling would add — not the 0 those modules already had.
+
+    WHAT THIS DOES NOT PIN. It stops the suite READING the operator's file; it
+    does not exercise the precedence rule quoted at the top. For the Slack,
+    Jenkins and intake keys `load_env_var` lets a populated `.env` overwrite an
+    inherited value, and no test drives that conflict:
+    tests/test_linear_issues_endpoint.py and tests/test_jira_issues_endpoint.py
+    populate a temp `.env` with the process env deliberately EMPTY, which pins
+    "the file is read", not "the file wins". The one place precedence is pinned
+    runs the OPPOSITE way and covers one key — the GITLAB_TOKEN test in
+    tests/test_ci.py puts a stale token in a populated temp `.env` against an
+    exported live one and requires the shell to win, which is
+    `_load_gitlab_token`'s early return rather than `load_env_var`'s rule. This
+    fixture returns `env_path` precisely so a test that wants the conflict can
+    write to it. None does yet.
+
+    AND THE GAP THIS FIXTURE IS NOT BIG ENOUGH TO CLOSE, named here so nobody
+    reads the isolation as broader than it is. `config.ENV_PATH` can be
+    redirected at all only because `load_env_var` resolves it at CALL time.
+    `DB_PATH` and `CONFIG_PATH` are bound at IMPORT time from `NO_HUMAN_HOME =
+    Path.home() / ".no_human"` (config.py), so the suite still writes `cache/`,
+    `worktrees/` and `config.yaml` into whatever HOME it is given, and a branch
+    carrying a migration replays that migration into the operator's live
+    database — which has actually happened, not a hypothetical. Closing it
+    needs a session-scoped plugin that redirects HOME BEFORE `no_human.config`
+    is imported: a different mechanism, not an extension of this fixture, and
+    deliberately out of scope here. Until it exists, the suite is run under a
+    temp HOME, and that is a procedure rather than a guard.
+    """
+    import no_human.config as nh_config
+
+    env_path = tmp_path / "isolated.env"
+    env_path.write_text("")
+    env_path.chmod(0o600)
+    monkeypatch.setattr(nh_config, "ENV_PATH", env_path)
+    return env_path
+
+
 class _HermeticUtilityBackend:
     """Stands in for every ClaudeBackend the ORCHESTRATOR constructs itself
     (utility eval, distillation, supervisor LLM, planners). Those calls are

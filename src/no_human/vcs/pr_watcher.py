@@ -144,17 +144,50 @@ async def fetch_github_pr_comments(
     return comments
 
 
+def gitlab_project_path(project: str) -> str:
+    """Percent-encode a GitLab project for the REST API — idempotently.
+
+    GitLab addresses a project as ``group%2Frepo``; a RAW slash splits the URL
+    path and 404s. Verified against the live API (2026-08-06)::
+
+        projects/gitlab-org%2Fgitlab-foss  -> HTTP 200
+        projects/gitlab-org/gitlab-foss    -> HTTP 404
+
+    Every project has a namespace, so this is the normal case, not an edge one.
+    A 404 here is silent — ``_run_cli`` returns None, the state reads "", and a
+    ``pr_merged:`` blocker stays parked forever, which is the exact failure the
+    GitLab lifecycle support was added to remove.
+
+    Callers arrive in BOTH forms and neither can be made to go away: this
+    module's own :func:`parse_pr_url` already encodes, while the ``project!iid``
+    short ref — GitLab's own native notation, and the only form a human or an
+    LLM writes by hand — carries a raw slash. Decoding before encoding makes the
+    function idempotent, so both land on the same argv, and a MIXED ref such as
+    ``grp%2Fsub/proj!7`` is normalized rather than half-encoded.
+
+    The round trip cannot lose information: a GitLab path segment is
+    ``[A-Za-z0-9_.-]`` joined by ``/``, so a literal ``%`` cannot occur in one
+    and can only ever be an escape introducer. ``unquote`` leaves a malformed
+    escape untouched, so a stray ``%`` re-encodes to ``%25`` rather than
+    silently corrupting the path.
+    """
+    from urllib.parse import quote, unquote
+    return quote(unquote(project), safe="")
+
+
 async def fetch_gitlab_mr_comments(
     project_id: str, mr_iid: int, *, since: str | None = None,
     agent_username: str = "no-human-bot",
 ) -> list[PrComment]:
     """Fetch MR notes from GitLab via ``glab`` CLI.
 
-    ``project_id`` is URL-encoded (e.g. ``group%2Frepo``).
+    ``project_id`` may be given either encoded (``group%2Frepo``) or as a plain
+    path (``group/repo``); :func:`gitlab_project_path` normalizes it.
     """
     if not shutil.which("glab"):
         return []
 
+    project_id = gitlab_project_path(project_id)
     comments: list[PrComment] = []
     out = await _run_cli([
         "glab", "api",
@@ -211,28 +244,20 @@ def parse_pr_url(url: str) -> tuple[str, str, str, int] | None:
 
 
 async def default_pr_merged(ref: str) -> bool:
-    """Resolve a ``pr_merged:`` wake condition via gh.
+    """Resolve a ``pr_merged:`` wake condition — gh for GitHub/GHE, glab for
+    GitLab.
 
-    ``ref`` may be a full PR URL or ``owner/repo#num``. Unknown/unsupported →
-    False (never falsely report merged). Used by serve/wake/api watchers.
+    ``ref`` may be a full PR/MR URL, ``owner/repo#num`` (GitHub) or
+    ``project!iid`` (GitLab). Unknown/unsupported → False (never falsely report
+    merged). Used by serve/wake/api watchers.
+
+    Derived from :func:`default_pr_state` rather than running its own query:
+    the two used to be separate `gh` calls that could in principle disagree,
+    and every forge added to one had to be remembered in the other. A GitLab MR
+    returned False here forever, with no error anywhere, so a task parked on
+    ``pr_merged:<MR>`` never woke.
     """
-    if not shutil.which("gh"):
-        return False
-    if ref.startswith("http"):
-        parsed = parse_pr_url(ref)
-        if not parsed or parsed[0] != "github":
-            return False
-        _, host, slug, num = parsed
-        repo_arg, num_str = f"{host}/{slug}", str(num)  # gh --repo takes [HOST/]OWNER/REPO
-    elif "#" in ref:
-        repo, _, num_str = ref.partition("#")
-        repo_arg = repo
-    else:
-        return False
-    out = await _run_cli(
-        ["gh", "pr", "view", num_str, "--repo", repo_arg, "--json", "state"]
-    )
-    return bool(out) and '"MERGED"' in out
+    return (await default_pr_state(ref)) == "MERGED"
 
 
 async def check_pr_comments(
@@ -312,6 +337,7 @@ async def post_reply_comment(pr_ref: str, message: str) -> bool:
     message = f"{AGENT_COMMENT_MARKER}\n{message}"
     if "!" in pr_ref:
         project_id, _, iid_str = pr_ref.partition("!")
+        project_id = gitlab_project_path(project_id)
         out = await _run_cli([
             "glab", "api", "--method", "POST",
             f"projects/{project_id}/merge_requests/{iid_str}/notes",
@@ -360,7 +386,7 @@ async def upsert_agent_comment(pr_ref: str, message: str, key: str = "") -> bool
 
     if "!" in pr_ref:  # GitLab MR: "project!iid"
         project, _, iid = pr_ref.partition("!")
-        base = f"projects/{project}/merge_requests/{iid}/notes"
+        base = f"projects/{gitlab_project_path(project)}/merge_requests/{iid}/notes"
         nid = _find_marker_id(await _run_cli(["glab", "api", f"{base}?per_page=100"]), find)
         if nid and await _run_cli(["glab", "api", "--method", "PUT",
                                    f"{base}/{nid}", "--field", f"body={body}"]) is not None:
@@ -386,26 +412,70 @@ async def upsert_agent_comment(pr_ref: str, message: str, key: str = "") -> bool
     return False
 
 
-async def default_pr_state(ref: str) -> str:
-    """The PR's lifecycle state via gh: "MERGED" | "CLOSED" | "OPEN" | "".
+#: GitLab MR ``state`` → the GitHub vocabulary the rest of this module speaks.
+#: Deliberately partial: GitLab also reports ``locked``, which is neither open
+#: nor finished, and guessing it into CLOSED would escalate a live MR. Anything
+#: not listed falls through to "" — unknown, which callers treat as no action.
+_GITLAB_MR_STATE = {"merged": "MERGED", "closed": "CLOSED", "opened": "OPEN"}
 
-    "" means unknown (no gh, unparseable ref, network error) — callers must
-    treat unknown as "no action", never as closed. An awaiting-approval task
-    previously watched only comments, so a merged PR left it parked forever
-    and a closed-unmerged PR was polled until the end of time.
+
+async def _gitlab_mr_state(project: str, iid: str, *, host: str = "") -> str:
+    """One GitLab MR's lifecycle state via ``glab``, in GitHub's vocabulary.
+
+    ``project`` may be encoded (``group%2Frepo``, what :func:`parse_pr_url`
+    produces) or a plain path (``group/repo``, what the ``project!iid`` short
+    ref carries); :func:`gitlab_project_path` normalizes both. ``host`` is
+    required for self-hosted GitLab: ``glab`` defaults to gitlab.com, which is
+    the exact failure ``ci/gitlab.py`` records for ``glab ci run``.
     """
-    if not shutil.which("gh"):
+    if not shutil.which("glab"):
         return ""
+    project = gitlab_project_path(project)
+    hostarg = ["--hostname", host] if host else []
+    out = await _run_cli(
+        ["glab", "api", *hostarg, f"projects/{project}/merge_requests/{iid}"]
+    )
+    if not out:
+        return ""
+    try:
+        raw = json.loads(out)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    return _GITLAB_MR_STATE.get(str(raw.get("state") or "").lower(), "")
+
+
+async def default_pr_state(ref: str) -> str:
+    """The PR/MR's lifecycle state: "MERGED" | "CLOSED" | "OPEN" | "".
+
+    "" means unknown (no gh/glab, unparseable ref, network error, a state this
+    module does not map) — callers must treat unknown as "no action", never as
+    closed. An awaiting-approval task previously watched only comments, so a
+    merged PR left it parked forever and a closed-unmerged PR was polled until
+    the end of time.
+
+    GitHub/GHE goes through ``gh``, GitLab through ``glab``. Before that split
+    existed every GitLab ref returned "" here — silently, so an MR that had
+    been merged for days looked exactly like a network blip.
+    """
     if ref.startswith("http"):
         parsed = parse_pr_url(ref)
-        if not parsed or parsed[0] != "github":
+        if not parsed:
             return ""
-        _, host, slug, num = parsed
+        forge, host, slug, num = parsed
+        if forge == "gitlab":
+            return await _gitlab_mr_state(slug, str(num), host=host)
         repo_arg, num_str = f"{host}/{slug}", str(num)
+    elif "!" in ref:                       # GitLab short ref: "project!iid"
+        project, _, num_str = ref.partition("!")
+        return await _gitlab_mr_state(project, num_str)
     elif "#" in ref:
         repo, _, num_str = ref.partition("#")
         repo_arg = repo
     else:
+        return ""
+    if not shutil.which("gh"):
         return ""
     out = await _run_cli(
         ["gh", "pr", "view", num_str, "--repo", repo_arg, "--json", "state"]

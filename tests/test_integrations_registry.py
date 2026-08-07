@@ -627,18 +627,58 @@ def test_configured_detection():
     cfg = {
         "integrations": {
             "jira": {"site": "acme.atlassian.net", "project_key": "PROJ", "email": "me@x.com"},
-            "circleci": {"org_slug": "gh/acme", "project": "svc"},
         },
         "ci": {"enabled": True, "backend": "github_actions", "project": "o/r", "job": ""},
         "notifications": {"slack_webhook_url": "https://hooks.slack.com/x"},
     }
     st = {s.name: s for s in list_integrations(cfg)}
     assert st["jira"].configured is True
-    assert st["circleci"].configured is True
     assert st["github"].configured is True      # ci.backend == github_actions + project
     assert st["gitlab"].configured is False     # backend isn't gitlab
     assert st["jenkins"].configured is False    # backend isn't jenkins
+    assert st["circleci"].configured is False   # backend isn't circleci
     assert st["slack"].configured is True
+
+
+def test_circleci_is_configured_only_when_the_ci_block_selects_it():
+    """CircleCI is a view over `ci.*` like its three siblings. It reported
+    `configured` off `integrations.circleci.org_slug` + `.project` — keys the
+    CI layer never reads — so the card said Configured with no gate anywhere."""
+    cfg = {"ci": {"enabled": True, "backend": "circleci", "project": "gh/acme/svc"}}
+    st = {s.name: s for s in list_integrations(cfg)}
+    assert st["circleci"].configured is True
+    assert "gh/acme/svc" in st["circleci"].detail
+    assert st["github"].configured is False
+    assert st["gitlab"].configured is False
+    assert st["jenkins"].configured is False
+
+
+@pytest.mark.parametrize("legacy", [
+    {"org_slug": "gh/acme", "project": "svc"},
+    # Switched ON and never filled in. This operator is the MOST likely to
+    # believe a gate is running, and matching only on the two data fields gave
+    # exactly them a bare "not configured" with nothing to act on.
+    {"enabled": True},
+    {"enabled": True, "org_slug": "gh/acme"},
+])
+def test_a_legacy_circleci_block_reads_unconfigured_and_says_what_to_do(legacy):
+    """Upgrade path. That config never produced a gate, so promoting it would
+    switch one ON silently; it is reported honestly instead, with the fix."""
+    cfg = {"integrations": {"circleci": legacy}}
+    st = {s.name: s for s in list_integrations(cfg)}["circleci"]
+    assert st.configured is False
+    assert "integrations.circleci" in st.detail and "re-save" in st.detail
+    # The nudge must not be a trap: saving any CI form pins `ci.backend`, so an
+    # operator on another backend needs to know before they follow it.
+    assert "ci.backend" in st.detail, st.detail
+
+
+def test_no_circleci_block_at_all_gets_the_plain_unconfigured_detail():
+    """Non-vacuity for the nudge: a detail string that had simply become
+    unconditional would pass every case above."""
+    st = {s.name: s for s in list_integrations({"integrations": {}, "ci": {}})}["circleci"]
+    assert st.configured is False
+    assert st.detail == "not configured", st.detail
 
 
 def test_null_sections_are_safe():

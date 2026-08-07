@@ -15,12 +15,18 @@ import { useEscapeKey } from "./useEscapeKey.js";
 // no_human/integrations/__init__.py) — saving one of their forms is how the
 // backend picks which CI backend is active, so it auto-pins ci.backend +
 // ci.enabled alongside the field(s) just saved. The form must say so plainly.
+//
+// This set must equal `_CI_BACKEND_BY_NAME` in
+// no_human/integrations/__init__.py, and integrations.test.mjs reads that file
+// to check it. It listed circleci while the Python map did NOT, so this note
+// promised an active CI backend for a form that pinned nothing — the panel
+// said the gate was on and every PR went out ungated.
 const CI_AUTOPIN = new Set(["github", "gitlab", "jenkins", "circleci"]);
 
 // Plain-language help for field names that read as internal jargon on their
 // own — everything else is covered by its label.
 const FIELD_HELP = {
-  org_slug: "Your CircleCI organization slug, e.g. gh/your-org.",
+  project_slug: "Your CircleCI project slug: <vcs>/<org>/<repo>, e.g. gh/your-org/your-repo.",
   jql: "Optional JQL query to filter which issues sync in — leave blank for the default.",
   job: "The Jenkins job path, e.g. folder/job-name.",
 };

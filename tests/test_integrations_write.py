@@ -268,11 +268,110 @@ async def test_get_integrations_includes_fields_with_set_booleans(client, mock_a
 
     await client.put(
         "/api/integrations/circleci/config",
-        json={"fields": {"org_slug": "gh/acme", "project": "svc", "api_token": "cc-secret"}},
+        json={"fields": {"project_slug": "gh/acme/svc", "api_token": "cc-secret"}},
     )
     r2 = await client.get("/api/integrations")
     circleci = next(x for x in r2.json()["integrations"] if x["name"] == "circleci")
     by_name = {f["name"]: f for f in circleci["fields"]}
-    assert by_name["org_slug"]["set"] is True
+    assert by_name["project_slug"]["set"] is True
     assert by_name["api_token"]["set"] is True
     assert "cc-secret" not in r2.text
+
+
+# --------------------------------------------------------------------------- #
+# The CI auto-pin (github / gitlab / jenkins / circleci)                       #
+#                                                                              #
+# The settings form for a CI backend is how the UI SELECTS that backend, and   #
+# the panel says so in as many words ("Saving here makes X your active CI      #
+# backend and turns CI on for this workspace"). Nothing tested it. CircleCI    #
+# was missing from `_CI_BACKEND_BY_NAME` AND wrote its settings to a config    #
+# path the CI layer never reads, so saving the form produced no `ci:` block    #
+# at all — the card said Configured, Test-connection said Connected, and       #
+# every PR went out ungated.                                                   #
+#                                                                              #
+# These assert the END behaviour (a backend the CI layer can actually build),  #
+# not the presence of a key, because the key was present and still wrong.      #
+# --------------------------------------------------------------------------- #
+
+_CI_FORMS = [
+    ("github", {"project": "acme/svc"}, "github_actions", "GitHubActionsCI"),
+    ("gitlab", {"project": "grp/svc"}, "gitlab", "GitLabCI"),
+    ("jenkins", {"job": "job/acme/job/PR-1"}, "jenkins", "JenkinsCI"),
+    ("circleci", {"project_slug": "gh/acme/svc"}, "circleci", "CircleCICI"),
+]
+
+
+@pytest.mark.parametrize("name,fields,backend,cls_name", _CI_FORMS)
+def test_saving_a_ci_form_yields_a_backend_the_ci_layer_can_build(
+    tmp_path, name, fields, backend, cls_name,
+):
+    from no_human.ci import ci_from_config
+
+    status = save_integration_config(name, fields)
+    resolved = nh_config.load_config(nh_config.CONFIG_PATH).data
+
+    assert resolved["ci"]["backend"] == backend
+    assert resolved["ci"]["enabled"] is True
+    runner = ci_from_config(resolved)
+    assert runner is not None, (
+        f"saving the {name} form promised an active CI backend, but "
+        f"ci_from_config built nothing — the PR would go out ungated")
+    assert type(runner).__name__ == cls_name
+    assert status.configured is True, "the card must agree with the gate"
+
+
+@pytest.mark.parametrize("name,fields,backend,_cls", _CI_FORMS)
+def test_ci_form_never_leaves_the_card_and_the_gate_disagreeing(
+    tmp_path, name, fields, backend, _cls,
+):
+    """The defect class, stated directly: `configured` on the card and a
+    buildable backend must be the same fact. Before the fix CircleCI reported
+    configured=True with no `ci:` block on disk at all."""
+    from no_human.ci import ci_from_config
+
+    status = save_integration_config(name, fields)
+    resolved = nh_config.load_config(nh_config.CONFIG_PATH).data
+    assert status.configured is (ci_from_config(resolved) is not None)
+
+
+def test_every_ci_kind_form_is_covered_by_the_autopin():
+    """Discovery, not a hand-written list: any FIELD_SPECS entry whose fields
+    write into `ci.*` must be in the auto-pin map, or saving it silently fails
+    to select the backend. This is what let circleci diverge."""
+    from no_human.integrations import _CI_BACKEND_BY_NAME
+
+    writes_ci = {
+        name for name, specs in FIELD_SPECS.items()
+        if any((s.config_path or "").startswith("ci.") for s in specs)
+    }
+    assert writes_ci, "non-vacuity: no integration writes ci.* — the scan broke"
+    assert writes_ci == set(_CI_BACKEND_BY_NAME), (
+        f"forms writing ci.* {sorted(writes_ci)} != auto-pinned "
+        f"{sorted(_CI_BACKEND_BY_NAME)}")
+
+
+def test_circleci_form_writes_the_slug_the_backend_reads(tmp_path):
+    """`ci_from_config` builds CircleCICI from `ci.project` (the project slug
+    "<vcs>/<org>/<repo>"). The form used to write
+    integrations.circleci.org_slug/.project, which nothing reads."""
+    from no_human.ci import ci_from_config
+
+    save_integration_config("circleci", {"project_slug": "gh/acme/svc"})
+    resolved = nh_config.load_config(nh_config.CONFIG_PATH).data
+    runner = ci_from_config(resolved)
+    assert runner.project_slug == "gh/acme/svc"
+
+
+def test_a_legacy_integrations_circleci_block_is_never_reported_as_configured():
+    """Read-compat decision, recorded as a test: an install that filled the OLD
+    CircleCI form has settings under `integrations.circleci` and NO CI gate —
+    that config never produced one. Auto-promoting it to `ci.backend: circleci`
+    + `ci.enabled: true` would switch on a gate the operator never had, on
+    upgrade, silently. So it is reported UNCONFIGURED and the detail says what
+    to do."""
+    from no_human.integrations import list_integrations
+
+    cfg = {"integrations": {"circleci": {"org_slug": "gh/acme", "project": "svc"}}}
+    st = {s.name: s for s in list_integrations(cfg)}["circleci"]
+    assert st.configured is False
+    assert "integrations.circleci" in st.detail

@@ -21,6 +21,11 @@ from no_human.cli.commands import cli
 from no_human.core.db import Store
 from no_human.core.task import Task, TaskStatus
 
+# The `nh start` poller tests reach ``config.load_env_var``, which reads the
+# operator's real ``~/.no_human/.env`` BEFORE the process env. Requested by
+# NAME through `usefixtures` — never an autouse marker; see tests/conftest.py.
+pytestmark = pytest.mark.usefixtures("isolated_env_file")
+
 
 # --------------------------------------------------------------------------- #
 # Helpers — each opens a fresh Store connection in its own asyncio.run()      #

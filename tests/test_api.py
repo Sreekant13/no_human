@@ -11,6 +11,11 @@ from no_human.api.app import app
 from no_human.core.db import Store
 from no_human.profile import ProjectProfile
 
+# Tests here reach ``config.load_env_var``, which reads the operator's real
+# ``~/.no_human/.env`` BEFORE the process env. Requested by NAME through
+# `usefixtures` — never an autouse marker; see tests/conftest.py.
+pytestmark = pytest.mark.usefixtures("isolated_env_file")
+
 
 # --------------------------------------------------------------------------- #
 # Fixtures                                                                     #

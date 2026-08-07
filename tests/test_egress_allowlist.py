@@ -645,7 +645,7 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
         "http:httpx": Allowed(
             "Jira / Linear / CircleCI / your Teams webhook — health checks",
             _CFG + "integrations.jira.enabled, integrations.linear.enabled, "
-                   "integrations.circleci.enabled — nothing configured, "
+                   "ci.enabled — nothing configured, "
                    "nothing sent"),
     },
 
@@ -1707,20 +1707,81 @@ def test_every_entry_names_a_destination_and_a_gate() -> None:
             assert entry.gate.startswith(_GATE_FORMS), (module, channel)
 
 
+#: The phrase a gate must contain to be allowed to name a key DEFAULT_CONFIG
+#: does not have. Kept as a constant so the assertion and the message that
+#: tells an author how to satisfy it cannot drift apart.
+_DECLARED_ABSENT = "absent from DEFAULT_CONFIG"
+
+
+def _resolve_config_key(key: str) -> tuple[bool, object]:
+    """Walk a dotted gate key through DEFAULT_CONFIG -> ``(exists, value)``.
+
+    Split out of the test below so the walk itself can be tested. Absence and a
+    falsy value are DIFFERENT answers and the caller needs both: conflating
+    them is what let a deleted key keep passing.
+    """
+    from no_human.config import DEFAULT_CONFIG
+
+    node: object = DEFAULT_CONFIG
+    for part in key.split("."):
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        else:
+            return False, None
+    return True, node
+
+
+def test_the_config_key_walk_can_actually_tell_absent_from_falsy() -> None:
+    """Non-vacuity for `_resolve_config_key`, and the reason it exists.
+
+    `test_config_gates_are_really_off` asserts every gate key EXISTS. On a
+    clean tree nothing violates that, so the assertion has no live subject and
+    a walk hard-wired to "exists" would pass unnoticed — the same shape of
+    hole this whole change is closing. Pin the walk's discrimination directly:
+    a real falsy key, a real truthy key, and a key that is not there.
+    """
+    assert _resolve_config_key("ci.enabled") == (True, False)
+    assert _resolve_config_key("ci.backend") == (True, "gitlab")
+    assert _resolve_config_key("integrations.circleci.enabled") == (False, None)
+    assert _resolve_config_key("no.such.key.anywhere") == (False, None)
+    # A scalar mid-path must not be indexed into as if it were a dict.
+    assert _resolve_config_key("ci.enabled.deeper") == (False, None)
+
+
 def test_config_gates_are_really_off() -> None:
     """The one part of "when does it fire?" a static test can check. #49 was a
     channel claimed to be configuration-gated that fired unconfigured; a key
     whose DEFAULT is truthy makes the claim false in the other direction."""
-    from no_human.config import DEFAULT_CONFIG
-
     checked = 0
     for module, channels in sorted(ALLOWLIST.items()):
         for channel, entry in sorted(channels.items()):
             for key in entry.config_keys():
                 checked += 1
-                node: object = DEFAULT_CONFIG
-                for part in key.split("."):
-                    node = node.get(part) if isinstance(node, dict) else None
+                exists, node = _resolve_config_key(key)
+                # PER-KEY existence. Without it this whole loop is vacuous for
+                # any key that has been DELETED or misspelled: the walk yields
+                # None, `assert not None` is green, and the disclosure keeps
+                # naming a setting the operator cannot find. That is not
+                # hypothetical — `integrations.circleci.enabled` survived here
+                # after the block was removed, because the only non-vacuity
+                # counter was the global `checked` below, which cannot see one
+                # key of many vanish.
+                #
+                # A key MAY legitimately be absent (context.m365.token is: the
+                # client raises before building a request, so there is nothing
+                # to default). The rule is that the disclosure must SAY SO in
+                # the text the operator reads, rather than the test carrying a
+                # private list of blessed exceptions that rots out of sight.
+                # Scope note: the escape hatch is per ENTRY, not per key, so an
+                # entry naming several keys is exempted wholesale once it
+                # declares one absence — acceptable, since an author who wrote
+                # that sentence has already been made to look at the config.
+                assert exists or _DECLARED_ABSENT in entry.gate, (
+                    f"{module} {channel} claims to be gated on {key!r}, but "
+                    "DEFAULT_CONFIG has no such key — the gate names a setting "
+                    "that does not exist, so nothing is actually disclosed. If "
+                    f"the absence is deliberate, say {_DECLARED_ABSENT!r} in "
+                    "the gate text.")
                 assert not node, (
                     f"{module} {channel} claims to be gated on {key!r}, but "
                     f"DEFAULT_CONFIG has it as {node!r} — it is on by default, "

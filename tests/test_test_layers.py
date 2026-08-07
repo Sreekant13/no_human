@@ -13,6 +13,11 @@ from no_human.testing.test_layers import (
 )
 from no_human.project_model import Project
 
+# `test_ci_from_layer_jenkins` reaches ``config.load_env_var``, which reads the
+# operator's real ``~/.no_human/.env`` BEFORE the process env. Requested by
+# NAME through `usefixtures` — never an autouse marker; see tests/conftest.py.
+pytestmark = pytest.mark.usefixtures("isolated_env_file")
+
 
 def test_layer_roundtrip():
     layer = TestLayer(

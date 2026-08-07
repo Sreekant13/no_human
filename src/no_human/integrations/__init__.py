@@ -1,10 +1,17 @@
 """Integrations registry — a status layer over the config.
 
-Two integrations are first-class config sections (``integrations.jira`` and
-``integrations.circleci``); the rest are read-only STATUS VIEWS over existing
-config: github / gitlab / jenkins over ``ci.*`` and slack over
-``notifications.*``. There is exactly one source of truth per setting — no
-duplicate keys.
+The issue trackers are first-class config sections (``integrations.jira`` and
+friends); the rest are read-only STATUS VIEWS over existing config: github /
+gitlab / jenkins / circleci over ``ci.*`` and slack over ``notifications.*``.
+There is exactly one source of truth per setting — no duplicate keys.
+
+CircleCI used to be a first-class ``integrations.circleci`` section holding
+``org_slug`` + ``project``. Nothing in the CI layer ever read it
+(``ci_from_config`` builds ``CircleCICI`` from ``ci.project``), so saving that
+form produced a card reading "Configured", a Test-connection reading
+"Connected", and NO ``ci:`` block at all — every PR went out ungated while the
+panel said CircleCI was the active CI backend. It is now a ``ci.*`` view like
+its three siblings, which is what makes that sentence true.
 
 ``list_integrations`` is pure and synchronous (never a secret in a detail
 string, ``healthy`` always None until checked). ``test_integration`` runs a
@@ -92,11 +99,19 @@ class FieldSpec:
     config_path: str | None = None
 
 
-# github/gitlab/jenkins are STATUS VIEWS over the single shared `ci.*` section
-# (see module docstring — one CI backend active at a time). Saving a field for
-# one of them is how the UI selects it as that backend, so a successful save
-# also pins `ci.backend` (+ `ci.enabled`) alongside whatever field was given.
-_CI_BACKEND_BY_NAME = {"github": "github_actions", "gitlab": "gitlab", "jenkins": "jenkins"}
+# github/gitlab/jenkins/circleci are STATUS VIEWS over the single shared `ci.*`
+# section (see module docstring — one CI backend active at a time). Saving a
+# field for one of them is how the UI selects it as that backend, so a
+# successful save also pins `ci.backend` (+ `ci.enabled`) alongside whatever
+# field was given.
+#
+# This map and FIELD_SPECS must not drift: an entry that writes into `ci.*`
+# without a line here saves its settings and selects nothing, which is exactly
+# how CircleCI shipped a form promising a gate it never created.
+# `test_every_ci_kind_form_is_covered_by_the_autopin` derives one from the
+# other rather than listing either, so a fifth backend cannot repeat it.
+_CI_BACKEND_BY_NAME = {"github": "github_actions", "gitlab": "gitlab",
+                       "jenkins": "jenkins", "circleci": "circleci"}
 
 FIELD_SPECS: dict[str, list[FieldSpec]] = {
     # integrations/jira.py + intake/jira.py read integrations.jira.* / JIRA_API_TOKEN.
@@ -125,11 +140,15 @@ FIELD_SPECS: dict[str, list[FieldSpec]] = {
                   config_path="integrations.monday.status_column"),
         FieldSpec("api_token", "API token", True, env_var="MONDAY_API_TOKEN"),
     ],
-    # ci/circleci.py reads CIRCLECI_TOKEN; integrations.circleci.* is the
-    # first-class config section (see _circleci_status above).
+    # ci/circleci.py reads CIRCLECI_TOKEN; `ci.project` is the ONE key the CI
+    # layer builds CircleCICI from — it is the API v2 project slug
+    # "<vcs>/<org>/<repo>" (ci/__init__.py's circleci branch), which is why
+    # this is one field and not the org_slug + project pair it used to be.
+    # Named `project_slug` rather than `project` so the panel can give it its
+    # own help text without that hint appearing on github/gitlab/jenkins.
     "circleci": [
-        FieldSpec("org_slug", "Org slug", False, config_path="integrations.circleci.org_slug"),
-        FieldSpec("project", "Project", False, config_path="integrations.circleci.project"),
+        FieldSpec("project_slug", "Project slug (vcs/org/repo)", False,
+                  config_path="ci.project"),
         FieldSpec("api_token", "API token", True, env_var="CIRCLECI_TOKEN"),
     ],
     # ci/github_actions.py + _ci_view read ci.project as the id_field for this backend.
@@ -240,12 +259,38 @@ def _teams_status(config: dict) -> IntegrationStatus:
                               status=_status_str(configured))
 
 
+#: What a pre-move install has on disk: settings under `integrations.circleci`
+#: and no `ci:` block. That config NEVER produced a CI gate, so promoting it to
+#: `ci.backend: circleci` + `ci.enabled: true` on upgrade would switch on a gate
+#: the operator never had, silently, and start blocking their PRs on a pipeline
+#: that has never run for them. It is reported unconfigured — which is the
+#: truth — and the detail says the one thing that fixes it.
+#: The second clause is not padding. Saving ANY CI form pins `ci.backend`
+#: (see `_CI_BACKEND_BY_NAME`), so an operator who has a live `ci:` block on
+#: another backend AND a stale `integrations.circleci` block would, by
+#: following this nudge, move their CI gate onto CircleCI. Telling them that
+#: up front is the difference between an instruction and a trap.
+_CIRCLECI_LEGACY_DETAIL = (
+    "settings found under integrations.circleci, which no CI backend reads — "
+    "re-save the CircleCI form to activate the gate (this makes CircleCI your "
+    "ci.backend)"
+)
+
+
 def _circleci_status(config: dict) -> IntegrationStatus:
-    c = _sect(config, "integrations").get("circleci") or {}
-    configured = bool(c.get("org_slug") and c.get("project"))
-    detail = f"{c['org_slug']} · {c['project']}" if configured else "not configured"
-    return IntegrationStatus("circleci", "ci", configured, None, detail,
-                              status=_status_str(configured))
+    """CircleCI as a view over ``ci.*``, plus a named nudge for the legacy block."""
+    status = _ci_view(config, "circleci", "circleci", "ci", "project", "CircleCI")
+    if status.configured:
+        return status
+    legacy = _sect(config, "integrations").get("circleci") or {}
+    # `enabled` counts as evidence of the legacy block on its own. An operator
+    # who switched CircleCI ON but never filled the slug in is the one MOST
+    # likely to believe a gate is running, and matching only on the two data
+    # fields gave exactly them a bare "not configured" with no way to learn
+    # why. Any key present means the block is theirs and the nudge applies.
+    if any(legacy.get(k) for k in ("enabled", "org_slug", "project")):
+        return replace(status, detail=_CIRCLECI_LEGACY_DETAIL)
+    return status
 
 
 def _ci_view(config: dict, name: str, backend: str, kind: str,
@@ -720,7 +765,11 @@ SETUP_SECRET_ENV: dict[str, tuple[str, ...]] = {
     "jira": ("JIRA_API_TOKEN",),                       # intake/jira.py
     "linear": ("LINEAR_API_KEY",),                     # intake/linear.py
     "monday": ("MONDAY_API_TOKEN",),                   # intake/monday.py
-    "circleci": ("CIRCLECI_TOKEN",),                   # ci/circleci.py
+    # No circleci entry: like github/gitlab/jenkins it has no
+    # `integrations.circleci` block, so `setup_specs` never reaches it and an
+    # entry here would be unreachable. CIRCLECI_TOKEN is collected by the
+    # Settings form (FIELD_SPECS above), which is where the other CI backends'
+    # credentials are collected too.
     # integrations/slack/worker.py — Socket Mode needs both.
     "slack": ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"),
     "teams": (),                                       # see SETUP_SECRET_NOTE

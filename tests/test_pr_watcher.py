@@ -306,3 +306,235 @@ def test_upsert_body_never_says_no_human_visibly():
     # The visible text must not mention no_human; only the invisible HTML marker does.
     from no_human.vcs.pr_watcher import AGENT_COMMENT_MARKER
     assert AGENT_COMMENT_MARKER.startswith("<!--")  # invisible
+
+
+# --------------------------------------------------------------------------- #
+# GitLab merge requests must resolve, not park forever                         #
+#                                                                              #
+# `default_pr_merged` / `default_pr_state` early-returned for every non-GitHub #
+# ref, with no error anywhere: a task parked on `pr_merged:<gitlab MR>` could  #
+# never wake, and the awaiting-approval watcher (`blockers/wake.py`, rung 1)   #
+# never saw the MR merge. Comment fetch/post were already GitLab-aware, so     #
+# the silence was specific to the lifecycle calls.                             #
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def cli_recorder(monkeypatch):
+    """Record every CLI argv `pr_watcher` shells out to, and script replies."""
+    from no_human.vcs import pr_watcher as pw
+
+    calls: list[list[str]] = []
+    replies: dict[str, str | None] = {}
+
+    async def fake_run_cli(cmd):
+        calls.append(cmd)
+        return replies.get(cmd[0])
+
+    monkeypatch.setattr(pw, "_run_cli", fake_run_cli)
+    monkeypatch.setattr(pw.shutil, "which", lambda name: f"/usr/bin/{name}")
+    return calls, replies
+
+
+GITLAB_MR_URL = "https://gitlab.acme.net/grp/svc/-/merge_requests/7"
+GITLAB_MR_REF = "grp%2Fsvc!7"
+#: GitLab's OWN native short form, and the only one a human or an LLM writes by
+#: hand: `group/project!7`, with a raw slash. The pre-encoded constant above
+#: could not see the bug below — it arrives already correct, and the recorder
+#: mock ignores the path it is handed.
+GITLAB_MR_REF_RAW = "grp/svc!7"
+GITLAB_MR_REF_SUBGROUP = "grp/sub/proj!7"
+GITHUB_PR_URL = "https://github.com/acme/svc/pull/7"
+
+
+def _api_path(calls) -> str:
+    """The `projects/…` argument out of the recorded glab argv."""
+    return next(a for c in calls for a in c if "merge_requests" in a)
+
+
+@pytest.mark.parametrize("ref,expect_path", [
+    (GITLAB_MR_REF_RAW, "projects/grp%2Fsvc/merge_requests/7"),
+    (GITLAB_MR_REF_SUBGROUP, "projects/grp%2Fsub%2Fproj/merge_requests/7"),
+    # Idempotency: an already-encoded ref must NOT become grp%252Fsvc.
+    (GITLAB_MR_REF, "projects/grp%2Fsvc/merge_requests/7"),
+    # A mixed ref is normalized rather than left half-encoded.
+    ("grp%2Fsub/proj!7", "projects/grp%2Fsub%2Fproj/merge_requests/7"),
+])
+async def test_a_raw_slash_short_ref_is_url_encoded_for_the_gitlab_api(
+    cli_recorder, ref, expect_path,
+):
+    """GitLab addresses a project as `group%2Frepo`; a raw slash 404s.
+
+    Verified against the live API (2026-08-06):
+    `projects/gitlab-org%2Fgitlab-foss` -> HTTP 200,
+    `projects/gitlab-org/gitlab-foss` -> HTTP 404. Every project has a
+    namespace, so this is the normal case.
+
+    The 404 is SILENT — `_run_cli` returns None, the state reads "", and
+    `default_pr_merged` is False forever with no error anywhere. That is
+    verbatim the failure GitLab lifecycle support was added to remove, so the
+    feature was undelivered for the one ref form a human actually types.
+    """
+    from no_human.vcs.pr_watcher import default_pr_state
+
+    calls, replies = cli_recorder
+    replies["glab"] = json.dumps({"state": "merged", "iid": 7})
+
+    assert await default_pr_state(ref) == "MERGED"
+    assert _api_path(calls) == expect_path
+    assert "%252F" not in _api_path(calls), "double-encoded"
+
+
+@pytest.mark.parametrize("fn,verb", [
+    ("post_reply_comment", "POST"),
+    ("upsert_agent_comment", "list/POST"),
+])
+async def test_the_comment_writers_encode_a_raw_slash_short_ref_too(
+    cli_recorder, fn, verb,
+):
+    """Same defect, same ref form, three other call sites: comment fetch and
+    both comment writers built the same `projects/{project}/…` path by hand.
+    Fixing only the lifecycle query would have left a task able to SEE its MR
+    merge while still unable to reply on it."""
+    import no_human.vcs.pr_watcher as pw
+
+    calls, replies = cli_recorder
+    replies["glab"] = "[]"
+    await getattr(pw, fn)(GITLAB_MR_REF_RAW, "hello")
+    assert calls, f"{fn} ({verb}) asked glab nothing"
+    assert all("projects/grp%2Fsvc/" in a
+               for c in calls for a in c if a.startswith("projects/")), calls
+
+
+@pytest.mark.parametrize("ref", [GITLAB_MR_REF_RAW, GITLAB_MR_URL])
+@pytest.mark.parametrize("fn,empty", [
+    ("default_pr_checks", []),
+    ("default_pr_head", ""),
+    ("default_pr_mergeable", {"mergeable": "", "mergeStateStatus": ""}),
+    ("default_pr_files", []),
+])
+async def test_the_gitlab_bound_on_the_gh_only_helpers_is_what_docs_say(
+    cli_recorder, ref, fn, empty,
+):
+    """These four are GitHub-only, and that bound lived ONLY in a Python
+    docstring until `docs/adapters.md` gained the table this pins.
+
+    It is silent in both directions: the empty value they return for a GitLab
+    ref is identical to "no checks / no files", so a GitLab operator cannot
+    tell "nothing is failing" from "this is never read here". Asserting the
+    exact empties AND zero CLI calls is what makes the doc table checkable —
+    if someone implements the GitLab path, this test fails and the doc gets
+    updated with it.
+    """
+    import no_human.vcs.pr_watcher as pw
+
+    calls, replies = cli_recorder
+    replies["gh"] = replies["glab"] = json.dumps(
+        {"statusCheckRollup": [{"name": "x", "conclusion": "FAILURE"}],
+         "headRefOid": "deadbeef", "mergeable": "CONFLICTING",
+         "files": [{"path": "a.py"}]})
+
+    assert await getattr(pw, fn)(ref) == empty
+    assert calls == [], f"{fn} is documented as not implemented for GitLab: {calls}"
+
+
+async def test_the_same_helpers_do_resolve_for_github(cli_recorder):
+    """Non-vacuity control for the bound above: a helper that had simply
+    stopped working would pass every assertion in that test."""
+    import no_human.vcs.pr_watcher as pw
+
+    calls, replies = cli_recorder
+    replies["gh"] = json.dumps(
+        {"statusCheckRollup": [{"name": "x", "conclusion": "FAILURE"}],
+         "headRefOid": "deadbeef", "mergeable": "CONFLICTING",
+         "files": [{"path": "a.py"}]})
+
+    assert await pw.default_pr_head("acme/svc#7") == "deadbeef"
+    assert await pw.default_pr_files("acme/svc#7") == ["a.py"]
+    assert (await pw.default_pr_mergeable("acme/svc#7"))["mergeable"] == "CONFLICTING"
+    assert await pw.default_pr_checks("acme/svc#7") != []
+    assert calls and all(c[0] == "gh" for c in calls)
+
+
+async def test_comment_fetch_encodes_a_raw_slash_short_ref(cli_recorder):
+    """The read side of the same defect (`check_pr_comments` -> notes)."""
+    calls, replies = cli_recorder
+    replies["glab"] = "[]"
+    await check_pr_comments(GITLAB_MR_REF_RAW)
+    assert _api_path(calls) == "projects/grp%2Fsvc/merge_requests/7/notes"
+
+
+@pytest.mark.parametrize("ref", [GITLAB_MR_URL, GITLAB_MR_REF])
+@pytest.mark.parametrize("gitlab_state,expect_state,expect_merged", [
+    ("merged", "MERGED", True),
+    ("opened", "OPEN", False),
+    ("closed", "CLOSED", False),
+])
+async def test_gitlab_mr_lifecycle_resolves_via_glab(
+    cli_recorder, ref, gitlab_state, expect_state, expect_merged,
+):
+    from no_human.vcs.pr_watcher import default_pr_merged, default_pr_state
+
+    calls, replies = cli_recorder
+    replies["glab"] = json.dumps({"state": gitlab_state, "iid": 7})
+
+    assert await default_pr_state(ref) == expect_state
+    assert await default_pr_merged(ref) is expect_merged
+    assert calls, "a GitLab MR ref must actually ask glab — it asked nothing"
+    assert all(c[0] == "glab" for c in calls), f"wrong CLI: {calls}"
+    assert any("merge_requests/7" in a for c in calls for a in c), calls
+
+
+async def test_gitlab_mr_url_targets_the_mr_host_not_gitlab_com(cli_recorder):
+    """A self-hosted MR URL must carry --hostname: `glab` defaults to
+    gitlab.com, which is the failure this repo already documents for
+    `glab ci run`."""
+    from no_human.vcs.pr_watcher import default_pr_state
+
+    calls, replies = cli_recorder
+    replies["glab"] = json.dumps({"state": "merged"})
+    await default_pr_state(GITLAB_MR_URL)
+    cmd = calls[0]
+    assert "--hostname" in cmd and cmd[cmd.index("--hostname") + 1] == "gitlab.acme.net"
+
+
+async def test_gitlab_unknown_state_is_unknown_never_merged(cli_recorder):
+    """An unmapped/garbled state must read as "" (no action), never MERGED."""
+    from no_human.vcs.pr_watcher import default_pr_merged, default_pr_state
+
+    _calls, replies = cli_recorder
+    replies["glab"] = json.dumps({"state": "locked"})
+    assert await default_pr_state(GITLAB_MR_REF) == ""
+    assert await default_pr_merged(GITLAB_MR_REF) is False
+
+
+async def test_github_pr_lifecycle_still_resolves_via_gh(cli_recorder):
+    """Known-positive control: the GitHub path is unchanged and still uses
+    `gh`, so a green GitLab test above cannot be an artefact of a broken
+    harness."""
+    from no_human.vcs.pr_watcher import default_pr_merged, default_pr_state
+
+    calls, replies = cli_recorder
+    replies["gh"] = json.dumps({"state": "MERGED"})
+    assert await default_pr_state(GITHUB_PR_URL) == "MERGED"
+    assert await default_pr_merged("acme/svc#7") is True
+    assert all(c[0] == "gh" for c in calls), f"wrong CLI: {calls}"
+
+
+async def test_a_gitlab_mr_wakes_a_pr_merged_blocker(store, cli_recorder):
+    """End to end through the WakeWatcher: the condition the product writes
+    into a parked task must actually fire for a GitLab MR."""
+    from no_human.vcs.pr_watcher import default_pr_merged
+
+    _calls, replies = cli_recorder
+    replies["glab"] = json.dumps({"state": "merged"})
+
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    watcher = WakeWatcher(store, _cfg(), pr_merged=default_pr_merged)
+    args = dict(raised_at=now - timedelta(hours=1), now=now, wake_check_at=None)
+
+    assert await watcher.condition_satisfied(
+        f"pr_merged:{GITLAB_MR_URL}", **args) is True
+
+    replies["glab"] = json.dumps({"state": "opened"})
+    assert await watcher.condition_satisfied(
+        f"pr_merged:{GITLAB_MR_URL}", **args) is False
