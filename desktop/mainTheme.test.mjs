@@ -16,19 +16,18 @@
 // and additionally covers the min/max/close buttons, which are the thing a
 // wrong overlay colour makes invisible.
 //
-// WHY FORCING IT IS SAFE — and it is NOT "the other reads never run". main.mjs
-// reads process.platform six times; this file reaches four of them. Three are
-// the theme reads this file exists to drive. The fourth is buildAppMenu's
-// `isMac`, and stub.fireReady() below DOES dispatch it: app.whenReady calls
-// buildAppMenu before createWindow. So the guarantee is:
-//   1. a test FILE is its own process, so nothing outside this file ever sees
-//      win32 — the sibling desktop test files are unaffected; and
-//   2. the one non-theme read this file reaches only picks a MENU template,
-//      and nothing here asserts on the menu. Verified by pinning that read to
-//      darwin's value while the platform stayed win32: all assertions passed.
-// The remaining two reads (the window "close" handler and "window-all-closed")
-// are genuinely never dispatched here. If you add an assertion that depends on
-// the menu, or on either of those handlers, this forcing stops being free.
+// WHY FORCING IT IS SAFE. Not because the non-theme process.platform reads go
+// undispatched — one of them does run here. stub.fireReady() below triggers
+// app.whenReady, which calls buildAppMenu, whose `isMac` is a platform read. It
+// is harmless because it only picks a MENU template and nothing in this file
+// asserts on the menu: pinning that read to darwin's value while the platform
+// stayed win32 left every assertion here passing. What actually holds the line
+// is that a test FILE is its own process, so nothing outside it ever sees
+// win32. main.mjs's other platform reads live in the window "close" and
+// "window-all-closed" handlers, which this file never dispatches — but do not
+// re-derive that from this comment. Re-derive it from main.mjs: an assertion
+// added here that depends on the menu, or on either handler, makes the forcing
+// load-bearing, and this paragraph will not have noticed.
 import { register } from "node:module";
 import assert from "node:assert/strict";
 import test from "node:test";
