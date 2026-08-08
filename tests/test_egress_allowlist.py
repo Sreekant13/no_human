@@ -791,6 +791,20 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
             "`[sys.executable, '-m', 'pytest', <holdout>]` — the golden's "
             "held-out tests", "user-invoked: `nh eval replay` only"),
     },
+    # The channel is `<dynamic>` because argv[0] is `python or sys.executable`,
+    # chosen at runtime. The program is `python -m pytest` run on a throwaway
+    # probe file written INSIDE the bench sandbox (:88-98) — the `wrong_tree_imports`
+    # pre-flight that checks, once per spec, whether the sandbox's own packages
+    # import from the sandbox or leak to an editable install of the original tree.
+    # It imports local packages and prints a path; it dials nothing.
+    "eval/sandbox_selftest.py": {
+        "exec:<dynamic>": Allowed(
+            "nothing off this machine — `<python> -m pytest` on a probe file "
+            "inside the sandbox, to see which top-level packages resolve OUTSIDE "
+            "the sandbox tree",
+            "user-invoked: the northstar bench pre-flight "
+            "(`eval/northstar.py:600`), `nh bench` only"),
+    },
 }
 
 
