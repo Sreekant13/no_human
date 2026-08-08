@@ -210,10 +210,25 @@ export function taskSummary(events) {
   const lastBlocker = blockers.length
     ? /\*\*Category:\*\*\s*(\w+)/.exec(blockers[blockers.length - 1].text || "")?.[1]
     : null;
+  // A finding raised by a failed attempt is RESOLVED once the loop demonstrably
+  // got past it: a later passing review, a PR opened, or CI passed after that
+  // failure. Without this, a finding the coder found-and-fixed keeps rendering
+  // as an open (red) issue, so a reviewer can't tell it was dealt with.
+  const isResolved = (failEvent) => {
+    const idx = events.indexOf(failEvent);
+    return events.slice(idx + 1).some(
+      (e) => (e.kind === "review" && e.passed === true)
+        || e.kind === "pr_open"
+        || e.kind === "ci_gate_pass",
+    );
+  };
   const failReasons = events
     .filter((e) => e.kind === "attempt_failed" && e.text)
     .slice(-3)
-    .map((e) => clip(e.text.replace(/^review failed:\s*/, ""), 130));
+    .map((e) => ({
+      text: `Review finding: ${clip(e.text.replace(/^review failed:\s*/, ""), 130)}`,
+      resolved: isResolved(e),
+    }));
   const last = events[events.length - 1];
 
   const facts = [
@@ -239,8 +254,8 @@ export function taskSummary(events) {
     facts,
     highlights: [`Now: ${clip(last.text || last.kind, 140)}`],
     issues: [
-      ...failReasons.map((r) => `Review finding: ${r}`),
-      ...(lastBlocker ? [`Last blocker: ${lastBlocker}`] : []),
+      ...failReasons,
+      ...(lastBlocker ? [{ text: `Last blocker: ${lastBlocker}`, resolved: false }] : []),
     ],
   };
 }

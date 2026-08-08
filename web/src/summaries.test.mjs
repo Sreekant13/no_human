@@ -71,8 +71,41 @@ test("task digest: attempts, verdict chain, PR, budget, current line", () => {
   assert.match(s.headline, /PR open/);
   assert.equal(s.facts.find(([l]) => l === "Attempts")[1], "2");
   assert.equal(s.facts.find(([l]) => l === "Reviews")[1], "2 (FP)");
-  assert.match(s.issues[0], /Outer 60m timeout/);
+  assert.match(s.issues[0].text, /Outer 60m timeout/);
+  // Found on attempt 1, then attempt 2 passed and a PR opened — resolved, not open.
+  assert.equal(s.issues[0].resolved, true);
   assert.match(s.highlights[0], /^Now: /);
+});
+
+test("task digest: a finding with no later success stays open (red)", () => {
+  const s = taskSummary([
+    { ts: 1, kind: "attempt_start", text: "attempt 1/3" },
+    { ts: 2, kind: "review", text: "FAIL", passed: false, blocking_count: 1 },
+    { ts: 3, kind: "attempt_failed", text: "review failed: null deref in parser" },
+    { ts: 4, kind: "escalated", text: "**Category:** budget" },
+  ]);
+  const finding = s.issues.find((i) => i.text.includes("null deref"));
+  assert.ok(finding, "expected the finding to be listed");
+  assert.equal(finding.resolved, false);
+  // The blocker line is likewise still open.
+  const blocker = s.issues.find((i) => i.text.startsWith("Last blocker:"));
+  assert.equal(blocker.resolved, false);
+});
+
+test("task digest: an earlier finding fixed, a later one still open", () => {
+  const s = taskSummary([
+    { ts: 1, kind: "attempt_start", text: "attempt 1/3" },
+    { ts: 2, kind: "attempt_failed", text: "review failed: finding A" },
+    { ts: 3, kind: "attempt_start", text: "attempt 2/3" },
+    { ts: 4, kind: "review", text: "PASS", passed: true },
+    { ts: 5, kind: "pr_open", text: "https://example.com/pr/1" },
+    // A round-2 review reopens something, and no later success follows it.
+    { ts: 6, kind: "attempt_failed", text: "review failed: finding B" },
+  ]);
+  const a = s.issues.find((i) => i.text.includes("finding A"));
+  const b = s.issues.find((i) => i.text.includes("finding B"));
+  assert.equal(a.resolved, true);
+  assert.equal(b.resolved, false);
 });
 
 test("empty events yield null, not a crash", () => {

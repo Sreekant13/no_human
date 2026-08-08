@@ -1185,7 +1185,18 @@ function SummaryCard({ summary }) {
       )}
       {summary.issues.length > 0 && (
         <ul className="digest-issues">
-          {summary.issues.map((h, i) => <li key={i}>{h}</li>)}
+          {summary.issues.map((h, i) => {
+            // An issue is either a plain string (still open — red) or an object
+            // carrying a resolved flag. A resolved finding was found-and-fixed by
+            // the loop, so it renders green with a "fixed" marker instead of red.
+            const text = typeof h === "string" ? h : h.text;
+            const resolved = typeof h === "object" && h !== null && h.resolved;
+            return (
+              <li key={i} className={resolved ? "digest-issue-resolved" : undefined}>
+                {resolved ? "✓ " : ""}{text}{resolved ? " — fixed" : ""}
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>

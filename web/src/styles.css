@@ -5581,6 +5581,8 @@ a.so-chip-value:hover { color: var(--accent-300); }
 }
 .digest-highlights li { color: var(--text-muted); margin-bottom: 3px; }
 .digest-issues li { color: var(--state-blocked, #C9372C); margin-bottom: 3px; }
+/* A found-and-fixed finding is resolved, not open — green, not the blocking red. */
+.digest-issues li.digest-issue-resolved { color: var(--state-done, #216E4E); }
 
 .rich-supervisor { display: flex; gap: 8px; align-items: baseline; }
 
