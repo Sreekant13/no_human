@@ -563,6 +563,41 @@ def test_no_standard_price_changes():
     assert quote(2.0, "EC1A 1BB", "WC2N 5DU") == 5.40
     assert quote(2.0, "EC1A 1BB", "SW1A 2AA") == 6.90
     assert quote(2.0, "EC1A 1BB", "AB10 1AA") == 8.40
+
+
+# A criterion that says "unchanged" is universal, and five sampled prices cannot
+# check a universal claim — par-11 proved that when a float re-association moved
+# 133 prices that its five pinned values all happened to miss. This ticket
+# restructures the same arithmetic, so the invariant half gets a sweep.
+def _price_before_the_change(weight_kg, surcharge, express):
+    """parcelo/rates.py exactly as it stands at this spec's pin."""
+    weight_cost = round(1.10 * weight_kg, 2)
+    total = 3.20 + weight_cost + surcharge
+    if express:
+        total = total * 1.5 + surcharge
+    return round(total, 2)
+
+
+def test_nothing_outside_the_express_cross_zone_rule_moves_at_all():
+    routes = [("EC1A 1BB", "WC2N 5DU", 0.0),
+              ("EC1A 1BB", "SW1A 2AA", 1.50),
+              ("EC1A 1BB", "AB10 1AA", 3.00)]
+    moved = []
+    for cents in range(1, 20001):                    # 0.01 .. 200.00
+        weight = cents / 100
+        for origin, destination, surcharge in routes:
+            # Standard prices must never move, whatever the route.
+            got = quote(weight, origin, destination)
+            want = _price_before_the_change(weight, surcharge, False)
+            if got != want:
+                moved.append(("standard", weight, destination, want, got))
+            # Express must not move INSIDE one zone (no surcharge to double).
+            if surcharge == 0.0:
+                got = quote(weight, origin, destination, express=True)
+                want = _price_before_the_change(weight, 0.0, True)
+                if got != want:
+                    moved.append(("express-same-zone", weight, destination, want, got))
+    assert not moved, f"{len(moved)} price(s) moved; first 5: {moved[:5]}"
 ''',
         "reference": {"parcelo/rates.py": REF_RATES_EXPRESS},
     },
@@ -746,6 +781,36 @@ def test_light_parcels_are_unchanged():
     assert quote(2.0, "EC1A 1BB", "SW1A 2AA") == 6.90
     assert quote(2.0, "EC1A 1BB", "AB10 1AA") == 8.40
     assert quote(2.0, "EC1A 1BB", "WC2N 5DU", express=True) == 8.10
+
+
+# A criterion that says "unchanged" is universal, and five sampled prices cannot
+# check a universal claim — par-11 proved that when a float re-association moved
+# 133 prices that its five pinned values all happened to miss. This ticket
+# restructures the same arithmetic, so the invariant half gets a sweep.
+def _price_before_the_change(weight_kg, surcharge, express):
+    """parcelo/rates.py exactly as it stands at this spec's pin."""
+    weight_cost = round(1.10 * weight_kg, 2)
+    total = 3.20 + weight_cost + surcharge
+    if express:
+        total = total * 1.5 + surcharge
+    return round(total, 2)
+
+
+def test_every_quote_at_or_below_the_threshold_is_untouched():
+    routes = [("EC1A 1BB", "WC2N 5DU", 0.0),
+              ("EC1A 1BB", "SW1A 2AA", 1.50),
+              ("EC1A 1BB", "AB10 1AA", 3.00)]
+    moved = []
+    for cents in range(1, 1001):                     # 0.01 .. 10.00 inclusive
+        weight = cents / 100
+        for origin, destination, surcharge in routes:
+            for express in (False, True):
+                got = quote(weight, origin, destination, express=express)
+                want = _price_before_the_change(weight, surcharge, express)
+                if got != want:
+                    moved.append((weight, destination, express, want, got))
+    assert not moved, (
+        f"{len(moved)} price(s) at or below 10kg moved; first 5: {moved[:5]}")
 ''',
         "reference": {"parcelo/rates.py": REF_RATES_HEAVY_DISCOUNT},
     },
@@ -977,6 +1042,39 @@ def test_zones_a_and_b_are_not_configurable(monkeypatch):
     monkeypatch.setenv(ENV, "5.00")
     assert quote(2.0, "EC1A 1BB", "WC2N 5DU") == 5.40
     assert quote(2.0, "EC1A 1BB", "SW1A 2AA") == 6.90
+
+
+# A criterion that says "unchanged" is universal, and five sampled prices cannot
+# check a universal claim — par-11 proved that when a float re-association moved
+# 133 prices that its five pinned values all happened to miss. This ticket
+# restructures the same arithmetic, so the invariant half gets a sweep.
+def _price_before_the_change(weight_kg, surcharge, express):
+    """parcelo/rates.py exactly as it stands at this spec's pin."""
+    weight_cost = round(1.10 * weight_kg, 2)
+    total = 3.20 + weight_cost + surcharge
+    if express:
+        total = total * 1.5 + surcharge
+    return round(total, 2)
+
+
+def test_no_zone_a_or_b_price_moves_whatever_the_env_says(monkeypatch):
+    for value in (None, "5.00", "0.00", "banana"):
+        if value is None:
+            monkeypatch.delenv(ENV, raising=False)
+        else:
+            monkeypatch.setenv(ENV, value)
+        moved = []
+        for cents in range(1, 5001):                 # 0.01 .. 50.00
+            weight = cents / 100
+            for destination, surcharge in (("WC2N 5DU", 0.0), ("SW1A 2AA", 1.50)):
+                for express in (False, True):
+                    got = quote(weight, "EC1A 1BB", destination, express=express)
+                    want = _price_before_the_change(weight, surcharge, express)
+                    if got != want:
+                        moved.append((value, weight, destination, express, want, got))
+        assert not moved, (
+            f"{len(moved)} zone A/B price(s) moved with {ENV}={value!r}; "
+            f"first 5: {moved[:5]}")
 ''',
         "reference": {"parcelo/zones.py": REF_ZONES_ENV},
     },
