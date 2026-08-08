@@ -3696,23 +3696,80 @@ class Orchestrator:
                         },
                     )
                 else:
-                    is_stuck = stuck.record(test_result.output)
-                    detail = f"tests failed: {test_result.summary}"
-                    if failing_tests:
-                        detail += " — " + ", ".join(failing_tests)
-                    if is_stuck:
-                        self.emit("stuck", "same failure signature repeated; resetting context")
-                    # Same ordering rule as the layered path: note before excerpt.
-                    stuck_note = stuck.stuck_reason
-                    if stuck_note:
-                        detail += f" — {stuck_note}"
-                    elif is_stuck:
-                        detail += " — same failure signature repeated across attempts"
-                    excerpt_block = getattr(test_result, "traceback_block", "") or ""
-                    if excerpt_block:
-                        detail += "\n" + excerpt_block
-                    await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
-                    return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+                    # A plain red run used to fail the attempt with NO check
+                    # whether these same tests ALREADY fail on the base tree — so
+                    # a repo carrying a flaky / env-dependent / pre-existing red
+                    # test made every task structurally unpassable. Mirror the
+                    # invocation-error base-check (B2 #4): re-run EXACTLY the
+                    # failing ids on the base tree (bounded to them, never the
+                    # full suite) and fail the attempt only on ids that are NEWLY
+                    # failing (pass on base, fail here). Ids red on BOTH are
+                    # pre-existing — surfaced honestly, not blamed on the change.
+                    newly_failing = await self._newly_failing_vs_base(
+                        repo, test_cmd, base, failing_tests, cwd=test_cwd,
+                        env_dependent=bool((task.config or {}).get("env_setup")),
+                    )
+                    # `newly_failing == []` is the ONLY excuse path: the base
+                    # check RAN and every failing id was already red on base. An
+                    # empty `failing_tests` (unparseable red) or an inconclusive
+                    # base check (`None`) both keep the current fail-the-attempt
+                    # behaviour — fail-closed, never a silent pass on a red run
+                    # we could not attribute.
+                    if newly_failing == []:
+                        note = (
+                            "tests failed, but every failing test already fails "
+                            "on the base tree — pre-existing, not introduced by "
+                            "this change: " + ", ".join(failing_tests)
+                        )
+                        self.emit("tests", note, ok=True,
+                                  failing_tests=failing_tests, pre_existing=True)
+                        await self.store.update_attempt(
+                            attempt_id,
+                            test_results={
+                                "ran": test_result.ran, "ok": test_result.ok,
+                                "passed": test_result.passed,
+                                "failed": test_result.failed,
+                                "errors": test_result.errors,
+                                "tamper_flag": False,
+                                "failing_tests": failing_tests,
+                                "pre_existing_failures": failing_tests,
+                            },
+                        )
+                    else:
+                        is_stuck = stuck.record(test_result.output)
+                        # Name the NEWLY-failing ids when the base check isolated
+                        # them (mixed run); otherwise (None → inconclusive/
+                        # fail-closed) fall back to all failing ids, byte-for-byte
+                        # the prior message.
+                        attributed = newly_failing or failing_tests
+                        detail = f"tests failed: {test_result.summary}"
+                        if attributed:
+                            detail += " — " + ", ".join(attributed)
+                        if newly_failing:
+                            detail += " (newly failing vs the base tree)"
+                        if is_stuck:
+                            self.emit("stuck", "same failure signature repeated; resetting context")
+                        # Same ordering rule as the layered path: note before excerpt.
+                        stuck_note = stuck.stuck_reason
+                        if stuck_note:
+                            detail += f" — {stuck_note}"
+                        elif is_stuck:
+                            detail += " — same failure signature repeated across attempts"
+                        # Show tracebacks only for the ids we actually blame the
+                        # change for: on a mixed run the excerpt must not carry a
+                        # pre-existing failure's traceback, or it would contradict
+                        # the attribution line above. When the base check was
+                        # inconclusive (newly_failing is None → all ids blamed)
+                        # keep the full block, byte-for-byte the prior behaviour.
+                        excerpts = getattr(test_result, "traceback_excerpts", {}) or {}
+                        if newly_failing:
+                            keep = set(newly_failing)
+                            excerpts = {k: v for k, v in excerpts.items() if k in keep}
+                        excerpt_block = runner.render_traceback_excerpts(excerpts)
+                        if excerpt_block:
+                            detail += "\n" + excerpt_block
+                        await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
+                        return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
 
         # --- CI (if configured): push branch first, then trigger pipeline ---
         if self.ci_runner is None:
@@ -5705,6 +5762,93 @@ class Orchestrator:
             return reproduces
         except Exception as exc:  # noqa: BLE001
             log.warning("base-tree check failed: %s", exc)
+            return None
+        finally:
+            with contextlib.suppress(Exception):
+                repo._run("worktree", "remove", "--force", str(wt_dir))
+            shutil.rmtree(wt_dir, ignore_errors=True)
+
+    async def _newly_failing_vs_base(
+        self, repo: GitRepo, test_cmd: str | None, base: str | None,
+        failing_tests: list[str], cwd: "Path | None" = None,
+        env_dependent: bool = False,
+    ) -> list[str] | None:
+        """Of *failing_tests* (red on the change), which are NEWLY failing?
+
+        The plain-red twin of ``_invocation_error_reproduces_on_base`` (B2 #4):
+        a plain test failure used to be blamed on the change with NO check
+        whether the same test ALREADY fails on the base tree, so any repo with
+        a flaky / env-dependent / pre-existing red test made every task
+        structurally unpassable. This re-runs EXACTLY the failing ids on the
+        BASE tree — bounded to those ids, NEVER the full suite — and splits
+        them:
+
+          * ids that PASS on base but fail on the change → NEWLY failing (the
+            change's fault) → returned, so the caller fails the attempt.
+          * ids that fail on BOTH base and change → pre-existing/flaky-on-base
+            → NOT the change's fault → excluded from the returned list.
+
+        Returns the list of newly-failing ids (``[]`` → every failing test was
+        already red on base, so the caller does NOT fail the attempt), or
+        ``None`` when the base check is INCONCLUSIVE and must not excuse
+        anything: the command is not a pytest command whose ids can be bounded,
+        the worktree add failed, the bounded base run itself errored or did not
+        run, or the project needs env_setup the bare worktree lacks (a base
+        failure could then be missing-env, not pre-existing, and excusing it
+        would be a false pass). ``None`` is fail-closed at the call site — same
+        doctrine as the invocation-error path, which never turns a real failure
+        into a pass on an undeterminable verdict.
+        """
+        import shlex
+        import tempfile
+
+        if not failing_tests:
+            return None
+        # A bare base worktree gets NONE of the attempt's env_setup, so a base
+        # failure there may be missing-env rather than pre-existing — excusing
+        # it would be a false pass. Fail-closed, mirroring the invocation-error
+        # path's env_dependent downgrade (there → None; here → None).
+        if env_dependent:
+            return None
+        # Only pytest node ids (`path::test`) can be bounded by appending them to
+        # the command; ``failing_tests`` is only ever populated from pytest-shaped
+        # output, but guard the command too so we never append node ids to `npm
+        # test`. Anything else is inconclusive → fail-closed.
+        cmd = test_cmd or runner.detect_command(Path(repo.path))
+        if not cmd or "pytest" not in cmd.lower():
+            return None
+
+        base_ref = self._review_base(repo, base)
+        wt_dir = Path(tempfile.mkdtemp(prefix="nh-basecheck-"))
+        try:
+            repo._run("worktree", "add", "--detach", str(wt_dir), base_ref)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("base-tree recheck: worktree add failed: %s", exc)
+            shutil.rmtree(wt_dir, ignore_errors=True)
+            return None
+        try:
+            mapped_cwd = None
+            if cwd is not None:
+                try:
+                    rel = Path(cwd).resolve().relative_to(Path(repo.path).resolve())
+                    mapped_cwd = wt_dir / rel
+                except ValueError:
+                    mapped_cwd = Path(cwd)  # cross-repo cwd: outside this repo
+            bounded_cmd = cmd + " " + " ".join(shlex.quote(t) for t in failing_tests)
+            result = await asyncio.to_thread(
+                runner.run_tests, wt_dir, bounded_cmd, cwd=mapped_cwd
+            )
+            # Could not get a trustworthy per-id verdict on base (collection/
+            # import error, or a test id absent on base because the change added
+            # it) → inconclusive → fail-closed. A newly-added failing test is the
+            # change's fault anyway, so failing here is the right outcome.
+            if not result.ran or result.invocation_error:
+                return None
+            base_failing = set(getattr(result, "failing_tests", []) or [])
+            # Newly failing = red on the change, but NOT red on base.
+            return [t for t in failing_tests if t not in base_failing]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("base-tree recheck failed: %s", exc)
             return None
         finally:
             with contextlib.suppress(Exception):

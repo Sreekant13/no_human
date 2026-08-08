@@ -162,3 +162,174 @@ async def test_node_missing_deps_invocation_error_does_not_fail_attempt(
         "a dependency-resolution crash must never be recorded as a failed attempt: "
         + str(attempts[-1])
     )
+
+
+# ---------------------------------------------------------------------------
+# The PLAIN-RED twin of the invocation-error base-check: a plain test failure
+# must be re-run on the base tree and only NEWLY-failing ids fail the attempt.
+# A test already red on base (flaky / env-dependent / pre-existing) used to be
+# blamed on the change, making any such repo structurally unpassable.
+# ---------------------------------------------------------------------------
+
+
+async def test_pre_existing_red_test_does_not_fail_the_attempt(
+    bare_repo, tmp_path, store
+):
+    """A test that ALREADY fails on the base tree is not the change's fault:
+    the base recheck sees it red on both trees and does NOT fail the attempt —
+    it proceeds to the human gate, with the pre-existing failure surfaced."""
+    (bare_repo / "pytest.ini").write_text("[pytest]\n")
+    # deterministic, env-independent red test — present on the BASE tree
+    (bare_repo / "test_preexisting.py").write_text(
+        "def test_preexisting():\n    assert False, 'red before the change'\n"
+    )
+    _git(bare_repo, "add", "-A")
+    _git(bare_repo, "commit", "-m", "pre-existing red test on base")
+
+    def mutate(cwd):
+        # a benign change that touches neither failing test nor any test file
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n"
+        )
+
+    orch = _orch(store, tmp_path, FakeBackend(mutate))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    assert outcome.pr_url is not None
+    attempts = await store.list_attempts(t.id)
+    assert attempts[-1]["status"] != "failed", (
+        "a failure that reproduces on the base tree must not be blamed on the "
+        "change: " + str(attempts[-1])
+    )
+
+
+async def test_newly_failing_test_still_fails_the_attempt(
+    bare_repo, tmp_path, store
+):
+    """THE GATE IS NOT WEAKENED: a test that PASSES on base but the change
+    breaks is a real regression and must still fail the attempt, named as
+    newly failing."""
+    (bare_repo / "pytest.ini").write_text("[pytest]\n")
+    _git(bare_repo, "add", "-A")
+    _git(bare_repo, "commit", "-m", "pytest marker — base is GREEN")
+
+    def mutate(cwd):
+        # break add() so the existing (green-on-base) test_add now fails
+        (cwd / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+
+    orch = _orch(store, tmp_path, FakeBackend(mutate))
+    t = Task.new("touch add()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is not TaskStatus.AWAITING_APPROVAL
+    assert outcome.pr_url is None
+    attempts = await store.list_attempts(t.id)
+    assert attempts[-1]["status"] == "failed"
+    reason = (attempts[-1]["failure_reason"] or "").lower()
+    assert "test_add" in reason, reason
+    assert "newly failing" in reason, (
+        "a real regression must be named as newly failing vs base: " + reason
+    )
+
+
+async def test_mixed_failures_fail_only_on_the_newly_failing_test(
+    bare_repo, tmp_path, store
+):
+    """Mixed run — one pre-existing red test + one the change newly breaks: the
+    attempt FAILS (there is a real regression), and the failure names ONLY the
+    newly-failing test, never the pre-existing one."""
+    (bare_repo / "pytest.ini").write_text("[pytest]\n")
+    (bare_repo / "test_preexisting.py").write_text(
+        "def test_preexisting():\n    assert False, 'red before the change'\n"
+    )
+    _git(bare_repo, "add", "-A")
+    _git(bare_repo, "commit", "-m", "pre-existing red test + marker")
+
+    def mutate(cwd):
+        # newly break test_add (green on base) while leaving the pre-existing
+        # red test exactly as it was
+        (cwd / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+
+    orch = _orch(store, tmp_path, FakeBackend(mutate))
+    t = Task.new("touch add()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is not TaskStatus.AWAITING_APPROVAL
+    assert outcome.pr_url is None
+    attempts = await store.list_attempts(t.id)
+    assert attempts[-1]["status"] == "failed"
+    reason = attempts[-1]["failure_reason"] or ""
+    assert "test_add" in reason, reason
+    assert "newly failing" in reason.lower(), reason
+    assert "test_preexisting" not in reason, (
+        "the pre-existing failure must NOT be blamed on the change: " + reason
+    )
+
+
+async def test_unparseable_red_run_fails_closed(bare_repo, tmp_path, store):
+    """A red run whose output carries counts but NO test node ids to bound a
+    base recheck on (empty failing_tests) keeps the current behaviour — the
+    attempt FAILS. Never silently pass a red run that cannot be attributed."""
+    from no_human.profile import ProjectProfile
+    prof = ProjectProfile(
+        repo_path=str(bare_repo), ecosystem="python",
+        # unittest-style summary: real counts, exit 1, but no `path::test` ids
+        test_cmd="printf 'Passed: 1\\nFailed: 1\\nErrors: 0\\n'; exit 1",
+        derived_from=["test"], proven={"test_cmd": True}, confirmed=True,
+    )
+    await store.upsert_profile(prof)
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n"
+        )
+
+    orch = _orch(store, tmp_path, FakeBackend(mutate))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is not TaskStatus.AWAITING_APPROVAL
+    assert outcome.pr_url is None
+    attempts = await store.list_attempts(t.id)
+    assert attempts[-1]["status"] == "failed"
+
+
+async def test_base_recheck_inconclusive_fails_closed(bare_repo, tmp_path, store):
+    """When the bounded base rerun cannot establish a per-id verdict it must
+    fail CLOSED (never PASS on an inconclusive base check). A failing test the
+    change ADDED does not exist on base, so the bounded rerun errors (nothing
+    to collect) → inconclusive → the attempt FAILS (a newly-added failing test
+    is the change's fault anyway)."""
+    (bare_repo / "pytest.ini").write_text("[pytest]\n")
+    _git(bare_repo, "add", "-A")
+    _git(bare_repo, "commit", "-m", "pytest marker")
+
+    def mutate(cwd):
+        (cwd / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n"
+        )
+        # a NEW test file, absent on base, whose test fails
+        (cwd / "test_mul.py").write_text(
+            "from calc import mul\n\ndef test_mul():\n    assert mul(2, 3) == 7\n"
+        )
+
+    orch = _orch(store, tmp_path, FakeBackend(mutate))
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is not TaskStatus.AWAITING_APPROVAL
+    assert outcome.pr_url is None
+    attempts = await store.list_attempts(t.id)
+    assert attempts[-1]["status"] == "failed"
