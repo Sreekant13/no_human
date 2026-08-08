@@ -808,3 +808,146 @@ def test_already_satisfied_prompt_is_not_diff_shaped():
     p = _build_already_satisfied_prompt(t, "ALREADY-SATISFIED\nCRITERION: x — MET — evidence: a.py:1")
     assert "REVIEW_JSON_START" in p
     assert "diff header" not in p and "side of the diff" not in p
+
+
+# --------------------------------------------------------------------------- #
+# Multi-repo: the gate reviewer must SEE and JUDGE every linked repo          #
+# (fix/reviewer-sees-linked-repos)                                            #
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def linked_pair(tmp_path):
+    """A primary repo and a linked repo, each with a base + a change commit.
+
+    The linked repo's change lives in service.py — a path ABSENT from the
+    primary repo, which is exactly the shape that made a legitimate linked-repo
+    finding get citation-demoted before the fix.
+    """
+    def _mk(name, base_files, change_files):
+        r = tmp_path / name
+        r.mkdir()
+        _git(r, "init", "-q")
+        _git(r, "config", "user.email", "t@t.t")
+        _git(r, "config", "user.name", "t")
+        for fn, txt in base_files.items():
+            (r / fn).write_text(txt)
+        _git(r, "add", "-A")
+        _git(r, "commit", "-qm", "base")
+        for fn, txt in change_files.items():
+            (r / fn).write_text(txt)
+        _git(r, "add", "-A")
+        _git(r, "commit", "-qm", "change")
+        return r
+
+    primary = _mk(
+        "primary",
+        {"app.py": "def a(): return 1\n"},
+        {"app.py": "def a(): return 2\n"},
+    )
+    linked = _mk(
+        "linked",
+        {"service.py": "def svc(): return 0\n"},
+        {"service.py": "def svc(): return 0\n\ndef broken(): pass  # TODO stub\n"},
+    )
+    return primary, linked
+
+
+async def test_gate_reviewer_sees_linked_repo_diff(linked_pair):
+    """The reviewer's prompt now carries each linked repo's diff, so it judges
+    the whole task's change and not just the primary repo's."""
+    primary, linked = linked_pair
+    calls = []
+
+    class CapturingBackend:
+        async def run(self, prompt, *, cwd, max_turns, effort=None,
+                      resume=None, on_event=None, supervisor_hook=None):
+            calls.append(prompt)
+            out = _block(True, [{"label": "ok", "passed": True,
+                                 "evidence": "app.py:1", "severity": "low"}])
+            return AgentResult(final_text=out, num_turns=1, is_error=False,
+                               tokens_used=10, session_id="f",
+                               stop_reason="end_turn")
+
+    reviewer = AdversarialReviewer(backend=CapturingBackend())
+    t = Task.new("multi-repo change", repo_path=str(primary))
+    t.linked_repos = [str(linked)]
+    await reviewer.review(
+        t, repo_path=primary, before_ref="HEAD~1",
+        linked_repos=[(linked, "HEAD~1")],
+    )
+    p = calls[0]
+    assert "LINKED REPOSITORIES UNDER REVIEW" in p
+    assert str(linked) in p
+    assert "def broken" in p  # the linked repo's actual change is visible
+
+
+async def test_broken_linked_repo_change_fails_review(linked_pair):
+    """A blocking finding that cites a LINKED repo file must fail the gate and
+    must NOT be citation-demoted just because the file is absent from primary."""
+    primary, linked = linked_pair
+    out = _block(False, [
+        {"label": "linked repo left a stub", "passed": False,
+         "severity": "critical",
+         "evidence": "service.py:3 defines broken() as a no-op stub",
+         "file": "service.py", "line": 3},
+    ])
+    reviewer = AdversarialReviewer(backend=FakeBackend(out))
+    t = Task.new("multi-repo change", repo_path=str(primary))
+    t.linked_repos = [str(linked)]
+    d = await reviewer.review(
+        t, repo_path=primary, before_ref="HEAD~1",
+        linked_repos=[(linked, "HEAD~1")],
+    )
+    assert d.passed is False
+    assert any("linked repo left a stub" in i.label for i in d.blocking_items)
+    assert not d.demoted_citations  # linked citation recognized, not demoted
+
+
+def test_linked_repo_citation_demoted_only_without_the_linked_repo(linked_pair):
+    """Control proving the fix matters: the same critical finding that cites a
+    linked-repo file is DEMOTED when the reviewer sees only the primary repo,
+    and KEPT when the linked repo is in scope."""
+    from no_human.review.reviewer import _verify_citations
+    from no_human.review.selfcheck import ChecklistItem
+
+    single = ChecklistItem(label="stub", passed=False, evidence="no-op",
+                           file="service.py", line=3, severity="critical")
+    demoted_single = _verify_citations([single], primary := linked_pair[0], "HEAD~1")
+    assert demoted_single and single.severity == "low"  # old behaviour: demoted
+
+    multi = ChecklistItem(label="stub", passed=False, evidence="no-op",
+                          file="service.py", line=3, severity="critical")
+    demoted_multi = _verify_citations(
+        [multi], primary, "HEAD~1", extra_repos=[(linked_pair[1], "HEAD~1")])
+    assert not demoted_multi and multi.severity == "critical"  # kept blocking
+
+
+async def test_single_repo_prompt_has_no_linked_section(simple_repo):
+    """No linked_repos → the prompt gains no linked section (single-repo path
+    unchanged)."""
+    calls = []
+
+    class CapturingBackend:
+        async def run(self, prompt, *, cwd, max_turns, effort=None,
+                      resume=None, on_event=None, supervisor_hook=None):
+            calls.append(prompt)
+            out = _block(True, [{"label": "ok", "passed": True,
+                                 "evidence": "calc.py:3", "severity": "low"}])
+            return AgentResult(final_text=out, num_turns=1, is_error=False,
+                               tokens_used=10, session_id="f",
+                               stop_reason="end_turn")
+
+    reviewer = AdversarialReviewer(backend=CapturingBackend())
+    t = Task.new("single-repo change")
+    await reviewer.review(t, repo_path=simple_repo)  # no linked_repos
+    assert "LINKED REPOSITORIES UNDER REVIEW" not in calls[0]
+
+
+def test_linked_section_notes_a_repo_with_no_changes(linked_pair):
+    """A linked repo the coder did not touch is stated, not omitted; and an
+    empty linked list yields the empty string (single-repo byte-identical)."""
+    from no_human.review.reviewer import _linked_repos_review_section
+    primary, _linked = linked_pair
+    section = _linked_repos_review_section([(primary, "HEAD")])  # HEAD..HEAD = no diff
+    assert "NO CHANGES in this repo" in section
+    assert _linked_repos_review_section([]) == ""

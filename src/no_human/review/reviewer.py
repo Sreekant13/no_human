@@ -287,6 +287,51 @@ def _full_file_context(
     return block, sorted(omitted)
 
 
+def _linked_repos_review_section(linked: list[tuple[Path, str]]) -> str:
+    """Render each linked repo's diff for the GATE reviewer.
+
+    Mirrors ``multi_repo.linked_repos_block`` — which tells the PLANNER the
+    linked repos exist — but adapted to a REVIEW: it shows each linked repo's
+    diff so the gate judges the WHOLE task's change, not just the primary repo's.
+    Before this, ``grep -rn linked src/no_human/review`` found nothing: the coder
+    committed into linked repos and the reviewer never saw it.
+
+    ``linked`` is a list of ``(repo_path, before_ref)`` pairs the orchestrator
+    resolves (the same per-repo base it uses for the linked-repo tamper guard).
+    An empty list returns ``""`` so single-repo prompts stay byte-identical.
+    A linked repo the coder did not touch (no diff) is stated as such rather
+    than omitted — "no changes here" is itself a fact the reviewer should judge
+    against the acceptance criteria. Each diff is bounded by ``_git_diff``'s
+    existing ``_DIFF_CAP``, so the section cannot bloat past the primary's.
+    """
+    if not linked:
+        return ""
+    parts = [
+        "LINKED REPOSITORIES UNDER REVIEW — this task changed more than one\n"
+        "repository. The diffs below are part of the SAME task as the primary\n"
+        "diff above and MUST be judged together against the acceptance criteria.\n"
+        "A broken, incomplete, or missing change in a linked repo fails the\n"
+        "review exactly as one in the primary repo does. When a finding is about\n"
+        "a linked repo, cite the file path as shown in that repo's diff header;\n"
+        "you may also read any linked repo by absolute path with your tools.\n"
+    ]
+    for lpath, lbefore in linked:
+        diff, total = _git_diff(lpath, lbefore, "HEAD")
+        if not diff.strip():
+            parts.append(
+                f"\n--- linked repo {lpath} — NO CHANGES in this repo ---\n"
+            )
+            continue
+        trunc = (
+            f" (TRUNCATED from {total:,} chars — read the repo with your tools)"
+            if total > len(diff) else ""
+        )
+        parts.append(
+            f"\n--- linked repo {lpath}{trunc} ---\n```\n{diff}\n```\n"
+        )
+    return "".join(parts) + "\n"
+
+
 _INVOCATION_ERROR_RE = re.compile(
     r"error: unrecognized arguments"
     r"|no tests ran"
@@ -394,6 +439,7 @@ def _build_review_prompt(
     prior_rounds: str = "",
     full_files: str = "",
     omitted_files: list[str] | None = None,
+    linked_section: str = "",
     allow_tools: bool = True,
     lint_evidence: str = "",
     wiring_evidence: str = "",
@@ -633,6 +679,7 @@ def _build_review_prompt(
         + f"Acceptance criteria:\n{criteria}\n\n"
         + diff_section
         + files_section
+        + linked_section
         + lint_section
         + wiring_section
         + _annotated_test_output(test_output)
@@ -1008,15 +1055,40 @@ def _citation_fails(
     return f"{rel} not found in the worktree or at {before_ref}"
 
 
+def _citation_fails_in_any(
+    item: ChecklistItem, roots: list[tuple[Path, str]]
+) -> str | None:
+    """Why the item's citation checks out in NONE of the task's repos, or None.
+
+    Multi-repo generalization of ``_citation_fails``: a finding is valid when
+    its cited location exists in ANY repo the task touched (primary or a linked
+    repo), so a legitimate linked-repo defect is not demoted merely because its
+    file is absent from the primary repo. With a single root this is identical
+    to ``_citation_fails`` — including its "no citation → None" behaviour, since
+    an empty citation yields None from the primary and short-circuits here. When
+    the citation exists nowhere, the primary repo's reason is reported.
+    """
+    reasons = [_citation_fails(item, rp, br) for rp, br in roots]
+    if any(r is None for r in reasons):
+        return None
+    return reasons[0]
+
+
 def _verify_citations(
-    items: list[ChecklistItem], repo_path: Path, before_ref: str
+    items: list[ChecklistItem], repo_path: Path, before_ref: str,
+    extra_repos: list[tuple[Path, str]] | None = None,
 ) -> list[str]:
-    """Demote blocking findings whose citations don't check out. Mutates items."""
+    """Demote blocking findings whose citations don't check out. Mutates items.
+
+    ``extra_repos`` are the task's linked repos as ``(path, before_ref)`` pairs;
+    a citation valid in any of them is kept. Empty/None → single-repo behaviour
+    unchanged, byte-for-byte."""
     demoted: list[str] = []
+    roots = [(repo_path, before_ref), *(extra_repos or [])]
     for item in items:
         if item.passed or not _is_blocking(item):
             continue
-        reason = _citation_fails(item, repo_path, before_ref)
+        reason = _citation_fails_in_any(item, roots)
         if reason:
             item.severity = "low"
             item.evidence = (
@@ -1029,7 +1101,8 @@ def _verify_citations(
 
 
 def _goal_entry_citation_fails(
-    goal: dict[str, Any], repo_path: Path, before_ref: str
+    goal: dict[str, Any], repo_path: Path, before_ref: str,
+    extra_repos: list[tuple[Path, str]] | None = None,
 ) -> str | None:
     """Why the goal block's entry_point does not check out, or None.
 
@@ -1049,11 +1122,12 @@ def _goal_entry_citation_fails(
         if head and num.isdigit():
             path, line = head, int(num)
     probe = ChecklistItem("goal", False, "", file=path, line=line)
-    return _citation_fails(probe, repo_path, before_ref)
+    return _citation_fails_in_any(probe, [(repo_path, before_ref), *(extra_repos or [])])
 
 
 def _parse_review_output(
     text: str, repo_path: Path | None = None, before_ref: str = "HEAD~1",
+    extra_repos: list[tuple[Path, str]] | None = None,
 ) -> ReviewDecision:
     m = _REVIEW_JSON.search(text or "")
     if not m:
@@ -1100,14 +1174,17 @@ def _parse_review_output(
     ]
     # The citation rule runs BEFORE the verdict: a blocking finding whose
     # cited location does not exist is advisory, and must not fail the gate.
-    demoted = _verify_citations(items, repo_path, before_ref) if repo_path else []
+    demoted = (
+        _verify_citations(items, repo_path, before_ref, extra_repos)
+        if repo_path else []
+    )
     # The goal block gets the same treatment: a `reachable: false` whose
     # entry_point does not check out is marked demoted — it is surfaced on the
     # demoted-citations channel and never fails the gate (hallucination guard).
     goal = data.get("goal") if isinstance(data.get("goal"), dict) else None
     if (goal is not None and goal.get("reachable") is False
             and repo_path is not None):
-        reason = _goal_entry_citation_fails(goal, repo_path, before_ref)
+        reason = _goal_entry_citation_fails(goal, repo_path, before_ref, extra_repos)
         if reason:
             goal = {**goal, "demoted": True}
             demoted.append(f"goal reachability: {reason}")
@@ -1205,6 +1282,7 @@ class AdversarialReviewer:
         claim_report: str = "",
         draft_pr: str = "",
         draft_pr_absent: str = "",
+        linked_repos: list[tuple[Path, str]] | None = None,
     ) -> ReviewDecision:
         # Code review mode: higher diff cap, different prompt, multi-turn agent.
         if mode == "code_review":
@@ -1244,6 +1322,15 @@ class AdversarialReviewer:
         full_files, omitted_files = "", []
         lint_evidence = ""
         wiring_evidence = ""
+        # Multi-repo: show the reviewer every LINKED repo's diff too, so it
+        # judges the whole task's change and can FAIL on a broken linked-repo
+        # change. Only in the multi-turn (no diff_override) gate path — the
+        # single-turn override path reviews the caller-supplied diff verbatim.
+        # Empty/None → byte-identical single-repo prompt and citation behaviour.
+        linked_section = (
+            _linked_repos_review_section(linked_repos or [])
+            if not diff_override else ""
+        )
         if diff_override:
             # Caller supplied the diff; there are no refs to read files from, and
             # _fast_review runs single-turn with no tools.
@@ -1287,6 +1374,7 @@ class AdversarialReviewer:
             prior_rounds=prior_rounds,
             full_files=full_files,
             omitted_files=omitted_files,
+            linked_section=linked_section,
             lint_evidence=lint_evidence,
             wiring_evidence=wiring_evidence,
             allow_tools=not diff_override,
@@ -1300,7 +1388,10 @@ class AdversarialReviewer:
             decision = await self._fast_review(prompt, repo_path, before_ref=before_ref)
         else:
             # Full agent session for post-implementation reviews (needs to read files).
-            decision = await self._agent_review(prompt, repo_path, before_ref=before_ref)
+            decision = await self._agent_review(
+                prompt, repo_path, before_ref=before_ref,
+                extra_repos=linked_repos or None,
+            )
 
         # C3-G1: complex-tier tasks get parallel single-turn angle passes.
         # Angles are ADDITIVE and best-effort: one that times out or crashes
@@ -1380,6 +1471,7 @@ class AdversarialReviewer:
         self, prompt: str, repo_path: Path,
         *, max_turns: int = _REVIEW_TURNS, timeout: int = _REVIEW_TIMEOUT,
         before_ref: str = "HEAD~1", verify_citations: bool = True,
+        extra_repos: list[tuple[Path, str]] | None = None,
     ) -> ReviewDecision:
         """Multi-turn review — model can explore the repo with read-only tools.
 
@@ -1416,6 +1508,7 @@ class AdversarialReviewer:
             decision, reason = await self._review_once(
                 prompt, repo_path, max_turns=budget, timeout=round_timeout,
                 before_ref=before_ref, verify_citations=verify_citations,
+                extra_repos=extra_repos,
             )
             if decision is not None:
                 return decision
@@ -1537,6 +1630,7 @@ class AdversarialReviewer:
     async def _review_once(
         self, prompt: str, repo_path: Path, *, max_turns: int, timeout: int,
         before_ref: str = "HEAD~1", verify_citations: bool = True,
+        extra_repos: list[tuple[Path, str]] | None = None,
     ) -> tuple[ReviewDecision | None, str]:
         """One reviewer session.
 
@@ -1563,11 +1657,14 @@ class AdversarialReviewer:
         # gates the demotion rule: claim mode must keep a refutation that names
         # a nonexistent (fabricated) path blocking (PR #101 review, critical).
         _vc_repo = repo_path if verify_citations else None
+        _vc_extra = extra_repos if verify_citations else None
         decision = _parse_review_output(result.final_text or "",
-                                        repo_path=_vc_repo, before_ref=before_ref)
+                                        repo_path=_vc_repo, before_ref=before_ref,
+                                        extra_repos=_vc_extra)
         if _reached_no_verdict(decision):
             decision = _parse_review_output("\n".join(all_text_parts),
-                                            repo_path=_vc_repo, before_ref=before_ref)
+                                            repo_path=_vc_repo, before_ref=before_ref,
+                                            extra_repos=_vc_extra)
         if _reached_no_verdict(decision):
             reason = result.stop_reason or "no REVIEW_JSON block"
             if getattr(result, "is_error", False):

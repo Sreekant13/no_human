@@ -6201,11 +6201,35 @@ class Orchestrator:
             profile_ctx = "\n".join(f"  {p}" for p in parts if p)
         confirmed_rules = self._format_active_memories() or ""
 
+        # Multi-repo: the reviewer must SEE and JUDGE every repo the task
+        # touched, not just the primary. The coder commits into linked repos
+        # (proven by commit/tamper events) but the gate reviewed only the
+        # primary diff, so a broken linked-repo change could not fail review.
+        # Resolve each linked repo's base ref the SAME way the linked-repo
+        # tamper guard above does. Empty for single-repo tasks → the reviewer
+        # call, prompt, and citation behaviour are byte-identical to before.
+        linked_for_review: list[tuple[Path, str]] = []
+        primary_resolved = repo.path.resolve() if repo is not None else None
+        for linked_path in (task.linked_repos or []):
+            lp = Path(linked_path)
+            if not (lp / ".git").is_dir():
+                continue
+            if primary_resolved is not None and lp.resolve() == primary_resolved:
+                continue  # a linked entry that is the primary repo — do not double-count
+            try:
+                lr_before = (
+                    await self._repro_base_ref(lp, base) if base else "HEAD~1"
+                )
+            except Exception:  # noqa: BLE001 — never block review on base resolution
+                lr_before = "HEAD~1"
+            linked_for_review.append((lp, lr_before))
+
         self._emit_review("review_start", "running independent staff-level reviewer")
         try:
             decision = await self.reviewer.review(
                 task,
                 repo_path=repo.path,
+                linked_repos=linked_for_review or None,
                 test_output=test_result.output if test_result.ran else "",
                 held_out_output=held_result.output if held_result else "",
                 profile_context=profile_ctx,
