@@ -446,6 +446,9 @@ RETIRED_CLAIMS = [
     ("5-lane", "recheck with: grep -n BOARD_LANES web/src/boardLanes.js"),
     ("code.example.com/dev", "placeholder clone URL that cannot work"),
     ("tests-passing", "a hard-coded badge asserting a build status nothing checks"),
+    ("no auto-merge setting to find", "false absolute — the auto_merge_on_approval "
+     "config key IS findable (recheck: grep -n auto_merge_on_approval "
+     "src/no_human/config.py); the honest claim is that no code path acts on it"),
 ]
 
 

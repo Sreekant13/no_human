@@ -78,7 +78,7 @@ nh reject <id> --reason "..."        # send it back with feedback
 
 `gh pr merge`, `glab mr merge` and the REST equivalents are denied before they
 execute. Pushes to `main`/`master`/`release/*` are refused at the git layer, and
-there is no auto-merge setting to find. Git is driven by no_human's own code
+no code path merges your PR on approval. Git is driven by no_human's own code
 under a distinct commit identity, not by the model; during review the backend is
 read-only. Credentials live in `~/.no_human/.env` (`chmod 600`), never in the
 repo. Detail: [docs/security.md](docs/security.md).
