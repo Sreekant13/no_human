@@ -294,6 +294,67 @@ def test_detects_self_equality_tautology():
     assert tamper_guard.check(before, after).tampered is True
 
 
+def test_string_literal_assert_true_is_not_a_tautology():
+    """Test DATA carrying `assert True` (a holdout body as an argument, or sample
+    source in a docstring) must NOT count as a tautology. This was a live FP that
+    escalated correct work: a test ABOUT the harness has to embed test source.
+    """
+    holdout_arg = (
+        'def test_holdout_rejects_empty():\n'
+        '    r = _holdout_ok(holdout="def test_x():\\n    assert True\\n")\n'
+        '    assert r is None\n'
+    )
+    docstring_sample = (
+        'def test_thing():\n'
+        '    """example the guard once miscounted:\n'
+        '        assert x == x\n'
+        '    """\n'
+        '    assert real_thing() == 5\n'
+    )
+    assert tamper_guard.count_tautologies(holdout_arg) == 0
+    assert tamper_guard.count_tautologies(docstring_sample) == 0
+    # And end-to-end: ADDING such a test to a real tests/ path is not "tampered".
+    report = tamper_guard.check(
+        {"tests/test_h.py": "def test_a():\n    assert f() == 1\n"},
+        {"tests/test_h.py": "def test_a():\n    assert f() == 1\n" + holdout_arg},
+    )
+    assert report.tampered is False, report.reasons
+    assert report.tautologies_after == report.tautologies_before, report.summary
+
+
+def test_real_tautology_forms_all_still_counted():
+    """Masking string literals must not drop any REAL tautology form — including
+    `assertTrue(True)` (a Call, not an Assert node) and the JS forms, which an
+    AST-Assert-only rewrite would have silently dropped (guard weakening)."""
+    for src in (
+        "def t():\n    assert True\n",
+        "def t():\n    assert not False\n",
+        "def t():\n    assert 1\n",
+        "def t():\n    x = 1\n    assert x == x\n",
+        "def t(self):\n    self.assertTrue(True)\n",
+        "it('x', () => { expect(true).toBe(true); })\n",          # JS: unparseable -> regex fallback
+        "it('x', () => { expect(true).toBeTruthy(); })\n",
+    ):
+        assert tamper_guard.count_tautologies(src) >= 1, src
+
+
+def test_tautology_masking_is_byte_correct_on_non_ascii():
+    """ast column offsets are UTF-8 byte offsets: a non-ASCII char before a real
+    tautology must not shift the mask and drop it; a fake one inside a non-ASCII
+    string must still be cured."""
+    real_after_nonascii = 'def t():\n    label = "café — ¡hola!"\n    assert True\n'
+    fake_in_nonascii = 'def t():\n    s = "café: assert x == x"\n    assert real() == 1\n'
+    assert tamper_guard.count_tautologies(real_after_nonascii) == 1
+    assert tamper_guard.count_tautologies(fake_in_nonascii) == 0
+
+
+def test_tautology_masking_falls_back_on_unparseable_source():
+    """Non-Python / partial diffs can't be AST-parsed; fall back to the raw regex
+    (no worse than before) so JS tautologies and broken snippets still register."""
+    assert tamper_guard.count_tautologies("def t(:\n    assert True\n") >= 1   # SyntaxError
+    assert tamper_guard.count_tautologies("expect(true).toBeTruthy()\n") >= 1  # JS
+
+
 def test_detects_conftest_autouse_monkeypatch():
     """A conftest autouse fixture that patches the SUT green without a real fix."""
     before = {}
@@ -607,9 +668,11 @@ def test_fixture_snapshots_do_not_raise_false_cheat_signals():
 
     `tests/test_vcs.py` seeds a fixture repo with the literal string
     `"assert True\\n"`, and `tests/test_jira_issues_endpoint.py` has a legitimate
-    `@pytest.fixture(autouse=True)` that monkeypatches config PATHS. Snapshotting
-    either registered `tautological assertions 0->1` / `autouse monkeypatch fixture
-    0->1` on a branch that touched no test at all.
+    `@pytest.fixture(autouse=True)` that monkeypatches config PATHS. The autouse
+    monkeypatch registers `autouse monkeypatch fixture 0->1` on a branch that
+    touched no test at all; the string-literal `assert True` no longer registers a
+    tautology (``count_tautologies`` masks string-literal interiors), so the path
+    exemption below is what still has to hold for the autouse signal.
     """
     snapshot = (
         'def test_seed(repo):\n'
@@ -619,9 +682,11 @@ def test_fixture_snapshots_do_not_raise_false_cheat_signals():
         'def _isolated_paths(tmp_path, monkeypatch):\n'
         '    monkeypatch.setattr(nh_config, "ENV_PATH", tmp_path / ".env")\n'
     )
-    # The content really does carry both signals — this is a live false positive,
-    # not a hypothetical one.
-    assert tamper_guard.count_tautologies(snapshot) == 1
+    # The autouse monkeypatch is a live cheat signal; the string-literal
+    # `assert True` handed to write_text is test DATA and is now correctly NOT
+    # counted as a tautology (the FP this guard used to raise — see
+    # count_tautologies's string-literal masking).
+    assert tamper_guard.count_tautologies(snapshot) == 0
     assert tamper_guard.count_faking_fixtures(snapshot) == 1
 
     r = tamper_guard.check(
@@ -643,7 +708,10 @@ def test_fixture_snapshots_do_not_raise_false_cheat_signals():
         },
     )
     assert live.tampered, live
-    assert any("tautological" in x for x in live.reasons), live.reasons
+    # The string-literal `assert True` is DATA, not a tautology — masked even
+    # under a real test path (this is exactly the FP that escalated correct work
+    # as NOVEL_UNKNOWN); only the autouse fixture fires here.
+    assert not any("tautological" in x for x in live.reasons), live.reasons
     assert any("autouse" in x for x in live.reasons), live.reasons
 
 

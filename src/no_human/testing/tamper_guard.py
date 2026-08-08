@@ -21,6 +21,7 @@ refactors don't trip it.
 
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass, field
 
@@ -212,8 +213,55 @@ def count_skips(source: str) -> int:
     return len(_SKIP_MARK.findall(source))
 
 
+def _mask_python_string_literals(source: str) -> str:
+    """Return *source* with the interior of every Python string literal blanked to
+    spaces, preserving byte offsets and newlines. Raises ``SyntaxError`` (via
+    ``ast.parse``) on non-Python or partial/unparseable diffs.
+
+    Why: ``count_tautologies`` scans text, so an ``assert True`` living INSIDE a
+    string literal — e.g. a holdout body handed to ``_holdout_ok`` as
+    ``holdout="def t():\\n    assert True\\n"``, or sample source in a docstring —
+    was counted as a neutered test. That is test DATA, not a tautological
+    assertion, and any test ABOUT the test harness must carry test source as data;
+    the guard was penalising exactly the honest act of adding such tests and
+    escalating it as a tamper. Masking the string interiors removes the false
+    positive while leaving every REAL form intact (a genuine ``assert True`` is not
+    inside a string, so it still counts) — verified against ``assert True/1/not
+    False/x==x``, ``assertTrue(True)`` and the JS ``expect(true).toBe(true)`` forms.
+
+    ``ast`` column offsets are UTF-8 BYTE offsets, so the masking is done on the
+    encoded bytes to stay correct on non-ASCII source (mis-masking a line could
+    otherwise drop a real tautology on it — a silent weakening).
+    """
+    tree = ast.parse(source)
+    data = bytearray(source.encode("utf-8"))
+    line_starts = [0]
+    for line in source.encode("utf-8").splitlines(keepends=True):
+        line_starts.append(line_starts[-1] + len(line))
+    def _offset(lineno: int, col: int) -> int:      # 1-based lineno, 0-based byte col
+        return line_starts[lineno - 1] + col
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and node.end_lineno is not None):
+            start = _offset(node.lineno, node.col_offset)
+            end = _offset(node.end_lineno, node.end_col_offset)
+            for i in range(start, min(end, len(data))):
+                if data[i] != 0x0A:                 # keep newlines so line structure holds
+                    data[i] = 0x20                  # space
+    return data.decode("utf-8")
+
+
 def count_tautologies(source: str) -> int:
-    return len(_TAUTOLOGY.findall(source))
+    """Tautological assertions (rule 3). String-literal interiors are masked first
+    so test DATA carrying an ``assert True`` is not miscounted as a neutered test
+    (a false positive that escalated good work as NOVEL_UNKNOWN). Every real form is
+    preserved, including ``assertTrue(True)`` and the JS forms; non-Python or
+    unparseable source falls back to scanning the raw text, exactly as before."""
+    try:
+        scannable = _mask_python_string_literals(source)
+    except SyntaxError:
+        scannable = source
+    return len(_TAUTOLOGY.findall(scannable))
 
 
 def count_faking_fixtures(source: str) -> int:
