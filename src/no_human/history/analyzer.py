@@ -242,8 +242,17 @@ def build_llm_prompt(transcript: Transcript) -> str:
       off-topic or unjustified verdict yields zero findings regardless of what
       the model went on to list.
     """
+    # Drop PII-bearing messages BEFORE they enter the prompt — the LLM pass runs
+    # against the vendor API, so a home address / phone / payment / ID in a user
+    # message would otherwise be transmitted off-machine even though the finding
+    # it produces is later dropped at persistence. Filtering here (drop, not
+    # redact — same policy as learning/pii.py) means the sensitive message never
+    # leaves the machine, so the onboarding copy's privacy claim holds for
+    # transmission, not just storage. A transcript that is entirely PII yields an
+    # empty convo → zero findings, which is the correct privacy outcome.
     user_msgs = [
-        (i, m.content) for i, m in enumerate(transcript.messages) if m.role == "user"
+        (i, m.content) for i, m in enumerate(transcript.messages)
+        if m.role == "user" and contains_pii(m.content) is None
     ][:_LLM_USER_MSG_CAP]
     convo = "\n".join(
         f"[msg {i}] {c.strip()[:_LLM_MSG_CHARS]}" for i, c in user_msgs

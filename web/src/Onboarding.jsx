@@ -813,6 +813,12 @@ export default function Onboarding({ onComplete }) {
                 conversations, catalogs your <strong>skills</strong>, and distills the
                 corrections you keep repeating — so the Supervisor enforces them for you.
               </p>
+              <p className="ob-sub" style={{ opacity: 0.75, fontSize: "0.9em" }}>
+                Scope: your last <strong>30 days</strong> of conversations, read from this machine.
+                Recent messages are sent to <strong>Claude</strong> to distill the lessons —
+                personal details (home addresses, phone numbers, payment and ID info) are dropped
+                <strong> before a message is sent or saved</strong>.
+              </p>
               <button className="ob-btn" disabled={scanning} onClick={scanHistory}>
                 {scanPhase === "extracting" ? "Reading conversations…"
                   : scanPhase === "analyzing" ? "Distilling rules…"

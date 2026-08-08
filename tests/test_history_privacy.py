@@ -695,3 +695,22 @@ def test_spa_does_not_pre_tick_proposals():
            / "web" / "src" / "Onboarding.jsx").read_text(encoding="utf-8")
     assert "setChosenRules(new Set((an.proposals || []).map((p) => p.id)))" not in src
     assert "filter((p) => p.selected === true)" in src
+
+
+def test_pii_bearing_messages_are_dropped_before_the_llm_prompt():
+    """A user message carrying PII (phone / home address) must NOT reach the LLM
+    prompt. The LLM pass runs against the vendor API, so PII would otherwise be
+    transmitted off-machine before the finding is ever dropped at persistence.
+    build_llm_prompt filters (drop, not redact — same policy as learning/pii.py)."""
+    t = Transcript(
+        cascade_id="c-pii", title="mixed", created="2026-07-20",
+        workspaces=["file:///Users/op/git/acme"],
+        messages=[
+            Message("user", "always run the tests before pushing", "STEP"),
+            Message("user", "my number is 415-555-0132, ship to 1600 Pennsylvania Ave", "STEP"),
+        ],
+    )
+    prompt = build_llm_prompt(t)
+    assert "always run the tests before pushing" in prompt          # clean message kept
+    assert "415-555-0132" not in prompt                             # PII message dropped
+    assert "Pennsylvania" not in prompt
