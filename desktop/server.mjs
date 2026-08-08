@@ -80,22 +80,49 @@ export function isAppOrigin(url, origin = DEFAULT_ORIGIN) {
 import { execFile, spawn } from "node:child_process";
 import { canSignal, hasExited, ownsChild } from "./serverOwnership.mjs";
 
-export const DEFAULT_NH_PATHS = [
+const IS_WINDOWS = process.platform === "win32";
+
+/**
+ * The frozen server's filename. PyInstaller's `EXE(name="nh")` emits `nh` on
+ * POSIX and `nh.exe` on Windows — the spec needs no platform branch for this
+ * (verified against a real Windows freeze; see docs/WINDOWS.md).
+ */
+export const NH_EXE_NAME = IS_WINDOWS ? "nh.exe" : "nh";
+
+// BOTH lists are exported, and the platform only chooses between them. Gating a
+// single list on process.platform would make the other one unreachable from the
+// host that builds the other artefact — the Windows list would be untestable on
+// the Mac that ships the DMG, and vice versa. The tests exercise each list by
+// name, so neither can rot unnoticed.
+export const POSIX_NH_PATHS = [
   path.join(os.homedir(), ".local", "bin", "nh"),
   "/opt/homebrew/bin/nh",
   "/usr/local/bin/nh",
 ];
 
+// Deliberately short. On macOS this list is load-bearing because a GUI app
+// inherits launchd's PATH and cannot see the operator's own bin dirs; on
+// Windows a GUI process inherits the user's PATH, so the PATH scan in
+// resolveNhBin already covers the ordinary installs and this is only a
+// backstop for the one location a `uv tool install` uses.
+export const WINDOWS_NH_PATHS = [
+  path.join(os.homedir(), ".local", "bin", "nh.exe"),
+];
+
+export const DEFAULT_NH_PATHS = IS_WINDOWS ? WINDOWS_NH_PATHS : POSIX_NH_PATHS;
+
 /**
- * The `nh` frozen by packaging/build-installer.sh and shipped in the app's
- * Resources (electron-builder extraResources). Present only in a packaged
- * build: unpackaged, `process.resourcesPath` points inside node_modules/electron
- * and has no nh-server dir, and under plain `node --test` it is undefined —
- * both cases return "" so resolution falls through to a developer's own nh.
+ * The `nh` frozen by packaging/build-installer.sh (or build-installer.ps1 on
+ * Windows) and shipped in the app's Resources (electron-builder
+ * extraResources). Present only in a packaged build: unpackaged,
+ * `process.resourcesPath` points inside node_modules/electron and has no
+ * nh-server dir, and under plain `node --test` it is undefined — both cases
+ * return "" so resolution falls through to a developer's own nh.
  */
-export function bundledNhPath(resourcesPath = process.resourcesPath) {
+export function bundledNhPath(resourcesPath = process.resourcesPath,
+                              exeName = NH_EXE_NAME) {
   if (!resourcesPath) return "";
-  const p = path.join(resourcesPath, "nh-server", "nh");
+  const p = path.join(resourcesPath, "nh-server", exeName);
   return fs.existsSync(p) ? p : "";
 }
 
@@ -109,16 +136,56 @@ export function bundledNhPath(resourcesPath = process.resourcesPath) {
  * pointing a packaged app at a working tree, and demoting it would silently
  * pin such installs to the frozen copy.
  */
+/**
+ * Find `nh` on a Windows PATH, by READING the PATH rather than shelling out.
+ *
+ * This is deliberately NOT the Windows spelling of the login-shell trick above.
+ * That trick exists on macOS for one reason: a GUI app inherits launchd's PATH
+ * and genuinely cannot see the operator's shell PATH, so the only way to learn
+ * it is to start a login shell and ask. A Windows GUI process DOES inherit the
+ * user's PATH, so there is nothing to recover — spawning `where.exe` would add
+ * a subprocess, a 5s timeout and a dependency on machine state to answer a
+ * question already in `env`.
+ *
+ * Reading `env` also makes this deterministic and unit-testable from any host,
+ * which `where.exe` (which consults the live process PATH, ignoring `env`)
+ * could not be. That claim is only true because the join below is
+ * `path.win32.join` and not the host-native `path.join`: on a POSIX host the
+ * native join produces `C:\a/nh.exe`, so the function returned a path Windows
+ * would never see and the tests for it failed everywhere except Windows —
+ * including on the ubuntu CI runner that is supposed to be checking it.
+ * PATHEXT order is fixed rather than read from the environment: these are the
+ * three forms a console entry point is ever installed as, and hardcoding them
+ * keeps a machine with an exotic PATHEXT from changing which binary the app
+ * picks.
+ */
+export function windowsPathLookup(env = process.env, exists = fs.existsSync,
+                                  delimiter = path.delimiter) {
+  // `PATH` and `Path` are the same variable on Windows and Node normalises the
+  // real process.env, but a plain object handed in by a caller (or a test) is
+  // not normalised — accept either spelling rather than silently finding nothing.
+  const raw = env.PATH ?? env.Path ?? "";
+  for (const dir of String(raw).split(delimiter).filter(Boolean)) {
+    for (const name of ["nh.exe", "nh.cmd", "nh.bat"]) {
+      const p = path.win32.join(dir, name);
+      if (exists(p)) return p;
+    }
+  }
+  return "";
+}
+
 export async function resolveNhBin(env = process.env,
                                    fallbackPaths = DEFAULT_NH_PATHS,
                                    bundled = bundledNhPath()) {
   if (env.NH_BIN && fs.existsSync(env.NH_BIN)) return env.NH_BIN;
   if (bundled) return bundled;
-  const viaShell = await new Promise((resolve) => {
-    execFile(env.SHELL || "/bin/zsh", ["-lc", "command -v nh"],
-             { timeout: 5000 }, (err, stdout) =>
-      resolve(err ? "" : stdout.trim()));
-  });
+  const viaShell = IS_WINDOWS
+    ? windowsPathLookup(env)
+    : await new Promise((resolve) => {
+      execFile(env.SHELL || "/bin/zsh", ["-lc", "command -v nh"],
+               { timeout: 5000 }, (err, stdout) =>
+        resolve(err ? "" : stdout.trim()));
+    });
   if (viaShell && fs.existsSync(viaShell)) return viaShell;
   for (const p of fallbackPaths) {
     if (fs.existsSync(p)) return p;
@@ -137,7 +204,7 @@ export async function resolveNhBin(env = process.env,
  * ~/.local/bin/claude is invisible to a packaged build. /opt/homebrew/bin is
  * worse still — it is in neither launchd's PATH nor the SDK's fallback list.
  */
-export const CLI_HINT_DIRS = [
+export const POSIX_CLI_HINT_DIRS = [
   "/opt/homebrew/bin",                                   // Homebrew, Apple Silicon
   "/usr/local/bin",                                      // Homebrew, Intel
   path.join(os.homedir(), ".local", "bin"),
@@ -147,18 +214,66 @@ export const CLI_HINT_DIRS = [
 ];
 
 /**
+ * The same job on Windows, for the same reason — the Agent SDK still resolves
+ * `claude` off PATH, and a task that cannot find it dies while the board looks
+ * healthy. The pressure is lower here (a GUI process inherits the user PATH, so
+ * an ordinary install is already visible) but not absent: an npm-global or
+ * `uv tool` install can sit outside the PATH a service or elevated launch
+ * inherits.
+ *
+ * `%APPDATA%`/`%LOCALAPPDATA%` are read from the environment rather than
+ * derived from the home directory: on a roaming or redirected profile they do
+ * not sit under it, and a derived path would silently point at nothing.
+ * mergePath drops every directory that does not exist, so listing a location
+ * that is absent on a given machine costs nothing.
+ *
+ * `path.win32.join`, not `path.join`. These are Windows paths by construction —
+ * they are only ever consumed under IS_WINDOWS — so the separator must be the
+ * WINDOWS one regardless of the host that evaluated this module. With the
+ * native join they came out `/Users/x/.local/bin`-shaped on a Mac or a Linux
+ * runner, which is not a path Windows resolves and is not something a test on
+ * either host could assert about.
+ */
+export const WINDOWS_CLI_HINT_DIRS = [
+  path.win32.join(os.homedir(), ".local", "bin"),        // uv tool install
+  path.win32.join(process.env.APPDATA
+    || path.win32.join(os.homedir(), "AppData", "Roaming"), "npm"),   // npm -g
+  path.win32.join(os.homedir(), ".claude", "local"),
+  path.win32.join(process.env.LOCALAPPDATA
+    || path.win32.join(os.homedir(), "AppData", "Local"), "Programs", "claude"),
+];
+
+export const CLI_HINT_DIRS = IS_WINDOWS
+  ? WINDOWS_CLI_HINT_DIRS : POSIX_CLI_HINT_DIRS;
+
+/**
  * Append missing directories to a PATH. APPEND, never prepend: nh shells out to
  * git/gh/pytest, and putting user-writable dirs first would let a stray binary
  * shadow the system one. Non-existent dirs are skipped so PATH stays honest.
  */
 export function mergePath(basePath, extraDirs = CLI_HINT_DIRS,
-                          exists = fs.existsSync) {
-  const parts = String(basePath || "").split(":").filter(Boolean);
-  const seen = new Set(parts);
+                          exists = fs.existsSync, delimiter = path.delimiter) {
+  // The separator is a PARAMETER defaulting to path.delimiter, not a literal
+  // ":". On Windows the separator is ";" and every entry contains a colon
+  // ("C:\\Windows"), so splitting on ":" does not merely fail to find entries —
+  // it SHREDS them: "C:\\Windows;C:\\Users\\x" becomes
+  // ["C", "\\Windows;C", "\\Users\\x"], and the PATH handed to the spawned
+  // server is then garbage. This was the one POSIX assumption in this file that
+  // was actively destructive rather than inert.
+  //
+  // Injectable so each platform's behaviour is verifiable from either host —
+  // path.delimiter alone would make the Windows semantics untestable on macOS.
+  const parts = String(basePath || "").split(delimiter).filter(Boolean);
+  // Windows paths are case-insensitive, so "C:\\Foo" and "c:\\foo" name one
+  // directory; comparing them case-sensitively would append a duplicate and
+  // break this function's stated contract. The KEY is folded, never the value —
+  // the emitted PATH keeps each entry's original casing.
+  const fold = (d) => (delimiter === ";" ? d.toLowerCase() : d);
+  const seen = new Set(parts.map(fold));
   for (const dir of extraDirs) {
-    if (!seen.has(dir) && exists(dir)) { parts.push(dir); seen.add(dir); }
+    if (!seen.has(fold(dir)) && exists(dir)) { parts.push(dir); seen.add(fold(dir)); }
   }
-  return parts.join(":");
+  return parts.join(delimiter);
 }
 
 /**
@@ -271,6 +386,12 @@ export async function ensureServer({
   const capture = makeOutputCapture();
   const child = spawn(bin, nhArgs, {
     env: spawnEnv, detached: true, stdio: ["ignore", "pipe", "pipe"],
+    // Windows only, and ignored elsewhere. `nh` is a CONSOLE-subsystem binary,
+    // and `detached` on Windows gives a detached child its own console — so
+    // without this a black console window appears beside the app on every
+    // launch and stays for the server's whole life. It does not affect what is
+    // captured: stdout/stderr are piped above, not written to that console.
+    windowsHide: true,
   });
   child.unref();
   for (const stream of [child.stdout, child.stderr]) {
@@ -346,6 +467,84 @@ export function forceStopServer(state) {
  * NOTE: a `true` return means the signal was DELIVERED, not that the process
  * died. Callers must confirm death with hasExited().
  */
+/**
+ * The `taskkill` argv for stopping a process TREE. Pure, so the escalation it
+ * encodes is testable without spawning anything.
+ *
+ * `/T` is the load-bearing flag: it takes the process and its descendants.
+ * Killing only the direct child would leave `nh`'s workers running and holding
+ * the port — the exact orphaning the POSIX branch uses a process group to
+ * avoid. `CREATE_NEW_PROCESS_GROUP` is NOT an alternative: a Windows process
+ * group is not a kill target, which is why `src/no_human/testing/runner.py`
+ * reaches for taskkill too rather than mirroring killpg.
+ *
+ * `/F` maps SIGKILL and its absence maps SIGTERM, mirroring
+ * `cli/commands.py::_windows_try_kill(pid, force=...)` exactly. Windows has no
+ * real graceful-terminate for a console process with no window, so the
+ * un-forced form frequently does nothing — that is precisely why the caller's
+ * SIGTERM→SIGKILL escalation is kept rather than collapsing straight to /F: the
+ * escalation is what makes the difference observable instead of assumed.
+ */
+export function taskkillArgs(pid, signal) {
+  return [...(signal === "SIGKILL" ? ["/F"] : []), "/T", "/PID", String(pid)];
+}
+
+/**
+ * Stop a process tree on Windows. Returns true when the kill was DISPATCHED —
+ * the same contract the POSIX branch has, where `process.kill` returning
+ * without throwing says nothing about whether the process died. Callers confirm
+ * death with hasExited(), and both lifecycle paths already poll for it.
+ *
+ * Deliberately ASYNC (execFile, not execFileSync). This runs from `before-quit`
+ * on the main thread; a synchronous taskkill would freeze the UI for as long as
+ * it takes, and the caller is polling for death anyway. The child's own 'exit'
+ * event is what ultimately sets exitCode and satisfies hasExited().
+ */
+function windowsStopTree(child, signal) {
+  const args = taskkillArgs(child.pid, signal);
+  try {
+    execFile("taskkill", args, (err) => {
+      if (!err) return;
+      // MEASURED on Windows 11, not assumed. taskkill exits 128 for BOTH
+      // "the process ... not found" AND "This process can only be terminated
+      // forcefully (with /F option)". Treating 128 as benign — which an earlier
+      // draft of this function did — silently swallows the second case, and the
+      // second case is the NORMAL one here: `nh` is a console process with no
+      // window, so an un-forced taskkill CANNOT terminate it. Verified directly:
+      //   taskkill /T /PID <console pid>  -> exit 128, process still alive
+      //   taskkill /F /T /PID <same pid>  -> exit 0,   process gone
+      if (signal === "SIGKILL") {
+        console.error(`taskkill ${args.join(" ")} failed:`,
+                      (err && err.message) || err);
+        return;
+      }
+      // The graceful form failed. Either it is already gone (success) or
+      // Windows refuses without /F. Distinguish by ASKING THE OS whether the
+      // pid still exists rather than by matching taskkill's message — that
+      // message is localised, and a German or Japanese Windows would defeat
+      // any text match while this check is language-independent.
+      let alive = true;
+      try { process.kill(child.pid, 0); } catch { alive = false; }
+      if (!alive) return;                     // raced its own shutdown: fine
+      // Escalate NOW rather than leaving it to the caller's grace timer. There
+      // is no grace period actually elapsing here — the un-forced kill did
+      // nothing at all — so waiting the full 10s of lifecycle.shutdown() would
+      // add a 10-second hang to EVERY quit on Windows and still end up sending
+      // exactly this. If `nh` ever gains a console-ctrl handler that makes the
+      // graceful form work, that path succeeds and this never runs.
+      execFile("taskkill", taskkillArgs(child.pid, "SIGKILL"), (err2) => {
+        if (err2) {
+          console.error(`taskkill /F for pid ${child.pid} failed:`,
+                        (err2 && err2.message) || err2);
+        }
+      });
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function stopServer(state, signal = "SIGTERM") {
   // ownsChild is the single definition of "ours". Gating on status==="spawned"
   // here contradicted it: ensureServer returns {status:"failed", child} for a
@@ -357,6 +556,22 @@ export function stopServer(state, signal = "SIGTERM") {
   // "stopped" count. Crucially it also stops us reaching the group kill with a
   // PID the OS may have reused.
   if (hasExited(child)) return false;
+  // Windows first: `process.kill(-pid)` is POSIX-only. A negative pid is not a
+  // process group there — Node rejects it outright (EINVAL), so this whole
+  // branch used to throw and fall through to child.kill(), which terminates the
+  // DIRECT CHILD ONLY and orphans `nh`'s workers still holding the port.
+  // Guarded on canSignal for the same PID-reuse reason as the POSIX branch: a
+  // reaped PID can be reused, and taskkill has no more identity check than
+  // killpg does.
+  if (IS_WINDOWS) {
+    if (canSignal(child)) return windowsStopTree(child, signal);
+    try {
+      child.kill(signal);
+      return true;
+    } catch {
+      return false;
+    }
+  }
   // Kill the process GROUP first: `nh` spawns workers, and signalling only the
   // direct child left them alive at PPID 1 holding the port.
   // Only signal a group while the child is demonstrably alive: after exit its

@@ -23,6 +23,7 @@ fs.mkdirSync(path.join(home, ".no_human"));
 fs.writeFileSync(path.join(home, ".no_human", ".env"),
   "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-recovery\n");
 process.env.HOME = home;
+process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows (see mainIpc.test.mjs)
 process.env.NH_ORIGIN = `http://127.0.0.1:${PORT}`;
 // NH_TEST_LOG diverts openExternal to a file; with it set in the ambient
 // environment the routing assertions below would pass vacuously.

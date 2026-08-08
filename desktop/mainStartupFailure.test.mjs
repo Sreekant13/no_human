@@ -18,6 +18,7 @@ register("./testing/electronLoader.mjs", import.meta.url);
 const home = fs.mkdtempSync(path.join(os.tmpdir(), "nh-startfail-"));
 fs.mkdirSync(path.join(home, ".no_human"));
 process.env.HOME = home;
+process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows (see mainIpc.test.mjs)
 process.env.NH_ORIGIN = `http://127.0.0.1:${19100 + (process.pid % 150)}`;
 
 const rejections = [];

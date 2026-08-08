@@ -16,7 +16,7 @@ import {
 import { createNavScheduler } from "./navScheduler.mjs";
 import { createServerLifecycle } from "./serverLifecycle.mjs";
 import { quitAction } from "./quitPolicy.mjs";
-import { parseBadgeCount } from "./badge.mjs";
+import { parseBadgeCount, overlayBadgeBitmap } from "./badge.mjs";
 import { buildMenuTemplate } from "./menu.mjs";
 import { createUpdater } from "./updater.mjs";
 import { updateMessage } from "./updatePolicy.mjs";
@@ -46,12 +46,51 @@ let quitting = false;
 // 16x16 template circle, GENERATED + verified by scripts (review finding:
 // the previous hand-typed base64 was corrupt — invisible tray, dead feature).
 // desktop/trayIcon.test.mjs decodes + inflates it so corruption can't return.
+//
+// THIS ONE IS A macOS TEMPLATE MASK: three colours only (transparent, black,
+// antialiased black). macOS reads the ALPHA and paints the glyph itself, so a
+// black mask is correct there and only there — see trayIcon().
 export const TRAY_ICON_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAARUlEQVR42mNgoCHoQcNkafwP" +
   "xUQbhK4RHeM1hJBmgoYQoxnZELJsx+kKUjRjdQVVDKDICxQHIlWikeKERJWkTJXMRBIAAFkt" +
   "fBGd64lBAAAAAElFTkSuQmCC";
 
-function trayIcon() {
+// The WINDOWS tray glyph. Same 16x16 silhouette as the mask above, but with
+// real colours, because `setTemplateImage` is macOS-ONLY and Windows renders
+// the PNG's own RGB. Shipping the mask on Windows put a black-on-near-black
+// circle in the notification area: measured 1.29:1 against the Windows dark
+// taskbar (#202020), with ZERO opaque pixels reaching even 3:1. That is a
+// blocker on this branch and not a cosmetic one — close now hides to the tray
+// on Windows, and docs/WINDOWS.md §7 records that the application menu bar is
+// unreachable there, so the tray menu is the only reachable Quit. A dark-mode
+// user closed the window and was hunting an invisible icon.
+//
+// TWO-TONE ON PURPOSE, rather than simply inverting to a light glyph. The
+// taskbar is not always dark: a plain white circle would have scored ~1.1:1 on
+// the LIGHT taskbar (#F3F3F3) and merely moved the same defect to the other
+// theme. A white core carries dark mode (16.29:1) and a near-black rim carries
+// light mode (15.68:1), so one static bitmap is legible on both. Deliberately
+// NOT switched on nativeTheme.shouldUseDarkColors: on Windows that follows the
+// APPS theme (AppsUseLightTheme) while the taskbar follows the SYSTEM theme
+// (SystemUsesLightTheme), and a "Custom" theme decouples them — the switch
+// would pick confidently and wrongly. trayIcon.test.mjs pins both ratios.
+export const TRAY_ICON_WIN_B64 =
+  "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAhUlEQVR42rVTwQkAIQxzjkzg" +
+  "0yX8O4ILOYPbuMaN0qNFoYiciL1AQaqJTa3O/QUAAUDuEU6ICcADgKbgXNqR6yDEGKmUIsFr" +
+  "JVS/bibvPbXWaAbneK+LpJWAlL0ia5FhZ9UwKXUHZSdoAe60+N2Bz3SBbCpwZ+G6iSbPeD1I" +
+  "JqNs8plO8QIbHVhQosLM3wAAAABJRU5ErkJggg==";
+
+// Exported ONLY so trayIconRouting.test.mjs can call it: the asset is pinned by
+// trayIcon.test.mjs, but nothing exercised the ROUTING, so deleting the win32
+// branch below put the mask back on Windows with all 281 tests green.
+export function trayIcon() {
+  // Windows: hand it the real-colour glyph and do NOT call setTemplateImage —
+  // it is a no-op off macOS, so the mask would render as its own black RGB.
+  // Linux is left on the mask deliberately: it has the same theoretical issue,
+  // but it is not this branch's platform and the change is unverified there.
+  if (process.platform === "win32") {
+    return nativeImage.createFromBuffer(Buffer.from(TRAY_ICON_WIN_B64, "base64"));
+  }
   const img = nativeImage.createFromBuffer(Buffer.from(TRAY_ICON_B64, "base64"));
   img.setTemplateImage(true);
   return img;
@@ -690,20 +729,38 @@ async function createWindow() {
   // error.html (loadBoardOrError always loads one of them).
   win.once("ready-to-show", () => { if (win && !win.isDestroyed()) win.show(); });
   win.on("closed", () => { win = null; });
-  // E3 (darwin): closing HIDES to the tray — the board keeps polling and
-  // notifications keep coming. Quit is explicit: tray menu or Cmd-Q.
+  // E3 (darwin AND win32): closing HIDES to the tray — the board keeps polling
+  // and notifications keep coming. Quit is explicit: tray menu, Cmd-Q, or
+  // File→Quit. Windows joined 2026-08-05 for feature parity — the two apps are
+  // one product, and "close stops the notifications" was a real divergence, not
+  // a platform convention (the tray-resident close is the norm for apps of this
+  // shape on Windows too). Linux keeps the plain close-quits behavior.
   win.on("close", (e) => {
-    if (process.platform === "darwin" && !quitting) {
+    if ((process.platform === "darwin" || process.platform === "win32") && !quitting) {
       e.preventDefault();
       win.hide();
     }
   });
   // Dock/taskbar badge mirrors the web app's own "(N) no_human" title —
   // the count the board derives with isNeedsYou. No IPC, no second truth.
+  // setBadgeCount only renders on macOS and Unity Linux; the Windows taskbar
+  // equivalent is an overlay icon, drawn from the SAME parsed title.
   win.webContents.on("page-title-updated", (_e, title) => {
     const count = parseBadgeCount(title);
     if (count === null) return; // foreign title (error page) — keep the last truthful badge
     try { app.setBadgeCount(count); } catch { /* linux without libunity */ }
+    if (process.platform === "win32" && win && !win.isDestroyed()) {
+      try {
+        if (count === 0) {
+          win.setOverlayIcon(null, "");
+        } else {
+          const { width, height, data } = overlayBadgeBitmap(count);
+          win.setOverlayIcon(
+            nativeImage.createFromBuffer(Buffer.from(data.buffer), { width, height, scaleFactor: 2.0 }),
+            `${count} task${count === 1 ? "" : "s"} need${count === 1 ? "s" : ""} you`);
+        }
+      } catch { /* a failed overlay must never take down title handling */ }
+    }
   });
   routeExternally(win.webContents);
   await loadBoardOrError(win);
@@ -714,12 +771,26 @@ if (!gotLock) {
   app.quit();
 } else {
   app.on("second-instance", () => {
+    // Never relaunch a window into a teardown. `showWindow()` FALLS THROUGH to
+    // `createWindow()` when `win` is null or destroyed, and on darwin `win` is
+    // null in exactly one situation: the app is quitting. Quitting is
+    // deliberately DELAYED here (see before-quit below) so a server that
+    // ignores SIGTERM can be escalated to SIGKILL — and the single-instance
+    // lock is still held for the whole of that delay, so a second launch during
+    // it lands in this handler rather than starting a fresh app. Without this
+    // line that second launch builds a new window and points it at a server
+    // being torn down underneath it.
+    if (quitting) return;
     // Guard the close→quit race (review finding: a destroyed BrowserWindow
     // reference throws in the main process).
-    if (win && !win.isDestroyed()) {
-      if (win.isMinimized()) win.restore();
-      win.focus();
-    }
+    //
+    // showWindow, not bare focus(): with close-to-tray on darwin AND win32,
+    // "launch the app again" is how a user reopens a HIDDEN window — the
+    // Windows walkthrough measured focus() alone leaving it invisible (the
+    // process count moved, the screen did not). focus() without show() only
+    // ever worked for a window that was still visible.
+    if (win && !win.isDestroyed() && win.isMinimized()) win.restore();
+    showWindow();
   });
   app.whenReady().then(async () => {
     // Tray failure must never abort startup (review: a bad image on some

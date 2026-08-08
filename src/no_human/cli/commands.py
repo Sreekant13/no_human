@@ -4548,10 +4548,15 @@ def _probe_pid(pid: int):
     """Is *pid* alive? True / False / None (another user's process).
 
     ``os.kill(pid, 0)`` is the POSIX idiom and is kept verbatim there. It CANNOT
-    be used on Windows: ``os.kill`` on Windows always calls ``TerminateProcess``
-    — signal 0 included — so the liveness probe that guards the instance lock
-    KILLED the running ``nh`` it was asked to detect, then reported the lock
-    free and took it.
+    be used on Windows, and the mechanism is worse than the obvious guess: for
+    most signals ``os.kill`` there calls ``TerminateProcess``, but signal 0 IS
+    ``signal.CTRL_C_EVENT``, which ``os.kill`` implements as
+    ``GenerateConsoleCtrlEvent`` — a Ctrl-C broadcast to a console process
+    GROUP, the caller's own console included. So the liveness probe that guards
+    the instance lock did not merely kill the running ``nh`` it was asked to
+    detect — it could take down everything sharing the console, asynchronously,
+    a moment later (measured: it killed the test suite exercising it, and the
+    session driving that suite, three separate times before it was traced).
     """
     if _IS_WINDOWS:
         return _windows_pid_alive(pid)

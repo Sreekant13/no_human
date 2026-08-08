@@ -8,7 +8,15 @@ import { pathToFileURL } from "node:url";
 
 import { isSetupUrl } from "./setupGate.mjs";
 
-const SETUP = path.join("/apps", "no_human", "token.html");
+// path.resolve, not path.join: this fixture must be a genuinely ABSOLUTE path
+// on the host running the test. "/apps/no_human/token.html" is absolute on
+// POSIX but drive-relative on Windows, so pathToFileURL there anchors it to the
+// current drive ("C:\apps\...") while the fixture string stays "\apps\...", and
+// the round-trip through fileURLToPath can never match — the accept case failed
+// on Windows while the predicate itself was correct. Resolving first makes both
+// sides agree on every platform WITHOUT changing what is being asserted; the
+// rejection cases below are unaffected, since they only need to differ from this.
+const SETUP = path.resolve(path.join("/apps", "no_human", "token.html"));
 const setupUrl = pathToFileURL(SETUP).href;
 
 test("isSetupUrl: only the exact local setup file passes", () => {

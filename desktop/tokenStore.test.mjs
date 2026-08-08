@@ -7,12 +7,65 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { execFileSync } from "node:child_process";
+
 import {
-  TOKEN_KEY, configuredProfile, envPath, hasToken, parseEnv, tokenVarFor,
-  validateToken, writeToken,
+  CredentialPermissionError,
+  TOKEN_KEY, configuredProfile, envPath, hasToken, icaclsGrantees, parseEnv,
+  tokenVarFor, validateToken, windowsOwnerPrincipal, writeToken,
 } from "./tokenStore.mjs";
 
+/**
+ * Run *fn* with the platform's "restrict this file to its owner" primitive
+ * forced to fail, then restore it.
+ *
+ * Stubs `fs.chmodSync` rather than `restrictToOwner` itself, so the REAL
+ * restrictToOwner runs and throws from its real POSIX branch — the same shape
+ * `windowsRestrictToOwner` throws when icacls is missing, exits non-zero, or
+ * reads back an ACL that still lists SYSTEM. `import fs from "node:fs"` yields
+ * node:fs's own module.exports object in both this file and tokenStore.mjs, so
+ * the assignment is visible to the code under test; the `assert.throws` in each
+ * caller is what proves the stub actually took effect rather than passing
+ * vacuously.
+ */
+function withFailingRestrict(fn) {
+  const real = fs.chmodSync;
+  fs.chmodSync = () => {
+    throw new CredentialPermissionError("forced failure: cannot secure the file");
+  };
+  try {
+    return fn();
+  } finally {
+    fs.chmodSync = real;
+  }
+}
+
 const home = () => mkdtempSync(join(tmpdir(), "nhhome-"));
+
+/**
+ * Assert the platform's "only the owner can read this" guarantee.
+ *
+ * The assertion used to be `statSync(p).mode & 0o777 === 0o600` everywhere.
+ * That can NEVER hold on Windows — node reports 0o666 for any file without the
+ * readonly attribute, whatever the ACL says — so on Windows it was testing a
+ * number the OS does not model rather than the property anyone cares about.
+ *
+ * So the PROPERTY is asserted per platform, and the Windows form is strictly
+ * STRONGER than the mode check it replaces: it reads the real ACL back and
+ * demands exactly one grantee. That is what caught the original defect, where
+ * a freshly written .env was inherited by SYSTEM and BUILTIN\Administrators.
+ */
+function assertOwnerOnly(p) {
+  if (process.platform !== "win32") {
+    assert.equal(fs.statSync(p).mode & 0o777, 0o600);
+    return;
+  }
+  const out = execFileSync("icacls", [p], { encoding: "utf8", windowsHide: true });
+  const got = [...icaclsGrantees(out, p)].map((g) => g.toLowerCase()).sort();
+  const want = [windowsOwnerPrincipal().toLowerCase()];
+  assert.deepEqual(got, want,
+    `${p} must grant its owner and nobody else, got: ${got.join(", ")}`);
+}
 
 test("hasToken: the .env file wins, then process env, else false", () => {
   const h = home();
@@ -47,7 +100,7 @@ test("writeToken: preserves other secrets, one token line after rewrite", () => 
 test("writeToken: creates the file 0600", () => {
   const h = home();
   const p = writeToken("sk-ant-oat-x", h);
-  assert.equal(fs.statSync(p).mode & 0o777, 0o600);
+  assertOwnerOnly(p);
 });
 
 test("writeToken: removes DUPLICATE keys — dotenv is later-wins", () => {
@@ -69,7 +122,40 @@ test("writeToken: hardens an existing 0644 .env to 0600", () => {
   fs.writeFileSync(envPath(h), "FOO=b\n", { mode: 0o644 });
   fs.chmodSync(envPath(h), 0o644);
   writeToken("sk-ant-oat-x", h);
-  assert.equal(fs.statSync(envPath(h)).mode & 0o777, 0o600);
+  assertOwnerOnly(envPath(h));
+});
+
+// The ordering guard. Before the atomic-rename fix these two passed ONLY
+// because nothing asserted them: the credential was written to .env first and
+// restrictToOwner ran after, so a failure left a readable token on disk and
+// nh:save-token reported {ok:false} over it.
+test("writeToken: a failing restrictToOwner leaves NO .env behind", () => {
+  const h = home();
+  withFailingRestrict(() => {
+    assert.throws(() => writeToken("sk-ant-oat-mustnotpersist", h),
+      /forced failure: cannot secure the file/);
+  });
+  assert.equal(fs.existsSync(envPath(h)), false,
+    ".env must not exist: the credential may not reach disk before its "
+    + "permissions are proven");
+  assert.equal(fs.existsSync(`${envPath(h)}.tmp`), false,
+    "the temp file must be cleaned up, not left holding the credential");
+});
+
+test("writeToken: a failing restrictToOwner leaves an EXISTING .env untouched", () => {
+  const h = home();
+  fs.mkdirSync(join(h, ".no_human"), { recursive: true });
+  const before = "# comment\nJIRA_API_TOKEN=keepme\n";
+  fs.writeFileSync(envPath(h), before);
+  withFailingRestrict(() => {
+    assert.throws(() => writeToken("sk-ant-oat-mustnotpersist", h));
+  });
+  const after = fs.readFileSync(envPath(h), "utf8");
+  assert.equal(after, before, "an existing .env must be byte-identical");
+  assert.ok(!after.includes("sk-ant-oat-mustnotpersist"),
+    "no credential byte may reach disk on the failure path");
+  assert.equal(fs.existsSync(`${envPath(h)}.tmp`), false,
+    "the temp file must be cleaned up");
 });
 
 test("writeToken: always ends with a newline", () => {
@@ -151,7 +237,7 @@ test("writeCredential: api_key mode writes ANTHROPIC_API_KEY, 0600, others prese
   const text = fs.readFileSync(p, "utf8");
   assert.equal(parseEnv(text)[API_KEY_VAR], "sk-ant-api03-abc");
   assert.match(text, /JIRA_API_TOKEN=keepme/);
-  assert.equal(fs.statSync(p).mode & 0o777, 0o600);
+  assertOwnerOnly(p);
   assert.throws(() => writeCredential("sk-ant-oat-x", "api_key", h),
     /subscription token/i, "wrong shape never touches disk");
 });

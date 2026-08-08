@@ -3,11 +3,12 @@
 import os from "node:os";
 import path from "node:path";
 export const calls = { quit: 0, exit: 0, handlers: new Map(), ipc: new Map(),
-                       opened: [], nav: new Map(), badge: [], sent: [] };
+                       opened: [], nav: new Map(), badge: [], sent: [],
+                       images: [] };
 export function reset() {
   calls.quit = 0; calls.exit = 0; calls.handlers.clear(); calls.ipc.clear();
   calls.opened.length = 0; calls.nav.clear(); calls.badge.length = 0;
-  calls.sent.length = 0;
+  calls.sent.length = 0; calls.images.length = 0;
 }
 let readyResolve;
 export const readyGate = new Promise((r) => { readyResolve = r; });
@@ -32,7 +33,24 @@ export const ipcMain = { handle: (ch, fn) => { calls.ipc.set(ch, fn); } };
 // untestable, so deleting it survived every test.
 export const shell = { openExternal: (u) => { calls.opened.push(u); } };
 export const nativeTheme = { shouldUseDarkColors: false };
-export const nativeImage = { createFromBuffer: () => ({ setTemplateImage() {} }) };
+// RECORDS the bytes and the template flag. A double that discarded both made
+// trayIcon()'s platform routing untestable: deleting its win32 branch shipped
+// the macOS template MASK on Windows — where setTemplateImage is a no-op, so
+// the mask paints as its own black RGB, 1.29:1 on the dark taskbar — and every
+// one of the 281 tests stayed green. Recording is what lets a test tell the two
+// bitmaps apart.
+export const nativeImage = {
+  createFromBuffer(buffer, opts) {
+    const img = {
+      buffer,
+      opts,
+      templated: false,
+      setTemplateImage(on = true) { img.templated = on; },
+    };
+    calls.images.push(img);
+    return img;
+  },
+};
 export const Menu = { buildFromTemplate: (t) => t, setApplicationMenu: () => {} };
 export function Tray() {
   return { setToolTip() {}, setContextMenu() {}, on() {} };
@@ -73,12 +91,16 @@ export function BrowserWindow(opts) {
       // recovery is indistinguishable from the failure.
       const want = BrowserWindow.failLoadFile;
       if (want === true || (typeof want === "string" && f.includes(want))) {
-        win.loaded.push(`file-failed:${f.split("/").pop()}`);
+        // path.basename, not split("/"): loadFile receives host-native paths
+        // (main.mjs builds them with path.join), and on Windows the "/" split
+        // passed the WHOLE backslashed path through — every basename assertion
+        // in main*.test.mjs failed on the platform the app was being ported to.
+        win.loaded.push(`file-failed:${path.basename(f)}`);
         throw new Error("ERR_FILE_NOT_FOUND (-6) loading '" + f + "'");
       }
       const q = opts?.query ?? {};
       const tag = q.reason ? `?${q.reason}` : (q.canReturn ? "?canReturn" : "");
-      win.loaded.push(`file:${f.split("/").pop()}${tag}`);
+      win.loaded.push(`file:${path.basename(f)}${tag}`);
     },
     // once() RECORDS: with a no-op double, deleting the ready-to-show reveal
     // was invisible — and that ships an app whose window never appears.

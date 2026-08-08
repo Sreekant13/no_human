@@ -54,6 +54,39 @@ const mac = {
   gatekeeperAssess: false,
 };
 
+// The Windows half. Deliberately as close to `mac` as the two OSes allow —
+// every difference below is forced by a platform convention, and each one is
+// written down in docs/WINDOWS.md.
+//
+// `target` mirrors the reasoning in this file's header rather than copying its
+// list. On macOS the ZIP is load-bearing because Squirrel.Mac updates FROM a
+// zip and electron-builder only emits `latest-mac.yml` when a zip target is
+// present. On Windows the updater consumes the NSIS installer directly and
+// `latest.yml` is emitted for the nsis target — so nsis alone would satisfy the
+// updater. `zip` is kept anyway for parity of SHAPE: it is the artifact a human
+// can unpack and inspect without running an installer, which is exactly the
+// role the .app-in-a-zip plays on the Mac.
+//
+// NOT signed. There is no Windows code-signing certificate, and unlike macOS
+// this does not produce a broken artifact — it produces one SmartScreen warns
+// about on first run. That warning is documented honestly in docs/WINDOWS.md
+// rather than worked around, and `nhCanAutoUpdate` below stays false: NSIS
+// differs from Squirrel.Mac in that it CAN install an unsigned update, but that
+// path is unverified on this machine, and shipping an update path nobody has
+// watched work is exactly the "guessing wrong" this file's header rejects.
+const win = {
+  target: ["nsis", "zip"],
+  // Generated from desktop/build/icon.icns by packaging/make-win-icon.ps1, so
+  // both platforms wear the same mark from one committed source. The site's
+  // mark-dark PNGs that icon.icns was originally cut from are not in this repo.
+  icon: "build/icon.ico",
+  // The filename carries the verdict, exactly as make-dmg.sh does for the DMG:
+  // "An operator cannot upload no_human-0.1.0-UNSIGNED.dmg to a release page
+  // believing it is shippable." The same must be true of the .exe, or Windows
+  // becomes the soft spot in a rule macOS enforces.
+  artifactName: "${productName}-${version}" + plan.artifactTag + ".${ext}",
+};
+
 // Ad-hoc re-seal when we are NOT signing for real.
 //
 // `identity: null` tells electron-builder not to sign AT ALL. That does not
@@ -102,7 +135,16 @@ module.exports = {
   // DMG show. Generated from the site's mark-dark-512.png; without it every
   // build wore Electron's stock atom icon.
   directories: { output: "dist", buildResources: "build" },
-  files: require("./package.json").build.files,
+  // `nhPackagedFiles`, NOT `build`. electron-builder reads a `build` key out of
+  // package.json all by itself whenever it is invoked WITHOUT `--config` —
+  // `npx electron-builder --win`, an IDE task, a future CI step. The key here
+  // holds only the file list, so that invocation used to produce a green build
+  // of a PAYLOAD-LESS installer: no signing plan, no extraResources (so no
+  // nh-server), no extraMetadata, none of the reasoning in this file. Under a
+  // name electron-builder does not look for, that path cannot silently half-run
+  // — it fails outright with nothing to configure. The list stays in
+  // package.json because desktop/packagedFiles.test.mjs reads it from there.
+  files: require("./package.json").nhPackagedFiles.files,
   asar: true,
   extraResources: [
     { from: "../packaging/dist/nh-server", to: "nh-server" },
@@ -161,6 +203,12 @@ module.exports = {
     nhCanAutoUpdate: plan.canAutoUpdate,
   },
   mac,
+  win,
+  // Darwin-only by construction: adhocSeal returns immediately unless
+  // electronPlatformName is "darwin". Windows needs NO afterPack equivalent —
+  // the macOS hook exists to repair a signature electron-builder INVALIDATES by
+  // injecting into Contents/, and Windows has no equivalent seal to break. An
+  // unsigned .exe here is simply unsigned, not "damaged".
   afterPack: adhocSeal,
   // Generates latest-mac.yml locally. `--publish never` on every script means
   // nothing is ever uploaded; this block only tells the updater where to LOOK

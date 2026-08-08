@@ -25,6 +25,7 @@ fs.mkdirSync(path.join(home, ".no_human"));
 fs.writeFileSync(path.join(home, ".no_human", ".env"),
   "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-test\n");
 process.env.HOME = home;
+process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows (see mainIpc.test.mjs)
 process.env.NH_ORIGIN = `http://127.0.0.1:${PORT}`;
 
 const server = http.createServer((q, s) => s.end("[]"));

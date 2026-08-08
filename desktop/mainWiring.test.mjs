@@ -41,6 +41,7 @@ setInterval(() => {}, 1000);
 `);
   fs.chmodSync(bin, 0o755);
   process.env.HOME = home;                 // BEFORE importing main.mjs
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows (see mainIpc.test.mjs)
   process.env.NH_ORIGIN = `http://127.0.0.1:${PORT}`;
   process.env.NH_BIN = bin;
   return home;

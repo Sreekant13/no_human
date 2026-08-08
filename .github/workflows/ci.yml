@@ -186,10 +186,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Node 20 on purpose. `npm test` is `node --test src/`, and from Node 22
-      # a directory argument to --test is resolved as a module instead of
-      # being walked, so the script fails there. .gitlab-ci.yml pins
-      # node:20-slim for the same job.
+      # `npm test` passes an EXPLICIT FILE LIST (`node --test src/*.test.mjs`,
+      # expanded by the shell npm runs the script in). That is the only form
+      # that works across the whole Node range this repo touches, measured:
+      #
+      #   form                     Node 20.20.2        Node 22.22.3
+      #   node --test src/         910 tests           ERR "Cannot find module .../src"
+      #   node --test "src/**/..."  0 tests, exit 1    910 tests
+      #   node --test src/*.test.mjs   910 tests       910 tests
+      #
+      # A directory argument stopped being walked in Node 22; --test glob
+      # support does not exist in the Node 20 line, so a quoted glob is passed
+      # through as a literal path and matches nothing — a red job that ran no
+      # test at all. The file list depends on neither behaviour.
+      #
+      # Node 20 is kept on purpose: it is the OLDEST line the script claims to
+      # support, so pinning it here is what keeps that claim measured rather
+      # than asserted. .gitlab-ci.yml pins node:20-slim for the same job and
+      # the same reason. web/src/testScriptCoverage.test.mjs fails if a test
+      # file is ever added where `src/*.test.mjs` cannot see it.
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -233,3 +248,161 @@ jobs:
             files+=("$f")
           done
           node --test "${files[@]}"
+
+  # The only job here that is not ubuntu-latest. Everything Windows-specific in
+  # this repo — packaging/build-installer.ps1, the `_IS_WINDOWS` branches in
+  # config.py / testing/runner.py / api/app.py / cli/commands.py, and the 67
+  # tests written to reach them — had no automated signal anywhere before this.
+  # The two Windows suites ran only under a monkeypatched `_IS_WINDOWS` on a
+  # POSIX host, which proves a branch is REACHABLE and cannot prove Windows
+  # honours it. Here they run on the real OS.
+  #
+  # WHAT THIS JOB CANNOT SEE, so nobody reads more into a green tick than is
+  # there. It is a build-and-test signal only:
+  #   * Signing. Nothing below signs anything and no signing credential is
+  #     configured. The bundle is Authenticode-UNSIGNED.
+  #   * SmartScreen / Defender reputation, and Mark-of-the-Web on a downloaded
+  #     file — all post-download, none reachable from a runner.
+  #   * Installer UX. build-installer.ps1 produces the frozen onedir SERVER
+  #     bundle (packaging\dist\nh-server\, nh.exe + _internal\), not the NSIS
+  #     installer; nothing here runs an install, an upgrade or an uninstall.
+  #   * That nh.exe RUNS. The script's gates check what is in the bundle; none
+  #     of them launches it.
+  #   * A hostile path. The runner's USERPROFILE is C:\Users\runneradmin and
+  #     the checkout is D:\a\<repo>\<repo> — ASCII, no spaces, short. Paths
+  #     with spaces, non-ASCII names or >260 chars are untested.
+  #   * Windows PowerShell 5.1. GitHub's `pwsh` is PowerShell 7, so the 5.1
+  #     defences the script documents (GetEncoding(28591) for Latin1, the
+  #     BOM-less ANSI parse hazard) are never exercised here.
+  #   * Windows 10, ARM64, and any non-UTF-8 console codepage.
+  windows:
+    name: Windows bundle (unsigned)
+    # windows-latest bills at 2x a Linux minute and this is by far the most
+    # expensive job in the file (a full board build plus a PyInstaller freeze),
+    # so it deliberately does NOT run on every pull request — a docs-only PR
+    # must not pay for it, because a job that bills on every commit is a job
+    # that gets switched off. It runs on every push to main, so every merged
+    # state carries the signal, and on demand for any PR that opts in by
+    # carrying the `windows` label. Add the label to get a run; remove it to
+    # stop paying.
+    if: >-
+      github.event_name != 'pull_request'
+      || contains(github.event.pull_request.labels.*.name, 'windows')
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # fetch-depth: 0 on purpose. build-installer.ps1 refuses to build a
+      # checkout that is behind origin/main (the stale-DMG guard). With the
+      # default shallow fetch there is no origin/main ref for it to resolve,
+      # the guard silently finds nothing and does not fire — a gate that cannot
+      # fire, which is the exact defect that guard exists to prevent.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # desktop/package.json declares `engines: node >=22.12`; "22" resolves to
+      # the newest 22.x, which satisfies it. Same major as the desktop job.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            desktop/package-lock.json
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # Creates .venv\Scripts\pyinstaller.exe, which the build script requires
+      # by that exact path. pyinstaller is in the `dev` dependency-group, which
+      # `uv sync` installs by default.
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # build-installer.ps1 runs `npm run build` in web/ but does not install
+      # into it — the same division of labour as build-installer.sh.
+      - name: Install the board's dependencies
+        working-directory: web
+        run: npm ci
+
+      # Run as a SEPARATE process via -File. The script signals failure with
+      # `exit 1`; called in-process the exit would leave the step's own success
+      # ambiguous, and a build gate that cannot turn a step red is not a gate.
+      #
+      # The build runs BEFORE the test steps on purpose: exercising
+      # build-installer.ps1 end to end is half the point of the job, and a test
+      # failure below must not hide a build that also broke.
+      #
+      # NH_ALLOW_STALE_BUILD is deliberately NOT set — the staleness guard is
+      # left armed.
+      #
+      # Nothing is uploaded. This job is a build-and-test SIGNAL, not a release
+      # channel: an unsigned server bundle parked as a downloadable CI artifact
+      # reads like a deliverable and is not one. Releases have their own path.
+      - name: Build the Windows bundle (UNSIGNED)
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File packaging\build-installer.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The same file list as the ubuntu desktop job, for the same reason:
+      # uiPages.test.mjs is the one suite that needs the real Electron binary,
+      # and `npm ci --ignore-scripts` skips the ~100 MB download that would
+      # fetch it.
+      - name: Install the desktop shell's dependencies
+        working-directory: desktop
+        run: npm ci --ignore-scripts
+
+      - name: Desktop shell tests
+        working-directory: desktop
+        run: |
+          $files = @(Get-ChildItem -Filter '*.test.mjs' -Name |
+                     Where-Object { $_ -ne 'uiPages.test.mjs' })
+          if ($files.Count -eq 0) { throw 'no desktop test files matched' }
+          node --test @files
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The point of the whole job. On a POSIX host these 67 tests only ever
+      # take the Windows branches through a monkeypatched `_IS_WINDOWS`; here
+      # the branch is the host's, icacls and taskkill are the real programs,
+      # and the paths are real WindowsPaths.
+      #
+      # Four tests are deselected, and ONLY these four. They assert
+      # `stat().st_mode & 0o777 == 0o600` on the POSIX write path. Windows does
+      # not model POSIX permission bits at all — every non-readonly file reads
+      # back as 0o666 — so they cannot pass on this filesystem no matter which
+      # branch is pinned, and relaxing the assertion would weaken the guard that
+      # keeps a credential file private on the platform where it does ship.
+      # They are covered by the ubuntu `python` job above, which is where that
+      # code path runs. Measured and analysed in docs/WINDOWS.md §4.2.
+      #
+      # Nothing else is deselected. In particular the three `backend_check`
+      # failures docs/WINDOWS.md reports — the Agent SDK's BUNDLED claude
+      # resolving ahead of the operator's own on Windows — are left to fail.
+      # That is an open product finding awaiting a decision, not a runner
+      # artifact, and suppressing it here would be exactly the fake "done" this
+      # job was added to make impossible. Expect this step red until it is
+      # decided.
+      - name: Windows portability and credential-file tests
+        run: |
+          # Built as an array and splatted rather than continued with backticks:
+          # a pwsh line-continuation backtick is broken by a single trailing
+          # space, and nothing in a YAML review would show that space.
+          $skip = @(
+            'tests/test_windows_portability.py::test_atomic_write_0600_posix_still_chmods',
+            'tests/test_windows_portability.py::test_secure_credential_file_chmods_on_posix',
+            'tests/test_windows_credential_file.py::test_atomic_write_0600_posix_still_chmods',
+            'tests/test_windows_credential_file.py::test_secure_credential_file_chmods_on_posix'
+          ) | ForEach-Object { '--deselect'; $_ }
+          $argv = @(
+            'run', 'pytest', '-q', '--tb=short',
+            'tests/test_windows_portability.py',
+            'tests/test_windows_credential_file.py'
+          ) + $skip
+          uv @argv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -91,6 +91,13 @@ def test_atomic_write_0600_posix_does_not_shell_out(tmp_path, monkeypatch):
     def _boom(*a, **k):  # pragma: no cover - must never run
         raise AssertionError("POSIX write must not spawn a process")
 
+    # Force the POSIX branch rather than relying on the HOST being POSIX. Every
+    # "windows" test in this file pins `_IS_WINDOWS = True`; this one asserted a
+    # POSIX property while leaving the flag at whatever the host happened to be,
+    # so on a Windows host it took the WINDOWS branch, called _run_icacls, and
+    # tripped its own tripwire. The flag exists precisely so neither branch
+    # depends on which machine runs the suite.
+    monkeypatch.setattr(cfg, "_IS_WINDOWS", False)
     monkeypatch.setattr(cfg, "_run_icacls", _boom)
     cfg.atomic_write_0600(tmp_path / ".env", "K=v\n")
     assert (tmp_path / ".env").read_text(encoding="utf-8") == "K=v\n"
@@ -525,10 +532,24 @@ def test_probe_pid_distinguishes_denied_from_gone_on_windows(monkeypatch):
 
 
 def test_probe_pid_still_uses_signal_zero_on_posix(monkeypatch):
+    """THE LIVE-PID PROBE IS POSIX-HOST-ONLY, and the reason is a scar, not a
+    style choice. This test pins ``_IS_WINDOWS = False`` and then ran the REAL
+    ``os.kill(os.getpid(), 0)`` — but on a Windows HOST, signal 0 is
+    ``signal.CTRL_C_EVENT``, and ``os.kill`` implements it with
+    ``GenerateConsoleCtrlEvent``: a Ctrl-C BROADCAST to the console process
+    group. Not a no-op liveness probe, not even a kill of the target — a kill
+    of EVERYTHING sharing the console. Delivery is asynchronous, so pytest died
+    a few tests LATER with a KeyboardInterrupt at a misleading location ("after
+    exactly 40 tests, inside Thread.join"), and the harness session driving the
+    suite — same console — died with it, three sessions running. The mocked
+    half below pins the branch's wiring on every host; the real-signal half
+    proves an OS guarantee and belongs only to hosts whose signal 0 IS that
+    guarantee."""
     cmds = importlib.import_module("no_human.cli.commands")
 
     monkeypatch.setattr(cmds, "_IS_WINDOWS", False)
-    assert cmds._probe_pid(os.getpid()) is True
+    if os.name != "nt":
+        assert cmds._probe_pid(os.getpid()) is True
 
     seen: list[tuple[int, int]] = []
     monkeypatch.setattr(cmds.os, "kill", lambda p, s: seen.append((p, s)))
@@ -602,6 +623,13 @@ def test_try_kill_still_signals_on_posix(monkeypatch):
     cmds = importlib.import_module("no_human.cli.commands")
     monkeypatch.setattr(cmds, "_IS_WINDOWS", False)
     seen: list[tuple[int, int]] = []
+    # `signal.SIGKILL` does not exist on Windows, so forcing the POSIX branch on
+    # a Windows host made _try_kill raise AttributeError at commands.py:4352 —
+    # the very shape test_stop_path_never_names_sigkill_at_module_scope below
+    # exists to fence. Supplying the constant lets the POSIX branch be exercised
+    # from either host; the assertion is unchanged. 9 is SIGKILL's POSIX value.
+    monkeypatch.setattr(_signal, "SIGKILL", getattr(_signal, "SIGKILL", 9),
+                        raising=False)
     monkeypatch.setattr(cmds.os, "kill", lambda p, s: seen.append((p, s)))
     assert cmds._try_kill(4321, cmds._KILL_TERM) is True
     assert cmds._try_kill(4321, cmds._KILL_FORCE) is True
@@ -727,8 +755,19 @@ def test_kill_process_tree_uses_taskkill_on_windows(monkeypatch):
     runner = importlib.import_module("no_human.testing.runner")
 
     monkeypatch.setattr(runner, "_IS_WINDOWS", True)
+    # raising=False because `os.killpg` DOES NOT EXIST on a Windows host, and
+    # monkeypatch.setattr refuses to patch a missing attribute. Without it this
+    # test — the one that proves the Windows branch reaches taskkill — was the
+    # single test in this file that could not run ON Windows, failing during
+    # setup with AttributeError before its body executed. It passed everywhere
+    # it was not needed and errored on the only platform it describes.
+    #
+    # Nothing is weakened: this ACE is a tripwire, and creating it on Windows
+    # keeps the tripwire armed. If _kill_process_tree ever reaches killpg there,
+    # the lambda still throws. On POSIX the attribute exists and this behaves
+    # exactly as before.
     monkeypatch.setattr(runner.os, "killpg", lambda *a: (_ for _ in ()).throw(
-        AssertionError("killpg must never be reached on Windows")))
+        AssertionError("killpg must never be reached on Windows")), raising=False)
     ran = _Ran()
 
     class _P:
@@ -750,8 +789,22 @@ def test_kill_process_tree_still_killpgs_on_posix(monkeypatch):
 
     monkeypatch.setattr(runner, "_IS_WINDOWS", False)
     seen: list[tuple[int, int]] = []
-    monkeypatch.setattr(runner.os, "getpgid", lambda pid: pid)
-    monkeypatch.setattr(runner.os, "killpg", lambda g, s: seen.append((g, s)))
+    # raising=False on all three: `os.getpgid`, `os.killpg` and `signal.SIGKILL`
+    # DO NOT EXIST on a Windows host, so monkeypatch refused to create them and
+    # this test errored during setup there. That is the mirror image of the
+    # reason the Windows branches are gated behind a patchable `_IS_WINDOWS`
+    # flag in the first place — "so the Windows branches are reachable (and
+    # therefore testable) from any platform", per config.py. The symmetry has to
+    # hold in both directions or half this file is dead on whichever host runs it.
+    #
+    # The assertion is unchanged and still proves the POSIX branch signals the
+    # process GROUP with SIGKILL; only the constants are supplied on a platform
+    # that does not define them. 9 is SIGKILL's real POSIX value.
+    monkeypatch.setattr(_signal, "SIGKILL", getattr(_signal, "SIGKILL", 9),
+                        raising=False)
+    monkeypatch.setattr(runner.os, "getpgid", lambda pid: pid, raising=False)
+    monkeypatch.setattr(runner.os, "killpg", lambda g, s: seen.append((g, s)),
+                        raising=False)
 
     class _Proc:
         pid = 4321
@@ -761,7 +814,7 @@ def test_kill_process_tree_still_killpgs_on_posix(monkeypatch):
     # A dead process is reported as "tree kill did not happen", so the caller
     # still falls back to killing the direct child — unchanged behaviour.
     monkeypatch.setattr(runner.os, "killpg", lambda g, s: (_ for _ in ()).throw(
-        ProcessLookupError()))
+        ProcessLookupError()), raising=False)
     assert runner._kill_process_tree(_Proc()) is False
 
 

@@ -1,5 +1,47 @@
 # Quickstart — from zero to first task in 5 minutes
 
+## Installed the Windows app? Start here instead
+
+**If you ran `no_human-<version>.exe`, sections 1–3 below are NOT for you.** The
+same reasoning as the Mac section that follows: the app carries its own Python,
+its own server and its own dependencies, so there is nothing to install, nothing
+to clone, and no `uv sync` to run. Doing any of it would set up a *second*,
+unrelated copy.
+
+Two things specific to Windows, both expected:
+
+* The installer is **not code-signed yet**, so if you downloaded it, Windows
+  SmartScreen says *"Windows protected your PC"*. Choose **More info → Run
+  anyway**. Signing is planned; until then this prompt is normal.
+* It installs **per user** — no administrator prompt — into
+  `%LOCALAPPDATA%\Programs\no-human-desktop`. The folder is named after the
+  package while the app itself is called **no_human**; that is normal.
+
+What you actually do:
+
+1. Open **no_human** from the Start Menu.
+2. It shows **Connect Claude** and asks for a credential — either a Claude
+   subscription token (it looks like `sk-ant-oat…`) or an Anthropic API key.
+   Paste one and continue.
+3. The board opens. Create your first task there.
+
+Then confirm the install is actually working:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\no-human-desktop\resources\nh-server\nh.exe" doctor
+```
+
+Expect a `coding backend` line, a mechanism-liveness table, and
+`no contradictions, no evidence gaps` with exit code 0. Same command, same
+output and same exit codes as the Mac install — only the path to the bundled
+binary differs. See
+[INSTALLER.md#verify-your-install-is-real](INSTALLER.md#verify-your-install-is-real),
+and `WINDOWS.md` for the Windows build and its known limits.
+
+To uninstall: **Settings → Apps → no_human**. Your tasks and credential live in
+`~/.no_human` and are deliberately left behind, so reinstalling picks up where
+you left off; delete that folder yourself if you want a clean slate.
+
 ## Installed the Mac app? Start here instead
 
 **If you opened a `.dmg` and dragged no_human to Applications, sections 1–3

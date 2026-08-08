@@ -40,6 +40,7 @@ setInterval(() => {}, 1000);
 `);
 fs.chmodSync(fakeNh, 0o755);
 process.env.HOME = home;
+process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows (see mainIpc.test.mjs)
 process.env.NH_BIN = fakeNh;                       // never resolve the real nh
 process.env.NH_ORIGIN = `http://10.255.255.1:${19900 + (process.pid % 80)}`;
 

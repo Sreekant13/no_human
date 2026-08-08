@@ -724,6 +724,13 @@ export default function App() {
   useEffect(() => {
     document.documentElement.classList.toggle(
       "nh-in-shell", Boolean(window.nhDesktop?.shell));
+    // Sided accommodation: Windows window controls live top-RIGHT (the
+    // titleBarOverlay), so the main bar needs right clearance there the way
+    // the sidebar brand zone needs top clearance for macOS traffic lights.
+    // Without it, "+ New Task" sat under the overlay — clipped and unclickable.
+    document.documentElement.classList.toggle(
+      "nh-shell-win32",
+      Boolean(window.nhDesktop?.shell) && window.nhDesktop?.platform === "win32");
   }, []);
   // null = checking; false = needs onboarding; true = onboarded. Fail-open so a
   // missing/old endpoint never blocks an existing user at the board.

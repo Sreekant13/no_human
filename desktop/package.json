@@ -11,13 +11,15 @@
     "test": "node --test",
     "dist": "electron-builder --config electron-builder.config.cjs --mac --publish never",
     "dist:dir": "electron-builder --config electron-builder.config.cjs --mac dir --publish never",
-    "dist:bundled": "bash ../packaging/build-installer.sh && electron-builder --config electron-builder.config.cjs --mac --publish never && bash ../packaging/make-dmg.sh"
+    "dist:bundled": "bash ../packaging/build-installer.sh && electron-builder --config electron-builder.config.cjs --mac --publish never && bash ../packaging/make-dmg.sh",
+    "dist:win": "electron-builder --config electron-builder.config.cjs --win --publish never",
+    "dist:win:bundled": "powershell -NoProfile -ExecutionPolicy Bypass -File ../packaging/build-installer.ps1 && electron-builder --config electron-builder.config.cjs --win --publish never"
   },
   "devDependencies": {
     "electron": "38.2.1",
     "electron-builder": "^26.15.3"
   },
-  "build": {
+  "nhPackagedFiles": {
     "files": [
       "main.mjs",
       "server.mjs",

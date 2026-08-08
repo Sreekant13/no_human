@@ -9,7 +9,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "e2e": "node e2e/run-all.mjs",
-    "test": "node --test src/",
+    "test": "node --test src/*.test.mjs",
     "lint": "eslint ."
   },
   "dependencies": {

@@ -9,10 +9,19 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import path from "node:path";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
-const ELECTRON = path.join(HERE, "node_modules", ".bin", "electron");
+// The electron PACKAGE's exported binary path, not node_modules/.bin/electron.
+// That .bin entry is an extensionless shell script: on Windows the executable
+// is electron.cmd and spawning the extensionless name fails with ENOENT, which
+// took this whole file out on the first real Windows run. Naming electron.cmd
+// instead would not fix it either — Node 22 refuses to spawn .cmd/.bat without
+// shell:true (the CVE-2024-27980 mitigation), and turning on a shell to run a
+// test harness invites quoting bugs. `require("electron")` returns the real
+// electron.exe/electron path on every platform, which is what execFileSync wants.
+const ELECTRON = createRequire(import.meta.url)("electron");
 
 const probe = (() => {
   const out = execFileSync(ELECTRON, [path.join(HERE, "testing", "pageProbe.cjs")],

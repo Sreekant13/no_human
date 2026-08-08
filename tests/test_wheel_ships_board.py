@@ -270,6 +270,18 @@ def _run_probe(venv_python: Path, home: Path) -> dict:
     # than assumed.
     home.mkdir(parents=True, exist_ok=True)
     env["HOME"] = str(home)
+    # On Windows `Path.home()` does NOT consult $HOME: ntpath.expanduser prefers
+    # USERPROFILE and falls back to HOMEDRIVE+HOMEPATH, so setting HOME alone
+    # left the probe resolving the REAL profile directory — precisely the
+    # "boots a server against the operator's live ~/.no_human" outcome this
+    # override exists to prevent. The assertion below caught it rather than
+    # letting it through, which is why it is asserted per run and not assumed.
+    # HOMEDRIVE/HOMEPATH are cleared as well so no fallback can reintroduce the
+    # real profile if USERPROFILE is ever absent.
+    if os.name == "nt":
+        env["USERPROFILE"] = str(home)
+        env.pop("HOMEDRIVE", None)
+        env.pop("HOMEPATH", None)
     env.pop("XDG_CONFIG_HOME", None)
     env.pop("XDG_DATA_HOME", None)
     proc = subprocess.run([str(venv_python), "-c", _PROBE],
@@ -307,7 +319,16 @@ def test_wheel_installed_in_a_clean_venv_serves_the_board(tmp_path):
     mk = subprocess.run(["uv", "venv", str(venv), "--python", "3.12"],
                         capture_output=True, text=True, timeout=300)
     assert mk.returncode == 0, f"uv venv failed:\n{mk.stderr}"
-    venv_python = venv / ("Scripts" if os.name == "nt" else "bin") / "python"
+    # ".exe" is required on Windows, not cosmetic. The Scripts/bin split was
+    # already handled here, but the interpreter on disk is `python.exe` and
+    # `uv pip install --python <path>` does a FILE-EXISTENCE check on the value
+    # it is given — so the extensionless path failed with "No virtual
+    # environment or system Python installation found for path ...\Scripts\python"
+    # and this test could never pass on Windows. Spawning would have masked it
+    # (CreateProcess resolves the extension itself); an explicit path argument
+    # does not.
+    venv_python = (venv / ("Scripts" if os.name == "nt" else "bin")
+                   / ("python.exe" if os.name == "nt" else "python"))
 
     inst = subprocess.run(
         ["uv", "pip", "install", "--python", str(venv_python), str(wheels[0])],
@@ -400,7 +421,16 @@ def _assert_missing_board_is_honest(venv_python: Path, tmp_path: Path,
     Folded into the slow test rather than given its own, because it needs the
     same expensive clean install and simply deletes the board from it.
     """
-    site = next((venv_python.parent.parent / "lib").glob("python3.*/site-packages"))
+    # A Windows venv is `<venv>\Lib\site-packages` — no `python3.x` level at all
+    # — so the POSIX glob matched nothing and `next()` raised a bare
+    # StopIteration that named neither the path nor the reason. Verified against
+    # a real venv on this host: `.venv\Lib\site-packages\...`.
+    venv_root = venv_python.parent.parent
+    if os.name == "nt":
+        site = venv_root / "Lib" / "site-packages"
+    else:
+        site = next((venv_root / "lib").glob("python3.*/site-packages"))
+    assert site.is_dir(), f"no site-packages under {venv_root}"
     board = site / "no_human" / "web_dist"
     assert board.is_dir(), board
     shutil.rmtree(board)

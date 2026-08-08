@@ -9,12 +9,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { NH_EXE_NAME, bundledNhPath } from "./server.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(fs.readFileSync(path.join(here, "package.json"), "utf8"));
-const declared = new Set(pkg.build.files);
+// `nhPackagedFiles`, not `build` — see the shadow-config test below for why the
+// key was renamed. The list itself is unchanged.
+const declared = new Set(pkg.nhPackagedFiles.files);
 
 /**
  * Sibling files referenced by static import, dynamic import, require, or
@@ -90,15 +94,16 @@ for (const entry of Object.keys(EXPECTED)) {
     for (const dep of deps) {
       assert.ok(fs.existsSync(path.join(here, dep)), `${dep} should exist on disk`);
       assert.ok(declared.has(dep),
-        `${entry} loads "${dep}" but build.files does not list it — it would be ` +
+        `${entry} loads "${dep}" but nhPackagedFiles.files does not list it — it would be ` +
         `missing from app.asar and the packaged app would fail to launch`);
     }
   });
 }
 
-test("build.files lists only files that exist", () => {
-  for (const f of pkg.build.files) {
-    assert.ok(fs.existsSync(path.join(here, f)), `build.files lists missing ${f}`);
+test("nhPackagedFiles.files lists only files that exist", () => {
+  for (const f of pkg.nhPackagedFiles.files) {
+    assert.ok(fs.existsSync(path.join(here, f)),
+      `nhPackagedFiles.files lists missing ${f}`);
   }
 });
 
@@ -115,10 +120,54 @@ test("both shell pages declare a language (WCAG 3.1.1)", () => {
 // The real electron-builder configuration. It moved out of package.json into a
 // .cjs file because the signing decision has to branch on the environment, so
 // these invariants must be read from the file the BUILD actually uses — a test
-// still asserting against package.json.build would pass while the shipped
-// config said something else entirely.
+// still asserting against a config-shaped key in package.json would pass while
+// the shipped config said something else entirely.
 const builderConfig = await import("./electron-builder.config.cjs")
   .then((m) => m.default ?? m);
+
+test("package.json holds no `build` key — electron-builder must never find a shadow config", () => {
+  // THE TRAP, and why the key is called `nhPackagedFiles`.
+  //
+  // package.json needs to hold the `files` list (the config above sources it
+  // from there, and the allowlist guard at the top of this file reads it) — but
+  // under the name `build` that list IS a config as far as electron-builder is
+  // concerned. It reads a `build` key out of package.json all by itself
+  // whenever --config is absent, and that minimal key has no extraResources, no
+  // win/mac blocks, no artifactName and no signing plan. It happened on
+  // 2026-08-05: a bare `npx electron-builder --win` produced a default-named
+  // installer 22 MB lighter than the real one — an app with no server in it —
+  // and every step reported success.
+  //
+  // Fencing the npm scripts (asserted below) does not close it: `npx
+  // electron-builder --win`, an IDE task and a future CI step all reach the
+  // shadow without going through a script. Renaming the key removes the shadow
+  // instead of fencing it — electron-builder now finds no config at all on that
+  // path and fails outright rather than half-building.
+  const raw = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url)));
+  assert.equal(raw.build, undefined,
+    "a `build` key is back in desktop/package.json. electron-builder will use "
+    + "it as a config whenever --config is absent and will ship a payload-less "
+    + "installer with every step green. Keep the list under `nhPackagedFiles`.");
+  assert.ok(Array.isArray(raw.nhPackagedFiles?.files) && raw.nhPackagedFiles.files.length > 0,
+    "nhPackagedFiles.files is where the packaged allowlist lives now");
+});
+
+test("every dist script names the real config", () => {
+  // Belt as well as braces. With no `build` key an unconfigured invocation now
+  // fails instead of shadow-building, but --config is still what selects the
+  // signing plan, extraResources and artifactName, so the sanctioned path must
+  // keep passing it explicitly.
+  const scripts = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url))).scripts;
+  const dist = Object.entries(scripts).filter(([name]) => name.startsWith("dist"));
+  assert.ok(dist.length >= 2, "the dist scripts are the sanctioned build path; where did they go?");
+  for (const [name, cmd] of dist) {
+    for (const invocation of cmd.split("&&").map((s) => s.trim())
+      .filter((s) => s.includes("electron-builder"))) {
+      assert.match(invocation, /--config electron-builder\.config\.cjs/,
+        `${name}: an electron-builder invocation without --config does not use the real config`);
+    }
+  }
+});
 
 test("the frozen server is actually shipped as extraResources", () => {
   // `files` is guarded above; the PAYLOAD was not. Deleting this block builds a
@@ -128,10 +177,23 @@ test("the frozen server is actually shipped as extraResources", () => {
   assert.ok(server, `no nh-server in extraResources: ${JSON.stringify(extra)}`);
   assert.match(server.from ?? "", /packaging\/dist\/nh-server$/,
     "extraResources points somewhere the build script does not produce");
-  // server.mjs looks for it at Resources/nh-server/nh — keep the two in step.
-  const srv = fs.readFileSync(new URL("./server.mjs", import.meta.url), "utf8");
-  assert.match(srv, /"nh-server",\s*"nh"/,
+  // server.mjs must look for the binary at exactly that destination — keep the
+  // two in step. Asserted BEHAVIOURALLY rather than by matching the literal
+  // `"nh-server", "nh"` in server.mjs's source: the binary's basename is now
+  // platform-dependent (nh vs nh.exe), so a source regex would either have to
+  // be loosened until it proved nothing, or would fail on Windows while the
+  // code was right. Building the destination and asking bundledNhPath to find
+  // it tests the actual invariant — that resolution lands where extraResources
+  // puts the payload — on whichever platform is running.
+  const res = fs.mkdtempSync(path.join(os.tmpdir(), "nhres-"));
+  const dir = path.join(res, server.to);
+  fs.mkdirSync(dir, { recursive: true });
+  const exe = path.join(dir, NH_EXE_NAME);
+  fs.writeFileSync(exe, "");
+  assert.equal(bundledNhPath(res), exe,
     "bundledNhPath no longer matches the extraResources destination");
+  // And the name really is the one PyInstaller emits for this platform.
+  assert.equal(NH_EXE_NAME, process.platform === "win32" ? "nh.exe" : "nh");
 });
 
 test("the MIT licence text ships inside the app bundle", () => {
@@ -216,7 +278,7 @@ test("the mac targets include zip, or auto-update cannot work at all", () => {
 
 test("the build config and the packaging guard read the SAME file list", () => {
   // The allowlist above is only meaningful if it is the list the build uses.
-  assert.deepEqual(builderConfig.files, pkg.build.files,
+  assert.deepEqual(builderConfig.files, pkg.nhPackagedFiles.files,
     "electron-builder.config.cjs must source `files` from package.json, or the "
     + "guard protects a list nobody ships");
 });
@@ -448,4 +510,104 @@ test("main.mjs wires the Help handler and names the CANONICAL docs URL", () => {
     + "through a 307, and the site's own markup links /docs everywhere");
   assert.doesNotMatch(src, /getnohuman\.com\/docs\.html/,
     "the non-canonical /docs.html form is back; it pins a redirect");
+});
+
+// ---------------------- mac / win parity (anti-drift) --------------------- //
+//
+// The Mac and Windows apps are ONE product. The realistic way they stop being
+// one is not a deliberate decision — it is someone fixing a Windows problem by
+// adding a `win.extraResources` or a Windows-only version, which works, ships,
+// and silently gives the two platforms different payloads or different version
+// numbers. These tests exist so that edit fails CI instead.
+
+test("parity: extraResources is shared by both platforms, never per-platform", () => {
+  // ONE mapping at the top level, inherited by mac and win alike. A
+  // platform-scoped extraResources REPLACES the top-level list for that
+  // platform, so the moment either block grows one, the two builds can ship
+  // different payloads — the frozen server, the docs, or a licence notice could
+  // be present on one platform and absent on the other with no build error.
+  assert.ok(Array.isArray(builderConfig.extraResources),
+    "extraResources must be declared once, at the top level");
+  for (const p of ["mac", "win"]) {
+    assert.equal(builderConfig[p]?.extraResources, undefined,
+      `${p}.extraResources exists — it would OVERRIDE the shared list and let `
+      + `${p} ship a different payload than the other platform`);
+    assert.equal(builderConfig[p]?.files, undefined,
+      `${p}.files exists — the asar allowlist must stay shared`);
+  }
+  // Both platforms are actually built, or "parity" is vacuous.
+  assert.ok(Array.isArray(builderConfig.mac?.target) && builderConfig.mac.target.length);
+  assert.ok(Array.isArray(builderConfig.win?.target) && builderConfig.win.target.length);
+  // The payload both of them mount.
+  const server = builderConfig.extraResources.find((e) => (e.to ?? e) === "nh-server");
+  assert.ok(server, "the shared extraResources no longer carries the frozen server");
+  assert.match(server.from ?? "", /packaging\/dist\/nh-server$/);
+});
+
+test("parity: the updater feed is emitted for both platforms", () => {
+  // The mac header explains why `zip` is in mac.target: Squirrel.Mac updates
+  // from a zip and electron-builder only writes latest-mac.yml when a zip
+  // target exists. The Windows equivalent is nsis -> latest.yml. Losing either
+  // leaves that platform's updater fetching a file no build produces.
+  assert.ok(builderConfig.mac.target.includes("zip"),
+    "mac lost its zip target — latest-mac.yml stops being emitted and the "
+    + "updater fails with ERR_UPDATER_ZIP_FILE_NOT_FOUND");
+  assert.ok(builderConfig.win.target.includes("nsis"),
+    "win lost its nsis target — latest.yml stops being emitted");
+  assert.ok(builderConfig.publish, "no publish block: neither feed is generated");
+});
+
+test("parity: one version source, with no platform-specific override", () => {
+  // The NSIS exe must report the same version as the DMG. Both take it from
+  // desktop/package.json, so the failure mode is not a mismatch today but a
+  // Windows-only override added later.
+  assert.match(pkg.version, /^\d+\.\d+\.\d+/, "package.json has no usable version");
+  for (const p of ["mac", "win"]) {
+    for (const key of ["version", "buildVersion"]) {
+      assert.equal(builderConfig[p]?.[key], undefined,
+        `${p}.${key} is set — that is a platform-specific version source and `
+        + "the two installers would report different versions");
+    }
+  }
+  assert.equal(builderConfig.extraMetadata?.version, undefined,
+    "extraMetadata.version overrides the packaged version for BOTH platforms "
+    + "and detaches it from package.json");
+});
+
+test("parity: the app version and the frozen server's version cannot drift", () => {
+  // `nh --version` comes from pyproject; the shell's version comes from
+  // package.json. They ship in ONE artifact, so a user reading either must see
+  // the same number. Bumping one and forgetting the other is the drift.
+  const pyproject = fs.readFileSync(path.join(here, "..", "pyproject.toml"), "utf8");
+  // The [project] table's own version, not a dependency pin further down.
+  const m = pyproject.match(/^\s*version\s*=\s*["']([^"']+)["']/m);
+  assert.ok(m, "no version found in pyproject.toml");
+  assert.equal(m[1], pkg.version,
+    `pyproject version ${m[1]} != desktop/package.json version ${pkg.version} — `
+    + "the installer and the `nh` inside it would report different versions");
+});
+
+test("parity: the Windows build has an icon, and it is a real .ico", () => {
+  // Without this electron-builder falls back to Electron's stock atom icon, the
+  // exact defect the mac icon.icns comment records. Checked as BYTES, not by
+  // existence: a 0-byte or PNG-named-.ico placeholder would satisfy a path check
+  // and still produce a broken installer.
+  const icon = builderConfig.win?.icon;
+  assert.ok(icon, "win.icon is unset — the installer would wear Electron's icon");
+  const p = path.join(here, icon);
+  assert.ok(fs.existsSync(p), `win.icon points at a file that does not exist: ${icon}`);
+  const buf = fs.readFileSync(p);
+  // ICONDIR: reserved=0, type=1, count>=1.
+  assert.equal(buf.readUInt16LE(0), 0, `${icon} is not an ICO (reserved != 0)`);
+  assert.equal(buf.readUInt16LE(2), 1, `${icon} is not an ICO (type != 1)`);
+  const count = buf.readUInt16LE(4);
+  assert.ok(count >= 1, `${icon} declares no images`);
+  // NSIS needs a 256x256 entry; 256 is encoded as 0 in the single-byte field.
+  const sizes = [];
+  for (let i = 0; i < count; i++) {
+    const w = buf[6 + i * 16];
+    sizes.push(w === 0 ? 256 : w);
+  }
+  assert.ok(sizes.includes(256),
+    `${icon} has no 256x256 entry (has ${sizes.join(", ")}) — NSIS requires one`);
 });

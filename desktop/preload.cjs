@@ -30,6 +30,12 @@ try {
 
 contextBridge.exposeInMainWorld("nhDesktop", {
   shell: true,
+  // The board's shell accommodations are SIDED: macOS window controls sit
+  // top-left (traffic-light clearance), Windows' titleBarOverlay sits
+  // top-right — without knowing which, the board's own top-right controls
+  // (+ New Task) render UNDER the overlay, visible as a clipped sliver and
+  // unclickable. Found by a user on the first Windows walkthrough.
+  platform: process.platform,
   version: appVersion,
   // The application menu (main process) drives the board's own navigation:
   // main sends "nh:menu" with a page id ("board"/"stats"/"settings") or

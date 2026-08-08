@@ -521,6 +521,33 @@ checkout, no `uv run`:
 /Applications/no_human.app/Contents/Resources/nh-server/nh doctor
 ```
 
+On **Windows** the same command, at the same place in the installed tree. The
+nesting differs only because the two platforms nest an app differently — macOS
+puts resources inside the `.app` bundle, Windows puts them beside the `.exe`:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\no-human-desktop\resources\nh-server\nh.exe" doctor
+```
+
+The install directory is `no-human-desktop` (from the package `name`) while the
+app and the "Add or remove programs" entry read `no_human` — that is
+electron-builder's convention, not a mis-install. The NSIS installer is
+per-user, so it needs no administrator prompt.
+
+Verified output on Windows 11, from the installed artifact — same semantics,
+same exit code as macOS:
+
+```
+coding backend - claude CLI: ...\.local\bin\claude.EXE
+mechanism liveness (lifetime firings)
+  planning                0  last: never  zero = planning disabled or no task got past intake
+  ...
+no contradictions, no evidence gaps
+EXIT CODE: 0
+```
+
+Full Windows build, divergence and acceptance record: `docs/WINDOWS.md`.
+
 What you should see: a `coding backend — claude CLI: <path>` line, then a
 mechanism-liveness table, ending either `no contradictions, no evidence gaps`
 (exit 0) or a red `contradictions` block naming what's wrong (exit 1).

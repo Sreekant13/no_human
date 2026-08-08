@@ -39,6 +39,12 @@ eval-gate:
 # pure-helper tests). Until now it ran on no gate, so a frontend regression could
 # merge silently. Only the unit suite runs here; the Playwright e2es need browser
 # binaries and are run locally, so the browser download is skipped on install.
+# node:20-slim is the OLDEST Node line `npm test` claims to support. The script
+# is `node --test src/*.test.mjs` — an explicit file list, which is the only
+# form that runs on both the 20 and 22 lines (a directory argument stopped being
+# walked in 22; --test glob support does not exist in 20 and silently matches
+# nothing there). Pinning the old line is what keeps that claim measured. The
+# same reasoning, with the measured numbers, is in .github/workflows/ci.yml.
 web-gate:
   stage: test
   image: node:20-slim

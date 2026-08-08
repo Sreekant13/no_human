@@ -23,6 +23,10 @@ fs.mkdirSync(path.join(home, ".no_human"));
 fs.writeFileSync(path.join(home, ".no_human", ".env"),
   "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-original\n");
 process.env.HOME = home;
+// os.homedir() reads USERPROFILE on Windows, not HOME — without this the run
+// WRITES THROUGH to the operator's real ~/.no_human (observed: a fixture token
+// landed in the real .env and flipped the real config.yaml to api_key mode).
+process.env.USERPROFILE = home;
 process.env.NH_ORIGIN = `http://127.0.0.1:${PORT}`;
 delete process.env.NH_TEST_LOG;      // must not divert the routing under test
 

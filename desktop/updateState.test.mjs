@@ -55,11 +55,20 @@ test("valid JSON that is not an object is rejected", () => {
 
 test("an unwritable location reports failure instead of throwing", () => {
   // A read-only home must never take down app startup.
+  //
+  // The unwritable location is made by putting a FILE where the state
+  // directory would have to be, so mkdir/write fails with ENOTDIR/EEXIST. The
+  // original mechanism was `fs.chmodSync(dir, 0o500)`, which is a silent no-op
+  // on Windows — chmod there only toggles FILE_ATTRIBUTE_READONLY and does not
+  // apply to directories at all, so the write SUCCEEDED and this test failed on
+  // the very platform it was checking robustness for. This form is genuinely
+  // unwritable on both platforms, so the assertion below is unchanged and is
+  // now actually exercised everywhere rather than only on POSIX.
   const dir = tmp();
-  fs.chmodSync(dir, 0o500);
-  const target = path.join(dir, "sub");
+  const blocker = path.join(dir, "blocker");
+  fs.writeFileSync(blocker, "not a directory");
+  const target = path.join(blocker, "sub");
   const ok = writeUpdateState(target, { deferredVersion: "0.2.0" });
-  fs.chmodSync(dir, 0o700);
   assert.equal(ok, false, "failure must be reported as a value, not an exception");
 });
 

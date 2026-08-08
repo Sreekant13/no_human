@@ -64,11 +64,45 @@ test("isAppOrigin: same-origin stays in-window, everything else leaves", () => {
 
 // ------------------------------ E2 tests ---------------------------------- //
 
-import { CLI_HINT_DIRS, bundledNhPath, ensureServer, mergePath, resolveNhBin, stopServer } from "./server.mjs";
+import { CLI_HINT_DIRS, NH_EXE_NAME, POSIX_CLI_HINT_DIRS, WINDOWS_CLI_HINT_DIRS,
+         bundledNhPath, ensureServer, mergePath, resolveNhBin, stopServer,
+         taskkillArgs, windowsPathLookup } from "./server.mjs";
 import { mkdirSync } from "node:fs";
 import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
+
+const IS_WIN = process.platform === "win32";
+
+/**
+ * Write a fake `nh` that is launchable on BOTH platforms, and return how to
+ * launch it.
+ *
+ * These fixtures were POSIX shebang scripts (`#!/bin/sh`, `#!${process.execPath}`)
+ * made runnable with `chmod 0o755`. Windows has none of that machinery: no
+ * shebang, no execute bit, and Node 22 refuses to spawn a .cmd/.bat shim
+ * without `shell: true`. So the SAME JavaScript body is delivered differently
+ * per platform — POSIX keeps the shebang script and launches it directly;
+ * Windows writes a plain .js and launches `node` with it as an argument.
+ *
+ * Nothing in the code under test changes: `ensureServer` already accepts
+ * `nhArgs`, so the difference is entirely in how the fixture is invoked. The
+ * assertions each test makes are untouched, which is the point — this restores
+ * these tests on Windows instead of exempting them.
+ */
+function fakeNh(dir, jsBody) {
+  if (IS_WIN) {
+    const js = join(dir, "nh.js");
+    writeFileSync(js, jsBody);
+    return { bin: process.execPath, args: [js] };
+  }
+  const sh = join(dir, "nh");
+  // Absolute shebang: several callers narrow PATH deliberately, and resolving
+  // the interpreter must not be what those tests accidentally measure.
+  writeFileSync(sh, `#!${process.execPath}\n${jsBody}`);
+  chmodSync(sh, 0o755);
+  return { bin: sh, args: [] };
+}
 
 test("resolveNhBin: NH_BIN wins when it exists; missing → shell/known-path fallbacks", async () => {
   const dir = mkdtempSync(join(tmpdir(), "nhbin-"));
@@ -86,10 +120,25 @@ test("bundledNhPath: finds Resources/nh-server/nh, empty when absent or unpackag
   const res = mkdtempSync(join(tmpdir(), "nhres-"));
   assert.equal(bundledNhPath(res), "", "no bundle yet → empty");
   mkdirSync(join(res, "nh-server"));
-  writeFileSync(join(res, "nh-server", "nh"), "#!/bin/sh\nexit 0\n");
-  assert.equal(bundledNhPath(res), join(res, "nh-server", "nh"));
+  // NH_EXE_NAME, not a literal "nh": PyInstaller emits nh.exe on Windows, so a
+  // hardcoded fixture asserted the wrong filename there. Same assertion, on the
+  // name the platform actually produces.
+  writeFileSync(join(res, "nh-server", NH_EXE_NAME), "#!/bin/sh\nexit 0\n");
+  assert.equal(bundledNhPath(res), join(res, "nh-server", NH_EXE_NAME));
   // Outside Electron process.resourcesPath is undefined — must not throw.
   assert.equal(bundledNhPath(undefined), "");
+});
+
+test("NH_EXE_NAME is the binary PyInstaller actually emits for this platform", () => {
+  assert.equal(NH_EXE_NAME, process.platform === "win32" ? "nh.exe" : "nh");
+  // The exeName is injectable so BOTH platforms' resolution is verifiable from
+  // either host — otherwise the Windows path is unreachable on the Mac that
+  // builds the DMG, and vice versa.
+  const res = mkdtempSync(join(tmpdir(), "nhres-"));
+  mkdirSync(join(res, "nh-server"));
+  writeFileSync(join(res, "nh-server", "nh.exe"), "");
+  assert.equal(bundledNhPath(res, "nh.exe"), join(res, "nh-server", "nh.exe"));
+  assert.equal(bundledNhPath(res, "nh"), "", "must not match a different name");
 });
 
 test("resolveNhBin: bundled nh wins over PATH, but NH_BIN still wins over bundled", async () => {
@@ -121,21 +170,19 @@ test("ensureServer: spawns a fake nh and waits until the port answers", async ()
   // The fake `nh` starts a real HTTP server on a fixed port via node.
   const dir = mkdtempSync(join(tmpdir(), "nhbin-"));
   const port = 18000 + (process.pid % 1000);
-  const fake = join(dir, "nh");
-  writeFileSync(fake, `#!/usr/bin/env node
+  const { bin, args } = fakeNh(dir, `
 const http = require("node:http");
 setTimeout(() => {
   http.createServer((req, res) => res.end("[]")).listen(${port}, "127.0.0.1");
 }, 300);
 setInterval(() => {}, 1000);
 `);
-  chmodSync(fake, 0o755);
   const origin = "http://127.0.0.1:" + port;
   const state = await ensureServer({
     // Deadline, not a fixed wait: ensureServer returns as soon as the port
     // answers (~400ms idle). A roomier deadline only affects a genuinely slow
     // boot under load, which is the flake this widens out (gate finding #2).
-    origin, spawnTimeoutMs: 20000, env: { NH_BIN: fake }, nhArgs: [] });
+    origin, spawnTimeoutMs: 20000, env: { NH_BIN: bin }, nhArgs: args });
   try {
     assert.equal(state.status, "spawned");
     assert.ok(state.child.pid > 0);
@@ -146,14 +193,12 @@ setInterval(() => {}, 1000);
 
 test("ensureServer: onSpawn fires immediately, not when the wait finishes", async () => {
   const dir = mkdtempSync(join(tmpdir(), "nhbin-"));
-  const fake = join(dir, "nh");
-  writeFileSync(fake, "#!/bin/sh\nsleep 30\n");
-  chmodSync(fake, 0o755);
+  const { bin, args } = fakeNh(dir, "setTimeout(() => {}, 30000);\n");
   const seen = [];
   const t0 = Date.now();
   const state = await ensureServer({
-    origin: "http://127.0.0.1:1", spawnTimeoutMs: 900, env: { NH_BIN: fake },
-    nhArgs: [], onSpawn: (c) => seen.push({ pid: c.pid, at: Date.now() - t0 }) });
+    origin: "http://127.0.0.1:1", spawnTimeoutMs: 900, env: { NH_BIN: bin },
+    nhArgs: args, onSpawn: (c) => seen.push({ pid: c.pid, at: Date.now() - t0 }) });
   try {
     assert.equal(seen.length, 1, "the caller must be able to track it at once");
     assert.ok(seen[0].pid > 0);
@@ -205,52 +250,157 @@ test("stopServer: ONLY kills a spawned child — attached/failed states are neve
 // PATH, so without this the packaged build serves a healthy board on which
 // EVERY task dies with CLINotFoundError.
 
+// The delimiter is passed EXPLICITLY in the POSIX cases below. It used to be a
+// hardcoded ":" inside mergePath; it is now a parameter defaulting to
+// path.delimiter, so naming it here keeps these assertions testing POSIX
+// semantics on every host instead of quietly becoming Windows assertions when
+// run on Windows. The Windows semantics get their own cases further down.
 test("mergePath: appends missing dirs, never reorders or duplicates", () => {
   const exists = () => true;
-  assert.equal(mergePath("/usr/bin:/bin", ["/opt/homebrew/bin"], exists),
+  assert.equal(mergePath("/usr/bin:/bin", ["/opt/homebrew/bin"], exists, ":"),
     "/usr/bin:/bin:/opt/homebrew/bin", "hint dirs go AFTER the inherited PATH");
-  assert.equal(mergePath("/usr/bin:/opt/homebrew/bin", ["/opt/homebrew/bin"], exists),
+  assert.equal(mergePath("/usr/bin:/opt/homebrew/bin", ["/opt/homebrew/bin"], exists, ":"),
     "/usr/bin:/opt/homebrew/bin", "an entry already present is not duplicated");
-  assert.equal(mergePath("", ["/opt/homebrew/bin"], exists), "/opt/homebrew/bin");
+  assert.equal(mergePath("", ["/opt/homebrew/bin"], exists, ":"), "/opt/homebrew/bin");
 });
 
 test("mergePath: never appends a directory that does not exist", () => {
-  assert.equal(mergePath("/usr/bin", ["/nope/nowhere"], () => false), "/usr/bin");
+  assert.equal(mergePath("/usr/bin", ["/nope/nowhere"], () => false, ":"), "/usr/bin");
 });
 
 test("mergePath: makes a Homebrew claude reachable from launchd's PATH", () => {
   // The real failure: /opt/homebrew/bin is in NEITHER launchd's default PATH
   // nor the SDK's hardcoded fallback list, so a Homebrew install is invisible.
+  // POSIX_CLI_HINT_DIRS by name, not the platform-selected CLI_HINT_DIRS: this
+  // is a statement about the macOS list, and it must keep holding when the
+  // suite runs on Windows.
   const launchd = "/usr/bin:/bin:/usr/sbin:/sbin";
   const onlyBrew = (d) => d === "/opt/homebrew/bin";
-  assert.ok(mergePath(launchd, CLI_HINT_DIRS, onlyBrew).split(":")
+  assert.ok(mergePath(launchd, POSIX_CLI_HINT_DIRS, onlyBrew, ":").split(":")
     .includes("/opt/homebrew/bin"),
     "a Homebrew-installed claude must be reachable by the spawned server");
+});
+
+// ------------------------- Windows path semantics ------------------------- //
+// These run on every host: the logic is pure and the delimiter is injected, so
+// the Windows behaviour is verifiable from the Mac that builds the DMG.
+
+test("mergePath: a Windows PATH is split on ';' and never shredded on ':'", () => {
+  // THE DEFECT this guards. Splitting a Windows PATH on ":" does not merely
+  // fail to find entries, it destroys them: every entry contains a drive colon,
+  // so "C:\\Windows;C:\\Users\\x" would become ["C", "\\Windows;C", "\\Users\\x"]
+  // and the PATH handed to the spawned server would be garbage.
+  const exists = () => true;
+  const base = "C:\\Windows;C:\\Users\\x\\bin";
+  const got = mergePath(base, ["C:\\hints"], exists, ";");
+  assert.equal(got, "C:\\Windows;C:\\Users\\x\\bin;C:\\hints");
+  assert.ok(got.split(";").includes("C:\\Windows"),
+    "a drive-qualified entry must survive intact");
+  assert.equal(mergePath(base, [], exists, ";"), base,
+    "with nothing to add the PATH must come back byte-identical");
+});
+
+test("mergePath: Windows entries are de-duplicated case-insensitively", () => {
+  // Windows paths are case-insensitive, so these name ONE directory. Comparing
+  // case-sensitively would append a duplicate and break the documented
+  // never-duplicates contract.
+  const got = mergePath("C:\\Program Files\\Git", ["c:\\program files\\git"],
+                        () => true, ";");
+  assert.equal(got, "C:\\Program Files\\Git", "a case-variant duplicate is not appended");
+  // The KEY is folded, never the value: original casing must be preserved.
+  assert.equal(mergePath("C:\\Windows", ["C:\\Hints"], () => true, ";"),
+    "C:\\Windows;C:\\Hints", "appended entries keep their own casing");
+});
+
+test("mergePath: POSIX stays case-SENSITIVE (folding must not leak across)", () => {
+  assert.equal(mergePath("/usr/Bin", ["/usr/bin"], () => true, ":"),
+    "/usr/Bin:/usr/bin", "two distinct POSIX dirs must both survive");
+});
+
+test("WINDOWS_CLI_HINT_DIRS: real locations, and mergePath appends them", () => {
+  assert.ok(WINDOWS_CLI_HINT_DIRS.length > 0);
+  for (const d of WINDOWS_CLI_HINT_DIRS) {
+    assert.ok(!d.includes("/"), `a Windows hint dir must be backslashed: ${d}`);
+  }
+  // A claude installed by `uv tool` under ~\.local\bin must become reachable.
+  const uvBin = WINDOWS_CLI_HINT_DIRS[0];
+  const only = (d) => d === uvBin;
+  assert.ok(mergePath("C:\\Windows;C:\\Windows\\System32",
+                      WINDOWS_CLI_HINT_DIRS, only, ";").split(";").includes(uvBin));
+});
+
+test("windowsPathLookup: finds nh.exe on PATH, prefers .exe, honours PATH order", () => {
+  const has = (set) => (p) => set.has(p);
+  // Reads env.PATH rather than shelling out to where.exe, so it is deterministic.
+  assert.equal(
+    windowsPathLookup({ PATH: "C:\\a;C:\\b" }, has(new Set(["C:\\b\\nh.exe"])), ";"),
+    "C:\\b\\nh.exe");
+  // Earlier PATH entries win, matching how Windows itself resolves.
+  assert.equal(
+    windowsPathLookup({ PATH: "C:\\a;C:\\b" },
+      has(new Set(["C:\\a\\nh.exe", "C:\\b\\nh.exe"])), ";"),
+    "C:\\a\\nh.exe");
+  // .cmd and .bat shims are found too — a console entry point is installed as
+  // any of the three.
+  assert.equal(
+    windowsPathLookup({ PATH: "C:\\a" }, has(new Set(["C:\\a\\nh.cmd"])), ";"),
+    "C:\\a\\nh.cmd");
+  // Within one directory .exe outranks .cmd.
+  assert.equal(
+    windowsPathLookup({ PATH: "C:\\a" },
+      has(new Set(["C:\\a\\nh.cmd", "C:\\a\\nh.exe"])), ";"),
+    "C:\\a\\nh.exe");
+});
+
+test("windowsPathLookup: accepts either PATH spelling and fails closed", () => {
+  const has = (p) => p === "C:\\a\\nh.exe";
+  // process.env normalises PATH/Path, a plain object handed in by a caller does
+  // not — finding nothing because the key was spelled "Path" would be a silent
+  // resolution failure.
+  assert.equal(windowsPathLookup({ Path: "C:\\a" }, has, ";"), "C:\\a\\nh.exe");
+  assert.equal(windowsPathLookup({ PATH: "C:\\a" }, has, ";"), "C:\\a\\nh.exe");
+  // Nothing on PATH, no PATH at all, empty entries — all "" and never a throw.
+  assert.equal(windowsPathLookup({ PATH: "C:\\zzz" }, has, ";"), "");
+  assert.equal(windowsPathLookup({}, has, ";"), "");
+  assert.equal(windowsPathLookup({ PATH: ";;" }, has, ";"), "");
+});
+
+test("taskkillArgs: /T always, /F only for SIGKILL", () => {
+  // /T is load-bearing: without it only the direct child dies and nh's workers
+  // are orphaned still holding the port. Mirrors _windows_try_kill(force=...)
+  // in src/no_human/cli/commands.py.
+  assert.deepEqual(taskkillArgs(1234, "SIGTERM"), ["/T", "/PID", "1234"]);
+  assert.deepEqual(taskkillArgs(1234, "SIGKILL"), ["/F", "/T", "/PID", "1234"]);
+  assert.ok(taskkillArgs(1, "SIGTERM").includes("/T"),
+    "the graceful form must still take the TREE, or workers outlive the app");
+  // The pid is stringified — execFile rejects a number argument outright.
+  assert.equal(typeof taskkillArgs(1234, "SIGKILL").at(-1), "string");
 });
 
 test("ensureServer: the spawned server inherits the widened PATH", async () => {
   const dir = mkdtempSync(join(tmpdir(), "nhpath-"));
   const port = 18400 + (process.pid % 400);
   const out = join(dir, "path.txt");
-  const fake = join(dir, "nh");
-  // Absolute shebang: the test PATH below is deliberately too narrow to find
-  // `node`, and the shebang must not be what this test is measuring.
-  writeFileSync(fake, `#!${process.execPath}
+  const { bin, args } = fakeNh(dir, `
 require("node:fs").writeFileSync(${JSON.stringify(out)}, process.env.PATH || "");
 const http = require("node:http");
 http.createServer((req, res) => res.end("[]")).listen(${port}, "127.0.0.1");
 setInterval(() => {}, 1000);
 `);
-  chmodSync(fake, 0o755);
   // LAUNCHD'S PATH. Running under a normal shell the hint dirs are already
   // inherited, so the widening is invisible and the test proves nothing —
-  // which is exactly the reason this defect shipped.
+  // which is exactly the reason this defect shipped. The Windows equivalent is
+  // a bare system PATH: an app launched from Explorer or an elevated context
+  // need not carry the user's own bin dirs either.
+  const narrowPath = IS_WIN
+    ? "C:\\Windows\\system32;C:\\Windows"
+    : "/usr/bin:/bin:/usr/sbin:/sbin";
   const state = await ensureServer({
     origin: "http://127.0.0.1:" + port, spawnTimeoutMs: 8000,
-    env: { NH_BIN: fake, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" }, nhArgs: [] });
+    env: { NH_BIN: bin, PATH: narrowPath }, nhArgs: args });
   try {
     assert.equal(state.status, "spawned");
-    const childPath = readFileSync(out, "utf8").split(":");
+    const childPath = readFileSync(out, "utf8").split(delimiter);
     const expected = CLI_HINT_DIRS.filter((d) => existsSync(d));
     assert.ok(expected.length > 0, "no hint dir exists here; the test proves nothing");
     for (const d of expected) {
@@ -292,18 +442,25 @@ test("stopServer: kills the process GROUP, not just the direct child", async () 
   // This is the entire reason for detached:true. Signalling only the direct
   // child left nh's workers alive at PPID 1, still holding the port.
   const dir = mkdtempSync(join(tmpdir(), "nhgrp-"));
+  //
+  // The MECHANISM differs by platform but the guarantee does not, so this test
+  // is deliberately written against the guarantee. POSIX kills the process
+  // group that detached:true created. Windows has no killable process group —
+  // it walks the tree with `taskkill /T` instead, exactly as
+  // src/no_human/testing/runner.py::_kill_process_tree does. If that dispatch
+  // regressed to a plain child.kill(), the grandchild below would survive on
+  // Windows and this assertion would catch it.
   const marker = join(dir, "grandchild.pid");
-  const fake = join(dir, "nh");
-  writeFileSync(fake, `#!${process.execPath}
+  const { bin, args } = fakeNh(dir, `
 const { spawn } = require("node:child_process");
-const kid = spawn(${JSON.stringify(process.execPath)}, ["-e", "setInterval(()=>{},1000)"]);
+const kid = spawn(${JSON.stringify(process.execPath)}, ["-e", "setInterval(()=>{},1000)"],
+                  { windowsHide: true });
 require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(kid.pid));
 setInterval(() => {}, 1000);
 `);
-  chmodSync(fake, 0o755);
   const state = await ensureServer({
     origin: "http://127.0.0.1:1", spawnTimeoutMs: 700,
-    env: { NH_BIN: fake }, nhArgs: [] });
+    env: { NH_BIN: bin }, nhArgs: args });
   const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
   // Poll for the worker's BIRTH as well as its death: a bare read here went
   // ENOENT under parallel load and produced a random red build.
@@ -389,11 +546,10 @@ test("ensureServer: failure-window capture still classifies real spawn output (d
   // Proves the diagnosis path stays intact for the window this ticket does
   // NOT touch: a launch that never comes up must still surface why.
   const dir = mkdtempSync(join(tmpdir(), "nhfail-"));
-  const fake = join(dir, "nh");
-  writeFileSync(fake, "#!/bin/sh\necho 'coding backend unavailable: cli missing'\nexit 2\n");
-  chmodSync(fake, 0o755);
+  const { bin, args } = fakeNh(dir,
+    "console.log('coding backend unavailable: cli missing');\nprocess.exit(2);\n");
   const state = await ensureServer({
-    origin: "http://127.0.0.1:1", env: { NH_BIN: fake }, nhArgs: [],
+    origin: "http://127.0.0.1:1", env: { NH_BIN: bin }, nhArgs: args,
     spawnTimeoutMs: 2000 });
   assert.equal(state.status, "failed");
   assert.equal(state.reason, "backend-cli-missing");
@@ -408,18 +564,31 @@ test("ensureServer: a silent fast non-zero exit is labeled backend-exited, not s
   // never fired), this assertion would fail only after a ~20s hang — so a
   // fast pass here proves the race resolves on 'close' within milliseconds.
   const dir = mkdtempSync(join(tmpdir(), "nhexit-"));
-  const fake = join(dir, "nh");
-  writeFileSync(fake, "#!/bin/sh\nexit 3\n");
-  chmodSync(fake, 0o755);
+  const { bin, args } = fakeNh(dir, "process.exit(3);\n");
   const state = await ensureServer({
-    origin: "http://127.0.0.1:1", env: { NH_BIN: fake }, nhArgs: [],
+    origin: "http://127.0.0.1:1", env: { NH_BIN: bin }, nhArgs: args,
     spawnTimeoutMs: 20000 });
   assert.equal(state.status, "failed");
   assert.equal(state.reason, "backend-exited");
   assert.equal(state.detail, "", "silent exit must not fabricate a diagnosis");
 });
 
-test("ensureServer: stops capturing once confirmed up, but keeps draining so the running server never EPIPEs", async () => {
+// POSIX-ONLY, and deliberately NOT ported to Windows rather than faked.
+//
+// This test's guarantee rests on SIGPIPE, and its fixture must be a SHELL
+// script for the reason given below: a shell dies on the next write to a broken
+// pipe, while Node silently swallows EPIPE and would not catch a regression to
+// destroy(). Windows has neither SIGPIPE nor a shell-script mechanism, so the
+// only Windows fixture available is a node one — precisely the fixture this
+// test already rejects as unable to detect the defect. A "ported" version would
+// therefore be a test that cannot fail, which is worse than an honest skip.
+//
+// What still covers it: capture.stop() and the stream handling it guards are
+// platform-independent — there is no Windows branch in that code — so the macOS
+// run governs the behaviour on both. Recorded in docs/WINDOWS.md.
+test("ensureServer: stops capturing once confirmed up, but keeps draining so the running server never EPIPEs",
+     { skip: IS_WIN ? "requires SIGPIPE and a shell fixture; neither exists on Windows" : false },
+     async () => {
   // A shell script, not node: on a broken pipe the shell's default SIGPIPE
   // action TERMINATES it on the very next write — Node silently swallows
   // EPIPE on stdout/stderr and would not catch a regression to destroy().

@@ -141,6 +141,10 @@ def test_atomic_write_0600_posix_does_not_shell_out(tmp_path, monkeypatch):
     def _boom(*a, **k):  # pragma: no cover - must never run
         raise AssertionError("POSIX write must not spawn a process")
 
+    # Force the POSIX branch rather than relying on the HOST being POSIX — see
+    # the identical note in tests/test_windows_portability.py. On a Windows host
+    # this took the Windows branch and tripped its own tripwire.
+    monkeypatch.setattr(cfg, "_IS_WINDOWS", False)
     monkeypatch.setattr(cfg, "_run_icacls", _boom)
     cfg.atomic_write_0600(tmp_path / ".env", "K=v\n")
     assert (tmp_path / ".env").read_text(encoding="utf-8") == "K=v\n"

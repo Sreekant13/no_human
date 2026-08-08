@@ -73,6 +73,24 @@ test("buildMenuTemplate: macOS gets the app menu; other platforms do not", () =>
   assert.ok(!win.some((t) => t.role === "appMenu"), "no app menu off macOS");
 });
 
+test("off macOS the File menu still carries every recovery path, ending in quit", () => {
+  // There is no appMenu off macOS, so File is the ONLY home for these. "New
+  // Task" is the way back to work, "Re-enter Claude Token…" the only remedy
+  // for a revoked token, "Check for Updates…" the only way back to a skipped
+  // update — losing any of them to a mac-only branch would strand the Windows
+  // app with no in-app recovery. Verified on real Windows 2026-08-05.
+  const t = buildMenuTemplate({
+    isMac: false, isDev: false, onNavigate() {}, onNewTask() {},
+    onReenterToken() {}, onCheckForUpdates() {},
+  });
+  const file = t.find((m) => m.label === "File");
+  for (const label of ["New Task", "Re-enter Claude Token…", "Check for Updates…"]) {
+    assert.ok(file.submenu.some((i) => i.label === label), `${label} reachable off macOS`);
+  }
+  const last = file.submenu[file.submenu.length - 1];
+  assert.equal(last.role, "quit", "File ends in quit off macOS (close would strand a tray app)");
+});
+
 test("File menu exposes Re-enter Claude Token and it routes", () => {
   let called = 0;
   const t = buildMenuTemplate({
