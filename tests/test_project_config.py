@@ -298,3 +298,22 @@ def test_repo_hints_reach_the_prompt_via_apply(store, tmp_path):
     orch._apply_repo_safety(repo)
     assert orch._repo_hints == ["run make check first"]
     assert "run make check first" in build_repo_hints_block(orch._repo_hints)
+
+
+def test_no_human_repo_ships_the_export_gate_playbook_hint():
+    """Regression: no_human's own `.no_human.yml` must surface the export-gate
+    PROCEDURE to the coder — the `export_guard.py approve` command — so a coder
+    that adds a tracked file re-pins the manifest instead of doom-looping on the
+    meta-gate that stalled the large-repo tier. The command must reach the coder
+    prompt UN-truncated (project_config.MAX_HINT_CHARS caps each hint at 200)."""
+    from pathlib import Path
+
+    from no_human.core.prompt_blocks import build_repo_hints_block
+
+    repo_root = Path(__file__).resolve().parents[1]
+    hints = load_repo_config(repo_root).get("playbook_hints") or []
+    joined = " ".join(hints)
+    assert "export_guard.py approve" in joined, "export-gate procedure (the HOW) missing"
+    assert "RELEASE_MANIFEST.txt" in joined and "EXPORT_CLASSIFICATION.txt" in joined
+    block = build_repo_hints_block(hints)
+    assert "export_guard.py approve" in block, "procedure did not reach the coder prompt (truncated?)"

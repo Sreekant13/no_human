@@ -59,3 +59,11 @@ test_commands:
       node --test desktop/*.test.mjs &&
       uv run pytest tests/test_no_banned_terms.py
       tests/test_identity_scrub_guard.py tests/test_readme_claims.py -q
+
+# Procedures the coder cannot discover from the code, surfaced upfront so a
+# review-enforced convention does not cost a doom-loop. build_repo_hints_block
+# renders these into the coder prompt; advisory (never override criteria/safety).
+# Keep each <=200 chars (project_config.MAX_HINT_CHARS) or it is truncated.
+playbook_hints:
+  - "Adding, renaming or deleting a TRACKED file fails the export gate. Classify new files in EXPORT_CLASSIFICATION.txt (ship or drop), then run: uv run python scripts/export_guard.py approve <path> ..."
+  - "Never hand-edit RELEASE_MANIFEST.txt: it pins sha256 so hand-edits never converge (export_guard.py approve regenerates it). Commit EXPORT_CLASSIFICATION.txt + RELEASE_MANIFEST.txt with your change."
