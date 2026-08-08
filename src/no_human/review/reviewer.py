@@ -43,6 +43,13 @@ from ..core.task import Task
 log = logging.getLogger(__name__)
 
 _REVIEW_JSON = re.compile(r"REVIEW_JSON_START\s*(.*?)\s*REVIEW_JSON_END", re.DOTALL)
+# When `_REVIEW_JSON` does not match, the fail-closed evidence keeps this many
+# trailing characters of the reviewer's own output so a truncated verdict (the
+# START marker + JSON present, but the END marker never emitted — par-07, where
+# three genuinely-passing verdicts read as "no parseable block" and burned 3
+# attempts) is diagnosable from the event trail instead of being discarded. The
+# verdict is UNCHANGED — this only stops throwing away the evidence.
+_UNPARSED_TAIL_CHARS = 300
 
 # 10 was set when the reviewer could not read files. D16 gave it read-only tools,
 # and it now spends most turns fetching the code it cites — the grounding that
@@ -1050,14 +1057,26 @@ def _parse_review_output(
 ) -> ReviewDecision:
     m = _REVIEW_JSON.search(text or "")
     if not m:
+        # Fail closed — a missing END marker is NOT a pass — but preserve the
+        # tail of the raw output in the evidence so the next occurrence can be
+        # diagnosed (truncation before END vs. a genuine no-verdict). This is
+        # the reviewer's own text, which `raw_output` already carries in full;
+        # 300 chars in the evidence is strictly less than that, not new
+        # exposure. Truncates safely when the output is shorter than the window.
+        raw = text or ""
+        tail = raw[-_UNPARSED_TAIL_CHARS:] if raw else "(empty output)"
+        evidence = (
+            "reviewer produced no parseable REVIEW_JSON block — fail closed. "
+            f"unparsed reviewer output (tail): {tail}"
+        )
         return ReviewDecision(
             passed=False,
             checklist=[ChecklistItem(
                 _NO_VERDICT_LABEL,
                 False,
-                "reviewer produced no parseable REVIEW_JSON block — fail closed",
+                evidence,
             )],
-            raw_output=text or "",
+            raw_output=raw,
         )
     try:
         data = loads_lenient(m.group(1))

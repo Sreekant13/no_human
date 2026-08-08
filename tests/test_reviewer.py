@@ -71,6 +71,34 @@ def test_parse_malformed_json_fails_closed():
     assert d.checklist[0].label == "json parse"
 
 
+def test_parse_truncated_verdict_fails_closed_but_preserves_tail():
+    """par-07: the reviewer emitted a passing verdict but was cut off before the
+    REVIEW_JSON_END marker. The verdict MUST still fail closed (a missing END is
+    not a pass), AND the unparsed output must now be preserved in the evidence so
+    the truncation is diagnosable instead of discarded."""
+    text = (
+        "I reviewed the diff and it looks good.\n"
+        'REVIEW_JSON_START\n{"passed": true, "items": [{"label": "criterion 1", '
+        '"passed": true, "evidence": "foo.py:10"}]'
+        # NOTE: no closing brace / no REVIEW_JSON_END — the reviewer was truncated.
+    )
+    d = _parse_review_output(text)
+    # (1) verdict unchanged — still fails closed on the missing END marker.
+    assert d.passed is False
+    # (2) the previously-discarded evidence is now preserved and labelled.
+    assert "unparsed reviewer output (tail)" in d.checklist[0].evidence
+    assert "passed" in d.checklist[0].evidence
+    # existing contract preserved: the fail-closed reason still says why.
+    assert "no parseable REVIEW_JSON block" in d.checklist[0].evidence
+
+
+def test_parse_no_block_tail_truncates_safely_when_short():
+    """Short output (< the tail window) must not raise and is preserved whole."""
+    d = _parse_review_output("oops")
+    assert d.passed is False
+    assert "oops" in d.checklist[0].evidence
+
+
 def test_parse_empty_items_with_passed_true_fails_closed():
     """A passed:true with ZERO checklist items is a vacuous pass — the reviewer
     presented no evidence. The absence of evidence is not evidence of passing;
