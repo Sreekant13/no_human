@@ -303,13 +303,14 @@ tickets:
 
       def test_quote_bills_actual_weight_when_it_is_greater():
           assert quote(20.0, "EC1A 1BB", "WC2N 5DU", dimensions_cm=(10, 10, 10)) == 25.20
+  # Asserted through quote() ONLY — the surface the request names. An earlier
+  # version also imported a `volumetric_weight` helper by name and failed three
+  # live runs against an agent that had named its own helper
+  # `volumetric_weight_kg` and priced every case correctly (runs 20260807T112644,
+  # run2, run3). A holdout that prescribes an internal name measures the naming,
+  # not the behaviour, and books a correct sprint as a failure.
   holdout: |
-    from parcelo.rates import quote, volumetric_weight
-
-
-    def test_volumetric_weight_helper():
-        assert volumetric_weight((50, 40, 30)) == 12.0
-        assert volumetric_weight(None) == 0.0
+    from parcelo.rates import quote
 
 
     def test_quote_bills_the_greater_of_actual_and_volumetric():
@@ -322,6 +323,8 @@ tickets:
     def test_quotes_without_dimensions_are_unchanged():
         assert quote(2.0, "EC1A 1BB", "WC2N 5DU") == 5.40
         assert quote(2.0, "EC1A 1BB", "SW1A 2AA") == 6.90
+        # Explicitly passing no dimensions is the same as omitting them.
+        assert quote(2.0, "EC1A 1BB", "SW1A 2AA", dimensions_cm=None) == 6.90
   regression_of: []
   break_probe:
     path: parcelo/rates.py
@@ -440,16 +443,17 @@ tickets:
   title: PAR-13 Show customers what they are paying for
   kind: feature
   request: 'Support keeps getting ''why is this so expensive'' emails and we have nothing to show. The
-    quote response from the API layer needs a breakdown alongside the total: the base fee, the weight
-    charge, the zone surcharge, the express uplift, and the weight we actually charged on. The components
-    must add up to the total that is returned. The API layer should also accept parcel dimensions and
-    pass them through.'
+    quote response from the API layer needs a breakdown alongside the total, under a "breakdown" key.
+    The storefront renders it straight from the response with no translation layer, so the field names
+    have to be exactly these: "base" (the base fee), "weight" (the weight charge), "surcharge" (the zone
+    surcharge), "express_uplift" (the express uplift) and "chargeable_weight_kg" (the weight we actually
+    charged on). The four money fields must add up to the total that is returned. The API layer should
+    also accept parcel dimensions, as a "dimensions_cm" field on the request, and pass them through.'
   acceptance_criteria:
-  - a quote request through the API layer returns a breakdown as well as a total
-  - the breakdown names the base fee, weight charge, zone surcharge, express uplift and the chargeable
-    weight
-  - the breakdown components sum to the returned total
-  - the API layer accepts parcel dimensions and passes them to quoting
+  - a quote request through the API layer returns a "breakdown" as well as a total
+  - the breakdown uses exactly the field names base, weight, surcharge, express_uplift and chargeable_weight_kg
+  - the four money fields base, weight, surcharge and express_uplift sum to the returned total
+  - the API layer accepts parcel dimensions as "dimensions_cm" and passes them to quoting
   solution:
     parcelo/rates.py: |
       """Quoting: what a shipment costs."""
