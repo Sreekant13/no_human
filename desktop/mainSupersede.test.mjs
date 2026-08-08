@@ -58,7 +58,17 @@ test.after(() => {
 const spawnCount = () => (fs.existsSync(spawnLog)
   ? fs.readFileSync(spawnLog, "utf8").trim().split("\n").filter(Boolean).length : 0);
 
-test("a discarded navigation never spawns a server", async () => {
+test("a discarded navigation never spawns a server",
+  // The fake `nh` is a `#!/usr/bin/env node` shebang script made executable with
+  // chmod 0o755 — neither the shebang nor the +x bit means anything on Windows,
+  // so main.mjs's spawn of NH_BIN never runs the fake and spawnCount stays 0.
+  // The teardown's /usr/bin/pkill is POSIX-only too (guarded by try/catch). This
+  // is a POSIX process-lifecycle scenario; a Windows form needs a .cmd/.bat shim
+  // spawned as `node <script>` and tasklist/taskkill detection (see batch report).
+  { skip: process.platform === "win32"
+    ? "POSIX process-lifecycle scenario: the fake nh is a shebang script that "
+      + "cannot be spawned directly on Windows" : false },
+  async () => {
   assert.equal(spawnCount(), 0,
     "precondition: no token at startup, so nothing should have been spawned");
   fs.writeFileSync(path.join(home, ".no_human", ".env"),

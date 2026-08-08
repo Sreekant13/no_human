@@ -43,6 +43,23 @@ function withFailingRestrict(fn) {
 
 const home = () => mkdtempSync(join(tmpdir(), "nhhome-"));
 
+// withFailingRestrict forces the POSIX primitive (fs.chmodSync) to throw so the
+// REAL restrictToOwner fails closed. On a real Windows host restrictToOwner
+// dispatches to icacls instead, which has NO mockable seam from a test: it is a
+// named `execFileSync` import (not the reassignable `fs` module object the chmod
+// stub relies on) and the real binary lives in System32, so emptying PATH cannot
+// hide it either. The forced-failure ORDERING guard is therefore only observable
+// on POSIX, where it runs in full. The Windows END STATE — a correctly restricted
+// .env — is covered by "writeToken: creates the file 0600", which reads the real
+// ACL back. (Coverage gap on real Windows: the writeToken cleanup-on-restrict-
+// failure path is unexercised; closing it needs a mockable icacls seam.)
+const SKIP_FAILING_RESTRICT = process.platform === "win32"
+  ? "forcing restrictToOwner to fail needs the POSIX chmod seam; on Windows it "
+    + "uses icacls, which has no mockable seam (named import; real binary in "
+    + "System32). POSIX runs this in full; the Windows end state is covered by "
+    + "\"writeToken: creates the file 0600\"."
+  : false;
+
 /**
  * Assert the platform's "only the owner can read this" guarantee.
  *
@@ -173,7 +190,8 @@ test("writeToken: hardens an existing 0644 .env to 0600", () => {
 // because nothing asserted them: the credential was written to .env first and
 // restrictToOwner ran after, so a failure left a readable token on disk and
 // nh:save-token reported {ok:false} over it.
-test("writeToken: a failing restrictToOwner leaves NO .env behind", () => {
+test("writeToken: a failing restrictToOwner leaves NO .env behind",
+  { skip: SKIP_FAILING_RESTRICT }, () => {
   const h = home();
   withFailingRestrict(() => {
     assert.throws(() => writeToken("sk-ant-oat-mustnotpersist", h),
@@ -186,7 +204,8 @@ test("writeToken: a failing restrictToOwner leaves NO .env behind", () => {
     "the temp file must be cleaned up, not left holding the credential");
 });
 
-test("writeToken: a failing restrictToOwner leaves an EXISTING .env untouched", () => {
+test("writeToken: a failing restrictToOwner leaves an EXISTING .env untouched",
+  { skip: SKIP_FAILING_RESTRICT }, () => {
   const h = home();
   fs.mkdirSync(join(h, ".no_human"), { recursive: true });
   const before = "# comment\nJIRA_API_TOKEN=keepme\n";

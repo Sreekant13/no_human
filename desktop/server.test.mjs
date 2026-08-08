@@ -377,7 +377,18 @@ test("taskkillArgs: /T always, /F only for SIGKILL", () => {
   assert.equal(typeof taskkillArgs(1234, "SIGKILL").at(-1), "string");
 });
 
-test("ensureServer: the spawned server inherits the widened PATH", async () => {
+test("ensureServer: the spawned server inherits the widened PATH",
+  // On a fresh Windows runner NONE of WINDOWS_CLI_HINT_DIRS exist (no uv tool,
+  // no global npm, no ~/.claude), so `CLI_HINT_DIRS.filter(existsSync)` is empty
+  // and the test's own guard ("no hint dir exists here; the test proves nothing")
+  // fires. The Windows widening LOGIC is covered portably by the pure
+  // "WINDOWS_CLI_HINT_DIRS: real locations, and mergePath appends them" test,
+  // which runs on every host; only this end-to-end observation depends on a hint
+  // dir actually existing, which happens to hold on a POSIX dev/CI box.
+  { skip: IS_WIN ? "no WINDOWS_CLI_HINT_DIRS exist on a fresh runner, so the "
+    + "spawned-child observation is vacuous; the widening logic is covered by the "
+    + "pure WINDOWS_CLI_HINT_DIRS mergePath test" : false },
+  async () => {
   const dir = mkdtempSync(join(tmpdir(), "nhpath-"));
   const port = 18400 + (process.pid % 400);
   const out = join(dir, "path.txt");

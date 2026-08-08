@@ -146,8 +146,21 @@ const skipOnRealWindows = { skip: REAL_PLATFORM === "win32"
 // THE ORDERING PROPERTY
 // ---------------------------------------------------------------------------
 
+// This is the POSIX chmod variant of the ordering property. On a real Windows
+// host restrictToOwner dispatches to icacls and never chmods, so wrapping
+// fs.chmodSync observes nothing and the test would read as vacuous; the "Windows:"
+// sibling below is the icacls form of the same property (itself skipped on a real
+// Windows host because its oracle is a POSIX-shell fake icacls). Ordering on a
+// REAL Windows host is therefore not observed by this file — see the batch report.
+const skipPosixOrderingOnRealWindows = { skip: REAL_PLATFORM === "win32"
+  ? "asserts the POSIX chmod ordering; on a real Windows host restrictToOwner "
+    + "uses icacls and never chmods, so this cannot observe the ordering. The "
+    + "'Windows:' sibling is the icacls form (skipped here too — its oracle is a "
+    + "POSIX-shell fake icacls)."
+  : false };
+
 test("POSIX: the temp file is EMPTY when it is chmodded, not after the write",
-  () => {
+  skipPosixOrderingOnRealWindows, () => {
     // Runs on the platform we actually develop and CI on, so the ordering stays
     // pinned even for someone who deletes every win32 test in this file.
     // Wrapping fs.chmodSync is the mechanism tokenStore.test.mjs already
@@ -423,8 +436,11 @@ test("no test above left the platform flipped", () => {
   assert.deepEqual(Object.getOwnPropertyDescriptor(process, "platform"),
     REAL_PLATFORM_DESC, "process.platform was left redefined");
 
-  // Not just the flag — the BEHAVIOUR. Under a leaked win32 this chmod would
-  // never happen and the assertion below would fail.
+  // Not just the flag — the BEHAVIOUR: after the flips, restrictToOwner must
+  // dispatch to the HOST's real primitive. The mechanism to observe that differs
+  // by host, so the assertion does too — the earlier form assumed a POSIX host
+  // and wrongly read a real Windows runner (where the restored platform IS win32
+  // and icacls, not chmod, is correct) as a leaked flag.
   const h = home();
   const real = fs.chmodSync;
   let chmodded = 0;
@@ -434,8 +450,21 @@ test("no test above left the platform flipped", () => {
   } finally {
     fs.chmodSync = real;
   }
-  assert.ok(chmodded >= 1,
-    "restrictToOwner did not take the POSIX path after this file's win32 "
-    + "tests, so something is still dispatching to Windows");
-  assert.equal(fs.statSync(path.join(h, ".no_human", ".env")).mode & 0o777, 0o600);
+  if (REAL_PLATFORM === "win32") {
+    // The restored platform is win32, so the POSIX chmod branch must NOT run —
+    // restrictToOwner shells out to the real icacls. A chmod here would be the
+    // actual leak this test guards against (a leaked win32 flag could only cause
+    // MORE icacls; a POSIX flag cannot be leaked onto a win32 host). The
+    // credential still lands through the real Windows path.
+    assert.equal(chmodded, 0,
+      "restrictToOwner chmodded on a real Windows host — the POSIX branch was "
+      + "taken, so process.platform is not reading win32 for the code under test");
+    assert.ok(fs.existsSync(path.join(h, ".no_human", ".env")),
+      "the credential did not land through the real Windows (icacls) path");
+  } else {
+    assert.ok(chmodded >= 1,
+      "restrictToOwner did not take the POSIX path after this file's win32 "
+      + "tests, so something is still dispatching to Windows");
+    assert.equal(fs.statSync(path.join(h, ".no_human", ".env")).mode & 0o777, 0o600);
+  }
 });

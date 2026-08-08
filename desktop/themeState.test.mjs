@@ -100,7 +100,17 @@ test("writeTheme refuses junk instead of persisting it", () => {
   assert.equal(readTheme(dir), "light", "a refused write still changed the file");
 });
 
-test("a write that cannot land is reported, not thrown", () => {
+test("a write that cannot land is reported, not thrown",
+  // A read-only directory is a POSIX-permission scenario: `chmod 0o500` is a
+  // no-op on Windows (it toggles only FILE_ATTRIBUTE_READONLY, which does not
+  // stop file creation inside a directory), so writeTheme would SUCCEED there and
+  // the assertion "returns false" would wrongly fail. Making a directory truly
+  // non-writable on Windows needs an icacls deny ACE, which is heavy and flaky;
+  // the reported-not-thrown property is validated in full on macOS/Linux.
+  { skip: process.platform === "win32"
+    ? "read-only-directory is a POSIX-permission scenario; chmod 0o500 does not "
+      + "make a directory non-writable on Windows" : false },
+  () => {
   // A read-only home is a real deployment; it must cost one wrong-coloured
   // frame, never a crash on the way to the board.
   const dir = tmp();

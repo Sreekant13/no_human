@@ -54,6 +54,21 @@ const livePids = () => {
 };
 const liveFakes = () => livePids().length;
 
+// This whole file is a POSIX process-lifecycle scenario and cannot run on a real
+// Windows host: bootstrapEnv writes a `#!/usr/bin/env node` shebang fake nh
+// (unspawnable on Windows), livePids shells out to `/bin/ps ... | grep`, and the
+// teardown uses /usr/bin/pkill — none exist on Windows, and the top-level poll
+// below (liveFakes) would throw and crash the file outright before any test runs.
+// A Windows form needs a .cmd/.bat shim spawned as `node <script>` plus
+// tasklist/taskkill process detection (see the batch report — this is the T8
+// piece that genuinely needs a Windows machine).
+const ON_WINDOWS = process.platform === "win32";
+if (ON_WINDOWS) {
+  test("main.mjs wiring (POSIX process-lifecycle scenario)",
+    { skip: "POSIX-only: shebang fake nh, /bin/ps and pkill do not exist on "
+      + "Windows and the top-level process poll would crash the file" }, () => {});
+} else {
+
 // One module instance is shared: main.mjs has top-level side effects.
 const home = bootstrapEnv();
 const stub = await import("./testing/electronStub.mjs");
@@ -161,3 +176,5 @@ test("the held shutdown stops the server we spawned", async () => {
   assert.equal(liveFakes(), 0, "the spawned server survived the shutdown");
   assert.ok(stub.calls.quit >= 1, "the app must actually quit once shutdown finishes");
 });
+
+}  // end of the POSIX process-lifecycle scenario (see ON_WINDOWS guard above)
