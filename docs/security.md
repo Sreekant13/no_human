@@ -122,8 +122,11 @@ named here.
   `git fetch origin` (`vcs/git.py:374-381`), while a task waits on CI or review.
   These read; they send only the identifiers of a PR you just created.
 - **`nh merge-stack run` calls `gh pr merge`** against your git host
-  (`cli/commands.py:1661`). This is *your* command, not the agent's — the agent
-  is never allowed to reach it (§2).
+  (`cli/commands.py:1793`). This is *your* command, not the agent's — an agent
+  session's Bash is denied it in every mode (`_MERGE_STACK_RUN` in
+  `agent/guard.py`, alongside the `gh pr merge` / `glab mr merge` denial; §2).
+  Until 2026-08-08 this sentence overstated: the guard denied the direct
+  spellings but not this wrapper.
 - **One `GET https://pypi.org/pypi/no-human/json` per day**, to notice a newer
   release (`updates.py:39`). No identifier, no repo name, no telemetry — the
   same request `pip install` makes. On by default (`updates.enabled: true`,

@@ -5,10 +5,12 @@ Blocks, before execution:
   - pushes/force-updates to protected branches (never_push_to) — which must
     include the PR's *base* branch, or "never merge" is trivially bypassed by
     pushing straight to it
-  - merging a pull/merge request (`gh pr merge`, `glab mr merge`, and the
-    equivalent REST call). This is constraint §3.2 — the agent never merges —
-    and until 2026-07-10 nothing enforced it: only `git merge` was blocked,
-    which is not how a PR gets merged.
+  - merging a pull/merge request (`gh pr merge`, `glab mr merge`, the
+    equivalent REST call, and the product's own `nh merge-stack run`, which
+    shells `gh pr merge` per ready PR). This is constraint §3.2 — the agent
+    never merges — and until 2026-07-10 nothing enforced it: only `git merge`
+    was blocked, which is not how a PR gets merged. The `nh merge-stack run`
+    spelling was the same hole again, open until 2026-08-08 (P3 gap G6).
   - destructive shell (`rm -rf`, history rewrites) — a circuit breaker that
     fires even under bypass permissions
   - git that overwrites or discards WORKING-TREE content the agent did not
@@ -141,6 +143,21 @@ _FORGE_MERGE = re.compile(
     r"|gh\s+api\b[^|;&]*?/(?:pulls|merge_requests)/\d+/merge"  # the REST call
     r"|glab\s+api\b[^|;&]*?/merge_requests/\d+/merge)"
 )
+
+# The product's OWN spelling of the same act: `nh merge-stack run` shells
+# `gh pr merge` for every READY PR in the stack (cli/commands.py,
+# `merge_stack_run`). It is the OPERATOR's command — a human drives the stack —
+# so in an agent session it is denied in EVERY mode, exactly like
+# `_FORGE_MERGE` above. Proven live 2026-08-08 (P3 gap G6): the guard returned
+# allow=True for `nh merge-stack run --yes` while denying every direct
+# spelling. Unlike `_LIVE_SERVER`, this is NOT anchored to a command position:
+# `uv run nh merge-stack run` and `sh -c "nh merge-stack run"` are the same
+# merge one wrapper deeper, and for the merge family a prose false positive
+# (an echo or a commit message quoting the full literal command) costs one
+# denial with a stated alternative, while a miss merges a PR — the same
+# polarity `_FORGE_MERGE` already accepts for `gh pr merge` in a quoted
+# string. `plan` and `link` only read/record order and are not matched.
+_MERGE_STACK_RUN = re.compile(r"(?<![\w.-])nh\s+merge-stack\s+run\b")
 
 # Any git/forge command that mutates history or a remote. A read-only session
 # (planner, aggregator, reviewer) explores and reports; it never writes. Dropping
@@ -758,6 +775,14 @@ def evaluate(
                 "merging a pull/merge request is blocked — the agent never "
                 "merges. Open the PR, push your fixes to its branch, and stop. "
                 "A human merges it (`nh approve`).",
+            )
+        if _MERGE_STACK_RUN.search(cmd):
+            return GuardDecision(
+                False,
+                "`nh merge-stack run` merges PRs — it drives `gh pr merge` for "
+                "every ready PR in the stack — and the agent never merges, in "
+                "any session mode. It is the operator's command. Open or "
+                "update your PR and stop; a human runs the merge stack.",
             )
         if _LIVE_SERVER.search(cmd):
             return GuardDecision(

@@ -79,6 +79,68 @@ def test_allows_the_agent_to_merge_into_its_own_branch():
     assert _ev("Bash", {"command": "gh pr create --base dev --head scratch/x"}).allow
 
 
+def test_blocks_nh_merge_stack_run_in_every_mode():
+    """G6, proven live 2026-08-08: `nh merge-stack run --yes` reached
+    `gh pr merge` (shelled at cli/commands.py:1793) with the guard returning
+    allow=True in BOTH modes — the product's own CLI spelling of the forge
+    merge was unmatched while every direct spelling was denied. The agent
+    never merges (§2), and that includes merging through our own wrapper."""
+    for readonly in (False, True):
+        for cmd in (
+            "nh merge-stack run --yes",
+            "nh merge-stack run --squash --yes",
+            "cd /repo && nh merge-stack run --yes",
+            ".venv/bin/nh merge-stack run --yes",
+            "uv run nh merge-stack run --yes",
+            'sh -c "nh merge-stack run --yes"',
+        ):
+            d = guard.evaluate("Bash", {"command": cmd},
+                               forbidden_paths=FORBIDDEN,
+                               never_push_to=PROTECTED, readonly=readonly)
+            assert not d.allow, f"readonly={readonly} must deny: {cmd}"
+            assert "merge" in d.reason.lower(), d.reason
+
+
+def test_forge_merge_family_denied_in_both_modes():
+    """Guards get tested in one direction only (documented failure class) —
+    so pin the merge family in coder mode AND readonly mode explicitly,
+    including the refspec spellings that merge by pushing at the base."""
+    for readonly in (False, True):
+        for cmd in (
+            "gh pr merge 7004 --squash",
+            "glab mr merge 12",
+            "gh api -X PUT repos/o/r/pulls/7004/merge",
+            "glab api --method PUT projects/1/merge_requests/12/merge",
+            "git push origin :main",
+            "git push origin HEAD:refs/heads/main",
+            "git push origin HEAD:refs/heads/release/1.2",
+        ):
+            d = guard.evaluate("Bash", {"command": cmd},
+                               forbidden_paths=FORBIDDEN,
+                               never_push_to=PROTECTED, readonly=readonly)
+            assert not d.allow, f"readonly={readonly} must deny: {cmd}"
+
+
+def test_merge_stack_denial_does_not_overcorrect():
+    """The other direction: ordinary agent git/gh workflow — including the
+    WORD "merge" in a PR title or comment (a guard once denied an agent
+    titling its own PR; that class must not come back) — stays allowed.
+    Only `nh merge-stack run` merges; `plan` and `link` read/record order."""
+    for cmd in (
+        'gh pr create --title "Merge the stack guard fix" --base dev',
+        'gh pr comment 7 --body "ready to merge after review"',
+        "gh pr view 7 --comments",
+        'git commit -m "merge base into my branch"',
+        "git merge origin/dev",
+        "git push -u origin no-human/abc123",
+        "nh merge-stack plan",
+        "nh merge-stack link https://x/pr/1 https://x/pr/2",
+        "nh --help",
+    ):
+        d = _ev("Bash", {"command": cmd})
+        assert d.allow, f"must stay allowed: {cmd} -> {d.reason}"
+
+
 def test_the_pr_base_branch_must_be_pushable_by_nobody():
     """`never_push_to` lists main/master/release/* — but a real task's base was
     `dev`, so `git push origin HEAD:dev` merged without review. The orchestrator
