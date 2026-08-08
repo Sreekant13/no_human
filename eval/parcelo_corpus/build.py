@@ -1143,6 +1143,44 @@ def test_not_one_price_changed():
     assert quote(2.0, "EC1A 1BB", "AB10 1AA") == 8.40
     assert quote(2.0, "EC1A 1BB", "WC2N 5DU", express=True) == 8.10
     assert quote(2.0, "EC1A 1BB", "SW1A 2AA", express=True) == 11.85
+
+
+# The five prices above are what this holdout used to be, and they were not
+# enough. A live agent shipped `express_uplift = standard * MULT + surcharge -
+# standard` and re-added it through `sum()`; in binary floating point
+# `a + (b - a) != b`, and the delta crosses the 2-dp rounding boundary. All five
+# pinned prices happened to be FP-stable, so the holdout passed it — and the
+# GOAL JUDGE caught it instead, with an exhaustive sweep finding 249 mismatches.
+#
+# A criterion of the form "not one price may change" cannot be verified by
+# sampling. The only honest instrument is a differential sweep against the
+# pre-change formula, so that is what this now is.
+def _price_before_the_change(weight_kg, surcharge, express):
+    """parcelo/rates.py exactly as it stands at this spec's pin."""
+    weight_cost = round(1.10 * weight_kg, 2)
+    total = 3.20 + weight_cost + surcharge
+    if express:
+        total = total * 1.5 + surcharge
+    return round(total, 2)
+
+
+def test_no_price_changes_anywhere_not_just_at_the_five_pinned_points():
+    # Every zone pair reachable through the public surface, so the sweep runs
+    # through quote() itself rather than a reimplementation of it.
+    routes = [("EC1A 1BB", "WC2N 5DU", 0.0),     # within zone A
+              ("EC1A 1BB", "SW1A 2AA", 1.50),    # A -> B
+              ("EC1A 1BB", "AB10 1AA", 3.00)]    # A -> C
+    mismatches = []
+    for cents in range(1, 20001):               # 0.01 .. 200.00
+        weight = cents / 100
+        for origin, destination, surcharge in routes:
+            for express in (False, True):
+                got = quote(weight, origin, destination, express=express)
+                want = _price_before_the_change(weight, surcharge, express)
+                if got != want:
+                    mismatches.append((weight, destination, express, want, got))
+    assert not mismatches, (
+        f"{len(mismatches)} price(s) changed; first 5: {mismatches[:5]}")
 ''',
         "reference": {"parcelo/rates.py": REF_RATES_PRICE_PARTS},
     },
