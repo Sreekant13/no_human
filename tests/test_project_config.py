@@ -315,5 +315,9 @@ def test_no_human_repo_ships_the_export_gate_playbook_hint():
     joined = " ".join(hints)
     assert "export_guard.py approve" in joined, "export-gate procedure (the HOW) missing"
     assert "RELEASE_MANIFEST.txt" in joined and "EXPORT_CLASSIFICATION.txt" in joined
+    # nh02-VERIFY found a coder MODIFYING (not just adding/renaming/deleting) a tracked
+    # file still doom-looped, because a modified file also loses its manifest pin. The
+    # hint must name that case too.
+    assert "MODIFY" in joined.upper(), "hint must cover MODIFYING a tracked file"
     block = build_repo_hints_block(hints)
     assert "export_guard.py approve" in block, "procedure did not reach the coder prompt (truncated?)"

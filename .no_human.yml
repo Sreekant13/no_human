@@ -65,5 +65,5 @@ test_commands:
 # renders these into the coder prompt; advisory (never override criteria/safety).
 # Keep each <=200 chars (project_config.MAX_HINT_CHARS) or it is truncated.
 playbook_hints:
-  - "Adding, renaming or deleting a TRACKED file fails the export gate. Classify new files in EXPORT_CLASSIFICATION.txt (ship or drop), then run: uv run python scripts/export_guard.py approve <path> ..."
+  - "Adding, renaming, deleting or MODIFYING a TRACKED file fails the export gate. Fix: uv run python scripts/export_guard.py approve <path> (classify any NEW file in EXPORT_CLASSIFICATION.txt first)."
   - "Never hand-edit RELEASE_MANIFEST.txt: it pins sha256 so hand-edits never converge (export_guard.py approve regenerates it). Commit EXPORT_CLASSIFICATION.txt + RELEASE_MANIFEST.txt with your change."
