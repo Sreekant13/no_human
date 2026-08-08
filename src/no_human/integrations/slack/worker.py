@@ -46,6 +46,7 @@ class SlackWorker:
         self._on_event = on_event or (lambda kind, text: None)
         self._handlers: dict[str, list[EventHandler]] = defaultdict(list)
         self._client: SocketModeClient | None = None
+        self._web_client: WebClient | None = None
 
         bot_token = load_env_var("SLACK_BOT_TOKEN")
         app_token = load_env_var("SLACK_APP_TOKEN")
@@ -69,6 +70,19 @@ class SlackWorker:
     @property
     def is_running(self) -> bool:
         return self._client is not None
+
+    def reply(self, channel: str, thread_ts: str, text: str) -> None:
+        """Post ``text`` as an in-thread reply — the ``ReplyFn`` an
+        ``AppMentionHandler`` calls to answer a mention (missing/unknown repo,
+        or a creation failure). Best-effort by contract: the handler wraps it
+        in ``_safe_reply``. A call before ``start()`` or after ``stop()`` is a
+        no-op rather than an error, so a reply that races teardown never
+        raises. Uses the client ``start()`` built; the bot token itself is
+        never re-exposed."""
+        client = self._web_client
+        if client is None:
+            return
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
 
     def _dispatch(self, client: SocketModeClient, request: SocketModeRequest) -> None:
         """Socket-mode request listener: ack immediately (Slack requires a
@@ -96,8 +110,8 @@ class SlackWorker:
         already running is a no-op."""
         if self._client is not None:
             return
-        web_client = WebClient(token=self._bot_token)
-        client = SocketModeClient(app_token=self._app_token, web_client=web_client)
+        self._web_client = WebClient(token=self._bot_token)
+        client = SocketModeClient(app_token=self._app_token, web_client=self._web_client)
         client.socket_mode_request_listeners.append(self._dispatch)
         client.connect()
         self._client = client
@@ -109,6 +123,7 @@ class SlackWorker:
         if self._client is None:
             return
         client, self._client = self._client, None
+        self._web_client = None
         try:
             client.close()
         except Exception as exc:  # noqa: BLE001 — best-effort teardown

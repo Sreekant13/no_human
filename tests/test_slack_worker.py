@@ -246,3 +246,40 @@ def test_disabled_by_default_constructs_no_client_when_never_started(monkeypatch
     assert DEFAULT_CONFIG["integrations"]["slack"]["intake"] is False
     _worker(monkeypatch)
     assert _FakeSocketModeClient.instances == []
+
+
+# ---------------------- reply() ReplyFn (D4c wiring) ------------------------
+# The worker holds the bot token and is the only object that can post; the
+# AppMentionHandler needs a ReplyFn to answer a mention. These bind reply()
+# and its web_client lifecycle (start stores it, stop clears it).
+
+class _FakeWebClient:
+    def __init__(self):
+        self.posts = []
+
+    def chat_postMessage(self, *, channel, thread_ts, text):
+        self.posts.append((channel, thread_ts, text))
+
+
+def test_reply_posts_in_thread_via_web_client(monkeypatch):
+    w = _worker(monkeypatch)
+    fake = _FakeWebClient()
+    w._web_client = fake  # exactly what start() assigns
+    w.reply("C123", "1700000000.0001", "on it")
+    assert fake.posts == [("C123", "1700000000.0001", "on it")]
+
+
+def test_reply_before_start_or_after_stop_is_a_noop(monkeypatch):
+    w = _worker(monkeypatch)  # never started -> no client to post through
+    w.reply("C123", "1.0", "dropped, not raised")  # must not raise
+    assert w._web_client is None
+
+
+def test_start_stores_web_client_and_stop_clears_it(monkeypatch):
+    _patch_transport(monkeypatch)
+    w = _worker(monkeypatch)
+    assert w._web_client is None
+    w.start()
+    assert w._web_client is not None  # reply() has a client to post through
+    w.stop()
+    assert w._web_client is None      # a reply racing teardown is a no-op

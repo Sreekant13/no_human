@@ -2709,33 +2709,34 @@ def serve(max_workers):
                     f"poll={monday_secs}s")
                 coros.append(_monday_poll_loop(monday_poller, stop, monday_secs))
 
-            # Slack intake (SCRUM-60, foundation only — no @mention handlers
-            # attached yet, that's SCRUM-61/62): Socket-Mode worker, opt-in via
-            # integrations.slack.intake. Disabled by default -> not imported,
-            # not constructed, zero new behavior. A setup/connect failure is
-            # caught so a misconfigured Slack integration never breaks `serve`.
+            # Slack intake: Socket-Mode worker with the @mention handler
+            # attached (below), opt-in via integrations.slack.intake. Disabled
+            # by default -> not imported, not constructed, zero new behavior.
+            # A setup/connect failure is caught so a misconfigured Slack
+            # integration never breaks `serve`.
             slack_cfg = (config.data.get("integrations") or {}).get("slack") or {}
             slack_worker = None
             if slack_cfg.get("intake"):
                 try:
-                    from ..integrations.slack import SlackWorker
+                    from ..integrations.slack import (
+                        AppMentionHandler, SlackWorker)
                     slack_worker = SlackWorker(
                         config.data,
                         on_event=lambda k, t: console.print(f"[cyan]◆ {k}[/] {t}"))
                     await asyncio.to_thread(slack_worker.start)
-                    # NOT "connected" in green. The socket connects, but no
-                    # handler is registered on it: AppMentionHandler.register()
-                    # has zero callers outside tests, so SlackWorker._dispatch
-                    # iterates an empty list and every @mention is acked and
-                    # DROPPED. A green success line for a channel that silently
-                    # discards its input is worse than no line — the operator
-                    # turns it on, sees it "work", and waits for tasks that will
-                    # never arrive. Say what actually happens instead.
+                    # Attach the @mention handler so a mention actually creates a
+                    # task. register() captures THIS running loop; _dispatch, on
+                    # the SocketMode callback thread, bridges each event back to
+                    # it. The worker's own reply posts the handler's in-thread
+                    # answers. Without this call the socket connected but every
+                    # @mention was acked and DROPPED — the gap this closes.
+                    slack_handler = AppMentionHandler(
+                        store, slack_worker.reply, config=slack_cfg,
+                        on_event=lambda k, t: console.print(f"[cyan]◆ {k}[/] {t}"))
+                    slack_handler.register(slack_worker)
                     console.print(
-                        "[yellow]Slack intake[/] socket connected, but NO "
-                        "@mention handler is attached — messages will be "
-                        "received and discarded. This is foundation only; "
-                        "mentions do not create tasks yet.")
+                        "[green]Slack intake[/] socket connected; @mention me "
+                        "with repo:<name> to create a task.")
                 except Exception as exc:  # noqa: BLE001 — optional integration, never break `serve`
                     console.print(f"[yellow]Slack intake failed to start[/] {exc}")
                     slack_worker = None
