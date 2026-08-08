@@ -75,8 +75,9 @@ def open_pr(
             # a DRAFT before the review gate, so the first body is the pre-review one
             # (no test evidence, no review evidence) and `_finalize`'s richer body was
             # being discarded. A review caught it: the human-visible PR permanently lost
-            # its "## Review evidence" and "## Test evidence" sections, which regresses
-            # W1.6/M-B and defeats 0a's own purpose. The comment claiming "_finalize's
+            # its consolidated "## Evidence" section (the reviewer's verdict and the test
+            # run), which regresses W1.6/M-B and defeats 0a's own purpose. The comment
+            # claiming "_finalize's
             # later call UPDATES the same PR" was simply false — nothing in src/ ran
             # `gh pr edit` at all.
             #

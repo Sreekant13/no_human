@@ -10658,9 +10658,10 @@ SIX of them read a checkpoint and TWO do not — but do
     def _close_orphaned_block(text: str) -> str:
         """Close a fence — or an HTML block — left open at the end of *text*.
 
-        The summary renders BEFORE ## Test evidence, ## Review evidence and ## Stats, so an
-        unterminated fence swallows all three reviewer-facing sections — and the truncation
-        notice itself — into a code block. Found by a review, in the artifact.
+        The summary renders BEFORE ## Evidence (the reviewer's verdict and the test
+        run) and ## How I verified this, so an unterminated fence swallows those
+        reviewer-facing sections — and the truncation notice itself — into a code
+        block. Found by a review, in the artifact.
 
         The closer MATCHES the opener (same character, same length): appending a
         fixed ``` closed neither a ```` block nor a ~~~ one.
@@ -11120,7 +11121,7 @@ SIX of them read a checkpoint and TWO do not — but do
 
         THE GUARANTEE, stated so it can be tested: nothing the coder writes may
         render as an `<h1>` or an `<h2>`. The template's own sections (`## Task`,
-        `## Test evidence`, `## Stats`) are `<h2>`, so a coder heading at that
+        `## Evidence`, `## How I verified this`) are `<h2>`, so a coder heading at that
         level or above stops being part of the summary and becomes a top-level
         section of the PR — the outline then lies about what no_human is
         asserting. Consecutive `CRITERION: …` lines are the second collision:
@@ -11134,7 +11135,7 @@ SIX of them read a checkpoint and TWO do not — but do
         * `<h2>Heading</h2>` is raw HTML, which GitHub renders, and passed
           through untouched.
         * `# Heading` was demoted by exactly one, to `## Heading` — the precise
-          sibling of `## Task` and `## Stats` the docstring promised to prevent.
+          sibling of `## Task` and `## Evidence` the docstring promised to prevent.
           Demotion is now by TWO, so the coder's top level lands at `###`, one
           below `## Implementation summary`, and every relative level the coder
           used is preserved rather than collapsed.
@@ -11541,8 +11542,18 @@ SIX of them read a checkpoint and TWO do not — but do
         criteria = "\n".join(
             f"- {self._inline_cell(c, None)}" for c in task.acceptance_criteria
         ) or "- (none stated)"
-        stats = self._branch_stats(repo, base, commit)
         head_sha = (getattr(commit, "sha", "") or "").strip()
+        # ONE evidence area, decisive-first (the independent reviewer's verdict,
+        # then the orchestrator's own test run) — see `_evidence_section`. The
+        # raw command receipts stay their own `## How I verified this` appendix
+        # after it: that section is a mechanical, deliberately exhaustive audit
+        # log with its own truthfulness contract, not part of the short
+        # "does it work" summary a reviewer reads first.
+        #
+        # The `## Stats` line (files/diffstat/turns) was REMOVED: the forge shows
+        # the diffstat itself, and the turn count is internal noise. `repo`/`base`
+        # remain live — `base` scopes the merge-boundary footer and `repo` proves
+        # the review rounds judged THIS head (C4).
         return (
             f"{self._ticket_line(task)}"
             f"## Task\n{self._inline_cell(task.title, None)}\n\n"
@@ -11550,13 +11561,41 @@ SIX of them read a checkpoint and TWO do not — but do
             f"{self._assumptions_section(task)}"
             f"{self._superseded_section(task)}"
             f"## Implementation summary\n{self._summary_section(result)}\n\n"
-            f"{self._test_evidence_section(test_evidence)}"
+            f"{self._evidence_section(task, test_evidence=test_evidence, head_sha=head_sha, repo=repo)}"
             f"{self._verification_section(receipts, test_evidence=test_evidence, observable=self._backend_is_observable())}"
-            f"{self._review_evidence_section(task, head_sha=head_sha, repo=repo)}"
-            f"## Stats\n{stats['files_changed']} files, "
-            f"+{stats['insertions']}/-{stats['deletions']}, {result.num_turns} turns."
             f"{self._merge_boundary_footer(task, branch=branch, base=base, attempt_n=attempt_n)}"
         )
+
+    def _evidence_section(
+        self, task: Task, *, test_evidence: dict | None = None,
+        head_sha: str = "", repo=None,
+    ) -> str:
+        """The operator's "ONE area of evidence": what confirms this change works,
+        decisive-first, in rich text.
+
+        Consolidates two channels that used to render as separate, out-of-order
+        top-level sections (`## Test evidence` BEFORE the buried `## Review
+        evidence`): the independent reviewer's verdict LEADS — it is the direct
+        answer to "does the reviewer say this works?" — followed by the
+        orchestrator's own test run. Each is a `###` sub-section, so the whole
+        thing reads as one block. The mechanical command-receipts log stays its
+        own `## How I verified this` section after this one.
+
+        Returns "" when neither channel has anything, so a body with no review
+        and no test run gains no empty heading. Reorganises existing truthful
+        content only — no new claim is made here.
+        """
+        review = self._review_evidence_section(task, head_sha=head_sha, repo=repo)
+        tests = self._test_evidence_section(test_evidence)
+        if not review and not tests:
+            return ""
+        lead = (
+            "## Evidence\n"
+            "_Decisive first: the independent reviewer's verdict, then the "
+            "orchestrator's own test run. Raw command receipts are under "
+            "**How I verified this** below._\n\n"
+        )
+        return lead + review + tests
 
     # ------------------------- PR body: the pieces ------------------------- #
 
@@ -11596,37 +11635,6 @@ SIX of them read a checkpoint and TWO do not — but do
         # it silently would hide a tracker record that is already malformed.
         return (f"**Ticket:** {key} (unlinkable tracker URL: "
                 f"{self._inline_cell(url, None)})\n\n")
-
-    def _branch_stats(self, repo, base: str | None, commit) -> dict:
-        """C2: the diff a reviewer will actually see — branch vs the review base.
-
-        ``commit`` describes ONE commit. On a resumed or multi-commit attempt
-        that is a fraction of the PR: a real body read "1 files, +0/-1" for a
-        PR of 4 files and +166/-6, off by two orders of magnitude, and the
-        human-gated-CI resume path fabricates a zeroed commit outright. The
-        review base is the same merge-base the reviewer read and the same range
-        the forge renders, so the three finally agree.
-
-        Best-effort: any git trouble falls back to the commit's own numbers
-        (the previous behaviour) rather than blocking the PR.
-        """
-        fallback = {
-            "files_changed": getattr(commit, "files_changed", 0),
-            "insertions": getattr(commit, "insertions", 0),
-            "deletions": getattr(commit, "deletions", 0),
-        }
-        if repo is None:
-            return fallback
-        try:
-            whole = repo.head_commit(self._review_base(repo, base))
-            return {
-                "files_changed": whole.files_changed,
-                "insertions": whole.insertions,
-                "deletions": whole.deletions,
-            }
-        except Exception as exc:  # noqa: BLE001 — stats never block a PR
-            log.warning("branch-vs-base stats failed (%s); using the last commit's", exc)
-            return fallback
 
     def _superseded_section(self, task: Task) -> str:
         """C5: link the drafts earlier attempts abandoned.
@@ -11739,7 +11747,7 @@ SIX of them read a checkpoint and TWO do not — but do
             return ""
         history = Orchestrator._rounds_for_head(history, head_sha=head_sha, repo=repo)
         if not history:
-            return ("## Review evidence\n- (no review has run against this "
+            return ("### Independent review\n- (no review has run against this "
                     "commit yet — the rounds on record judged a different "
                     "commit of this task)\n\n")
         rounds = len(history)
@@ -11768,7 +11776,7 @@ SIX of them read a checkpoint and TWO do not — but do
         if addressed:
             lines.append("- findings raised and addressed across rounds:")
             lines += [f"  - {a}" for a in addressed[:8]]
-        return "## Review evidence\n" + "\n".join(lines) + "\n\n"
+        return "### Independent review\n" + "\n".join(lines) + "\n\n"
 
     #: How many recorded commands are shown WITH their captured output, and how
     #: many are listed at all. Both are needed: 200 receipts x a 1,200-character
@@ -12200,4 +12208,4 @@ SIX of them read a checkpoint and TWO do not — but do
                          "deleted or weakened tests")
         if not lines:
             return ""
-        return "## Test evidence\n" + "\n".join(lines) + "\n\n"
+        return "### Test evidence\n" + "\n".join(lines) + "\n\n"

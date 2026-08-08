@@ -151,26 +151,35 @@ def test_a_short_but_real_summary_survives(store, tmp_path):
     assert "No implementation summary was produced" not in body
 
 
-# ─────────────────── C2: stats describe the whole branch ──────────────────── #
+# ───────────── C2: the Stats section is gone (files/diffstat/turns) ────────── #
+#
+# The `## Stats` line — "N files, +X/-Y, N turns" — was REMOVED at the operator's
+# instruction: the forge shows the diffstat itself and the turn count is internal
+# noise. These two tests used to pin the branch-vs-base diffstat (C2) and its
+# best-effort fallback; both are now asserted the other way — the section, its
+# heading, and the turn count must NOT appear in any body.
 
-def test_stats_report_the_branch_not_the_last_commit(store, tmp_path):
-    """PR #104's body said "1 files, +0/-1" for a PR of 4 files and +166/-6.
-    The last commit is not the change; the diff against the review base is."""
+def test_the_stats_section_is_gone_even_on_a_multi_commit_branch(store, tmp_path):
+    """The exact C2 scenario that used to render "3 files, +102/-0": with a real
+    repo and base, no `## Stats` heading, no diffstat line, no turn count."""
     work = _repo_with_two_commits(tmp_path)
     orch = _orch(store, tmp_path)
     repo = GitRepo(work)
     body = orch._pr_body(Task.new("t", repo_path=str(work)), _Commit(), _Result(),
                          repo=repo, base="main")
-    stats = body.split("## Stats\n", 1)[1].splitlines()[0]
-    assert stats.startswith("3 files, +102/-0"), stats
-    assert "1 files, +0/-1" not in body
+    assert "## Stats" not in body
+    assert "3 files, +102/-0" not in body
+    assert "files, +" not in body
+    assert "turns." not in body
 
 
-def test_stats_fall_back_to_the_commit_when_git_cannot_answer(store, tmp_path):
-    """Stats never block a PR: no repo means the old numbers, not a crash."""
+def test_the_stats_section_is_gone_on_the_no_repo_path_too(store, tmp_path):
+    """The old best-effort fallback path (no repo) must not resurrect the line."""
     orch = _orch(store, tmp_path)
     body = orch._pr_body(Task.new("t", repo_path="/r"), _Commit(), _Result())
-    assert "1 files, +0/-1" in body
+    assert "## Stats" not in body
+    assert "1 files, +0/-1" not in body
+    assert "turns." not in body
 
 
 # ──────────────── C3: a suite that never ran said "0 failed" ──────────────── #
@@ -885,9 +894,12 @@ def captured_pr_body(monkeypatch):
 async def test_finalize_hands_the_pr_body_the_branch_it_is_opening(
     store, tmp_path, captured_pr_body,
 ):
-    """WIRING. Remove `repo=repo, base=base, branch=branch` from `_finalize`'s
-    `_pr_body(...)` call and this goes red: the stats collapse back to the last
-    commit and the footer stops naming the branch pair."""
+    """WIRING. Remove `base=base, branch=branch` from `_finalize`'s
+    `_pr_body(...)` call and this goes red: the footer stops naming the branch
+    pair. (The `## Stats` canary this test used for `repo`/`base` is gone with
+    the Stats section; `repo` reaching `_pr_body` from `_finalize` is now proven
+    by the sibling `test_finalize_scopes_the_review_dossier_to_the_head_it_is_
+    shipping`, which reads the review-evidence output `repo` drives.)"""
     work = _repo_with_two_commits(tmp_path)
     repo = GitRepo(work)
     orch = _orch(store, tmp_path)
@@ -904,12 +916,9 @@ async def test_finalize_hands_the_pr_body_the_branch_it_is_opening(
     assert out.status == TaskStatus.AWAITING_APPROVAL
     body = captured_pr_body["body"]
 
-    # C2: the whole branch (3 files, +102/-0), not the last commit (1, +0/-1).
-    stats = body.split("## Stats\n", 1)[1].splitlines()[0]
-    assert stats.startswith("3 files, +102/-0"), (
-        f"the PR body reverted to per-commit stats — `repo`/`base` are not "
-        f"reaching `_pr_body` from `_finalize`: {stats!r}")
-    assert "1 files, +0/-1" not in body
+    # The Stats section must not come back through the real `_finalize` path.
+    assert "## Stats" not in body
+    assert "turns." not in body
 
     # H8: the footer names the branch pair, which nothing else on the PR says.
     assert "`feat/x` → `main`" in body, (
@@ -1051,8 +1060,10 @@ def captured_draft_body(monkeypatch):
 async def test_the_pre_gate_draft_body_gets_the_branch_it_is_opening(
     store, tmp_path, captured_draft_body,
 ):
-    """WIRING. Remove `repo=repo, base=base, branch=branch` from
-    `_open_draft_pr_for_review`'s `_pr_body(...)` call and this goes red."""
+    """WIRING. Remove `base=base, branch=branch` from
+    `_open_draft_pr_for_review`'s `_pr_body(...)` call and this goes red on the
+    footer. (The `## Stats` canary is gone with the Stats section; the footer
+    branch pair proves the args still reach `_pr_body`.)"""
     work = _repo_with_two_commits(tmp_path)
     # `_open_draft_pr_for_review` is GitHub-only by design (the only backend that
     # is both draft-by-default and already-exists idempotent).
@@ -1070,20 +1081,19 @@ async def test_the_pre_gate_draft_body_gets_the_branch_it_is_opening(
     assert url == "https://github.com/o/r/pull/400", "the draft never opened"
     body = captured_draft_body["body"]
 
-    stats = body.split("## Stats\n", 1)[1].splitlines()[0]
-    assert stats.startswith("3 files, +102/-0"), (
-        f"the pre-gate draft body reverted to per-commit stats — the body an "
-        f"escalated attempt leaves behind carries the C2 lie: {stats!r}")
-    assert "1 files, +0/-1" not in body
+    assert "## Stats" not in body
+    assert "turns." not in body
     assert "`feat/x` → `main`" in body, (
         "`branch`/`base` are not reaching the merge-boundary footer")
 
 
-async def test_the_abandoned_draft_body_is_the_one_carrying_true_stats(
+async def test_the_abandoned_draft_body_is_the_only_one_written(
     store, tmp_path, captured_draft_body, forge,
 ):
     """Why R1 is worse than the `_finalize` case: on the escalation path this
-    body is the ONLY one ever written, and it is what "[ABANDONED]" labels."""
+    body is the ONLY one ever written, and it is what "[ABANDONED]" labels.
+    (Formerly pinned the C2 branch stats; the Stats section is gone, so this now
+    asserts the abandoned body is written, labelled, and carries no Stats line.)"""
     work = _repo_with_two_commits(tmp_path)
     _git(work, "remote", "add", "origin", "https://github.com/o/r.git")
     repo = GitRepo(work)
@@ -1103,8 +1113,10 @@ async def test_the_abandoned_draft_body_is_the_one_carrying_true_stats(
     assert out.status == TaskStatus.ESCALATED
     assert forge.titles and "[ABANDONED" in forge.titles[0][1], (
         "this draft was never delivered, so C5 must still label it")
-    # …and the body it was labelled ON describes the whole branch.
-    assert "3 files, +102/-0" in captured_draft_body["body"]
+    # …and the body it was labelled ON exists and carries no Stats line.
+    assert captured_draft_body["body"], "no draft body was ever written"
+    assert "## Stats" not in captured_draft_body["body"]
+    assert "3 files, +102/-0" not in captured_draft_body["body"]
 
 
 # ───── R3: pin the URL half of the D1 guard ───────────────────────────────── #
@@ -2138,9 +2150,17 @@ async def test_the_escalating_route_fixtures_are_not_attributed_either(
 # inside it, which is what `tests/test_verification_receipts.py` pins. Adding
 # it here widens the ALLOWED set by exactly one string the renderer hardcodes;
 # every coder-authored channel is still asserted to produce nothing outside it.
+#
+# 🔴 `Evidence` IS THE UMBRELLA `_evidence_section` EMITS. The reviewer's verdict
+# and the orchestrator's test run used to be their own top-level `## Review
+# evidence` / `## Test evidence` sections; they are now `###` sub-sections under
+# `## Evidence` (decisive-first, reviewer's verdict leading), so those two
+# strings are no longer level-1/2 headings and leave this set. `Stats` LEFT it
+# outright: the diffstat/turns line was removed (the forge shows the diffstat;
+# the turn count is internal noise).
 _TEMPLATE_H2 = {"Task", "Acceptance criteria", "Implementation summary",
-                "Test evidence", "How I verified this", "Review evidence",
-                "Superseded PRs", "Stats",
+                "Evidence", "How I verified this",
+                "Superseded PRs",
                 "⚠️ Assumptions & Open Questions"}
 
 
@@ -2850,7 +2870,7 @@ def test_the_coder_cannot_author_a_top_level_section_of_the_pr(
     # for `<div>` + ``` (the appended fence closer became a real OPENER) and for
     # an unterminated `<pre>`. "No intruders" is satisfied by a body with no
     # sections at all, so the template's own outline is asserted too.
-    assert "Stats" in _live_headings(body), (
+    assert "How I verified this" in _live_headings(body), (
         f"the summary swallowed the sections after it:\n--- body ---\n{body}")
 
 
@@ -3014,7 +3034,7 @@ def test_the_orphaned_closer_hole_is_exactly_where_it_is_documented(
         assert intruders == [], (
             f"the in-item closer control leaked, which limit 4 does not "
             f"cover:\n{body}")
-        assert "Stats" in _pandoc_headings(body), (
+        assert "How I verified this" in _pandoc_headings(body), (
             f"the summary swallowed the sections after it:\n{body}")
 
 
@@ -3046,7 +3066,7 @@ def test_the_same_holds_when_the_payload_is_NOT_the_first_thing_in_the_summary(
     assert intruders == [], (
         f"the coder authored a top-level section of the PR when the payload was "
         f"not the first thing in the summary: {intruders}\n--- body ---\n{body}")
-    assert "Stats" in _live_headings(body), (
+    assert "How I verified this" in _live_headings(body), (
         f"the summary swallowed the sections after it:\n--- body ---\n{body}")
 
 
@@ -3137,7 +3157,7 @@ def test_the_independent_parser_is_actually_reading_the_body(store, tmp_path):
 
     assert _MARKER in seen, (
         f"the independent oracle read nothing — it is not an oracle: {seen}")
-    assert "Stats" in seen, seen
+    assert "How I verified this" in seen, seen
 
 
 # ── the carriers OUTSIDE `## Implementation summary` ──────────────────────── #
@@ -3262,7 +3282,7 @@ def test_no_channel_of_the_body_can_author_a_top_level_section(
     assert _intruders(_pandoc_headings(body)) == [], (
         f"`{channel}` authored a top-level section an independent parser can "
         f"see:\n--- body ---\n{body}")
-    assert "Stats" in _live_headings(body), (
+    assert "How I verified this" in _live_headings(body), (
         f"`{channel}` swallowed the sections after it:\n--- body ---\n{body}")
     # Neutralised, not deleted: a body that silently drops the reviewer's
     # evidence is a different lie from one that renders it as a heading.
@@ -3426,8 +3446,8 @@ def test_the_stats_and_the_merge_boundary_never_land_inside_a_code_block(
 
     assert Orchestrator._open_fence_at_end(body) == "", (
         f"the body ends inside an open code fence:\n{body}")
-    assert "Stats" in _live_headings(body), (
-        f"## Stats was swallowed into a code block:\n{body}")
+    assert "How I verified this" in _live_headings(body), (
+        f"## How I verified this was swallowed into a code block:\n{body}")
     live = [ln for ln in body.split("\n") if "never merges" in ln]
     assert live, "the merge-boundary footer vanished"
 
@@ -3646,7 +3666,7 @@ def test_the_live_heading_scanner_sees_what_github_sees(
     rendered = _headings_from_html(html)
     assert _intruders(rendered) == [], (
         f"GitHub rendered a coder-authored top-level section:\n{html}")
-    assert "Stats" in rendered, (
+    assert "How I verified this" in rendered, (
         f"GitHub swallowed the sections after the summary:\n{html}")
     # …and the offline scanner agrees with it, which is what lets the offline
     # tests stand in for this one.
@@ -3723,7 +3743,7 @@ def test_github_agrees_no_channel_can_author_a_top_level_section(
     assert _intruders(rendered) == [], (
         f"GitHub rendered a top-level section authored by `{channel}`: "
         f"{_intruders(rendered)}\n--- body ---\n{body}")
-    assert "Stats" in rendered, (
+    assert "How I verified this" in rendered, (
         f"`{channel}` swallowed the sections after it on GitHub:\n{body}")
     # …and the offline pair agrees with GitHub, which is what lets the hermetic
     # matrix stand in for this test the rest of the time.

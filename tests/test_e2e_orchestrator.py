@@ -845,7 +845,8 @@ async def test_the_draft_pr_url_REACHES_the_reviewer_end_to_end_0a(
     assert opens[0]["refresh"] is not True, "the FIRST open creates the draft; nothing to refresh"
     assert opens[-1]["refresh"] is True, opens
     # and the refresh must actually carry the evidence the draft body could not have had
-    assert "Review evidence" in opens[-1]["body"], opens[-1]["body"][:400]
+    # (the reviewer's verdict now leads the consolidated `## Evidence` area).
+    assert "### Independent review" in opens[-1]["body"], opens[-1]["body"][:400]
 
 
 async def test_a_run_that_did_NOT_open_the_draft_never_rewrites_the_body_0a(
@@ -967,7 +968,7 @@ async def test_the_finalize_RETRY_still_refreshes_the_body_0a(
     assert retry["refresh"] is True, (
         "REGRESSION: _finalize's transient retry dropped update_existing_body, so the PR "
         f"keeps the pre-review draft body forever. flags={[o['refresh'] for o in opens]}")
-    assert "Review evidence" in retry["body"], retry["body"][:300]
+    assert "### Independent review" in retry["body"], retry["body"][:300]
 
 
 async def test_reviewer_fails_blocks_pr_and_loops(bare_repo, tmp_path, store):
@@ -5080,7 +5081,9 @@ def test_pr_body_carries_the_review_evidence_dossier():
         {"round": 2, "passed": True, "blocking": []},
     ]}
     section = Orchestrator._review_evidence_section(t)
-    assert "## Review evidence" in section
+    # The reviewer's verdict now leads the consolidated `## Evidence` area as its
+    # `### Independent review` sub-section (was its own `## Review evidence`).
+    assert "### Independent review" in section
     assert "review rounds: 2" in section
     assert "**PASSED**" in section
     assert "Image build failure" in section

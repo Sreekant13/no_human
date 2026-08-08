@@ -108,11 +108,17 @@ def test_pr_body_surfaces_layered_evidence(store, tmp_path):
         ],
     }
     body = orch._pr_body(t, _Commit(), _Result(), test_evidence=evidence)
-    assert "## Test evidence" in body
+    # The test run is now a `### Test evidence` sub-section under the one
+    # `## Evidence` umbrella, and the Stats section is gone.
+    assert "## Evidence" in body
+    assert "### Test evidence" in body
+    assert "## Stats" not in body
     assert "integration: PASS — 4 passed" in body
     assert "e2e: deferred (wake-gated)" in body
-    # Evidence sits before Stats.
-    assert body.index("Test evidence") < body.index("## Stats")
+    # The test evidence sits inside the Evidence umbrella, before the mechanical
+    # "How I verified this" receipts section.
+    assert body.index("## Evidence") < body.index("Test evidence")
+    assert body.index("Test evidence") < body.index("## How I verified this")
 
 
 def test_pr_body_surfaces_single_run_aggregate(store, tmp_path):
