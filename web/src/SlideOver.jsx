@@ -357,12 +357,16 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
         </div>
         {task && taskProgress(task.status) != null && (
           <div className="so-progress"
-               title={`~${taskProgress(task.status)}% through the pipeline (${task.status})`}
+               title={task.status === "awaiting_approval"
+                 ? "The agent has finished — a PR is up, awaiting your review/approval"
+                 : `~${taskProgress(task.status)}% through the pipeline (${task.status})`}
                role="progressbar" aria-valuenow={taskProgress(task.status)}
                aria-valuemin={0} aria-valuemax={100}>
             <div className="so-progress-fill"
                  style={{ width: `${taskProgress(task.status)}%` }} />
-            <span className="so-progress-label">{taskProgress(task.status)}%</span>
+            <span className="so-progress-label">{task.status === "awaiting_approval"
+              ? "Ready — awaiting your approval"
+              : `${taskProgress(task.status)}%`}</span>
           </div>
         )}
 
