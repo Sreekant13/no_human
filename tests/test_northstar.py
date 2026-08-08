@@ -982,3 +982,196 @@ async def test_judge_evidence_notes_keep_2000_chars(tmp_path):
     score = await runner._score(
         spec, _FakeOutcome(TaskStatus.AWAITING_APPROVAL), repo, "HEAD", [], 1.0)
     assert len(score.notes) == 2000
+
+
+# --------------------------- multi-repo sandbox ----------------------------- #
+
+def _second_repo(tmp_path: Path) -> Path:
+    """A SECOND real source repo, to stand in for a linked one."""
+    repo = tmp_path / "srcrepo2"
+    repo.mkdir()
+    for args in (["init", "-b", "main"], ["config", "user.email", "t@t"],
+                 ["config", "user.name", "t"]):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    (repo / "client.py").write_text("def call():\n    return 'v1'\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True,
+                   capture_output=True)
+    return repo
+
+
+def test_a_linked_repo_is_sandboxed_and_the_task_never_sees_the_real_path(tmp_path):
+    """The safety property of the multi-repo tier, stated as a test.
+
+    `Task.linked_repos` makes the orchestrator open a branch and push a PR in
+    EVERY listed repo. The push-proof guard protects whatever it is pointed at,
+    so handing the Task the spec's real linked path — the operator's other
+    checkout — would give an agent write access to a repo nothing is watching.
+    """
+    from no_human.eval.northstar import (
+        _bench_task, _setup_linked_sandboxes, _setup_sandbox,
+    )
+
+    primary, secondary = _src_repo(tmp_path), _second_repo(tmp_path)
+    pin2 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=secondary,
+                          capture_output=True, text=True).stdout.strip()
+    spec = _spec(primary, linked_repos=[
+        {"path": str(secondary), "pin": pin2, "branch": "main"}])
+
+    workdir = tmp_path / "wd"
+    work = _setup_sandbox(spec, workdir)
+    linked = _setup_linked_sandboxes(spec, workdir)
+
+    assert len(linked) == 1
+    sandboxed = Path(linked[0])
+    # NOT the real repo, and inside the workdir.
+    assert sandboxed != secondary
+    assert sandboxed.is_relative_to(workdir)
+    assert (sandboxed / "client.py").exists()      # it really is that repo
+    # Same push-proof guarantee as the primary: origin cannot escape.
+    origin = subprocess.run(["git", "remote", "get-url", "origin"],
+                            cwd=sandboxed, capture_output=True,
+                            text=True).stdout.strip()
+    assert Path(origin).resolve().is_relative_to(workdir.resolve())
+
+    task = _bench_task(spec, work, linked)
+    assert task.linked_repos == [str(sandboxed)]
+    assert str(secondary) not in task.linked_repos
+
+
+def test_a_single_repo_spec_still_gets_no_linked_repos(tmp_path):
+    """The corpus is single-repo today. The new path must be inert for it."""
+    from no_human.eval.northstar import _setup_linked_sandboxes, _bench_task
+
+    spec = _spec(_src_repo(tmp_path))
+    assert _setup_linked_sandboxes(spec, tmp_path / "wd") == []
+    assert _bench_task(spec, tmp_path / "work").linked_repos == []
+
+
+def test_an_unresolvable_linked_repo_is_refused_not_silently_skipped(tmp_path):
+    """A linked repo that does not exist must stop the spec. Skipping it would
+    run a multi-repo task as a single-repo one and score the result as if the
+    whole thing had been attempted."""
+    from no_human.eval.northstar import _setup_linked_sandboxes
+
+    spec = _spec(_src_repo(tmp_path),
+                 linked_repos=[{"path": str(tmp_path / "nope"), "pin": "HEAD"}])
+    with pytest.raises(RuntimeError, match="does not resolve"):
+        _setup_linked_sandboxes(spec, tmp_path / "wd")
+
+
+# --------------------------- tool calls in the digest ----------------------- #
+
+def test_a_tool_call_reaches_the_digest_instead_of_an_empty_string():
+    """A tool_use event has no `text` — it carries tool_name/tool_input. The
+    digest only ever read `text`, so every tool call in every score record was
+    stored as "", and the calls behind a failed spec were unreadable afterwards.
+    """
+    from no_human.eval.northstar import _digest_events
+
+    rows = [
+        {"kind": "tool_use", "tool_name": "Bash",
+         "tool_input": {"command": "pytest -q tests/"}, "ts": 1},
+        {"kind": "tool_use", "tool_name": "Edit",
+         "tool_input": {"file_path": "parcelo/rates.py"}, "ts": 2},
+        {"kind": "text", "text": "thinking out loud", "ts": 3},
+    ]
+    digest = _digest_events(rows)
+    assert digest[0]["text"] == "Bash: pytest -q tests/"
+    assert digest[1]["text"] == "Edit: parcelo/rates.py"
+    assert digest[2]["text"] == "thinking out loud"   # unchanged
+
+
+def test_a_tool_input_is_bounded_and_single_line():
+    """A Write's input is a whole file and this rides into a TRACKED results
+    JSON, so the rendering is capped far below the text cap."""
+    from no_human.eval.northstar import _DIGEST_MAX_TOOL_INPUT, _digest_events
+
+    rows = [{"kind": "tool_use", "tool_name": "Write",
+             "tool_input": {"file_path": "x.py", "content": "y" * 10_000}}]
+    text = _digest_events(rows)[0]["text"]
+    assert len(text) <= len("Write: ") + _DIGEST_MAX_TOOL_INPUT
+    assert "\n" not in text
+
+
+def test_a_tool_call_naming_the_local_repo_path_is_redacted(tmp_path):
+    """The digest is written into eval/results/northstar/*.json, which is
+    tracked. A tool input routinely names paths, and after the repo-map
+    translation that path is the operator's real checkout."""
+    from no_human.eval.northstar import _digest_events
+
+    spec = _spec(tmp_path)
+    spec.repo["path"] = "/Users/someone/git/private-thing"
+    spec.spec_repo_path = "/repo"
+    rows = [{"kind": "tool_use", "tool_name": "Bash",
+             "tool_input": {"command": "ls /Users/someone/git/private-thing/src"}}]
+    text = _digest_events(rows, spec)[0]["text"]
+    assert "/Users/someone" not in text
+    assert "/repo/src" in text
+
+
+def test_an_unknown_tool_shape_does_not_break_the_digest():
+    from no_human.eval.northstar import _digest_events
+
+    rows = [{"kind": "tool_use", "tool_name": "Weird", "tool_input": None},
+            {"kind": "tool_use", "tool_name": "Other", "tool_input": {"z": 1, "a": 2}},
+            {"kind": "tool_use"}]
+    out = [e["text"] for e in _digest_events(rows)]
+    assert out == ["Weird", "Other: a,z", ""]
+
+
+def test_a_long_tool_input_keeps_BOTH_ends():
+    """Head-only truncation made every path in a doom-loop render as the same
+    120 characters of shared prefix, so five different files read as one
+    repeated call — the loop was indistinguishable from a stutter."""
+    from no_human.eval.northstar import _DIGEST_MAX_TOOL_INPUT, _digest_events
+
+    prefix = "/private/tmp/claude-501/-Users-someone-very-long-path/deep/nested/dir"
+    rows = [{"kind": "tool_use", "tool_name": "Read",
+             "tool_input": {"file_path": f"{prefix}/{leaf}"}}
+            for leaf in ("alpha_module.py", "beta_module.py")]
+    a, b = (e["text"] for e in _digest_events(rows))
+    assert a != b, "two different files must not render identically"
+    assert a.endswith("alpha_module.py") and b.endswith("beta_module.py")
+    assert len(a) <= len("Read: ") + _DIGEST_MAX_TOOL_INPUT
+
+
+@pytest.mark.asyncio
+async def test_a_sandbox_that_did_not_test_itself_LEADS_the_score_note(tmp_path):
+    """The pre-flight's finding conditions every other number on the row, so a
+    reader has to meet it first — not after 2000 characters of judge evidence.
+    A warning nobody sees is the same as no warning."""
+    from no_human.core.task import TaskStatus
+
+    spec = _spec(_src_repo(tmp_path), expect_escalation=True)
+    runner = NorthStarRunner({}, backend_factory=lambda s: None)
+
+    warned = await runner._score(
+        spec, _FakeOutcome(TaskStatus.ESCALATED), tmp_path, "sha",
+        attempts=[], elapsed=1.0,
+        wrong_tree=["thing imports from /elsewhere/thing/__init__.py"])
+    assert warned.notes.startswith("⚠ sandbox did not test itself:")
+    assert "/elsewhere/thing" in warned.notes
+    assert "honestly escalated as expected" in warned.notes
+
+    clean = await runner._score(
+        spec, _FakeOutcome(TaskStatus.ESCALATED), tmp_path, "sha",
+        attempts=[], elapsed=1.0)
+    assert not clean.notes.startswith("⚠")
+    assert clean.notes == "honestly escalated as expected"
+
+
+@pytest.mark.asyncio
+async def test_the_warning_also_leads_a_did_not_reach_the_gate_note(tmp_path):
+    """The failure mode it was found in: an escalated spec whose feedback loop
+    was pointed at another tree. That row must not read as a plain capability
+    failure."""
+    from no_human.core.task import TaskStatus
+
+    spec = _spec(_src_repo(tmp_path))
+    runner = NorthStarRunner({}, backend_factory=lambda s: None)
+    score = await runner._score(
+        spec, _FakeOutcome(TaskStatus.ESCALATED), tmp_path, "sha",
+        attempts=[], elapsed=1.0, wrong_tree=["pkg imports from /other/pkg"])
+    assert score.notes.startswith("⚠ sandbox did not test itself:")
+    assert "did not reach the human gate" in score.notes

@@ -164,6 +164,11 @@ target = "web/dist"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Make a COPY of this repo test ITSELF. Without it, `import no_human`
+# in any checkout resolves through the editable install in the active
+# environment — i.e. the ORIGINAL working tree — so a sandbox, a
+# worktree or a bench clone silently validates code it did not change.
+pythonpath = ["src"]
 markers = [
     "real_backend: exercises the real ClaudeBackend over a mocked SDK client — exempt from the hermetic stub",
     "slow: marks tests that take >10s (deselect with '-m \"not slow\"')",

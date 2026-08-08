@@ -230,10 +230,12 @@ tickets:
   request: Our carrier bills us on volumetric weight for bulky parcels and we only ever bill the customer
     on actual weight, so every large light box loses us money. Quoting needs to charge on whichever is
     greater. Volumetric weight in kg is length x width x height in centimetres divided by 5000. Callers
-    should be able to pass the parcel's dimensions to quote(); when they don't, nothing about the price
-    may change.
+    pass the parcel's dimensions to quote() as a single optional `dimensions_cm` argument holding a
+    (length, width, height) tuple in centimetres — the warehouse client already builds that triple, so
+    keep the shape. When callers don't pass it, nothing about the price may change.
   acceptance_criteria:
-  - quote() accepts optional parcel dimensions in centimetres
+  - quote() accepts an optional dimensions_cm argument holding a (length, width, height) tuple in
+    centimetres
   - the billed weight is the greater of actual and volumetric weight
   - a quote with no dimensions returns exactly the price it does today
   - the new behaviour is covered by a test
@@ -653,11 +655,12 @@ tickets:
   title: PAR-14 Retried checkouts create duplicate orders
   kind: bugfix
   request: 'The mobile app retries on a flaky connection and we end up shipping the same parcel twice.
-    Order creation needs an idempotency key: two create_order calls with the same key must return the
-    same order and must only ever create one. Calls without a key keep today''s behaviour and always create
-    a new order. The key has to be accepted through the API layer too.'
+    Order creation needs an idempotency key, passed as an optional `idempotency_key`: two create_order
+    calls with the same key must return the same order and must only ever create one. Calls without a
+    key keep today''s behaviour and always create a new order. The key has to be accepted through the
+    API layer too, under the same `idempotency_key` name on the request.'
   acceptance_criteria:
-  - create_order accepts an optional idempotency key
+  - create_order accepts an optional idempotency_key
   - two creations with the same key return the same order and create one order
   - two creations with different keys create two orders
   - a creation with no key always creates a new order

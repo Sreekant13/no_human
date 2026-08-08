@@ -352,6 +352,13 @@ class BenchTask:
     request: str                       # verbatim initial user message ONLY
     source: dict[str, Any] = field(default_factory=dict)
     repo: dict[str, Any] = field(default_factory=dict)   # {path, pin, branch}
+    #: ADDITIONAL repos this spec spans, same {path, pin, branch} shape.
+    #: The product already supports multi-repo tasks (`Task.linked_repos`,
+    #: `core/multi_repo.py`: a branch and a PR per repo, and the task only
+    #: reaches the human gate once every repo has one) — the bench could
+    #: not express it, so that capability was unmeasured. Empty for every
+    #: single-repo spec, which is the whole corpus today.
+    linked_repos: list[dict[str, Any]] = field(default_factory=list)
     original: dict[str, Any] = field(default_factory=dict)
     acceptance_criteria: list[str] = field(default_factory=list)
     #: JUDGE-ONLY grading rubric. `acceptance_criteria` is DUAL-AUDIENCE: the
@@ -414,6 +421,7 @@ class BenchTask:
             request=data.get("request", ""),
             source=dict(data.get("source", {}) or {}),
             repo=dict(data.get("repo", {}) or {}),
+            linked_repos=[dict(r) for r in (data.get("linked_repos") or [])],
             original=dict(data.get("original", {}) or {}),
             acceptance_criteria=list(data.get("acceptance_criteria", []) or []),
             judge_rubric=list(data.get("judge_rubric", []) or []),
@@ -430,7 +438,8 @@ class BenchTask:
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id, "title": self.title, "request": self.request,
-            "source": self.source, "repo": self.repo, "original": self.original,
+            "source": self.source, "repo": self.repo,
+            "linked_repos": self.linked_repos, "original": self.original,
             "acceptance_criteria": self.acceptance_criteria,
             "judge_rubric": self.judge_rubric,
             "holdout": self.holdout, "subset": self.subset,

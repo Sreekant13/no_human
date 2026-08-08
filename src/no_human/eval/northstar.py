@@ -34,6 +34,7 @@ from ..core.orchestrator import Orchestrator
 from ..core.task import Task, TaskStatus
 from ..notify.slack import SlackNotifier
 from .bench_task import BenchTask, redact_local_path, spec_project_name
+from .sandbox_selftest import wrong_tree_imports
 
 BackendFactory = Callable[[BenchTask], Any]
 
@@ -52,13 +53,76 @@ _DIGEST_MAX_EVENTS = 300
 _DIGEST_MAX_TEXT = 200
 
 
-def _digest_events(rows: list[dict]) -> list[dict]:
+#: How much of a tool call to keep. Deliberately much tighter than
+#: _DIGEST_MAX_TEXT: a Write's input is a whole file, and this rides into a
+#: TRACKED results JSON.
+_DIGEST_MAX_TOOL_INPUT = 120
+
+
+def _ends(text: str, cap: int) -> str:
+    """Truncate to *cap* keeping BOTH ends, because the informative half of a
+    tool input is usually the tail.
+
+    Head-only truncation looked fine until it was used in anger: every path in a
+    doom-loop rendered as the same 120 characters of shared prefix, so five
+    different files read as one repeated call and the loop could not be told
+    apart from a stutter. Keeping the tail is what makes two long paths
+    distinguishable at a glance.
+    """
+    if len(text) <= cap:
+        return text
+    head = max(cap // 3, 1)
+    tail = cap - head - 1
+    return f"{text[:head]}…{text[-tail:]}"
+
+
+def _tool_text(e: dict) -> str:
+    """A one-line rendering of a tool call: ``Bash: pytest -q …``.
+
+    A ``tool_use`` event carries NO ``text`` — it is built from ``tool_name``
+    and ``tool_input`` (agent/backend.py: AgentEvent), and the sinks persist
+    both. The digest only ever read ``text``, so every tool call in every score
+    record was stored as an empty string, and the 55 calls behind a failed spec
+    were unreadable afterwards. That cost two diagnoses in one day: par-07's
+    reviewer verdict and nh-01's empty diff. Raising the truncation cap would
+    have fixed neither — the field was never being read.
+    """
+    name = str(e.get("tool_name") or "")
+    if not name:
+        return ""
+    raw = e.get("tool_input")
+    if isinstance(raw, dict):
+        # The fields worth having, in the order a reader wants them; anything
+        # else is summarised by its keys rather than dumped.
+        for key in ("command", "file_path", "path", "pattern", "description"):
+            if raw.get(key):
+                detail = str(raw[key])
+                break
+        else:
+            detail = ",".join(sorted(raw)[:6])
+    else:
+        detail = str(raw or "")
+    detail = _ends(" ".join(detail.split()), _DIGEST_MAX_TOOL_INPUT)
+    return f"{name}: {detail}" if detail else name
+
+
+def _digest_events(rows: list[dict], spec: BenchTask | None = None) -> list[dict]:
     """Compact the persisted event stream for the score record: kind + text
     (truncated) + ts. Keeps the LAST _DIGEST_MAX_EVENTS — terminal behavior
-    (budget nudges, escalations, wrap-ups) clusters at the end."""
+    (budget nudges, escalations, wrap-ups) clusters at the end.
+
+    *spec* is used only to redact the locally-translated repo path, exactly as
+    crash notes and judge evidence already are. It matters more here than there:
+    a tool call's input is free text that routinely NAMES paths, and this digest
+    is written into ``eval/results/northstar/*.json``, which is tracked.
+    """
     out = []
     for e in rows[-_DIGEST_MAX_EVENTS:]:
         text = str(e.get("text") or e.get("message") or "")[:_DIGEST_MAX_TEXT]
+        if not text:
+            text = _tool_text(e)
+        if text and spec is not None:
+            text = redact_local_path(text, spec)
         out.append({"kind": str(e.get("kind") or e.get("source") or ""),
                     "text": text, "ts": e.get("ts")})
     return out
@@ -209,6 +273,90 @@ def _sandbox_copy(src: Path, dst: Path) -> None:
                    check=True, capture_output=True)
 
 
+def _sandbox_repo(src: Path, work: Path, pin: str, bare: Path) -> Path:
+    """Copy *src* to *work* at *pin*, with origin re-pointed at *bare*.
+
+    The push-proof core, extracted so the PRIMARY repo and every LINKED repo of
+    a multi-repo spec go through the SAME guard. Duplicating it for linked repos
+    was the alternative and it is the worse one: the guard that matters would
+    then exist twice and could drift, and the half that drifts is the half that
+    hands an agent write access to a real checkout.
+
+    The caller owns the containment assertion (it needs the workdir root), and
+    calls `_assert_sandboxed` immediately after — see `_setup_sandbox`.
+    """
+    _sandbox_copy(src, work)
+    # The source may be DIRTY (uncommitted/untracked files ride along in a
+    # file-level copy): force the worktree to exactly the pinned commit, clean.
+    _git(work, "reset", "--hard", "HEAD" if pin == "HEAD" else pin)
+    _git(work, "clean", "-fdx")
+    if pin != "HEAD":
+        _git(work, "checkout", "--detach", pin)
+        # The coder needs a branch to work from. `-B`, not `-b`: a subject repo
+        # that already carries a `bench-base` branch made `-b` exit non-zero and
+        # crashed the spec at setup with zero tokens spent (observed live on the
+        # large-repo tier). Re-pointing it is exactly the intent.
+        _git(work, "checkout", "-B", "bench-base")
+    _git(work, "config", "user.email", "bench@no_human")
+    _git(work, "config", "user.name", "nh-bench")
+
+    subprocess.run(["git", "init", "--bare", str(bare)],
+                   check=True, capture_output=True)
+    # A copied repo carries the SOURCE's remotes (possibly none, possibly
+    # several — the push-proof guard resolves only origin, so a ride-along
+    # upstream would be a guard-invisible escape). Remove them ALL, then add
+    # origin at the local bare.
+    existing = subprocess.run(["git", "remote"], cwd=work,
+                              capture_output=True, text=True).stdout.split()
+    for r in existing:
+        subprocess.run(["git", "remote", "remove", r], cwd=work,
+                       capture_output=True)
+    subprocess.run(["git", "config", "--unset-all", "remote.pushDefault"],
+                   cwd=work, capture_output=True)
+    _git(work, "remote", "add", "origin", str(bare))
+    return work
+
+
+def _assert_sandboxed(work: Path, workdir: Path) -> None:
+    """HARD GUARD — BEFORE any push. A guard that runs after the push detects an
+    escape only once the write has already landed in the real repo."""
+    origin = Path(_git(work, "remote", "get-url", "origin")).resolve()
+    if not str(origin).startswith(str(workdir.resolve())):
+        raise RuntimeError(
+            f"push-proofing failed: origin {origin} escapes sandbox {workdir}")
+
+
+def _setup_linked_sandboxes(spec: BenchTask, workdir: Path) -> list[str]:
+    """Sandbox every LINKED repo of a multi-repo spec, and return their paths.
+
+    Empty list for the single-repo specs that are the whole corpus today, so
+    nothing about them changes.
+
+    This exists because `Task.linked_repos` is a real product feature (the
+    orchestrator opens a branch and a PR per repo) and a bench spec could not
+    express it. The dangerous way to add it would have been to hand the Task the
+    REAL linked paths: the push-proof guard covers whatever it is pointed at,
+    and pointing it only at the primary would leave an agent with write access
+    to the operator's other checkouts. Every linked repo therefore gets its own
+    sandbox copy, its own workdir-local bare, and the same containment
+    assertion, before the Task ever sees a path.
+    """
+    linked: list[str] = []
+    for i, entry in enumerate(spec.linked_repos or []):
+        src = Path(str(entry.get("path") or "").strip())
+        if not src.is_absolute() or not (src / ".git").exists():
+            raise RuntimeError(
+                f"linked repo {i} of {spec.id} does not resolve: {src}")
+        work = workdir / "linked" / f"{i}-{src.name}"
+        work.parent.mkdir(parents=True, exist_ok=True)
+        _sandbox_repo(src, work, str(entry.get("pin") or "HEAD"),
+                      workdir / f"linked-remote-{i}.git")
+        _assert_sandboxed(work, workdir)
+        _git(work, "push", "origin", "HEAD")
+        linked.append(str(work))
+    return linked
+
+
 def _setup_sandbox(spec: BenchTask, workdir: Path) -> Path:
     """Clone the real repo at the spec's pin; re-point origin to a local bare.
 
@@ -221,44 +369,10 @@ def _setup_sandbox(spec: BenchTask, workdir: Path) -> Path:
     ref-signature tamper check sees it. Non-APFS platforms fall back to the
     slow-but-isolated copy clone."""
     src = Path(spec.repo.get("path", ""))
-    work = workdir / "work"
-    _sandbox_copy(src, work)
-    pin = spec.repo.get("pin") or "HEAD"
-    # The source may be DIRTY (uncommitted/untracked files ride along in a
-    # file-level copy, and v7's ns-4092c756 crash was a checkout over a dirty
-    # tree): force the worktree to exactly the pinned commit, clean.
-    _git(work, "reset", "--hard", "HEAD" if pin == "HEAD" else pin)
-    _git(work, "clean", "-fdx")
-    if pin != "HEAD":
-        _git(work, "checkout", "--detach", pin)
-        # The coder needs a branch to work from.
-        _git(work, "checkout", "-b", "bench-base")
-    _git(work, "config", "user.email", "bench@no_human")
-    _git(work, "config", "user.name", "nh-bench")
-
-    bare = workdir / "remote.git"
-    subprocess.run(["git", "init", "--bare", str(bare)],
-                   check=True, capture_output=True)
-    # A copied repo carries the SOURCE's remotes (possibly none, possibly
-    # several — the push-proof guard resolves only origin, so a ride-along
-    # upstream would be a guard-invisible escape, review F4). Remove them
-    # ALL, then add origin at the local bare.
-    existing = subprocess.run(["git", "remote"], cwd=work,
-                              capture_output=True, text=True).stdout.split()
-    for r in existing:
-        subprocess.run(["git", "remote", "remove", r], cwd=work,
-                       capture_output=True)
-    subprocess.run(["git", "config", "--unset-all", "remote.pushDefault"],
-                   cwd=work, capture_output=True)
-    _git(work, "remote", "add", "origin", str(bare))
-
-    # HARD GUARD — BEFORE any push (review finding: guard-after-push detects
-    # an escape only after the write has landed in the real repo).
-    origin = Path(_git(work, "remote", "get-url", "origin")).resolve()
-    if not str(origin).startswith(str(workdir.resolve())):
-        raise RuntimeError(
-            f"push-proofing failed: origin {origin} escapes sandbox {workdir}")
-
+    work = _sandbox_repo(src, workdir / "work",
+                         spec.repo.get("pin") or "HEAD",
+                         workdir / "remote.git")
+    _assert_sandboxed(work, workdir)
     _git(work, "push", "origin", "HEAD")
 
     # Dirty-tree seed — AFTER the commit+push above, so the seeded files are
@@ -315,7 +429,8 @@ def _ref_signature(repo: Path) -> str:
         return ""
 
 
-def _bench_task(spec: BenchTask, work: Path) -> Task:
+def _bench_task(spec: BenchTask, work: Path,
+                linked: list[str] | None = None) -> Task:
     """Build the orchestrator Task for a spec EXACTLY as the product front door
     would — including kind classification (`nh` runs classify_kind at intake,
     cli/commands.py). Without it every replayed task defaulted to the feature
@@ -332,6 +447,12 @@ def _bench_task(spec: BenchTask, work: Path) -> Task:
     # golden descriptions; review D1 caught it reopening through this field).
     # The rubric joins the criteria only in the judge call in `_score`.
     task.acceptance_criteria = list(spec.acceptance_criteria)
+    # SANDBOXED linked paths only — never `spec.linked_repos`, which holds the
+    # operator's REAL checkouts. The orchestrator opens a branch and pushes a PR
+    # in every linked repo, so putting a real path here would hand the agent
+    # write access to a repo no guard is watching. `_setup_linked_sandboxes` has
+    # already copied each one and asserted its origin is inside the workdir.
+    task.linked_repos = list(linked or [])
     task.kind = classify_kind(task).kind.value
     return task
 
@@ -459,8 +580,27 @@ class NorthStarRunner:
         # block EVERY in-flight spec's SDK stream — and, worse, freeze the
         # stuck-watchdog clock so a quiet-but-alive spec could be booked as a
         # false SpecStalled crash.
-        refs_before = await asyncio.to_thread(_ref_signature, src_repo)
+        # The tamper check covers EVERY source repo a multi-repo spec touches,
+        # not just the primary — a linked repo is exactly as real as this one.
+        sources = [src_repo] + [
+            Path(str(e.get("path") or "").strip())
+            for e in (spec.linked_repos or [])]
+        refs_before = {
+            str(p): await asyncio.to_thread(_ref_signature, p) for p in sources}
         work = await asyncio.to_thread(_setup_sandbox, spec, workdir)
+        linked = await asyncio.to_thread(_setup_linked_sandboxes, spec, workdir)
+        # Is the sandbox even testing ITSELF? For a src/ layout the answer can
+        # be no — `import <pkg>` resolves through an editable install pointing
+        # at the ORIGINAL tree — and then the agent's own tests grade code it
+        # never touched, silently. Advisory: a repo may legitimately import an
+        # installed sibling, and a pre-flight must not break the run it
+        # protects. Recorded on the score so the question "was this spec's
+        # feedback loop pointed at the right tree?" is answerable from the
+        # record instead of by archaeology.
+        wrong_tree = await asyncio.to_thread(wrong_tree_imports, work)
+        for problem in wrong_tree:
+            logging.getLogger(__name__).warning(
+                "bench %s: %s", spec.id, problem)
         base_sha = await asyncio.to_thread(_git, work, "rev-parse", "HEAD")
 
         store = await Store(workdir / "bench.db").connect()
@@ -469,7 +609,7 @@ class NorthStarRunner:
             # Supervisor/budget events only exist in this stream; dropping it
             # left the v9 budget-class regression undrillable — whether the
             # 85% wrap-up nudge fired or was ignored was unknowable post hoc.
-            task = _bench_task(spec, work)
+            task = _bench_task(spec, work, linked)
             async with EventPersister(store, task.id) as persister:
                 forward = self._event_sink or (lambda e: None)
 
@@ -494,7 +634,7 @@ class NorthStarRunner:
             # downgrade a completed spec to "crashed" (r1 F2).
             try:
                 event_digest = _digest_events(
-                    await store.list_events(task.id))
+                    await store.list_events(task.id), spec)
             except Exception:  # noqa: BLE001 — telemetry only
                 logging.getLogger(__name__).warning(
                     "event digest harvest failed for %s", spec.id)
@@ -502,14 +642,16 @@ class NorthStarRunner:
         finally:
             await store.close()
 
-        if await asyncio.to_thread(_ref_signature, src_repo) != refs_before:
-            raise RuntimeError(
-                f"SOURCE REPO REFS CHANGED during bench run of {spec.id} — "
-                "push-proofing failed; halt the bench")
+        for p_src, before in refs_before.items():
+            if await asyncio.to_thread(_ref_signature, Path(p_src)) != before:
+                raise RuntimeError(
+                    f"SOURCE REPO REFS CHANGED during bench run of {spec.id} "
+                    f"({p_src}) — push-proofing failed; halt the bench")
 
         return await self._score(spec, outcome, work, base_sha,
                                  attempts, elapsed,
-                                 events=event_digest)
+                                 events=event_digest,
+                                 wrong_tree=wrong_tree)
 
     def _skipped(self, spec: BenchTask, reason: str = "") -> BenchScore:
         orig = spec.original or {}
@@ -542,7 +684,8 @@ class NorthStarRunner:
     async def _score(self, spec: BenchTask, outcome, work: Path,
                      base_sha: str, attempts: list[dict],
                      elapsed: float,
-                     events: list[dict] | None = None) -> BenchScore:
+                     events: list[dict] | None = None,
+                     wrong_tree: list[str] | None = None) -> BenchScore:
         status = outcome.status
         # EVERY registered role, per price class (angle-4 finding: coder-only
         # summation rigged the north-star ratio). The role list is imported,
@@ -562,6 +705,12 @@ class NorthStarRunner:
         orig = spec.original or {}
         toks = orig.get("tokens", {}) or {}
 
+        # Prefix, not append: if the sandbox was not testing itself, that fact
+        # conditions every other number on the row and a reader must meet it
+        # first, not find it after 2000 characters of judge evidence.
+        wrong_tree_note = (
+            "⚠ sandbox did not test itself: " + "; ".join(wrong_tree) + " — "
+            if wrong_tree else "")
         score = BenchScore(
             events=list(events or []),
             task_id=spec.id, title=spec.title, outcome_status=status.value,
@@ -585,13 +734,15 @@ class NorthStarRunner:
         if spec.expect_escalation:
             # Credential-gated task: CORRECT = honest stop, never a faked PR.
             score.goal_satisfied = score.escalated_honestly
-            score.notes = ("honestly escalated as expected" if score.goal_satisfied
-                           else f"expected escalation, got {status.value}")
+            score.notes = wrong_tree_note + (
+                "honestly escalated as expected" if score.goal_satisfied
+                else f"expected escalation, got {status.value}")
             return score
 
         if status not in _GATE_STATES:
             score.goal_satisfied = False
-            score.notes = f"did not reach the human gate ({status.value})"
+            score.notes = (wrong_tree_note
+                           + f"did not reach the human gate ({status.value})")
             return score
 
         # Put the work dir on the coder's PR branch. The orchestrator commits the
@@ -649,10 +800,11 @@ class NorthStarRunner:
             # so this is not a known leak channel — but it is the one remaining
             # free-text field that reaches the tracked report, and "is redaction
             # applied everywhere notes are written" should have one answer.
-            score.notes = redact_local_path(verdict.evidence, spec)[:2000]
+            score.notes = (wrong_tree_note
+                           + redact_local_path(verdict.evidence, spec)[:2000])
         else:
             score.goal_satisfied = score.mergeable in (True, None)
-            score.notes = "no judge injected; holdout-only scoring"
+            score.notes = wrong_tree_note + "no judge injected; holdout-only scoring"
         return score
 
     @staticmethod
