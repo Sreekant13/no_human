@@ -13,6 +13,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import tomllib
 from dataclasses import dataclass, field
@@ -451,6 +452,27 @@ def _fix_invocation(cmd: str, output: str, repo_path: Path) -> str | None:
     # pytest bad flags → strip addopts
     if "pytest" in cmd and "unrecognized arguments" in output:
         return f'pytest -q --override-ini="addopts=" --override-ini="testpaths=" {repo_path}'
+    # bare `pytest` can't import pytest ITSELF → re-run via no_human's own
+    # interpreter, which always has pytest (it's a dependency of ours). This is
+    # deterministic (no PATH guessing) and CANNOT manufacture a false pass: if
+    # the tested project needs deps our interpreter lacks, pytest re-errors with
+    # a DIFFERENT module name, `_is_invocation_error` re-flags it, and the loop
+    # stays at honest "no test evidence". Scoped to a BARE `pytest` — `uv run
+    # pytest ...` manages its own env (a different failure mode) and is left
+    # alone. The needle matches pytest ITSELF or a `pytest_*` plugin being
+    # unimportable — both are safe: a still-missing plugin just re-errors on the
+    # retry → honest "no evidence", never a false pass. A ModuleNotFound naming
+    # some OTHER project dep does not match, so a real project-dep gap stays honest.
+    stripped = cmd.strip()
+    if stripped == "pytest" or stripped.startswith("pytest "):
+        out_lower = output.lower()
+        if (
+            "no module named pytest" in out_lower
+            or "no module named 'pytest'" in out_lower
+            or ("pytest" in out_lower and "command not found" in out_lower)
+        ):
+            rest = stripped[len("pytest"):]
+            return f"{sys.executable} -m pytest{rest}"
     return None
 
 

@@ -392,6 +392,66 @@ def test_fix_invocation_leaves_non_python_and_found_python_alone():
     assert _fix_invocation("node --test", "node: command not found", Path("/tmp")) is None
 
 
+def test_fix_invocation_reruns_bare_pytest_via_our_interpreter(tmp_path):
+    # A bare `pytest` whose only problem is that pytest-the-tool isn't
+    # importable on that PATH is re-run through no_human's own interpreter,
+    # which always has pytest. Args after `pytest` are preserved.
+    import sys
+
+    from no_human.testing.runner import _fix_invocation
+
+    out = "ModuleNotFoundError: No module named 'pytest'"
+    fixed = _fix_invocation("pytest -q", out, tmp_path)
+    assert fixed is not None
+    assert fixed.startswith(sys.executable)
+    assert fixed.endswith("-m pytest -q")
+
+
+def test_fix_invocation_leaves_a_project_dep_gap_honest(tmp_path):
+    # A ModuleNotFoundError naming some OTHER module is a project-dependency
+    # gap, not pytest-the-tool missing — it must NOT be silently swapped, so the
+    # run stays at honest "no test evidence".
+    from no_human.testing.runner import _fix_invocation
+
+    out = "ModuleNotFoundError: No module named 'requests'"
+    assert _fix_invocation("pytest -q", out, tmp_path) is None
+
+
+def test_fix_invocation_does_not_hijack_uv_run_pytest(tmp_path):
+    # `uv run pytest ...` manages its own environment (a different failure
+    # mode) — the bare-pytest rule must not touch it.
+    from no_human.testing.runner import _fix_invocation
+
+    assert _fix_invocation("uv run pytest -q", "No module named pytest", tmp_path) is None
+
+
+def test_run_tests_recovers_evidence_when_only_pytest_was_missing(tmp_path, monkeypatch):
+    # Integration: a bare `pytest` that can't import pytest is retried once via
+    # `sys.executable -m pytest`, which passes — so the run yields real test
+    # evidence (ok, not the advisory invocation_error path).
+    import sys
+
+    import no_human.testing.runner as runner_mod
+
+    calls = []
+
+    def fake_run_shell(cmd, work_dir, timeout, env):
+        calls.append(cmd)
+        if len(calls) == 1:
+            return 1, "ModuleNotFoundError: No module named 'pytest'", False
+        return 0, "1 passed in 0.01s", False
+
+    monkeypatch.setattr(runner_mod, "_run_shell", fake_run_shell)
+
+    result = runner_mod.run_tests(tmp_path, "pytest -q", timeout=3)
+
+    assert len(calls) == 2, ("expected exactly one fixed-command retry", calls)
+    assert calls[1].startswith(sys.executable), calls[1]
+    assert result.ok is True
+    assert result.invocation_error is False
+    assert result.passed == 1
+
+
 def test_venv_bin_finds_repo_python(tmp_path):
     from no_human.testing.runner import _venv_bin
     assert _venv_bin(tmp_path) is None  # no venv yet
