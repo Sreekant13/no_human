@@ -346,6 +346,11 @@ def test_cli_fallbacks_are_windows_shaped(monkeypatch, tmp_path):
     """
     from no_human.agent import backend_check as bc
 
+    # The SDK's bundled CLI wins step 1 and short-circuits before the fallback
+    # list this test exercises. On a real Windows runner that bundled binary is
+    # `claude.exe` and DOES exist, so null the SDK out to reach the fallbacks —
+    # the same isolation `test_posix_cli_resolution_is_unchanged` performs.
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
     monkeypatch.setattr(bc, "_IS_WINDOWS", True)
     monkeypatch.setattr(bc.shutil, "which", lambda _n: None)
     monkeypatch.setattr(bc.Path, "home", staticmethod(lambda: tmp_path))
@@ -362,6 +367,8 @@ def test_cli_fallbacks_cover_the_posix_npm_layout_on_windows(
     """Git-Bash / WSL-style installs put it at `.npm-global/bin/claude.cmd`."""
     from no_human.agent import backend_check as bc
 
+    # Null the SDK so its bundled CLI does not win step 1 (see sibling test).
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
     monkeypatch.setattr(bc, "_IS_WINDOWS", True)
     monkeypatch.setattr(bc.shutil, "which", lambda _n: None)
     monkeypatch.setattr(bc.Path, "home", staticmethod(lambda: tmp_path))
@@ -416,6 +423,9 @@ def test_which_is_asked_for_the_bare_name_on_windows(monkeypatch, tmp_path):
     shim. Asking for "claude.exe" would narrow the search and miss it."""
     from no_human.agent import backend_check as bc
 
+    # Null the SDK so step 1 (bundled CLI) does not answer before `which` is
+    # ever consulted — on a real Windows runner the bundled `claude.exe` exists.
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
     asked: list[str] = []
     monkeypatch.setattr(bc, "_IS_WINDOWS", True)
     monkeypatch.setattr(bc.Path, "home", staticmethod(lambda: tmp_path))
@@ -924,6 +934,15 @@ def test_gitlab_probe_does_not_name_usr_bin_true_on_windows(monkeypatch):
     askpass and fall back to prompting — the anti-hang guard becoming the
     hang."""
     ints = importlib.import_module("no_human.integrations")
+
+    # The probe builds `env = {**os.environ, ...}`, so the assertions below —
+    # "the POSIX branch did not ADD GCM_INTERACTIVE", "the Windows branch did
+    # not inherit GIT_ASKPASS" — only hold against a clean baseline. A real
+    # Windows runner has Git Credential Manager installed and carries an
+    # ambient GCM_INTERACTIVE; strip both so each assertion reflects what the
+    # branch under test sets, not what the host happens to export.
+    monkeypatch.delenv("GCM_INTERACTIVE", raising=False)
+    monkeypatch.delenv("GIT_ASKPASS", raising=False)
 
     captured: dict[str, dict] = {}
 
