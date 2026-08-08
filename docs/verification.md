@@ -167,7 +167,8 @@ hour to review.
   pytest, `npm test` and `mvn`
   ([`DeclarationDeriver`](../src/no_human/onboard.py)); anything else you
   configure by hand. The tamper guard reads Python, JS/TS and Java test files.
-  The reproduction gate is pytest-only.
+  The reproduction gate defaults to pytest and routes other ecosystems through
+  the project profile's `test_cmd`.
 
 ## The merge ban, in code
 

@@ -68,8 +68,9 @@ nh reject <id> --reason "..."        # send it back with feedback
   never a numeric self-score.
 - **A tamper guard.** Deleted tests, new skips, an assertion turned into a
   tautology — blocked before a reviewer token is spent.
-- **Proof the fix fixes something.** The tests offered as evidence must fail at
-  the merge base and pass on the new tree.
+- **Proof the fix fixes something.** For a bug fix, the tests offered as evidence
+  must fail at the merge base and pass on the new tree — the reproduction gate
+  enforces that, and you can require it for every change.
 - **Your tests run**, locally and optionally through your CI.
 - **An honest stop.** When it cannot finish, it parks with one specific question
   instead of inventing a plausible diff.

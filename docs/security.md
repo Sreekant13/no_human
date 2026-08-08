@@ -35,7 +35,8 @@ may live in config; the key never does.
 The orchestrator opens a PR/MR and **stops** at `awaiting_approval`. There is no
 auto-merge anywhere; merge is always a human action. The board's **Approve**
 button records approval and tells you to merge in your git host — it does not
-merge. `approval.auto_merge_on_approval` is hard-wired `false`.
+merge. `approval.auto_merge_on_approval` defaults to `false` and nothing in the
+code reads it, so approval never triggers a merge.
 
 ## 3. Deterministic VCS under a distinct identity
 

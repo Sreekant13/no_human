@@ -449,6 +449,8 @@ RETIRED_CLAIMS = [
     ("no auto-merge setting to find", "false absolute — the auto_merge_on_approval "
      "config key IS findable (recheck: grep -n auto_merge_on_approval "
      "src/no_human/config.py); the honest claim is that no code path acts on it"),
+    ("reproduction gate is pytest-only", "understated — repro_gate.py routes "
+     "non-Python ecosystems through the profile's test_cmd (repro_gate.py:157-169)"),
 ]
 
 
