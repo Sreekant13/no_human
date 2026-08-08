@@ -263,7 +263,45 @@ fi
 # of tool that bakes build paths into binaries. The file:// prefix is also only
 # how pip happens to write it; RECORD-style or compiled-in paths are bare.
 # Verified with planted controls in both forms before being trusted.
-leaked="$(grep -ral -e "file://${HOME}" -e "${HOME}/" "${BUNDLE}" 2>/dev/null || true)"
+#
+# THIRD-PARTY COMPILED EXTENSIONS ARE EXCLUDED FROM THIS SCAN, and here is why.
+# Prebuilt Rust/C wheels from PyPI (pydantic_core, rpds, watchfiles, ...) bake
+# their OWN build machine's cargo source paths into the .so for panic
+# backtraces: e.g. `/Users/runner/.cargo/registry/...` on a macOS wheel,
+# `C:\Users\runneradmin\.cargo\...` on a Windows one. That is a THIRD PARTY's
+# transient CI home, not this maintainer's -- and on a GitHub-hosted runner the
+# current build's own home is ALSO `runneradmin`/`runner`, so `${HOME}/` matches
+# the wheel's baked-in path byte-for-byte and reports a leak that is not one
+# (this turned Windows CI red on 2026-08-08). We compile NONE of these: our own
+# Python is pure and lives in the zlib PYZ, so any compiled extension under
+# _internal that is NOT under our own package (_internal/no_human/) is
+# third-party by construction. The split is DISCOVERED from the tree, never a
+# hardcoded package list.
+#
+# BOTH real leak vectors stay fully scanned. (1) direct_url.json's
+# `file:///Users/<maintainer>/git/<employer>/.../no_human` is a TEXT file in a
+# .dist-info -- never a compiled extension, so it is still scanned (and is the
+# known-positive control for this gate). (2) A maintainer path baked by
+# PyInstaller into our OWN frozen launcher or the PYZ is likewise not a
+# third-party compiled extension, so it is still scanned. Only foreign
+# .so/.dylib/.pyd/.dll binaries are skipped.
+scan_files=()
+while IFS= read -r -d '' f; do
+  case "${f}" in
+    *.so|*.dylib|*.pyd|*.dll)
+      case "${f}" in
+        "${BUNDLE}/_internal/no_human/"*) scan_files+=("${f}") ;;  # ours: keep
+        *) ;;                                                       # third-party binary: skip
+      esac
+      ;;
+    *) scan_files+=("${f}") ;;
+  esac
+done < <(find "${BUNDLE}" -type f -print0)
+
+leaked=""
+if [ "${#scan_files[@]}" -gt 0 ]; then
+  leaked="$(grep -lal -e "file://${HOME}" -e "${HOME}/" "${scan_files[@]}" 2>/dev/null || true)"
+fi
 if [ -n "${leaked}" ]; then
   echo "FAIL: the bundle records this machine's build path (P1: no maintainer trace ships)" >&2
   echo "${leaked}" >&2

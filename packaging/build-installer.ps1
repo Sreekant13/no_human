@@ -191,16 +191,60 @@ if ($priv.Count -gt 0) {
 # forward-slash form and is removed above.
 #
 # The repo root is checked IN ADDITION to the user profile (the macOS script
-# checks only $HOME). A checkout outside the user profile — C:\dev\no_human, a
-# build agent's workspace — leaks a path that a $HOME-only check cannot see.
-$needles = @()
-foreach ($base in @($env:USERPROFILE, $Root)) {
-  if ($base) { $needles += $base; $needles += $base.Replace('\', '/') }
+# checks only $HOME). A checkout outside the user profile - C:\dev\no_human, a
+# build agent's workspace - leaks a path that a $HOME-only check cannot see.
+#
+# TWO needle sets, scanned over DIFFERENT file sets:
+#
+#  * The HOME (USERPROFILE) needle is NOT matched against third-party vendored
+#    compiled extensions. Prebuilt Rust/C wheels (pydantic_core, rpds,
+#    watchfiles, ...) bake their OWN build machine's cargo path into the .pyd
+#    for panic backtraces - on a GitHub-hosted Windows runner that is
+#    `C:\Users\runneradmin\.cargo\...`, and $env:USERPROFILE on THIS runner is
+#    also `C:\Users\runneradmin`, so the needle collides and reports a leak that
+#    is not one (Windows CI red 2026-08-08). We compile none of these; our own
+#    Python is pure and lives in the PYZ, so any compiled extension under
+#    _internal that is NOT under our own package (_internal\no_human\) is
+#    third-party by construction. DISCOVERED from the tree, never enumerated.
+#
+#  * The $Root (current build path) needle STILL scans EVERYTHING, including
+#    nh.exe and the PYZ: PyInstaller can bake the build cwd into the frozen
+#    launcher, and that is a real leak that must stay armed.
+#
+# Both real HOME-leak vectors stay covered: direct_url.json is TEXT in a
+# .dist-info (not a compiled extension), and a maintainer path baked into our
+# own frozen launcher/PYZ is not a third-party compiled extension either.
+$homeNeedles = @()
+if ($env:USERPROFILE) {
+  $homeNeedles += $env:USERPROFILE
+  $homeNeedles += $env:USERPROFILE.Replace('\', '/')
 }
-$needles = $needles | Sort-Object -Unique
+$homeNeedles = $homeNeedles | Sort-Object -Unique
+$rootNeedles = @()
+if ($Root) {
+  $rootNeedles += $Root
+  $rootNeedles += $Root.Replace('\', '/')
+}
+$rootNeedles = $rootNeedles | Sort-Object -Unique
+
+$thirdPartyExt = @('.pyd', '.so', '.dll', '.dylib')
+# Trailing separator so a sibling like `_internal\no_human_helper\` is NOT
+# treated as ours — exact parity with the `.sh` glob `_internal/no_human/`*.
+$ourPkg = (Join-Path $Bundle '_internal\no_human') + [IO.Path]::DirectorySeparatorChar
+
 $leaked = New-Object System.Collections.ArrayList
 foreach ($f in (Get-ChildItem -Path $Bundle -Recurse -File)) {
-  if (Test-FileContainsAny -Path $f.FullName -Needles $needles) { [void]$leaked.Add($f.FullName) }
+  # $Root needle: every file, no exception.
+  if (($rootNeedles.Count -gt 0) -and (Test-FileContainsAny -Path $f.FullName -Needles $rootNeedles)) {
+    [void]$leaked.Add($f.FullName); continue
+  }
+  # HOME needle: skip third-party vendored compiled extensions.
+  $isThirdPartyBinary = ($thirdPartyExt -contains $f.Extension.ToLower()) -and
+                        (-not $f.FullName.StartsWith($ourPkg, [System.StringComparison]::OrdinalIgnoreCase))
+  if ((-not $isThirdPartyBinary) -and ($homeNeedles.Count -gt 0) -and
+      (Test-FileContainsAny -Path $f.FullName -Needles $homeNeedles)) {
+    [void]$leaked.Add($f.FullName)
+  }
 }
 if ($leaked.Count -gt 0) {
   Write-Host "FAIL: the bundle records this machine's build path (P1: no maintainer trace ships)" -ForegroundColor Red
