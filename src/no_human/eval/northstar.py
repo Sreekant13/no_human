@@ -112,6 +112,17 @@ class BenchScore:
         return self.nh_tokens / self.orig_tokens
 
     @property
+    def nh_priced_tokens(self) -> float:
+        """no_human's own price-weighted spend — the numerator side of
+        ``cost_ratio``, exposed on its own so "did this row spend ANYTHING"
+        is asked of the same arithmetic the cost median prices with, never a
+        re-derivation. Every weight is positive, so this is 0.0 IFF every
+        nh token class is zero — a row that burned literally nothing."""
+        return (self.nh_tokens
+                + CACHE_READ_WEIGHT * self.nh_cache_tokens
+                + CACHE_CREATION_WEIGHT * self.nh_cache_creation_tokens)
+
+    @property
     def cost_ratio(self) -> float | None:
         """Price-weighted ratio using Anthropic's cache multipliers
         (fresh=1.0, cache_read=0.1, cache_creation=1.25) applied SYMMETRICALLY
@@ -131,10 +142,7 @@ class BenchScore:
                 + CACHE_CREATION_WEIGHT * self.orig_cache_creation_tokens)
         if orig <= 0:
             return None
-        nh = (self.nh_tokens
-              + CACHE_READ_WEIGHT * self.nh_cache_tokens
-              + CACHE_CREATION_WEIGHT * self.nh_cache_creation_tokens)
-        return nh / orig
+        return self.nh_priced_tokens / orig
 
     def as_dict(self) -> dict[str, Any]:
         return {

@@ -29,6 +29,12 @@ export function selectPublishedRun(bench) {
     trials: bench.trials,
     specs: bench.specs,
     ran_specs: bench.ran_specs,
+    // P0.1: the headline rate divides over the specs that DID PRICED WORK
+    // (deaths excluded), and this pair is that population's own fraction —
+    // dropping it here would silently send the fraction below back to the
+    // pooled pair the headline no longer matches.
+    measured_specs: bench.measured_specs,
+    measured_satisfied: bench.measured_satisfied,
     dead_specs: bench.dead_specs,
     dead_spec_count: bench.dead_spec_count,
     honest_escalations: bench.honest_escalations,
@@ -144,6 +150,17 @@ export function benchSuccessDenominator(card) {
   const { specs, ranSpecs, skippedSpecs, trials } = benchSpecCounts(card);
   if (!ranSpecs) return "";
   if (trials > 1) return ` (over ${ranSpecs} specs × ${trials} trials)`;
+  // P0.1: the percentage in front of this fraction is computed over the specs
+  // that DID PRICED WORK — deaths excluded — so the fraction must be the same
+  // population or it stops reducing to it (a 1-dead card would print 25/53
+  // beside a rate measured over 52). The backend publishes that population's
+  // own pair (`measured_satisfied`/`measured_specs`); at one trial per spec it
+  // reduces to the headline exactly. Cards written before those keys existed
+  // fall back to the ran pair — on such cards the headline itself predates the
+  // measured population, so the pair still matches what stands in front of it.
+  if (fin(card?.measured_satisfied) && fin(card?.measured_specs)) {
+    return formatSuccessFraction(card.measured_satisfied, card.measured_specs, 0);
+  }
   // Through `formatSuccessFraction`, not a second copy of `${a}/${b}`: it owns
   // the rule that the denominator is RAN (total minus skipped) and the rule
   // that a non-finite input omits the fraction rather than printing a wrong

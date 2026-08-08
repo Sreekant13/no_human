@@ -67,6 +67,25 @@ def test_the_v14_shape_is_refused():
     assert any("zero tokens" in r for r in refusals), refusals
 
 
+def test_a_cache_only_run_is_not_refused_as_saturated():
+    """The resumed/attempt-2 shape: every row's burn is cache-read, so
+    nh_tokens == 0 across the whole run while real priced spend is real work.
+    `publish_refusals` must ask the shared did-priced-work predicate — its own
+    inline `not s.nh_tokens` copy (the third one this fix removed) would call
+    this run 100% dead and refuse it as a quota outage it wasn't."""
+    scores = []
+    for i in range(30):
+        s = _score(f"ns-{i}", nh_tokens=0)
+        s.nh_cache_tokens = 200_000
+        scores.append(s)
+    card = _card(scores, label="cache-only")
+    assert all(not s.nh_tokens for s in card.ran), "fixture: zero fresh tokens"
+    assert all(s.nh_priced_tokens for s in card.ran), \
+        "fixture: every row carries real priced spend"
+    assert card.dead_specs == 0
+    assert publish_refusals(card) == []
+
+
 def test_a_one_spec_probe_is_refused():
     """The `--limit 1` health probe that replaced the gate baseline."""
     refusals = publish_refusals(_card([_score("ns-0", nh_tokens=0)]))

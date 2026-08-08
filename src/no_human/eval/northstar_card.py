@@ -169,6 +169,33 @@ def score_succeeded(score: Any) -> bool:
     return bool(_score_field(score, "goal_satisfied"))
 
 
+def score_did_priced_work(score: BenchScore) -> bool:
+    """Did this row spend ANYTHING, priced the way the cost median prices it?
+
+    THE one "did no work" predicate — every consumer (``priced_scores``,
+    ``dead_specs``/``dead_spec_count``, the success denominator, and
+    ``publish_refusals``' saturation rule) asks this function, none re-derives
+    it. It existed as TWO disagreeing rules in this file: ``dead_specs`` gated
+    on raw ``nh_tokens`` while ``priced_scores`` gated on the priced quantity,
+    so a cache-only row (nh_tokens == 0 with real cache-read spend — the
+    normal shape on resumed/attempt-2 runs) was simultaneously REAL WORK to
+    the cost median and DEAD to the death counter.
+
+    Gates on ``nh_priced_tokens`` — the cost median's own numerator — not on
+    any one token class. The weights are all positive, so a row this rejects
+    burned zero of EVERY class: the SDK died before any model call. The
+    baseline half of ``priced_scores`` (``cost_ratio is not None``) is
+    deliberately NOT part of this predicate: a missing ORIGINAL baseline makes
+    a row unpriceABLE, not dead — real work with nothing to divide by.
+
+    ``BenchScore``-only on purpose, unlike ``score_ran``/``score_succeeded``:
+    every consumer holds card scores, and the dict path (``bench_compare``)
+    never asks this question — a dict branch here would be untested code
+    waiting to drift.
+    """
+    return bool(score.nh_priced_tokens)
+
+
 def published_file() -> Path:
     """`latest.json` records the last `bench publish` CALL, clean or
     `--force`d over refusals. This file records only the last CLEAN one
@@ -231,7 +258,38 @@ class NorthStarCard:
         return sum(1 for s in self.ran if score_succeeded(s))
 
     @property
+    def measured_scores(self) -> list[BenchScore]:
+        """Ran rows that did priced work — the success population.
+
+        Three tiers, one exclusion rule applied twice: a SKIP is a decision
+        and never enters ``ran``; a DEATH ran but measured nothing (the SDK
+        died before any model call), so it leaves this list on exactly the
+        same reasoning. What remains is the population every success figure
+        divides over — counting a death as a quality failure makes a quota
+        outage read as a quality regression (run 2: 2 dead of 5 rows was the
+        difference between a reported 20% and a measured 33%)."""
+        return [s for s in self.ran if score_did_priced_work(s)]
+
+    @property
     def success_rate(self) -> float:
+        """Pooled pass rate over the rows that DID PRICED WORK.
+
+        Numerator and denominator over the SAME population: a dead
+        expect-escalation row can carry goal_satisfied=True (the runner scores
+        a pre-model death as escalated-honestly), so counting ``satisfied``
+        (which pools every ran row) over a measured-only denominator could
+        exceed 1.0."""
+        measured = self.measured_scores
+        if not measured:
+            return 0.0
+        return sum(1 for s in measured if score_succeeded(s)) / len(measured)
+
+    @property
+    def success_rate_incl_dead(self) -> float:
+        """The pre-P0.1 pooled rate: every ran row, deaths included. Kept in
+        the aggregate under its own honest name for continuity with older
+        cards — NEVER the headline, because its denominator counts rows that
+        measured nothing."""
         return self.satisfied / len(self.ran) if self.ran else 0.0
 
     # ------------------------- trials (V1) ---------------------------------- #
@@ -254,9 +312,14 @@ class NorthStarCard:
 
     @property
     def per_spec_passes(self) -> dict[str, tuple[int, int]]:
-        """``{task_id: (passes, trials_that_ran)}`` over non-skipped scores."""
+        """``{task_id: (passes, trials_that_measured)}`` over the rows that
+        did priced work — the same population every success figure divides
+        over. A trial whose SDK died before any model call is no observation
+        of the spec, so it adds to neither element; a spec dead in EVERY
+        trial has no entry at all and renders as "— (not measured)", which is
+        what happened, rather than a measured 0/N, which is not."""
         out: dict[str, list[int]] = {}
-        for s in self.ran:
+        for s in self.measured_scores:
             row = out.setdefault(s.task_id, [0, 0])
             row[0] += 1 if score_succeeded(s) else 0
             row[1] += 1
@@ -302,9 +365,16 @@ class NorthStarCard:
         ``spec_mean_success_rate * S`` is ``satisfied`` because each per-spec
         mean is 0 or 1. Every single-trial card therefore prints the interval
         it printed before, to the bit.
+
+        MEASURED rows and specs, not ``ran`` — the same population
+        ``spec_mean_success_rate`` (this interval's centre) is computed over.
+        Counting dead rows here while the point estimate excludes them would
+        put the point and the interval on different populations, the exact
+        two-estimator defect the docstring below records; on a card with no
+        deaths the two pairs are identical.
         """
-        specs = self.ran_spec_count
-        rows = len(self.ran)
+        specs = len(self.per_spec_passes)
+        rows = len(self.measured_scores)
         if specs <= 0:
             return 0.0
         deff = 1.0 + (rows / specs - 1.0) * self.intracluster_correlation
@@ -376,11 +446,14 @@ class NorthStarCard:
         is price-weighted (nh_tokens + 0.1*cache_read + 1.25*cache_creation),
         so a spec can have nh_tokens == 0 yet real cache-read spend and a real
         non-zero cost_ratio — gating on raw nh_tokens would wrongly drop that
-        spec too. ``cost_ratio`` is falsy for both None (no baseline) and 0.0
-        (no_human spent nothing — crashed/skipped/escalated before any model
-        call), and a 0.0 is a non-result, not a cost win, so both are
-        excluded here."""
-        return [s for s in self.ran if s.cost_ratio]
+        spec too. Two exclusions, deliberately separate because they mean
+        different things: no BASELINE (``cost_ratio is None`` — real work,
+        nothing to divide by) and no SPEND (``score_did_priced_work`` false —
+        a non-result, not a cost win). The spend half is the shared predicate
+        ``dead_specs`` counts the complement of; re-testing spend locally is
+        how the two definitions drifted apart in the first place."""
+        return [s for s in self.ran
+                if s.cost_ratio is not None and score_did_priced_work(s)]
 
     @property
     def median_cost_ratio(self) -> float | None:
@@ -392,8 +465,14 @@ class NorthStarCard:
     @property
     def dead_specs(self) -> int:
         """Specs that ran but burned zero tokens — the SDK died before any model
-        call. A skip is a decision and is excluded; this counts deaths only."""
-        return sum(1 for s in self.ran if not s.nh_tokens)
+        call. A skip is a decision and is excluded; this counts deaths only.
+
+        The SAME "did priced work" predicate ``priced_scores`` gates its spend
+        exclusion on — one definition, two consumers. It briefly gated on raw
+        ``nh_tokens`` while the cost median gated on the priced quantity, and
+        a cache-only row (normal on resumed runs, where cache-read dominates)
+        was counted as real work by the median AND as an SDK death here."""
+        return sum(1 for s in self.ran if not score_did_priced_work(s))
 
     @property
     def dead_spec_count(self) -> int:
@@ -404,7 +483,8 @@ class NorthStarCard:
         corpus" needs this one; the refusal fraction deliberately keeps using
         the row count, because there it is rows ÷ rows and asking a different
         question (how saturated was the backend, per attempt)."""
-        return len({s.task_id for s in self.ran if not s.nh_tokens})
+        return len({s.task_id for s in self.ran
+                    if not score_did_priced_work(s)})
 
     @property
     def total_nh_tokens(self) -> int:
@@ -477,6 +557,20 @@ class NorthStarCard:
                 "total": self.total, "skipped": self.skipped,
                 "satisfied": self.satisfied,
                 "success_rate": round(self.success_rate, 4),
+                # The pre-P0.1 pooled rate, deaths still in the denominator —
+                # kept under an honest name so old cards stay comparable, and
+                # so the two rates diverging IS the saturation signal. Never
+                # the headline.
+                "success_rate_incl_dead": round(self.success_rate_incl_dead, 4),
+                # The measured population's own pair, published so no surface
+                # (the report headline, the web Stats fraction) has to
+                # re-derive it from counts that include deaths. Spec-wise
+                # denominator, trial-wise numerator: at one trial per spec the
+                # two axes coincide and the pair IS the headline fraction; the
+                # only surface printing them as a fraction guards trials == 1.
+                "measured_specs": len(self.per_spec_passes),
+                "measured_satisfied": sum(
+                    1 for s in self.measured_scores if score_succeeded(s)),
                 # --- V1: trials & intervals -------------------------------- #
                 # ADDITIVE. Every field above keeps its meaning, so a card
                 # written here still loads into a reader that knows nothing of
@@ -610,11 +704,17 @@ def sample_phrase(card: NorthStarCard) -> str:
       which states a trial count that nothing on the card measured. The one
       thing such a file does know is how many specs it covered.
     """
-    specs = card.ran_spec_count
-    rows = len(card.ran)
+    # MEASURED specs and rows — the population behind the headline and its
+    # interval. A trial whose SDK died before any model call is not an
+    # observation, and an ``n=`` that counted it would claim more data than
+    # the estimator in front of it used. The deaths are not hidden: the report
+    # prints the dead count on its own line, labeled as infrastructure.
+    per = card.per_spec_passes
+    specs = len(per)
+    rows = sum(n for _, n in per.values())
     if card.trials < 1:
         return f"n={specs} specs (trials unrecorded)"
-    counts = {n for _, n in card.per_spec_passes.values()}
+    counts = {n for _, n in per.values()}
     if len(counts) == 1 and counts == {card.trials}:
         return f"n={specs}×{card.trials}={rows}"
     return f"n={rows} trials over {specs} specs"
@@ -767,7 +867,10 @@ def publish_refusals(card: NorthStarCard,
             f"problem, not a result")
         return reasons
 
-    dead = [s for s in ran if not s.nh_tokens]
+    # The card's own death notion (shared "did priced work" predicate), not a
+    # locally re-derived zero-token test — a third copy of the rule is exactly
+    # how dead_specs and priced_scores came to disagree.
+    dead = [s for s in ran if not score_did_priced_work(s)]
     if len(dead) / len(ran) > MAX_DEAD_FRACTION:
         reasons.append(
             f"{len(dead)}/{len(ran)} specs burned zero tokens "
@@ -1087,18 +1190,25 @@ def render_northstar_md(card: NorthStarCard,
         "## Headline",
         "",
         # The headline is the CI string, never a bare percentage (V1). The raw
-        # satisfied/ran pair stays in front of it — an interval is not a
-        # substitute for the counts it was computed from — but the number a
-        # reader quotes is now inseparable from its precision.
+        # fraction stays in front of it — an interval is not a substitute for
+        # the counts it was computed from — but it is the MEASURED pair
+        # (passes over rows that did priced work), the same population the
+        # headline divides over: the dead-specs line below promises deaths
+        # "are EXCLUDED from the success figures above", and a pooled
+        # satisfied/ran pair here made that sentence false on any
+        # dead-carrying card. The ran count (deaths included) stays on the
+        # line, labeled as what it is, so nothing is hidden by the move.
         #
         # The UNIT is named above one trial. That pair counts ROWS, so under
         # `--trials 20` it reads "220/221" — 99.5% — beside a headline of
         # 91.7%, and a reader with no unit on either has no way to tell that
         # they are answering different questions (how many replays passed, vs
         # how much of the corpus the agent can do). Naming it costs a word.
-        f"- **Success (goal satisfied, unattended): {agg['satisfied']}/"
-        f"{agg['total'] - agg['skipped']}"
-        f"{' trials' if card.trials > 1 else ''} ran — {success_headline(card)}**"
+        f"- **Success (goal satisfied, unattended): {agg['measured_satisfied']}/"
+        f"{agg['total'] - agg['skipped'] - agg['dead_specs']}"
+        f"{' trials' if card.trials > 1 else ''} measured — "
+        f"{success_headline(card)}**"
+        f"  ·  of {agg['total'] - agg['skipped']} ran ({agg['dead_specs']} dead)"
         # "non-runnable" was true when EVERY skip came from spec.runnable=False,
         # decided at generation time. The dominant skip is now "repo missing at
         # run time" — the instrument breaking, not a spec that was never
@@ -1144,7 +1254,13 @@ def render_northstar_md(card: NorthStarCard,
         # and a silent omission when not.
         f"- Specs that ran but burned zero tokens (backend died before any "
         f"model call): **{agg['dead_specs']}** of {agg['total'] - agg['skipped']}"
-        + ("  ⚠ read every figure here with that in mind"
+        + ("  ⚠ a death is an infrastructure failure, not a quality verdict, "
+           "so these rows are EXCLUDED from the success figures above (the "
+           "rate with them still in the denominator is recorded as "
+           "`success_rate_incl_dead`) — read every figure here with that in "
+           "mind. `success_rate_incl_dead` exists precisely so the two rates' "
+           "divergence stays visible to a reader; nothing gates on it — a "
+           "saturated run is caught by the publish refusals, not by this line."
            if agg['dead_specs'] else ""),
         f"- **Original-session follow-ups avoided on DELIVERED tasks: "
         f"{agg['corrections_avoided_delivered']}** (proxy for corrections)"

@@ -114,6 +114,159 @@ def test_median_cost_ratio_is_none_when_every_spec_did_zero_work():
     assert card.median_cost_ratio is None
 
 
+def test_a_cache_only_spec_is_not_dead():
+    """A spec with nh_tokens == 0 but real cache-read spend did REAL WORK —
+    the cost median already counts it (`priced_scores` gates on the priced
+    quantity), so the death counter must not simultaneously call it an SDK
+    death. This is the normal shape on resumed/attempt-2 runs, where
+    cache-read dominates the burn."""
+    cache_only = _score(task_id="cache-only", satisfied=True, nh=0,
+                        nh_cache_tokens=500_000,
+                        nh_cache_creation_tokens=0, orig=1000)
+    # The exact empirical shape of the defect: priced spend 50_000 (0.1 ×
+    # 500k) over a 1_000-token original — counted by the cost median at 50.0
+    # AND counted dead by the old `not s.nh_tokens` predicate.
+    assert cache_only.cost_ratio == 50.0
+    failed = _score(task_id="failed", satisfied=False)
+    card = NorthStarCard(scores=[cache_only, failed])
+    assert card.dead_specs == 0
+    assert card.dead_spec_count == 0
+    # ...and it counts in the success denominator: 1 pass over the 2 rows
+    # that did priced work, on BOTH estimators.
+    assert card.success_rate == 0.5
+    assert card.spec_mean_success_rate == 0.5
+
+
+def test_a_creation_only_spec_is_not_dead():
+    """Cache CREATION is priced spend too (1.25×, the most expensive class).
+    The predicate must gate on the full priced quantity — a rewrite that sums
+    only nh_tokens + cache_read (dropping the creation term) survives every
+    cache-only test, because those rows carry read spend as well. A row whose
+    ONLY spend is cache creation is the case that tells them apart."""
+    creation_only = _score(task_id="creation-only", satisfied=True, nh=0,
+                           nh_cache_tokens=0, nh_cache_creation_tokens=400,
+                           orig=1000)
+    assert creation_only.nh_tokens == 0 and creation_only.nh_cache_tokens == 0
+    assert creation_only.cost_ratio == 0.5          # 1.25 × 400 / 1000
+    other = _score(task_id="other", satisfied=False)
+    card = NorthStarCard(scores=[creation_only, other])
+    assert card.dead_specs == 0
+    assert card.dead_spec_count == 0
+    assert creation_only in card.measured_scores
+    assert card.success_rate == 0.5
+
+
+def test_success_rate_cannot_exceed_one_when_a_dead_row_is_satisfied():
+    """The runner scores a pre-model death on an expect-escalation spec as
+    escalated-honestly, which arrives here as goal_satisfied=True — so the
+    POOLED numerator (`satisfied`) counts rows the measured denominator
+    excludes. Numerator and denominator must come from the same population:
+    pairing `self.satisfied` with the measured denominator yields 2.0 on this
+    card, a rate no probability admits."""
+    failed = _score(task_id="f", satisfied=False)
+    dead_gated = [
+        _score(task_id=f"dg{i}", satisfied=True, status="escalated",
+               expected_escalation=True, nh=0, nh_cache_tokens=0,
+               nh_cache_creation_tokens=0)
+        for i in range(2)
+    ]
+    card = NorthStarCard(scores=[failed] + dead_gated)
+    assert card.satisfied == 2                  # pooled: counts the dead pair
+    assert card.measured_scores == [failed]     # they did no priced work
+    # The hazard, stated as arithmetic: the mutant's value on this card.
+    assert card.satisfied / len(card.measured_scores) == 2.0
+    assert card.success_rate == 0.0             # 0 passes of 1 measured
+    assert card.success_rate <= 1.0
+    measured = card.measured_scores
+    assert card.success_rate == (
+        sum(1 for s in measured if s.goal_satisfied) / len(measured))
+
+
+def test_the_printed_success_fraction_counts_the_measured_population():
+    """The report's Success bullet prints a raw fraction in front of the
+    headline percentage, and the dead-specs line below promises deaths "are
+    EXCLUDED from the success figures above". Printing the POOLED pair there
+    (satisfied over every ran row) makes that sentence false on any
+    dead-carrying card — the fraction must divide over the same measured
+    population the headline does, with the ran count and the death count
+    still on the line, labeled as what they are."""
+    alive_pass = _score(task_id="ap", satisfied=True)
+    alive_fail = _score(task_id="af", satisfied=False)
+    dead = _score(task_id="dd", satisfied=False, nh=0, nh_cache_tokens=0,
+                  nh_cache_creation_tokens=0)
+    card = NorthStarCard(label="x", created_at="2026-08-08",
+                         scores=[alive_pass, alive_fail, dead])
+    assert card.spec_mean_success_rate == 0.5   # the headline's own value
+    md = render_northstar_md(card)
+    line = next(ln for ln in md.splitlines()
+                if "Success (goal satisfied" in ln)
+    # The fraction reduces to the percentage standing behind it: 1/2, not 1/3.
+    assert "1/2 measured" in line, line
+    assert "1/3" not in line, line
+    # The death is not hidden — the ran population is on the line, labeled.
+    assert "of 3 ran (1 dead)" in line, line
+
+
+def test_quota_deaths_are_excluded_from_the_success_denominator():
+    """A spec whose SDK died before any model call produced no measurement —
+    counting it as a quality failure makes a quota outage read as a quality
+    regression. A death leaves the success denominator the same way a skip
+    already does; the pre-fix pooled rate survives, clearly named, never the
+    headline."""
+    scores = [
+        _score(task_id="a", satisfied=True),
+        _score(task_id="b", satisfied=False),
+        _score(task_id="c", satisfied=False, nh=0, nh_cache_tokens=0,
+               nh_cache_creation_tokens=0),
+        _score(task_id="d", satisfied=False, nh=0, nh_cache_tokens=0,
+               nh_cache_creation_tokens=0),
+        # A skip is a DECISION, not a death: it is excluded from `ran`
+        # already, so it must move neither rate nor the death count.
+        _score(task_id="e", status="skipped", satisfied=None, nh=0,
+               nh_cache_tokens=0, nh_cache_creation_tokens=0),
+    ]
+    card = NorthStarCard(scores=scores)
+    assert card.dead_specs == 2
+    assert card.success_rate == 0.5                 # 1 of the 2 that worked
+    assert card.success_rate_incl_dead == 0.25      # kept, named, not headline
+    agg = card.as_dict()["aggregate"]
+    assert agg["success_rate"] == 0.5
+    assert agg["success_rate_incl_dead"] == 0.25
+
+
+def test_the_dead_definition_matches_the_priced_definition():
+    """THE one-definition guard. `dead_specs` and `priced_scores` used to hold
+    two disagreeing notions of "did no work" (raw nh_tokens vs the priced
+    quantity), so a cache-only spec was simultaneously real work to the cost
+    median and dead to the death counter. Over every combination of the three
+    nh-side token classes, a row must be dead IFF the priced population
+    excludes it — re-deriving either side breaks this by name."""
+    grid = [0, 1, 40_000]
+    for nh in grid:
+        for cache in grid:
+            for creation in grid:
+                s = _score(task_id="g", nh=nh, nh_cache_tokens=cache,
+                           nh_cache_creation_tokens=creation, orig=1000)
+                card = NorthStarCard(scores=[s])
+                dead = card.dead_specs == 1
+                excluded = card.priced_scores == []
+                assert dead == excluded, (nh, cache, creation, dead, excluded)
+    # Control, deliberately OUTSIDE the grid: a missing BASELINE (orig side,
+    # cost_ratio None) makes a row unpriceABLE, not dead. `priced_scores`
+    # excludes it — there is no ratio to median — but its real spend keeps it
+    # out of the death count and inside the success denominator.
+    # `test_bench_task` pins the same fact end-to-end (dead_specs == 0 on
+    # baseline-less runs), so folding "no baseline" into "dead" cannot pass
+    # the suite either.
+    no_baseline = _score(task_id="nb", nh=500, nh_cache_tokens=0,
+                         nh_cache_creation_tokens=0, orig=0)
+    nb_card = NorthStarCard(scores=[no_baseline])
+    assert no_baseline.cost_ratio is None
+    assert nb_card.priced_scores == []
+    assert nb_card.dead_specs == 0
+    assert nb_card.success_rate == 1.0
+
+
 def test_priced_denominator_matches_the_medians_population():
     """The report's 'over the N ran spec(s)' denominator must count the same
     population median_cost_ratio is computed over — not every spec that
@@ -301,12 +454,21 @@ def test_gate_blocks_when_most_of_the_corpus_went_unmeasured():
 
 def test_gate_counts_dead_specs_as_unmeasured_too():
     """A spec that RAN but burned zero tokens measured nothing either — the
-    backend died before any model call. Same tolerance, same verdict."""
+    backend died before any model call. Same tolerance, same verdict.
+
+    Zero tokens of EVERY class: the fixture used to zero only `nh` and leak
+    the helper's cache defaults, which made these rows the cache-only shape
+    (real priced spend) and silently pinned the raw-nh_tokens predicate the
+    one-definition fix removed. Dead means zero priced spend, so the fixture
+    must actually burn nothing."""
     prev = NorthStarCard(label="baseline",
                          scores=[_score(task_id=f"p{i}") for i in range(4)])
+    dead_rows = [_score(task_id=f"d{i}", nh=0, nh_cache_tokens=0,
+                        nh_cache_creation_tokens=0) for i in range(2)]
+    assert all(not s.nh_priced_tokens for s in dead_rows), \
+        "fixture rows must burn zero PRICED tokens to be deaths"
     cur = NorthStarCard(label="saturated", scores=[
-        _score(task_id="c1"), _score(task_id="c2")] + [
-        _score(task_id=f"d{i}", nh=0) for i in range(2)])   # ran, zero tokens
+        _score(task_id="c1"), _score(task_id="c2")] + dead_rows)
     assert len(cur.ran) == len(prev.ran)          # narrowing rule cannot fire
     g = northstar_gate(cur, prev)
     assert not g.passed

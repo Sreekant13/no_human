@@ -35,6 +35,10 @@ test("published baseline yields the trusted figures", () => {
     trials: undefined,
     specs: undefined,
     ran_specs: undefined,
+    // P0.1: the measured population's own fraction (deaths excluded) —
+    // undefined on this pre-P0.1 fixture, carried when the backend sends it.
+    measured_specs: undefined,
+    measured_satisfied: undefined,
     dead_specs: undefined,
     dead_spec_count: undefined,
   });
@@ -72,6 +76,45 @@ test("success fraction is over RAN specs, not loaded total (v13 pin)", () => {
   assert.equal(row.skipped, 3);
   const pct = Math.round(row.success_rate * 100);
   assert.equal(`${pct}%${formatSuccessFraction(row.satisfied, row.total, row.skipped)}`, "47% (25/53)");
+});
+
+// P0.1: on a dead-carrying card the headline rate is measured over the specs
+// that did priced work, so the fraction beside it must reduce to that
+// percentage — the pooled pair (satisfied over every ran row) no longer does.
+test("the success fraction reduces to the headline on a dead-carrying card", () => {
+  // 5 rows ran, 1 died before any model call: 4 measured, 2 passed → 50%.
+  const deadRun = {
+    ...publishedBaseline,
+    total: 5, skipped: 0, satisfied: 2, dead_specs: 1, dead_spec_count: 1,
+    trials: 1, specs: 5, ran_specs: 5,
+    measured_specs: 4, measured_satisfied: 2,
+    success_rate: 0.5, spec_mean_success_rate: 0.5,
+    success_ci_low: 0.15, success_ci_high: 0.85,
+  };
+  const row = selectPublishedRun(deadRun);
+  // The whitelist carries the measured pair — dropping either key silently
+  // reverts the fraction to the pooled pair on the "last published" row.
+  assert.equal(row.measured_specs, 4);
+  assert.equal(row.measured_satisfied, 2);
+  const fraction = benchSuccessDenominator(row);
+  assert.equal(fraction, " (2/4)");
+  // The reduction the test is named for: 2/4 IS the 50% in front of it…
+  assert.equal(row.measured_satisfied / row.measured_specs,
+               row.spec_mean_success_rate);
+  // …whereas the pooled pair (2/5 = 40%) is NOT, which is why it must not be
+  // what renders beside the headline.
+  assert.notEqual(fraction, " (2/5)");
+  assert.notEqual(row.satisfied / (row.total - row.skipped),
+                  row.spec_mean_success_rate);
+});
+
+// An older card (no measured_* keys) keeps the pre-P0.1 pair — where the
+// headline itself was computed over ran, so the pair still matches it.
+test("a card without measured keys falls back to the ran pair", () => {
+  const legacy = { ...publishedBaseline, total: 56, skipped: 3, satisfied: 25,
+    measured_specs: undefined, measured_satisfied: undefined };
+  const row = selectPublishedRun(legacy);
+  assert.equal(benchSuccessDenominator(row), " (25/53)");
 });
 
 test("success fraction is omitted (not wrong) when skipped is unknown", () => {

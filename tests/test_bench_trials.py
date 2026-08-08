@@ -772,7 +772,10 @@ def test_the_resumed_12_spec_run_the_reviewer_drove_through_the_real_publish(
     assert "n=221 trials over 12 specs" in text
     # ...and the raw pair in front of the headline names its unit, so "220/221"
     # (99.5% of TRIALS) cannot be read as the corpus figure beside it (91.7%).
-    assert "220/221 trials ran" in text, \
+    # "measured", not "ran", since P0.1: the pair divides over the rows that
+    # did priced work (identical here — nothing died), and the unit is still
+    # named, which is what this assertion exists to hold.
+    assert "220/221 trials measured" in text, \
         next(ln for ln in text.splitlines() if "Success (goal" in ln)
 
 
