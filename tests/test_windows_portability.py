@@ -50,6 +50,17 @@ _ICACLS_OWNER_ONLY = (
     "\n"
     "Successfully processed 1 files; Failed processing 0 files\n"
 )
+# Owner + SYSTEM + Administrators + a genuinely OTHER account. SYSTEM and the
+# local Administrators group are the platform TCB (POSIX root's analog, which
+# 0600 also cannot exclude) and are accepted; only BUILTIN\Users is a defect.
+_ICACLS_OTHER_USER = (
+    "{path} NT AUTHORITY\\SYSTEM:(F)\n"
+    "        BUILTIN\\Administrators:(F)\n"
+    "        CORP\\alice:(R,W)\n"
+    "        BUILTIN\\Users:(RX)\n"
+    "\n"
+    "Successfully processed 1 files; Failed processing 0 files\n"
+)
 
 
 class _FakeIcacls:
@@ -147,20 +158,56 @@ def test_atomic_write_0600_windows_refuses_when_icacls_is_absent(
 def test_atomic_write_0600_windows_refuses_when_others_retain_access(
     tmp_path, monkeypatch, as_windows
 ):
-    """A grant that reports success but leaves other principals ⇒ refuse.
+    """A grant that leaves a NON-TCB, non-owner account ⇒ refuse, and name it.
 
-    `icacls` exiting 0 is not evidence: this is the readback catching a grant
-    that did not take, which is the same class of failure as the chmod no-op.
+    `icacls` exiting 0 is not evidence: this is the readback catching a file
+    another standard user can still reach. SYSTEM and Administrators (the
+    platform TCB) alongside it are accepted and must NOT be blamed.
     """
-    fake = _FakeIcacls(_ICACLS_SHARED)
+    fake = _FakeIcacls(_ICACLS_OTHER_USER)
     monkeypatch.setattr(cfg, "_run_icacls", fake)
     target = tmp_path / ".env"
     with pytest.raises(cfg.CredentialPermissionError) as exc:
         cfg.atomic_write_0600(target, "CLAUDE_CODE_OAUTH_TOKEN=sk-tok\n")
     msg = str(exc.value)
-    assert "NT AUTHORITY\\SYSTEM" in msg and "BUILTIN\\Administrators" in msg
-    assert "CORP\\alice" not in msg.split("readable by")[1].split(".")[0]
+    readable = msg.split("readable by")[1].split(".")[0]
+    assert "BUILTIN\\Users" in readable
+    assert "NT AUTHORITY\\SYSTEM" not in readable
+    assert "BUILTIN\\Administrators" not in readable
+    assert "CORP\\alice" not in readable
     assert not target.exists()
+
+
+def test_atomic_write_0600_windows_accepts_tcb_and_owner(
+    tmp_path, monkeypatch, as_windows
+):
+    """Owner + SYSTEM + Administrators is the common secured state on an
+    admin-owned file (the CI runner's), and must be WRITTEN, not refused."""
+    fake = _FakeIcacls(_ICACLS_SHARED)
+    monkeypatch.setattr(cfg, "_run_icacls", fake)
+    target = tmp_path / ".env"
+    cfg.atomic_write_0600(target, "CLAUDE_CODE_OAUTH_TOKEN=sk-tok\n")
+    assert target.read_text() == "CLAUDE_CODE_OAUTH_TOKEN=sk-tok\n"
+
+
+def test_non_owner_grantees_accepts_tcb_flags_others():
+    """The readback filter, directly: TCB accepted, any other account flagged."""
+    grantees = {"CORP\\alice", "NT AUTHORITY\\SYSTEM",
+                "BUILTIN\\Administrators", "BUILTIN\\Users"}
+    assert cfg._non_owner_grantees(grantees, "CORP\\alice") == {"BUILTIN\\Users"}
+    assert cfg._non_owner_grantees(
+        {"CORP\\alice", "NT AUTHORITY\\SYSTEM", "BUILTIN\\Administrators"},
+        "CORP\\alice") == set()
+
+
+def test_is_windows_tcb_principal_names_and_sids():
+    """SYSTEM and Administrators by localized name AND well-known SID; nobody
+    else — icacls prints a raw SID when it cannot resolve a name."""
+    for g in ("NT AUTHORITY\\SYSTEM", "builtin\\administrators",
+              "S-1-5-18", "*S-1-5-32-544"):
+        assert cfg._is_windows_tcb_principal(g), g
+    for g in ("BUILTIN\\Users", "Everyone", "CORP\\bob", "S-1-5-11"):
+        assert not cfg._is_windows_tcb_principal(g), g
 
 
 def test_atomic_write_0600_windows_refuses_when_grant_fails(

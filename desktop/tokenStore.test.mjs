@@ -11,7 +11,8 @@ import { execFileSync } from "node:child_process";
 
 import {
   CredentialPermissionError,
-  TOKEN_KEY, configuredProfile, envPath, hasToken, icaclsGrantees, parseEnv,
+  TOKEN_KEY, configuredProfile, envPath, hasToken, icaclsGrantees,
+  isWindowsTcbPrincipal, nonOwnerGrantees, parseEnv,
   tokenVarFor, validateToken, windowsOwnerPrincipal, writeToken,
 } from "./tokenStore.mjs";
 
@@ -50,10 +51,12 @@ const home = () => mkdtempSync(join(tmpdir(), "nhhome-"));
  * readonly attribute, whatever the ACL says — so on Windows it was testing a
  * number the OS does not model rather than the property anyone cares about.
  *
- * So the PROPERTY is asserted per platform, and the Windows form is strictly
- * STRONGER than the mode check it replaces: it reads the real ACL back and
- * demands exactly one grantee. That is what caught the original defect, where
- * a freshly written .env was inherited by SYSTEM and BUILTIN\Administrators.
+ * So the PROPERTY is asserted per platform, and the Windows form reads the real
+ * ACL back. The owner must be present, and NO principal outside the platform
+ * TCB (SYSTEM + the local Administrators group — POSIX root's analog, which the
+ * POSIX branch's 0600 also cannot exclude) may appear. That still catches the
+ * original defect — a .env inherited by *other* accounts — while accepting the
+ * TCB, which is unavoidable on an admin-owned file (the CI runner's case).
  */
 function assertOwnerOnly(p) {
   if (process.platform !== "win32") {
@@ -61,11 +64,52 @@ function assertOwnerOnly(p) {
     return;
   }
   const out = execFileSync("icacls", [p], { encoding: "utf8", windowsHide: true });
-  const got = [...icaclsGrantees(out, p)].map((g) => g.toLowerCase()).sort();
-  const want = [windowsOwnerPrincipal().toLowerCase()];
-  assert.deepEqual(got, want,
-    `${p} must grant its owner and nobody else, got: ${got.join(", ")}`);
+  const grantees = icaclsGrantees(out, p);
+  const owner = windowsOwnerPrincipal();
+  const got = [...grantees].map((g) => g.toLowerCase()).sort();
+  assert.ok(got.includes(owner.toLowerCase()),
+    `${p} must grant its owner, got: ${got.join(", ")}`);
+  const extra = nonOwnerGrantees(grantees, owner);
+  assert.deepEqual(extra, [],
+    `${p} must grant only its owner and the platform TCB, but also grants: `
+    + extra.join(", "));
 }
+
+// The readback filter, tested directly (the real icacls path is Windows-only).
+// SYSTEM and the local Administrators group are the platform TCB and accepted;
+// any OTHER non-owner account is the fail-closed signal that protects a
+// non-admin user's credential.
+test("nonOwnerGrantees: accepts owner + TCB, flags any other account", () => {
+  const readback =
+    "C:\\Users\\alice\\.no_human\\.env CORP\\alice:(R,W)\n"
+    + "        NT AUTHORITY\\SYSTEM:(F)\n"
+    + "        BUILTIN\\Administrators:(F)\n"
+    + "        BUILTIN\\Users:(RX)\n"
+    + "\nSuccessfully processed 1 files; Failed processing 0 files\n";
+  const grantees = icaclsGrantees(readback, "C:\\Users\\alice\\.no_human\\.env");
+  assert.deepEqual([...grantees].sort(), [
+    "BUILTIN\\Administrators", "BUILTIN\\Users",
+    "CORP\\alice", "NT AUTHORITY\\SYSTEM",
+  ]);
+  // SYSTEM and Administrators are accepted (owner too); only Users survives.
+  assert.deepEqual(nonOwnerGrantees(grantees, "CORP\\alice"), ["BUILTIN\\Users"]);
+  // Owner + TCB alone ⇒ nothing flagged.
+  assert.deepEqual(
+    nonOwnerGrantees(
+      new Set(["CORP\\alice", "NT AUTHORITY\\SYSTEM", "BUILTIN\\Administrators"]),
+      "CORP\\alice"),
+    []);
+});
+
+test("isWindowsTcbPrincipal: names and well-known SIDs, not other accounts", () => {
+  for (const g of ["NT AUTHORITY\\SYSTEM", "builtin\\administrators",
+                   "S-1-5-18", "*S-1-5-32-544"]) {
+    assert.ok(isWindowsTcbPrincipal(g), `${g} is the platform TCB`);
+  }
+  for (const g of ["BUILTIN\\Users", "Everyone", "CORP\\bob", "S-1-5-11"]) {
+    assert.ok(!isWindowsTcbPrincipal(g), `${g} must NOT be accepted`);
+  }
+});
 
 test("hasToken: the .env file wins, then process env, else false", () => {
   const h = home();

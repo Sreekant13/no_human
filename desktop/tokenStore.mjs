@@ -117,6 +117,50 @@ function runIcacls(args) {
   }
 }
 
+/**
+ * The Windows Trusted Computing Base: SYSTEM and the local Administrators
+ * group. These are the platform's root-equivalent — the exact analog of POSIX
+ * `root`, which this module's own POSIX branch (`fs.chmodSync(p, 0o600)`)
+ * leaves with full access and cannot exclude. Any local administrator can
+ * already read this file, take ownership of it, or run as SYSTEM to reach it
+ * regardless of its ACL, so treating them as forbidden is BOTH impossible on an
+ * admin-owned file — the common case, since the primary account on most
+ * personal Windows installs is a local admin, and files it creates carry
+ * EXPLICIT Administrators/SYSTEM ACEs that `/inheritance:r` does not strip —
+ * AND stricter than the POSIX contract this module mirrors. Accepting them
+ * realigns Windows with that contract. The readback STILL flags every OTHER
+ * principal (Users, Everyone, a specific non-owner account); that is the real
+ * protection for a non-admin user and it is unchanged.
+ *
+ * Matched by the localized names an en-US readback emits AND by the well-known
+ * SIDs, since icacls prints a raw SID when it cannot resolve a name. A
+ * non-English Windows emits localized display names not listed here; those fall
+ * through to the throw, which names the surviving principal, so an incomplete
+ * allowlist is self-reporting on the next run rather than a silent weakening.
+ */
+const WINDOWS_TCB_NAMES = new Set([
+  "nt authority\\system",
+  "builtin\\administrators",
+]);
+const WINDOWS_TCB_SIDS = new Set(["s-1-5-18", "s-1-5-32-544"]);
+
+export function isWindowsTcbPrincipal(grantee) {
+  const g = String(grantee || "").replace(/^\*/, "").trim().toLowerCase();
+  return WINDOWS_TCB_NAMES.has(g) || WINDOWS_TCB_SIDS.has(g);
+}
+
+/**
+ * The grantees on a readback that are neither the owner nor the Windows TCB —
+ * i.e. some OTHER account can reach the credential. A non-empty result is the
+ * fail-closed signal. Case-insensitive: Windows account names are, and a case
+ * difference would otherwise fail closed on a correctly secured file.
+ */
+export function nonOwnerGrantees(grantees, principal) {
+  const owner = String(principal || "").toLowerCase();
+  return [...grantees].filter(
+    (g) => g.toLowerCase() !== owner && !isWindowsTcbPrincipal(g));
+}
+
 /** Replace *p*'s ACL with an owner-only one, then VERIFY the result. */
 export function windowsRestrictToOwner(p, { directory = false } = {}) {
   const principal = windowsOwnerPrincipal();
@@ -142,10 +186,10 @@ export function windowsRestrictToOwner(p, { directory = false } = {}) {
       `cannot verify permissions on ${p}: icacls listed no grantees, so the `
       + "restriction cannot be confirmed to have taken effect.");
   }
-  // Case-insensitive: Windows account names are, and a case difference would
-  // otherwise fail closed on a correctly secured file.
-  const extra = [...grantees].filter(
-    (g) => g.toLowerCase() !== principal.toLowerCase());
+  // SYSTEM and the local Administrators group are the platform TCB and are
+  // accepted (see nonOwnerGrantees / WINDOWS_TCB_*); any OTHER non-owner
+  // grantee is the fail-closed signal.
+  const extra = nonOwnerGrantees(grantees, principal);
   if (extra.length) {
     throw new CredentialPermissionError(
       `refusing to write a credential to ${p}: it is still readable by `

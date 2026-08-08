@@ -338,24 +338,59 @@ test("THROW SITE: an ACL listing NO grantees cannot confirm the restriction",
     }
   });
 
-test("THROW SITE: a surviving SYSTEM/Administrators ACE is the original defect",
+test("SYSTEM + Administrators + owner is ACCEPTED — they are the platform TCB",
   skipOnRealWindows, () => {
+    // What a correctly-secured file looks like when the OWNER is a local admin
+    // (the common case, and the CI runner's): /inheritance:r cannot strip the
+    // EXPLICIT Administrators/SYSTEM ACEs an admin-owned file carries. These are
+    // POSIX root's analog — the 0600 POSIX branch leaves root with access too —
+    // so accepting them realigns Windows with the contract this module mirrors.
     const f = path.join(home(), "creds");
     fs.writeFileSync(f, "");
-    // Exactly what the bug report measured on a real box: the inherited ACL.
     const fake = fakeIcacls({ readBody: [
       aclLine(f, "NT AUTHORITY\\SYSTEM"),
       "BUILTIN\\Administrators:(I)(F)",
       "tessa:(I)(F)",
     ].join("\n") });
     try {
+      assert.doesNotThrow(() => windowsRestrictToOwner(f),
+        "SYSTEM and the local Administrators group are the platform TCB; "
+        + "excluding them is impossible on an admin-owned file and stricter "
+        + "than the POSIX 0600 contract this mirrors");
+    } finally {
+      fake.restore();
+    }
+  });
+
+test("THROW SITE: a surviving NON-TCB account is refused, and named",
+  skipOnRealWindows, () => {
+    // The real guarantee for a NON-admin user: any other account that can still
+    // reach the credential is the fail-closed signal. TCB principals alongside
+    // it are accepted and must NOT be blamed in the message.
+    const f = path.join(home(), "creds");
+    fs.writeFileSync(f, "");
+    const fake = fakeIcacls({ readBody: [
+      aclLine(f, "NT AUTHORITY\\SYSTEM"),
+      "BUILTIN\\Administrators:(I)(F)",
+      "tessa:(I)(F)",
+      "BUILTIN\\Users:(RX)",          // a genuinely other principal
+    ].join("\n") });
+    try {
       assert.throws(() => windowsRestrictToOwner(f),
-        (err) => err instanceof CredentialPermissionError
-          && /still readable by/.test(err.message)
-          && /BUILTIN\\Administrators/.test(err.message)
-          && /NT AUTHORITY\\SYSTEM/.test(err.message),
-        "this is THE defect: the token readable by every administrator while "
-        + "the module reported it had written a private file");
+        (err) => {
+          if (!(err instanceof CredentialPermissionError)) return false;
+          // The owner legitimately appears in the "Fix the ACL with: icacls …
+          // /grant:r <owner>" hint, so only the "readable by …" segment names
+          // culprits. The TCB and the owner must not be blamed there.
+          const readable = err.message.split("readable by")[1]?.split(". ")[0] ?? "";
+          return /BUILTIN\\Users/.test(readable)
+            && !/BUILTIN\\Administrators/.test(readable)
+            && !/NT AUTHORITY\\SYSTEM/.test(readable)
+            && !/tessa/.test(readable);
+        },
+        "a non-owner, non-TCB account on the credential is THE defect: the "
+        + "token readable by another standard user while the module reports a "
+        + "private file. The TCB and the owner must not be named as culprits");
     } finally {
       fake.restore();
     }

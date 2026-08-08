@@ -112,10 +112,46 @@ CODEX_ALTERNATE_ROUTING_VARS = (
 # Windows branches are reachable (and therefore testable) from any platform.
 _IS_WINDOWS = os.name == "nt"
 
-# The one ACE we allow on a credential file, besides the owner's own.
-# ``icacls /inheritance:r /grant:r <user>:(R,W)`` leaves exactly one grantee, so
-# anything else in the readback means the restriction did not take.
 _ICACLS_OK_TAIL = ("Successfully processed", "Failed processing")
+
+# The Windows Trusted Computing Base: SYSTEM and the local Administrators group.
+# These are the platform's root-equivalent — the exact analog of POSIX ``root``,
+# which the ``os.chmod(path, 0o600)`` branch of this module leaves with full
+# access and cannot exclude. Any local administrator can already read this file,
+# take ownership of it, or run as SYSTEM to reach it regardless of its ACL, so
+# treating them as forbidden is BOTH impossible on an admin-owned file — the
+# common case, since the primary account on most personal Windows installs is a
+# local admin, and files it creates carry EXPLICIT Administrators/SYSTEM ACEs
+# that ``/inheritance:r`` does not strip — AND stricter than the POSIX contract
+# this module mirrors. Accepting them realigns Windows with that contract; the
+# readback STILL flags every OTHER principal (Users, Everyone, a specific
+# non-owner account), which is the real protection for a non-admin user.
+#
+# Matched by the localized names an en-US readback emits AND by the well-known
+# SIDs, since icacls prints a raw SID when it cannot resolve a name. A
+# non-English Windows emits localized display names not listed here; those fall
+# through to the throw, which names the surviving principal, so an incomplete
+# allowlist is self-reporting on the next run rather than a silent weakening.
+_WINDOWS_TCB_NAMES = frozenset({"nt authority\\system", "builtin\\administrators"})
+_WINDOWS_TCB_SIDS = frozenset({"s-1-5-18", "s-1-5-32-544"})
+
+
+def _is_windows_tcb_principal(grantee: str) -> bool:
+    """True if *grantee* is SYSTEM or the local Administrators group."""
+    g = (grantee or "").lstrip("*").strip().lower()
+    return g in _WINDOWS_TCB_NAMES or g in _WINDOWS_TCB_SIDS
+
+
+def _non_owner_grantees(grantees: set[str], principal: str) -> set[str]:
+    """Grantees that are neither the owner nor the Windows TCB — i.e. some OTHER
+    account can reach the credential. Case-insensitive: Windows account names
+    are, and a case difference would otherwise fail closed on a secured file.
+    """
+    owner = principal.casefold()
+    return {
+        g for g in grantees
+        if g.casefold() != owner and not _is_windows_tcb_principal(g)
+    }
 
 
 class AuthError(RuntimeError):
@@ -235,9 +271,10 @@ def windows_assert_owner_only(path: Path) -> None:
             f"cannot verify permissions on {path}: icacls listed no grantees, "
             f"so the restriction cannot be confirmed to have taken effect."
         )
-    # Case-insensitive: Windows account names are, and a case difference here
-    # would fail closed on a correctly secured file.
-    extra = {g for g in grantees if g.casefold() != principal.casefold()}
+    # SYSTEM and the local Administrators group are the platform TCB and are
+    # accepted (see _non_owner_grantees / _WINDOWS_TCB_*); any OTHER non-owner
+    # grantee is the fail-closed signal.
+    extra = _non_owner_grantees(grantees, principal)
     if extra:
         raise CredentialPermissionError(
             f"refusing to write a credential to {path}: it is still readable "
