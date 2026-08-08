@@ -1314,6 +1314,47 @@ def test_no_price_changes_anywhere_not_just_at_the_five_pinned_points():
 # Controls                                                                     #
 # --------------------------------------------------------------------------- #
 
+#: SWE-bench calls this PASS_TO_PASS: the tests that passed BEFORE the change
+#: must still pass after it. This corpus only had a proxy for it — a count of
+#: test functions (SUITE_GUARD below), which notices a deletion and is blind to
+#: a test that is still present and now fails. That is the same shape as every
+#: other instrument defect found today: checking a stand-in for the property
+#: instead of the property.
+#:
+#: So the pin's own test files are embedded at generation time and RUN, from a
+#: temp directory, against whatever the agent left behind. Temp, not in-tree,
+#: because the agent may have edited the in-tree copies and PASS_TO_PASS is a
+#: claim about the ORIGINAL tests. It subsumes the deletion case (a deleted
+#: test still runs from the embedded copy) and adds the case the count missed.
+def pass_to_pass_block(subject: Path) -> str:
+    tests = {p.name: p.read_text()
+             for p in sorted((subject / "tests").glob("test_*.py"))}
+    return f'''
+
+_PIN_TESTS = {tests!r}
+
+
+def test_the_pins_own_tests_still_pass_against_this_change():
+    """PASS_TO_PASS, run for real rather than counted."""
+    import pathlib
+    import subprocess
+    import sys
+    import tempfile
+
+    work = pathlib.Path(__file__).resolve().parents[2]
+    d = pathlib.Path(tempfile.mkdtemp(prefix="pass2pass-"))
+    for name, body in _PIN_TESTS.items():
+        (d / name).write_text(body)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(d)],
+        cwd=work, capture_output=True, text=True,
+        env={{"PYTHONPATH": str(work), "PATH": "/usr/bin:/bin"}})
+    assert proc.returncode == 0, (
+        "the tests that passed at this spec's pin no longer pass:\\n"
+        + proc.stdout[-2000:])
+'''
+
+
 #: Appended to every code spec's holdout. A holdout asserts the NEW behaviour;
 #: nothing in it notices a coder that reached green by deleting somebody else's
 #: test, because a deleted test changes no behaviour the holdout measures. The
@@ -1481,7 +1522,7 @@ def main() -> int:
         sid = spec["id"]
         holdout = spec["holdout"]
         if holdout:
-            holdout += SUITE_GUARD
+            holdout += SUITE_GUARD + pass_to_pass_block(subject)
         if spec.get("expect_escalation"):
             print(f"{sid:42} escalation spec — no holdout by design")
         else:
