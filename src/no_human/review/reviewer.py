@@ -1125,19 +1125,128 @@ def _goal_entry_citation_fails(
     return _citation_fails_in_any(probe, [(repo_path, before_ref), *(extra_repos or [])])
 
 
+# The START marker on its own, for the missing-END recovery path below.
+_REVIEW_JSON_START = re.compile(r"REVIEW_JSON_START\s*", re.DOTALL)
+
+
+def _first_json_object(s: str) -> str | None:
+    """Return the substring of ``s`` spanning its first balanced ``{...}``
+    object, or None if no object closes.
+
+    ``s`` is expected to start at (or before) a ``{``. Braces inside string
+    literals — and backslash-escaped quotes inside them — are respected, so a
+    ``{`` or ``}`` written in an ``evidence`` value never miscounts the depth.
+    When the object never closes (the JSON was genuinely cut off mid-object)
+    the depth never returns to zero and None is returned, which is exactly the
+    fail-closed signal the caller needs.
+    """
+    start = s.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        c = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start : i + 1]
+    return None
+
+
+def _verdict_is_complete(data: Any) -> bool:
+    """True only when ``data`` carries the ENTIRE documented verdict shape.
+
+    This is the guard that makes the missing-END recovery safe. Without the
+    END marker the only remaining signal that the reviewer finished is that
+    every key ``_VERDICT_FORMAT`` promises is present: a JSON cut off
+    mid-object is missing at least one of them and fails this check, so it
+    stays fail-closed. The required set is the SAME one the START...END path's
+    format documents (``passed``, ``stages.spec_compliance.passed``,
+    ``stages.code_quality.passed``, ``items``) — never a weaker subset. ``goal``
+    is deliberately NOT required: ``_gate_verdict`` treats an absent goal block
+    as "changes nothing", so demanding it here would reject complete verdicts.
+    """
+    if not isinstance(data, dict):
+        return False
+    if not isinstance(data.get("passed"), bool):
+        return False
+    stages = data.get("stages")
+    if not isinstance(stages, dict):
+        return False
+    for stage in ("spec_compliance", "code_quality"):
+        sub = stages.get(stage)
+        if not isinstance(sub, dict) or not isinstance(sub.get("passed"), bool):
+            return False
+    if not isinstance(data.get("items"), list):
+        return False
+    return True
+
+
+def _recover_unterminated_verdict(text: str) -> str | None:
+    """Recover a verdict that has REVIEW_JSON_START but no REVIEW_JSON_END.
+
+    par-07 root cause: a single-turn angle pass (`_fast_review`, max_turns=1)
+    emits ``REVIEW_JSON_START`` + a COMPLETE verdict JSON, then is cut off by
+    "Reached maximum number of turns (1)" before it can emit the closing
+    ``REVIEW_JSON_END``. ``_REVIEW_JSON`` requires END, so a genuinely-passing
+    verdict read as "no parseable block", became an unclassified (blocking)
+    finding, and flipped a passing gate to fail ~50% of the time.
+
+    So: when END is absent, greedily extract the first balanced JSON object
+    after START and accept it ONLY IF it parses AND is a COMPLETE verdict
+    (`_verdict_is_complete`). A JSON truncated mid-object — even one that
+    happens to close at a coincidentally-valid boundary — is missing a required
+    key and is rejected, staying fail-closed. Returns the JSON text on success
+    (parsed identically to the START...END path downstream), or None.
+    """
+    m = _REVIEW_JSON_START.search(text)
+    if not m:
+        return None
+    candidate = _first_json_object(text[m.end():])
+    if candidate is None:
+        return None
+    try:
+        data = loads_lenient(candidate)
+    except json.JSONDecodeError:
+        return None
+    if not _verdict_is_complete(data):
+        return None
+    return candidate
+
+
 def _parse_review_output(
     text: str, repo_path: Path | None = None, before_ref: str = "HEAD~1",
     extra_repos: list[tuple[Path, str]] | None = None,
 ) -> ReviewDecision:
-    m = _REVIEW_JSON.search(text or "")
-    if not m:
+    raw = text or ""
+    m = _REVIEW_JSON.search(raw)
+    if m:
+        json_text: str | None = m.group(1)
+    else:
+        # START present but END missing: recover a COMPLETE verdict if we can
+        # (par-07 truncation), else stay fail-closed below.
+        json_text = _recover_unterminated_verdict(raw)
+    if json_text is None:
         # Fail closed — a missing END marker is NOT a pass — but preserve the
         # tail of the raw output in the evidence so the next occurrence can be
         # diagnosed (truncation before END vs. a genuine no-verdict). This is
         # the reviewer's own text, which `raw_output` already carries in full;
         # 300 chars in the evidence is strictly less than that, not new
         # exposure. Truncates safely when the output is shorter than the window.
-        raw = text or ""
         tail = raw[-_UNPARSED_TAIL_CHARS:] if raw else "(empty output)"
         evidence = (
             "reviewer produced no parseable REVIEW_JSON block — fail closed. "
@@ -1153,7 +1262,7 @@ def _parse_review_output(
             raw_output=raw,
         )
     try:
-        data = loads_lenient(m.group(1))
+        data = loads_lenient(json_text)
     except json.JSONDecodeError as exc:
         return ReviewDecision(
             passed=False,

@@ -12,10 +12,12 @@ from no_human.core.task import Task
 from no_human.review.reviewer import (
     AdversarialReviewer,
     ReviewDecision,
+    _NO_VERDICT_LABEL,
     _build_code_review_prompt,
     _build_review_prompt,
     _full_file_context,
     _parse_review_output,
+    _reached_no_verdict,
 )
 
 
@@ -108,6 +110,111 @@ def test_parse_empty_items_with_passed_true_fails_closed():
     d = _parse_review_output(text)
     assert d.passed is False
     assert d.checklist == []
+
+
+# --------------------------------------------------------------------------- #
+# par-07 ROOT: recover a COMPLETE verdict when END is missing but no weaker    #
+# --------------------------------------------------------------------------- #
+
+def _full_verdict(passed: bool, items: list[dict], *,
+                  spec: bool = True, quality: bool = True) -> dict:
+    """The full documented gate/angle verdict shape (`_VERDICT_FORMAT`)."""
+    return {
+        "passed": passed,
+        "stages": {"spec_compliance": {"passed": spec},
+                   "code_quality": {"passed": quality}},
+        "suggested_next": None,
+        "goal": {"reachable": True},
+        "items": items,
+    }
+
+
+def test_parse_recovers_complete_verdict_when_end_marker_missing():
+    """(a) par-07 ROOT: a single-turn angle emits START + a COMPLETE verdict,
+    then is cut off ('Reached maximum number of turns (1)') before END. The
+    passing verdict must be RECOVERED, not read as 'no parseable block'."""
+    verdict = _full_verdict(True, [
+        {"label": "criterion 1", "passed": True, "evidence": "foo.py:10",
+         "severity": "low"},
+    ])
+    text = (
+        "REVIEW_JSON_START\n" + json.dumps(verdict) +
+        "\nClaude Code returned an error result: "
+        "Reached maximum number of turns (1)"
+        # NOTE: no REVIEW_JSON_END — the reviewer was cut off after the JSON.
+    )
+    d = _parse_review_output(text)
+    assert d.passed is True                 # verdict recovered
+    assert not _reached_no_verdict(d)       # NOT the fail-closed sentinel
+    assert len(d.checklist) == 1
+
+
+def test_parse_recovered_clean_angle_is_not_a_no_verdict_finding():
+    """par-07 ROOT: an angle with NO findings, cut off before END. Recovering it
+    as a real (vacuous) verdict — rather than the `_NO_VERDICT_LABEL` sentinel —
+    is what stops `merge_angle_findings` from folding a spurious blocking finding
+    and flipping the passing main gate to fail."""
+    text = "REVIEW_JSON_START\n" + json.dumps(_full_verdict(True, []))
+    d = _parse_review_output(text)
+    assert not _reached_no_verdict(d)       # the bug was: this WAS the sentinel
+    assert d.failed_items == []             # so merge adds nothing / gate holds
+
+
+def test_parse_missing_end_and_missing_required_key_fails_closed():
+    """(b) A JSON that parses AND closes at a coincidentally-valid boundary but
+    is missing a required verdict key (`stages.code_quality`) is genuinely
+    truncated — it must STAY fail-closed, never recovered."""
+    partial = {
+        "passed": True,
+        "stages": {"spec_compliance": {"passed": True}},  # code_quality missing
+        "items": [{"label": "x", "passed": True, "severity": "low"}],
+    }
+    text = "REVIEW_JSON_START\n" + json.dumps(partial)  # balanced, but incomplete
+    d = _parse_review_output(text)
+    assert d.passed is False
+    assert d.checklist[0].label == _NO_VERDICT_LABEL
+
+
+def test_parse_missing_end_and_truncated_mid_object_fails_closed():
+    """(b') Cut off mid-object: braces never balance, so nothing is recovered."""
+    text = ('REVIEW_JSON_START\n{"passed": true, "stages": '
+            '{"spec_compliance": {"passed": true}, "code_quality": {"passed": tr')
+    d = _parse_review_output(text)
+    assert d.passed is False
+    assert d.checklist[0].label == _NO_VERDICT_LABEL
+
+
+def test_parse_missing_end_malformed_json_fails_closed():
+    """(d) START present, END absent, and what follows is not JSON — fail closed."""
+    text = "REVIEW_JSON_START\nthis is not json at all, just prose"
+    d = _parse_review_output(text)
+    assert d.passed is False
+    assert d.checklist[0].label == _NO_VERDICT_LABEL
+
+
+def test_parse_complete_block_with_end_unchanged_by_recovery():
+    """(c) The START...END happy path is untouched: a complete block WITH the END
+    marker still parses via the primary regex; the recovery path never runs."""
+    verdict = _full_verdict(True, [
+        {"label": "ok", "passed": True, "evidence": "a.py:1", "severity": "nit"},
+    ])
+    text = "REVIEW_JSON_START\n" + json.dumps(verdict) + "\nREVIEW_JSON_END\n"
+    d = _parse_review_output(text)
+    assert d.passed is True
+    assert len(d.checklist) == 1
+
+
+def test_parse_recovery_respects_braces_inside_string_evidence():
+    """A `{`/`}` written inside an evidence string must not miscount the object
+    depth — the balanced-object scan respects string literals and escapes."""
+    verdict = _full_verdict(True, [
+        {"label": "brace", "passed": True,
+         "evidence": 'has a quote " and a brace } inside', "severity": "nit"},
+    ])
+    text = "REVIEW_JSON_START\n" + json.dumps(verdict)  # no END
+    d = _parse_review_output(text)
+    assert d.passed is True
+    assert not _reached_no_verdict(d)
 
 
 # --------------------------------------------------------------------------- #
