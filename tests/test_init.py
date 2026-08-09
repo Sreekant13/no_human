@@ -261,6 +261,101 @@ def test_nh_init_uses_the_HARDENED_writer_not_a_third_implementation(tmp_path):
     assert env.read_text() == "CLAUDE_CODE_OAUTH_TOKEN=good-token\n"
 
 
+def _init_env(tmp_path, monkeypatch, *, with_token: bool = False):
+    """A `nh init` run wired to tmp dirs: no real HOME, no real credential."""
+    nh_home = tmp_path / "nh_home"
+    nh_home.mkdir(mode=0o700)
+    config_path = nh_home / "config.yaml"
+    config_path.write_text("llm:\n  auth_mode: subscription\n")
+    env_path = nh_home / ".env"
+    if with_token:
+        env_path.write_text("CLAUDE_CODE_OAUTH_TOKEN=test_token\n")
+        env_path.chmod(0o600)
+
+    import no_human.cli.init_cmd as init_mod
+
+    monkeypatch.setattr(init_mod, "NO_HUMAN_HOME", nh_home)
+    monkeypatch.setattr(init_mod, "ENV_PATH", env_path)
+    monkeypatch.setattr(init_mod, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(init_mod, "load_config", lambda **kw: None)
+    return env_path
+
+
+def test_nh_init_refuses_an_api_key_pasted_into_the_oauth_field(tmp_path, monkeypatch):
+    """`nh init` accepted ANY string and printed `Auth: ✓ ready`.
+
+    Onboarding walkthrough 2026-08-09, finding B4/B4b: `sk-ant-api03-…` typed
+    at the subscription-token prompt was written verbatim into
+    CLAUDE_CODE_OAUTH_TOKEN — while `PUT /api/auth/token` and the desktop app
+    both refused exactly that. The CLI now goes through the same validator, so
+    the bad value is never written and the user is told which option they want.
+    """
+    env_path = _init_env(tmp_path, monkeypatch)
+
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        runner = CliRunner()
+        result = runner.invoke(
+            cli, ["init"],
+            input="1\nsk-ant-api03-FAKEFAKEFAKE\nn\n",
+            catch_exceptions=False,
+        )
+        # And it did not smuggle itself into the process env for this run.
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in os.environ
+
+    # Nothing written: no .env at all, and certainly not the key.
+    assert not env_path.exists()
+    # Told what it looks like they pasted, and where that credential belongs.
+    assert "not an OAuth token" in result.output
+    assert "auth_mode: api_key" in result.output
+    # The summary must not claim readiness.
+    assert "not set" in result.output
+
+
+def test_nh_init_accepts_a_valid_oauth_token(tmp_path, monkeypatch):
+    """The valid path is unchanged: the token is written at 0600 and reported
+    ready. Guards the fix against being over-strict — only the demonstrated bad
+    shapes are refused, never a plausible OAuth token."""
+    env_path = _init_env(tmp_path, monkeypatch)
+
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        runner = CliRunner()
+        result = runner.invoke(
+            cli, ["init"],
+            input="1\nsk-ant-oat01-VALIDLOOKINGTOKEN\nn\n",
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 0
+    assert env_path.read_text() == (
+        "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-VALIDLOOKINGTOKEN\n"
+    )
+    assert (env_path.stat().st_mode & 0o777) == 0o600
+    assert "ready" in result.output
+
+
+def test_save_subscription_token_refuses_what_cannot_be_a_credential(tmp_path):
+    """Empty and whitespace-only never reach the .env — the validator's own
+    rule, not a second opinion about token shapes."""
+    from no_human.cli.init_cmd import _save_subscription_token
+
+    env = tmp_path / ".env"
+    nh_home = tmp_path / ".no_human"
+    nh_home.mkdir(mode=0o700)
+    with (
+        patch("no_human.cli.init_cmd.ENV_PATH", env),
+        patch("no_human.cli.init_cmd.NO_HUMAN_HOME", nh_home),
+    ):
+        for bad in ("", "   ", "\t\n "):
+            assert _save_subscription_token(bad) is False
+        assert not env.exists()
+        assert _save_subscription_token("plausible-oauth-token") is True
+    assert "CLAUDE_CODE_OAUTH_TOKEN=plausible-oauth-token" in env.read_text()
+
+
 def test_no_module_defines_the_same_top_level_name_twice():
     """The general form of the bug above, which no test could see.
 

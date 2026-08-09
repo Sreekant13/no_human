@@ -31,12 +31,15 @@ from ..config import (
     API_KEY_VAR,
     CONFIG_PATH,
     DB_PATH,
+    DEFAULT_AUTH_PROFILE,
     ENV_PATH,
     METERED_AUTH_VARS,
     NO_HUMAN_HOME,
     SUBSCRIPTION_TOKEN_VAR,
+    AuthError,
     credential_status,
     load_config,
+    set_profile_token,
 )
 
 console = Console()
@@ -247,7 +250,8 @@ def _setup_subscription_token() -> bool:
     if os.environ.get(SUBSCRIPTION_TOKEN_VAR):
         console.print(f"  [green]✓[/] {SUBSCRIPTION_TOKEN_VAR} found in environment")
         if click.confirm("    Persist it to ~/.no_human/.env?", default=True):
-            _append_env(SUBSCRIPTION_TOKEN_VAR, os.environ[SUBSCRIPTION_TOKEN_VAR])
+            if not _save_subscription_token(os.environ[SUBSCRIPTION_TOKEN_VAR]):
+                return False
             console.print("    [green]saved[/] to ~/.no_human/.env")
         return True
 
@@ -272,7 +276,8 @@ def _setup_subscription_token() -> bool:
     )
     token = click.prompt("    Token", default="", show_default=False).strip()
     if token:
-        _append_env(SUBSCRIPTION_TOKEN_VAR, token)
+        if not _save_subscription_token(token):
+            return False
         os.environ[SUBSCRIPTION_TOKEN_VAR] = token
         console.print("    [green]saved[/] to ~/.no_human/.env")
         return True
@@ -281,6 +286,35 @@ def _setup_subscription_token() -> bool:
         f"      echo '{SUBSCRIPTION_TOKEN_VAR}=<your_token>' >> ~/.no_human/.env"
     )
     return False
+
+
+def _save_subscription_token(token: str) -> bool:
+    """Write the OAuth token through the product's OWN validator. True if saved.
+
+    `nh init` used to hand any string straight to :func:`_append_env`, which
+    validates the *line*, not the *credential*: an ``sk-ant-api…`` key pasted
+    into the OAuth prompt was written verbatim to ``CLAUDE_CODE_OAUTH_TOKEN``
+    and the summary card then printed ``Auth: ✓ ready`` (onboarding walkthrough
+    2026-08-09, findings B4/B4b). Both the HTTP path (``PUT /api/auth/token``)
+    and the desktop app (``desktop/tokenStore.mjs:274-278``) already refused it
+    — the CLI was the odd one out.
+
+    :func:`config.set_profile_token` is that shared refusal: empty token,
+    over-length, embedded line break, ``sk-ant-api…``. Its message already
+    names what the user pasted and where the key belongs, so it is printed as
+    it stands rather than paraphrased — one opinion about token shapes, not two.
+
+    ponytail: no format whitelist. Enterprise OAuth tokens are first-class and
+    their shape is the vendor's to change; only the demonstrated bad inputs are
+    refused.
+    """
+    ensure_home_dir()
+    try:
+        set_profile_token(DEFAULT_AUTH_PROFILE, token, ENV_PATH)
+    except AuthError as exc:
+        console.print(f"\n    [bold red]✗ not saved —[/] {exc}")
+        return False
+    return True
 
 
 def _append_env(key: str, value: str) -> None:
