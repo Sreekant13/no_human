@@ -687,14 +687,17 @@ def init_cmd(non_interactive, auth_mode, token_stdin, repo_arg, no_repo):
     if repo_path:
         # Run onboard inline — reuse the existing nh onboard logic.
         # Catch SystemExit so a failing onboard doesn't kill init.
-        console.print(f"  Running [bold]nh onboard {repo_path}[/] …")
+        # soft_wrap on every line carrying a copy-able command + path: Rich
+        # folds a long path mid-token at the ambient console width.
+        console.print(f"  Running [bold]nh onboard {repo_path}[/] …", soft_wrap=True)
         try:
             ctx = click.Context(onboard, info_name="nh onboard")
             ctx.invoke(onboard, repo=repo_path, confirm=False, agent=False)
         except SystemExit:
             console.print(
                 "  [yellow]onboarding did not complete — you can re-run:[/]\n"
-                f"    [bold]nh onboard {repo_path}[/]"
+                f"    [bold]nh onboard {repo_path}[/]",
+                soft_wrap=True,
             )
         else:
             # Auto-confirm if the test command was proven — don't force a
@@ -705,7 +708,8 @@ def init_cmd(non_interactive, auth_mode, token_stdin, repo_arg, no_repo):
             except SystemExit:
                 console.print(
                     f"\n  To confirm the profile:\n"
-                    f"    [bold]nh onboard {repo_path} --confirm[/]"
+                    f"    [bold]nh onboard {repo_path} --confirm[/]",
+                    soft_wrap=True,
                 )
 
     # 6. Summary.
@@ -898,13 +902,19 @@ def task_add(source, title, repo, description, criteria, external_id, kind, link
             # would be a lie (it drove ca23ce68 to a clean PR while this warned).
             auto = bool(config.data.get("profile", {}).get("auto_confirm_proven", False))
             if not prof or not prof.usable_under_policy(auto_confirm_proven=auto):
+                # soft_wrap for the same reason print_path_error has it: these
+                # two lines are commands the user copies, and Rich's default
+                # wrap folds `nh onboard <long path>` mid-command at whatever
+                # width the ambient environment happens to imply — 80 whenever
+                # stdout is not a terminal. A folded command is not a command.
                 console.print(
                     "[yellow]⚠ repo profile not usable[/] — test command will be "
                     "auto-detected (may be wrong). Run both:\n"
                     f"  [bold]nh onboard {t.repo_path}[/]"
                     "            [dim]# derive + prove[/]\n"
                     f"  [bold]nh onboard {t.repo_path} --confirm[/]"
-                    "  [dim]# then confirm[/]"
+                    "  [dim]# then confirm[/]",
+                    soft_wrap=True,
                 )
             if not run:
                 console.print(f"staged. run it with:  [bold]nh watch {t.id[:8]}[/]")

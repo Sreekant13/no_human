@@ -568,16 +568,31 @@ def test_task_add_still_grills_when_a_terminal_is_there(tmp_path, monkeypatch):
     assert "skipping the scoping questions" not in result.output, result.output
 
 
+@pytest.mark.parametrize("ambient_width", [None, 80], ids=["default", "ci-80-cols"])
 def test_the_unonboarded_repo_hint_prints_a_sequence_that_works(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, ambient_width):
     """The hint named only the SECOND half of a two-step dance: following
     `nh onboard <repo> --confirm` verbatim answers `no profile to confirm —
     run nh onboard <repo> first` (walkthrough B11/Q3).
 
-    COLUMNS is pinned because Rich folds a long path at 80 columns and the
-    assertions read the rendered lines.
+    The `ci-80-cols` case is the ubuntu runner, which kept CI red for five
+    landings. Rich resolves its width in ``Console.__init__`` — a COLUMNS in
+    the ambient environment is baked into ``console._width`` when
+    ``no_human.cli.commands`` is imported, and a later
+    ``monkeypatch.setenv("COLUMNS", ...)`` cannot move it. The runner has such
+    a COLUMNS and this machine does not, so the hint folded mid-command there
+    and nowhere else, and both `nh onboard` lines came back as the bare word
+    `nh onboard` with the path on a line of its own.
+
+    So the assertions below test the invariant — two DISTINCT lines, each a
+    whole copy-able command — and the hint is printed ``soft_wrap=True`` so no
+    console width can fold it. Pinning ``_width`` is exactly what an inherited
+    COLUMNS does, so this parametrization reproduces the runner rather than
+    describing it.
     """
-    monkeypatch.setenv("COLUMNS", "300")
+    if ambient_width is not None:
+        import no_human.cli.commands as cmd_mod
+        monkeypatch.setattr(cmd_mod.console, "_width", ambient_width)
     db = tmp_path / "test.db"
     repo = tmp_path / "repo"
     (repo / ".git").mkdir(parents=True)
@@ -592,6 +607,9 @@ def test_the_unonboarded_repo_hint_prints_a_sequence_that_works(
     assert "repo profile not usable" in result.output, result.output
     steps = [ln.strip() for ln in result.output.splitlines() if "nh onboard" in ln]
     assert len(steps) == 2, f"the hint is still one step:\n{result.output}"
+    # Two DISTINCT steps: a fold produced two identical 'nh onboard' lines,
+    # which satisfied the count above while printing no runnable command.
+    assert steps[0] != steps[1], steps
     assert "--confirm" not in steps[0], steps
     assert steps[0].startswith(f"nh onboard {repo.resolve()}"), steps
     assert steps[1].startswith(f"nh onboard {repo.resolve()} --confirm"), steps
