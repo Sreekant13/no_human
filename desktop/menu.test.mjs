@@ -81,10 +81,11 @@ test("off macOS the File menu still carries every recovery path, ending in quit"
   // app with no in-app recovery. Verified on real Windows 2026-08-05.
   const t = buildMenuTemplate({
     isMac: false, isDev: false, onNavigate() {}, onNewTask() {},
-    onReenterToken() {}, onCheckForUpdates() {},
+    onReenterToken() {}, onRerunSetup() {}, onCheckForUpdates() {},
   });
   const file = t.find((m) => m.label === "File");
-  for (const label of ["New Task", "Re-enter Claude Token…", "Check for Updates…"]) {
+  for (const label of ["New Task", "Re-enter Claude Token…", "Re-run Setup…",
+                       "Check for Updates…"]) {
     assert.ok(file.submenu.some((i) => i.label === label), `${label} reachable off macOS`);
   }
   const last = file.submenu[file.submenu.length - 1];
@@ -108,6 +109,46 @@ test("the token item is omitted when no handler is supplied", () => {
   const t = buildMenuTemplate({ isMac: true, isDev: false, onNavigate() {}, onNewTask() {} });
   const file = t.find((m) => m.label === "File");
   assert.equal(file.submenu.some((i) => i.label === "Re-enter Claude Token…"), false);
+});
+
+// The wizard writes onboarding.completed once and NOTHING wrote it back, so a
+// user who set themselves up wrong — no proven repo, no projects, history never
+// scanned, none of the nine steps gates — could not reach the screen that fixes
+// it. The only route was hand-editing config.yaml and restarting the server.
+test("File menu exposes Re-run Setup and it routes", () => {
+  let called = 0;
+  const t = buildMenuTemplate({
+    isMac: true, isDev: false, onNavigate() {}, onNewTask() {},
+    onRerunSetup: () => { called += 1; },
+  });
+  const file = t.find((m) => m.label === "File");
+  const item = file.submenu.find((i) => i.label === "Re-run Setup…");
+  assert.ok(item, "the only in-app route back into onboarding must be present");
+  item.click();
+  assert.equal(called, 1, "it must invoke onRerunSetup");
+});
+
+test("the setup item is omitted when no handler is supplied", () => {
+  const t = buildMenuTemplate({ isMac: true, isDev: false, onNavigate() {}, onNewTask() {} });
+  const file = t.find((m) => m.label === "File");
+  assert.equal(file.submenu.some((i) => i.label === "Re-run Setup…"), false);
+});
+
+// The menu item is only a route if main.mjs actually resets AND reloads: the
+// board reads onboarding status once, at load, so a reset with no reload leaves
+// the user looking at the same board and concluding the item is broken.
+test("main.mjs wires Re-run Setup to the reset endpoint and reloads the board", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const src = readFileSync(fileURLToPath(new URL("./main.mjs", import.meta.url)), "utf8");
+  assert.match(src, /onRerunSetup\s*:/, "buildAppMenu no longer passes onRerunSetup");
+  const handler = src.match(/onRerunSetup:[\s\S]*?\n {4}\},/)?.[0];
+  assert.ok(handler, "could not locate the onRerunSetup handler");
+  assert.match(handler, /\/api\/onboarding\/reset/,
+    "it must call the reset endpoint, not just open a window");
+  assert.match(handler, /method: "POST"/);
+  assert.match(handler, /loadBoardOrError\(win\)/,
+    "without the reload the flag changes and the screen does not");
 });
 
 test("File menu exposes Check for Updates and it routes", () => {

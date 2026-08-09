@@ -290,6 +290,22 @@ function buildAppMenu() {
           console.error("setup screen failed:", err));
       }
     },
+    // The only route back into the first-run wizard. The flag lives in the
+    // server's config, not here, so this is a POST and then a RELOAD: the board
+    // reads onboarding status once, at load (web/src/App.jsx), so a reset
+    // without the reload changes nothing the user can see. Reload happens even
+    // if the POST failed — loadBoardOrError probes first and renders the error
+    // page when the server is down, which is the honest thing to show.
+    onRerunSetup: async () => {
+      showWindow();
+      try {
+        const res = await fetch(`${ORIGIN}/api/onboarding/reset`, { method: "POST" });
+        if (!res.ok) console.error("setup reset failed:", res.status);
+      } catch (err) {
+        console.error("setup reset failed:", String((err && err.message) || err));
+      }
+      if (win && !win.isDestroyed()) loadBoardOrError(win);
+    },
     // Routed through openExternallyIfWeb, NOT shell.openExternal directly. That
     // helper is the one place this process hands a URL to the OS, and it
     // refuses anything that is not http(s); going around it for a URL that

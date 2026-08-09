@@ -161,6 +161,42 @@ async def test_complete_persists_and_status_reflects(client, tmp_path):
     assert (tmp_path / "config.yaml").exists()
 
 
+@pytest.mark.asyncio
+async def test_reset_clears_only_the_completed_flag(client, tmp_path):
+    """A reset is a re-entry, not a wipe.
+
+    `completed` was written True in one place and False nowhere, so the wizard
+    removed the only screen that can fix a wrong setup. The fix must clear that
+    one flag and nothing else: everything the user is coming back to keep —
+    team, repos, docs — stays, in memory AND on disk.
+    """
+    import yaml
+
+    payload = {"team": "PLATFORM", "repos": ["/x/svc"], "docs": ["/docs/adr"]}
+    assert (await client.post("/api/onboarding/complete", json=payload)).status_code == 200
+
+    r = await client.post("/api/onboarding/reset")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["completed"] is False          # the new status comes back
+    assert body["team"] == "PLATFORM"          # …with everything else intact
+    assert body["repos"] == ["/x/svc"]
+    assert body["docs"] == ["/docs/adr"]
+
+    # The wizard renders again…
+    s = await client.get("/api/onboarding/status")
+    assert s.json()["completed"] is False
+    assert s.json()["team"] == "PLATFORM"
+
+    # …and it survives a restart, because it landed on disk too — the only route
+    # that existed before this endpoint was hand-editing exactly this file.
+    on_disk = yaml.safe_load((tmp_path / "config.yaml").read_text())["onboarding"]
+    assert on_disk["completed"] is False
+    assert on_disk["team"] == "PLATFORM"
+    assert on_disk["repos"] == ["/x/svc"]
+    assert on_disk["docs"] == ["/docs/adr"]
+
+
 # --------------------------------------------------------------------------- #
 # GET /api/repos/discover — the typed-path replacement. The endpoint is bound  #
 # to the process's home, so these tests relocate HOME onto tmp_path rather     #

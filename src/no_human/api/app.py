@@ -3748,6 +3748,31 @@ async def onboarding_complete(
     return {"ok": True, "onboarding": ob}
 
 
+@app.post("/api/onboarding/reset")
+async def onboarding_reset(request: Request) -> dict[str, Any]:
+    """Show the setup wizard again. Clears `completed` and NOTHING else.
+
+    There was no way back into onboarding: `completed` was written True in one
+    place and False nowhere, so a user who blew through the nine steps (none of
+    which gate) and landed in a wrong state — no proven repo, no projects,
+    history never scanned — had one route, hand-editing config.yaml and
+    restarting the server. The wizard is the screen that fixes all of those and
+    it removed itself.
+
+    A reset is therefore a re-entry, not a wipe: repos, profiles, projects,
+    confirmed rules, docs and the team all stay exactly where they are, and every
+    wizard step reads its state from the server, so it renders over them. The
+    patch is deliberately one key — anything wider would delete work the user is
+    coming back to keep.
+
+    The board reads this flag once, at load: the desktop's File → "Re-run Setup…"
+    resets and reloads the window; a caller hitting this endpoint on its own has
+    to reload the board itself.
+    """
+    ob = _persist_onboarding(request.app.state.config, {"completed": False})
+    return {"completed": bool(ob.get("completed")), **ob}
+
+
 class DocsGenerateRequest(BaseModel):
     repo_path: str
 

@@ -644,6 +644,15 @@ export default function App() {
   const prevTasksRef = useRef([]);
   const [fetchError, setFetchError] = useState(null);
   const [showNewTask, setShowNewTask] = useState(false);
+  // What the composer opens pre-filled with, when something upstream already
+  // knows the answer. Today that is onboarding handing over the repo it just
+  // PROVED — the wizard's last button says "Create your first task in <repo>"
+  // and the composer used to open on an empty path field, which is the exact
+  // moment the setup's payoff was supposed to land. Cleared on close so the
+  // next "+ New Task" opens blank. Deliberately NOT the Backlog path's `key`
+  // remount: this modal is unmounted while closed, so `initial` is read fresh
+  // at mount anyway, and a shared key would couple the two seeds.
+  const [newTaskSeed, setNewTaskSeed] = useState(null);
   const [page, setPage] = useState("board");
   // ── Backlog → intake queue ────────────────────────────────────────────────
   // The tickets the operator selected on the Backlog page, still to be started.
@@ -734,6 +743,14 @@ export default function App() {
   }, []);
   // null = checking; false = needs onboarding; true = onboarded. Fail-open so a
   // missing/old endpoint never blocks an existing user at the board.
+  //
+  // Fetched ONCE, on mount, and deliberately not polled: POST
+  // /api/onboarding/reset clears the flag on the server, but a board that is
+  // already open will not notice — the wizard reappears on the next load of
+  // this page. The desktop File → "Re-run Setup…" item therefore resets AND
+  // reloads the window (desktop/main.mjs); a reset driven by the API alone
+  // needs a browser reload to take effect. A poll would buy nothing: the only
+  // writer is a deliberate human action that already has a reload attached.
   const [onboarded, setOnboarded] = useState(null);
   const wsRef = useRef(null);
 
@@ -931,7 +948,14 @@ export default function App() {
       <Onboarding
         onComplete={(res) => {
           setOnboarded(true);
-          if (res && res.firstTaskRepo) setShowNewTask(true);
+          // The path itself, not just the fact that there is one: TaskComposer
+          // already seeds `repoPath` from `initial` (and pins free-text mode
+          // once a path is present), so this is all it takes for the composer
+          // to open on the repo the wizard just proved.
+          if (res && res.firstTaskRepo) {
+            setNewTaskSeed({ repoPath: res.firstTaskRepo });
+            setShowNewTask(true);
+          }
         }}
       />
     );
@@ -1134,7 +1158,8 @@ export default function App() {
       </main>
       {showNewTask && (
         <NewTaskModal
-          onClose={() => setShowNewTask(false)}
+          initial={newTaskSeed}
+          onClose={() => { setShowNewTask(false); setNewTaskSeed(null); }}
           onCreated={() => fetchTasks().then((ts) => dispatch({ type: "set", tasks: ts }))}
           onOpenBacklog={() => { setShowNewTask(false); setPage("backlog"); }}
         />

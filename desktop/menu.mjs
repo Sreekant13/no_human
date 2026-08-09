@@ -9,7 +9,7 @@
 // the Edit menu (copy/paste/select-all) must be included explicitly or text
 // inputs lose it.
 export function buildMenuTemplate({ isMac, isDev, onNavigate, onNewTask,
-                                    onReenterToken, onCheckForUpdates,
+                                    onReenterToken, onRerunSetup, onCheckForUpdates,
                                     onOpenDocs, onShowAbout }) {
   const nav = (label, page, accelerator) => ({
     label, accelerator, click: () => onNavigate(page),
@@ -27,6 +27,17 @@ export function buildMenuTemplate({ isMac, isDev, onNavigate, onNewTask,
       // opens and fails every task with no in-app remedy.
       ...(onReenterToken
         ? [{ label: "Re-enter Claude Token…", click: () => onReenterToken() },
+           { type: "separator" }]
+        : []),
+      // The same class of problem as the item above, applied to setup rather
+      // than the token: the wizard writes `onboarding.completed` once and there
+      // was nothing anywhere that wrote it back, so a user who realises on day
+      // two that they set it up wrong (no proven repo, no projects, history
+      // never scanned — none of the nine steps gates) could not reach the screen
+      // that fixes it. Resetting is not a wipe; it only makes the wizard render
+      // again over the state that is already there.
+      ...(onRerunSetup
+        ? [{ label: "Re-run Setup…", click: () => onRerunSetup() },
            { type: "separator" }]
         : []),
       // The manual half of "download it then or when they want": a user who

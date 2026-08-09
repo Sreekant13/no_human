@@ -145,7 +145,49 @@ test("onboarding ends on a first task when a repo is actually ready", () => {
   assert.match(onboarding, /onComplete\(firstTaskRepo \? \{ firstTaskRepo \} : \{\}\)/);
   // …and only when the SERVER says a repo is usable.
   assert.match(onboarding, /readiness\.first_usable/);
-  assert.match(app, /res\.firstTaskRepo\) setShowNewTask\(true\)/);
+  assert.match(app, /res\.firstTaskRepo\)/);
+});
+
+// The button says "Create your first task in <repo>". The composer opened with
+// an EMPTY repository field showing its placeholder, because App.jsx read the
+// handover as a boolean — `if (res && res.firstTaskRepo) setShowNewTask(true)` —
+// and threw the path away. The user retyped a path they had just spent minutes
+// proving, at the exact instant the setup's payoff was supposed to land.
+test("the proved repo reaches the composer, not just the decision to open it", () => {
+  assert.match(app, /setNewTaskSeed\(\{ repoPath: res\.firstTaskRepo \}\)/,
+    "the path itself must be kept, not used as a boolean and discarded");
+  assert.match(app, /<NewTaskModal\s+initial=\{newTaskSeed\}/,
+    "the first-task modal must be seeded with it");
+  assert.match(app, /setShowNewTask\(false\); setNewTaskSeed\(null\)/,
+    "closing must clear the seed, or the next '+ New Task' opens pre-filled");
+  // Not the Backlog path's remount: that key belongs to the ticket queue, and
+  // sharing it would couple two unrelated seeds.
+  assert.doesNotMatch(app, /<NewTaskModal\s+initial=\{newTaskSeed\}\s+key=/);
+  // The seed is only useful because the composer already reads it.
+  const composer = readFileSync(join(SRC, "TaskComposer.jsx"), "utf8");
+  assert.match(composer, /useState\(initial\?\.repoPath \?\? ""\)/,
+    "TaskComposer must still seed repoPath from `initial`");
+});
+
+// ── a running prove has a way out ──────────────────────────────────────────
+//
+// While `status === "running"` the panel rendered a spinner and elapsed seconds
+// and nothing else. On a real monorepo that is a 5-20 minute wait with no
+// control: the only escape was reloading the page, which discards the entire
+// wizard (team, selections, docs and project definitions are React state and
+// none of it is persisted).
+test("a running prove can be stopped without reloading the wizard", () => {
+  assert.match(onboarding, /function stopProve\(path\)/);
+  assert.match(onboarding, /onStop=\{\(\) => stopProve\(r\.path\)\}/,
+    "the panel must be wired to the stop handler");
+  const panel = onboarding.slice(onboarding.indexOf("export function ProvePanel"));
+  assert.match(panel, /status === "running" &&[\s\S]{0,600}?onClick=\{onStop\}/,
+    "Stop must be offered while the run is in flight, not only afterwards");
+  // Closing the stream is what aborts it — the same close() the unmount cleanup
+  // uses — and the panel must come back to a state the user can act in.
+  assert.match(onboarding, /const s = proveStreams\.current\[path\];[\s\S]{0,200}?s\.close\(\)/);
+  assert.match(onboarding, /status: "idle"/,
+    "stopping must re-enable the Prove/Retry control, not leave a dead panel");
 });
 
 // ── styling exists for every class the new UI renders ──────────────────────

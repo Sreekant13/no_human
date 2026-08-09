@@ -14,6 +14,7 @@ import {
   switchLabel,
 } from "./integrationSetup.js";
 import { backDisabled, backDisabledReason, forwardDisabled } from "./onboardingNav.js";
+import { scanSummary } from "./onboardingHistory.js";
 import {
   newProjectDef, toggleProjectRepo as bindProjectRepo, setPrimaryRepo,
   dropRepoEverywhere, unboundProjects, unboundProjectsMessage, projectPayload,
@@ -131,6 +132,10 @@ export default function Onboarding({ onComplete }) {
   const [newProjName, setNewProjName] = useState("");
   const [docs, setDocs] = useState([""]);
   const [history, setHistory] = useState(null);     // {available, transcripts}
+  // The ANALYZE response. Separate from `history` (the extract probe) because
+  // the result callout must describe the pass that actually ingested — see
+  // onboardingHistory.js for what printing the two together said.
+  const [analysis, setAnalysis] = useState(null);
   const [scanPhase, setScanPhase] = useState("idle"); // idle|extracting|analyzing|done|unavailable
   const [proposals, setProposals] = useState([]);
   const [chosenRules, setChosenRules] = useState(new Set());
@@ -346,6 +351,25 @@ export default function Onboarding({ onComplete }) {
     );
   }
 
+  // Stop reading a prove that is taking too long. The ONLY way out of a running
+  // prove used to be reloading the page — which discards the whole wizard (team,
+  // selections, docs, project definitions are all React state, none of it
+  // persisted). Back to "idle", so the Prove/Retry button and the editable
+  // command come back exactly as they were before the run.
+  //
+  // Same close() the unmount cleanup uses, and the same caveat: the server-side
+  // run is bounded independently, so this stops us READING it, not the tests
+  // themselves. The log says so rather than claiming a kill we did not perform.
+  function stopProve(path) {
+    const s = proveStreams.current[path];
+    if (s) { try { s.close(); } catch { /* already gone */ } }
+    delete proveStreams.current[path];
+    patchProve(path, (cur) => ({
+      status: "idle",
+      lines: [...cur.lines, "— stopped watching (the run itself finishes on its own)"],
+    }));
+  }
+
   async function confirmProved(path) {
     await guard(async () => {
       const res = await confirmRepoProfile(path);
@@ -377,6 +401,7 @@ export default function Onboarding({ onComplete }) {
       if (ext.available && (ext.transcripts > 0 || ext.skills > 0)) {
         setScanPhase("analyzing");
         const an = await analyzeHistory(30);
+        setAnalysis(an);
         setProposals(an.proposals || []);
         // Confirmation is OPT-IN per memory. Nothing is pre-ticked: a real user
         // was shown their own home address and phone number already checked,
@@ -643,6 +668,7 @@ export default function Onboarding({ onComplete }) {
                         editedCmd={proveCmd[r.path]}
                         onEditCmd={(v) => setProveCmd((c) => ({ ...c, [r.path]: v }))}
                         onProve={(cmd) => startProve(r.path, cmd)}
+                        onStop={() => stopProve(r.path)}
                         onConfirm={() => confirmProved(r.path)}
                         busy={busy}
                       />
@@ -677,7 +703,15 @@ export default function Onboarding({ onComplete }) {
                 <input className="ob-input" value={newProjName} placeholder="Project name, e.g. checkout-api" onChange={(e) => setNewProjName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addProject()} />
                 <button className="ob-btn-ghost" onClick={addProject} disabled={!newProjName.trim()}>+ Add project</button>
               </div>
-              {projectDefs.length === 0 && <div className="ob-empty">No projects defined yet. Add at least one to continue.</div>}
+              {/* "Add at least one…" was a promise of a gate that does
+                  not exist and must not: Continue is never disabled here
+                  (onboardingNav.js locks only the terminal launch), the composer
+                  works with no project at all ("No projects yet — give the path
+                  of the repo to work in", TaskComposer.jsx), and a real gate
+                  would DEAD-END anyone who selected no repos — the only project
+                  they could add would bind none, and finish() refuses exactly
+                  those (unboundProjectsMessage). So the copy is what was wrong. */}
+              {projectDefs.length === 0 && <div className="ob-empty">No projects yet — this step is optional. You can add them here or later in Settings.</div>}
               {projectDefs.map((pd, pi) => (
                 <div key={pd.name} className="ob-project-card">
                   <div className="ob-project-head">
@@ -831,16 +865,26 @@ export default function Onboarding({ onComplete }) {
                 </div>
               )}
 
+              {/* The headline states the condition actually detected. `unavailable`
+                  is reached on exactly one condition — the extract found no
+                  transcripts AND no skills — and it used to announce instead that
+                  a particular third-party IDE was not running, with the real
+                  reason demoted to grey parenthetical text. A developer who uses
+                  Claude Code and simply has no history on this machine was told a
+                  product they have never heard of was missing. The server's own
+                  `detail` still rides along; it names the sources it looked in. */}
               {scanPhase === "unavailable" && history && (
-                <div className="ob-callout">No running ide-agent/agent-a IDE detected — you can skip this and add rules later. <span className="ob-faint">({history.detail})</span></div>
+                <div className="ob-callout">No past AI conversations or skills found on this machine — you can skip this and add rules later. <span className="ob-faint">({history.detail})</span></div>
               )}
-              {scanPhase === "done" && history && (
+              {scanPhase === "done" && analysis && (
                 <div className="ob-callout ok">
-                  Scanned <strong>{history.transcripts}</strong> conversations
-                  {history.messages ? <> (<strong>{history.messages.toLocaleString()}</strong> messages)</> : null}
-                  {history.sources?.claude_code ? <> · <strong>{history.sources.claude_code}</strong> from Claude Code</> : null} →{" "}
-                  <strong>{proposals.length}</strong> item{proposals.length === 1 ? "" : "s"} to review
-                  {history.skills ? <> (incl. <strong>{history.skills}</strong> skill{history.skills === 1 ? "" : "s"})</> : null}.
+                  {scanSummary({
+                    transcripts: analysis.transcripts,
+                    messages: analysis.messages,
+                    skills: analysis.skills,
+                    proposals: proposals.length,
+                    claudeCode: analysis.sources?.claude_code,
+                  })}
                   <div className="ob-faint" style={{ marginTop: 6 }}>
                     {proposals.length === 0
                       ? "No durable rules stood out in these conversations — you can add rules anytime in Settings."
@@ -974,9 +1018,14 @@ export default function Onboarding({ onComplete }) {
  *               the user can correct it and retry instead of being stuck
  *  - skipped -> allowed; the repo simply runs without a proven test command
  *               until it is proved here or via `nh onboard <repo> --confirm`
+ *
+ * A fourth state used to have no exit at all: while it RUNS, this panel showed a
+ * spinner and nothing else, so a monorepo's 20-minute suite left reloading the
+ * page (which discards the whole wizard) as the only way on. `onStop` is that
+ * exit.
  */
 export function ProvePanel({ repoPath, profile, prove, editedCmd, onEditCmd,
-                             onProve, onConfirm, busy }) {
+                             onProve, onStop, onConfirm, busy }) {
   const logRef = useRef(null);
   const status = prove?.status || "idle";
   const lines = prove?.lines || [];
@@ -1007,10 +1056,18 @@ export function ProvePanel({ repoPath, profile, prove, editedCmd, onEditCmd,
           </button>
         )}
         {status === "running" && (
-          <span className="ob-prove-verdict">
-            <span className="grill-spinner" style={{ width: 12, height: 12, verticalAlign: "middle", marginRight: 6 }} />
-            Running the tests…{prove?.elapsed ? ` ${prove.elapsed}s` : ""}
-          </span>
+          <>
+            <span className="ob-prove-verdict">
+              <span className="grill-spinner" style={{ width: 12, height: 12, verticalAlign: "middle", marginRight: 6 }} />
+              Running the tests…{prove?.elapsed ? ` ${prove.elapsed}s` : ""}
+            </span>
+            {onStop && (
+              <button className="ob-btn-ghost" type="button" onClick={onStop}
+                      title="Stop watching this run and go back to the command">
+                Stop
+              </button>
+            )}
+          </>
         )}
         {status === "proven" && (
           <button className="ob-btn" type="button" disabled={busy} onClick={onConfirm}>

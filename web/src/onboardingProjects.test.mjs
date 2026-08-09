@@ -218,3 +218,34 @@ test("the projects step shows the unbound state and offers the default picker", 
   assert.match(step, /chooseProjectPrimary\(pi, e\.target\.value\)/,
     "the default repo must be configurable in the wizard");
 });
+
+// ── the empty state must not promise a gate that does not exist ────────────
+//
+// Measured on a live wizard: the empty state read "No projects defined yet. Add
+// at least one to continue." and Continue was enabled the whole time
+// (contDisabled:false). Users invented a project name they did not need.
+//
+// The copy is what was wrong, not the missing gate. Three things say this step
+// is optional BY DESIGN: the step's own closing note ("You can add or edit
+// projects later in Settings. Repos not assigned to any project can still be
+// used via the 'other' option"), TaskComposer's "No projects yet — give the path
+// of the repo to work in", and finish(), which requires no project at all. And a
+// real gate would DEAD-END the user who selected no repos: the only project they
+// could add would bind none, addProject seeds from selectedRepos, and finish()
+// refuses exactly those definitions by name — a wizard you cannot leave.
+test("the projects empty state does not claim a gate the nav does not enforce", () => {
+  const step = onboarding.slice(onboarding.indexOf('step.key === "projects"'),
+                                onboarding.indexOf('step.key === "docs"'));
+  assert.doesNotMatch(step, /Add at least one to continue/,
+    "Continue is never disabled on this step — see onboardingNav.forwardDisabled");
+  assert.match(step, /No projects yet — this step is optional/,
+    "the empty state must say what is true: nothing here is required");
+});
+
+test("nothing gates the projects step, so the copy above stays true", () => {
+  // If a future change DOES gate this step, this assertion fails and points at
+  // the copy that would then have to change back.
+  assert.doesNotMatch(onboarding, /projectDefs\.length === 0[^)]*\}\s*\/>\s*$/m);
+  assert.match(onboarding, /disabled=\{forwardDisabled\(navState\)\}>Continue<\/button>/,
+    "Continue must still be the tested predicate alone, with no per-step gate");
+});
