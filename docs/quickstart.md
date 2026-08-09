@@ -277,6 +277,12 @@ and a pool wider than one worker is then refused outright. Leave `nh serve` runn
 overnight; wake up to open PRs and review with `nh review` / `nh approve` as
 in step 7 — **merge always stays a human action**, `nh serve` never merges.
 
+From cron or CI, add `--until-empty`: same pool, same graceful drain, but it
+stops once nothing is claimable and nothing is in flight, and exits `1` if a
+task it ran ended FAILED (or a signal cut the drain short). Parked tasks —
+blocked, awaiting input, escalated, quota-paused — end the drain without
+failing it; they are waiting for you, not broken.
+
 ---
 
 ## Key files

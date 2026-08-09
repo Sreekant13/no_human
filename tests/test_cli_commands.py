@@ -1566,9 +1566,48 @@ def test_serve_does_not_warn_below_the_ceiling(tmp_path, monkeypatch):
     assert cfg.data["concurrency"]["max_workers"] == 3, cfg.data
 
 
+def test_serve_defaults_to_running_forever(tmp_path, monkeypatch):
+    """`--until-empty` is opt-in. If its default ever flips, a plain `nh serve`
+    left running overnight would exit the moment the queue emptied."""
+    cfg = _make_start_cfg_concurrent(tmp_path / "test.db")
+    _patch_serve_scaffolding(monkeypatch, cfg)
+    params = {p.name: p for p in cli.commands["serve"].params}
+
+    assert "until_empty" in params, "the drain-and-exit flag is missing"
+    assert params["until_empty"].default is False
+    assert params["until_empty"].is_flag
+
+    # And the flagless path still exits 0 (the prelude runs; `_go` does not).
+    result = CliRunner().invoke(cli, ["serve", "--max-workers", "1"])
+    assert result.exit_code == 0, result.output
+
+
+def test_serve_until_empty_exit_code_is_the_drains_verdict(tmp_path, monkeypatch):
+    """The batch caller's only channel is the exit code, so `_go`'s return
+    value must reach it. Without this, `serve` could compute a failure and
+    still exit 0 — the exact silence KI-3 is about."""
+    cfg = _make_start_cfg_concurrent(tmp_path / "test.db")
+    _patch_serve_scaffolding(monkeypatch, cfg)
+
+    def _run_returning_one(coro):
+        coro.close()
+        return 1
+
+    monkeypatch.setattr(asyncio, "run", _run_returning_one)
+
+    result = CliRunner().invoke(cli, ["serve", "--until-empty"])
+    assert result.exit_code == 1, result.output
+
+
 # --------------------------------------------------------------------------- #
 # nh stop                                                                      #
 # --------------------------------------------------------------------------- #
+
+def test_stop_waits_long_enough_for_a_real_drain():
+    """3s was shorter than one Agent SDK turn, so `nh stop` SIGKILLed the very
+    drain SIGTERM had just asked for. The default must stay generous."""
+    default = {p.name: p for p in cli.commands["stop"].params}["timeout"].default
+    assert default >= 30.0, f"nh stop --timeout default fell back to {default}s"
 
 def _write_pidfile(home: Path, pid: int) -> Path:
     home.mkdir(parents=True, exist_ok=True)

@@ -90,8 +90,9 @@ by anyone touching `core/db.py` or the scheduler.
 
 ## KI-3 — `nh serve` cannot drain-and-exit
 
-**Status:** open. Found 2026-08-01 by the adoption harness, persona "Sam, senior
-developer", step `serve-help`.
+**Status:** CLOSED 2026-08-09 by `nh serve --until-empty`. Found 2026-08-01 by
+the adoption harness, persona "Sam, senior developer", step `serve-help`. The
+symptom below is kept as found.
 
 **Symptom.** `nh serve`'s only option is `--max-workers`. It runs until
 interrupted. There is no `--once` / `--drain` / `--until-empty`, and therefore
@@ -116,6 +117,21 @@ that supervision loop and is a working reference for it.
 2. It exits non-zero when it stops for any other reason (budget, timeout,
    crash), with the reason on stderr.
 3. In-flight tasks still drain on Ctrl-C exactly as they do today.
+
+**What was built, and where it differs from that list.** `--until-empty` sets
+the same `stop` event a signal sets (`Scheduler.run_forever`), so there is one
+shutdown path, not two, and (3) is untouched — the default `nh serve` has no
+new behaviour at all. Exit 1 is keyed on `task.status == FAILED` for the ids
+this process dispatched (`Scheduler.failed_dispatched`), or on the drain being
+cut short by a signal with work still claimable (`queue_is_drained`); the
+reason goes to stderr. It deliberately reads **narrower** than (2): a task
+parked BLOCKED for budget, awaiting input, escalated or quota-paused exits 0,
+because those are the honest off-ramps the loop is built to produce and
+failing the batch on them would make a non-zero exit meaningless. A caller who
+needs "did anything park" reads `nh status --json`; only a FAILED task is a
+failure. Separately, `nh stop --timeout` defaulted to 3s — shorter than one
+Agent SDK turn, so it SIGKILLed the drain SIGTERM had just requested — and now
+defaults to 30s.
 
 ---
 

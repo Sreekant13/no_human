@@ -986,3 +986,125 @@ async def test_a_pool_crash_records_a_durable_reason(store):
 
     # The pool must SURVIVE the crash — the whole reason that except exists.
     assert sched.inflight == set(), "the crashed task was not released"
+
+
+# --------------------------------------------------------------------------- #
+# `nh serve --until-empty`: drain-and-exit (KI-3 / ADOPT-17)                   #
+# --------------------------------------------------------------------------- #
+
+
+class TerminalOrch:
+    """Ends each task in a status chosen per id — used to prove the exit
+    condition tells a FAILED task apart from an honest park."""
+
+    def __init__(self, store, statuses: dict, default=TaskStatus.AWAITING_APPROVAL):
+        self.store = store
+        self.statuses = statuses
+        self.default = default
+        self.started: list[str] = []
+
+    async def run_task(self, task):
+        self.started.append(task.id)
+        status = self.statuses.get(task.id, self.default)
+        await self.store.set_status(task, status, validate=False)
+        return SimpleNamespace(status=status, task=task)
+
+
+async def test_until_empty_exits_immediately_on_an_empty_queue(store):
+    """Nothing queued → the drain is already done. The poll interval is 30s
+    and the whole call must return well inside it: an empty queue must not
+    cost a caller one tick of waiting."""
+    sched = Scheduler(store, lambda task=None: FakeOrch(store), max_workers=2)
+    stop = asyncio.Event()
+
+    await asyncio.wait_for(
+        sched.run_forever(stop=stop, poll_interval=30.0, until_empty=True), 2.0)
+
+    assert stop.is_set(), "the drain must set the SAME stop event a signal sets"
+    assert await sched.queue_is_drained()
+    assert await sched.failed_dispatched() == []
+
+
+async def test_until_empty_drains_the_queue_then_exits(store):
+    fake = FakeOrch(store)
+    sched = Scheduler(store, lambda task=None: fake, max_workers=2)
+    ids = await _mk_tasks(store, 5)
+    stop = asyncio.Event()
+
+    await asyncio.wait_for(
+        sched.run_forever(stop=stop, poll_interval=0.01, until_empty=True), 10.0)
+
+    assert sorted(fake.started) == sorted(ids), "every queued task must run"
+    assert sched.inflight == set()
+    assert await sched.queue_is_drained()
+    assert await sched.failed_dispatched() == []
+
+
+async def test_until_empty_reports_a_failed_task_but_not_a_park(store):
+    """The exit condition is keyed on `task.status == TaskStatus.FAILED`.
+    A parked task (here ESCALATED — an honest off-ramp the loop is designed
+    to produce) must NOT make the batch look failed, or every real run of a
+    hard task exits non-zero and the code says nothing."""
+    ids = await _mk_tasks(store, 2)
+    orch = TerminalOrch(store, {ids[0]: TaskStatus.FAILED,
+                                ids[1]: TaskStatus.ESCALATED})
+    sched = Scheduler(store, lambda task=None: orch, max_workers=2)
+    stop = asyncio.Event()
+
+    await asyncio.wait_for(
+        sched.run_forever(stop=stop, poll_interval=0.01, until_empty=True), 10.0)
+
+    assert await sched.failed_dispatched() == [ids[0]]
+
+
+async def test_until_empty_ignores_failed_rows_this_process_never_dispatched(store):
+    """A real install's DB routinely holds OLD failed rows. The exit code is
+    scoped to `self._dispatched` — tasks THIS process started — or every cron
+    run of `--until-empty` exits 1 forever and non-zero means nothing. This is
+    the test an independent review's mutation (count ALL failed rows) proved
+    missing: with that mutation, the stale row below flips the answer."""
+    stale = Task.new("failed long ago", repo_path="/tmp/x")
+    await store.create_task(stale)
+    await store.set_status(stale, TaskStatus.FAILED, validate=False)
+
+    ids = await _mk_tasks(store, 1)
+    fake = FakeOrch(store)
+    sched = Scheduler(store, lambda task=None: fake, max_workers=1)
+    stop = asyncio.Event()
+    await asyncio.wait_for(
+        sched.run_forever(stop=stop, poll_interval=0.01, until_empty=True), 10.0)
+
+    assert fake.started == ids, "the fresh task ran"
+    assert await sched.failed_dispatched() == [], (
+        "a FAILED row this process never dispatched leaked into the exit code")
+
+
+async def test_until_empty_does_not_stop_while_a_task_is_still_running(store):
+    """`_claimable` is empty the moment the only task is dispatched — if the
+    exit condition ignored `_inflight` the drain would exit mid-task."""
+    hold = asyncio.Event()
+    sched = Scheduler(store, lambda task=None: FakeOrch(store, hold=hold),
+                      max_workers=1)
+    await _mk_tasks(store, 1)
+    stop = asyncio.Event()
+    run = asyncio.ensure_future(
+        sched.run_forever(stop=stop, poll_interval=0.01, until_empty=True))
+
+    await asyncio.sleep(0.2)
+    assert not run.done(), "exited while a task was still in flight"
+    assert not await sched.queue_is_drained()
+
+    hold.set()
+    await asyncio.wait_for(run, 10.0)
+    assert await sched.queue_is_drained()
+
+
+async def test_bare_run_forever_still_runs_forever_on_an_empty_queue(store):
+    """The default is untouched: no flag, no exit, empty queue or not."""
+    sched = Scheduler(store, lambda task=None: FakeOrch(store), max_workers=1)
+    stop = asyncio.Event()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            sched.run_forever(stop=stop, poll_interval=0.01), 0.4)
+    assert not stop.is_set()

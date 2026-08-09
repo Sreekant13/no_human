@@ -289,6 +289,10 @@ class Scheduler:
         self.max_workers = max(1, int(max_workers))
         self.wake = wake_watcher
         self._inflight: set[str] = set()
+        # Every id this process has dispatched, kept after it finishes: the
+        # drain's exit code is about what THIS run did, not about whatever
+        # else is in the database.
+        self._dispatched: set[str] = set()
         self._on_event = on_event or (lambda kind, text: None)
         self._quota_cooldown_until: datetime | None = None
         self.reanalysis = reanalysis_job
@@ -674,6 +678,7 @@ class Scheduler:
             asyncio.ensure_future(self._run(task))
             started.append(task.id)
         if started:
+            self._dispatched.update(started)
             self._last_dispatch_at = time.time()
             self._on_event("dispatch", f"started {len(started)} task(s); "
                            f"{len(self._inflight)}/{self.max_workers} busy")
@@ -879,9 +884,19 @@ class Scheduler:
                 )
 
     async def run_forever(
-        self, *, stop: asyncio.Event, poll_interval: float = 10.0
+        self, *, stop: asyncio.Event, poll_interval: float = 10.0,
+        until_empty: bool = False,
     ) -> None:
-        """Loop until ``stop`` is set, then drain in-flight tasks."""
+        """Loop until ``stop`` is set, then drain in-flight tasks.
+
+        ``until_empty`` (``nh serve --until-empty``) sets that SAME ``stop``
+        event as soon as a tick leaves the queue drained. It is deliberately
+        one more way to raise the flag ctrl-c/SIGTERM already raise, not a
+        second shutdown path: everything after the loop is unchanged. Parked
+        work (blocked / awaiting-input / escalated / paused-quota) is not
+        claimable, so it ENDS the drain rather than holding the process open
+        for a human who is not there.
+        """
         # Recorded so `health_snapshot` can judge "this loop has stopped
         # ticking" against the interval it is SUPPOSED to tick at, rather than
         # against a constant that would be wrong for any other configuration.
@@ -889,11 +904,42 @@ class Scheduler:
         await self._recover_orphans()
         while not stop.is_set():
             await self.tick()
+            # After the tick, so a task dispatched this pass is already in
+            # `_inflight` and an empty queue can never be read mid-dispatch.
+            if until_empty and await self.queue_is_drained():
+                stop.set()
+                break
             try:
                 await asyncio.wait_for(stop.wait(), timeout=poll_interval)
             except asyncio.TimeoutError:
                 pass
         await self.drain()
+
+    async def queue_is_drained(self) -> bool:
+        """Nothing running, nothing left to claim — the drain's exit condition.
+
+        Also the CLI's after-the-fact check: a run that stopped on a SIGNAL
+        with work still queued did NOT drain, and must not report that it did.
+        """
+        return not self._inflight and not await self._claimable()
+
+    async def failed_dispatched(self) -> list[str]:
+        """Ids this process dispatched whose task ended ``TaskStatus.FAILED``.
+
+        `task.status` is the field, and FAILED is the only value on it that
+        means failure: `core/task.py`'s TERMINAL_STATES is {DONE, FAILED}, and
+        every other resting place — awaiting_approval, blocked, awaiting_input,
+        escalated, paused_quota — is an honest park the loop is designed to
+        produce. A pool-level crash lands here too: `_run`'s handler writes
+        FAILED (and, if even that write fails, it says so loudly rather than
+        silently downgrading the outcome).
+        """
+        out: list[str] = []
+        for tid in sorted(self._dispatched):
+            task = await self.store.get_task(tid)
+            if task is not None and task.status == TaskStatus.FAILED:
+                out.append(tid)
+        return out
 
     async def drain(self) -> None:
         """Wait for all in-flight tasks to finish (best-effort, bounded poll)."""

@@ -2686,7 +2686,14 @@ async def _monday_poll_loop(poller, stop, poll_interval: int) -> None:
                    "even if concurrency.enabled is false in config (config on "
                    "disk is left untouched). Refused above 1 worker when "
                    "isolation.enabled is false.")
-def serve(max_workers):
+@click.option("--until-empty", is_flag=True, default=False,
+              help="Work the queue, then exit instead of running forever "
+                   "(cron/CI). Exits 0 when nothing is claimable and nothing "
+                   "is in flight, 1 if any task this run dispatched ended "
+                   "FAILED or the drain was cut short by a signal. Parked "
+                   "tasks (blocked/awaiting-input/escalated/paused-quota) are "
+                   "not claimable: they end the drain and do not fail it.")
+def serve(max_workers, until_empty):
     """Run the concurrent scheduler daemon (Phase 7): drain pending + resumed
     tasks into a bounded worker pool, each task in its own git worktree, running
     the wake-watcher in the same loop. Ctrl-C to stop (drains in-flight tasks).
@@ -2694,6 +2701,9 @@ def serve(max_workers):
     Requires concurrency.enabled in config, or pass --max-workers N to run the
     pool for this run only. Worktree isolation (isolation.enabled) is on by
     default for every task and is mandatory for a pool wider than one worker.
+
+    Add --until-empty to make it a batch job: same loop, same graceful
+    shutdown, but the queue going empty sets the stop event a signal would.
     """
     config, _ = _bootstrap()
     _assert_backend_usable()
@@ -2722,7 +2732,7 @@ def serve(max_workers):
     interval = parse_duration(str(conc.get("poll_interval", "10s")))
     secs = int(interval.total_seconds()) if interval else 10
 
-    async def _go():
+    async def _go() -> int:
         async with Store(config.db_path) as store:
             from ..vcs.pr_watcher import (
         check_pr_comments, default_branch_shipped, default_ci_log_excerpt,
@@ -2784,12 +2794,14 @@ def serve(max_workers):
                 except NotImplementedError:  # pragma: no cover — non-unix
                     pass
             console.print(f"[green]serving[/] pool={workers} poll={secs}s "
-                          "(ctrl-c to stop)")
+                          + ("(until the queue is empty)" if until_empty
+                             else "(ctrl-c to stop)"))
 
             # Jira intake: poll the operator's JQL into tasks (+ opt-in status
             # write-back) on its own cadence, in the same loop. Opt-in via
             # integrations.jira.enabled.
-            coros = [sched.run_forever(stop=stop, poll_interval=secs)]
+            coros = [sched.run_forever(stop=stop, poll_interval=secs,
+                                       until_empty=until_empty)]
             jira_cfg = (config.data.get("integrations") or {}).get("jira") or {}
             if jira_cfg.get("enabled"):
                 from ..config import load_env_var
@@ -2883,7 +2895,25 @@ def serve(max_workers):
                     await asyncio.to_thread(slack_worker.stop)
             console.print("[dim]drained; stopped[/]")
 
-    asyncio.run(_go())
+            if not until_empty:
+                return 0
+            # The batch caller's only channel is the exit code, so it says
+            # what happened rather than that the process ended. Failures
+            # first: a run that both failed a task and was cut short is a
+            # failed run.
+            err = Console(stderr=True)
+            failed = await sched.failed_dispatched()
+            if failed:
+                err.print(f"[red]{len(failed)} task(s) FAILED[/] "
+                          + ", ".join(t[:8] for t in failed))
+                return 1
+            if not await sched.queue_is_drained():
+                err.print("[red]stopped before the queue drained[/] "
+                          "(signalled) — work is still claimable")
+                return 1
+            return 0
+
+    sys.exit(asyncio.run(_go()) or 0)
 
 
 @cli.command("status")
@@ -4931,8 +4961,9 @@ def _stop_server(timeout: float) -> int:
 
 
 @cli.command("stop")
-@click.option("--timeout", default=3.0, type=float,
-              help="Seconds to wait after SIGTERM before escalating to SIGKILL (default 3).")
+@click.option("--timeout", default=30.0, type=float,
+              help="Seconds to wait after SIGTERM before escalating to SIGKILL "
+                   "(default 30).")
 def stop(timeout):
     """Stop the running `nh start`/`nh serve` server.
 
@@ -4940,6 +4971,14 @@ def stop(timeout):
     --timeout seconds, then escalates to SIGKILL if the process is wedged.
     Pairs with `nh start` — this is the command referenced by the
     auth-switch restart hint.
+
+    The default was 3s, which is not a graceful stop of this server: SIGTERM
+    sets the scheduler's stop event and `run_forever` then DRAINS in-flight
+    tasks, and a task is an Agent SDK session finishing a turn — seconds at
+    best. A 3s bound SIGKILLed the drain it was supposed to wait for. 30s is
+    a wait long enough for a turn to land, still short enough that a genuinely
+    wedged process is force-killed while somebody is watching; pass --timeout
+    to choose your own.
     """
     sys.exit(_stop_server(timeout))
 
