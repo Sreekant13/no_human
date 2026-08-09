@@ -11,12 +11,27 @@ mechanism of its own, so they are written down here instead.
 
 ## Source tree
 
-This repository's source tree contains no vendored third-party code. Runtime
-dependencies are declared in [`pyproject.toml`](pyproject.toml),
+Runtime dependencies are declared in [`pyproject.toml`](pyproject.toml),
 [`web/package.json`](web/package.json) and
 [`desktop/package.json`](desktop/package.json), and are fetched at install time
-under their own licences. Cloning this repository therefore obliges you to
-nothing beyond `LICENSE`.
+under their own licences.
+
+The source tree vendors two third-party libraries, used only as fixtures for
+the Commit0-style benchmark tier (`eval/commit0_corpus/`) — never imported by
+the product at runtime. Each is pinned, unmodified, and carries its own licence
+beside it:
+
+- **wcwidth** 0.2.13 — MIT — Copyright (c) Jeff Quast — vendored under
+  `eval/commit0_corpus/vendor/wcwidth-0.2.13/` (licence at
+  `eval/commit0_corpus/vendor/wcwidth-0.2.13/LICENSE`).
+- **cachetools** 5.5.2 — MIT — Copyright (c) Thomas Kemmer — vendored under
+  `eval/commit0_corpus/vendor/cachetools-5.5.2/` (licence at
+  `eval/commit0_corpus/vendor/cachetools-5.5.2/LICENSE`).
+
+MIT permits redistribution provided the copyright notice and licence text
+travel with the code, which the vendored `LICENSE` files satisfy. Cloning this
+repository therefore obliges you to `LICENSE` and to those two vendored
+licences, and to nothing else.
 
 ## Binary distributions
 
