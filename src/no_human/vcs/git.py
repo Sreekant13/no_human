@@ -126,6 +126,20 @@ class GitRepo:
         self._run("checkout", branch)
         return branch
 
+    def resolve_commitish(self, name: str) -> str | None:
+        """`name` if it resolves to a commit here, else `origin/name`, else None.
+
+        A branch NAME the caller derived (a project's default branch, say) may
+        have no local ref — single-branch clone, renamed remote default — while
+        `origin/<name>` is present and current. Git does not DWIM that inside
+        `worktree add` or `checkout -B <new> <base>`, so callers resolve first.
+        `^{commit}` makes --verify an EXISTENCE check, not a shape check."""
+        for cand in (name, f"origin/{name}"):
+            if self._run("rev-parse", "--verify", "--quiet",
+                         f"{cand}^{{commit}}", check=False):
+                return cand
+        return None
+
     def create_branch(self, name: str, *, base: str | None = None) -> str:
         if _branch_protected(name, self.never_push_to):
             raise ProtectedBranch(f"refusing to create protected branch: {name}")
@@ -134,7 +148,10 @@ class GitRepo:
         # worktree-safe — checking out the base branch directly fails when it is
         # already checked out in the primary worktree.
         if base:
-            self._run("checkout", "-B", name, base)
+            # A derived base with no local ref falls through to origin/<base>
+            # (review finding F1's second site). A base that resolves NOWHERE
+            # still goes to git verbatim so the failure is loud and names it.
+            self._run("checkout", "-B", name, self.resolve_commitish(base) or base)
         else:
             self._run("checkout", "-B", name)
         return name

@@ -1297,6 +1297,57 @@ class Orchestrator:
 
     # ------------------------------ driver --------------------------------- #
 
+    async def _implicit_base_branch(self, repo) -> str:
+        """The PR base for a task nobody pinned one on: the PROJECT's default
+        branch — never the branch the checkout happens to be sitting on.
+
+        THE DEFECT THIS EXISTS FOR (dogfooded 2026-08-09, three tasks on the
+        live board, reference trace task 0960f3a9): the operator's checkout was
+        parked on a stale local feature branch, the base was taken from it, and
+        `gh pr create` refused twice — "No commits between land/term-gate and
+        no-human/<id>", "Base ref must be a branch" — because that branch
+        exists only locally, before the task escalated NOVEL_UNKNOWN. The
+        product already KNEW: `_finalize` emitted "PR base ... differs from
+        project default_branch ..." and then opened the PR on the wrong base
+        anyway. A warning is not a decision.
+
+        EXPLICIT bases are unaffected, and are resolved by the callers before
+        this is reached — it is only ever the `or` arm of
+        `ctx.get("base_branch") or ...`. Two real flows pin one:
+        the API's `base_branch` (PR-001, `api/app.py`), and the lead agent's
+        stacked-PR chaining, which propagates a dependency's PR branch as the
+        dependent sub-task's base (`lead_agent._unblock_ready`). Only the
+        IMPLICIT inheritance of the checkout's branch dies here.
+
+        Order: the confirmed profile's declared default, then the remote's
+        actual default (origin/HEAD), then — only when NEITHER can be read —
+        the checkout's branch. That last arm is not a regression in disguise:
+        a repo with no origin has no default branch to discover and no forge to
+        refuse the PR, which is the shape of every bench fixture and most
+        tests. It logs rather than emits, because a per-run event for the
+        normal state of a remoteless repo is noise, and the mismatch that DOES
+        matter is still reported at PR-open time in `_finalize`."""
+        prof = None
+        try:
+            prof = await self._usable_profile(repo.path)
+        except Exception as exc:  # noqa: BLE001 — never block a run on a profile read
+            log.warning("profile lookup failed while deriving the PR base: %s", exc)
+        # str() first: a YAML `default_branch: yes` arrives as bool True and
+        # `.strip()` on it is an AttributeError out of a derivation that must
+        # never raise (review finding A5).
+        base = (str(getattr(prof, "default_branch", "") or "") if prof else "").strip()
+        if not base:
+            try:
+                base = repo.default_branch()
+            except Exception:  # noqa: BLE001 — best-effort; falls through below
+                base = ""
+        if base:
+            return base
+        fallback = repo.current_branch()
+        log.info("no project/remote default branch for %s — PR base falls back "
+                 "to the checkout's branch %r", repo.path, fallback)
+        return fallback
+
     async def run_task(self, task: Task) -> TaskOutcome:
         """Drive a task to a terminal/parked outcome.
 
@@ -1330,11 +1381,12 @@ class Orchestrator:
             finally:
                 self._cleanup_plan_file(main_repo)
 
-        # Worktree-isolated mode. Derive + persist the base from the PRIMARY
-        # checkout before detaching a worktree (a detached worktree's
-        # current_branch() is not the base).
+        # Worktree-isolated mode. Derive + persist the base before detaching a
+        # worktree (a detached worktree's current_branch() is not the base).
+        # Derived from the PROJECT's default branch, not from whatever branch
+        # the primary checkout is parked on — see `_implicit_base_branch`.
         ctx = task.context or {}
-        base = ctx.get("base_branch") or main_repo.current_branch()
+        base = ctx.get("base_branch") or await self._implicit_base_branch(main_repo)
         ctx["base_branch"] = base
         task.context = ctx
         await self.store.update_task(task)
@@ -1847,14 +1899,19 @@ class Orchestrator:
                 )
                 return await lead.park_parent(task)
 
-        # Capture the base branch once and PERSIST it on the task. Re-deriving
-        # from current_branch() is wrong on two axes: (1) within a run, after a
-        # failed attempt the head points at a feature branch; (2) across runs, a
-        # resumed task (nh reply / wake) is checked out on the parked feature
-        # branch, so deriving base from it would open a PR with base == head.
+        # Capture the base branch once and PERSIST it on the task. Deriving it
+        # from current_branch() is wrong on three axes: (1) within a run, after
+        # a failed attempt the head points at a feature branch; (2) across
+        # runs, a resumed task (nh reply / wake) is checked out on the parked
+        # feature branch, so the base would equal the head; (3) even on the
+        # FIRST derivation, the checkout may be parked on a branch that is not
+        # the project's default and may not exist on the forge at all — the
+        # live "No commits between land/term-gate and no-human/<id>" failures.
+        # (1) and (2) are why it is persisted; (3) is why it is not read from
+        # the checkout in the first place.
         ctx = task.context or {}
         if not ctx.get("base_branch"):
-            ctx["base_branch"] = repo.current_branch()
+            ctx["base_branch"] = await self._implicit_base_branch(repo)
             task.context = ctx
             await self.store.update_task(task)
         base_branch = ctx["base_branch"]
@@ -2522,7 +2579,14 @@ class Orchestrator:
                 lr_repo = GitRepo(
                     lr, never_push_to=self.config.get("git", {}).get("never_push_to", []),
                 )
-                lr_base = lr_repo.current_branch()
+                # Same rule as the primary repo's base, for the same reason:
+                # this value is both the branch point AND the base of the
+                # linked PR (`_finalize` opens it with `base=lr_base`), so a
+                # linked checkout parked on a local-only branch produces a PR
+                # the forge refuses — here inside a `try` that only LOGS, so it
+                # fails silently. A linked repo with no discoverable default
+                # (no origin) resolves to its checkout branch exactly as before.
+                lr_base = await self._implicit_base_branch(lr_repo)
                 lr_repo.create_branch(branch, base=lr_base)
                 linked_repos_git.append((lr_path, lr_repo, lr_base))
                 self.emit("linked_repo", f"{lr_path}: staged on {branch}", ok=True)
@@ -4003,6 +4067,22 @@ class Orchestrator:
         # profile never set one, auto-detect the remote's actual default
         # (origin/HEAD) so a stale local checkout doesn't silently skip this
         # protection (the "assumed master, remote is main" root cause).
+        #
+        # What a mismatch MEANS changed on 2026-08-09. It used to mean "the
+        # base was inherited from whatever branch the checkout was on, and this
+        # PR is about to fail" — the warning named the right answer and the
+        # code then used the wrong one. Implicit bases now ARE the default
+        # branch (`_implicit_base_branch`), so a mismatch here can only be an
+        # EXPLICIT base: pinned through the API (PR-001) or chained from a
+        # dependency's PR branch for a stacked PR. Both are legitimate; both
+        # are still worth saying out loud, because a stack that targets a
+        # branch which later merges or is deleted is a real failure mode.
+        # ONE residual non-explicit case, and it is why this stays a warning:
+        # a task PARKED BEFORE this change carries a checkout-derived base in
+        # its context, and `ctx.get("base_branch")` still wins on resume. The
+        # two are indistinguishable once persisted — an explicit pin and an
+        # inherited one are the same key — so those tasks are re-filed, not
+        # migrated, and this warning is what names them.
         prof = getattr(self, "_active_profile", None)
         expected_default = getattr(prof, "default_branch", "") if prof else ""
         if not expected_default:
@@ -4014,7 +4094,9 @@ class Orchestrator:
             self.emit(
                 "warning",
                 f"PR base '{base}' differs from project default_branch "
-                f"'{expected_default}' — verify this is intentional",
+                f"'{expected_default}' — an explicit base (pinned, or a "
+                f"stacked PR's parent branch); nothing is inherited from the "
+                f"checkout's branch any more, so verify this is intentional",
             )
 
         title = self._commit_message(task)
@@ -7648,8 +7730,26 @@ class Orchestrator:
 
         Registration happens after the checkout exists, and the pid is already
         in the directory NAME, so a reaper that runs in between still sees an
-        owner (us) that is alive and leaves it alone."""
-        repo = main_repo.add_worktree(wt_path, base=base, detach=True)
+        owner (us) that is alive and leaves it alone.
+
+        The BRANCH POINT is resolved before the add (review finding F1): the
+        derived default branch may have no LOCAL ref — a single-branch clone,
+        an old clone after a remote default rename, a typo'd profile — and
+        `git worktree add` does not DWIM `origin/<base>`, so the raw name
+        hard-failed the task with remediation text blaming the worktree root.
+        `origin/<base>` is tried second; the PR BASE stays `<base>` (the forge
+        resolves its own ref — only the local checkout needs a reachable
+        commit). Only when neither resolves does the checkout's branch carry
+        the worktree, loudly: a typo'd profile default must not be quiet."""
+        branch_point = main_repo.resolve_commitish(base)
+        if branch_point is None:
+            branch_point = main_repo.current_branch()
+            log.warning(
+                "PR base %r has no local ref and no origin/%s — branching the "
+                "worktree from the checkout's %r instead; if the profile's "
+                "default_branch is a typo, fix the profile", base, base,
+                branch_point)
+        repo = main_repo.add_worktree(wt_path, base=branch_point, detach=True)
         _LIVE_WORKTREES.add(str(wt_path))
         return repo
 

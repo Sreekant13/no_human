@@ -488,21 +488,25 @@ class CreateTaskRequest(BaseModel):
     # before filing anything", i.e. a precondition a human has to remember every
     # time, which is not a fix.
     #
-    # Left as None it preserves exactly the old behaviour, deliberately: the
-    # bench and `nh repo new` create tasks through this same path and rely on
-    # the checkout's branch, and §5 says the bench is an instrument, never a
-    # target. Pinning is opt-in.
+    # Left as None, the base is now the PROJECT'S DEFAULT BRANCH — the profile's
+    # declared `default_branch`, else the remote's `origin/HEAD`, and only for a
+    # repo with neither (no origin: the bench's fixtures, most tests) the
+    # checkout's branch. `orchestrator._implicit_base_branch` is the one place
+    # that decides it, for the primary repo and for linked repos alike.
     #
     # 🔴 THIS IS HALF OF PR-001, AND THE HALF A HUMAN CANNOT REACH.
     # An earlier version of this comment said "the composer offers it, so a
     # person filing a ticket can see and choose it". It does not — there is no
     # `base_branch` anywhere in `web/src`, an architecture audit proved it with
     # a positive control, and PR-001 is explicit that this is "A GUI fix, not a
-    # doc fix". So for the only user PR-001 describes — someone filing through
-    # the board — NOTHING has changed yet, and the run-book precondition "put
-    # the primary checkout on `main` before filing anything" still stands.
-    # What remains: a composer field defaulting to the project's resolved
-    # default branch (falling back to the remote's `origin/HEAD`), editable.
+    # doc fix". What HAS changed (2026-08-09) is the default that field would
+    # have offered: the run-book precondition "put the primary checkout on
+    # `main` before filing anything" is retired — the checkout's branch is no
+    # longer inherited, so a stale checkout can no longer send a run to a base
+    # `gh pr create` refuses ("No commits between <stale> and no-human/<id>").
+    # What remains for PR-001: the composer field itself, for the person who
+    # wants a base OTHER than the default (a stacked PR onto a colleague's
+    # branch), defaulting to the resolved default branch and editable.
     base_branch: str | None = None
     # GAP 1 — the optional human plan-approval gate. Default False keeps every
     # existing caller (bench, `nh repo new`, the composer) on today's

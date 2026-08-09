@@ -530,8 +530,8 @@ async def create_task(body: CreateTaskRequest, request: Request) -> TaskSummaryO
     # PR-001: honour an explicitly pinned base. Blank/whitespace is treated as
     # "not pinned" so an empty composer field cannot write an empty string that
     # would then beat the fallback (`ctx.get("base_branch") or
-    # current_branch()` — "" is falsy, but an empty key is still misleading to
-    # every reader and to the PR-time mismatch warning).
+    # await self._implicit_base_branch(repo)` — "" is falsy, but an empty key is
+    # still misleading to every reader and to the PR-time mismatch warning).
     pinned_base = (body.base_branch or "").strip()
     if pinned_base:
         task.context = {**(task.context or {}), "base_branch": pinned_base}

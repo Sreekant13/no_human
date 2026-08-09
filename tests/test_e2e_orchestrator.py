@@ -459,11 +459,13 @@ async def test_task_can_opt_out_of_global_pr_labels(bare_repo, tmp_path, store,
     assert labels == []
 
 
-async def test_default_branch_auto_detect_warns_on_stale_local_checkout(tmp_path, store):
-    """C3: a local checkout stuck on 'master' while the remote's real default
-    moved to 'main' must be caught even when no ProjectProfile.default_branch
-    was ever confirmed — the auto-detect fallback in GitRepo.default_branch(),
-    not just the pre-existing (opt-in) profile-declared check."""
+async def _run_on_stale_checkout(tmp_path, store, monkeypatch, *, pinned_base=None,
+                                 drop_local_default=False):
+    """Run a task in a repo whose CHECKOUT is parked on 'master' while the
+    remote's real default is 'main'. Returns (outcome, base passed to open_pr,
+    the task as stored, events)."""
+    from no_human.core import orchestrator as orch_mod
+
     bare = tmp_path / "remote.git"
     subprocess.run(["git", "init", "--bare", "-b", "main", str(bare)], check=True,
                    capture_output=True)
@@ -481,6 +483,11 @@ async def test_default_branch_auto_detect_warns_on_stale_local_checkout(tmp_path
     _git(work, "remote", "add", "origin", str(bare))
     _git(work, "push", "-u", "origin", "main")  # establishes real refs/heads/main
     _git(work, "checkout", "-b", "master")  # stale local checkout, mismatched
+    if drop_local_default:
+        # The F1 shape: the derived default has NO local ref (single-branch
+        # clone / renamed remote default / typo'd profile) — only origin/main
+        # can seed the worktree.
+        _git(work, "branch", "-D", "main")
 
     def mutate(cwd):
         (cwd / "calc.py").write_text(
@@ -490,16 +497,88 @@ async def test_default_branch_auto_detect_warns_on_stale_local_checkout(tmp_path
             "def test_add():\n    assert add(1, 2) == 3\n\n"
             "def test_mul():\n    assert mul(2, 3) == 6\n")
 
+    captured = {}
+    real_open_pr = orch_mod.open_pr
+
+    def spy_open_pr(repo, branch, title, body, **kwargs):
+        captured["base"] = kwargs.get("base")
+        return real_open_pr(repo, branch, title, body, **kwargs)
+
+    monkeypatch.setattr(orch_mod, "open_pr", spy_open_pr)
+
     cfg = _config(tmp_path)
     events = []
     orch = Orchestrator(store, cfg.data, FakeBackend(mutate), SlackNotifier(None),
                         event_sink=events.append)
     t = Task.new("add mul()", repo_path=str(work))
+    if pinned_base:
+        t.context = {**(t.context or {}), "base_branch": pinned_base}
     await store.create_task(t)
 
     outcome = await orch.run_task(t)
+    return outcome, captured.get("base"), await store.get_task(t.id), events
+
+
+async def test_pr_base_is_the_default_branch_not_the_stale_checkout_branch(
+        tmp_path, store, monkeypatch):
+    """The live defect (2026-08-09, reference trace task 0960f3a9): the
+    operator's checkout was parked on a stale local branch, the base was taken
+    from it, and `gh pr create` refused twice — "No commits between
+    land/term-gate and no-human/<id>", "Base ref must be a branch" — before the
+    task escalated NOVEL_UNKNOWN. The product warned first and proceeded on the
+    wrong base anyway, which is what this pins: the checkout is on 'master',
+    the remote's default is 'main', and the PR must target 'main'.
+
+    This test used to assert the WARNING (C3's auto-detect) and accept the
+    wrong base. The auto-detect it covered is still covered — it is what
+    resolves 'main' here, with no ProjectProfile.default_branch ever confirmed
+    — but the outcome it now demands is the right base, not a note about the
+    wrong one."""
+    outcome, base, stored, events = await _run_on_stale_checkout(
+        tmp_path, store, monkeypatch)
 
     assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert base == "main", f"PR opened against {base!r}, not the default branch"
+    assert stored.context["base_branch"] == "main", (
+        "the persisted base must be the default branch, so a resume/wake "
+        "re-derives nothing from the checkout either")
+    mismatch = [e for e in events
+                if e.get("kind") == "warning"
+                and "differs from project default_branch" in e["text"]]
+    assert not mismatch, (
+        f"no mismatch warning is due when the base IS the default: {mismatch}")
+
+
+async def test_a_default_branch_with_no_local_ref_still_runs_and_targets_it(
+        tmp_path, store, monkeypatch):
+    """Review finding F1, empirically proven on the first cut: when 'main' has
+    no LOCAL ref (single-branch clone, renamed remote default, typo'd profile)
+    the task hard-failed at `git worktree add ... main` with remediation text
+    blaming isolation.worktree_root. The branch point must fall through to
+    origin/main while the PR base stays 'main'."""
+    outcome, base, stored, events = await _run_on_stale_checkout(
+        tmp_path, store, monkeypatch, drop_local_default=True)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, (
+        f"the task must run, not die at worktree creation: {outcome}")
+    assert base == "main", f"PR opened against {base!r}, not the default branch"
+    assert stored.context["base_branch"] == "main"
+
+
+async def test_an_explicitly_pinned_base_still_wins_and_warns(
+        tmp_path, store, monkeypatch):
+    """The implicit inheritance dies; explicit bases do not. A pinned base
+    (the API's `base_branch`, PR-001) and the lead agent's stacked-PR chaining
+    (`_unblock_ready` propagates a dependency's PR branch) both arrive as
+    `context["base_branch"]`, and both must still target exactly that branch —
+    with the mismatch warning, which now means "explicit override" rather than
+    "about to fail"."""
+    outcome, base, stored, events = await _run_on_stale_checkout(
+        tmp_path, store, monkeypatch, pinned_base="master")
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL
+    assert base == "master", f"the pinned base was overridden with {base!r}"
+    assert stored.context["base_branch"] == "master"
     warnings = [e for e in events if e.get("kind") == "warning"]
     assert any("master" in w["text"] and "main" in w["text"] for w in warnings), (
         f"expected a default-branch mismatch warning, got: {[e['text'] for e in warnings]}"
