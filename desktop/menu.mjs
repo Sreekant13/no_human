@@ -10,7 +10,7 @@
 // inputs lose it.
 export function buildMenuTemplate({ isMac, isDev, onNavigate, onNewTask,
                                     onReenterToken, onCheckForUpdates,
-                                    onOpenDocs }) {
+                                    onOpenDocs, onShowAbout }) {
   const nav = (label, page, accelerator) => ({
     label, accelerator, click: () => onNavigate(page),
   });
@@ -115,6 +115,12 @@ export function buildMenuTemplate({ isMac, isDev, onNavigate, onNewTask,
         // that gains new material between releases, and the copy that can be
         // wrong about the version actually installed.
         { label: "Documentation (Online)", click: () => onOpenDocs("site") },
+        // "About no_human" in Help too, not only the macOS app menu: Windows and
+        // Linux have no appMenu, so this is the ONLY About entry there. On macOS
+        // it duplicates the app-menu item, which is harmless and expected.
+        ...(onShowAbout
+          ? [{ type: "separator" }, { label: "About no_human", click: () => onShowAbout() }]
+          : []),
       ],
     });
   }

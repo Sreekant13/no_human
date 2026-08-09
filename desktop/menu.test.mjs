@@ -160,6 +160,29 @@ test("buildMenuTemplate: Help offers the BUNDLED quickstart first, then the site
     "each item must ask for its own target, not share one handler");
 });
 
+test("buildMenuTemplate: Help gains an 'About no_human' item that fires onShowAbout", () => {
+  let shown = 0;
+  const t = buildMenuTemplate({
+    isMac: true, isDev: false, onNavigate: () => {}, onNewTask: () => {},
+    onOpenDocs: () => {}, onShowAbout: () => { shown++; },
+  });
+  const help = t.find((m) => m.role === "help");
+  const about = (help.submenu || []).find((i) => i.label === "About no_human");
+  assert.ok(about, "an About item exists when onShowAbout is supplied");
+  about.click();
+  assert.equal(shown, 1, "clicking About invokes onShowAbout");
+});
+
+test("buildMenuTemplate: no About item when onShowAbout is absent", () => {
+  const t = buildMenuTemplate({
+    isMac: true, isDev: false, onNavigate: () => {}, onNewTask: () => {},
+    onOpenDocs: () => {},
+  });
+  const help = t.find((m) => m.role === "help");
+  const about = (help.submenu || []).find((i) => i.label === "About no_human");
+  assert.equal(about, undefined, "no About item without a handler (no dead menu entry)");
+});
+
 test("buildMenuTemplate: no Help menu when no docs handler is supplied", () => {
   const t = buildMenuTemplate({
     isMac: true, isDev: false, onNavigate: () => {}, onNewTask: () => {},

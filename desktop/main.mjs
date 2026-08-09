@@ -18,6 +18,7 @@ import { createServerLifecycle } from "./serverLifecycle.mjs";
 import { quitAction } from "./quitPolicy.mjs";
 import { parseBadgeCount, overlayBadgeBitmap } from "./badge.mjs";
 import { buildMenuTemplate } from "./menu.mjs";
+import { docPage } from "./docRender.mjs";
 import { createUpdater } from "./updater.mjs";
 import { updateMessage } from "./updatePolicy.mjs";
 import { readUpdateState, writeUpdateState } from "./updateState.mjs";
@@ -242,6 +243,28 @@ const DOCS_URL = "https://getnohuman.com/docs";
  * is used — otherwise the menu item would be dead for every developer and the
  * one person able to notice it broken would never see it.
  */
+// The native macOS About panel (⌘-triggered via the app menu's "About
+// no_human", and shown by app.showAboutPanel()). Content is truthful and
+// matches the site: what it is, that it never merges, and the site. A contact
+// email is deliberately absent until the operator signs one off — the term
+// gate refuses the personal address in shipped content, and it is not this
+// code's call to override that.
+function setupAboutPanel() {
+  try {
+    app.setAboutPanelOptions({
+      applicationName: "no_human",
+      applicationVersion: app.getVersion(),
+      credits:
+        "A team of AI agents that works your tickets to reviewed pull requests.\n" +
+        "It opens PRs — it never merges. You approve.\n\n" +
+        "getnohuman.com",
+      copyright: "© no_human",
+    });
+  } catch (err) {
+    console.error("about panel failed:", err);
+  }
+}
+
 function bundledDoc(name) {
   const base = app.isPackaged
     ? path.join(process.resourcesPath, "docs")
@@ -281,10 +304,58 @@ function buildAppMenu() {
       // doing nothing: a Help item that silently no-ops is worse than one that
       // opens the wrong-ish page, because the user cannot tell it tried.
       const p = bundledDoc("quickstart");
-      return p ? shell.openPath(p) : openExternallyIfWeb(DOCS_URL);
+      // RENDER the bundled markdown in-app rather than shell.openPath(p): the
+      // OS opens a `.md` in whatever owns that extension (TextEdit → raw
+      // markdown), which is what the user saw. openDocWindow keeps it offline
+      // and readable. Falls back to the site if the bundled copy is missing.
+      return p ? openDocWindow(p, "no_human Quickstart") : openExternallyIfWeb(DOCS_URL);
     },
+    onShowAbout: () => (app.showAboutPanel ? app.showAboutPanel() : null),
   });
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+// Render a bundled markdown doc into a self-contained, offline HTML page and
+// show it in its own frameless-menu BrowserWindow. Falls back to the site if
+// the file cannot be read. In test mode it records what it would render
+// (rendered=<bytes>) instead of opening a window, so a test can prove the
+// quickstart is RENDERED and never handed to the OS as raw `.md`.
+function openDocWindow(mdPath, title) {
+  let md;
+  try {
+    md = fs.readFileSync(mdPath, "utf8");
+  } catch {
+    return openExternallyIfWeb(DOCS_URL);
+  }
+  const html = docPage(title, md);
+  if (process.env.NH_TEST_LOG) {
+    fs.appendFileSync(
+      process.env.NH_TEST_LOG,
+      `openDoc ${path.basename(mdPath)} rendered=${html.length}\n`,
+    );
+    return;
+  }
+  const win = new BrowserWindow({
+    width: 860,
+    height: 780,
+    title,
+    backgroundColor: "#0e1320",
+    webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true },
+  });
+  if (win.removeMenu) win.removeMenu();
+  // In-doc anchors stay in the window; any http(s) link goes to the OS browser
+  // through the one guarded helper, never straight to the shell.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    openExternallyIfWeb(url);
+    return { action: "deny" };
+  });
+  win.webContents.on("will-navigate", (event, url) => {
+    if (/^https?:\/\//i.test(url)) {
+      event.preventDefault();
+      openExternallyIfWeb(url);
+    }
+  });
+  win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(html));
 }
 
 // Defense-in-depth (review finding): only ever hand web schemes to the OS —
@@ -796,6 +867,7 @@ if (!gotLock) {
     // Tray failure must never abort startup (review: a bad image on some
     // platforms throws here, and this runs BEFORE the window exists).
     try { buildTray(); } catch (err) { console.error("tray failed:", err); }
+    setupAboutPanel();
     buildAppMenu();
     await createWindow();
     // AFTER the window exists (it is the thing that renders the notice) and
