@@ -58,6 +58,7 @@ from ..config import active_auth_profile
 from ..history.skills import discover_skills
 from ..intake.split_proposal import generate_split_proposal
 from ..intake.surface_advisory import surface_advisory
+from ..learning import CONFIRMED_BY_AUTO, ORIGIN_REVIEW
 from ..learning.triggers import filter_triggered
 from ..notify.slack import SlackNotifier
 from ..review import selfcheck
@@ -5023,10 +5024,12 @@ class Orchestrator:
                     parts.append(f"Test command: {prof.test_cmd}")
                 profile_ctx = "\n".join(f"  {p}" for p in parts if p)
             try:
-                decision = await self.reviewer.review(
+                # Through the single reviewer chokepoint, which computes the
+                # reviewer's confirmed_rules from the exclusion channel (gate
+                # independence — see `_run_reviewer`).
+                decision = await self._run_reviewer(
                     task, repo_path=repo.path, mode="already_satisfied",
                     claim_report=claim, profile_context=profile_ctx,
-                    confirmed_rules=self._format_active_memories() or "",
                 )
             except ReviewerUnavailable as exc:
                 return await self._escalate_reviewer_unavailable(
@@ -5606,6 +5609,12 @@ class Orchestrator:
                 # Refusal and dedupe both return a bare None; route the reason
                 # into the advisory stream so neither is silent.
                 note=self._advisory,
+                # D3-M1: a recurring, human-approved review lesson may
+                # auto-confirm into the CODER's channel (never the reviewer's).
+                # Default OFF; the reviewer-memory exclusion holds regardless.
+                auto_confirm_recurring=bool(
+                    (self.config.get("learning") or {}).get(
+                        "auto_confirm_recurring", False)),
             )
             if mem_id:
                 self.emit("learning_proposed",
@@ -6343,7 +6352,6 @@ class Orchestrator:
             if prof.lint_cmd:
                 parts.append(f"Lint command: {prof.lint_cmd}")
             profile_ctx = "\n".join(f"  {p}" for p in parts if p)
-        confirmed_rules = self._format_active_memories() or ""
 
         # Multi-repo: the reviewer must SEE and JUDGE every repo the task
         # touched, not just the primary. The coder commits into linked repos
@@ -6370,14 +6378,15 @@ class Orchestrator:
 
         self._emit_review("review_start", "running independent staff-level reviewer")
         try:
-            decision = await self.reviewer.review(
+            # Single reviewer chokepoint; confirmed_rules is set inside it from
+            # the exclusion channel (gate independence — see `_run_reviewer`).
+            decision = await self._run_reviewer(
                 task,
                 repo_path=repo.path,
                 linked_repos=linked_for_review or None,
                 test_output=test_result.output if test_result.ran else "",
                 held_out_output=held_result.output if held_result else "",
                 profile_context=profile_ctx,
-                confirmed_rules=confirmed_rules,
                 prior_rounds=self._review_continuity(task),
                 before_ref=self._review_base(repo, base),
                 # 0a: the artifact a "the PR body contains X" criterion refers to.
@@ -6559,7 +6568,6 @@ class Orchestrator:
             if prof.lint_cmd:
                 parts.append(f"Lint command: {prof.lint_cmd}")
             profile_ctx = "\n".join(f"  {p}" for p in parts if p)
-        confirmed_rules = self._format_active_memories() or ""
 
         # Fetch existing PR comments so the reviewer can check they were addressed.
         pr_comments_text = ""
@@ -6575,14 +6583,15 @@ class Orchestrator:
             return await self._fail(task, "no reviewer configured for code_review tasks")
 
         try:
-            decision = await self.reviewer.review(
+            # Single reviewer chokepoint; confirmed_rules is set inside it from
+            # the exclusion channel (gate independence — see `_run_reviewer`).
+            decision = await self._run_reviewer(
                 task,
                 repo_path=repo.path,
                 test_output="",
                 held_out_output="",
                 diff_override=diff,
                 profile_context=profile_ctx,
-                confirmed_rules=confirmed_rules,
                 mode="code_review",
                 pr_comments=pr_comments_text,
             )
@@ -9801,10 +9810,81 @@ class Orchestrator:
 
     def _format_active_memories(self) -> str:
         """Format confirmed rules + skills for prompt injection (importance-
-        tiered). Pure logic in prompt_blocks.build_memories_block."""
+        tiered). Pure logic in prompt_blocks.build_memories_block.
+
+        THIS IS THE CODER'S (and supervisor's) CHANNEL. It INCLUDES
+        auto-confirmed review-origin lessons — that is D3-M1's whole learning
+        value: a lesson the reviewer keeps re-deriving reaches the coder without
+        a human click. The REVIEWER reads `_format_reviewer_memories` instead,
+        which strips exactly those rows — see that method."""
         return build_memories_block(
             getattr(self, "_active_memories", None),
             self._RULES_CRITICAL_CAP, self._RULES_RELEVANT_CAP,
+        )
+
+    def _format_reviewer_memories(self) -> str:
+        """Confirmed rules for the REVIEWER prompt — `_format_active_memories`
+        MINUS every AUTO-confirmed REVIEW-origin lesson.
+
+        GATE INDEPENDENCE BY CONSTRUCTION (constraint #3 / design principle 6).
+        D3-M1 lets a recurring review-origin lesson auto-confirm without a human
+        click. Feeding such a lesson back to the reviewer would let the gate
+        consume a rule distilled from its OWN past verdicts with no human in
+        between — the one thing the gate must never do. This exclusion is the
+        wall, and it is the ONLY thing standing between auto-confirm and a
+        broken invariant, so it lives in code, not in a prompt instruction:
+
+          * excluded: origin='review' AND confirmed_by='auto' — reaches the
+            coder via `_format_active_memories`, never here.
+          * NOT excluded: a HUMAN-confirmed review lesson (confirmed_by='human',
+            or NULL for a row confirmed before the column existed) — a human
+            stood between the verdict and the rule, which is exactly what the
+            gate requires. Non-review-origin rows (supervisor, history, …) are
+            never touched, whatever confirmed them.
+
+        Mutation proof: delete the `not (...)` filter and
+        tests/test_auto_confirm_recurring.py::
+        test_invariant_auto_confirmed_review_lesson_absent_from_reviewer fails.
+        """
+        raw = getattr(self, "_active_memories", None) or []
+        visible = [
+            m for m in raw
+            if not (m.get("origin") == ORIGIN_REVIEW
+                    and m.get("confirmed_by") == CONFIRMED_BY_AUTO)
+        ]
+        return build_memories_block(
+            visible, self._RULES_CRITICAL_CAP, self._RULES_RELEVANT_CAP,
+        )
+
+    async def _run_reviewer(self, task: Task, **kwargs: Any) -> ReviewDecision:
+        """THE SINGLE CHOKEPOINT for the review gate. Every ``reviewer.review``
+        call MUST route through here — enforced by
+        ``tests/test_reviewer_channel_guard.py``, which fails if any
+        ``self.reviewer.review(...)`` appears outside this method.
+
+        WHY A CHOKEPOINT, not just a shared helper. `_format_reviewer_memories`
+        already strips auto-confirmed review-origin lessons, but it was only as
+        good as every call site remembering to use it: a future reviewer site
+        that reached for `_format_active_memories` (the CODER channel) would
+        silently feed the gate a rule derived from its own auto-confirmed
+        verdicts — the exact invariant D3-M1 must not break. Computing
+        ``confirmed_rules`` HERE, in the one place `reviewer.review` is reached,
+        makes that bypass impossible by construction: a new site either goes
+        through here (exclusion applied) or the AST guard fails.
+
+        ``confirmed_rules`` is NOT a caller kwarg. It is set here, always, from
+        the exclusion channel. A caller passing it is a programming error,
+        raised loudly rather than silently overridden — mirroring
+        `add_memory`'s refusal of a wrong `source`.
+        """
+        if "confirmed_rules" in kwargs:
+            raise TypeError(
+                "confirmed_rules is computed by _run_reviewer (the "
+                "gate-independence channel), never passed by the caller")
+        return await self.reviewer.review(
+            task,
+            confirmed_rules=self._format_reviewer_memories() or "",
+            **kwargs,
         )
 
     def _resume_digest(self, task: Task) -> str:

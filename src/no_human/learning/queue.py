@@ -72,6 +72,23 @@ ORIGIN_CURATOR = "curator"        # curator.py's consolidation of N proposals in
 ARCHIVE_ON_REJECT = frozenset({ORIGIN_SUPERVISOR, ORIGIN_HISTORY, ORIGIN_CURATOR})
 
 
+# WHO confirmed a memory into the active set — the `memories.confirmed_by`
+# column (D3-M1). 'human' is every `nh learnings`/API confirm; 'auto' is the
+# evidence-gated auto-confirm below. The pair (ORIGIN_REVIEW, CONFIRMED_BY_AUTO)
+# is the EXACT tuple the reviewer's confirmed-rules channel excludes, so an
+# auto-confirmed review lesson reaches the coder and never the reviewer that
+# produced it (gate independence, constraint #3). A NULL `confirmed_by` (a row
+# confirmed before the column existed) is human/legacy, not 'auto'.
+CONFIRMED_BY_HUMAN = "human"
+CONFIRMED_BY_AUTO = "auto"
+
+# D3-M1: how many DISTINCT human-approved tasks a review finding must recur on
+# before it may auto-confirm. Two is the minimum that makes "recurring" mean
+# more than one task — one occurrence is this task's own bug, two across
+# distinct approved tasks is a repository requirement.
+_MIN_RECURRENCE_TASKS = 2
+
+
 # Memory types (matches the migrations schema CHECK-free `type` column).
 TYPE_SKILL = "skill"
 TYPE_FACT = "fact"
@@ -399,6 +416,7 @@ class LearningQueue:
         self, task: Task, *, findings: list[dict[str, Any]],
         attempt: int | None = None, review_round: int = 1,
         distill: DistillFn | None = None, note: NoteFn | None = None,
+        auto_confirm_recurring: bool = False,
     ) -> str | None:
         """Queue ONE proposal distilled from a reviewer FAIL round's blocking
         findings. Returns the new memory id, or None (nothing learnable, or
@@ -423,6 +441,18 @@ class LearningQueue:
         ``confirmed=0``/``source="proposed"``, and the reviewer prompt is built
         from ``list_memories(confirmed=True, …)``. A reviewer therefore cannot
         consume a rule derived from its own verdict until a HUMAN confirms it.
+
+        *auto_confirm_recurring* (D3-M1, default False, from
+        ``config learning.auto_confirm_recurring``) narrows — never removes —
+        that human step for the CODER'S CHANNEL ONLY. When a review finding
+        DEDUPES (it has recurred) across >=2 DISTINCT tasks in this project that
+        each reached HUMAN approval (a MERGED PR outcome), the deduped row is
+        auto-confirmed with ``confirmed_by='auto'``. Gate independence still
+        holds because the reviewer's confirmed-rules channel EXCLUDES
+        (origin='review' AND confirmed_by='auto'): the lesson reaches the coder
+        (its learning value) but never the reviewer that produced it. A human
+        confirm still writes ``confirmed_by='human'`` and DOES reach the
+        reviewer, because a human then stands behind the rule.
         """
         proposal = await self._build_from_review(
             task, findings=findings, attempt=attempt,
@@ -492,10 +522,91 @@ class LearningQueue:
         # this queue ("we keep tripping on the same rule"), so say it rather
         # than let the second occurrence vanish. The dedupe key is quoted so the
         # reader can find the row it collapsed onto.
-        if mem_id is None and note is not None:
-            note("recurring review finding, deduped to "
-                 f"{proposal.dedupe_key}")
+        #
+        # D3-M1: a dedupe hit is ALSO the trigger for evidence-gated
+        # auto-confirm — the finding recurred, and this task is the fresh
+        # occurrence. Only review-origin proposals are eligible; nothing else
+        # takes this branch because only they carry ORIGIN_REVIEW.
+        if mem_id is None:
+            if proposal.origin == ORIGIN_REVIEW:
+                await self._maybe_auto_confirm_recurring(
+                    task, proposal.dedupe_key,
+                    enabled=auto_confirm_recurring, note=note)
+            if note is not None:
+                note("recurring review finding, deduped to "
+                     f"{proposal.dedupe_key}")
         return mem_id
+
+    async def _maybe_auto_confirm_recurring(
+        self, task: Task, dedupe_key: str, *, enabled: bool,
+        note: NoteFn | None,
+    ) -> bool:
+        """D3-M1: evidence-gated auto-confirm of a RECURRING review-origin
+        lesson, into the CODER'S CHANNEL ONLY.
+
+        Returns True iff it confirmed the row. Every gate below is required, and
+        a miss is always the SAFE direction — it withholds a lesson from the
+        coder, it can never let one reach the reviewer:
+
+          * ``enabled`` (``config learning.auto_confirm_recurring``, default
+            OFF). When off this returns immediately and records NOTHING, so the
+            feature is inert by default down to the last write.
+          * the finding recurred on >= 2 DISTINCT tasks in this project (the
+            deduped row's ``evidence.task_id`` plus its recorded recurrences —
+            ``Store.add_review_recurrence`` counts them; the dedupe key already
+            scopes to one repo, so "same project" holds by construction).
+          * >= 2 of those distinct tasks reached HUMAN approval — a MERGED PR
+            outcome (migration 0010). A merge is the human-in-the-loop signal
+            this repo can actually verify.
+          * the row is still UNCONFIRMED. Never overwrite a human's confirm
+            (that would downgrade ``confirmed_by`` from 'human' to 'auto' and,
+            worse, is pointless) and never resurrect a human's reject (a
+            review-origin reject DELETES the row, so a rejected lesson is never
+            reachable here — the dedupe key is gone and the next occurrence
+            starts a fresh proposal instead).
+
+        On success writes ``confirmed_by='auto'`` via ``store.confirm_memory``.
+        """
+        if not enabled:
+            # OFF must be inert: do not even record the recurrence, so a run with
+            # the flag off is byte-for-byte the pre-D3-M1 behaviour.
+            return False
+        distinct = await self.store.add_review_recurrence(dedupe_key, task.id)
+        if len(distinct) < _MIN_RECURRENCE_TASKS:
+            return False
+        row = await self.store.get_memory_by_dedupe_key(dedupe_key)
+        if row is None or row.get("confirmed"):
+            return False  # gone, or already confirmed (human or auto)
+        approved = 0
+        for tid in distinct:
+            if await self._task_reached_human_approval(tid):
+                approved += 1
+                if approved >= _MIN_RECURRENCE_TASKS:
+                    break
+        if approved < _MIN_RECURRENCE_TASKS:
+            return False
+        ok = await self.store.confirm_memory(
+            row["id"], confirmed_by=CONFIRMED_BY_AUTO)
+        if ok and note is not None:
+            note("auto-confirmed recurring review lesson "
+                 f"{str(row['id'])[:8]} — recurred across >= "
+                 f"{_MIN_RECURRENCE_TASKS} human-approved tasks (coder channel "
+                 "only; excluded from the reviewer)")
+        return ok
+
+    async def _task_reached_human_approval(self, task_id: str) -> bool:
+        """True when a task's PR reached a MERGED outcome (migration 0010's
+        ``pr_outcomes``).
+
+        A merge is the human-approval signal this product can VERIFY: a human
+        clicked merge on the forge. ``closed_unmerged``/``open``/``unknown`` are
+        not approval — a closed-unmerged PR is a human's rejection, and open/
+        unknown are undecided. Multi-repo tasks open several PRs; ANY merged
+        outcome for the task counts it approved, matching how the finding could
+        have been fixed in any one of them."""
+        from ..vcs.pr_outcome import MERGED
+        rows = await self.store.list_pr_outcomes(task_id=task_id)
+        return any(r.get("outcome") == MERGED for r in rows)
 
     async def _build_from_review(
         self, task: Task, *, findings: list[dict[str, Any]],

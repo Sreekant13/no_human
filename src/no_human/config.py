@@ -1483,6 +1483,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # stop being injected until one succeeds.
         "max_stale_days": 14,
     },
+    "learning": {
+        # D3-M1: auto-confirm a RECURRING review-origin lesson without a human
+        # click — but ONLY into the CODER's channel, NEVER the reviewer's. The
+        # channel split (core/db.py `confirmed_by` + the orchestrator's
+        # reviewer-memory exclusion) preserves gate independence (constraint #3)
+        # BY CONSTRUCTION: an auto-confirmed review lesson reaches the coder and
+        # can never reach the reviewer that produced it.
+        #
+        # Modeled on `profile.auto_confirm_proven` — the same "proof, not a
+        # click" shape, default OFF. Here the proof is the same review finding
+        # recurring across >=2 DISTINCT tasks in one project that each reached
+        # HUMAN approval (a MERGED PR outcome, migration 0010). A miss is always
+        # the safe direction: it withholds a lesson, it never lets one through.
+        "auto_confirm_recurring": False,
+    },
 }
 
 

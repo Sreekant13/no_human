@@ -1048,6 +1048,24 @@ class Store:
         if "last_used_at" not in mem_existing:
             await self.db.execute(
                 "ALTER TABLE memories ADD COLUMN last_used_at TEXT")
+        # D3-M1: WHO confirmed this memory into the active set — 'human' (every
+        # `nh learnings`/API confirm path, the default) or 'auto' (the
+        # evidence-gated auto-confirm of a RECURRING review-origin lesson,
+        # `learning.queue`). This column is the wall that keeps auto-confirm from
+        # weakening gate independence: the reviewer's confirmed-rules channel
+        # EXCLUDES rows that are (origin='review' AND confirmed_by='auto'), so an
+        # auto-confirmed review lesson reaches the coder and NEVER the reviewer
+        # that produced it.
+        #
+        # NO DEFAULT, same reasoning as `origin`/`evidence`/`last_used_at`: a row
+        # confirmed before this column genuinely does not record who confirmed
+        # it, and NULL says so honestly. NULL is treated as human/legacy — it is
+        # NOT 'auto', so a review-origin rule confirmed the old way (a human
+        # clicked it, before auto-confirm existed) stays visible to the reviewer,
+        # which is correct: a human stood between that verdict and that rule.
+        if "confirmed_by" not in mem_existing:
+            await self.db.execute(
+                "ALTER TABLE memories ADD COLUMN confirmed_by TEXT")
 
         # Phase 6a: test_layers column on projects (JSON-encoded TestPlan layers).
         proj_existing = {row["name"]
@@ -1978,6 +1996,63 @@ class Store:
             "SELECT id FROM memories WHERE file_path = ? LIMIT 1", (dedupe_key,)
         ) is not None
 
+    async def get_memory_by_dedupe_key(
+        self, dedupe_key: str,
+    ) -> dict[str, Any] | None:
+        """The memory carrying this dedupe signature (stored in ``file_path``),
+        or None. D3-M1 uses it to reach the row a recurring review finding
+        collapsed onto — to read its recurrence set and to confirm it in place."""
+        row = await self._fetchone(
+            "SELECT * FROM memories WHERE file_path = ? LIMIT 1", (dedupe_key,))
+        return dict(row) if row is not None else None
+
+    @serialized_write
+    async def add_review_recurrence(
+        self, dedupe_key: str, task_id: str,
+    ) -> list[str]:
+        """Record that a deduped review proposal recurred on ``task_id`` and
+        return the full set of DISTINCT tasks now associated with it — the
+        original (``evidence.task_id``) plus every recorded recurrence.
+
+        WHY THIS EXISTS. Dedupe collapses every re-occurrence of a finding onto
+        ONE memory row (`add_memory` returns None and writes nothing on a key
+        hit), so the row is the only place that can remember which tasks its
+        later occurrences came from. D3-M1 auto-confirms only when a finding
+        recurred across >=2 DISTINCT tasks, so those task ids must be counted
+        somewhere — here, in the ``evidence`` JSON (a ``recurrences`` list
+        beside the original ``task_id``), because evidence IS the structured
+        "what happened" record and a recurrence is part of what happened.
+
+        Idempotent: a task already recorded (or the original) is not re-added, so
+        replaying the same review round does not inflate the count. Returns [] if
+        the key is unknown (the row was rejected-and-deleted between calls)."""
+        row = await self._fetchone(
+            "SELECT id, evidence FROM memories WHERE file_path = ? LIMIT 1",
+            (dedupe_key,))
+        if row is None:
+            return []
+        try:
+            evidence = json.loads(row["evidence"]) if row["evidence"] else {}
+        except (ValueError, TypeError):
+            evidence = {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+        original = evidence.get("task_id")
+        recur = evidence.get("recurrences")
+        recur = [t for t in recur if t] if isinstance(recur, list) else []
+        if task_id and task_id != original and task_id not in recur:
+            recur.append(task_id)
+            evidence["recurrences"] = recur
+            await self.db.execute(
+                "UPDATE memories SET evidence = ? WHERE id = ?",
+                (json.dumps(evidence), row["id"]))
+            await self.db.commit()
+        distinct: list[str] = []
+        for t in [original, *recur]:
+            if t and t not in distinct:
+                distinct.append(t)
+        return distinct
+
     async def list_memories(
         self, *, confirmed: bool | None = None, source: str | None = None,
         mem_type: str | None = None, project: str | None = None,
@@ -2325,12 +2400,26 @@ class Store:
                 if not r.get("last_used_at") or r["last_used_at"] < cutoff]
 
     @serialized_write
-    async def confirm_memory(self, mem_id: str) -> bool:
-        """Promote a proposed memory into the active set (one-click confirm)."""
+    async def confirm_memory(
+        self, mem_id: str, *, confirmed_by: str = "human",
+    ) -> bool:
+        """Promote a proposed memory into the active set (one-click confirm).
+
+        ``confirmed_by`` records WHO confirmed it — 'human' (the default: every
+        `nh learnings`/API confirm path) or 'auto' (D3-M1's evidence-gated
+        auto-confirm of a recurring review-origin lesson). It is load-bearing
+        for gate independence: the reviewer's confirmed-rules channel EXCLUDES
+        (origin='review' AND confirmed_by='auto') rows, so an auto-confirmed
+        review lesson reaches the coder but never the reviewer that produced it.
+
+        A HUMAN confirm always writes 'human', deliberately overwriting an
+        'auto' a prior auto-confirm may have stamped: a human clicking confirm
+        is a stronger signal than the auto heuristic, and it promotes the row
+        into the reviewer's channel too (a human now stands behind it)."""
         cur = await self.db.execute(
             "UPDATE memories SET confirmed = 1, source = 'confirmed', "
-            "updated_at = ? WHERE id = ?",
-            (_now(), mem_id),
+            "confirmed_by = ?, updated_at = ? WHERE id = ?",
+            (confirmed_by, _now(), mem_id),
         )
         await self.db.commit()
         return cur.rowcount > 0
