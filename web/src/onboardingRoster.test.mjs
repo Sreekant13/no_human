@@ -52,12 +52,21 @@ test("no card claims a nonexistent agent (Shepherd / Investigator are gone)", ()
   assert.doesNotMatch(jsx, /Investigator/, "Orchestrator card must not still read 'Investigator'");
 });
 
-test("the intro paragraph still advertises the investigation capability, and does NOT call it read-only", () => {
+test("the intro paragraph carries the operator's 2026-08-09 copy, and does NOT call investigations read-only", () => {
   const lede = jsx.match(/<p className="ob-lede">([\s\S]*?)<\/p>/)?.[1] ?? "";
+  // The operator dictated this paragraph verbatim on 2026-08-09 (dropping the
+  // cost clause and the investigations sentence from the welcome card). The
+  // pin keeps a later edit from drifting the approved copy; changing it again
+  // is an operator decision, not a wording cleanup.
   assert.match(
     lede,
-    /investigation|root cause/i,
-    "the .ob-lede intro must keep advertising investigations after the capability moved out of a card",
+    /fields an <em>entire team of specialized agents at once<\/em>\. Each/,
+    "the .ob-lede must open with the operator-approved 2026-08-09 sentence",
+  );
+  assert.match(
+    lede,
+    /You just review and approve\./,
+    "the .ob-lede must end on the operator-approved close, without the cost clause",
   );
   // 🔴 THE GUARD USED TO DEMAND THE FALSEHOOD. Its name, its comment and its failure
   // message all said "read-only investigations", and `read-only` sat in the alternation
@@ -73,12 +82,10 @@ test("the intro paragraph still advertises the investigation capability, and doe
     /read-only/i,
     "the .ob-lede must NOT call investigations read-only — they are not, and this claim was retracted 2026-07-29",
   );
-  // The thesis line. "10× in parallel" was removed 2026-08-01: it is an
-  // unmeasured design ambition (nothing measures delivery volume, and
-  // concurrency ships OFF by default at max_workers 2), and an unmeasured
-  // number standing beside the measured cost claim spends its credibility.
-  // The cost half IS measured and stays.
-  assert.match(jsx, /Stop hand-holding one chat\. Hand over the ticket, review the finished PR — at a tenth of the cost\./);
+  // The thesis line. "10× in parallel" was removed 2026-08-01 (unmeasured
+  // ambition), and the cost clause was removed 2026-08-09 by the operator's
+  // explicit rewrite of the headline.
+  assert.match(jsx, /Stop hand-holding one chat\. Give it a ticket, review the finished PR</);
   assert.doesNotMatch(
     jsx,
     /10×|10x in parallel/i,

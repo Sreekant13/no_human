@@ -117,16 +117,18 @@ test("no clone folders at all tells the user to type a path", () => {
   assert.match(m, /type a repository path/i);
 });
 
-test("folders scanned but nothing found names how many were searched", () => {
+test("folders scanned but nothing found NAMES the searched roots, not a count", () => {
+  // A count once read as "broken page" when the real story was "wrong
+  // directory" (operator, 2026-08-09): the path itself is the diagnostic.
   const m = discoveryMessage(result({ roots_scanned: ["/Users/x/git", "/Users/x/Code"] }));
-  assert.match(m, /2 folders/);
+  assert.match(m, /\/Users\/x\/git, \/Users\/x\/Code/);
   assert.match(m, /type a repository path/i);
+  assert.ok(!/\d+ folders?/.test(m), "a bare count must not replace the paths");
 });
 
-test("one scanned folder is not pluralised", () => {
+test("a single scanned root is named verbatim", () => {
   const m = discoveryMessage(result({ roots_scanned: ["/Users/x/git"] }));
-  assert.match(m, /1 folder\b/);
-  assert.ok(!/1 folders/.test(m));
+  assert.match(m, /Searched \/Users\/x\/git and found no repositories/);
 });
 
 test("a healthy result with repos and no cap says nothing", () => {

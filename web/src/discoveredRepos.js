@@ -54,10 +54,15 @@ export function discoveryMessage(res) {
 
   const parts = [];
   if (repos.length === 0) {
+    // NAME the searched roots, never just count them. An operator with a
+    // machine full of repos read "Searched 1 folder and found no repositories"
+    // and concluded the page was broken — the folder was a sandbox home their
+    // repos were never under, which the path itself would have shown at a
+    // glance (2026-08-09). A count hides exactly the fact that matters.
     parts.push(
       scanned.length === 0
         ? "No standard clone folders found under your home directory - type a repository path instead."
-        : `Searched ${scanned.length} ${scanned.length === 1 ? "folder" : "folders"} and found no repositories - type a repository path instead.`,
+        : `Searched ${scanned.join(", ")} and found no repositories - type a repository path instead.`,
     );
   }
   if (res.walk_truncated) {

@@ -102,7 +102,10 @@ function PathInput({ value, onChange, placeholder, autoFocus }) {
 
 const STEPS = [
   { key: "welcome",  title: "Welcome" },
-  { key: "team",     title: "You" },
+  // The "You"/team step left the free-tier wizard on the operator's 2026-08-09
+  // decision: the value it collected was write-only in the local product
+  // (persisted at complete, read by nothing). It belongs to the future
+  // free→team / free→cloud UPGRADE onboarding, where team scoping is real.
   { key: "repos",    title: "Repositories" },
   { key: "projects", title: "Projects" },
   { key: "docs",     title: "Docs" },
@@ -116,7 +119,6 @@ export const repoName = (p) => (p || "").replace(/\/+$/, "").split("/").pop() ||
 
 export default function Onboarding({ onComplete }) {
   const [i, setI] = useState(0);
-  const [team, setTeam] = useState("");
   const [root, setRoot] = useState("");
   const [detected, setDetected] = useState([]);
   // The auto-discovery response, kept whole so the roots it searched, the cap
@@ -447,7 +449,8 @@ export default function Onboarding({ onComplete }) {
         }
       }
       await completeOnboarding({
-        team: team.trim() || null,
+        // team stays null on the free tier — the upgrade onboarding owns it.
+        team: null,
         repos: [...selectedRepos],
         docs: docs.map((d) => d.trim()).filter(Boolean),
       });
@@ -510,15 +513,11 @@ export default function Onboarding({ onComplete }) {
                   `*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }`
                   reset near the top of styles.css. If that reset is ever narrowed, this
                   headline needs an explicit margin-top. */}
-              <h2 className="ob-h1">Stop hand-holding one chat. Hand over the ticket, review the finished PR — at a tenth of the cost.</h2>
+              <h2 className="ob-h1">Stop hand-holding one chat. Give it a ticket, review the finished PR</h2>
               <p className="ob-lede">
-                no_human fields an <em>entire team of specialized agents at once</em> — many
-                tasks, across many repos, in parallel. Each one is carried from intake to an
-                open PR on its own: no babysitting, no re-explaining, no steering every step.
-                You just review and approve — for about <em>a tenth</em> of what one
-                hand-held session burns. Need answers, not a diff? The same pipeline runs
-                investigations that dig for root cause and hand back a cited findings
-                report when no code change is needed.
+                no_human fields an <em>entire team of specialized agents at once</em>. Each
+                one is carried from intake to an open PR on its own: no babysitting, no
+                re-explaining, no steering every step. You just review and approve.
               </p>
               <div className="ob-agents">
                 <div className="ob-agent ob-agent-supervisor">
@@ -555,19 +554,6 @@ export default function Onboarding({ onComplete }) {
                 <span className="ob-flow-pr">open PR</span>
                 <span className="ob-flow-you">you approve</span>
               </div>
-              <p className="ob-note">Plus fast utility helpers that summarize, classify, and distill — each agent on the model tier that fits its job. Let's teach them how <em>you</em> work — about five minutes.</p>
-            </Stagger>
-          )}
-
-          {step.key === "team" && (
-            <Stagger>
-              <h2 className="ob-h2">Who are you with?</h2>
-              <p className="ob-sub">Used to scope rules to your team.</p>
-              <label className="ob-field">
-                <span>Team</span>
-                <input className="ob-input" value={team} placeholder="e.g. PLATFORM, PAYMENTS"
-                       onChange={(e) => setTeam(e.target.value)} autoFocus />
-              </label>
             </Stagger>
           )}
 
@@ -576,7 +562,9 @@ export default function Onboarding({ onComplete }) {
               <h2 className="ob-h2">Which repositories do you work on?</h2>
               <p className="ob-sub">
                 {discovery?.roots_scanned?.length
-                  ? `Found by searching ${discovery.roots_scanned.length} ${discovery.roots_scanned.length === 1 ? "folder" : "folders"} under your home directory.`
+                  // Name the roots, don't count them — a count once read as
+                  // "broken page" when the real story was "wrong directory".
+                  ? `Found by searching ${discovery.roots_scanned.join(", ")}.`
                   : "Searching the usual places people keep their clones."}
               </p>
               <div className="ob-row">
@@ -899,7 +887,6 @@ export default function Onboarding({ onComplete }) {
                   : "Almost ready."}
               </h2>
               <ul className="ob-summary">
-                <li><span>Team</span><b>{team || "—"}</b></li>
                 <li>
                   <span>Projects</span>
                   <b>{projectDefs.length}{unbound.length ? ` · ${unbound.length} with no repos` : ""}</b>
