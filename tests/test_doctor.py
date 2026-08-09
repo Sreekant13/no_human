@@ -482,7 +482,7 @@ def test_doctor_reports_the_auth_profile_and_mode(tmp_path):
 
 
 def test_the_mechanism_table_is_behind_verbose_and_the_exit_code_is_not(tmp_path):
-    """The 19-row table moves behind `--verbose`; the summary line, the
+    """The 20-row table moves behind `--verbose`; the summary line, the
     `healthy` predicate and the exit code do not move at all."""
     home, tmpdir = tmp_path / "home", _mktmp(tmp_path)
     quiet = _run_doctor(home, tmpdir)
@@ -493,11 +493,11 @@ def test_the_mechanism_table_is_behind_verbose_and_the_exit_code_is_not(tmp_path
     assert "mechanism liveness" in quiet.stdout, quiet.stdout
     assert "last: never" not in quiet.stdout, quiet.stdout
     assert "review_gate" not in quiet.stdout, quiet.stdout
-    assert "0/19 have ever fired" in quiet.stdout, quiet.stdout
+    assert "0/20 have ever fired" in quiet.stdout, quiet.stdout
 
     # --verbose: the whole table, exactly as it always rendered.
     assert "review_gate" in loud.stdout, loud.stdout
-    assert loud.stdout.count("last: never") == 19, loud.stdout
+    assert loud.stdout.count("last: never") == 20, loud.stdout
     assert len(loud.stdout.splitlines()) > len(quiet.stdout.splitlines())
 
     # Same verdict, same exit code either way.

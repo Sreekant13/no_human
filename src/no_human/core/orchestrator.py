@@ -61,7 +61,7 @@ from ..intake.surface_advisory import surface_advisory
 from ..learning import CONFIRMED_BY_AUTO, ORIGIN_REVIEW
 from ..learning.triggers import filter_triggered
 from ..notify.slack import SlackNotifier
-from ..review import selfcheck
+from ..review import selfcheck, tamper_adjudication
 from ..review.reviewer import AdversarialReviewer, ReviewDecision, ReviewerUnavailable
 from ..review.selfcheck import ChecklistItem
 from ..testing import runner
@@ -3309,22 +3309,15 @@ class Orchestrator:
         # (merge-base..HEAD), not HEAD~1..HEAD — test-gutting buried in an
         # earlier commit of the branch (a resumed attempt's checkpoint, or a
         # commit the agent made itself) used to be invisible to the guard.
-        tamper = runner.tamper_check_between(
-            repo.path, before_ref=self._review_base(repo, base)
-        )
+        tamper_before = self._review_base(repo, base)
+        tamper = runner.tamper_check_between(repo.path, before_ref=tamper_before)
         self.emit("tamper", tamper.summary, tampered=tamper.tampered)
-        if tamper.tampered:
-            await self.store.update_attempt(
-                attempt_id, status="failed",
-                failure_reason="tamper guard: " + "; ".join(tamper.reasons)[:400],
-                test_results={"tamper_flag": True, "reasons": tamper.reasons},
-            )
-            return await self._escalate(
-                task,
-                "test-tampering detected — net reduction in tests/assertions: "
-                + "; ".join(tamper.reasons),
-                repo=repo, branch=branch,
-            )
+        outcome = await self._handle_tamper_fire(
+            task, tamper, repo=repo, branch=branch, attempt_id=attempt_id,
+            attempt_n=attempt_n, diff_repo=repo.path, before_ref=tamper_before,
+        )
+        if outcome is not None:
+            return outcome
 
         # PR-F Gate 1: extend tamper guard to every linked repo. Without this
         # a worker could gut assertions in a linked repo to force a layer green.
@@ -3340,26 +3333,34 @@ class Orchestrator:
                     await self._repro_base_ref(linked, base) if base else "HEAD~1"
                 )
                 lr_tamper = runner.tamper_check_between(linked, before_ref=lr_before)
-                self.emit("tamper", f"[linked:{linked_path}] {lr_tamper.summary}",
-                          tampered=lr_tamper.tampered)
-                if lr_tamper.tampered:
-                    await self.store.update_attempt(
-                        attempt_id, status="failed",
-                        failure_reason=(f"tamper guard [linked:{linked_path}]: "
-                                        + "; ".join(lr_tamper.reasons)[:400]),
-                        test_results={
-                            "tamper_flag": True, "linked_repo": linked_path,
-                            "reasons": lr_tamper.reasons,
-                        },
-                    )
-                    return await self._escalate(
-                        task,
-                        f"test-tampering in linked repo {linked_path}: "
-                        + "; ".join(lr_tamper.reasons),
-                        repo=repo, branch=branch,
-                    )
             except Exception as exc:  # noqa: BLE001 — guard must not crash the pipeline
                 log.warning("tamper check failed for linked repo %s: %s", linked_path, exc)
+                continue
+            # 🔴 THE FIRE IS HANDLED OUTSIDE THE `try`, AND THAT IS THE POINT.
+            # It used to sit inside it, so anything the escalation itself threw
+            # was caught by the blanket handler above, logged as a warning, and
+            # the loop moved on — a DETECTED tamper silently continuing to the
+            # review gate. That was survivable while the branch was one
+            # `_escalate` call; it is not now that a fire routes through an
+            # adjudication (`_handle_tamper_fire` also never raises, but a
+            # guard that depends on two things staying true is one thing too
+            # many). The `try` now covers only the DETECTION, where a failure
+            # genuinely is "this repo could not be inspected".
+            self.emit("tamper", f"[linked:{linked_path}] {lr_tamper.summary}",
+                      tampered=lr_tamper.tampered)
+            # SAME route as the primary repo, deliberately. A linked repo's
+            # tests are gamed the same way and its ticket-required test changes
+            # are misread the same way; splitting the routes is how one of them
+            # silently keeps the old raw-jargon escalation.
+            lr_outcome = await self._handle_tamper_fire(
+                task, lr_tamper, repo=repo, branch=branch,
+                attempt_id=attempt_id, attempt_n=attempt_n,
+                diff_repo=linked, before_ref=lr_before,
+                where=f"linked repo {linked_path}",
+                extra_attempt_fields={"linked_repo": linked_path},
+            )
+            if lr_outcome is not None:
+                return lr_outcome
 
         # M2/W1.2: reproduction-test gate — deterministic, before any reviewer
         # tokens. Advisory by default; for BUGFIX-classed tasks the gate is
@@ -5534,6 +5535,174 @@ class Orchestrator:
         ctx["review_history"] = history[-self._REVIEW_HISTORY_ROUNDS * 2:]
         task.context = ctx
         await self.store.update_task(task)
+
+    # ------------------------ tamper adjudication -------------------------- #
+
+    def _tamper_adjudication_enabled(self) -> bool:
+        return bool((self.config.get("tamper_adjudication") or {})
+                    .get("enabled", True))
+
+    async def _handle_tamper_fire(
+        self, task: Task, report, *, repo: GitRepo, branch: str | None,
+        attempt_id: str, attempt_n: int, diff_repo: Path, before_ref: str,
+        where: str = "", extra_attempt_fields: dict | None = None,
+    ) -> "TaskOutcome | None":
+        """What a tamper-guard fire DOES. Returns None to let the pipeline
+        continue, or the outcome that ends this attempt.
+
+        CONSTRAINT #4 IS UNCHANGED AND SO IS THE DETECTOR. `tamper_guard.check`
+        is byte-untouched: the same net reduction in tests/assertions, the same
+        skip/tautology/fake-fixture rules, the same absolute fire. What this
+        method changes is the ROUTE the fire takes, on the operator's explicit
+        direction (2026-08-09): *"no_human's agents either messed up the tests —
+        fix the bug — or they really needed to change the tests as the logic
+        changed — in which case no_human shouldn't be blocking."*
+
+        Before this, EVERY fire ended the task on a human's desk, phrased in the
+        guard's own counters ("skip/xfail markers 0->1"). Six live instances
+        were the guard being RIGHT about the numbers and wrong about the
+        meaning — an `@needs_terms` skip decorator that was itself an acceptance
+        criterion, a requested test rename read as a net reduction. Now one
+        fresh-context adjudication decides which of the two it is, and only what
+        it cannot resolve reaches a person.
+
+        WHY THIS IS NOT A WEAKENING, stated where the waiver is granted:
+
+        * The adjudicator is not the coder and never hears from it (single-turn,
+          no tools, three inputs — see `review/tamper_adjudication.py`).
+        * A waiver is never silent. It is recorded as a task event AND printed
+          in the PR body, under the human's eyes at the moment they already
+          decide whether to merge. The gate moved; it did not disappear.
+        * The unresolved cases still stop the run. TAMPERING costs the coder a
+          bounded attempt; a second TAMPERING, or any doubt at all, parks.
+        * A crash, a timeout, an unparseable verdict and a disabled reviewer all
+          land on CANNOT_DECIDE, which parks. There is no path from "the
+          adjudication did not happen" to "the gate passed".
+        """
+        if not report.tampered:
+            return None
+        scope = f" [{where}]" if where else ""
+        reasons_text = "; ".join(report.reasons)
+        extra = dict(extra_attempt_fields or {})
+
+        async def _fail_attempt(detail: str) -> None:
+            await self.store.update_attempt(
+                attempt_id, status="failed", failure_reason=detail[:400],
+                test_results={"tamper_flag": True, "reasons": report.reasons,
+                              **extra},
+            )
+
+        if not self._tamper_adjudication_enabled():
+            # The off-switch restores the pre-2026-08-09 behaviour exactly.
+            await _fail_attempt(f"tamper guard{scope}: " + reasons_text)
+            return await self._escalate(
+                task,
+                f"test-tampering detected{scope} — net reduction in "
+                f"tests/assertions: {reasons_text}",
+                repo=repo, branch=branch,
+            )
+
+        adj = await self._adjudicate_tamper(
+            task, report, diff_repo=diff_repo, before_ref=before_ref)
+        self.emit(
+            "tamper_adjudication",
+            f"{adj.verdict}{scope}: "
+            + "; ".join(adj.justification or adj.restore
+                        or [adj.uncertainty or "no reason given"])[:400],
+            verdict=adj.verdict,
+        )
+        record = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "attempt": attempt_n,
+            "where": where,
+            "reasons": list(report.reasons),
+            "summary": report.summary,
+            **adj.to_dict(),
+        }
+        # Read the prior verdicts from the STORE, not from the in-memory task.
+        # "A second TAMPERING parks" spans ATTEMPTS, and the attempt loop hands
+        # `_run_attempt` a Task whose `context` was loaded before the previous
+        # attempt wrote to it — counting off a stale copy would read 0 forever
+        # and the second verdict would bounce to the coder again instead of
+        # parking, which is an unbounded loop wearing a bound's clothes.
+        task.context = await self.store.merge_context(task.id, {})
+        prior_tampering = sum(
+            1 for e in ((task.context or {}).get("tamper_adjudications") or [])
+            if isinstance(e, dict) and e.get("verdict") == tamper_adjudication.TAMPERING
+        )
+        await self.store.append_context_list(
+            task.id, "tamper_adjudications", record)
+        task.context = await self.store.merge_context(task.id, {})
+
+        if adj.verdict == tamper_adjudication.LEGITIMATE:
+            # The gate passes. `_pr_body` reads the same context list, so the
+            # human sees this justification where they already review.
+            return None
+
+        if adj.verdict == tamper_adjudication.TAMPERING and prior_tampering == 0:
+            # Bounce inside the EXISTING bounded loop — the same
+            # send_back_feedback channel the repro gate uses. No new loop, no
+            # extra attempts: max_attempts still ends this task.
+            await self.store.append_context_list(
+                task.id, "send_back_feedback", {
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "message": tamper_adjudication.send_back_message(
+                        adj, reasons=report.reasons),
+                    "author": "tamper_adjudication",
+                    "source": "tamper_adjudication",
+                })
+            task.context = await self.store.merge_context(task.id, {})
+            detail = (f"test tampering{scope} — restore: "
+                      + "; ".join(adj.restore))
+            await _fail_attempt(detail)
+            return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+
+        # A SECOND tampering verdict, or CANNOT_DECIDE: stop, in plain language.
+        repeat = adj.verdict == tamper_adjudication.TAMPERING
+        await _fail_attempt(f"test tampering{scope} ({adj.verdict}): "
+                            + reasons_text)
+        blocker = tamper_adjudication.escalation_blocker(
+            task, adj, reasons=report.reasons, summary=report.summary,
+            repeat=repeat, where=where,
+        )
+        return await self._raise_blocker(task, blocker, repo=repo, branch=branch)
+
+    async def _adjudicate_tamper(
+        self, task: Task, report, *, diff_repo: Path, before_ref: str,
+    ):
+        """Run the adjudication review. NEVER raises: every failure is a
+        CANNOT_DECIDE, which parks.
+
+        Fail-closed matters more here than anywhere else in this file, because
+        the caller sits inside the linked-repo loop's blanket `except`, where a
+        raised exception would be logged as a warning and the tamper fire would
+        be DROPPED — a fire that silently continues is the one outcome this
+        design must not have.
+        """
+        findings = report.summary + "\n" + "\n".join(
+            f"- {r}" for r in report.reasons)
+        test_diff = await asyncio.to_thread(
+            runner.test_file_diff, diff_repo, before_ref, "HEAD")
+        if self.reviewer is None:
+            return tamper_adjudication.Adjudication(
+                uncertainty="no reviewer is configured, so the tamper "
+                            "adjudication could not run")
+        try:
+            # Single reviewer chokepoint (D3-M1); `confirmed_rules` is computed
+            # there and the adjudication prompt deliberately ignores it.
+            decision = await self._run_reviewer(
+                task,
+                repo_path=diff_repo,
+                mode="tamper_adjudication",
+                tamper_findings=findings,
+                diff_override=test_diff,
+            )
+        except Exception as exc:  # noqa: BLE001 — a dead adjudicator parks
+            self._advisory(f"tamper adjudication failed to run: {exc}")
+            return tamper_adjudication.Adjudication(
+                uncertainty=f"the tamper adjudication could not run: {exc}")
+        return tamper_adjudication.Adjudication.from_dict(
+            (decision.stages or {}).get(tamper_adjudication.STAGE_KEY))
 
     async def _record_review_feedback(
         self, task: Task, failed_items: list,
@@ -11810,8 +11979,14 @@ SIX of them read a checkpoint and TWO do not — but do
         content only — no new claim is made here.
         """
         review = self._review_evidence_section(task, head_sha=head_sha, repo=repo)
+        # A waived tamper-guard fire is evidence the human MUST see. It rides in
+        # this section, not a footnote: `_handle_tamper_fire` passes the gate on
+        # a LEGITIMATE verdict, and the only thing that keeps that from being a
+        # silent weakening is the human reading the justification here, at the
+        # moment they decide to merge.
+        tamper = self._tamper_adjudication_section(task)
         tests = self._test_evidence_section(test_evidence)
-        if not review and not tests:
+        if not review and not tamper and not tests:
             return ""
         lead = (
             "## Evidence\n"
@@ -11819,9 +11994,44 @@ SIX of them read a checkpoint and TWO do not — but do
             "orchestrator's own test run. Raw command receipts are under "
             "**How I verified this** below._\n\n"
         )
-        return lead + review + tests
+        return lead + review + tamper + tests
 
     # ------------------------- PR body: the pieces ------------------------- #
+
+    @staticmethod
+    def _tamper_adjudication_section(task: Task) -> str:
+        """The LEGITIMATE waivers this task's tamper fires produced, in the PR
+        body. "" when the guard never fired or nothing was waived.
+
+        Only LEGITIMATE entries render: TAMPERING and CANNOT_DECIDE never reach
+        a PR (they bounce the attempt or park the task), so printing them would
+        describe a state this artifact cannot be in.
+
+        Every cell goes through `_inline_cell`. `justification` is the
+        adjudicator model's own prose, and a model-authored cell in a PR body is
+        a heading-injection channel — a single newline in it renders a live
+        `<h1>` outside any section, which is precisely the fabrication the
+        review-evidence section was hardened against.
+        """
+        entries = [
+            e for e in ((task.context or {}).get("tamper_adjudications") or [])
+            if isinstance(e, dict)
+            and e.get("verdict") == tamper_adjudication.LEGITIMATE
+        ]
+        if not entries:
+            return ""
+        safe = [
+            {
+                "verdict": tamper_adjudication.LEGITIMATE,
+                "where": Orchestrator._inline_cell(str(e.get("where") or ""), None),
+                "reasons": [Orchestrator._inline_cell(str(r), None)
+                            for r in (e.get("reasons") or [])],
+                "justification": [Orchestrator._inline_cell(str(j), None)
+                                  for j in (e.get("justification") or [])],
+            }
+            for e in entries
+        ]
+        return tamper_adjudication.pr_body_section(safe)
 
     def _ticket_line(self, task: Task) -> str:
         """H9: name the tracker issue this PR answers, on line one.

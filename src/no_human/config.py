@@ -1158,6 +1158,27 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # enforcing, and this comment still claimed otherwise until 2026-07-22.
         "mode": "advisory",
     },
+    "tamper_adjudication": {
+        # When the test-tampering guard fires, ask ONE fresh-context reviewer
+        # whether the ticket REQUIRED those test changes, instead of ending the
+        # task on a human's desk in the guard's own counter jargon.
+        # Operator-directed, 2026-08-09.
+        #
+        # ON BY DEFAULT, and the reasoning is worth keeping next to the switch:
+        # the guard's DETECTOR is unchanged and still absolute, and every
+        # unresolved outcome still stops the run (a TAMPERING verdict costs a
+        # bounded attempt, a second one parks, and any doubt at all parks). The
+        # only new outcome is "the ticket asked for this, here is the criterion,
+        # printed on the PR" — which is strictly more information than the
+        # escalation it replaces, in front of the same human.
+        #
+        # false restores the pre-2026-08-09 behaviour byte for byte: every fire
+        # escalates immediately with the raw findings. It exists for an operator
+        # who wants no LLM in this path at all, and because a feature that
+        # changes what a SAFETY gate does should be answerable with a config
+        # line rather than a revert.
+        "enabled": True,
+    },
     "context": {
         # Repo-map seed (M3): a ~3K-token map of the repo in the coder prompt
         # to cut exploration turns. Cached per (repo, HEAD). Off = fall back to

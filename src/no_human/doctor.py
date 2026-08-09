@@ -36,6 +36,14 @@ MECHANISMS: list[tuple[str, tuple[str, ...], str]] = [
     ("tests", ("tests",),
      "zero across attempts = TESTING is dead (it was, for the system's entire life)"),
     ("tamper_guard", ("tamper",), "zero = no diff ever tamper-checked"),
+    # `total()` looks kinds up by EXACT key, so `tamper_adjudication` is not
+    # swept into `tamper_guard` above — and would be counted by nothing at all
+    # without this row, which is precisely the miss the grill comment below
+    # records. Zero here is the healthy state: it means the guard never fired.
+    ("tamper_adjudication", ("tamper_adjudication",),
+     "zero is good — the test-tampering guard never fired. Non-zero alongside "
+     "delivered PRs means fires are being WAIVED as ticket-required; the "
+     "justification is on each PR and is worth spot-checking"),
     ("context_distill", ("context_distill",),
      "has never fired to date — plausible with quota headroom, worth knowing"),
     ("lifetime_budget", ("lifetime_budget",),

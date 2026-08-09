@@ -31,6 +31,7 @@ from ..agent.claude_backend import (
     AgentResult,
     is_transport_failure,
 )
+from ..review import tamper_adjudication
 from ..review.selfcheck import ChecklistItem
 from ..review.lint_evidence import collect_lint_evidence, format_lint_evidence
 from ..review.wiring_evidence import (
@@ -1412,7 +1413,43 @@ class AdversarialReviewer:
         draft_pr: str = "",
         draft_pr_absent: str = "",
         linked_repos: list[tuple[Path, str]] | None = None,
+        tamper_findings: str = "",
     ) -> ReviewDecision:
+        # Tamper-adjudication mode: the tamper guard fired and something has to
+        # decide whether the TICKET required those test changes (see
+        # `review/tamper_adjudication.py` for why this exists and what it may
+        # not be given). Deliberately the narrowest call in this class:
+        #
+        #   * SINGLE-TURN, NO TOOLS (`_fast_review`). Every other mode can open
+        #     files; this one must not. The party under suspicion authored the
+        #     commit messages, the PR body and its own session summary, and a
+        #     multi-turn adjudicator would simply go and read its advocacy — the
+        #     mitigation would be a comment rather than a wall.
+        #   * `confirmed_rules` is accepted (the chokepoint always sets it) and
+        #     deliberately NOT threaded into the prompt: a memory-derived rule
+        #     is a channel into a verdict, and this verdict's whole input
+        #     surface is ticket + guard findings + test diff.
+        #   * The tri-state verdict rides on `stages`, not on `passed` alone —
+        #     `passed` cannot distinguish TAMPERING (bounce to the coder) from
+        #     CANNOT_DECIDE (park), and those are different consequences.
+        if mode == "tamper_adjudication":
+            prompt = tamper_adjudication.build_prompt(
+                task,
+                guard_findings=tamper_findings,
+                test_diff=diff_override or "",
+            )
+            decision = await self._fast_review(prompt, repo_path)
+            adj = tamper_adjudication.parse(decision.raw_output)
+            decision.passed = adj.passes_gate
+            decision.stages = {tamper_adjudication.STAGE_KEY: adj.to_dict()}
+            decision.checklist = [ChecklistItem(
+                f"tamper adjudication: {adj.verdict}",
+                adj.passes_gate,
+                "; ".join(adj.justification or adj.restore
+                          or [adj.uncertainty or "no reason given"]),
+            )]
+            return decision
+
         # Code review mode: higher diff cap, different prompt, multi-turn agent.
         if mode == "code_review":
             cap = _CODE_REVIEW_DIFF_CAP

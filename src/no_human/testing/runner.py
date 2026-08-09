@@ -1048,6 +1048,44 @@ def run_held_out_tests(repo_path: Path, *, timeout: int = 120) -> TestRunResult 
     return TestRunResult(True, ok, passed, failed, errors, cmd, output[-4000:])
 
 
+def test_file_diff(
+    repo_path: Path, before_ref: str = "HEAD~1", after_ref: str = "HEAD",
+) -> str:
+    """The diff of the TEST FILES ONLY between two refs, "" when there is none.
+
+    The adjudicator's whole evidence about what changed. Test files only, by the
+    SAME `tamper_guard.is_test_file` predicate the guard itself counts with, so
+    the diff it reads and the counts it is explaining are about the same set of
+    files. Shipping the product diff too would hand the adjudicator the coder's
+    comments and docstrings — a channel for exactly the self-advocacy the
+    adjudicator must not receive.
+
+    Best-effort by contract: a git failure returns "" and the adjudicator says
+    it could not see the diff, which routes to CANNOT_DECIDE (park). It never
+    raises, because a missing diff must not crash the pipeline the guard just
+    stopped.
+    """
+    repo_path = Path(repo_path)
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--name-only", f"{before_ref}..{after_ref}"],
+            cwd=repo_path, capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            return ""
+        paths = [p for p in proc.stdout.splitlines()
+                 if p and tamper_guard.is_test_file(p)]
+        if not paths:
+            return ""
+        proc = subprocess.run(
+            ["git", "diff", "--no-color", f"{before_ref}..{after_ref}", "--", *paths],
+            cwd=repo_path, capture_output=True, text=True,
+        )
+        return proc.stdout if proc.returncode == 0 else ""
+    except Exception:  # noqa: BLE001 — no diff is a CANNOT_DECIDE, not a crash
+        return ""
+
+
 class TamperCheckUnavailable(RuntimeError):
     """The tamper guard could not be run — the checkout was not inspectable.
 
