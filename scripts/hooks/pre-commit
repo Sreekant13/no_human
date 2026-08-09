@@ -1,0 +1,28 @@
+#!/bin/sh
+# no_human pre-commit gate -- blocks a commit that changes a manifest-pinned
+# file without re-pinning it in the same commit. Committed to the repo and
+# OPT-IN: it does nothing until you install it (see scripts/hooks/install.sh).
+#
+# Delegates to scripts/precommit_manifest_gate.py, which is standard-library +
+# git only, so no project venv is required. Prefers the repo's .venv python for
+# speed if present, then a system python3/python. If none is found the commit is
+# allowed rather than blocked -- a missing interpreter must not wedge the repo.
+#
+# Git runs pre-commit hooks with cwd at the top of the working tree.
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+gate="$root/scripts/precommit_manifest_gate.py"
+[ -f "$gate" ] || exit 0
+
+if [ -x "$root/.venv/bin/python" ]; then
+    py="$root/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    py=python3
+elif command -v python >/dev/null 2>&1; then
+    py=python
+else
+    echo "no_human pre-commit gate: no python found; skipping (commit allowed)." >&2
+    exit 0
+fi
+
+exec "$py" "$gate"

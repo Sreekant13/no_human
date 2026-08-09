@@ -59,6 +59,27 @@ reaches the model API unless you set `NH_TESTS_LIVE_SDK=1`. You only need a
 credential to run the product end to end. See
 [`docs/quickstart.md`](docs/quickstart.md) for that.
 
+### Optional: the pre-commit manifest gate
+
+[`RELEASE_MANIFEST.txt`](RELEASE_MANIFEST.txt) pins every shipped file's content
+with a SHA-256. When you change a pinned file you must re-pin it in the *same*
+commit (`uv run python scripts/export_guard.py approve <path>` then
+`git add RELEASE_MANIFEST.txt`). Forgetting the re-pin is a split commit that
+CI's inventory job only catches at push, after `main` has gone red.
+
+An opt-in git hook catches it at commit time instead. It is committed but does
+nothing until you enable it for your clone:
+
+```bash
+./scripts/hooks/install.sh              # enable it
+./scripts/hooks/install.sh --uninstall  # disable it
+```
+
+It refuses only a commit that stages a pinned file whose content no longer
+matches its pin; commits that touch no pinned file, or that re-pin correctly,
+pass untouched. It is standard-library + git only, so it needs no venv, and it
+changes only your clone's git config — never the shared repo.
+
 ## Running the tests
 
 ### Python
