@@ -88,50 +88,6 @@ by anyone touching `core/db.py` or the scheduler.
 
 ---
 
-## KI-2 — `nh init` has no non-interactive mode
-
-**Status:** open. Found 2026-08-01 by the adoption harness (`e2e/adoption/`),
-persona "Dana, CTO", step `nh-init-noninteractive`.
-
-**Symptom**
-
-```
-$ uv run nh init < /dev/null
-...
-3. Authentication
-  How will this install pay for Claude?
-    Choice (1, 2) [1]: Aborted!
-```
-
-`nh init` is the only documented way to produce a working `~/.no_human`, and it
-is interactive-only: no `--yes`, no `--auth-mode`, no `--non-interactive`, no
-config-from-file. Any path without a TTY — a provisioning script, a Dockerfile,
-CI, a `curl | sh` onboarding one-liner, or the daily adoption harness itself —
-cannot use it.
-
-**Why it matters more than it looks.** The scenario this was found in is a
-startup putting the same install on several developers' machines. The CTO's
-first instinct is to script it once so the team is set up identically; the tool
-has no answer, so each developer runs a wizard by hand and the installs diverge
-in exactly the settings (`git.agent_identity_*`, `llm.auth_mode`, `server.port`)
-where divergence is most confusing later.
-
-**Workaround.** Write `~/.no_human/config.yaml` and `~/.no_human/.env` directly;
-`load_config` fills every unset key from `DEFAULT_CONFIG`, so a partial file is
-enough. This is what `e2e/adoption/adoption_run.py::Ctx.seed_config` does, and
-it is the shape a `--non-interactive` mode should produce.
-
-**What a fix has to prove**
-
-1. `nh init --non-interactive --auth-mode subscription` produces a
-   `~/.no_human` that `nh doctor` accepts, with stdin closed.
-2. It still refuses to invent a credential: no token means an explicit,
-   non-zero, named failure, never a config that silently cannot run.
-3. Re-running it is still safe — `nh init`'s existing "never overwrites
-   existing config, secrets, or data" property holds.
-
----
-
 ## KI-3 — `nh serve` cannot drain-and-exit
 
 **Status:** open. Found 2026-08-01 by the adoption harness, persona "Sam, senior

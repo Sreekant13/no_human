@@ -538,3 +538,232 @@ async def test_the_intake_grill_passes_are_listed_mechanisms(store):
     # A mechanism that HAS fired carries no zero-hint.
     assert all(not m["hint"] for m in d.mechanisms
                if m["name"].startswith("grill_"))
+
+
+# --------------------------------------------------------------------------- #
+# `nh doctor --verify-auth` — the one gap presence-checking cannot close       #
+#                                                                              #
+# A valid-SHAPED but expired or revoked credential passes every check in this  #
+# file and dies at the first task (walkthrough B5). The live call is OPT-IN,   #
+# because the rule that no diagnostic spends quota unasked is what makes the   #
+# rest of doctor safe to run anywhere. The live call itself is mocked at its   #
+# boundary in every test below: no credential, real or otherwise, is used.     #
+# --------------------------------------------------------------------------- #
+
+
+class _FakeResult:
+    def __init__(self, is_error=False, final_text="ok"):
+        self.is_error = is_error
+        self.final_text = final_text
+
+
+def _fake_backend(monkeypatch, *, result=None, raises=None, hang=False):
+    """Replace ClaudeBackend.run — the boundary where quota would be spent."""
+    import no_human.agent.claude_backend as cb_mod
+
+    seen = {"constructed": 0, "kwargs": None}
+
+    class _FakeBackend:
+        def __init__(self, **kw):
+            seen["constructed"] += 1
+            seen["kwargs"] = kw
+
+        async def run(self, prompt, **kw):
+            import asyncio
+
+            seen["prompt"] = prompt
+            seen["run_kwargs"] = kw
+            if raises is not None:
+                raise raises
+            if hang:
+                await asyncio.sleep(30)
+            return result or _FakeResult()
+
+    monkeypatch.setattr(cb_mod, "ClaudeBackend", _FakeBackend)
+    return seen
+
+
+@pytest.fixture
+def _no_auth_assertion(monkeypatch):
+    """Neutralise the credential export so no test reads ~/.no_human/.env."""
+    from no_human import config as config_mod
+
+    monkeypatch.setattr(config_mod, "assert_subscription_mode",
+                        lambda **kw: None)
+
+
+async def test_verify_credential_live_returns_nothing_when_the_call_lands(
+        monkeypatch, _no_auth_assertion):
+    """The verdict is "an authenticated request succeeded", not "the answer was
+    correct" — holding a diagnostic hostage to a model's phrasing would fail
+    installs that work."""
+    from no_human.agent.backend_check import verify_credential_live
+
+    seen = _fake_backend(monkeypatch, result=_FakeResult(final_text="banana"))
+    assert await verify_credential_live(model="claude-haiku-4-5") is None
+    # …and it is the CHEAP shape: one turn, low effort, readonly.
+    assert seen["run_kwargs"]["max_turns"] == 1
+    assert seen["run_kwargs"]["effort"] == "low"
+    assert seen["kwargs"]["readonly"] is True
+
+
+async def test_verify_credential_live_reports_a_rejected_credential(
+        monkeypatch, _no_auth_assertion):
+    from no_human.agent.backend_check import verify_credential_live
+
+    _fake_backend(monkeypatch, result=_FakeResult(
+        is_error=True, final_text="API Error: 401 OAuth token is invalid"))
+    problem = await verify_credential_live(model="claude-haiku-4-5")
+    assert problem is not None
+    assert problem[0] == "rejected"
+    assert "401" in problem[1]
+
+
+async def test_verify_credential_live_reports_a_crash_instead_of_raising(
+        monkeypatch, _no_auth_assertion):
+    """A diagnostic that dies with a traceback tells the operator less than one
+    that says what happened."""
+    from no_human.agent.backend_check import verify_credential_live
+
+    _fake_backend(monkeypatch, raises=RuntimeError("CLI not found"))
+    problem = await verify_credential_live(model="claude-haiku-4-5")
+    assert problem == ("rejected", "RuntimeError: CLI not found")
+
+
+async def test_a_slow_link_is_not_reported_as_a_dead_credential(
+        monkeypatch, _no_auth_assertion):
+    """Reporting a timeout as a rejected token would send the operator off to
+    regenerate a credential that was fine."""
+    from no_human.agent.backend_check import verify_credential_live
+
+    _fake_backend(monkeypatch, hang=True)
+    problem = await verify_credential_live(model="claude-haiku-4-5",
+                                           timeout_s=0.05)
+    assert problem is not None
+    assert problem[0] == "inconclusive"
+    assert "nothing about the credential" in problem[1]
+
+
+async def test_a_dead_network_is_not_reported_as_a_dead_credential(
+        monkeypatch, _no_auth_assertion):
+    """The independent review demonstrated the first cut folding
+    OSError("Network is unreachable") into CREDENTIAL DOES NOT WORK — a cron
+    doctor on a flaky link must not send the operator to rotate a credential
+    the API never even saw."""
+    from no_human.agent.backend_check import verify_credential_live
+
+    _fake_backend(monkeypatch, raises=OSError("Network is unreachable"))
+    problem = await verify_credential_live(model="claude-haiku-4-5")
+    assert problem is not None
+    assert problem[0] == "inconclusive"
+    assert "never reached the API" in problem[1]
+
+
+async def test_verify_credential_live_never_calls_out_with_no_credential(
+        monkeypatch):
+    """An AuthError is the answer, not a reason to spend: the backend is never
+    even constructed."""
+    from no_human import config as config_mod
+    from no_human.agent.backend_check import verify_credential_live
+
+    def _boom(**kw):
+        raise config_mod.AuthError("no ANTHROPIC_API_KEY was found")
+
+    monkeypatch.setattr(config_mod, "assert_subscription_mode", _boom)
+    seen = _fake_backend(monkeypatch)
+
+    problem = await verify_credential_live(model="claude-haiku-4-5",
+                                           auth_mode="api_key")
+    assert problem == ("rejected", "no ANTHROPIC_API_KEY was found")
+    assert seen["constructed"] == 0
+
+
+def _doctor(monkeypatch, tmp_path, *args, live=None):
+    """Run the `doctor` COMMAND (not the group) against a tmp DB.
+
+    The command object directly, so the group callback's update notice never
+    runs; `load_config` and `check_backend` are replaced so nothing here reads
+    the operator's real ~/.no_human.
+    """
+    from click.testing import CliRunner
+
+    import no_human.agent.backend_check as bc_mod
+    from no_human.cli import commands as cmd_mod
+
+    class _Cfg:
+        data: dict = {}
+        db_path = tmp_path / "doctor.db"
+        utility_model = "claude-haiku-4-5"
+
+        def get(self, key, default=None):
+            return self.data.get(key, default)
+
+    calls = []
+
+    async def _live(**kw):
+        calls.append(kw)
+        return live
+
+    monkeypatch.setattr(cmd_mod, "load_config", lambda *a, **k: _Cfg())
+    monkeypatch.setattr(bc_mod, "check_backend", lambda **kw: bc_mod.BackendStatus(
+        cli_path="/fake/claude", token_present=True))
+    monkeypatch.setattr(bc_mod, "verify_credential_live", _live)
+    result = CliRunner().invoke(cmd_mod.doctor, list(args))
+    return result, calls
+
+
+def test_doctor_makes_no_live_call_unless_asked(monkeypatch, tmp_path):
+    """The default is byte-for-byte what it was: presence only, no spend."""
+    result, calls = _doctor(monkeypatch, tmp_path,
+                            live=("rejected", "would have failed"))
+
+    assert result.exit_code == 0, result.output
+    assert calls == [], "doctor spent quota without being asked"
+    assert "presence only — no live auth call" in result.output, result.output
+
+
+def test_verify_auth_says_so_on_the_auth_line_when_the_credential_works(
+        monkeypatch, tmp_path):
+    result, calls = _doctor(monkeypatch, tmp_path, "--verify-auth", live=None)
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1, "exactly one live call, or the flag is not cheap"
+    assert calls[0]["model"] == "claude-haiku-4-5", calls
+    assert "verified by one live call" in result.output, result.output
+    assert "presence only" not in result.output, result.output
+
+
+def test_a_transport_failure_does_not_fail_the_doctor_gate(
+        monkeypatch, tmp_path):
+    """The review's exact demonstration, inverted: a network failure must be
+    reported as NOT VERIFIED — never as a dead credential, and never exit 1.
+    An operator's cron on a flaky link must not rotate a working token."""
+    result, calls = _doctor(
+        monkeypatch, tmp_path, "--verify-auth",
+        live=("inconclusive",
+              "OSError: Network is unreachable — the request never reached "
+              "the API, so this says nothing about the credential; try again"))
+
+    assert len(calls) == 1
+    assert result.exit_code == 0, (
+        f"a transport failure must not fail the gate:\n{result.output}")
+    flat = " ".join(result.output.split())  # Rich wraps lines mid-phrase
+    assert "NOT VERIFIED (transport failure)" in flat, result.output
+    assert "credential not verified" in flat, result.output
+    assert "CREDENTIAL DOES NOT WORK" not in flat, result.output
+
+
+def test_a_credential_the_live_call_rejects_fails_the_doctor_gate(
+        monkeypatch, tmp_path):
+    """The B5 gap closed: `nh doctor --verify-auth || exit 1` fires on an
+    install whose token is present, well-shaped, and dead."""
+    result, calls = _doctor(
+        monkeypatch, tmp_path, "--verify-auth",
+        live=("rejected", "API Error: 401 OAuth token is invalid"))
+
+    assert len(calls) == 1
+    assert "CREDENTIAL DOES NOT WORK" in result.output, result.output
+    assert "401" in result.output, result.output
+    assert "live call REJECTED" in result.output, result.output
+    assert result.exit_code == 1, (
+        f"a dead credential must fail the gate:\n{result.output}")

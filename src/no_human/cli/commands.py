@@ -575,10 +575,30 @@ def shell_cmd(ctx: click.Context, repo: str | None) -> None:
 
 
 @cli.command("init")
-def init_cmd():
+@click.option("--non-interactive", is_flag=True,
+              help="Ask nothing. For provisioning scripts, Dockerfiles and CI.")
+@click.option("--auth-mode", type=click.Choice(["subscription", "api_key"]),
+              default=None,
+              help="Which credential pays (--non-interactive only; default: "
+                   "subscription). The wizard asks this question instead.")
+@click.option("--token-stdin", is_flag=True,
+              help="Read the credential as one line from stdin "
+                   "(--non-interactive only). There is deliberately no --token "
+                   "argument: argv is world-readable in `ps` and lands in shell "
+                   "history.")
+@click.option("--repo", "repo_arg", default=None, type=click.Path(),
+              help="Onboard this repo (--non-interactive only).")
+@click.option("--no-repo", is_flag=True,
+              help="Onboard no repo (--non-interactive only).")
+def init_cmd(non_interactive, auth_mode, token_stdin, repo_arg, no_repo):
     """Set up no_human from scratch: prerequisites, token, config, first repo.
 
     Safe to run again — never overwrites existing config, secrets, or data.
+
+    \b
+    Scripted (KI-2): asks nothing, writes exactly what the wizard writes.
+      printf %s "$TOKEN" | nh init --non-interactive --token-stdin --no-repo
+      nh init --non-interactive --auth-mode api_key --token-stdin --repo ~/git/x
     """
     from .init_cmd import (
         check_prerequisites,
@@ -586,8 +606,25 @@ def init_cmd():
         ensure_home_dir,
         offer_onboard,
         print_summary,
+        resolve_repo_arg,
         setup_token,
+        setup_token_noninteractive,
     )
+
+    # The scripted flags are meaningless without the mode they belong to, and
+    # silently ignoring `--token-stdin` would leave a script blocked on a pipe
+    # nobody reads while the wizard prompts for the token it was handed.
+    if not non_interactive:
+        stray = [name for name, given in (
+            ("--auth-mode", auth_mode is not None),
+            ("--token-stdin", token_stdin), ("--repo", repo_arg is not None),
+            ("--no-repo", no_repo),
+        ) if given]
+        if stray:
+            raise click.UsageError(
+                f"{', '.join(stray)} require --non-interactive.")
+    elif repo_arg is not None and no_repo:
+        raise click.UsageError("--repo and --no-repo contradict each other.")
 
     console.rule("[bold]no_human — first-time setup")
 
@@ -609,7 +646,23 @@ def init_cmd():
 
     # 3. Billing / authentication.
     console.print("\n[bold]3. Authentication[/]")
-    token_ready, auth_mode = setup_token()
+    if non_interactive:
+        auth_mode = auth_mode or "subscription"
+        # One line, from stdin, never from argv. A `--token <value>` would put
+        # the credential in `ps` output, in the shell's history file, and in
+        # any CI log that echoes the command it ran.
+        token = sys.stdin.readline().strip() if token_stdin else None
+        token_ready = setup_token_noninteractive(auth_mode, token)
+        if not token_ready:
+            # The wizard prints a summary card saying "Token not set" and exits
+            # 0, because a human is reading it. A script's only channel is the
+            # exit code, and an install that cannot make a call must not report
+            # success. Nothing was stored; config.yaml is left as it was.
+            raise click.ClickException(
+                "the credential was refused (see above). Fix it and re-run — "
+                "no credential was stored.")
+    else:
+        token_ready, auth_mode = setup_token()
 
     # 4. Config file.
     console.print("\n[bold]4. Configuration[/]")
@@ -617,7 +670,20 @@ def init_cmd():
 
     # 5. Optional: onboard a repo.
     console.print("\n[bold]5. Repo onboarding[/]")
-    repo_path = offer_onboard()
+    if non_interactive:
+        repo_path = resolve_repo_arg(repo_arg) if repo_arg else None
+        if repo_arg and not repo_path:
+            # The wizard carries on without a repo because a human can see the
+            # error and re-run one command. A script cannot, and a half-set-up
+            # install that reports success is the failure this mode exists to
+            # remove.
+            raise click.ClickException(
+                f"--repo {repo_arg} cannot be onboarded (see above). "
+                f"Authentication and config were already written.")
+        if repo_path is None:
+            console.print("  [dim]skipped (no --repo)[/]")
+    else:
+        repo_path = offer_onboard()
     if repo_path:
         # Run onboard inline — reuse the existing nh onboard logic.
         # Catch SystemExit so a failing onboard doesn't kill init.
@@ -1491,6 +1557,62 @@ def auth_status():
     if _server_owns_worker(config):
         console.print(
             "\n[dim]A server is running; it bills the profile it started with.[/]"
+        )
+
+
+@auth_group.command("set-token")
+@click.option("--profile", default=None,
+              help="Which profile's token to write (default: the active one).")
+def auth_set_token(profile):
+    """Replace a profile's OAuth token, reading it from stdin.
+
+    The CLI twin of the Mac app's *File → Re-enter Claude Token…*. Until this
+    existed a mistyped token could not be fixed from the CLI at all: `nh init`
+    short-circuits on the PRESENCE of a credential and never overwrites one, so
+    the only remedy was hand-editing ~/.no_human/.env (walkthrough B14b).
+
+    The token is read from stdin, never taken as an argument — argv shows up in
+    `ps` and in shell history. Piped in, it is one line; typed at a terminal,
+    it is prompted for without echo.
+
+    \b
+      printf %s "$TOKEN" | nh auth set-token
+      nh auth set-token --profile personal      # then paste when prompted
+    """
+    from ..config import DEFAULT_AUTH_PROFILE, profile_token_var, set_profile_token
+
+    config = load_config()
+    target = profile or (config.get("llm") or {}).get(
+        "auth_profile") or DEFAULT_AUTH_PROFILE
+    # A bad profile name must fail BEFORE a credential is read, so a rejected
+    # run never has the token in memory at all.
+    try:
+        var = profile_token_var(target)
+    except AuthError as exc:
+        console.print(f"[bold red]auth error:[/] {exc}")
+        sys.exit(2)
+
+    # getpass would read /dev/tty when one exists, which silently ignores a
+    # pipe; readline would hang with no prompt on a terminal. Branch, and each
+    # half is correct for the case it serves.
+    if sys.stdin.isatty():
+        token = click.prompt(var, hide_input=True, default="",
+                             show_default=False)
+    else:
+        token = sys.stdin.readline()
+
+    try:
+        set_profile_token(target, token)
+    except AuthError as exc:
+        console.print(f"[bold red]not saved —[/] {exc}")
+        sys.exit(2)
+
+    console.print(f"[green]✓[/] wrote [bold]{var}[/] "
+                  f"(profile [bold]{target}[/]) to ~/.no_human/.env")
+    if _server_owns_worker(config):
+        console.print(
+            "[yellow]The running server still holds the old token.[/] "
+            "Restart it (`nh stop && nh start`) for this to take effect."
         )
 
 
@@ -4214,7 +4336,11 @@ def _release_pid_lock() -> None:
 @cli.command("doctor")
 @click.option("-v", "--verbose", is_flag=True,
               help="Show the per-mechanism lifetime-firings table.")
-def doctor(verbose):
+@click.option("--verify-auth", is_flag=True,
+              help="Also make ONE cheap live call to prove the credential is "
+                   "accepted, not merely present. Costs a few tokens, so it is "
+                   "off by default.")
+def doctor(verbose, verify_auth):
     """Liveness check: which guarded mechanisms have actually ever fired.
 
     The system's worst bugs were silences, not crashes — TESTING dead for its
@@ -4254,6 +4380,35 @@ def doctor(verbose):
         for reason in backend.reasons:
             d.contradictions.append(f"CODING BACKEND UNUSABLE: {reason}")
 
+        # The gap presence-checking cannot close: a valid-SHAPED but expired or
+        # revoked credential passes everything above and dies at the first task
+        # (walkthrough B5). Opt-in, because the rule that doctor never spends
+        # quota unasked is what makes the rest of it safe to run anywhere. Run
+        # HERE, before the verdict is computed, so a rejected credential is a
+        # contradiction like any other and the exit code follows it.
+        auth_note = "presence only — no live auth call"
+        if verify_auth:
+            from ..agent.backend_check import verify_credential_live
+
+            problem = await verify_credential_live(
+                model=config.utility_model, profile=profile,
+                auth_mode=auth_mode)
+            if problem is None:
+                auth_note = "verified by one live call"
+            elif problem[0] == "inconclusive":
+                # Transport failure judges the NETWORK, not the credential —
+                # a cron doctor on a flaky link must not read as a dead
+                # credential (independent-review finding). Not a
+                # contradiction; the exit code is unchanged by this outcome.
+                auth_note = "live call NOT VERIFIED (transport failure)"
+                console.print(
+                    f"    [yellow]! credential not verified —[/] {problem[1]}")
+            else:
+                auth_note = "live call REJECTED"
+                d.contradictions.append(
+                    f"CREDENTIAL DOES NOT WORK: a single live call was made "
+                    f"with it and failed — {problem[1]}")
+
         # The verdict, first — a first run printed 149 lines of all-zero
         # mechanism rows and internal history, and a newcomer could not tell
         # healthy from broken. Three lines say it; the table is still one flag
@@ -4283,7 +4438,7 @@ def doctor(verbose):
         console.print(f"[bold]auth[/] — profile: "
                       f"[cyan]{profile or DEFAULT_AUTH_PROFILE}[/]  "
                       f"mode: [cyan]{auth_mode}[/]  "
-                      f"[dim](presence only — no live auth call)[/]")
+                      f"[dim]({auth_note})[/]")
         console.print(f"[bold]coding backend[/] — claude CLI: "
                       f"[{colour}]{cli}[/]")
 

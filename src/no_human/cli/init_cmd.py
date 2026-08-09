@@ -13,6 +13,7 @@ Idempotent: running twice never destroys existing config, secrets, or data.
 
 from __future__ import annotations
 
+import hmac
 import os
 import re
 import shutil
@@ -208,6 +209,24 @@ def _found_subscription_token() -> tuple[str, str] | None:
     return None
 
 
+def _found_api_key() -> tuple[str, str] | None:
+    """The metered API key already on this machine, and where it came from.
+
+    The BYO-API-key twin of :func:`_found_subscription_token`, with the same
+    precedence :func:`config.load_api_key` uses (.env wins over the process
+    environment) — and, like it, read-only: nothing is exported here.
+    """
+    from ..config import _read_env_file
+
+    value = _read_env_file(ENV_PATH).get(API_KEY_VAR)
+    if value:
+        return value, "~/.no_human/.env"
+    value = os.environ.get(API_KEY_VAR)
+    if value:
+        return value, "the environment"
+    return None
+
+
 def _report_found_token(value: str, where: str, suffix: str = "") -> bool:
     """Report a token init FOUND rather than wrote. True if it can work.
 
@@ -282,6 +301,83 @@ def setup_token() -> tuple[bool, str]:
     if choice == "2":
         return _setup_api_key(), "api_key"
     return _setup_subscription_token(), "subscription"
+
+
+def setup_token_noninteractive(auth_mode: str, token: str | None) -> bool:
+    """:func:`setup_token` with the questions removed. True if the install can pay.
+
+    Same two sanctioned modes, same variables, same writers — the only thing
+    that changes is where the answers come from. Every write here goes through
+    the function the wizard uses (:func:`_save_subscription_token` /
+    :func:`_append_env`), so a scripted install and a hand-run one produce the
+    same ``.env``, at the same 0600, refused by the same validator.
+
+    Two behaviours are worth stating because a script cannot see them happen:
+
+    * **Never overwrites.** ``nh init`` short-circuits on the PRESENCE of a
+      credential (walkthrough B14) and this keeps that exactly. A stored value
+      is reported and left alone; re-supplying the SAME token is a no-op so a
+      provisioning script stays re-runnable, and supplying a DIFFERENT one is
+      refused by name rather than silently ignored or silently applied. The
+      comparison is :func:`hmac.compare_digest` — it is comparing two secrets,
+      and there is no reason to leak their common prefix through timing.
+    * **Never invents one.** No credential and none supplied is an explicit,
+      named, non-zero failure (KI-2's second acceptance condition), not a
+      ``~/.no_human`` that looks set up and cannot make a call.
+    """
+    found = _found_api_key() if auth_mode == "api_key" else _found_subscription_token()
+    var = API_KEY_VAR if auth_mode == "api_key" else SUBSCRIPTION_TOKEN_VAR
+    if found:
+        return _keep_found_credential(auth_mode, var, found, token)
+
+    if not token:
+        raise click.ClickException(
+            f"no credential to install: {var} is in neither ~/.no_human/.env "
+            f"nor the environment, and nothing arrived on stdin. Supply one "
+            f'(printf %s "$TOKEN" | nh init --non-interactive --token-stdin) '
+            f"or export {var} before running. Nothing was written."
+        )
+
+    if auth_mode == "api_key":
+        # The wizard's own API-key write: no shape check beyond the .env line
+        # guard, because the key is the operator's chosen billing path and
+        # `_assert_api_key_mode` is what enforces it at run time.
+        _append_env(API_KEY_VAR, token)
+    elif not _save_subscription_token(token):
+        return False
+    os.environ[var] = token
+    console.print(f"  [green]✓[/] {var} saved to ~/.no_human/.env")
+    return True
+
+
+def _keep_found_credential(auth_mode: str, var: str, found: tuple[str, str],
+                           token: str | None) -> bool:
+    """Report the credential already on this machine; never replace it."""
+    value, where = found
+    if token and not hmac.compare_digest(token, value):
+        raise click.ClickException(
+            f"{var} is already set in {where} and the value on stdin is a "
+            f"different one. `nh init` never overwrites a stored credential. "
+            + ("To replace it: nh auth set-token"
+               if auth_mode == "subscription" else
+               "To replace it, edit ~/.no_human/.env")
+            + ". Nothing was written."
+        )
+    if auth_mode == "api_key":
+        console.print(f"  [green]✓[/] {var} found in {where} (auth_mode: api_key)")
+        ready = True
+    else:
+        ready = _report_found_token(value, where, suffix=" (auth_mode: subscription)")
+    # The wizard asks "Persist it to ~/.no_human/.env?" and defaults to yes; a
+    # scripted install that skipped the question must not end up quietly
+    # depending on a variable that was exported for one shell.
+    if ready and where == "the environment":
+        if auth_mode == "api_key":
+            _append_env(var, value)
+        elif not _save_subscription_token(value):
+            return False
+        console.print("    [green]saved[/] to ~/.no_human/.env")
+    return ready
 
 
 def _configured_auth_mode() -> str:
@@ -505,12 +601,14 @@ def _git_config(key: str) -> str:
 # Repo onboard offer                                                          #
 # --------------------------------------------------------------------------- #
 
-def offer_onboard() -> str | None:
-    """Offer to onboard a repo. Returns the repo path or None if skipped."""
-    console.print()
-    if not click.confirm("  Onboard a repo now?", default=True):
-        return None
-    repo = click.prompt("  Repo path", default=".", show_default=True).strip()
+def resolve_repo_arg(repo: str) -> str | None:
+    """Resolve *repo* and refuse what `nh onboard` cannot use. None if unusable.
+
+    Shared with the non-interactive path so a scripted `--repo` is held to the
+    same two conditions the wizard's prompt applies, and reports them in the
+    same words. The CALLER decides what an unusable path means: the wizard
+    carries on without a repo, a provisioning script must fail.
+    """
     repo_path = str(Path(repo).expanduser().resolve())
     if not Path(repo_path).is_dir():
         print_path_error(console, "  [red]not a directory:[/]", repo_path)
@@ -519,6 +617,15 @@ def offer_onboard() -> str | None:
         print_path_error(console, "  [red]not a git repo:[/]", repo_path)
         return None
     return repo_path
+
+
+def offer_onboard() -> str | None:
+    """Offer to onboard a repo. Returns the repo path or None if skipped."""
+    console.print()
+    if not click.confirm("  Onboard a repo now?", default=True):
+        return None
+    return resolve_repo_arg(click.prompt("  Repo path", default=".",
+                                         show_default=True).strip())
 
 
 # --------------------------------------------------------------------------- #

@@ -128,9 +128,21 @@ uv run nh init
 ```
 
 `nh init` is an interactive wizard: it asks how you want to pay for Claude and
-walks you through the token. There is currently no non-interactive/`--yes` mode,
-so it cannot be run from a provisioning script or over a pipe — see
-[docs/KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+walks you through the token.
+
+For a provisioning script, a Dockerfile or CI, add `--non-interactive` — it asks
+nothing and writes exactly what the wizard writes:
+
+```bash
+printf %s "$CLAUDE_CODE_OAUTH_TOKEN" | uv run nh init --non-interactive \
+  --token-stdin --repo ~/git/my-repo
+```
+
+- `--auth-mode subscription|api_key` picks which credential pays (default: subscription)
+- `--token-stdin` reads it as one line from stdin — there is no `--token` flag, because argv is visible in `ps` and lands in shell history
+- `--repo <path>` onboards a repo; `--no-repo` says so explicitly, and omitting both also skips it
+- It never overwrites a credential you already have: the same token is a no-op, a different one is refused — to replace one, use `nh auth set-token` (it reads the token from stdin too)
+- No credential at all — none stored, none on stdin — is an error, not a `~/.no_human` that cannot make a call
 
 This guided wizard will:
 - Check that python, git, uv, and claude CLI are installed
@@ -153,12 +165,16 @@ backend is *present* — that the `claude` CLI resolves, and that a credential i
 on file. It exits non-zero on a contradiction or an evidence gap, so
 `nh doctor || exit 1` works in a pipeline.
 
-Read that last part precisely: doctor checks the CLI is present and a credential
-exists — **it does not verify the credential works.** A token that is expired,
-revoked, or simply mistyped is still "present", so doctor prints a green backend
-line and exits 0, and the first task is where you find out. Doctor prints the
-active auth profile and mode with an explicit "(presence only — no live auth
-call)" marker, so its green line cannot be misread as a verified credential.
+Read that last part precisely: by default doctor checks the CLI is present and
+a credential *exists* — **not that it works** — because no diagnostic here
+spends quota unless you ask. A token that is expired, revoked, or simply
+mistyped is still "present", so the default run prints a green backend line
+with an explicit "(presence only — no live auth call)" marker and exits 0.
+When you want the stronger claim, `uv run nh doctor --verify-auth` asks for
+it: one cheap live call, and an expired or revoked token that passes every
+other check fails this one. If the network drops the call before the API ever
+sees it, doctor says the credential was NOT verified — a transport failure is
+reported as exactly that, never as a dead credential.
 
 On a brand-new install most counters will read zero, which is expected — nothing
 has run yet. Its value is later: run it whenever something behaves oddly, and

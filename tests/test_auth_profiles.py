@@ -309,3 +309,114 @@ async def test_attempt_row_records_the_paying_subscription(store):
 
     (row,) = await store.list_attempts(task.id)
     assert row["auth_profile"] == "enterprise"
+
+
+# --------------------------------------------------------------------------- #
+# `nh auth set-token` — the CLI twin of the app's File → Re-enter Claude Token #
+#                                                                              #
+# Until this existed a mistyped token could not be fixed from the CLI at all:  #
+# `nh init` short-circuits on the PRESENCE of a credential and never           #
+# overwrites one, `nh auth` had only status/use, and `nh config` only          #
+# show/edit/path — so the remedy was hand-editing ~/.no_human/.env while the   #
+# Mac app had a menu item for it (walkthrough B14b).                           #
+# --------------------------------------------------------------------------- #
+
+
+def _set_token(tmp_path, monkeypatch, stdin: str, *args):
+    """Run `nh auth set-token` against a tmp .env. Returns (result, env_path)."""
+    from click.testing import CliRunner
+
+    from no_human.cli import commands as cmd_mod
+
+    env_path = tmp_path / ".env"
+    cfg = load_config(tmp_path / "config.yaml")
+    monkeypatch.setattr(config, "ENV_PATH", env_path)
+    monkeypatch.setattr(cmd_mod, "load_config", lambda *a, **k: cfg)
+    # Never probe the operator's real server from a unit test.
+    monkeypatch.setattr(cmd_mod, "_server_owns_worker", lambda _cfg: False)
+    result = CliRunner().invoke(cmd_mod.auth_set_token, list(args), input=stdin,
+                                catch_exceptions=False)
+    return result, env_path
+
+
+def test_set_token_writes_the_active_profiles_variable(tmp_path, monkeypatch):
+    """A fresh install: nothing on file, one token in, the canonical variable
+    out — and the command names what it wrote so the operator can check it."""
+    result, env_path = _set_token(tmp_path, monkeypatch,
+                                  "sk-ant-oat01-FRESHTOKEN\n")
+
+    assert result.exit_code == 0, result.output
+    assert env_path.read_text() == (
+        f"{SUBSCRIPTION_TOKEN_VAR}=sk-ant-oat01-FRESHTOKEN\n")
+    assert (env_path.stat().st_mode & 0o777) == 0o600
+    assert SUBSCRIPTION_TOKEN_VAR in result.output
+    assert "default" in result.output
+    assert "FRESHTOKEN" not in result.output, "the token was echoed back"
+
+
+def test_set_token_replaces_a_token_that_is_already_there(tmp_path, monkeypatch):
+    """The whole point: `nh init` refuses to overwrite, so SOMETHING has to.
+    The other lines in .env survive — this is the guarded upsert, not a
+    rewrite of the file."""
+    env_path = tmp_path / ".env"
+    env_path.write_text(f"# mine\n{SUBSCRIPTION_TOKEN_VAR}=mistyped\nOTHER=keep\n")
+
+    result, env_path = _set_token(tmp_path, monkeypatch, "corrected-token\n")
+
+    assert result.exit_code == 0, result.output
+    assert env_path.read_text() == (
+        f"# mine\n{SUBSCRIPTION_TOKEN_VAR}=corrected-token\nOTHER=keep\n")
+
+
+def test_set_token_writes_a_named_profiles_own_variable(tmp_path, monkeypatch):
+    result, env_path = _set_token(tmp_path, monkeypatch, "personal-tok\n",
+                                  "--profile", "personal")
+
+    assert result.exit_code == 0, result.output
+    assert env_path.read_text() == f"{PERSONAL_VAR}=personal-tok\n"
+    assert PERSONAL_VAR in result.output
+
+
+def test_set_token_refuses_an_api_key_through_the_shared_validator(
+        tmp_path, monkeypatch):
+    """One opinion about what a usable token is: the same refusal `nh init`,
+    `PUT /api/auth/token` and the desktop app all raise."""
+    result, env_path = _set_token(tmp_path, monkeypatch,
+                                  "sk-ant-api03-WRONGFIELD\n")
+
+    assert result.exit_code == 2, result.output
+    assert "not an OAuth token" in result.output, result.output
+    assert not env_path.exists(), "a refused token must not be written"
+
+
+def test_set_token_refuses_an_empty_line(tmp_path, monkeypatch):
+    result, env_path = _set_token(tmp_path, monkeypatch, "\n")
+
+    assert result.exit_code == 2, result.output
+    assert "must not be empty" in result.output, result.output
+    assert not env_path.exists()
+
+
+def test_set_token_rejects_a_bad_profile_before_reading_the_token(
+        tmp_path, monkeypatch):
+    """The name is validated FIRST, so a run that was going to fail never has
+    the credential in memory at all."""
+    result, env_path = _set_token(tmp_path, monkeypatch, "a-token\n",
+                                  "--profile", "not a profile!")
+
+    assert result.exit_code == 2, result.output
+    assert "invalid auth profile name" in result.output, result.output
+    assert not env_path.exists()
+    assert "a-token" not in result.output
+
+
+def test_set_token_defaults_to_the_profile_the_config_pins(tmp_path, monkeypatch):
+    """`nh auth use personal` then `nh auth set-token` must write PERSONAL's
+    variable — writing `default`'s would silently leave the pinned profile
+    unfixed, which is the bug this command exists to remove."""
+    (tmp_path / "config.yaml").write_text("llm:\n  auth_profile: personal\n")
+
+    result, env_path = _set_token(tmp_path, monkeypatch, "personal-tok\n")
+
+    assert result.exit_code == 0, result.output
+    assert env_path.read_text() == f"{PERSONAL_VAR}=personal-tok\n"

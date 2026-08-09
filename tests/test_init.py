@@ -529,3 +529,216 @@ def test_no_module_defines_the_same_top_level_name_twice():
         offenders += [f"{py.relative_to(src)}:{n} defined {c}x"
                       for n, c in names.items() if c > 1]
     assert not offenders, offenders
+
+
+# --------------------------------------------------------------------------- #
+# `nh init --non-interactive` — the scripted install (F1 / ADOPT-3 / KI-2)     #
+#                                                                              #
+# The property under test is that the scripted path is the SAME install as the #
+# wizard's, not a second one: same variables, same file, same 0600, same       #
+# validator, same "never overwrites" idempotence. A parallel implementation    #
+# that drifts is exactly how the CLI, the HTTP path and the desktop app ended  #
+# up with three opinions about a token (walkthrough B4b).                      #
+# --------------------------------------------------------------------------- #
+
+
+def _scripted(tmp_path, monkeypatch, *args, stdin: str = "", with_token=False):
+    """Run `nh init --non-interactive …` against tmp dirs. Returns (result, env)."""
+    env_path = _init_env(tmp_path, monkeypatch, with_token=with_token)
+    result = CliRunner().invoke(cli, ["init", "--non-interactive", *args],
+                                input=stdin, catch_exceptions=False)
+    return result, env_path
+
+
+def test_scripted_subscription_install_writes_what_the_wizard_writes(
+        tmp_path, monkeypatch):
+    """KI-2 acceptance 1: a working ~/.no_human with stdin closed to questions.
+
+    Byte-compared against the wizard's own output in
+    `test_nh_init_accepts_a_valid_oauth_token` — same variable, same file, same
+    mode — because "scripted" must not mean "a different install".
+    """
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        result, env_path = _scripted(
+            tmp_path, monkeypatch, "--token-stdin", "--no-repo",
+            stdin="sk-ant-oat01-SCRIPTEDTOKEN\n")
+
+    assert result.exit_code == 0, result.output
+    assert env_path.read_text() == (
+        "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-SCRIPTEDTOKEN\n")
+    assert (env_path.stat().st_mode & 0o777) == 0o600
+    assert "ready" in result.output
+
+
+def test_scripted_api_key_install_writes_the_key_and_pins_the_mode(
+        tmp_path, monkeypatch):
+    """The other sanctioned billing path. The MODE goes in config.yaml, the KEY
+    only ever in .env — constraint #1's `_reject_api_key_in_config`."""
+    import no_human.cli.init_cmd as init_mod
+
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        result, env_path = _scripted(
+            tmp_path, monkeypatch, "--auth-mode", "api_key", "--token-stdin",
+            "--no-repo", stdin="sk-ant-api03-MYOWNMETEREDKEY\n")
+
+    assert result.exit_code == 0, result.output
+    assert env_path.read_text() == (
+        "ANTHROPIC_API_KEY=sk-ant-api03-MYOWNMETEREDKEY\n")
+    assert (env_path.stat().st_mode & 0o777) == 0o600
+    config_text = init_mod.CONFIG_PATH.read_text()
+    assert "auth_mode: api_key" in config_text
+    assert "MYOWNMETEREDKEY" not in config_text, "the key must never reach config"
+
+
+def test_scripted_install_refuses_a_bad_token_with_the_shared_message(
+        tmp_path, monkeypatch):
+    """The same validator, and the same words, as the wizard and the app.
+
+    And it EXITS NON-ZERO where the wizard prints a summary card: a script's
+    only channel is the exit code, so an install that cannot make a call must
+    not report success.
+    """
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        result, env_path = _scripted(
+            tmp_path, monkeypatch, "--token-stdin", "--no-repo",
+            stdin="sk-ant-api03-PASTEDINTOTHEWRONGFIELD\n")
+
+    assert result.exit_code != 0, result.output
+    assert "not an OAuth token" in result.output, result.output
+    assert not env_path.exists(), "a refused credential must not be written"
+
+
+def test_scripted_install_never_invents_a_credential(tmp_path, monkeypatch):
+    """KI-2 acceptance 2: no token is an explicit, non-zero, NAMED failure —
+    never a ~/.no_human that looks set up and cannot make a single call."""
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        result, env_path = _scripted(tmp_path, monkeypatch, "--no-repo")
+
+    assert result.exit_code != 0, result.output
+    assert "no credential to install" in result.output, result.output
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in result.output, result.output
+    assert not env_path.exists()
+
+
+def test_re_running_the_same_scripted_install_is_a_no_op(tmp_path, monkeypatch):
+    """KI-2 acceptance 3: `nh init`'s "never overwrites" property holds.
+
+    A provisioning script runs on every boot; handing it the token it already
+    installed must not be an error, and must not rewrite the file.
+    """
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        result, env_path = _scripted(
+            tmp_path, monkeypatch, "--token-stdin", "--no-repo",
+            stdin="test_token\n", with_token=True)
+
+    assert result.exit_code == 0, result.output
+    assert "found in ~/.no_human/.env" in result.output, result.output
+    assert env_path.read_text() == "CLAUDE_CODE_OAUTH_TOKEN=test_token\n"
+
+
+def test_a_different_token_is_refused_rather_than_overwritten(
+        tmp_path, monkeypatch):
+    """The dangerous half of idempotence. Silently ignoring the supplied token
+    would leave the operator believing they had rotated a credential they had
+    not; silently applying it would break `nh init`'s stated contract. Refuse,
+    name the file, and name the command that DOES replace it."""
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        result, env_path = _scripted(
+            tmp_path, monkeypatch, "--token-stdin", "--no-repo",
+            stdin="a-completely-different-token\n", with_token=True)
+
+    assert result.exit_code != 0, result.output
+    assert "never overwrites" in result.output, result.output
+    assert "nh auth set-token" in result.output, result.output
+    assert env_path.read_text() == "CLAUDE_CODE_OAUTH_TOKEN=test_token\n"
+
+
+def test_a_token_found_only_in_the_environment_is_persisted(tmp_path, monkeypatch):
+    """The wizard asks "Persist it to ~/.no_human/.env?" and defaults to yes.
+    A scripted install that skipped the question must not end up depending on a
+    variable that was exported for one shell."""
+    with patch.dict(os.environ,
+                    {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-FROMTHESHELL"},
+                    clear=False):
+        result, env_path = _scripted(tmp_path, monkeypatch, "--no-repo")
+
+    assert result.exit_code == 0, result.output
+    assert env_path.read_text() == (
+        "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-FROMTHESHELL\n")
+    assert (env_path.stat().st_mode & 0o777) == 0o600
+
+
+def test_a_bad_token_in_the_environment_fails_the_scripted_run(
+        tmp_path, monkeypatch):
+    """…and the persist step is still the guarded writer, so an unusable value
+    inherited from the shell is refused rather than copied into .env."""
+    with patch.dict(os.environ,
+                    {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-api03-FROMTHESHELL"},
+                    clear=False):
+        result, env_path = _scripted(tmp_path, monkeypatch, "--no-repo")
+
+    assert result.exit_code != 0, result.output
+    assert not env_path.exists(), "a validate-only check must write nothing"
+
+
+def test_an_unusable_repo_fails_the_scripted_run(tmp_path, monkeypatch):
+    """The wizard carries on without a repo because a human can see the error
+    and re-run one command. A script cannot, and a half-set-up install that
+    reports success is the failure this mode exists to remove."""
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        result, _ = _scripted(tmp_path, monkeypatch, "--repo",
+                              str(tmp_path / "not-a-repo"), with_token=True)
+
+    assert result.exit_code != 0, result.output
+    assert "not a directory" in result.output, result.output
+
+
+@pytest.mark.parametrize("flag", ["--token-stdin", "--no-repo"])
+def test_the_scripted_flags_refuse_to_be_used_without_the_mode(
+        tmp_path, monkeypatch, flag):
+    """Silently ignoring `--token-stdin` would block a script on a pipe nobody
+    reads while the wizard prompts for the token it was handed."""
+    _init_env(tmp_path, monkeypatch)
+    result = CliRunner().invoke(cli, ["init", flag], catch_exceptions=False)
+
+    assert result.exit_code != 0
+    assert "require --non-interactive" in result.output, result.output
+
+
+def test_repo_and_no_repo_contradict_each_other(tmp_path, monkeypatch):
+    _init_env(tmp_path, monkeypatch)
+    result = CliRunner().invoke(
+        cli, ["init", "--non-interactive", "--repo", ".", "--no-repo"],
+        catch_exceptions=False)
+
+    assert result.exit_code != 0
+    assert "contradict" in result.output, result.output
+
+
+def test_the_interactive_wizard_is_unchanged_by_the_scripted_flags(
+        tmp_path, monkeypatch):
+    """The control. Every flag above is additive: with none of them given,
+    `nh init` still asks its two questions and behaves exactly as before."""
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        env_path = _init_env(tmp_path, monkeypatch)
+        result = CliRunner().invoke(
+            cli, ["init"], input="1\nsk-ant-oat01-TYPEDBYAHUMAN\nn\n",
+            catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    assert "How will this install pay for Claude?" in result.output
+    assert env_path.read_text() == (
+        "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-TYPEDBYAHUMAN\n")

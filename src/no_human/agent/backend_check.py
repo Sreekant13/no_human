@@ -16,12 +16,19 @@ binary first, then ``PATH``, then the known npm/local install locations. Kept in
 lockstep so this never reports "missing" for a CLI the SDK would have found, nor
 "present" for one it would not.
 
-Read-only and side-effect-free: it resolves paths and reads config, it never
-spawns the CLI (a live auth probe would spend quota) and never mutates the env.
+:func:`check_backend` is read-only and side-effect-free: it resolves paths and
+reads config, it never spawns the CLI (a live auth probe would spend quota) and
+never mutates the env. That is what makes it safe to call from `nh doctor`, the
+board's auth payload and startup alike — and it is also its ceiling: a
+valid-SHAPED but expired or revoked credential passes it and dies at the first
+task. :func:`verify_credential_live` is the opt-in answer to exactly that, and
+it is the one function here that DOES spend quota and DOES export a credential.
+Nothing calls it implicitly.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 from dataclasses import dataclass, field
@@ -189,3 +196,77 @@ def check_backend(*, token_present: bool | None = None,
             )
     return BackendStatus(cli_path=cli, token_present=bool(token_present),
                          reasons=reasons)
+
+
+# The cheapest authenticated call this codebase can make: the utility tier
+# (haiku), one turn, low effort, readonly, and a prompt short enough that the
+# answer is the only interesting thing about it. It is the same shape as the
+# advisory calls in `nh learnings-curate` — deliberately, so "cheap" here means
+# what it already means everywhere else in the product rather than a new claim.
+_PROBE_PROMPT = "Reply with exactly: ok"
+
+# Generous, because the point is to distinguish "this credential is rejected"
+# from "this network is slow", and reporting a slow link as a dead credential
+# would send the operator to regenerate a token that was fine.
+_PROBE_TIMEOUT_S = 90.0
+
+
+async def verify_credential_live(*, model: str, profile: str | None = None,
+                                 auth_mode: str = "subscription",
+                                 timeout_s: float = _PROBE_TIMEOUT_S,
+                                 ) -> tuple[str, str] | None:
+    """Spend ONE cheap call to prove the credential actually works.
+
+    Returns ``None`` when the call came back, else ``(kind, why)`` where
+    ``kind`` is ``"rejected"`` — the failure is ABOUT the credential/config —
+    or ``"inconclusive"`` — transport never delivered an answer (timeout,
+    network down), which says nothing about the credential either way. The
+    split exists because an independent review demonstrated the first cut
+    reporting "Network is unreachable" as CREDENTIAL DOES NOT WORK: a cron
+    doctor run on a flaky network must not read as a dead credential.
+    Opt-in only (`nh doctor --verify-auth`): every other probe in this module
+    is presence-only precisely so no diagnostic spends quota unasked.
+
+    It exports the credential (via :func:`config.assert_subscription_mode`,
+    which is also what scrubs every other metered path) because there is no way
+    to make an authenticated call without doing so — which is the second reason
+    this is never implicit: it mutates the process environment.
+
+    The verdict is "did an authenticated request succeed", not "was the answer
+    correct". A model that replies with something other than ``ok`` still
+    proves the credential was accepted, and holding a diagnostic hostage to a
+    model's phrasing would fail installs that work.
+    """
+    from ..config import AuthError, assert_subscription_mode
+
+    try:
+        assert_subscription_mode(profile=profile, auth_mode=auth_mode)
+    except AuthError as exc:
+        return ("rejected", str(exc))
+
+    from .claude_backend import ClaudeBackend
+
+    try:
+        result = await asyncio.wait_for(
+            ClaudeBackend(model=model, readonly=True).run(
+                _PROBE_PROMPT, cwd=Path.cwd(), max_turns=1, effort="low"),
+            timeout=timeout_s,
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        return ("inconclusive",
+                f"the check did not answer within {timeout_s:.0f}s — this says "
+                f"nothing about the credential either way; try again")
+    except (OSError, ConnectionError) as exc:
+        # Transport never carried the request: unreachable network, DNS,
+        # refused socket. The credential was never judged.
+        return ("inconclusive",
+                f"{type(exc).__name__}: {exc} — the request never reached the "
+                f"API, so this says nothing about the credential; try again")
+    except Exception as exc:  # noqa: BLE001 — every failure is a report, not a crash
+        return ("rejected", f"{type(exc).__name__}: {exc}")
+    if result.is_error:
+        # The call went out and came back an error — an answer ABOUT the
+        # attempt (401s land here), not a transport gap.
+        return ("rejected",
+                result.final_text.strip() or "the backend reported an error")
+    return None
