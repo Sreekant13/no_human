@@ -147,6 +147,165 @@ def test_pyproject_routes_the_board_through_the_hook_and_not_the_static_table():
 
 
 # --------------------------------------------------------------------------- #
+# Editable installs BUILD the board when npm is available                      #
+# --------------------------------------------------------------------------- #
+
+def _npm_stub(calls, *, install_rc=0, build_rc=0, write_index=True):
+    """A fake `runner` for `try_build_board`: records `(argv, cwd)` and, for a
+    successful `npm run build`, writes the artifact the real command would."""
+    def runner(argv, cwd, **kwargs):
+        calls.append((list(argv), Path(cwd)))
+        if argv == ["npm", "install"]:
+            return subprocess.CompletedProcess(argv, install_rc)
+        if argv == ["npm", "run", "build"]:
+            if build_rc == 0 and write_index:
+                dist = Path(cwd) / "dist"
+                dist.mkdir(parents=True, exist_ok=True)
+                (dist / "index.html").write_text("<html><div id='root'></div></html>")
+            return subprocess.CompletedProcess(argv, build_rc)
+        raise AssertionError(f"unexpected npm invocation: {argv}")
+    return runner
+
+
+def _checkout(root: Path) -> None:
+    """A minimal stand-in for a real checkout: just enough for the
+    `web/package.json` precondition that keeps the other fast tests from
+    ever shelling out to a real npm."""
+    (root / "web").mkdir(parents=True, exist_ok=True)
+    (root / "web" / "package.json").write_text("{}")
+
+
+def test_an_editable_build_runs_npm_and_ships_the_board_it_produces(
+    tmp_path, monkeypatch,
+):
+    """npm on PATH: the build actually runs, in `web/`, in the documented
+    order, and the artifact it produces is what gets shipped."""
+    _checkout(tmp_path)
+    monkeypatch.setattr(hatch_build.shutil, "which", lambda name: "/usr/bin/npm")
+    calls = []
+
+    built = hatch_build.try_build_board(
+        tmp_path, "web/dist", runner=_npm_stub(calls))
+
+    assert built is True
+    assert (tmp_path / "web" / "dist" / "index.html").is_file()
+    assert calls == [
+        (["npm", "install"], tmp_path / "web"),
+        (["npm", "run", "build"], tmp_path / "web"),
+    ]
+    for cwd in (c for _, c in calls):
+        assert cwd == tmp_path / "web"
+    assert hatch_build._build_it() == "cd web && npm install && npm run build"
+
+
+def test_a_successful_editable_build_is_included_with_no_warning(
+    tmp_path, monkeypatch,
+):
+    """The same success, through `plan_board_inclusion`'s public seam."""
+    _checkout(tmp_path)
+    monkeypatch.setattr(hatch_build.shutil, "which", lambda name: "/usr/bin/npm")
+    stub_builder = lambda root, source: hatch_build.try_build_board(
+        root, source, runner=_npm_stub([]))
+
+    additions, warning = hatch_build.plan_board_inclusion(
+        tmp_path, "web/dist", "no_human/web_dist", "editable",
+        builder=stub_builder)
+
+    assert additions == {"web/dist": "no_human/web_dist"}
+    assert warning is None
+
+
+def test_without_npm_the_editable_install_still_succeeds_with_the_same_warning(
+    tmp_path, monkeypatch,
+):
+    """npm absent: the install proceeds and the warning is byte-identical to
+    the pre-existing one — nothing about its text changed."""
+    _checkout(tmp_path)
+    monkeypatch.setattr(hatch_build.shutil, "which", lambda name: None)
+
+    additions, warning = hatch_build.plan_board_inclusion(
+        tmp_path, "web/dist", "no_human/web_dist", "editable")
+
+    assert additions == {}
+    expected = hatch_build.board_missing_warning(
+        tmp_path / "web" / "dist" / "index.html")
+    assert warning == expected
+
+
+@pytest.mark.parametrize("install_rc, build_rc", [(1, 0), (0, 1)])
+def test_a_failing_npm_build_warns_and_does_not_fail_the_install(
+    tmp_path, monkeypatch, install_rc, build_rc,
+):
+    """A non-zero exit from either step never raises — it falls back to the
+    warning, and the install itself still succeeds."""
+    _checkout(tmp_path)
+    monkeypatch.setattr(hatch_build.shutil, "which", lambda name: "/usr/bin/npm")
+    runner = _npm_stub([], install_rc=install_rc, build_rc=build_rc)
+
+    built = hatch_build.try_build_board(tmp_path, "web/dist", runner=runner)
+    assert built is False
+
+    additions, warning = hatch_build.plan_board_inclusion(
+        tmp_path, "web/dist", "no_human/web_dist", "editable",
+        builder=lambda root, source: hatch_build.try_build_board(
+            root, source, runner=_npm_stub([], install_rc=install_rc,
+                                            build_rc=build_rc)))
+    assert additions == {}
+    expected = hatch_build.board_missing_warning(
+        tmp_path / "web" / "dist" / "index.html")
+    assert warning == expected
+
+
+def test_npm_exiting_zero_without_an_index_html_is_not_a_built_board(
+    tmp_path, monkeypatch,
+):
+    """npm can exit 0 having produced an incomplete build — that is not a
+    board, and it must not be force-included as one."""
+    _checkout(tmp_path)
+    monkeypatch.setattr(hatch_build.shutil, "which", lambda name: "/usr/bin/npm")
+    runner = _npm_stub([], write_index=False)
+
+    built = hatch_build.try_build_board(tmp_path, "web/dist", runner=runner)
+    assert built is False
+
+    additions, warning = hatch_build.plan_board_inclusion(
+        tmp_path, "web/dist", "no_human/web_dist", "editable",
+        builder=lambda root, source: hatch_build.try_build_board(
+            root, source, runner=_npm_stub([], write_index=False)))
+    assert additions == {} and warning
+
+
+@pytest.mark.parametrize("exc", [
+    FileNotFoundError("npm"),
+    PermissionError("npm"),
+    subprocess.TimeoutExpired("npm", 1),
+])
+def test_the_build_attempt_never_raises(tmp_path, monkeypatch, exc):
+    """npm vanishing between `which` and `run`, a permissions failure, or a
+    hang must all resolve to `False`, never propagate."""
+    _checkout(tmp_path)
+    monkeypatch.setattr(hatch_build.shutil, "which", lambda name: "/usr/bin/npm")
+
+    def runner(argv, cwd, **kwargs):
+        raise exc
+
+    built = hatch_build.try_build_board(tmp_path, "web/dist", runner=runner)
+    assert built is False
+
+
+def test_a_standard_build_never_invokes_npm(tmp_path):
+    """The build attempt is unreachable on the distributable path — it must
+    still fail closed, and it must never even look at `builder`."""
+    def forbidden(root, source):
+        raise AssertionError("the standard/distributable path invoked npm")
+
+    with pytest.raises(hatch_build.BoardNotBuiltError):
+        hatch_build.plan_board_inclusion(
+            tmp_path, "web/dist", "no_human/web_dist", "standard",
+            builder=forbidden)
+
+
+# --------------------------------------------------------------------------- #
 # Real-artifact tier — a real clean clone, real builds                          #
 # --------------------------------------------------------------------------- #
 

@@ -30,8 +30,10 @@ hook adds to `build_data["force_include"]` (merged in `BuilderConfig.
 set_build_data`, read by both `build_standard` and `build_editable_detection`).
 That is the whole seam:
 
-  * editable + no board  -> warn, and include nothing. The install succeeds and
-    the developer is told the board will not render until they build it.
+  * editable + no board  -> build it automatically when `npm` is on PATH ("cd
+    web && npm install && npm run build"). If npm is absent, the build fails,
+    or it exits 0 without producing `index.html`, fall back to warning and
+    include nothing — the install still succeeds either way.
   * editable + board     -> include it, exactly as before.
   * standard + no board  -> FAIL, with a message that names `npm run build` and
     the directory. The release-time guarantee is unchanged; only its blast
@@ -58,6 +60,9 @@ specific place to test it.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 try:  # pragma: no cover - the real build environment always has hatchling
@@ -70,6 +75,12 @@ EDITABLE = "editable"
 
 DEFAULT_SOURCE = "web/dist"
 
+NPM = "npm"
+
+# `npm install` on a cold `node_modules` can take a while; this bounds an
+# editable install rather than hanging it forever.
+NPM_TIMEOUT = 900
+
 
 class BoardNotBuiltError(RuntimeError):
     """A distributable artifact was built without a board to put in it."""
@@ -77,6 +88,43 @@ class BoardNotBuiltError(RuntimeError):
 
 def _build_it() -> str:
     return "cd web && npm install && npm run build"
+
+
+def _npm_available() -> bool:
+    return shutil.which(NPM) is not None
+
+
+def try_build_board(
+    root: str | Path,
+    source: str,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> bool:
+    """Attempt the editable-install board build named by `_build_it()`.
+
+    Runs `npm install` then `npm run build` in `<root>/<web dir>` (the parent
+    of `source`) and returns whether `<root>/<source>/index.html` exists
+    afterwards. Never raises: an absent `npm`, a missing `web/package.json`
+    (not a real checkout — e.g. a test's bare `tmp_path`), a non-zero exit, a
+    crash, or a timeout all just return `False` so the caller can fall back to
+    `board_missing_warning`. A 0 exit with no `index.html` is also `False` —
+    npm can exit 0 having produced an incomplete build.
+    """
+    web_dir = Path(root) / Path(source).parent
+    if not (web_dir / "package.json").is_file():
+        return False
+    if not _npm_available():
+        return False
+    try:
+        for argv in (["npm", "install"], ["npm", "run", "build"]):
+            result = runner(
+                argv, cwd=web_dir, capture_output=True, text=True,
+                check=False, timeout=NPM_TIMEOUT,
+            )
+            if result.returncode != 0:
+                return False
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return (Path(root) / source / "index.html").is_file()
 
 
 def board_missing_warning(index: Path) -> str:
@@ -115,6 +163,8 @@ def plan_board_inclusion(
     target: str,
     version: str,
     target_name: str = "wheel",
+    *,
+    builder: Callable[[str | Path, str], bool] | None = None,
 ) -> tuple[dict[str, str], str | None]:
     """Decide what a build of `version` does about the board.
 
@@ -123,11 +173,18 @@ def plan_board_inclusion(
     out of the hook class so it can be tested without hatchling and without
     running a build — the branch that matters (editable vs standard) is one
     string comparison, and it should be provable in milliseconds.
+
+    `builder` is test-injectable and only ever consulted on the editable path
+    (default `try_build_board`); the standard/distributable path never calls
+    it and always fails closed when the board is absent.
     """
     index = Path(root) / source / "index.html"
     if index.is_file():
         return {source: target}, None
     if version == EDITABLE:
+        build = builder or try_build_board
+        if build(root, source) and index.is_file():
+            return {source: target}, None
         return {}, board_missing_warning(index)
     raise BoardNotBuiltError(board_missing_error(index, target_name))
 
