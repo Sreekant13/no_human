@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { cardBlockerLine } from "./cardBlockerLine.js";
+import { BUDGET_FAILED_LINE, cardBlockerLine, failedReasonLine } from "./cardBlockerLine.js";
 
 // Four instances of the backend's BUDGET_EXHAUSTED template as it is actually
 // emitted — same cap, different overspend. This is the shape the card has to
@@ -159,4 +159,45 @@ test("the untouched sentence is still reachable from the card", () => {
   // Reshaping the line is only acceptable because nothing is lost: the full
   // agent text stays on the element's title, and the drawer is unchanged.
   assert.match(boardJsx, /className="card-blocker-q" title=\{task\.blocker_question\}/);
+});
+
+// --------------------------------------------------------------------------- //
+// The other outcome: `budget.exhaustion_terminal` (backend default) ends the
+// task instead of asking, so there is no question to reshape and the row would
+// otherwise say only "failed".
+// --------------------------------------------------------------------------- //
+
+test("a budget-terminated failure explains itself in plain English", () => {
+  const line = failedReasonLine({ status: "failed", blocker_category: "BUDGET_EXHAUSTED" });
+  assert.equal(line, BUDGET_FAILED_LINE);
+  // The two things a human needs: what happened, and what to do about it.
+  assert.match(line, /budget/i);
+  assert.match(line, /Refile it smaller/);
+});
+
+test("nothing else grows a reason line", () => {
+  for (const task of [
+    null,
+    undefined,
+    { status: "failed" },                                              // no blocker at all
+    { status: "failed", blocker_category: "SCOPE_EXPLOSION" },
+    { status: "escalated", blocker_category: "BUDGET_EXHAUSTED" },     // still being asked
+    // A cancelled task also ends in `failed`, and the board is explicit that it
+    // is not a capability failure (boardLanes.isRealFailure). It must not be
+    // told it ran out of budget.
+    { status: "failed", blocker_category: "BUDGET_EXHAUSTED", cancelled: true },
+  ]) {
+    assert.equal(failedReasonLine(task), null, JSON.stringify(task));
+  }
+});
+
+test("the failed table renders the reason through failedReasonLine", () => {
+  // Same source-pin as the board wiring above — no React renderer here.
+  const taskTable = readFileSync(fileURLToPath(new URL("./TaskTable.jsx", import.meta.url)), "utf8");
+  assert.match(taskTable, /import \{ failedReasonLine \} from "\.\/cardBlockerLine\.js"/);
+  assert.match(taskTable, /className="stats-td-reason">\{failedReasonLine\(t\)\}/);
+  // ...and the class it uses is actually defined, or the line renders unstyled
+  // at the table's default font size and reads as part of the title.
+  const css = readFileSync(fileURLToPath(new URL("./styles.css", import.meta.url)), "utf8");
+  assert.match(css, /\.stats-td-reason \{/);
 });

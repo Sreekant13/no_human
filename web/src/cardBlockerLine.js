@@ -19,6 +19,32 @@
 
 import { fmtTokens } from "./cost.js";
 
+// The other half of the same job, for the other outcome. With
+// `budget.exhaustion_terminal` on (the default) the backend no longer ASKS
+// "spend more, or stop here?" — the answer was standing policy, so the task
+// ends as `failed` carrying a blocker with NO question at all. The row that
+// results would otherwise read "failed" and nothing else, which is strictly
+// less than the escalation it replaced. So the one line is written here.
+//
+// Deliberately plain English, not the blocker's `root_cause_hypothesis`
+// ("lifetime budget exhausted: cost-weighted tokens 4,102,912/4,000,000") —
+// the drawer still shows that, with the full spend breakdown and the exact
+// commands under "Was waiting for".
+export const BUDGET_FAILED_LINE =
+  "Ran out of its token budget — the ticket was probably too big. " +
+  "Refile it smaller, or raise the budget explicitly.";
+
+/**
+ * @param {object|null|undefined} task a task summary (needs `status`,
+ *   `blocker_category`, `cancelled`)
+ * @returns {string|null} the plain-English reason a FAILED row should show, or
+ *   null when there is nothing to add beyond the status itself.
+ */
+export function failedReasonLine(task) {
+  if (!task || task.status !== "failed" || task.cancelled) return null;
+  return task.blocker_category === "BUDGET_EXHAUSTED" ? BUDGET_FAILED_LINE : null;
+}
+
 // The backend template (orchestrator._park_budget), kept deliberately tight: a
 // loose regex that half-matched some future blocker would silently mangle an
 // agent's real question.

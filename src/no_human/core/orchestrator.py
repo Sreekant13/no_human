@@ -411,6 +411,14 @@ class TaskOutcome:
     #: terse status ("PR opened; awaiting human approval"). Consumers that judge
     #: the deliverable (the north-star bench) read this, not the status string.
     report: str = ""
+    #: Set only by `_raise_blocker` — this outcome came off the blocker funnel,
+    #: it is not a plain attempt failure. `_drive`'s retry test used to read
+    #: "status != FAILED" as "we off-ramped", which held only while every
+    #: off-ramp route happened to be a non-FAILED status. `budget.
+    #: exhaustion_terminal` routes BUDGET_EXHAUSTED to FAILED, so the two
+    #: meanings came apart: a task that had just been ENDED would have been
+    #: retried by the bounded loop, raising the same blocker a second time.
+    off_ramp: bool = False
 
 
 #: Kinds whose deliverable is a REPORT, not a diff. Named once: the tuple was
@@ -2116,9 +2124,12 @@ class Orchestrator:
             except QuotaExhausted as exc:
                 return await self._park_quota(task, exc)
             # Only a plain FAILED attempt is retried (bounded exploration, 22.3).
-            # Any off-ramp (escalated / awaiting_input / blocked / paused_quota)
-            # or a ready PR returns immediately — never retry blindly.
-            if outcome.status != TaskStatus.FAILED:
+            # Any off-ramp (escalated / awaiting_input / blocked / paused_quota /
+            # a budget-terminated FAILED) or a ready PR returns immediately —
+            # never retry blindly. `off_ramp` is the test, not the status: the
+            # blocker funnel can now end a task in FAILED, and reading that as a
+            # retryable attempt failure would raise the same blocker twice.
+            if outcome.status != TaskStatus.FAILED or outcome.off_ramp:
                 return outcome
             self.emit("attempt_failed", outcome.detail)
 
@@ -5206,7 +5217,11 @@ class Orchestrator:
             from ..blockers import Route
             route = Route(TaskStatus.ESCALATED, notify_now=True, parked=False)
         else:
-            route = triage(blocker, escalate_below_confidence=self._escalate_below_conf())
+            route = triage(
+                blocker,
+                escalate_below_confidence=self._escalate_below_conf(),
+                budget_exhaustion_terminal=self._budget_exhaustion_terminal(),
+            )
 
         # 3. Parked routes get a wake_check_at so the watcher re-evaluates.
         if route.parked:
@@ -5224,6 +5239,11 @@ class Orchestrator:
             TaskStatus.AWAITING_INPUT: "awaiting_input",
             TaskStatus.BLOCKED: "blocked",
             TaskStatus.PAUSED_QUOTA: "paused_quota",
+            # `budget.exhaustion_terminal` routes BUDGET_EXHAUSTED straight to
+            # FAILED. Without this entry the event would have been emitted as
+            # "escalated" — a timeline saying a human was asked, on the one
+            # change whose whole point is that nobody was.
+            TaskStatus.FAILED: "failed",
         }.get(route.target_status, "escalated")
         report = render_report(blocker, task_title=task.title, task_id=task.id)
         self.emit(kind, report, status=route.target_status.value,
@@ -5235,7 +5255,12 @@ class Orchestrator:
         # resume onto the SAME branch (`_resume_human_gated` -> `_finalize`
         # refreshes exactly that draft's body), so retiring it here would both
         # mislabel a live PR and lose the body refresh.
-        if route.target_status == TaskStatus.ESCALATED:
+        #
+        # FAILED joins ESCALATED here for the same reason, not by analogy: a
+        # budget-terminated task is MORE dead than an escalated one — no human
+        # is even being asked — so leaving a draft PR up that still claims its
+        # acceptance criteria are met is the same lie, told for longer.
+        if route.target_status in (TaskStatus.ESCALATED, TaskStatus.FAILED):
             # 🔴 THE ATTRIBUTION FOLLOWS THE TEXT, NOT THE ROUTE. This used to
             # take `_abandon_draft_pr`'s `reason_from_agent=True` default and
             # therefore stamped "in the coding agent's own words — quoted from
@@ -5287,6 +5312,7 @@ class Orchestrator:
         return TaskOutcome(
             task, status=route.target_status,
             detail=blocker.root_cause_hypothesis or blocker.question or "",
+            off_ramp=True,
         )
 
     async def _persist_plan(self, task: Task, plan_text: str) -> None:
@@ -8065,6 +8091,10 @@ class Orchestrator:
             "lifetime_attempts": used_attempts + self.bounds.max_attempts,
             "lifetime_tokens": math.ceil(used_tokens * 1.5 / 100_000) * 100_000,
         }
+        # ...still computed in TERMINAL mode: it is the concrete number the
+        # revival instruction names, so a human who does decide to raise the cap
+        # gets the same proportional figure the option used to offer.
+        terminal = self._budget_exhaustion_terminal()
         return Blocker(
             category=BlockerCategory.BUDGET_EXHAUSTED,
             transient=False, confidence=1.0, goal=task.title,
@@ -8083,11 +8113,21 @@ class Orchestrator:
                 f"By class: {breakdown}"
                 + self._spend_shape_note(task)
             ),
-            question=(
+            # TERMINAL (the default): no question and no options, because there
+            # is no decision left to make — `budget.exhaustion_terminal` states
+            # the standing answer. What the human gets instead is the same
+            # structured record plus a wake condition that says, in full, what
+            # would legitimately revive this task. `triage` turns this into
+            # status FAILED; nothing automatic re-claims it.
+            wake_condition=(
+                self._budget_revival_condition(task, raise_to) if terminal
+                else None
+            ),
+            question=None if terminal else (
                 "This task has exhausted its lifetime budget "
                 f"({over}). Spend more, or stop here?"
             ),
-            options=[
+            options=[] if terminal else [
                 BlockerOption(
                     label=(
                         f"raise the budget to {raise_to['lifetime_attempts']} "
@@ -8099,6 +8139,40 @@ class Orchestrator:
                 BlockerOption(label="stop — keep the work parked as-is",
                               action={"park": True}),
             ],
+        )
+
+    def _budget_exhaustion_terminal(self) -> bool:
+        """Is an exhausted lifetime budget the END of the task? (config default
+        True — see `config.py:budget.exhaustion_terminal` for the measurement
+        and the operator rule that justifies the default.)"""
+        return bool(
+            self.config.get("budget", {}).get("exhaustion_terminal", True)
+        )
+
+    @staticmethod
+    def _budget_revival_condition(task: Task, raise_to: dict[str, int]) -> str:
+        """What would legitimately revive a budget-terminated task.
+
+        Stored in `Blocker.wake_condition`, which is normally machine-checkable —
+        here it is deliberately a human-only condition, and the text says so.
+        Nothing polls it: `_raise_blocker` leaves `wake_check_at` None for a
+        non-parked route, and `WakeWatcher.tick` sweeps only blocked /
+        paused_quota / awaiting_input / awaiting_approval, never FAILED.
+
+        Phrased to read correctly under the drawer's own label for a terminal
+        task's wake condition — `SlideOver.jsx` renders it as "Was waiting for",
+        so the value is written as a noun phrase completing that sentence rather
+        than as an enum the label would fight.
+        """
+        short = task.id[:8]
+        return (
+            "a human. Either refile this ticket smaller and inline-complete (the "
+            "usual right answer — an exhausted budget means the ticket was too "
+            "big), or raise the cap deliberately: `nh task config "
+            f"{short} lifetime_tokens={raise_to['lifetime_tokens']} "
+            f"lifetime_attempts={raise_to['lifetime_attempts']}` then `nh task "
+            f"retry {short}` (board: Retry, or POST /api/tasks/{short}/retry). "
+            "Nothing automatic will restart it."
         )
 
     def _size_limits(self, task: Task | None = None) -> tuple[int, int]:

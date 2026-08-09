@@ -105,6 +105,19 @@ _ROUTING: dict[BlockerCategory, Route] = {
 }
 
 
+#: BUDGET_EXHAUSTED under `budget.exhaustion_terminal` (the default). The task
+#: ENDS — no question is asked, because the answer is standing policy: "stop;
+#: an exhausted budget means the ticket was wrong, refile it inline-complete
+#: and smaller". FAILED rather than a parked state so nothing automatic can
+#: revive it: the scheduler's `_CLAIMABLE` is (implementing, pending) and the
+#: wake watcher only sweeps blocked/paused_quota/awaiting_input/
+#: awaiting_approval, so FAILED is the one terminal state both ignore.
+#: `notify_now=False` because a "needs you now" ping is exactly the
+#: interruption this removes — the Failed lane, the plain card line and
+#: `nh doctor` still surface it.
+BUDGET_TERMINAL_ROUTE = Route(TaskStatus.FAILED, notify_now=False, parked=False)
+
+
 def route_for(category: BlockerCategory) -> Route:
     return _ROUTING[category]
 
@@ -306,15 +319,25 @@ class Blocker:
 
 
 def triage(
-    blocker: Blocker, *, escalate_below_confidence: float = 0.6
+    blocker: Blocker, *, escalate_below_confidence: float = 0.6,
+    budget_exhaustion_terminal: bool = True,
 ) -> Route:
     """Decide routing for a blocker.
 
-    Honours the 22.2 taxonomy, but with one override from the config knob
-    ``escalate_on_low_confidence_below`` (22.8 / Part 22 config): if the agent
-    is *unsure what's wrong* (low confidence) on an otherwise-parkable blocker,
-    we escalate and ask rather than silently parking on a wrong hypothesis.
+    Honours the 22.2 taxonomy, with two overrides from config:
+
+    * ``escalate_on_low_confidence_below`` (22.8 / Part 22 config): if the agent
+      is *unsure what's wrong* (low confidence) on an otherwise-parkable
+      blocker, we escalate and ask rather than silently parking on a wrong
+      hypothesis.
+    * ``budget.exhaustion_terminal`` (the default): BUDGET_EXHAUSTED ends the
+      task instead of escalating it. See ``BUDGET_TERMINAL_ROUTE``. Checked
+      FIRST — it is not a confidence call, and the budget blocker's confidence
+      is a hardcoded 1.0 anyway (the harness counted, it did not guess).
     """
+    if (budget_exhaustion_terminal
+            and blocker.category is BlockerCategory.BUDGET_EXHAUSTED):
+        return BUDGET_TERMINAL_ROUTE
     route = blocker.route
     if route.parked and blocker.confidence < escalate_below_confidence:
         # Unsure → don't thrash silently; ask a human.

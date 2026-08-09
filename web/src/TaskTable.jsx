@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { fmtCost, fmtTokens, taskBurn, taskCost } from "./cost.js";
 import { httpPrUrl } from "./prUrl.js";
+import { failedReasonLine } from "./cardBlockerLine.js";
 
 // The task table, extracted from Stats.jsx so the outcome screens (5D: Done / Failed) show the
 // SAME table instead of a second one that would drift out of step with it.
@@ -128,6 +129,14 @@ export default function TaskTable({ tasks, onSelect = null, emptyHint = null }) 
                   )
                 )}
                 </div>
+                {/* A budget-terminated task ends in `failed` with no question
+                    attached — nobody was asked, by design. Without this line the
+                    row says "failed" and nothing else, which is less than the
+                    escalation it replaced told you. Copy lives in
+                    cardBlockerLine.js beside the parked-card copy. */}
+                {failedReasonLine(t) && (
+                  <div className="stats-td-reason">{failedReasonLine(t)}</div>
+                )}
               </td>
               <td className="stats-td stats-td-status">
                 <span

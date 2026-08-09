@@ -248,9 +248,15 @@ async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagno
     # by something that wasn't human feedback (the 2026-07-10 self-comment
     # incident) — the spend was already capped, so the escalation is noise
     # pointing at a resume-trigger bug, not at the budget.
+    #
+    # BOTH terminal statuses, since 2026-08-09: `budget.exhaustion_terminal`
+    # (default on) routes BUDGET_EXHAUSTED to `failed` instead of `escalated`.
+    # Pinned to 'escalated' alone, this detector would have gone quietly blind
+    # on the default configuration — the diagnostic still needs to see the
+    # shape, and the shape is the blocker category, not the status it parked in.
     rows = await store.query(
         """SELECT t.id FROM tasks t
-           WHERE t.status = 'escalated'
+           WHERE t.status IN ('escalated', 'failed')
              AND json_extract(t.blocker, '$.category') = 'BUDGET_EXHAUSTED'
              AND EXISTS (
                SELECT 1 FROM task_events e WHERE e.task_id = t.id
@@ -263,7 +269,7 @@ async def diagnose(store: Store, config: dict[str, Any] | None = None) -> Diagno
                             AND json_extract(e3.data, '$.kind') = 'ci_gate_pass'))""")
     for (task_id,) in rows:
         d.contradictions.append(
-            f"SPURIOUS ESCALATION: task {task_id[:8]} escalated "
+            f"SPURIOUS ESCALATION: task {task_id[:8]} stopped on "
             "BUDGET_EXHAUSTED after its integration validation passed with no "
             "new coder work — a resume fired on a non-human trigger. Repair: "
             "nh task restore-approval."

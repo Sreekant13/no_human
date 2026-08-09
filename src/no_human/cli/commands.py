@@ -1341,11 +1341,19 @@ def task_resume(task_id):
 def task_restore_approval(task_id, reason):
     """Return a spuriously-escalated task to awaiting_approval.
 
-    Hard-scoped repair, not a generic override: only an ESCALATED task that
-    already opened a PR (pr_open event + pr_watch in context) qualifies —
-    the shape of the 2026-07-10 incident where the product's own results
-    comment resumed a merge-ready task into the budget gate. The repair is
-    recorded as a state_repaired event carrying the displaced blocker.
+    Hard-scoped repair, not a generic override: only a task STOPPED on a
+    blocker that already opened a PR (pr_open event + pr_watch in context)
+    qualifies — the shape of the 2026-07-10 incident where the product's own
+    results comment resumed a merge-ready task into the budget gate. The repair
+    is recorded as a state_repaired event carrying the displaced blocker.
+
+    Accepts FAILED as well as ESCALATED since 2026-08-09: with
+    `budget.exhaustion_terminal` (default on) the budget gate ends the task in
+    FAILED, and this repair — which `nh doctor` names by name for exactly that
+    incident shape — would otherwise refuse the only status the incident can
+    now produce. The narrow guards are unchanged and are what make it safe: an
+    open PR and a pr_open event, neither of which a task that never got there
+    can fake.
     """
     config, _ = _bootstrap(require_auth=False)
 
@@ -1355,9 +1363,20 @@ def task_restore_approval(task_id, reason):
             if not t:
                 print_no_task_matching(task_id)
                 sys.exit(1)
-            if t.status != TaskStatus.ESCALATED:
+            if t.status not in (TaskStatus.ESCALATED, TaskStatus.FAILED):
                 console.print(f"[yellow]task is {t.status.value!r}, not "
-                              "escalated — nothing to restore[/]")
+                              "escalated or failed — nothing to restore[/]")
+                sys.exit(1)
+            if (t.context or {}).get("cancel_reason"):
+                # A CANCELLED task is FAILED by a human's explicit decision —
+                # the incident this verb repairs (a parked-PR task wrongly
+                # terminal) never produces one. Review-proven: a cancelled
+                # task with an old PR passed every guard below, then the
+                # terminal CAS silently refused the transition while the
+                # "repair" event and blocker wipe went through — a recorded
+                # transition that never happened.
+                console.print("[yellow]task was cancelled by a human "
+                              "(cancel_reason set) — refusing to restore[/]")
                 sys.exit(1)
             if not (t.context or {}).get("pr_watch"):
                 console.print("[yellow]task has no open PR (pr_watch) — "
@@ -1367,17 +1386,29 @@ def task_restore_approval(task_id, reason):
             if not any(e.get("kind") == "pr_open" for e in events):
                 console.print("[yellow]no pr_open event on record — refusing[/]")
                 sys.exit(1)
-            import time as _time
-            await store.save_events(t.id, [{
-                "source": "human", "kind": "state_repaired",
-                "text": f"escalated → awaiting_approval: {reason}; "
-                        f"displaced blocker: {str(t.blocker)[:400]}",
-                "ts": _time.time(),
-            }])
+            # Transition FIRST, record after — review-proven: writing the
+            # repair event before the transition let a silently-refused CAS
+            # leave an event describing a state change that never happened.
+            prior = t.status.value
+            displaced = str(t.blocker)[:400]
+            moved = await store.set_status(
+                t, TaskStatus.AWAITING_APPROVAL, validate=False,
+                human_override=True)
+            if moved is None:
+                console.print("[red]the transition was refused by the store "
+                              "(concurrent change?) — nothing was recorded; "
+                              "re-run after checking `nh task show`[/]")
+                sys.exit(1)
             t.blocker = None
             t.wake_check_at = None
             await store.update_task(t)
-            await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+            import time as _time
+            await store.save_events(t.id, [{
+                "source": "human", "kind": "state_repaired",
+                "text": f"{prior} → awaiting_approval: {reason}; "
+                        f"displaced blocker: {displaced}",
+                "ts": _time.time(),
+            }])
             console.print(f"[green]{t.id[:8]} → awaiting_approval[/] "
                           f"(repair recorded)")
 

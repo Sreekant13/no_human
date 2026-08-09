@@ -125,11 +125,20 @@ new behaviour at all. Exit 1 is keyed on `task.status == FAILED` for the ids
 this process dispatched (`Scheduler.failed_dispatched`), or on the drain being
 cut short by a signal with work still claimable (`queue_is_drained`); the
 reason goes to stderr. It deliberately reads **narrower** than (2): a task
-parked BLOCKED for budget, awaiting input, escalated or quota-paused exits 0,
-because those are the honest off-ramps the loop is built to produce and
-failing the batch on them would make a non-zero exit meaningless. A caller who
-needs "did anything park" reads `nh status --json`; only a FAILED task is a
-failure. Separately, `nh stop --timeout` defaulted to 3s — shorter than one
+awaiting input, escalated, blocked or quota-paused exits 0, because those are
+the honest off-ramps the loop is built to produce and failing the batch on them
+would make a non-zero exit meaningless. A caller who needs "did anything park"
+reads `nh status --json`; only a FAILED task is a failure.
+
+*(Amended 2026-08-09, same day, by `budget.exhaustion_terminal`.* The paragraph
+above originally read "a task parked BLOCKED **for budget**, awaiting input …
+exits 0". That is no longer true and the change is in (2)'s favour: an exhausted
+lifetime budget now ENDS the task in FAILED rather than parking it, so
+`--until-empty` exits **1** on it, which is exactly the "budget" clause of (2).
+Nothing about `--until-empty` changed — the same one field, `task.status`, is
+still read; what changed is which status a budget cross produces.)
+
+Separately, `nh stop --timeout` defaulted to 3s — shorter than one
 Agent SDK turn, so it SIGKILLed the drain SIGTERM had just requested — and now
 defaults to 30s.
 

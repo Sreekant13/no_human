@@ -177,9 +177,20 @@ safety:
 bounds:
   max_attempts: 3
   max_turns_per_attempt: 500
-  lifetime_attempts: 9             # across resumes; exhausting it parks BUDGET_EXHAUSTED
+  lifetime_attempts: 9             # across resumes; exhausting it ends the task (see budget:)
   max_correction_rounds: 2         # also caps autonomous PR-comment->revise rounds;
                                    # exceeding it escalates to a human (no infinite revise)
+
+budget:
+  exhaustion_terminal: true       # an exhausted lifetime budget ENDS the task (status
+                                  # failed) with its full BUDGET_EXHAUSTED record and a
+                                  # wake condition naming what would revive it - it does
+                                  # not ask "spend more, or stop here?". The answer to
+                                  # that question was standing policy ("stop; the ticket
+                                  # was too big - refile it smaller"), and asking it was
+                                  # 69 of 119 human-blocking questions. Set false to be
+                                  # asked. Raising a cap is human-only either way:
+                                  # `nh task config <id> lifetime_tokens=N`.
 
 hooks:
   per_edit_lint: true             # B1: after each Edit/Write, lint the changed file and

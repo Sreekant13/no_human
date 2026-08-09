@@ -4281,6 +4281,16 @@ a.so-chip-value:hover { color: var(--accent-300); }
   flex: 0 0 auto;
   margin-left: 0;
 }
+/* The plain-English "why" under a failed row's title (TaskTable.jsx). Wraps —
+   it is a sentence, not a label, and clipping it to one line would lose the
+   half that says what to do about it. */
+.stats-td-reason {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: normal;
+}
 .stats-td-mono {
   font-family: var(--font-mono);
   font-size: 12px;

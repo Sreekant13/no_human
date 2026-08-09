@@ -1133,6 +1133,33 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Rationale on core.bounds.Bounds.attempt_tokens.
         "attempt_tokens": 2_000_000,
     },
+    # A separate section from `bounds` on purpose: `bounds` is mirrored
+    # key-for-key by core.bounds.Bounds and guarded by
+    # tests/test_run_84251cb2_regressions.py::
+    # test_bounds_defaults_have_exactly_one_source_of_truth, which asserts every
+    # key there has a Bounds field. This is policy, not a bound.
+    "budget": {
+        # An exhausted lifetime budget ENDS the task (status `failed`) with a
+        # structured record and a wake condition naming what a human would have
+        # to do, instead of asking the human "spend more, or stop here?".
+        #
+        # Default ON because the answer never varied. Measured 2026-08-09: of
+        # 119 parked tasks awaiting a human, 69 were this one question, and the
+        # operator's standing rule is "the answer is STOP. NEVER RAISE A CAP.
+        # Budget raises have never once produced a merge on this project. An
+        # exhausted budget means the TICKET is wrong — answer stop, then rewrite
+        # it inline-complete and re-file." A question whose answer is invariant
+        # policy is the product's problem, not the operator's.
+        #
+        # This changes the OUTCOME, never the CAP: the caps stay in `bounds`,
+        # resume spend still counts against them, and raising one is still a
+        # human-only act (`nh task config <id> lifetime_tokens=N`).
+        #
+        # False restores the old behaviour exactly — ESCALATED, with the
+        # question and the raise/stop options — for an operator who would
+        # rather be asked.
+        "exhaustion_terminal": True,
+    },
     "bounds_investigation": {
         "max_attempts": 8,
         "max_turns_per_attempt": 80,

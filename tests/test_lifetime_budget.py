@@ -23,16 +23,28 @@ async def store(tmp_path):
     await s.close()
 
 
-def _orch(store, cfg_extra=None):
-    """A minimal orchestrator: only .store, .bounds and .emit are exercised."""
+def _orch(store, cfg_extra=None, *, config=None):
+    """A minimal orchestrator: only .store, .bounds, .config and .emit are
+    exercised.
+
+    ``config`` is the app config the blocker builder reads for
+    ``budget.exhaustion_terminal``; ``{}`` means "the default", which is ON.
+    Pass ``ASK_THE_HUMAN`` for the pre-2026-08-09 escalate-and-ask behaviour.
+    """
     from no_human.core.bounds import Bounds
     from no_human.core.orchestrator import Orchestrator
 
     o = Orchestrator.__new__(Orchestrator)
     o.store = store
     o.bounds = Bounds.from_config(cfg_extra or {})
+    o.config = config if config is not None else {}
     o._sink = lambda e: None
     return o
+
+
+#: The off-switch: `budget.exhaustion_terminal: false` restores the old
+#: ESCALATED-with-a-question behaviour for an operator who wants to be asked.
+ASK_THE_HUMAN = {"budget": {"exhaustion_terminal": False}}
 
 
 async def _spend(store, task_id, attempts, tokens_each):
@@ -113,7 +125,11 @@ async def test_the_raise_option_actually_raises_and_unblocks(store):
     await store.create_task(t)
     await _spend(store, t.id, attempts=9, tokens_each=100)
 
-    o = _orch(store)
+    # The one-click raise option only exists with the off-switch on — with
+    # `budget.exhaustion_terminal` (the default) there is no question and no
+    # options at all. The RAISE MECHANISM itself is unchanged and is asserted
+    # for the default mode too, one test down.
+    o = _orch(store, config=ASK_THE_HUMAN)
     b = await o._check_lifetime_budget(t)
     raise_opt = next(opt for opt in b.options if opt.action)
     summary = apply_action(t, raise_opt.action)
@@ -121,6 +137,27 @@ async def test_the_raise_option_actually_raises_and_unblocks(store):
 
     assert await o._check_lifetime_budget(t) is None, (
         "after the human raises the budget, the same check must pass"
+    )
+
+
+async def test_the_human_raise_path_still_clears_the_gate_when_terminal(store):
+    """The guard rail on the change of 2026-08-09: making exhaustion TERMINAL
+    removed the question, not the human's ability to raise a cap. `nh task
+    config` (apply_action with human_override=True — commands.py:task_config)
+    is that path, and after it the same check must pass."""
+    t = Task.new("task", repo_path="/tmp/x")
+    await store.create_task(t)
+    await _spend(store, t.id, attempts=9, tokens_each=100)
+
+    o = _orch(store)  # default: terminal
+    b = await o._check_lifetime_budget(t)
+    assert b is not None and not b.options, "terminal mode offers no options"
+
+    summary = apply_action(t, {"set_task_config": {"lifetime_attempts": 12}},
+                           human_override=True)
+    assert "lifetime_attempts=12" in summary
+    assert await o._check_lifetime_budget(t) is None, (
+        "an explicit human budget raise must still clear the gate"
     )
 
 
@@ -392,7 +429,7 @@ async def test_the_blocker_reports_the_weighted_number_and_the_raw_classes(store
     aid = await store.create_attempt(t.id, 1)
     await store.update_attempt(aid, **D6E4B72A_LEDGER)
 
-    b = await _orch(store)._check_lifetime_budget(t)
+    b = await _orch(store, config=ASK_THE_HUMAN)._check_lifetime_budget(t)
     assert b is not None
     assert "3,386,434" in b.evidence and "cost-weighted" in b.evidence
     # Every raw class, named and priced, not just their sum.
@@ -405,6 +442,15 @@ async def test_the_blocker_reports_the_weighted_number_and_the_raw_classes(store
     assert "cost-weighted" in raise_opt.label
     # 3,386,434 x 1.5, rounded up to the next 100,000.
     assert raise_opt.action["set_task_config"]["lifetime_tokens"] == 5_100_000
+
+    # TERMINAL mode reports the SAME evidence and the SAME proportional raise —
+    # it drops the question, not the numbers. A record that lost the figure the
+    # operator needs to act on would be a worse escalation, not a better park.
+    term = await _orch(store)._check_lifetime_budget(t)
+    assert term is not None
+    assert term.evidence == b.evidence
+    assert term.question is None and term.options == []
+    assert "lifetime_tokens=5100000" in (term.wake_condition or "")
 
 
 async def test_the_under_budget_event_carries_both_numbers(store):

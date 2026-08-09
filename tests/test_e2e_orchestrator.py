@@ -4109,7 +4109,16 @@ async def test_a_budget_abort_in_the_nudge_still_parks_and_still_bills(
     fresh = await store.find_task(t.id)
     assert (fresh.blocker or {}).get("category") == "BUDGET_EXHAUSTED", \
         fresh.blocker
-    assert outcome.status in (TaskStatus.BLOCKED, TaskStatus.ESCALATED), outcome
+    assert outcome.status in (TaskStatus.BLOCKED, TaskStatus.ESCALATED,
+                              TaskStatus.FAILED), outcome
+    # Since `budget.exhaustion_terminal` (default on) the cross ENDS the task
+    # rather than asking a human whose answer was always "stop". Two things
+    # this test already proves, now stated: it came off the blocker funnel
+    # (`off_ramp`) rather than being a plain attempt failure, and `len(attempts)
+    # == 1` above is the evidence the bounded loop did NOT read that FAILED as
+    # a retryable attempt and raise the same blocker a second time.
+    assert outcome.off_ramp is True, outcome
+    assert (fresh.blocker or {}).get("question") is None, fresh.blocker
 
 
 async def test_a_stuck_abort_in_the_nudge_fails_the_attempt_with_its_reason(
