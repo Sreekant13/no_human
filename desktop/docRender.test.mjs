@@ -89,6 +89,30 @@ test("docPage is self-contained: no external stylesheet/script/font/CDN", () => 
   assert.doesNotMatch(html, /https?:\/\//); // no CDN/font/remote asset
 });
 
+test("the SHIPPED quickstart.md has no multi-line list items — the renderer splits them", () => {
+  // The renderer is line-oriented: a continuation line under a list item ends
+  // the list and becomes a paragraph, so "1. a\n   b\n2. c" renders as THREE
+  // blocks numbered 1 / (text) / 1. An independent review caught a commit
+  // adding exactly that to the doc a menu opens — and the artefact test below
+  // could not see it, because no raw markdown survives. This lint catches the
+  // class at the source: every list item must be a single source line.
+  const md = readFileSync(path.join(here, "..", "docs", "quickstart.md"), "utf8");
+  const lines = md.split("\n");
+  let fence = false;
+  let prevList = false;
+  const offenders = [];
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.trim().startsWith("```")) { fence = !fence; prevList = false; continue; }
+    if (fence) continue;
+    const isList = /^\s*(\d+\.|[-*])\s+/.test(l);
+    const isCont = /^\s{2,}\S/.test(l) && !isList;
+    if (isCont && prevList) offenders.push(`${i + 1}: ${l.slice(0, 60)}`);
+    prevList = isList || (isCont && prevList);
+  }
+  assert.deepEqual(offenders, [], "multi-line list items split the rendered list");
+});
+
 test("the SHIPPED quickstart.md renders without leaving raw markdown artefacts", () => {
   const md = readFileSync(path.join(here, "..", "docs", "quickstart.md"), "utf8");
   const html = renderMarkdown(md);

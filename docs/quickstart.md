@@ -4,25 +4,22 @@
 
 **If you ran `no_human-<version>.exe`, sections 1–3 below are NOT for you.** The
 same reasoning as the Mac section that follows: the app carries its own Python,
-its own server and its own dependencies, so there is nothing to install, nothing
-to clone, and no `uv sync` to run. Doing any of it would set up a *second*,
-unrelated copy.
+its own server and its own dependencies, so there is nothing to clone and no
+`uv sync` to run. Doing any of it would set up a *second*, unrelated copy. The
+same exception applies too — the bundle does **not** carry Node.js or the
+Claude Code CLI, and the coding backend shells out to that CLI for every task,
+so install both first: Node.js from nodejs.org, then
+`npm install -g @anthropic-ai/claude-code`.
 
 Two things specific to Windows, both expected:
 
-* The installer is **not code-signed yet**, so if you downloaded it, Windows
-  SmartScreen says *"Windows protected your PC"*. Choose **More info → Run
-  anyway**. Signing is planned; until then this prompt is normal.
-* It installs **per user** — no administrator prompt — into
-  `%LOCALAPPDATA%\Programs\no-human-desktop`. The folder is named after the
-  package while the app itself is called **no_human**; that is normal.
+* The installer is **not code-signed yet**, so if you downloaded it, Windows SmartScreen says *"Windows protected your PC"*. Choose **More info → Run anyway**. Signing is planned; until then this prompt is normal.
+* It installs **per user** — no administrator prompt — into `%LOCALAPPDATA%\Programs\no-human-desktop`. The folder is named after the package while the app itself is called **no_human**; that is normal.
 
 What you actually do:
 
 1. Open **no_human** from the Start Menu.
-2. It shows **Connect Claude** and asks for a credential — either a Claude
-   subscription token (it looks like `sk-ant-oat…`) or an Anthropic API key.
-   Paste one and continue.
+2. It shows **Connect Claude** and asks for a credential — either a Claude subscription token (it looks like `sk-ant-oat…`) or an Anthropic API key. Paste one and continue.
 3. The board opens. Create your first task there.
 
 Then confirm the install is actually working:
@@ -46,18 +43,24 @@ you left off; delete that folder yourself if you want a clean slate.
 
 **If you opened a `.dmg` and dragged no_human to Applications, sections 1–3
 below are NOT for you.** The app carries its own Python, its own server and its
-own dependencies — there is nothing to `brew install`, nothing to clone, and no
-`uv sync` to run. Doing any of it would set up a *second*, unrelated copy. The
-Connect Claude screen below does what `nh init` (section 3) does for a source
-install: it writes your credential to `~/.no_human/`.
+own dependencies — there is nothing to clone and no `uv sync` to run. Doing any
+of it would set up a *second*, unrelated copy. The Connect Claude screen below
+does what `nh init` (section 3) does for a source install: it writes your
+credential to `~/.no_human/`.
+
+The app bundle is self-contained, but the product still needs **two things it
+does not ship**: **Node.js** (from nodejs.org) and the **Claude Code CLI**,
+which the coding backend shells out to for every task, whichever credential
+type you choose. Install the CLI once with
+`npm install -g @anthropic-ai/claude-code`. Without it the app starts, the
+board loads, and every task dies at the first call.
 
 What you actually do:
 
-1. Open **no_human** from Applications.
-2. It shows **Connect Claude** and asks for a credential — either a Claude
-   subscription token (it looks like `sk-ant-oat…`) or an Anthropic API key.
-   Paste one and continue.
-3. The board opens. Create your first task there.
+1. Install Node.js if you don't have it, then `npm install -g @anthropic-ai/claude-code`.
+2. Open **no_human** from Applications.
+3. It shows **Connect Claude** and asks for a credential — either a Claude subscription token (it looks like `sk-ant-oat…`, from `claude setup-token`) or an Anthropic API key from console.anthropic.com. Paste one and continue.
+4. The board opens. Create your first task there.
 
 If you ever need that screen again — a revoked or mistyped token strands the
 app otherwise — it is **File → Re-enter Claude Token…**.
@@ -99,7 +102,13 @@ npm install -g @anthropic-ai/claude-code
 ```bash
 git clone <repo_url> no_human && cd no_human
 uv sync
+cd web && npm install && npm run build && cd ..
 ```
+
+The `web` build is **not** optional if you want the board. A source checkout
+ships no `web/dist`, so without it `nh start` boots the API and prints
+`board not found … serving the API only` — no UI at all, including the board
+the README leads with. Warm caches build in seconds; a cold first `npm install` can take minutes.
 
 `uv sync` installs the `nh` entry point into `.venv/bin/nh`. It does **not** put
 `nh` on your `PATH`, so every command below is written as `uv run nh …`. If you
@@ -127,8 +136,7 @@ This guided wizard will:
 - Check that python, git, uv, and claude CLI are installed
 - Create `~/.no_human/` with secure permissions
 - Guide you through subscription token setup (`claude setup-token`)
-- Generate `~/.no_human/config.yaml` with a distinct agent git identity
-  (your own identity is read and shown, but the agent commits under its own)
+- Generate `~/.no_human/config.yaml` with a distinct agent git identity (your own identity is read and shown, but the agent commits under its own)
 - Offer to onboard your first repo
 
 Then confirm the install is actually working before you rely on it:
@@ -140,9 +148,17 @@ uv run nh doctor
 `nh doctor` is a liveness check, and it answers a question no other command
 does: **which guarded mechanisms have actually ever fired.** It enumerates every
 mechanism's lifetime firings, flags the known silent-death patterns (a gate that
-has never run, a watcher that has persisted nothing), reports your auth profile
-and mode, and refuses if the coding backend is unusable. It exits non-zero on a
-contradiction or an evidence gap, so `nh doctor || exit 1` works in a pipeline.
+has never run, a watcher that has persisted nothing), and checks the coding
+backend is *present* — that the `claude` CLI resolves, and that a credential is
+on file. It exits non-zero on a contradiction or an evidence gap, so
+`nh doctor || exit 1` works in a pipeline.
+
+Read that last part precisely: doctor checks the CLI is present and a credential
+exists — **it does not verify the credential works.** A token that is expired,
+revoked, or simply mistyped is still "present", so doctor prints a green backend
+line and exits 0, and the first task is where you find out. Doctor prints the
+active auth profile and mode with an explicit "(presence only — no live auth
+call)" marker, so its green line cannot be misread as a verified credential.
 
 On a brand-new install most counters will read zero, which is expected — nothing
 has run yet. Its value is later: run it whenever something behaves oddly, and
@@ -157,6 +173,16 @@ uv run nh task add --title "Fix the flaky E2E test" --repo ~/git/my-repo \
 
 # From a GitHub or GitLab issue URL:
 uv run nh task add https://github.com/org/repo/issues/42 --repo ~/git/my-repo
+```
+
+Either form then opens the **scoping grill**: a few interactive questions that
+sharpen the spec before any code is written. It needs a terminal, so a piped or
+scripted `nh task add` aborts on the first question. Pass `--no-grill` to skip
+it and stage the task as written:
+
+```bash
+uv run nh task add --title "Fix the flaky E2E test" --repo ~/git/my-repo \
+  --criteria "the test passes 20 runs in a row" --no-grill
 ```
 
 `nh task add` takes **a GitHub/GitLab issue URL, or `--title`**. A bare

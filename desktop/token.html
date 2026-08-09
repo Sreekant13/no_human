@@ -97,6 +97,18 @@
     subscription, or with your own Anthropic API key. The credential is
     stored only on this Mac, in <code>~/.no_human/.env</code>.
   </p>
+  <!-- Deliberately OUTSIDE #steps, which renderMode() hides in api_key mode:
+       the CLI is required for BOTH credential types (agent/backend_check.py —
+       the Agent SDK shells out to `claude` for every task, whatever pays for
+       it), and the app bundle does not ship it. Same string as error.html's
+       steps-cli-missing, which a first-run user cannot reach. -->
+  <p class="hint" id="prereq">
+    <strong>First, on this Mac:</strong> no_human runs Claude through the
+    <code>claude</code> CLI — for every task, with either credential type
+    below — and the app does not bundle it. No <code>claude</code> command
+    yet? Install Node.js (nodejs.org), then run
+    <code>npm install -g @anthropic-ai/claude-code</code>.
+  </p>
 
   <form id="form" novalidate>
     <fieldset>

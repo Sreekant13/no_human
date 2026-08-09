@@ -35,11 +35,17 @@ switch off, and what you cannot:
 ```bash
 git clone <your-clone-url>/no_human.git && cd no_human
 uv sync                 # installs the `nh` entry point into .venv
+(cd web && npm install && npm run build)   # builds the board (cold first install can take minutes)
 uv run nh init          # token, config, first repo (about 2 minutes)
 uv run nh doctor        # verify the install is real before relying on it
 ```
 
-Needs Python 3.12+, [uv](https://github.com/astral-sh/uv), git, and a Claude
+The `web` build is not optional if you want the board pictured above: a source
+checkout ships no `web/dist`, so without it `nh start` serves the API only and
+renders no UI.
+
+Needs Python 3.12+, [uv](https://github.com/astral-sh/uv), git, Node and npm
+(for the board build above, and for the `claude` CLI), and a Claude
 credential — an OAuth token from `claude setup-token` (personal subscription or
 enterprise). To pay Anthropic directly instead, set `llm.auth_mode: "api_key"`
 and put your `ANTHROPIC_API_KEY` in `~/.no_human/.env`.
