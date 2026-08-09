@@ -76,9 +76,10 @@ const mac = {
 // watched work is exactly the "guessing wrong" this file's header rejects.
 const win = {
   target: ["nsis", "zip"],
-  // Generated from desktop/build/icon.icns by packaging/make-win-icon.ps1, so
-  // both platforms wear the same mark from one committed source. The site's
-  // mark-dark PNGs that icon.icns was originally cut from are not in this repo.
+  // Same art as desktop/build/icon.icns, so both platforms wear the same
+  // mark. Regenerate with packaging/make-win-icon.ps1 (Windows) or any tool
+  // that packs the iconset's 16/32/48/64/128/256 PNGs as PNG-compressed ICO
+  // members. The source PNGs the icons are cut from are not in this repo.
   icon: "build/icon.ico",
   // The filename carries the verdict, exactly as make-dmg.sh does for the DMG:
   // "An operator cannot upload no_human-0.1.0-UNSIGNED.dmg to a release page
