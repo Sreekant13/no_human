@@ -503,3 +503,95 @@ def test_resume_continues_from_the_blockers_checkpoint(tmp_path, monkeypatch):
     t = _get_task(db, task_id)
     assert t.context["resume_from"]["sha"] == "06cd40fc" * 5
     assert t.status is TaskStatus.IMPLEMENTING
+
+
+# --------------------------------------------------------------------------- #
+# nh task add — the two onboarding papercuts (walkthrough Q3, Q10)             #
+# --------------------------------------------------------------------------- #
+
+def test_task_add_skips_the_grill_when_there_is_no_terminal(tmp_path, monkeypatch):
+    """The intake grill asks one question at a time at a `click.prompt`. Over a
+    pipe there is nobody to answer, so `nh task add … --no-run` died on
+    `Your answer []: Aborted!` (walkthrough B9/Q10) — the quickstart's own
+    step-4 example is not scriptable.
+
+    Bare `nh` already refuses a terminal it does not have rather than hanging;
+    this is the same predicate, so there is one answer to "is anyone there".
+    """
+    db = tmp_path / "test.db"
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    runner = _make_runner(db, monkeypatch)
+
+    import no_human.cli.commands as cmd_mod
+
+    async def _never(*a, **kw):
+        raise AssertionError("the grill ran with no terminal to answer it")
+
+    monkeypatch.setattr(cmd_mod, "_run_cli_grill", _never)
+    monkeypatch.setattr(cmd_mod, "stdio_is_interactive", lambda: False)
+
+    result = runner.invoke(cli, [
+        "task", "add", "--title", "piped task", "--repo", str(repo), "--no-run",
+    ], catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    assert "skipping the scoping questions" in result.output, result.output
+    assert "created task" in result.output, result.output
+
+
+def test_task_add_still_grills_when_a_terminal_is_there(tmp_path, monkeypatch):
+    """The control: the skip must be the TTY check doing it, not the grill
+    having quietly stopped running for everyone."""
+    db = tmp_path / "test.db"
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    runner = _make_runner(db, monkeypatch)
+
+    import no_human.cli.commands as cmd_mod
+    grilled: list[str] = []
+
+    async def _fake_grill(config, task, store=None):
+        grilled.append(task.title)
+        return task
+
+    monkeypatch.setattr(cmd_mod, "_run_cli_grill", _fake_grill)
+    monkeypatch.setattr(cmd_mod, "stdio_is_interactive", lambda: True)
+
+    result = runner.invoke(cli, [
+        "task", "add", "--title", "interactive task", "--repo", str(repo),
+        "--no-run",
+    ], catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    assert grilled == ["interactive task"], result.output
+    assert "skipping the scoping questions" not in result.output, result.output
+
+
+def test_the_unonboarded_repo_hint_prints_a_sequence_that_works(
+        tmp_path, monkeypatch):
+    """The hint named only the SECOND half of a two-step dance: following
+    `nh onboard <repo> --confirm` verbatim answers `no profile to confirm —
+    run nh onboard <repo> first` (walkthrough B11/Q3).
+
+    COLUMNS is pinned because Rich folds a long path at 80 columns and the
+    assertions read the rendered lines.
+    """
+    monkeypatch.setenv("COLUMNS", "300")
+    db = tmp_path / "test.db"
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, [
+        "task", "add", "--title", "unonboarded", "--repo", str(repo),
+        "--no-grill", "--no-run",
+    ], catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    assert "repo profile not usable" in result.output, result.output
+    steps = [ln.strip() for ln in result.output.splitlines() if "nh onboard" in ln]
+    assert len(steps) == 2, f"the hint is still one step:\n{result.output}"
+    assert "--confirm" not in steps[0], steps
+    assert steps[0].startswith(f"nh onboard {repo.resolve()}"), steps
+    assert steps[1].startswith(f"nh onboard {repo.resolve()} --confirm"), steps

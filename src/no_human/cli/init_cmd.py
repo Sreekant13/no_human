@@ -14,6 +14,7 @@ Idempotent: running twice never destroys existing config, secrets, or data.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -37,6 +38,7 @@ from ..config import (
     NO_HUMAN_HOME,
     SUBSCRIPTION_TOKEN_VAR,
     AuthError,
+    assert_oauth_token_usable,
     credential_status,
     load_config,
     set_profile_token,
@@ -44,10 +46,16 @@ from ..config import (
 
 console = Console()
 
-# Required external tools. Each: (binary, version_flag, install_hint).
+# Required external tools. Each: (binary, version_flag, install_hint, minimum).
+# `minimum` is a version tuple or None when any version will do. It must track
+# pyproject's `requires-python` — this list is what a user is TOLD, and for a
+# long time it told them Python 3.10 was fine (onboarding walkthrough
+# 2026-08-09, finding B12: a green tick against a stated 3.12+ requirement).
+_MIN_PYTHON = (3, 12)
 _PREREQUISITES = [
-    ("python3", "--version", "https://python.org or `brew install python@3.12`"),
-    ("git", "--version", "https://git-scm.com or `brew install git`"),
+    ("python3", "--version", "https://python.org or `brew install python@3.12`",
+     _MIN_PYTHON),
+    ("git", "--version", "https://git-scm.com or `brew install git`", None),
 ]
 
 # Optional but recommended tools.
@@ -75,15 +83,53 @@ def _check_tool(binary: str, flag: str) -> str | None:
         return None
 
 
+def _version_too_old(version: str, minimum: tuple[int, ...] | None) -> str | None:
+    """Return why *version* fails *minimum* (naming it), or None if it passes.
+
+    ``_check_tool`` already captured the version string and nothing ever read
+    it, so `nh init` printed a green tick for a Python it knew was too old.
+    An UNPARSEABLE string is deliberately not an error: a version format this
+    doesn't recognise is not evidence of an old interpreter, and failing on it
+    would block an install that works.
+    """
+    if not minimum:
+        return None
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", version)
+    if not m:
+        return None
+    found = tuple(int(g) for g in m.groups() if g is not None)
+    if found >= minimum:
+        return None
+    return f"too old — {'.'.join(str(p) for p in minimum)}+ required"
+
+
 def check_prerequisites() -> tuple[list[str], list[str]]:
     """Check required and optional tools. Returns (errors, warnings)."""
     errors: list[str] = []
     warnings: list[str] = []
 
-    for binary, flag, hint in _PREREQUISITES:
+    for binary, flag, hint, minimum in _PREREQUISITES:
         ver = _check_tool(binary, flag)
-        if ver:
+        old = _version_too_old(ver, minimum) if ver else None
+        if ver and not old:
             console.print(f"  [green]✓[/] {binary}: {ver}")
+        elif ver and binary == "python3" and sys.version_info[:2] >= _MIN_PYTHON:
+            # The `python3` on PATH is too old, but no_human is RUNNING on an
+            # interpreter that is not — a venv or `uv run`, which is the
+            # documented install. Reporting it is the fix (the green tick
+            # claimed a requirement was met that this binary does not meet);
+            # failing the install over a binary nothing here uses would refuse
+            # a machine the product demonstrably works on.
+            running = ".".join(str(p) for p in sys.version_info[:3])
+            warnings.append(f"{binary} {old} (no_human is running on {running})")
+            console.print(
+                f"  [yellow]~[/] {binary}: {ver} — {old}; no_human is running "
+                f"on {running}, so this is only a problem for `python3 -m "
+                f"no_human`. {hint}"
+            )
+        elif ver:
+            errors.append(f"{binary} {old} — install: {hint}")
+            console.print(f"  [red]✗[/] {binary}: {ver} — {old}. {hint}")
         else:
             errors.append(f"{binary} not found — install: {hint}")
             console.print(f"  [red]✗[/] {binary}: not found — {hint}")
@@ -144,6 +190,55 @@ def _env_has_key(key: str) -> bool:
     return bool(_read_env_file(ENV_PATH).get(key))
 
 
+def _found_subscription_token() -> tuple[str, str] | None:
+    """The OAuth token already on this machine, and where it came from.
+
+    ``.env`` wins over the process environment — the same precedence
+    :func:`config.load_env_token` uses, so init reports on the value a RUN
+    would actually bill with, not a different one.
+    """
+    from ..config import _read_env_file
+
+    value = _read_env_file(ENV_PATH).get(SUBSCRIPTION_TOKEN_VAR)
+    if value:
+        return value, "~/.no_human/.env"
+    value = os.environ.get(SUBSCRIPTION_TOKEN_VAR)
+    if value:
+        return value, "the environment"
+    return None
+
+
+def _report_found_token(value: str, where: str, suffix: str = "") -> bool:
+    """Report a token init FOUND rather than wrote. True if it can work.
+
+    `nh init` short-circuits on the PRESENCE of a credential, so a value stored
+    before the writer was hardened — or exported in a shell — got a
+    ``✓`` and a summary card reading ``Auth: ✓ ready`` from an install that
+    cannot make a single call (walkthrough B4b; init-fix review advisory 5).
+    This runs the writer's own refusal (:func:`config.assert_oauth_token_usable`)
+    over the found value so there is still exactly one opinion about what a
+    usable token is.
+
+    Validate-ONLY: nothing is written, rewritten or scrubbed. A stored
+    credential is the user's, and init's contract is that a re-run destroys
+    nothing — so a bad value is reported, and left where it is.
+    """
+    try:
+        assert_oauth_token_usable(value)
+    except AuthError as exc:
+        console.print(
+            f"  [red]✗[/] {SUBSCRIPTION_TOKEN_VAR} is present in {where} but "
+            f"invalid: {exc}"
+        )
+        console.print(
+            "    [dim]nothing was changed — the stored value is left exactly "
+            "as it is. Replace it with a token from `claude setup-token`.[/]"
+        )
+        return False
+    console.print(f"  [green]✓[/] {SUBSCRIPTION_TOKEN_VAR} found in {where}{suffix}")
+    return True
+
+
 def _metered_key_in_env() -> str | None:
     """Return the name of the first metered-auth var found in the environment."""
     for var in METERED_AUTH_VARS:
@@ -169,13 +264,12 @@ def setup_token() -> tuple[bool, str]:
     ):
         console.print(f"  [green]✓[/] {API_KEY_VAR} found (auth_mode: api_key)")
         return True, "api_key"
-    if configured == "subscription" and (
-        _env_has_key(SUBSCRIPTION_TOKEN_VAR) or os.environ.get(SUBSCRIPTION_TOKEN_VAR)
-    ):
-        console.print(
-            f"  [green]✓[/] {SUBSCRIPTION_TOKEN_VAR} found (auth_mode: subscription)"
+    found = _found_subscription_token()
+    if configured == "subscription" and found:
+        return (
+            _report_found_token(*found, suffix=" (auth_mode: subscription)"),
+            "subscription",
         )
-        return True, "subscription"
 
     console.print(
         "  How will this install pay for Claude?\n"
@@ -241,14 +335,15 @@ def _setup_api_key() -> bool:
 
 def _setup_subscription_token() -> bool:
     """Guide the user through subscription token setup. Returns True if ready."""
-    # Check .env file first.
-    if _env_has_key(SUBSCRIPTION_TOKEN_VAR):
-        console.print(f"  [green]✓[/] {SUBSCRIPTION_TOKEN_VAR} found in ~/.no_human/.env")
-        return True
+    # A token already on the machine (.env first, then the process env) is
+    # reported, never rewritten — but it is VALIDATED before it is called ready.
+    found = _found_subscription_token()
+    if found and found[1] == "~/.no_human/.env":
+        return _report_found_token(*found)
 
-    # Check process environment.
-    if os.environ.get(SUBSCRIPTION_TOKEN_VAR):
-        console.print(f"  [green]✓[/] {SUBSCRIPTION_TOKEN_VAR} found in environment")
+    if found:  # process environment
+        if not _report_found_token(*found):
+            return False
         if click.confirm("    Persist it to ~/.no_human/.env?", default=True):
             if not _save_subscription_token(os.environ[SUBSCRIPTION_TOKEN_VAR]):
                 return False
@@ -274,7 +369,12 @@ def _setup_subscription_token() -> bool:
         f"      [bold]claude setup-token[/]\n"
         f"    Then paste the token here, or press Enter to skip for now."
     )
-    token = click.prompt("    Token", default="", show_default=False).strip()
+    # hide_input: a credential typed here used to be echoed to the terminal and
+    # left in scrollback (walkthrough finding B13). The API-key prompt above has
+    # always hidden it; this is the same prompt for the same class of secret.
+    token = click.prompt(
+        "    Token", default="", show_default=False, hide_input=True
+    ).strip()
     if token:
         if not _save_subscription_token(token):
             return False

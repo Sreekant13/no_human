@@ -383,7 +383,8 @@ DOCTOR_SRC = Path(__file__).resolve().parent.parent / "src"
 
 
 def _run_doctor(home: Path, tmpdir: Path, *, config: str | None = None,
-                token: bool = True) -> subprocess.CompletedProcess:
+                token: bool = True,
+                args: tuple[str, ...] = ()) -> subprocess.CompletedProcess:
     """Run `nh doctor` against an isolated HOME. Returns the completed process
     so the caller can assert on ``returncode`` directly."""
     (home / ".no_human").mkdir(parents=True, exist_ok=True)
@@ -399,7 +400,7 @@ def _run_doctor(home: Path, tmpdir: Path, *, config: str | None = None,
         # a placeholder is enough and no real credential is ever read here.
         env["CLAUDE_CODE_OAUTH_TOKEN"] = "sk-ant-oat-not-a-real-token"
     return subprocess.run(
-        [sys.executable, "-m", "no_human.cli.commands", "doctor"],
+        [sys.executable, "-m", "no_human.cli.commands", "doctor", *args],
         capture_output=True, text=True, timeout=180, env=env, cwd=str(tmpdir),
     )
 
@@ -448,6 +449,61 @@ def test_doctor_advisory_alone_does_not_change_the_exit_code(tmp_path):
         f"an advisory must never fail the doctor gate, got {proc.returncode}:"
         f"\n{proc.stdout}"
     )
+
+
+def test_doctor_leads_with_a_three_line_verdict(tmp_path):
+    """A first run printed 149 lines of all-zero mechanism rows and internal
+    history before saying anything a newcomer could act on (walkthrough B6/Q11).
+    The first three lines now answer: is it healthy, has anything run, how many
+    tasks."""
+    proc = _run_doctor(tmp_path / "home", _mktmp(tmp_path))
+    head = [line.strip() for line in proc.stdout.splitlines()[:3]]
+
+    assert head[0].startswith("install healthy"), proc.stdout
+    assert head[1] == "nothing has run yet", proc.stdout
+    assert head[2] == "0 task(s)", proc.stdout
+
+
+def test_doctor_reports_the_auth_profile_and_mode(tmp_path):
+    """quickstart.md promises `nh doctor` "reports your auth profile and mode".
+    It loaded both values and printed neither — 149 lines with no occurrence of
+    "auth" at all (walkthrough B5/Q4)."""
+    proc = _run_doctor(tmp_path / "home", _mktmp(tmp_path),
+                       config="llm:\n  auth_profile: enterprise\n"
+                              "  auth_mode: subscription\n")
+    auth = [ln for ln in proc.stdout.splitlines() if ln.startswith("auth")]
+
+    assert auth, f"no auth line at all:\n{proc.stdout}"
+    assert "enterprise" in auth[0], auth
+    assert "subscription" in auth[0], auth
+    # And it must not overclaim: the probe is presence-only by design
+    # (backend_check never spends quota on a live call).
+    assert "presence only" in auth[0], auth
+
+
+def test_the_mechanism_table_is_behind_verbose_and_the_exit_code_is_not(tmp_path):
+    """The 19-row table moves behind `--verbose`; the summary line, the
+    `healthy` predicate and the exit code do not move at all."""
+    home, tmpdir = tmp_path / "home", _mktmp(tmp_path)
+    quiet = _run_doctor(home, tmpdir)
+    loud = _run_doctor(home, tmpdir, args=("--verbose",))
+
+    # Default: the header survives (it is what `nh doctor` renders at all),
+    # the per-mechanism rows do not.
+    assert "mechanism liveness" in quiet.stdout, quiet.stdout
+    assert "last: never" not in quiet.stdout, quiet.stdout
+    assert "review_gate" not in quiet.stdout, quiet.stdout
+    assert "0/19 have ever fired" in quiet.stdout, quiet.stdout
+
+    # --verbose: the whole table, exactly as it always rendered.
+    assert "review_gate" in loud.stdout, loud.stdout
+    assert loud.stdout.count("last: never") == 19, loud.stdout
+    assert len(loud.stdout.splitlines()) > len(quiet.stdout.splitlines())
+
+    # Same verdict, same exit code either way.
+    assert quiet.returncode == loud.returncode == 0, (quiet.stdout, loud.stdout)
+    for out in (quiet.stdout, loud.stdout):
+        assert "no contradictions, no evidence gaps" in out, out
 
 
 def _mktmp(tmp_path: Path) -> Path:

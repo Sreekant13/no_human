@@ -21,7 +21,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from . import print_path_error
+from . import print_path_error, stdio_is_interactive
 from .. import __version__
 from ..agent.claude_backend import ClaudeBackend
 from ..agent.backend import make_backend, resolve_backend_name
@@ -757,6 +757,16 @@ def task_add(source, title, repo, description, criteria, external_id, kind, link
     """
     config, _ = _bootstrap()
 
+    # The grill asks one question at a time at a click.prompt. With no terminal
+    # there is nobody to answer it, and `nh task add … | tee` died on
+    # `Your answer []: Aborted!` (walkthrough B9) — even under --no-run. Bare
+    # `nh` already refuses the same way rather than hanging; this reuses its
+    # check instead of keeping a second opinion about what interactive means.
+    if grill and not stdio_is_interactive():
+        console.print("[dim]no terminal on stdin/stdout — skipping the scoping "
+                      "questions (same as --no-grill).[/]")
+        grill = False
+
     async def _go():
         async with Store(config.db_path) as store:
             if source:
@@ -824,8 +834,11 @@ def task_add(source, title, repo, description, criteria, external_id, kind, link
             if not prof or not prof.usable_under_policy(auto_confirm_proven=auto):
                 console.print(
                     "[yellow]⚠ repo profile not usable[/] — test command will be "
-                    "auto-detected (may be wrong). Run:\n"
+                    "auto-detected (may be wrong). Run both:\n"
+                    f"  [bold]nh onboard {t.repo_path}[/]"
+                    "            [dim]# derive + prove[/]\n"
                     f"  [bold]nh onboard {t.repo_path} --confirm[/]"
+                    "  [dim]# then confirm[/]"
                 )
             if not run:
                 console.print(f"staged. run it with:  [bold]nh watch {t.id[:8]}[/]")
@@ -4199,7 +4212,9 @@ def _release_pid_lock() -> None:
 
 
 @cli.command("doctor")
-def doctor():
+@click.option("-v", "--verbose", is_flag=True,
+              help="Show the per-mechanism lifetime-firings table.")
+def doctor(verbose):
     """Liveness check: which guarded mechanisms have actually ever fired.
 
     The system's worst bugs were silences, not crashes — TESTING dead for its
@@ -4216,6 +4231,7 @@ def doctor():
     """
     from datetime import datetime
 
+    from ..config import DEFAULT_AUTH_PROFILE
     from ..doctor import diagnose
 
     config, _ = _bootstrap(require_auth=False)
@@ -4225,30 +4241,66 @@ def doctor():
     async def _go():
         async with Store(config.db_path) as store:
             d = await diagnose(store, config.data)
+            tasks = (await store.query_one("SELECT COUNT(*) FROM tasks"))[0]
 
         # Live readiness (not history): can the coding backend actually run a
         # task right now? A missing `claude` CLI makes the board load green
         # while every task fails at launch — a contradiction, so it flips
         # `healthy` and the exit code below.
-        backend = check_backend(
-            profile=(config.get("llm") or {}).get("auth_profile"),
-            auth_mode=(config.get("llm") or {}).get("auth_mode", "subscription"))
-        cli = backend.cli_path or "not found"
-        colour = "green" if backend.ready else "red"
-        console.print(f"[bold]coding backend[/] — claude CLI: "
-                      f"[{colour}]{cli}[/]")
+        llm = config.get("llm") or {}
+        profile = llm.get("auth_profile")
+        auth_mode = llm.get("auth_mode", "subscription")
+        backend = check_backend(profile=profile, auth_mode=auth_mode)
         for reason in backend.reasons:
             d.contradictions.append(f"CODING BACKEND UNUSABLE: {reason}")
 
-        console.print("[bold]mechanism liveness[/] (lifetime firings)")
-        for m in d.mechanisms:
-            when = (datetime.fromtimestamp(m["last_ts"]).strftime("%Y-%m-%d %H:%M")
-                    if m["last_ts"] else "never")
-            colour = "green" if m["count"] else "yellow"
-            line = f"  [{colour}]{m['name']:<18}[/] {m['count']:>6}  last: {when}"
-            if m["hint"]:
-                line += f"  [dim]{m['hint']}[/]"
-            console.print(line)
+        # The verdict, first — a first run printed 149 lines of all-zero
+        # mechanism rows and internal history, and a newcomer could not tell
+        # healthy from broken. Three lines say it; the table is still one flag
+        # away. This reads `d.healthy`, it does not redefine it: the predicate
+        # and the exit code below are exactly what they were.
+        fired = sum(1 for m in d.mechanisms if m["count"])
+        if d.healthy:
+            console.print("[bold green]install healthy[/] — no contradictions, "
+                          "no evidence gaps")
+        else:
+            console.print(
+                f"[bold red]install needs attention[/] — "
+                f"{len(d.contradictions)} contradiction(s), "
+                f"{len(d.evidence_gaps)} evidence gap(s) below")
+        console.print(
+            "[dim]nothing has run yet[/]" if not fired else
+            f"{fired} of {len(d.mechanisms)} mechanisms have fired")
+        console.print(f"{tasks} task(s)")
+        console.print()
+
+        # The two live facts about THIS install: which credential pays, and
+        # whether the thing that spends it is even present. doctor loaded both
+        # of these and printed neither — quickstart.md promised it "reports
+        # your auth profile and mode" and nothing in 149 lines said "auth".
+        cli = backend.cli_path or "not found"
+        colour = "green" if backend.ready else "red"
+        console.print(f"[bold]auth[/] — profile: "
+                      f"[cyan]{profile or DEFAULT_AUTH_PROFILE}[/]  "
+                      f"mode: [cyan]{auth_mode}[/]  "
+                      f"[dim](presence only — no live auth call)[/]")
+        console.print(f"[bold]coding backend[/] — claude CLI: "
+                      f"[{colour}]{cli}[/]")
+
+        if verbose:
+            console.print("[bold]mechanism liveness[/] (lifetime firings)")
+            for m in d.mechanisms:
+                when = (datetime.fromtimestamp(m["last_ts"]).strftime("%Y-%m-%d %H:%M")
+                        if m["last_ts"] else "never")
+                colour = "green" if m["count"] else "yellow"
+                line = f"  [{colour}]{m['name']:<18}[/] {m['count']:>6}  last: {when}"
+                if m["hint"]:
+                    line += f"  [dim]{m['hint']}[/]"
+                console.print(line)
+        else:
+            console.print(
+                f"[bold]mechanism liveness[/] — {fired}/{len(d.mechanisms)} have "
+                f"ever fired  [dim](nh doctor --verbose for the table)[/]")
 
         if d.contradictions:
             console.print("\n[bold red]contradictions[/] — evidence of activity "
@@ -4265,8 +4317,9 @@ def doctor():
                           "(do not affect health):")
             for a in d.advisories:
                 console.print(f"  [cyan]•[/] {a}")
-        if d.healthy:
-            console.print("\n[green]no contradictions, no evidence gaps[/]")
+        # The healthy line is the verdict at the top — printed once, in the
+        # same words ("no contradictions, no evidence gaps") anything grepping
+        # this output already looks for, rather than twice.
         return d.healthy
 
     # The exit code is the machine-readable half of this command, and for a

@@ -770,6 +770,41 @@ def upsert_env_var(env_path: Path, key: str, value: str) -> None:
     atomic_write_0600(env_path, "\n".join(out) + "\n")
 
 
+def assert_oauth_token_usable(token: str) -> str:
+    """Refuse an OAuth token that cannot work; return it stripped.
+
+    The refusal half of :func:`set_profile_token`, split out so a caller that
+    only wants to JUDGE a token — `nh init` reporting on a credential it
+    FOUND already on the machine — asks the same question without writing
+    anything. Two copies of "what is a usable token" is how the CLI, the HTTP
+    path and the desktop app ended up with three opinions (onboarding
+    walkthrough 2026-08-09, B4b); this keeps it at one.
+
+    Refuses, in this order: an empty token; an over-length one; one carrying a
+    line break that would forge a second .env line; a metered ``sk-ant-api…``
+    key, which silently bills the metered API (constraint #1 is OAuth-only).
+    Both personal and enterprise OAuth tokens are first-class, so it rejects
+    the known-bad shape rather than whitelisting a format.
+    """
+    token = (token or "").strip()
+    if not token:
+        raise AuthError("token must not be empty")
+    if len(token) > MAX_TOKEN_LEN:
+        raise AuthError(
+            f"token is implausibly long ({len(token)} chars, max "
+            f"{MAX_TOKEN_LEN}) — refusing to write it")
+    assert_single_env_line(token, "token")
+    if token.casefold().startswith("sk-ant-api"):
+        raise AuthError(
+            "that is an ANTHROPIC_API_KEY, not an OAuth token. This field "
+            "takes a subscription or enterprise OAuth token "
+            "(CLAUDE_CODE_OAUTH_TOKEN) — create one with: claude setup-token. "
+            "To bill your own Anthropic API account with that key, set "
+            "llm.auth_mode: api_key and keep the key in ~/.no_human/.env."
+        )
+    return token
+
+
 def set_profile_token(profile: str, token: str,
                       env_path: Path | None = None) -> str:
     """Store *profile*'s OAuth token in ``~/.no_human/.env``; return the KEY.
@@ -792,25 +827,13 @@ def set_profile_token(profile: str, token: str,
       product refuses to do. Both personal and enterprise OAuth tokens are
       first-class, so the check rejects the one known-bad shape rather than
       whitelisting a format and locking out a valid enterprise token.
+
+    The last four live in :func:`assert_oauth_token_usable` so a validate-only
+    caller cannot drift from the writer.
     """
     env_path = ENV_PATH if env_path is None else env_path
     key = profile_token_var(profile)
-    token = (token or "").strip()
-    if not token:
-        raise AuthError("token must not be empty")
-    if len(token) > MAX_TOKEN_LEN:
-        raise AuthError(
-            f"token is implausibly long ({len(token)} chars, max "
-            f"{MAX_TOKEN_LEN}) — refusing to write it")
-    assert_single_env_line(token, "token")
-    if token.casefold().startswith("sk-ant-api"):
-        raise AuthError(
-            "that is an ANTHROPIC_API_KEY, not an OAuth token. This field "
-            "takes a subscription or enterprise OAuth token "
-            "(CLAUDE_CODE_OAUTH_TOKEN) — create one with: claude setup-token. "
-            "To bill your own Anthropic API account with that key, set "
-            "llm.auth_mode: api_key and keep the key in ~/.no_human/.env."
-        )
+    token = assert_oauth_token_usable(token)
     upsert_env_var(env_path, key, token)
     return key
 

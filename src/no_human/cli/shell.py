@@ -20,7 +20,6 @@ Two things this deliberately does NOT do:
 from __future__ import annotations
 
 import asyncio
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +28,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Footer, Input, RichLog, Static
 
+from . import stdio_is_interactive
 from .api_client import (
     DEFAULT_BASE_URL,
     NhApiError,
@@ -477,28 +477,6 @@ def _repo_from_cwd() -> str | None:
         if (candidate / ".git").exists():
             return str(candidate)
     return None
-
-
-def stdio_is_interactive() -> bool:
-    """Is there a human at a terminal on BOTH ends?
-
-    Textual takes the screen and does not give it back until a key says so, so
-    without a terminal there is no key and no exit: `nh </dev/null` ran
-    forever, wrote nothing to stdout, and painted a full screen of escapes to
-    stderr. That wedges a CI job, a wrapper script, and — since no_human's own
-    coder agents run shell commands — an agent's run. Worse, the SIGINT that
-    eventually kills it exits 0, so the wedge reads as success.
-
-    A stream that has been closed or replaced raises instead of answering;
-    guessing "interactive" there is how the hang comes back.
-    """
-    for stream in (sys.stdin, sys.stdout):
-        try:
-            if not stream.isatty():
-                return False
-        except (AttributeError, ValueError, OSError):
-            return False
-    return True
 
 
 def non_interactive_message() -> str:

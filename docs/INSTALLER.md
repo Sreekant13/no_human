@@ -548,9 +548,15 @@ EXIT CODE: 0
 
 Full Windows build, divergence and acceptance record: `docs/WINDOWS.md`.
 
-What you should see: a `coding backend — claude CLI: <path>` line, then a
-mechanism-liveness table, ending either `no contradictions, no evidence gaps`
-(exit 0) or a red `contradictions` block naming what's wrong (exit 1).
+What you should see: a three-line verdict — `install healthy — no
+contradictions, no evidence gaps` (exit 0) or `install needs attention` over a
+red `contradictions` block naming what's wrong (exit 1) — then the `auth` and
+`coding backend — claude CLI: <path>` lines and a one-line mechanism-liveness
+summary. `nh doctor --verbose` prints the full per-mechanism table.
+
+The captured runs below predate that summary (they were taken when the table
+printed by default); the verdict, the backend line and both exit codes are
+unchanged, and the table itself is one flag away.
 
 **Real output**, captured by building the frozen bundle in this environment
 (`bash packaging/build-installer.sh`, then running
