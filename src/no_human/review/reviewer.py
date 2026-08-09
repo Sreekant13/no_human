@@ -136,7 +136,53 @@ class ReviewerUnavailable(RuntimeError):
     wrong — its checklist becomes feedback the coder is told to act on, so a
     reviewer that merely ran out of turns costs the coder a bounded attempt for
     a defect nobody found.
+
+    It carries the SAME four usage fields a :class:`ReviewDecision` does, and
+    for the same reason: the rounds that reached no verdict were still paid for,
+    and this exception is the only thing that leaves ``_agent_review`` on that
+    path. Class-level defaults so a caller can read them off any instance —
+    including the "no reviewer is wired" raise, which spent nothing — through
+    exactly one accounting channel (`_carry_usage`, and the orchestrator's
+    `_record_review_usage`).
     """
+
+    tokens_used: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    output_tokens: int | None = None
+
+
+def _carry_usage(target: Any, discarded: list[Any]) -> Any:
+    """Fold the spend of rounds that produced NO verdict onto whatever finally
+    leaves ``_agent_review`` — a decision, or the ``ReviewerUnavailable`` raised
+    when every round failed.
+
+    The reviewer's burn has exactly ONE channel to the attempt row: the four
+    usage fields stamped in ``_review_once``, read by the orchestrator's
+    ``_record_review_usage``. A round the loop DISCARDS never reaches that
+    stamp, so without this fold its tokens are simply lost — and it is the
+    expensive round: a reviewer that read the whole diff for 30 turns before
+    dying costs far more than the retry that then succeeds in ten. Under-count
+    here propagates straight into the lifetime-budget park gate
+    (`lifetime_usage_by_class`), `metrics.review_tokens_used_total` and the
+    board, which is the same shape as the bug `_run_bounded` lists first in its
+    own docstring: spend that was billed and never recorded.
+
+    Sums, rather than a second write, because the attempt row holds one figure
+    per role — the gate's cost is what the gate cost, retries included.
+    ``output_tokens`` keeps its None-vs-0 distinction: None everywhere means no
+    session reported a usage split, and must not become a measured zero.
+    """
+    if not discarded:
+        return target
+    for field in ("tokens_used", "cache_read_tokens", "cache_creation_tokens"):
+        setattr(target, field, (getattr(target, field, 0) or 0)
+                + sum((getattr(r, field, 0) or 0) for r in discarded))
+    outs = [o for o in [getattr(target, "output_tokens", None)]
+            + [getattr(r, "output_tokens", None) for r in discarded]
+            if o is not None]
+    target.output_tokens = sum(outs) if outs else None
+    return target
 
 
 @dataclass
@@ -1652,6 +1698,16 @@ class AdversarialReviewer:
         then raise :class:`ReviewerUnavailable` so the task escalates honestly.
         No path here ever turns a missing verdict into a pass.
 
+        A round that ERRORED is a round with no verdict (see ``_review_once``),
+        which means a finding made in the last turn before truncation is
+        discarded and round two's verdict is trusted instead — deliberately: the
+        second round is better informed (a bigger turn budget, the same diff),
+        while the first was, by construction, cut off mid-exploration. Every
+        discarded round that RETURNED A RESULT has its tokens folded onto what
+        this returns; a round killed by the wall-clock bound leaves no
+        ``AgentResult`` at all, so its spend is unrecoverable here — the session
+        was cancelled without ever reporting usage.
+
         **THE BOUND, in full, because two retries now compose here.** Each of
         these ``_REVIEW_INFRA_RETRIES + 1 = 2`` rounds calls ``_run_bounded``,
         which calls ``ClaudeBackend.run``, which may itself spend a second
@@ -1669,15 +1725,22 @@ class AdversarialReviewer:
         """
         last_reason = "unknown"
         round_timeout = timeout
+        # Rounds that reached no verdict. Discarded for CORRECTNESS, but they
+        # were billed — `_carry_usage` folds their spend onto whatever leaves
+        # this method so the attempt row shows what the gate really cost.
+        discarded: list[AgentResult] = []
         for round_n in range(_REVIEW_INFRA_RETRIES + 1):
             budget = max_turns * (2 ** round_n)
-            decision, reason = await self._review_once(
+            decision, reason, result = await self._review_once(
                 prompt, repo_path, max_turns=budget, timeout=round_timeout,
                 before_ref=before_ref, verify_citations=verify_citations,
                 extra_repos=extra_repos,
             )
             if decision is not None:
-                return decision
+                # `result`'s own usage is already stamped on `decision`.
+                return _carry_usage(decision, discarded)
+            if result is not None:
+                discarded.append(result)
             last_reason = reason
             # A *timeout* means the reviewer is hung/saturated, not turn-starved,
             # so granting another full window just doubles the wall-time a task
@@ -1692,12 +1755,12 @@ class AdversarialReviewer:
                 reason, round_n + 1, _REVIEW_INFRA_RETRIES + 1, budget,
             )
 
-        raise ReviewerUnavailable(
+        raise _carry_usage(ReviewerUnavailable(
             f"the reviewer reached no verdict after {_REVIEW_INFRA_RETRIES + 1} "
             f"rounds ({last_reason}). The review gate did not run, so this diff "
             "is unreviewed. Escalating rather than passing it — or blaming the "
             "coder for a finding that was never made."
-        )
+        ), discarded)
 
     async def _run_bounded(
         self, prompt: str, repo_path: Path, *, max_turns: int,
@@ -1793,15 +1856,38 @@ class AdversarialReviewer:
             f"reviewer's session, not a defect in the change."
         )
 
+    @staticmethod
+    def _errored_round_reason(result: AgentResult) -> str:
+        """Why an errored reviewer session did not produce a review.
+
+        A transport death and a reviewer that argued itself into no verdict are
+        the same shape to the caller — ``(None, reason)`` — and used to read
+        identically downstream: "reviewer session error (error)". That string
+        names no cause, and it is what the escalation, the blocker category and
+        the human all inherit. The backend has already retried a transport
+        failure once and appended its own diagnosis (worker, concurrency, and
+        the CLI's own wording); carry that through verbatim instead of
+        flattening it, so the blocker can route it as infra.
+        """
+        if is_transport_failure(result):
+            tail = (result.final_text or "").strip()[-_TRANSPORT_TAIL_CHARS:]
+            return f"reviewer session transport failure — {tail}"
+        return f"reviewer session error ({result.stop_reason or 'error'})"
+
     async def _review_once(
         self, prompt: str, repo_path: Path, *, max_turns: int, timeout: int,
         before_ref: str = "HEAD~1", verify_citations: bool = True,
         extra_repos: list[tuple[Path, str]] | None = None,
-    ) -> tuple[ReviewDecision | None, str]:
+    ) -> tuple[ReviewDecision | None, str, AgentResult | None]:
         """One reviewer session.
 
-        Returns ``(decision, "")`` on a real verdict — pass or fail — and
-        ``(None, reason)`` when the gate could not run at all.
+        Returns ``(decision, "", result)`` on a real verdict — pass or fail —
+        and ``(None, reason, result)`` when the gate could not run at all. The
+        raw ``AgentResult`` comes back either way (``None`` only when no session
+        survived to report anything) because a round with no verdict still SPENT
+        its tokens, and ``_agent_review`` is where they are folded back in
+        (`_carry_usage`); this method's own usage stamp only ever reaches a
+        decision it returns.
         """
         all_text_parts: list[str] = []
         original_on_event = self._on_event
@@ -1817,7 +1903,38 @@ class AdversarialReviewer:
             on_event=_capture_event,
         )
         if result is None:
-            return None, timed_out
+            return None, timed_out, None
+
+        # An ERRORED round did not finish, whatever text it left behind. This
+        # check used to live inside the no-decision branch below, so it only
+        # ever fired when parsing ALSO found nothing — and a session that ran
+        # out of turns *after* emitting a REVIEW_JSON block had its verdict
+        # taken at face value. That verdict is the reviewer's state of mind
+        # mid-exploration, not its conclusion: on task 8e1f7543 a truncated
+        # pass produced a blocking finding whose cited locations do not exist
+        # (`review_citation_demoted`), and on 872407d4 it produced a terminal
+        # FAIL about a `try/except` the reviewer had not read yet. Same shape as
+        # the planner's error-string-as-a-plan (1bb3be36): the SDK never raises,
+        # it hands the failure back as a normal result with `is_error` set.
+        #
+        # So: no decision, and `_agent_review`'s doubling retry — which exists
+        # for exactly this failure and was unreachable for it — gets its round.
+        # If the retry is also truncated, the existing no-verdict path runs:
+        # ReviewerUnavailable, an honest escalation, never a pass.
+        #
+        # WHAT THIS KNOWINGLY TRADES AWAY, because `is_error` is coarser than
+        # "truncated". It is also set when a session FINISHED its reasoning and
+        # then died in the transport, leaving a COMPLETE REVIEW_JSON in the
+        # captured event stream. That verdict was probably sound, and this
+        # discards it and pays for a second full Opus round. The trade is
+        # deliberate: nothing here can tell a complete verdict from a
+        # mid-exploration one — both parse — and the wrong half of that guess is
+        # the one that shipped 8e1f7543's nonexistent citations and 872407d4's
+        # terminal FAIL. Fail closed, pay the round. If the retry cost measures
+        # badly (B1 should report the rate), the lever is a completeness signal
+        # from the backend, NOT reading a verdict out of a failed session.
+        if getattr(result, "is_error", False):
+            return None, self._errored_round_reason(result), result
 
         # Try final_text first, then all captured text. `verify_citations`
         # gates the demotion rule: claim mode must keep a refutation that names
@@ -1832,28 +1949,11 @@ class AdversarialReviewer:
                                             repo_path=_vc_repo, before_ref=before_ref,
                                             extra_repos=_vc_extra)
         if _reached_no_verdict(decision):
-            reason = result.stop_reason or "no REVIEW_JSON block"
-            if getattr(result, "is_error", False):
-                # A transport death and a reviewer that argued itself into no
-                # verdict are the same shape here — `(None, reason)` — and used
-                # to read identically downstream: "reviewer session error
-                # (error)". That string names no cause, and it is what the
-                # escalation, the blocker category and the human all inherit.
-                # The backend has already retried a transport failure once and
-                # appended its own diagnosis (worker, concurrency, and the
-                # CLI's own wording); carry that through verbatim instead of
-                # flattening it, so the blocker below can route it as infra.
-                if is_transport_failure(result):
-                    tail = (result.final_text or "").strip()[
-                        -_TRANSPORT_TAIL_CHARS:]
-                    reason = f"reviewer session transport failure — {tail}"
-                else:
-                    reason = f"reviewer session error ({reason})"
-            return None, reason
+            return None, result.stop_reason or "no REVIEW_JSON block", result
         decision.tokens_used = result.tokens_used
         decision.cache_read_tokens = getattr(result, "cache_read_tokens", 0)
         decision.cache_creation_tokens = getattr(result, "cache_creation_tokens", 0)
         # Default None, not 0 — an absent split must stay distinguishable from
         # a measured zero all the way to `attempts.review_output_tokens`.
         decision.output_tokens = getattr(result, "output_tokens", None)
-        return decision, ""
+        return decision, "", result

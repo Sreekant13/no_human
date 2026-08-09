@@ -7,6 +7,7 @@ stamp. `nh watch` did exactly that in production.
 
 import ast
 import pathlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -103,14 +104,17 @@ def test_no_production_orchestrator_is_built_without_a_reviewer():
 
 
 class _FakeAgentResult:
-    def __init__(self, final_text, *, is_error=False, stop_reason="end_turn"):
+    def __init__(self, final_text, *, is_error=False, stop_reason="end_turn",
+                 tokens_used=0, cache_read_tokens=0, cache_creation_tokens=0,
+                 output_tokens=None):
         self.final_text = final_text
         self.is_error = is_error
         self.stop_reason = stop_reason
         self.num_turns = 11
-        self.tokens_used = 0
-        self.cache_read_tokens = 0
-        self.cache_creation_tokens = 0
+        self.tokens_used = tokens_used
+        self.cache_read_tokens = cache_read_tokens
+        self.cache_creation_tokens = cache_creation_tokens
+        self.output_tokens = output_tokens
         self.session_id = "s"
 
 
@@ -525,4 +529,231 @@ def test_the_already_exists_path_refreshes_the_body_only_when_asked_0a(tmp_path,
     assert edits, "update_existing_body=True did not refresh the body"
     assert edits[0][-1] == "new body" and "--body" in edits[0], (
         f"the edit did not carry the new body: {edits[0]!r}"
+    )
+
+
+# ---- R5: a TRUNCATED reviewer's verdict is not a verdict ------------------- #
+#
+# 4 August tasks hit a reviewer session that ran out of turns and still carried
+# a parseable REVIEW_JSON block. `_review_once` gated on `result.is_error` only
+# inside the branch where parsing had ALSO found nothing, so the mid-flight
+# verdict was accepted as the reviewer's conclusion. Two of the four did
+# demonstrable damage: 8e1f7543's blocking finding cited locations that do not
+# exist (`review_citation_demoted`), and 872407d4 took a terminal FAIL on a
+# `try/except` the reviewer had not read. Same class as the planner's
+# error-string-as-a-plan (1bb3be36).
+
+
+class _TruncatedBackend:
+    """A session that emits a verdict mid-flight and then dies on max_turns.
+
+    Both places `_review_once` looks for a verdict are covered: `final_text`
+    (``where="final"``) and the captured event stream it falls back to
+    (``where="events"``) — the shape the live incidents had, since the SDK
+    replaces `final_text` with its own error sentence.
+    """
+
+    def __init__(self, *rounds, where="events"):
+        self._rounds = list(rounds)
+        self._where = where
+        self.budgets: list[int] = []
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, on_event=None, **kw):
+        self.budgets.append(max_turns)
+        text, errored, usage = self._rounds.pop(0)
+        if not errored:
+            return _FakeAgentResult(text, **usage)
+        if self._where == "events" and on_event is not None:
+            on_event(SimpleNamespace(text=text, kind="assistant", meta={}))
+        return _FakeAgentResult(
+            text if self._where == "final" else _MAX_TURNS_ERROR,
+            is_error=True, stop_reason="max_turns", **usage,
+        )
+
+
+# A verdict a truncated session might leave behind — the 872407d4 shape: a
+# terminal FAIL on code it had not finished reading.
+_BURNED = dict(tokens_used=120_000, cache_read_tokens=900_000,
+               cache_creation_tokens=30_000, output_tokens=9_000)
+_CHEAP = dict(tokens_used=40_000, cache_read_tokens=50_000,
+              cache_creation_tokens=1_000, output_tokens=3_000)
+
+_TRUNCATED_FAIL = (
+    'REVIEW_JSON_START {"passed": false, "items": '
+    '[{"label": "unverified try/except", "passed": false, "severity": "high", '
+    '"evidence": "calc.py:999"}]} REVIEW_JSON_END\n' + _MAX_TURNS_ERROR
+)
+
+
+@pytest.mark.parametrize("where", ["events", "final"])
+async def test_a_truncated_reviewer_verdict_is_retried_not_accepted(tmp_path, where):
+    """R5. The round did not finish, so its verdict is discarded and the
+    EXISTING doubling retry — built for exactly this and unreachable for it —
+    runs. Round two's real verdict is what the gate returns."""
+    from no_human.review.reviewer import AdversarialReviewer
+
+    backend = _TruncatedBackend(
+        (_TRUNCATED_FAIL, True, _BURNED), (_VERDICT, False, _CHEAP), where=where,
+    )
+    decision = await AdversarialReviewer(backend=backend)._agent_review("p", tmp_path)
+
+    assert len(backend.budgets) == 2, (
+        "the truncated round was accepted as a verdict — no retry happened")
+    assert backend.budgets[1] > backend.budgets[0], "the retry gets more turns"
+    assert decision.passed is True, "the truncated FAIL survived into the verdict"
+    assert not any("try/except" in i.label for i in decision.checklist), (
+        "a finding from the discarded truncated round leaked into the decision")
+    # The round was DISCARDED, not free. Reviewer spend has one channel to the
+    # attempt row — the four fields on the decision — so a discarded round that
+    # is not folded in here is billed and never recorded, and it is the
+    # expensive round: it read the whole diff for 30 turns before dying.
+    assert decision.tokens_used == _BURNED["tokens_used"] + _CHEAP["tokens_used"]
+    assert decision.cache_read_tokens == (
+        _BURNED["cache_read_tokens"] + _CHEAP["cache_read_tokens"])
+    assert decision.cache_creation_tokens == (
+        _BURNED["cache_creation_tokens"] + _CHEAP["cache_creation_tokens"])
+    assert decision.output_tokens == (
+        _BURNED["output_tokens"] + _CHEAP["output_tokens"])
+
+
+@pytest.mark.parametrize("where", ["events", "final"])
+async def test_two_truncated_rounds_take_the_existing_no_verdict_path(tmp_path, where):
+    """Retry exhaustion is unchanged: ReviewerUnavailable, which the
+    orchestrator escalates. No path here turns a truncated verdict into a pass
+    — and none of it blames the coder for a finding never properly made."""
+    from no_human.review.reviewer import AdversarialReviewer
+
+    backend = _TruncatedBackend(
+        (_TRUNCATED_FAIL, True, _BURNED), (_TRUNCATED_FAIL, True, _CHEAP),
+        where=where,
+    )
+    with pytest.raises(ReviewerUnavailable, match="no verdict") as exc:
+        await AdversarialReviewer(backend=backend)._agent_review("p", tmp_path)
+
+    assert len(backend.budgets) == 2, "one bounded infra retry (constraint #4)"
+    assert "reviewer session error (max_turns)" in str(exc.value), (
+        "the escalation must name the cause it inherited from the errored round")
+    # No decision ever leaves this path, so the exception is the only carrier
+    # for two fully-paid reviewer rounds. Recording zero here under-counts the
+    # lifetime-budget park gate by the whole gate.
+    err = exc.value
+    assert err.tokens_used == _BURNED["tokens_used"] + _CHEAP["tokens_used"]
+    assert err.cache_read_tokens == (
+        _BURNED["cache_read_tokens"] + _CHEAP["cache_read_tokens"])
+    assert err.cache_creation_tokens == (
+        _BURNED["cache_creation_tokens"] + _CHEAP["cache_creation_tokens"])
+    assert err.output_tokens == _BURNED["output_tokens"] + _CHEAP["output_tokens"]
+
+
+async def test_a_clean_round_is_untouched_by_the_error_gate(tmp_path):
+    """Negative control (green before AND after): a non-error result whose
+    verdict only appears in the EVENT stream — the fallback parse — still
+    returns on round one, with no retry."""
+    from no_human.review.reviewer import AdversarialReviewer
+
+    class _EventOnlyBackend:
+        def __init__(self):
+            self.budgets: list[int] = []
+
+        async def run(self, prompt, *, cwd, max_turns, effort=None, on_event=None, **kw):
+            self.budgets.append(max_turns)
+            on_event(SimpleNamespace(text=_VERDICT, kind="assistant", meta={}))
+            return _FakeAgentResult("")
+
+    backend = _EventOnlyBackend()
+    decision = await AdversarialReviewer(backend=backend)._agent_review("p", tmp_path)
+    assert decision.passed is True
+    assert len(backend.budgets) == 1, "a healthy round must never be retried"
+
+
+async def test_tamper_adjudication_fails_closed_on_a_truncated_session(tmp_path):
+    """Pins the OTHER mode's behaviour, which does NOT go through
+    `_review_once`: `tamper_adjudication` is single-turn via `_fast_review`,
+    which has no error gate and no retry. It is fail-closed by its PARSER —
+    anything unparseable is CANNOT_DECIDE, which parks — so a truncated
+    adjudication cannot pass the tamper gate. Unchanged by this commit; pinned
+    so a future edit to either side has to notice."""
+    from no_human.review import tamper_adjudication
+    from no_human.review.reviewer import AdversarialReviewer
+
+    class _TruncatedAdjudicator:
+        async def run(self, prompt, *, cwd, max_turns, effort=None, on_event=None, **kw):
+            return _FakeAgentResult(_MAX_TURNS_ERROR, is_error=True,
+                                    stop_reason="max_turns")
+
+    decision = await AdversarialReviewer(backend=_TruncatedAdjudicator()).review(
+        Task(id="t1", source="manual", title="t", description="d"),
+        repo_path=tmp_path, mode="tamper_adjudication",
+        tamper_findings="2 assertions deleted", diff_override="- assert x",
+    )
+    stage = decision.stages[tamper_adjudication.STAGE_KEY]
+    assert stage["verdict"] == tamper_adjudication.CANNOT_DECIDE
+    assert decision.passed is False, "a truncated adjudication must not clear the guard"
+
+
+async def test_the_unavailable_reviewer_s_burn_reaches_the_attempt_row():
+    """The other half of the same channel: `_record_review_usage` is what the
+    orchestrator calls on BOTH exits, so an escalated review gate writes the
+    same four columns a verdict would. Before, the `ReviewerUnavailable` branch
+    returned before any recording and two paid rounds vanished."""
+    from no_human.review.reviewer import ReviewerUnavailable
+
+    written: dict = {}
+
+    class _Store:
+        async def update_attempt(self, attempt_id, **kw):
+            written.update(kw, attempt_id=attempt_id)
+
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.store = _Store()
+
+    exc = ReviewerUnavailable("no verdict after 2 rounds")
+    exc.tokens_used, exc.cache_read_tokens = 160_000, 950_000
+    exc.cache_creation_tokens, exc.output_tokens = 31_000, 12_000
+    await orch._record_review_usage(7, exc)
+
+    assert written == {
+        "attempt_id": 7,
+        "review_tokens_used": 160_000,
+        "review_cache_read_tokens": 950_000,
+        "review_cache_creation_tokens": 31_000,
+        "review_output_tokens": 12_000,
+    }
+
+    # A reviewer that reported no usage split writes NULL, not a measured zero.
+    written.clear()
+    await orch._record_review_usage(7, ReviewerUnavailable("no reviewer wired"))
+    assert written["review_output_tokens"] is None
+    assert written["review_tokens_used"] == 0
+
+
+def test_every_reviewer_unavailable_handler_records_the_burn():
+    """The escalation returns BEFORE the orchestrator's normal recording, so
+    each `except ReviewerUnavailable` is its own chance to lose a fully-paid
+    review gate — and both handlers could be deleted with the whole suite still
+    green. Structural, in the shape this file already uses for the gate wiring
+    above: the e2e in test_e2e_orchestrator proves the already-satisfied
+    handler end to end, and this proves NEITHER handler can quietly stop
+    recording (nor a third one arrive without it).
+    """
+    src = pathlib.Path("src/no_human/core/orchestrator.py")
+    handlers, silent = 0, []
+    for node in ast.walk(ast.parse(src.read_text())):
+        if not (isinstance(node, ast.ExceptHandler)
+                and getattr(node.type, "id", "") == "ReviewerUnavailable"):
+            continue
+        # A handler that re-raises is not an exit — its caller still records.
+        # The ones that RETURN are the last chance the burn has.
+        if not any(isinstance(n, ast.Return) for n in ast.walk(node)):
+            continue
+        handlers += 1
+        if not any(getattr(c.func, "attr", "") == "_record_review_usage"
+                   for c in ast.walk(node) if isinstance(c, ast.Call)):
+            silent.append(f"{src}:{node.lineno}")
+    assert handlers == 2, (
+        f"expected the gate and already-satisfied handlers, found {handlers} — "
+        "if the path moved, this guard is watching nothing")
+    assert not silent, (
+        "a review gate that escalated still BILLED for its rounds; this handler "
+        "returns without recording them: " + ", ".join(silent)
     )

@@ -822,7 +822,7 @@ async def test_the_real_giveup_text_survives_the_reviewers_600_char_slice(
         async def run(self, prompt, **kwargs):
             return real
 
-    decision, reason = await AdversarialReviewer(backend=_Backend())._review_once(
+    decision, reason, _round = await AdversarialReviewer(backend=_Backend())._review_once(
         "prompt", tmp_path, max_turns=1, timeout=30)
 
     assert decision is None
@@ -904,7 +904,7 @@ async def test_a_review_window_no_longer_swallows_the_retry_its_spend_and_its_di
         session_id="s2", stop_reason="end_turn", output_tokens=23)
     backend = _RetryingBackend(work=0.30, result=recovered)
 
-    decision, reason = await rv.AdversarialReviewer(backend=backend)._review_once(
+    decision, reason, _round = await rv.AdversarialReviewer(backend=backend)._review_once(
         "prompt", tmp_path, max_turns=1, timeout=0.05)
 
     assert decision is not None, f"the retry was swallowed: {reason}"
@@ -925,7 +925,7 @@ async def test_a_merely_slow_reviewer_gets_no_grace(tmp_path, monkeypatch):
     backend = _RetryingBackend(work=5.0, result=None, announce=False)
 
     start = time.monotonic()
-    decision, reason = await rv.AdversarialReviewer(backend=backend)._review_once(
+    decision, reason, _round = await rv.AdversarialReviewer(backend=backend)._review_once(
         "prompt", tmp_path, max_turns=1, timeout=0.05)
     elapsed = time.monotonic() - start
 

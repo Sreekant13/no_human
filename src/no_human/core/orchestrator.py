@@ -3544,22 +3544,14 @@ class Orchestrator:
                 draft_pr_absent=getattr(self, "_draft_pr_absent", ""))
         except ReviewerUnavailable as exc:
             # Fail closed: a missing gate is an operator problem, not a pass.
+            # The rounds that reached no verdict were still BILLED, and this
+            # return is the only exit that skips the recording below — so the
+            # exception carries their spend and it lands on the same columns.
+            await self._record_review_usage(attempt_id, exc)
             return await self._escalate_reviewer_unavailable(
                 task, str(exc), repo=repo, branch=branch
             )
-        # The reviewer's burn was discarded after the verdict, so the DB held the coder's tokens
-        # only and every cost surface under-reported the run by the whole gate (Opus-4-8 over the
-        # full diff, plus the tier-gated angle passes). Its OWN columns: coder attribution — and
-        # by_tier / by_auth_profile with it — must stay the coder's.
-        await self.store.update_attempt(
-            attempt_id,
-            review_tokens_used=getattr(decision, "tokens_used", 0) or 0,
-            # NOT `or 0` like its neighbours: None means the reviewer session
-            # reported no usage block, and that must reach the column as NULL.
-            review_output_tokens=getattr(decision, "output_tokens", None),
-            review_cache_read_tokens=getattr(decision, "cache_read_tokens", 0) or 0,
-            review_cache_creation_tokens=getattr(decision, "cache_creation_tokens", 0) or 0,
-        )
+        await self._record_review_usage(attempt_id, decision)
         if not decision.passed:
             # Lead with what actually blocks. A nit in the feedback reads to the
             # coder exactly like a defect, and it spent attempts chasing them.
@@ -4353,6 +4345,33 @@ class Orchestrator:
         blocker = fallback_blocker(detail, goal=goal or task.title)
         return await self._raise_blocker(task, blocker, repo=repo, branch=branch)
 
+    async def _record_review_usage(self, attempt_id: str, source: Any) -> None:
+        """THE channel for reviewer spend onto the attempt row. One function,
+        because a second one would drift and half the burn would go missing —
+        which is the bug this collapses.
+
+        The reviewer's burn was once discarded after the verdict, so the DB held
+        the coder's tokens only and every cost surface under-reported the run by
+        the whole gate (Opus over the full diff, plus the tier-gated angle
+        passes). Its OWN columns: coder attribution — and by_tier /
+        by_auth_profile with it — must stay the coder's, which is why the
+        reviewer is deliberately outside ``AUX_USAGE_TIERS`` (db.py).
+
+        ``source`` is a ``ReviewDecision`` on the verdict paths and a
+        ``ReviewerUnavailable`` when no verdict was ever reached — both carry
+        the same four fields, and the second one is exactly the case that used
+        to record nothing while having paid for two full reviewer rounds.
+        """
+        await self.store.update_attempt(
+            attempt_id,
+            review_tokens_used=getattr(source, "tokens_used", 0) or 0,
+            # NOT `or 0` like its neighbours: None means the reviewer session
+            # reported no usage block, and that must reach the column as NULL.
+            review_output_tokens=getattr(source, "output_tokens", None),
+            review_cache_read_tokens=getattr(source, "cache_read_tokens", 0) or 0,
+            review_cache_creation_tokens=getattr(source, "cache_creation_tokens", 0) or 0,
+        )
+
     async def _escalate_reviewer_unavailable(
         self, task: Task, detail: str, *, repo: GitRepo | None = None,
         branch: str | None = None,
@@ -5126,21 +5145,15 @@ class Orchestrator:
                     claim_report=claim, profile_context=profile_ctx,
                 )
             except ReviewerUnavailable as exc:
+                # As above: the no-verdict rounds' spend rides on the exception.
+                await self._record_review_usage(attempt_id, exc)
                 return await self._escalate_reviewer_unavailable(
                     task, str(exc), repo=repo, branch=branch)
             except Exception as exc:  # noqa: BLE001 — fail closed, never pass on error
                 self._emit_review("review_error", str(exc))
                 decision = ReviewDecision(passed=False, checklist=[ChecklistItem(
                     "reviewer run", False, f"reviewer crashed: {exc}")])
-        await self.store.update_attempt(
-            attempt_id,
-            review_tokens_used=getattr(decision, "tokens_used", 0) or 0,
-            # NOT `or 0` like its neighbours: None means the reviewer session
-            # reported no usage block, and that must reach the column as NULL.
-            review_output_tokens=getattr(decision, "output_tokens", None),
-            review_cache_read_tokens=getattr(decision, "cache_read_tokens", 0) or 0,
-            review_cache_creation_tokens=getattr(decision, "cache_creation_tokens", 0) or 0,
-        )
+        await self._record_review_usage(attempt_id, decision)
         if not decision.passed:
             failed = decision.blocking_items or decision.failed_items
             detail = "already-satisfied claim refuted: " + "; ".join(

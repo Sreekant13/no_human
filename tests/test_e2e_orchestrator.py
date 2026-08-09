@@ -3554,8 +3554,15 @@ async def test_already_satisfied_advisory_mode_is_honest_about_no_review(
 
 class _UnavailableReviewer:
     async def review(self, task, **kwargs):
-        from no_human.review.reviewer import ReviewerUnavailable
-        raise ReviewerUnavailable("no verdict after retries")
+        from no_human.review.reviewer import _carry_usage, ReviewerUnavailable
+        # Carrying spend exactly as `_agent_review` does: the rounds that
+        # reached no verdict were still billed, and this exception is the only
+        # thing that leaves the reviewer on this path.
+        raise _carry_usage(
+            ReviewerUnavailable("no verdict after retries"),
+            [_SimpleNamespace(tokens_used=120_000, cache_read_tokens=900_000,
+                             cache_creation_tokens=30_000, output_tokens=9_000)],
+        )
 
 
 async def test_already_satisfied_reviewer_unavailable_escalates(
@@ -3575,6 +3582,15 @@ async def test_already_satisfied_reviewer_unavailable_escalates(
     outcome = await orch.run_task(t)
 
     assert outcome.status is TaskStatus.ESCALATED
+    # The gate escalated, but it had already PAID for its rounds. That handler
+    # returns before the normal recording, so without its own
+    # `_record_review_usage` call the whole gate's burn is missing from the
+    # attempt row — and from the lifetime-budget ceiling that reads it.
+    attempts = await store.list_attempts(t.id)
+    assert attempts, "no attempt row to carry the reviewer's burn"
+    assert attempts[-1]["review_tokens_used"] == 120_000
+    assert attempts[-1]["review_cache_read_tokens"] == 900_000
+    assert attempts[-1]["review_output_tokens"] == 9_000
 
 
 class _CrashingReviewer:
