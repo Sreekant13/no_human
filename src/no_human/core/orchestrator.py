@@ -9246,6 +9246,28 @@ class Orchestrator:
         return not (spec.files_to_change or spec.approach.strip()
                     or spec.test_plan.strip())
 
+    async def _plan_unavailable(self, task: Task, reason: str) -> str:
+        """Record that planning DIED, so the coder is told rather than deceived.
+
+        A failed plan and a deliberately skipped one both reach the coder as the
+        same thing today: no IMPLEMENTATION PLAN block. To the coder that is
+        indistinguishable from "this task was trivial enough not to need one", so
+        it starts editing on the strength of the ticket alone. Naming the failure
+        in its prompt costs a sentence and buys an exploration pass — an informed
+        coder beats a deceived one.
+
+        Returns "" so every failure site stays a one-line `return await …`.
+        """
+        self.emit("planning", f"no plan for the coder: {reason}")
+        ctx = task.context or {}
+        ctx["plan_unavailable"] = reason
+        task.context = ctx
+        # Durable too, for the UI and for a resume — but the in-memory context
+        # above is what `_build_implement_prompt` actually reads this run, and it
+        # must survive a task row that does not exist yet.
+        await self.store.merge_context(task.id, {"plan_unavailable": reason})
+        return ""
+
     async def _generate_plan(self, task: Task, repo: GitRepo) -> str:
         """Generate a detailed implementation plan before the implement loop.
 
@@ -9258,6 +9280,14 @@ class Orchestrator:
           - task kind: code_review skips (no implementation)
           - complexity: the planner may emit SKIP_PLAN for trivial one-line diffs
         """
+        # The no-plan notice describes THIS round. `_replan_for_approval` and the
+        # attempt loop re-enter here, so a marker that is only ever set outlives
+        # the round that earned it: a second round that legitimately SKIP_PLANs a
+        # trivial task would still hand the coder "planning FAILURE". Clear it
+        # first, in memory and durably (RFC 7396: null deletes the key).
+        if (task.context or {}).pop("plan_unavailable", None) is not None:
+            await self.store.merge_context(task.id, {"plan_unavailable": None})
+
         plan_cfg = self.config.get("planning", {})
         if not plan_cfg.get("enabled", True):
             self.emit("planning", "skipped (disabled in config)")
@@ -9492,9 +9522,8 @@ class Orchestrator:
                 if moa_plan is not None:
                     # "" is MoA's own SKIP_PLAN verdict, not a degenerate plan.
                     if moa_plan and self._plan_is_unusable(moa_plan):
-                        self.emit("planning", "planner output unusable (no plan "
-                                  "sections) — proceeding without a plan")
-                        return ""
+                        return await self._plan_unavailable(
+                            task, "the planner's output was unusable (no plan sections)")
                     return moa_plan
                 # Any MoA failure (too few proposers succeeded, aggregator error)
                 # falls through to the normal single-proposer path below — MoA is
@@ -9515,11 +9544,42 @@ class Orchestrator:
             )
             self._note_plan_usage(result)
             if self._planner_result_failed(result, role="planner"):
-                return ""
+                # R3: turn exhaustion discarded the ENTIRE planning spend and the
+                # coder then ran plan-less, with nothing retried and nothing said.
+                # Retry once at double the budget — the same shape the reviewer
+                # already uses for a no-verdict round (reviewer.py `_agent_review`).
+                # Bounded at exactly one retry, and only for turn starvation: a
+                # transport or API failure is not fixed by more turns.
+                #
+                # KNOWN GAP: `stop_reason == "max_turns"` is set only on the
+                # backends' terminal-EXCEPTION path (`claude_backend.py`,
+                # `codex_backend.py`). A max-turns *ResultMessage* on the normal
+                # path is still discarded by `_planner_result_failed` but reaches
+                # the `!= "max_turns"` branch above, so it is NOT retried — it
+                # gets the honest no-plan notice instead. All 14 August instances
+                # match the exception path, so retry coverage is deliberate for
+                # the observed shape, not total. Widen it on evidence, not on
+                # taste: keying on the text would also match a plan that merely
+                # QUOTES the phrase.
+                if result.stop_reason != "max_turns":
+                    return await self._plan_unavailable(
+                        task, f"planning failed ({result.stop_reason or 'error'})")
+                self.emit("planning",
+                          f"planner exhausted its {max_turns}-turn budget — "
+                          f"retrying once at {max_turns * 2} turns")
+                result = await planner.run(
+                    prompt, cwd=repo.path, max_turns=max_turns * 2,
+                    effort="medium", on_event=self._sink_for(PLANNER_ROLE),
+                )
+                self._note_plan_usage(result)
+                if self._planner_result_failed(result, role="planner"):
+                    return await self._plan_unavailable(
+                        task, f"the planner ran out of turns twice "
+                              f"({max_turns} then {max_turns * 2})")
             plan = (result.final_text or "").strip()
             if not plan:
-                self.emit("planning", "planner produced no output")
-                return ""
+                return await self._plan_unavailable(
+                    task, "the planner produced no output")
             if "SKIP_PLAN" in plan[:200]:
                 self.emit("planning", "skipped (trivial — planner assessed as one-line diff)")
                 return ""
@@ -9533,9 +9593,8 @@ class Orchestrator:
                 )
                 return plan
             if self._plan_is_unusable(plan):
-                self.emit("planning", "planner output unusable (no plan "
-                          "sections) — proceeding without a plan")
-                return ""
+                return await self._plan_unavailable(
+                    task, "the planner's output was unusable (no plan sections)")
             self.emit("planning", f"plan generated ({len(plan)} chars, "
                        f"{result.num_turns} turns, {result.tokens_used} tokens)")
             return plan
@@ -9545,8 +9604,11 @@ class Orchestrator:
             raise
         except Exception as exc:  # noqa: BLE001 — planning is best-effort
             log.warning("planning step failed (proceeding without plan): %s", exc)
-            self.emit("planning", f"planning failed: {exc}")
-        return ""
+            # Capped like the sibling discard event (`_planner_result_failed`):
+            # this string is interpolated into the coder prompt, and an
+            # exception's repr can be arbitrarily long.
+            return await self._plan_unavailable(
+                task, f"planning failed: {str(exc)[:200]}")
 
     async def _apply_decomposition(self, task: Task, plan: str) -> dict | None:
         """Shared tail for both planning paths: if `plan` carries a
@@ -9843,6 +9905,18 @@ class Orchestrator:
                 "conventions not listed there. Its opening, for orientation:\n"
                 f"{plan[:self._PLAN_HEAD_CHARS]}\n"
                 "[… truncated — the complete plan is in `.no_human/PLAN.md`]\n\n"
+            )
+        elif ctx.get("plan_unavailable"):
+            # R3: no plan block used to mean two opposite things — "trivial, none
+            # needed" and "planning died". Say which.
+            plan_block = (
+                "NO IMPLEMENTATION PLAN EXISTS for this task — "
+                f"{ctx['plan_unavailable']}. This is a planning FAILURE, not a "
+                "sign the task is trivial, and nothing was dropped from this "
+                "prompt. Explore before you edit: find and read the files "
+                "involved, confirm the conventions they already use, and only "
+                "then make the smallest change that satisfies every acceptance "
+                "criterion. Do not invent scope the criteria do not ask for.\n\n"
             )
 
         # Repo-map seed (M3, cli-agent-style): ~3K tokens that answer "where does

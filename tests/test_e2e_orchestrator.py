@@ -2097,8 +2097,14 @@ async def test_planner_error_result_never_becomes_the_plan(
     # falsy plan, which is also the guard on the .no_human/PLAN.md write.
     await orch._persist_plan(t, plan)
     assert not (t.context or {}).get("plan")
-    assert "IMPLEMENTATION PLAN" not in orch._build_implement_prompt(t)
-    assert _MAX_TURNS_ERROR not in orch._build_implement_prompt(t)
+    prompt = orch._build_implement_prompt(t)
+    # No plan is inlined as an implementation contract...
+    assert "IMPLEMENTATION PLAN (follow this plan closely" not in prompt
+    assert "the full plan is at `.no_human/PLAN.md`" not in prompt
+    assert _MAX_TURNS_ERROR not in prompt
+    # ...and the coder is told the block is missing because planning FAILED (R3),
+    # not because the task was trivial enough to need no plan.
+    assert "NO IMPLEMENTATION PLAN EXISTS" in prompt
 
     planning = [e for e in events if e.get("kind") == "planning"]
     # The failure is named out loud: what stopped it, how far it got, what it
@@ -2108,6 +2114,166 @@ async def test_planner_error_result_never_becomes_the_plan(
     assert "10 turns" in failed[0]["text"]
     assert "1234 tokens" in failed[0]["text"]
     assert "Reached maximum number of turns" in failed[0]["text"]
+
+
+class ScriptedPlannerBackend:
+    """Returns a scripted `AgentResult` per call and records the turn budget
+    each call was given — the seam R3's retry has to be asserted at."""
+
+    def __init__(self, *results):
+        self._results = list(results)
+        self.budgets: list[int] = []
+
+    async def run(self, prompt, *, cwd, max_turns, effort=None, resume=None,
+                  on_event=None, supervisor_hook=None, **kwargs):
+        self.budgets.append(max_turns)
+        return self._results[min(len(self.budgets) - 1, len(self._results) - 1)]
+
+
+def _exhausted(turns: int) -> AgentResult:
+    return AgentResult(
+        final_text="Claude Code returned an error result: Reached maximum "
+                   f"number of turns ({turns})",
+        num_turns=turns, is_error=True, tokens_used=1234, session_id="s",
+        stop_reason="max_turns")
+
+
+def _r3_config(tmp_path):
+    """Single-planner path at the LIVE planning.max_turns (24), which is what
+    the 14 August tasks actually ran under (code default is 10)."""
+    cfg = _single_planner_config(tmp_path)
+    cfg.data["planning"]["max_turns"] = 24
+    return cfg
+
+
+async def test_planner_turn_exhaustion_retries_once_at_double_turns(
+    bare_repo, tmp_path, store,
+):
+    """R3: a planner that burns its turn cap had its whole spend discarded and
+    the coder ran plan-less. Retry ONCE at double the budget instead."""
+    cfg = _r3_config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    backend = ScriptedPlannerBackend(
+        _exhausted(24),
+        AgentResult(final_text=_SAMPLE_PLAN, num_turns=30, is_error=False,
+                    tokens_used=900, session_id="s", stop_reason="end_turn"),
+    )
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=backend):
+        plan = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert backend.budgets == [24, 48], backend.budgets
+    assert plan == _SAMPLE_PLAN.strip()
+    assert not (t.context or {}).get("plan_unavailable")
+    texts = [e.get("text", "") for e in events if e.get("kind") == "planning"]
+    assert any("retrying once at 48" in x for x in texts), texts
+
+
+async def test_planner_exhausted_twice_tells_the_coder_there_is_no_plan(
+    bare_repo, tmp_path, store,
+):
+    """R3: bounded at exactly one retry — and when it also exhausts, the coder
+    is TOLD there is no plan (an informed coder beats a deceived one)."""
+    cfg = _r3_config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    backend = ScriptedPlannerBackend(_exhausted(24), _exhausted(48))
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=backend):
+        plan = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert plan == ""
+    assert backend.budgets == [24, 48], "exactly one retry, no new loop"
+    prompt = orch._build_implement_prompt(t)
+    assert "NO IMPLEMENTATION PLAN" in prompt
+    assert "ran out of turns twice (24 then 48)" in prompt
+    # The error string itself still never reaches the coder (1bb3be36 holds).
+    assert "Reached maximum number of turns" not in prompt
+    texts = [e.get("text", "") for e in events if e.get("kind") == "planning"]
+    assert any("no plan for the coder" in x and "out of turns twice" in x
+               for x in texts), texts
+
+
+async def test_a_later_planning_round_clears_the_stale_no_plan_notice(
+    bare_repo, tmp_path, store,
+):
+    """The notice describes THIS round's planning. A first round that died and a
+    second that legitimately skipped (`SKIP_PLAN` — trivial one-line diff) must
+    not leave the coder reading "planning FAILURE" about a planner that just
+    called the task trivial. `_replan_for_approval` re-enters here, so a marker
+    that is only ever set is a lie by the second round."""
+    cfg = _r3_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=[].append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend",
+                return_value=ScriptedPlannerBackend(_exhausted(24), _exhausted(48))):
+        assert await orch._generate_plan(t, GitRepo(bare_repo)) == ""
+    assert (t.context or {}).get("plan_unavailable")   # round 1 set it
+
+    with _patch("no_human.core.orchestrator.ClaudeBackend",
+                return_value=PlannerBackend("SKIP_PLAN — one-line diff")):
+        assert await orch._generate_plan(t, GitRepo(bare_repo)) == ""
+
+    assert "plan_unavailable" not in (t.context or {})
+    assert "plan_unavailable" not in (await store.get_task(t.id)).context
+    assert "NO IMPLEMENTATION PLAN" not in orch._build_implement_prompt(t)
+
+
+async def test_planner_non_turn_failure_is_not_retried(
+    bare_repo, tmp_path, store,
+):
+    """The retry exists for turn starvation. Any other terminal failure gets
+    one call and the same honest no-plan notice — never a second Opus run."""
+    cfg = _r3_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=[].append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    backend = ScriptedPlannerBackend(AgentResult(
+        final_text="Claude Code returned an error result: transport closed",
+        num_turns=2, is_error=True, tokens_used=10, session_id="s",
+        stop_reason="error"))
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=backend):
+        plan = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert plan == ""
+    assert backend.budgets == [24]
+    assert "NO IMPLEMENTATION PLAN" in orch._build_implement_prompt(t)
+
+
+async def test_planning_happy_path_is_one_call_and_carries_no_notice(
+    bare_repo, tmp_path, store,
+):
+    """R3 must be byte-invisible when the planner succeeds: one planner call at
+    the configured budget, and a coder prompt with the plan and no notice."""
+    cfg = _r3_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=[].append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    backend = ScriptedPlannerBackend(
+        AgentResult(final_text=_SAMPLE_PLAN, num_turns=5, is_error=False,
+                    tokens_used=200, session_id="s", stop_reason="end_turn"))
+    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=backend):
+        plan = await orch._generate_plan(t, GitRepo(bare_repo))
+    await orch._persist_plan(t, plan)
+
+    assert backend.budgets == [24]
+    prompt = orch._build_implement_prompt(t)
+    assert "IMPLEMENTATION PLAN (follow this plan closely" in prompt
+    assert "NO IMPLEMENTATION PLAN" not in prompt
 
 
 async def test_planner_quota_wall_raises_instead_of_planning_blind(
