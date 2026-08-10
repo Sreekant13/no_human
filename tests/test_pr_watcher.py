@@ -261,6 +261,26 @@ async def test_post_reply_comment_stamps_the_agent_marker(monkeypatch):
     assert not pr_watcher.is_agent_comment("hello reviewer")
 
 
+def test_every_product_marker_is_recognized_as_self():
+    """R18 (2026-08-10, PR #147): the verification-receipts comment carries
+    `<!-- no_human:verification-receipts -->`, NOT AGENT_COMMENT_MARKER, so the
+    wake watcher's `_is_self_or_bot` let the product's own receipt re-wake the
+    finished task into a wasted attempt 22 seconds after the PR opened. Every
+    product-authored comment marker shares the `<!-- no_human` prefix; the
+    filter must key on the family, not one member."""
+    from no_human.vcs import pr_watcher
+    assert pr_watcher.is_agent_comment(
+        "<!-- no_human:verification-receipts -->\n## How I verified this")
+    assert pr_watcher.is_agent_comment(
+        "<!-- no_human-agent-comment -->\naddressed the feedback")
+    # A future marker in the same family is covered without a code change.
+    assert pr_watcher.is_agent_comment("<!-- no_human:some-future-surface -->")
+    # Human comments — including ones that merely mention the product.
+    assert not pr_watcher.is_agent_comment("no_human should also fix X")
+    assert not pr_watcher.is_agent_comment("")
+    assert not pr_watcher.is_agent_comment(None)
+
+
 # ── upsert_agent_comment: update one comment, never pile up (PR #7004 had 17) ──
 
 async def test_upsert_updates_existing_github_comment_instead_of_posting_new(monkeypatch):

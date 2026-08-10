@@ -322,9 +322,17 @@ async def check_pr_comments(
 AGENT_COMMENT_MARKER = "<!-- no_human-agent-comment -->"
 
 
+# Every product-authored comment marker starts with this prefix
+# (AGENT_COMMENT_MARKER above, the orchestrator's
+# `<!-- no_human:verification-receipts -->`, and any future surface). R18
+# (2026-08-10): filtering on the one agent marker let the receipts comment
+# re-wake its own finished task 22 seconds after the PR opened.
+_SELF_MARKER_PREFIX = "<!-- no_human"
+
+
 def is_agent_comment(body: str | None) -> bool:
     """True if a PR comment body was authored by no_human itself."""
-    return bool(body) and AGENT_COMMENT_MARKER in body
+    return bool(body) and _SELF_MARKER_PREFIX in body
 
 
 async def post_reply_comment(pr_ref: str, message: str) -> bool:
