@@ -65,16 +65,32 @@ class CorpusTask:
         origin is a bare repo inside *dest*, so the agent's branch push is
         push-proof by construction rather than by luck — the invariant
         `eval.northstar._setup_sandbox` states and then asserts.
+
+        Re-runnable: a second nightly against the same home finds last night's
+        tree and bare origin here and REPLACES both. Not `dirs_exist_ok=True` —
+        merging night 1's residue into night 2's fixture contaminates the
+        measurement. The bare origin goes too: it still carries last night's
+        coder branch, so an agent that can `git fetch origin` a previous
+        night's solution is not being measured on this night's work — and the
+        base push below is rejected non-fast-forward against it anyway (the
+        mutation that cleans only `work` fails the re-run test on exactly
+        that). Deleting
+        is safe because the work tree is disposable by design and
+        `funnel_eval._assert_isolated` has already guaranteed the home is never
+        the operator's ~/.no_human.
         """
         dest = Path(dest)
         work = dest / self.name
+        bare = dest / f"{self.name}-remote.git"
+        for stale in (work, bare):
+            if stale.exists():
+                shutil.rmtree(stale)
         shutil.copytree(self.repo_fixture, work)
         _git(work, "init", "-b", "main")
         _git(work, "config", "user.email", "corpus@example.invalid")
         _git(work, "config", "user.name", "funnel corpus")
         _git(work, "add", "-A")
         _git(work, "commit", "-m", f"{self.name}: base")
-        bare = dest / f"{self.name}-remote.git"
         subprocess.run(["git", "init", "--bare", str(bare)],
                        check=True, capture_output=True)
         _git(work, "remote", "add", "origin", str(bare))

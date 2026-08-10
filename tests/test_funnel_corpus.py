@@ -18,6 +18,7 @@ read.
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -113,6 +114,36 @@ def test_materialize_gives_the_agent_a_local_bare_origin_it_cannot_escape():
                             capture_output=True, text=True).stdout.strip()
     assert Path(origin).resolve().is_relative_to(dest.resolve()), origin
     assert (Path(origin) / "HEAD").exists(), "origin must be a real bare repo"
+
+
+def test_materialize_is_rerunnable_and_does_not_merge_the_previous_run(tmp_path):
+    """A second nightly run against the SAME home must not crash, and must not
+    inherit night 1's tree. Before the fix `copytree` raised FileExistsError on
+    every tier, so the launchd nightly job succeeded once and crashed forever
+    after; merging instead of replacing would be worse — stale residue in the
+    fixture contaminates the measurement.
+    """
+    task = load_corpus()[0]
+    first = task.materialize(tmp_path)
+    stale = first / "LEFTOVER_FROM_NIGHT_1.txt"
+    stale.write_text("residue")
+    # ...and the coder branch night 1 pushed to the tier's bare origin. If that
+    # survives, night 2's agent can fetch last night's solution.
+    subprocess.run(["git", "push", "origin", "HEAD:refs/heads/nh/night-1"],
+                   cwd=first, check=True, capture_output=True)
+
+    second = task.materialize(tmp_path)
+
+    assert second == first
+    assert not stale.exists(), "re-materialize merged night 1's residue"
+    assert (second / ".git").is_dir()
+    origin = subprocess.run(["git", "remote", "get-url", "origin"], cwd=second,
+                            capture_output=True, text=True).stdout.strip()
+    assert Path(origin).resolve().is_relative_to(tmp_path.resolve()), origin
+    heads = subprocess.run(["git", "branch", "--format=%(refname:short)"],
+                           cwd=origin, capture_output=True,
+                           text=True).stdout.split()
+    assert heads == ["main"], f"night 1's branches survived in origin: {heads}"
 
 
 def test_no_fixture_quotes_this_project_or_a_real_employer_subject():
