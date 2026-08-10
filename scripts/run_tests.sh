@@ -3,9 +3,16 @@
 #
 # Usage:
 #   ./scripts/run_tests.sh              # full suite, parallel
-#   ./scripts/run_tests.sh fast          # fast tests only (~50s), skip slow
+#   ./scripts/run_tests.sh fast          # the PR lane: not slow, not nightly
 #   ./scripts/run_tests.sh slow          # slow tests only (~5min)
+#   ./scripts/run_tests.sh nightly       # the nightly lane: slow or nightly
 #   ./scripts/run_tests.sh full          # all tests, parallel
+#
+# `fast` and `nightly` are the two halves of the CI split in
+# .github/workflows/ci.yml, spelled identically on purpose: if the selectors
+# here and there disagree, a green local run stops predicting the CI result,
+# and a node can fall out of both lanes without anything going red.
+# tests/test_test_lanes.py asserts the two files agree.
 #
 # Designed to work with any runner: local, agent-a, CI.
 # Exit code 0 = all tests passed.
@@ -30,13 +37,20 @@ run_web_tests() {
 
 case "$MODE" in
   fast)
-    echo "=== Running fast tests only (skipping slow) ==="
-    uv run pytest -q --tb=short -n auto -m "not slow" "$@"
+    echo "=== Running the PR lane (not slow, not nightly) ==="
+    uv run pytest -q --tb=short -n auto -m "not slow and not nightly" "$@"
     run_web_tests
     ;;
   slow)
     echo "=== Running slow tests only ==="
     uv run pytest -q --tb=short -n auto -m slow "$@"
+    ;;
+  nightly)
+    # -n 4, not -n auto: this one is run unattended by the 03:00 launchd job on
+    # a machine that is also serving the live queue, and -n auto has wedged
+    # this repo before. The other modes are left as they were.
+    echo "=== Running the nightly lane (slow or nightly) ==="
+    uv run pytest -q --tb=short -n 4 -m "slow or nightly" "$@"
     ;;
   full|*)
     echo "=== Running full test suite ==="

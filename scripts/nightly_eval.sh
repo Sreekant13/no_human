@@ -15,8 +15,21 @@
 # operator is looking at. `funnel_eval._assert_isolated` re-checks that in
 # Python; this is the outer half of the same guarantee.
 #
-# Exit code IS the verdict and is passed straight through: 0 only when every
-# tier passed and the ratchet held. A timeout is 124, like timeout(1).
+# This job is also where the NIGHTLY TEST LANE runs. GitHub Actions minutes
+# are exhausted, so the scheduled workflow in ci.yml cannot be the only home
+# for `-m "slow or nightly"`; this machine already wakes at 03:00, so the lane
+# rides along for free. It runs FIRST, because the eval below has a four-hour
+# timeout that would otherwise pre-empt it, and its failure does not stop the
+# eval — both verdicts are wanted from one run.
+#
+# Exit code IS the verdict: 0 only when the nightly test lane passed AND every
+# eval tier passed and the ratchet held. The eval's own code wins when both
+# fail, so a timeout is still 124, like timeout(1).
+#
+# NOT SAFE TO RUN CONCURRENTLY WITH THE 03:00 JOB. There is no run lock here,
+# and since 6b4a73f6 a second concurrent run rmtree's the live work tree.
+# Nothing below changes that; adding the test lane does not make a manual run
+# alongside the scheduled one safe.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -91,10 +104,25 @@ run_guarded() {
 CAFFEINE=()
 command -v caffeinate >/dev/null 2>&1 && CAFFEINE=(caffeinate -i)
 
+# The nightly test lane. Guarded like the eval so a wedged xdist worker cannot
+# hold the machine until morning, and its code is captured rather than allowed
+# to abort the script under `set -e`: a red lane must still leave an eval
+# verdict behind.
+echo "=== nightly test lane: ./scripts/run_tests.sh nightly ==="
+lane_rc=0
+run_guarded "${CAFFEINE[@]}" ./scripts/run_tests.sh nightly || lane_rc=$?
+echo "=== nightly test lane exit $lane_rc ==="
+
 echo "=== nightly funnel eval: home=$NH_NIGHTLY_HOME out=$NH_NIGHTLY_OUT ==="
 rc=0
 run_guarded "${CAFFEINE[@]}" uv run python -m no_human.eval.funnel_eval \
   --home "$NH_NIGHTLY_HOME" --out "$NH_NIGHTLY_OUT" || rc=$?
 
-echo "=== exit $rc — read $NH_NIGHTLY_OUT/SUMMARY.md ==="
-exit "$rc"
+echo "=== eval exit $rc, test lane exit $lane_rc — read $NH_NIGHTLY_OUT/SUMMARY.md ==="
+# The eval's code wins when both are non-zero, so 124 still means what the
+# header says it means; the lane can only turn a 0 into a failure, never mask
+# one.
+if [ "$rc" -ne 0 ]; then
+  exit "$rc"
+fi
+exit "$lane_rc"

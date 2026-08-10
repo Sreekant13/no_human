@@ -172,4 +172,5 @@ pythonpath = ["src"]
 markers = [
     "real_backend: exercises the real ClaudeBackend over a mocked SDK client — exempt from the hermetic stub",
     "slow: marks tests that take >10s (deselect with '-m \"not slow\"')",
+    "nightly: heavy guard whose protection is consumed off the push path (at DMG/publish time, or only when the demo is rebuilt) — runs in the nightly/release lane, not per PR. Lane composition is pinned by tests/test_test_lanes.py.",
 ]

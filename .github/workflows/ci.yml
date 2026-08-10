@@ -15,6 +15,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The nightly lane. `-m "slow or nightly"` collects the heavy guards whose
+  # protection is consumed off the push path, so they need a trigger that is
+  # not a push; without one the mark would just switch them off. 04:00 UTC is
+  # chosen to sit clear of the machine's own 03:00 local launchd eval.
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -165,16 +172,26 @@ jobs:
       # fixed. Repro data, the hypothesis already ruled out, and what a fix has
       # to prove are in docs/KNOWN_ISSUES.md (KI-1). Run it locally, repeatedly,
       # if you touch core/db.py or the scheduler.
-      # PRs run the fast lane (`-m "not slow"`: the 47 tests marked slow are
-      # >10s each — the e2e/orchestrator tail that dominates wall-clock); every
-      # push to main runs the full suite, so every merged state still carries
-      # the whole signal. Same trade the windows job below already makes, for
-      # the same reason: a job that bills its worst case on every PR commit is
-      # a job that gets switched off.
+      # Three lanes, ONE computed selector — a second job would be a second
+      # thing to keep in sync, and the failure it fails at is a node that runs
+      # in neither lane, which looks exactly like a node that passes.
+      #
+      #   pull_request              -m "not slow and not nightly"
+      #   schedule / dispatch       -m "slow or nightly"
+      #   push to main              (empty — everything, as before)
+      #
+      # `slow` is >10s each (the e2e/orchestrator tail that dominates
+      # wall-clock). `nightly` is the heavy guards whose protection is consumed
+      # off the push path. The two lanes partition the suite: every node is in
+      # exactly one, which tests/test_test_lanes.py pins and the collection
+      # counts reconcile. Every push to main still runs the full suite, so
+      # every merged state carries the whole signal — same trade the windows
+      # job below already makes, for the same reason: a job that bills its
+      # worst case on every PR commit is a job that gets switched off.
       - name: Run tests
         run: |
           uv run pytest -q --tb=short -n 4 \
-            ${{ github.event_name == 'pull_request' && '-m "not slow"' || '' }} \
+            ${{ (github.event_name == 'pull_request' && '-m "not slow and not nightly"') || ((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '-m "slow or nightly"') || '' }} \
             --deselect tests/test_scheduler.py::test_reanalysis_maybe_run_produces_result \
             --deselect tests/test_scheduler.py::test_reanalysis_dedup_across_runs \
             --deselect tests/test_scheduler.py::test_two_repos_run_concurrently_in_worktrees

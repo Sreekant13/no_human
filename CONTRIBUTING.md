@@ -115,12 +115,34 @@ found`, and the assertion you see is about a task that escalated, which does not
 point at the cause. `uv run pytest` puts the virtualenv's `bin` on `PATH`, which
 is why CI uses it. This is recorded because nothing else in the repo says so.
 
-Two markers are declared in `pyproject.toml`:
+Three markers are declared in `pyproject.toml`:
 
-- `slow` for tests over 10 seconds. Skip them with `-m "not slow"`.
+- `slow` for tests over 10 seconds.
+- `nightly` for heavy guards whose protection is consumed off the push path —
+  at DMG or publish time, or only when the demo is rebuilt.
 - `real_backend` for tests that exercise the real `ClaudeBackend` class over a
   mocked SDK client. They are exempt from the hermetic stub and still make no
   network call.
+
+The first two define the two lanes CI runs, and they partition the suite:
+
+| Trigger | Selector |
+|---|---|
+| pull request | `-m "not slow and not nightly"` |
+| nightly schedule, or `workflow_dispatch` | `-m "slow or nightly"` |
+| push to `main` | none — the whole suite |
+
+Every node is in exactly one lane. That is the property worth protecting: a
+mistyped marker expression drops a node out of *both*, and a test that runs
+nowhere looks exactly like a test that passes. `tests/test_test_lanes.py` pins
+the selectors in `ci.yml` and `scripts/run_tests.sh` against each other, and
+the two lanes' collection counts must sum to the unfiltered total:
+
+```
+uv run pytest --collect-only -q | tail -1
+uv run pytest --collect-only -q -m "not slow and not nightly" | tail -1
+uv run pytest --collect-only -q -m "slow or nightly" | tail -1
+```
 
 Two tests need a running Windsurf IDE on the same machine and fail everywhere
 else, including CI:
@@ -148,8 +170,9 @@ hypothesis already ruled out, and what a fix has to prove. Run it locally,
 several times, if you touch `core/db.py` or the scheduler.
 
 There is also [`scripts/run_tests.sh`](scripts/run_tests.sh) with `fast`,
-`slow`, and `full` modes. It uses `-n auto`, so prefer the direct `pytest`
-invocation above.
+`slow`, `nightly` and `full` modes. `fast` and `nightly` are the two CI lanes,
+spelled identically on purpose. Everything except `nightly` uses `-n auto`, so
+prefer the direct `pytest` invocation above.
 
 ### Web board
 
