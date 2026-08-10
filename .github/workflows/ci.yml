@@ -15,12 +15,26 @@ on:
   push:
     branches: [main]
   pull_request:
-  # The nightly lane. `-m "slow or nightly"` collects the heavy guards whose
-  # protection is consumed off the push path, so they need a trigger that is
-  # not a push; without one the mark would just switch them off. 04:00 UTC is
-  # chosen to sit clear of the machine's own 03:00 local launchd eval.
-  schedule:
-    - cron: "0 4 * * *"
+  # The nightly lane's manual handle. `-m "slow or nightly"` collects the heavy
+  # guards whose protection is consumed off the push path, so they need a
+  # trigger that is not a push; without one the mark would just switch them off.
+  #
+  # NO `schedule:` HERE, deliberately, and the reason is the one this whole
+  # change exists for. `schedule` is workflow-level, not job-level, and the
+  # `desktop` and `windows` jobs below gate on `github.event_name !=
+  # 'pull_request'` — which is TRUE for a scheduled run. A cron would therefore
+  # fire python + web + desktop + windows every night, and windows bills at 2x
+  # a Linux minute with a 45-minute timeout. Adding a nightly bill to a repo
+  # whose presenting problem is exhausted Actions minutes is the opposite of
+  # the fix. (The `concurrency` group below is a second reason: it keys on
+  # `github.ref`, so a scheduled run on main and a push to main share a group
+  # under `cancel-in-progress: true` — a merge would silently cancel the
+  # nightly, and a cancelled run is not a red one.)
+  #
+  # Where the lane actually runs today: the machine's own 03:00 launchd job,
+  # `scripts/nightly_eval.sh`, which invokes `./scripts/run_tests.sh nightly`.
+  # A cron here is only worth adding once windows/desktop/web carry a
+  # `github.event_name != 'schedule'` guard of their own.
   workflow_dispatch:
 
 concurrency:
@@ -177,7 +191,7 @@ jobs:
       # in neither lane, which looks exactly like a node that passes.
       #
       #   pull_request              -m "not slow and not nightly"
-      #   schedule / dispatch       -m "slow or nightly"
+      #   workflow_dispatch         -m "slow or nightly"
       #   push to main              (empty — everything, as before)
       #
       # `slow` is >10s each (the e2e/orchestrator tail that dominates
@@ -191,7 +205,7 @@ jobs:
       - name: Run tests
         run: |
           uv run pytest -q --tb=short -n 4 \
-            ${{ (github.event_name == 'pull_request' && '-m "not slow and not nightly"') || ((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '-m "slow or nightly"') || '' }} \
+            ${{ (github.event_name == 'pull_request' && '-m "not slow and not nightly"') || (github.event_name == 'workflow_dispatch' && '-m "slow or nightly"') || '' }} \
             --deselect tests/test_scheduler.py::test_reanalysis_maybe_run_produces_result \
             --deselect tests/test_scheduler.py::test_reanalysis_dedup_across_runs \
             --deselect tests/test_scheduler.py::test_two_repos_run_concurrently_in_worktrees

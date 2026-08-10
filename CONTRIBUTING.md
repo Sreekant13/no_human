@@ -129,8 +129,16 @@ The first two define the two lanes CI runs, and they partition the suite:
 | Trigger | Selector |
 |---|---|
 | pull request | `-m "not slow and not nightly"` |
-| nightly schedule, or `workflow_dispatch` | `-m "slow or nightly"` |
+| `workflow_dispatch` | `-m "slow or nightly"` |
 | push to `main` | none — the whole suite |
+
+There is no `schedule:` in `ci.yml` on purpose. `schedule` is workflow-level,
+and the `desktop` and `windows` jobs gate on `github.event_name !=
+'pull_request'` — true for a scheduled run — so a cron would bill the
+45-minute, 2x-priced windows job every night. The nightly lane's actual home
+is the machine's 03:00 `scripts/nightly_eval.sh`, which runs
+`./scripts/run_tests.sh nightly` under a throwaway `HOME` and folds its exit
+code into the nightly verdict.
 
 Every node is in exactly one lane. That is the property worth protecting: a
 mistyped marker expression drops a node out of *both*, and a test that runs

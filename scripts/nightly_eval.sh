@@ -16,11 +16,16 @@
 # Python; this is the outer half of the same guarantee.
 #
 # This job is also where the NIGHTLY TEST LANE runs. GitHub Actions minutes
-# are exhausted, so the scheduled workflow in ci.yml cannot be the only home
-# for `-m "slow or nightly"`; this machine already wakes at 03:00, so the lane
-# rides along for free. It runs FIRST, because the eval below has a four-hour
-# timeout that would otherwise pre-empt it, and its failure does not stop the
-# eval — both verdicts are wanted from one run.
+# are exhausted and ci.yml deliberately carries no `schedule:` (a cron there
+# would also fire the windows job, which bills at 2x), so this machine — which
+# already wakes at 03:00 — is where `-m "slow or nightly"` actually runs. It
+# runs FIRST, because the eval below has a four-hour timeout that would
+# otherwise pre-empt it, and its failure does not stop the eval — both
+# verdicts are wanted from one run.
+#
+# THE TEST LANE GETS A THROWAWAY HOME OF ITS OWN, separate from both the
+# operator's ~/.no_human and this script's NH_NIGHTLY_HOME. See the comment at
+# the invocation: the suite binds its database path from HOME at import time.
 #
 # Exit code IS the verdict: 0 only when the nightly test lane passed AND every
 # eval tier passed and the ratchet held. The eval's own code wins when both
@@ -108,9 +113,29 @@ command -v caffeinate >/dev/null 2>&1 && CAFFEINE=(caffeinate -i)
 # hold the machine until morning, and its code is captured rather than allowed
 # to abort the script under `set -e`: a red lane must still leave an eval
 # verdict behind.
-echo "=== nightly test lane: ./scripts/run_tests.sh nightly ==="
+#
+# IT RUNS UNDER ITS OWN HOME, and that is not tidiness. tests/conftest.py says
+# it in the repo's own words: `config.DB_PATH` and `config.CONFIG_PATH` bind at
+# IMPORT time from `Path.home()/".no_human"`, so the suite writes `cache/`,
+# `worktrees/` and `config.yaml` into whatever HOME it is given and "a branch
+# carrying a migration replays that migration into the operator's live database
+# — which has actually happened". The mitigation there is "a procedure rather
+# than a guard", and an unattended 03:00 job cannot follow a procedure. Two
+# things make it worse than the general case here: the live server holds
+# `~/.no_human/no_human.db` open, and this lane is exactly the e2e/orchestrator
+# tail that creates and rmtree's directories under `~/.no_human/worktrees/`,
+# where a live task worktree sits. NH_NIGHTLY_HOME is the eval's isolation and
+# is not reused: the lane gets a throwaway of its own, removed on exit.
+#
+# UV_CACHE_DIR is pinned to the real one first, because uv resolves its cache
+# from HOME (`uv cache dir` under a fresh HOME points inside it) and an
+# unpinned cache means re-downloading the whole environment every night.
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$HOME/.cache/uv}"
+lane_home="$(mktemp -d)"
+trap 'rm -rf "$lane_home"' EXIT
+echo "=== nightly test lane: ./scripts/run_tests.sh nightly (HOME=$lane_home) ==="
 lane_rc=0
-run_guarded "${CAFFEINE[@]}" ./scripts/run_tests.sh nightly || lane_rc=$?
+run_guarded "${CAFFEINE[@]}" env HOME="$lane_home" ./scripts/run_tests.sh nightly || lane_rc=$?
 echo "=== nightly test lane exit $lane_rc ==="
 
 echo "=== nightly funnel eval: home=$NH_NIGHTLY_HOME out=$NH_NIGHTLY_OUT ==="

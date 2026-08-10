@@ -49,8 +49,21 @@ case "$MODE" in
     # -n 4, not -n auto: this one is run unattended by the 03:00 launchd job on
     # a machine that is also serving the live queue, and -n auto has wedged
     # this repo before. The other modes are left as they were.
+    #
+    # The same three --deselects ci.yml applies, and for a sharper reason here.
+    # KI-1 (docs/KNOWN_ISSUES.md) fails test_two_repos_run_concurrently_in_worktrees
+    # in roughly a third of runs, and that test IS `slow`, so it is in this
+    # lane. scripts/nightly_eval.sh propagates this mode's exit code into its
+    # own verdict, so without these the flake turns the nightly verdict red and
+    # masks the eval signal the lane was added not to mask. The other two are
+    # not `slow` and so collect nothing here; they are listed anyway because
+    # the list that drifts is the list nobody reconciles.
     echo "=== Running the nightly lane (slow or nightly) ==="
-    uv run pytest -q --tb=short -n 4 -m "slow or nightly" "$@"
+    uv run pytest -q --tb=short -n 4 -m "slow or nightly" \
+      --deselect tests/test_scheduler.py::test_reanalysis_maybe_run_produces_result \
+      --deselect tests/test_scheduler.py::test_reanalysis_dedup_across_runs \
+      --deselect tests/test_scheduler.py::test_two_repos_run_concurrently_in_worktrees \
+      "$@"
     ;;
   full|*)
     echo "=== Running full test suite ==="
