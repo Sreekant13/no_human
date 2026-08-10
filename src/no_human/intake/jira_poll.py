@@ -65,6 +65,14 @@ _TARGET_CATEGORY: dict[TaskStatus, str] = {
     TaskStatus.DONE: "done",
 }
 
+# Status-category key -> human label for event text only (adapter.transition
+# still gets the raw key above). Falls back to the raw key if unmapped.
+_CATEGORY_LABEL: dict[str, str] = {
+    "new": "To Do",
+    "indeterminate": "In Progress",
+    "done": "Done",
+}
+
 
 @dataclass
 class PollResult:
@@ -187,7 +195,8 @@ class JiraPoller:
                     # handled outcome; only a raised exception should retry.
                     jira["nh_jira_transitions"] = [*done_cats, target]
                     changed = True
-                    self._on_event("jira_transitioned", f"{task.external_id} → {target}")
+                    label = _CATEGORY_LABEL.get(target, target)
+                    self._on_event("jira_transitioned", f"{task.external_id} → {label}")
 
             # --- comment (existing behavior; PR link now also on DONE) ---
             note = _STATUS_NOTE.get(task.status)

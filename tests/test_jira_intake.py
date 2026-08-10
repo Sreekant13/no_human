@@ -455,10 +455,12 @@ async def test_poller_claim_transitions_in_progress_once(monkeypatch, tmp_path):
 
         a = JiraAdapter(_cfg(write_back=True))
         transition_calls = []
+        events = []
         monkeypatch.setattr(a, "transition",
                             lambda key, cat: transition_calls.append((key, cat)) or True)
         monkeypatch.setattr(a, "comment", lambda *a_, **k_: True)
-        poller = JiraPoller(a, store, config=_cfg(write_back=True))
+        poller = JiraPoller(a, store, config=_cfg(write_back=True),
+                            on_event=lambda kind, text: events.append((kind, text)))
 
         await poller.sync_statuses()
         await poller.sync_statuses()          # second tick: no re-trigger
@@ -466,6 +468,11 @@ async def test_poller_claim_transitions_in_progress_once(monkeypatch, tmp_path):
         assert transition_calls == [("PROJ-1", "indeterminate")]
         saved = await store.get_task(task.id)
         assert saved.context["jira"]["nh_jira_transitions"] == ["indeterminate"]
+
+        transitioned = [text for kind, text in events if kind == "jira_transitioned"]
+        assert len(transitioned) == 1
+        assert "In Progress" in transitioned[0]
+        assert "indeterminate" not in transitioned[0]
     finally:
         await store.close()
 
