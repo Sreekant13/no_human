@@ -59,6 +59,12 @@ _UNPARSED_TAIL_CHARS = 300
 # last bounded attempt for a defect that did not exist.
 _REVIEW_TURNS = 30
 _REVIEW_TIMEOUT = 600
+# Trivial tier (2026-08-09): a real review, bounded. The whole artefact is a
+# ≤2-file prose diff already pasted into the prompt, plus the ticket — the
+# turns exist for opening cited files, and there are at most two. Still a
+# multi-turn agent session with tools, still fail-closed, still infra-retried
+# (which doubles this budget once, as for any other tier).
+_TRIVIAL_REVIEW_TURNS = 6
 # Constraint #4: retry only on infra failures, and boundedly. A reviewer that
 # never reaches a verdict is an infra failure, not a finding.
 _REVIEW_INFRA_RETRIES = 1
@@ -265,9 +271,29 @@ def _git_diff(repo_path: Path, before: str = "HEAD~1", after: str = "HEAD") -> t
     return raw[:_DIFF_CAP], len(raw)
 
 
-def _changed_paths(repo_path: Path, before: str, after: str) -> list[str]:
-    """Paths that exist at `after`. Deletions are skipped (no text to show);
-    for a rename, the new path is returned."""
+def _changed_paths(repo_path: Path, before: str, after: str,
+                   *, include_deleted: bool = False) -> list[str]:
+    """Two contracts, picked by ``include_deleted``.
+
+    Default (``False``) — **what can I show the reviewer?** Only paths that
+    exist at `after`: deletions are skipped (a deleted file has no text to
+    show) and a rename yields its NEW path. This is what the review prompt
+    builders want and it is unchanged.
+
+    ``True`` — **what did this diff TOUCH?** Adds the paths the diff REMOVED:
+    deletions, and the SOURCE side of a rename or copy. The trivial tier's
+    escalation checkpoint asks this question, and asking the first one instead
+    cost it two defects of the same shape: a diff that deleted
+    `core/never_push.py` while rewording one doc read as a two-file prose edit,
+    and — once deletions were counted — `git mv`-ing that module to
+    `docs/never_push.md` read as two prose files, because only the destination
+    was ever returned. A rename REMOVES its source exactly as a delete does.
+
+    `-M` stays on for both: rename detection is then explicit rather than left
+    to `diff.renames` (on by default since git 2.9), so neither contract shifts
+    under a user's config. A COPY's source still exists, so listing it is
+    strictly conservative — it can only escalate, never bound.
+    """
     proc = subprocess.run(
         ["git", "diff", "--name-status", "-M", f"{before}..{after}"],
         cwd=repo_path, capture_output=True, text=True, errors="replace",
@@ -275,8 +301,14 @@ def _changed_paths(repo_path: Path, before: str, after: str) -> list[str]:
     paths: list[str] = []
     for line in (proc.stdout or "").splitlines():
         parts = line.split("\t")
-        if len(parts) < 2 or parts[0].startswith("D"):
+        if len(parts) < 2:
             continue
+        status = parts[0]
+        if status.startswith("D") and not include_deleted:
+            continue
+        # `R100\told\tnew` / `C75\told\tnew` — parts[1] is the source.
+        if include_deleted and status[:1] in ("R", "C") and len(parts) > 2:
+            paths.append(parts[1])
         paths.append(parts[-1])
     return paths
 
@@ -1602,6 +1634,7 @@ class AdversarialReviewer:
             # Full agent session for post-implementation reviews (needs to read files).
             decision = await self._agent_review(
                 prompt, repo_path, before_ref=before_ref,
+                max_turns=self._tier_review_turns(task),
                 extra_repos=linked_repos or None,
             )
 
@@ -1642,6 +1675,26 @@ class AdversarialReviewer:
             if angle_decisions:
                 decision = merge_angle_findings(decision, angle_decisions)
         return decision
+
+    @staticmethod
+    def _tier_review_turns(task: Task) -> int:
+        """Turn budget for the gate review: BOUNDED on the trivial tier, full
+        everywhere else.
+
+        What does NOT change on the fast path, because it is the gate: a fresh
+        Agent SDK context, the reviewer model, read-only repo tools, the
+        pass/fail checklist with cited evidence, citation verification, and
+        fail-closed on a missing verdict. Only the exploration budget shrinks —
+        a ≤2-file prose diff that needs 30 turns of repo reading is a diff that
+        no longer matches the tier, and by the time this is read the
+        orchestrator has already re-checked the actual diff and escalated if
+        it did not (`_run_reviewer`).
+        """
+        try:
+            from ..core.complexity import is_trivial
+            return _TRIVIAL_REVIEW_TURNS if is_trivial(task) else _REVIEW_TURNS
+        except Exception:  # noqa: BLE001 — never let a tier lookup skip review
+            return _REVIEW_TURNS
 
     @staticmethod
     def _tier_wants_angles(task: Task) -> bool:

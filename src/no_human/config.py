@@ -1081,6 +1081,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "forbidden_paths": [".env", "secrets/", "*.key", "*.pem"],
         "block_test_weakening": True,
     },
+    "pipeline": {
+        # Proportionality (2026-08-09). Measured: a one-line edit to a markdown
+        # file took 35+ minutes of intake grill → 9-turn Opus planning → 9
+        # skills → multi-stage review, while the complexity gate had already
+        # (correctly) computed "tier simple" and nothing downstream read it.
+        # ON: a task whose file set is ≤2 non-executed prose files skips the
+        # grill, plans on the utility model in ≤2 turns, loads no discovered
+        # skills, and gets a BOUNDED (not skipped, not weakened) review; it
+        # escalates back to full ceremony the moment the plan or the actual
+        # diff leaves that file set. OFF: exactly the pre-2026-08-09 pipeline.
+        # What this never touches: the review gate itself, the tamper guard,
+        # the export gate, and the human merge.
+        "trivial_tier": {"enabled": True},
+    },
     "planning": {
         # Plan-first worker (Phase 1): generate a detailed implementation plan
         # before the implement loop. Sonnet explores the codebase and writes a

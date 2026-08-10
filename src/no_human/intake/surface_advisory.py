@@ -13,7 +13,7 @@ from __future__ import annotations
 _TEST_DIR_SEGMENTS = {"test", "tests", "__tests__"}
 
 
-def _extract_path_token(item: str) -> str | None:
+def extract_path_token(item: str) -> str | None:
     """First path-like token in a raw plan line (mirrors
     ``scope_guard._extract_path_token`` without importing it, to avoid
     coupling this pure module to the agent-side scope guard)."""
@@ -59,7 +59,7 @@ def classify_surfaces(files_to_change: list[str]) -> set[str]:
     """Distinct surfaces touched by *files_to_change*, tests-only excluded."""
     surfaces: set[str] = set()
     for item in files_to_change:
-        path = _extract_path_token(item)
+        path = extract_path_token(item)
         if not path:
             continue
         path = path.removeprefix("./")

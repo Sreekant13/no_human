@@ -83,6 +83,7 @@ from ..vcs import pr_watcher
 from ..vcs.receipts import verify_pr_receipt
 from . import plan_gate
 from .bounds import Bounds, QuotaExhausted, StuckDetector
+from .complexity import is_trivial as _is_trivial
 from .db import AUX_USAGE_TIERS, Store
 from .pricing import class_breakdown as _class_breakdown
 from .pricing import (
@@ -520,6 +521,30 @@ _REFORMAT_NUDGE = (
 #: it in any useful sense. Used as a CEILING on the attempt knob, never a floor
 #: — shortening the attempt ceiling shortens this too.
 _NUDGE_TIMEOUT_S = 120.0
+
+#: NOTE (drift): the file names in this text are a hand-kept SUMMARY of
+#: `complexity._INSTRUCTION_ROOTS` + `_REPO_INSTRUCTION_FILES` +
+#: `complexity._GATE_CONTROL_NAMES`, which is what actually decides. Prose, not
+#: logic — a stale name here misinforms an operator, it never mis-gates a diff.
+#: Same for `cli.commands.format_tier_summary`. Re-read those three when adding
+#: a family; deriving the sentence was rejected as more machinery than the
+#: mistake is worth.
+#: What the fast path actually skips, in the task's own record. An operator
+#: must be able to read WHICH ceremony was dropped and why — a cheaper run
+#: that does not say it was cheaper is indistinguishable from a broken one.
+TRIVIAL_FAST_PATH_NOTE = (
+    "trivial tier: intake scoping questions skipped, utility-model planner "
+    "(≤2 turns), no skill discovery, bounded single-pass review. NOT reduced: "
+    "the review gate itself (fresh context, cited pass/fail), the tamper "
+    "guard, the export gate, and the human merge. A diff that edits agent "
+    "instructions (.agents/, CLAUDE.md, AGENTS.md) or the gates' own control "
+    "data (EXPORT_CLASSIFICATION.txt, RELEASE_MANIFEST.txt) gets the full "
+    "review, not the bounded one."
+)
+
+#: Planner turns on the fast path. The plan for a ≤2-file prose edit is a
+#: sentence; ten turns of Opus exploration buys nothing it can act on.
+_TRIVIAL_PLAN_TURNS = 2
 
 
 def _moa_complexity_signals(task: "Task", moa_cfg: dict) -> list[str]:
@@ -1855,6 +1880,12 @@ class Orchestrator:
                 except Exception as exc:  # noqa: BLE001
                     self._advisory(f"intake evaluator skipped: {exc}")
 
+            # Proportionality (2026-08-09): classify BEFORE the grill, because
+            # the grill is the first stage the verdict can make cheaper. The
+            # intake evaluator above has already run, so its verdict is one of
+            # the signals this reads.
+            await self._classify_tier(task)
+
             # §6 directive: the full grill runs on EVERY task before planning
             # so the plan builds on the enriched, question-answered spec.
             await self._run_intake_grill(task)
@@ -1984,7 +2015,14 @@ class Orchestrator:
         self._discovered_skills: list[str] = []
         self._discovered_skills_info: list = []  # SkillInfo objects for compact instructions
         self._copied_skill_dirs: list[Path] = []  # user-skill copies to clean up
-        if task.repo_path:
+        if _is_trivial(task):
+            # Every delivered skill costs context on every turn of the session.
+            # The measured trace loaded NINE of them to delete a phrase from a
+            # markdown file. Confirmed DB rules are untouched — this drops the
+            # optional, relevance-guessed disclosure, not the operator's rules.
+            self.emit("skills_loaded",
+                      "0 skills (trivial tier: skill discovery skipped)")
+        elif task.repo_path:
             extra_roots = [Path(task.repo_path) / ".claude" / "skills"]
             disk_skills = await asyncio.to_thread(
                 discover_skills, extra_roots=extra_roots,
@@ -5347,6 +5385,14 @@ class Orchestrator:
         await self._apply_surface_advisory(ctx, spec, task)
         task.context = ctx
         await self.store.update_task(task)
+        # Escalation checkpoint 1 of 2: the plan is the first statement of the
+        # file set that is not the ticket's own wording. A plan that names a
+        # code file, or more files than the predicate allows, revokes the tier
+        # BEFORE the coder starts — so the attempt runs with full ceremony.
+        from .complexity import named_paths, trivial_paths
+        if not trivial_paths(named_paths(task)):
+            await self._escalate_from_trivial(
+                task, "the plan's file set is not ≤2 prose files")
 
     async def _park_for_plan_approval(
         self, task: Task, plan_text: str, *, capped: bool = False
@@ -7336,6 +7382,60 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001 — advisory, never blocks
             self._advisory(f"acting on eval verdict skipped: {exc}")
 
+    async def _classify_tier(self, task: Task) -> str:
+        """Record the complexity tier BEFORE the intake grill, so every stage
+        below reads one verdict instead of each re-guessing (proportionality,
+        2026-08-09).
+
+        The tier was already computed twice — at the thinking gate and inside
+        the MoA gate — but both sit AFTER the grill and after planning has been
+        paid for, which is why "tier simple (no signals)" could be computed on
+        a one-line docs edit and change nothing about the 35 minutes that
+        followed. Computing it here is what lets `trivial` buy anything.
+
+        The off-switch binds HERE, once: with ``pipeline.trivial_tier.enabled``
+        false the classification is recorded as ``simple`` and no consumer
+        (which all read the STORED tier via ``is_trivial``) can fast-path.
+        """
+        from .complexity import compute_tier, store_tier, trivial_enabled
+
+        moa_cfg = (self.config.get("llm") or {}).get("moa_planning") or {}
+        tier, signals = compute_tier(task, moa_cfg)
+        if tier == "trivial" and not trivial_enabled(self.config):
+            self.emit("complexity",
+                      "trivial-tier fast path disabled "
+                      "(pipeline.trivial_tier.enabled=false) — full ceremony")
+            tier = "simple"
+        if store_tier(task, tier, signals):
+            await self.store.update_task(task)
+            self.emit("complexity",
+                      f"tier {tier} ({', '.join(signals) or 'no signals'})",
+                      tier=tier, signals=signals)
+        if tier == "trivial":
+            self.emit("fast_path", TRIVIAL_FAST_PATH_NOTE, tier="trivial")
+        return tier
+
+    async def _escalate_from_trivial(self, task: Task, why: str) -> None:
+        """Leave the fast path mid-flight and restore full ceremony.
+
+        The bet the tier made (≤2 non-executed prose files) is re-checked at
+        every point new evidence arrives — after planning names its file set,
+        and again after the coder's actual diff exists. Losing the bet must
+        cost ceremony, never safety, so this only ever RAISES the tier
+        (``store_tier`` is escalate-only) and the review that follows is the
+        full one.
+        """
+        from .complexity import store_tier
+
+        if not _is_trivial(task):
+            return
+        signals = list((task.context or {}).get("complexity_signals") or [])
+        if store_tier(task, "simple", signals):
+            await self.store.update_task(task)
+        self.emit("fast_path",
+                  f"trivial tier revoked: {why} — full ceremony restored",
+                  tier="simple")
+
     async def _run_intake_grill(self, task: Task) -> None:
         """The full intake grill, on EVERY task (operator directive
         2026-07-17): generate the clarifying questions a real requester would
@@ -7357,6 +7457,16 @@ class Orchestrator:
             # must degrade advisory like everything else here, not fail the
             # task (review r1 finding 4).
             if not (self.config.get("intake") or {}).get("grill", True):
+                return
+            # Proportionality: a ≤2-file, prose-only change has nothing for two
+            # LLM sessions of clarifying questions to clarify (the grill is the
+            # most expensive pre-plan stage: two sessions on EVERY task). The
+            # gate that matters is untouched — the review still runs on the
+            # diff, fresh-context and evidence-cited.
+            if _is_trivial(task):
+                self.emit("intake_grill",
+                          "skipped (trivial tier: ≤2 prose files) — "
+                          "the review gate still runs on the diff")
                 return
             # Late-bound module attribute (not a from-import) so tests and
             # callers patch one seam — the same pattern _act_on_eval uses.
@@ -9298,7 +9408,8 @@ class Orchestrator:
         return not (spec.files_to_change or spec.approach.strip()
                     or spec.test_plan.strip())
 
-    async def _plan_unavailable(self, task: Task, reason: str) -> str:
+    async def _plan_unavailable(self, task: Task, reason: str,
+                                *, benign: bool = False) -> str:
         """Record that planning DIED, so the coder is told rather than deceived.
 
         A failed plan and a deliberately skipped one both reach the coder as the
@@ -9309,7 +9420,37 @@ class Orchestrator:
         coder beats a deceived one.
 
         Returns "" so every failure site stays a one-line `return await …`.
+
+        EXCEPT for a ``benign`` non-plan on the trivial tier, where the premise
+        above does not hold. There a plan-less coder is not a deceived one:
+        running on the ticket alone for a ≤2-file prose edit is the tier's own
+        BET, made out loud, and the notice's remedy — "explore before you edit:
+        find and read the files involved, confirm the conventions they already
+        use" — is precisely the exploration pass the fast path exists to stop
+        paying for. Marking it would buy the 35 minutes back through the coder
+        prompt. So the tier records a SKIP instead of a failure. R3's other half
+        is untouched and is why this emits rather than returning silently:
+        nothing is dropped without saying so, and the drop is stated in the same
+        event stream. The gates are unmoved — the review still reads the diff,
+        and the escalation checkpoints still revoke the tier the moment the file
+        set stops matching the bet.
+
+        ``benign`` is the CALLER's claim, never inferred from ``reason``, and
+        only the three sites where a shrunken budget is the whole explanation
+        pass it: a starved planner, an empty one, and one whose output had no
+        plan sections. A planner that CRASHED (transport, API, an exception) is
+        not benign on any tier — R9 review F4 — and gets the full notice, so
+        the coder is told the truth even though it costs the exploration pass.
+        The tier's no-retry rule is decided in `_generate_plan` and is unaffected
+        either way: a crash is not fixed by more turns.
         """
+        if benign and _is_trivial(task):
+            self.emit("planning",
+                      f"trivial tier: no plan ({reason}) — proceeding on the "
+                      "ticket alone. A benign skip, not a planning failure: "
+                      "the tier's bet is that a ≤2-file prose edit does not "
+                      "need one. The review gate is unchanged.")
+            return ""
         self.emit("planning", f"no plan for the coder: {reason}")
         ctx = task.context or {}
         ctx["plan_unavailable"] = reason
@@ -9353,6 +9494,19 @@ class Orchestrator:
             self.config.get("llm", {}).get("review_model", "claude-opus-5"),
         )
         max_turns = plan_cfg.get("max_turns", 10)
+
+        # Proportionality: the fast path plans on the UTILITY tier. Consistent
+        # with the four-tier rule, which reserves that tier for advisory
+        # single-turn work — a plan is advisory by construction (the coder may
+        # depart from it) and here it is a plan to edit ≤2 prose files, while
+        # the verdict on the result still belongs to the reviewer tier. A wrong
+        # answer in this tier degrades a hint, never a verdict.
+        if _is_trivial(task):
+            planner_model = self._utility_model()
+            max_turns = min(int(max_turns), _TRIVIAL_PLAN_TURNS)
+            self.emit("planning",
+                      f"trivial tier: {planner_model}, ≤{max_turns} turns "
+                      "(no MoA fan-out)")
 
         prof = getattr(self, "_active_profile", None)
         test_cmd = ""
@@ -9542,7 +9696,11 @@ class Orchestrator:
         )
 
         moa_cfg = self.config.get("llm", {}).get("moa_planning", {})
-        if moa_cfg.get("enabled", False):
+        # `_is_trivial` reads the STORED tier, so this also honours an operator
+        # who set min_signals=0 (documented "fan out on everything") — three
+        # Opus proposers for a two-line prose edit is the exact disproportion
+        # this path exists to stop, and the fast path is itself opt-out-able.
+        if moa_cfg.get("enabled", False) and not _is_trivial(task):
             # B2: three Opus proposers + an Opus aggregator is ~16× a single
             # planner. Spend it only on tasks that look complex before planning,
             # and say out loud which way the gate went — an invisible gate is how
@@ -9613,9 +9771,24 @@ class Orchestrator:
                 # the observed shape, not total. Widen it on evidence, not on
                 # taste: keying on the text would also match a plan that merely
                 # QUOTES the phrase.
+                # A CRASH first, and on every tier (R9 review F4): a transport
+                # or API failure is not turn starvation, is not fixed by more
+                # turns, and is not "benign" just because the tier is trivial.
+                # The coder is told, exactly as R3 intended.
                 if result.stop_reason != "max_turns":
                     return await self._plan_unavailable(
                         task, f"planning failed ({result.stop_reason or 'error'})")
+                if _is_trivial(task):
+                    # R3 × the fast path. R3 doubles the budget because turn
+                    # exhaustion threw away a whole planning spend nobody meant
+                    # to cap. Here the cap is not an accident to recover from:
+                    # it IS `_TRIVIAL_PLAN_TURNS`, chosen two lines of config
+                    # away, and doubling it would quietly undo the cut while
+                    # the tier still advertises "≤2 turns". Route straight to
+                    # the notice, which for THIS reason is a stated benign skip.
+                    return await self._plan_unavailable(
+                        task, f"the planner used its {max_turns}-turn budget "
+                              "without producing one", benign=True)
                 self.emit("planning",
                           f"planner exhausted its {max_turns}-turn budget — "
                           f"retrying once at {max_turns * 2} turns")
@@ -9631,7 +9804,7 @@ class Orchestrator:
             plan = (result.final_text or "").strip()
             if not plan:
                 return await self._plan_unavailable(
-                    task, "the planner produced no output")
+                    task, "the planner produced no output", benign=True)
             if "SKIP_PLAN" in plan[:200]:
                 self.emit("planning", "skipped (trivial — planner assessed as one-line diff)")
                 return ""
@@ -9646,7 +9819,8 @@ class Orchestrator:
                 return plan
             if self._plan_is_unusable(plan):
                 return await self._plan_unavailable(
-                    task, "the planner's output was unusable (no plan sections)")
+                    task, "the planner's output was unusable (no plan sections)",
+                    benign=True)
             self.emit("planning", f"plan generated ({len(plan)} chars, "
                        f"{result.num_turns} turns, {result.tokens_used} tokens)")
             return plan
@@ -10363,6 +10537,56 @@ class Orchestrator:
             raise TypeError(
                 "confirmed_rules is computed by _run_reviewer (the "
                 "gate-independence channel), never passed by the caller")
+        # Escalation checkpoint 2 of 2, and the last one that can still matter:
+        # what the coder ACTUALLY changed. The tier was granted on a prediction;
+        # the diff is the fact. Anything outside ≤2 prose files gets the full
+        # review — bounding the review of a change that turned out to touch code
+        # is the one way this feature could weaken the gate. Fail-safe by
+        # construction: only a positive `trivial_paths` keeps the bound, so an
+        # unreadable diff and an empty one both escalate.
+        #
+        # `include_deleted=True` because this asks what the diff TOUCHED, not
+        # what can be shown to the reviewer. Without it a DELETION is invisible
+        # here (R9 review F3): removing `core/never_push.py` while rewording one
+        # doc read as a two-file prose edit and kept the bounded review. A
+        # deletion-only diff escalated by accident — it left NO paths, and empty
+        # is not trivial — but the mixed diff, which is the one an attacker
+        # writes, sailed through.
+        if _is_trivial(task) and kwargs.get("mode", "gate") == "gate":
+            from ..review.reviewer import _changed_paths
+            from .complexity import review_must_be_unbounded, trivial_paths
+            try:
+                changed = _changed_paths(
+                    kwargs["repo_path"],
+                    kwargs.get("before_ref") or "HEAD~1",
+                    kwargs.get("after_ref") or "HEAD",
+                    include_deleted=True,
+                )
+            except Exception as exc:  # noqa: BLE001 — unreadable diff escalates
+                changed, exc_note = [], f" ({type(exc).__name__})"
+            else:
+                exc_note = ""
+            if not trivial_paths(changed):
+                await self._escalate_from_trivial(
+                    task,
+                    f"the diff is not ≤2 prose files{exc_note}: "
+                    f"{', '.join(changed[:5]) or 'no readable paths'}")
+            elif review_must_be_unbounded(changed):
+                # R9: the incident this whole path was built from was a one-line
+                # edit to an agent DEFINITION under `.agents/`. It IS ≤2 prose
+                # files, so it reaches the fast path and keeps every cut above
+                # — that is the point, and the tier decides ceremony, not trust.
+                # But the diff read here is agent instructions or the gates' own
+                # control data: one changed sentence redirects an agent on every
+                # future run, and one changed line of EXPORT_CLASSIFICATION.txt
+                # reclassifies a file drop→ship. Both are small on purpose, and
+                # the smallness IS the risk. The exploration budget is the one
+                # reduction that lands on a gate, so it is the one given back —
+                # same reviewer, same fresh context, full turns.
+                await self._escalate_from_trivial(
+                    task,
+                    "the diff edits agent instructions or gate control data "
+                    f"({', '.join(changed)}) — the review is not bounded")
         return await self.reviewer.review(
             task,
             confirmed_rules=self._format_reviewer_memories() or "",

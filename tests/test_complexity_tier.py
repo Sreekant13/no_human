@@ -16,11 +16,23 @@ def _task(**kw):
 
 # ---------------------------------------------------------------- compute --
 
-def test_tiny_task_is_trivial():
+def test_tiny_task_naming_only_prose_is_trivial():
+    """Since the trivial tier BUYS a fast path (2026-08-09) a tiny spec is no
+    longer sufficient — the file set it names must be prose too."""
+    t = _task(title="Drop a struck phrase from notes/positioning.md",
+              description="small docs edit",
+              acceptance_criteria=["phrase gone", "nothing else changed"])
+    tier, signals = compute_tier(t)
+    assert tier == "trivial" and signals == []
+
+
+def test_tiny_task_naming_no_file_is_not_trivial():
+    """The pre-2026-08-09 behaviour for the same spec: a small task that names
+    no file at all is `simple`, not fast-pathed."""
     t = _task(title="Add a camelCase helper", description="small helper",
               acceptance_criteria=["works", "tested"])
     tier, signals = compute_tier(t)
-    assert tier == "trivial" and signals == []
+    assert tier == "simple" and signals == []
 
 
 def test_one_signal_is_standard():
@@ -54,7 +66,7 @@ def test_spec_files_and_plan_size_are_signals():
 
 
 def test_enriched_criteria_do_not_raise_the_tier():
-    t = _task(title="Add a helper", description="small")
+    t = _task(title="Fix a typo in docs/adapters.md", description="small")
     t.acceptance_criteria = [f"enriched {i}" for i in range(8)]
     t.context = {"original_criteria": ["works", "tested"]}
     tier, _ = compute_tier(t)

@@ -774,14 +774,34 @@ def format_tier_summary(
         angles_mark = "·"
         angles_line = "complex-tier angle review passes: not applied"
 
-    return "\n".join([
+    lines = [
         f"tier: {tier_display} ({label})",
         f"signals: {fired}",
         "resourcing:",
         f"  {moa_mark} {moa_line}",
         f"  {thinking_mark} {thinking_line}",
         f"  {angles_mark} {angles_line}",
-    ])
+    ]
+    if tier == "trivial":
+        # The fast path must be READABLE, not inferable from a shorter runtime.
+        # The file names below are a hand-kept summary of the predicate's own
+        # constants — see the drift note on `TRIVIAL_FAST_PATH_NOTE`.
+        # Mirrors orchestrator.TRIVIAL_FAST_PATH_NOTE and the events each stage
+        # emits — same rule as every other line here: one live gate per line.
+        lines += [
+            "trivial-tier fast path (ceremony reduced, gates unchanged):",
+            "  − intake scoping questions: skipped",
+            "  − planner: utility model, ≤2 turns, no MoA fan-out",
+            "  − skill discovery: skipped",
+            "  − review: bounded single pass (fresh context, cited pass/fail)",
+            "  ✓ unchanged: review gate, tamper guard, export gate, human merge",
+            "  ↑ escalates to full ceremony if the plan or diff leaves "
+            "≤2 prose files (deletions included), or if the diff edits agent "
+            "instructions (.agents/, CLAUDE.md, AGENTS.md) or gate control "
+            "data (EXPORT_CLASSIFICATION.txt, RELEASE_MANIFEST.txt) — those "
+            "keep the full review",
+        ]
+    return "\n".join(lines)
 
 
 @cli.group()
