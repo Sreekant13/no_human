@@ -310,17 +310,30 @@ def test_an_unseeded_baseline_reports_only_and_says_so():
                for ln in lines), lines
 
 
-def test_the_shipped_baseline_is_still_the_unseeded_placeholder():
-    """It is seeded by C5's first real run, by a human who read it — never by
-    this branch and never by a runner turning its own red night green."""
+def test_the_shipped_baseline_is_seeded_and_keeps_its_refresh_doctrine():
+    """Seeded 2026-08-10 from the second real run (5/5 PASS on the post-
+    incident tip), by a human who read it — the transition the unseeded-
+    placeholder version of this test existed to guard. What must survive the
+    seed: the refresh doctrine stays in the file, and the seed carries real
+    rows (the tier-by-tier shape is pinned by
+    test_the_seeded_baseline_covers_every_corpus_tier_from_a_passing_run)."""
     from no_human.eval import funnel_eval
     data = json.loads(Path(funnel_eval.BASELINE_PATH).read_text())
-    assert data["unseeded"] is True
-    assert data["tasks"] == []
+    assert data["unseeded"] is False
+    assert data["tasks"] != []
     assert "_how_to_refresh" in data
 
 
-def test_a_red_night_still_reports_the_ratchet_line_in_the_summary(tmp_path):
+def test_a_red_night_still_reports_the_ratchet_line_in_the_summary(
+        tmp_path, monkeypatch):
+    # Pins the UNSEEDED-baseline report line forever, decoupled from the
+    # shipped baseline.json (which is seeded now): reading the shipped file
+    # made this test's meaning change whenever that data file did.
+    from no_human.eval import funnel_eval
+    unseeded = tmp_path / "baseline.json"
+    unseeded.write_text(json.dumps(
+        {"unseeded": True, "tasks": [], "_how_to_refresh": "test fixture"}))
+    monkeypatch.setattr(funnel_eval, "BASELINE_PATH", unseeded)
     run_funnel_eval(tmp_path / "home", tmp_path / "out",
                     backend_factory=lambda t: _TierBackend(t.name),
                     reviewer=_PassReviewer(), corpus=_four_tier_corpus()[:1])
@@ -463,6 +476,13 @@ def test_the_shipped_path_constructs_a_coder_backend_that_actually_works(
     default, so the obvious `ClaudeBackend()` is a TypeError raised BEFORE the
     coder starts: five crashed tiers, exit 1, every night, for a reason that
     is not a regression."""
+    # Decouple from the shipped (now seeded) baseline: this one-tier fixture
+    # run would otherwise report every seeded tier missing and exit 1.
+    from no_human.eval import funnel_eval
+    unseeded = tmp_path / "baseline.json"
+    unseeded.write_text(json.dumps(
+        {"unseeded": True, "tasks": [], "_how_to_refresh": "test fixture"}))
+    monkeypatch.setattr(funnel_eval, "BASELINE_PATH", unseeded)
     _RecordingBackend.made.clear()
     monkeypatch.setattr("no_human.agent.claude_backend.ClaudeBackend",
                         _RecordingBackend)
@@ -599,3 +619,25 @@ def test_the_holdout_env_leaves_no_bytecode_in_the_tree(tmp_path):
     finally:
         sp.Popen = real
     assert captured.get("PYTHONDONTWRITEBYTECODE") == "1", captured
+
+
+def test_the_seeded_baseline_covers_every_corpus_tier_from_a_passing_run():
+    """A seed that omits a tier silently disables the ratchet for it, and a
+    seed copied from a FAILING or empty run arms the ratchet with a floor
+    nobody measured. Pins the real seeded file's shape: every EXPECTED_TIERS
+    member present, seeded from a pass, with a real cost and wall."""
+    import json as _json
+
+    from no_human.eval.funnel_corpus import CORPUS_DIR, EXPECTED_TIERS
+
+    baseline = _json.loads((CORPUS_DIR / "baseline.json").read_text())
+    assert baseline.get("unseeded") is False, "the ratchet is not armed"
+    assert baseline.get("recorded"), "a seed must say when it was measured"
+    assert baseline.get("product_commit"), "a seed must say what it measured"
+    rows = {r["task"]: r for r in baseline.get("tasks", [])}
+    assert set(rows) == set(EXPECTED_TIERS), (
+        f"baseline covers {sorted(rows)}, corpus has {sorted(EXPECTED_TIERS)}")
+    for tier, row in rows.items():
+        assert row["passed"] is True, f"{tier} seeded from a FAILING run"
+        assert row["cost"] > 0, f"{tier} seeded with an empty cost"
+        assert row["wall_seconds"] > 0, f"{tier} seeded with an empty wall"
