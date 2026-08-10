@@ -11,6 +11,7 @@ assert that subscription mode is active before any task can run.
 from __future__ import annotations
 
 import contextlib
+import copy
 import logging
 import os
 import re
@@ -1672,13 +1673,24 @@ def pid_alive(pid: int) -> bool:
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    """Recursively merge ``override`` onto a copy of ``base``."""
-    merged = dict(base)
+    """Recursively merge ``override`` onto a DEEP copy of ``base``.
+
+    The copy has to be deep. ``dict(base)`` duplicates only the top level, so
+    every section the user's config.yaml does not mention came back as
+    DEFAULT_CONFIG's OWN nested dict — and a caller writing into its own
+    resolved config then re-pointed the default for the whole process. Measured
+    2026-08-10: the nightly eval sets ``server.port`` on its isolated instance's
+    config, which moved ``DEFAULT_CONFIG["server"]["port"]`` from 8420 to 8431
+    and surfaced (a suite away) as a README-claims failure. Lists are copied for
+    the same reason — ``never_push_to`` and ``forbidden_paths`` are the shapes a
+    caller is most likely to append to.
+    """
+    merged = copy.deepcopy(base)
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = _deep_merge(merged[key], value)
         else:
-            merged[key] = value
+            merged[key] = copy.deepcopy(value)
     return merged
 
 

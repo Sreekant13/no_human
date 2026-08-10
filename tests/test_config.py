@@ -238,3 +238,30 @@ def test_stuck_active_watchdog_default():
     above the 30-min test timeout) — discoverable and tunable."""
     from no_human.config import DEFAULT_CONFIG
     assert DEFAULT_CONFIG["blockers"]["stuck_active_minutes"] == 40
+
+
+def test_a_loaded_config_never_aliases_the_global_defaults(tmp_path):
+    """A config.yaml that omits a section used to hand back DEFAULT_CONFIG's own
+    nested dict: `_deep_merge` copied only the TOP level, so
+    `merged["server"] is DEFAULT_CONFIG["server"]`. Any caller that then wrote
+    into its own config — the nightly eval sets `server.port` for its isolated
+    instance — silently re-pointed the DEFAULT for the whole process. Measured
+    2026-08-10: DEFAULT_CONFIG["server"]["port"] 8420 -> 8431, which surfaced as
+    a README-claims failure in an unrelated test."""
+    from no_human.config import DEFAULT_CONFIG, load_config
+
+    home = tmp_path / "home"
+    home.mkdir()
+    # No `server:` block — the shape that aliased.
+    (home / "config.yaml").write_text("llm:\n  review_model: claude-opus-5\n")
+
+    before = DEFAULT_CONFIG["server"]["port"]
+    cfg = load_config(home / "config.yaml")
+
+    assert cfg.data["server"] is not DEFAULT_CONFIG["server"], (
+        "the loaded config aliases DEFAULT_CONFIG's nested dict")
+    cfg.data["server"]["port"] = before + 11
+    assert DEFAULT_CONFIG["server"]["port"] == before, (
+        "writing to a loaded config mutated the global defaults")
+    # ...and the user's own override still wins over the default.
+    assert cfg.data["llm"]["review_model"] == "claude-opus-5"
