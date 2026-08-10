@@ -9,6 +9,7 @@ import {
   isHumanStopped,
   ADVISORY_SEVERITIES, isBlockingFinding, reviewVerdict, severityChip,
   checklistRowClass, approveButtonState, approvalFeedback, taskApprovedAt,
+  testResultVerdict,
 } from "./slideOverSummary.js";
 
 const SRC = dirname(fileURLToPath(import.meta.url));
@@ -617,6 +618,76 @@ test("a FAILED review keeps today's failure-first presentation (verdict word, no
   assert.equal(v.tone, "fail");
   assert.equal(v.detail, null, "the failed header is unchanged");
   assert.equal(v.blocking, 1);
+});
+
+// ── test result verdict ─────────────────────────────────────────────────────
+// orchestrator.py's change-aware gate has two distinct excuse paths that let
+// an attempt with a nonzero failed count still open a PR: pre_existing_failures
+// (a plain red run whose failing ids already fail on the base tree) and
+// invocation_error + reproduces_on_base (the runner itself errored, and the
+// same error reproduces on the base tree). Neither is "clean" and neither is
+// a genuine "failed" — the card must name the excuse, never say bare "clean".
+
+test("an excused-failure pass (pre_existing_failures) renders excused wording with the test ids, not clean", () => {
+  const v = testResultVerdict({
+    ran: true, ok: false, passed: 7637, failed: 1, errors: 0, tamper_flag: false,
+    failing_tests: ["tests/test_flaky.py::test_x"],
+    pre_existing_failures: ["tests/test_flaky.py::test_x"],
+  });
+  assert.equal(v.tone, "excused");
+  assert.notEqual(v.label, "clean");
+  assert.match(v.label, /pre-existing/);
+  assert.match(v.label, /tests\/test_flaky\.py::test_x/);
+});
+
+test("a genuinely clean run still says clean", () => {
+  const v = testResultVerdict({
+    ran: true, ok: true, passed: 7638, failed: 0, errors: 0, tamper_flag: false,
+  });
+  assert.equal(v.tone, "clean");
+  assert.equal(v.label, "clean");
+});
+
+// The second base-tree excuse path (orchestrator.py `_run_attempt`, the
+// invocation-error branch): the test runner itself errored, but the SAME
+// error reproduces on the base tree, so the orchestrator proceeds without
+// failing the attempt. That record carries invocation_error/
+// reproduces_on_base instead of pre_existing_failures — it must not fall
+// through to the red "failed" bucket.
+test("an invocation-error excused by reproduces_on_base renders excused, not the red failed bucket", () => {
+  const v = testResultVerdict({
+    ran: true, ok: false, passed: 2335, failed: 1, errors: 0, tamper_flag: false,
+    invocation_error: true, reproduces_on_base: true,
+  });
+  assert.equal(v.tone, "excused");
+  assert.notEqual(v.tone, "failed");
+  assert.notEqual(v.label, "clean");
+  assert.match(v.label, /invocation/);
+});
+
+test("an invocation error that does NOT reproduce on base is a genuine failure, never clean or excused", () => {
+  const v = testResultVerdict({
+    ran: true, ok: false, passed: 0, failed: 0, errors: 0, tamper_flag: false,
+    invocation_error: true, reproduces_on_base: false,
+  });
+  assert.equal(v.tone, "failed");
+});
+
+test("a genuinely red run with no excuse recorded never renders clean", () => {
+  const v = testResultVerdict({
+    ran: true, ok: false, passed: 100, failed: 3, errors: 0, tamper_flag: false,
+  });
+  assert.equal(v.tone, "failed");
+  assert.notEqual(v.label, "clean");
+});
+
+test("tamper-flagged results render no test-result verdict badge (the tamper banner owns that message)", () => {
+  assert.equal(testResultVerdict({ ran: true, ok: false, failed: 1, tamper_flag: true }), null);
+});
+
+test("no test_results at all renders no verdict", () => {
+  assert.equal(testResultVerdict(null), null);
+  assert.equal(testResultVerdict(undefined), null);
 });
 
 test("severity chips render the reviewer's grade, and a PASSING row without one omits the chip", () => {

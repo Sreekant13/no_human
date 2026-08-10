@@ -390,6 +390,55 @@ export function reviewVerdict(checklist) {
   return { verdict: "PASSED", tone: "pass", detail, blocking, advisory, findings: failed.length };
 }
 
+// ── test result verdict ─────────────────────────────────────────────────────
+// The test-results card used to show the bare word "clean" whenever
+// `tamper_flag` was unset — with no regard for whether the attempt actually
+// carried failures. `orchestrator.py`'s change-aware gate has TWO distinct
+// excuse paths that let an attempt with a nonzero failed count still open a
+// PR (constraint: gate logic itself is untouched, this only renders it
+// honestly):
+//   1. `_newly_failing_vs_base` (plain red run): every failing id already
+//      fails on the base tree → `pre_existing_failures` is written with the
+//      ids (orchestrator.py `_run_attempt`, the `newly_failing == []` branch).
+//   2. `_invocation_error_reproduces_on_base` (the runner itself errored):
+//      the SAME invocation error reproduces on the base tree → the attempt
+//      proceeds with `invocation_error: true, reproduces_on_base: true` and
+//      NO `pre_existing_failures` key — a different record shape for the
+//      same "gate excused this, don't blame the change" outcome.
+// Neither bucket is "clean" (there IS a nonzero failed/invocation-error
+// count) and neither is a genuine "failed" (the gate did not fail the
+// attempt on it) — they get their own "excused" tone naming the excuse.
+// Anything left over — `ok === false` with no excuse recorded — is a
+// genuinely red result and must never render as clean.
+export function testResultVerdict(testResults) {
+  if (!testResults) return null;
+  if (testResults.tamper_flag) return null;
+  const failed = Number(testResults.failed) || 0;
+  const errors = Number(testResults.errors) || 0;
+  const preExisting = Array.isArray(testResults.pre_existing_failures)
+    ? testResults.pre_existing_failures.filter(Boolean)
+    : [];
+  if (preExisting.length > 0) {
+    const n = preExisting.length;
+    return {
+      tone: "excused",
+      label: `passed — ${n} pre-existing failure${n === 1 ? "" : "s"} also fail `
+        + `on the base tree, excused: ${preExisting.join(", ")}`,
+    };
+  }
+  if (testResults.invocation_error && testResults.reproduces_on_base) {
+    return {
+      tone: "excused",
+      label: "passed — test invocation also fails on the base tree, "
+        + "excused (no test evidence)",
+    };
+  }
+  if (testResults.ok === false || failed > 0 || errors > 0) {
+    return { tone: "failed", label: "failed" };
+  }
+  return { tone: "clean", label: "clean" };
+}
+
 // ── approval feedback ──────────────────────────────────────────────────────
 // Approve recorded server-side while the drawer said nothing, so the operator
 // read a successful approval as a dead button. These two pure helpers give the

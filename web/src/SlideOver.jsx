@@ -19,7 +19,7 @@ import {
   PARKED_STATUSES, narrativeFor, chipsFor, milestonesFor, sectionSummary,
   defaultOpenSection, isTerminalStatus,
   reviewVerdict, severityChip, checklistRowClass, isBlockingFinding,
-  approveButtonState, approvalFeedback, taskApprovedAt,
+  approveButtonState, approvalFeedback, taskApprovedAt, testResultVerdict,
 } from "./slideOverSummary.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
@@ -2191,6 +2191,7 @@ function ReviewTab({ task, diff }) {
   const verdict = reviewVerdict(checklist);
   const testResults = lastAttempt?.test_results;
   const tamperFlag = testResults?.tamper_flag;
+  const testVerdict = testResultVerdict(testResults);
   const ciUrl = lastAttempt?.ci_pipeline_url;
   const rawOutput = checklist.raw_output;
   const hasPrUrl = !!(task.context?.pr_url);
@@ -2462,7 +2463,14 @@ function ReviewTab({ task, diff }) {
         <section>
           <div className="so-section-label so-section-label-row">
             <span>Test results</span>
-            {!tamperFlag && <span className="verdict-clean">clean</span>}
+            {testVerdict && (
+              <span
+                className={`verdict-${testVerdict.tone}`}
+                data-testid="test-result-verdict"
+              >
+                {testVerdict.label}
+              </span>
+            )}
           </div>
           <TestResultCard result={testResults} />
         </section>
