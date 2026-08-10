@@ -165,9 +165,16 @@ jobs:
       # fixed. Repro data, the hypothesis already ruled out, and what a fix has
       # to prove are in docs/KNOWN_ISSUES.md (KI-1). Run it locally, repeatedly,
       # if you touch core/db.py or the scheduler.
+      # PRs run the fast lane (`-m "not slow"`: the 47 tests marked slow are
+      # >10s each — the e2e/orchestrator tail that dominates wall-clock); every
+      # push to main runs the full suite, so every merged state still carries
+      # the whole signal. Same trade the windows job below already makes, for
+      # the same reason: a job that bills its worst case on every PR commit is
+      # a job that gets switched off.
       - name: Run tests
         run: |
           uv run pytest -q --tb=short -n 4 \
+            ${{ github.event_name == 'pull_request' && '-m "not slow"' || '' }} \
             --deselect tests/test_scheduler.py::test_reanalysis_maybe_run_produces_result \
             --deselect tests/test_scheduler.py::test_reanalysis_dedup_across_runs \
             --deselect tests/test_scheduler.py::test_two_repos_run_concurrently_in_worktrees
@@ -217,6 +224,13 @@ jobs:
 
   desktop:
     name: Desktop shell
+    # Same billing philosophy as the windows job below: ~20 Linux minutes a
+    # run that a docs-only or Python-only PR should not pay for. Every push
+    # to main runs it, so every merged state carries the signal; a PR opts in
+    # by carrying the `desktop` label.
+    if: >-
+      github.event_name != 'pull_request'
+      || contains(github.event.pull_request.labels.*.name, 'desktop')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
