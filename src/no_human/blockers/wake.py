@@ -217,14 +217,13 @@ class WakeWatcher:
 
         if low.startswith("pr_comment_on:"):
             pr_ref = cond.split(":", 1)[1].strip()
-            if self._pr_comment is None:
-                return False
-            try:
-                comments = await self._pr_comment(pr_ref)
-                return len(comments) > 0
-            except Exception as exc:  # noqa: BLE001
-                log.warning("pr_comment checker failed: %s", exc)
-                return False
+            # Feedback the task could act on — NOT merely "a comment exists".
+            # The rung used to satisfy on len(comments) > 0, so the task's own
+            # marked comment (an abandoned-draft note, a verification receipt,
+            # a CI_GATE table) woke the very task that posted it, which then
+            # found nothing to revise — `_inject_pr_feedback` filters self and
+            # bot chatter — and burned an attempt on an empty round.
+            return bool(await self._human_pr_comments(pr_ref))
 
         if low.startswith("ci_terminal_on:"):
             pipeline_ref = cond.split(":", 1)[1].strip()
@@ -417,6 +416,9 @@ class WakeWatcher:
                 if await self._is_terminal(task):
                     return None
                 # If the condition is pr_comment_on, inject the comments as feedback.
+                # `rounds` stays 0 for every other condition — only None means
+                # "the injection delivered nothing", and only that falls through.
+                rounds: int | None = 0
                 if condition and condition.strip().lower().startswith("pr_comment_on:"):
                     rounds = await self._inject_pr_feedback(task, condition)
                     # Bound the comment→revise loop: after max_revision_rounds
@@ -424,7 +426,21 @@ class WakeWatcher:
                     if rounds is not None and rounds > self.max_revision_rounds:
                         await self._escalate_revisions(task, rounds)
                         return "escalated_revisions"
-                return await self._resume(task)
+                if rounds is not None:
+                    return await self._resume(task)
+                # The rung and the injection each fetch, so they can see
+                # different data however well they agree on the predicate: a 502
+                # between the two calls, a comment deleted or edited, or the task
+                # going terminal mid-await all end here. Resuming anyway is what
+                # burned an attempt on an empty round — the very failure the
+                # marker was added to stop. So: do NOT resume, but FALL THROUGH
+                # to the max_park check below rather than returning. An early
+                # return here stranded the task forever on an ALTERNATING forge
+                # (answers the rung, fails the injection — gh secondary rate
+                # limits, which this design meets twice as often because it
+                # fetches twice per tick): no resume, no escalation, the human's
+                # review never delivered. Inside max_park the next tick still
+                # re-decides on a fresh read; past it, the timeout escalates.
 
         # Timeout → escalate (never silently abandon). Re-verify: max_park
         # re-escalation must not revive a task a human already closed out.
@@ -485,15 +501,8 @@ class WakeWatcher:
         Returns the task's running revision-round count after this batch (so the
         caller can enforce the cap), or None if there were no new comments.
         """
-        if self._pr_comment is None:
-            return None
         pr_ref = condition.split(":", 1)[1].strip()
-        try:
-            comments = await self._pr_comment(pr_ref)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("failed to fetch PR comments for injection: %s", exc)
-            return None
-        comments = [c for c in comments if not self._is_self_or_bot(c)]
+        comments = await self._human_pr_comments(pr_ref)
         if not comments:
             return None
         # The comment fetch above is a network await — a POST /shipped landing
@@ -529,6 +538,34 @@ class WakeWatcher:
         operator feedback and must never trigger a revision attempt."""
         a = (author or "").lower()
         return a.endswith("[bot]") or a in self.ignore_comment_authors
+
+    async def _human_pr_comments(self, pr_ref: str) -> list:
+        """Comments on *pr_ref* that are actual feedback: no bot chatter, and
+        none of no_human's own marked output.
+
+        The one place the two rungs that ask "is there feedback on this PR?"
+        route through — the wake condition and the injection that follows it.
+        Filtering at the FETCH is what keeps them from disagreeing: they used
+        to, and the rung's unfiltered `len(comments) > 0` woke tasks on their
+        own comments that the injection then discarded.
+
+        A missing checker or a fetch error yields no feedback (never an
+        exception): a forge blip must not crash the watcher, and "we could not
+        look" is not "a human replied".
+
+        (The `_check_approval_pr_comments` poll rung deliberately does NOT use
+        this: it needs the unfiltered list to advance its `pr_comment_since`
+        cursor past bot comments, or it re-reads them forever. It applies the
+        same `_is_self_or_bot` predicate after that.)
+        """
+        if self._pr_comment is None:
+            return []
+        try:
+            comments = await self._pr_comment(pr_ref)
+        except Exception as exc:  # noqa: BLE001 — checker must never crash watcher
+            log.warning("pr_comment checker failed for %s: %s", pr_ref, exc)
+            return []
+        return [c for c in comments if not self._is_self_or_bot(c)]
 
     def _is_self_or_bot(self, comment) -> bool:
         """A comment that must never trigger a revision: bot chatter OR

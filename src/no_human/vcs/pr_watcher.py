@@ -315,12 +315,14 @@ async def check_pr_comments(
 # ---------------------------------------------------------------------------
 
 # Invisible HTML comment stamped on every PR comment no_human posts. The
-# forge renders it as nothing, and copy-pasting the rendered comment does not
-# carry it — so a human quoting agent output is never misclassified. Load-
-# bearing: comments are posted under the operator's own gh login, so author
-# identity CANNOT distinguish the product's comments from the human's — the
-# 2026-07-10 incident (the CI_GATE results comment resumed its own task into
-# the budget gate) is exactly this gap.
+# forge renders it as nothing, so copy-pasting the RENDERED comment does not
+# carry it. Copying the RAW markdown does — GitHub's "Quote reply" is exactly
+# that — which is why `is_agent_comment` anchors to the start of the BODY
+# instead of scanning the whole body. Load-bearing: comments are posted under
+# the operator's own gh login, so author identity CANNOT distinguish the
+# product's comments from the human's — the 2026-07-10 incident (the CI_GATE
+# results comment resumed its own task into the budget gate) is exactly this
+# gap.
 AGENT_COMMENT_MARKER = "<!-- no_human-agent-comment -->"
 
 
@@ -333,8 +335,34 @@ _SELF_MARKER_PREFIX = "<!-- no_human"
 
 
 def is_agent_comment(body: str | None) -> bool:
-    """True if a PR comment body was authored by no_human itself."""
-    return bool(body) and _SELF_MARKER_PREFIX in body
+    """True if a PR comment body was authored by no_human itself.
+
+    The marker must OPEN THE BODY — position 0, not merely the start of some
+    line. An unanchored substring test misreads a human who used GitHub's
+    "Quote reply" (it copies the raw markdown, HTML comments included, with a
+    "> " on every quoted line) as the product's own comment. Anchoring
+    per-LINE still misread four human shapes: a marker at column 0 inside a
+    ``` fence, a human's own text followed by a raw paste at column 0 on line
+    2+, and the separators `str.splitlines` honours but no forge renders as a
+    line break (`\\x0c`, `\\u2028`, `\\x1c`).
+
+    Since this verdict gates WAKING, a false "self" costs the whole review:
+    the task never wakes and escalates 48h later as a timeout with the human's
+    comment never delivered. Body-anchoring is safe because EVERY IN-REPO
+    producer emits the marker at line 1, column 0 — `post_reply_comment`,
+    `upsert_agent_comment`, the orchestrator's verification receipts, and
+    `comment_poster._stamped` (which keeps it there when it inserts a location
+    prefix). A marker anywhere else came from a human's keyboard. "In-repo" is
+    the real bound: no tool allowlist restricts the coder/reviewer agent's Bash,
+    so an agent could `gh pr comment` an unmarked body that reads as human —
+    identically so under the previous per-line anchor, hence a pre-existing
+    residual of the unrestricted tool, not of this predicate.
+
+    RESIDUAL, unchanged: a human whose comment OPENS with an un-quoted raw
+    paste of ours is still indistinguishable and still reads as self. That
+    direction costs one skipped tick, not the review, so it is the cheaper one.
+    """
+    return bool(body) and body.startswith(_SELF_MARKER_PREFIX)
 
 
 async def post_reply_comment(pr_ref: str, message: str) -> bool:

@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 import subprocess
 
-from .pr_watcher import parse_pr_url
+from .pr_watcher import AGENT_COMMENT_MARKER, is_agent_comment, parse_pr_url
 
 _DIFF_FILE = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)
 _DIFF_GIT = re.compile(r"^diff --git a/.+ b/(.+)$", re.MULTILINE)
@@ -63,30 +63,54 @@ def _run(argv: list[str], timeout: int = 15) -> tuple[bool, str]:
         return False, "timeout"
 
 
+def _stamped(body: str, loc: str = "") -> str:
+    """*body* with a self-marker in front, and *loc* leading the visible text.
+
+    Comments are posted under the operator's own forge login, so author identity
+    cannot tell the product's comments from the human's — the wake watcher does
+    it with the `<!-- no_human` marker family (`pr_watcher.is_agent_comment`).
+    An UNMARKED comment this module posts on a watched PR therefore reads as
+    human feedback and re-wakes the task that posted it (R18, 2026-08-10: the
+    abandoned-draft note and approved draft review comments both did). Stamped
+    here, at the one function that talks to a forge, so a new caller cannot
+    forget. A body that already carries a family marker (the verification
+    receipts comment) is left alone — but *loc* still goes AFTER that marker's
+    line, because `is_agent_comment` requires the marker to open the BODY and a
+    prefix would push it off position 0, un-marking our own comment.
+    """
+    if not is_agent_comment(body):
+        return f"{AGENT_COMMENT_MARKER}\n{loc}{body}"
+    marker_line, sep, rest = body.partition("\n")
+    return f"{marker_line}{sep}{loc}{rest}"
+
+
 def post_to_pr(url: str, body: str, file: str | None = None, line: int | None = None) -> dict:
     """Post *body* to the PR/MR at *url* using its forge's API.
 
     Returns ``{"ok": bool, "mode": "inline"|"issue_comment"|"mr_note", "error": str}``.
+    Every body is stamped with a self-marker — see `_stamped`.
     """
     parsed = parse_pr_url(url)
     if not parsed:
         return {"ok": False, "mode": None, "error": f"unparseable PR URL: {url}"}
     forge, host, slug, number = parsed
     host_args = ["--hostname", host]
+    # Location prefix for the non-inline fallbacks, where the forge does not
+    # anchor the comment to the line itself.
+    loc = f"`{file}:{line}` — " if file and line else ""
 
     if forge == "gitlab":
         # A real review comments ON the code line. GitLab inline = a Discussion
         # with a diff position (the MR's base/start/head SHAs + file + line).
         if file and line and line > 0:
-            ok, err = _post_gitlab_inline(host, slug, number, body, file, line)
+            ok, err = _post_gitlab_inline(host, slug, number, _stamped(body), file, line)
             if ok:
                 return {"ok": True, "mode": "inline", "error": ""}
         # Fall back to a general MR note (location prefixed) when there's no line
         # or the position isn't a valid diff line.
-        loc = f"`{file}:{line}` — " if file and line else ""
         ok, err = _run(["glab", "api", *host_args, "-X", "POST",
                         f"projects/{slug}/merge_requests/{number}/notes",
-                        "-f", f"body={loc}{body}"])
+                        "-f", f"body={_stamped(body, loc)}"])
         return {"ok": ok, "mode": "mr_note", "error": err}
 
     # GitHub / GHE. Try an inline review comment when we have a file:line.
@@ -95,7 +119,7 @@ def post_to_pr(url: str, body: str, file: str | None = None, line: int | None = 
         if ok_sha and sha:
             ok, err = _run(["gh", "api", *host_args, "-X", "POST",
                             f"repos/{slug}/pulls/{number}/comments",
-                            "-f", f"body={body}", "-f", f"commit_id={sha}",
+                            "-f", f"body={_stamped(body)}", "-f", f"commit_id={sha}",
                             "-f", f"path={file}", "-F", f"line={line}",
                             "-f", "side=RIGHT"])
             if ok:
@@ -104,11 +128,12 @@ def post_to_pr(url: str, body: str, file: str | None = None, line: int | None = 
         # back to a general issue comment with the location prefixed.
         ok, err = _run(["gh", "api", *host_args, "-X", "POST",
                         f"repos/{slug}/issues/{number}/comments",
-                        "-f", f"body=`{file}:{line}` — {body}"])
+                        "-f", f"body={_stamped(body, loc)}"])
         return {"ok": ok, "mode": "issue_comment", "error": err}
 
     ok, err = _run(["gh", "api", *host_args, "-X", "POST",
-                    f"repos/{slug}/issues/{number}/comments", "-f", f"body={body}"])
+                    f"repos/{slug}/issues/{number}/comments",
+                    "-f", f"body={_stamped(body)}"])
     return {"ok": ok, "mode": "issue_comment", "error": err}
 
 

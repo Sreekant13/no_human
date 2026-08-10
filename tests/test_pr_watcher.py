@@ -281,6 +281,119 @@ def test_every_product_marker_is_recognized_as_self():
     assert not pr_watcher.is_agent_comment(None)
 
 
+def test_a_quote_reply_carrying_the_raw_marker_is_not_self():
+    """GitHub's "Quote reply" copies the RAW markdown — HTML comments and all —
+    and prefixes every quoted line with "> ". An unanchored substring test read
+    that as the product's own comment; because the verdict gates WAKING, the
+    task then never woke at all and escalated 48h later as a timeout with the
+    human's review undelivered. The marker must OPEN a line to count as ours."""
+    from no_human.vcs import pr_watcher
+    quoted = ("> <!-- no_human-agent-comment -->\n"
+              "> Abandoned by no_human.\n\n"
+              "No — reopen it, the retry path is still wrong.")
+    assert not pr_watcher.is_agent_comment(quoted)
+    # GitLab quotes the same way; so does a human indenting the paste.
+    assert not pr_watcher.is_agent_comment(">>> <!-- no_human:verification-receipts -->")
+    assert not pr_watcher.is_agent_comment("    <!-- no_human-agent-comment -->")
+    # ...and a human simply mentioning the marker mid-sentence.
+    assert not pr_watcher.is_agent_comment(
+        "your bot stamps <!-- no_human-agent-comment --> on everything")
+    # Quote-reply spelt every way a forge and a human produce it.
+    assert not pr_watcher.is_agent_comment(">> > <!-- no_human-agent-comment -->")
+    assert not pr_watcher.is_agent_comment(">\t<!-- no_human-agent-comment -->")
+    assert not pr_watcher.is_agent_comment("><!-- no_human-agent-comment -->")
+    assert not pr_watcher.is_agent_comment("> <!-- no_human-agent-comment -->\r\n> x")
+    # Under CRLF the marker still opens the body, so it is still ours.
+    assert pr_watcher.is_agent_comment("<!-- no_human-agent-comment -->\r\nhi")
+
+
+def test_a_marker_below_the_first_line_is_a_human_paste_not_self():
+    """The anchor is the START OF THE BODY, not the start of any line.
+
+    Anchoring per-line still read four HUMAN shapes as the product's own, and
+    because the verdict gates WAKING the cost is the whole review: the task
+    never wakes and escalates 48h later as a timeout with the comment
+    undelivered. Every producer puts the marker at line 1, column 0 —
+    `pr_watcher.post_reply_comment`, `pr_watcher.upsert_agent_comment`,
+    `orchestrator`'s verification receipts, and `comment_poster._stamped` —
+    so a marker anywhere below line 1 came from a human's keyboard."""
+    from no_human.vcs import pr_watcher
+    # A human pasting our comment inside a fenced code block.
+    assert not pr_watcher.is_agent_comment(
+        "```\n<!-- no_human-agent-comment -->\n```\nplease fix the retry")
+    # A human's own text, then a raw paste at column 0 on line 2+.
+    assert not pr_watcher.is_agent_comment(
+        "I ran it and got:\n<!-- no_human-agent-comment -->\nAbandoned by no_human.")
+    # `str.splitlines` also splits on separators no forge renders as newlines,
+    # so a marker after one of those is not at the start of any *rendered* line.
+    assert not pr_watcher.is_agent_comment(
+        "look at this\x0c<!-- no_human-agent-comment -->")
+    assert not pr_watcher.is_agent_comment(
+        "look at this\u2028<!-- no_human-agent-comment -->")
+    assert not pr_watcher.is_agent_comment(
+        "look at this\x1c<!-- no_human-agent-comment -->")
+
+
+async def test_every_producer_shape_is_still_self(monkeypatch):
+    """Every producer is CALLED and the body it actually sends is captured, so a
+    producer that stops putting the marker at position 0 fails here.
+
+    Hand-written f-string mirrors of the producers did NOT do this: they restated
+    the source instead of running it, so `body = f"### CI\\n{MARKER}..."` in
+    `upsert_agent_comment` left the whole suite green while the CI-gate comment
+    read as HUMAN to `_is_self_or_bot` and re-woke the task onto its own comment.
+    Whether a FOURTH producer exists at all is a different guard and lives in
+    `tests/test_comment_poster.py::test_no_module_outside_the_two_stampers_posts_a_pr_comment`.
+
+    "Every producer" means every IN-REPO producer: the coder/reviewer agents have
+    an unrestricted Bash tool and could `gh pr comment` an unmarked body. That
+    reads as human under the old line-anchored predicate and the new body-anchored
+    one alike, so it is a pre-existing residual, not a regression of this change.
+    """
+    from no_human.core.orchestrator import Orchestrator
+    from no_human.vcs import comment_poster, pr_watcher
+
+    sent: list[str] = []
+    listing = "[]"
+
+    async def record(cmd):
+        for i, arg in enumerate(cmd):
+            if arg in ("--body", "-f", "--field") and i + 1 < len(cmd):
+                sent.append(cmd[i + 1].removeprefix("body="))
+        return listing
+
+    monkeypatch.setattr(pr_watcher, "_run_cli", record)
+    # Both upsert send paths (create when nothing is there, update when one is)
+    # on both forges — a divergent body on any one of them fails here.
+    for listing in ("[]", '[{"id": 9, "body": "<!-- nh:ci_gate -->"}]'):
+        for ref in ("host/o/r#1", "o/r!1"):  # GitHub/GHE, then GitLab
+            assert await pr_watcher.post_reply_comment(ref, "x")
+            assert await pr_watcher.upsert_agent_comment(ref, "x", key="ci_gate")
+
+    def record_receipt(url, body, marker):
+        sent.append(body)
+        return {"ok": True, "mode": "posted"}
+
+    monkeypatch.setattr(comment_poster, "post_to_pr_once", record_receipt)
+    orch = Orchestrator.__new__(Orchestrator)  # the body f-string is what is under test
+    orch._verification_section = lambda *a, **k: "## How I verified this"
+    orch._backend_is_observable = lambda: True
+    orch.emit = lambda *a, **k: None
+    # `_post_verification_comment` swallows every exception; route the swallow
+    # into `sent` so a silent failure fails the assertion instead of passing it.
+    orch._advisory = lambda msg: sent.append(f"advisory: {msg}")
+    assert await orch._post_verification_comment(None, "https://github.com/o/r/pull/1", [])
+
+    assert len(sent) == 9, sent  # 4 producer calls × 2 listings + 1 receipt
+    produced = sent + [
+        comment_poster._stamped("a finding", "`src/a.py:12` — "),
+        comment_poster._stamped(
+            f"{Orchestrator.VERIFICATION_COMMENT_MARKER}\nevidence", "`src/a.py:12` — "),
+    ]
+    for body in produced:
+        assert pr_watcher.is_agent_comment(body), body
+
+
 # ── upsert_agent_comment: update one comment, never pile up (PR #7004 had 17) ──
 
 async def test_upsert_updates_existing_github_comment_instead_of_posting_new(monkeypatch):
@@ -558,3 +671,303 @@ async def test_a_gitlab_mr_wakes_a_pr_merged_blocker(store, cli_recorder):
     replies["glab"] = json.dumps({"state": "opened"})
     assert await watcher.condition_satisfied(
         f"pr_merged:{GITLAB_MR_URL}", **args) is False
+
+
+@pytest.mark.asyncio
+async def test_the_tasks_own_marked_comment_does_not_wake_it(store):
+    """R18: the marker must close the loop, not just the injection half.
+
+    A task parked on ``pr_comment_on:<pr>`` posts its own (correctly marked)
+    comment — an abandoned-draft note, a verification receipt, a CI_GATE table.
+    The injection path filters it as self, so the task woke with ZERO feedback
+    and burned an attempt: the wake rung satisfied itself on ``len(comments) >
+    0`` with no self/bot filter at all. The marker only pays for itself if the
+    rung honours it too.
+    """
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={
+            "category": "DEPENDENCY_WAIT",
+            "wake_condition": "pr_comment_on:org/repo#42",
+            "raised_at": now.isoformat(), "confidence": 0.9,
+        },
+    )
+    own = PrComment(author="operator",
+                    body="<!-- no_human-agent-comment -->\nAbandoned by no_human.",
+                    created_at=now.isoformat())
+    bot = PrComment(author="ci-bot[bot]", body="pipeline green", created_at=now.isoformat())
+
+    async def pr_comment_checker(ref):
+        return [own, bot]
+
+    watcher = WakeWatcher(store, _cfg(), pr_comment=pr_comment_checker)
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") not in actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.BLOCKED
+    assert not refreshed.context.get("send_back_feedback")
+
+
+@pytest.mark.asyncio
+async def test_one_human_comment_among_the_agents_own_still_wakes(store):
+    """The filter must not swallow real feedback that arrives alongside it."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={
+            "category": "DEPENDENCY_WAIT",
+            "wake_condition": "pr_comment_on:org/repo#42",
+            "raised_at": now.isoformat(), "confidence": 0.9,
+        },
+    )
+    own = PrComment(author="operator",
+                    body="<!-- no_human:verification-receipts -->\nevidence",
+                    created_at=now.isoformat())
+    human = PrComment(author="alice", body="this breaks the retry", created_at=now.isoformat())
+
+    async def pr_comment_checker(ref):
+        return [own, human]
+
+    watcher = WakeWatcher(store, _cfg(), pr_comment=pr_comment_checker)
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") in actions
+    feedback = (await store.get_task(t.id)).context.get("send_back_feedback", [])
+    assert len(feedback) == 1, feedback
+    assert "this breaks the retry" in feedback[-1]["message"]
+
+
+@pytest.mark.asyncio
+async def test_a_blip_between_the_two_fetches_does_not_burn_an_attempt(store):
+    """The rung and the injection each call the checker. Routing both through
+    one predicate made them agree on WHAT COUNTS as feedback, not on the DATA:
+    a 502 (or a deleted comment) between the two calls left `_human_pr_comments`
+    returning [] on the second read, `_inject_pr_feedback` returning None, and
+    the caller resuming anyway with an empty `send_back_feedback` — an attempt
+    spent on nothing, which is precisely the failure the marker work set out to
+    remove. Nothing injected now means nothing resumed."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={
+            "category": "DEPENDENCY_WAIT",
+            "wake_condition": "pr_comment_on:org/repo#42",
+            "raised_at": now.isoformat(), "confidence": 0.9,
+        },
+    )
+    state = {"n": 0, "flaky": True}
+
+    async def pr_comment_checker(ref):
+        state["n"] += 1
+        if state["flaky"] and state["n"] > 1:
+            raise RuntimeError("forge 502")
+        return [PrComment(author="alice", body="this breaks the retry",
+                          created_at=now.isoformat())]
+
+    watcher = WakeWatcher(store, _cfg(), pr_comment=pr_comment_checker)
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") not in actions, actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.BLOCKED
+    assert not (refreshed.context or {}).get("send_back_feedback")
+    # ...and the next tick, on a forge that answers, delivers the comment.
+    state["flaky"] = False
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") in actions, actions
+    feedback = (await store.get_task(t.id)).context.get("send_back_feedback", [])
+    assert len(feedback) == 1 and "this breaks the retry" in feedback[0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_a_task_that_goes_terminal_between_the_two_fetches_is_not_resumed(store):
+    """Same fall-through, different cause: `_inject_pr_feedback` also returns
+    None when its own terminal re-check fires (a POST /shipped landing during
+    the fetch). The caller used to resume the finished task regardless."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={
+            "category": "DEPENDENCY_WAIT",
+            "wake_condition": "pr_comment_on:org/repo#42",
+            "raised_at": now.isoformat(), "confidence": 0.9,
+        },
+    )
+
+    async def pr_comment_checker(ref):
+        return [PrComment(author="alice", body="fix this", created_at=now.isoformat())]
+
+    watcher = WakeWatcher(store, _cfg(), pr_comment=pr_comment_checker)
+    calls = {"n": 0}
+    real_terminal = watcher._is_terminal
+
+    async def flips_terminal(task):
+        calls["n"] += 1
+        return calls["n"] > 1 or await real_terminal(task)
+
+    watcher._is_terminal = flips_terminal
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") not in actions, actions
+    assert (await store.get_task(t.id)).status == TaskStatus.BLOCKED
+
+
+# ── the over-filtering direction: every shape of real feedback still wakes ──
+# A filter that wakes a task spuriously costs one attempt. A filter that never
+# wakes it costs the whole review: the task sits BLOCKED until max_park and
+# escalates as a timeout, with the human's comment never delivered. So each
+# shape a genuine human comment arrives in gets a row here.
+
+_HUMAN = "this breaks the retry"
+_MARKED_SELF = "<!-- no_human:verification-receipts -->\nevidence"
+_QUOTE_REPLY = ("> <!-- no_human-agent-comment -->\n"
+                "> Abandoned by no_human.\n\n" + _HUMAN)
+_FENCED_MARKER = "```\n<!-- no_human-agent-comment -->\n```\n" + _HUMAN
+_PASTE_AFTER_TEXT = "I ran it and got:\n<!-- no_human-agent-comment -->\nAbandoned."
+
+
+@pytest.mark.parametrize("shape,ref,comments,expect_in_message", [
+    ("human only", "org/repo#42",
+     [PrComment(author="alice", body=_HUMAN)], _HUMAN),
+    ("human beside the agent's own marked comment", "org/repo#42",
+     [PrComment(author="operator", body=_MARKED_SELF),
+      PrComment(author="alice", body=_HUMAN)], _HUMAN),
+    ("human beside a foreign bot", "org/repo#42",
+     [PrComment(author="dependabot[bot]", body="bump lodash"),
+      PrComment(author="alice", body=_HUMAN)], _HUMAN),
+    ("human quote-replying to the agent", "org/repo#42",
+     [PrComment(author="alice", body=_QUOTE_REPLY)], _HUMAN),
+    ("inline review comment", "org/repo#42",
+     [PrComment(author="alice", body="null check missing",
+                path="src/a.py", line=10, diff_hunk="- old\n+ new")],
+     "[src/a.py:10] null check missing"),
+    ("GitLab merge-request ref", "grp/svc!7",
+     [PrComment(author="alice", body=_HUMAN)], _HUMAN),
+    ("plain-string comment", "org/repo#42", ["please fix the retry"],
+     "please fix the retry"),
+    ("human pasting the marker inside a fence", "org/repo#42",
+     [PrComment(author="alice", body=_FENCED_MARKER)], _HUMAN),
+    ("human's own text, then a raw paste at column 0", "org/repo#42",
+     [PrComment(author="alice", body=_PASTE_AFTER_TEXT)], "I ran it and got"),
+    ("form-feed before the marker", "org/repo#42",
+     [PrComment(author="alice", body=f"{_HUMAN}\x0c<!-- no_human-agent-comment -->")],
+     _HUMAN),
+    ("U+2028 line separator before the marker", "org/repo#42",
+     [PrComment(author="alice", body=f"{_HUMAN}\u2028<!-- no_human-agent-comment -->")],
+     _HUMAN),
+])
+@pytest.mark.asyncio
+async def test_every_shape_of_human_feedback_still_wakes_the_task(
+        store, shape, ref, comments, expect_in_message):
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={
+            "category": "DEPENDENCY_WAIT",
+            "wake_condition": f"pr_comment_on:{ref}",
+            "raised_at": now.isoformat(), "confidence": 0.9,
+        },
+    )
+
+    async def pr_comment_checker(_ref):
+        return list(comments)
+
+    watcher = WakeWatcher(store, _cfg(), pr_comment=pr_comment_checker)
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") in actions, f"{shape}: never woke — {actions}"
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING, shape
+    feedback = (refreshed.context or {}).get("send_back_feedback", [])
+    assert len(feedback) == 1, f"{shape}: {feedback}"
+    assert expect_in_message in feedback[0]["message"], f"{shape}: {feedback}"
+
+
+# ── the guard must not strand the task: a divergence that never clears ──
+
+
+@pytest.mark.asyncio
+async def test_an_alternating_forge_still_escalates_at_max_park(store):
+    """`rounds is None` returned from `_evaluate` BEFORE the max_park check, so
+    the comment at that guard ("escalated by the max_park timeout below") was
+    false. An ALTERNATING forge — answers the rung, fails the injection, which
+    this design hits twice as often because it fetches twice per tick (gh
+    secondary rate limits do exactly this) — parked the task forever: no
+    resume, no escalation, the human's review never delivered. Strictly worse
+    than the empty attempt the guard was added to prevent."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    raised = now - timedelta(days=30)  # long past max_park (48h)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={
+            "category": "DEPENDENCY_WAIT",
+            "wake_condition": "pr_comment_on:org/repo#42",
+            "raised_at": raised.isoformat(), "confidence": 0.9,
+        },
+    )
+    calls = {"n": 0}
+
+    async def alternating(_ref):
+        calls["n"] += 1
+        if calls["n"] % 2 == 0:      # the injection's fetch, every tick
+            raise RuntimeError("gh: secondary rate limit")
+        return [PrComment(author="alice", body="this breaks the retry",
+                          created_at=now.isoformat())]
+
+    watcher = WakeWatcher(store, _cfg(), pr_comment=alternating)
+    for _ in range(5):
+        actions = await watcher.tick(now=now)
+        if (t.id, "escalated_timeout") in actions:
+            break
+    else:
+        raise AssertionError(f"5 ticks, 30 days parked, never escalated: {actions}")
+    assert (t.id, "resumed") not in actions, actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.ESCALATED, refreshed.status
+
+
+@pytest.mark.asyncio
+async def test_a_flat_forge_outage_still_escalates_at_max_park(store):
+    """Control for the test above: when the rung itself never satisfies, the
+    timeout path was already reached. It must stay reached."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={
+            "category": "DEPENDENCY_WAIT",
+            "wake_condition": "pr_comment_on:org/repo#42",
+            "raised_at": (now - timedelta(days=30)).isoformat(), "confidence": 0.9,
+        },
+    )
+
+    async def always_down(_ref):
+        raise RuntimeError("gh: 503")
+
+    watcher = WakeWatcher(store, _cfg(), pr_comment=always_down)
+    actions = await watcher.tick(now=now)
+    assert (t.id, "escalated_timeout") in actions, actions
+
+
+@pytest.mark.asyncio
+async def test_a_divergence_inside_max_park_still_stays_parked(store):
+    """The fall-through must not become an escalation: before max_park, a
+    divergent tick still parks quietly and re-decides next tick."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={
+            "category": "DEPENDENCY_WAIT",
+            "wake_condition": "pr_comment_on:org/repo#42",
+            "raised_at": now.isoformat(), "confidence": 0.9,
+        },
+    )
+    calls = {"n": 0}
+
+    async def alternating(_ref):
+        calls["n"] += 1
+        if calls["n"] % 2 == 0:
+            raise RuntimeError("gh: secondary rate limit")
+        return [PrComment(author="alice", body="this breaks the retry",
+                          created_at=now.isoformat())]
+
+    watcher = WakeWatcher(store, _cfg(), pr_comment=alternating)
+    actions = await watcher.tick(now=now)
+    assert actions == [] or all(a[1] == "wake_tick" for a in actions), actions
+    assert (await store.get_task(t.id)).status == TaskStatus.BLOCKED
