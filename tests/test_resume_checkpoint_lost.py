@@ -108,12 +108,14 @@ def _plant_and_lose_checkpoint(work) -> str:
 
 
 async def _attempt_with_checkpoint(repo, tmp_path, store, monkeypatch, sha,
-                                   *, wip_sha=None, attempt_n=1):
+                                   *, wip_sha=None, attempt_n=1, by="human"):
     """Drive the REAL `_run_attempt` branch decision with `sha` as the task's
-    human-gated resume point, and stop the moment the decision is made.
+    resume point, and stop the moment the decision is made.
 
     ``wip_sha``/``attempt_n`` describe the OTHER checkpoint: the [WIP-PARTIAL]
     an earlier attempt of this run left behind, which only attempt 2+ inherits.
+    ``by`` is the resume's provenance — ``"orphan_recovery"`` is the scheduler's
+    crash requeue, whose checkpoint is an ORDINARY work commit.
     """
     cfg = load_config(tmp_path / "config.yaml")
     events: list[dict] = []
@@ -127,7 +129,7 @@ async def _attempt_with_checkpoint(repo, tmp_path, store, monkeypatch, sha,
         lambda self, *a, **k: (_ for _ in ()).throw(_Stop()))
 
     t = Task.new("resume me", repo_path=str(repo))
-    ctx = {"resume_from": {"sha": sha, "by": "human"}}
+    ctx = {"resume_from": {"sha": sha, "by": by}}
     if wip_sha:
         ctx["handoff"] = {"wip_sha": wip_sha}
     t.context = ctx
@@ -203,6 +205,62 @@ async def test_a_checkpoint_that_is_present_is_still_resumed_from(
     assert [e for e in events if e.get("kind") == "resume_wip"]
     assert not [e for e in events if e.get("kind") == "resume_checkpoint_lost"]
     assert attempt["resume_checkpoint_lost"] is None
+    # …and the row says WHICH checkpoint it got, not merely that nothing was
+    # lost. `resume_checkpoint_lost` is NULL on every attempt that resumed
+    # normally AND on every attempt that never had a checkpoint at all — the
+    # live DB had it NULL on all 828 rows — so on its own it cannot measure
+    # whether resuming works. The success side needs its own column.
+    assert attempt["resume_checkpoint"] == kept
+
+
+@pytest.mark.asyncio
+async def test_a_crash_requeue_is_not_announced_as_a_blocked_checkpoint(
+    repo, tmp_path, store, monkeypatch,
+):
+    """The `resume_wip` label must describe the COMMIT, not the gate's verdict.
+
+    It read `"WIP-PARTIAL" if branched_from_own_partial else "WIP-BLOCKED"`,
+    which assumed every checkpoint is one of the loop's two WIP commits. The
+    scheduler's crash requeue points at `attempt.commit_sha` — an ORDINARY work
+    commit — so both labels lie, and "branching from WIP-BLOCKED" says a human
+    answered a blocker that nothing ever raised.
+    """
+    _git(repo, "checkout", "-q", "-b", "wip")
+    (repo / "shipped.py").write_text("# committed work, then the process died\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "feat: the dead attempt's work")
+    dead = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", "main")
+
+    _t, events, attempt = await _attempt_with_checkpoint(
+        repo, tmp_path, store, monkeypatch, dead, by="orphan_recovery")
+
+    assert _git(repo, "rev-parse", attempt["branch_name"]) == dead
+    assert attempt["resume_checkpoint"] == dead
+    resumed = [e for e in events if e.get("kind") == "resume_wip"]
+    assert len(resumed) == 1, [e.get("kind") for e in events]
+    assert "WIP-BLOCKED" not in resumed[0]["text"], resumed[0]["text"]
+    assert "WIP-PARTIAL" not in resumed[0]["text"], resumed[0]["text"]
+    assert dead[:8] in resumed[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_a_crash_requeue_onto_a_vanished_commit_is_recorded_as_lost(
+    repo, tmp_path, store, monkeypatch,
+):
+    """The other half of the measurement, on the provenance that had never
+    produced a row: a machine requeue whose checkpoint the object store can no
+    longer read falls back to base and SAYS so on the attempt."""
+    lost = _plant_and_lose_checkpoint(repo)
+
+    _t, _events, attempt = await _attempt_with_checkpoint(
+        repo, tmp_path, store, monkeypatch, lost, by="orphan_recovery")
+
+    assert attempt["resume_checkpoint"] is None, \
+        "it branched from base — there is no checkpoint to record"
+    assert attempt["resume_checkpoint_lost"], \
+        "a crash requeue that lost its checkpoint recorded nothing"
+    assert lost[:8] in attempt["resume_checkpoint_lost"]
 
 
 @pytest.mark.asyncio

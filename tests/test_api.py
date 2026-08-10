@@ -2293,6 +2293,52 @@ async def test_retry_clears_the_resume_checkpoint_so_a_fresh_run_is_fresh(client
         f"from a stale sha: {ctx.get('resume_from')}")
 
 
+@pytest.mark.parametrize("status", [TaskStatus.CONTEXT, TaskStatus.PLANNING])
+async def test_a_retried_checkpoint_stays_cleared_when_the_fresh_run_crashes(
+        client, store, status):
+    """The clear has to survive the NEXT crash, and clearing the context alone
+    did not.
+
+    `Scheduler._recover_orphans` re-derives a checkpoint from the attempt row
+    still `in_progress`. `run_task` reaches CONTEXT and PLANNING — both
+    orphanable — before it ever calls `create_attempt`, so a fresh run that
+    dies in either leaves the PRE-RETRY row as the only row there is, and the
+    sweep stamped its sha straight back: the retry's "from base" promise
+    silently became "from the checkpoint of the run that already failed".
+    Wrong-base work, not fabrication — the stamp carries MACHINE provenance so
+    the zero-diff gate stays armed — but a broken documented promise.
+
+    Driven through the real endpoint, not a hand-written `merge_context`: what
+    fixes this is `Store.close_open_attempts`, which lives at the clear, so a
+    test that simulates the clear itself would be testing its own simulation.
+    """
+    t = await _seed_task(store, status=TaskStatus.FAILED)
+    dead = await store.create_attempt(t.id, 1)
+    await store.update_attempt(dead, commit_sha="a" * 40)
+
+    from no_human.core.scheduler import Scheduler
+    sched = Scheduler(store, lambda task=None: None)
+
+    # The crash before the retry: the sweep correctly rescues that work.
+    await store.set_status(t, TaskStatus.REVIEWING, validate=False)
+    await sched._recover_orphans()
+    assert ((await store.find_task(t.id)).context or {})["resume_from"]["sha"] == "a" * 40
+
+    await store.set_status(t, TaskStatus.FAILED, validate=False)
+    assert (await client.post(f"/api/tasks/{t.id}/retry")).status_code == 200
+
+    # …and the fresh run dies before it ever opens an attempt row of its own.
+    await store.set_status(await store.find_task(t.id), status, validate=False)
+    await sched._recover_orphans()
+
+    rf = ((await store.find_task(t.id)).context or {}).get("resume_from") or {}
+    assert not rf.get("sha"), (
+        f"the cleared checkpoint was resurrected in {status.value} — the retry "
+        f"branches from a run that had already failed: {rf!r}")
+    assert [a["status"] for a in await store.list_attempts(t.id)] == ["interrupted"], (
+        "the pre-retry row is still open, so the next sweep will reach it")
+
+
 # --------------------------------------------------------------------------- #
 # The review gate's verdict reaches the human (both event surfaces)            #
 # --------------------------------------------------------------------------- #

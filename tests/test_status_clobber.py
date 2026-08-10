@@ -295,6 +295,76 @@ async def test_runtime_sweep_skips_a_plan_correction_wait(store):
     assert (await store.get_task(t.id)).status is TaskStatus.PLANNING
 
 
+async def test_a_refused_status_write_leaves_no_checkpoint_behind(store):
+    """The sweep must not leave a side-effect behind a write the CAS guard
+    refused.
+
+    `set_status` no-ops on a terminal row (SCRUM-73) and returns None, so a
+    task a human marks DONE between the sweep's `list_tasks` read and its write
+    keeps its status. The checkpoint stamp used to be written BEFORE that
+    check, and `merge_context` is not rolled back — so a finished task quietly
+    acquired an `orphan_recovery` checkpoint that nothing would ever clear, and
+    a later retry would branch from it. Before the checkpoint existed a lost
+    race here was free; it is not free any more, so the write goes second.
+    """
+    t = Task.new("finished under the sweep", repo_path="/tmp/r")
+    await store.create_task(t)
+    await store.set_status(t, TaskStatus.REVIEWING, validate=False)
+    attempt = await store.create_attempt(t.id, 1)
+    await store.update_attempt(attempt, commit_sha="a" * 40)
+
+    sched = Scheduler(store, lambda task=None: _NeverRunOrch(), max_workers=0)
+    stale = await store.get_task(t.id)          # the sweep's stale handle
+    real_list = store.list_tasks
+
+    async def _list_tasks(status):              # the human wins the race
+        if status is TaskStatus.REVIEWING:
+            await store.set_status(stale, TaskStatus.DONE, validate=False)
+            return [stale]
+        return await real_list(status)
+
+    store.list_tasks = _list_tasks
+    try:
+        await sched._recover_orphans()
+    finally:
+        store.list_tasks = real_list
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE, "CAS guard held the status"
+    assert not ((fresh.context or {}).get("resume_from") or {}).get("sha"), (
+        "a DONE task acquired an orphan_recovery checkpoint from a status "
+        f"write that never landed; got {fresh.context!r}")
+    assert not [e for e in await store.list_events(t.id)
+                if e.get("kind") == "orphan_recovered"], (
+        "the sweep announced a requeue that did not happen")
+
+
+async def test_one_tasks_checkpoint_failure_does_not_abort_the_whole_sweep(store):
+    """Recovery is a sweep over every orphan, and it ran the checkpoint lookup
+    unguarded inside the loop — so one raise (a DB read error, a corrupt
+    context) took every REMAINING task down with it, on the one code path whose
+    whole job is to rescue tasks after a crash."""
+    doomed = await _stranded_task(store, age_seconds=0)
+    other = await _stranded_task(store, age_seconds=0)
+
+    sched = Scheduler(store, lambda task=None: _NeverRunOrch(), max_workers=0)
+    real = sched._inherited_checkpoint
+
+    async def _boom(t):
+        if t.id == doomed.id:
+            raise RuntimeError("attempt read blew up")
+        return await real(t)
+
+    sched._inherited_checkpoint = _boom
+    await sched._recover_orphans()
+
+    assert (await store.get_task(other.id)).status is TaskStatus.IMPLEMENTING, (
+        "one task's checkpoint failure aborted recovery for every task after it")
+    assert (await store.get_task(doomed.id)).status is TaskStatus.IMPLEMENTING, (
+        "the task whose checkpoint lookup failed was not requeued at all — a "
+        "checkpoint is an optimisation, requeueing is the rescue")
+
+
 async def test_unparseable_updated_at_reads_young_never_requeued(store):
     """A corrupt timestamp must fail closed (no requeue), not fail open."""
     assert Scheduler._row_age_s("garbage") == 0.0

@@ -661,3 +661,118 @@ async def test_a_HUMAN_gated_checkpoint_is_still_credited(bare_repo, tmp_path, s
     assert [a for a in attempts if a["status"] == "succeeded"], (
         "a HUMAN-gated resume whose attempt correctly added nothing was failed "
         f"as fabrication — the D15 regression: {[(a['attempt_number'], a['status'], a['failure_reason']) for a in attempts]}")
+
+
+# --------------------------------------------------------------------------- #
+# D1's side effect: an ORDINARY-subject wake checkpoint is now gated           #
+# --------------------------------------------------------------------------- #
+#
+# 🔴 UNTESTED LIVE BEHAVIOUR CHANGE, flagged by review of the reordered gate.
+#
+# `_is_own_partial` used to ask the commit's SHAPE first and returned False for
+# anything that was not a [WIP-PARTIAL] — so every `by: "wake"` resume onto an
+# ordinary commit was CREDITED. The reorder puts provenance first, and
+# `wake.py:474` stamps `by: "wake"` on EVERY wake resume from
+# `blocker.resume_commit`, which `_checkpoint_wip` fills with plain HEAD
+# whenever the tree is clean. Ordinary-subject wake checkpoints are therefore
+# routine, not exotic: a `ci_green_on:` or `quota_refreshed` resume where the
+# agent correctly adds nothing moved from credited to "file a parseable
+# ALREADY-SATISFIED claim or burn the attempt".
+#
+# The direction is the safe one — a false FAIL, never a false credit, which is
+# what the gate is for. But `orchestrator.py:~2458` records an incident of
+# exactly this class ("two burnt attempts and a human paged"), so the escape
+# hatch is not something to assume: these two tests pin BOTH halves, the cost
+# and the escape, on the routine shape rather than on a [WIP-PARTIAL].
+
+def _wake_resume_onto_an_ordinary_commit(bare_repo):
+    """The live shape: a wake checkpoint whose subject is an ordinary commit
+    message, sitting one commit ahead of the base branch."""
+    sha = _commit_on_main(bare_repo, "feature.py", "def feature():\n    return 1\n",
+                          "implement the feature")   # NOT [WIP-*] — the point
+    _git(bare_repo, "push", "origin", "main")
+    # Base must be BEHIND the checkpoint or `commits_ahead(base)` is 0 and
+    # nothing is creditable in either direction — the test would be inert.
+    _git(bare_repo, "branch", "-f", "base-behind", "HEAD~1")
+    _git(bare_repo, "push", "origin", "base-behind")
+    return sha
+
+
+async def test_a_wake_resume_onto_an_ordinary_commit_is_no_longer_credited(
+        bare_repo, tmp_path, store):
+    """THE COST, stated executably. The agent adds nothing and says so in
+    prose. Before the reorder this was recorded `succeeded` on the strength of
+    a commit the WAKE WATCHER chose; now the attempt is not credited."""
+    sha = _wake_resume_onto_an_ordinary_commit(bare_repo)
+
+    def changes_nothing(cwd):
+        return _ok("CI is green now and the change was already committed.")
+
+    orch = Orchestrator(store, _config(tmp_path).data,
+                        ScriptedBackend(changes_nothing), SlackNotifier(None))
+    t = Task.new("resumed on ci_green_on", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["feature() returns 1"]
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+    await store.merge_context(t.id, {
+        "resume_from": {"sha": sha, "branch": "main", "by": "wake"},
+        "resume_reason": "wake_condition_satisfied",
+        "base_branch": "base-behind",
+    })
+
+    t = await store.get_task(t.id)
+    final = await orch.run_task(t)
+
+    attempts = await store.list_attempts(t.id)
+    assert not [a for a in attempts if a["status"] == "succeeded"], (
+        "a MACHINE resume onto an ordinary commit was credited with a diff no "
+        f"attempt produced: {[(a['attempt_number'], a['status']) for a in attempts]}")
+    assert final.status is not TaskStatus.AWAITING_APPROVAL, (
+        "a PR was advanced for work no attempt produced")
+
+
+async def test_the_already_satisfied_escape_fires_for_that_same_wake_resume(
+        bare_repo, tmp_path, store):
+    """THE ESCAPE, on the same shape — and the reason the cost above is
+    acceptable. An agent that correctly adds nothing and files the cited claim
+    must reach the human gate through the fresh-context reviewer, not burn the
+    attempt. Without this, "never credit a wake resume" would pass the test
+    above, and that is the two-burnt-attempts incident all over again."""
+    from .test_e2e_orchestrator import ChecklistItem, FakeReviewer, ReviewDecision
+
+    sha = _wake_resume_onto_an_ordinary_commit(bare_repo)
+    claim = ("Re-checked every criterion after CI went green.\n"
+             "ALREADY-SATISFIED\n"
+             "CRITERION: feature() returns 1 — MET — evidence: feature.py:2\n")
+
+    def files_the_claim(cwd):
+        return _ok(claim)
+
+    reviewer = FakeReviewer(ReviewDecision(passed=True, checklist=[
+        ChecklistItem("feature() returns 1", True, "feature.py:2 returns 1")]))
+    orch = Orchestrator(store, _config(tmp_path).data,
+                        ScriptedBackend(files_the_claim), SlackNotifier(None),
+                        reviewer=reviewer)
+    t = Task.new("resumed on ci_green_on, nothing left to do",
+                 repo_path=str(bare_repo))
+    t.acceptance_criteria = ["feature() returns 1"]
+    # Pin intake: the claim's per-criterion COVERAGE check reads
+    # `acceptance_criteria`, and live enrichment would expand it mid-test.
+    t.context = {"eval_result": {"verdict": "accept"}}
+    await store.create_task(t)
+    await store.merge_context(t.id, {
+        "resume_from": {"sha": sha, "branch": "main", "by": "wake"},
+        "resume_reason": "wake_condition_satisfied",
+        "base_branch": "base-behind",
+    })
+
+    t = await store.get_task(t.id)
+    final = await orch.run_task(t)
+
+    assert [c for c in reviewer.calls if c["mode"] == "already_satisfied"], (
+        "the zero-diff escape never reached the reviewer — a correct "
+        f"'nothing to add' on a wake resume burns the attempt: {reviewer.calls}")
+    assert final.status is TaskStatus.AWAITING_APPROVAL, final.status
+    attempts = await store.list_attempts(t.id)
+    assert attempts[-1]["status"] == "succeeded", (
+        f"{[(a['attempt_number'], a['status'], a['failure_reason']) for a in attempts]}")

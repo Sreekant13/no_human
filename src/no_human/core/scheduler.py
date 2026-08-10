@@ -426,8 +426,32 @@ class Scheduler:
                     text = (f"found in {status.value} at startup with no "
                             "worker attached (previous process died mid-run) "
                             "— requeued from its checkpoint")
-                await self.store.set_status(
-                    t, TaskStatus.IMPLEMENTING, validate=False)
+                # THE STATUS WRITE GOES FIRST, and nothing else happens until it
+                # lands. `set_status` CAS-guards terminal rows (SCRUM-73) and
+                # returns None when it refuses — a human can mark this task DONE
+                # or cancel it between the `list_tasks` read above and here, and
+                # `merge_context` has no rollback, so stamping first left a
+                # FINISHED task holding an `orphan_recovery` checkpoint nothing
+                # would ever clear. A lost race here used to be free because the
+                # sweep wrote nothing; it is not free any more.
+                if await self.store.set_status(
+                        t, TaskStatus.IMPLEMENTING, validate=False) is None:
+                    continue
+                try:
+                    sha = await self._inherited_checkpoint(t)
+                except Exception:  # noqa: BLE001 — sweep must not kill the pool
+                    # One task's checkpoint must never abort the sweep. This is
+                    # the code path whose whole job is to rescue tasks after a
+                    # crash, and an unguarded raise inside the loop took every
+                    # REMAINING orphan down with it. A checkpoint is an
+                    # optimisation; requeueing is the rescue — which has already
+                    # happened above, so a failure here costs a cold start.
+                    log.exception(
+                        "orphan recovery: checkpoint lookup failed for %s — "
+                        "requeued from base", t.id[:8])
+                    sha = ""
+                if sha:
+                    text += f" {sha[:8]}"
                 await self.store.save_events(t.id, [{
                     "source": "orchestrator", "kind": "orphan_recovered",
                     "text": text,
@@ -436,6 +460,86 @@ class Scheduler:
                 self._on_event(
                     "orphan_recovered",
                     f"{t.id[:8]} was orphaned in {status.value} — requeued")
+
+    async def _inherited_checkpoint(self, t) -> str:
+        """The sha the requeued run must branch from, stamped if it is not
+        already recorded. Returns it, or "" when there is nothing to resume.
+
+        🔴 A REQUEUE IS NOT A RESTART, AND THE ROW ALONE DOES NOT SAY SO.
+        `run_task` re-enters as a FRESH bounded loop at ``attempt_n == 1``,
+        where `_resume_branch_point` ignores ``handoff.wip_sha`` (attempt 1 has
+        no predecessor of its own) — so the only checkpoint that survives a
+        requeue is ``resume_from``, which is not attempt-gated. The dead
+        attempt's work is committed and its sha is on the attempt row, but
+        nothing copied it there: measured 2026-08-10, three restarts closed 11
+        attempts as 'superseded by a newer attempt' across 5 live tasks and
+        every successor re-ran the coder from base. No loss was reported
+        (`resume_checkpoint_lost` NULL on all of them) because no checkpoint
+        was ever considered.
+
+        Provenance is the machine's, never ``human``: the zero-diff honesty
+        gate (`Orchestrator._is_own_partial`) credits work already ahead of
+        base only when a human gated the branch point, and a requeue is a
+        machine decision. A HUMAN's ``resume_from`` is INHERITED untouched —
+        stamping over their gated sha relabels it as the machine's and fails
+        their resume as fabrication, which is the bug that gate keeps
+        re-learning; the human is identified by the SAME rule that gate uses,
+        including its legacy fallback, so the two cannot drift apart. A sha the
+        object store can no longer read needs no check here: the orchestrator
+        already falls back to base and says so (`resume_checkpoint_lost`).
+
+        🔴 TWO THINGS THIS MUST NOT DO, both found by review of the first cut.
+
+        It must not inherit its OWN earlier stamp. The measured incident was
+        THREE restarts. Bailing on any existing ``resume_from`` cannot tell a
+        human's gate from the machine's last one, so restart 2 resumed onto
+        restart 1's sha and discarded everything the run in between committed —
+        the same loss, one restart later. Only ``human`` is inherited.
+
+        And the candidate is the attempt that actually DIED —
+        `Store.latest_open_attempt`, the most recently STARTED row still
+        ``in_progress``, and only that row. "The newest attempt this task ever
+        had" reaches back PAST a deliberate clear: `POST /tasks/{id}/retry`,
+        `nh task retry`, `LeadAgent`'s sub-task retry, `_unblock_ready` and
+        both "send back" twins all drop the checkpoint because a fresh run must
+        not branch from one an earlier actor chose, and the first sweep after
+        any of them put it straight back, from a run that had already failed.
+        Those paths now call `Store.close_open_attempts` FIRST, so after a
+        clear there is no open row to reach back to; the reason that fix is
+        there and not here is written out on that method — the context a clear
+        leaves behind is indistinguishable from a task that never had a
+        checkpoint, so no amount of reading it can tell them apart.
+
+        Not a search for "the newest open row that HAS a sha", either. Falling
+        past an open row with no commit is the same reach-back by another
+        route: after a clear the requeued run's own row is open and empty, and
+        skipping it lands on the pre-clear row. If the attempt that died
+        committed nothing, there is nothing to resume, and a cold start is the
+        correct answer.
+        """
+        ctx = t.context or {}
+        resume = ctx.get("resume_from") or {}
+        by = resume.get("by")
+        if resume.get("sha") and (
+                by == "human"
+                # No stamp at all is a row written before provenance existed;
+                # `wake.py` has always set `resume_reason`, so anything else is
+                # a legacy HUMAN resume. Identical to `_is_own_partial`'s tail.
+                or (not by
+                    and ctx.get("resume_reason") != "wake_condition_satisfied")):
+            return ""                    # a human gated it — execute, don't decide
+        sha = (await self.store.latest_open_attempt(t.id) or {}).get("commit_sha") or ""
+        if not sha:
+            # Nothing newer to point at. Deliberately NOT a clear: an earlier
+            # machine stamp is the only thing still protecting that work.
+            return ""
+        if sha == resume.get("sha"):
+            return sha                   # already stamped — no write, no churn
+        from ..blockers import resume_provenance
+        t.context = await self.store.merge_context(
+            t.id, {"resume_from": resume_provenance(
+                {"sha": sha}, "orphan_recovery")})
+        return sha
 
     @staticmethod
     def _row_age_s(stamp: str | None) -> float:

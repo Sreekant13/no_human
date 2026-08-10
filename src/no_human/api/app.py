@@ -946,6 +946,11 @@ async def send_back(
     # relabelling a sha this human never chose — relabelling is what disarmed
     # the gate and credited the loop's own abandoned partial.
     from ..blockers import resume_provenance
+    # A CLEAR is a clear however it is spelled: this writes `sha: None`, and
+    # the orphan sweep reads a `resume_from` with no sha exactly as it reads no
+    # `resume_from` at all — so without this the sweep would re-stamp the dead
+    # attempt's sha over the human's decision, with MACHINE provenance.
+    await store.close_open_attempts(task.id)
     task.context = await store.merge_context(
         task.id, {"resume_from": resume_provenance(None, "human")})
     # Reset to IMPLEMENTING so the next `nh watch <id>` retries.
@@ -1180,6 +1185,11 @@ async def retry_task(
     # and if that stale pair carried `by: "human"`, the gate was disarmed for a
     # run no human had gated. Retry means from base; a human who wants to
     # continue from a checkpoint has Resume for that.
+    # And the attempt rows the dead worker left `in_progress` are retired with
+    # it. The orphan sweep re-derives a checkpoint from exactly those rows, so
+    # clearing the context alone let the next sweep undo this endpoint's whole
+    # promise — see `Store.close_open_attempts`.
+    await store.close_open_attempts(task.id)
     task.context = await store.merge_context(
         task.id, {"cancel_reason": None, "retried_at": _now(),
                   "resume_from": None})

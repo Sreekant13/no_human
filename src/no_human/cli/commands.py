@@ -1597,6 +1597,13 @@ def task_retry(task_id):
             # `nh reply` behind the reply endpoint, `nh unblock` behind the
             # Resume endpoint's guards, and now here. When a CLI verb and an
             # HTTP endpoint share a docstring, they share an invariant.
+            # Dropping `resume_from` is not enough on its own: the orphan sweep
+            # re-derives a checkpoint from the attempt row still `in_progress`,
+            # so the first sweep after this retry put the cleared checkpoint
+            # straight back. Retire those rows first — see
+            # `Store.close_open_attempts` for why the distinction has to be
+            # made here and cannot be made by the sweep.
+            await store.close_open_attempts(t.id)
             t.context = await store.merge_context(
                 t.id, {"cancel_reason": None, "retried_at": _now_iso(),
                        "resume_from": None})
@@ -3826,6 +3833,10 @@ def reject(task_id, reason):
             # provenance stamp. No checkpoint is involved, so this CLEARS any
             # recorded sha rather than relabelling one it never chose.
             from ..blockers import resume_provenance
+            # Twin of the endpoint, down to this line: a `resume_from` with no
+            # sha reads to the orphan sweep exactly like none at all, so the
+            # dead rows are retired or the sweep re-stamps over this decision.
+            await store.close_open_attempts(t.id)
             t.context = await store.merge_context(
                 t.id, {"resume_from": resume_provenance(None, "human")})
             await store.set_status(t, TaskStatus.IMPLEMENTING, validate=False)
@@ -4061,6 +4072,14 @@ def logs(task_id):
                         + "[/]")
                 if a.get("branch_name"):
                     console.print(f"    branch: {a['branch_name']}")
+                if a.get("resume_checkpoint"):
+                    # The other half of the same question. Green, and stated
+                    # positively: this attempt continued from work that already
+                    # existed, which is the only evidence anyone has that
+                    # resuming works at all.
+                    console.print(
+                        f"    [green]resume: continued from "
+                        f"{escape(str(a['resume_checkpoint'])[:8])}[/]")
                 if a.get("resume_checkpoint_lost"):
                     # "why did this attempt start from scratch?" is asked here
                     # first, and nothing on the attempt row used to answer it.

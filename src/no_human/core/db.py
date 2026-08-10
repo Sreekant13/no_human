@@ -972,6 +972,22 @@ class Store:
             # writing "why did this fail" on a succeeding attempt would put a
             # red line under it on every surface that prints that column.
             "resume_checkpoint_lost": "TEXT",
+            # The checkpoint this attempt DID branch from. Its sibling above
+            # records only the failure, and is NULL both when a resume worked
+            # and when there was never a checkpoint to resume — NULL on all 828
+            # rows of the live DB — so on its own it cannot answer "does
+            # resuming work?", which is the question the crash-requeue path
+            # exists to move. The pair answers two different questions and BOTH
+            # can be true of one attempt: this one names the checkpoint the
+            # attempt did branch from, the other names a checkpoint that was
+            # recorded and could not be read. An attempt that steps over a
+            # human's pruned gate onto a surviving [WIP-PARTIAL] writes both
+            # (`orchestrator._run_attempt`, same `if self._commit_exists(...)`
+            # branch) — it USED one and LOST another. An earlier version of
+            # this comment said "exactly one of the pair is ever written per
+            # attempt"; a review refuted it executably, and this repo has a
+            # documented class of claims that exceed their mechanism.
+            "resume_checkpoint": "TEXT",
             # Which CODE produced this attempt's verdict — the sha of what the
             # server actually has IN MEMORY, not HEAD at query time. The server
             # loads the backend once; merging a fix to main does not reload it,
@@ -1515,6 +1531,78 @@ class Store:
             (task_id,),
         )
         return [dict(r) for r in rows]
+
+    async def latest_open_attempt(self, task_id: str) -> dict[str, Any] | None:
+        """The attempt that DIED: the most recently STARTED row still
+        ``in_progress``, or None.
+
+        Not `list_attempts()[-1]`, and not `reversed(list_attempts(...))`.
+        That list is ``ORDER BY attempt_number``, which is not recency: the
+        live DB holds task ``61406d02`` with rows (1, failed, 88a1ea35),
+        (2, in_progress, 75c68e08) and then (1, in_progress, —) inserted
+        fifteen minutes AFTER the 2 — a lower number written later — and
+        ``46fe6b92`` with four rows all numbered 1. Both came from a
+        `create_attempt` call site that passed a hardcoded 1 while
+        `create_attempt` closes only ``attempt_number < ?``, so it closed
+        nothing. Ordering by the number would have handed a caller asking
+        "which attempt just died" the row from forty-five minutes earlier;
+        rows TIED at one number resolve by SQLite's unspecified within-tie
+        order, which is not an answer at all.
+
+        ``started_at`` is second-resolution (``datetime('now')``), so ``rowid``
+        breaks the tie — it is insertion order, and attempts are never deleted.
+        """
+        row = await self._fetchone(
+            "SELECT * FROM attempts WHERE task_id = ? AND status = 'in_progress' "
+            "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            (task_id,),
+        )
+        return dict(row) if row else None
+
+    @serialized_write
+    async def close_open_attempts(self, task_id: str) -> None:
+        """Retire every ``in_progress`` row of *task_id* — the caller has just
+        declared the run that owned them over.
+
+        Called by the CHECKPOINT-CLEARING paths (`POST /tasks/{id}/retry`,
+        `nh task retry`, `LeadAgent`'s sub-task retry and `_unblock_ready`,
+        and both "send back" twins), all of which promise "a fresh run branches
+        from base". The criterion that picks those six is INTENT TO DISCARD, not
+        sha-lessness: a sha-less ``resume_from`` describes twelve sites, and the
+        other six pass a VARIABLE checkpoint and are CONTINUE re-entries, where
+        the sweep re-deriving a sha is the designed rescue under
+        ``by: "orphan_recovery"`` with the zero-diff gate armed — so retiring
+        their rows would break them, not protect them.
+        Clearing ``resume_from`` alone did not keep that promise:
+        the orphan sweep re-derives a checkpoint from the attempt that died,
+        and a row left ``in_progress`` by a crashed worker is still exactly
+        that row — so the first sweep after ANY clear put the cleared
+        checkpoint straight back, from a run that had already failed.
+
+        THE DISTINCTION HAS TO BE MADE HERE, not in the sweep. A context with
+        no ``resume_from`` looks identical whether a human deliberately cleared
+        it or it never had one, and the sweep has nothing else to read. What
+        actually changed at the clear is that the previous run's rows stopped
+        being resumable, and `attempts.status` is where that already belongs —
+        `create_attempt` closes stale rows for the same reason and in the same
+        words. A clear therefore leaves NO open row to reach back past, while
+        an attempt started AFTER it is open and is inherited normally: the
+        tombstone expires by itself, with no timestamp arithmetic and no
+        second source of truth.
+
+        Safe to call when nothing is running (every clear path runs on a task
+        whose worker is already gone) and idempotent.
+        """
+        await self.db.execute(
+            "UPDATE attempts SET status = 'interrupted', "
+            "failure_reason = COALESCE(NULLIF(TRIM(failure_reason), ''), "
+            "'interrupted: its checkpoint was cleared for a fresh run from "
+            "base — the worker process had already died without closing this "
+            "row') "
+            "WHERE task_id = ? AND status = 'in_progress'",
+            (task_id,),
+        )
+        await self.db.commit()
 
     @serialized_write
     async def add_verification_receipt(self, attempt_id: str, receipt: Any) -> None:

@@ -28,6 +28,12 @@ class AttemptOut(BaseModel):
     # part of the wire shape: the drawer is where a human asks why an attempt
     # started from scratch, and a field omitted here reads as "never happened".
     resume_checkpoint_lost: str | None = None
+    # …and the one it DID branch from. Its sibling above records only failures,
+    # so a surface carrying that alone answers "why did this start from
+    # scratch?" and can never answer "did resuming work?" — which is the
+    # question the crash-requeue path exists to move, and it had no reader
+    # outside SQL.
+    resume_checkpoint: str | None = None
     turns_used: int | None = None
     tokens_used: int | None = None
     cache_read_tokens: int | None = None
@@ -60,6 +66,7 @@ class AttemptOut(BaseModel):
             ci_status=row.get("ci_status"),
             failure_reason=row.get("failure_reason"),
             resume_checkpoint_lost=row.get("resume_checkpoint_lost"),
+            resume_checkpoint=row.get("resume_checkpoint"),
             turns_used=row.get("turns_used"),
             tokens_used=row.get("tokens_used"),
             cache_read_tokens=row.get("cache_read_tokens"),

@@ -229,7 +229,14 @@ class LeadAgent:
                 # `resume_from` the previous actor left — a stale `by:"human"`
                 # would tell the zero-diff honesty gate a human gated this run.
                 # Same rule as `POST /retry` and `nh task retry`: a fresh run
-                # branches from base.
+                # branches from base. Closing the dead attempt rows FIRST is
+                # what makes that stick — the orphan sweep re-derives a
+                # checkpoint from the attempt still `in_progress`, so clearing
+                # the context alone let the next sweep put this very checkpoint
+                # back (`Store.close_open_attempts`). Ordered so a crash
+                # between the two leaves the rows closed rather than the
+                # checkpoint cleared with the rows still open.
+                await self.store.close_open_attempts(t.id)
                 await self.store.merge_context(t.id, {"resume_from": None})
                 await self.store.set_status(
                     t, TaskStatus.PENDING, validate=False,
@@ -307,7 +314,9 @@ class LeadAgent:
                 await self.store.update_task(t)
                 # Dependencies being met is a MACHINE decision — see the retry
                 # path above. Nothing here chose a checkpoint, so nothing may
-                # inherit one.
+                # inherit one, and the same row-closing keeps the orphan sweep
+                # from re-deriving the one this just dropped.
+                await self.store.close_open_attempts(t.id)
                 await self.store.merge_context(t.id, {"resume_from": None})
                 await self.store.set_status(t, TaskStatus.PENDING)
                 unblocked += 1

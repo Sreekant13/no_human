@@ -2525,9 +2525,33 @@ class Orchestrator:
                     # `except` could not undo it — the "fall back to base" the
                     # comment promised could not happen on that path at all.
                     effective_base = checkpoint
-                    kind = "WIP-PARTIAL" if branched_from_own_partial else "WIP-BLOCKED"
+                    # THE LABEL DESCRIBES THE COMMIT, not the gate's verdict.
+                    # It read `"WIP-PARTIAL" if branched_from_own_partial else
+                    # "WIP-BLOCKED"`, which assumed every checkpoint is one of
+                    # the loop's two WIP commits. The scheduler's crash requeue
+                    # points at `attempt.commit_sha` — an ordinary work commit —
+                    # so both labels lied, and "branching from WIP-BLOCKED"
+                    # claimed a human had answered a blocker nothing raised.
+                    subject = (repo._run("log", "-1", "--format=%s", checkpoint,
+                                         "--", check=False) or "").strip()
+                    kind = next((k for k in ("WIP-PARTIAL", "WIP-BLOCKED")
+                                 if subject.startswith(f"[{k}]")), "commit")
                     self.emit("resume_wip",
                               f"branching from {kind} {checkpoint[:8]}")
+                    # Which checkpoint this attempt ACTUALLY got, on the row.
+                    # `resume_checkpoint_lost` is NULL both when a resume worked
+                    # and when there was nothing to resume — it was NULL on all
+                    # 828 live attempts — so alone it cannot measure whether
+                    # resuming works at all. The two columns answer two
+                    # different questions, and this branch can write BOTH: the
+                    # `stepped_over` write twelve lines down is inside this same
+                    # `if self._commit_exists(...)`, so an attempt that
+                    # continued from a live [WIP-PARTIAL] after the human's
+                    # gated commit was pruned USED a checkpoint and LOST one.
+                    # (The comment here used to claim exactly one is ever
+                    # written; a review refuted that executably.)
+                    await self.store.update_attempt(
+                        attempt_id, resume_checkpoint=checkpoint)
                     # A checkpoint was USED, and a different one was still lost:
                     # the human-gated resume point the repository can no longer
                     # read, which `_resume_branch_point` stepped over to reach
@@ -6884,8 +6908,19 @@ class Orchestrator:
         }
         await self.store.update_task(task)
 
-        # Create a review attempt to store the checklist.
-        attempt_id = await self.store.create_attempt(task.id, 1)
+        # Create a review attempt to store the checklist. NUMBERED LIKE EVERY
+        # OTHER ATTEMPT — `len(list_attempts) + 1`, the same expression as
+        # `_run_attempt` and `_resume_human_gated_ci`. It used to pass a
+        # hardcoded 1, and `create_attempt` closes stale rows only ``WHERE
+        # attempt_number < ?``, so a hardcoded 1 closed nothing: a re-review of
+        # the same task inserted a SECOND row at 1 beside the live one. That is
+        # the measured source of the live duplicates — task 46fe6b92 holds four
+        # rows numbered 1, and 61406d02 holds a (1, in_progress) written
+        # forty-five minutes after its (2, in_progress) — and duplicate/
+        # out-of-order numbers are what made "the attempt that died"
+        # unanswerable by number (see `Store.latest_open_attempt`).
+        attempt_id = await self.store.create_attempt(
+            task.id, len(await self.store.list_attempts(task.id)) + 1)
 
         # Build profile + rules context for the staff-level reviewer.
         prof = await self._usable_profile(repo.path)
@@ -10719,20 +10754,47 @@ SIX of them read a checkpoint and TWO do not — but do
         gate stays armed. Rows written before provenance existed have no ``by``
         and fall back to ``resume_reason``, which `wake.py` has always set.
 
-        🔴 ``scheduler._recover_orphans`` also moves tasks into IMPLEMENTING and
-        deliberately writes NOTHING. It is not a resume DECISION — it requeues
-        an attempt that was already in flight when the process died, and the
-        branch point it resumes onto was gated by whoever gated it before the
-        crash. Stamping there would overwrite a human's provenance with the
+        🔴 ``scheduler._recover_orphans`` also moves tasks into IMPLEMENTING,
+        and writes nothing when a HUMAN gated the branch point before the
+        crash: stamping there would overwrite their provenance with the
         machine's and fail their resume as fabrication, which is the bug this
-        gate keeps re-learning. Inheriting is correct on that path precisely
-        because no new decision was made.
+        gate keeps re-learning. It identifies the human by the same rule this
+        method uses, legacy fallback included, so the two cannot drift apart.
+        Anything else it stamps ``by: "orphan_recovery"`` over the sha of the
+        attempt that died — a MACHINE label, so this gate stays armed exactly
+        as it does for ``wake``. Both halves of that cost real work when they
+        were absent: inheriting NOTHING left a requeue branching from base
+        (a requeue re-enters at ``attempt_n == 1``, where
+        `_resume_branch_point` ignores ``handoff.wip_sha``, so the dead
+        attempt's committed work was simply redone), and inheriting the
+        sweep's OWN previous stamp made restarts 2 and 3 resume onto restart
+        1's sha — 11 attempts over three restarts, 2026-08-10.
         """
-        if not branch_point or not self._is_wip_partial(repo, branch_point):
-            return False          # not a partial at all — nothing to withhold
+        if not branch_point:
+            return False          # branching from base — nothing is ahead of it
         resume = ctx.get("resume_from") or {}
         if resume.get("sha") != branch_point:
-            return True           # we are on the loop's own handoff checkpoint
+            # NOTHING RECORDS WHO PRODUCED THIS BRANCH POINT — the
+            # `handoff.wip_sha` path and a reused `pr_branch` both land here —
+            # so the commit's SUBJECT is the only signal left. Fails closed:
+            # `_is_wip_partial` reads an unreadable subject as the loop's own.
+            return self._is_wip_partial(repo, branch_point)
+        # PROVENANCE OUTRANKS SHAPE for the sha it actually names.
+        #
+        # 🔴 The shape test used to run FIRST, over every path, and it
+        # DISARMED this gate for the machine resumes it was written to catch.
+        # A [WIP-PARTIAL] subject is not the only way the loop's own work gets
+        # ahead of base: `attempt.commit_sha` is the attempt's ORDINARY work
+        # commit (`_run_attempt`, and `_resume_human_gated_ci`), and
+        # `_checkpoint_wip` returns HEAD unchanged on a clean tree — so a
+        # blocker's `resume_commit`, and therefore the `resume_from` `wake.py`
+        # stamps from it, routinely names a commit with an ordinary subject.
+        # Every one of those returned False here, before `by` was ever read,
+        # and an attempt that edited NOTHING was credited with the inherited
+        # diff: recorded `succeeded`, a PR opened on work it did not do, and
+        # `unproductive_streak` never incrementing — the exact failure the
+        # paragraphs above describe, reachable by the exact rows they cite.
+        #
         # Identify the HUMAN positively, and read `by` FIRST.
         #
         # 🔴 An earlier version asked "is this machine-made?" via

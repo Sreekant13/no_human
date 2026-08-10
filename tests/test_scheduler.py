@@ -952,6 +952,225 @@ async def test_startup_recovers_orphaned_midrun_tasks(tmp_path):
         await store.close()
 
 
+def _branch_point(ctx: dict) -> str:
+    """What the requeued run will actually branch from, asked of the code that
+    decides it. A requeue re-enters `run_task` as a FRESH bounded loop, so
+    attempt_n is 1 — the number at which `handoff.wip_sha` is ignored."""
+    from no_human.core.orchestrator import Orchestrator
+    return Orchestrator._resume_branch_point(None, None, ctx, 1)
+
+
+class _SubjectRepo:
+    """Stand-in for GitRepo where only the commit SUBJECT matters."""
+
+    def __init__(self, subject: str):
+        self.subject = subject
+
+    def _run(self, *args, **kw):
+        return self.subject
+
+
+def _gate_armed(ctx: dict, sha: str, subject: str) -> bool:
+    """Is the zero-diff honesty gate armed for this branch point?
+
+    Asked of `_is_own_partial` itself, not of a proxy. True means the work
+    already ahead of base is the LOOP's and must NOT be credited to an attempt
+    that edited nothing.
+    """
+    from no_human.core.orchestrator import Orchestrator
+    return Orchestrator._is_own_partial(
+        Orchestrator.__new__(Orchestrator), _SubjectRepo(subject), ctx, sha)
+
+
+@pytest.mark.asyncio
+async def test_orphan_recovery_resumes_from_the_dead_attempts_commit(store):
+    """A restart must resume the in-flight attempt, not burn it.
+
+    Measured 2026-08-10: three server restarts produced 11 attempts closed as
+    'interrupted: superseded by a newer attempt' across 5 live tasks, and every
+    successor restarted the coder from base even though the dead attempt's work
+    was committed and its sha recorded on the attempt row. Nothing was reported
+    lost (`resume_checkpoint_lost` NULL on all of them) because no checkpoint
+    was ever considered.
+    """
+    orphan = Task.new("killed mid-review", repo_path="/r")
+    await store.create_task(orphan)
+    await store.set_status(orphan, TaskStatus.REVIEWING, validate=False)
+    attempt_id = await store.create_attempt(orphan.id, 1)
+    sha = "a" * 40
+    await store.update_attempt(attempt_id, commit_sha=sha)
+
+    await Scheduler(store, lambda task=None: None)._recover_orphans()
+
+    fresh = await store.get_task(orphan.id)
+    assert fresh.status is TaskStatus.IMPLEMENTING
+    resume_from = (fresh.context or {}).get("resume_from") or {}
+    assert resume_from.get("sha") == sha, (
+        "the requeued row carries no checkpoint — the successor attempt will "
+        f"redo the dead attempt's work from base; got {resume_from!r}")
+    # A machine requeue is NOT a human gate. Asked of the GATE, not of a proxy:
+    # `by not in (None, "human")` was the assertion here and it proved nothing —
+    # `_is_own_partial` short-circuited on the commit's SHAPE before it ever
+    # read `by`, and `commit_sha` on an attempt row is the attempt's ORDINARY
+    # work commit (`_run_attempt`: update_attempt(commit_sha=commit.sha)), never
+    # a [WIP-PARTIAL]. So the label was right and the gate was DOWN: the
+    # successor attempt could edit nothing, inherit this diff and be recorded
+    # `succeeded` with `unproductive_streak` never incrementing.
+    assert _gate_armed(fresh.context, sha, "fix: the dead attempt's work"), (
+        "the zero-diff honesty gate is DOWN on a machine requeue whose "
+        "checkpoint is an ordinary work commit")
+    assert _branch_point(fresh.context) == sha
+
+
+def test_a_human_gated_checkpoint_still_disarms_the_gate():
+    """Control for the assertion above, in the direction that has regressed
+    twice (D15 / task-84251cb2): a human who gated the branch point IS credited
+    with the work already on it, whatever the commit's subject looks like.
+    Arming there fails a correct "nothing to add" as fabrication."""
+    for subject in ("fix: work a human gated", "[WIP-PARTIAL] half a feature"):
+        ctx = {"resume_from": {"sha": "a" * 40, "by": "human"}}
+        assert _gate_armed(ctx, "a" * 40, subject) is False
+
+
+def test_the_gate_still_reads_the_subject_when_no_provenance_names_the_sha():
+    """Control: on the `handoff.wip_sha` / reused-`pr_branch` paths nothing
+    records who produced the branch point, so the SUBJECT remains the signal —
+    provenance only outranks shape for the sha it actually names."""
+    ctx = {"resume_from": {"sha": "b" * 40, "by": "human"}}
+    assert _gate_armed(ctx, "a" * 40, "[WIP-PARTIAL] half a feature") is True
+    assert _gate_armed(ctx, "a" * 40, "fix: a real commit") is False
+
+
+@pytest.mark.asyncio
+async def test_orphan_recovery_without_a_checkpoint_still_starts_cold(store):
+    """Control: an attempt that died before committing anything has nothing to
+    resume onto, and must requeue exactly as it always has — branching from
+    base, with no fabricated provenance."""
+    orphan = Task.new("killed before its first commit", repo_path="/r")
+    await store.create_task(orphan)
+    await store.set_status(orphan, TaskStatus.CONTEXT, validate=False)
+    await store.create_attempt(orphan.id, 1)          # no commit_sha
+
+    await Scheduler(store, lambda task=None: None)._recover_orphans()
+
+    fresh = await store.get_task(orphan.id)
+    assert fresh.status is TaskStatus.IMPLEMENTING
+    assert not ((fresh.context or {}).get("resume_from") or {}).get("sha")
+    assert _branch_point(fresh.context or {}) == ""
+
+
+@pytest.mark.asyncio
+async def test_orphan_recovery_never_overwrites_an_existing_provenance(store):
+    """The requeue must still INHERIT a decision another actor already made:
+    stamping over a human's `resume_from` relabels their gated sha as the
+    machine's and fails their resume as fabrication (orchestrator
+    `_is_own_partial`)."""
+    from no_human.blockers import resume_provenance
+
+    orphan = Task.new("resumed by a human, then killed", repo_path="/r")
+    await store.create_task(orphan)
+    gated = "b" * 40
+    await store.merge_context(
+        orphan.id, {"resume_from": resume_provenance({"sha": gated}, "human")})
+    await store.set_status(orphan, TaskStatus.TESTING, validate=False)
+    attempt_id = await store.create_attempt(orphan.id, 1)
+    await store.update_attempt(attempt_id, commit_sha="c" * 40)
+
+    await Scheduler(store, lambda task=None: None)._recover_orphans()
+
+    resume_from = ((await store.get_task(orphan.id)).context or {})["resume_from"]
+    # `branch: None` DELETES under RFC 7396, so it is absent, not stored.
+    assert resume_from == {"sha": gated, "by": "human"}
+
+
+@pytest.mark.asyncio
+async def test_orphan_recovery_does_not_resurrect_a_deliberately_cleared_checkpoint(
+        store):
+    """A CLEARS path removed the checkpoint; the sweep must not put it back.
+
+    `POST /api/tasks/{id}/retry`, `LeadAgent`'s sub-task retry and
+    `_unblock_ready` all write `resume_from: None` — "retry means from base; a
+    fresh run must not silently branch from a checkpoint some EARLIER actor
+    chose". The candidate sha must therefore come from the attempt that
+    actually DIED (the one still `in_progress`, db.py `create_attempt` closes
+    every older one), never from "the newest attempt this task ever had": the
+    latter reaches straight back past the clear, into a run that already
+    failed, and resurrects exactly what the human deleted.
+    """
+    t = Task.new("failed, then retried from base", repo_path="/r")
+    await store.create_task(t)
+    dead = await store.create_attempt(t.id, 1)
+    await store.update_attempt(dead, commit_sha="a" * 40)
+
+    t.context = await store.merge_context(t.id, {"resume_from": None})
+    # run 2 starts (closing run 1's row) and dies before committing anything
+    await store.create_attempt(t.id, 2)
+    await store.set_status(t, TaskStatus.PLANNING, validate=False)
+
+    await Scheduler(store, lambda task=None: None)._recover_orphans()
+
+    fresh = await store.get_task(t.id)
+    assert not ((fresh.context or {}).get("resume_from") or {}).get("sha"), (
+        "the retry's cleared checkpoint came back from a run that already "
+        f"failed; got {(fresh.context or {}).get('resume_from')!r}")
+
+
+@pytest.mark.asyncio
+async def test_a_second_restart_restamps_instead_of_reusing_its_own_stale_sha(store):
+    """The measured incident was THREE restarts, not one.
+
+    Bailing on ANY existing `resume_from` cannot tell a human's gate from the
+    machine's own earlier stamp, so restart 2 resumed onto restart 1's sha and
+    silently discarded everything the run in between committed — the same class
+    of loss this branch exists to stop, one restart later. Only `by == "human"`
+    is inherited; a machine stamp is re-stamped with the dead attempt's own sha.
+    """
+    t = Task.new("orphaned twice", repo_path="/r")
+    await store.create_task(t)
+    a1 = await store.create_attempt(t.id, 1)
+    await store.update_attempt(a1, commit_sha="a" * 40)
+    await store.set_status(t, TaskStatus.REVIEWING, validate=False)
+
+    await Scheduler(store, lambda task=None: None)._recover_orphans()
+    assert ((await store.get_task(t.id)).context or {})["resume_from"] == {
+        "sha": "a" * 40, "by": "orphan_recovery"}
+
+    # the requeued run gets further, commits MORE work, and dies again
+    a2 = await store.create_attempt(t.id, 2)
+    await store.update_attempt(a2, commit_sha="b" * 40)
+    t = await store.get_task(t.id)
+    await store.set_status(t, TaskStatus.TESTING, validate=False)
+
+    await Scheduler(store, lambda task=None: None)._recover_orphans()
+
+    resume_from = ((await store.get_task(t.id)).context or {})["resume_from"]
+    assert resume_from == {"sha": "b" * 40, "by": "orphan_recovery"}, (
+        "restart 2 resumed onto restart 1's stale checkpoint and discarded "
+        f"the interim run's commit; got {resume_from!r}")
+
+
+@pytest.mark.asyncio
+async def test_a_machine_stamp_survives_a_restart_that_finds_nothing_newer(store):
+    """Control for the re-stamp above: re-stamping is not CLEARING. A requeued
+    run that dies before committing leaves the previous machine checkpoint in
+    place — dropping it would burn the very work the stamp was protecting."""
+    t = Task.new("orphaned twice, second run committed nothing", repo_path="/r")
+    await store.create_task(t)
+    a1 = await store.create_attempt(t.id, 1)
+    await store.update_attempt(a1, commit_sha="a" * 40)
+    await store.set_status(t, TaskStatus.REVIEWING, validate=False)
+
+    await Scheduler(store, lambda task=None: None)._recover_orphans()
+    await store.create_attempt(t.id, 2)               # no commit_sha
+    t = await store.get_task(t.id)
+    await store.set_status(t, TaskStatus.TESTING, validate=False)
+
+    await Scheduler(store, lambda task=None: None)._recover_orphans()
+
+    assert ((await store.get_task(t.id)).context or {})["resume_from"] == {
+        "sha": "a" * 40, "by": "orphan_recovery"}
+
+
 async def test_a_pool_crash_records_a_durable_reason(store):
     """A task killed by a pool-level exception must say WHY, somewhere durable.
 
