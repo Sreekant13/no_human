@@ -8563,20 +8563,33 @@ class Orchestrator:
     # WS-A: a per-kind directive steers the same implement→review→test loop at
     # the task type the classifier tagged. The pipeline shape (gate, tamper guard,
     # never-merge) is unchanged; only the agent's framing differs.
+    # The feature/bugfix/test_gap wording below used to tell the coder to run
+    # the full/repo-wide test suite, which contradicts .no_human.yml's routing
+    # hint and the "scoped evidence, not the marathon" framing in
+    # prompt_blocks.py — and a hand-run of this repo's ~8k tests exceeds tool
+    # timeouts. These three now demand change-scoped test evidence instead.
     _KIND_DIRECTIVES: dict[str, str] = {
         "feature": (
             "This is a FEATURE task. Implement the feature, add tests covering "
-            "the new behaviour, and run the full unit test suite to confirm "
-            "everything passes (paste the output). If integration tests exist, "
-            "run them too or verify compatibility."
+            "the new behaviour, then run the tests for your change scope — the "
+            "tests you added/changed plus any that directly exercise the "
+            "modified module (e.g. `uv run pytest tests/test_<area>.py -q` or "
+            "`-k <name>`) — and paste the command and its full output. Verify "
+            "compatibility with existing tests rather than running them all; "
+            "the harness independently reruns the authoritative change-scoped "
+            "gate afterward."
             " If the description specifies literal values (URLs, branch refs, "
             "API params), use them exactly as stated."
         ),
         "bugfix": (
             "This is a BUGFIX. Reproduce the defect with a failing test first, "
-            "then fix the root cause (not the symptom), and run the full test "
-            "suite to confirm the fix AND that no regressions were introduced. "
-            "Paste the test output as evidence."
+            "then fix the root cause (not the symptom), and run the tests for "
+            "your change scope — the tests you added/changed plus any that "
+            "directly exercise the fixed module (e.g. `uv run pytest "
+            "tests/test_<area>.py -q` or `-k <name>`) — then paste the command "
+            "and its full output as evidence that the fix works and introduces "
+            "no regressions in that scope; the harness independently reruns "
+            "the authoritative change-scoped gate afterward."
         ),
         "ci_fix": (
             "This task is to make a failing remote CI build GREEN. Fix the actual "
@@ -8597,8 +8610,11 @@ class Orchestrator:
             "This task is to ADD missing test coverage for existing behaviour. "
             "Do not change production behaviour except minimally to make the code "
             "testable; the new tests must genuinely exercise the code. Run the "
-            "full test suite (unit and integration if available) and paste the "
-            "output to prove all tests pass."
+            "tests for your change scope — the new tests plus any others that "
+            "directly exercise the same module (e.g. `uv run pytest "
+            "tests/test_<area>.py -q`) — and paste the command and its full "
+            "output to prove they pass; the harness independently reruns the "
+            "authoritative change-scoped gate afterward."
         ),
         "investigation": (
             "This is an INVESTIGATION / ROOT-CAUSE ANALYSIS task. You have wider "
