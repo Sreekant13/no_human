@@ -1,0 +1,7 @@
+{
+  "pr_opened": true,
+  "review_passed": true,
+  "holdout_green": true,
+  "max_weighted_tokens": 3000000,
+  "max_wall_seconds": 2700
+}

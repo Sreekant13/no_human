@@ -1,0 +1,10 @@
+{
+  "title": "README.md states the wrong item limit",
+  "description": "README.md line 7 reads \"A store holds at most 100 items. Adding one more raises `ListFull`.\" The code disagrees: tinytodo/store.py line 3 declares `MAX_ITEMS = 200`, and tests/test_store.py pins that value with `assert MAX_ITEMS == 200`. The CODE is correct and the prose is stale \u2014 the limit was raised from 100 to 200 and the README was never updated. Change the number 100 to 200 on README.md line 7 and change nothing else. Do not touch tinytodo/store.py, do not touch tests/test_store.py, and do not reflow or reformat any other line of README.md.",
+  "acceptance_criteria": [
+    "README.md line 7 says 200 instead of 100",
+    "no other line of README.md changes",
+    "tinytodo/store.py is unchanged",
+    "tests/test_store.py is unchanged and still passes"
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "title": "A typo'd id reads as a successful completion",
+  "description": "tinytodo/store.py line 17 defines `complete(self, item_id)`. Lines 18-20 read `item = self._items.get(item_id)` / `if item is None:` / `return None` \u2014 so completing an id that was never added returns None and looks, to every caller that does not check, exactly like success. Support have twice closed a ticket that was never marked done.\n\nMake it raise instead. Define `UnknownItem` in tinytodo/store.py, subclassing KeyError, and raise `UnknownItem(item_id)` from `complete()` when the id is not in the store \u2014 so `str(exc)` contains the id that was asked for. Completing a known id must behave exactly as it does now: it sets `done` to True and returns the item dict. Every test already in tests/test_store.py must still pass unchanged.",
+  "acceptance_criteria": [
+    "tinytodo/store.py defines UnknownItem and it subclasses KeyError",
+    "complete() raises UnknownItem for an id that is not in the store",
+    "str() of the raised exception contains the id that was asked for",
+    "complete() on a known id still sets done to True and returns the item",
+    "every test in tests/test_store.py still passes, unchanged"
+  ]
+}

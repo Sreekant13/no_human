@@ -783,6 +783,22 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
             "held-out tests",
             "user-invoked: `nh bench` only, never reached from `nh run`"),
     },
+    # The nightly funnel eval. Same standing as the bench above: developer
+    # tooling, never on the installed run path. `nh run` reaches neither.
+    "eval/funnel_corpus.py": {
+        "exec:git push": Allowed(
+            "a bare repo created inside the run's OWN workdir — `materialize` "
+            "inits it two lines earlier and pushes to that path and no other; "
+            "the corpus fixtures have no remote of their own to inherit",
+            "user-invoked: `python -m no_human.eval.funnel_eval` only"),
+    },
+    "eval/funnel_eval.py": {
+        "exec:<dynamic>": Allowed(
+            "`[sys.executable, '-m', 'pytest', <holdout>]` — the tier's "
+            "held-out test, built by `funnel_corpus.load_corpus` from a path "
+            "inside `eval/funnel_corpus/`",
+            "user-invoked: `python -m no_human.eval.funnel_eval` only"),
+    },
     "eval/replay.py": {
         "exec:git push": Allowed(
             "a bare repo created inside the replay sandbox (`str(bare)`)",

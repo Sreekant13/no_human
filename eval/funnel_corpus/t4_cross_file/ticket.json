@@ -1,0 +1,12 @@
+{
+  "title": "list has no machine-readable output",
+  "description": "Our dashboard shells out to `list` and screen-scrapes the boxes out of tinytodo/render.py's `as_text`. Give it real JSON. This touches two files.\n\n1. tinytodo/render.py currently defines only `as_text(items)` (line 4). Add `as_json(items)` beside it. It returns a JSON STRING \u2014 the output of `json.dumps` \u2014 of the list of item dicts exactly as given, every field kept (`id`, `title`, `done`), no re-ordering and no renaming. `as_json([])` returns the JSON for an empty array.\n\n2. tinytodo/cli.py's `main(argv)` handles `list` at line 26 with `print(as_text(STORE.all()))`. Accept a `--json` flag after `list`: `main([\"list\", \"--json\"])` prints `as_json(STORE.all())` instead and returns 0. `main([\"list\"])` with no flag must print exactly what it prints today.\n\n`as_text` must not change, and every test already in tests/test_render.py and tests/test_cli.py must still pass unchanged.",
+  "acceptance_criteria": [
+    "tinytodo/render.py defines as_json(items) returning a JSON string",
+    "as_json keeps every field of every item and re-orders nothing",
+    "main([\"list\", \"--json\"]) prints that JSON and returns 0",
+    "main([\"list\"]) prints exactly what it prints today",
+    "as_text is unchanged",
+    "every test in tests/test_render.py and tests/test_cli.py still passes"
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "_what_this_is": "The funnel-regression ratchet. The nightly run fails when a tier that PASSED at this baseline fails tonight, or when a tier costs more than 25% over its baseline cost. It does not cap the absolute number of passes: a count-based gate drifts and never fails.",
+  "_how_to_refresh": "Deliberately, by a human, in the commit that fixes or accepts something — never to turn a red night green, and never by the runner itself. Copy the `tasks` array out of an out/nightly-YYYY-MM-DD.json you have READ, and set `unseeded` to false. A cheaper night is recorded and changes nothing: auto-tightening turns one lucky run into a gate nobody can pass.",
+  "unseeded": true,
+  "recorded": null,
+  "product_commit": null,
+  "tasks": []
+}

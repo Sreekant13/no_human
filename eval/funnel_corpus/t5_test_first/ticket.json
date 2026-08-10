@@ -1,0 +1,13 @@
+{
+  "title": "Nothing tells us which items are late",
+  "description": "Write the test first. This ticket is deliberately test-first: add the failing test to tests/test_store.py, watch it fail, then make it pass.\n\ntinytodo/store.py defines `Store` with `add(title, due=None)` (line 10), `complete` (line 16) and `all` (line 22). `due` is a day number (an int) counted from day 0, or None for \"no due date\". Add `overdue(self, today)` to `Store`, directly after `all()`.\n\nIt returns the list of item dicts (the same `{\"id\", \"title\", \"done\", \"due\"}` dicts `all()` returns) that are LATE, in insertion order. An item is late when its `due` is an int STRICTLY LESS THAN `today`. An item due exactly on `today` is not late. An item whose `due` is None is never late. An item whose `done` is True is never late, whatever its due day. Nothing late returns an empty list.\n\nAdd tests for each of those five rules to tests/test_store.py before you implement `overdue`. Do not change `add`, `complete` or `all`, and every test already in tests/test_store.py must still pass unchanged.",
+  "acceptance_criteria": [
+    "tests/test_store.py gains a test per rule, written before the fix",
+    "Store.overdue(today) exists in tinytodo/store.py",
+    "an item is late only when due is an int strictly less than today",
+    "an item due exactly today, or with due None, is never late",
+    "a completed item is never late whatever its due day",
+    "it returns whole item dicts in insertion order, [] when none are late",
+    "every test already in tests/test_store.py still passes, unchanged"
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "title": "There is no way to find an item by its title",
+  "description": "tinytodo/store.py defines `Store` with `add`, `complete` and `all`. `all()` is at line 26 and returns every item; with a few hundred items that is useless for finding one. Add a `search(self, term)` method to `Store` in tinytodo/store.py, directly after `all()`.\n\nIt returns a list of the item dicts (the same `{\"id\", \"title\", \"done\"}` dicts `all()` returns) whose `title` contains `term` as a substring, compared CASE-INSENSITIVELY, in insertion order. An empty `term` matches every item. A term that matches nothing returns an empty list. `search` must not modify the store. Do not change `add`, `complete` or `all`, and every test already in tests/test_store.py must still pass unchanged.",
+  "acceptance_criteria": [
+    "Store.search(term) exists in tinytodo/store.py",
+    "it matches term as a case-insensitive substring of title",
+    "it returns whole item dicts in insertion order",
+    "an empty term matches everything and an unmatched term returns []",
+    "it does not modify the store",
+    "every test in tests/test_store.py still passes, unchanged"
+  ]
+}

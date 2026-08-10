@@ -1174,6 +1174,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # rather be asked.
         "exhaustion_terminal": True,
     },
+    # The nightly funnel eval (Phase C). The only knob it has: a run REFUSES
+    # to start when the corpus's own ceiling sum exceeds this, so an unattended
+    # 03:00 job cannot be authorised to spend more than the corpus was designed
+    # to cost. The default IS that sum (400k + 1.5M + 3M + 4M + 2M across the
+    # five tiers), weighted exactly as `bounds.lifetime_tokens` is weighted —
+    # so out of the box the guard permits the corpus and nothing more. Raise it
+    # only with a corpus that justifies the raise; `tests/test_funnel_eval.py
+    # ::test_the_default_budget_is_the_corpus_ceiling` is the drift guard, and
+    # it recomputes the sum from the corpus rather than restating it.
+    "eval": {
+        "nightly_budget_tokens": 10_900_000,
+    },
     "bounds_investigation": {
         "max_attempts": 8,
         "max_turns_per_attempt": 80,

@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The nightly funnel-regression eval, at 03:00 local.
+
+  SHIPPED DISABLED. `Disabled` is true and `RunAtLoad` is false, so installing
+  this file schedules nothing: it takes an operator turning it on, deliberately,
+  after they have read one real run. An unattended job that spends subscription
+  quota every night is not something a checkout should switch on by itself.
+
+  Install (after sign-off, and only then):
+    sed "s|__REPO__|$PWD|g" scripts/com.nohuman.nightly-eval.plist \
+      > ~/Library/LaunchAgents/com.nohuman.nightly-eval.plist \
+      && launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.nohuman.nightly-eval.plist \
+      && launchctl enable gui/$UID/com.nohuman.nightly-eval
+
+  Stop it:
+    launchctl bootout gui/$UID/com.nohuman.nightly-eval
+
+  __REPO__ must be replaced with the absolute path of the checkout — launchd
+  runs with no shell, no PATH from your profile and no cwd of its own.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nohuman.nightly-eval</string>
+
+    <key>Disabled</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-lc</string>
+        <string>exec __REPO__/scripts/nightly_eval.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- launchd would otherwise restart a job that exits immediately, in a
+         loop. A red night must exit and stay exited until tomorrow. -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/nohuman-nightly-eval.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/nohuman-nightly-eval.err.log</string>
+</dict>
+</plist>
