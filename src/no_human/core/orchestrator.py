@@ -7307,18 +7307,67 @@ class Orchestrator:
         Uses a readonly backend (same pattern as _generate_plan) to compress
         raw file/grep bytes into task-relevant summaries. Best-effort: any
         failure preserves the original (truncated) chunk.
+
+        EVERY OUTCOME LEAVES A RECORD, and that is an accounting requirement,
+        not telemetry taste. ``attempts.distill_*`` is the only evidence this
+        role leaves, and a zero there has two opposite causes — the distiller
+        ran and cost nothing, or it never ran at all. Measured 2026-08-10:
+        distill_* was 0 on all 828 attempt rows, which was read as spend the
+        plumbing had lost; it was not. The last of 162 distillations ran
+        2026-07-28, the columns landed 2026-08-03, and the two have never
+        coexisted. Nothing recorded the skip, so the correct zero was
+        indistinguishable from a broken one for twelve days.
+
+        The invariant that makes ``nh doctor``'s hints TRUE, rather than true
+        of the two outcomes that happened to be instrumented: exactly one
+        event per gather with nothing to weigh, and exactly one event per
+        chunk that IS weighed — one of
+
+          ``context_distill``          a chunk was replaced by its summary
+          ``context_distill_skipped``  weighed, nothing replaced, no error
+                                       (``reason``: no_large_chunk / no_gain)
+          ``context_distill_failed``   the attempt raised and was swallowed
+
+        so all three at zero means, and only means, that this function never
+        ran. The failure kind is the one that had no record at all: a dead
+        backend (quota exhausted, credentials scrubbed) raised on every chunk,
+        ``except Exception: pass`` ate it, ``_note_distill_usage`` was never
+        reached, and every counter read exactly like a distiller nobody
+        consults — while it was being consulted and failing on every call.
         """
         large = [
             (i, c) for i, c in enumerate(chunks)
             if len(c.content) > self._CHUNK_DISTILL_THRESHOLD
         ]
         if not large:
+            # Its OWN kind, never `context_distill`: doctor.py counts that one
+            # as proof the mechanism is alive, and a skip counted as a firing
+            # would report a dead lever as healthy — the failure this record
+            # exists to end. `largest` is what makes the zero diagnosable: a
+            # gather whose biggest chunk is 879 chars against a 2000 threshold
+            # is a lever that CANNOT fire, not one that had no work. What caps
+            # a codebase chunk that low is `CodebaseSource._search`'s own
+            # `[:200]` slice per matched line (context/codebase.py:96) times
+            # `--max-count 5`; rg's `--max-columns 200` does NOT truncate — it
+            # OMITS a longer line entirely — so do not read that flag as the
+            # ceiling, and note the grep fallback slices the same 200 but has
+            # no per-file cap at all.
+            self.emit(
+                "context_distill_skipped",
+                f"0 of {len(chunks)} chunks over "
+                f"{self._CHUNK_DISTILL_THRESHOLD} chars — nothing to distill",
+                chunks=len(chunks),
+                largest=max((len(c.content) for c in chunks), default=0),
+                threshold=self._CHUNK_DISTILL_THRESHOLD,
+                reason="no_large_chunk",
+            )
             return
         # D21: these are per-chunk summaries of context the coder will read —
         # a utility job. They ran on review_model, i.e. Opus, once per oversized
         # chunk, for no gain the reviewer's gate would ever see.
         distill_model = self._utility_model()
         for idx, chunk in large:
+            before = len(chunk.content)
             try:
                 backend = ClaudeBackend(model=distill_model, readonly=True)
                 prompt = (
@@ -7339,11 +7388,54 @@ class Orchestrator:
                 # coder's column and needs this one to be its own.
                 self._note_distill_usage(result)
                 summary = (result.final_text or "").strip()
-                if summary and len(summary) < len(chunk.content):
+                if summary and len(summary) < before:
                     chunk.content = f"[distilled] {summary}"
-                    self.emit("context_distill", f"distilled {chunk.source}/{chunk.title}")
-            except Exception:  # noqa: BLE001 — distillation is best-effort
-                pass
+                    # The OTHER side of the trade `_note_distill_usage`'s
+                    # docstring says cannot be measured. `distill_*` records
+                    # what the summariser cost; these two record the SIZE OF
+                    # THIS CHUNK either side of the replacement — before minus
+                    # after, which is usually a saving and is NOT always one:
+                    # the guard compares the raw summary against `before`
+                    # while the replacement prepends "[distilled] ", so a
+                    # summary one char under the original leaves the chunk 11
+                    # chars BIGGER and this pair says so. Read the delta, do
+                    # not assume its sign. (The off-by-12 is pre-existing and
+                    # deliberately not fixed here: narrowing the guard would
+                    # change which chunks get distilled. Recording only the
+                    # cost half is how a "pays for itself" claim stays
+                    # unfalsifiable — a growth recorded as a saving is how it
+                    # stays wrong.)
+                    self.emit(
+                        "context_distill",
+                        f"distilled {chunk.source}/{chunk.title}",
+                        chars_before=before, chars_after=len(chunk.content),
+                    )
+                else:
+                    # Billed and bought nothing: `_note_distill_usage` above
+                    # already charged the call. Without this the spend has no
+                    # counterpart event at all.
+                    self.emit(
+                        "context_distill_skipped",
+                        f"kept {chunk.source}/{chunk.title} — the summary was "
+                        f"not smaller ({len(summary)} vs {before} chars)",
+                        reason="no_gain", chars_before=before,
+                        summary_chars=len(summary),
+                        threshold=self._CHUNK_DISTILL_THRESHOLD,
+                    )
+            except Exception as exc:  # noqa: BLE001 — distillation is best-effort
+                # Swallowing this is the design (a failed distillation must
+                # never break a gather) and the silence was not: with no
+                # record here, a backend that raises on every chunk leaves
+                # `distill_*` at 0 and every distill event kind at 0 — the
+                # exact signature of a distiller that is never consulted.
+                # Best-effort in turn: the sink must not resurrect the failure.
+                with contextlib.suppress(Exception):
+                    self.emit(
+                        "context_distill_failed",
+                        f"{chunk.source}/{chunk.title}: "
+                        f"{type(exc).__name__}: {exc}",
+                        error=type(exc).__name__, chars_before=before,
+                    )
 
     def _context_digest(self, task: Task, limit: int = 8) -> str:
         gathered = (task.context or {}).get("gathered") or {}

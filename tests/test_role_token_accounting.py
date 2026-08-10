@@ -69,10 +69,11 @@ async def store(tmp_path):
     await s.close()
 
 
-def _orch(store, tmp_path):
+def _orch(store, tmp_path, sink=None):
     cfg = load_config(tmp_path / "config.yaml")
     cfg.data.setdefault("planning", {})["enabled"] = False
-    return Orchestrator(store, cfg.data, _NoBackend(), SlackNotifier(None))
+    return Orchestrator(store, cfg.data, _NoBackend(), SlackNotifier(None),
+                        event_sink=sink)
 
 
 async def _task(store, repo="/r"):
@@ -217,6 +218,168 @@ async def test_the_two_roles_do_not_share_a_bucket(
     # The total is unchanged by the split: both are still in the task's burn.
     _, total = await store.lifetime_usage(t.id)
     assert total == sum(SUP) + sum(DIS)
+
+
+async def test_a_skipped_distillation_is_recorded_so_a_zero_is_falsifiable(
+    store, tmp_path, monkeypatch,
+):
+    """`distill_* == 0` had two completely different causes and no way to tell
+    them apart: the distiller ran and was free, or it never ran at all.
+
+    Measured on the live DB 2026-08-10: 162 `context_distill` events, the last
+    on 2026-07-28, and the `distill_*` columns landed 2026-08-03 — so the
+    distiller and its own columns have never once coexisted, and every one of
+    the 828 zeros is CORRECT. That was read as lost spend instead, because
+    nothing anywhere recorded the decision NOT to distill. The threshold and
+    the decision are unchanged here; only the record of it is added."""
+    events = []
+    be = _TokenBackend(DIS, text="must never be produced")
+    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", be)
+    orch = _orch(store, tmp_path, sink=events.append)
+    t = await _task(store, repo=str(tmp_path))
+    small = _Chunk("x" * (orch._CHUNK_DISTILL_THRESHOLD - 1))
+
+    await orch._distill_large_chunks([small], t)
+
+    assert be.calls == 0                                  # behaviour unchanged
+    row = await _drain_to_attempt(orch, store, t)
+    assert row["distill_tokens_used"] == 0
+    skipped = [e for e in events if e["kind"] == "context_distill_skipped"]
+    assert len(skipped) == 1
+    # The three numbers that make the zero readable: how many chunks were
+    # WEIGHED, how close the biggest came, and against what.
+    assert skipped[0]["chunks"] == 1
+    assert skipped[0]["largest"] == len(small.content)
+    assert skipped[0]["threshold"] == orch._CHUNK_DISTILL_THRESHOLD
+    assert skipped[0]["reason"] == "no_large_chunk"    # which skip this is
+    # ...and no distillation was claimed. `nh doctor` counts this kind as
+    # liveness evidence, so a skip must never inflate it.
+    assert [e for e in events if e["kind"] == "context_distill"] == []
+
+
+async def test_a_distillation_records_the_bytes_it_removed(
+    store, tmp_path, monkeypatch,
+):
+    """The OTHER half of `_note_distill_usage`'s own claim: distillation "pays
+    for itself — a smaller coder prompt in exchange for N summarizer sessions
+    — and that trade cannot be measured while the two sides of it are not
+    separately recorded." The spend side got a column; the saving side was
+    recorded nowhere, so the trade stayed untestable even for the 162 runs that
+    did happen. This is that side."""
+    events = []
+    be = _TokenBackend(DIS, text="a short summary")
+    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", be)
+    orch = _orch(store, tmp_path, sink=events.append)
+    t = await _task(store, repo=str(tmp_path))
+    chunk = _Chunk("x" * (orch._CHUNK_DISTILL_THRESHOLD + 1))
+    before = len(chunk.content)
+
+    await orch._distill_large_chunks([chunk], t)
+
+    row = await _drain_to_attempt(orch, store, t)
+    assert row["distill_tokens_used"] == DIS[0]           # spend side
+    ev = [e for e in events if e["kind"] == "context_distill"]
+    assert len(ev) == 1
+    assert ev[0]["chars_before"] == before                # saving side
+    assert ev[0]["chars_after"] == len(chunk.content)
+    assert ev[0]["chars_after"] < before
+    assert [e for e in events if e["kind"] == "context_distill_skipped"] == []
+
+
+async def test_a_distillation_that_grows_the_chunk_is_recorded_as_a_growth(
+    store, tmp_path, monkeypatch,
+):
+    """`chars_after` can EXCEED `chars_before`, and this pins the case so the
+    pair cannot be read as "bytes saved". The guard compares the RAW summary
+    against `before`, but the replacement prepends `"[distilled] "` — 12 chars
+    — so a summary one char under the original leaves the chunk 11 chars
+    BIGGER. The event records that honestly; nothing else may claim otherwise.
+
+    The off-by-12 is pre-existing and deliberately NOT fixed here: narrowing
+    the guard would change which chunks get distilled, which is a behaviour
+    change this commit does not make."""
+    events = []
+    orch_threshold = Orchestrator._CHUNK_DISTILL_THRESHOLD
+    before = orch_threshold + 100
+    be = _TokenBackend(DIS, text="y" * (before - 1))   # one char under
+    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", be)
+    orch = _orch(store, tmp_path, sink=events.append)
+    t = await _task(store, repo=str(tmp_path))
+    chunk = _Chunk("x" * before)
+
+    await orch._distill_large_chunks([chunk], t)
+
+    ev = [e for e in events if e["kind"] == "context_distill"]
+    assert len(ev) == 1
+    assert ev[0]["chars_before"] == before
+    assert ev[0]["chars_after"] == before + 11        # 12-char prefix, -1 char
+    assert ev[0]["chars_after"] > ev[0]["chars_before"]
+    assert len(chunk.content) == before + 11          # behaviour unchanged
+
+
+async def test_a_distillation_that_raises_is_recorded_not_silent(
+    store, tmp_path, monkeypatch,
+):
+    """The third outcome. `except Exception: pass` swallowed backend failures
+    whole, so a gather with an oversized chunk and a dead backend (quota
+    exhausted, credentials scrubbed, backend unavailable) emitted NOTHING:
+    not `context_distill`, not `context_distill_skipped`, and
+    `_note_distill_usage` was never reached, so `distill_*` stayed 0 too.
+
+    Every counter then read exactly like a distiller that is never consulted,
+    while it was being consulted and failing on every call — the same
+    zero-with-two-causes this commit exists to end, one layer down."""
+    events = []
+
+    class _Boom:
+        def __call__(self, *a, **kw):
+            raise RuntimeError("Credit balance too low")
+
+    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", _Boom())
+    orch = _orch(store, tmp_path, sink=events.append)
+    t = await _task(store, repo=str(tmp_path))
+    chunk = _Chunk("x" * (orch._CHUNK_DISTILL_THRESHOLD + 1))
+    before = len(chunk.content)
+
+    await orch._distill_large_chunks([chunk], t)      # never raises
+
+    assert chunk.content == "x" * before              # chunk preserved
+    failed = [e for e in events if e["kind"] == "context_distill_failed"]
+    assert len(failed) == 1
+    assert failed[0]["error"] == "RuntimeError"
+    assert failed[0]["chars_before"] == before
+    # Not a firing and not a skip: those two count as "weighed and decided".
+    assert [e for e in events if e["kind"] == "context_distill"] == []
+    assert [e for e in events if e["kind"] == "context_distill_skipped"] == []
+
+
+async def test_a_distillation_that_buys_nothing_is_recorded_too(
+    store, tmp_path, monkeypatch,
+):
+    """The fourth outcome, and the other half of the same blind spot: the call
+    SUCCEEDS and is billed, but the summary is empty or no shorter than the
+    chunk, so the chunk is left alone and `context_distill` is not emitted.
+
+    Without this record, `distill_*` is non-zero while all three event kinds
+    are zero — spend with no trace of what it bought."""
+    events = []
+    be = _TokenBackend(DIS, text="z" * 9_000)         # longer than the chunk
+    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", be)
+    orch = _orch(store, tmp_path, sink=events.append)
+    t = await _task(store, repo=str(tmp_path))
+    chunk = _Chunk("x" * (orch._CHUNK_DISTILL_THRESHOLD + 1))
+    before = len(chunk.content)
+
+    await orch._distill_large_chunks([chunk], t)
+
+    assert chunk.content == "x" * before              # behaviour unchanged
+    row = await _drain_to_attempt(orch, store, t)
+    assert row["distill_tokens_used"] == DIS[0]       # it WAS billed
+    skipped = [e for e in events if e["kind"] == "context_distill_skipped"]
+    assert len(skipped) == 1
+    assert skipped[0]["reason"] == "no_gain"
+    assert skipped[0]["chars_before"] == before
+    assert [e for e in events if e["kind"] == "context_distill"] == []
 
 
 # --------------------------------------------------------------------------- #

@@ -482,8 +482,12 @@ def test_doctor_reports_the_auth_profile_and_mode(tmp_path):
 
 
 def test_the_mechanism_table_is_behind_verbose_and_the_exit_code_is_not(tmp_path):
-    """The 20-row table moves behind `--verbose`; the summary line, the
-    `healthy` predicate and the exit code do not move at all."""
+    """The mechanism table moves behind `--verbose`; the summary line, the
+    `healthy` predicate and the exit code do not move at all.
+
+    Row count comes from `MECHANISMS`, not a literal: registering a mechanism
+    is a one-line change and used to fail HERE, in a rendering test that has
+    nothing to say about it."""
     home, tmpdir = tmp_path / "home", _mktmp(tmp_path)
     quiet = _run_doctor(home, tmpdir)
     loud = _run_doctor(home, tmpdir, args=("--verbose",))
@@ -493,17 +497,78 @@ def test_the_mechanism_table_is_behind_verbose_and_the_exit_code_is_not(tmp_path
     assert "mechanism liveness" in quiet.stdout, quiet.stdout
     assert "last: never" not in quiet.stdout, quiet.stdout
     assert "review_gate" not in quiet.stdout, quiet.stdout
-    assert "0/20 have ever fired" in quiet.stdout, quiet.stdout
+    assert f"0/{len(MECHANISMS)} have ever fired" in quiet.stdout, quiet.stdout
 
     # --verbose: the whole table, exactly as it always rendered.
     assert "review_gate" in loud.stdout, loud.stdout
-    assert loud.stdout.count("last: never") == 20, loud.stdout
+    assert loud.stdout.count("last: never") == len(MECHANISMS), loud.stdout
     assert len(loud.stdout.splitlines()) > len(quiet.stdout.splitlines())
 
     # Same verdict, same exit code either way.
     assert quiet.returncode == loud.returncode == 0, (quiet.stdout, loud.stdout)
     for out in (quiet.stdout, loud.stdout):
         assert "no contradictions, no evidence gaps" in out, out
+
+
+async def test_a_dead_distiller_is_readable_from_the_three_distill_mechanisms(store):
+    """A LIFETIME count cannot show a death: `context_distill` stood at 162 on
+    2026-08-10 with its last firing on 2026-07-28, so doctor read "alive" for
+    twelve days while the lever was dead, and the resulting `distill_* == 0`
+    was misdiagnosed as lost spend.
+
+    The other two kinds are what separate the causes. All three carry
+    `last_ts`, so "distilled 162×, last a fortnight ago; skipped 73×, last
+    today" is readable off one screen. Deliberately NOT a contradiction rule:
+    keying one off lifetime counts would inherit the exact blindness above."""
+    names = {n for n, _, _ in MECHANISMS}
+    assert {"context_distill", "context_distill_skipped",
+            "context_distill_failed"} <= names
+
+    t = Task.new("x", repo_path="/tmp/x")
+    await store.create_task(t)
+    await store.save_events(t.id, [
+        _ev("context_distill_skipped", chunks=3, largest=879, threshold=2000,
+            reason="no_large_chunk"),
+        _ev("context_distill_skipped", chunks=4, largest=782, threshold=2000,
+            reason="no_large_chunk"),
+    ])
+    d = await diagnose(store)
+    counts = {m["name"]: m["count"] for m in d.mechanisms}
+    assert counts["context_distill_skipped"] == 2
+    assert counts["context_distill"] == 0
+    assert counts["context_distill_failed"] == 0
+    # A skip is not a firing: it must never be swept into the liveness count.
+    hints = {m["name"]: m["hint"] for m in d.mechanisms}
+    assert hints["context_distill"]          # still flagged as never-fired
+    assert not hints["context_distill_skipped"]
+    # ...and neither is a health failure — doctor reports, the human decides.
+    assert d.evidence_gaps == []
+
+
+async def test_a_distiller_that_only_throws_is_not_read_as_never_consulted(store):
+    """The state the skip kind alone could not see. A gather WITH an oversized
+    chunk and a backend that raises emits neither a firing nor a skip, so both
+    of those counts sit at zero while distillation is being consulted on every
+    gather and failing on every call — and the zero-hint on the skip row said
+    that shape meant "not being consulted at all". The failure kind is what
+    makes that sentence true: its count is the only surviving evidence,
+    because the exception is swallowed and the call never bills `distill_*`."""
+    t = Task.new("x", repo_path="/tmp/x")
+    await store.create_task(t)
+    await store.save_events(t.id, [
+        _ev("context_distill_failed", error="RuntimeError", chars_before=4096),
+    ])
+    d = await diagnose(store)
+    counts = {m["name"]: m["count"] for m in d.mechanisms}
+    assert counts["context_distill_failed"] == 1
+    assert counts["context_distill"] == counts["context_distill_skipped"] == 0
+    hints = {m["name"]: m["hint"] for m in d.mechanisms}
+    assert not hints["context_distill_failed"]   # non-zero: no zero-hint shown
+    # The skip row's zero-hint may only claim "not consulted" for the case
+    # where this row is zero too — the reading it now spells out.
+    assert "both other context_distill_* rows at zero" in hints[
+        "context_distill_skipped"]
+    assert d.evidence_gaps == []
 
 
 def _mktmp(tmp_path: Path) -> Path:

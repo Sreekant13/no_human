@@ -44,8 +44,32 @@ MECHANISMS: list[tuple[str, tuple[str, ...], str]] = [
      "zero is good — the test-tampering guard never fired. Non-zero alongside "
      "delivered PRs means fires are being WAIVED as ticket-required; the "
      "justification is on each PR and is worth spot-checking"),
+    # Read these THREE TOGETHER, and read their `last_ts`, not just their
+    # counts. The first hint used to say distillation "has never fired to
+    # date"; by 2026-08-10 it had fired 162 times, the last on 2026-07-28, and
+    # a LIFETIME count of 162 reported a mechanism that had been dead for
+    # twelve days as alive. `_distill_large_chunks` emits exactly one of these
+    # three per gather with nothing to weigh and one per chunk it does weigh,
+    # so all three at zero means, and only means, that distillation is never
+    # consulted — no single one of them carries that reading on its own.
     ("context_distill", ("context_distill",),
-     "has never fired to date — plausible with quota headroom, worth knowing"),
+     "zero = no chunk has ever been distilled; the other two context_distill_* "
+     "rows say whether the lever was even reachable"),
+    ("context_distill_skipped", ("context_distill_skipped",),
+     "zero here WITH both other context_distill_* rows at zero = distillation "
+     "is not being consulted at all; zero here with either of them non-zero "
+     "means it is consulted and every chunk it weighed either distilled or "
+     "threw. Non-zero with a STALE context_distill last_ts is the live shape: "
+     "consulted and never firing — each event carries a `reason` "
+     "(no_large_chunk: nothing reached `_CHUNK_DISTILL_THRESHOLD`, with the "
+     "largest chunk it saw; no_gain: the summary came back no smaller) so the "
+     "gap is readable, not guessed"),
+    ("context_distill_failed", ("context_distill_failed",),
+     "zero is good — no distillation attempt has ever raised. Non-zero means "
+     "the lever is being consulted and throwing (quota exhausted, credentials "
+     "scrubbed, backend unavailable); the failures are swallowed by design so "
+     "a gather never breaks, which makes this count the only evidence they "
+     "happened — `distill_*` stays 0 because the call never billed"),
     ("lifetime_budget", ("lifetime_budget",),
      "zero = no task ever hit its lifetime caps (good), or the gate is dead"),
     ("stuck_detection", ("stuck",), "zero = no attempt ever looped (or detector dead)"),
