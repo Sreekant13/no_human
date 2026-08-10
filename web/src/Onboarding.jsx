@@ -352,8 +352,8 @@ export default function Onboarding({ onComplete }) {
   }
 
   // Stop reading a prove that is taking too long. The ONLY way out of a running
-  // prove used to be reloading the page — which discards the whole wizard (team,
-  // selections, docs, project definitions are all React state, none of it
+  // prove used to be reloading the page — which discards the whole wizard
+  // (selections, docs, project definitions are all React state, none of it
   // persisted). Back to "idle", so the Prove/Retry button and the editable
   // command come back exactly as they were before the run.
   //
@@ -489,7 +489,7 @@ export default function Onboarding({ onComplete }) {
     <div className="ob-shell">
       <div className="ob-stage">
         {/* The wizard replaces the whole app shell (App.jsx returns it before the shell's
-            own h1 element), so without this the document had no h1 at all on eight of the nine
+            own h1 element), so without this the document had no h1 at all on seven of the eight
             steps — the step headings are h2. Visually hidden: the visible headline is the
             step's own. */}
         <h1 className="sr-only">Set up no_human</h1>
@@ -531,7 +531,7 @@ export default function Onboarding({ onComplete }) {
               <div className="ob-brand"><LegionLogo size={44} /><span>no_human</span></div>
               {/* h2, not h1: the wizard's h1 is the hidden one on .ob-stage, so every step
                   now reads h1 → h2 instead of this step alone owning the h1 and the other
-                  eight starting at h2. Renders identically — verified pixel-identical —
+                  seven starting at h2. Renders identically — verified pixel-identical —
                   but NOT merely because `.ob-h1` is a class-only selector: Tailwind
                   preflight is off here, so UA margins would otherwise differ (h1 0.67em
                   vs h2 0.83em). What actually makes the swap safe is the universal

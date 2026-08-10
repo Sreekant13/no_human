@@ -3760,17 +3760,21 @@ async def onboarding_reset(request: Request) -> dict[str, Any]:
     """Show the setup wizard again. Clears `completed` and NOTHING else.
 
     There was no way back into onboarding: `completed` was written True in one
-    place and False nowhere, so a user who blew through the nine steps (none of
+    place and False nowhere, so a user who blew through the eight steps (none of
     which gate) and landed in a wrong state — no proven repo, no projects,
     history never scanned — had one route, hand-editing config.yaml and
     restarting the server. The wizard is the screen that fixes all of those and
     it removed itself.
 
-    A reset is therefore a re-entry, not a wipe: repos, profiles, projects,
-    confirmed rules, docs and the team all stay exactly where they are, and every
-    wizard step reads its state from the server, so it renders over them. The
-    patch is deliberately one key — anything wider would delete work the user is
-    coming back to keep.
+    The reset patch is deliberately one key (`completed`): repos, profiles,
+    projects, confirmed rules, docs and the persisted `team` value (config only,
+    not a wizard step — the step itself left the free-tier wizard) all survive
+    the reset itself, untouched in memory and on disk. But the wizard FORM does
+    not read any of that back: `Onboarding.jsx` starts repo, docs and project
+    selections as empty React state and posts `team: null`, so if the user
+    re-completes the wizard afterwards, `onboarding_complete` overwrites
+    `team`/`repos`/`docs` with whatever the fresh form holds. The reset alone
+    loses nothing; a full re-completion afterwards can.
 
     The board reads this flag once, at load: the desktop's File → "Re-run Setup…"
     resets and reloads the window; a caller hitting this endpoint on its own has

@@ -113,7 +113,7 @@ test("the token item is omitted when no handler is supplied", () => {
 
 // The wizard writes onboarding.completed once and NOTHING wrote it back, so a
 // user who set themselves up wrong — no proven repo, no projects, history never
-// scanned, none of the nine steps gates — could not reach the screen that fixes
+// scanned, none of the eight steps gates — could not reach the screen that fixes
 // it. The only route was hand-editing config.yaml and restarting the server.
 test("File menu exposes Re-run Setup and it routes", () => {
   let called = 0;

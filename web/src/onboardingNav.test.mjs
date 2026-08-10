@@ -98,7 +98,7 @@ const NAV = (() => {
   return src.slice(start, end);
 })();
 
-test("the wizard's STEPS list really has lastIndex 8, so these cases are the real ones", () => {
+test("the wizard's STEPS list really has lastIndex 7, so these cases are the real ones", () => {
   const steps = [...src.matchAll(/\{ key: "\w+",\s+title:/g)];
   assert.equal(steps.length - 1, LAST,
     "STEPS changed length — update LAST in this test so the launch case still tests the LAST step");
