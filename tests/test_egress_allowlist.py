@@ -318,6 +318,10 @@ GIT_SUBCOMMANDS: dict[str, tuple[str, str]] = {
     "for-each-ref": (LOCAL, "reads local refs"),
     "symbolic-ref": (LOCAL, "reads/writes HEAD"),
     "merge-base": (LOCAL, "walks local history"),
+    "merge-tree": (LOCAL, "three-way merges two local commits; with "
+                          "--write-tree it writes the result to the local "
+                          "object store and prints its OID — no remote, no "
+                          "worktree, no ref moved"),
     "grep": (LOCAL, "searches local tracked files / a local ref's tree; "
                     "reads the object store, never a remote"),
     "add": (LOCAL, "writes the index"),

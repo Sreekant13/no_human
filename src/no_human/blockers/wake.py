@@ -676,9 +676,10 @@ class WakeWatcher:
                         log.warning("pr_shipped check failed for %s: %s", task.id[:8], exc)
                         shipped = False
                     # The shipped check just ran several local git subprocesses
-                    # (merge-base, diff --name-only, diff --quiet) — easily a
-                    # few seconds on a large repo — so re-verify terminal-ness
-                    # before writing, same SCRUM-68 guard as every other rung.
+                    # (rev-parse, and up to two merge-trees per candidate base
+                    # tip) — easily a few seconds on a large repo — so re-verify
+                    # terminal-ness before writing, same SCRUM-68 guard as
+                    # every other rung.
                     if await self._is_terminal(task):
                         return None
                     if shipped:

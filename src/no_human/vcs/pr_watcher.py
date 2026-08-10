@@ -11,10 +11,12 @@ injectable callable for unit tests.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import shutil
+import signal
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Awaitable
@@ -678,18 +680,64 @@ async def default_ci_log_excerpt(link: str) -> str:
     return "\n".join(lines[-15:])[:2000]
 
 
+# `start_new_session` is POSIX-only and Windows rejects it outright, so it is
+# read through a constant rather than passed inline (same shape as
+# `testing.runner._NEW_GROUP_KWARGS`, kept local so `vcs` does not import
+# `testing`). On Windows the timeout below still returns; only the tree kill
+# degrades to killing git alone. UNTESTED ON WINDOWS.
+_NEW_SESSION: dict[str, object] = {} if os.name == "nt" else {"start_new_session": True}
+
+# A ceiling, not a budget: every command below is local and the slow one
+# (`merge-tree` on a large repo) is seconds, not minutes. It exists because
+# `merge-tree` EXECUTES the repo's custom merge drivers -- arbitrary commands
+# from the USER'S repo, run up to twice per candidate base tip -- so one that
+# blocks would otherwise wedge the watcher for good. Overrun reads as a
+# non-zero rc, i.e. the same fail-closed False as every other git failure.
+# It bounds ONE command, so the probe's real ceiling is `2 x len(tips) x` this
+# -- 480s at two candidate tips, not 120s and not 240s: on the ordinary path
+# BOTH driver-executing passes run for every tip. Measured with an instrumented
+# driver at `_GIT_TIMEOUT=5`: 2 invocations / 4.5s for a one-tip probe, 4 / 8.6s
+# for two. The `and` below short-circuits pass 2 only where pass 1 FAILS or
+# times out (a driver that hangs: 1 invocation, 5.0s), so it lowers the worst
+# case in the failing case alone; a driver finishing just inside the bound costs
+# the full 2x (4.5s sleep: 2 invocations, 9.5s). The three `rev-parse` calls are
+# bounded too, so the strict command-count ceiling is higher still -- but they
+# cannot execute user code, which is why the driver passes are the ones that
+# matter.
+_GIT_TIMEOUT = 120.0
+
+
 async def _git_rc(repo_path: str, *args: str) -> tuple[int, str]:
     """Run a local git command; return (returncode, stripped stdout)."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "git", "-C", repo_path, *args,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            # Its own process group, so the timeout below can reap the merge
+            # driver too. Killing git alone is not enough and not even
+            # sufficient to return: the driver INHERITS git's stdout pipe, so
+            # `communicate`/`wait` stay blocked until the grandchild exits —
+            # measured at the driver's full runtime, i.e. no bound at all.
+            **_NEW_SESSION,
         )
-        out, _ = await proc.communicate()
     except OSError:
         # FileNotFoundError (git absent) and E2BIG (argv too long on a very
         # large touched set) both land here. The caller's contract is "never
         # a false shipped", so any failure must read as a non-zero rc.
+        return 1, ""
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), _GIT_TIMEOUT)
+    except TimeoutError:  # asyncio.TimeoutError is an alias of it since 3.11
+        # Every failure mode of the cleanup is swallowed: `os.killpg` does not
+        # exist on Windows, the group may already be gone, and this runs on the
+        # watcher's event loop, where a raise would take down the poll.
+        with contextlib.suppress(Exception):
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            proc.kill()
+        log.warning("git %s timed out after %ss in %s", args[0] if args else "",
+                    _GIT_TIMEOUT, repo_path)
         return 1, ""
     return proc.returncode, out.decode("utf-8", "replace").strip()
 
@@ -724,6 +772,59 @@ async def refs_resolvable(repo_path: str, *refs: str) -> bool:
     return True
 
 
+async def _base_tips(repo_path: str, base: str) -> list[str]:
+    """``base`` plus its remote-tracking counterpart — every ref that can
+    legitimately be holding the landing.
+
+    The checkout a watcher inspects routinely has a STALE local base. This repo
+    lands every PR as an identity-normalized squash committed and pushed from a
+    throwaway worktree, which advances ``refs/remotes/origin/main`` while the
+    long-lived checkout's own ``main`` stays exactly where it was. Asking only
+    the local ref reports a fully landed PR as absent — live on 2026-08-10, two
+    tasks escalated "closed without merging" within minutes of their content
+    reaching main, with local ``main`` 20+ commits behind ``origin/main``.
+
+    Resolved through ``@{upstream}`` rather than a hardcoded ``origin/`` prefix,
+    so a repo whose remote is named otherwise still works. ``@{upstream}`` names
+    the ONE remote branch this base tracks -- which is the whole point, because
+    the question is about the tip the PR TARGETS and no other.
+
+    ``@{upstream}`` is defined only for a LOCAL BRANCH of that name, so a
+    worktree or a fresh clone sitting on the task branch, a base created
+    ``--no-track``, or a customised ``remote.origin.fetch`` all leave it unset;
+    then only the local ref is offered, and if that is missing too the probe
+    returns False and the task escalates spuriously.
+
+    A ``refs/remotes/*/<base>`` fallback for that case was implemented and then
+    REMOVED, deliberately. It cures noise and causes silence: in the standard
+    OSS fork layout (``origin`` = the developer's fork, ``upstream`` =
+    canonical) the glob returns ``origin/main`` alongside ``upstream/main``, and
+    ``default_branch_shipped`` ORs across the list -- so a branch merged into
+    the developer's OWN fork reports shipped for a PR that canonical never
+    merged, and the CLOSED rung writes ``TaskStatus.DONE`` with no human in the
+    loop. Nothing available here distinguishes the remote the PR targets from
+    any other remote carrying a branch of that name. A spurious escalation has
+    a human on the other end of it; a false DONE does not.
+    """
+    tips = [base]
+    rc, upstream = await _git_rc(repo_path, "rev-parse", "--abbrev-ref",
+                                 f"{base}@{{upstream}}")
+    if rc == 0 and upstream and upstream != base:
+        tips.append(upstream)
+    return tips
+
+
+async def _merges_to(repo_path: str, want_tree: str, ours: str, theirs: str) -> bool:
+    """Whether merging ``theirs`` into ``ours`` produces exactly ``want_tree``.
+
+    Every non-zero rc is "no landing observed", not "not landed": 1 is a
+    conflicting merge, 128 an unresolvable ref or unrelated histories, 129 a
+    git too old to know ``--write-tree``.
+    """
+    rc, merged = await _git_rc(repo_path, "merge-tree", "--write-tree", ours, theirs)
+    return rc == 0 and merged.splitlines()[:1] == [want_tree]
+
+
 async def default_branch_shipped(repo_path: str, branch: str, base: str = "main") -> bool:
     """Whether ``branch``'s changes are actually present in ``base``, checked
     by tree CONTENT rather than commit ancestry.
@@ -735,44 +836,105 @@ async def default_branch_shipped(repo_path: str, branch: str, base: str = "main"
     squash commit has no lineage back to the branch it came from. Ancestry is
     therefore not a valid "did this ship" test here.
 
-    Instead: find the files ``branch`` touched relative to its merge-base with
-    ``base``, then diff those same paths between ``branch`` and ``base``'s
-    current tip. No remaining differences means the content already landed,
-    regardless of how the commit graph got there.
+    Instead, ask whether the branch still has anything left to contribute: `git
+    merge-tree --write-tree <base-tip> <branch>` builds the tree that merging
+    the branch into the tip would produce, and when that tree IS the tip's tree
+    the content is already there, however the commit graph got there.
+
+    That replaced a per-file blob comparison over the branch's touched paths,
+    which demanded BYTE EQUALITY on every one of them and so could never
+    recognise a PR touching a file some later landing had extended. The live
+    case is ``RELEASE_MANIFEST.txt``: every merge rewrites that generated
+    checksum list, so a PR that edits it is byte-different from base the moment
+    anything else lands, and task 2f29209f escalated with its content already on
+    main. A three-way merge answers containment instead of equality, and it
+    needs no pathspecs — which also retires the `--no-renames` / `-z` /
+    trailing-`--` hazards the old path had to work around. A no-op merge writes
+    no new objects, because the trees it would write already exist.
+
+    Both the local base and its upstream are tried; see ``_base_tips``.
+
+    The merge is run in BOTH directions, and both must land on the tip's tree.
+    One direction is not enough because `merge-tree` honours `.gitattributes`:
+    a repo that routes a path to a merge driver DISCARDING the incoming side
+    (`f.py merge=keepours` + `merge.keepours.driver = true`, the documented way
+    to own a generated or lockfile-shaped path) resolves every contested path
+    to whichever commit was named FIRST -- exit 0, and the tree written is the
+    tip's own, for content that never landed. `pr_watcher` runs against the
+    USER'S repo, so any customer repo may carry such a driver, and the caller
+    turns a true here into `TaskStatus.DONE` with no human in the loop. Merging
+    the other way is what the question actually asks -- "does the branch have
+    anything base lacks?"
+
+    WHAT THAT DOES AND DOES NOT COVER -- stated precisely, because the rule is
+    narrower than "a merge driver cannot manufacture a landing":
+
+    * COVERED: drivers that resolve by POSITION, i.e. by which side git handed
+      them as %A (ours) and which as %B (theirs). Keep-ours (`true`) yields the
+      tip's tree on the forward pass and the BRANCH's tree on the reverse one;
+      keep-theirs (`cp %B %A`) yields them the other way round. Neither can
+      answer both passes with the tip's tree, so swapping the arguments defeats
+      the whole class. The attribute SOURCE does not matter, which
+      `.gitattributes`-specific neutralisation (`--attr-source`,
+      `core.attributesFile`) could not say: `$GIT_DIR/info/attributes` outranks
+      both and no override switches it off. Pinned by test against
+      `.gitattributes`, `$GIT_DIR/info/attributes`, `core.attributesFile`, a
+      `*` wildcard, and attributes committed on the BASE side only -- each
+      asserting the driver actually ran. Attributes that are not present in the
+      CHECKOUT are never consulted: `merge-tree` reads the CHECKOUT's
+      attributes, not either commit's. So a rule committed on the BRANCH side
+      only is a weaker no rather than a defeated driver *while the checkout
+      sits on base* -- which `task.repo_path` (`blockers/wake.py`) usually
+      does, being the user's long-lived checkout -- and IS consulted once a
+      human checks the agent's branch out. Verified in both configurations;
+      the answer is False either way, because the both-directions rule defeats
+      the driver wherever it does fire.
+
+    * NOT COVERED, and this is a KNOWN, UNFIXED LIMITATION: drivers that
+      resolve by CONTENT rather than position -- a constant emitter
+      (`cp /some/fixed/file %A`), a regenerator that rebuilds the path from
+      elsewhere in the tree, or a rule-picker (`if grep -q MARKER %A; then
+      cp %B %A; fi`). Those are direction-INDEPENDENT by construction: they
+      write the same bytes whichever side is %A, so if that output happens to
+      equal the tip's blob they satisfy both passes and this returns True for
+      content that never landed -- a silent `TaskStatus.DONE` on undelivered
+      work, the same failure mode the position case had. Both shapes are
+      confirmed live, and both behave identically on the single-direction
+      predecessor, so this is a pre-existing hole that the both-directions rule
+      narrows rather than closes. Closing it needs a merge engine that ignores
+      merge drivers entirely, which `merge-tree` does not offer at any flag;
+      that is out of scope here. Do not restate this rule as "a merge driver
+      cannot manufacture a landing": the true claim is "a POSITION-resolving
+      merge driver cannot". `test_a_content_resolving_merge_driver_is_a_known_
+      residual` pins the hole so a later fix cannot land without this paragraph
+      being revisited.
+
+    * NOT COVERED, in the other direction: a GENUINE landing on a path owned by
+      a POSITION-resolving driver, where base has since moved on, now reads
+      False. Once a later task edits the same path, both sides carry an edit
+      git must merge, so the driver fires: the forward pass keeps the tip's
+      blob and answers True, the reverse pass keeps the BRANCH's blob and
+      answers False, and the probe reports absent for work that really shipped.
+      That is a spurious escalation with a human on the other end of it, never
+      a silent DONE -- the same asymmetry the both-directions rule exists to
+      buy, paid in the other currency. It is not curable here for the same
+      reason as the bullet above: it needs a merge that ignores merge drivers.
+      `test_a_genuine_landing_under_a_position_driver_reads_absent_once_base_
+      moves` and its no-driver control pin the pair, so this cannot rot
+      silently either.
 
     Returns False (never a false "shipped") on any git failure: missing repo,
-    missing/deleted branch, unrelated histories, etc. -- callers must treat
-    False as "can't tell", same as GitHub's PR state going unknown.
+    missing/deleted branch, unrelated histories, a conflicting merge, or a git
+    older than 2.38 (no ``--write-tree``) -- callers must treat False as
+    "can't tell", same as GitHub's PR state going unknown.
     """
-    if not repo_path or not branch:
+    if not repo_path or not branch or not base:
         return False
-    rc, merge_base = await _git_rc(repo_path, "merge-base", branch, base)
-    if rc != 0 or not merge_base:
-        return False
-    # --no-renames: rename detection reports a `git mv` as the DESTINATION
-    # path only, so the source path never enters the touched set and its
-    # deletion is never compared against base. A branch that moves a file
-    # would then report "shipped" while the removal half had not landed, and
-    # the task would be marked DONE with half its deliverable missing.
-    # Trailing `--`: without it, a branch whose name is also a path in the
-    # tree makes git bail with "ambiguous argument".
-    # `-z`: git C-QUOTES any path containing a non-ASCII byte, a quote, a
-    # backslash or a control character (core.quotePath, on by default), e.g.
-    # `café.py` comes back as `"caf\303\251.py"`. Feeding that literal string
-    # back as a pathspec matches NOTHING, so `--quiet` reports "no
-    # differences" and a branch that never landed is reported as shipped.
-    # `-z` emits raw NUL-separated names, so what we pass back is what git
-    # gave us.
-    rc, touched = await _git_rc(
-        repo_path, "diff", "--name-only", "-z", "--no-renames",
-        merge_base, branch, "--",
-    )
-    if rc != 0:
-        return False
-    files = [f for f in touched.split("\0") if f.strip()]
-    if not files:
-        return True  # branch never diverged in content from base — trivially shipped
-    rc, _ = await _git_rc(repo_path, "diff", "--quiet", branch, base, "--", *files)
-    if rc not in (0, 1):  # anything other than "clean"/"differs" is an error
-        return False
-    return rc == 0
+    for tip in await _base_tips(repo_path, base):
+        rc, tip_tree = await _git_rc(repo_path, "rev-parse", f"{tip}^{{tree}}")
+        if rc != 0 or not tip_tree:
+            continue
+        if (await _merges_to(repo_path, tip_tree, tip, branch)
+                and await _merges_to(repo_path, tip_tree, branch, tip)):
+            return True
+    return False
