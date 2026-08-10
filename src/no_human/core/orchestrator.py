@@ -6934,6 +6934,29 @@ class Orchestrator:
                 mode="code_review",
                 pr_comments=pr_comments_text,
             )
+        except ReviewerUnavailable as exc:
+            # R17: routing a malformed verdict to the no-verdict retry made this
+            # raise REACHABLE here, and the bare handler below records nothing —
+            # so a fully paid Opus round billed 0. Pre-R17 the garbled round
+            # returned a stamped decision and the `update_attempt` after this
+            # try booked it, which makes the silence a regression, not an old
+            # gap. Books the four carried fields to THIS SITE'S columns, not the
+            # `review_` ones: a code_review task's only spend is the reviewer's
+            # and it is attributed here deliberately (see below). Then fails
+            # exactly as the handler under it does — same wording, which is also
+            # what `learning/queue.py` classifies as an infra finding.
+            await self.store.update_attempt(
+                attempt_id,
+                tokens_used=exc.tokens_used or 0,
+                # None -> NULL: an absent split is not a measured zero.
+                output_tokens=exc.output_tokens,
+                cache_read_tokens=exc.cache_read_tokens or 0,
+                cache_creation_tokens=exc.cache_creation_tokens or 0,
+                status="failed",
+                failure_reason=f"reviewer crashed: {exc}",
+            )
+            self._emit_review("review_error", str(exc))
+            return await self._fail(task, f"reviewer crashed: {exc}")
         except Exception as exc:  # noqa: BLE001
             self._emit_review("review_error", str(exc))
             return await self._fail(task, f"reviewer crashed: {exc}")

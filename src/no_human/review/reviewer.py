@@ -81,8 +81,13 @@ _REVIEW_MIN_RETRY_TIMEOUT = 120
 # Sized like the halving above (and floored the same way) rather than as
 # another full window, so the wall-clock stays bounded at 1.5x the round.
 _TRANSPORT_GRACE_DIVISOR = 2
-# The sentinel `_parse_review_output` returns when no REVIEW_JSON block was found.
+# The sentinel `_parse_review_output` returns when no USABLE REVIEW_JSON block
+# was found — absent, or present and unparseable (R17: one event, one label).
 _NO_VERDICT_LABEL = "structured output present"
+# Stop reasons that mean the session was CUT OFF mid-output, so whatever text it
+# left is a fragment and not a conclusion. Both can arrive on the normal
+# (non-`is_error`) result path — see `_review_once`.
+_TRUNCATED_STOP_REASONS = ("max_turns", "max_tokens")
 _DIFF_CAP = 60_000  # chars — ~15K tokens, fits in 200K context alongside test output
 _FILES_CAP = 80_000  # chars — full text of the changed files, ~20K tokens
 _CODE_REVIEW_DIFF_CAP = 120_000  # code_review tasks: ~30K tokens, fits in 200K context
@@ -1363,9 +1368,27 @@ def _parse_review_output(
     try:
         data = loads_lenient(json_text)
     except json.JSONDecodeError as exc:
+        # R17: a block that is PRESENT but does not parse is the same event as a
+        # block that is absent — the reviewer produced no verdict — and it takes
+        # the same route. Its own "json parse" label did not match
+        # `_reached_no_verdict`, so it walked past the retry/escalation
+        # machinery in `_agent_review` and arrived at the verdict handler as a
+        # FAIL whose finding text was the parse exception, charged to the CODER
+        # and costing it one of three bounded attempts (task fef3221f, attempts
+        # 1 and 2: "review failed: json parse: Expecting ',' delimiter: line 27
+        # column 3 (char 4542)" — a long verdict cut mid-JSON). The label is
+        # unified here rather than by widening `_reached_no_verdict`, because
+        # one sentinel with the diagnosis in its EVIDENCE is what every consumer
+        # already handles; nothing outside this module read the old label.
         return ReviewDecision(
             passed=False,
-            checklist=[ChecklistItem("json parse", False, str(exc))],
+            checklist=[ChecklistItem(
+                _NO_VERDICT_LABEL,
+                False,
+                "reviewer produced no parseable REVIEW_JSON block — fail "
+                f"closed. json parse error: {exc}. unparsed verdict (tail): "
+                f"{json_text[-_UNPARSED_TAIL_CHARS:]}",
+            )],
             raw_output=text,
         )
     items = [
@@ -1630,6 +1653,21 @@ class AdversarialReviewer:
         # The model has everything it needs in the prompt — no repo exploration.
         if diff_override:
             decision = await self._fast_review(prompt, repo_path, before_ref=before_ref)
+            # R17: `_fast_review` has no no-verdict interception of its own, so
+            # this exit used to hand the fail-closed sentinel to the verdict
+            # handler as a finding against the DIFF. It is the gate — a gate
+            # that did not run escalates, exactly like the multi-turn path.
+            if _reached_no_verdict(decision):
+                # `_carry_usage` for the same reason `_agent_review` raises
+                # through it: the round was PAID, and the exception is now the
+                # only thing that leaves this path.
+                raise _carry_usage(ReviewerUnavailable(
+                    "the reviewer reached no verdict on the single-turn gate "
+                    f"review ({decision.checklist[0].evidence}). The review "
+                    "gate did not run, so this diff is unreviewed. Escalating "
+                    "rather than passing it — or blaming the coder for a "
+                    "finding that was never made."
+                ), [decision])
         else:
             # Full agent session for post-implementation reviews (needs to read files).
             decision = await self._agent_review(
@@ -1664,7 +1702,28 @@ class AdversarialReviewer:
                     skipped = str(r)[:120]
                 elif any(i2.label == "timeout" for i2 in r.checklist):
                     skipped = "timed out"
+                elif _reached_no_verdict(r):
+                    # R17, finding 3 — the path that produced the live
+                    # attempt-FAILs. An angle's fail-closed sentinel has no
+                    # severity, so `merge_angle_findings` read it as BLOCKING
+                    # and flipped a passing gate to FAIL with the reviewer's own
+                    # failure ("<angle>: structured output present: reviewer
+                    # produced no parseable REVIEW_JSON block") as the finding
+                    # the coder was told to fix. An angle that reached no
+                    # verdict is an angle that did not run — same advisory note
+                    # as a timeout, since by contract an angle can never fail
+                    # the gate by itself.
+                    skipped = "reached no verdict"
                 if skipped is not None:
+                    # A skipped angle STILL SPENT. `continue` walks past
+                    # `merge_angle_findings`, which is the only place an angle's
+                    # usage is folded in, and `_fast_review` stamps the real
+                    # figures on the decision it returns — so a skip billed
+                    # three Opus sessions and reported none of them (R5's
+                    # accounting rule, `_carry_usage`). No-op for the two older
+                    # branches: an exception carries no usage, and a timeout
+                    # returns before the stamp.
+                    _carry_usage(decision, [r])
                     log.warning("review angle %r skipped: %s", name, skipped)
                     decision.checklist.append(ChecklistItem(
                         f"{name} angle did not run ({skipped})", True,
@@ -1986,7 +2045,18 @@ class AdversarialReviewer:
         # terminal FAIL. Fail closed, pay the round. If the retry cost measures
         # badly (B1 should report the rate), the lever is a completeness signal
         # from the backend, NOT reading a verdict out of a failed session.
-        if getattr(result, "is_error", False):
+        #
+        # R17 WIDENS THE GATE FROM `is_error` TO "did not finish". `is_error` is
+        # set only on the backends' terminal-EXCEPTION path; the SAME truncation
+        # also arrives as a NORMAL `ResultMessage` carrying a truncation
+        # `stop_reason` and `is_error=False` (the known gap the planner's R3
+        # comment records, `core/orchestrator.py` "KNOWN GAP"). That shape came
+        # straight here with its cut-off text, parsed as a malformed verdict,
+        # and was charged to the coder. A round cut off mid-output has no
+        # conclusion to read whether the cut was turns or output tokens, so both
+        # reasons take the no-verdict route and get the doubling retry.
+        if (getattr(result, "is_error", False)
+                or (result.stop_reason or "") in _TRUNCATED_STOP_REASONS):
             return None, self._errored_round_reason(result), result
 
         # Try final_text first, then all captured text. `verify_citations`

@@ -735,6 +735,12 @@ def test_every_reviewer_unavailable_handler_records_the_burn():
     above: the e2e in test_e2e_orchestrator proves the already-satisfied
     handler end to end, and this proves NEITHER handler can quietly stop
     recording (nor a third one arrive without it).
+
+    R17 added the third: `code_review`, which books the reviewer's spend to its
+    OWN columns rather than the `review_` ones (that task kind's only spend IS
+    the reviewer's), so the guard accepts either channel — `_record_review_usage`
+    or an `update_attempt` that carries the usage — and still fails on a handler
+    that records through neither.
     """
     src = pathlib.Path("src/no_human/core/orchestrator.py")
     handlers, silent = 0, []
@@ -747,13 +753,384 @@ def test_every_reviewer_unavailable_handler_records_the_burn():
         if not any(isinstance(n, ast.Return) for n in ast.walk(node)):
             continue
         handlers += 1
-        if not any(getattr(c.func, "attr", "") == "_record_review_usage"
-                   for c in ast.walk(node) if isinstance(c, ast.Call)):
+        records = False
+        for c in ast.walk(node):
+            if not isinstance(c, ast.Call):
+                continue
+            attr = getattr(c.func, "attr", "")
+            if attr == "_record_review_usage" or (
+                attr == "update_attempt"
+                and any(kw.arg == "tokens_used" for kw in c.keywords)
+            ):
+                records = True
+        if not records:
             silent.append(f"{src}:{node.lineno}")
-    assert handlers == 2, (
-        f"expected the gate and already-satisfied handlers, found {handlers} — "
-        "if the path moved, this guard is watching nothing")
+    assert handlers == 3, (
+        f"expected the gate, already-satisfied and code_review handlers, found "
+        f"{handlers} — if the path moved, this guard is watching nothing")
     assert not silent, (
         "a review gate that escalated still BILLED for its rounds; this handler "
         "returns without recording them: " + ", ".join(silent)
     )
+
+
+# ------ R17: a MALFORMED verdict is a no-verdict round, not a coder finding -- #
+#
+# Live funnel killer (2026-08-09, four of five dogfood tasks). Two distinct
+# holes, same consequence — the reviewer failing to produce a verdict was
+# charged to the CODER and burned one of its three bounded attempts:
+#
+#   1. `_parse_review_output`'s JSONDecodeError branch labelled the round
+#      "json parse", and `_reached_no_verdict` matches only the OTHER label, so
+#      a PRESENT-but-malformed verdict walked past the retry/escalation
+#      machinery. Task fef3221f, attempts 1 and 2: "review failed: json parse:
+#      Expecting ',' delimiter: line 27 column 3 (char 4542)" / "(char 4114)".
+#   2. `stop_reason` truncation arriving on a NORMAL ResultMessage (not the
+#      terminal-exception path) has `is_error=False`, so R5's hoisted error
+#      gate in `_review_once` never saw it and the cut-off text went to the
+#      parser. Same known gap the planner's R3 comment records.
+
+
+def _truncated_verdict_with_end() -> str:
+    """The live shape: a long verdict cut mid-item, END marker still present.
+
+    `_REVIEW_JSON` therefore MATCHES (so `_recover_unterminated_verdict` never
+    runs) and `loads_lenient` raises — the exact route to the "json parse"
+    branch, at the same ~4kB scale as the two live failures.
+    """
+    items = ",\n".join(
+        f'  {{"label": "criterion {n}", "passed": true, "severity": "low", '
+        f'"evidence": "calc.py:{n} — verified by reading the function"}}'
+        for n in range(1, 26)
+    )
+    return (
+        "REVIEW_JSON_START\n"
+        '{"passed": true, "items": [\n' + items
+        + ',\n  {"label": "criterion 26", "passed": tr'  # cut mid-token
+        + "\nREVIEW_JSON_END"
+    )
+
+
+def test_the_truncated_fixture_really_is_the_live_json_parse_shape():
+    """Control on the fixture itself: without it the tests below could pass by
+    exercising the (already-handled) missing-END path instead."""
+    import json as _json
+
+    from no_human.core.jsonparse import loads_lenient
+    from no_human.review.reviewer import _REVIEW_JSON
+
+    m = _REVIEW_JSON.search(_truncated_verdict_with_end())
+    assert m, "the END marker must be present or this is the par-07 path"
+    with pytest.raises(_json.JSONDecodeError, match="Expecting"):
+        loads_lenient(m.group(1))
+
+
+def test_a_malformed_verdict_is_the_no_verdict_sentinel(tmp_path):
+    """(a) One shape for one event. A block that is present but does not parse
+    is the gate failing to run, exactly like a block that is absent."""
+    from no_human.review.reviewer import _parse_review_output, _reached_no_verdict
+
+    d = _parse_review_output(_truncated_verdict_with_end())
+    assert d.passed is False
+    assert _reached_no_verdict(d), (
+        "a malformed verdict bypassed the no-verdict machinery — this is what "
+        "fed the parse exception to the coder as a finding")
+    # The diagnosis is not lost, it just stops being a finding about the diff.
+    assert "Expecting" in d.checklist[0].evidence
+
+
+async def test_a_malformed_verdict_is_retried_then_escalated(tmp_path):
+    """(a) end to end on the gate path: retry at a doubled budget, and on a
+    second malformed round, ReviewerUnavailable naming the reviewer — never a
+    checklist item the coder is told to fix."""
+    from no_human.review.reviewer import AdversarialReviewer
+
+    broken = _truncated_verdict_with_end()
+    backend = _ReviewerBackend(
+        _FakeAgentResult(broken, stop_reason="end_turn"),
+        _FakeAgentResult(_VERDICT, stop_reason="end_turn"),
+    )
+    decision = await AdversarialReviewer(backend=backend)._agent_review("p", tmp_path)
+    assert decision.passed is True
+    assert len(backend.budgets) == 2 and backend.budgets[1] > backend.budgets[0]
+    assert not any("json parse" in i.label or "Expecting" in i.evidence
+                   for i in decision.checklist), "the parse error reached the coder"
+
+    twice = _ReviewerBackend(
+        _FakeAgentResult(broken, stop_reason="end_turn"),
+        _FakeAgentResult(broken, stop_reason="end_turn"),
+    )
+    with pytest.raises(ReviewerUnavailable, match="the reviewer reached no verdict"):
+        await AdversarialReviewer(backend=twice)._agent_review("p", tmp_path)
+
+
+async def test_max_turns_on_a_normal_result_is_a_no_verdict_round(tmp_path):
+    """(b) The R3 known gap, on the reviewer. `is_error` is False on the normal
+    ResultMessage path, so R5's error gate missed it and the truncated text was
+    parsed as a verdict. The doubling retry exists for exactly this."""
+    from no_human.review.reviewer import AdversarialReviewer
+
+    backend = _ReviewerBackend(
+        _FakeAgentResult(_truncated_verdict_with_end(),
+                         is_error=False, stop_reason="max_turns"),
+        _FakeAgentResult(_VERDICT, stop_reason="end_turn"),
+    )
+    decision = await AdversarialReviewer(backend=backend)._agent_review("p", tmp_path)
+    assert decision.passed is True
+    assert len(backend.budgets) == 2, "the truncated normal-path round was accepted"
+    assert backend.budgets[1] > backend.budgets[0], "the retry gets more turns"
+
+
+async def test_a_complete_verdict_from_a_cut_off_round_is_still_discarded(tmp_path):
+    """(b), the other half: a round that ran out of turns did not FINISH, so
+    even a parseable verdict in it is a mid-exploration state of mind (R5's
+    rule) — the normal-path shape must be treated like the exception path."""
+    from no_human.review.reviewer import AdversarialReviewer
+
+    terminal_fail = (
+        'REVIEW_JSON_START {"passed": false, "items": '
+        '[{"label": "unread try/except", "passed": false, "severity": "high", '
+        '"evidence": "calc.py:999"}]} REVIEW_JSON_END'
+    )
+    backend = _ReviewerBackend(
+        _FakeAgentResult(terminal_fail, is_error=False, stop_reason="max_turns"),
+        _FakeAgentResult(_VERDICT, stop_reason="end_turn"),
+    )
+    decision = await AdversarialReviewer(backend=backend)._agent_review("p", tmp_path)
+    assert len(backend.budgets) == 2, "a cut-off round's verdict was taken at face value"
+    assert decision.passed is True
+    assert not any("try/except" in i.label for i in decision.checklist)
+
+
+async def test_an_angle_that_reaches_no_verdict_never_fails_the_gate(tmp_path):
+    """(c) FINDING 3, the path that let the no-verdict label through as an
+    ATTEMPT-FAIL on R5 code (task 87fcf4eb, attempts 1 AND 2, complex tier).
+
+    The gate review is intercepted in `_agent_review`; the complex-tier ANGLE
+    passes are not — they run through `_fast_review`, and `merge_angle_findings`
+    appends any failed item, which for a no-verdict angle is the fail-closed
+    sentinel with no severity. Unclassified ⇒ blocking ⇒ a PASSING gate flips to
+    FAIL with "structured output present: reviewer produced no parseable
+    REVIEW_JSON block" as the finding the coder is told to fix. Angles are
+    advisory by contract — one that did not run is a note, never a verdict.
+    """
+    from no_human.core.task import Task
+    from no_human.review.reviewer import AdversarialReviewer
+
+    broken = _truncated_verdict_with_end()
+
+    class _MainPassesAnglesBreak:
+        def __init__(self):
+            self.n = 0
+
+        async def run(self, prompt, *, cwd, max_turns, effort=None,
+                      on_event=None, **kw):
+            self.n += 1
+            if self.n == 1:
+                return _FakeAgentResult(_VERDICT, stop_reason="end_turn")
+            return _FakeAgentResult(broken, stop_reason="end_turn")
+
+    backend = _MainPassesAnglesBreak()
+    task = Task.new("big task", repo_path=str(tmp_path))
+    task.context = {"complexity_tier": "complex"}
+    d = await AdversarialReviewer(backend=backend).review(
+        task, repo_path=tmp_path, diff_override="+ x = 1\n")
+
+    assert backend.n == 4, "main + 3 angles"
+    assert d.passed is True, "an angle that never reached a verdict failed the gate"
+    notes = [i for i in d.checklist if "did not run" in i.label]
+    assert len(notes) == 3 and all(i.passed for i in notes)
+    assert not any("no parseable REVIEW_JSON" in i.evidence for i in d.checklist), (
+        "the reviewer's own failure was appended as a finding against the diff")
+
+
+async def test_a_single_turn_gate_review_with_no_verdict_escalates(tmp_path):
+    """(c), the sibling hole: the gate's `diff_override` path also returns
+    `_fast_review`'s decision straight out of `review()`. A no-verdict there is
+    the gate failing to run, so it escalates like every other gate path instead
+    of failing the attempt."""
+    from no_human.core.task import Task
+    from no_human.review.reviewer import AdversarialReviewer
+
+    class _BrokenOnce:
+        async def run(self, prompt, *, cwd, max_turns, effort=None,
+                      on_event=None, **kw):
+            return _FakeAgentResult(_truncated_verdict_with_end(),
+                                    stop_reason="end_turn")
+
+    task = Task.new("small task", repo_path=str(tmp_path))
+    task.context = {"complexity_tier": "simple"}
+    with pytest.raises(ReviewerUnavailable, match="no verdict"):
+        await AdversarialReviewer(backend=_BrokenOnce()).review(
+            task, repo_path=tmp_path, diff_override="+ x = 1\n")
+
+
+async def test_tamper_adjudication_still_cannot_decide_on_garbage(tmp_path):
+    """Control for (a): the tamper adjudicator reads its verdict from its OWN
+    parser and overwrites the checklist, so relabelling the parse failure must
+    not change it — garbage still parks, and still does not clear the guard."""
+    from no_human.review import tamper_adjudication
+    from no_human.review.reviewer import AdversarialReviewer
+
+    class _Garbage:
+        async def run(self, prompt, *, cwd, max_turns, effort=None,
+                      on_event=None, **kw):
+            return _FakeAgentResult(_truncated_verdict_with_end(),
+                                    stop_reason="end_turn")
+
+    decision = await AdversarialReviewer(backend=_Garbage()).review(
+        Task(id="t1", source="manual", title="t", description="d"),
+        repo_path=tmp_path, mode="tamper_adjudication",
+        tamper_findings="2 assertions deleted", diff_override="- assert x",
+    )
+    stage = decision.stages[tamper_adjudication.STAGE_KEY]
+    assert stage["verdict"] == tamper_adjudication.CANNOT_DECIDE
+    assert decision.passed is False
+
+
+async def test_a_truncation_by_OUTPUT_LENGTH_is_also_a_no_verdict_round(tmp_path):
+    """(b), the half the live incident actually was: a verdict cut mid-JSON at
+    char 4542 is an OUTPUT-length cut, so the session ends NORMALLY —
+    `is_error` False, `stop_reason` "max_tokens" — and `max_tokens` carries the
+    fix. It must be pinned by a round whose verdict PARSES, or the assertion
+    only re-proves the parser fix and stays green with "max_tokens" mutated out
+    of `_TRUNCATED_STOP_REASONS` (it did).
+
+    So: a complete, parseable FAIL emitted by a session that was then cut off.
+    R5's rule is that a round which did not finish has no conclusion to read —
+    that terminal FAIL is a mid-write state of mind, and taking it at face
+    value is what charges the coder for a finding never properly made."""
+    from no_human.review.reviewer import AdversarialReviewer
+
+    cut_off_fail = (
+        'REVIEW_JSON_START {"passed": false, "items": '
+        '[{"label": "unread try/except", "passed": false, "severity": "high", '
+        '"evidence": "calc.py:999"}]} REVIEW_JSON_END'
+    )
+    backend = _ReviewerBackend(
+        _FakeAgentResult(cut_off_fail, is_error=False, stop_reason="max_tokens"),
+        _FakeAgentResult(_VERDICT, stop_reason="end_turn"),
+    )
+    decision = await AdversarialReviewer(backend=backend)._agent_review("p", tmp_path)
+    assert len(backend.budgets) == 2, "an output-truncated round was read as a verdict"
+    assert backend.budgets[1] > backend.budgets[0], "the retry gets more turns"
+    assert decision.passed is True
+    assert not any("try/except" in i.label for i in decision.checklist), (
+        "the cut-off round's finding was charged to the coder")
+
+
+async def test_a_skipped_angle_still_bills_its_tokens_to_the_attempt(tmp_path):
+    """R5's accounting discipline, on the new skip path. The advisory `continue`
+    walks past `merge_angle_findings` — the ONLY fold of an angle's usage — and
+    `_fast_review` stamps real spend on the decision it returns. Without the
+    fold, three paid Opus angle sessions bill and report nothing, which
+    under-counts the lifetime-budget park gate by the whole angle fan-out."""
+    from no_human.core.task import Task
+    from no_human.review.reviewer import AdversarialReviewer
+
+    broken = _truncated_verdict_with_end()
+    spend = dict(tokens_used=50_000, cache_read_tokens=400_000,
+                 cache_creation_tokens=7_000, output_tokens=2_000)
+
+    class _AnglesBurnThenBreak:
+        n = 0
+
+        async def run(self, prompt, *, cwd, max_turns, effort=None,
+                      on_event=None, **kw):
+            type(self).n += 1
+            if self.n == 1:
+                return _FakeAgentResult(_VERDICT, stop_reason="end_turn",
+                                        tokens_used=1_000, output_tokens=100)
+            return _FakeAgentResult(broken, stop_reason="end_turn", **spend)
+
+    task = Task.new("big task", repo_path=str(tmp_path))
+    task.context = {"complexity_tier": "complex"}
+    d = await AdversarialReviewer(backend=_AnglesBurnThenBreak()).review(
+        task, repo_path=tmp_path, diff_override="+ x = 1\n")
+
+    assert d.passed is True
+    assert d.tokens_used == 1_000 + 3 * spend["tokens_used"], (
+        "three skipped angles were billed and reported nothing")
+    assert d.cache_read_tokens == 3 * spend["cache_read_tokens"]
+    assert d.cache_creation_tokens == 3 * spend["cache_creation_tokens"]
+    assert d.output_tokens == 100 + 3 * spend["output_tokens"]
+
+
+async def test_the_escalating_single_turn_gate_carries_its_burn(tmp_path):
+    """Same discipline on the other new exit: the round that reached no verdict
+    was PAID, and the exception is the only thing that leaves this path."""
+    from no_human.core.task import Task
+    from no_human.review.reviewer import AdversarialReviewer
+
+    class _BrokenOnce:
+        async def run(self, prompt, *, cwd, max_turns, effort=None,
+                      on_event=None, **kw):
+            return _FakeAgentResult(_truncated_verdict_with_end(),
+                                    stop_reason="end_turn", tokens_used=80_000,
+                                    cache_read_tokens=500_000,
+                                    cache_creation_tokens=9_000,
+                                    output_tokens=4_000)
+
+    task = Task.new("small task", repo_path=str(tmp_path))
+    task.context = {"complexity_tier": "simple"}
+    with pytest.raises(ReviewerUnavailable) as exc:
+        await AdversarialReviewer(backend=_BrokenOnce()).review(
+            task, repo_path=tmp_path, diff_override="+ x = 1\n")
+
+    assert exc.value.tokens_used == 80_000
+    assert exc.value.cache_read_tokens == 500_000
+    assert exc.value.cache_creation_tokens == 9_000
+    assert exc.value.output_tokens == 4_000
+
+
+async def test_a_code_review_task_books_an_unavailable_reviewer_s_burn(
+    bare_repo, tmp_path, store, monkeypatch
+):
+    """R17/F3 — the carried burn needs a RECORDER, and this site is the one
+    place `_record_review_usage` is not it.
+
+    Routing a malformed verdict to the no-verdict retry made
+    `ReviewerUnavailable` reachable on the `code_review` path, where the only
+    handler is a bare `except Exception` that records nothing — so a fully paid
+    Opus round bills 0. Pre-R17 the garbled round returned a STAMPED decision
+    and the `update_attempt` after the try booked it, which makes this a
+    regression against 97596a7e, not just an old gap.
+
+    The columns are this site's own (`tokens_used`, not `review_tokens_used`):
+    a code_review task's ONLY spend is the reviewer's, and the site books it to
+    the coder-tier columns deliberately — see the comment there.
+    """
+    from no_human.core.orchestrator import Orchestrator
+
+    class _UnavailableReviewer:
+        model = "claude-opus-5"
+        _on_event = None
+
+        async def review(self, *a, **kw):
+            exc = ReviewerUnavailable(
+                "the reviewer reached no verdict after 2 rounds")
+            exc.tokens_used, exc.cache_read_tokens = 120_000, 900_000
+            exc.cache_creation_tokens, exc.output_tokens = 30_000, 9_000
+            raise exc
+
+    orch = Orchestrator(store, _config(tmp_path).data,
+                        FakeBackend(lambda cwd: None), SlackNotifier(None),
+                        reviewer=_UnavailableReviewer())
+    t = Task.new("review this PR https://forge.example/x/y/pull/42",
+                 repo_path=str(bare_repo), kind="code_review")
+    await store.create_task(t)
+    monkeypatch.setattr(orch, "_fetch_pr_diff",
+                        lambda repo, url: "diff --git a/f.py b/f.py\n+x = 1\n")
+
+    async def _no_comments(pr_url):
+        return ""
+    monkeypatch.setattr(orch, "_fetch_pr_comments_text", _no_comments)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.FAILED, "the gate did not run — fail closed"
+    (attempt,) = await store.list_attempts(t.id)
+    assert attempt["tokens_used"] == 120_000, "a paid reviewer round billed 0"
+    assert attempt["cache_read_tokens"] == 900_000
+    assert attempt["cache_creation_tokens"] == 30_000
+    assert attempt["output_tokens"] == 9_000

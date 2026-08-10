@@ -70,7 +70,13 @@ def test_parse_no_block_fails_closed():
 def test_parse_malformed_json_fails_closed():
     d = _parse_review_output("REVIEW_JSON_START\n{invalid json here\nREVIEW_JSON_END")
     assert d.passed is False
-    assert d.checklist[0].label == "json parse"
+    # R17: a present-but-unparseable block is the no-verdict sentinel, not its
+    # own "json parse" label — that label missed `_reached_no_verdict` and the
+    # parse exception was fed to the coder as a finding. The diagnosis moved
+    # into the evidence, so nothing about it is lost.
+    assert d.checklist[0].label == _NO_VERDICT_LABEL
+    assert _reached_no_verdict(d)
+    assert "json parse error" in d.checklist[0].evidence
 
 
 def test_parse_truncated_verdict_fails_closed_but_preserves_tail():
