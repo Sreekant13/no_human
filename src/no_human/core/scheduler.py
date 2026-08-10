@@ -375,14 +375,27 @@ class Scheduler:
     _ORPHANABLE = (TaskStatus.CONTEXT, TaskStatus.PLANNING,
                    TaskStatus.REVIEWING, TaskStatus.TESTING)
 
-    async def _recover_orphans(self) -> None:
-        """Startup-only crash recovery (review 2026-07-25): scoping the
-        stuck-active sweep to claimed tasks fixed false parks but left a task
-        orphaned mid-run (server killed during review/testing) INVISIBLE
-        forever — not claimable, not swept, no escalation. At startup nothing
-        is legitimately in-flight yet, so any mid-run status is an orphan:
-        flip it to IMPLEMENTING (claimable) so the pool re-runs it from its
-        checkpoint, and say so in the event stream."""
+    # Runtime sweep only: a mid-run row whose last persisted ACTIVITY (row
+    # updated_at OR newest task event — a live run keeps flushing events from
+    # whatever process drives it, even one this scheduler knows nothing
+    # about) is younger than this is left alone. Generous on purpose: a
+    # genuinely stranded row otherwise waits forever, so fifteen minutes
+    # costs little, while a live out-of-process run's longest silent stretch
+    # (a full-suite pytest inside review) must fit under it.
+    _STRANDED_GRACE_S = 900.0
+
+    async def _recover_orphans(self, *, startup: bool = True) -> None:
+        """Crash/strand recovery. At STARTUP (review 2026-07-25): nothing is
+        legitimately in-flight yet, so any mid-run status is an orphan of a
+        killed process — flip it to IMPLEMENTING (claimable) so the pool
+        re-runs it from its checkpoint. Since R15 (2026-08-09 incident) the
+        sweep also runs PER-TICK with ``startup=False``: a status write that
+        is lost or reverted (a stale full-row write-back did exactly that)
+        strands a row in a worker-only status while the process lives, and
+        the startup-only sweep left it invisible until the next restart —
+        66 minutes, in the incident. At runtime a row is an orphan only when
+        no live worker has it claimed AND it has not been touched for
+        ``_STRANDED_GRACE_S``."""
         for status in self._ORPHANABLE:
             for t in await self.store.list_tasks(status):
                 # Not an orphan: a task sitting in PLANNING with a human's
@@ -391,18 +404,48 @@ class Scheduler:
                 # very plan they rejected. `_claimable` picks it up instead.
                 if plan_gate.correcting(t):
                     continue
+                if not startup:
+                    if t.id in self._inflight:
+                        continue
+                    # Liveness is judged on the newest persisted activity —
+                    # row write OR event — because `_inflight` is per-process:
+                    # a CLI-driven run in another process is invisible to it,
+                    # but its events land in the same DB (B1, review
+                    # 2026-08-10; every in-process runner, including the
+                    # `nh watch` TUI, persists through EventPersister).
+                    if self._row_age_s(t.updated_at) < self._STRANDED_GRACE_S:
+                        continue      # row itself is young — no query needed
+                    ev_ts = await self.store.last_event_ts(t.id)
+                    if (ev_ts is not None
+                            and time.time() - ev_ts < self._STRANDED_GRACE_S):
+                        continue
+                    text = (f"found in {status.value} with no worker attached "
+                            "(status write lost, or its worker died) — "
+                            "requeued from its checkpoint")
+                else:
+                    text = (f"found in {status.value} at startup with no "
+                            "worker attached (previous process died mid-run) "
+                            "— requeued from its checkpoint")
                 await self.store.set_status(
                     t, TaskStatus.IMPLEMENTING, validate=False)
                 await self.store.save_events(t.id, [{
                     "source": "orchestrator", "kind": "orphan_recovered",
-                    "text": (f"found in {status.value} at startup with no "
-                             "worker attached (previous process died mid-run) "
-                             "— requeued from its checkpoint"),
+                    "text": text,
                     "ts": time.time(),
                 }])
                 self._on_event(
                     "orphan_recovered",
                     f"{t.id[:8]} was orphaned in {status.value} — requeued")
+
+    @staticmethod
+    def _row_age_s(stamp: str | None) -> float:
+        """Seconds since an isoformat stamp; unparseable reads as 0 (young),
+        so a corrupt timestamp can never cause a false requeue."""
+        try:
+            return max(0.0, time.time()
+                       - datetime.fromisoformat(str(stamp)).timestamp())
+        except (ValueError, TypeError):
+            return 0.0
 
     async def _check_db_liveness(self) -> None:
         """Per-tick: is the Store's read view still the database's?
@@ -663,6 +706,14 @@ class Scheduler:
                 await self.wake.tick(now=now, active_ids=set(self._inflight))
             except Exception as exc:  # noqa: BLE001 — watcher must not kill the pool
                 log.warning("wake tick failed: %s", exc)
+
+        # R15: a lost/reverted status write strands a task in a worker-only
+        # status with no worker attached — sweep every tick, not only at
+        # startup, or it stays invisible until the next restart.
+        try:
+            await self._recover_orphans(startup=False)
+        except Exception as exc:  # noqa: BLE001 — sweep must not kill the pool
+            log.warning("stranded-task sweep failed: %s", exc)
 
         if self._in_quota_cooldown(now):
             return []  # 7.4: pool-wide pause until the subscription resets

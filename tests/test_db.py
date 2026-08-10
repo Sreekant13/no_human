@@ -167,14 +167,19 @@ async def test_update_task_cas_guard_blocks_stale_status_over_cancelled_row(stor
     assert fresh.blocker["category"] == "AMBIGUITY"  # other columns still write
 
 
-async def test_update_task_normal_status_write_unaffected(store):
-    """Non-terminal rows must write status through update_task exactly as
-    before the CAS guard was added."""
+async def test_update_task_leaves_status_to_set_status(store):
+    """update_task never moves the status column (R15, 2026-08-09 incident:
+    a poller's stale full-row write-back reverted a live task's advance and
+    stranded it). Only set_status moves status; the handle is refreshed to
+    the row's truth."""
     t = Task.new("x", repo_path="/tmp/r")
     await store.create_task(t)
-    t.status = TaskStatus.CONTEXT
+    t.status = TaskStatus.CONTEXT           # a caller trying the old way
     result = await store.update_task(t)
-    assert result.status is TaskStatus.CONTEXT
+    assert result.status is TaskStatus.PENDING      # handle refreshed
+    assert (await store.get_task(t.id)).status is TaskStatus.PENDING
+    # ...and the sanctioned path still works.
+    await store.set_status(t, TaskStatus.CONTEXT)
     assert (await store.get_task(t.id)).status is TaskStatus.CONTEXT
 
 

@@ -219,8 +219,12 @@ class JiraPoller:
                         self._on_event("jira_status_synced", f"{task.external_id} → {task.status.value}")
 
             if changed:
-                task.context = {**(task.context or {}), "jira": jira}
-                await self.store.update_task(task)
+                # merge_context, never update_task: this loop holds a snapshot
+                # taken before slow network calls, and a full-row write from it
+                # erased context keys (pr_watch) merged in the meantime (R15,
+                # 2026-08-09 incident).
+                task.context = await self.store.merge_context(
+                    task.id, {"jira": jira})
                 written += 1
         return written
 

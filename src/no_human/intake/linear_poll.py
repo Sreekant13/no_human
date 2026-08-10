@@ -267,8 +267,10 @@ class LinearPoller:
                                        f"{task.external_id} → {task.status.value}")
 
             if changed:
-                task.context = {**(task.context or {}), "linear": linear}
-                await self.store.update_task(task)
+                # merge_context, never update_task — see jira_poll.sync_statuses
+                # (R15: a stale snapshot's full-row write erased live context).
+                task.context = await self.store.merge_context(
+                    task.id, {"linear": linear})
                 written += 1
         return written
 

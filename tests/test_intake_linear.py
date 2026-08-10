@@ -758,8 +758,7 @@ async def test_write_back_is_off_by_default(store):
     # The task must be in a status that WOULD produce a note and a transition,
     # otherwise "nothing was written" proves nothing about the opt-in gate.
     (task,) = await store.list_tasks()
-    task.status = TaskStatus.IMPLEMENTING
-    await store.update_task(task)
+    await store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
     assert await poller.sync_statuses() == 0
     assert adapter.comments == [] and adapter.transitions == []
 
@@ -772,8 +771,7 @@ async def test_write_back_comments_and_transitions_once_per_change(store):
     await poller.poll_once()
     (task,) = await store.list_tasks()
 
-    task.status = TaskStatus.IMPLEMENTING
-    await store.update_task(task)
+    await store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
     assert await poller.sync_statuses() == 1
     assert adapter.transitions == [("uuid-eng-1", "started")]
     assert len(adapter.comments) == 1
@@ -790,8 +788,7 @@ async def test_write_back_uses_the_uuid_not_the_human_identifier(store):
     poller = LinearPoller(adapter, store, config=_cfg(write_back=True))
     await poller.poll_once()
     (task,) = await store.list_tasks()
-    task.status = TaskStatus.DONE
-    await store.update_task(task)
+    await store.set_status(task, TaskStatus.DONE, validate=False)
     await poller.sync_statuses()
     assert adapter.transitions == [("uuid-eng-1", "completed")]
     assert adapter.comments[0][0] == "uuid-eng-1"
@@ -820,8 +817,7 @@ async def test_off_ramp_statuses_comment_but_never_transition(store, status):
     poller = LinearPoller(adapter, store, config=_cfg(write_back=True))
     await poller.poll_once()
     (task,) = await store.list_tasks()
-    task.status = status
-    await store.update_task(task)
+    await store.set_status(task, status, validate=False)
     await poller.sync_statuses()
     assert adapter.transitions == []          # state must never lie
     assert len(adapter.comments) == 1
@@ -834,8 +830,7 @@ async def test_no_needs_a_human_note_when_a_human_already_closed_the_issue(store
     poller = LinearPoller(adapter, store, config=_cfg(write_back=True))
     await poller.poll_once()
     (task,) = await store.list_tasks()
-    task.status = TaskStatus.ESCALATED
-    await store.update_task(task)
+    await store.set_status(task, TaskStatus.ESCALATED, validate=False)
     await poller.sync_statuses()
     assert adapter.comments == []             # the note would have lied
 
@@ -863,8 +858,7 @@ async def test_the_closed_state_set_is_exactly_completed_canceled_duplicate(
     poller = LinearPoller(adapter, store, config=_cfg(write_back=True))
     await poller.poll_once()
     (task,) = await store.list_tasks()
-    task.status = TaskStatus.BLOCKED
-    await store.update_task(task)
+    await store.set_status(task, TaskStatus.BLOCKED, validate=False)
     await poller.sync_statuses()
     assert (len(adapter.comments) == 1) is posts_note
     assert set(STATE_TYPES) == {"completed", "canceled", "duplicate",
@@ -889,8 +883,7 @@ async def test_a_failed_state_check_still_posts_the_needs_a_human_note(store, ca
     poller = LinearPoller(adapter, store, config=_cfg(write_back=True))
     await poller.poll_once()
     (task,) = await store.list_tasks()
-    task.status = TaskStatus.ESCALATED
-    await store.update_task(task)
+    await store.set_status(task, TaskStatus.ESCALATED, validate=False)
     with caplog.at_level(logging.WARNING, logger="no_human.intake.linear_poll"):
         await poller.sync_statuses()
     assert len(adapter.comments) == 1
@@ -921,8 +914,7 @@ async def test_a_failed_comment_leaves_the_marker_unset_so_the_next_tick_retries
     poller = LinearPoller(adapter, store, config=_cfg(write_back=True))
     await poller.poll_once()
     (task,) = await store.list_tasks()
-    task.status = TaskStatus.IMPLEMENTING
-    await store.update_task(task)
+    await store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
 
     await poller.sync_statuses()
     assert adapter.comments == []              # the note did not land
@@ -955,8 +947,7 @@ async def test_a_non_linear_task_in_the_same_store_is_never_written_through_line
     await store.create_task(jira)
 
     (linear_task,) = [t for t in await store.list_tasks() if t.source == "linear"]
-    linear_task.status = TaskStatus.IMPLEMENTING
-    await store.update_task(linear_task)
+    await store.set_status(linear_task, TaskStatus.IMPLEMENTING, validate=False)
 
     with caplog.at_level(logging.WARNING, logger="no_human.intake.linear_poll"):
         assert await poller.sync_statuses() == 1        # the linear task only
@@ -979,8 +970,7 @@ async def test_a_failed_transition_does_not_suppress_the_comment(store):
     poller = LinearPoller(adapter, store, config=_cfg(write_back=True))
     await poller.poll_once()
     (task,) = await store.list_tasks()
-    task.status = TaskStatus.IMPLEMENTING
-    await store.update_task(task)
+    await store.set_status(task, TaskStatus.IMPLEMENTING, validate=False)
     await poller.sync_statuses()
     assert len(adapter.comments) == 1         # independent idempotency markers
 
@@ -1000,7 +990,6 @@ async def test_tick_runs_write_back_even_though_it_is_a_separate_half(store):
     poller = LinearPoller(adapter, store, config=_cfg(write_back=True))
     await poller.tick()
     (task,) = await store.list_tasks()
-    task.status = TaskStatus.DONE
-    await store.update_task(task)
+    await store.set_status(task, TaskStatus.DONE, validate=False)
     await poller.tick()
     assert adapter.transitions == [("uuid-eng-1", "completed")]

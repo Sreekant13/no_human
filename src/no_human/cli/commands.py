@@ -2096,11 +2096,63 @@ def skills_propose(title, content, tag, project):
     asyncio.run(_go())
 
 
+async def _follow_task(store, task_id: str, *, poll_s: float = 1.0,
+                       echo=None) -> "Task | None":
+    """Stream a task's persisted events until it leaves the active statuses.
+
+    The read-only half of `nh watch`, used when a running server owns the
+    worker pool: `nh watch` must NEVER drive a second orchestrator beside
+    the server's (two coders, two reviewers, two PRs on one checkout — and
+    since the runtime stranded sweep judges liveness from outside, a silent
+    duplicate is also what the sweep exists to requeue). Follows by polling
+    the same event table the server flushes to."""
+    echo = echo or render_event
+    seen = 0
+    active = {TaskStatus.PENDING, TaskStatus.CONTEXT, TaskStatus.PLANNING,
+              TaskStatus.IMPLEMENTING, TaskStatus.REVIEWING,
+              TaskStatus.TESTING}
+    t = await store.find_task(task_id)
+    if t is None:
+        return None
+    while True:
+        # ponytail: full re-read + slice each poll; add a since-cursor on
+        # list_events if a follow of a many-thousand-event task ever matters.
+        events = await store.list_events(t.id)
+        for ev in events[seen:]:
+            echo(ev)
+        seen = len(events)
+        t = await store.find_task(t.id)
+        if t is None:
+            return None            # row deleted mid-follow — stop, don't spin
+        if t.status not in active:
+            return t
+        await asyncio.sleep(poll_s)
+
+
 @cli.command("watch")
 @click.argument("task_id")
 def watch(task_id):
-    """Run a staged task in the live Textual TUI (Claude-Code-like view)."""
+    """Watch a task. With `nh start` running, follows the server's run
+    read-only; otherwise runs the task in the live Textual TUI."""
     config, _ = _bootstrap()
+    if _server_owns_worker(config):
+        # The server's scheduler owns the pool — running the task HERE would
+        # put two orchestrators on one checkout (task 84251cb2's duplicate
+        # PR), and the server's stranded sweep may requeue whichever copy
+        # goes silent. Follow the server's run instead.
+        console.print("[cyan]a running server owns this task[/] — following "
+                      "its events (read-only)")
+
+        async def _go():
+            async with Store(config.db_path) as store:
+                t = await _follow_task(store, task_id)
+                if t is None:
+                    print_no_task_matching(task_id)
+                    sys.exit(1)
+                console.print(f"[bold]── {t.status.value} ──[/]")
+
+        asyncio.run(_go())
+        return
     from .tui import run_watch  # lazy import: Textual is heavy
     run_watch(config, task_id)
 

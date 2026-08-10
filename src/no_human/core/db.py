@@ -1270,19 +1270,22 @@ class Store:
 
     @serialized_write
     async def update_task(self, task: Task) -> Task:
-        """Persist the full mutable surface of a task row.
+        """Persist the full mutable surface of a task row — EXCEPT status.
 
-        CAS guard (SCRUM-73): mirrors set_status's terminal definition (done,
-        or failed with a `cancel_reason` in context) — a terminal row's
-        status column is protected from being resurrected by a stale
-        in-memory `task.status`, via a CASE keyed on the row's own
-        pre-update status/context (evaluated atomically inside this one
-        statement, before this call's own :context write applies). Every
-        other column still writes normally, so e.g. the Jira poller can keep
-        updating context write-back markers on an already-DONE row. No
-        override parameter here — callers that must move a row OUT of a
-        terminal state go through set_status(..., human_override=True)
-        instead, since update_task never carries that intent.
+        Status has exactly one writer: ``set_status`` (which validates
+        transitions and CAS-guards terminal rows, SCRUM-73). This method
+        used to write the handle's status too, guarded only for terminal
+        rows — so any caller holding a stale snapshot across an ``await``
+        could revert a LIVE task's advance. That is the 2026-08-09 demo
+        incident (R15): a tracker poller's write-back, snapshotted before
+        slow network calls, reverted awaiting_approval back to reviewing;
+        the row then sat in a worker-only status with no worker attached,
+        invisible until the next restart re-ran the whole task and opened
+        a duplicate PR. The status column is therefore never touched here;
+        the handle's ``.status`` is refreshed to the row's truth below so
+        callers keep reasoning about reality. Every other column still
+        writes normally, so e.g. the Jira poller can keep updating context
+        write-back markers on an already-DONE row.
         """
         task.updated_at = _now()
         row = task.to_row()
@@ -1292,13 +1295,6 @@ class Store:
                  description=:description, requirements=:requirements,
                  acceptance_criteria=:acceptance_criteria, repo_path=:repo_path,
                  kind=:kind, parent_id=:parent_id,
-                 status = CASE
-                            WHEN (
-                              status = 'done'
-                              OR (status = 'failed'
-                                  AND json_extract(context, '$.cancel_reason') IS NOT NULL)
-                            ) AND status != :status
-                            THEN status ELSE :status END,
                  blocker=:blocker, wake_check_at=:wake_check_at,
                  priority=:priority, context=:context, plan=:plan, config=:config,
                  updated_at=:updated_at
@@ -1323,9 +1319,9 @@ class Store:
         )
         await self.db.commit()
         if result is not None and result["status"] != row["status"]:
-            log.warning(
-                "update_task: blocked status %s -> %s on terminal row %s",
-                result["status"], row["status"], task.id,
+            log.info(
+                "update_task: handle held stale status %s; row is %s (%s)",
+                row["status"], result["status"], task.id,
             )
             task.status = TaskStatus(result["status"])
         return task
@@ -1381,10 +1377,13 @@ class Store:
 
     @serialized_write
     async def update_task_columns(self, task: Task) -> Task:
-        """Persist the task's mutable columns EXCEPT context. Multi-writer
-        zones (watcher, CLI, gate) must write context only via merge_context/
-        append_context_list — this companion writes the rest without
-        clobbering concurrent context merges with a stale blob."""
+        """Persist the task's mutable columns EXCEPT context and status.
+        Multi-writer zones (watcher, CLI, gate) must write context only via
+        merge_context/append_context_list — this companion writes the rest
+        without clobbering concurrent context merges with a stale blob.
+        Status is excluded for the same reason as in ``update_task`` (R15):
+        ``set_status`` is the only status writer; a stale handle here had
+        no terminal guard at all."""
         task.updated_at = _now()
         row = task.to_row()
         await self.db.execute(
@@ -1393,7 +1392,7 @@ class Store:
                  description=:description, requirements=:requirements,
                  acceptance_criteria=:acceptance_criteria, repo_path=:repo_path,
                  kind=:kind, parent_id=:parent_id,
-                 status=:status, blocker=:blocker, wake_check_at=:wake_check_at,
+                 blocker=:blocker, wake_check_at=:wake_check_at,
                  priority=:priority, plan=:plan, config=:config,
                  updated_at=:updated_at
                WHERE id=:id""",

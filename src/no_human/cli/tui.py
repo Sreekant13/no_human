@@ -113,12 +113,21 @@ class WatchApp(App):
             # One production construction site. This used to build its own
             # Orchestrator and forgot the reviewer, so `nh watch` drove tasks
             # all the way to a PR with the review gate silently pass-through.
-            from .commands import _build_orchestrator
+            from .commands import _build_orchestrator, _persisting
+            from ..core.events import EventPersister
 
-            orch = _build_orchestrator(
-                self.config, store, event_sink=self._sink, task=t
-            )
-            outcome = await orch.run_task(t)
+            # Persist events like every other in-process runner (`nh task add
+            # --run`, `nh reply --run`): the board reads task_events, and the
+            # scheduler's stranded sweep reads them as LIVENESS — a TUI run
+            # that persisted nothing was invisible to both, so an `nh serve`
+            # scheduler sharing the DB could requeue it mid-review (R15/B2).
+            async with EventPersister(store, t.id) as persister:
+                orch = _build_orchestrator(
+                    self.config, store,
+                    event_sink=_persisting(persister, t.id, self._sink),
+                    task=t,
+                )
+                outcome = await orch.run_task(t)
             log.write(f"[bold]── {outcome.status.value} ──[/]")
             if outcome.pr_url:
                 log.write(f"[bold green]PR: {outcome.pr_url}[/]")
