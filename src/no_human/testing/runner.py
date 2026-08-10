@@ -133,6 +133,18 @@ def _looks_like_pytest(repo_path: Path) -> bool:
     return False
 
 
+def _declares_xdist(repo_path: Path) -> bool:
+    """True when the repo declares pytest-xdist (pyproject or uv.lock).
+    File reads only, like every other check in this module."""
+    for name in ("pyproject.toml", "uv.lock"):
+        try:
+            if "pytest-xdist" in (repo_path / name).read_text(errors="ignore"):
+                return True
+        except OSError:
+            pass
+    return False
+
+
 def detect_command(repo_path: Path) -> str | None:
     """Best-effort test command detection.
 
@@ -143,6 +155,16 @@ def detect_command(repo_path: Path) -> str | None:
     repo_path = Path(repo_path)
     if _looks_like_pytest(repo_path):
         if (repo_path / "uv.lock").exists():
+            # Parallelize only when the repo itself declares pytest-xdist:
+            # `uv run` syncs the default groups from the lock, so the plugin
+            # is present in every ordinary layout (a non-default-group or
+            # platform-marked declaration can still miss — that lands in
+            # _is_invocation_error and the -n-less retry, an honest failure,
+            # never a false pass). A bare `pytest` environment carries no
+            # guarantee at all, so the non-uv path below stays serial. Fixed
+            # worker count: `-n auto` has wedged on large suites.
+            if _declares_xdist(repo_path):
+                return "uv run pytest -q -n 4"
             return "uv run pytest -q"
         return "pytest -q"
     if (repo_path / "package.json").exists():

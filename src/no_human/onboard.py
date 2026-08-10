@@ -233,7 +233,15 @@ class DeclarationDeriver:
         pyproject = _read_text(repo / "pyproject.toml")
         if (repo / "uv.lock").exists():
             d.candidates.append(CommandCandidate("install", "uv sync", "uv.lock"))
-            test_cmd, run_prefix = "uv run pytest -q", "uv run "
+            # Same rule as runner.detect_command: parallelize only when the
+            # repo declares pytest-xdist. An onboarded serial test_cmd is what
+            # made every attempt run a 7,700-test suite serially (2026-08-10) —
+            # the profile overrides the runner heuristic, so the derivation
+            # here is the value that actually governs.
+            if runner._declares_xdist(repo):
+                test_cmd, run_prefix = "uv run pytest -q -n 4", "uv run "
+            else:
+                test_cmd, run_prefix = "uv run pytest -q", "uv run "
             d.sources.append("uv.lock")
         elif (repo / "poetry.lock").exists():
             d.candidates.append(CommandCandidate("install", "poetry install", "poetry.lock"))

@@ -59,6 +59,18 @@ def test_derive_python_uv_lock(tmp_path):
     assert any(c.command == "uv run ruff check ." for c in d.of_kind("lint"))
 
 
+def test_derive_python_uv_lock_with_xdist_parallelizes(tmp_path):
+    """The onboarded test_cmd is what the orchestrator actually runs — the
+    profile overrides runner.detect_command — so the serial/parallel choice
+    made HERE, at onboard time, is the one that governs every attempt. A
+    serial derivation for an xdist-declaring repo re-creates the 2026-08-10
+    zero-throughput incident on the next onboard."""
+    _python_repo(tmp_path)
+    (tmp_path / "uv.lock").write_text('# lock\nname = "pytest-xdist"\n')
+    d = DeclarationDeriver().derive(tmp_path)
+    assert [c.command for c in d.of_kind("test")] == ["uv run pytest -q -n 4"]
+
+
 def test_derive_node_scripts(tmp_path):
     d = DeclarationDeriver().derive(_node_repo(tmp_path))
     assert d.ecosystem == "node"

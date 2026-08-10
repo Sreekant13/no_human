@@ -25,6 +25,36 @@ def test_uv_pyproject_uses_uv_pytest(tmp_path):
     assert detect_command(tmp_path) == "uv run pytest -q"
 
 
+def test_uv_project_with_xdist_parallelizes(tmp_path):
+    """2026-08-10 zero-throughput incident: four workers each ran a serial
+    `pytest -q` over a 7,700-test repo (~40-60 min each under load) while the
+    rest of the board starved in the queue. When the repo itself declares
+    pytest-xdist, `uv run` guarantees the plugin is installed, so the gate may
+    parallelize. Fixed worker count — `-n auto` has wedged this repo."""
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname='x'\n"
+        "[dependency-groups]\ndev = ['pytest-xdist>=3.5']\n")
+    (tmp_path / "uv.lock").write_text("")
+    assert detect_command(tmp_path) == "uv run pytest -q -n 4"
+
+
+def test_uv_project_with_xdist_only_in_lock_parallelizes(tmp_path):
+    """A transitive or group-declared xdist shows up in uv.lock even when
+    pyproject names it indirectly; the lock is what `uv run` installs from."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+    (tmp_path / "uv.lock").write_text('name = "pytest-xdist"\n')
+    assert detect_command(tmp_path) == "uv run pytest -q -n 4"
+
+
+def test_bare_pytest_never_gets_dash_n(tmp_path):
+    """Without uv nothing guarantees xdist is installed in whatever
+    environment runs the command; `-n` with the plugin missing is exit code 4
+    (an invocation error), not a test verdict. The bare path stays serial."""
+    (tmp_path / "pytest.ini").write_text("[pytest]\n")
+    (tmp_path / "requirements-dev.txt").write_text("pytest-xdist\n")
+    assert detect_command(tmp_path) == "pytest -q"
+
+
 def test_plain_pytest_project(tmp_path):
     (tmp_path / "pytest.ini").write_text("[pytest]\n")
     assert detect_command(tmp_path) == "pytest -q"
