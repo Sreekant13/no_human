@@ -311,6 +311,33 @@ def raw_cap_as_weighted(raw_cap: int) -> int:
     return int(int(raw_cap or 0) * RAW_TO_WEIGHTED_RATIO)
 
 
+def override_inverted(raw_cap: int | None, weighted_default: int) -> bool:
+    """Does converting this pre-cutover RAW override flip a raise into a cut?
+
+    R1, the defect that killed the August funnel. The `no_human` repo profile
+    carried ``default_lifetime_tokens = 12,000,000``, written before the
+    cutover, so unmarked, so converted: 2,382,000 — BELOW the ungranted
+    4,000,000 default. An operator who types a number ABOVE the default is
+    unambiguously asking for MORE than the default; a conversion that turns
+    that into 40% LESS has not re-expressed their intent, it has inverted it.
+    32 of 33 August tasks ran against `/2,382,000` and the median one died
+    exactly there.
+
+    The predicate is the sign flip and nothing else: raise as typed
+    (``raw_cap > default``), cut as read (``converted < default``). It is
+    deliberately NOT ``max(converted, default)``, because that would also raise
+    a value that was small in BOTH units — a deliberate lowering, which the
+    caps must keep supporting: every budget test in the suite writes a tiny
+    unmarked cap, and `_stored_token_cap` has always honoured it. Those are
+    untouched here; only the contradiction is.
+
+    Nothing about this guesses at intent from a magic value or a date. It reads
+    the operator's own number against the operator's own default and refuses
+    the one interpretation that is self-contradictory.
+    """
+    return int(raw_cap or 0) > int(weighted_default or 0) > raw_cap_as_weighted(raw_cap)
+
+
 def class_breakdown(
     *,
     tokens_used: int = 0,

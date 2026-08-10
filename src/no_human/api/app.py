@@ -2552,6 +2552,7 @@ async def reply_task(
         resume_provenance,
     )
     from ..core import plan_gate
+    from ..core.bounds import Bounds
 
     store = _store(request)
     task = await _require_task(store, task_id)
@@ -2579,7 +2580,13 @@ async def reply_task(
         terminal = is_terminal_action(option.action)
         approves_plan = is_plan_approval_action(option.action)
         try:
-            applied = apply_action(task, option.action)
+            applied = apply_action(
+                task, option.action,
+                # The install's effective bounds, so a stamped cap is the one
+                # the gate will enforce (see `actions._normalised`).
+                bounds=Bounds.from_config(
+                    (getattr(request.app.state, "config", None)
+                     or {}).get("bounds")))
         except ActionError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

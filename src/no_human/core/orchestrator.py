@@ -85,7 +85,10 @@ from . import plan_gate
 from .bounds import Bounds, QuotaExhausted, StuckDetector
 from .db import AUX_USAGE_TIERS, Store
 from .pricing import class_breakdown as _class_breakdown
-from .pricing import config_is_weighted, raw_cap_as_weighted
+from .pricing import (
+    RAW_TO_WEIGHTED_RATIO, config_is_weighted, override_inverted,
+    raw_cap_as_weighted,
+)
 from .pricing import weighted_tokens as _weighted_tokens
 from .task import Task, TaskSpec, TaskStatus
 
@@ -7907,7 +7910,8 @@ class Orchestrator:
         self._token_ceiling: tuple[str, int, str] = (task_id, ceiling, label)
 
     @staticmethod
-    def _stored_token_cap(tcfg: dict, key: str, default: int) -> int:
+    def _stored_token_cap(
+        tcfg: dict, key: str, default: int, task: "Task | None" = None) -> int:
         """A per-task TOKEN cap out of `task.config`, in the weighted unit.
 
         THE CUTOVER GUARD, and the only place either token cap is read, so the
@@ -7924,6 +7928,27 @@ class Orchestrator:
         fails closed: an under-read parks a task early and asks a human, an
         over-read spends five times the money with nobody watching.
 
+        THE RAISE-FLOOR (R1, funnel forensics 2026-08-10). The conversion above
+        is right about the unit and was wrong about one case, expensively: a
+        pre-cutover value written ABOVE the default converts to something BELOW
+        it, so an override typed as a raise is applied as a cut. The `no_human`
+        profile's 12,000,000 became 2,382,000 against a 4,000,000 default — 32
+        of 33 August tasks ran under that, and the median one died at it. So a
+        conversion that inverts the sign yields the default instead. See
+        `core.pricing.override_inverted` for why this is the sign flip and not
+        `max(converted, default)` — a cap small in BOTH units is a deliberate
+        lowering and still goes through untouched.
+
+        THE CLAIM, EXACTLY. An unmarked value ABOVE the default can never be
+        applied as below it. That is all. It is specifically NOT "an override
+        never leaves a task worse off than no override at all": an unmarked
+        value at or under the default is still converted down and NOT warned
+        about — an unmarked 4,000,000 against a 4,000,000 default reads as
+        794,000, an 80% cut, silently. That case is indistinguishable from a
+        deliberate lowering, which is a supported thing to write, so nothing
+        here can tell them apart and nothing here pretends to. The only cure
+        is the unit marker: a stamped value means what it says.
+
         Never writes. The stored value is left exactly as the human typed it;
         only its interpretation is pinned.
         """
@@ -7938,6 +7963,33 @@ class Orchestrator:
             return default
         if config_is_weighted(tcfg):
             return value
+        if override_inverted(value, default):
+            # ponytail: warned on every read (3-4 per attempt), not deduped —
+            # this costs an operator their whole funnel and it went unseen for
+            # nine days. Dedupe if it ever drowns something.
+            #
+            # BOTH remedies, because this function cannot tell which surface
+            # wrote the value: a repo profile default and a per-task override
+            # arrive in the same dict, indistinguishable. And the value to
+            # re-type is the RAISE THE OPERATOR MEANT, not `default` — naming
+            # the default here would talk them into discarding the very grant
+            # this guard exists to preserve.
+            log.warning(
+                "budget override inverted by the 2026-07-31 unit cutover: "
+                "%s=%s reads as %s cost-weighted tokens, BELOW the ungranted "
+                "default of %s — an unmarked value is treated as pre-cutover "
+                "RAW and converted (x%s). Applying the default instead. "
+                "Fix it for good by re-writing the budget you actually want "
+                "in COST-WEIGHTED tokens (not the raw number, and not the "
+                "default): `nh repo config %s default_%s=<weighted>` for the "
+                "whole repo, or `nh task config %s %s=<weighted>` for this "
+                "task alone.",
+                key, f"{value:,}", f"{raw_cap_as_weighted(value):,}",
+                f"{default:,}", RAW_TO_WEIGHTED_RATIO,
+                (task.repo_path if task and task.repo_path else "<repo>"),
+                key, (task.id[:8] if task else "<task>"), key,
+            )
+            return default
         # Floor of 1, not `default`: a converted cap must stay an override.
         # Falling back to the default here would silently RAISE a deliberately
         # tiny cap (the shape every budget test uses) instead of lowering it.
@@ -7963,7 +8015,7 @@ class Orchestrator:
             # A COUNT, not tokens: no unit, so no conversion.
             _cap("lifetime_attempts", self.bounds.lifetime_attempts),
             self._stored_token_cap(
-                tcfg, "lifetime_tokens", self.bounds.lifetime_tokens),
+                tcfg, "lifetime_tokens", self.bounds.lifetime_tokens, task),
         )
 
     def _attempt_token_cap(self, task: Task) -> int:
@@ -7972,7 +8024,7 @@ class Orchestrator:
         through the same cutover guard: 162 tasks on this install carry a raw
         `attempt_tokens` (4M or 6M) written before the caps became weighted."""
         return self._stored_token_cap(
-            task.config or {}, "attempt_tokens", self.bounds.attempt_tokens)
+            task.config or {}, "attempt_tokens", self.bounds.attempt_tokens, task)
 
     def _spend_shape_note(self, task: Task) -> str:
         """The running attempt's spend SHAPE, for the parked task's evidence.

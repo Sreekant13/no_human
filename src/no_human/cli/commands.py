@@ -1028,6 +1028,7 @@ def task_config(task_id, assignments):
     — see `apply_action`.)
     """
     from ..blockers import ActionError, apply_action
+    from ..core.bounds import Bounds
 
     config, _ = _bootstrap(require_auth=False)
 
@@ -1046,7 +1047,9 @@ def task_config(task_id, assignments):
                 print_no_task_matching(task_id)
                 sys.exit(1)
             try:
-                applied = apply_action(t, {"set_task_config": settings}, human_override=True)
+                applied = apply_action(
+                    t, {"set_task_config": settings}, human_override=True,
+                    bounds=Bounds.from_config(config.get("bounds")))
             except ActionError as exc:
                 console.print(f"[red]{exc}[/]")
                 sys.exit(1)
@@ -1079,22 +1082,41 @@ def repo_config(repo_path, assignments):
     no explicit override; an explicit `nh task config` value always wins.
     Accepts exactly default_attempt_tokens / default_lifetime_tokens.
 
-    UNIT — RAW tokens, which is NOT the unit the caps themselves are in.
-    Since 2026-07-31 `bounds.attempt_tokens` / `bounds.lifetime_tokens` are
-    cost-weighted (fresh in/out x1.0, cache write x1.25, cache read x0.1 —
-    core.pricing) and default to 2,000,000 / 4,000,000 (raised 2026-08-03 —
-    the converted caps were calibrated on the pre-fix ledger that under-counted
-    subagent spend; rationale on core.bounds.Bounds). A value set here reaches
-    task.config carrying no `budget_unit` marker, so the orchestrator reads it
-    as a pre-cutover raw number and converts it (x0.1985). That is deliberate
-    and fail-closed: it is the only safe reading of a value that may have been
-    written before the cutover.
+    UNIT — COST-WEIGHTED tokens, the same unit as the caps themselves and the
+    same unit `nh task config` takes. Since 2026-07-31 `bounds.attempt_tokens`
+    / `bounds.lifetime_tokens` are cost-weighted (fresh in/out x1.0, cache
+    write x1.25, cache read x0.1 — core.pricing) and default to 2,000,000 /
+    4,000,000 (raised 2026-08-03; rationale on core.bounds.Bounds). Every write
+    here stamps `default_budget_unit: weighted` on the profile, which stamps
+    `budget_unit` into the task config, so the value is read at face value and
+    never converted.
 
-    So type raw tokens. The weighted defaults above correspond to roughly
-    10,100,000 (attempt) and 20,200,000 (lifetime) in this field at the
-    0.1985 conversion. To set a per-task budget in weighted tokens directly,
-    use `nh task config`, which stamps the unit and is read at face value.
+    CHANGED 2026-08-10, and it changed because of what it cost (R1, funnel
+    forensics). This field USED to take raw tokens and be converted x0.1985 on
+    read, with this docstring telling operators the weighted defaults
+    "correspond to roughly 10,100,000 / 20,200,000 in this field". The
+    `no_human` profile held 12,000,000 — a number that looks like a generous
+    raise and read as 2,382,000, 40% BELOW the ungranted default. 32 of 33
+    August tasks ran under that cut and none of them merged. Asking an operator
+    to type one unit while the product enforces another was the defect; there
+    is now one unit.
+
+    Values already stored WITHOUT the stamp are still read as raw and
+    converted, because they were written under the old contract. Re-set them
+    here to move them over — `nh repo config REPO` prints which unit each is
+    in. Note that a pre-cutover value must be RE-DERIVED, not re-typed: a habit
+    of typing 20,200,000 now means 20,200,000 weighted, 5x the default, so the
+    write echoes the ratio to the ungranted default.
+
+    Moving a pre-cutover profile over therefore takes ONE command carrying
+    EVERY budget key. A partial write on an unstamped profile is REFUSED:
+    `default_budget_unit` is a single field describing both values, so
+    stamping it on a one-key write would silently re-declare the untouched
+    sibling as weighted — about 5x, permanently, with no floor and no warning
+    because a stamped value is taken at face value.
     """
+    from ..core.bounds import Bounds
+    from ..core.pricing import WEIGHTED_UNIT
     from ..profile import ProjectProfile
 
     config, _ = _bootstrap(require_auth=False)
@@ -1129,13 +1151,77 @@ def repo_config(repo_path, assignments):
             if not resolved:
                 console.print(f"default_attempt_tokens={profile.default_attempt_tokens or 0}")
                 console.print(f"default_lifetime_tokens={profile.default_lifetime_tokens or 0}")
+                # R1: the unit these two are in used to be knowable only by
+                # doing the 0.1985 arithmetic by hand against a docstring. It
+                # is the thing that made the August cut invisible, so it is
+                # printed next to the numbers whose meaning it decides.
+                if profile.default_budget_unit == WEIGHTED_UNIT:
+                    console.print(f"budget_unit={WEIGHTED_UNIT}")
+                else:
+                    console.print(
+                        "budget_unit=raw [dim](written before the 2026-07-31"
+                        " cutover; converted x0.1985 on read — re-set it here"
+                        " to store it in the weighted unit)[/]"
+                    )
                 return
+            # THE MARKER DESCRIBES THE WHOLE PROFILE. `default_budget_unit` is
+            # one field for both values, so a PARTIAL write cannot honestly
+            # claim it: stamping on a one-key write re-declares the untouched,
+            # still-pre-cutover sibling as weighted, and a stamped value is
+            # taken at face value — no conversion, no floor, no warning. On
+            # the live profile ({10,100,000 / 20,200,000} unstamped) a write
+            # of default_lifetime_tokens alone moved the ENFORCED attempt cap
+            # from 2,004,850 to 10,100,000: 5.0x, permanent, fail-open.
+            #
+            # So refuse, rather than guess. The human is right here and can
+            # type both numbers; converting the sibling for them would change
+            # a value they did not touch, which is how this class of bug got
+            # started. (Third instance of it on this branch — task.config's
+            # dict-wide marker, then the profile->task copy, now the write
+            # that creates the stamp. The rule: a marker over a record may be
+            # written only when every value in that record is in the unit it
+            # claims.)
+            stale = sorted(
+                k for k in REPO_CONFIG_KEYS - set(resolved) if getattr(profile, k, 0))
+            if stale and profile.default_budget_unit != WEIGHTED_UNIT:
+                names = ", ".join(f"{k}={getattr(profile, k):,}" for k in stale)
+                console.print(
+                    f"[red]refusing a partial write:[/] this profile is still "
+                    f"in the pre-cutover RAW unit and carries {names}, which "
+                    f"this command does not set. Recording "
+                    f"{', '.join(sorted(resolved))} alone would declare the "
+                    f"whole profile cost-weighted and silently re-type "
+                    f"{' and '.join(stale)} as weighted — roughly 5x, "
+                    f"permanently.\n"
+                    f"  Either write every budget key in ONE command:\n"
+                    f"    nh repo config {repo_path} "
+                    + " ".join(
+                        f"{k}=<weighted>" for k in sorted(REPO_CONFIG_KEYS))
+                    + f"\n  or re-type just the sibling in COST-WEIGHTED "
+                    f"tokens first ({' and '.join(stale)}), then repeat this "
+                    f"command. `nh repo config {repo_path}` prints the current "
+                    f"values and which unit they are in."
+                )
+                sys.exit(1)
             for key, value in resolved.items():
                 setattr(profile, key, value)
+            # Every write is in the current unit, and says so. This is what
+            # kills the ambiguity class rather than flooring it forever.
+            profile.default_budget_unit = WEIGHTED_UNIT
             await store.upsert_profile(profile)
             console.print(
                 "[green]applied[/] " + ", ".join(f"{k}={resolved[k]}" for k in sorted(resolved))
+                + " [dim](cost-weighted tokens)[/]"
             )
+            # The ratio to the ungranted default, at the one moment a 5x typo
+            # is cheap to catch: a pre-cutover habit types 20,200,000 here.
+            bounds = Bounds.from_config((config.get("bounds") or {}))
+            for key in sorted(resolved):
+                default = getattr(bounds, key.removeprefix("default_"))
+                console.print(
+                    f"  [dim]{key}: {resolved[key]:,} vs the ungranted default "
+                    f"{default:,} — {resolved[key] / default:.1f}x[/]"
+                )
 
     asyncio.run(_go())
 
@@ -2538,6 +2624,7 @@ def reply(task_id, answer, choose, run):
         resume_checkpoint,
         resume_provenance,
     )
+    from ..core.bounds import Bounds
     from ..core import plan_gate
 
     async def _go():
@@ -2572,7 +2659,9 @@ def reply(task_id, answer, choose, run):
                 terminal = is_terminal_action(option.action)
                 approves_plan = is_plan_approval_action(option.action)
                 try:
-                    applied = apply_action(t, option.action)
+                    applied = apply_action(
+                        t, option.action,
+                        bounds=Bounds.from_config(config.get("bounds")))
                 except ActionError as exc:
                     console.print(f"[red]cannot apply that option:[/] {exc}")
                     sys.exit(1)

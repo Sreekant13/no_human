@@ -22,9 +22,10 @@ from typing import TYPE_CHECKING, Any
 
 # `core.pricing` is a leaf (it imports nothing from this package), so this
 # cannot reintroduce the cycle the TYPE_CHECKING guard below exists for.
+from ..core.bounds import Bounds
 from ..core.pricing import (
     BUDGET_UNIT_KEY, TOKEN_CAP_KEYS, WEIGHTED_UNIT, config_is_weighted,
-    raw_cap_as_weighted,
+    override_inverted, raw_cap_as_weighted,
 )
 
 if TYPE_CHECKING:  # pragma: no cover — typing only, avoids an import cycle
@@ -71,8 +72,31 @@ def is_plan_approval_action(action: dict[str, Any] | None) -> bool:
     return isinstance(action, dict) and action.get(APPROVE_PLAN) is True
 
 
+def _normalised(raw_cap: int, key: str, bounds: "Bounds") -> int:
+    """An unmarked (pre-cutover) token cap, in the weighted unit this module
+    is about to STAMP — read exactly as `Orchestrator._stored_token_cap` reads
+    it, raise-floor included.
+
+    The two must agree, and `bounds` is what makes that true rather than
+    aspirational. This path converts a stale prior and then marks it weighted,
+    so whatever it decides is FROZEN, out of reach of the read-time floor —
+    and the reader floors against `Bounds.from_config(config["bounds"])`, not
+    against the dataclass literals. An earlier cut of this used `Bounds()`
+    here, and on a tuned install the two disagreed in both directions: with
+    `bounds.lifetime_tokens: 8,000,000` a sibling write froze the literal
+    4,000,000, a permanent 50% cut; with `1,000,000` it froze 4,000,000, 4x
+    what the install configured. Same defaults in, same answer out, or this
+    module quietly overrules the operator's config on the money path.
+    """
+    bound = getattr(bounds, key, 0)
+    if override_inverted(raw_cap, bound):
+        return bound
+    return max(raw_cap_as_weighted(raw_cap), 1)
+
+
 def apply_action(
-    task: "Task", action: dict[str, Any] | None, *, human_override: bool = False
+    task: "Task", action: dict[str, Any] | None, *, human_override: bool = False,
+    bounds: "Bounds | None" = None,
 ) -> str | None:
     """Apply `action` to `task` in place. Returns a human-readable summary of
     what changed, or None when the option carried no action.
@@ -82,6 +106,14 @@ def apply_action(
     already bigger stored cap. `human_override=True` is passed ONLY by the
     human CLI (`nh task config KEY=VALUE`), which sets the exact value —
     raising or lowering — because the human is the gate.
+
+    `bounds` is this install's EFFECTIVE bounds, and every caller that has a
+    config passes it. It is used for exactly one thing — the raise-floor on a
+    pre-cutover cap this write is about to convert and stamp (`_normalised`) —
+    and it must be the same object the orchestrator reads with, or the write
+    freezes a cap the gate would never have enforced. `None` falls back to the
+    dataclass defaults, which is precisely what the reader does on an install
+    whose config carries no `bounds` block.
     """
     if not action:
         return None
@@ -139,7 +171,7 @@ def apply_action(
             # unreachable by the very flow that exists to correct a budget.
             # Normalising the prior first is what makes them correctable.
             if key in TOKEN_CAP_KEYS and not config_is_weighted(existing):
-                prior = max(raw_cap_as_weighted(prior), 1)
+                prior = _normalised(prior, key, bounds or Bounds())
         if (not human_override
                 and isinstance(prior, int) and not isinstance(prior, bool)
                 and prior > value):
@@ -179,6 +211,7 @@ def apply_action(
                 stale = existing.get(other)
                 if (isinstance(stale, int) and not isinstance(stale, bool)
                         and stale > 0):
-                    task.config[other] = max(raw_cap_as_weighted(stale), 1)
+                    task.config[other] = _normalised(
+                        stale, other, bounds or Bounds())
         task.config[BUDGET_UNIT_KEY] = WEIGHTED_UNIT
     return ", ".join(notes[k] for k in sorted(notes))

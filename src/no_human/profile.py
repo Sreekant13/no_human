@@ -61,6 +61,14 @@ class ProjectProfile:
     # override, so an operator hand-set task.config always still wins.
     default_attempt_tokens: int = 0
     default_lifetime_tokens: int = 0
+    # R1 (funnel forensics, 2026-08-10): which UNIT the two values above are
+    # in. Empty means unknown, which means written before the 2026-07-31
+    # cutover, which means RAW — the same fail-closed reading `task.config`
+    # takes, and the reading every existing profile on every install needs to
+    # keep getting. `nh repo config` stamps `"weighted"` on every write from
+    # now on, so a value typed today is never re-converted and the ambiguity
+    # this field exists for cannot be created again.
+    default_budget_unit: str = ""
 
     # --- serialization ---------------------------------------------------- #
 
@@ -86,6 +94,7 @@ class ProjectProfile:
             "default_branch": self.default_branch,
             "default_attempt_tokens": self.default_attempt_tokens,
             "default_lifetime_tokens": self.default_lifetime_tokens,
+            "default_budget_unit": self.default_budget_unit,
         }
 
     @classmethod
@@ -146,9 +155,45 @@ def apply_default_task_config(
     the profile leaves ``task_config`` byte-for-byte unchanged."""
     if profile is None:
         return task_config
+    from .core.pricing import BUDGET_UNIT_KEY, TOKEN_CAP_KEYS, WEIGHTED_UNIT
+
     merged = dict(task_config)
+    # R1 — MIXED UNITS: copy nothing, in EITHER direction. `BUDGET_UNIT_KEY`
+    # marks the WHOLE dict, so one unit has to describe both sides of this
+    # merge, and there are two ways for that to be false:
+    #
+    #   - a WEIGHTED profile writing beside a cap the caller brought with no
+    #     marker, i.e. a raw one. Copying the profile's weighted 4,000,000
+    #     under no marker reads it back as raw and converts it to 794,000 —
+    #     a 5x CUT of a number the operator typed correctly.
+    #   - a RAW profile writing into a dict that already DECLARES weighted.
+    #     Copying its 20,200,000 under that marker takes it at face value —
+    #     5.04x fail-open, and unlike the first direction nothing warns,
+    #     because a marked value never reaches the raise-floor.
+    #
+    # The first cure covered only the first direction while this comment
+    # claimed both; the guard is now the symmetric statement it always
+    # described. Copying nothing leaves the ungranted default in force for the
+    # key the caller did not set, and the ungranted default is never worse
+    # than a value read in the wrong unit.
+    #
+    # The second clause is not `TOKEN_CAP_KEYS & set(merged)` alone: a bare
+    # marker with no cap yet still declares the dict's unit, and copying a
+    # raw default under it is exactly the 5.04x above.
+    profile_weighted = profile.default_budget_unit == WEIGHTED_UNIT
+    caller_weighted = merged.get(BUDGET_UNIT_KEY) == WEIGHTED_UNIT
+    caller_declares_a_unit = bool(TOKEN_CAP_KEYS & set(merged)) or BUDGET_UNIT_KEY in merged
+    if profile_weighted != caller_weighted and caller_declares_a_unit:
+        return merged
     if profile.default_attempt_tokens and "attempt_tokens" not in merged:
         merged["attempt_tokens"] = profile.default_attempt_tokens
     if profile.default_lifetime_tokens and "lifetime_tokens" not in merged:
         merged["lifetime_tokens"] = profile.default_lifetime_tokens
+    # Stamp the unit so the orchestrator reads these at face value instead of
+    # treating them as pre-cutover raw and converting them (R1, the 40% cut
+    # that killed the August funnel). An UNSTAMPED profile is every profile
+    # that exists today, including the 12,000,000 one, and it must keep being
+    # converted or this change 5x's every install at once.
+    if profile_weighted and TOKEN_CAP_KEYS & set(merged):
+        merged[BUDGET_UNIT_KEY] = WEIGHTED_UNIT
     return merged

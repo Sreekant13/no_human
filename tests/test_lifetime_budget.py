@@ -363,7 +363,12 @@ async def test_d6e4b72a_would_not_have_been_killed_when_it_was(store):
     await store.update_attempt(aid, **D6E4B72A_ATTEMPT)
 
     o = _orch(store)
-    assert o._lifetime_limits(t)[1] == 2_382_000, "grant read in its own unit"
+    # 12,000,000 raw converts to 2,382,000 — but that is BELOW the ungranted
+    # 4,000,000 default, so the raise-floor (R1) applies the default instead.
+    # Either way the grant is read in its own unit and either way this task
+    # survives; the floor only made the raise stop being a cut.
+    assert raw_cap_as_weighted(D6E4B72A_CAP) == 2_382_000
+    assert o._lifetime_limits(t)[1] == 4_000_000, "grant read in its own unit"
     _, raw = await store.lifetime_usage(t.id)
     assert raw == 6_764_316 > 2_382_000, "the raw sum is what stopped it"
 
@@ -376,13 +381,23 @@ async def test_d6e4b72a_would_not_have_been_killed_when_it_was(store):
 async def test_d6e4b72a_is_not_handed_a_blank_cheque_either(store):
     """The honest other half, recorded so the fix is not oversold.
 
-    Across all FOUR of its attempts the task spent 3,386,434 weighted against
-    a grant worth 2,382,000. It does park — later, and on a true reading of
-    what it cost. Re-pricing the counter moved WHEN the gate fires; it did not
-    exempt an expensive task from it.
+    Across all FOUR of its attempts the task spent 3,386,434 weighted. Against
+    a grant of 2,382,000 it parks — later than the raw counter killed it, and
+    on a true reading of what it cost. Re-pricing the counter moved WHEN the
+    gate fires; it did not exempt an expensive task from it.
+
+    MOVED BY R1, and stated rather than hidden: an UNMARKED 12,000,000 no
+    longer means 2,382,000, because that reading turned a raise into a cut. It
+    now means the ungranted 4,000,000, and 3,386,434 is under that, so THIS
+    ledger no longer parks on the unmarked config. That is the trade the
+    2026-08-03 global raise already accepted at 6.8% of tasks — it is not a
+    weakening of the gate, and the marked half below proves the gate itself is
+    untouched: state the same grant unambiguously and the same spend still
+    parks, at the same arithmetic, to the token.
     """
     t = Task.new("d6e4b72a, all four attempts", repo_path="/tmp/x")
-    t.config = {"lifetime_tokens": D6E4B72A_CAP}          # raw, unmarked
+    # 2,382,000 — the same grant, stated in the unit the gate enforces.
+    t.config = {"lifetime_tokens": raw_cap_as_weighted(D6E4B72A_CAP), **_MARKED}
     await store.create_task(t)
     aid = await store.create_attempt(t.id, 1)
     await store.update_attempt(aid, **D6E4B72A_LEDGER)
@@ -390,6 +405,16 @@ async def test_d6e4b72a_is_not_handed_a_blank_cheque_either(store):
     b = await _orch(store)._check_lifetime_budget(t)
     assert b is not None and b.category is BlockerCategory.BUDGET_EXHAUSTED
     assert "3,386,434/2,382,000" in b.root_cause_hypothesis
+
+    # ...and the unmarked half, so the change of meaning is on the record.
+    u = Task.new("d6e4b72a, unmarked", repo_path="/tmp/x")
+    u.config = {"lifetime_tokens": D6E4B72A_CAP}          # raw, unmarked
+    await store.create_task(u)
+    uid = await store.create_attempt(u.id, 1)
+    await store.update_attempt(uid, **D6E4B72A_LEDGER)
+    assert await _orch(store)._check_lifetime_budget(u) is None, (
+        "3,386,434 is under the floored 4,000,000 grant — R1"
+    )
 
 
 async def test_a_genuinely_expensive_task_still_parks_at_the_same_cap(store):
@@ -590,7 +615,7 @@ def test_the_class_breakdown_names_and_prices_every_class():
 
 from no_human.core.pricing import (  # noqa: E402
     BUDGET_UNIT_KEY, RAW_TO_WEIGHTED_RATIO, TOKEN_CAP_KEYS, WEIGHTED_UNIT,
-    config_is_weighted, raw_cap_as_weighted,
+    config_is_weighted, override_inverted, raw_cap_as_weighted,
 )
 
 _MARKED = {BUDGET_UNIT_KEY: WEIGHTED_UNIT}
@@ -604,17 +629,35 @@ def test_an_unmarked_stored_cap_is_read_as_raw_and_converted():
     o = Orchestrator.__new__(Orchestrator)
     o.bounds = Bounds()
 
+    # 68,000,000 — the largest stale row, and one whose CONVERSION still lands
+    # above the ungranted default, so it shows the conversion on its own with
+    # no interaction from the raise-floor below.
     stale = Task.new("pre-cutover", repo_path="/tmp/x")
-    stale.config = {"lifetime_tokens": 12_000_000}
-    assert o._lifetime_limits(stale)[1] == 2_382_000
+    stale.config = {"lifetime_tokens": 68_000_000}
+    assert o._lifetime_limits(stale)[1] == 13_498_000
 
     fresh = Task.new("post-cutover", repo_path="/tmp/x")
+    fresh.config = {"lifetime_tokens": 68_000_000, **_MARKED}
+    assert o._lifetime_limits(fresh)[1] == 68_000_000
+
+    # 12,000,000 is the SAME conversion — but its result, 2,382,000, is below
+    # the ungranted 4,000,000 default, so the raise-floor takes over. R1.
+    stale.config = {"lifetime_tokens": 12_000_000}
+    assert raw_cap_as_weighted(12_000_000) == 2_382_000
+    assert o._lifetime_limits(stale)[1] == Bounds().lifetime_tokens
     fresh.config = {"lifetime_tokens": 12_000_000, **_MARKED}
     assert o._lifetime_limits(fresh)[1] == 12_000_000
 
     # BOTH keys, not just the loud one: 162 rows carry a raw attempt_tokens.
+    stale.config = {"attempt_tokens": 20_000_000}
+    assert o._attempt_token_cap(stale) == 3_970_000
+    fresh.config = {"attempt_tokens": 20_000_000, **_MARKED}
+    assert o._attempt_token_cap(fresh) == 20_000_000
+    # ...and the raw 4,000,000 the 162 rows actually carry converts to 794,000,
+    # under the 2,000,000 default, so it floors too.
     stale.config = {"attempt_tokens": 4_000_000}
-    assert o._attempt_token_cap(stale) == 794_000
+    assert raw_cap_as_weighted(4_000_000) == 794_000
+    assert o._attempt_token_cap(stale) == Bounds().attempt_tokens
     fresh.config = {"attempt_tokens": 4_000_000, **_MARKED}
     assert o._attempt_token_cap(fresh) == 4_000_000
     assert TOKEN_CAP_KEYS == {"lifetime_tokens", "attempt_tokens"}
@@ -656,11 +699,12 @@ def test_a_stale_raw_ceiling_is_correctable_and_does_not_become_permanent():
     assert t.config["lifetime_tokens"] == 5_100_000, summary
     assert t.config[BUDGET_UNIT_KEY] == WEIGHTED_UNIT
     # ...and the never-lower guard is INTACT, not disabled: a request under the
-    # converted prior (2,382,000) is still refused.
+    # normalised prior is still refused. The prior is 4,000,000, not the
+    # converted 2,382,000 — see the raise-floor block below (R1).
     t2 = Task.new("stale2", repo_path="/tmp/x")
     t2.config = {"lifetime_tokens": 12_000_000}
     apply_action(t2, {"set_task_config": {"lifetime_tokens": 1_000_000}})
-    assert t2.config["lifetime_tokens"] == 2_382_000
+    assert t2.config["lifetime_tokens"] == 4_000_000
     assert t2.config[BUDGET_UNIT_KEY] == WEIGHTED_UNIT
 
 
@@ -698,8 +742,272 @@ def test_a_repo_profile_default_is_covered_by_the_same_guard():
     o.bounds = Bounds()
     t = Task.new("from profile", repo_path="/tmp/x")
     t.config = cfg
-    assert o._lifetime_limits(t)[1] == 3_176_000    # 16M raw, converted
-    assert o._attempt_token_cap(t) == 1_191_000     # 6M raw, converted
+    # 16M -> 3,176,000 and 6M -> 1,191,000 are the conversions; both land under
+    # the ungranted defaults (4,000,000 / 2,000,000), so both floor. R1.
+    assert raw_cap_as_weighted(16_000_000) == 3_176_000
+    assert raw_cap_as_weighted(6_000_000) == 1_191_000
+    assert o._lifetime_limits(t)[1] == Bounds().lifetime_tokens
+    assert o._attempt_token_cap(t) == Bounds().attempt_tokens
+
+
+# --------------------------------------------------------------------------- #
+# R1 — the raise-floor.
+#
+# Funnel forensics, 2026-08-10: the `no_human` repo profile carried
+# `default_lifetime_tokens = 12,000,000`, written BEFORE the 07-31 cutover, so
+# unmarked, so read as raw and converted to 2,382,000 — BELOW the ungranted
+# 4,000,000 default. An override typed as a raise was applied as a 40% CUT, and
+# nothing said so. 32 of 33 August tasks ran against `/2,382,000`; the median
+# August task spent 2,210,973 and died at that wall. The one August task
+# without a profile override (`e68a85e0`, in another repo) ran against
+# `/4,000,000` and was the only one to reach `awaiting_approval`.
+#
+# The invariant: an override written as a raise can never leave a task WORSE
+# off than having written no override at all. That is the only thing floored —
+# a value below the default in BOTH units is a deliberate lowering and is
+# untouched, so no legitimate flow loses anything.
+# --------------------------------------------------------------------------- #
+
+def test_a_pre_cutover_raise_never_converts_into_a_cut(caplog):
+    """THE AUGUST DEATH SHAPE. Red on the parent commit: it returns 2,382,000."""
+    import logging
+
+    from no_human.core.orchestrator import Orchestrator
+    from no_human.profile import ProjectProfile, apply_default_task_config
+
+    prof = ProjectProfile(repo_path="/repos/no_human",
+                          default_lifetime_tokens=12_000_000)
+    t = Task.new("august", repo_path="/repos/no_human")
+    t.config = apply_default_task_config(prof, {})
+    assert t.config == {"lifetime_tokens": 12_000_000}, "unmarked, as written"
+
+    o = Orchestrator.__new__(Orchestrator)
+    o.bounds = Bounds()
+    with caplog.at_level(logging.WARNING, logger="no_human.orchestrator"):
+        cap = o._lifetime_limits(t)[1]
+
+    assert cap == 4_000_000, "the ungranted default, not the converted 2,382,000"
+    assert cap != 2_382_000
+
+    # The warning has to be actionable on its own: both numbers, the cause and
+    # the remedy. Nothing warned in August, which is why it ran for nine days.
+    msg = "\n".join(r.getMessage() for r in caplog.records)
+    assert "12,000,000" in msg
+    assert "2,382,000" in msg
+    assert "4,000,000" in msg
+    assert "lifetime_tokens" in msg
+    assert "/repos/no_human" in msg, "the remedy must be copy-pasteable"
+    # BOTH surfaces: this function cannot tell a repo-profile default from a
+    # per-task override — they arrive in the same dict — so naming only one
+    # sends half the operators to a command that will not fix their task.
+    assert "nh repo config /repos/no_human default_lifetime_tokens=" in msg
+    assert f"nh task config {t.id[:8]} lifetime_tokens=" in msg
+    # ...and it must NOT talk the operator into typing the default: that
+    # discards the raise this guard exists to preserve.
+    assert "<weighted>" in msg
+    assert "nh repo config /repos/no_human default_lifetime_tokens=4000000" not in msg
+    assert "COST-WEIGHTED" in msg
+
+
+def test_a_genuine_post_cutover_raise_is_applied_verbatim(caplog):
+    """A marked value is deliberate in the current unit — raise or lower, it
+    is taken exactly as written and never floored."""
+    import logging
+
+    from no_human.core.orchestrator import Orchestrator
+
+    o = Orchestrator.__new__(Orchestrator)
+    o.bounds = Bounds()
+
+    t = Task.new("raised", repo_path="/tmp/x")
+    t.config = {"lifetime_tokens": 9_000_000, **_MARKED}
+    with caplog.at_level(logging.WARNING, logger="no_human.orchestrator"):
+        assert o._lifetime_limits(t)[1] == 9_000_000
+
+    # A marked value BELOW the default is the one unambiguous way to ask for a
+    # smaller budget, and the floor must not eat it.
+    t.config = {"lifetime_tokens": 1_500_000, **_MARKED}
+    assert o._lifetime_limits(t)[1] == 1_500_000
+    assert caplog.records == [], "nothing ambiguous happened"
+
+
+def test_a_deliberate_lowering_is_never_floored(caplog):
+    """Below the default in BOTH units — there is no raise to preserve, so the
+    conversion stands and the tiny caps every budget test uses still work."""
+    import logging
+
+    from no_human.core.orchestrator import Orchestrator
+
+    o = Orchestrator.__new__(Orchestrator)
+    o.bounds = Bounds()
+    t = Task.new("tiny", repo_path="/tmp/x")
+
+    with caplog.at_level(logging.WARNING, logger="no_human.orchestrator"):
+        t.config = {"lifetime_tokens": 3}
+        assert o._lifetime_limits(t)[1] == 1
+        t.config = {"lifetime_tokens": 1_000_000}
+        assert o._lifetime_limits(t)[1] == 198_500
+        t.config = {"attempt_tokens": 500_000}
+        assert o._attempt_token_cap(t) == 99_250
+
+    assert caplog.records == [], "a lowering is not the ambiguous class"
+
+
+def test_no_override_is_unchanged(caplog):
+    import logging
+
+    from no_human.core.orchestrator import Orchestrator
+
+    o = Orchestrator.__new__(Orchestrator)
+    o.bounds = Bounds()
+    t = Task.new("plain", repo_path="/tmp/x")
+
+    with caplog.at_level(logging.WARNING, logger="no_human.orchestrator"):
+        for cfg in ({}, {"lifetime_tokens": 0}, {"lifetime_tokens": "nonsense"},
+                    {"lifetime_tokens": None}):
+            t.config = dict(cfg)
+            assert o._lifetime_limits(t)[1] == Bounds().lifetime_tokens
+            assert o._attempt_token_cap(t) == Bounds().attempt_tokens
+    assert caplog.records == [], "no override, nothing to warn about"
+
+
+def test_override_inverted_is_the_whole_predicate():
+    """Pure, and it is the ONLY thing that decides the floor: raise as typed,
+    cut as read. Everything else converts exactly as before."""
+    assert override_inverted(12_000_000, 4_000_000) is True    # 2,382,000
+    assert override_inverted(4_000_000, 2_000_000) is True     # 794,000
+    # Not a raise to begin with — a deliberate lowering.
+    assert override_inverted(1_000_000, 4_000_000) is False
+    assert override_inverted(4_000_000, 4_000_000) is False    # not ">"
+    # A raise that SURVIVES conversion needs no floor.
+    assert override_inverted(68_000_000, 4_000_000) is False   # 13,498,000
+    assert override_inverted(0, 4_000_000) is False
+    assert override_inverted(None, 4_000_000) is False
+
+
+def test_the_raise_floor_also_holds_where_a_stale_prior_is_normalised():
+    """The laundering path. `actions.py` converts the same unmarked prior for
+    its never-lower comparison and then STAMPS the result weighted — so an
+    un-floored conversion freezes the cut permanently, out of reach of the read
+    path's floor. Same helper, same answer, or the two disagree."""
+    t = Task.new("stale", repo_path="/tmp/x")
+    t.config = {"lifetime_tokens": 12_000_000}
+    apply_action(t, {"set_task_config": {"lifetime_tokens": 1_000_000}})
+    assert t.config["lifetime_tokens"] == 4_000_000, "floored prior kept, not 2,382,000"
+    assert t.config[BUDGET_UNIT_KEY] == WEIGHTED_UNIT
+
+    # The untouched SIBLING is converted-and-stamped by the same write, and
+    # gets the same floor — otherwise the write itself installs a permanent cut.
+    t2 = Task.new("sibling", repo_path="/tmp/x")
+    t2.config = {"lifetime_tokens": 12_000_000, "attempt_tokens": 4_000_000}
+    apply_action(t2, {"set_task_config": {"lifetime_tokens": 9_000_000}})
+    assert t2.config["lifetime_tokens"] == 9_000_000
+    assert t2.config["attempt_tokens"] == 2_000_000, "floored, not 794,000"
+    assert t2.config[BUDGET_UNIT_KEY] == WEIGHTED_UNIT
+
+
+# --------------------------------------------------------------------------- #
+# D1: the writer's floor must use the SAME default the reader enforces.
+#
+# The first cut of the raise-floor floored `actions.py` against
+# `Bounds()` — the dataclass LITERALS — while the reader floors against
+# `Bounds.from_config(config["bounds"])`. On any install that tunes `bounds`
+# the two disagree, and because this write STAMPS `budget_unit: weighted`, the
+# disagreement is frozen permanently, out of reach of the read-time floor. It
+# lands on the money path and it is silent both ways.
+# --------------------------------------------------------------------------- #
+
+def _writer_reader_pair(cfg_bounds: dict, stale: dict, action: dict):
+    """Apply `action` to a task carrying `stale`, on an install configured with
+    `cfg_bounds`; return (written config, what the reader makes of it)."""
+    from no_human.core.orchestrator import Orchestrator
+
+    bounds = Bounds.from_config(cfg_bounds)
+    t = Task.new("tuned install", repo_path="/tmp/x")
+    t.config = dict(stale)
+    apply_action(t, {"set_task_config": action}, bounds=bounds)
+
+    o = Orchestrator.__new__(Orchestrator)
+    o.bounds = bounds
+    return t.config, (o._lifetime_limits(t)[1], o._attempt_token_cap(t))
+
+
+def test_a_tuned_install_is_floored_against_its_own_default_not_the_literal():
+    """Direction (a): an install that RAISED the defaults. Floored against the
+    4,000,000 literal, a sibling write cut a configured 8,000,000 in half and
+    stamped it, permanently."""
+    written, read = _writer_reader_pair(
+        {"lifetime_tokens": 8_000_000, "attempt_tokens": 4_000_000},
+        {"lifetime_tokens": 12_000_000, "attempt_tokens": 6_000_000},
+        {"attempt_tokens": 5_000_000},    # touches attempt; lifetime is the SIBLING
+    )
+    assert written["lifetime_tokens"] == 8_000_000, (
+        "the untouched sibling was frozen at the dataclass literal, not this "
+        f"install's default; config={written}")
+    assert written[BUDGET_UNIT_KEY] == WEIGHTED_UNIT
+    # The invariant, stated as the invariant: what the write freezes is what
+    # the gate would have enforced. (5,000,000 clears the never-lower guard,
+    # whose normalised prior here is the floored 4,000,000.)
+    assert read == (8_000_000, 5_000_000)
+
+
+def test_a_lowered_install_is_never_handed_the_bigger_literal():
+    """Direction (b): an install that LOWERED the defaults. Floored against the
+    literals, the same write hands it 4,000,000 / 2,000,000 — 4x what it
+    configured — and stamps that as deliberate."""
+    written, read = _writer_reader_pair(
+        {"lifetime_tokens": 1_000_000, "attempt_tokens": 500_000},
+        {"lifetime_tokens": 12_000_000, "attempt_tokens": 6_000_000},
+        {"attempt_tokens": 1_500_000},
+    )
+    # Neither cap is inverted against these small defaults — 12M converts to
+    # 2,382,000 which is still ABOVE 1,000,000 — so both are plain conversions
+    # and NO floor applies. The literals must not appear anywhere.
+    assert written["lifetime_tokens"] == 2_382_000, (
+        f"handed a literal-derived cap it never configured; config={written}")
+    assert 4_000_000 not in written.values()
+    assert 2_000_000 not in written.values()
+    assert read == (2_382_000, 1_500_000)
+
+
+def test_a_write_to_one_cap_never_changes_what_the_other_ENFORCES():
+    """The general statement, swept over install shapes.
+
+    Deliberately NOT "the stamped value reads back as itself" — that is a
+    tautology (a marked cap is taken verbatim by construction, so it holds
+    even while the writer is using the wrong default; it passed on the defect).
+    The real invariant compares across the write: what the untouched sibling
+    ENFORCED before the write must be what it enforces after, on the same
+    install. That is what the defect broke, and it is what pins it."""
+    from no_human.core.orchestrator import Orchestrator
+
+    stale = {"lifetime_tokens": 12_000_000, "attempt_tokens": 6_000_000}
+    shapes = ({}, {"lifetime_tokens": 8_000_000, "attempt_tokens": 4_000_000},
+              {"lifetime_tokens": 1_000_000, "attempt_tokens": 500_000},
+              {"lifetime_tokens": 20_000_000}, {"attempt_tokens": 100_000})
+    read = {"lifetime_tokens": lambda o, t: o._lifetime_limits(t)[1],
+            "attempt_tokens": lambda o, t: o._attempt_token_cap(t)}
+    assert set(read) == TOKEN_CAP_KEYS, "a cap key is missing from this sweep"
+
+    for cfg_bounds in shapes:
+        for written_key in TOKEN_CAP_KEYS:
+            untouched, = TOKEN_CAP_KEYS - {written_key}
+            o = Orchestrator.__new__(Orchestrator)
+            o.bounds = Bounds.from_config(cfg_bounds)
+
+            before = Task.new("before", repo_path="/tmp/x")
+            before.config = dict(stale)
+            was = read[untouched](o, before)
+
+            after = Task.new("after", repo_path="/tmp/x")
+            after.config = dict(stale)
+            apply_action(after, {"set_task_config": {written_key: 3_000_000}},
+                         bounds=o.bounds)
+
+            assert read[untouched](o, after) == was, (
+                f"bounds={cfg_bounds}: writing {written_key} moved the "
+                f"enforced {untouched} from {was:,} to "
+                f"{read[untouched](o, after):,}")
 
 
 async def test_the_armed_mid_attempt_ceiling_is_in_the_weighted_unit(store):
@@ -757,13 +1065,15 @@ async def test_a_partial_write_cannot_promote_the_key_it_did_not_touch(store):
     # -- direction A: the blocker's raise option touches lifetime only -------
     t = Task.new("stale two-key", repo_path="/tmp/x")
     t.config = dict(stale)
-    assert (o._lifetime_limits(t)[1], o._attempt_token_cap(t)) == (2_382_000, 1_191_000)
+    # Both convert (2,382,000 / 1,191,000) and both land under the ungranted
+    # defaults, so both floor to them — R1's raise-floor, not a raw read.
+    assert (o._lifetime_limits(t)[1], o._attempt_token_cap(t)) == (4_000_000, 2_000_000)
 
     apply_action(t, {"set_task_config": {"lifetime_attempts": 12,
                                          "lifetime_tokens": 5_100_000}})
 
     assert o._lifetime_limits(t)[1] == 5_100_000            # the key it wrote
-    assert o._attempt_token_cap(t) == 1_191_000, (          # the key it did NOT
+    assert o._attempt_token_cap(t) == 2_000_000, (          # the key it did NOT
         "a lifetime raise silently promoted the untouched raw attempt_tokens "
         f"to {o._attempt_token_cap(t):,}; config={t.config}")
     assert t.config[BUDGET_UNIT_KEY] == WEIGHTED_UNIT
@@ -779,7 +1089,7 @@ async def test_a_partial_write_cannot_promote_the_key_it_did_not_touch(store):
     apply_action(t2, {"set_task_config": {"attempt_tokens": 800_000}},
                  human_override=True)
     assert t2.config["attempt_tokens"] == 800_000
-    assert o._lifetime_limits(t2)[1] == 2_382_000, (
+    assert o._lifetime_limits(t2)[1] == 4_000_000, (
         "an attempt-cap write silently promoted the untouched raw "
         f"lifetime_tokens to {o._lifetime_limits(t2)[1]:,}; config={t2.config}")
 

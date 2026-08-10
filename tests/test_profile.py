@@ -181,3 +181,126 @@ def test_apply_default_task_config_explicit_override_wins():
     original = {"attempt_tokens": 1_234}
     apply_default_task_config(prof, original)
     assert original == {"attempt_tokens": 1_234}
+
+
+# --------------------------------------------------------------------------- #
+# R1: unit provenance on the repo-profile defaults.
+#
+# The August funnel died because a profile value written before the 2026-07-31
+# cutover was indistinguishable from one written after it. `default_budget_unit`
+# is that distinction, and it is stamped by the only write path there is.
+# --------------------------------------------------------------------------- #
+
+def test_default_budget_unit_is_unset_on_an_old_profile():
+    """Absence is what every profile written before this change carries, and it
+    has to keep meaning 'raw, convert it' — fail-closed, same as task.config."""
+    assert ProjectProfile(repo_path="/r").default_budget_unit == ""
+
+
+def test_yaml_and_store_round_trip_carry_the_unit(tmp_path):
+    from no_human.core.pricing import WEIGHTED_UNIT
+
+    prof = _sample(tmp_path)
+    prof.default_lifetime_tokens = 4_000_000
+    prof.default_budget_unit = WEIGHTED_UNIT
+    prof.save()
+    assert ProjectProfile.load(tmp_path).default_budget_unit == WEIGHTED_UNIT
+
+
+def test_a_weighted_profile_stamps_the_task_config_it_writes():
+    from no_human.core.pricing import BUDGET_UNIT_KEY, WEIGHTED_UNIT
+
+    prof = ProjectProfile(repo_path="/r", default_attempt_tokens=2_000_000,
+                          default_lifetime_tokens=4_000_000,
+                          default_budget_unit=WEIGHTED_UNIT)
+    assert apply_default_task_config(prof, {}) == {
+        "attempt_tokens": 2_000_000,
+        "lifetime_tokens": 4_000_000,
+        BUDGET_UNIT_KEY: WEIGHTED_UNIT,
+    }
+
+
+def test_an_unstamped_profile_still_writes_no_marker():
+    """Backward compatibility is the whole point: an existing profile's value
+    must keep being read as raw, or this change silently 5x's every install."""
+    from no_human.core.pricing import BUDGET_UNIT_KEY
+
+    prof = ProjectProfile(repo_path="/r", default_lifetime_tokens=16_000_000)
+    assert BUDGET_UNIT_KEY not in apply_default_task_config(prof, {})
+
+
+def test_mixed_units_copy_nothing_rather_than_copying_unmarked():
+    """The marker describes the WHOLE dict, so a stamped profile cannot
+    describe a cap the caller brought — and withholding the marker while
+    copying the profile's values anyway is WORSE than doing nothing: a
+    weighted 4,000,000 then reads as pre-cutover raw and converts to 794,000,
+    a 5x cut of a number the operator typed correctly.
+
+    So: copy nothing. The caller's own cap stands, and the key it did not set
+    falls back to the ungranted default, which is never worse than a value
+    read in the wrong unit."""
+    from no_human.core.pricing import BUDGET_UNIT_KEY, WEIGHTED_UNIT
+
+    prof = ProjectProfile(repo_path="/r", default_attempt_tokens=2_000_000,
+                          default_lifetime_tokens=4_000_000,
+                          default_budget_unit=WEIGHTED_UNIT)
+    merged = apply_default_task_config(prof, {"attempt_tokens": 6_000_000})
+    assert merged == {"attempt_tokens": 6_000_000}, (
+        "the profile's weighted lifetime default was copied where it would "
+        f"have been read as raw; merged={merged}")
+    assert BUDGET_UNIT_KEY not in merged, "mixed units — no dict-wide claim"
+    assert "lifetime_tokens" not in merged, "no unmarked weighted value copied"
+
+    # An UNSTAMPED profile is the pre-existing contract and is untouched: its
+    # values are raw, the caller's cap is raw, one unit, so copying is safe.
+    old = ProjectProfile(repo_path="/r", default_attempt_tokens=6_000_000,
+                         default_lifetime_tokens=16_000_000)
+    assert apply_default_task_config(old, {"attempt_tokens": 1_234}) == {
+        "attempt_tokens": 1_234, "lifetime_tokens": 16_000_000}
+
+
+def test_mixed_units_are_refused_in_the_OTHER_direction_too():
+    """D6. The mirror of the case above, and the one the first cure missed:
+    an UNSTAMPED (raw) profile writing into a caller dict that already
+    DECLARES weighted. The raw value lands under the weighted marker and
+    `_stored_token_cap` takes it at face value — 20,200,000 enforced where
+    4,009,700 is the honest reading, 5.04x, fail-open and unwarned.
+
+    Latent while no creation surface stamps at birth; guarded anyway, because
+    the comment on this function claims both directions and because the
+    mirror case was cured at exactly this latency bar."""
+    from no_human.core.bounds import Bounds
+    from no_human.core.orchestrator import Orchestrator
+    from no_human.core.pricing import BUDGET_UNIT_KEY, WEIGHTED_UNIT
+
+    raw_profile = ProjectProfile(repo_path="/r",
+                                 default_lifetime_tokens=20_200_000)
+    caller = {"attempt_tokens": 2_000_000, BUDGET_UNIT_KEY: WEIGHTED_UNIT}
+
+    merged = apply_default_task_config(raw_profile, caller)
+    assert "lifetime_tokens" not in merged, (
+        "a RAW profile default landed under the caller's WEIGHTED marker; "
+        f"merged={merged}")
+    assert merged == caller
+
+    # End to end: what the gate would enforce is the ungranted default, not
+    # the raw number read at face value.
+    assert Orchestrator._stored_token_cap(
+        merged, "lifetime_tokens", Bounds().lifetime_tokens) == 4_000_000
+
+    # The marker ALONE is enough to poison a copy — there need not already be
+    # a token cap in the dict. (A guard written as
+    # `... and TOKEN_CAP_KEYS & set(merged)` passes the case above and still
+    # fails this one.)
+    marker_only = apply_default_task_config(
+        raw_profile, {BUDGET_UNIT_KEY: WEIGHTED_UNIT})
+    assert marker_only == {BUDGET_UNIT_KEY: WEIGHTED_UNIT}, (
+        f"copied a raw default under a bare weighted marker; {marker_only}")
+
+    # Control, so this does not over-fire: same unit on both sides copies.
+    both_weighted = ProjectProfile(repo_path="/r",
+                                   default_lifetime_tokens=8_000_000,
+                                   default_budget_unit=WEIGHTED_UNIT)
+    assert apply_default_task_config(
+        both_weighted, {BUDGET_UNIT_KEY: WEIGHTED_UNIT}) == {
+            "lifetime_tokens": 8_000_000, BUDGET_UNIT_KEY: WEIGHTED_UNIT}
