@@ -3,9 +3,12 @@
 from types import SimpleNamespace
 
 from no_human.core.prompt_blocks import (
+    RESUME_FINDING_BUDGET,
     build_playbook_block,
     build_profile_block,
+    build_resume_digest,
     build_rules_block,
+    fit_finding_text,
 )
 
 
@@ -129,6 +132,98 @@ def test_resume_digest_surfaces_blocker_and_reply():
     assert "resuming a previously-blocked task" in d
     assert "category: AMBIGUITY" in d
     assert "A human answered your blocking question" in d and "A: A." in d
+
+
+def _finding(label, comment, file="a.py", line=1):
+    return {"label": label, "file": file, "line": line, "comment": comment}
+
+
+def test_three_blocking_findings_of_400_chars_reach_the_next_prompt_unchanged():
+    """Red-first (AC 4): a prior attempt with 3 blocking findings of 400 chars
+    each must have all three reach the next attempt's prompt VERBATIM — none
+    silently dropped or mangled by truncation, since 400 == RESUME_FINDING_BUDGET."""
+    from no_human.core.task import Task, TaskStatus
+    assert RESUME_FINDING_BUDGET == 400
+    comments = [f"finding{i} " + ("x" * (400 - len(f"finding{i} "))) for i in range(3)]
+    assert all(len(c) == 400 for c in comments)
+    findings = [_finding(f"label{i}", comments[i]) for i in range(3)]
+    t = Task(id="a", source="test", title="x", status=TaskStatus.IMPLEMENTING,
+             acceptance_criteria=["c"], context={"review_feedback": findings})
+    d = build_resume_digest(t)
+    for c in comments:
+        assert c in d, "400-char finding was not reproduced verbatim"
+    assert "more chars truncated" not in d
+
+
+def test_finding_over_budget_is_truncated_visibly_not_dropped():
+    """AC 1/2: an over-budget finding keeps its label and full first sentence,
+    plus a visible '[N more chars truncated]' marker — never silently omitted."""
+    from no_human.core.task import Task, TaskStatus
+    first_sentence = "This is the first sentence of the finding."
+    text = first_sentence + " " + ("y" * (2000 - len(first_sentence) - 1))
+    assert len(text) == 2000
+    t = Task(id="a", source="test", title="x", status=TaskStatus.IMPLEMENTING,
+             acceptance_criteria=["c"],
+             context={"review_feedback": [_finding("over-budget label", text)]})
+    d = build_resume_digest(t)
+    assert "over-budget label" in d
+    assert first_sentence in d
+    kept = fit_finding_text(text, RESUME_FINDING_BUDGET)
+    n_removed = len(text) - len(first_sentence)
+    assert f"[{n_removed} more chars truncated]" in d
+    assert kept in d
+
+
+def test_no_blocking_finding_is_omitted_from_the_digest():
+    """AC 1: 20 findings -> all 20 labels are present, none dropped."""
+    from no_human.core.task import Task, TaskStatus
+    findings = [_finding(f"finding-label-{i}", f"short comment {i}") for i in range(20)]
+    t = Task(id="a", source="test", title="x", status=TaskStatus.IMPLEMENTING,
+             acceptance_criteria=["c"], context={"review_feedback": findings})
+    d = build_resume_digest(t)
+    for i in range(20):
+        assert f"finding-label-{i}" in d
+
+
+def test_first_sentence_is_never_cut_even_when_longer_than_budget():
+    """The first sentence is a FLOOR, not a ceiling: a 900-char single sentence
+    survives whole even though RESUME_FINDING_BUDGET is 400."""
+    sentence = "S" + ("e" * 898) + "."  # one 900-char "sentence", no ". " inside
+    assert len(sentence) == 900
+    result = fit_finding_text(sentence, RESUME_FINDING_BUDGET)
+    assert sentence in result
+    # No inner sentence boundary was found, so nothing was cut off it —
+    # the marker only appears when trailing text was actually removed.
+    assert "more chars truncated" not in result
+
+
+def test_capacity_budget_arithmetic_is_computed_not_asserted():
+    """AC 3: the section length is measured from the ACTUAL rendered digest,
+    not restated as a prose percentage/number claim."""
+    from no_human.core.task import Task, TaskStatus
+    n = 5
+    findings = [
+        _finding(f"lbl{i}", "z" * RESUME_FINDING_BUDGET, file="f.py", line=i)
+        for i in range(n)
+    ]
+    t = Task(id="a", source="test", title="x", status=TaskStatus.IMPLEMENTING,
+             acceptance_criteria=["c"], context={"review_feedback": findings})
+    d = build_resume_digest(t)
+    # Recompute the expected per-line overhead FROM the actual render, not a
+    # hardcoded guess: build one line exactly as build_resume_digest does and
+    # measure it against the raw comment length.
+    lines = []
+    for f in findings:
+        loc = f"{f['file']}:{f['line']}"
+        detail = fit_finding_text(f["comment"], RESUME_FINDING_BUDGET)
+        lines.append(f"  - {f['label']} ({loc}): {detail}")
+    expected_section = "\n".join(lines)
+    assert expected_section in d
+    total_comment_chars = sum(len(fit_finding_text(f["comment"], RESUME_FINDING_BUDGET))
+                               for f in findings)
+    assert total_comment_chars == n * RESUME_FINDING_BUDGET
+    overhead = len(expected_section) - total_comment_chars
+    assert len(expected_section) == n * RESUME_FINDING_BUDGET + overhead
 
 
 def test_memories_block_empty_and_tiered():

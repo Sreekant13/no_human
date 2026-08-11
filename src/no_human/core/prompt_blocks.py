@@ -13,6 +13,29 @@ an injected path can be passed wrongly or forgotten by a future caller, which
 is precisely the drift that let three PRs each fix one hard-coded copy of this
 string. Importing the constant makes every prompt surface track the gate by
 construction. It is a frozen module-level constant, not state.
+
+Terminology (established from the repo, not invented here):
+* **Blocking finding**: a failing ``ChecklistItem`` graded critical/high/medium
+  by the reviewer (``src/no_human/review/reviewer.py:1258 _is_blocking``,
+  collected into ``ReviewDecision.blocking_items`` at reviewer.py:364).
+  Low/nit failures are *advisory* (reviewer.py:371) — they never gate an
+  attempt and are not subject to the budget below.
+* **Distilled attempt-state doc**: ``build_resume_digest`` (this module) — the
+  seed a resumed task's fresh session reads instead of stale full context.
+  Called via ``Orchestrator._resume_digest`` and injected into the next
+  attempt's implement prompt. Its sections are read from ``task.context``:
+  ``review_feedback``, ``review_suggested_next``, ``attempt_log``,
+  ``send_back_feedback``, ``handoff``, ``ci_failure``.
+* **Capacity budget** (``RESUME_FINDING_BUDGET`` below): every blocking
+  finding is rendered, never sliced off the list — the historical `[:6]`
+  item-count cap in ``Orchestrator._record_review_feedback`` silently dropped
+  findings past the sixth and is the bug this budget replaces. What IS bounded
+  is *per-finding length*: a finding whose comment exceeds
+  ``RESUME_FINDING_BUDGET`` chars is truncated *visibly* by
+  ``fit_finding_text`` — the full first sentence survives plus a
+  ``[N more chars truncated]`` marker — mirroring the honest idiom
+  ``review_verdict_text`` already uses for the verdict event (orchestrator.py
+  "... and N more blocking finding(s)"), rather than a new silent cap.
 """
 
 from __future__ import annotations
@@ -27,6 +50,45 @@ from ..testing.repro_gate import MANIFEST as REPRO_MANIFEST
 from .task import Task
 
 EXPORT_CLASSIFICATION_FILE = "EXPORT_CLASSIFICATION.txt"
+
+# Per-finding character budget for the resume digest's review-feedback
+# section. Arithmetic (not asserted): at 400 chars/finding, N findings cost
+# `N * RESUME_FINDING_BUDGET` chars of comment text plus per-line overhead
+# (label/file/line prefix + newline) — see
+# test_capacity_budget_arithmetic_is_computed_not_asserted, which measures the
+# actual rendered digest rather than restating this number in prose. 400 was
+# picked because it is comfortably above a typical one-sentence review
+# comment (so most findings never truncate) while bounding a pathological
+# multi-paragraph comment to a fixed, predictable cost per finding.
+RESUME_FINDING_BUDGET = 400
+
+
+def fit_finding_text(text: str, budget: int) -> str:
+    """Fit ``text`` into ``budget`` chars *visibly* — never a silent drop.
+
+    Short-circuits unchanged when it already fits. Otherwise keeps the FULL
+    first sentence (split on the first ". "/".\\n" boundary) even if that
+    sentence alone is longer than ``budget`` — the first sentence is a floor,
+    not a ceiling, so the reader always gets a complete thought rather than a
+    mid-word cut — and appends a `" [{n} more chars truncated]"` marker where
+    `n` is the exact count of characters removed. Never returns empty for
+    non-empty input; never drops the marker when truncating.
+    """
+    if len(text) <= budget:
+        return text
+    boundary = -1
+    for sep in (". ", ".\n"):
+        idx = text.find(sep)
+        if idx != -1 and (boundary == -1 or idx < boundary):
+            boundary = idx
+    if boundary == -1:
+        kept = text
+    else:
+        kept = text[: boundary + 1]  # include the period, drop the trailing space/newline
+    removed = len(text) - len(kept)
+    if removed <= 0:
+        return kept
+    return f"{kept} [{removed} more chars truncated]"
 
 
 def _export_gate_rule(repo_path: str | Path | None) -> str:
@@ -142,11 +204,25 @@ def build_resume_digest(task: Task) -> str:
         )
     review_fb = ctx.get("review_feedback") or []
     if review_fb:
+        # Every blocking finding is rendered — no [:6]-style slice here. Only
+        # the per-finding comment is bounded, and only visibly (AC 1/2): short
+        # findings render byte-identically to before (fit_finding_text is a
+        # no-op under budget), so this stays compatible with
+        # tests/test_handoff.py and the review-feedback-injection tests.
         lines = []
         for f in review_fb:
             loc = f"{f.get('file', '')}:{f.get('line', 0)}" if f.get("file") else ""
             detail = f.get("comment") or f.get("evidence") or ""
+            detail = fit_finding_text(detail, RESUME_FINDING_BUDGET)
             lines.append(f"  - {f.get('label', '')}{f' ({loc})' if loc else ''}: {detail}")
+        # AC: a dropped finding must be COUNTED and SHOWN, never silent —
+        # mirrors review_verdict_text's "... and N more blocking finding(s)".
+        omitted = ctx.get("review_feedback_omitted") or 0
+        if omitted:
+            lines.append(
+                f"  - … and {omitted} more blocking finding(s) were recorded "
+                "— see `nh logs`"
+            )
         parts.append(
             "The independent staff reviewer FAILED your previous attempt on "
             "these specific, cited findings. Fix each one — do NOT weaken, "

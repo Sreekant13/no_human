@@ -6254,7 +6254,15 @@ class Orchestrator:
         prompt targets them (EVOLUTION_PLAN §2.2). Cited evidence (file:line) and
         the actionable comment are kept; the worker re-implements against the named
         gaps rather than blindly retrying. Bounded by max_attempts — never an
-        unbounded loop; the tamper guard still gates every round."""
+        unbounded loop; the tamper guard still gates every round.
+
+        EVERY blocking item is persisted here — no item-count slice. A
+        blocking finding is the reviewer's labelled-failure signal
+        (`review/reviewer.py:1258 _is_blocking`); dropping one past a fixed
+        slice made it vanish between the review and the next attempt's prompt
+        with no trace it ever existed. Per-finding *length* is still bounded,
+        but visibly, in `prompt_blocks.build_resume_digest` via
+        `fit_finding_text` — never here, and never silently."""
         ctx = task.context or {}
         ctx["review_feedback"] = [
             {
@@ -6264,7 +6272,7 @@ class Orchestrator:
                 "file": i.file,
                 "line": i.line,
             }
-            for i in (failed_items or [])[:6]
+            for i in (failed_items or [])
         ]
         if suggested_next:
             ctx["review_suggested_next"] = suggested_next

@@ -126,6 +126,33 @@ async def test_failed_round_queues_one_unconfirmed_proposal(store):
 
 
 @pytest.mark.asyncio
+async def test_record_review_feedback_keeps_every_blocking_finding(store):
+    """Regression guard for the historical `[:6]` slice: a review round with
+    MORE than 6 blocking items must not silently lose the 7th+ finding between
+    the review and the next attempt's prompt."""
+    from no_human.review.selfcheck import ChecklistItem
+    o = _orch(store)
+    t = await _task(store)
+    items = [
+        ChecklistItem(
+            f"criterion {i}", False, f"file{i}.py:{i} evidence {i}",
+            file=f"file{i}.py", line=i, comment=f"comment {i}", severity="high")
+        for i in range(9)
+    ]
+
+    await o._record_review_feedback(t, items, attempt_n=1)
+
+    stored = (t.context or {})["review_feedback"]
+    labels = {row["label"] for row in stored}
+    omitted = (t.context or {}).get("review_feedback_omitted", 0)
+    # No item-count cap: every one of the 9 findings is kept, and the digest
+    # need never render an omission count.
+    assert len(stored) == 9, stored
+    assert labels == {f"criterion {i}" for i in range(9)}
+    assert omitted == 0
+
+
+@pytest.mark.asyncio
 async def test_proposal_carries_trigger_tags_from_the_finding(store):
     o = _orch(store)
     await o._record_review_feedback(await _task(store), _items(), attempt_n=1)
