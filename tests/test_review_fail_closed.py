@@ -741,6 +741,10 @@ def test_every_reviewer_unavailable_handler_records_the_burn():
     the reviewer's), so the guard accepts either channel — `_record_review_usage`
     or an `update_attempt` that carries the usage — and still fails on a handler
     that records through neither.
+
+    The fourth is `tamper_adjudication`'s own `diff_override` caller
+    (`_adjudicate_tamper`), the sibling R17 declared and deferred: same
+    `_record_review_usage` channel as the gate and already-satisfied handlers.
     """
     src = pathlib.Path("src/no_human/core/orchestrator.py")
     handlers, silent = 0, []
@@ -765,9 +769,10 @@ def test_every_reviewer_unavailable_handler_records_the_burn():
                 records = True
         if not records:
             silent.append(f"{src}:{node.lineno}")
-    assert handlers == 3, (
-        f"expected the gate, already-satisfied and code_review handlers, found "
-        f"{handlers} — if the path moved, this guard is watching nothing")
+    assert handlers == 4, (
+        f"expected the gate, already-satisfied, code_review and "
+        f"tamper_adjudication handlers, found {handlers} — if the path moved, "
+        f"this guard is watching nothing")
     assert not silent, (
         "a review gate that escalated still BILLED for its rounds; this handler "
         "returns without recording them: " + ", ".join(silent)
@@ -1134,3 +1139,186 @@ async def test_a_code_review_task_books_an_unavailable_reviewer_s_burn(
     assert attempt["cache_read_tokens"] == 900_000
     assert attempt["cache_creation_tokens"] == 30_000
     assert attempt["output_tokens"] == 9_000
+
+
+# ------ the sibling hole: `tamper_adjudication`'s own diff_override caller -- #
+
+
+async def test_a_tamper_adjudication_books_an_unavailable_reviewer_s_burn(
+    bare_repo, tmp_path, store
+):
+    """The declared-and-deferred sibling of R17/F3: this call site's only
+    handler was a bare `except Exception` that recorded nothing, so a fully
+    paid adjudication round billed 0. Mirrors R17's cure, but on THIS site's
+    own channel — `_record_review_usage` / the `review_*` columns, not the
+    coder-tier ones `_adjudicate_tamper` runs inside of (see the comment at
+    the call site for why: `tokens_used` already holds the CODER's burn)."""
+    from no_human.core.orchestrator import Orchestrator
+
+    class _UnavailableAdjudicator:
+        model = "claude-opus-5"
+        _on_event = None
+
+        async def review(self, *a, **kw):
+            exc = ReviewerUnavailable(
+                "the reviewer reached no verdict after 2 rounds")
+            exc.tokens_used, exc.cache_read_tokens = 120_000, 900_000
+            exc.cache_creation_tokens, exc.output_tokens = 30_000, 9_000
+            raise exc
+
+    orch = Orchestrator(store, _config(tmp_path).data,
+                        FakeBackend(lambda cwd: None), SlackNotifier(None),
+                        reviewer=_UnavailableAdjudicator())
+    assert orch._tamper_adjudication_enabled() is True, (
+        "an accidentally-disabled config would exercise nothing")
+
+    task = Task.new("add add()", repo_path=str(bare_repo))
+    task.acceptance_criteria = ["add(a,b) returns a+b"]
+    await store.create_task(task)
+    attempt_id = await store.create_attempt(task.id, 1)
+
+    report = SimpleNamespace(
+        tampered=True, reasons=["tests/test_calc.py: tests 2->1"],
+        summary="a test was deleted")
+
+    outcome = await orch._handle_tamper_fire(
+        task, report, repo=None, branch="nh/x", attempt_id=attempt_id,
+        attempt_n=1, diff_repo=bare_repo, before_ref="HEAD~1")
+
+    assert outcome is not None, "CANNOT_DECIDE must stop the run, not continue it"
+    (attempt,) = await store.list_attempts(task.id)
+    assert attempt["review_tokens_used"] == 120_000, (
+        "a paid adjudication round billed 0")
+    assert attempt["review_cache_read_tokens"] == 900_000
+    assert attempt["review_cache_creation_tokens"] == 30_000
+    assert attempt["review_output_tokens"] == 9_000
+
+
+async def test_a_tamper_adjudication_with_no_reported_split_writes_null(
+    bare_repo, tmp_path, store
+):
+    """Same channel, the `None -> NULL` half: an absent usage split must stay
+    distinguishable from a measured zero all the way to the column."""
+    from no_human.core.orchestrator import Orchestrator
+
+    class _UnavailableAdjudicator:
+        model = "claude-opus-5"
+        _on_event = None
+
+        async def review(self, *a, **kw):
+            raise ReviewerUnavailable("no reviewer session ever started")
+
+    orch = Orchestrator(store, _config(tmp_path).data,
+                        FakeBackend(lambda cwd: None), SlackNotifier(None),
+                        reviewer=_UnavailableAdjudicator())
+    task = Task.new("add add()", repo_path=str(bare_repo))
+    await store.create_task(task)
+    attempt_id = await store.create_attempt(task.id, 1)
+
+    await orch._handle_tamper_fire(
+        task, SimpleNamespace(tampered=True, reasons=["x"], summary="s"),
+        repo=None, branch="nh/x", attempt_id=attempt_id, attempt_n=1,
+        diff_repo=bare_repo, before_ref="HEAD~1")
+
+    (attempt,) = await store.list_attempts(task.id)
+    assert attempt["review_output_tokens"] is None
+    assert attempt["review_tokens_used"] == 0
+
+
+async def test_a_real_adjudicator_s_burn_is_booked_on_the_path_it_takes(
+    bare_repo, tmp_path, store
+):
+    """The path production ACTUALLY takes: `mode="tamper_adjudication"` never
+    raises `ReviewerUnavailable` (see
+    `test_tamper_adjudication_fails_closed_on_a_truncated_session` — it is
+    fail-closed by its own PARSER, not by the no-verdict retry machinery), so
+    the `except ReviewerUnavailable` handler alone would be dead code against
+    the real reviewer. A garbled single-turn round still returns a decision —
+    CANNOT_DECIDE, and still paid for — and that decision's usage must be
+    booked here, on the branch that runs every time."""
+    from no_human.review import tamper_adjudication
+    from no_human.review.reviewer import AdversarialReviewer
+
+    class _Garbage:
+        async def run(self, prompt, *, cwd, max_turns, effort=None,
+                      on_event=None, **kw):
+            return _FakeAgentResult(
+                _truncated_verdict_with_end(), stop_reason="end_turn",
+                tokens_used=45_000, cache_read_tokens=300_000,
+                cache_creation_tokens=6_000, output_tokens=1_500,
+            )
+
+    orch = Orchestrator(store, _config(tmp_path).data,
+                        FakeBackend(lambda cwd: None), SlackNotifier(None),
+                        reviewer=AdversarialReviewer(backend=_Garbage()))
+    task = Task.new("add add()", repo_path=str(bare_repo))
+    await store.create_task(task)
+    attempt_id = await store.create_attempt(task.id, 1)
+
+    adj = await orch._adjudicate_tamper(
+        task, SimpleNamespace(tampered=True, reasons=["x"], summary="s"),
+        diff_repo=bare_repo, before_ref="HEAD~1", attempt_id=attempt_id)
+
+    assert adj.verdict == tamper_adjudication.CANNOT_DECIDE
+    (attempt,) = await store.list_attempts(task.id)
+    assert attempt["review_tokens_used"] == 45_000, (
+        "a paid adjudication round that returned a decision (no raise) billed 0")
+    assert attempt["review_cache_read_tokens"] == 300_000
+    assert attempt["review_cache_creation_tokens"] == 6_000
+    assert attempt["review_output_tokens"] == 1_500
+
+
+async def test_an_unavailable_adjudicator_still_parks_exactly_as_before(
+    bare_repo, tmp_path, store
+):
+    """AC2: the new recording must not change a single byte of the failure
+    path. Same status, same failure-reason shape, same blocker, same advisory
+    wording, same context entry — and the CODER's own `tokens_used` (a
+    different column, pre-set on the row before this call) must survive
+    untouched, which is the anti-clobber half of the guarantee."""
+    from no_human.core.orchestrator import Orchestrator
+
+    events = []
+
+    class _UnavailableAdjudicator:
+        model = "claude-opus-5"
+        _on_event = None
+
+        async def review(self, *a, **kw):
+            exc = ReviewerUnavailable("the reviewer reached no verdict")
+            exc.tokens_used = 50_000
+            raise exc
+
+    orch = Orchestrator(store, _config(tmp_path).data,
+                        FakeBackend(lambda cwd: None), SlackNotifier(None),
+                        reviewer=_UnavailableAdjudicator(),
+                        event_sink=events.append)
+    task = Task.new("add add()", repo_path=str(bare_repo))
+    await store.create_task(task)
+    attempt_id = await store.create_attempt(task.id, 1)
+    await store.update_attempt(attempt_id, tokens_used=7_777)
+
+    report = SimpleNamespace(
+        tampered=True, reasons=["tests/test_calc.py: tests 2->1"],
+        summary="a test was deleted")
+
+    outcome = await orch._handle_tamper_fire(
+        task, report, repo=None, branch="nh/x", attempt_id=attempt_id,
+        attempt_n=1, diff_repo=bare_repo, before_ref="HEAD~1")
+
+    assert outcome.status is TaskStatus.AWAITING_INPUT, "CANNOT_DECIDE parks"
+    (attempt,) = await store.list_attempts(task.id)
+    assert attempt["status"] == "failed"
+    assert "CANNOT_DECIDE" in attempt["failure_reason"]
+    assert attempt["tokens_used"] == 7_777, (
+        "the coder's own spend must not be clobbered by the reviewer's column")
+
+    blocker = (await store.get_task(task.id)).blocker
+    assert blocker is not None, "CANNOT_DECIDE must reach a human"
+
+    ctx = await store.merge_context(task.id, {})
+    entry = ctx["tamper_adjudications"][-1]
+    assert "the tamper adjudication could not run" in entry["uncertainty"]
+
+    (advisory,) = [e for e in events if e["kind"] == "advisory"]
+    assert "tamper adjudication failed to run" in advisory["text"]

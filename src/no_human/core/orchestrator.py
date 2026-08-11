@@ -6055,7 +6055,8 @@ class Orchestrator:
             )
 
         adj = await self._adjudicate_tamper(
-            task, report, diff_repo=diff_repo, before_ref=before_ref)
+            task, report, diff_repo=diff_repo, before_ref=before_ref,
+            attempt_id=attempt_id)
         self.emit(
             "tamper_adjudication",
             f"{adj.verdict}{scope}: "
@@ -6121,6 +6122,7 @@ class Orchestrator:
 
     async def _adjudicate_tamper(
         self, task: Task, report, *, diff_repo: Path, before_ref: str,
+        attempt_id: str,
     ):
         """Run the adjudication review. NEVER raises: every failure is a
         CANNOT_DECIDE, which parks.
@@ -6149,10 +6151,46 @@ class Orchestrator:
                 tamper_findings=findings,
                 diff_override=test_diff,
             )
+        except ReviewerUnavailable as exc:
+            # Defensive parity with the `code_review` handler (R17, 3767ec0d),
+            # NOT today's live path: `reviewer.review(mode="tamper_adjudication")`
+            # returns at reviewer.py:1536-1551 via `_fast_review`, which fails
+            # closed through its OWN parser (`tamper_adjudication.parse`) rather
+            # than raising — see `test_a_real_adjudicator_s_burn_is_booked_on_the_path_it_takes`,
+            # which drives the real `AdversarialReviewer` through this mode and
+            # proves it returns a CANNOT_DECIDE decision, never this exception.
+            # THE decision-path record below is what actually recovers the
+            # bug this task reports. This handler stays for the day that stops
+            # being true — the mode dispatch is one `if` away from routing
+            # through the no-verdict retry machinery the other modes use, and
+            # when it does, the caller must not lose the tokens on day one —
+            # and because `_record_review_usage` here (not the bare handler's
+            # silence) is what the structural guard
+            # (`test_every_reviewer_unavailable_handler_records_the_burn`)
+            # requires of every `except ReviewerUnavailable` in this file.
+            # Columns: `_record_review_usage`, not `update_attempt(tokens_used=...)`
+            # — unlike the code_review site, this runs inside a coder attempt
+            # whose own `tokens_used` column holds the CODER's burn; writing it
+            # here would clobber a real measurement, so the reviewer's own
+            # `review_*` columns are what carry this.
+            await self._record_review_usage(attempt_id, exc)
+            self._advisory(f"tamper adjudication failed to run: {exc}")
+            return tamper_adjudication.Adjudication(
+                uncertainty=f"the tamper adjudication could not run: {exc}")
         except Exception as exc:  # noqa: BLE001 — a dead adjudicator parks
             self._advisory(f"tamper adjudication failed to run: {exc}")
             return tamper_adjudication.Adjudication(
                 uncertainty=f"the tamper adjudication could not run: {exc}")
+        # THE FIX for the reported bug: the path every real adjudication round
+        # actually takes. `_fast_review` never raises for this mode (see the
+        # comment above) — it returns a decision, even a garbled/CANNOT_DECIDE
+        # one, and that decision carries real, paid usage that the old bare
+        # `except Exception` above never saw (it only fires on decisions
+        # returned normally, not on exceptions). Same channel and same
+        # reasoning as the handler above — book it here too, or the reviewer's
+        # spend on the common (and, today, ONLY reachable) case is the one
+        # that goes missing.
+        await self._record_review_usage(attempt_id, decision)
         return tamper_adjudication.Adjudication.from_dict(
             (decision.stages or {}).get(tamper_adjudication.STAGE_KEY))
 
