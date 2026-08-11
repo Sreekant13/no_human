@@ -73,6 +73,8 @@ from ..testing import runner
 from ..testing.repro_gate import MANIFEST as REPRO_MANIFEST
 from ..testing.repro_gate import run_repro_gate
 from .prompt_blocks import (
+    EXPORT_CLASSIFICATION_FILE,
+    _export_gate_rule,
     build_intake_qa_block,
     build_memories_block,
     build_playbook_block,
@@ -9620,6 +9622,19 @@ class Orchestrator:
             "4. Review every change as a staff engineer would."
         )
 
+        # 5b. Export gate — conditional on this repo actually having the file
+        # (see prompt_blocks._export_gate_rule; shared wording, one source of
+        # truth). Silent in every repo without EXPORT_CLASSIFICATION.txt.
+        try:
+            has_export_gate = (repo_path / EXPORT_CLASSIFICATION_FILE).exists()
+        except OSError:
+            has_export_gate = False
+        if has_export_gate:
+            sections.append(
+                "**Export gate (this repo has EXPORT_CLASSIFICATION.txt):**\n"
+                + _export_gate_rule(repo_path).strip("\n")
+            )
+
         # 6. Operational directives (C1, C6, C10, C11).
         directives = [
             "Do exactly what the task asks — not what seems easier.",
@@ -10652,6 +10667,7 @@ class Orchestrator:
             self.ci_runner.name if self.ci_runner is not None else None,
             routing_rules=list(getattr(prof, "test_commands", None) or []),
             repro_mode=self.config.get("repro_gate", {}).get("mode", "advisory"),
+            repo_path=work_dir or task.repo_path,
         )
         # Append confirmed rules + skills from the learning queue (Phase G).
         extra = self._format_active_memories()

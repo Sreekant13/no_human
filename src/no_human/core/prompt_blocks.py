@@ -19,11 +19,57 @@ from __future__ import annotations
 
 import json
 import secrets
+from pathlib import Path
 from typing import Any
 
 from ..blockers import Blocker
 from ..testing.repro_gate import MANIFEST as REPRO_MANIFEST
 from .task import Task
+
+EXPORT_CLASSIFICATION_FILE = "EXPORT_CLASSIFICATION.txt"
+
+
+def _export_gate_rule(repo_path: str | Path | None) -> str:
+    """The export-gate rule bullet, or '' when the target repo has no
+    EXPORT_CLASSIFICATION.txt. Conditional by design: the export gate is this
+    product's own mechanism, not every repo's, so the rule must stay silent in
+    every repo that doesn't have it — a repo-specific instruction leaking into
+    unrelated tasks would be its own defect. The existence check never raises:
+    ``repo_path`` can be None/empty (no task.repo_path set) or point at a path
+    that doesn't exist (some tests pass placeholder paths), and both must
+    collapse to "rule absent" rather than break prompt construction."""
+    if not repo_path:
+        return ""
+    try:
+        has_gate = (Path(repo_path) / EXPORT_CLASSIFICATION_FILE).exists()
+    except OSError:
+        return ""
+    if not has_gate:
+        return ""
+    return (
+        "  - EXPORT GATE (this repo has EXPORT_CLASSIFICATION.txt — a real gate\n"
+        "    you must pass): every tracked file is explicitly ship or drop; an\n"
+        "    unmatched file FAILS the build with its own name, it does not\n"
+        "    silently ship.\n"
+        "    * ADD A FILE -> add or extend a classification rule for it in\n"
+        "      EXPORT_CLASSIFICATION.txt in the SAME commit. Do not assume a\n"
+        "      generic pattern already covers it: check what its SIBLING files\n"
+        "      are classified as — if they are drop, a new file matching a\n"
+        "      generic ship rule is a leak.\n"
+        "    * Each rule declares a win-count; bump the declared count in the\n"
+        "      same commit as the file change it reflects, or the gate fails on\n"
+        "      count drift.\n"
+        "    * CHANGE AN ALREADY-SHIPPED FILE -> its approval/pin in\n"
+        "      RELEASE_MANIFEST.txt is dropped; it must be re-approved\n"
+        "      (re-pinned) in the same commit.\n"
+        "    * Run `python scripts/export_guard.py verify` and confirm it is\n"
+        "      GREEN before you consider the work done. Paste the output as\n"
+        "      evidence. NOTE: a file you CREATE this session stays untracked\n"
+        "      until the harness commits it after you return, so `verify` run\n"
+        "      now cannot see it and your bumped count will read as drift —\n"
+        "      bump it anyway and report the expected post-commit delta rather\n"
+        "      than reverting the bump to force a green you can't yet reach.\n"
+    )
 
 
 def build_playbook_block(playbook: dict[str, Any] | None) -> str:
@@ -210,9 +256,18 @@ def build_rules_block(
     test_cmd_str: str, integration_cmd_str: str, ci_name: str | None,
     routing_rules: list[dict] | None = None,
     repro_mode: str = "advisory",
+    repo_path: str | Path | None = None,
 ) -> str:
     """The implement-prompt Rules section. ``ci_name`` is the remote CI runner's
     name, or None when there is none (mirrors ``self.ci_runner``).
+
+    ``repo_path`` is the target repo's working directory. When given and the
+    repo actually has an ``EXPORT_CLASSIFICATION.txt``, an extra EXPORT GATE
+    bullet is appended naming the four obligations (classify, bump the
+    win-count, re-approve a changed shipped file, verify green). It is
+    conditional on the file's existence so the bullet stays silent in every
+    other repo the product works on — this is this product's own export
+    mechanism, not a general convention.
 
     ``repro_mode`` is ``repro_gate.mode`` (off | advisory | required). The
     manifest bullet must say exactly what the gate will DO, because the coder
@@ -300,7 +355,8 @@ def build_rules_block(
            f"    compatible. Do NOT assume local-only tests are sufficient.\n"
            if ci_name is not None and not integration_cmd_str else "")
         + "  - NEVER weaken, skip, or delete a test to make things pass.\n"
-        "  - If, after verifying with evidence, you find EVERY acceptance criterion is\n"
+        + _export_gate_rule(repo_path)
+        + "  - If, after verifying with evidence, you find EVERY acceptance criterion is\n"
         "    ALREADY satisfied by the existing code: do NOT fabricate an edit, and do\n"
         "    NOT simply report success. End your final report with a line reading\n"
         "    exactly ALREADY-SATISFIED, then the per-criterion lines (format below),\n"
