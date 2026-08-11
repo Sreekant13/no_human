@@ -17,20 +17,34 @@
 # here (project_config only reads the three keys above).
 #
 # Each command deliberately still runs the repo-wide guards that scan the
-# frontend, because a web-only edit CAN break them:
-#   test_no_banned_terms.py     — scans web/src (skips only web/dist)
-#   test_identity_scrub_guard.py— scans every tracked file the export ships
-#                                 (i.e. what EXPORT_CLASSIFICATION.txt ships,
-#                                 nothing else — it has no skip list of its own)
-#   test_readme_claims.py       — asserts README claims against web/src
-# Dropping those would trade cost for a real safety regression.
+# frontend, because a web-only edit CAN break them. Dropping them would trade
+# cost for a real safety regression, and not a theoretical one: the harness's
+# OWN gate resolves through these same rules (orchestrator._resolve_test_target
+# — "Both the reviewer's run and TESTING call this"), so a guard left out here
+# does not run at all for a web-only change. There is no later net.
+#
+# They are selected by the `repoguard` MARKER, not by filename. Naming files
+# here was wrong twice over: a checkout that does not carry one of them fails
+# the command outright with file-not-found, and a config that ships to other
+# people should not enumerate what those guards inspect. `-m repoguard` runs
+# whichever guards the tree actually has. Selecting nothing is exit code 5, so
+# an emptied marker fails loudly rather than passing silently.
+#
+# Cost, measured 2026-08-11 on this tree: `pytest tests/ -m repoguard -q` is
+# 95 passed / 1 skipped / 7973 deselected in 62.9s. Naming the three files by
+# path ran the SAME 95 tests; the marker adds only the full-collection step,
+# 3.5s. With the two private guards absent (a checkout that ships without
+# them) the same command selects 43 and still exits 0.
 #
 # Note: runner._parse_test_output keys off "node --test" and reports the node
 # TAP counts for these compound commands, so the displayed PASSED count covers
 # the node half only. The VERDICT is unaffected — runner.py:619 takes the
 # verdict from the exit code, and `&&` propagates a pytest failure.
 #
-# Measured: web route ~5s vs ~380s for the default suite.
+# Measured: the web route is ~63s (node tests plus the repoguard selection
+# above) vs ~380s for the default suite. The "~5s" this line claimed until
+# 2026-08-11 predated the repo-wide guards being added to the route and was
+# never re-measured after.
 
 # Each node command first provisions node_modules. A task runs in a fresh git
 # worktree under ~/.no_human/worktrees/<id>, which has NO node_modules of its
@@ -48,8 +62,7 @@ test_commands:
       "$(dirname "$(git rev-parse --git-common-dir)")/web/node_modules"
       web/node_modules; } &&
       node --test web/src/*.test.mjs &&
-      uv run pytest tests/test_no_banned_terms.py
-      tests/test_identity_scrub_guard.py tests/test_readme_claims.py -q
+      uv run pytest tests/ -m repoguard -q
 
   - glob: "desktop/**"
     command: >-
@@ -57,8 +70,7 @@ test_commands:
       "$(dirname "$(git rev-parse --git-common-dir)")/desktop/node_modules"
       desktop/node_modules; } &&
       node --test desktop/*.test.mjs &&
-      uv run pytest tests/test_no_banned_terms.py
-      tests/test_identity_scrub_guard.py tests/test_readme_claims.py -q
+      uv run pytest tests/ -m repoguard -q
 
 # Procedures the coder cannot discover from the code, surfaced upfront so a
 # review-enforced convention does not cost a doom-loop. build_repo_hints_block

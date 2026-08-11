@@ -173,4 +173,5 @@ markers = [
     "real_backend: exercises the real ClaudeBackend over a mocked SDK client — exempt from the hermetic stub",
     "slow: marks tests that take >10s (deselect with '-m \"not slow\"')",
     "nightly: heavy guard whose protection is consumed off the push path (at DMG/publish time, or only when the demo is rebuilt) — runs in the nightly/release lane, not per PR. Lane composition is pinned by tests/test_test_lanes.py.",
+    "repoguard: repo-wide guard that a change in ANY directory can break, so `.no_human.yml`'s scoped web/desktop routes select it with `-m repoguard` instead of naming files. The guard set differs between checkouts; selecting nothing is exit 5, so an emptied marker fails loudly.",
 ]

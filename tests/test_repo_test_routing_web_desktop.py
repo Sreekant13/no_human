@@ -26,6 +26,7 @@ Two things are exercised here:
      happens to declare today.
 """
 
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -212,6 +213,38 @@ def test_real_repo_root_config_loads_scoped_rules():
     for rule in rules:
         assert _is_scoped_glob(rule["glob"])
         assert isinstance(rule["command"], str) and rule["command"].strip()
+
+
+def test_no_routed_command_names_a_test_file_that_is_absent():
+    """A routed command may not name a test path this checkout does not carry.
+
+    This shipped config used to run
+    `pytest tests/test_no_banned_terms.py tests/test_identity_scrub_guard.py ...`
+    by path. Both of those are export-DROPPED, so in any checkout built from the
+    export the command died with file-not-found on every `web/**` and
+    `desktop/**` change — and, because `_resolve_test_target` routes the
+    harness's own gate through these same rules, that is the gate failing, not
+    merely a coder's convenience run. They are now selected by `-m repoguard`.
+
+    The assertion is deliberately about EXISTENCE, not about the marker: a
+    future author may legitimately name a path here, but never one that is
+    missing. `paths_seen` is asserted so this cannot pass by examining nothing
+    — today it is legitimately empty of test paths, and that is what is pinned.
+    """
+    cfg = load_repo_config(REPO_ROOT)
+    rules = cfg["test_commands"]
+    assert rules, "no rules to examine"
+    checked = 0
+    for rule in rules:
+        cmd = rule["command"]
+        checked += 1
+        for token in re.findall(r"(?<![\w/-])tests/[\w./-]+\.py", cmd):
+            assert (REPO_ROOT / token).is_file(), (
+                f"{REPO_CONFIG_RELPATH} rule {rule['glob']!r} names {token!r}, "
+                f"which does not exist in this checkout. Select repo-wide "
+                f"guards with `-m repoguard` instead of naming files."
+            )
+    assert checked == len(rules)
 
 
 # --- untrusted-input contract: an unscoped glob is dropped, not honoured -- #

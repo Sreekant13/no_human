@@ -29,6 +29,10 @@ import pytest
 from no_human.blockers.taxonomy import BlockerCategory
 from no_human.config import DEFAULT_CONFIG
 
+# Selected by `.no_human.yml`'s web/desktop routes as `-m repoguard`, alongside
+# whichever other repo-wide guards the checkout carries.
+pytestmark = pytest.mark.repoguard
+
 REPO = Path(__file__).resolve().parents[1]
 README = REPO / "README.md"
 
