@@ -9,6 +9,7 @@ import { keepFocusInDialog } from "./keepFocusInDialog.js";
 import { formatBytes } from "./formatBytes.js";
 import { pluralize } from "./pluralize.js";
 import { useEscapeKey } from "./useEscapeKey.js";
+import { loadDraft, saveDraft, clearDraft, mergeWithSeed } from "./composerDraft.js";
 import PathInput from "./PathInput.jsx";
 import QueueNotice from "./QueueNotice.jsx";
 
@@ -96,6 +97,34 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
   const [selectedProjectId, setSelectedProjectId] = useState(initial?.projectId ?? "");
   const [repoPath, setRepoPath] = useState(initial?.repoPath ?? "");
   const [customRepo, setCustomRepo] = useState(Boolean(initial?.customRepo));
+  // Draft recovery (composerDraft.js, part 1). A lazy initializer reads
+  // localStorage on the very first render, ahead of any effect.
+  const [draft, setDraft] = useState(() => {
+    try {
+      return loadDraft();
+    } catch {
+      return null;
+    }
+  });
+  const [draftDismissed, setDraftDismissed] = useState(false);
+  // The seed this composer started from, captured once. The save effect below
+  // compares against this — not against hardcoded defaults — so an untouched
+  // composer never manufactures a "draft": kind/priority always carry a
+  // non-empty default, so writing them as-is on every render would persist a
+  // 4-key object and re-show the banner for nothing the operator typed.
+  const seedRef = useRef({
+    prompt: initial?.prompt ?? "",
+    kind: initial?.kind ?? "feature",
+    priority: initial?.priority ?? "medium",
+    repoPath: initial?.repoPath ?? "",
+  });
+  // Set once, by handleSubmit only (never by an effect): a successful submit
+  // must permanently stop this mounted instance from re-persisting the very
+  // values it just turned into a task. Safe as a ref here because it is armed
+  // by a real event handler, not by mount-order bookkeeping inside an effect
+  // (that pattern is what let StrictMode's double mount-effect invoke clobber
+  // a just-loaded draft in an earlier version of this fix).
+  const draftDoneRef = useRef(false);
   // "Create a new repo" (plan Task 5) - an inline disclosure inside free-text
   // repo mode, same progressive-disclosure idiom as the Jira panel above.
   const [createRepoOpen, setCreateRepoOpen] = useState(false);
@@ -145,6 +174,34 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
   // captured at mount would be stale by resolve time).
   const repoPathRef = useRef("");
   useEffect(() => { repoPathRef.current = repoPath; });
+
+  // Persist the form on every relevant change; composerDraft.js's saveDraft
+  // debounces the actual write. Two guards, both load-bearing:
+  // (1) a submitted instance never re-persists (draftDoneRef); (2) nothing is
+  // written while every field still equals the seed this composer started
+  // from, so a fresh, untouched composer never manufactures a "draft" that
+  // re-shows the banner for nothing typed.
+  //
+  // A loaded, unresolved draft (the banner still showing) does NOT gate this
+  // effect on its own: typing while it is up is itself a decision — it
+  // diverges from the seed, so it falls through the guard above, and is
+  // treated as an implicit dismissal of the banner (the operator is now
+  // composing fresh text, not reading the old one) so the new text is
+  // persisted under the same key rather than silently dropped. Only an
+  // UNTOUCHED banner (fields still equal the seed) blocks the write —
+  // otherwise the very act of mounting with a draft present would overwrite
+  // it with the seed before the operator ever sees the banner.
+  useEffect(() => {
+    if (draftDoneRef.current) return;
+    const seed = seedRef.current;
+    const changed =
+      prompt !== seed.prompt || kind !== seed.kind || priority !== seed.priority || repoPath !== seed.repoPath;
+    if (!changed) return;
+    if (draft && Object.keys(draft).length > 0 && !draftDismissed) {
+      setDraftDismissed(true);
+    }
+    saveDraft({ prompt, kind, priority, repoPath });
+  }, [prompt, kind, priority, repoPath, draft, draftDismissed]);
 
   // Create-repo success moves focus to the repository input exactly once, on
   // the false->true transition. Deps are `[repoCreated]` only, so unrelated
@@ -244,6 +301,9 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
     };
   }, []);
 
+  // Non-empty is the gate — a draft of only non-allowlisted keys loads as
+  // `{}` and must not show the banner.
+  const showDraftBanner = Boolean(draft) && Object.keys(draft).length > 0 && !draftDismissed;
   const { title, description } = splitPrompt(prompt);
   const discoveredRepos = discovered?.repos ?? [];
   const discoveryNote = discoveryMessage(discovered);
@@ -290,9 +350,41 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
     }
   }
 
+  // Applies mergeWithSeed's documented rule (seed wins per present field) and
+  // marks the draft resolved so the save effect above resumes persisting.
+  function restoreDraft() {
+    const merged = mergeWithSeed(draft, initial);
+    if (merged.prompt !== undefined) setPrompt(merged.prompt);
+    if (merged.kind !== undefined) setKind(merged.kind);
+    if (merged.priority !== undefined) setPriority(merged.priority);
+    if (merged.repoPath !== undefined) {
+      setRepoPath(merged.repoPath);
+      // Mirrors the fetchProjects resolve rule above: non-empty free text pins
+      // custom mode, so a restored path is never silently dropped in favour
+      // of the auto-defaulted project.
+      if (merged.repoPath) setCustomRepo(true);
+    }
+    setDraftDismissed(true);
+  }
+
+  // Shared by the Discard button and the × close affordance (same effect).
+  // clearDraft() also cancels any save already armed, so a 300ms-old pending
+  // write can't resurrect the draft right after this clears it.
+  function discardDraft() {
+    clearDraft();
+    setDraft(null);
+    setDraftDismissed(true);
+  }
+
   function handleSubmit(e) {
     if (e) e.preventDefault();
     if (!canSubmit) return;
+    // Successful submit: stop this instance from ever re-persisting the
+    // values it just turned into a task, and clear the stored draft so the
+    // banner does not come back on a re-seed (grill failure) or next mount.
+    draftDoneRef.current = true;
+    clearDraft();
+    setDraft(null);
     // The PR URL rides in the description — that is where parse_pr_refs looks.
     const fullDescription =
       [description, needsPrUrl(kind) ? prUrl.trim() : ""].filter(Boolean).join("\n\n") || null;
@@ -375,6 +467,25 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
           </h2>
           <p className="mt-3 font-ui text-base text-text-muted">What should I work on?</p>
         </div>
+
+        {showDraftBanner && (
+          <div
+            role="status"
+            className="mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-solid border-line bg-panel px-4 py-3"
+          >
+            <p className="min-w-0 flex-1 font-ui text-sm text-text-muted">You have an unsent draft from last time.</p>
+            <button type="button" className={`${ACCENT} px-5`} onClick={restoreDraft}>Restore draft</button>
+            <button type="button" className={`${ON_CARD} px-5`} onClick={discardDraft}>Discard</button>
+            <button
+              type="button"
+              aria-label="Dismiss draft notice"
+              className={`${GHOST} w-10 text-lg`}
+              onClick={discardDraft}
+            >
+              ×
+            </button>
+          </div>
+        )}
 
         <form onSubmit={handleSubmit} className={busy ? "pointer-events-none opacity-60" : ""}>
           {/* What shape of work this is. One choice out of many → radios, not toggles.
