@@ -7,6 +7,7 @@ import Stats from "./Stats.jsx";
 import Onboarding from "./Onboarding.jsx";
 import TaskComposer from "./TaskComposer.jsx";
 import Outcomes from "./Outcomes.jsx";
+import About from "./About.jsx";
 import { keepFocusInDialog } from "./keepFocusInDialog.js";
 import { LegionLogo } from "./Logo.jsx";
 import { newlyNeedsYou, notificationBody, titleWithBadge } from "./notifications.js";
@@ -108,6 +109,15 @@ function IconStats() {
       <path d="M4.5 13.5V9" />
       <path d="M8 13.5V5.5" />
       <path d="M11.5 13.5V7" />
+    </svg>
+  );
+}
+function IconAbout() {
+  return (
+    <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="8" cy="8" r="6.2" />
+      <path d="M8 7.2v4" />
+      <path d="M8 4.9h.01" />
     </svg>
   );
 }
@@ -1119,6 +1129,14 @@ export default function App() {
           {/* Settings pinned at the very bottom, Claude-app placement — opens the
               overlay dialog from task 1.1 (page routing is unchanged). */}
           <NavRow
+            icon={<IconAbout />}
+            label="About"
+            active={page === "about"}
+            current={page === "about"}
+            onClick={() => setPage("about")}
+            title="What no_human is, docs, and contact"
+          />
+          <NavRow
             icon={<IconGear />}
             label="Settings"
             active={settingsOpen}
@@ -1136,6 +1154,7 @@ export default function App() {
             : page === "done" ? "Done tasks"
             : page === "failed" ? "Failed tasks"
             : page === "stats" ? "Performance"
+            : page === "about" ? "About no_human"
             : "Settings"}
         </h1>
         {page === "board" && (
@@ -1155,6 +1174,7 @@ export default function App() {
         {page === "done" && <Outcomes tasks={tasks} lane="done" />}
         {page === "failed" && <Outcomes tasks={tasks} lane="failed" />}
         {page === "stats" && <Stats tasks={tasks} />}
+        {page === "about" && <About />}
       </main>
       {showNewTask && (
         <NewTaskModal

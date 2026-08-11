@@ -6312,3 +6312,12 @@ textarea:disabled {
 .ob-prove-verdict { font-size: 12px; line-height: 1.6; }
 .ob-prove-verdict.ok { color: var(--state-done); }
 .ob-prove-verdict.bad { color: var(--state-failed); }
+
+/* About page. `.nh-main` is overflow:hidden, so the page owns its own scroll.
+   Max-width caps the measure for readable prose; everything else reuses the
+   existing text tokens rather than introducing new ones. */
+.nh-about { overflow-y: auto; padding: 24px 28px; max-width: 720px; color: var(--text-body); }
+.nh-about-block { margin: 0 0 28px; }
+.nh-about-block h2 { font-size: 15px; color: var(--text-hi); margin: 0 0 8px; }
+.nh-about-block p { margin: 0 0 10px; line-height: 1.6; }
+.nh-about-block code { color: var(--text-hi); }
