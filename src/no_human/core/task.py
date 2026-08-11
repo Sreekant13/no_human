@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -145,6 +146,103 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+#: Extension-less filenames that are still real paths (lowercased basenames).
+_EXTENSIONLESS_PATHS = frozenset({
+    "jenkinsfile", "makefile", "dockerfile", "rakefile", "gemfile",
+    "procfile", "license", "readme", "vagrantfile", "brewfile",
+})
+
+#: Suffixes that make a token a file path. Union of the repo's existing
+#: lists — agent/lint_hook.py:_CODE_EXTS (source) and
+#: agent/guard.py:_WHOLE_READ_OK_EXTS (data/config/doc) — plus the shapes
+#: this repo's own plans name (.pyi, .sh, .cfg, .env, .tf, .proto, ...).
+_KNOWN_EXTENSIONS = frozenset({
+    # source (lint_hook.py:_CODE_EXTS)
+    "py", "pyi", "js", "jsx", "ts", "tsx", "mjs", "cjs", "java", "go", "rs",
+    "rb", "php", "c", "cc", "cpp", "h", "hpp", "cs", "kt", "swift", "scala",
+    "sh", "bash", "zsh", "ps1", "bat",
+    # data/config/doc (guard.py:_WHOLE_READ_OK_EXTS)
+    "json", "yaml", "yml", "toml", "lock", "csv", "xml", "sql", "txt", "md",
+    "rst", "ini", "cfg", "conf", "env", "properties",
+    # web + infra
+    "html", "css", "scss", "less", "vue", "svelte", "tf", "proto", "gradle",
+    "plist", "service",
+})
+
+#: Prose abbreviations that survive decoration-stripping and look
+#: extension-ish (e.g. "e.g." -> "e.g" after trailing-punctuation strip).
+#: Belt-and-braces on top of the extension allowlist.
+_PROSE_ABBREVIATIONS = frozenset({
+    "e.g", "eg", "i.e", "ie", "etc", "vs", "cf", "no", "nos", "fig", "eq",
+    "al", "approx", "ca", "ver", "vol", "ch", "sec", "pp", "resp",
+})
+
+#: Two-segment slash idioms that are prose, not paths.
+_PROSE_SLASHES = frozenset({
+    "and/or", "n/a", "i/o", "w/o", "yes/no", "read/write", "input/output",
+    "tcp/ip", "client/server", "pass/fail",
+})
+
+
+def _path_candidate(item: str) -> str | None:
+    """First path-shaped whitespace token in *item*, or ``None``.
+
+    A token is path-shaped when it is a known extension-less filename
+    (``Jenkinsfile``, ``Makefile``, ...), has a known code/config/doc
+    extension on a plausible basename, starts with a leading dot
+    (``.gitignore``), or contains a ``/`` with at least one real (longer
+    than two chars) segment — that last check exists so a short
+    slash-separated abbreviation like ``N/A`` is not mistaken for a path.
+    A path requires a ``/`` or a known extension on a plausible basename;
+    a bare prose abbreviation that merely contains a dot (``v2.1``,
+    ``e.g.``, ``No.4``, ``i.e.``) is never a path, even though it survives
+    decoration-stripping and looks extension-ish. Markdown decoration
+    (backticks, ``*``, ``_``, quotes, trailing punctuation) is stripped
+    before the check.
+    """
+    for tok in item.split():
+        cleaned = tok.strip("`*_'\"").rstrip(".,:;()")
+        if not cleaned:
+            continue
+        low = cleaned.lower()
+        if low.rstrip(".") in _PROSE_ABBREVIATIONS:
+            continue
+        base = cleaned.rsplit("/", 1)[-1]
+        if base.lower() in _EXTENSIONLESS_PATHS:
+            return cleaned
+        if "." in base:
+            stem, _, suffix = base.rpartition(".")
+            if (
+                stem
+                and suffix.isalpha()
+                and suffix.lower() in _KNOWN_EXTENSIONS
+                and re.match(r"^[A-Za-z0-9_.+\-]+$", stem)
+            ):
+                return cleaned
+        if cleaned.startswith(".") and re.match(r"^[A-Za-z0-9_-]{2,}$", cleaned[1:]):
+            return cleaned
+        if (
+            "/" in cleaned
+            and low not in _PROSE_SLASHES
+            and any(len(seg) > 2 for seg in cleaned.split("/"))
+        ):
+            return cleaned
+    return None
+
+
+def _looks_like_path(item: str) -> bool:
+    """True when *item* contains at least one path-shaped token.
+
+    Used both to pick the right cell out of a markdown-table row and as a
+    universal final filter on ``files_to_change`` — junk like ``'#'``,
+    bare row numbers, or blank cells must never survive into that field
+    regardless of which branch produced it (empty is safer than junk: see
+    the ``commit_paths`` incident class — consumers scope real decisions by
+    this list).
+    """
+    return _path_candidate(item) is not None
+
+
 @dataclass
 class TaskSpec:
     """Structured spec extracted from the planner's output."""
@@ -166,12 +264,11 @@ class TaskSpec:
     @staticmethod
     def from_plan(plan_text: str) -> "TaskSpec":
         """Parse structured sections from the planner's markdown output."""
-        import re as _re
         sections: dict[str, str] = {}
         current: str | None = None
         lines: list[str] = []
         for line in plan_text.splitlines():
-            m = _re.match(r"^##\s+(.+)", line)
+            m = re.match(r"^##\s+(.+)", line)
             if m:
                 if current:
                     sections[current] = "\n".join(lines).strip()
@@ -189,7 +286,7 @@ class TaskSpec:
                 # Skip markdown horizontal rules ("---", "***", ...) — these
                 # separate sections in the planner's output and would otherwise
                 # be mis-parsed as an empty bullet item.
-                if _re.match(r"^[-*_]{3,}$", s):
+                if re.match(r"^[-*_]{3,}$", s):
                     continue
                 if s.startswith(("-", "*")):
                     item = s.lstrip("-*").strip()
@@ -198,28 +295,55 @@ class TaskSpec:
             return items
 
         def _table_files(text: str) -> list[str]:
-            """Extract file paths from the first column of a markdown table.
+            """Extract file paths from a markdown table's FIRST path-shaped cell.
 
-            The planner sometimes emits FILES TO CHANGE/CREATE as a
-            `| File | Change |` table instead of a bullet list.
+            The planner sometimes emits FILES TO CHANGE/CREATE as a table —
+            `| File | Change |` (path in column 0) or `| # | Path | Change |`
+            (index in column 0, path in column 1). Picking `cells[0]`
+            unconditionally captured the index column ('#', '1', '2', ...)
+            for the latter shape, so instead pick whichever cell in the row
+            is path-shaped.
             """
             files = []
             for l in text.splitlines():
                 s = l.strip()
                 if not s.startswith("|"):
                     continue
-                if _re.match(r"^\|[\s:-]+\|", s):
+                if re.match(r"^\|[\s:-]+\|", s):
                     continue  # separator row, e.g. |------|------|
                 cells = [c.strip().strip("`").strip() for c in s.strip("|").split("|")]
-                if not cells or not cells[0]:
+                if not cells:
                     continue
-                if cells[0].lower() in ("file", "files", "path"):
-                    continue  # header row
-                files.append(cells[0])
+                if cells[0].lower() in ("file", "files", "path", "#"):
+                    continue  # header row (belt-and-braces on top of the shape filter)
+                match = next((c for c in cells if _looks_like_path(c)), None)
+                if match:
+                    files.append(match.replace("`", ""))
             return files
 
         files_section = sections.get("FILES TO CHANGE/CREATE", "")
-        files_to_change = _list_items(files_section) or _table_files(files_section)
+        # Junk ('#', bare row numbers, blank cells) must never enter
+        # files_to_change regardless of source format — filter each branch,
+        # and only fall through to the table branch when the bullet-list
+        # branch yielded nothing usable (not merely nothing at all).
+        #
+        # BLAST RADIUS (grep-verified, `grep -rn files_to_change src/ tests/`):
+        # table-shaped plans used to yield junk ('#', '1', '2', ...) here, so
+        # every consumer below was effectively inert or wrong for that shape.
+        # This fix changes their behaviour for table-shaped plans specifically
+        # (bullet-list plans are unchanged — see the parametrized control
+        # test): scope_guard.py:113 iterates files_to_change to scope its
+        # checks and now sees real paths instead of digits, so it goes from
+        # inert to ACTIVE on table-shaped plans; complexity.py:222's
+        # `files_to_change > 4` tier signal now counts real path entries
+        # instead of table-row markers, so the tier it reports for a
+        # table-shaped repro case can shift. Nothing found scopes a commit or
+        # skips validation by this field directly (no `commit_paths`-style
+        # write path off of it) — the exposure is these two read-only
+        # signals, not commit scoping.
+        files_to_change = [f for f in _list_items(files_section) if _looks_like_path(f)]
+        if not files_to_change:
+            files_to_change = [f for f in _table_files(files_section) if _looks_like_path(f)]
 
         return TaskSpec(
             files_to_change=files_to_change,
