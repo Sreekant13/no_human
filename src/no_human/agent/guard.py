@@ -19,6 +19,10 @@ Blocks, before execution:
   - interactive prompts (`AskUserQuestion`) — nobody is at the keyboard (§22)
   - background polling (`Monitor`, `TaskStop`, `ToolSearch`) in a read-only
     session — a planner does not need to busy-wait on its own subagents
+  - spawning subagents (`Task`, `Agent`, `Workflow`, `CronCreate`,
+    `RemoteTrigger`) in a read-only session — a spawned subagent's own
+    toolset, not the parent's readonly gate, decides what it can do, so
+    spawning one is a capability-laundering channel out of readonly
 
 Deliberately allowed (user, 2026-07-10): the agent may `git commit`, `git push`
 its own branch, `git merge` another ref *into* that branch, and open a PR. Only
@@ -74,16 +78,32 @@ INTERACTIVE_TOOLS = {"AskUserQuestion"}
 # them ("idle wait for agent a422b247…", "idle until agent 2 completes"). It
 # burned 100 events against the `minimal-first` lens's 22 for the same one plan
 # draft, and gathered nothing with any of it.
-#
-# The `Agent` tool is deliberately NOT denied: it returns its result directly.
-# The `risk-first` lens proves it — three subagents, zero Monitor/TaskStop calls,
-# draft delivered.
 BACKGROUND_TOOLS = {"Monitor", "TaskStop", "ToolSearch"}
 
+# Spawn tools. `Agent`/`Task` were deliberately NOT denied here until this was
+# fixed: the `risk-first` lens proved a legitimate readonly research pattern —
+# three subagents, zero Monitor/TaskStop calls, draft delivered. But a spawned
+# subagent gets its OWN toolset, not the parent's readonly gate — a reviewer
+# session could spawn a subagent with Write/Edit and launder its way out of
+# readonly (the lexical-guards-cannot-enforce-capability class; sibling hole
+# already fixed in a21f124a7). `Workflow` explicitly orchestrates subagents;
+# `CronCreate`/`RemoteTrigger` launch async work that escapes this session's
+# control the same way. All are denied in readonly sessions — no
+# backward-compatibility exemption for the risk-first pattern above: a readonly
+# session that needs to delegate research is not truly readonly.
+SPAWN_TOOLS = {"Task", "Agent", "Workflow", "CronCreate", "RemoteTrigger"}
+
 _NO_POLLING_REASON = (
-    "{tool} is unavailable in a read-only session. The Agent tool returns its "
-    "result to you directly when the subagent finishes — do not spawn helpers "
-    "to wait for it, and do not poll. Read, Grep, Glob, Bash and Agent are all "
+    "{tool} is unavailable in a read-only session. A subagent's result returns "
+    "to you directly when it finishes — do not spawn helpers to wait for it, "
+    "and do not poll. Read, Grep, Glob and Bash are all you need; use them and "
+    "write your report."
+)
+
+_NO_SPAWN_REASON = (
+    "{tool} is unavailable in a read-only session: a spawned subagent gets its "
+    "own toolset, not this session's read-only gate, so spawning one is a way "
+    "to launder capability out of read-only. Read, Grep, Glob and Bash are all "
     "you need; use them and write your report."
 )
 
@@ -703,6 +723,8 @@ def evaluate(
         return GuardDecision(False, f"read-only session: {tool_name} blocked")
     if readonly and tool_name in BACKGROUND_TOOLS:
         return GuardDecision(False, _NO_POLLING_REASON.format(tool=tool_name))
+    if readonly and tool_name in SPAWN_TOOLS:
+        return GuardDecision(False, _NO_SPAWN_REASON.format(tool=tool_name))
 
     # 1b. Phase C: unbounded reads of huge files are redirected, not denied.
     # ONLY in the coder loop (readonly reviewer/researcher sessions are one-shot

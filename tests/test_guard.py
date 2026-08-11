@@ -247,9 +247,9 @@ def test_readonly_session_cannot_poll_for_its_subagents():
 
 
 def test_readonly_session_keeps_the_tools_it_actually_needs():
-    """The Agent tool returns its result directly — risk-first spawned three
-    subagents with zero Monitor calls. Denying it would break real research."""
-    for tool in ("Read", "Grep", "Glob", "Agent"):
+    """Read/Grep/Glob/Bash stay available — a readonly session explores and
+    reports without spawning anything."""
+    for tool in ("Read", "Grep", "Glob"):
         assert _ro(tool, {"file_path": "Jenkinsfile"}).allow, f"{tool} must stay"
     assert _ro("Bash", {"command": "git log --oneline -5"}).allow
 
@@ -257,6 +257,24 @@ def test_readonly_session_keeps_the_tools_it_actually_needs():
 def test_the_coder_may_still_use_background_tools():
     """Only read-only sessions are restricted; the implementer is not."""
     for tool in ("Monitor", "TaskStop", "ToolSearch"):
+        assert _ev(tool, {}).allow, f"{tool} must remain available to the coder"
+
+
+def test_readonly_session_cannot_spawn_subagents():
+    """A readonly reviewer/researcher session must not spawn subagents: the
+    spawned session gets its OWN toolset, not the parent's readonly gate — a
+    capability-laundering channel out of readonly (sibling hole fixed in
+    a21f124a7). `Workflow` explicitly orchestrates subagents; `CronCreate` and
+    `RemoteTrigger` launch async work the same way."""
+    for tool in ("Task", "Agent", "Workflow", "CronCreate", "RemoteTrigger"):
+        d = _ro(tool)
+        assert not d.allow, f"{tool} must be denied in a read-only session"
+        assert "read-only" in d.reason.lower()
+
+
+def test_coder_session_may_still_spawn_subagents():
+    """Only read-only sessions are restricted; the implementer is not."""
+    for tool in ("Task", "Agent"):
         assert _ev(tool, {}).allow, f"{tool} must remain available to the coder"
 
 
