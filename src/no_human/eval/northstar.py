@@ -27,8 +27,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from ..config import DEFAULT_CONFIG
 from ..core.db import USAGE_ROLES, usage_columns_for, Store
-from ..core.pricing import CACHE_CREATION_WEIGHT, CACHE_READ_WEIGHT
+from ..core.pricing import (CACHE_CREATION_WEIGHT, CACHE_READ_WEIGHT,
+                            MODEL_PRICES_USD_PER_MTOK)
 from ..core.events import EventPersister
 from ..core.orchestrator import Orchestrator
 from ..core.task import Task, TaskStatus
@@ -37,6 +39,97 @@ from .bench_task import BenchTask, redact_local_path, spec_project_name
 from .sandbox_selftest import wrong_tree_imports
 
 BackendFactory = Callable[[BenchTask], Any]
+
+#: `db.USAGE_ROLES` role name -> the `config["llm"]` KEY that names its
+#: model. A model id is never typed here — the tier is always resolved
+#: through this key (or through a per-row recorded id), so there is exactly
+#: one place a role's model can be looked up. `distill` is registered in
+#: `USAGE_ROLES` but has no dedicated tier key (it rides on other calls'
+#: models today) and is deliberately absent — never dropped, priced by the
+#: fail-closed path in `tier_weight` below.
+PRICED_ROLES: dict[str, str] = {
+    "coder": "primary_model",
+    "reviewer": "review_model",
+    "planner": "planner_model",
+    "supervisor": "supervisor_model",
+    "utility": "utility_model",
+}
+
+#: The ticket's spelling of the coder role vs. `db.USAGE_ROLES`'s. Resolved
+#: by `_canonical_role` before any `PRICED_ROLES`/`is_priced_role` lookup.
+ROLE_ALIASES: dict[str, str] = {"implementer": "coder"}
+
+#: The tier `tier_weight` prices every role relative to. The corpus's
+#: `original:` blocks record no model (`eval/northstar_tasks/*.yaml` carry
+#: `tokens: {}`), so the denominator's tier is an assumption; anchoring at
+#: Sonnet means an anchor error can only INFLATE the published ratio (worse
+#: for no_human), never deflate it.
+ANCHOR_MODEL = "claude-sonnet-5"
+
+
+def _canonical_role(role: str) -> str:
+    return ROLE_ALIASES.get((role or "").strip().lower(),
+                            (role or "").strip().lower())
+
+
+def is_priced_role(role: str) -> bool:
+    """The ONE predicate for "does this role have a dedicated price tier".
+
+    Every role-selection branch in this module calls this — never
+    ``role in PRICED_ROLES`` or ``role != "distill"`` written inline — so the
+    priced set cannot drift between `tier_weight`, the `_score` breakdown
+    builder, and anything added later. This is the exact predicate-mismatch
+    that failed an earlier review of this change.
+    """
+    return _canonical_role(role) in PRICED_ROLES
+
+
+def _input_rate(model: str | None) -> float:
+    """One model's fresh-input USD/MTok rate. An unknown or absent id prices
+    at the HIGHEST input rate in the table — never the lowest, never zero —
+    so an unrecognized tier is never priced as cheaper than a known one
+    (mirrors `pricing.output_extra_weight`'s fallback rationale)."""
+    if model:
+        priced = MODEL_PRICES_USD_PER_MTOK.get(model)
+        if priced is not None:
+            return priced[0]
+    return max(rate for rate, _out in MODEL_PRICES_USD_PER_MTOK.values())
+
+
+def _model_for(role: str, models: dict[str, str] | None) -> str | None:
+    """The model id to price *role* at.
+
+    Prefers the RECORDED id (a historical row is priced at what it was
+    actually billed, not at today's config) and falls back to the live
+    default in `config.DEFAULT_CONFIG["llm"]`. A role `is_priced_role`
+    rejects (e.g. `distill`) has no config key to fall back to and resolves
+    to ``None``, which `_input_rate` fail-closes to the table's highest rate.
+    """
+    canonical = _canonical_role(role)
+    if models:
+        recorded = models.get(role) or models.get(canonical)
+        if recorded:
+            return recorded
+    if not is_priced_role(role):
+        return None
+    return DEFAULT_CONFIG["llm"].get(PRICED_ROLES[canonical])
+
+
+def tier_weight(role: str, models: dict[str, str] | None = None) -> float:
+    """*role*'s fresh-input rate as a ratio against `ANCHOR_MODEL` — e.g.
+    5/3 for an Opus-tier role when the anchor is Sonnet. An unpriced role or
+    an unresolved model both fail closed to the table's highest ratio:
+    dropping or under-pricing a role's spend rigs the ratio in no_human's
+    favour, the same angle-4 defect `token_ratio`'s docstring already
+    records for coder-only summation.
+    """
+    return _input_rate(_model_for(role, models)) / _input_rate(ANCHOR_MODEL)
+
+
+def tier_weighted(tokens: float, role: str,
+                  models: dict[str, str] | None = None) -> float:
+    """*tokens*, priced at *role*'s tier relative to `ANCHOR_MODEL`."""
+    return float(tokens) * tier_weight(role, models)
 
 # Off-ramps that count as "reached the human gate" for gate-kind outcomes vs
 # honest-escalation outcomes (expect_escalation specs). DONE is a gate state
@@ -168,6 +261,19 @@ class BenchScore:
     # latest.json so completed specs stay drillable post hoc (v11 live:
     # early escalations whose reasons were already deleted).
     events: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    # Per-role breakdown of the same three addend columns `nh_tokens` /
+    # `nh_cache_tokens` / `nh_cache_creation_tokens` already sum — role name
+    # (`db.USAGE_ROLES` values) -> {"tokens_used", "cache_read_tokens",
+    # "cache_creation_tokens"}. Both optional and both empty by default so
+    # every existing constructor call (tests, old `latest.json` loads) keeps
+    # building the exact score it always did. Empty means "no breakdown was
+    # recorded", not "recorded and zero" — `nh_priced_tokens` reads emptiness
+    # as the signal to take the pre-tier-weighting compat path.
+    nh_role_tokens: dict[str, dict[str, int]] = dataclasses.field(
+        default_factory=dict)
+    # role -> the model id it was actually billed at, when known. Consulted
+    # by `tier_weight` before it falls back to today's config default.
+    nh_role_models: dict[str, str] = dataclasses.field(default_factory=dict)
 
     @property
     def token_ratio(self) -> float | None:
@@ -188,10 +294,32 @@ class BenchScore:
         ``cost_ratio``, exposed on its own so "did this row spend ANYTHING"
         is asked of the same arithmetic the cost median prices with, never a
         re-derivation. Every weight is positive, so this is 0.0 IFF every
-        nh token class is zero — a row that burned literally nothing."""
-        return (self.nh_tokens
-                + CACHE_READ_WEIGHT * self.nh_cache_tokens
-                + CACHE_CREATION_WEIGHT * self.nh_cache_creation_tokens)
+        nh token class is zero — a row that burned literally nothing.
+
+        Two paths. With no per-role breakdown (``nh_role_tokens`` empty —
+        every pre-tier-weighting caller, every score built before this field
+        existed, and every legacy ``latest.json``) this is the ORIGINAL
+        class-weighted expression, byte-for-byte: published ratios and
+        ``test_token_ratio_math`` do not move. With a breakdown, each role's
+        class-weighted subtotal is additionally priced at its own tier via
+        `tier_weighted` (through `is_priced_role`'s single predicate, never a
+        role check written inline here) before the parts are summed — a
+        role's totals can be cheaper OR pricier than the anchor, so this can
+        land on either side of the unweighted figure.
+        """
+        if not self.nh_role_tokens:
+            return (self.nh_tokens
+                    + CACHE_READ_WEIGHT * self.nh_cache_tokens
+                    + CACHE_CREATION_WEIGHT * self.nh_cache_creation_tokens)
+        total = 0.0
+        for role, cols in self.nh_role_tokens.items():
+            fresh = int(cols.get("tokens_used") or 0)
+            read = int(cols.get("cache_read_tokens") or 0)
+            creation = int(cols.get("cache_creation_tokens") or 0)
+            class_total = (fresh + CACHE_READ_WEIGHT * read
+                          + CACHE_CREATION_WEIGHT * creation)
+            total += tier_weighted(class_total, role, self.nh_role_models)
+        return total
 
     @property
     def cost_ratio(self) -> float | None:
@@ -207,6 +335,12 @@ class BenchScore:
         The arithmetic is kept in float (rather than routed through
         `pricing.weighted_tokens`, which floors to an int for the caps) so a
         ratio over small samples is not quantised.
+
+        The NUMERATOR (`nh_priced_tokens`) is additionally tier-weighted per
+        role when a breakdown was recorded — see its docstring. The
+        DENOMINATOR is not: the original session's per-role split was never
+        captured, so it stays anchored at the flat class weights above (the
+        same basis every published ratio has always used).
         """
         orig = (self.orig_tokens
                 + CACHE_READ_WEIGHT * self.orig_cache_tokens
@@ -244,6 +378,8 @@ class BenchScore:
                            if self.cost_ratio is not None else None),
             "notes": self.notes,
             "events": self.events,
+            "nh_role_tokens": self.nh_role_tokens,
+            "nh_role_models": self.nh_role_models,
         }
 
 
@@ -703,13 +839,40 @@ class NorthStarRunner:
         # the 10%-of-cost target the card publishes is only as honest as the
         # longest of those lists. A role that exists in the schema but not in
         # this sum is spend the benchmark hands the product for free.
-        def _class_total(idx: int) -> int:
-            keys = [usage_columns_for(t)[idx] for t in USAGE_ROLES]
-            return sum(int(a.get(k) or 0) for a in attempts for k in keys)
+        # The per-role breakdown IS the derivation, never a second summation
+        # of the same columns: nh_tokens/nh_cache_tokens/nh_cache_creation_
+        # tokens below are sums OF `role_tokens`, so the scalar totals and the
+        # tier-weighted `nh_priced_tokens` can never disagree with each other.
+        role_tokens: dict[str, dict[str, int]] = {}
+        for prefix, role in USAGE_ROLES.items():
+            fresh_key, read_key, creation_key = usage_columns_for(prefix)
+            fresh = sum(int(a.get(fresh_key) or 0) for a in attempts)
+            read = sum(int(a.get(read_key) or 0) for a in attempts)
+            creation = sum(int(a.get(creation_key) or 0) for a in attempts)
+            if fresh or read or creation:
+                role_tokens[role] = {"tokens_used": fresh,
+                                     "cache_read_tokens": read,
+                                     "cache_creation_tokens": creation}
 
-        nh_tokens = _class_total(0)
-        nh_cache = _class_total(1)
-        nh_creation = _class_total(2)
+        nh_tokens = sum(v["tokens_used"] for v in role_tokens.values())
+        nh_cache = sum(v["cache_read_tokens"] for v in role_tokens.values())
+        nh_creation = sum(
+            v["cache_creation_tokens"] for v in role_tokens.values())
+
+        # Only for roles that actually spent AND that `is_priced_role` — the
+        # one predicate, never `role in PRICED_ROLES` inline. `self.config`
+        # is absent on a bare `NorthStarRunner.__new__` (unit tests exercise
+        # `_score` that way), so this reads it defensively rather than as
+        # `self.config` directly.
+        llm_config = (getattr(self, "config", None) or {}).get("llm") or {}
+        role_models: dict[str, str] = {}
+        for role in role_tokens:
+            if not is_priced_role(role):
+                continue
+            model = llm_config.get(PRICED_ROLES[_canonical_role(role)])
+            if model:
+                role_models[role] = model
+
         turns = sum(int(a.get("turns_used") or 0) for a in attempts)
         orig = spec.original or {}
         toks = orig.get("tokens", {}) or {}
@@ -728,6 +891,7 @@ class NorthStarRunner:
             mergeable=None,
             nh_tokens=nh_tokens, nh_cache_tokens=nh_cache,
             nh_cache_creation_tokens=nh_creation, nh_turns=turns,
+            nh_role_tokens=role_tokens, nh_role_models=role_models,
             nh_wall_clock_s=elapsed,
             orig_tokens=int(toks.get("input_tokens", 0)) + int(toks.get("output_tokens", 0)),
             orig_cache_tokens=int(toks.get("cache_read_input_tokens", 0)),

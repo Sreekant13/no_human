@@ -666,6 +666,8 @@ class NorthStarCard:
             tokens_before_escalation=int(s.get("tokens_before_escalation") or 0),
             notes=s.get("notes", ""),
             events=s.get("events") or [],
+            nh_role_tokens=s.get("nh_role_tokens") or {},
+            nh_role_models=s.get("nh_role_models") or {},
         ) for s in data.get("scores", [])]
         agg = data.get("aggregate") or {}
         return NorthStarCard(scores=scores,

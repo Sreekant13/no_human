@@ -7,6 +7,7 @@ and the source-repo-refs-untouched assertion.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -14,10 +15,15 @@ import pytest
 
 from no_human.eval.bench_task import BenchTask
 from no_human.eval.northstar import (
+    ANCHOR_MODEL,
+    PRICED_ROLES,
     BenchScore,
     NorthStarRunner,
     _ref_signature,
     _setup_sandbox,
+    is_priced_role,
+    tier_weight,
+    tier_weighted,
 )
 
 
@@ -1175,3 +1181,184 @@ async def test_the_warning_also_leads_a_did_not_reach_the_gate_note(tmp_path):
         attempts=[], elapsed=1.0, wrong_tree=["pkg imports from /other/pkg"])
     assert score.notes.startswith("⚠ sandbox did not test itself:")
     assert "did not reach the human gate" in score.notes
+
+
+# ------------------------- tier-weighted cost_ratio ------------------------- #
+
+def test_priced_roles_covers_every_metered_role_or_fails_closed():
+    """Every `PRICED_ROLES` key must resolve to a real config tier, and every
+    role `db.USAGE_ROLES` can emit must be either priced or fail closed to the
+    table's HIGHEST ratio — never dropped, never priced below a known role."""
+    from no_human.config import DEFAULT_CONFIG
+    from no_human.core.db import USAGE_ROLES
+    from no_human.core.pricing import MODEL_PRICES_USD_PER_MTOK
+
+    assert ANCHOR_MODEL in MODEL_PRICES_USD_PER_MTOK
+    for role, key in PRICED_ROLES.items():
+        assert key in DEFAULT_CONFIG["llm"], f"{role} -> {key} is not a real tier"
+        assert DEFAULT_CONFIG["llm"][key]
+
+    for role in USAGE_ROLES.values():
+        if is_priced_role(role):
+            continue
+        # Unpriced (e.g. "distill"): fails closed at the table's max ratio,
+        # so it is never cheaper than a role that IS priced.
+        assert tier_weight(role) >= tier_weight("reviewer")
+        assert tier_weight(role) >= tier_weight("coder")
+
+
+def test_tier_weighted_reads_the_canonical_price_table(monkeypatch):
+    """`tier_weighted` must move when `core.pricing`'s ONE table moves — proof
+    that northstar carries no second price list of its own."""
+    import no_human.core.pricing as pricing
+    from no_human.config import DEFAULT_CONFIG
+
+    utility_model = DEFAULT_CONFIG["llm"]["utility_model"]
+    before_rate = pricing.MODEL_PRICES_USD_PER_MTOK[utility_model]
+
+    before = tier_weighted(1000, "utility")
+    monkeypatch.setitem(pricing.MODEL_PRICES_USD_PER_MTOK, utility_model,
+                        (before_rate[0] * 2, before_rate[1]))
+    after = tier_weighted(1000, "utility")
+
+    assert after == pytest.approx(before * 2)
+
+
+def test_is_priced_role_is_the_only_predicate():
+    assert is_priced_role("implementer") is is_priced_role("coder") is True
+    assert is_priced_role("distill") is False
+    assert is_priced_role("Reviewer") is True
+
+    # Behavioural check: a role the predicate REJECTS still contributes
+    # non-zero weighted spend — it must never be silently dropped.
+    s = BenchScore(
+        task_id="x", title="t", outcome_status="done", goal_satisfied=True,
+        escalated_honestly=False, mergeable=True,
+        nh_tokens=10, nh_cache_tokens=0, nh_cache_creation_tokens=0,
+        nh_turns=1, nh_wall_clock_s=1.0,
+        orig_tokens=100, orig_cache_tokens=0, orig_cache_creation_tokens=0,
+        orig_wall_clock_s=1.0, orig_corrections=0,
+        nh_role_tokens={"distill": {"tokens_used": 10, "cache_read_tokens": 0,
+                                    "cache_creation_tokens": 0}})
+    assert not is_priced_role("distill")
+    assert s.nh_priced_tokens > 0.0
+
+
+def test_cost_ratio_is_tier_weighted_across_mixed_tiers():
+    """RED-FIRST: an Opus-tier role (reviewer) and a Haiku-tier role (utility)
+    with tokens chosen so the plain class-weighted sum disagrees with the
+    tier-weighted total. Must fail before `nh_priced_tokens`/`cost_ratio`
+    consult `nh_role_tokens`."""
+    reviewer_class_total = 100 + 0.1 * 1000 + 1.25 * 40   # 250.0
+    utility_class_total = 500.0
+    expected = (tier_weighted(reviewer_class_total, "reviewer")
+               + tier_weighted(utility_class_total, "utility"))
+    plain_sum = reviewer_class_total + utility_class_total
+    assert expected != pytest.approx(plain_sum)   # the mismatch this proves
+
+    s = BenchScore(
+        task_id="x", title="t", outcome_status="done", goal_satisfied=True,
+        escalated_honestly=False, mergeable=True,
+        nh_tokens=600, nh_cache_tokens=1000, nh_cache_creation_tokens=40,
+        nh_turns=1, nh_wall_clock_s=1.0,
+        orig_tokens=1000, orig_cache_tokens=0, orig_cache_creation_tokens=0,
+        orig_wall_clock_s=1.0, orig_corrections=0,
+        nh_role_tokens={
+            "reviewer": {"tokens_used": 100, "cache_read_tokens": 1000,
+                        "cache_creation_tokens": 40},
+            "utility": {"tokens_used": 500, "cache_read_tokens": 0,
+                       "cache_creation_tokens": 0}})
+
+    assert s.nh_priced_tokens == pytest.approx(expected)
+    assert s.nh_priced_tokens != pytest.approx(plain_sum)
+    assert s.cost_ratio == pytest.approx(expected / 1000)
+
+
+def test_cost_ratio_without_a_breakdown_is_byte_identical():
+    """No `nh_role_tokens` recorded (every pre-tier-weighting caller, every
+    legacy `latest.json`) must give the EXACT pre-change number — a bare
+    `BenchScore(...)` call is the compat path, not an opt-in."""
+    s = BenchScore(task_id="x", title="t", outcome_status="done",
+                   goal_satisfied=True, escalated_honestly=False,
+                   mergeable=True, nh_tokens=750, nh_cache_tokens=100,
+                   nh_cache_creation_tokens=0,
+                   nh_turns=5, nh_wall_clock_s=60.0, orig_tokens=1500,
+                   orig_cache_tokens=9000, orig_cache_creation_tokens=0,
+                   orig_wall_clock_s=600.0, orig_corrections=3)
+    assert s.nh_role_tokens == {}
+    assert s.nh_priced_tokens == pytest.approx(750 + 0.1 * 100)
+    assert s.cost_ratio == pytest.approx((750 + 0.1 * 100) / (1500 + 0.1 * 9000))
+
+
+@pytest.mark.asyncio
+async def test_score_breakdown_sums_to_the_scalar_totals(tmp_path):
+    """Extends `test_score_counts_reviewer_tokens`: with coder + reviewer +
+    utility columns populated, the per-role breakdown's class sums must equal
+    the scalar `nh_tokens`/`nh_cache_tokens`/`nh_cache_creation_tokens` —
+    they are DERIVED from the same breakdown, so they cannot disagree."""
+    from no_human.core.task import TaskStatus
+    repo = _src_repo(tmp_path)
+    runner = NorthStarRunner({}, backend_factory=lambda s: None)
+    score = await runner._score(
+        _spec(repo), _FakeOutcome(TaskStatus.FAILED), tmp_path, "sha",
+        attempts=[{"tokens_used": 200, "cache_read_tokens": 1000,
+                   "cache_creation_tokens": 30, "turns_used": 2,
+                   "review_tokens_used": 50, "review_cache_read_tokens": 400,
+                   "review_cache_creation_tokens": 7,
+                   "utility_tokens_used": 9, "utility_cache_read_tokens": 2,
+                   "utility_cache_creation_tokens": 1}],
+        elapsed=5.0)
+
+    assert set(score.nh_role_tokens) == {"coder", "reviewer", "utility"}
+    fresh_sum = sum(v["tokens_used"] for v in score.nh_role_tokens.values())
+    read_sum = sum(v["cache_read_tokens"] for v in score.nh_role_tokens.values())
+    creation_sum = sum(
+        v["cache_creation_tokens"] for v in score.nh_role_tokens.values())
+    assert fresh_sum == score.nh_tokens
+    assert read_sum == score.nh_cache_tokens
+    assert creation_sum == score.nh_cache_creation_tokens
+
+
+def test_role_breakdown_survives_card_reload(tmp_path):
+    from no_human.eval.northstar_card import NorthStarCard
+
+    orig = BenchScore(
+        task_id="ns-1", title="t", outcome_status="done", goal_satisfied=True,
+        escalated_honestly=False, mergeable=True,
+        nh_tokens=600, nh_cache_tokens=1000, nh_cache_creation_tokens=40,
+        nh_turns=1, nh_wall_clock_s=1.0,
+        orig_tokens=1000, orig_cache_tokens=0, orig_cache_creation_tokens=0,
+        orig_wall_clock_s=1.0, orig_corrections=0,
+        nh_role_tokens={
+            "reviewer": {"tokens_used": 100, "cache_read_tokens": 1000,
+                        "cache_creation_tokens": 40},
+            "utility": {"tokens_used": 500, "cache_read_tokens": 0,
+                       "cache_creation_tokens": 0}},
+        nh_role_models={"reviewer": "claude-opus-4-8",
+                       "utility": "claude-haiku-4-5"})
+    card = NorthStarCard(scores=[orig], created_at="2026-08-12", label="x")
+    p = tmp_path / "latest.json"
+    card.save(p)
+    loaded = NorthStarCard.load(p)
+
+    assert loaded is not None
+    reloaded = loaded.scores[0]
+    assert reloaded.nh_role_tokens == orig.nh_role_tokens
+    assert reloaded.nh_role_models == orig.nh_role_models
+    assert reloaded.cost_ratio == pytest.approx(orig.cost_ratio)
+
+    # A legacy dict with NEITHER key must still load and take the compat path.
+    legacy = orig.as_dict()
+    del legacy["nh_role_tokens"]
+    del legacy["nh_role_models"]
+    legacy_path = tmp_path / "legacy.json"
+    legacy_path.write_text(json.dumps({
+        "created_at": "x", "label": "legacy", "aggregate": {},
+        "scores": [legacy],
+    }))
+    legacy_card = NorthStarCard.load(legacy_path)
+    assert legacy_card is not None
+    legacy_score = legacy_card.scores[0]
+    assert legacy_score.nh_role_tokens == {}
+    assert legacy_score.cost_ratio == pytest.approx(
+        (600 + 0.1 * 1000 + 1.25 * 40) / 1000)
