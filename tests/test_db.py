@@ -419,3 +419,71 @@ async def test_interrupted_attempts_get_a_reason_stamped(store):
     rows = await store.list_attempts(t.id)
     assert rows[0]["status"] == "interrupted"
     assert "superseded by a newer attempt" in (rows[0]["failure_reason"] or "")
+
+
+# --------------------------------------------------------------------------
+# Attempt rows left open on a task that already finished. Measured 2026-08-11:
+# 42 of them, oldest open 32 days; one task (`a8ffc957`) stayed hidden behind
+# one for nine days, and `nh task cancel` creates them (it marks the task FAILED
+# and leaves the row open). They also corrupt any event-window query, because a
+# row with completed_at NULL coalesces to *now* and swallows every later event.
+# --------------------------------------------------------------------------
+
+async def _task_with_open_attempt(store, status: TaskStatus):
+    t = Task.new(f"t-{status.value}", repo_path="/tmp/r")
+    await store.create_task(t)
+    await store.create_attempt(t.id, 1)
+    await store.set_status(t, status, validate=False)
+    return t
+
+
+async def _open_count(store, task_id: str) -> int:
+    rows = await store.list_attempts(task_id)
+    return sum(1 for r in rows if r["status"] == "in_progress")
+
+
+async def test_open_attempts_on_finished_tasks_are_retired(store):
+    done = await _task_with_open_attempt(store, TaskStatus.DONE)
+    failed = await _task_with_open_attempt(store, TaskStatus.FAILED)
+    assert await _open_count(store, done.id) == 1
+    assert await _open_count(store, failed.id) == 1
+
+    n = await store.close_attempts_of_terminal_tasks()
+
+    assert n == 2, "both terminal tasks' rows should be retired"
+    assert await _open_count(store, done.id) == 0
+    assert await _open_count(store, failed.id) == 0
+
+
+async def test_a_live_tasks_open_attempt_is_never_touched(store):
+    """THE safety property. A task still in flight owns its open row; closing
+    it would break the resume `latest_open_attempt` exists to protect."""
+    live = await _task_with_open_attempt(store, TaskStatus.IMPLEMENTING)
+    done = await _task_with_open_attempt(store, TaskStatus.DONE)
+
+    n = await store.close_attempts_of_terminal_tasks()
+
+    assert n == 1, "only the finished task's row may be retired"
+    assert await _open_count(store, live.id) == 1, (
+        "a running task's attempt row was closed out from under it")
+
+
+async def test_retiring_is_idempotent_and_reports_zero_when_clean(store):
+    await _task_with_open_attempt(store, TaskStatus.DONE)
+    assert await store.close_attempts_of_terminal_tasks() == 1
+    assert await store.close_attempts_of_terminal_tasks() == 0
+
+
+async def test_an_existing_failure_reason_is_preserved(store):
+    """COALESCE, not overwrite: a row that already explained itself keeps its
+    explanation, so this reconciliation cannot erase a real diagnosis."""
+    t = Task.new("t", repo_path="/tmp/r")
+    await store.create_task(t)
+    a = await store.create_attempt(t.id, 1)
+    await store.update_attempt(a, failure_reason="the real reason")
+    await store.set_status(t, TaskStatus.FAILED, validate=False)
+
+    await store.close_attempts_of_terminal_tasks()
+
+    rows = await store.list_attempts(t.id)
+    assert rows[0]["failure_reason"] == "the real reason"

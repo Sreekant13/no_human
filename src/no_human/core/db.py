@@ -1605,6 +1605,50 @@ class Store:
         await self.db.commit()
 
     @serialized_write
+    async def close_attempts_of_terminal_tasks(self) -> int:
+        """Retire ``in_progress`` attempt rows whose TASK has already finished.
+
+        `close_open_attempts` above is per-task and is called by the paths that
+        DISCARD a checkpoint. Nothing was reconciling the other shape: a task
+        reaches `done`/`failed` while an attempt row is still `in_progress`, and
+        `Scheduler._recover_orphans` cannot see it because that sweep iterates
+        `_ORPHANABLE`, which holds only NON-terminal task statuses. The rows
+        therefore live forever. Measured 2026-08-11: **42** of them, the oldest
+        `in_progress` for 32 days.
+
+        They are not cosmetic. Three costs, all observed:
+          * A task hid behind one for NINE DAYS (`a8ffc957`) — the board and
+            `nh task cancel` both read it as still running.
+          * `nh task cancel` itself creates them: it marks the task FAILED and
+            leaves the row open (reproduced on 2 of 5 tasks cancelled that day).
+          * They corrupt any query that windows events by attempt, because a row
+            with `completed_at IS NULL` coalesces to *now* and its window
+            swallows every later event. That silently inflated a measurement I
+            was using to diagnose a live regression.
+
+        STARTUP ONLY, and that is the safety argument, not a convenience: at
+        startup no worker owns any row, which is exactly the precondition
+        `close_open_attempts` documents ("safe to call when nothing is
+        running"). Do NOT move this to the per-tick sweep — `latest_open_attempt`
+        is load-bearing for orphan recovery, and closing a row out from under a
+        live worker would break the resume it exists to protect.
+
+        The status filter is the whole safety property: a task still in flight
+        keeps its open row untouched. Returns the number of rows retired so the
+        caller can say so out loud rather than reconciling in silence.
+        """
+        cur = await self.db.execute(
+            "UPDATE attempts SET status = 'interrupted', "
+            "failure_reason = COALESCE(NULLIF(TRIM(failure_reason), ''), "
+            "'interrupted: its task had already finished while this row was "
+            "left open — the worker died without closing it') "
+            "WHERE status = 'in_progress' AND task_id IN ("
+            "  SELECT id FROM tasks WHERE status IN ('done', 'failed'))",
+        )
+        await self.db.commit()
+        return int(cur.rowcount or 0)
+
+    @serialized_write
     async def add_verification_receipt(self, attempt_id: str, receipt: Any) -> None:
         """Append one verification receipt to *attempt_id*.
 

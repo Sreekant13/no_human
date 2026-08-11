@@ -384,6 +384,27 @@ class Scheduler:
     # (a full-suite pytest inside review) must fit under it.
     _STRANDED_GRACE_S = 900.0
 
+    async def _reconcile_terminal_task_attempts(self) -> None:
+        """Startup-only: retire attempt rows left open on tasks that finished.
+
+        Separate from `_recover_orphans` on purpose. That sweep iterates
+        `_ORPHANABLE`, i.e. NON-terminal task statuses, so a `done`/`failed`
+        task holding an `in_progress` row is invisible to it — which is why 42
+        such rows had accumulated by 2026-08-11, the oldest open for 32 days,
+        and why one task stayed hidden behind one for nine days. See
+        `Store.close_attempts_of_terminal_tasks` for why this is startup-only.
+        """
+        try:
+            n = await self.store.close_attempts_of_terminal_tasks()
+        except Exception:  # noqa: BLE001 — reconciliation must never block boot
+            log.exception("startup: reconciling terminal-task attempts failed")
+            return
+        if n:
+            # Say it out loud. A silent reconciliation of 42 rows is
+            # indistinguishable from a bug that closed rows it should not have.
+            log.info("startup: retired %d attempt row(s) left open on tasks "
+                     "that had already finished", n)
+
     async def _recover_orphans(self, *, startup: bool = True) -> None:
         """Crash/strand recovery. At STARTUP (review 2026-07-25): nothing is
         legitimately in-flight yet, so any mid-run status is an orphan of a
@@ -1056,6 +1077,10 @@ class Scheduler:
         # ticking" against the interval it is SUPPOSED to tick at, rather than
         # against a constant that would be wrong for any other configuration.
         self._poll_interval = float(poll_interval)
+        # BEFORE the orphan sweep: that sweep reads `latest_open_attempt` to
+        # recover a checkpoint, and a row left open on a task that already
+        # FINISHED is not a checkpoint to resume from — it is debris.
+        await self._reconcile_terminal_task_attempts()
         await self._recover_orphans()
         while not stop.is_set():
             await self.tick()
