@@ -1026,7 +1026,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # server — a live process keeps the token it started with.
         "auth_profile": DEFAULT_AUTH_PROFILE,
         "primary_model": "claude-sonnet-5",
-        "review_model": "claude-opus-5",
+        # 2026-08-11, OPERATOR INSTRUCTION ("revert the reviewer to 4.8"): the
+        # Jul-26 move to claude-opus-5 was reverted on overdetermined evidence —
+        # the operator's own same-day A/B scored 4.8 better (15/16 recall + 2/4
+        # specificity vs 14/16 + 0/4), and opus-5-as-reviewer measured 3x round
+        # duration (360s -> ~1078s), ~7x session cost from tool-call sprawl
+        # beginning the day of the switch (2.9 -> 16.4 calls/run; still 13.2
+        # after prompt bounds), and two no-verdict failure flavors (600s wall,
+        # end_turn-without-verdict) that cost tasks their attempts. Confirm with
+        # the recall measurement in eval/ (control set now 10). The README's
+        # published catch-rate was measured on 4.8 and is consistent again.
+        "review_model": "claude-opus-4-8",
         # Wall-clock seconds granted to ONE reviewer session before it is cut
         # off. These are the walls, not budgets: the reviewer is bounded by
         # turns as well, and a round that dies on the wall halves the next one.

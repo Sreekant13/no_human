@@ -631,7 +631,7 @@ def test_the_default_config_still_selects_claude():
     assert DEFAULT_CONFIG["llm"]["codex_cli_path"] is None
     # The four Claude tiers are untouched by this change.
     assert DEFAULT_CONFIG["llm"]["primary_model"] == "claude-sonnet-5"
-    assert DEFAULT_CONFIG["llm"]["review_model"] == "claude-opus-5"
+    assert DEFAULT_CONFIG["llm"]["review_model"] == "claude-opus-4-8"
     assert DEFAULT_CONFIG["llm"]["planner_model"] == "claude-opus-5"
     assert DEFAULT_CONFIG["llm"]["supervisor_model"] == "claude-sonnet-5"
     assert DEFAULT_CONFIG["llm"]["utility_model"] == "claude-haiku-4-5"

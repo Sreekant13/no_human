@@ -194,17 +194,14 @@ on purpose. An earlier version filled it with illustrative numbers next to a rea
 id, which reads as a measurement of that model — exactly the re-attribution this document
 exists to prevent.
 
-**No catch-rate is currently published on any user-facing surface.** The retired 4.8 figure
-is named only in a private maintainer-instruction file and an internal positioning note,
-neither of which is part of this repository's public surface, in both cases in order to
-**forbid** its reuse — which is the opposite of publishing it. (An earlier draft of this
-line said "anywhere in this repo", the same false absolute that was caught and rescoped in
-`README.md`; it was fixed there and left standing here, one file away, in the very document
-the README points at.) The last full measurement
-ran on `claude-opus-4-8`; the shipping reviewer has been `claude-opus-5` since 2026-07-26
-and has not been re-measured, and the one A/B that did run scored Opus 5 lower. Until a
-real run exists, this file holds the METHOD and no number. When one does, publish it with
-denominator, date and model id — never a bare percentage.
+**The shipping reviewer and the measured model are the same again.** The last full measurement
+ran on `claude-opus-4-8`; the shipping reviewer has been `claude-opus-4-8` again since
+2026-08-11 (the 2026-07-26 tier move was reverted by the operator on measured evidence:
+the same-day A/B scored the newer tier lower, and it showed 3x round duration and ~7x
+session cost in production). The historical figure predates the control-set growth from
+4 to 10 cases, so a confirmation run at the current size is scheduled before any number
+returns to a user-facing surface. When one is published, publish it with denominator,
+date and model id — never a bare percentage.
 
 ## Instrument discipline (non-negotiable)
 

@@ -69,7 +69,7 @@ def test_load_config_generates_default(tmp_path):
     cfg = load_config(cfg_path)
     assert cfg_path.exists()
     assert cfg.primary_model == "claude-sonnet-5"
-    assert cfg.review_model == "claude-opus-5"
+    assert cfg.review_model == "claude-opus-4-8"
     assert cfg["approval"]["auto_merge_on_approval"] is False
     # the metered key must never appear anywhere in the generated config
     assert "ANTHROPIC_API_KEY" not in cfg_path.read_text()
@@ -167,7 +167,7 @@ def test_supervisor_has_its_own_model_key():
     llm = DEFAULT_CONFIG["llm"]
     assert llm["supervisor_model"] == "claude-sonnet-5"
     assert llm["primary_model"] == "claude-sonnet-5"
-    assert llm["review_model"] == "claude-opus-5"
+    assert llm["review_model"] == "claude-opus-4-8"
     assert llm["planner_model"] == "claude-opus-5"
 
 

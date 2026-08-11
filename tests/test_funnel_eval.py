@@ -409,7 +409,7 @@ def test_the_shipped_path_wires_a_real_reviewer(tmp_path, monkeypatch):
                     backend_factory=lambda t: _TierBackend(t.name),
                     corpus=corpus)
 
-    assert seen.get("model") == "claude-opus-5", seen
+    assert seen.get("model") == "claude-opus-4-8", seen
 
 
 def test_the_reviewer_model_comes_from_the_runs_own_instance_config(tmp_path):

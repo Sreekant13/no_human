@@ -1791,7 +1791,7 @@ class AdversarialReviewer:
 
         llm = data.get("llm") or {}
         return cls(
-            model=llm.get("review_model") or "claude-opus-5",
+            model=llm.get("review_model") or "claude-opus-4-8",
             backend=backend,
             on_event=on_event,
             timeout=review_timeout_seconds(data),

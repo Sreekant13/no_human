@@ -10154,7 +10154,7 @@ class Orchestrator:
 
         planner_model = self.config.get("llm", {}).get(
             "planner_model",
-            self.config.get("llm", {}).get("review_model", "claude-opus-5"),
+            self.config.get("llm", {}).get("review_model", "claude-opus-4-8"),
         )
         max_turns = plan_cfg.get("max_turns", 10)
 

@@ -11,7 +11,7 @@ changes in code and not here fails the suite.
 |---|---|---|
 | `llm.auth_mode` | `subscription` | `subscription` (OAuth) or `api_key` (your own key) |
 | `llm.primary_model` | `claude-sonnet-5` | The implementer |
-| `llm.review_model` | `claude-opus-5` | The fresh-context reviewer |
+| `llm.review_model` | `claude-opus-4-8` | The fresh-context reviewer |
 | `llm.review_timeout_seconds` | `1500` | Wall-clock seconds one reviewer session gets before it is cut off. Raise it if reviews time out; a review round measured ~1078s (worst 1357s) on the Opus reviewer tier |
 | `llm.code_review_timeout_seconds` | `1800` | The same wall for `code_review` mode, which reads a whole PR diff at twice the gate's cap |
 | `bounds.max_attempts` | `3` | Implement/review cycles in one loop |
@@ -83,7 +83,7 @@ server:
 llm:
   auth_mode: subscription         # subscription (default) | api_key — see auth modes below
   primary_model: claude-sonnet-5  # implementer (coder)
-  review_model: claude-opus-5   # fresh-context reviewer + eval judge (different model)
+  review_model: claude-opus-4-8   # fresh-context reviewer + eval judge (different model)
   review_timeout_seconds: 1500    # wall-clock per review session; a round that
                                   # dies on this wall escalates UNREVIEWED
   code_review_timeout_seconds: 1800  # same, for `nh review` on a whole PR diff
