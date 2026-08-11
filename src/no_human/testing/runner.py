@@ -82,6 +82,15 @@ class TestRunResult:
     invocation_error: bool = False
     failing_tests: list[str] = field(default_factory=list)
     traceback_excerpts: dict[str, str] = field(default_factory=dict)
+    # WHICH tests passed, not how many. `passed` is a COUNT parsed from a
+    # summary line that may belong to another framework entirely (a compound
+    # `node --test … && … pytest …` command reports node's TAP tally), so it
+    # cannot answer "did THIS id run?". Only populated when the output actually
+    # carries pytest's `PASSED <nodeid>` short-summary lines, i.e. when the
+    # command asked for them (`-rA`/`-rP`) — an empty list means "not reported",
+    # never "nothing passed", so every consumer must treat it as evidence that
+    # is present or absent, not as a count.
+    passed_tests: list[str] = field(default_factory=list)
 
     @property
     def summary(self) -> str:
@@ -209,13 +218,85 @@ _PYTEST_FAILED_ID = re.compile(
     r"^(?:FAILED|ERROR)\s+(\S+::\S+?)(?:\s+-.*)?$", re.M)
 
 
+_PYTEST_PASSED_ID = re.compile(r"^PASSED\s+(\S+::\S+?)\s*$", re.M)
+
+# 🔴 THE ONLY PART OF THE OUTPUT THE TESTS THEMSELVES CANNOT WRITE.
+# Everything above this bar — the FAILURES blocks, and under `-rA` the PASSES
+# blocks with each passing test's `Captured stdout call` echoed verbatim — is
+# text the code under test can author. A test containing
+# `print("PASSED tests/test_x.py::test_x")` puts a line matching
+# `_PYTEST_PASSED_ID` at column 0 in that echo (verified against real output),
+# so an unanchored scan hands the change under test a way to MINT identities
+# for tests that never ran, and `_flaky_on_rerun`'s identity accounting — the
+# whole point of which is that only pytest may say what ran — would believe it.
+# Anchoring to the LAST bar also defeats a forged bar line, because captured
+# stdout is always printed before the real summary section — the same ordering
+# assumption, with the same atexit-output caveat, that `_PYTEST_SUMMARY_LINE`
+# already rests on.
+_SHORT_SUMMARY_BAR = re.compile(r"^=+ short test summary info =+\s*$", re.M)
+
+
+def _short_summary_section(output: str) -> str | None:
+    """The text after the LAST ``short test summary info`` bar, or None if the
+    run printed no such section (``-rN``, ``--no-summary``, or a green run with
+    no ``-r`` flags — pytest prints the bar for failures by default, including
+    under ``-q``, ``--tb=no`` and xdist; verified per-flag)."""
+    last = None
+    for m in _SHORT_SUMMARY_BAR.finditer(output):
+        last = m
+    return None if last is None else output[last.end():]
+
+
+def _pytest_passed_tests(output: str) -> list[str]:
+    """Extract PASSING test node ids from pytest's short test summary info
+    (``PASSED path::test``), which pytest only prints when asked (``-rA`` /
+    ``-rP``). Ordered, de-duplicated; empty when the run did not report them.
+
+    The twin of `_pytest_failing_tests`, and it exists for the same reason
+    that one does: a count cannot name anything. ``passed`` is parsed from a
+    summary line whose framework is guessed (`_parse_test_output`), so on a
+    compound command it can be some other runner's tally — a caller asking
+    "did this specific id run and pass?" must have the ids, and only these
+    lines carry them. SKIPPED/XFAIL lines are deliberately not matched: they
+    do not carry a node id in this section, and neither is a pass.
+
+    Read STRICTLY from the summary section: no section, no names. This one
+    grants passes, so an unanchored read would be fail-OPEN — see the bar
+    comment above.
+    """
+    section = _short_summary_section(output)
+    if section is None:
+        return []
+    seen: list[str] = []
+    for m in _PYTEST_PASSED_ID.finditer(section):
+        name = m.group(1)
+        if name not in seen:
+            seen.append(name)
+    return seen
+
+
 def _pytest_failing_tests(output: str) -> list[str]:
     """Extract failing/erroring test node ids from pytest's short test summary
     info section (``FAILED path::test - reason`` / ``ERROR path::test -
     reason``). Ordered, de-duplicated. Without this the gate's failure event
-    carried only a bare count — the failing test(s) were never named."""
+    carried only a bare count — the failing test(s) were never named.
+
+    Read from the summary section when there is one, for the same
+    anti-forgery reason as `_pytest_passed_tests` — this direction is
+    fail-CLOSED (a phantom failure only ever bills more), so it is hardening
+    rather than a fix, and it retires the printed-`FAILED` half of the
+    phantom class the 2026-07-25 `::` guard above only narrowed.
+
+    The unanchored FALLBACK stays for runs with no section at all (`-rN`,
+    `--no-summary`): there the whole-output scan is the only source of names,
+    and losing them would strip the failing tests out of the PR body and out
+    of the base-tree attribution — a real regression in exchange for closing
+    a direction that cannot manufacture a pass.
+    """
+    section = _short_summary_section(output)
+    scan = output if section is None else section
     seen: list[str] = []
-    for m in _PYTEST_FAILED_ID.finditer(output):
+    for m in _PYTEST_FAILED_ID.finditer(scan):
         name = m.group(1)
         if name not in seen:
             seen.append(name)
@@ -878,6 +959,9 @@ def run_tests(
         return TestRunResult(True, False, 0, 0, 1, cmd, f"timed out after {timeout}s")
     passed, failed, errors = _parse_test_output(cmd, output)
     failing_tests = _pytest_failing_tests(output)
+    # Parsed off the FULL captured output, like the failing ids above — the
+    # [-8000:] tail each result carries below would drop most of an -rA summary.
+    passed_tests = _pytest_passed_tests(output)
     ok = rc == 0
     if not ok and failed == 0 and errors == 0 and not failing_tests and _is_teardown_race(output):
         # INFRA, not a coder-bug: the tests already passed (the anchored
@@ -905,10 +989,12 @@ def run_tests(
             # list nothing could fill.
             return TestRunResult(True, False, passed_r, failed_r, errors_r,
                                  cmd, output_r[-8000:], invocation_error=True,
-                                 failing_tests=_pytest_failing_tests(output_r))
+                                 failing_tests=_pytest_failing_tests(output_r),
+                                 passed_tests=_pytest_passed_tests(output_r))
         failing_tests_r = _pytest_failing_tests(output_r)
         return TestRunResult(True, rc_r == 0, passed_r, failed_r, errors_r,
                              cmd, output_r[-8000:], failing_tests=failing_tests_r,
+                             passed_tests=_pytest_passed_tests(output_r),
                              traceback_excerpts=_pytest_traceback_excerpts(output_r, failing_tests_r))
     if not ok and _is_invocation_error(rc, output, passed, failed, errors):
         retry_cmd = _fix_invocation(cmd, output, repo_path)
@@ -928,18 +1014,21 @@ def run_tests(
                 return TestRunResult(True, False, passed2, failed2, errors2,
                                      retry_cmd, output2[-8000:],
                                      invocation_error=True,
-                                     failing_tests=_pytest_failing_tests(output2))
+                                     failing_tests=_pytest_failing_tests(output2),
+                                     passed_tests=_pytest_passed_tests(output2))
             failing_tests2 = _pytest_failing_tests(output2)
             return TestRunResult(True, ok2, passed2, failed2, errors2,
                                  retry_cmd, output2[-8000:],
                                  failing_tests=failing_tests2,
+                                 passed_tests=_pytest_passed_tests(output2),
                                  traceback_excerpts=_pytest_traceback_excerpts(output2, failing_tests2))
         # No fixable retry — mark as invocation error
         return TestRunResult(True, False, passed, failed, errors,
                              cmd, output[-8000:], invocation_error=True,
-                             failing_tests=failing_tests)
+                             failing_tests=failing_tests,
+                             passed_tests=passed_tests)
     return TestRunResult(True, ok, passed, failed, errors, cmd, output[-8000:],
-                         failing_tests=failing_tests,
+                         failing_tests=failing_tests, passed_tests=passed_tests,
                          traceback_excerpts=_pytest_traceback_excerpts(output, failing_tests))
 
 

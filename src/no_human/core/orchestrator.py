@@ -3889,40 +3889,83 @@ class Orchestrator:
                             },
                         )
                     else:
-                        is_stuck = stuck.record(test_result.output)
                         # Name the NEWLY-failing ids when the base check isolated
                         # them (mixed run); otherwise (None → inconclusive/
                         # fail-closed) fall back to all failing ids, byte-for-byte
                         # the prior message.
                         attributed = newly_failing or failing_tests
-                        detail = f"tests failed: {test_result.summary}"
-                        if attributed:
-                            detail += " — " + ", ".join(attributed)
-                        if newly_failing:
-                            detail += " (newly failing vs the base tree)"
-                        if is_stuck:
-                            self.emit("stuck", "same failure signature repeated; resetting context")
-                        # Same ordering rule as the layered path: note before excerpt.
-                        stuck_note = stuck.stuck_reason
-                        if stuck_note:
-                            detail += f" — {stuck_note}"
-                        elif is_stuck:
-                            detail += " — same failure signature repeated across attempts"
-                        # Show tracebacks only for the ids we actually blame the
-                        # change for: on a mixed run the excerpt must not carry a
-                        # pre-existing failure's traceback, or it would contradict
-                        # the attribution line above. When the base check was
-                        # inconclusive (newly_failing is None → all ids blamed)
-                        # keep the full block, byte-for-byte the prior behaviour.
-                        excerpts = getattr(test_result, "traceback_excerpts", {}) or {}
-                        if newly_failing:
-                            keep = set(newly_failing)
-                            excerpts = {k: v for k, v in excerpts.items() if k in keep}
-                        excerpt_block = runner.render_traceback_excerpts(excerpts)
-                        if excerpt_block:
-                            detail += "\n" + excerpt_block
-                        await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
-                        return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
+                        # ONE more piece of evidence before we bill the attempt.
+                        # The base check reads ONE run of the base tree, so for a
+                        # LOAD-DEPENDENT flake it is a coin flip: base happened to
+                        # pass → the id lands here as "newly failing" and the coder
+                        # is charged for a failure it did not cause. The tiebreaker
+                        # that does not depend on which tree got lucky is the
+                        # CHANGE tree itself — see `_flaky_on_rerun`: the ids on
+                        # their own, then the whole suite again, both here.
+                        flaky = await self._flaky_on_rerun(
+                            repo, test_cmd, attributed, cwd=test_cwd,
+                        )
+                        # The helper answers all-or-nothing by construction. This
+                        # re-checks the coverage anyway so that a future partial
+                        # answer BILLS rather than silently excusing the rest —
+                        # fail-closed is a property of the call site too.
+                        if flaky and not [t for t in attributed if t not in set(flaky)]:
+                            # Every id we were about to bill went green on the
+                            # re-run. Same excuse shape as the pre-existing block
+                            # above: the attempt is NOT failed, and the reason is
+                            # on the record in BOTH the event stream and
+                            # `test_results` — an excuse nobody can see is a
+                            # silent pass, the one thing this path must never be.
+                            note = (
+                                "tests failed, then passed on an identical "
+                                "bounded re-run — flaky on this tree, not "
+                                "attributed to this change: " + ", ".join(flaky)
+                            )
+                            self.emit("tests", note, ok=True,
+                                      failing_tests=failing_tests,
+                                      flaky_excused=flaky)
+                            await self.store.update_attempt(
+                                attempt_id,
+                                test_results={
+                                    "ran": test_result.ran, "ok": test_result.ok,
+                                    "passed": test_result.passed,
+                                    "failed": test_result.failed,
+                                    "errors": test_result.errors,
+                                    "tamper_flag": False,
+                                    "failing_tests": failing_tests,
+                                    "flaky_excused": flaky,
+                                },
+                            )
+                        else:
+                            is_stuck = stuck.record(test_result.output)
+                            detail = f"tests failed: {test_result.summary}"
+                            if attributed:
+                                detail += " — " + ", ".join(attributed)
+                            if newly_failing:
+                                detail += " (newly failing vs the base tree)"
+                            if is_stuck:
+                                self.emit("stuck", "same failure signature repeated; resetting context")
+                            # Same ordering rule as the layered path: note before excerpt.
+                            stuck_note = stuck.stuck_reason
+                            if stuck_note:
+                                detail += f" — {stuck_note}"
+                            elif is_stuck:
+                                detail += " — same failure signature repeated across attempts"
+                            # Show tracebacks only for the ids we actually blame the
+                            # change for: on a mixed run the excerpt must not carry a
+                            # pre-existing failure's traceback, or it would contradict
+                            # the attribution line above. When the base check was
+                            # inconclusive (newly_failing is None → all ids blamed)
+                            # keep the full block, byte-for-byte the prior behaviour.
+                            excerpts = getattr(test_result, "traceback_excerpts", {}) or {}
+                            if newly_failing:
+                                keep = set(newly_failing)
+                                excerpts = {k: v for k, v in excerpts.items() if k in keep}
+                            excerpt_block = runner.render_traceback_excerpts(excerpts)
+                            if excerpt_block:
+                                detail += "\n" + excerpt_block
+                            await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
+                            return TaskOutcome(task, status=TaskStatus.FAILED, detail=detail)
 
         # --- CI (if configured): push branch first, then trigger pipeline ---
         if self.ci_runner is None:
@@ -6265,6 +6308,175 @@ class Orchestrator:
             with contextlib.suppress(Exception):
                 repo._run("worktree", "remove", "--force", str(wt_dir))
             shutil.rmtree(wt_dir, ignore_errors=True)
+
+    async def _flaky_on_rerun(
+        self, repo: GitRepo, test_cmd: str | None, attributed: list[str],
+        cwd: "Path | None" = None,
+    ) -> list[str] | None:
+        """Are ALL of *attributed* (about to be billed) flaky rather than broken?
+
+        WHY THIS EXISTS. `_newly_failing_vs_base` decides attribution from ONE
+        run of the base tree. For a LOAD-DEPENDENT flake that run is a COIN
+        FLIP, and the coin decides who pays: base happened to pass → the id
+        reads NEWLY failing and the attempt is billed for a failure the coder
+        did not cause; base happened to fail → the same id, on the same task, is
+        excused as pre-existing. Measured on the live system: 17 real tasks lost
+        attempt 1 of max_attempts=3 to this, one of them blamed on attempt 1 and
+        excused on attempt 4 for the identical test.
+
+        TWO STAGES, because a bounded re-run alone cannot tell a flake from
+        SUITE-ONLY POLLUTION the change introduced (import-time `os.environ`
+        mutation in a new module, a global left dirty by a new test): both look
+        like "red in the suite, green on its own", and the second is squarely
+        the change's fault.
+
+          1. PRE-FILTER — the resolved command with the attributed ids appended
+             (`shlex`-quoted), run in ``repo.path`` with the original ``cwd``.
+             Cheap, and it is only ever allowed to REFUSE, never to excuse: any
+             attributed id red again → the change's, bill it; anything
+             unaccounted → ``None``.
+          2. PROOF — only if every attributed id came back green: ONE run of the
+             UNBOUNDED original command, same cwd, same ``source_repo``, i.e.
+             the exact scope the failure was observed at. Green there, or red
+             with none of the attributed ids among the failures → flaky at the
+             observed scope → excused. Any attributed id red again → determin-
+             istic at suite scope → billed. COST: a full suite run, paid only on
+             the rare path where the bounded stage already cleared every id.
+             That is the price of not excusing deterministic pollution, and it
+             buys an outcome change (fail → not-fail); nothing else here does.
+
+        Both stages run through ``runner.run_tests`` with ``source_repo`` set
+        exactly as `_run_tests_once` sets it, so the re-run imports the
+        WORKTREE's ``src/`` and not the primary checkout's (the editable install
+        resolves to main — SCRUM-18). Without it a re-run "proves" things about
+        main's code and excuses genuinely broken changes for path reasons.
+
+        ACCOUNTING IS BY IDENTITY, NEVER BY COUNT, on BOTH stages. ``passed`` is
+        a number off a summary line whose framework `_parse_test_output` GUESSES
+        — for a command carrying positional paths (``pytest -q tests/``, the
+        documented shape of `profile.integration_test_cmd`) it counts unrelated
+        tests, and for a compound command (``node --test … && uv run pytest …``)
+        it is node's TAP tally. Combined with the project's own ``addopts = -x``,
+        an unrelated green test could satisfy a counting guard while the
+        attributed id never ran at all, and an ALWAYS-RED test was excused as
+        flaky. So each stage must see every attributed id BY NAME in that run's
+        ``passed_tests``/``failing_tests``, or it answers nothing. This is also
+        why the compound route needs no special case: TAP output carries no
+        pytest ``PASSED`` lines, the subset check fails, and it bills.
+
+        Hence ``-rA``, appended to both commands. It is a REPORTING flag: it
+        changes which result lines pytest prints in its short summary, and
+        nothing about selection, ordering, parallelism or exit status. The set
+        of tests that run is byte-identical with and without it, so stage 2's
+        "same command, same scope" claim survives it — scope means WHICH TESTS
+        RUN, and that is exactly what ``-rA`` leaves alone. (This is the test
+        `--maxfail=0` fails: that flag changes how many tests run.)
+
+        Returns ALL of *attributed* (the caller excuses them together and
+        records them as ``flaky_excused``) or ``None``. It is deliberately
+        all-or-nothing: a partial split would excuse ids on bounded evidence
+        alone, which is the very thing stage 2 exists to refuse. ``None`` means
+        INCONCLUSIVE-or-billed and excuses nothing — no ids, a command whose ids
+        cannot be bounded (not pytest-shaped), a run that did not run / errored
+        its invocation / came back red with no parseable ids, a run the runner
+        SUBSTITUTED a different command for (`runner._fix_invocation` answers
+        "unrecognized arguments" by dropping the node ids and running the FULL
+        suite — that verdict is not the bounded one we asked for), any
+        attributed id that did not RUN (`-x` / `--maxfail` / `-k` / `-m`
+        truncation or deselection, from the command or the project's own
+        `addopts`; also a SKIP, which is not a pass), or any exception.
+        Fail-closed, the same doctrine as the base check: never turn a real
+        failure into a pass on an undeterminable verdict.
+
+        Stage 2 can excuse while OTHER ids are red in its run, and that is
+        deliberate: those ids did not fail the run this attempt is being billed
+        for, so they are not what is under attribution here. The question asked
+        is only ever "do the ids we are about to charge for reproduce at the
+        scope they were observed at" — a suite that is red for some third reason
+        answers it just as well as a green one.
+        """
+        import shlex
+
+        if not attributed:
+            return None
+        # Only pytest node ids (`path::test`) can be bounded by appending them to
+        # the command — mirrors `_newly_failing_vs_base`, so we never append node
+        # ids to `npm test`. Anything else is inconclusive → fail-closed.
+        cmd = test_cmd or runner.detect_command(Path(repo.path))
+        if not cmd or "pytest" not in cmd.lower():
+            return None
+        # Identical to `_run_tests_once`'s: the worktree's own src/ must lead on
+        # PYTHONPATH, and forced build artifacts must be materialized, or this
+        # re-run silently tests the primary checkout.
+        primary = self._primary_repo_path(repo.path)
+        source_repo = Path(primary) if primary else None
+
+        async def _rerun(command: str) -> "runner.TestRunResult | None":
+            """Run *command* and return it only if it is a usable verdict.
+
+            Deliberately NOT `_run_tests_once`: that reuses this attempt's
+            cached result for the same commit, which is the very run we are
+            trying to get a second opinion on.
+            """
+            try:
+                res = await asyncio.to_thread(
+                    runner.run_tests, repo.path, command, cwd=cwd,
+                    source_repo=source_repo,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("flaky re-run failed: %s", exc)
+                return None
+            if not res.ran or res.invocation_error:
+                return None
+            # The runner retries a bad invocation with a REWRITTEN command
+            # (dropping our node ids, widening to the whole repo). Its answer is
+            # honest, but it is not the answer to the question we asked.
+            if getattr(res, "command", command) != command:
+                log.warning("flaky re-run: runner substituted a command (%s); "
+                            "verdict discarded", res.command)
+                return None
+            # Red with no names: there is no per-id verdict, and reading "not in
+            # the failing set" as "passed" would manufacture an excuse out of it.
+            if not res.ok and not (res.failing_tests or []):
+                return None
+            return res
+
+        wanted = set(attributed)
+
+        def _all_green(res: "runner.TestRunResult") -> bool:
+            """Did EVERY attributed id run, and pass, in *res*?
+
+            Identity, not arithmetic (see the docstring): each id must appear
+            by name in this run's reported passes, and none among its failures.
+            An id that is in neither did not run — truncated, deselected or
+            skipped — and a run that could not report names at all (a compound
+            command's TAP output has no pytest `PASSED` lines) reports nothing
+            about any of them. Both are "we know nothing" → not green.
+            """
+            reported = set(res.passed_tests or []) | set(res.failing_tests or [])
+            if not wanted <= reported:
+                return False
+            return not (wanted & set(res.failing_tests or []))
+
+        # `-rA` asks pytest to name every outcome in its short summary. It is
+        # the only way to learn WHICH ids ran, and it is reporting-only: the set
+        # of tests that run is unchanged, which is what lets stage 2 still claim
+        # the same scope as the original failure.
+        report = " -rA"
+        # --- stage 1: bounded pre-filter -----------------------------------
+        bounded_cmd = (cmd + report + " "
+                       + " ".join(shlex.quote(t) for t in attributed))
+        result = await _rerun(bounded_cmd)
+        if result is None or not _all_green(result):
+            # Red again → the change's, bill it. Unaccounted → we never asked
+            # the question → bill it too. Same outcome, deliberately: this stage
+            # may only refuse.
+            return None
+        # --- stage 2: proof at the scope the failure was observed at --------
+        suite = await _rerun(cmd + report)
+        if suite is None or not _all_green(suite):
+            return None  # deterministic at suite scope, or unproven → billed
+        return list(attributed)
 
     async def _run_tests_once(
         self, repo: GitRepo, test_cmd: str | None, cwd: "Path | None" = None,
