@@ -429,7 +429,7 @@ class GitRepo:
         return out or None
 
     def push(self, branch: str | None = None, *, remote: str = "origin",
-             set_upstream: bool = True) -> str:
+             set_upstream: bool = True, force_with_lease: bool = False) -> str:
         """Push ``branch`` to ``remote`` and return the SHA that was pushed.
 
         Resolved from the branch ref right BEFORE the push runs — not from
@@ -441,12 +441,46 @@ class GitRepo:
         landed PR got reported "lost": the receipt check compared the PR's
         head against a re-resolved `repo.head_sha()` that had drifted to
         main's tip, not the commit this push actually sent.
+
+        ``force_with_lease`` exists for ONE caller: a delivery retry whose plain
+        push was rejected non-fast-forward because the agent REBASED its own
+        already-pushed branch. That is not a corner case — `git reflog` on a
+        stranded branch reads ``rebase (finish): refs/heads/no-human/<id> onto
+        <new main>``, and `agent/guard.py` deliberately permits that rebase as
+        "the legitimate rebase/merge base into my branch workflow". A rebased
+        branch cannot be fast-forwarded; force is the ONLY correct push, and
+        without it the attempt's reviewed, green work is thrown away. Measured
+        2026-08-11: 81 rejections in one week, and 0 of the 7 tasks that ever
+        hit one reached `done`.
+
+        Two safety properties, both load-bearing:
+
+        * The protected-branch check above runs FIRST and is untouched, so this
+          can never force main/master/release — constraint #2 is unaffected.
+        * The lease is judged against the remote-tracking ref, and there must
+          be NO fetch of that ref beforehand. The tracking ref records the
+          remote as of our last contact — the push earlier in this same
+          attempt. If the remote still matches it, only OUR own rebase moved
+          the branch and the force is safe; if it does not (someone else
+          pushed — a human fixup, another attempt), git refuses with
+          ``stale info`` and that refusal reaches the caller as the ordinary
+          push failure, which the delivery retry escalates honestly. A fetch
+          here would refresh the tracking ref to the remote's current value,
+          making the comparison always match — the lease degrades to a plain
+          ``--force`` and would destroy exactly the commit it exists to
+          protect. Proven both ways by tests: the benign own-rebase delivers,
+          the unseen third-party commit is refused, and a missing tracking
+          ref refuses rather than guesses.
         """
         branch = branch or self.current_branch()
         if _branch_protected(branch, self.never_push_to):
             raise ProtectedBranch(f"refusing to push protected branch: {branch}")
         sha = self._run("rev-parse", branch)
         args = ["push"]
+        if force_with_lease:
+            # NO fetch here — see the docstring: refreshing the tracking ref
+            # is what would make the lease vacuous.
+            args += ["--force-with-lease"]
         if set_upstream:
             args += ["-u"]
         args += [remote, branch]

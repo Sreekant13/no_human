@@ -41,8 +41,14 @@ def open_pr(
     github_hosts: list[str] | None = None,
     labels: list[str] | None = None,
     update_existing_body: bool = False,
+    force_with_lease: bool = False,
 ) -> PrResult:
     """Push the branch and open a PR/MR against the detected remote.
+
+    ``force_with_lease`` is passed straight to ``GitRepo.push`` and is set by
+    exactly one caller — the delivery retry after a non-fast-forward rejection.
+    See ``GitRepo.push`` for why a rebased agent branch cannot be delivered any
+    other way, and why the protected-branch refusal is unaffected.
 
     ``github_hosts`` lists extra GitHub Enterprise hosts (from ``git.github_hosts``)
     so a GHE remote like code.example.com is recognized as GitHub.
@@ -69,7 +75,7 @@ def open_pr(
             "GitHub Enterprise instance."
         )
 
-    pushed_sha = repo.push(branch)
+    pushed_sha = repo.push(branch, force_with_lease=force_with_lease)
     if is_github:
         return PrResult(github.open_pr(repo.path, branch, title, body, base=base,
                                        labels=labels,

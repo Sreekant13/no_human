@@ -661,3 +661,137 @@ def test_coder_touched_non_code_files_flagged_as_leftovers(repo_with_bare_remote
         coder_touched={"Dockerfile"})
     assert "Dockerfile" in flagged
     assert "alert-state.json" not in flagged
+
+
+# --------------------------------------------------------------------------
+# DELIVERY: a rebased branch cannot fast-forward, and that stranded real work.
+#
+# Reproduces the measured incident (2026-08-11). `git reflog` on a stranded
+# branch read:
+#     rebase (finish): refs/heads/no-human/fd53d187-2 onto <new main>
+#     commit: ...                                  <- already PUSHED
+# The agent rebases its own pushed branch (agent/guard.py permits this as the
+# legitimate "rebase base into my branch" workflow), so `_finalize`'s plain
+# `git push -u` is rejected non-fast-forward. The attempt held a PASSING review
+# and a green suite and was escalated anyway. 81 rejections in one week; 0 of
+# the 7 tasks that ever hit one reached `done`.
+# --------------------------------------------------------------------------
+
+def _rebased_pushed_branch(work):
+    """Push a branch, then rebase it onto a moved main — the incident's shape."""
+    repo = GitRepo(work, identity_name="no_human", identity_email="a@b.invalid")
+    repo.create_branch("no-human/t1")
+    (work / "feature.py").write_text("y = 1\n")
+    repo.commit_all("the work")
+    repo.push("no-human/t1")                      # delivered, remote holds this
+    _git(work, "checkout", "main")
+    (work / "other.py").write_text("z = 1\n")     # main moves under the branch
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "main moves on")
+    _git(work, "checkout", "no-human/t1")
+    _git(work, "rebase", "main")                  # rewrites the pushed commit
+    return repo
+
+
+def test_a_rebased_branch_cannot_be_delivered_by_a_plain_push(repo_with_bare_remote):
+    """The incident's shape, pinned: a plain push of a rebased branch is
+    rejected. True before and after the fix — this is the failure the retry
+    detects, not a behaviour the fix changes."""
+    repo = _rebased_pushed_branch(repo_with_bare_remote)
+    with pytest.raises(Exception) as exc:
+        repo.push("no-human/t1")
+    assert "rejected" in str(exc.value).lower()
+
+
+def test_force_with_lease_delivers_the_rebased_branch(repo_with_bare_remote):
+    """The fix: the same push succeeds, and the remote ends at OUR commit."""
+    repo = _rebased_pushed_branch(repo_with_bare_remote)
+    local = repo._run("rev-parse", "no-human/t1")
+    pushed = repo.push("no-human/t1", force_with_lease=True)
+    assert pushed == local
+    remote = subprocess.run(
+        ["git", "ls-remote", "origin", "refs/heads/no-human/t1"],
+        cwd=repo_with_bare_remote, capture_output=True, text=True, check=True,
+    ).stdout.split()[0]
+    assert remote == local, "the remote did not end at the branch we pushed"
+
+
+def test_force_with_lease_still_refuses_a_protected_branch(repo_with_bare_remote):
+    """The protection check runs BEFORE the force flag is ever consulted, so
+    the escape hatch can never reach main — constraint #2 is unaffected."""
+    repo = GitRepo(repo_with_bare_remote, never_push_to=["main"])
+    with pytest.raises(ProtectedBranch):
+        repo.push("main", force_with_lease=True)
+
+
+# The detector decides whether a retry may FORCE-push, so a false positive is a
+# force-push on an unrelated error. It must key on git's rejection vocabulary,
+# not on the word "rejected" alone — protection refusals and auth failures both
+# contain it.
+@pytest.mark.parametrize("msg,expected", [
+    ("! [rejected] no-human/t1 -> no-human/t1 (non-fast-forward)", True),
+    ("! [rejected] main -> main (fetch first)", True),
+    ("refusing to push protected branch: main", False),
+    ("remote: Permission to org/repo.git denied; push rejected", False),
+    ("fatal: could not read Username: terminal prompts disabled", False),
+    ("error: failed to push some refs", False),
+    ("", False),
+])
+def test_only_a_real_non_fast_forward_earns_a_force_push(msg, expected):
+    from no_human.core.orchestrator import _is_non_fast_forward
+    assert _is_non_fast_forward(RuntimeError(msg)) is expected
+
+
+def _remote_tip(bare_root, branch="no-human/t1"):
+    return subprocess.run(
+        ["git", "ls-remote", str(bare_root), f"refs/heads/{branch}"],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()[0]
+
+
+def test_the_lease_refuses_a_commit_we_have_never_seen(repo_with_bare_remote, tmp_path):
+    """THE property the lease exists for: someone else moved the branch since
+    our last contact — a human fixup via the revision flow, another attempt,
+    anything. The push must be REFUSED (git's ``stale info``), never delivered,
+    and the third party's commit must survive on the remote. The refusal
+    surfaces as the ordinary push failure, so the delivery retry's second
+    failure escalates honestly instead of destroying work.
+
+    Regression test for the 2026-08-11 review finding: a pre-push fetch of the
+    branch refreshed the very remote-tracking ref the lease is judged against,
+    making the lease vacuous — equivalent to a plain ``--force`` — and this
+    exact scenario silently destroyed the third party's commit.
+    """
+    repo = _rebased_pushed_branch(repo_with_bare_remote)
+    bare = tmp_path / "remote.git"
+    intruder = tmp_path / "intruder"
+    subprocess.run(["git", "clone", "-q", str(bare), str(intruder)],
+                   check=True, capture_output=True)
+    _git(intruder, "config", "user.email", "h@example.com")
+    _git(intruder, "config", "user.name", "h")
+    _git(intruder, "checkout", "no-human/t1")
+    (intruder / "human_fixup.py").write_text("fix = 1\n")
+    _git(intruder, "add", "-A")
+    _git(intruder, "commit", "-m", "human fixup on the PR branch")
+    _git(intruder, "push", "origin", "no-human/t1")
+    theirs = _remote_tip(bare)
+
+    with pytest.raises(Exception) as exc:
+        repo.push("no-human/t1", force_with_lease=True)
+    assert "rejected" in str(exc.value).lower() or "stale" in str(exc.value).lower()
+    assert _remote_tip(bare) == theirs, (
+        "the third party's commit was destroyed — the lease did not protect it")
+
+
+def test_the_lease_without_a_tracking_ref_refuses_rather_than_guesses(
+        repo_with_bare_remote, tmp_path):
+    """A fresh checkout with no remote-tracking ref for the branch has no basis
+    for a lease. The push must refuse (an honest escalation upstream), never
+    silently force over whatever the remote holds."""
+    repo = _rebased_pushed_branch(repo_with_bare_remote)
+    _git(repo_with_bare_remote, "update-ref", "-d",
+         "refs/remotes/origin/no-human/t1")
+    before = _remote_tip(tmp_path / "remote.git")
+    with pytest.raises(Exception):
+        repo.push("no-human/t1", force_with_lease=True)
+    assert _remote_tip(tmp_path / "remote.git") == before

@@ -161,6 +161,25 @@ AGGREGATOR_ROLE = "aggregator"
 REVIEWER_ROLE = "reviewer"
 
 
+def _is_non_fast_forward(exc: BaseException) -> bool:
+    """Is this push failure a non-fast-forward rejection?
+
+    Module-level so it is testable without an Orchestrator, and deliberately
+    NARROW: it decides whether a retry may force-push, so anything it matches by
+    accident becomes a force-push on a real error. It requires git's own
+    rejection vocabulary, not merely the word "rejected" — a protected-branch
+    refusal, an auth failure and a dead remote all say "rejected" somewhere and
+    none of them may force.
+
+    Both spellings are git's: `! [rejected] ... (non-fast-forward)` from a plain
+    push, and `(fetch first)` when the remote has commits the local ref lacks.
+    """
+    text = str(exc).lower()
+    if "rejected" not in text:
+        return False
+    return "non-fast-forward" in text or "fetch first" in text
+
+
 def repro_send_back_message(detail: str) -> str:
     """What a coder reads AFTER the repro gate already cost it an attempt.
 
@@ -4226,9 +4245,28 @@ class Orchestrator:
             # idempotent on GitHub (already-exists returns the existing URL),
             # GitLab refuses a duplicate MR loudly, and re-pushing an
             # up-to-date branch is a no-op — the retry cannot double-open.
+            # A non-fast-forward rejection is NOT transient, and retrying the
+            # identical call is guaranteed to fail again — which is exactly what
+            # happened: the retry below re-issued the same push and the task then
+            # escalated "opening PR failed twice" while holding a PASSING review
+            # and a green suite. Measured 2026-08-11: 81 rejections in W32 and
+            # 0 of the 7 tasks that ever hit one reached `done`.
+            #
+            # The cause is not a race. `git reflog` on a stranded branch reads
+            # `rebase (finish): refs/heads/no-human/<id> onto <new main>` — the
+            # AGENT rebased its own already-pushed branch, which `agent/guard.py`
+            # deliberately permits as the legitimate "rebase base into my branch"
+            # workflow. A rebased branch cannot fast-forward; force is the only
+            # correct push. Scoped to THIS branch (never protected — `push`
+            # refuses those first) and to THIS rejection, so no other path can
+            # acquire it.
+            forced = _is_non_fast_forward(exc)
             self.emit("pr_open_retry",
                       f"PR open failed ({exc}); retrying in "
-                      f"{self.PR_OPEN_RETRY_DELAY}s")
+                      f"{self.PR_OPEN_RETRY_DELAY}s"
+                      + (" with --force-with-lease: the branch was rebased after "
+                         "it was pushed, so a fast-forward is impossible"
+                         if forced else ""))
             await asyncio.sleep(self.PR_OPEN_RETRY_DELAY)
             try:
                 # 🔴 THE RETRY MUST CARRY THE SAME KWARG. It omitted it, and 0a makes
@@ -4239,7 +4277,8 @@ class Orchestrator:
                 pr = open_pr(repo, branch, title, body, base=base,
                              github_hosts=self.config.get("git", {}).get("github_hosts"),
                              labels=pr_labels,
-                             update_existing_body=may_refresh_body)
+                             update_existing_body=may_refresh_body,
+                             force_with_lease=forced)
             except Exception as exc2:  # noqa: BLE001
                 return await self._escalate(
                     task, f"opening PR failed twice: {exc2}", repo=repo, branch=branch)
