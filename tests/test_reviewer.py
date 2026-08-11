@@ -12,7 +12,11 @@ from no_human.core.task import Task
 from no_human.review.reviewer import (
     AdversarialReviewer,
     ReviewDecision,
+    _AUX_CAP,
     _NO_VERDICT_LABEL,
+    _READ_BUDGET_CALLS,
+    _SECTION_TRUNCATED,
+    _build_already_satisfied_prompt,
     _build_code_review_prompt,
     _build_review_prompt,
     _full_file_context,
@@ -416,6 +420,164 @@ def test_prompt_without_tools_keeps_the_no_tools_policy():
     prompt = _build_review_prompt(t, "diff", "tests", "", allow_tools=False)
     assert "Do NOT read any files" in prompt
     assert "MUST: before asserting" not in prompt
+
+
+# --------------------------------------------------------------------------- #
+# Bounded reviewer inputs (W29 cost regression, 2026-08-11)                    #
+#                                                                              #
+# Measured driver: the reviewer session's TOOL CALLS per run went 2.9 (mean,   #
+# ISO week 29 = Jul 20-26, n=152) to 16.4 (Aug 10-11, n=122), 98% of them      #
+# Bash. Cache-read is `turns x context`, so that is the 7x. The assembled      #
+# prompt template grew only 5,137 -> 8,685 chars over the same period (~890    #
+# tokens, ~1.8% of the W29 per-attempt cache-creation figure) and is NOT the   #
+# driver. These tests pin the two bounds added in response.                    #
+# --------------------------------------------------------------------------- #
+
+def test_tooled_gate_prompt_states_the_read_budget_and_what_is_already_gathered():
+    """The driver fix: the reviewer is told the evidence it keeps re-deriving is
+    already in front of it, and what a normal review costs."""
+    t = Task.new("Fix bug")
+    prompt = _build_review_prompt(t, "diff", "tests", "")
+    assert "READING SCOPE" in prompt
+    assert "already" in prompt.lower()
+    assert str(_READ_BUDGET_CALLS) in prompt
+
+
+#: What the READING SCOPE enumeration may say about each conditional section,
+#: and the raw input whose presence licenses saying it. Four of these five
+#: sections are routinely ABSENT — full-files is whole-file-or-nothing under
+#: `_FILES_CAP` (this repo's own `reviewer.py` and `orchestrator.py` are both
+#: over it and get omitted), `held_out_output` is "" when no held-out suite ran,
+#: and lint/wiring are "" on a repo with no ruff config and on their advisory
+#: except-paths. A prompt that claims them unconditionally tells the GATE — the
+#: one component whose entire value is evidence-based judgement — that evidence
+#: is in front of it when it is not, and then contradicts itself 15k chars later
+#: with files_section's own "read them with your tools" note.
+_SCOPE_CLAIMS = {
+    "full_files": "full text of the changed files",
+    "test_output": "the test run's output",
+    "held_out_output": "the held-out test output",
+    "lint_evidence": "the lint findings",
+    "wiring_evidence": "the wiring findings",
+}
+
+
+def _scope_block(prompt: str) -> str:
+    """The enumeration half of the block, WHITESPACE-COLLAPSED.
+
+    The prompt is hard-wrapped, so a claim can straddle a newline ("the full\\n
+    text of the changed files"). Matching the raw text let the static-string
+    version pass one case of the test that exists to catch it — the instrument
+    was wrong before the code was. Collapse first, then match.
+    """
+    assert "READING SCOPE" in prompt
+    body = prompt[prompt.index("READING SCOPE"):]
+    return " ".join(body[:body.index("Spend a call on a fact")].split())
+
+
+@pytest.mark.parametrize("present", [
+    pytest.param(set(_SCOPE_CLAIMS), id="everything-rendered"),
+    pytest.param({"test_output", "full_files"}, id="no-held-out-no-lint-no-wiring"),
+    pytest.param({"test_output", "held_out_output"}, id="over-cap-file-omitted"),
+    pytest.param({"test_output"}, id="diff-and-tests-only"),
+    pytest.param(set(), id="diff-only"),
+])
+def test_the_reading_scope_names_exactly_the_sections_that_are_rendered(present):
+    """A2: the enumeration is built from what is actually below, never asserted."""
+    t = Task.new("Fix bug")
+    kwargs = {
+        "full_files": "--- a.py (full text @ HEAD) ---\nx = 1\n" if "full_files" in present else "",
+        "held_out_output": "held out ran" if "held_out_output" in present else "",
+        "lint_evidence": "LINT: a.py:1 E501" if "lint_evidence" in present else "",
+        "wiring_evidence": "WIRING: a.py:1 unreferenced" if "wiring_evidence" in present else "",
+        # The omitted-file case is the one the reviewer proved on this very
+        # commit: a changed file over `_FILES_CAP` is dropped whole.
+        "omitted_files": [] if "full_files" in present else ["huge.py"],
+    }
+    test_output = "3 passed" if "test_output" in present else ""
+    prompt = _build_review_prompt(t, "diff", test_output, kwargs.pop("held_out_output"),
+                                  **kwargs)
+    scope = _scope_block(prompt)
+    assert "the diff" in scope  # always rendered, always claimable
+    for key, claim in _SCOPE_CLAIMS.items():
+        if key in present:
+            assert claim in scope, f"{key} is rendered but the scope block hides it"
+        else:
+            assert claim not in scope, f"{key} is ABSENT but the scope block claims it"
+
+
+def test_omitted_files_are_pointed_at_rather_than_claimed_as_present():
+    """When a changed file was too large to include, the scope prose must not
+    imply its text is below — it must send the reviewer to open it."""
+    t = Task.new("Fix bug")
+    prompt = _build_review_prompt(t, "diff", "3 passed", "", omitted_files=["huge.py"])
+    scope = _scope_block(prompt)
+    assert _SCOPE_CLAIMS["full_files"] not in scope
+    assert "NOT included in full" in scope
+    # and the existing note further down still names the file to open
+    assert "huge.py" in prompt
+
+
+def test_read_budget_never_licenses_dropping_a_finding():
+    """Constraint #3 guard. The budget is a spending hint, never permission to
+    stop refuting — mutating the sentence out must redden a test."""
+    t = Task.new("Fix bug")
+    prompt = _build_review_prompt(t, "diff", "tests", "")
+    scope = prompt[prompt.index("READING SCOPE"):]
+    head = scope[:scope.index("\n\n")] if "\n\n" in scope else scope
+    assert "never" in head.lower()
+    # The exact promise: a call needed to decide a finding is always affordable.
+    assert "drop" in head.lower() or "soften" in head.lower()
+
+
+def test_untooled_prompt_carries_no_read_budget():
+    """The single-turn no-tools path cannot make tool calls at all; a reading
+    budget there is dead tokens on every angle pass and every override review."""
+    t = Task.new("Fix bug")
+    prompt = _build_review_prompt(t, "diff", "tests", "", allow_tools=False)
+    assert "READING SCOPE" not in prompt
+
+
+@pytest.mark.parametrize("kwarg", ["profile_context", "confirmed_rules", "prior_rounds"])
+def test_auxiliary_section_over_cap_is_truncated_with_a_visible_marker(kwarg):
+    t = Task.new("Fix bug")
+    huge = "Z" * (_AUX_CAP + 5_000)
+    prompt = _build_review_prompt(t, "diff", "tests", "", **{kwarg: huge})
+    assert _SECTION_TRUNCATED in prompt
+    assert huge not in prompt
+    assert prompt.count("Z") == _AUX_CAP
+
+
+@pytest.mark.parametrize("kwarg", ["profile_context", "confirmed_rules"])
+def test_already_satisfied_builder_bounds_the_same_aux_sections(kwarg):
+    """The other prompt builder that takes these two. One of two covered is how
+    a bound quietly stops applying."""
+    t = Task.new("Fix bug")
+    huge = "Z" * (_AUX_CAP + 5_000)
+    prompt = _build_already_satisfied_prompt(t, "claim", **{kwarg: huge})
+    assert _SECTION_TRUNCATED in prompt
+    assert prompt.count("Z") == _AUX_CAP
+
+
+@pytest.mark.parametrize("kwarg", ["profile_context", "confirmed_rules", "prior_rounds"])
+def test_auxiliary_section_under_cap_is_untouched(kwarg):
+    t = Task.new("Fix bug")
+    small = "Z" * 200
+    prompt = _build_review_prompt(t, "diff", "tests", "", **{kwarg: small})
+    assert small in prompt
+    assert _SECTION_TRUNCATED not in prompt
+
+
+def test_the_diff_and_the_criteria_are_never_cut_by_the_auxiliary_cap():
+    """What the cap must NEVER cut. The diff is the one input that must stay
+    whole (a reviewer cannot judge a change it cannot see), and the acceptance
+    criteria are the standard it judges against."""
+    t = Task.new("Fix bug")
+    t.acceptance_criteria = ["C" * (_AUX_CAP + 5_000)]
+    diff = "D" * (_AUX_CAP + 5_000)
+    prompt = _build_review_prompt(t, diff, "tests", "")
+    assert diff in prompt
+    assert t.acceptance_criteria[0] in prompt
 
 
 # --------------------------------------------------------------------------- #

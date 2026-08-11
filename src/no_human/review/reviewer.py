@@ -152,6 +152,53 @@ _CODE_REVIEW_TURNS = 15
 #: `llm.code_review_timeout_seconds`.
 _CODE_REVIEW_TIMEOUT = 1800  # seconds — larger diffs (2x the gate cap) need more time
 _OUTPUT_CAP = 4000
+# Cap for the review prompt's AUXILIARY sections — project profile, confirmed
+# rules, and the prior-rounds continuity block.
+#
+# WHAT IT PROTECTS: the cost envelope. Cache-read on a reviewer session is
+# `turns x context`, so every character here is paid once PER TURN, not once.
+# Measured ISO week 29 (Jul 20-26 2026) baseline: 48,908 cache-creation tokens
+# per review-bearing attempt. 16,000 chars is ~4K tokens, ~8% of that — and all
+# three sections at their cap together still sit under the ~15K tokens the diff
+# already occupies at `_DIFF_CAP`.
+#
+# WHAT IT MUST NEVER CUT, and does not: the DIFF (capped separately and far
+# higher at `_DIFF_CAP` — a reviewer cannot judge a change it cannot see, so
+# the diff is the one input that stays whole), the ACCEPTANCE CRITERIA (the
+# standard being judged against — rendered uncapped), and the FAILING TEST
+# NAMES (they arrive in `test_output`/`held_out_output`, governed by
+# `_OUTPUT_CAP`, untouched by this).
+#
+# WHY IT IS A NO-OP TODAY, deliberately: every current caller bounds these
+# upstream — `confirmed_rules` at 8,000 + 4,000 chars
+# (`orchestrator._RULES_CRITICAL_CAP`/`_RULES_RELEVANT_CAP`), `prior_rounds` at
+# `_REVIEW_HISTORY_ROUNDS` compact records, `profile_context` at three lines.
+# That bound lives entirely in ONE caller of four, with no test at this
+# boundary. This makes the boundary itself hold.
+_AUX_CAP = 16_000
+#: The marker a truncated section carries. Visible to the reviewer on purpose:
+#: a reviewer that cannot tell "this is all there was" from "this was cut" will
+#: make a confident finding about the missing half.
+_SECTION_TRUNCATED = "… (section truncated — bounded input, not the whole record)"
+# The stated tool-call budget for one gate review session.
+#
+# MEASURED, not chosen (2026-08-11, `~/.no_human/no_human.db` task_events,
+# reviewer-sourced `tool_use` between `review_start` and the verdict):
+#
+#   ISO week 29 (Jul 20-26), n=152 runs: mean 2.9, p50 2, p90 7, p95 8
+#   Aug 10-11,               n=122 runs: mean 16.4, p50 14, p90 30, p95 35
+#
+# 8 is the W29 week's p95 — the busiest reviews of the baseline week, the week
+# whose cost envelope this is measured against (0.17M cache-read per
+# review-bearing attempt). It therefore cannot cut a review the baseline week
+# considered thorough, while 83% of today's runs exceed it.
+#
+# It is a SOFT budget stated in the prompt, not a hard `max_turns` cut, and
+# that is deliberate: `_REVIEW_TURNS` (30) is not binding at today's p50, and
+# lowering it would turn a p75 run into a turn-truncated round with no verdict,
+# which `_agent_review` then retries at DOUBLE the budget — strictly more
+# expensive, and it degrades the gate.
+_READ_BUDGET_CALLS = 8
 # 🔴 A CROSS-FILE COUPLING THAT WAS SAFE BY 96 CHARACTERS AND SAID SO NOWHERE.
 # This window is the tail of a dead reviewer session's `final_text` that
 # `_review_once` carries out as the escalation reason. `claude_backend` APPENDS
@@ -581,6 +628,121 @@ _UNTRUSTED_INPUT = (
 )
 
 
+#: THE DRIVER FIX for the W29 -> August reviewer cost regression.
+#:
+#: MEASUREMENT (see `_READ_BUDGET_CALLS` for the full distribution). Reviewer
+#: tool calls per session went 2.9 -> 16.4 between ISO week 29 and Aug 10-11,
+#: and 98% of them are Bash. Cache-read is `turns x context`, so those calls —
+#: not the prompt — are the ~7x. The assembled prompt template grew 5,137 ->
+#: 8,685 chars over the same period (~890 tokens, ~1.8% of the W29 per-attempt
+#: cache-creation figure): real, and nowhere near the effect.
+#:
+#: WHAT THE CALLS WERE SPENT ON. The session re-ran the project's test suite and
+#: re-opened files whose text this prompt already carries verbatim —
+#: `_full_file_context` puts up to `_FILES_CAP` chars of the changed files in,
+#: `_annotated_test_output` puts the run's output in, `held_out_output` puts the
+#: tests the implementer never saw in, and `lint_evidence`/`wiring_evidence` are
+#: deterministic tool output already collected by the harness. The reviewer was
+#: paying a full pass over its own context to learn what was quoted to it.
+#:
+#: WHAT THIS MAY NOT DO, and does not: reduce what the reviewer is ALLOWED to
+#: check. Constraint #3 requires an independent reader that can refute "done"
+#: with cited evidence, and running the one command that decides a finding is
+#: exactly that work. The budget is spending guidance about REDUNDANT reads; the
+#: last two sentences say so explicitly, and
+#: `test_read_budget_never_licenses_dropping_a_finding` pins them.
+#:
+#: 🔴 THE ENUMERATION IS COMPUTED, NEVER ASSERTED (review of 82fc72e70, A2).
+#: My first version stated UNCONDITIONALLY that the diff, the full text of the
+#: changed files, the test output, the held-out output and the lint and wiring
+#: findings were all below, and that re-opening them "returns no new fact".
+#: FOUR of those five are conditional and routinely absent:
+#:
+#:   * `full_files` is whole-file-or-nothing under `_FILES_CAP` — proven on this
+#:     very commit's own diff, where `reviewer.py` (112,652 chars) is OMITTED
+#:     while the prose claimed its presence, and `orchestrator.py` (773k) is
+#:     omitted from every review that touches it;
+#:   * `held_out_output` is "" whenever no held-out suite ran;
+#:   * `lint_evidence`/`wiring_evidence` are "" on a repo with no ruff config
+#:     and on both collectors' advisory except-paths.
+#:
+#: So the gate — the one component whose entire value is evidence-based
+#: judgement — was told evidence was in front of it when it was not, and the
+#: prompt then contradicted itself 15k chars later with `files_section`'s own
+#: "NOT included in full … read them with your tools" note. That is exactly the
+#: defect class this file's `pr_section` comment grades as critical, made by the
+#: same hand two hundred lines away. The enumeration is now built from the
+#: rendered sections; `_READING_SCOPE_TAIL` below is the part that is true
+#: unconditionally and is held byte-identical.
+_READING_SCOPE_TAIL = (
+    "Spend a call on a fact this prompt cannot settle and a finding depends on:\n"
+    "opening a file the diff only touches at the edges, confirming a symbol\n"
+    "exists before calling it undefined, or running the ONE test or command\n"
+    "whose result decides a specific finding.\n"
+    f"Budget: about {_READ_BUDGET_CALLS} tool calls is a full review of a normal\n"
+    "diff. Past that, name the fact you are still missing; if you cannot name\n"
+    "one, you are done — write the verdict. This budget is never a reason to\n"
+    "soften, drop, or leave unverified a finding: a call you need to decide one\n"
+    "is always worth making.\n\n"
+)
+
+
+def _reading_scope(
+    *,
+    test_output: str,
+    held_out_output: str,
+    full_files: str,
+    omitted_files: list[str] | None,
+    lint_evidence: str,
+    wiring_evidence: str,
+) -> str:
+    """The READING SCOPE block, enumerating ONLY the sections actually rendered.
+
+    Every branch here mirrors the exact truthiness test the assembly below uses
+    to render the corresponding section, so the claim and the artifact cannot
+    drift apart. The diff is the one unconditional member — it is always
+    rendered (truncated or whole) and always claimable.
+
+    `omitted_files` is the case that is neither presence nor absence: some
+    changed files WERE included in full and others were dropped whole. The
+    prose then claims nothing about the dropped ones and points at them, which
+    is what `files_section` already tells the reviewer to do.
+    """
+    have = ["the diff"]
+    if full_files:
+        have.append("the full text of the changed files that fit")
+    if test_output:
+        have.append("the test run's output")
+    if held_out_output:
+        have.append("the held-out test output")
+    if lint_evidence:
+        have.append("the lint findings")
+    if wiring_evidence:
+        have.append("the wiring findings")
+    listed = have[0] if len(have) == 1 else f"{', '.join(have[:-1])} and {have[-1]}"
+    omitted_note = (
+        "\nChanged files too large to include are named below as NOT included in\n"
+        "full — those you DO have to open, and a claim about one you have not\n"
+        "read is not a finding."
+        if omitted_files else ""
+    )
+    return (
+        "READING SCOPE — this prompt already carries gathered evidence; do not\n"
+        f"spend a tool call re-deriving it. Below you already have {listed}.\n"
+        "Re-opening a file or re-running a command to read what is already quoted\n"
+        f"here costs a full pass over this context and returns no new fact.{omitted_note}\n"
+        + _READING_SCOPE_TAIL
+    )
+
+
+def _cap_section(text: str, cap: int = _AUX_CAP) -> str:
+    """Bound one auxiliary prompt section, marking the cut so the reviewer can
+    see it (`_AUX_CAP` documents what this protects and what it may not cut)."""
+    if len(text) <= cap:
+        return text
+    return text[:cap] + "\n" + _SECTION_TRUNCATED
+
+
 def _build_angle_prompt(task: Task, diff: str, focus: str,
                         diff_total_len: int = 0) -> str:
     """A dedicated single-concern prompt for an angle pass. Deliberately NOT
@@ -630,6 +792,12 @@ def _build_review_prompt(
     draft_pr: str = "",
     draft_pr_absent: str = "",
 ) -> str:
+    # Bound the auxiliary sections AT THIS BOUNDARY (see `_AUX_CAP`). The diff,
+    # the acceptance criteria and the test output are deliberately not routed
+    # through here — they have their own, much larger caps, or none at all.
+    profile_context = _cap_section(profile_context)
+    confirmed_rules = _cap_section(confirmed_rules)
+    prior_rounds = _cap_section(prior_rounds)
     criteria = "\n".join(f"  - {c}" for c in task.acceptance_criteria) or "  (none stated)"
     # The goal-reachability judgment needs the OUTCOME the ticket asks for, and
     # the title + acceptance criteria often carry only the mechanism. Rendered
@@ -720,6 +888,14 @@ def _build_review_prompt(
             "MUST: before asserting that a symbol is undefined, missing, unassigned,\n"
             "or orphaned, read the full file and confirm it. A declaration outside\n"
             "the changed hunks is still present in the code.\n\n"
+            + _reading_scope(
+                test_output=test_output,
+                held_out_output=held_out_output,
+                full_files=full_files,
+                omitted_files=omitted_files,
+                lint_evidence=lint_evidence,
+                wiring_evidence=wiring_evidence,
+            )
         )
         tool_rule = (
             "  - You MAY use read/search tools; you MUST use them before claiming a\n"
@@ -909,6 +1085,14 @@ def _build_already_satisfied_prompt(
     already met by the existing code, citing file:line per criterion. The
     artifact under review is that claim — there is no diff. Same trust chain as
     a code diff: the fresh-context reviewer verifies, or the claim dies."""
+    # Same boundary defence as `_build_review_prompt` (`_AUX_CAP`): this is the
+    # OTHER prompt builder that takes these two, and leaving one of two covered
+    # is how a bound quietly stops applying. `claim_report` keeps its own
+    # existing 20,000-char slice below, and the acceptance criteria stay
+    # uncapped here for the same reason they do there — they are the standard
+    # being judged against.
+    profile_context = _cap_section(profile_context)
+    confirmed_rules = _cap_section(confirmed_rules)
     criteria = "\n".join(f"  - {c}" for c in task.acceptance_criteria) or "  (none stated)"
     profile_section = (
         f"\nProject profile (use these conventions as a baseline):\n{profile_context}\n"
