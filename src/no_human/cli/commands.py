@@ -66,9 +66,12 @@ def _server_owns_worker(config) -> bool:
     reviewers, two commits, and potentially two PRs. Observed on task 84251cb2:
     duplicate `commit`/`reviewing` events and a doubled escalation.
 
-    Any failure to reach the server is treated as "no server": the cost of a
-    false negative is the old behavior, while a false positive would silently
-    strand the task.
+    A failure of the HTTP probe alone is not treated as "no server": `nh serve`
+    binds no socket, so its scheduler is invisible to this probe even while
+    running. The pidfile `nh serve` and `nh start` both take (`_acquire_pid_lock`)
+    is the second, socket-free channel, and `_pidfile_owner_alive` is checked as
+    a fallback. The cost of a false negative there is the old behavior, while a
+    false positive would silently strand the task.
     """
     import json as _json
     import urllib.error
@@ -86,7 +89,27 @@ def _server_owns_worker(config) -> bool:
             _json.loads(resp.read() or b"null")  # it really is our API
             return True
     except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return _pidfile_owner_alive()
+
+
+def _pidfile_owner_alive() -> bool:
+    """True when NO_HUMAN_HOME/nh.pid names a process that is alive.
+
+    `nh serve` binds no socket, so the HTTP probe above cannot see it. Since
+    serve now takes the same pid lock `nh start` does, the lock file IS the
+    second, socket-free channel. Missing, unreadable, non-integer or dead pid
+    → False, preserving the "any doubt means no server" bias.
+    """
+    from ..config import NO_HUMAN_HOME
+    try:
+        pid = int((NO_HUMAN_HOME / "nh.pid").read_text().strip())
+    except (OSError, ValueError):
         return False
+    # `_probe_pid` is tri-state (True/False/None-for-another-user's-pid); only
+    # a confirmed-alive PID counts here, unlike `_acquire_pid_lock` where None
+    # means "not ours to reason about, take the lock" — the safe answer for a
+    # probe is "assume no server", not "assume it's ours".
+    return _probe_pid(pid) is True
 
 
 def _running_pool_width(config) -> int | None:
@@ -2929,6 +2952,10 @@ def serve(max_workers, until_empty):
 
     Add --until-empty to make it a batch job: same loop, same graceful
     shutdown, but the queue going empty sets the stop event a signal would.
+
+    Refuses to start beside a running `nh start` / `nh serve` over the same
+    checkout — the two are mutually exclusive, since either one owns the
+    worker pool.
     """
     config, _ = _bootstrap()
     _assert_backend_usable()
@@ -2955,6 +2982,19 @@ def serve(max_workers, until_empty):
         # invocation only — the config default on disk is left untouched.
         conc["enabled"] = True
         conc["max_workers"] = workers
+
+    # `nh serve` binds no socket, so the pid lock is the ONLY thing a CLI
+    # runner (`nh task new --run`, `nh reply --run`, `nh watch`) can see. It is
+    # the same lock `nh start` takes: the two are mutually exclusive by design,
+    # since either one owns the worker pool over a single checkout.
+    if not _acquire_pid_lock():
+        console.print(
+            "[red]another no_human instance is already running[/]\n"
+            "Kill it first, or remove the stale lock:\n"
+            "  [bold]rm ~/.no_human/nh.pid[/]"
+        )
+        sys.exit(1)
+
     interval = parse_duration(str(conc.get("poll_interval", "10s")))
     secs = int(interval.total_seconds()) if interval else 10
 
@@ -3139,7 +3179,11 @@ def serve(max_workers, until_empty):
                 return 1
             return 0
 
-    sys.exit(asyncio.run(_go()) or 0)
+    try:
+        rc = asyncio.run(_go()) or 0
+    finally:
+        _release_pid_lock()
+    sys.exit(rc)
 
 
 @cli.command("status")

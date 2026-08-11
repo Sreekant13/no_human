@@ -379,10 +379,16 @@ def test_task_add_explicit_config_overrides_repo_defaults(tmp_path, monkeypatch)
 # --------------------------------------------------------------------------- #
 
 
-def test_server_owns_worker_is_false_when_nothing_is_listening():
-    """Any failure to reach the server means "no server" — a false positive would
-    silently strand the task, a false negative only restores the old behavior."""
+def test_server_owns_worker_is_false_when_nothing_is_listening(tmp_path, monkeypatch):
+    """A failed HTTP probe with no live pidfile means "no server" — a false
+    positive would silently strand the task, a false negative only restores
+    the old behavior. NO_HUMAN_HOME is isolated to an empty tmp dir so this
+    doesn't depend on whether the operator's own `nh start`/`nh serve` happens
+    to be running (the pidfile fallback the HTTP probe now falls back to)."""
     import no_human.cli.commands as cmd_mod
+    import no_human.config as config_mod
+
+    monkeypatch.setattr(config_mod, "NO_HUMAN_HOME", tmp_path / "home")
 
     class _Cfg(dict):
         def get(self, k, d=None):

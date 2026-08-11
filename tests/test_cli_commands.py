@@ -1517,6 +1517,8 @@ def _patch_serve_scaffolding(monkeypatch, cfg):
     monkeypatch.setattr(cmd_mod, "load_config", lambda: cfg)
     monkeypatch.setattr(cmd_mod, "assert_subscription_mode", lambda **kw: None)
     monkeypatch.setattr(cmd_mod, "_assert_backend_usable", lambda: None)
+    monkeypatch.setattr(cmd_mod, "_acquire_pid_lock", lambda: True)
+    monkeypatch.setattr(cmd_mod, "_release_pid_lock", lambda: None)
 
     def _dont_run(coro):
         coro.close()          # no "never awaited" warning, no scheduler, no DB
