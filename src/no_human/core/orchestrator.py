@@ -62,7 +62,12 @@ from ..learning import CONFIRMED_BY_AUTO, ORIGIN_REVIEW
 from ..learning.triggers import filter_triggered
 from ..notify.slack import SlackNotifier
 from ..review import selfcheck, tamper_adjudication
-from ..review.reviewer import AdversarialReviewer, ReviewDecision, ReviewerUnavailable
+from ..review.reviewer import (
+    REVIEW_SESSION_ERROR_MARKER as _SESSION_ERROR_BLOCKER_MARKER,
+    AdversarialReviewer,
+    ReviewDecision,
+    ReviewerUnavailable,
+)
 from ..review.selfcheck import ChecklistItem
 from ..testing import runner
 from ..testing.repro_gate import MANIFEST as REPRO_MANIFEST
@@ -474,6 +479,30 @@ _INADEQUATE_REPORT_DETAIL = "report deliverable inadequate"
 #: human is the 48h it replaces. It is only ever a floor — the watcher polls,
 #: and a human can `nh reply` sooner.
 _INFRA_SESSION_WAKE_AFTER = "30m"
+
+#: How many CONSECUTIVE times the review gate may die of infrastructure and be
+#: parked before the task stops self-healing and reaches a person.
+#:
+#: The park is the honest route for one outage; an unbounded park loop is worse
+#: than the escalation it replaced, because it is SILENT after the first
+#: notification and only the 48h `max_park` ever ends it. Three is the same
+#: bound the sibling round-caps use (`blockers.max_ci_fix_rounds`,
+#: `max_pr_conflict_rounds`) and the same shape as `bounds.max_attempts`: enough
+#: for a quota window or a saturated backend to clear, few enough that a
+#: standing outage is a human's problem within ~90 minutes rather than two days.
+#:
+#: A module constant rather than a config key on purpose — this is a safety
+#: bound on autonomy (constraint #5), not a preference, and an operator raising
+#: it in config is the one edit that would restore the loop it exists to stop.
+#: The counter it drives lives on `task.context` and is cleared the moment the
+#: gate actually produces a verdict, so "consecutive" means what it says.
+_MAX_REVIEW_INFRA_PARKS = 3
+
+#: Where that counter lives. On the task's context because it must survive the
+#: park: the wake watcher resumes a fresh attempt in a new process, and a
+#: counter held in memory would reset on every resume — which is precisely an
+#: unbounded loop wearing a cap's clothes.
+_REVIEW_INFRA_PARKS_KEY = "review_infra_parks"
 
 
 #: One claim line: "CRITERION: <text> — MET — evidence: <nonempty>". The
@@ -3635,6 +3664,11 @@ class Orchestrator:
             return await self._escalate_reviewer_unavailable(
                 task, str(exc), repo=repo, branch=branch
             )
+        # The gate RAN — pass or fail — so any streak of infra parks it survived
+        # is over. Cleared here rather than in `_escalate_reviewer_unavailable`
+        # because this is the only place a verdict is known, and a cap counting
+        # non-consecutive failures would escalate a task whose gate is working.
+        await self._clear_review_infra_parks(task)
         await self._record_review_usage(attempt_id, decision)
         if not decision.passed:
             # Lead with what actually blocks. A nit in the feedback reads to the
@@ -4567,8 +4601,101 @@ class Orchestrator:
 
         Detection is on the marker the backend itself writes, not on a guess
         about the prose: nothing else in the codebase emits `[transport]`.
+
+        🔴 THE TRANSPORT WAS NEVER THE ONLY WAY THAT SESSION DIES — 2026-08-11,
+        tasks ad5cde99 and 7d63dbe1. Both sat in `escalated` for hours, waiting
+        for a person, over a QUOTA outage. The gate had not rejected their
+        diffs; it had never run. Everything the paragraphs above say about a
+        dead socket is true word for word of a quota wall, an API error and an
+        SDK crash — they simply arrived as `reviewer session error (error)`,
+        with the reason flattened to nothing, so the only route left was
+        `_escalate` -> NOVEL_UNKNOWN: non-transient, `wake_condition: null`, a
+        human asked to decide something no one had judged. That is an
+        escalation spent on infrastructure, and it is the one thing a bounded
+        loop must not do (22.3: park with a wake condition, or escalate with a
+        diagnosis — never escalate for want of one).
+        `REVIEW_SESSION_ERROR_MARKER` is now that diagnosis, written where the
+        cause is known (`reviewer._errored_round_reason`) and matched here.
+
+        WHAT IS *NOT* WIDENED, and is the whole reason this reads two markers
+        instead of "did the gate run?": a reviewer that RAN and reached no
+        verdict on the CONTENT — turn-starved, no parseable REVIEW_JSON, or no
+        reviewer configured at all — still escalates, unchanged. Nothing
+        external clears any of those, so a timer would park them silently
+        forever. The gate itself is untouched in both directions: no path here
+        turns a missing verdict into a pass.
+
+        THE QUOTA FAMILY GETS ITS OWN CATEGORY because it has a better wake
+        condition than a timer. `_quota_signal` is the same classifier the coder
+        path uses, applied — as its docstring requires — only to text from an
+        ERRORED session, which is exactly what the marker guarantees.
+
+        AND IT IS CAPPED. A park that can re-park itself is a loop, and after
+        the first notification it is a SILENT one; `_MAX_REVIEW_INFRA_PARKS`
+        consecutive dead gates is where self-healing stops being honest and the
+        original escalation is the right answer after all.
         """
-        if _TRANSPORT_BLOCKER_MARKER in detail:
+        session_error = _SESSION_ERROR_BLOCKER_MARKER in detail
+        if not (session_error or _TRANSPORT_BLOCKER_MARKER in detail):
+            return await self._escalate(
+                task, detail, repo=repo, branch=branch, goal=task.title)
+
+        # Count the park BEFORE routing it: the cap is about how many times this
+        # gate has failed to run, not about which flavour of infra killed it.
+        ctx = getattr(task, "context", None) or {}
+        parks = int(ctx.get(_REVIEW_INFRA_PARKS_KEY) or 0) + 1
+        ctx[_REVIEW_INFRA_PARKS_KEY] = parks
+        task.context = ctx
+        spent = parks > _MAX_REVIEW_INFRA_PARKS
+
+        if session_error and _quota_signal(detail):
+            blocker = Blocker(
+                category=BlockerCategory.QUOTA,
+                transient=True,
+                confidence=0.9,
+                # The one condition whose whole implementation is "wake_check_at
+                # is set and due" — the same park `_park_quota` writes for the
+                # coder's own billing wall, so a still-closed window re-parks on
+                # the CLI's rejection instead of on a model call.
+                wake_condition="quota_refreshed",
+                goal=task.title,
+                root_cause_hypothesis=(
+                    "The reviewer's Agent SDK session hit a usage limit, so the "
+                    "review gate never ran. Nothing about the diff was judged — "
+                    "it is unreviewed, not rejected."
+                ),
+                tried=["reviewer session", "reviewer session (retried once)"],
+                evidence=detail,
+                question=(
+                    "The subscription paying for the review is out of quota. "
+                    "Nothing is needed from you — the task resumes and re-runs "
+                    "the gate once the window refreshes; `nh auth use <profile>` "
+                    "moves it to another profile sooner."
+                ),
+            )
+        elif session_error:
+            blocker = Blocker(
+                category=BlockerCategory.TRANSIENT_INFRA,
+                transient=True,
+                confidence=0.8,
+                wake_condition=f"after:{_INFRA_SESSION_WAKE_AFTER}",
+                goal=task.title,
+                root_cause_hypothesis=(
+                    "The reviewer's Agent SDK session errored on both of its "
+                    "bounded rounds, so the review gate never ran. Nothing "
+                    "about the diff was judged — it is unreviewed, not "
+                    "rejected."
+                ),
+                tried=["reviewer session", "reviewer session (retried once)"],
+                evidence=detail,
+                question=(
+                    "The reviewer's session died twice. Is the backend healthy "
+                    "(quota window, `claude` CLI, network)? The task retries "
+                    f"the review itself in {_INFRA_SESSION_WAKE_AFTER}; the "
+                    "session's own last words are in the evidence above."
+                ),
+            )
+        else:
             blocker = Blocker(
                 category=BlockerCategory.TRANSIENT_INFRA,
                 transient=True,
@@ -4590,10 +4717,57 @@ class Orchestrator:
                     "was dispatched into."
                 ),
             )
+
+        if spent:
+            # `escalate_now` is documented for exactly this: "a normally-parkable
+            # category has already exhausted its bounded auto-retries and must
+            # now reach a human". The CATEGORY stays infra — four outages are
+            # still an outage, and NOVEL_UNKNOWN would file one in the learning
+            # queue as a durable lesson about the repo — while the ROUTE becomes
+            # the escalation this method used to raise on the first failure.
+            #
+            # The prose is rewritten rather than reused: `root_cause_hypothesis`
+            # is the ONE field an escalation publishes to the forge, and the
+            # detail now carries a tail of the reviewer session's own text.
+            # Model prose belongs in `evidence`, which is never posted
+            # (`_escalate_exhausted` documents the same split and why).
+            blocker.root_cause_hypothesis = (
+                f"The review gate has failed to RUN {parks} times in a row — "
+                "the reviewer's Agent SDK session died each time, which is "
+                "infrastructure and not a finding about this change. The "
+                "bounded infra parks are spent, so this needs a person: the "
+                "diff is UNREVIEWED, it has never been judged, and it must not "
+                "merge until the gate runs."
+            )
+            blocker.question = (
+                "The reviewer's backend has been unavailable for "
+                f"{parks} consecutive attempts. Fix or switch it (quota window, "
+                "auth profile, `claude` CLI, network), then resume — the diff "
+                "still needs the gate."
+            )
+            # An ESCALATED task is not swept by the watcher, so the condition
+            # this blocker was built with can no longer fire. Leaving it on the
+            # record would tell the human — and the board — that the task is
+            # still going to retry itself, which is the one thing this branch
+            # has just decided it will not do.
+            blocker.wake_condition = None
             return await self._raise_blocker(
-                task, blocker, repo=repo, branch=branch, notify_override=True)
-        return await self._escalate(
-            task, detail, repo=repo, branch=branch, goal=task.title)
+                task, blocker, repo=repo, branch=branch, escalate_now=True)
+        return await self._raise_blocker(
+            task, blocker, repo=repo, branch=branch, notify_override=True)
+
+    async def _clear_review_infra_parks(self, task: Task) -> None:
+        """The gate produced a verdict, so the consecutive-park streak is over.
+
+        Written through `merge_context` (RFC 7396 — a ``None`` value DELETES the
+        key) rather than by rewriting the whole blob, because the wake watcher
+        and the CLI write context concurrently. A no-op when there is no streak,
+        which is every ordinary review.
+        """
+        if not (getattr(task, "context", None) or {}).get(_REVIEW_INFRA_PARKS_KEY):
+            return
+        task.context = await self.store.merge_context(
+            task.id, {_REVIEW_INFRA_PARKS_KEY: None})
 
     async def _escalate_exhausted(
         self, task: Task, repo: GitRepo, branch: str | None

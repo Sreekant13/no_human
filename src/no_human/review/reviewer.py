@@ -111,6 +111,30 @@ _OUTPUT_CAP = 4000
 # rather than re-spelling it, so growing either side reddens a test.
 _TRANSPORT_TAIL_CHARS = 600
 
+#: The token that says THE REVIEWER'S SESSION DIED, as opposed to the reviewer
+#: having run and reached no verdict on the diff. Same contract as
+#: `TRANSPORT_DIAGNOSIS_MARKER` and for the same reason — a constant, exported
+#: and imported by `orchestrator._escalate_reviewer_unavailable`, because a
+#: literal repeated in two files is the shape that silently stops matching.
+#:
+#: 🔴 THE DISTINCTION THIS CARRIES IS THE WHOLE FIX (2026-08-11, tasks ad5cde99
+#: and 7d63dbe1). Both sat in `escalated` for hours over a quota outage: the
+#: gate had not REJECTED the diff, it had never run, and the reason string
+#: ("reviewer session error (error)") named no cause, so the orchestrator could
+#: only route it as NOVEL_UNKNOWN — non-transient, no wake condition, waiting on
+#: a human who had nothing to decide. A dead session is infra and parks; a
+#: reviewer that ran and produced no parseable verdict, or ran out of turns,
+#: still escalates to a person. Only the first branch gets this marker.
+REVIEW_SESSION_ERROR_MARKER = "[session-error]"
+
+#: How much of a dead session's own text rides out with the marker. It is what
+#: lets the orchestrator tell the QUOTA family apart from a generic session
+#: death (`_quota_signal`), and it is the only place the CLI's own wording — "You've
+#: hit your weekly limit" — is available to route on. Same window as the
+#: transport tail: model prose, so it is carried as EVIDENCE and never as
+#: no_human's own root-cause sentence.
+_SESSION_ERROR_TAIL_CHARS = 600
+
 
 async def _cancel_and_reap(fut: "asyncio.Future") -> None:
     """End a shielded backend run this reviewer has given up on, and WAIT for it.
@@ -1870,8 +1894,9 @@ class AdversarialReviewer:
         raise _carry_usage(ReviewerUnavailable(
             f"the reviewer reached no verdict after {_REVIEW_INFRA_RETRIES + 1} "
             f"rounds ({last_reason}). The review gate did not run, so this diff "
-            "is unreviewed. Escalating rather than passing it — or blaming the "
-            "coder for a finding that was never made."
+            "is unreviewed. Never a pass, and never a finding against the "
+            "coder — a reviewer SESSION that died parks and runs the gate "
+            "again, anything else goes to a human."
         ), discarded)
 
     async def _run_bounded(
@@ -1980,11 +2005,31 @@ class AdversarialReviewer:
         failure once and appended its own diagnosis (worker, concurrency, and
         the CLI's own wording); carry that through verbatim instead of
         flattening it, so the blocker can route it as infra.
+
+        THE SAME ARGUMENT, ONE CLASS WIDER (2026-08-11, tasks ad5cde99 and
+        7d63dbe1). A transport death is not the only way this session dies —
+        it also dies on a quota wall, an API error and an SDK crash, and all of
+        those arrived as the bare, causeless "reviewer session error (error)"
+        that routed the two tasks above to a human for hours over an outage. So
+        an errored round now carries `REVIEW_SESSION_ERROR_MARKER` plus its own
+        tail, exactly as the transport branch does, and the orchestrator parks
+        it with a wake condition instead of escalating it.
+
+        TRUNCATION IS DELIBERATELY NOT IN THAT CLASS and is checked FIRST. A
+        round cut off at `max_turns` / `max_tokens` is a reviewer that RAN and
+        was too short of budget to conclude — nothing external will change, so a
+        timer cannot clear it and a park would be a silent loop. It keeps the
+        exact wording it has always had, and it keeps escalating.
         """
         if is_transport_failure(result):
             tail = (result.final_text or "").strip()[-_TRANSPORT_TAIL_CHARS:]
             return f"reviewer session transport failure — {tail}"
-        return f"reviewer session error ({result.stop_reason or 'error'})"
+        stop = result.stop_reason or ""
+        if stop in _TRUNCATED_STOP_REASONS:
+            return f"reviewer session error ({stop})"
+        tail = (result.final_text or "").strip()[-_SESSION_ERROR_TAIL_CHARS:]
+        return (f"{REVIEW_SESSION_ERROR_MARKER} reviewer session error "
+                f"({stop or 'error'}) — {tail}")
 
     async def _review_once(
         self, prompt: str, repo_path: Path, *, max_turns: int, timeout: int,

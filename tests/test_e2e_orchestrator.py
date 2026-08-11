@@ -6279,3 +6279,97 @@ async def test_planning_emits_what_steered_the_plan(bare_repo, tmp_path, store):
         f"a file the planner never saw was not named: {line}")
     assert "CANARY_SHOULD_NOT_BE_EMITTED" not in line, (
         "the audit line is leaking file CONTENT into the event stream")
+
+
+# --------------------------------------------------------------------------- #
+# A review gate that never RAN parks — end to end (2026-08-11, ad5cde99 /      #
+# 7d63dbe1: two tasks sat escalated for hours over a quota outage).            #
+# --------------------------------------------------------------------------- #
+
+class UnavailableReviewer:
+    """The gate's session dies instead of returning a verdict."""
+
+    def __init__(self, message: str):
+        self._message = message
+        self.calls = 0
+
+    async def review(self, task, **kwargs):
+        from no_human.review.reviewer import ReviewerUnavailable
+
+        self.calls += 1
+        raise ReviewerUnavailable(self._message)
+
+
+def _mutate_add_mul(cwd):
+    (cwd / "calc.py").write_text(
+        "def add(a, b):\n    return a + b\n\n"
+        "def mul(a, b):\n    return a * b\n"
+    )
+    (cwd / "test_calc.py").write_text(
+        "from calc import add, mul\n\n"
+        "def test_add():\n    assert add(1, 2) == 3\n\n"
+        "def test_mul():\n    assert mul(2, 3) == 6\n"
+    )
+
+
+async def test_a_dead_reviewer_session_parks_the_whole_run(bare_repo, tmp_path,
+                                                           store):
+    """Driven through `run_task`, because the routing fix is only worth what
+    the WIRING is worth: the attempt must reach `_escalate_reviewer_unavailable`
+    with the repo and branch, or the park records no checkpoint and the resume
+    throws the coder's finished work away."""
+    from no_human.review.reviewer import REVIEW_SESSION_ERROR_MARKER
+
+    cfg = _config(tmp_path)
+    reviewer = UnavailableReviewer(
+        "the reviewer reached no verdict after 2 rounds "
+        f"({REVIEW_SESSION_ERROR_MARKER} reviewer session error (error) — "
+        "You've hit your weekly limit. Your limit will reset at 3pm.)")
+    orch = Orchestrator(store, cfg.data, FakeBackend(_mutate_add_mul),
+                        SlackNotifier(None), event_sink=[].append,
+                        reviewer=reviewer)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+    parked = await store.get_task(t.id)
+
+    assert reviewer.calls, "the gate never ran — the test proves nothing"
+    assert outcome.status is TaskStatus.PAUSED_QUOTA, (
+        f"an outage burned a human escalation: {outcome.status} {outcome.detail}")
+    assert parked.blocker["wake_condition"] == "quota_refreshed"
+    assert parked.wake_check_at
+    # ...and the coder's finished work is what the resume continues from.
+    assert _SHA_RE.match(parked.blocker["resume_commit"] or ""), parked.blocker
+    assert parked.blocker["resume_branch"].startswith("no-human/")
+    # The diff did NOT pass: no PR was opened on an unreviewed change.
+    assert not outcome.pr_url
+
+
+async def test_a_verdict_clears_the_consecutive_infra_park_streak(
+        bare_repo, tmp_path, store):
+    """The other half of the cap. The counter is what escalates a task after
+    `_MAX_REVIEW_INFRA_PARKS` dead gates, so a run whose gate WORKS must clear
+    it — otherwise three unrelated outages over a task's life eventually
+    escalate a task whose reviewer is healthy."""
+    from no_human.core.orchestrator import _REVIEW_INFRA_PARKS_KEY
+
+    cfg = _config(tmp_path)
+    reviewer = FakeReviewer(ReviewDecision(passed=True, checklist=[
+        ChecklistItem("mul(a,b) implemented", True, "calc.py:4 returns a*b"),
+    ]))
+    orch = Orchestrator(store, cfg.data, FakeBackend(_mutate_add_mul),
+                        SlackNotifier(None), event_sink=[].append,
+                        reviewer=reviewer)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    t.context = {_REVIEW_INFRA_PARKS_KEY: 2}
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is TaskStatus.AWAITING_APPROVAL, outcome.detail
+    done = await store.get_task(t.id)
+    assert _REVIEW_INFRA_PARKS_KEY not in (done.context or {}), (
+        "a working review gate left the infra-park streak standing")
