@@ -102,6 +102,92 @@ async def test_stream_yields_a_result_event_on_error(tmp_path, monkeypatch):
     assert events[0].meta["stop_reason"] == "max_turns"
 
 
+def _fake_query_result(msg):
+    """The NORMAL path: the SDK ends the session with a ResultMessage and
+    never raises — unlike `_fake_query`, which mimics the terminal-exception
+    path."""
+    async def _q(*args, **kwargs):
+        yield msg
+    return _q
+
+
+async def test_normal_path_max_turns_result_reports_max_turns(tmp_path, monkeypatch):
+    rm = ResultMessage(
+        subtype="error_max_turns", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=24, session_id="s",
+        result="Reached maximum number of turns (24)",
+        usage={"input_tokens": 100, "output_tokens": 50},
+    )
+    monkeypatch.setattr(claude_backend, "query", _fake_query_result(rm))
+    backend = ClaudeBackend(model="claude-opus-5")
+
+    result = await backend.run("do it", cwd=tmp_path, max_turns=24)
+
+    assert result.is_error is True
+    assert result.stop_reason == "max_turns"
+    assert result.num_turns == 24
+
+
+async def test_a_result_that_merely_quotes_the_phrase_is_not_turn_exhaustion(tmp_path, monkeypatch):
+    # Negative control: model prose that quotes the phrase must not be read
+    # as turn exhaustion — the derivation is keyed on the structured
+    # subtype, never on the text.
+    rm = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=5, session_id="s", stop_reason=None,
+        result="...Reached maximum number of turns...",
+        usage={"input_tokens": 100, "output_tokens": 50},
+    )
+    monkeypatch.setattr(claude_backend, "query", _fake_query_result(rm))
+    backend = ClaudeBackend(model="claude-opus-5")
+
+    result = await backend.run("do it", cwd=tmp_path, max_turns=24)
+
+    assert result.stop_reason != "max_turns"
+
+
+async def test_normal_path_result_does_not_invent_max_turns_for_other_subtypes(tmp_path, monkeypatch):
+    rm = ResultMessage(
+        subtype="error_during_execution", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=5, session_id="s",
+        result="something else went wrong",
+        usage={"input_tokens": 100, "output_tokens": 50},
+    )
+    monkeypatch.setattr(claude_backend, "query", _fake_query_result(rm))
+    backend = ClaudeBackend(model="claude-opus-5")
+
+    result = await backend.run("do it", cwd=tmp_path, max_turns=24)
+
+    assert result.stop_reason != "max_turns"
+
+
+async def test_normal_path_max_turns_result_then_raise_survives_the_terminal_exception(
+        tmp_path, monkeypatch):
+    # The real end-to-end sequence: the CLI emits the error_max_turns
+    # ResultMessage, THEN the process exits non-zero and the SDK rewrites that
+    # into "Claude Code returned an error result: error_max_turns" (empty
+    # errors list — the wording carries no "maximum number of turns" text).
+    # The terminal-exception handler must not clobber the structurally-derived
+    # stop_reason with a text match that cannot possibly hit.
+    rm = ResultMessage(
+        subtype="error_max_turns", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=24, session_id="s",
+        result="Reached maximum number of turns (24)",
+        usage={"input_tokens": 100, "output_tokens": 50},
+    )
+    monkeypatch.setattr(
+        claude_backend, "query",
+        _result_then_raise(rm, "Claude Code returned an error result: error_max_turns"),
+    )
+    backend = ClaudeBackend(model="claude-opus-5")
+
+    result = await backend.run("do it", cwd=tmp_path, max_turns=24)
+
+    assert result.is_error is True
+    assert result.stop_reason == "max_turns"
+    assert result.num_turns == 24
+
+
 async def test_genuine_error_preserves_traceback_for_diagnosis(tmp_path, monkeypatch):
     """A bare "'bool' object is not subscriptable" with no file:line burned 3
     attempts undiagnosably (task 6cfdb936). Genuine errors must carry the

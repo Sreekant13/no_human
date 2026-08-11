@@ -708,6 +708,16 @@ class ClaudeBackend:
         # this the real reason is overwritten and lost.
         last_result_text = ""
         last_api_error_status: int | None = None
+        # The CLI always exits non-zero after an is_error ResultMessage, so
+        # the terminal-exception handler below ALWAYS runs after this branch
+        # and its corrective event is the one run() keeps — the derived
+        # `stop_reason` above would otherwise be thrown away every time. This
+        # carries the SDK's structured subtype across that seam so the
+        # exception handler can fold it in, instead of relying solely on the
+        # rewritten exception text (which for error_max_turns reads "Claude
+        # Code returned an error result: error_max_turns" and contains no
+        # "maximum number of turns" wording to match).
+        last_subtype: str | None = None
         # Carried onto the corrective error event below. run() keeps the LAST
         # result event, so anything missing there is lost: an attempt that hit
         # max_turns used to record 0 cache-read tokens — the attempts that burn
@@ -939,8 +949,22 @@ class ClaudeBackend:
                     last_cache_read += cache_read
                     last_cache_creation += cache_creation
                     last_session = message.session_id
+                    last_subtype = message.subtype
                     sub_io, sub_cr, sub_cc, sub_n, sub_floored = _rollup_subagents(
                         sub_streamed, sub_reported)
+                    # The SDK reports turn exhaustion two ways. The terminal-
+                    # EXCEPTION path (`_run_once`'s handler below) sets
+                    # stop_reason="max_turns"; the NORMAL path ends the session
+                    # with a ResultMessage whose `subtype` is "error_max_turns"
+                    # and whose stop_reason is None. Both are the same event
+                    # and must reach the orchestrator as the same signal, or
+                    # only one of them gets the bounded retry. Keyed on the
+                    # STRUCTURED subtype, never on the text: a plan that
+                    # merely QUOTES "Reached maximum number of turns" must not
+                    # be read as exhaustion.
+                    stop_reason = message.stop_reason
+                    if not stop_reason and message.subtype == "error_max_turns":
+                        stop_reason = "max_turns"
                     yield AgentEvent(
                         "result",
                         text=message.result or "",
@@ -967,7 +991,8 @@ class ClaudeBackend:
                             # share instead of the whole run.
                             "output_tokens": last_output if saw_usage else None,
                             "session_id": message.session_id,
-                            "stop_reason": message.stop_reason,
+                            "stop_reason": stop_reason,
+                            "subtype": message.subtype,
                             "denials": denials,
                             "api_error_status": message.api_error_status,
                             "cache_read_tokens": last_cache_read + sub_cr,
@@ -982,7 +1007,18 @@ class ClaudeBackend:
         except Exception as exc:  # noqa: BLE001 — SDK raises bare Exception on terminal errors
             import traceback
             msg = str(exc)
-            is_max_turns = "maximum number of turns" in msg.lower()
+            # The CLI always exits non-zero after an is_error ResultMessage, so
+            # this handler runs on EVERY max_turns ResultMessage, not only the
+            # cases where the SDK's rewritten exception text happens to say
+            # "maximum number of turns" — for error_max_turns it instead reads
+            # "Claude Code returned an error result: error_max_turns", which
+            # contains no such phrase. `last_subtype` is the structured signal
+            # from the ResultMessage seen just above; OR it in so this
+            # corrective event doesn't clobber that already-derived exhaustion.
+            is_max_turns = (
+                "maximum number of turns" in msg.lower()
+                or last_subtype == "error_max_turns"
+            )
             # Preserve the traceback for genuine errors — a bare "'bool' object is
             # not subscriptable" with no file:line burned 3 attempts undiagnosably
             # (task 6cfdb936). max_turns is not an error, so it keeps the clean msg.

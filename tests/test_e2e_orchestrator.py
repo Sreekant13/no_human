@@ -2276,6 +2276,175 @@ async def test_planning_happy_path_is_one_call_and_carries_no_notice(
     assert "NO IMPLEMENTATION PLAN" not in prompt
 
 
+def _scripted_normal_path_query(*messages):
+    """Stands in for `claude_backend.query` on the NORMAL path — yields a
+    scripted `ResultMessage` per call (never raises) and records the turn
+    budget `no_human.core.orchestrator.ClaudeBackend`'s real class passed
+    each time, the seam this gap's retry has to be asserted at."""
+    budgets = []
+
+    async def _q(*args, **kwargs):
+        budgets.append(kwargs["options"].max_turns)
+        idx = min(len(budgets) - 1, len(messages) - 1)
+        yield messages[idx]
+
+    _q.budgets = budgets
+    return _q
+
+
+@pytest.mark.real_backend
+async def test_normal_path_planner_exhaustion_retries_once_at_double_turns(
+    bare_repo, tmp_path, store, monkeypatch,
+):
+    """The gap this closes: a max-turns *ResultMessage* on the normal path
+    (no exception) must drive the same one-retry-at-double-turns discipline
+    the exception path already has."""
+    from claude_agent_sdk import ResultMessage
+    from no_human.agent import claude_backend
+
+    cfg = _r3_config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    exhausted = ResultMessage(
+        subtype="error_max_turns", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=24, session_id="s1",
+        result="Reached maximum number of turns (24)",
+        usage={"input_tokens": 100, "output_tokens": 50},
+    )
+    success = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=10, session_id="s2",
+        result=_SAMPLE_PLAN,
+        usage={"input_tokens": 100, "output_tokens": 50},
+    )
+    query_fn = _scripted_normal_path_query(exhausted, success)
+    monkeypatch.setattr(claude_backend, "query", query_fn)
+
+    plan = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert query_fn.budgets == [24, 48], query_fn.budgets
+    assert plan == _SAMPLE_PLAN.strip()
+    assert not (t.context or {}).get("plan_unavailable")
+    texts = [e.get("text", "") for e in events if e.get("kind") == "planning"]
+    assert any("retrying once at 48" in x for x in texts), texts
+
+
+@pytest.mark.real_backend
+async def test_normal_path_exhausted_twice_tells_the_coder_there_is_no_plan(
+    bare_repo, tmp_path, store, monkeypatch,
+):
+    from claude_agent_sdk import ResultMessage
+    from no_human.agent import claude_backend
+
+    cfg = _r3_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=[].append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    def _exhausted_msg(turns, session):
+        return ResultMessage(
+            subtype="error_max_turns", duration_ms=1, duration_api_ms=1,
+            is_error=True, num_turns=turns, session_id=session,
+            result=f"Reached maximum number of turns ({turns})",
+            usage={"input_tokens": 100, "output_tokens": 50},
+        )
+
+    query_fn = _scripted_normal_path_query(
+        _exhausted_msg(24, "s1"), _exhausted_msg(48, "s2"))
+    monkeypatch.setattr(claude_backend, "query", query_fn)
+
+    plan = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert plan == ""
+    assert query_fn.budgets == [24, 48], "exactly one retry, no new loop"
+    assert "ran out of turns twice (24 then 48)" in orch._build_implement_prompt(t)
+
+
+@pytest.mark.real_backend
+async def test_normal_path_is_error_false_truncation_still_retries(
+    bare_repo, tmp_path, store, monkeypatch,
+):
+    """R17's shape, mirrored in the planner: the SDK does not always mark a
+    cut-off round as an error — a `ResultMessage` can carry a truncation
+    `stop_reason` (set directly by the SDK, independent of `subtype`) with
+    `is_error=False`. `_planner_result_failed` used to bail at the first
+    `is_error` check, so this exact shape walked past the retry and its
+    cut-off fragment was taken as the plan. It must be discarded and
+    retried, the same as the `is_error=True` case."""
+    from claude_agent_sdk import ResultMessage
+    from no_human.agent import claude_backend
+
+    cfg = _r3_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=[].append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    truncated = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=24, session_id="s1", stop_reason="max_turns",
+        result="...cut off mid-plan",
+        usage={"input_tokens": 100, "output_tokens": 50},
+    )
+    success = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=10, session_id="s2",
+        result=_SAMPLE_PLAN,
+        usage={"input_tokens": 100, "output_tokens": 50},
+    )
+    query_fn = _scripted_normal_path_query(truncated, success)
+    monkeypatch.setattr(claude_backend, "query", query_fn)
+
+    plan = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert query_fn.budgets == [24, 48], query_fn.budgets
+    assert plan == _SAMPLE_PLAN.strip()
+    assert not (t.context or {}).get("plan_unavailable")
+
+
+@pytest.mark.real_backend
+async def test_normal_path_max_tokens_truncation_is_discarded_not_read_as_plan(
+    bare_repo, tmp_path, store, monkeypatch,
+):
+    """`max_tokens` is truncation too (R17's tuple), but the retry POLICY is
+    unchanged — doubling TURNS does not fix an output-token ceiling, so only
+    `max_turns` gets the doubling retry (`result.stop_reason != "max_turns"`
+    at the retry gate, untouched by this fix). What this pins is narrower and
+    is the actual gap: the cut-off fragment must never be read as the plan,
+    `is_error=False` or not. `result` carries `_SAMPLE_PLAN`'s own well-formed
+    sections — a plan `_plan_is_unusable` alone would happily accept — so
+    only the widened `_planner_result_failed` gate stands between this
+    fragment and the coder."""
+    from claude_agent_sdk import ResultMessage
+    from no_human.agent import claude_backend
+
+    cfg = _r3_config(tmp_path)
+    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
+                        SlackNotifier(None), event_sink=[].append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    await store.create_task(t)
+
+    truncated = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=24, session_id="s1", stop_reason="max_tokens",
+        result=_SAMPLE_PLAN,
+        usage={"input_tokens": 100, "output_tokens": 50},
+    )
+    query_fn = _scripted_normal_path_query(truncated)
+    monkeypatch.setattr(claude_backend, "query", query_fn)
+
+    plan = await orch._generate_plan(t, GitRepo(bare_repo))
+
+    assert plan == ""
+    assert plan != _SAMPLE_PLAN.strip()
+    assert (t.context or {}).get("plan_unavailable")
+
+
 async def test_planner_quota_wall_raises_instead_of_planning_blind(
     bare_repo, tmp_path, store,
 ):

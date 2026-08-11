@@ -596,6 +596,14 @@ TRIVIAL_FAST_PATH_NOTE = (
 #: sentence; ten turns of Opus exploration buys nothing it can act on.
 _TRIVIAL_PLAN_TURNS = 2
 
+#: Stop reasons that mean a planning round was CUT OFF mid-output, so its text
+#: is a fragment, not a conclusion — the same shape and reasons as the
+#: reviewer's own no-verdict gate (``review/reviewer.py``,
+#: ``_TRUNCATED_STOP_REASONS``). Can arrive on the normal (non-``is_error``)
+#: result path, so ``_planner_result_failed`` checks this independently of
+#: ``is_error``.
+_PLANNER_TRUNCATED_STOP_REASONS = ("max_turns", "max_tokens")
+
 
 def _moa_complexity_signals(task: "Task", moa_cfg: dict) -> list[str]:
     """Pre-plan complexity signals gating the MoA fan-out (B2).
@@ -10017,8 +10025,19 @@ class Orchestrator:
         A quota wall is the one failure that is NOT discardable: it is the same
         billing wall the coder path parks on, and proceeding plan-less would
         only walk into it again on the next call. Raise, and let the task park.
+
+        Widened the way R17 widened the reviewer's own no-verdict gate
+        (``review/reviewer.py``, ``_TRUNCATED_STOP_REASONS``): a truncated
+        session can end as a NORMAL ``ResultMessage`` with ``is_error=False``
+        — the SDK does not always mark a cut-off round as an error — so
+        gating on ``is_error`` alone still let that shape's cut-off fragment
+        through as ``final_text`` and on into the plan. ``stop_reason`` in
+        ``max_turns``/``max_tokens`` is the same "did not finish" signal
+        whichever way the SDK reports it, and is checked structurally, never
+        by matching the text.
         """
-        if not getattr(result, "is_error", False):
+        truncated = (result.stop_reason or "") in _PLANNER_TRUNCATED_STOP_REASONS
+        if not (getattr(result, "is_error", False) or truncated):
             return False
         text = (getattr(result, "final_text", "") or "").strip()
         if _quota_signal(text):
@@ -10405,16 +10424,15 @@ class Orchestrator:
                 # Bounded at exactly one retry, and only for turn starvation: a
                 # transport or API failure is not fixed by more turns.
                 #
-                # KNOWN GAP: `stop_reason == "max_turns"` is set only on the
-                # backends' terminal-EXCEPTION path (`claude_backend.py`,
-                # `codex_backend.py`). A max-turns *ResultMessage* on the normal
-                # path is still discarded by `_planner_result_failed` but reaches
-                # the `!= "max_turns"` branch above, so it is NOT retried — it
-                # gets the honest no-plan notice instead. All 14 August instances
-                # match the exception path, so retry coverage is deliberate for
-                # the observed shape, not total. Widen it on evidence, not on
-                # taste: keying on the text would also match a plan that merely
-                # QUOTES the phrase.
+                # CLOSED GAP: `stop_reason == "max_turns"` now arrives from
+                # BOTH backend paths — the terminal-EXCEPTION path
+                # (`claude_backend.py`, `codex_backend.py`) and the NORMAL
+                # path, where `claude_backend.py`'s ResultMessage branch
+                # derives it from the SDK's structured
+                # `subtype == "error_max_turns"`. So the retry below covers
+                # both without any new branch here. Still forbidden: keying
+                # on the text — a plan that merely QUOTES the phrase must not
+                # be read as exhaustion.
                 # A CRASH first, and on every tier (R9 review F4): a transport
                 # or API failure is not turn starvation, is not fixed by more
                 # turns, and is not "benign" just because the tier is trivial.
