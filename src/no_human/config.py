@@ -1359,6 +1359,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # replaces this map wholesale, so wake.py carries the same default.
         "ignore_comment_authors": [],
         "max_ci_fix_rounds": 3,
+        # "enforce" (default): a red PR check counts a fix round and can
+        # escalate past max_ci_fix_rounds. "advisory": record the red, never
+        # act on it — a TEMPORARY operator override for a private repo whose
+        # Actions quota is exhausted (set in ~/.no_human/config.yaml
+        # 2026-08-12; REMOVE at go-public, where Actions minutes are
+        # unlimited and CI is meaningful again).
+        "pr_ci_policy": "enforce",
         # Bounded CI_GATE-failure → fix cycles on an open PR (M6), counted per
         # distinct failure signature like max_ci_fix_rounds; past the cap the
         # failing job is escalated to the human.

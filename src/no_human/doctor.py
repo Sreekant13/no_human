@@ -87,6 +87,7 @@ MECHANISMS: list[tuple[str, tuple[str, ...], str]] = [
      "high waived-share means coders aren't writing manifests"),
     ("pr_watch_ladder",
      ("merged", "pr_closed", "pr_feedback", "pr_feedback_skipped", "pr_ci_red",
+      "pr_ci_infra", "pr_ci_advisory",
       "escalated_ci", "escalated_revisions", "escalated_timeout", "resumed"),
      "zero = the watcher never had to act (fine if pr_watch_heartbeat is alive)"),
     ("pr_watch_heartbeat", ("wake_tick",),

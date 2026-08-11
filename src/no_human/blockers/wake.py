@@ -52,6 +52,26 @@ _TICK_ABORTED = "__tick_aborted__"
 _DURATION = re.compile(r"(\d+)\s*([smhd])", re.IGNORECASE)
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
+# Platform-layer CI failures: the job never ran the code, so a red check
+# carrying this signature is INFRA, not a coder fix round (live incident
+# 2026-08-11: a GitHub Actions billing outage turned every review-PASSED
+# task into escalated_ci at the finish line). The match is ONE full
+# sentence, deliberately: partial phrases ("the job was not started
+# because…") also appear in unrelated failures and in pytest echoes of this
+# very corpus, and a match here SUPPRESSES reporting — overmatching is the
+# dangerous direction. An unrecognized failure is always treated as real.
+# REACH (review finding, 2026-08-12): this classifier reads the ci_log
+# excerpt, and the only production ci_log is the Jenkins consoleText
+# fetcher — GitHub Actions exposes this text ONLY via the check-run
+# annotation, which nothing fetches yet. So today this fires for
+# log-yielding forges only; ticket 8c8b36b5 wires the annotation channel.
+# Until it lands, blockers.pr_ci_policy=advisory is the operational cover
+# for GitHub-hosted checks.
+_CI_INFRA_RE = re.compile(
+    r"(?i)recent account payments have failed or your "
+    r"spending limit needs to be increased"
+)
+
 
 def parse_duration(text: str) -> timedelta | None:
     """Parse ``2h`` / ``30m`` / ``48h`` / ``1d`` into a timedelta, or None."""
@@ -114,6 +134,28 @@ class WakeWatcher:
         # human). Counted per distinct failure signature, so a re-run of the
         # same red check doesn't burn a round.
         self.max_ci_fix_rounds = int(blockers_cfg.get("max_ci_fix_rounds", 3))
+        # TEMPORARY OPERATOR OVERRIDE (2026-08-12): "advisory" makes rung 5
+        # record a red PR check without counting a fix round, resuming the
+        # coder, or escalating — the operator's instruction while the private
+        # repo's GitHub Actions quota is exhausted for the month ("DO NOT FAIL
+        # TASKS ON IT FOR NOW"). The default is "enforce"; the override lives
+        # in ~/.no_human/config.yaml and MUST be removed at go-public (public
+        # repos have unlimited Actions minutes, so CI becomes meaningful
+        # again). The billing-signature classifier below stays either way —
+        # it is the permanent, self-reverting handling for platform-layer
+        # failures; this knob exists because a quota-blocked job may expose
+        # no log at all, which the fail-closed classifier cannot see.
+        self.pr_ci_policy = str(
+            blockers_cfg.get("pr_ci_policy", "enforce")
+        ).strip().lower()
+        if self.pr_ci_policy not in ("enforce", "advisory"):
+            # Fail closed, loudly: a typo ("Advisory ") silently meaning
+            # "enforce" would re-escalate every task mid-outage with no signal.
+            log.warning(
+                "blockers.pr_ci_policy %r is not 'enforce'/'advisory' — "
+                "falling back to 'enforce'", self.pr_ci_policy,
+            )
+            self.pr_ci_policy = "enforce"
         # Bounded PR-conflict → rebase cycles (SCRUM-41), same pattern: a PR
         # that textually conflicts with main is invisible to CI (branch checks
         # stay green through it) — only `gh pr view --json mergeable` exposes
@@ -1027,6 +1069,31 @@ class WakeWatcher:
         ctx = task.context or {}
         if ctx.get("pr_ci_last_sig") == signature:
             return None  # already acted on this exact run; wait for a new build
+        if self.pr_ci_policy == "advisory":
+            # Operator override (Actions quota exhausted): record the red so
+            # the board can show it, but never count a round, resume, or
+            # escalate. Throttled once per build via its OWN key —
+            # pr_ci_last_sig must stay untouched, or a build recorded under
+            # advisory would read as "already acted on" forever after the
+            # operator flips back to enforce (re-run failed jobs keeps the
+            # same link, so only a new push would clear it).
+            if ctx.get("pr_ci_advisory_sig") == signature:
+                return None
+            task.context = await self.store.merge_context(
+                task.id, {"pr_ci_advisory_sig": signature})
+            await self._emit(
+                task, "pr_ci_advisory",
+                f"{task.id[:8]} PR CI red — pr_ci_policy=advisory (Actions "
+                "quota exhausted): recorded, not acted on",
+            )
+            return None
+        if ctx.get("pr_ci_infra_sig") == signature:
+            # This exact build was already classified platform-layer INFRA:
+            # polling it again while parked must be free (no log refetch, no
+            # event row) — the same invariant the pr_ci_last_sig dedup states
+            # above, kept on a separate key so infra classification never
+            # suppresses a later REAL failure's round-counting.
+            return None
         excerpt = ""
         if self._ci_log is not None and failing[0].get("link"):
             try:
@@ -1037,6 +1104,22 @@ class WakeWatcher:
         # before ANY write in this rung (SCRUM-68; the round counter, the
         # escalation, and the resume below all mutate the task).
         if await self._is_terminal(task):
+            return None
+        if excerpt and _CI_INFRA_RE.search(excerpt):
+            # The run failed at the platform layer (billing / runner
+            # provisioning), so it says nothing about the code: no fix round,
+            # no send-back, no escalation. pr_ci_last_sig stays unset so a
+            # later healthy build is evaluated fresh; pr_ci_infra_sig (its own
+            # key, checked above) makes re-polling this build free. An EMPTY
+            # or unreadable excerpt falls through to the real-failure path —
+            # infra must be positively identified, never assumed (fail closed).
+            task.context = await self.store.merge_context(
+                task.id, {"pr_ci_infra_sig": signature})
+            await self._emit(
+                task, "pr_ci_infra",
+                f"{task.id[:8]} PR CI red is billing/provisioning INFRA — "
+                "no fix round counted, not escalating",
+            )
             return None
         names = ", ".join(c.get("name", "?") for c in failing)
         rounds = int(ctx.get("pr_ci_rounds") or 0) + 1

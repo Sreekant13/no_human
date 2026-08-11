@@ -247,6 +247,158 @@ async def test_ci_rounds_cap_escalates_with_the_named_check(store):
     assert "check-4" in (fresh.blocker or {}).get("question", "")
 
 
+_BILLING_LOG = (
+    "The job was not started because recent account payments have failed "
+    "or your spending limit needs to be increased."
+)
+
+
+async def test_billing_infra_red_never_counts_a_round_or_escalates(store):
+    """A platform-layer failure (billing outage) says nothing about the code:
+    no fix round, no send-back, no escalation — the 2026-08-11 incident."""
+    t = await _approval_task(store)
+    events = []
+    w = _watcher(store, checks=[FAIL_CHECK], log=_BILLING_LOG, events=events)
+    assert await w._check_open_pr(t) is None
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.AWAITING_APPROVAL
+    assert "pr_ci_rounds" not in (fresh.context or {})
+    assert "send_back_feedback" not in (fresh.context or {})
+    assert any(k == "pr_ci_infra" for k, _ in events)
+    assert not any(k in ("escalated_ci", "pr_ci_red") for k, _ in events)
+
+
+async def test_billing_infra_never_records_the_acted_on_signature(store):
+    """The infra path must not write pr_ci_last_sig: a NEW build with a REAL
+    failure must count round 1 (a healthy pipeline is evaluated fresh)."""
+    t = await _approval_task(store)
+    assert await _watcher(store, checks=[FAIL_CHECK], log=_BILLING_LOG)._check_open_pr(t) is None
+    t = await store.get_task(t.id)
+    new_build = {**FAIL_CHECK, "link": FAIL_CHECK["link"].replace("/2/", "/3/")}
+    w2 = _watcher(store, checks=[new_build], log="AssertionError: boom")
+    assert await w2._check_open_pr(t) == "resumed"
+    fresh = await store.get_task(t.id)
+    assert fresh.context["pr_ci_rounds"] == 1
+    assert "AssertionError" in fresh.context["send_back_feedback"][-1]["message"]
+
+
+async def test_infra_repolls_are_free_no_refetch_no_new_event(store):
+    """Review finding 2026-08-12: without a throttle, a parked billing-red PR
+    costs a log fetch + an event row EVERY watcher tick (8640/day at the 10s
+    default). The same build must be classified once, then be free."""
+    t = await _approval_task(store)
+    fetches, events = [], []
+
+    async def pr_state(url): return "OPEN"
+    async def pr_checks(url): return [FAIL_CHECK]
+    async def ci_log(link):
+        fetches.append(link)
+        return _BILLING_LOG
+    w = WakeWatcher(
+        store, {}, pr_state=pr_state, pr_checks=pr_checks, ci_log=ci_log,
+        on_event=lambda k, t2: events.append(k),
+    )
+    for _ in range(5):
+        t = await store.get_task(t.id)
+        assert await w._check_open_pr(t) is None
+    assert len(fetches) == 1
+    assert events.count("pr_ci_infra") == 1
+
+
+async def test_the_infra_signature_is_one_full_sentence_not_a_prefix(store):
+    """Review finding 2026-08-12: partial phrases appear in unrelated failures
+    and in pytest echoes of this corpus; a match SUPPRESSES reporting, so the
+    dangerous direction is overmatch. Only the full billing sentence counts."""
+    from no_human.blockers.wake import _CI_INFRA_RE
+    assert _CI_INFRA_RE.search(_BILLING_LOG)
+    assert not _CI_INFRA_RE.search(
+        "ERROR: The job was not started because the upstream project failed to build."
+    )
+    assert not _CI_INFRA_RE.search(
+        "FAILED tests/test_billing.py::test_dunning - recent account payments have failed"
+    )
+
+
+async def test_advisory_policy_records_the_red_but_never_acts(store):
+    """Operator override while Actions quota is exhausted (2026-08-12): a red
+    check must not count a round, resume the coder, or escalate — even a REAL
+    failure with a readable log. Undo at go-public."""
+    t = await _approval_task(store)
+    events = []
+
+    async def pr_state(url): return "OPEN"
+    async def pr_checks(url): return [FAIL_CHECK]
+    async def ci_log(link): return "AssertionError: boom"
+    w = WakeWatcher(
+        store, {"blockers": {"pr_ci_policy": "advisory"}},
+        pr_state=pr_state, pr_checks=pr_checks, ci_log=ci_log,
+        on_event=lambda k, t2: events.append((k, t2)),
+    )
+    assert await w._check_open_pr(t) is None
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.AWAITING_APPROVAL
+    assert "pr_ci_rounds" not in (fresh.context or {})
+    assert "send_back_feedback" not in (fresh.context or {})
+    assert any(k == "pr_ci_advisory" for k, _ in events)
+    assert not any(k in ("escalated_ci", "pr_ci_red") for k, _ in events)
+    # Throttled: the same build emits once.
+    t2 = await store.get_task(t.id)
+    events.clear()
+    assert await w._check_open_pr(t2) is None
+    assert not events
+
+
+async def test_advisory_signature_never_suppresses_enforce_after_the_flip(store):
+    """Review finding 2026-08-12: advisory must use its OWN throttle key. A
+    build recorded under advisory (same link — GitHub re-runs keep it) must
+    still count a round after the operator flips back to enforce."""
+    t = await _approval_task(store)
+
+    async def pr_state(url): return "OPEN"
+    async def pr_checks(url): return [FAIL_CHECK]
+    async def ci_log(link): return "AssertionError: boom"
+    adv = WakeWatcher(store, {"blockers": {"pr_ci_policy": "advisory"}},
+                      pr_state=pr_state, pr_checks=pr_checks, ci_log=ci_log)
+    assert await adv._check_open_pr(t) is None
+    t = await store.get_task(t.id)
+    enf = WakeWatcher(store, {}, pr_state=pr_state, pr_checks=pr_checks,
+                      ci_log=ci_log)
+    assert await enf._check_open_pr(t) == "resumed"
+    assert (await store.get_task(t.id)).context["pr_ci_rounds"] == 1
+
+
+async def test_an_unknown_policy_value_falls_back_to_enforce_loudly(store, caplog):
+    """A typo must not silently disable enforcement — warn and enforce."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="no_human.wake"):
+        w = _watcher(store, checks=[FAIL_CHECK], log="AssertionError: boom")
+        w2 = WakeWatcher(store, {"blockers": {"pr_ci_policy": "Advisory "}},
+                         pr_state=None, pr_checks=None, ci_log=None)
+    assert w2.pr_ci_policy == "advisory"  # case/space normalized, still valid
+    w3 = WakeWatcher(store, {"blockers": {"pr_ci_policy": "advisry"}},
+                     pr_state=None, pr_checks=None, ci_log=None)
+    assert w3.pr_ci_policy == "enforce"
+    assert w.pr_ci_policy == "enforce"
+
+
+async def test_the_default_policy_is_enforce_and_still_acts(store):
+    """The advisory override must be opt-in: without the config key, a real
+    red check still counts a round (the go-public default)."""
+    t = await _approval_task(store)
+    w = _watcher(store, checks=[FAIL_CHECK], log="AssertionError: boom")
+    assert w.pr_ci_policy == "enforce"
+    assert await w._check_open_pr(t) == "resumed"
+    assert (await store.get_task(t.id)).context["pr_ci_rounds"] == 1
+
+
+async def test_an_empty_or_unreadable_excerpt_is_a_real_failure_not_infra(store):
+    """Fail closed: infra must be positively identified. No log = real round."""
+    t = await _approval_task(store)
+    w = _watcher(store, checks=[FAIL_CHECK], log="")
+    assert await w._check_open_pr(t) == "resumed"
+    assert (await store.get_task(t.id)).context["pr_ci_rounds"] == 1
+
+
 class _Comment:
     def __init__(self, author, body, created_at):
         self.author = author

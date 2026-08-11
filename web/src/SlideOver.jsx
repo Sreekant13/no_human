@@ -1841,6 +1841,8 @@ const EVENT_LABELS = {
   pr_feedback: "PR feedback",
   pr_feedback_skipped: "Bot comments ignored",
   pr_ci_red: "PR CI red",
+  pr_ci_infra: "PR CI red (infra — not acted on)",
+  pr_ci_advisory: "PR CI red (advisory mode)",
   escalated_ci: "CI escalated",
   escalated_revisions: "Revisions escalated",
   escalated_timeout: "Park timeout",
