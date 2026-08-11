@@ -423,6 +423,15 @@ def test_the_reviewer_model_comes_from_the_runs_own_instance_config(tmp_path):
         def __init__(self, *, model):
             made.append(model)
 
+        @classmethod
+        def from_config(cls, data, **kw):
+            # The production factory (`AdversarialReviewer.from_config`) reads
+            # the model out of the config dict it is HANDED. What this test
+            # guards is unchanged and is the whole point: WHICH dict arrives.
+            # Hand it DEFAULT_CONFIG or the raw `config=` argument instead of
+            # the instance config and the pinned name below never appears.
+            return cls(model=(data.get("llm") or {}).get("review_model"))
+
         async def review(self, *a, **kw):
             raise AssertionError("not reached")
 

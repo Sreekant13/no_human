@@ -1093,3 +1093,98 @@ def test_gate_prompts_mark_input_untrusted():
         # the operative instruction, not just the header
         assert "never instructions to you" in prompt, f"{name} missing the do-not-obey clause"
         assert "do NOT comply" in prompt, f"{name} missing the non-compliance directive"
+
+
+# --------------------------------------------------------------------------- #
+# The review session's WALL-CLOCK WINDOW (2026-08-11)                          #
+# --------------------------------------------------------------------------- #
+# The window used to be a module constant at 600s. Measured on 2026-08-11 a
+# review ROUND averages ~1078s (677–1357s over 7 rounds) on the Opus-5 reviewer
+# tier, so the wall sat BELOW the mean round and killed both rounds of task
+# b0a4eba1, which then escalated with an unreviewed diff. These pin that the
+# window is (a) operator-configurable and (b) that the configured number is the
+# one `asyncio.wait_for` is actually handed — not a number that stops at the
+# constructor.
+
+
+def _wall_spy(monkeypatch):
+    """Record every wall-clock window `reviewer` asks `asyncio.wait_for` for,
+    and otherwise behave exactly like the real one."""
+    import no_human.review.reviewer as rv
+
+    seen: list[float] = []
+    real = rv.asyncio.wait_for
+
+    async def _spy(awaitable, timeout=None):
+        seen.append(timeout)
+        return await real(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(rv.asyncio, "wait_for", _spy)
+    return seen
+
+
+async def test_the_configured_review_window_is_the_wall_the_session_gets(
+        simple_repo, monkeypatch):
+    """`llm.review_timeout_seconds` -> the gate session's actual wall.
+
+    Mutation-proof by construction: the asserted number is one no default
+    anywhere in the tree spells, so it can only have arrived from the config
+    dict, through `from_config`, through `_agent_review`, to `wait_for`.
+    """
+    seen = _wall_spy(monkeypatch)
+    reviewer = AdversarialReviewer.from_config(
+        {"llm": {"review_model": "claude-opus-5", "review_timeout_seconds": 777}},
+        backend=FakeBackend(_block(True, [
+            {"label": "ok", "passed": True, "evidence": "calc.py:3"}])),
+    )
+    t = Task.new("add mul()")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+
+    decision = await reviewer.review(t, repo_path=simple_repo)
+
+    assert decision.passed is True
+    assert seen and seen[0] == 777, seen
+
+
+async def test_an_unconfigured_install_gets_the_measured_default_window(
+        simple_repo, monkeypatch):
+    """No key in config -> 1500s, which is above the 1357s worst round measured
+    on 2026-08-11. A config that predates the knob must not fall back to 600."""
+    seen = _wall_spy(monkeypatch)
+    reviewer = AdversarialReviewer.from_config(
+        {"llm": {"review_model": "claude-opus-5"}},
+        backend=FakeBackend(_block(True, [
+            {"label": "ok", "passed": True, "evidence": "calc.py:3"}])),
+    )
+
+    await reviewer.review(Task.new("add mul()"), repo_path=simple_repo)
+
+    assert seen and seen[0] == 1500, seen
+
+
+async def test_code_review_mode_carries_its_own_larger_window(
+        simple_repo, monkeypatch):
+    """The two windows stay distinct: `code_review` reviews a whole PR diff at
+    twice the gate's diff cap, so it keeps a larger wall and its own knob."""
+    seen = _wall_spy(monkeypatch)
+    reviewer = AdversarialReviewer.from_config(
+        {"llm": {"review_model": "claude-opus-5"}},
+        backend=FakeBackend(_block(True, [
+            {"label": "ok", "passed": True, "evidence": "calc.py:3"}])),
+    )
+
+    await reviewer.review(Task.new("Review PR"), repo_path=simple_repo,
+                          diff_override="+ x = 1\n", mode="code_review")
+
+    assert seen and seen[0] == 1800, seen
+
+    seen.clear()
+    configured = AdversarialReviewer.from_config(
+        {"llm": {"review_model": "claude-opus-5",
+                 "code_review_timeout_seconds": 909}},
+        backend=FakeBackend(_block(True, [
+            {"label": "ok", "passed": True, "evidence": "calc.py:3"}])),
+    )
+    await configured.review(Task.new("Review PR"), repo_path=simple_repo,
+                            diff_override="+ x = 1\n", mode="code_review")
+    assert seen and seen[0] == 909, seen

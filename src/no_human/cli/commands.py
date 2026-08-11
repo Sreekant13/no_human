@@ -280,7 +280,7 @@ def _build_orchestrator(config, store: Store, *, event_sink=None, task=None) -> 
     gatherer = ContextGatherer(build_default_sources(store, config.data))
     from ..learning import LearningQueue
     from ..review.reviewer import AdversarialReviewer
-    reviewer = AdversarialReviewer(model=config.review_model, backend=review_backend)
+    reviewer = AdversarialReviewer.from_config(config.data, backend=review_backend)
     return Orchestrator(store, config.data, backend, notifier,
                         event_sink=event_sink, context_gatherer=gatherer,
                         learning_queue=LearningQueue(store),
@@ -5300,7 +5300,7 @@ def eval_cmd(prev_path, out_path, gate):
         run = await run_eval(
             config.data,
             backend_factory=backend_factory,
-            reviewer=AdversarialReviewer(model=config.review_model),
+            reviewer=AdversarialReviewer.from_config(config.data),
             judge=IntentJudge(model=config.review_model),
             previous=previous,
             now=_now_iso(),
@@ -5571,7 +5571,7 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
             return NorthStarRunner(
                 config.data,
                 backend_factory=backend_factory,
-                reviewer=AdversarialReviewer(model=config.review_model),
+                reviewer=AdversarialReviewer.from_config(config.data),
                 goal_judge=GoalJudge(model=config.review_model),
                 event_sink=lambda e: None,
             )
@@ -6396,7 +6396,7 @@ def shadow_cmd(title, repo, criteria):
         result = await run_shadow(
             config.data, repo_path=str(Path(repo).resolve()), task_title=title,
             backend=backend, acceptance_criteria=list(criteria),
-            reviewer=AdversarialReviewer(model=config.review_model),
+            reviewer=AdversarialReviewer.from_config(config.data),
             on_event=render_event,
         )
         console.rule(f"[bold]shadow: {result.outcome_status}")

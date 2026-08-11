@@ -265,3 +265,155 @@ def test_a_loaded_config_never_aliases_the_global_defaults(tmp_path):
         "writing to a loaded config mutated the global defaults")
     # ...and the user's own override still wins over the default.
     assert cfg.data["llm"]["review_model"] == "claude-opus-5"
+
+
+# --------------------------------------------------------------------------- #
+# Reviewer session windows (2026-08-11)                                        #
+# --------------------------------------------------------------------------- #
+
+def test_the_review_window_defaults_have_exactly_one_source_of_truth():
+    """DEFAULT_CONFIG and the reviewer's own fallback constants must be the same
+    numbers. Two spellings of a default is how a knob silently stops matching
+    the code it configures; this is the guard that catches the drift. Break
+    either side and this reddens."""
+    from no_human.config import DEFAULT_CONFIG
+    from no_human.review import reviewer as rv
+
+    assert DEFAULT_CONFIG["llm"]["review_timeout_seconds"] == rv._REVIEW_TIMEOUT
+    assert (DEFAULT_CONFIG["llm"]["code_review_timeout_seconds"]
+            == rv._CODE_REVIEW_TIMEOUT)
+    # The measured numbers themselves (see the constant's comment): above the
+    # 1357s worst review round observed 2026-08-11, not the old 600s wall that
+    # sat below the ~1078s mean.
+    assert rv._REVIEW_TIMEOUT == 1500
+    assert rv._CODE_REVIEW_TIMEOUT == 1800
+
+
+def test_an_absurdly_small_review_window_is_clamped_to_the_floor():
+    """A window under the floor is not a tuning choice, it is a typo: every
+    review would time out twice and every task would escalate unreviewed. Clamp
+    (loudly) rather than raise — a bad number in one knob must not make the
+    whole install unloadable."""
+    from no_human.config import (
+        REVIEW_TIMEOUT_FLOOR_S,
+        code_review_timeout_seconds,
+        review_timeout_seconds,
+    )
+
+    assert review_timeout_seconds({"llm": {"review_timeout_seconds": 5}}) == (
+        REVIEW_TIMEOUT_FLOOR_S)
+    assert review_timeout_seconds({"llm": {"review_timeout_seconds": 0}}) == (
+        REVIEW_TIMEOUT_FLOOR_S)
+    assert review_timeout_seconds({"llm": {"review_timeout_seconds": -30}}) == (
+        REVIEW_TIMEOUT_FLOOR_S)
+    assert code_review_timeout_seconds(
+        {"llm": {"code_review_timeout_seconds": 1}}) == REVIEW_TIMEOUT_FLOOR_S
+    # At the floor exactly: honoured, not clamped away.
+    assert review_timeout_seconds(
+        {"llm": {"review_timeout_seconds": REVIEW_TIMEOUT_FLOOR_S}}
+    ) == REVIEW_TIMEOUT_FLOOR_S
+
+
+def test_a_nonnumeric_review_window_falls_back_to_the_default():
+    """YAML hands back whatever was typed. A string, a null or a bool is not a
+    number of seconds — take the measured default rather than crash or, worse,
+    hand `asyncio.wait_for` something it will reject at review time."""
+    from no_human.config import DEFAULT_CONFIG, review_timeout_seconds
+
+    default = DEFAULT_CONFIG["llm"]["review_timeout_seconds"]
+    for bad in ("25 minutes", None, True, [1500], {"s": 1500}):
+        assert review_timeout_seconds({"llm": {"review_timeout_seconds": bad}}) == (
+            default), bad
+    # Absent key, absent section, empty dict — all the same default.
+    assert review_timeout_seconds({"llm": {}}) == default
+    assert review_timeout_seconds({}) == default
+
+
+def test_config_exposes_the_review_windows_as_properties():
+    """The Config object is what every production call site holds, so the knob
+    has to be readable from it the way `review_model` is."""
+    from no_human.config import Config, DEFAULT_CONFIG
+
+    cfg = Config(data={"llm": {"review_timeout_seconds": 1200,
+                               "code_review_timeout_seconds": 2400}},
+                 path=None)
+    assert cfg.review_timeout_seconds == 1200
+    assert cfg.code_review_timeout_seconds == 2400
+
+    empty = Config(data={"llm": {}}, path=None)
+    assert empty.review_timeout_seconds == (
+        DEFAULT_CONFIG["llm"]["review_timeout_seconds"])
+    assert empty.code_review_timeout_seconds == (
+        DEFAULT_CONFIG["llm"]["code_review_timeout_seconds"])
+
+
+def test_a_nonfinite_review_window_is_rejected_rather_than_crashing_the_install(
+        tmp_path, caplog):
+    """`.inf`, `.nan` and `-.inf` are LEGAL YAML floats.
+
+    Found in adversarial review of the config-driven window. They are real
+    `float`s, so `isinstance(raw, (int, float))` waves them through; `nan < 60`
+    is False so the floor branch does not catch them either; and `int(inf)` /
+    `int(nan)` then raise OverflowError / ValueError — out of a property that
+    every orchestrator construction reads (cli/commands.py `_build_orchestrator`)
+    and out of `load_config` itself. One typo in one knob would make the install
+    unloadable, which is the exact invariant `_timeout_knob` states twice and
+    the reason it clamps instead of raising. Driven through `yaml.safe_load`
+    and `load_config`, not through hand-built floats: the point is that YAML
+    produces these from ordinary-looking text.
+    """
+    import logging
+    import math
+
+    import yaml as _yaml
+
+    from no_human.config import DEFAULT_CONFIG, load_config, review_timeout_seconds
+
+    default = DEFAULT_CONFIG["llm"]["review_timeout_seconds"]
+    for literal in (".inf", ".nan", "-.inf"):
+        data = _yaml.safe_load(f"llm:\n  review_timeout_seconds: {literal}\n")
+        raw = data["llm"]["review_timeout_seconds"]
+        # The instrument first: if YAML ever stopped producing a non-finite
+        # float here, the rest of this test would be checking nothing.
+        assert isinstance(raw, float) and not math.isfinite(raw), (literal, raw)
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="no_human.config"):
+            assert review_timeout_seconds(data) == default, literal
+        assert any("review_timeout_seconds" in r.getMessage()
+                   for r in caplog.records), (literal, caplog.records)
+
+    # End to end, the way the crash was reproduced: a config.yaml on disk ->
+    # load_config -> the property every reviewer construction reads.
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "llm:\n  review_timeout_seconds: .inf\n  code_review_timeout_seconds: .nan\n")
+    cfg = load_config(home / "config.yaml")
+    assert cfg.review_timeout_seconds == default
+    assert cfg.code_review_timeout_seconds == (
+        DEFAULT_CONFIG["llm"]["code_review_timeout_seconds"])
+
+    # ...and the reviewer that reads it still builds, which is what "unloadable"
+    # actually meant.
+    from no_human.review.reviewer import AdversarialReviewer
+
+    class _B:
+        model = "claude-opus-5"
+
+    reviewer = AdversarialReviewer.from_config(cfg.data, backend=_B())
+    assert reviewer._timeout == default
+
+
+def test_the_config_floor_never_inverts_the_retry_window():
+    """`_agent_review` halves a timed-out round's window but floors it at
+    `_REVIEW_MIN_RETRY_TIMEOUT`. If the config floor sat BELOW that floor, a
+    configured window in between would give round TWO a bigger window than
+    round one — an inversion of the rule that a hang must escalate sooner, not
+    later. Aligning the two removes the case rather than documenting it."""
+    from no_human.config import REVIEW_TIMEOUT_FLOOR_S
+    from no_human.review.reviewer import _REVIEW_MIN_RETRY_TIMEOUT
+
+    assert REVIEW_TIMEOUT_FLOOR_S >= _REVIEW_MIN_RETRY_TIMEOUT, (
+        f"a configured window between {_REVIEW_MIN_RETRY_TIMEOUT} and "
+        f"{REVIEW_TIMEOUT_FLOOR_S} would grow on retry instead of shrinking")

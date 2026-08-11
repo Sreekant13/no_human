@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import logging
+import math
 import os
 import re
 import warnings
@@ -928,6 +929,70 @@ def assert_subscription_mode(
 # Config file                                                                  #
 # --------------------------------------------------------------------------- #
 
+#: Floor for the reviewer's session windows, in seconds. Below this a review
+#: cannot finish, so both of its bounded rounds die on the wall and the task
+#: escalates with an unreviewed diff — a value under the floor is a typo, not a
+#: tuning choice. Clamped rather than raised: one bad number in one knob must
+#: not make the whole install refuse to load.
+#:
+#: IT IS 120 AND NOT 60 BECAUSE OF `_REVIEW_MIN_RETRY_TIMEOUT` (raised in
+#: adversarial review). `review.reviewer._agent_review` HALVES a round that died
+#: on the wall — `max(_REVIEW_MIN_RETRY_TIMEOUT, window // 2)`, floored at 120 —
+#: so any configured window between 60 and 119 would hand round TWO a window
+#: LARGER than round one, inverting the rule that a hang must escalate sooner
+#: rather than sit blocked longer. Aligning the two floors deletes that case
+#: instead of documenting it. Keep them equal: `tests/test_config.py::
+#: test_the_config_floor_never_inverts_the_retry_window` goes red if either
+#: moves below the other.
+REVIEW_TIMEOUT_FLOOR_S = 120
+
+
+def _timeout_knob(data: dict[str, Any], key: str, default: int) -> int:
+    """Read one ``llm.<key>`` seconds knob: numeric, at or above the floor, or
+    the measured *default*.
+
+    YAML hands back whatever was typed, so a string, a null, a list or a bool
+    all have to survive here — ``asyncio.wait_for`` would otherwise reject them
+    at review time, i.e. after the coder attempt has already been paid for.
+    ``bool`` is excluded explicitly because it is an ``int`` in Python and
+    ``review_timeout_seconds: true`` means nothing in seconds.
+
+    ``math.isfinite`` is the same rule for the values that LOOK numeric and are
+    not usable (found in adversarial review of this function): ``.inf``,
+    ``-.inf`` and ``.nan`` are legal YAML floats, so they pass the isinstance
+    test; ``nan < FLOOR`` is False so the clamp below never sees them; and the
+    ``int()`` on the last line then raises OverflowError / ValueError out of a
+    property read by every orchestrator construction. That is exactly the
+    "one bad number must not make the install unloadable" invariant this
+    function exists to hold, defeated by three characters of YAML.
+    """
+    raw = (data.get("llm") or {}).get(key, None)
+    if (isinstance(raw, bool) or not isinstance(raw, (int, float))
+            or not math.isfinite(raw)):
+        if raw is not None:
+            log.warning("llm.%s is not a number of seconds (%r) — using %ds",
+                        key, raw, default)
+        return default
+    if raw < REVIEW_TIMEOUT_FLOOR_S:
+        log.warning("llm.%s=%s is below the %ds floor — clamping; a window this "
+                    "small times out every review", key, raw,
+                    REVIEW_TIMEOUT_FLOOR_S)
+        return REVIEW_TIMEOUT_FLOOR_S
+    return int(raw)
+
+
+def review_timeout_seconds(data: dict[str, Any]) -> int:
+    """Wall-clock window for ONE gate review session, from raw config data."""
+    return _timeout_knob(data, "review_timeout_seconds",
+                         DEFAULT_CONFIG["llm"]["review_timeout_seconds"])
+
+
+def code_review_timeout_seconds(data: dict[str, Any]) -> int:
+    """Wall-clock window for ONE ``code_review``-mode session (bigger diff cap)."""
+    return _timeout_knob(data, "code_review_timeout_seconds",
+                         DEFAULT_CONFIG["llm"]["code_review_timeout_seconds"])
+
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "server": {"host": "127.0.0.1", "port": 8420},
     "worker": {
@@ -962,6 +1027,31 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "auth_profile": DEFAULT_AUTH_PROFILE,
         "primary_model": "claude-sonnet-5",
         "review_model": "claude-opus-5",
+        # Wall-clock seconds granted to ONE reviewer session before it is cut
+        # off. These are the walls, not budgets: the reviewer is bounded by
+        # turns as well, and a round that dies on the wall halves the next one.
+        #
+        # Raised 600 -> 1500 / 1800 on 2026-08-11 because 600 sat BELOW the mean
+        # review round once the reviewer tier moved to claude-opus-5 (measured:
+        # ~1078s mean, 1357s worst, over 7 rounds; ~360s in the Jul 20–26
+        # baseline week that 600 was sized for). Task b0a4eba1 lost both of its
+        # rounds to "timed out after 600s" and escalated unreviewed. The full
+        # measurement, the worst-case arithmetic and the reason a higher wall is
+        # a real cost live at `review.reviewer._REVIEW_TIMEOUT` — and these two
+        # numbers are pinned equal to that module's constants by
+        # tests/test_config.py::test_the_review_window_defaults_have_exactly_
+        # one_source_of_truth, which is what catches a drift between them.
+        #
+        # These do NOT choose the reviewer tier — that is an open operator
+        # decision; re-measure with `nh bench report` under its reviewer recall
+        # flag (not spelled literally: that string is a needle the
+        # recall-corpus guard under tests/ forbids outside the CLI wiring).
+        # Read them with `review_timeout_seconds(data)` /
+        # `code_review_timeout_seconds(data)`, never straight off the dict: a
+        # nonsense value falls back and an under-floor one clamps there.
+        "review_timeout_seconds": 1500,
+        # `code_review` mode reads a 120K-char PR diff — twice the gate's cap.
+        "code_review_timeout_seconds": 1800,
         "planner_model": "claude-opus-5",
         # The supervisor is a sparse every-N-tool-calls course-corrector running
         # at effort="low", max_turns=1. It used to ride on review_model, so it
@@ -1714,6 +1804,14 @@ class Config:
     @property
     def review_model(self) -> str:
         return self.data["llm"]["review_model"]
+
+    @property
+    def review_timeout_seconds(self) -> int:
+        return review_timeout_seconds(self.data)
+
+    @property
+    def code_review_timeout_seconds(self) -> int:
+        return code_review_timeout_seconds(self.data)
 
     @property
     def planner_model(self) -> str:

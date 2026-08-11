@@ -471,7 +471,7 @@ async def _run(home: Path, out: Path, *, backend_factory, reviewer,
         # like a product regression. `reviewer.allow_advisory` is NOT the fix:
         # it makes a skipped gate report a pass.
         from ..review.reviewer import AdversarialReviewer
-        reviewer = AdversarialReviewer(model=data["llm"]["review_model"])
+        reviewer = AdversarialReviewer.from_config(data)
 
     report: dict[str, Any] = {
         "date": date.today().isoformat(),

@@ -160,7 +160,7 @@ async def lifespan(app: FastAPI):
         # Fan-out over every configured notify-OUT channel (Slack + Teams).
         notifier = build_notifier(config.data)
         gatherer = ContextGatherer(build_default_sources(store, config.data))
-        reviewer = AdversarialReviewer(model=config.review_model, backend=review_backend)
+        reviewer = AdversarialReviewer.from_config(config.data, backend=review_backend)
         return Orchestrator(
             store, config.data, backend, notifier,
             context_gatherer=gatherer,

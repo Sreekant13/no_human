@@ -58,7 +58,48 @@ _UNPARSED_TAIL_CHARS = 300
 # 1300-line Jenkinsfile and never emitted its verdict, which cost the coder its
 # last bounded attempt for a defect that did not exist.
 _REVIEW_TURNS = 30
-_REVIEW_TIMEOUT = 600
+#: DEFAULT wall-clock window for ONE gate review session, in seconds. The
+#: operator's `llm.review_timeout_seconds` overrides it; this constant is only
+#: what an install that sets nothing falls back to (`config.review_timeout_
+#: seconds`, whose DEFAULT_CONFIG entry is pinned equal to this number by
+#: `test_the_review_window_defaults_have_exactly_one_source_of_truth`).
+#:
+#: 🔴 IT WAS 600 AND 600 WAS BELOW THE MEAN ROUND. Measured 2026-08-11 over 7
+#: consecutive review rounds: mean ~1078s, range 677–1357s. The true baseline
+#: week (Jul 20–26, BEFORE the reviewer tier moved to `claude-opus-5` on
+#: 2026-07-26) averaged ~360s a round, which is the world 600 was sized for.
+#: The tier moved; the wall did not. Consequence, observed live rather than
+#: reasoned about: task b0a4eba1 lost BOTH of its rounds to "timed out after
+#: 600s" and escalated carrying a diff nobody had reviewed. A wall below the
+#: mean does not trim the tail — it fails the common case, for every nontrivial
+#: diff. 1500 is set ABOVE the worst round observed (1357s), not at the mean.
+#:
+#: An earlier proposal to raise this to 900 was rejected, correctly: its
+#: justification measured a PRE-REVIEW GAP, not the review round. This number
+#: is justified by the round-duration distribution itself.
+#:
+#: THE COST OF A HIGHER WALL, stated rather than buried. A genuinely hung
+#: session now burns up to 1500s instead of 600s before it is cut off. That is
+#: real, and it is bounded: `_agent_review` runs at most
+#: `_REVIEW_INFRA_RETRIES + 1` = 2 rounds, and a round killed by the wall
+#: HALVES the next one (see the halving in `_agent_review`), so the worst case
+#: for a totally hung reviewer is 1500 + 750 = 2250s ≈ 38 min per attempt, or
+#: 2×1500 = 3000s ≈ 50 min if the first round dies some other way and the
+#: window is not halved. Not one second of that is unbounded, and none of it
+#: sits inside `bounds.attempt_timeout_s` — that wall bounds the CODER turn
+#: only, so raising this does not eat the coder's budget.
+#:
+#: WHAT THIS KNOB DOES NOT DECIDE: which model reviews. The reviewer tier is an
+#: open operator decision — a same-day A/B rejected `claude-opus-5` as reviewer
+#: under the current prompt — and the honest re-measure is `nh bench report`
+#: under its reviewer recall flag. (Spelled that way on purpose: the flag's
+#: literal name is a needle the recall-corpus guard under tests/ forbids in
+#: every src module but the CLI wiring file, so writing it out here would trip
+#: a guard that is right. Do not "fix" this back.) This window serves whatever
+#: tier is configured; if the tier moves back to a faster one, re-measure the
+#: round distribution and lower this. It does not choose the tier and must not
+#: be read as an endorsement of one.
+_REVIEW_TIMEOUT = 1500
 # Trivial tier (2026-08-09): a real review, bounded. The whole artefact is a
 # ≤2-file prose diff already pasted into the prompt, plus the ticket — the
 # turns exist for opening cited files, and there are at most two. Still a
@@ -72,6 +113,15 @@ _REVIEW_INFRA_RETRIES = 1
 # is halved down to this floor rather than granted another full one — a hang
 # won't clear in a second full window, it just doubles how long a task sits
 # blocked in review. Floored so the retry still gets a fair chance.
+#
+# IT IS ALSO THE FLOOR THE OPERATOR'S OWN WINDOW IS CLAMPED TO (raised in
+# adversarial review of the config-driven window). `config.REVIEW_TIMEOUT_
+# FLOOR_S` is held equal to this number, because a configured window below it
+# would make `max(_REVIEW_MIN_RETRY_TIMEOUT, round_timeout // 2)` return
+# something BIGGER than round one's window — a hang would then sit blocked
+# longer on the retry, which is the inverse of what the halving is for. Move
+# one and `tests/test_config.py::test_the_config_floor_never_inverts_the_retry_
+# window` goes red.
 _REVIEW_MIN_RETRY_TIMEOUT = 120
 # ONE extra window, granted only after the backend has ANNOUNCED a transport
 # retry on the event stream, and never otherwise. See `_run_bounded`: without
@@ -92,7 +142,15 @@ _DIFF_CAP = 60_000  # chars — ~15K tokens, fits in 200K context alongside test
 _FILES_CAP = 80_000  # chars — full text of the changed files, ~20K tokens
 _CODE_REVIEW_DIFF_CAP = 120_000  # code_review tasks: ~30K tokens, fits in 200K context
 _CODE_REVIEW_TURNS = 15
-_CODE_REVIEW_TIMEOUT = 600  # seconds — larger diffs need more time
+#: Same knob family, sibling default, and the distinction IS load-bearing: this
+#: mode reviews a whole PR at `_CODE_REVIEW_DIFF_CAP` (120K chars — twice the
+#: gate's 60K), so it reads more text per session than the gate ever does and
+#: has always been documented as needing more time. It was nevertheless the
+#: SAME 600 as the gate, which is why "larger diffs need more time" was a
+#: comment and not a behaviour. Scaled off `_REVIEW_TIMEOUT`'s measurement the
+#: same way the diff cap is scaled: 1800s. Overridable independently via
+#: `llm.code_review_timeout_seconds`.
+_CODE_REVIEW_TIMEOUT = 1800  # seconds — larger diffs (2x the gate cap) need more time
 _OUTPUT_CAP = 4000
 # 🔴 A CROSS-FILE COUPLING THAT WAS SAFE BY 96 CHARACTERS AND SAID SO NOWHERE.
 # This window is the tail of a dead reviewer session's `final_text` that
@@ -1505,6 +1563,8 @@ class AdversarialReviewer:
         model: str = "claude-opus-5",
         backend: Any | None = None,
         on_event: Callable | None = None,
+        timeout: int | None = None,
+        code_review_timeout: int | None = None,
     ):
         if backend is not None:
             self._backend = backend
@@ -1518,6 +1578,41 @@ class AdversarialReviewer:
         # so an injected one reports itself rather than the default kwarg.
         self.model = getattr(self._backend, "model", model)
         self._on_event = on_event
+        # Wall-clock window per review session. None ⇒ the module default, so
+        # every existing direct construction (tests, ad-hoc callers) behaves
+        # exactly as before; production goes through `from_config` and gets the
+        # operator's number. See `_REVIEW_TIMEOUT` for what the numbers measure.
+        self._timeout = _REVIEW_TIMEOUT if timeout is None else int(timeout)
+        self._code_review_timeout = (
+            _CODE_REVIEW_TIMEOUT if code_review_timeout is None
+            else int(code_review_timeout))
+
+    @classmethod
+    def from_config(
+        cls,
+        data: dict[str, Any],
+        *,
+        backend: Any | None = None,
+        on_event: Callable | None = None,
+    ) -> "AdversarialReviewer":
+        """Build the reviewer every production call site builds.
+
+        ONE place reads the reviewer's config, so the model and the session
+        windows cannot drift apart the way `funnel_eval` records them drifting
+        before: six call sites each spelled `model=config.review_model` and any
+        knob added next was added to some of them. A raw dict rather than a
+        ``Config`` because the eval harness holds `config.data`, not a Config.
+        """
+        from ..config import code_review_timeout_seconds, review_timeout_seconds
+
+        llm = data.get("llm") or {}
+        return cls(
+            model=llm.get("review_model") or "claude-opus-5",
+            backend=backend,
+            on_event=on_event,
+            timeout=review_timeout_seconds(data),
+            code_review_timeout=code_review_timeout_seconds(data),
+        )
 
     async def review(
         self,
@@ -1591,7 +1686,7 @@ class AdversarialReviewer:
             return await self._agent_review(
                 prompt, repo_path,
                 max_turns=_CODE_REVIEW_TURNS,
-                timeout=_CODE_REVIEW_TIMEOUT,
+                timeout=self._code_review_timeout,
             )
 
         # Already-satisfied mode: the artifact is the coder's zero-diff claim.
@@ -1817,7 +1912,7 @@ class AdversarialReviewer:
 
     async def _agent_review(
         self, prompt: str, repo_path: Path,
-        *, max_turns: int = _REVIEW_TURNS, timeout: int = _REVIEW_TIMEOUT,
+        *, max_turns: int = _REVIEW_TURNS, timeout: int | None = None,
         before_ref: str = "HEAD~1", verify_citations: bool = True,
         extra_repos: list[tuple[Path, str]] | None = None,
     ) -> ReviewDecision:
@@ -1848,19 +1943,39 @@ class AdversarialReviewer:
         these ``_REVIEW_INFRA_RETRIES + 1 = 2`` rounds calls ``_run_bounded``,
         which calls ``ClaudeBackend.run``, which may itself spend a second
         session on a dead transport (see its docstring for the session count:
-        4 per gate, <=12 per task at ``max_attempts=3``). The wall-clock half:
+        4 per gate, <=12 per task at ``max_attempts=3``). The wall-clock half,
+        at the DEFAULT window (`_REVIEW_TIMEOUT` = 1500s; scale it if the
+        operator moved `llm.review_timeout_seconds`):
 
-            round 1: 600s + 300s grace  = 900s
-            round 2: 300s + 150s grace  = 450s   (window halved on a timeout)
+            round 1: 1500s + 750s grace  = 2250s
+            round 2:  750s + 375s grace  = 1125s  (window halved on a timeout)
             ------------------------------------------------------------------
-            worst case per review gate   1350s = 22.5 min
+            worst case per review gate    3375s = 56 min
+
+        THE HONEST COST OF THE 2026-08-11 RAISE (600 -> 1500). A genuinely hung
+        reviewer now wastes up to 1500s per round instead of 600s, and the
+        figures above are 2.5x what they were. That is the price of a wall that
+        is no longer BELOW the mean round (~1078s measured, 1357s worst — see
+        `_REVIEW_TIMEOUT`), where every nontrivial diff burned both rounds and
+        escalated unreviewed. The trade is bounded and the bound is stated:
+        rounds are capped at ``_REVIEW_INFRA_RETRIES + 1`` = 2, the second is
+        HALVED whenever the first died on the wall, and the grace is granted at
+        most once per round. Worst case without any grace is 1500 + 750 = 2250s
+        = 38 min; 2 x 1500 = 3000s = 50 min if the first round dies some way
+        other than the wall so no halving applies. None of it is unbounded, and
+        none of it is inside ``bounds.attempt_timeout_s``, which walls the coder
+        turn only.
 
         The grace is granted at most once per round and only to a round that
         actually entered a transport retry, so the common path is unchanged at
-        600s + 300s. Every factor is a named constant; none of it is unbounded.
+        one window. Every factor is a named constant or the operator's own knob.
         """
         last_reason = "unknown"
-        round_timeout = timeout
+        # None ⇒ this reviewer's configured window (`llm.review_timeout_seconds`,
+        # defaulting to `_REVIEW_TIMEOUT`). An explicit argument still wins, so
+        # every caller that passes one — including the tests that shrink it to
+        # fractions of a second — is untouched.
+        round_timeout = self._timeout if timeout is None else timeout
         # Rounds that reached no verdict. Discarded for CORRECTNESS, but they
         # were billed — `_carry_usage` folds their spend onto whatever leaves
         # this method so the attempt row shows what the gate really cost.
