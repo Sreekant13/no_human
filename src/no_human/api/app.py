@@ -979,7 +979,10 @@ _ACTIVE_STATUSES = {
 }
 
 
-_HOLDABLE_STATUSES = {TaskStatus.PAUSED_QUOTA, TaskStatus.BLOCKED}
+# ESCALATED is the state a task is in when it is asking a human to decide —
+# exactly the one a human most needs to be able to hold, same as a
+# supervisor reserving the quota window (SCRUM-58).
+_HOLDABLE_STATUSES = {TaskStatus.PAUSED_QUOTA, TaskStatus.BLOCKED, TaskStatus.ESCALATED}
 
 
 @app.post("/api/tasks/{task_id}/pause")

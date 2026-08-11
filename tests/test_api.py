@@ -807,12 +807,17 @@ async def test_resume_clears_blocker_and_implements(client, store):
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [TaskStatus.PAUSED_QUOTA, TaskStatus.BLOCKED])
+@pytest.mark.parametrize("status", [
+    TaskStatus.PAUSED_QUOTA, TaskStatus.BLOCKED, TaskStatus.ESCALATED,
+])
 async def test_pause_on_parked_task_stamps_human_stopped_and_keeps_status(client, store, status):
     """SCRUM-58: a supervisor reserving the quota window used to hit a 409
     ('only active tasks can be paused') and had to fall back to a raw DB
     write of blocker.human_stopped. /pause must accept parked statuses too,
-    stamping the hold without touching status or clobbering the blocker."""
+    stamping the hold without touching status or clobbering the blocker.
+    ESCALATED included: it's exactly the state a task is in when it's
+    asking a human to decide — the one a human most needs to be able to
+    hold (api/app.py's _HOLDABLE_STATUSES)."""
     t = await _seed_task(store, status=status)
     t.blocker = {"category": "PAUSED_QUOTA", "question": "no quota", "keep_me": "yes"}
     await store.update_task_columns(t)
@@ -824,6 +829,53 @@ async def test_pause_on_parked_task_stamps_human_stopped_and_keeps_status(client
     assert fresh.status == status                       # untouched
     assert fresh.blocker.get("human_stopped") is True
     assert fresh.blocker.get("keep_me") == "yes"          # existing payload kept
+
+
+@pytest.mark.asyncio
+async def test_pause_on_escalated_task_leaves_wake_sweep_parked(client, store):
+    """The one state a human most needs to hold: /pause on ESCALATED must
+    stamp a hold the wake sweep actually honors, not just a flag nobody
+    reads. `now` is set past max_park (48h) relative to raised_at, so the
+    ONLY thing standing between this task and re-escalation is the
+    human_stopped skip (blockers/wake.py:397) — proven by re-evaluating the
+    SAME task/blocker with the stamp stripped and asserting the sweep fires
+    'escalated_timeout' instead, so this control can actually fail if the
+    skip regresses."""
+    from datetime import datetime, timedelta
+
+    from no_human.blockers.wake import WakeWatcher
+
+    t = await _seed_task(store, status=TaskStatus.ESCALATED)
+    t.blocker = {"category": "AMBIGUITY", "question": "?",
+                 "raised_at": "2026-01-01T00:00:00+00:00"}
+    await store.update_task_columns(t)
+
+    r = await client.post(f"/api/tasks/{t.id}/pause")
+    assert r.status_code == 200, r.text
+    held = await store.find_task(t.id)
+    assert held.status == TaskStatus.ESCALATED
+    assert held.blocker.get("human_stopped") is True
+
+    now = datetime.fromisoformat("2026-01-01T00:00:00+00:00") + timedelta(hours=49)
+    watcher = WakeWatcher(store, {"blockers": {"max_park_duration": "48h"}})
+
+    action = await watcher._evaluate(held, now=now)
+    assert action is None, f"human-stopped ESCALATED task must stay parked, got {action!r}"
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.ESCALATED           # still parked
+
+    # NEGATIVE CONTROL: strip the human_stopped stamp on the SAME task and
+    # re-evaluate at the SAME `now`. Without the skip, max_park (48h) has
+    # elapsed since raised_at (49h ago) so the sweep must fire — proving the
+    # `action is None` assertion above is discriminating, not inert.
+    unheld_blocker = dict(fresh.blocker)
+    del unheld_blocker["human_stopped"]
+    fresh.blocker = unheld_blocker
+    await store.update_task_columns(fresh)
+
+    action2 = await watcher._evaluate(fresh, now=now)
+    assert action2 == "escalated_timeout", (
+        f"twin without human_stopped must be re-escalated by max_park, got {action2!r}")
 
 
 @pytest.mark.asyncio
@@ -896,6 +948,21 @@ async def test_resume_without_human_stopped_keeps_existing_semantics(client, sto
     fresh = await store.find_task(t.id)
     assert fresh.status == TaskStatus.IMPLEMENTING
     assert fresh.blocker is None
+
+
+@pytest.mark.asyncio
+async def test_pause_on_implementing_still_transitions_to_blocked(client, store):
+    """NEGATIVE CONTROL for the ESCALATED hold change: an ACTIVE task
+    (IMPLEMENTING is not in _HOLDABLE_STATUSES) must still take the
+    original pause branch — transition to BLOCKED with a fresh
+    USER_PAUSED blocker — not the new hold-in-place branch."""
+    t = await _seed_task(store, status=TaskStatus.IMPLEMENTING)
+    r = await client.post(f"/api/tasks/{t.id}/pause")
+    assert r.status_code == 200, r.text
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.BLOCKED
+    assert fresh.blocker.get("category") == "USER_PAUSED"
+    assert "human_stopped" not in fresh.blocker
 
 
 @pytest.mark.asyncio
