@@ -7,6 +7,7 @@ from pathlib import Path
 
 from . import github, gitlab
 from .git import CommitResult, GitError, GitRepo, ProtectedBranch
+from .manifest_repair import commit_with_manifest_repair, parse_manifest_refusal
 
 __all__ = [
     "GitRepo",
@@ -15,6 +16,8 @@ __all__ = [
     "CommitResult",
     "PrResult",
     "open_pr",
+    "commit_with_manifest_repair",
+    "parse_manifest_refusal",
 ]
 
 

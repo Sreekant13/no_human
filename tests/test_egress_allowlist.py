@@ -552,6 +552,20 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
         "exec:git fetch": Allowed("your git remote — refs only",
                                   _ON + "PR/CI status polling while a task waits"),
     },
+    # Its own module ON PURPOSE: the `<dynamic>` bucket is per-file, and
+    # parking it on vcs/git.py would blind this gate to any future dynamic
+    # exec added there (proven in review: a planted curl passed). Here the
+    # bucket covers ~40 lines that spawn exactly one thing.
+    "vcs/manifest_repair.py": {
+        "exec:<dynamic>": Allowed(
+            "the TARGET REPO's own `scripts/export_guard.py` (repo-controlled "
+            "content) run as `[sys.executable, <repo>/scripts/export_guard.py,"
+            " 'approve', <refused paths>]` — the manifest gate's documented "
+            "FIX, inside the task worktree, 120s timeout; the committed guard "
+            "rewrites RELEASE_MANIFEST.txt pins and dials nothing",
+            _ON + "the pipeline commit path, on exactly the manifest gate's "
+            "changed-pinned-files refusal (commit_with_manifest_repair)"),
+    },
     "vcs/github.py": {
         "exec:gh": Allowed("your GitHub host — PR create/read",
                            _ON + "open_pr terminates every task"),

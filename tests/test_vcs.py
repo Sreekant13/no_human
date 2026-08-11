@@ -795,3 +795,141 @@ def test_the_lease_without_a_tracking_ref_refuses_rather_than_guesses(
     with pytest.raises(Exception):
         repo.push("no-human/t1", force_with_lease=True)
     assert _remote_tip(tmp_path / "remote.git") == before
+
+
+# ---- manifest-gate refusal repair (2026-08-11 task_crashed incident) -------- #
+# Three finished tasks died at the pipeline's own commit because the manifest
+# pre-commit gate refused (changed pinned files, manifest not re-approved) and
+# the GitError propagated as task_crashed. The commit path must perform the
+# gate's own documented FIX for exactly that refusal shape, and ONLY that one.
+
+_REFUSAL = """no_human pre-commit gate: REFUSED.
+
+These staged file(s) are pinned in RELEASE_MANIFEST.txt, but their staged content does
+not match their pin — the file changed and its manifest row did not,
+so this commit would ship a file the export ledger has not approved:
+  src/pkg/mod.py
+      pinned 26d6294b11f3…  staged 42408d9ff027…
+  tests/test_mod.py
+      pinned 8adc2a3c8e17…  staged c1decc14a38b…
+
+  FIX: re-pin each file and stage the manifest in the SAME commit:
+    uv run python scripts/export_guard.py approve src/pkg/mod.py tests/test_mod.py
+    git add RELEASE_MANIFEST.txt
+"""
+
+
+def test_parse_manifest_refusal_extracts_exactly_the_pinned_paths():
+    from no_human.vcs import parse_manifest_refusal
+    assert parse_manifest_refusal(_REFUSAL) == ["src/pkg/mod.py", "tests/test_mod.py"]
+
+
+def test_parse_manifest_refusal_rejects_other_hook_failures():
+    from no_human.vcs import parse_manifest_refusal
+    assert parse_manifest_refusal("husky: commit-msg check failed") is None
+    # The gate's OTHER refusal shape (unclassified new file) must not parse:
+    # adding a file to the ship set is a ledger decision, never auto-repaired.
+    assert parse_manifest_refusal(
+        "no_human pre-commit gate: REFUSED.\n\n"
+        "These staged file(s) are not classified in EXPORT_CLASSIFICATION.txt:\n"
+        "  src/pkg/new_file.py\n"
+    ) is None
+
+
+def _repo_with_manifest_gate(repo_with_bare_remote):
+    """Wire the fixture repo with a refusing pre-commit hook + a stub
+    export_guard whose `approve` writes the manifest, satisfying the hook."""
+    work = repo_with_bare_remote
+    (work / "scripts").mkdir()
+    (work / "scripts" / "export_guard.py").write_text(
+        "import pathlib, sys\n"
+        "assert sys.argv[1] == 'approve'\n"
+        "root = pathlib.Path(__file__).resolve().parent.parent\n"
+        "(root / 'RELEASE_MANIFEST.txt').write_text('\\n'.join(sys.argv[2:]) + '\\n')\n"
+        "(root / 'approve_called.txt').write_text(' '.join(sys.argv[2:]))\n"
+    )
+    (work / "RELEASE_MANIFEST.txt").write_text("stale\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "gate fixture")
+    hook = work / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        # The hook refuses until the stub's approve has rewritten the manifest.
+        "if grep -q stale RELEASE_MANIFEST.txt; then\n"
+        "cat >&2 <<'TXT'\n" + _REFUSAL + "TXT\n"
+        "exit 1\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    return work
+
+
+def test_commit_repairs_the_changed_pinned_refusal_and_retries_once(
+        repo_with_bare_remote):
+    from no_human.vcs import commit_with_manifest_repair
+    work = _repo_with_manifest_gate(repo_with_bare_remote)
+    repo = GitRepo(work, identity_name="agent", identity_email="a@x.y",
+                   never_push_to=[])
+    repo.create_branch("no-human/cc1", base="main")
+    (work / "src").mkdir()
+    (work / "src" / "mod.py").write_text("y = 2\n")
+    repairs = []
+    result = commit_with_manifest_repair(
+        repo, ["src/mod.py"], "feat: change",
+        on_repair=lambda p, note: repairs.append(p))
+    assert result.sha
+    # The ledger change is reported to the caller (never silent).
+    assert repairs == [["src/pkg/mod.py", "tests/test_mod.py"]]
+    # The gate's documented FIX ran with exactly the refused paths…
+    assert (work / "approve_called.txt").read_text() == \
+        "src/pkg/mod.py tests/test_mod.py"
+    # …and the re-derived manifest is IN the commit (not left dirty).
+    committed = subprocess.run(
+        ["git", "show", "--name-only", "--format=", "HEAD"],
+        cwd=work, capture_output=True, text=True, check=True).stdout
+    assert "RELEASE_MANIFEST.txt" in committed
+
+
+def test_commit_propagates_a_non_manifest_hook_failure(repo_with_bare_remote):
+    from no_human.vcs import GitError, commit_with_manifest_repair
+    work = repo_with_bare_remote
+    hook = work / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\necho 'lint failed' >&2\nexit 1\n")
+    hook.chmod(0o755)
+    repo = GitRepo(work, identity_name="agent", identity_email="a@x.y",
+                   never_push_to=[])
+    repo.create_branch("no-human/cc2", base="main")
+    (work / "z.py").write_text("z = 3\n")
+    with pytest.raises(GitError, match="lint failed"):
+        commit_with_manifest_repair(repo, ["z.py"], "feat: z")
+
+
+def test_protected_branch_passes_through_the_repair_wrapper(
+        repo_with_bare_remote):
+    """ProtectedBranch is a GitError subclass, but a pipeline commit aimed at
+    main is a wiring bug — it must propagate unchanged (no repair attempt,
+    the caller re-raises it loudly instead of failing the attempt)."""
+    from no_human.vcs import commit_with_manifest_repair
+    work = repo_with_bare_remote
+    repo = GitRepo(work, identity_name="agent", identity_email="a@x.y")
+    (work / "p.py").write_text("p = 5\n")
+    with pytest.raises(ProtectedBranch):
+        commit_with_manifest_repair(repo, ["p.py"], "feat: p")
+
+
+def test_a_second_refusal_after_repair_propagates(repo_with_bare_remote):
+    """If approve runs but the hook still refuses, the retry's error must
+    surface — one repair round, never a loop."""
+    from no_human.vcs import GitError, commit_with_manifest_repair
+    work = _repo_with_manifest_gate(repo_with_bare_remote)
+    # Break the stub: approve succeeds but leaves the manifest stale.
+    (work / "scripts" / "export_guard.py").write_text(
+        "import sys\nassert sys.argv[1] == 'approve'\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "fixture", "--no-verify")
+    repo = GitRepo(work, identity_name="agent", identity_email="a@x.y",
+                   never_push_to=[])
+    repo.create_branch("no-human/cc3", base="main")
+    (work / "w.py").write_text("w = 4\n")
+    with pytest.raises(GitError, match="REFUSED"):
+        commit_with_manifest_repair(repo, ["w.py"], "feat: w")
