@@ -1625,7 +1625,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # image variables are injected at run time.
         "variables": {},
         "poll_interval": 30,
-        "timeout": 3600,
         # Cluster used to resolve latest_dev images (ci_gate/images.py) and to
         # check namespace collisions before triggering. kubectl only — the
         # registry API 401s and the enrich job is a separate (Part A) path.

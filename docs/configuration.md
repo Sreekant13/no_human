@@ -249,7 +249,6 @@ ci_gate:                          # post-PR CI gate (WakeWatcher rung 5)
   namespace_variable: CI_GATE_NAMESPACE         # pipeline var carrying the namespace
   variables: {}                   # extra pipeline variables
   poll_interval: 30
-  timeout: 3600
   kubeconfig: ~/.kube/configs/<your-ci-cluster>.yaml   # latest_dev images + ns guard
   pr_build: true                  # code PRs: build the image FROM the PR via the
                                   # Jenkins enrich job (external SSO trigger); false

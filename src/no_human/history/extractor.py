@@ -84,64 +84,6 @@ class LanguageServerClient:
             ) from exc
 
 
-def _discover_client() -> LanguageServerClient:
-    """Auto-discover the language server's ConnectRPC port and CSRF token.
-
-    Iterates over all ``language_server_*`` processes, reads the
-    ``WINDSURF_CSRF_TOKEN`` env var, then probes each LISTEN port until  # term-ok: real third-party env var
-    ``GetAllCascadeTrajectories`` responds.
-    """
-    try:
-        import psutil
-    except ImportError:
-        raise ImportError(
-            "psutil is required for IDE history extraction. It is a declared "
-            "dependency, so this environment is stale — reinstall no_human "
-            "(uv tool install --force --editable .)"
-        )
-
-    candidates: list[tuple[str, int, str]] = []  # (host, port, token)
-
-    for proc in psutil.process_iter(["pid", "name"]):
-        name = proc.info.get("name") or ""
-        if "language_server" not in name and "language_" not in name:
-            continue
-        try:
-            env = proc.environ()
-        except (psutil.AccessDenied, psutil.NoSuchProcess):
-            continue
-        token = env.get("WINDSURF_CSRF_TOKEN")  # term-ok: real third-party env var
-        if not token:
-            continue
-        try:
-            conns = proc.net_connections()
-        except (psutil.AccessDenied, psutil.NoSuchProcess):
-            continue
-        for conn in conns:
-            if conn.status == "LISTEN" and conn.laddr:
-                candidates.append((conn.laddr.ip, conn.laddr.port, token))
-
-    if not candidates:
-        raise IDENotRunningError(
-            "No Windsurf language server found. Is the IDE running?"  # term-ok: real IDE names
-        )
-
-    for host, port, token in candidates:
-        client = LanguageServerClient(host=host, port=port, csrf_token=token)
-        try:
-            result = client.call("GetAllCascadeTrajectories")
-            if "trajectorySummaries" in result:
-                log.info("connected to language server on %s:%d", host, port)
-                return client
-        except Exception:
-            continue
-
-    raise IDENotRunningError(
-        f"Found {len(candidates)} candidate ports but none responded to "
-        "GetAllCascadeTrajectories. The IDE may be starting up."
-    )
-
-
 def _discover_all_clients() -> list[LanguageServerClient]:
     """Discover ALL responding language servers across all IDE windows.
 

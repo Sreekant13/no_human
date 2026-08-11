@@ -290,10 +290,6 @@ class StuckDetector:
             )
         return None
 
-
-    def is_repeat(self, error_text: str) -> bool:
-        return error_signature(error_text) in self._seen
-
     def reset(self) -> None:
         self._seen.clear()
         self._last = None

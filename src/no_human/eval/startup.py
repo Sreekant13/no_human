@@ -134,15 +134,6 @@ def load_scenario(path: Path | str = DEFAULT_SCENARIO) -> Scenario:
     )
 
 
-def load_scenarios(directory: Path = SCENARIO_DIR) -> list[Scenario]:
-    """Every ``*.yaml`` scenario in *directory*, sorted by id."""
-    directory = Path(directory)
-    if not directory.is_dir():
-        return []
-    found = [load_scenario(p) for p in sorted(directory.glob("*.yaml"))]
-    return sorted(found, key=lambda s: s.id)
-
-
 # --------------------------------------------------------------------------- #
 # Validation                                                                   #
 # --------------------------------------------------------------------------- #
