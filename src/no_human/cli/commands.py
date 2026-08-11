@@ -222,6 +222,22 @@ def _assert_backend_usable() -> None:
             sys.exit(2)
 
 
+def _warn_if_editable_install_dangles() -> None:
+    """Loud, never fatal: a dangling _editable_impl_no_human.pth (left behind
+    when a coder worktree the shared venv was editable-installed against gets
+    garbage-collected) makes the checkout read as corrupted. Warning, not a
+    gate — never exits, never affects `nh doctor`'s pass/fail.
+    """
+    try:
+        from ..doctor import editable_install_problem
+
+        problem = editable_install_problem()
+    except Exception:  # noqa: BLE001 — a diagnostic must never block startup
+        return
+    if problem:
+        console.print(f"[bold yellow]⚠ {problem}[/]")
+
+
 def _build_orchestrator(config, store: Store, *, event_sink=None, task=None) -> Orchestrator:
     # THE ONE SWITCH. `make_backend` returns exactly the ClaudeBackend this
     # line used to construct — same class, same arguments — unless
@@ -2916,6 +2932,7 @@ def serve(max_workers, until_empty):
     """
     config, _ = _bootstrap()
     _assert_backend_usable()
+    _warn_if_editable_install_dangles()
     from ..blockers import WakeWatcher, parse_duration
     from ..core.scheduler import Scheduler, clamp_pool_width, resolve_serve_pool
 
@@ -4766,6 +4783,7 @@ def start(host, port, workers, no_open):
     """
     config, _ = _bootstrap()
     _assert_backend_usable()
+    _warn_if_editable_install_dangles()
 
     if not _acquire_pid_lock():
         console.print(

@@ -14,7 +14,10 @@ Read-only by design; ``nh doctor`` renders the result.
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -166,6 +169,141 @@ def ci_config_problems(config: dict[str, Any] | None) -> list[str]:
         f"(backend={ci_conf.get('backend', 'gitlab')!r}) but no backend can be "
         f"built — {why}. Tasks run with NO CI gate."
     ]
+
+
+def _running_checkout(start: Path | None = None) -> Path | None:
+    """The checkout the current process is running from: git's own toplevel
+    for ``start`` (or the cwd), else the nearest ancestor holding
+    ``pyproject.toml``. ``None`` when neither exists.
+
+    ``git rev-parse --show-toplevel`` already resolves subdirectories
+    correctly (it walks up from ``cwd`` internally) — this must NOT
+    special-case "primary checkout" vs. "linked worktree": every worktree
+    is a legitimate place to run ``nh`` from, and reporting a linked
+    worktree's own toplevel as "wrong" is exactly the false positive a
+    prior version of this check produced.
+    """
+    try:
+        start = (start or Path.cwd()).resolve()
+    except OSError:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=start, capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return Path(result.stdout.strip()).resolve()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    for candidate in (start, *start.parents):
+        if (candidate / "pyproject.toml").is_file():
+            return candidate
+    return None
+
+
+def _repo_worktree_roots(start: Path) -> list[Path]:
+    """Every worktree toplevel sharing ``start``'s repository (primary and
+    linked). A shared ``.venv`` can hold an editable install that resolves
+    into *any one* of these — e.g. a linked worktree's venv installed from
+    the primary checkout — and that is healthy, not dangling. Only a
+    package dir outside every one of them is a real problem. Returns []
+    (never raises) when ``start`` is not a git checkout or the command
+    fails.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=start, capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    roots: list[Path] = []
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            try:
+                roots.append(Path(line[len("worktree "):]).resolve())
+            except (OSError, ValueError):
+                continue
+    return roots
+
+
+def _package_dir_from_spec(spec: Any) -> Path | None:
+    """The directory ``import no_human`` actually resolves to, or ``None``
+    when ``spec.origin`` is missing/``None``/not a usable string — the
+    dangling-.pth shape (a namespace package has no ``__file__``).
+    """
+    origin = getattr(spec, "origin", None)
+    if not origin or not isinstance(origin, str):
+        return None
+    return Path(origin).resolve().parent
+
+
+def _dangling_install_warning(checkout: Path, pkg: Path | None) -> str:
+    where = str(pkg) if pkg is not None else "<namespace package: no __file__>"
+    return (
+        f"editable install points outside this checkout: `import no_human` "
+        f"resolves to {where} but you are running from {checkout}. A "
+        f"garbage-collected worktree leaves a dangling "
+        f"_editable_impl_no_human.pth. Repair: run `uv pip install -e .` "
+        f"from {checkout}."
+    )
+
+
+def editable_install_problem(
+    *, spec: Any | None = None, checkout: Path | None = None
+) -> str | None:
+    """Warn when ``import no_human`` does not resolve inside the checkout
+    the process is running from — the dangling-``.pth`` symptom left behind
+    when a coder worktree that a shared venv was editable-installed against
+    gets garbage-collected. Read-only, idempotent, and NEVER raises: a
+    broken probe must never block startup, so any failure here is silence,
+    not a guess. Returns a one-line warning string, or ``None`` when there
+    is nothing to report (including when there isn't enough signal to be
+    sure — a false silence is far cheaper here than a false alarm).
+    """
+    try:
+        if getattr(sys, "frozen", False):
+            # A PyInstaller/DMG binary has no checkout and no editable
+            # install to dangle; the warning would be pure noise there.
+            return None
+
+        resolved_checkout = checkout if checkout is not None else _running_checkout()
+        if resolved_checkout is None:
+            return None
+        resolved_checkout = Path(resolved_checkout).resolve()
+
+        # False-positive guard: only speak when the cwd checkout actually
+        # IS a no_human source tree (running `nh` from an unrelated
+        # project, or a plain wheel install, must stay silent).
+        if not (resolved_checkout / "src" / "no_human" / "__init__.py").is_file():
+            return None
+
+        resolved_spec = (
+            spec if spec is not None else importlib.util.find_spec("no_human")
+        )
+        if resolved_spec is None:
+            return _dangling_install_warning(resolved_checkout, None)
+
+        origin = getattr(resolved_spec, "origin", None)
+        pkg = _package_dir_from_spec(resolved_spec)
+        if pkg is None:
+            if origin is None:
+                return _dangling_install_warning(resolved_checkout, None)
+            # origin exists but is not a usable string — too malformed to
+            # trust; stay silent rather than report a guess.
+            return None
+
+        if pkg == resolved_checkout or resolved_checkout in pkg.parents:
+            return None
+        for root in _repo_worktree_roots(resolved_checkout):
+            if pkg == root or root in pkg.parents:
+                return None
+        return _dangling_install_warning(resolved_checkout, pkg)
+    except Exception:  # noqa: BLE001 — a diagnostic must never break startup
+        return None
 
 
 @dataclass
