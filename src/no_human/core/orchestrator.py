@@ -831,6 +831,62 @@ def purge_unscreened_skill_files(skills_dir: Path) -> list[str]:
     return removed
 
 
+# The guard's reason lines, mapped to the term a human should see named. The
+# guard fires on an OR of six per-file terms, of which only two are reductions;
+# saying "net reduction" for all six produced an impossible-looking report
+# (2026-08-09: tests 6093->7097 and assertions 16365->19949, both UP, reported
+# as a net reduction) and delayed diagnosis of a base-mismatch incident.
+_TAMPER_TERMS: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"^test file deleted: "), "deleted test files"),
+    (re.compile(r".*: tests \d+->\d+$"), "per-file test-count reductions"),
+    (re.compile(r".*: assertions \d+->\d+$"), "per-file assertion reductions"),
+    (re.compile(r".*: skip/xfail markers "), "skip/xfail marker increases"),
+    (re.compile(r".*: tautological assertions "), "tautological-assertion increases"),
+    (re.compile(r".*: autouse monkeypatch fixture "), "autouse-fixture additions"),
+)
+
+
+def _tamper_escalation_detail(report, scope: str = "") -> str:
+    """Build the tamper-fire escalation message named in the reasons.
+
+    Says "net reduction in tests/assertions" only when both aggregate totals
+    actually fell; otherwise names the specific per-file terms that fired
+    (e.g. skip/xfail marker increases) so an increase-only fire never reads
+    as a reduction that never happened.
+    """
+    reasons_text = "; ".join(report.reasons)
+    if not reasons_text:
+        return f"test-tampering detected{scope} — {report.summary}"
+
+    net_reduction = (
+        report.tests_after < report.tests_before
+        and report.assertions_after < report.assertions_before
+    )
+    if net_reduction:
+        return (
+            f"test-tampering detected{scope} — net reduction in "
+            f"tests/assertions: {reasons_text}"
+        )
+
+    labels: list[str] = []
+    for reason in report.reasons:
+        for pattern, label in _TAMPER_TERMS:
+            if pattern.match(reason) and label not in labels:
+                labels.append(label)
+    if not labels:
+        labels = ["test-file changes flagged by the tamper guard"]
+    if len(labels) == 1:
+        terms_text = labels[0]
+    else:
+        terms_text = ", ".join(labels[:-1]) + " and " + labels[-1]
+
+    return (
+        f"test-tampering detected{scope} — {terms_text}: {reasons_text} "
+        f"(totals: tests {report.tests_before}->{report.tests_after}, "
+        f"assertions {report.assertions_before}->{report.assertions_after})"
+    )
+
+
 class Orchestrator:
     # Pause before the single PR-open retry (transient forge trouble). A class
     # attribute so tests zero it instead of eating a real 30s sleep (EH1) —
@@ -6112,8 +6168,7 @@ class Orchestrator:
             await _fail_attempt(f"tamper guard{scope}: " + reasons_text)
             return await self._escalate(
                 task,
-                f"test-tampering detected{scope} — net reduction in "
-                f"tests/assertions: {reasons_text}",
+                _tamper_escalation_detail(report, scope),
                 repo=repo, branch=branch,
             )
 

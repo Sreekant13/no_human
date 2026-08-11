@@ -22,7 +22,7 @@ import pathlib
 
 import pytest
 
-from no_human.core.orchestrator import Orchestrator
+from no_human.core.orchestrator import Orchestrator, _tamper_escalation_detail
 from no_human.core.task import Task, TaskStatus
 from no_human.notify.slack import SlackNotifier
 from no_human.review import tamper_adjudication as ta
@@ -101,6 +101,20 @@ REPORT = TamperReport(
     reasons=[
         "tests/test_calc.py: tests 12->11",
         "tests/test_terms.py: skip/xfail markers 0->1 (test neutered)",
+    ],
+)
+
+
+INCREASE_ONLY_REPORT = TamperReport(
+    tampered=True,
+    tests_before=6093, tests_after=7097,
+    assertions_before=16365, assertions_after=19949,
+    skips_before=0, skips_after=1,
+    tautologies_before=10, tautologies_after=27,
+    reasons=[
+        "tests/x.py: skip/xfail markers 0->1 (test neutered)",
+        "tests/y.py: tautological assertions 10->27 "
+        "(real assertion replaced by a no-op)",
     ],
 )
 
@@ -391,6 +405,71 @@ async def test_the_off_switch_restores_the_old_escalation(store, tmp_path):
     assert outcome.status is TaskStatus.ESCALATED
     assert "test-tampering detected" in (await store.get_task(task.id)).blocker[
         "evidence"] + outcome.detail
+
+
+# --------------------------------------------------------------------------- #
+# 3. The escalation message names what actually fired.
+# --------------------------------------------------------------------------- #
+
+def test_an_increase_only_fire_names_the_triggering_terms_not_a_net_reduction():
+    """2026-08-09: tests 6093->7097 and assertions 16365->19949, both UP, were
+    reported as a "net reduction" and delayed diagnosis of a base-mismatch
+    incident. Both counts are up here too — the message must name the terms
+    that actually fired, not claim a reduction that never happened."""
+    detail = _tamper_escalation_detail(INCREASE_ONLY_REPORT)
+
+    assert "tests/x.py" in detail
+    assert "skip/xfail" in detail
+    assert "tests/y.py" in detail
+    assert "tautological" in detail
+    assert "6093->7097" in detail
+    assert "net reduction" not in detail.lower()
+
+
+async def test_the_off_switch_escalation_of_an_increase_only_fire_says_no_net_reduction(
+    store, tmp_path
+):
+    backend = _RecordingBackend(LEGIT)
+    orch = _orch(store, tmp_path, backend, enabled=False)
+    task = await _task(store)
+
+    outcome = await orch._handle_tamper_fire(
+        task, INCREASE_ONLY_REPORT, repo=None, branch="nh/x",
+        attempt_id="attempt-1", attempt_n=1, diff_repo=tmp_path,
+        before_ref="HEAD~1")
+
+    assert outcome.status is TaskStatus.ESCALATED
+    assert "test-tampering detected" in outcome.detail
+    stored = (await store.get_task(task.id)).blocker["evidence"]
+    assert "net reduction" not in (outcome.detail + stored).lower()
+
+
+def test_a_genuine_net_reduction_still_says_net_reduction():
+    report = TamperReport(
+        tampered=True,
+        tests_before=12, tests_after=11,
+        assertions_before=40, assertions_after=30,
+        reasons=["tests/test_calc.py: tests 12->11"],
+    )
+
+    detail = _tamper_escalation_detail(report)
+
+    assert "net reduction in tests/assertions" in detail
+    assert "tests/test_calc.py: tests 12->11" in detail
+
+
+def test_only_one_metric_falling_is_not_a_net_reduction():
+    report = TamperReport(
+        tampered=True,
+        tests_before=12, tests_after=11,
+        assertions_before=40, assertions_after=45,
+        reasons=["tests/test_calc.py: tests 12->11"],
+    )
+
+    detail = _tamper_escalation_detail(report)
+
+    assert "net reduction" not in detail.lower()
+    assert "tests/test_calc.py: tests 12->11" in detail
 
 
 async def test_end_to_end_a_gutted_test_bounces_once_then_parks(
