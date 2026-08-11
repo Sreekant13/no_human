@@ -454,10 +454,38 @@ async def _board_tasks(store: Store, scheduler=None) -> list[TaskSummaryOut]:
     return out
 
 
-def _git_diff(repo_path: str, commit_sha: str) -> str:
+def _git_diff(repo_path: str, commit_sha: str, base: str | None = None) -> str:
     try:
+        diff_range = f"{commit_sha}~1..{commit_sha}"
+        if base:
+            # A recorded base can still be gone (branch deleted, worktree
+            # pruned, base only ever existed on the remote) — verify it
+            # resolves before trusting it, so a broken base fails soft into
+            # the single-commit range instead of an empty diff.
+            check = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"],
+                cwd=repo_path, capture_output=True, text=True, timeout=10,
+            )
+            if check.returncode == 0:
+                # Three-dot form diffs from the merge-base, so base moving on
+                # after the branch was cut does not inject unrelated files.
+                diff_range = f"{base}...{commit_sha}"
+            else:
+                log.info(
+                    "commit_sha %s has an unresolvable base_branch %r; "
+                    "falling back to single-commit diff %s — the board will "
+                    "show only the last commit",
+                    commit_sha, base, diff_range,
+                )
+        else:
+            log.info(
+                "commit_sha %s has no recorded base_branch; falling back to "
+                "single-commit diff %s — the board will show only the last "
+                "commit",
+                commit_sha, diff_range,
+            )
         proc = subprocess.run(
-            ["git", "diff", f"{commit_sha}~1..{commit_sha}", "--no-color"],
+            ["git", "diff", diff_range, "--no-color"],
             cwd=repo_path, capture_output=True, text=True, timeout=10,
         )
         return proc.stdout[:32000] if proc.returncode == 0 else ""
@@ -822,10 +850,11 @@ async def get_diff(task_id: str, request: Request) -> str:
     if not task.repo_path:
         return ""
     attempts = await store.list_attempts(task.id)
+    base = (ctx.get("base_branch") or "").strip() or None
     for a in reversed(attempts):
         sha = a.get("commit_sha")
         if sha:
-            return _git_diff(task.repo_path, sha)
+            return _git_diff(task.repo_path, sha, base)
     return ""
 
 

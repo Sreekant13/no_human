@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import logging
+import subprocess
+
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
@@ -317,6 +320,136 @@ async def test_get_diff_no_attempts(client, store):
     r = await client.get(f"/api/tasks/{t.id}/diff")
     assert r.status_code == 200
     assert r.text == ""
+
+
+def _git(cwd, *args):
+    return subprocess.run(["git", *args], cwd=cwd, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _init_diff_repo(repo_dir):
+    """base (main) -> attempt branch: commit A touches 3 files, commit B
+    touches 1 line of a 4th (pre-existing) file. Returns (sha_a, sha_b)."""
+    repo_dir.mkdir()
+    _git(repo_dir, "init", "-b", "main")
+    _git(repo_dir, "config", "user.email", "u@e.com")
+    _git(repo_dir, "config", "user.name", "u")
+    (repo_dir / "base.txt").write_text("base\n")
+    (repo_dir / "d.txt").write_text("d1\nd2\nd3\n")
+    _git(repo_dir, "add", "-A")
+    _git(repo_dir, "commit", "-m", "base")
+
+    _git(repo_dir, "checkout", "-q", "-b", "attempt")
+    (repo_dir / "a.txt").write_text("a\n")
+    (repo_dir / "b.txt").write_text("b\n")
+    (repo_dir / "c.txt").write_text("c\n")
+    _git(repo_dir, "add", "-A")
+    _git(repo_dir, "commit", "-m", "commit A: three files")
+    sha_a = _git(repo_dir, "rev-parse", "HEAD")
+
+    (repo_dir / "d.txt").write_text("d1\nd2 changed\nd3\n")
+    _git(repo_dir, "add", "-A")
+    _git(repo_dir, "commit", "-m", "commit B: one line of a fourth file")
+    sha_b = _git(repo_dir, "rev-parse", "HEAD")
+
+    _git(repo_dir, "checkout", "-q", "main")
+    return sha_a, sha_b
+
+
+@pytest.mark.asyncio
+async def test_diff_spans_the_whole_branch_not_just_the_last_commit(client, store, tmp_path):
+    """A two-commit attempt branch must render the UNION of both commits
+    against its recorded base, not just the last commit (PR #213 defect)."""
+    repo = tmp_path / "repo"
+    sha_a, sha_b = _init_diff_repo(repo)
+
+    t = Task.new("Multi-commit", repo_path=str(repo))
+    t.context = {"base_branch": "main"}
+    await store.create_task(t)
+    attempt_id = await store.create_attempt(t.id, 1)
+    await store.update_attempt(attempt_id, commit_sha=sha_b)
+
+    r = await client.get(f"/api/tasks/{t.id}/diff")
+    assert r.status_code == 200
+    for path in ("a.txt", "b.txt", "c.txt", "d.txt"):
+        assert path in r.text, f"{path} missing from union diff: {r.text!r}"
+    assert r.text.count("diff --git") == 4
+
+
+@pytest.mark.asyncio
+async def test_single_commit_branch_diff_is_unchanged(client, store, tmp_path):
+    """A branch one commit ahead of its base must render exactly what the
+    old `<sha>~1..<sha>` form produced — the three-dot form is a strict
+    superset, not a behaviour change, for the single-commit case."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "u@e.com")
+    _git(repo, "config", "user.name", "u")
+    (repo / "base.txt").write_text("base\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "base")
+    _git(repo, "checkout", "-q", "-b", "attempt")
+    (repo / "only.txt").write_text("only\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "one commit ahead")
+    sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", "main")
+
+    t = Task.new("Single commit", repo_path=str(repo))
+    t.context = {"base_branch": "main"}
+    await store.create_task(t)
+    attempt_id = await store.create_attempt(t.id, 1)
+    await store.update_attempt(attempt_id, commit_sha=sha)
+
+    r = await client.get(f"/api/tasks/{t.id}/diff")
+    assert r.status_code == 200
+
+    expected = subprocess.run(
+        ["git", "diff", f"{sha}~1..{sha}", "--no-color"],
+        cwd=repo, capture_output=True, text=True,
+    ).stdout
+    assert r.text == expected
+    assert r.text != ""
+
+
+@pytest.mark.asyncio
+async def test_missing_base_branch_falls_back_to_single_commit(client, store, tmp_path, caplog):
+    """No recorded base, and a recorded-but-deleted base, must both fall
+    back to today's single-commit diff (not an empty string), with the
+    reason logged — never surfaced in the response body (PlainTextResponse
+    has no envelope to put it in)."""
+    repo = tmp_path / "repo"
+    sha_a, sha_b = _init_diff_repo(repo)
+    caplog.set_level(logging.INFO, logger="no_human.api")
+
+    # Case 1: no base_branch recorded in context at all.
+    t1 = Task.new("No base", repo_path=str(repo))
+    t1.context = {}
+    await store.create_task(t1)
+    attempt1 = await store.create_attempt(t1.id, 1)
+    await store.update_attempt(attempt1, commit_sha=sha_b)
+
+    r1 = await client.get(f"/api/tasks/{t1.id}/diff")
+    assert r1.status_code == 200
+    assert "d.txt" in r1.text
+    assert "a.txt" not in r1.text  # only commit B's file — today's behaviour
+    assert "no recorded base_branch" in caplog.text
+
+    caplog.clear()
+
+    # Case 2: base_branch recorded but unresolvable (branch deleted/pruned).
+    t2 = Task.new("Deleted base", repo_path=str(repo))
+    t2.context = {"base_branch": "branch-that-was-deleted"}
+    await store.create_task(t2)
+    attempt2 = await store.create_attempt(t2.id, 1)
+    await store.update_attempt(attempt2, commit_sha=sha_b)
+
+    r2 = await client.get(f"/api/tasks/{t2.id}/diff")
+    assert r2.status_code == 200
+    assert "d.txt" in r2.text
+    assert "a.txt" not in r2.text
+    assert "unresolvable base_branch" in caplog.text
 
 
 # --------------------------------------------------------------------------- #
