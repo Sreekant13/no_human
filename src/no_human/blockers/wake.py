@@ -42,6 +42,13 @@ PrCommentChecker = Callable[[str], Awaitable[list[Any]]]
 # squash merge makes ancestry the wrong test).
 PrShippedChecker = Callable[[str, str, str], Awaitable[bool]]
 
+#: Sentinel returned by ``_complete_if_content_landed`` when the task went
+#: TERMINAL while the (subprocess-heavy) content probe was running. It is not
+#: an action: the caller must abandon its tick entirely rather than fall
+#: through to its own escalate/send-back path, which is the SCRUM-68 guard the
+#: probe's own callers had inline before the path was shared.
+_TICK_ABORTED = "__tick_aborted__"
+
 _DURATION = re.compile(r"(\d+)\s*([smhd])", re.IGNORECASE)
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
@@ -617,6 +624,111 @@ class WakeWatcher:
             task.id, {"revision_rounds": rounds})
         return rounds
 
+    async def _complete_if_content_landed(
+        self, task: Task, url: str, *, forge_state: str, action: str,
+        situation: str,
+    ) -> str | None:
+        """THE completion path for "this branch's content is already on base".
+
+        ONE path, two callers — the CLOSED rung (which has always had it,
+        inline) and the CONFLICTING rung (which used to start a rebase round
+        without ever asking). Returns *action* once it has recorded the
+        outcome and written DONE; ``_TICK_ABORTED`` if the task went terminal
+        while the probe ran — on ANY answer the probe gave, see the guard
+        below, and both callers must abandon the tick on it; ``None`` for
+        every "no" — hook not wired, no branch or no base recorded, probe
+        error, or content genuinely absent — all of which mean the caller
+        keeps its existing behaviour unchanged.
+
+        The question is CONTENT, not ancestry, and that is not a preference:
+        this repo lands every PR as an identity-normalized LOCAL squash, so the
+        landing commit has no lineage back to the branch and
+        ``git merge-base --is-ancestor`` is False for every PR we ever merged.
+        See ``default_branch_shipped``.
+
+        WHAT A ``True`` HERE MEANS, precisely — it is stronger than "some of
+        this shipped". ``default_branch_shipped`` merges the branch into the
+        base tip (both directions) and demands the result be EXACTLY the tip's
+        tree, i.e. the branch has nothing left to contribute. A PARTIALLY
+        landed branch — half a rename, one of two files, a follow-up commit
+        still outstanding — writes a different tree and reads False, so it can
+        never complete here. That is pinned by test (the half-landed rename).
+
+        A ``False`` is deliberately overloaded ("absent" and "could not run"
+        collapse into it, per that function's contract), which is why it is
+        only ever read as "keep going": the caller's existing path — escalate
+        to a human, or run the rebase round — is the safe side of the
+        ambiguity in both callers.
+
+        REVIEW PRECONDITION. Neither caller may complete a task whose review
+        never passed, and neither needs its own check for that: both are
+        reached only through ``_check_open_pr``, which ``_evaluate`` calls only
+        for ``AWAITING_APPROVAL`` — the status a task reaches only after its
+        review passed and its PR was opened. That, plus a recorded
+        ``pr_branch``, is the whole precondition set of the CLOSED rung this
+        was extracted from, and it is preserved exactly. Pinned by the test
+        that a BLOCKED task with landed content is still never completed.
+        """
+        if self._pr_shipped is None:
+            return None
+        ctx = task.context or {}
+        branch = ctx.get("pr_branch")
+        base = ctx.get("base_branch")
+        if not task.repo_path or not branch:
+            return None
+        if not base:
+            # NEVER default to "main". The orchestrator persists the resolved
+            # base before any attempt runs (`orchestrator.py`: `if not
+            # ctx.get("base_branch")` → `_implicit_base_branch`, then
+            # `update_task`), so every task that can reach AWAITING_APPROVAL
+            # has one and this is unreachable for them. If it is ever reached —
+            # a legacy row, a hand-built context — the honest answer is "I do
+            # not know what this PR targets", not a guess: a backport opened
+            # against `release/2.3` would be asked about `main`, where the
+            # content usually IS present, and would complete a task whose work
+            # never reached its actual base. Falling back costs a spurious
+            # escalation or one wasted rebase round, with a human on the other
+            # end of both.
+            log.warning("no base_branch recorded for %s — skipping the "
+                        "content check rather than guessing", task.id[:8])
+            return None
+        try:
+            shipped = await self._pr_shipped(task.repo_path, branch, base)
+        except Exception as exc:  # noqa: BLE001 — a checker error must not crash the watcher
+            log.warning("pr_shipped check failed for %s: %s", task.id[:8], exc)
+            shipped = False
+        # The shipped check just ran several local git subprocesses (rev-parse,
+        # and up to two merge-trees per candidate base tip) — easily a few
+        # seconds on a large repo — so re-verify terminal-ness before ANY
+        # caller acts, same SCRUM-68 guard as every other rung.
+        #
+        # 🔴 THIS SITS ABOVE THE `not shipped` EARLY-OUT AND MUST STAY THERE.
+        # The guard is about the AWAIT, not about the answer: a `POST /shipped`
+        # or `/cancel` landing while the probe ran leaves the caller's own
+        # recheck stale on EVERY path out of here. Review 2026-08-11 caught it
+        # narrowed to the positive path alone, and reproduced the cost — a
+        # phantom "abandon or rework?" blocker, a `pr_closed` event and an
+        # outcome row on a task that was already DONE, plus a round counter and
+        # a send-back on the conflict rung. The store's CAS refuses only the
+        # STATUS flip; nothing else here is CAS-guarded, so a "harmless"
+        # refused transition still leaves a record of a state change that never
+        # happened — the shape `cli/commands.py`'s restore-approval path
+        # already documents as ruled wrong. The probe raising is treated as
+        # `shipped=False` (not as an early return) for exactly this reason.
+        if await self._is_terminal(task):
+            return _TICK_ABORTED
+        if not shipped:
+            return None
+        await observe_pr(self.store, task.id, url, forge_state=forge_state,
+                         shipped=True)
+        await self.store.set_status(task, TaskStatus.DONE, validate=False)
+        await self._emit(
+            task, "shipped",
+            f"{task.id[:8]} {situation} but its content is already on "
+            f"{base} (squash-merged): {url}",
+        )
+        return action
+
     async def _check_open_pr(self, task: Task) -> str | None:
         """The awaiting-approval priority ladder, one rung per tick.
 
@@ -677,8 +789,10 @@ class WakeWatcher:
             # FOR THE PR-OUTCOME RECORD ONLY — the escalation behaviour below is
             # deliberately unchanged.
             #
-            # `observed_shipped` is True or None, NEVER False, and that is not
-            # an oversight. `default_branch_shipped` is documented to return
+            # The `shipped` this rung RECORDS is True or None, NEVER False,
+            # and that is not an oversight (the helper records the True itself;
+            # the fall-through below records the None).
+            # `default_branch_shipped` is documented to return
             # False for BOTH "the content is not on base" and "the check could
             # not run" (missing repo, deleted branch, unrelated histories) —
             # "callers must treat False as 'can't tell'". That collapse is
@@ -700,37 +814,23 @@ class WakeWatcher:
             # re-polls it later with a probe that can tell the two cases apart
             # (`pr_outcome.probe_shipped`). Nothing is lost, and nothing is
             # asserted that was not observed.
-            observed_shipped: bool | None = None
-            if self._pr_shipped is not None:
-                ctx = task.context or {}
-                branch = ctx.get("pr_branch")
-                base = ctx.get("base_branch") or "main"
-                if task.repo_path and branch:
-                    try:
-                        shipped = await self._pr_shipped(task.repo_path, branch, base)
-                        observed_shipped = True if shipped else None
-                    except Exception as exc:  # noqa: BLE001 — a checker error must not crash the watcher
-                        log.warning("pr_shipped check failed for %s: %s", task.id[:8], exc)
-                        shipped = False
-                    # The shipped check just ran several local git subprocesses
-                    # (rev-parse, and up to two merge-trees per candidate base
-                    # tip) — easily a few seconds on a large repo — so re-verify
-                    # terminal-ness before writing, same SCRUM-68 guard as
-                    # every other rung.
-                    if await self._is_terminal(task):
-                        return None
-                    if shipped:
-                        await observe_pr(self.store, task.id, url,
-                                         forge_state=state, shipped=True)
-                        await self.store.set_status(task, TaskStatus.DONE, validate=False)
-                        await self._emit(
-                            task, "shipped",
-                            f"{task.id[:8]} PR closed but its content is already on "
-                            f"{base} (squash-merged): {url}",
-                        )
-                        return "shipped_pr_closed"
+            landed = await self._complete_if_content_landed(
+                task, url, forge_state=state, action="shipped_pr_closed",
+                situation="PR closed")
+            if landed == _TICK_ABORTED:
+                return None
+            if landed:
+                return landed
+            # Reaching here is exactly the `True`-or-`None` rule above: the
+            # helper writes DONE (and returns an action) on its ONLY `True`,
+            # so every path that falls through is one of the ambiguous cases —
+            # no probe wired, no branch recorded, the probe raised, or it said
+            # False, which is itself "absent OR could not run". None of those
+            # is evidence of absence, so the RECORD gets `None` and stays
+            # `unknown` (unsettled, re-polled) while the ESCALATION below —
+            # deliberately unchanged — proceeds and puts a human on it.
             await observe_pr(self.store, task.id, url, forge_state=state,
-                             shipped=observed_shipped)
+                             shipped=None)
             data = task.blocker or {}
             data["category"] = "AMBIGUITY"
             data["question"] = (
@@ -752,7 +852,7 @@ class WakeWatcher:
         # previous refresh measured stays.
         await observe_pr(self.store, task.id, url, forge_state=state)
 
-        acted = await self._check_pr_conflict(task, url)
+        acted = await self._check_pr_conflict(task, url, state)
         if acted:
             return acted
         acted = await self._check_approval_pr_comments(task)
@@ -766,7 +866,8 @@ class WakeWatcher:
         #    once per PR head, bounded send-back on failure.
         return await self._check_ci_gate_integration(task, url)
 
-    async def _check_pr_conflict(self, task: Task, url: str) -> str | None:
+    async def _check_pr_conflict(self, task: Task, url: str,
+                                 forge_state: str = "") -> str | None:
         """Rung 3 (SCRUM-41): a textual conflict with main is invisible to CI
         (branch checks only run the PR's own branch) — this rung is the only
         one that polls `gh pr view --json mergeable,mergeStateStatus` directly.
@@ -780,6 +881,27 @@ class WakeWatcher:
         rebase-and-repoll — reset every round and never reach the bound). The
         counter only resets on a *definite* MERGEABLE: that is a genuinely new
         failure cycle, not a continuation.
+
+        SHIPPED-FIRST (2026-08-11). Before starting OR continuing a round, ask
+        git whether the branch's content is already on the base; if it is, the
+        round has nothing to do and the task completes through the shared
+        ``_complete_if_content_landed`` path instead. Measured live twice that
+        day: a round is an ENTIRE coder attempt (session + tests + review +
+        delivery — millions of tokens, ~1h wall), and task 5ef97879's attempt 9
+        was moot at birth because PR #183's content was mid-landing through a
+        supervised local squash. It had to be paused by hand.
+
+        WHY THE TWO SIGNALS CAN HONESTLY DISAGREE, since "CONFLICTING yet
+        already contained" reads like a contradiction: they are computed at
+        different TIMES against different BASE TIPS. GitHub's ``mergeable`` is
+        asynchronous and cached — it reports the verdict it last computed,
+        against the base tip it last saw — while the content check runs now,
+        against the tip in the local checkout (and its upstream, per
+        ``_base_tips``). A squash landing pushed straight to ``origin/main``
+        resolves the conflict without touching the PR, so the stale
+        CONFLICTING survives it. That is precisely the live shape, and it is
+        why ancestry cannot be used instead: the squash has no lineage back to
+        the branch.
         """
         if self._pr_mergeable is None:
             return None
@@ -804,6 +926,27 @@ class WakeWatcher:
             # UNKNOWN, "", or anything else GitHub hasn't settled yet: no-op,
             # no state change — see the docstring above.
             return None
+
+        # A definite CONFLICTING, and the ONLY place the content check is paid
+        # for. Cost, stated because it is a local subprocess burst on a poll
+        # loop: a handful of `git rev-parse` / `merge-tree` calls, gated behind
+        # a verdict that (a) GitHub reports for a small minority of ticks —
+        # every other tick returns above without touching git — and (b) is
+        # about to authorise an entire coder attempt if it stands. Seconds of
+        # local git against millions of tokens is not a trade that needs a
+        # cache; a *negative* answer is paid at most once per round, since the
+        # round that follows it changes the task's status and the rung does not
+        # re-run until the coder is done.
+        landed = await self._complete_if_content_landed(
+            task, url, forge_state=forge_state, action="shipped_pr_conflict",
+            situation="PR CONFLICTING (no rebase round needed)")
+        if landed == _TICK_ABORTED:
+            return None
+        if landed:
+            return landed
+        # Inconclusive or negative — including every host that never wired the
+        # checker — falls through to exactly the behaviour that shipped before
+        # this guard existed.
 
         merge_state = str((info or {}).get("mergeStateStatus") or "").upper()
         ctx = task.context or {}

@@ -147,8 +147,27 @@ def classify_outcome(forge_state: str | None, *,
 
     ``shipped`` is a THREE-valued answer about the PR's branch: ``True`` (its
     content is on base), ``False`` (it is genuinely not), ``None`` (nobody could
-    tell). It only ever matters for ``CLOSED`` — see the module docstring for
-    why ``CLOSED`` alone cannot be classified in this repo.
+    tell).
+
+    A ``True`` is decisive on its OWN, whatever the forge state — that is not a
+    widening, it is the rule stated four paragraphs down and always relied on
+    here: "a false ``merged`` needs the forge's own merged flag or a positive
+    content match". The probe merges the branch into the base tip in BOTH
+    directions and demands the tip's exact tree; nothing about that answer
+    depends on what the forge says, and the forge routinely lags it. This repo
+    lands PRs as a LOCAL squash pushed straight to the base, so the content is
+    on base BEFORE the PR is closed — ``wake.py``'s CONFLICTING rung completes
+    tasks in exactly that window (review finding E, 2026-08-11). Dropping the
+    probe for ``OPEN`` filed those landings as ``open`` permanently, since
+    ``refresh_outcomes`` re-probes containment only for ``CLOSED`` rows.
+
+    ``False`` and ``None`` are NOT symmetric with it and never settle anything
+    on their own: ``False`` is the documented "absent OR could not run"
+    collapse, so it settles a PR as ``closed_unmerged`` only when the forge has
+    independently said ``CLOSED``. The forge's own merged flag still outranks
+    the probe for PROVENANCE (a ``MERGED`` state reports ``forge_merged``, not
+    ``content_on_base``), so the evidence token always names what was actually
+    observed.
 
     🔴 CALLERS MUST NOT PASS ``default_branch_shipped``'s RAW BOOLEAN HERE.
     That function is documented to return ``False`` for BOTH "the content is
@@ -176,6 +195,11 @@ def classify_outcome(forge_state: str | None, *,
         if shipped is False:
             return CLOSED_UNMERGED, EVIDENCE_CLOSED_CONTENT_ABSENT
         return UNKNOWN, EVIDENCE_CLOSED_SHIP_UNVERIFIED
+    if shipped is True:
+        # OPEN, or a state that could not be read at all. Positive containment
+        # is its own evidence and outlives a stale or missing forge answer;
+        # `False`/`None` fall through, because neither is evidence of absence.
+        return MERGED, EVIDENCE_CONTENT_ON_BASE
     if state == "OPEN":
         return OPEN, EVIDENCE_FORGE_OPEN
     return UNKNOWN, EVIDENCE_STATE_UNAVAILABLE

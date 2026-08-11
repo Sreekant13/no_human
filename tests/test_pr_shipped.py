@@ -736,3 +736,343 @@ async def test_squash_merge_shape_is_shipped_despite_no_ancestry(tmp_path):
 async def test_genuinely_absent_branch_is_not_shipped(tmp_path):
     repo = _unshipped_repo(tmp_path)
     assert await default_branch_shipped(str(repo), "feature", "main") is False
+
+
+# --------------------------------------------------------------------------- #
+# The same content check, one rung earlier: the CONFLICTING rung (2026-08-11).
+# --------------------------------------------------------------------------- #
+
+
+async def _conflicting_watcher(store, *, pr_shipped=default_branch_shipped):
+    async def pr_state(url):
+        return "OPEN"
+
+    async def pr_mergeable(url):
+        return {"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"}
+
+    return WakeWatcher(store, {}, pr_state=pr_state, pr_mergeable=pr_mergeable,
+                       pr_shipped=pr_shipped)
+
+
+async def test_open_conflicting_pr_whose_content_landed_ships_instead_of_rebasing(
+        tmp_path, store):
+    """End to end on real git, on the shape measured live on 2026-08-11: the
+    supervised local squash pushed the content to origin/main while the PR was
+    still OPEN and still carrying GitHub's cached CONFLICTING verdict. A full
+    rebase round — an entire coder attempt — used to start here."""
+    repo = _stale_local_base_repo(tmp_path)
+    t = await _approval_task(store, repo)
+    w = await _conflicting_watcher(store)
+
+    assert await w._check_open_pr(t) == "shipped_pr_conflict"
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    assert "pr_conflict_rounds" not in (fresh.context or {})
+    assert not (fresh.context or {}).get("send_back_feedback")
+
+
+async def test_open_conflicting_pr_with_content_absent_still_rebases(tmp_path, store):
+    """The control on the SAME real-git harness: nothing landed, so the round
+    starts exactly as before. Without this, the guard could be 'fixed' by
+    always reporting shipped."""
+    repo = _stale_local_base_repo(tmp_path, land=False)
+    t = await _approval_task(store, repo)
+    w = await _conflicting_watcher(store)
+
+    assert await w._check_open_pr(t) == "resumed"
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.IMPLEMENTING
+    assert fresh.context["pr_conflict_rounds"] == 1
+
+
+async def test_a_half_landed_branch_on_a_conflicting_pr_still_rebases(tmp_path, store):
+    """Devil's advocate (b): a PARTIALLY landed branch must never complete.
+    `default_branch_shipped` is all-or-nothing by construction — it asks
+    whether merging the branch into the base tip changes the tip's TREE, so a
+    branch with anything left to contribute fails it. Here the destination of
+    a rename landed and the source deletion did not."""
+    repo = _make_repo(tmp_path)
+    (repo / "old.py").write_text("value = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "add old")
+    _git(repo, "checkout", "-b", "feature")
+    _git(repo, "mv", "old.py", "new.py")
+    _git(repo, "commit", "-m", "move old -> new")
+    _git(repo, "checkout", "main")
+    (repo / "new.py").write_text("value = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "add new, forget to delete old")
+
+    t = await _approval_task(store, repo)
+    w = await _conflicting_watcher(store)
+    assert await w._check_open_pr(t) == "resumed"
+    assert (await store.get_task(t.id)).context["pr_conflict_rounds"] == 1
+
+
+@pytest.mark.parametrize("answer", [False, True, RuntimeError("git exploded")],
+                         ids=["absent", "landed", "probe-raised"])
+async def test_going_terminal_during_the_probe_aborts_the_closed_rung(
+        tmp_path, store, answer):
+    """Review finding D, on the rung that has had this guard since SCRUM-68:
+    the abort must fire on EVERY probe answer, not only the positive one.
+    Before the fix, a probe that said 'absent' (or raised) let the rung write
+    a phantom blocker, a `pr_closed` event and an outcome row onto a task that
+    had gone DONE while the probe ran — the store's CAS refuses only the
+    status flip, and `cli/commands.py`'s restore-approval path documents that
+    exact shape as already-ruled-wrong."""
+    repo = _unshipped_repo(tmp_path)
+    t = await _approval_task(store, repo)
+
+    async def pr_state(url):
+        return "CLOSED"
+
+    async def pr_shipped(repo_path, branch, base):
+        fresh = await store.get_task(t.id)
+        await store.set_status(fresh, TaskStatus.DONE, validate=False)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    w = WakeWatcher(store, {}, pr_state=pr_state, pr_shipped=pr_shipped)
+    assert await w._check_open_pr(t) is None
+
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    assert not fresh.blocker, "no phantom blocker on a finished task"
+    assert await store.list_pr_outcomes(task_id=t.id) == []
+    kinds = {e.get("kind") for e in await store.list_events(t.id)}
+    assert not (kinds & {"pr_closed", "shipped"}), kinds
+
+
+# --------------------------------------------------------------------------- #
+# The generated-ledger exclusion (live incident, 2026-08-11). Task 5ef97879's
+# PR #183 was fully landed on main as squash 5433835d8, and the CLOSED rung's
+# probe still said NOT shipped, so the task escalated "abandon or rework?".
+# Measured on the real refs at the time:
+#
+#   git merge-tree --write-tree origin/main no-human/5ef97879-2   -> rc=1
+#     CONFLICT (content): Merge conflict in RELEASE_MANIFEST.txt
+#   git diff --name-only <origin/main^{tree}> <merged>  ->  RELEASE_MANIFEST.txt
+#
+# …in BOTH directions, with RELEASE_MANIFEST.txt the ONLY differing path — the
+# classification ledger merged cleanly and was never implicated. The repo's
+# merge-result rule RE-DERIVES that manifest at landing instead of taking the
+# branch's rows, so it diverges on every landing — and nearly every branch
+# touches it, because adding or changing any shipped file re-pins. Without the
+# exclusion the completion path can essentially never fire on this repo's own
+# PRs. The exclusion is that ONE path: see `_GENERATED_LEDGERS` for why
+# EXPORT_CLASSIFICATION.txt was tried and removed.
+# --------------------------------------------------------------------------- #
+
+
+def _ledger_repo(tmp_path, *, extra_branch_file=None, extra_ledger=None,
+                 diverge_classification=False):
+    """The 5ef97879 shape: the code landed, the manifest was RE-DERIVED.
+
+    Base, branch and main each carry a different manifest row for the same
+    path, so the two sides changed the same line differently — a genuine
+    merge CONFLICT confined to the ledger, which is exactly what the live
+    refs produced. `EXPORT_CLASSIFICATION.txt` stays IDENTICAL across the two
+    sides unless `diverge_classification`, matching the incident (it merged
+    cleanly there) and keeping it out of the excluded set.
+    """
+    repo = _make_repo(tmp_path)
+    (repo / "RELEASE_MANIFEST.txt").write_text("AAA  a.txt\n")
+    (repo / "EXPORT_CLASSIFICATION.txt").write_text("ship     1  a.txt\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "add the generated ledgers")
+
+    _git(repo, "checkout", "-b", "feature")
+    (repo / "a.txt").write_text("changed\n")
+    (repo / "RELEASE_MANIFEST.txt").write_text("BBB  a.txt\n")
+    if diverge_classification:
+        (repo / "EXPORT_CLASSIFICATION.txt").write_text("drop     1  a.txt\n")
+    if extra_branch_file:
+        (repo / extra_branch_file).write_text("only on the branch\n")
+    if extra_ledger:
+        (repo / extra_ledger).parent.mkdir(parents=True, exist_ok=True)
+        (repo / extra_ledger).write_text("BBB  a.txt\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "feature: change a.txt and re-pin")
+
+    # The supervised local squash: the CODE lands verbatim, the ledgers are
+    # re-derived from the landed tree and land with DIFFERENT rows.
+    _git(repo, "checkout", "main")
+    (repo / "a.txt").write_text("changed\n")
+    (repo / "RELEASE_MANIFEST.txt").write_text("DDD  a.txt\n")
+    if extra_ledger:
+        (repo / extra_ledger).parent.mkdir(parents=True, exist_ok=True)
+        (repo / extra_ledger).write_text("DDD  a.txt\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "squash: land a.txt, re-derive the manifest")
+    return repo
+
+
+async def test_a_branch_diverging_only_in_the_generated_manifest_is_shipped(tmp_path):
+    """THE LIVE DEFECT. Every real change the branch carries is on base; the
+    only residue is the manifest the landing re-derived."""
+    repo = _ledger_repo(tmp_path)
+    assert (repo / "a.txt").read_text() == "changed\n", "fixture: code landed"
+    assert await default_branch_shipped(str(repo), "feature", "main") is True
+
+
+async def test_a_classification_only_divergence_is_not_shipped(tmp_path):
+    """THE NARROWING (review, 2026-08-11). `EXPORT_CLASSIFICATION.txt` was
+    briefly excluded too, by analogy rather than measurement. A row there is a
+    DECISION, not a derivation, so excluding it hid an unlanded `drop` — a file
+    somebody decided to stop publishing that goes on publishing — inside this
+    repo's primary privacy mechanism. Here the branch flips `ship` to `drop`
+    and the landing never took it: NOT shipped, so the task gets a rebase round
+    or a human rather than a silent DONE."""
+    repo = _ledger_repo(tmp_path, diverge_classification=True)
+    assert (repo / "EXPORT_CLASSIFICATION.txt").read_text() == "ship     1  a.txt\n", \
+        "fixture: base still carries the OLD decision"
+    assert await default_branch_shipped(str(repo), "feature", "main") is False
+
+
+async def test_ledger_noise_never_excuses_a_real_unlanded_path(tmp_path):
+    """The control that stops the exclusion from becoming 'ignore the diff':
+    the same ledger divergence, plus ONE real file that never landed."""
+    repo = _ledger_repo(tmp_path, extra_branch_file="b.txt")
+    assert not (repo / "b.txt").exists(), "fixture: b.txt must not be on base"
+    assert await default_branch_shipped(str(repo), "feature", "main") is False
+
+
+async def test_the_exclusion_is_one_exact_path_not_a_name_pattern(tmp_path):
+    """A file that merely LOOKS like the ledger is not it. The exclusion is a
+    frozenset of ONE exact repo-root path; anything matched by basename or by
+    glob would let real content through under a lookalike name."""
+    repo = _ledger_repo(tmp_path, extra_ledger="docs/RELEASE_MANIFEST.txt")
+    assert await default_branch_shipped(str(repo), "feature", "main") is False
+
+
+async def test_a_real_file_moved_onto_the_ledger_name_is_not_shipped(tmp_path):
+    """The exclusion must not become a laundering channel through git's RENAME
+    DETECTION — the reason `_unsettled_paths` passes `--no-renames`.
+
+    `git diff --name-only` pairs a deletion with an ADDITION and prints the
+    DESTINATION ALONE. A branch that moves a real file onto the ledger's name
+    (possible whenever the ledger is absent on base) therefore presents as a
+    diff touching only the excluded path, and the deletion of the real file —
+    work that never landed — disappears from the comparison. Measured both
+    ways on the same trees:
+
+        git diff --name-only        -> RELEASE_MANIFEST.txt
+        git diff --name-only --no-renames
+                                    -> RELEASE_MANIFEST.txt, keep.py
+
+    Only the second is the question this function is asking.
+    """
+    repo = _make_repo(tmp_path)
+    (repo / "keep.py").write_text("def keep():\n    return 42\n# distinctive\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "add a real file (no RELEASE_MANIFEST yet)")
+    _git(repo, "checkout", "-b", "feature")
+    # Destination is an ADD, which is what lets rename detection pair them.
+    _git(repo, "mv", "keep.py", "RELEASE_MANIFEST.txt")
+    _git(repo, "commit", "-m", "move a real file onto the ledger name")
+    _git(repo, "checkout", "main")
+
+    assert (repo / "keep.py").exists(), "fixture: base still carries the real file"
+    assert await default_branch_shipped(str(repo), "feature", "main") is False
+
+
+# --------------------------------------------------------------------------- #
+# The modify/delete channel (review finding, 2026-08-11). `merge-tree` resolves
+# a modify/delete conflict by KEEPING THE MODIFIED SIDE, so for a branch whose
+# outstanding work is a DELETION of a file base has since modified, the merged
+# tree IS the tip's tree — in both directions — and the residual diff is empty.
+# Measured on the shape below:
+#
+#   rc=1
+#   100644 3367afd… 1  dead.py
+#   100644 89710fb… 2  dead.py
+#   CONFLICT (modify/delete): dead.py deleted in feature and modified in main.
+#     Version main of dead.py left in tree.
+#   git diff --name-only <tip_tree> <merged>  ->  (empty)
+#
+# The tree difference cannot see it; the CONFLICTED PATH section can. This is
+# why containment gates on both. `merge-tree` reports a conflict for every
+# modify/delete, so GitHub's CONFLICTING actively SELECTS for this shape, and
+# "remove the deprecated module" is an ordinary task.
+# --------------------------------------------------------------------------- #
+
+
+def _modify_delete_repo(tmp_path, *, land_the_addition=False):
+    """Base modifies a file the branch DELETES — merge-tree keeps base's copy."""
+    repo = _make_repo(tmp_path)
+    (repo / "dead.py").write_text("old\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "add the module the branch will remove")
+
+    _git(repo, "checkout", "-b", "feature")
+    _git(repo, "rm", "-q", "dead.py")
+    if land_the_addition:
+        (repo / "live.py").write_text("the replacement\n")
+        _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "remove the deprecated module")
+
+    _git(repo, "checkout", "main")
+    (repo / "dead.py").write_text("old\n# main touched this\n")
+    if land_the_addition:
+        # HALF landed: the addition squashed onto main, the deletion did not.
+        (repo / "live.py").write_text("the replacement\n")
+        _git(repo, "add", "-A")
+    _git(repo, "commit", "-am", "main modifies dead.py (and takes the addition)")
+    return repo
+
+
+async def test_an_unlanded_deletion_of_a_file_base_modified_is_not_shipped(tmp_path):
+    """(a) The attack shape, at the probe. The branch's whole deliverable is
+    the removal of `dead.py`; it is still on base; containment must say no."""
+    repo = _modify_delete_repo(tmp_path)
+    assert (repo / "dead.py").exists(), "fixture: base still carries the file"
+    assert await default_branch_shipped(str(repo), "feature", "main") is False
+
+
+async def test_a_half_landed_delete_takes_a_rebase_round_not_a_completion(
+        tmp_path, store):
+    """(b) End to end through the CONFLICTING rung: the addition landed, the
+    deletion did not. Completing here marks the task DONE with `dead.py` still
+    on main — the all-or-nothing property, falsified."""
+    repo = _modify_delete_repo(tmp_path, land_the_addition=True)
+    t = await _approval_task(store, repo)
+    w = await _conflicting_watcher(store)
+
+    assert await w._check_open_pr(t) == "resumed"
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.IMPLEMENTING
+    assert fresh.context["pr_conflict_rounds"] == 1
+    assert (repo / "dead.py").exists(), "the deletion really is outstanding"
+
+
+async def test_an_unparseable_conflict_section_is_cannot_tell(tmp_path, monkeypatch):
+    """Fail CLOSED on an output shape this code does not understand.
+
+    The conflicted-path section is parsed positionally
+    (`<mode> <object> <stage>\\t<path>`), so a future git that reshapes it, or
+    any output the parser cannot read, must yield "cannot tell" — never
+    "nothing left to contribute". The repo underneath genuinely IS shipped, so
+    a `False` here can only come from the guard.
+
+    The substituted tree is the tip's REAL tree, not a made-up OID. With a
+    bogus one the subsequent `git diff` fails and returns None by itself, which
+    masks the guard entirely — a mutant that skips the malformed field instead
+    of failing closed survived that version of this test.
+    """
+    repo = _squash_merge_repo(tmp_path)
+    assert await default_branch_shipped(str(repo), "feature", "main") is True
+    tip_tree = _git_out(repo, "rev-parse", "main^{tree}").strip()
+    assert tip_tree, "fixture: need a real tree so the diff below succeeds"
+
+    real = pr_watcher._git_rc
+
+    async def fake_git(repo_path, *args):
+        if args[:2] == ("merge-tree", "--write-tree"):
+            # A valid tree (residue would be EMPTY) beside a field the parser
+            # cannot read: the malformed section alone decides the answer.
+            return 1, f"{tip_tree}\0no-tab-here\0"
+        return await real(repo_path, *args)
+
+    monkeypatch.setattr(pr_watcher, "_git_rc", fake_git)
+    assert await default_branch_shipped(str(repo), "feature", "main") is False

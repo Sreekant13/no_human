@@ -749,3 +749,58 @@ def test_autonomy_docstring_states_what_pr_reached_is_not():
     doc = " ".join((autonomy.__doc__ or "").split())
     assert "only one of them opens a pull request" in doc
     assert "contains no forge query" in doc
+
+
+def test_open_with_content_on_base_is_merged_not_open():
+    """Review finding E (2026-08-11). The wake watcher can now observe a PR
+    that the forge still calls OPEN while its content is demonstrably on the
+    base — the supervised local squash lands before the PR is closed, and
+    `wake.py`'s CONFLICTING rung completes the task there.
+
+    Dropping `shipped` for OPEN filed that landing as `open` FOREVER: the row
+    is unsettled, but `refresh_outcomes` only probes containment for CLOSED
+    PRs, so nothing would ever revisit it, and a task recorded DONE would sit
+    behind an `open` outcome permanently. The same positive evidence that
+    settles a CLOSED PR settles this one — it is the same probe, the same
+    both-directions tree containment, and the same evidence token."""
+    assert po.classify_outcome("OPEN", shipped=True) == (
+        po.MERGED, po.EVIDENCE_CONTENT_ON_BASE)
+
+
+def test_open_without_positive_containment_stays_open():
+    """The other three answers must not move: only a POSITIVE containment
+    reclassifies. `False` is the overloaded 'absent OR could not run' and an
+    open PR is the normal state of affairs, not a failed merge."""
+    assert po.classify_outcome("OPEN", shipped=False) == (
+        po.OPEN, po.EVIDENCE_FORGE_OPEN)
+    assert po.classify_outcome("OPEN", shipped=None) == (
+        po.OPEN, po.EVIDENCE_FORGE_OPEN)
+    assert po.classify_outcome("OPEN") == (po.OPEN, po.EVIDENCE_FORGE_OPEN)
+
+
+def test_positive_containment_settles_even_when_the_forge_state_is_unreadable():
+    """The `""` state (no gh / network error / unparseable ref) beside a
+    POSITIVE containment probe. The probe did run and did answer; the forge is
+    what failed. Recording `unknown` there would file a task the watcher is
+    completing on that very evidence as unmeasured."""
+    assert po.classify_outcome("", shipped=True) == (
+        po.MERGED, po.EVIDENCE_CONTENT_ON_BASE)
+    assert po.classify_outcome(None, shipped=True) == (
+        po.MERGED, po.EVIDENCE_CONTENT_ON_BASE)
+
+
+def test_a_negative_or_absent_probe_never_settles_a_non_closed_pr():
+    """The asymmetry that keeps `False` from inventing failures: only a forge
+    that independently says CLOSED lets a `False` settle anything."""
+    for state in ("", None, "OPEN", "DRAFT"):
+        for shipped in (False, None):
+            outcome, _ = po.classify_outcome(state, shipped=shipped)
+            assert outcome != po.CLOSED_UNMERGED, (state, shipped)
+            assert outcome != po.MERGED, (state, shipped)
+
+
+def test_the_forge_merged_flag_still_owns_its_own_evidence_token():
+    """Provenance: a forge-merged PR reports `forge_merged` even when the
+    content probe also says yes — the token must name what was observed."""
+    assert po.classify_outcome("MERGED", shipped=True) == (
+        po.MERGED, po.EVIDENCE_FORGE_MERGED)

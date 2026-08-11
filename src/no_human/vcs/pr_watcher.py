@@ -842,15 +842,122 @@ async def _base_tips(repo_path: str, base: str) -> list[str]:
     return tips
 
 
-async def _merges_to(repo_path: str, want_tree: str, ours: str, theirs: str) -> bool:
-    """Whether merging ``theirs`` into ``ours`` produces exactly ``want_tree``.
+#: The ONE path held out of the containment comparison, because a landing
+#: RE-DERIVES it rather than taking the branch's rows, so it diverges on every
+#: landing and nearly every branch touches it (changing any shipped file
+#: re-pins). It is a generated ledger OVER the other files — one
+#: `<sha256>  <path>` row each — and carries no content of its own.
+#:
+#: 🔴 A HARDCODED EXACT REPO-ROOT PATH. IT MUST NOT BECOME A PATTERN, AND IT
+#: MUST NOT GROW. Every name added here is content that stops being checked; a
+#: glob or basename match would let real work through under a lookalike name
+#: (`docs/RELEASE_MANIFEST.txt`) — pinned by test.
+#:
+#: WHY EXACTLY ONE NAME. This briefly also held `EXPORT_CLASSIFICATION.txt`,
+#: added by analogy rather than by measurement, and it was removed on review.
+#: The manifest is PURE DERIVATION: a row is a sha256 of a file whose own path
+#: is still compared, so excluding it provably hides nothing — if the file's
+#: content is unlanded, the file's own path is in the residue. A classification
+#: row is a DECISION (`<ship|drop>  <count>  <pattern>`), and excluding it hid
+#: an unlanded `drop` — a file somebody decided to stop publishing that keeps
+#: publishing — inside this repo's primary privacy mechanism. It was also never
+#: required: in the measured incident (PR #183) the manifest was the sole
+#: residue in both directions and the classification merged cleanly. A
+#: classification-only divergence now falls through to a rebase round or a
+#: human, which is the safe side of the trade.
+_GENERATED_LEDGERS = frozenset({"RELEASE_MANIFEST.txt"})
 
-    Every non-zero rc is "no landing observed", not "not landed": 1 is a
-    conflicting merge, 128 an unresolvable ref or unrelated histories, 129 a
-    git too old to know ``--write-tree``.
+
+async def _unsettled_paths(repo_path: str, want_tree: str, ours: str,
+                           theirs: str) -> set[str] | None:
+    """Paths where merging ``theirs`` into ``ours`` leaves ``want_tree`` short.
+
+    TWO sources, unioned, because neither sees the other's cases:
+
+    1. the TREE DIFFERENCE against ``want_tree`` — content the branch would add
+       to the tip; and
+    2. the CONFLICTED PATHS ``merge-tree`` names — content the merge could not
+       decide, which the tree difference can be blind to.
+
+    🔴 (2) IS LOAD-BEARING AND IS NOT A BELT-AND-BRACES DUPLICATE OF (1).
+    ``merge-tree`` resolves a modify/delete conflict by KEEPING THE MODIFIED
+    SIDE, so when the branch's outstanding work is a DELETION of a file base
+    has since modified, the merge writes base's copy back and the merged tree
+    IS the tip's tree — in BOTH directions. Measured:
+
+        rc=1
+        100644 3367afd… 1  dead.py
+        100644 89710fb… 2  dead.py
+        CONFLICT (modify/delete): dead.py deleted in feature and modified in
+          main.  Version main of dead.py left in tree.
+        git diff --name-only <tip_tree> <merged>   ->   (empty)
+
+    On (1) alone that reads as "nothing left to contribute" and completes a
+    task whose deliverable — the removal — never landed. `merge-tree` reports a
+    conflict for EVERY modify/delete, so a forge's CONFLICTING actively selects
+    for the shape, and "remove the deprecated module" is an ordinary task.
+
+    ``None`` is "the question could not be asked" — never an empty set, which
+    is the answer that means "the branch has nothing left to contribute" and
+    would be a false ``shipped``. 128 is an unresolvable ref or unrelated
+    histories, 129 a git too old for ``--write-tree``, and ``_git_rc`` itself
+    reports git-absent and argv-too-long as ``(1, "")``, which is why an empty
+    first line is rejected separately from the rc.
+
+    rc **1 is accepted**, and that is the change the live incident forced: 1 is
+    a CONFLICTING merge, which still writes a tree (conflict markers inlined in
+    the contested blobs) as the first output field. Rejecting it outright — the
+    behaviour before 2026-08-11 — is what made a ledger-only conflict
+    indistinguishable from unlanded code. Accepting it is only safe BECAUSE of
+    (2): the earlier version of this function justified it as "a conflict on a
+    real path puts that path in the diff, because a blob carrying conflict
+    markers is not the tip's blob", which is true of content conflicts and
+    FALSE of modify/delete — where no marker blob is written at all.
+
+    ``-z`` on ``merge-tree`` is what makes (2) parseable rather than guessed.
+    The output is NUL-separated fields: the tree OID, then one
+    ``<mode> <object> <stage>\\t<path>`` entry per conflicted stage, then an
+    EMPTY field closing that section, then free-text messages. Without ``-z``
+    git QUOTES unusual paths (``"w\\303\\251ird name.py"``), which would not
+    match its own name in the ledger set; with it they arrive verbatim. A field
+    in that section that does not parse yields ``None`` — an output shape this
+    code does not understand is "cannot tell", never "nothing left".
+
+    The empty-first-line rejection is a FAIL-FAST, not the load-bearing check,
+    and is documented as such so nobody mistakes it for one: with it removed,
+    the diff below runs with an empty rev argument, which git rejects —
+    ``git diff --name-only --no-renames -z <tree> "" --`` exits 128 (measured)
+    — so the ``rc != 0`` guard returns ``None`` anyway. It survives mutation
+    testing for that reason: it saves a subprocess, it does not decide.
+
+    ``--no-renames`` and ``-z`` are load-bearing, not hygiene. Rename detection
+    reports a move as its DESTINATION alone, so a branch that moves a real file
+    to a ledger's name could otherwise present as ledger-only noise; ``-z``
+    turns off the quoting that would otherwise make an unusual path fail to
+    match its own name in the frozenset. The trailing ``--`` keeps a tree OID
+    from ever being read as a pathspec.
     """
-    rc, merged = await _git_rc(repo_path, "merge-tree", "--write-tree", ours, theirs)
-    return rc == 0 and merged.splitlines()[:1] == [want_tree]
+    rc, out = await _git_rc(repo_path, "merge-tree", "--write-tree", "-z",
+                            ours, theirs)
+    if rc not in (0, 1):
+        return None
+    fields = out.split("\0")
+    merged = fields[0].strip()
+    if not merged:
+        return None
+    conflicted: set[str] = set()
+    for field in fields[1:]:
+        if not field:
+            break  # the empty field closes the conflicted-path section
+        meta, tab, path = field.partition("\t")
+        if not tab or not path or len(meta.split()) != 3:
+            return None  # unrecognised shape — refuse to answer, never assume
+        conflicted.add(path)
+    rc, names = await _git_rc(repo_path, "diff", "--name-only", "--no-renames",
+                              "-z", want_tree, merged, "--")
+    if rc != 0:
+        return None
+    return conflicted | {n for n in names.split("\0") if n}
 
 
 async def default_branch_shipped(repo_path: str, branch: str, base: str = "main") -> bool:
@@ -866,8 +973,53 @@ async def default_branch_shipped(repo_path: str, branch: str, base: str = "main"
 
     Instead, ask whether the branch still has anything left to contribute: `git
     merge-tree --write-tree <base-tip> <branch>` builds the tree that merging
-    the branch into the tip would produce, and when that tree IS the tip's tree
-    the content is already there, however the commit graph got there.
+    the branch into the tip would produce, and the branch has landed when that
+    merge leaves NOTHING UNSETTLED that matters — no tree difference against
+    the tip AND no conflicted path (see `_unsettled_paths`; a merged tree can
+    equal the tip's while a conflict hides an unlanded deletion). However the
+    commit graph got there.
+
+    "THAT MATTERS" IS ONE NAMED GENERATED LEDGER AND NOTHING ELSE
+    (`_GENERATED_LEDGERS`). This was an exact tree equality until a live
+    incident on 2026-08-11 showed the feature could essentially never fire on
+    this repo's own PRs. Task 5ef97879's PR #183 was fully landed on main as
+    squash 5433835d8; the probe said NOT shipped and the task escalated
+    "abandon or rework?". Measured on the real refs:
+
+        git merge-tree --write-tree origin/main no-human/5ef97879-2   -> rc=1
+          CONFLICT (content): Merge conflict in RELEASE_MANIFEST.txt
+        git diff --name-only <origin/main^{tree}> <merged>
+          -> RELEASE_MANIFEST.txt
+
+    …in both directions, with that one path the ONLY difference (the
+    classification ledger merged cleanly and was never implicated). The repo's
+    merge-result rule RE-DERIVES `RELEASE_MANIFEST.txt` at landing rather than
+    taking the branch's rows, so a branch's copy and the landed copy disagree
+    by construction — and nearly every branch touches it, because adding or
+    changing any shipped file re-pins. The real files' content identity is the
+    true signal; a derived ledger's rows are a restatement of it that the
+    landing rewrites.
+
+    WHAT EXCLUDING IT DOES NOT COST. The manifest is pure derivation: a row is
+    a sha256 of a file whose own path is still compared, so if that file's
+    content is unlanded its own path is in the residue and the answer is False
+    anyway. Excluding it provably hides nothing.
+
+    An earlier revision of this also excluded `EXPORT_CLASSIFICATION.txt`, by
+    analogy rather than by measurement, and it was REMOVED on review — the
+    residual it carried is gone with it, and this paragraph records the trade
+    so nobody re-adds the name. A classification row is a DECISION
+    (`<ship|drop>  <count>  <pattern>`), not a derivation, so excluding it hid
+    an unlanded `drop` — a file somebody decided to stop publishing that goes
+    on publishing — inside this repo's primary privacy mechanism. The obvious
+    sharper guard (require the branch's decision LINES to be present on base)
+    does not work, because the win-count is IN-BAND and every landing rewrites
+    the text of rows it decided nothing about. So the name is simply out: a
+    classification-only divergence now reads as NOT shipped and falls through
+    to a rebase round or a human, which is the safe side.
+    `test_a_classification_only_divergence_is_not_shipped` pins that, and
+    `test_the_exclusion_is_one_exact_path_not_a_name_pattern` pins the
+    boundary, so neither can widen quietly.
 
     That replaced a per-file blob comparison over the branch's touched paths,
     which demanded BYTE EQUALITY on every one of them and so could never
@@ -876,14 +1028,20 @@ async def default_branch_shipped(repo_path: str, branch: str, base: str = "main"
     checksum list, so a PR that edits it is byte-different from base the moment
     anything else lands, and task 2f29209f escalated with its content already on
     main. A three-way merge answers containment instead of equality, and it
-    needs no pathspecs — which also retires the `--no-renames` / `-z` /
-    trailing-`--` hazards the old path had to work around. A no-op merge writes
-    no new objects, because the trees it would write already exist.
+    needs no pathspecs. A no-op merge writes no new objects, because the trees
+    it would write already exist.
+
+    (That paragraph used to end "…which also retires the `--no-renames` / `-z`
+    / trailing-`--` hazards the old path had to work around". It no longer
+    does, and the correction matters: comparing the merged tree to the tip's
+    by NAME, rather than by a single OID, brings all three back. They are
+    handled explicitly in ``_unsettled_paths`` — read that before touching the
+    diff invocation.)
 
     Both the local base and its upstream are tried; see ``_base_tips``.
 
-    The merge is run in BOTH directions, and both must land on the tip's tree.
-    One direction is not enough because `merge-tree` honours `.gitattributes`:
+    The merge is run in BOTH directions, and both must leave nothing unsettled
+    outside the excluded ledger. One direction is not enough because `merge-tree` honours `.gitattributes`:
     a repo that routes a path to a merge driver DISCARDING the incoming side
     (`f.py merge=keepours` + `merge.keepours.driver = true`, the documented way
     to own a generated or lockfile-shaped path) resolves every contested path
@@ -962,7 +1120,12 @@ async def default_branch_shipped(repo_path: str, branch: str, base: str = "main"
         rc, tip_tree = await _git_rc(repo_path, "rev-parse", f"{tip}^{{tree}}")
         if rc != 0 or not tip_tree:
             continue
-        if (await _merges_to(repo_path, tip_tree, tip, branch)
-                and await _merges_to(repo_path, tip_tree, branch, tip)):
+        # Short-circuited on purpose: the second direction is a whole extra
+        # merge-tree, and the first one failing already settles the answer.
+        for ours, theirs in ((tip, branch), (branch, tip)):
+            unsettled = await _unsettled_paths(repo_path, tip_tree, ours, theirs)
+            if unsettled is None or (unsettled - _GENERATED_LEDGERS):
+                break
+        else:
             return True
     return False
