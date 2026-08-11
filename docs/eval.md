@@ -143,3 +143,58 @@ project to live autonomy only when shadow agreement is consistently high.
 
 When the agent says "done", how often is the PR merged without edits? Watch this
 over time; it is the trust signal that matters most.
+
+## Reading a bench run: pass^k, escalation latency, and what must not lead
+
+**pass^k: SUPPORTED (yes, not partial).** The bench runner already reruns each
+spec — `nh bench run --trials N` (`src/no_human/cli/commands.py:5456`), with a
+spec-major fan-out (`:5786-5788`) and `(task_id, trial)` as the checkpoint
+identity (`:5669`) so a resumed multi-trial run cannot double-count a spec.
+Each trial is its own `BenchScore` (`BenchScore.trial`,
+`src/no_human/eval/northstar.py`). The reliability figure this produces is
+`NorthStarCard.pass_k_rate` — the fraction of specs that passed **every**
+trial, not the mean success rate (`src/no_human/eval/northstar_card.py:412`) —
+surfaced in the headline as `· pass^{trials} {rate}`
+(`northstar_card.py:753`), in a dedicated "Per-spec reliability" table
+(`northstar_card.py:1318-1332`), and now also as a `pass^k` cell (`n/k`, read
+from the same `per_spec_passes` — no new arithmetic) on each core spec's row
+in the "Per-task" table, present only when `trials > 1` (`pass^1` is
+arithmetically the mean; printing it would read as a second, corroborating
+measurement that does not exist — `tests/test_bench_trials.py:270` pins this).
+So the deferral branch of this task's acceptance criteria does **not** apply.
+
+The one real caveat is operational, not a missing feature: a multi-trial full
+run over the whole corpus needs a **dedicated quota window** — it is `trials ×`
+as expensive as a single pass, and killing it mid-run (as has happened to the
+single-trial baseline before) discards a resumed run's earlier trials only if
+the checkpoint identity is wrong, which is exactly what `(task_id, trial)`
+exists to prevent. This is a scheduling constraint, not a "deferred"
+implementation, and must be reported as such.
+
+**`total_nh_tokens` validation.** Before believing any run's numbers, assert
+the harness actually spent tokens — a run whose harness died on startup scores
+every spec as an honest escalation and reads as a clean, cheap result:
+
+```bash
+python -c "import json,sys;d=json.load(open(sys.argv[1]))['aggregate'];sys.exit(0 if d['total_nh_tokens']>0 else 1)" <results.json>
+```
+
+A zero (or missing) `total_nh_tokens` means the run measured nothing — treat
+it as a failed run, not a strong result.
+
+**success_rate must never lead.** It is pooled over specs×trials rows, so an
+uneven trial count (a resumed run that died partway) silently over-weights
+whichever specs happened to run more often. The headline is
+`spec_mean_success_rate` — the mean of PER-SPEC means
+(`northstar_card.py:329`) — and it should be read together with cost ratio and
+the honest-escalation rate, never alone. **Bench is an instrument, not a target: never tune the product to pass the specific specs in this corpus** —
+that measures memorization of the benchmark, not capability.
+
+**Escalation latency.** Every off-ramp (`Orchestrator._raise_blocker`) now
+stamps `blocker.escalation_latency = {"attempts_before_escalation":
+int, "tokens_before_escalation": int}` from the same `store.lifetime_usage`
+call the budget gate uses, so the board, the CLI (`nh task show`) and the
+bench report can never disagree about how long a run took to reach a human.
+The bench "Per-task" table renders `attempts` and `tokens @ escalation`
+columns from the matching `BenchScore.attempts_before_escalation` /
+`tokens_before_escalation`, `—` for a non-escalated row.

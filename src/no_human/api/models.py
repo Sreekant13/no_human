@@ -164,6 +164,11 @@ class TaskOut(BaseModel):
     #: reason would explain a stop nobody asked about under a heading that says
     #: the task failed.
     failure_reason: str | None = None
+    # Mirrors TaskSummaryOut.escalation_attempts/escalation_tokens — the
+    # `failure_reason` comment above records exactly the bug caused by a
+    # component-only field, so this is drawer parity, not new surface.
+    escalation_attempts: int | None = None
+    escalation_tokens: int | None = None
 
     @classmethod
     def from_task(cls, task: Task, attempts: list[dict]) -> "TaskOut":
@@ -180,6 +185,12 @@ class TaskOut(BaseModel):
         total_review_cache_creation = _sum("review_cache_creation_tokens")
         total_review_cache_read = _sum("review_cache_read_tokens")
         total_aux_tokens, total_aux_cache_read, total_aux_cache_creation = _aux_totals(attempts)
+        escalation_attempts = None
+        escalation_tokens = None
+        if task.blocker and isinstance(task.blocker, dict):
+            _lat = task.blocker.get("escalation_latency") or {}
+            escalation_attempts = _lat.get("attempts_before_escalation")
+            escalation_tokens = _lat.get("tokens_before_escalation")
         return cls(
             id=task.id,
             external_id=task.external_id,
@@ -209,6 +220,8 @@ class TaskOut(BaseModel):
             wall_seconds=_wall_seconds(task.created_at, _last_activity(task, attempts)),
             attempt_count=len(attempts) if attempts else 0,
             failure_reason=_failure_reason(task, attempts),
+            escalation_attempts=escalation_attempts,
+            escalation_tokens=escalation_tokens,
         )
 
 
@@ -318,6 +331,11 @@ class TaskSummaryOut(BaseModel):
     blocker_question: str | None = None
     blocker_category: str | None = None
     blocker_wake_condition: str | None = None
+    # {attempts,tokens}_before_escalation from task.blocker["escalation_latency"];
+    # None when unmeasured (fail-open telemetry, see orchestrator._raise_blocker)
+    # — the board/CLI must render nothing, never a fabricated 0.
+    escalation_attempts: int | None = None
+    escalation_tokens: int | None = None
     # The human explicitly stopped this parked task (/pause on an already-parked
     # task, or /reply with terminal:true) — durable per wake.py, which already
     # skips these in the wake sweep. Silences "N need you" for the row without
@@ -397,11 +415,16 @@ class TaskSummaryOut(BaseModel):
         blocker_cat = None
         blocker_wake = None
         blocker_stopped = False
+        escalation_attempts = None
+        escalation_tokens = None
         if task.blocker and isinstance(task.blocker, dict):
             blocker_q = task.blocker.get("question")
             blocker_cat = task.blocker.get("category")
             blocker_wake = task.blocker.get("wake_condition")
             blocker_stopped = bool(task.blocker.get("human_stopped"))
+            _lat = task.blocker.get("escalation_latency") or {}
+            escalation_attempts = _lat.get("attempts_before_escalation")
+            escalation_tokens = _lat.get("tokens_before_escalation")
         # Per-task backend from config dict.
         task_backend = None
         if hasattr(task, "config") and isinstance(task.config, dict):
@@ -447,6 +470,8 @@ class TaskSummaryOut(BaseModel):
             blocker_category=blocker_cat,
             blocker_wake_condition=blocker_wake,
             blocker_human_stopped=blocker_stopped,
+            escalation_attempts=escalation_attempts,
+            escalation_tokens=escalation_tokens,
             last_activity=_last_activity(task, attempts),
             backend=task_backend,
             total_tokens=total_tokens,

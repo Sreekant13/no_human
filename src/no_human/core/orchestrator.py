@@ -5616,6 +5616,18 @@ class Orchestrator:
         else:
             task.wake_check_at = None
 
+        # 3b. Escalation latency: telemetry only, never allowed to break the
+        # off-ramp. Set for every route (not only ESCALATED) so a parked task
+        # that later escalates keeps the number the CLI/board render.
+        try:
+            n_attempts, n_tokens = await self.store.lifetime_usage(task.id)
+            blocker.escalation_latency = {
+                "attempts_before_escalation": int(n_attempts),
+                "tokens_before_escalation": int(n_tokens),
+            }
+        except Exception:
+            self._advisory("escalation latency unavailable")
+
         # 4. Persist the structured report and transition.
         task.blocker = blocker.to_dict()
         await self.store.update_task(task)

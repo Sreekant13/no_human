@@ -155,6 +155,13 @@ class BenchScore:
     # resumes on, and a single-trial run is exactly today's shape with every
     # trial == 0.
     trial: int = 0
+    # Escalation latency: how much of the run's cost it took to reach an
+    # honest stop. Set unconditionally from the same `attempts`/`nh_tokens`
+    # the row already computed (never a second summation, so this column and
+    # the cost column can never disagree) — the report filters on
+    # `escalated_honestly` to decide whether to show it.
+    attempts_before_escalation: int = 0
+    tokens_before_escalation: int = 0
     notes: str = ""
     # Capped digest of the run's event stream. bench.db dies with the
     # sandbox cleanup; the digest rides the score into progress.json /
@@ -229,6 +236,8 @@ class BenchScore:
             "subset": self.subset,
             "project": self.project,
             "trial": self.trial,
+            "attempts_before_escalation": self.attempts_before_escalation,
+            "tokens_before_escalation": self.tokens_before_escalation,
             "token_ratio": (round(self.token_ratio, 3)
                             if self.token_ratio is not None else None),
             "cost_ratio": (round(self.cost_ratio, 3)
@@ -729,6 +738,11 @@ class NorthStarRunner:
             expected_escalation=spec.expect_escalation,
             subset=spec.subset,
             project=spec_project_name(spec),
+            # Set unconditionally (they're the run's cost either way, same
+            # `attempts`/`nh_tokens` this call already computed); the report
+            # decides whether to SHOW them by filtering on escalated_honestly.
+            attempts_before_escalation=len(attempts),
+            tokens_before_escalation=nh_tokens,
         )
 
         if spec.expect_escalation:

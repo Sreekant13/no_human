@@ -264,6 +264,10 @@ class Blocker:
     # this True explicitly as a trust boundary, exactly like `options` and
     # `category`.
     reason_is_agent_authored: bool = False
+    # {"attempts_before_escalation": int, "tokens_before_escalation": int} or
+    # None when unmeasured (e.g. `store.lifetime_usage` failed — telemetry is
+    # fail-open, routing is not). Never invent zeros for a missing object.
+    escalation_latency: dict[str, int] | None = None
 
     def __post_init__(self) -> None:
         # `options` is list[BlockerOption] unconditionally, whoever built it:
@@ -291,6 +295,9 @@ class Blocker:
             "evidence": self.evidence,
             "raised_at": self.raised_at,
             "reason_is_agent_authored": self.reason_is_agent_authored,
+            "escalation_latency": (
+                dict(self.escalation_latency) if self.escalation_latency else None
+            ),
         }
 
     @classmethod
@@ -315,6 +322,17 @@ class Blocker:
             # cannot clear it and get its prose published as no_human's.
             reason_is_agent_authored=bool(
                 data.get("reason_is_agent_authored", False)),
+            escalation_latency=(
+                {
+                    "attempts_before_escalation": int(
+                        (data.get("escalation_latency") or {}).get(
+                            "attempts_before_escalation", 0) or 0),
+                    "tokens_before_escalation": int(
+                        (data.get("escalation_latency") or {}).get(
+                            "tokens_before_escalation", 0) or 0),
+                }
+                if data.get("escalation_latency") else None
+            ),
         )
 
 

@@ -662,6 +662,8 @@ class NorthStarCard:
             subset=s.get("subset", "full"),
             project=s.get("project", ""),
             trial=int(s.get("trial") or 0),
+            attempts_before_escalation=int(s.get("attempts_before_escalation") or 0),
+            tokens_before_escalation=int(s.get("tokens_before_escalation") or 0),
             notes=s.get("notes", ""),
             events=s.get("events") or [],
         ) for s in data.get("scores", [])]
@@ -1286,14 +1288,19 @@ def render_northstar_md(card: NorthStarCard,
         "## Per-task",
         "",
         "| task | outcome | satisfied | nh tokens | orig tokens | cost ratio | "
-        "orig follow-ups (proxy) | notes |",
-        "|---|---|---|---|---|---|---|---|",
+        "orig follow-ups (proxy) | attempts | tokens @ escalation | "
+        + ("pass^k | " if card.trials > 1 else "")
+        + "notes |",
+        "|---|---|---|---|---|---|---|---|---|"
+        + ("---|" if card.trials > 1 else "")
+        + "---|",
     ]
     # PRIVACY: only hand-curated (PR-reviewed) core specs get per-task rows
     # in this git-tracked report; generated specs are verbatim operator
     # conversations and appear only in the aggregates.
     core_scores = [s for s in card.scores if s.subset == "core"]
     hidden = len(card.scores) - len(core_scores)
+    per_spec = card.per_spec_passes if card.trials > 1 else {}
     for s in core_scores:
         ratio_s = (f"{s.cost_ratio:.2f}" if s.cost_ratio else "—")
         sat = {True: "✅", False: "❌", None: "—"}[s.goal_satisfied]
@@ -1302,9 +1309,24 @@ def render_northstar_md(card: NorthStarCard,
         # with themselves.
         task_cell = (f"{s.task_id} #{s.trial + 1}" if card.trials > 1
                      else s.task_id)
+        # Escalation-latency cells: escalated rows print the real numbers,
+        # non-escalated rows print "—" in both — the visual distinction the
+        # report is for. No new arithmetic: same attempts/nh_tokens `_score`
+        # already stamped on the row.
+        if s.escalated_honestly:
+            attempts_cell = f"{s.attempts_before_escalation}"
+            tokens_cell = f"{s.tokens_before_escalation:,}"
+        else:
+            attempts_cell = "—"
+            tokens_cell = "—"
+        pass_k_cell = ""
+        if card.trials > 1:
+            passes, ran_n = per_spec.get(s.task_id, (0, 0))
+            pass_k_cell = (f"{passes}/{ran_n} | " if ran_n else "— (not measured) | ")
         lines.append(
             f"| {task_cell} | {s.outcome_status} | {sat} | {s.nh_tokens:,} | "
             f"{s.orig_tokens:,} | {ratio_s} | {s.orig_corrections} | "
+            f"{attempts_cell} | {tokens_cell} | {pass_k_cell}"
             f"{redact_for_publish(s.notes or '')[:80].replace('|', '/')} |")
     if hidden:
         lines.append(f"\n_{hidden} non-core task(s) included in the aggregates only (privacy: raw corpus rows never enter git)._")

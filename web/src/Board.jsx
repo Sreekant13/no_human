@@ -7,6 +7,7 @@ import { topPrioritised } from "./laneView.js";
 import { partitionAnswerLane, shouldResetStaleOpen } from "./answerLane.js";
 import { showConflictBadge, conflictRoundLabel } from "./conflictStatus.js";
 import { cardBlockerLine } from "./cardBlockerLine.js";
+import { escalationLatencyLine } from "./escalationLatency.js";
 import { httpPrUrl } from "./prUrl.js";
 
 // 5B: how many cards a collapsible lane shows before the expand arrow. 4 keeps
@@ -361,6 +362,11 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClic
               paragraphs. The untouched sentence stays available on hover and in
               the drawer. */}
           <span>{cardBlockerLine(task.blocker_question)}</span>
+        </div>
+      )}
+      {escalationLatencyLine(task) && (
+        <div className="card-escalation-latency" title="how long it took this run to reach a human">
+          <span aria-hidden="true">↻</span> {escalationLatencyLine(task)}
         </div>
       )}
       {isAwaiting && actionHint(task) && (

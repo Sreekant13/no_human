@@ -1353,6 +1353,11 @@ def task_show(task_id):
             console.print(f"repo: {t.repo_path}")
             if t.blocker:
                 console.print(f"[red]blocker:[/] {t.blocker}")
+            lat = (t.blocker or {}).get("escalation_latency") if t.blocker else None
+            if lat and t.status is TaskStatus.ESCALATED:
+                console.print(
+                    f"[yellow]Escalated at attempt {lat['attempts_before_escalation']} "
+                    f"after {lat['tokens_before_escalation']:,} tokens[/]")
             attempts = await store.list_attempts(t.id)
             for a in attempts:
                 console.print(
