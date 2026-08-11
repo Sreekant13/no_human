@@ -594,6 +594,103 @@ async def test_stream_reports_tool_result_SIZE_from_the_user_message(tmp_path, m
     assert not results[0].text, f"tool_result must not carry the text; got {results[0].text!r}"
 
 
+@pytest.mark.real_backend  # exercises the REAL ClaudeBackend.stream
+async def test_stream_records_the_EXIT_CODE_of_a_failed_tool_and_still_no_text(
+    tmp_path, monkeypatch
+):
+    """Coder agents ran `export_guard` 103 times across 8 tasks in one night and
+    the DB cannot say whether any of that was a refusal LOOP: the tool_result
+    event carries the SIZE and never the text (DB bloat, and a command's stderr
+    can print a credential), and a size cannot tell a refusal from a pass. An
+    int can, and an int is not output.
+
+    THE MECHANISM IS `is_error` PLUS A FIRST-LINE PREFIX, and the correction
+    matters because the first version of this docstring got it wrong. Measured
+    over 3,733 real ToolResultBlocks: `block.content` is a plain STRING for
+    successes too (3,282 of them; 324 are block lists, 127 are the errors), so
+    the type says NOTHING about whether the command failed. The
+    `{stdout, stderr, interrupted, isImage, noOutputExpected}` dict does exist,
+    but it is the CLI's own `toolUseResult` record — the SDK never delivers it
+    as block content. What separates the two populations is `is_error`, and
+    what carries the number is the FIRST LINE of a failed result: `Exit code N`
+    (84 of 84 such lines, every one `is_error=True`; zero successes open with
+    it in that corpus).
+
+    So both halves are load-bearing, and the last three blocks below are each a
+    way the number would otherwise be invented:
+
+    * `printed_by_a_pass` — a command that SUCCEEDED while replaying a captured
+      log whose first line is `Exit code 7`. On the prefix alone that is a
+      failure with status 7. `is_error` is what refuses it.
+    * `second_line` — a failure whose SECOND line opens with the prefix. Any
+      scan that walks lines rather than reading the first one files this as 7.
+    * `quoted` — the prefix mid-line, which no body search may pick up either.
+
+    Unknown stays unknown: the key is simply absent, because a fabricated
+    status is worse than no measurement.
+    """
+    from claude_agent_sdk import UserMessage
+    from claude_agent_sdk.types import ToolResultBlock
+
+    from no_human.agent import claude_backend
+    from no_human.agent.claude_backend import ClaudeBackend
+
+    async def _q(*args, **kwargs):
+        yield UserMessage(content=[
+            ToolResultBlock(
+                tool_use_id="refused",
+                content="Exit code 1\nEXPORT_CLASSIFICATION.txt:12: `ship 4  docs/`"
+                        " actually wins 3 file(s).",
+                is_error=True),
+            ToolResultBlock(tool_use_id="passed", content="OK", is_error=False),
+            ToolResultBlock(
+                tool_use_id="killed",
+                content="Exit code 143\nterminated", is_error=True),
+            ToolResultBlock(
+                tool_use_id="quoted",
+                content="ran 3 checks\nthe log said Exit code 7\n", is_error=True),
+            # A command that SUCCEEDED and printed a captured log. Identical to
+            # `refused` at the prefix; only is_error tells them apart.
+            ToolResultBlock(
+                tool_use_id="printed_by_a_pass",
+                content="Exit code 7\n--- replayed from the captured log ---",
+                is_error=False),
+            ToolResultBlock(
+                tool_use_id="second_line",
+                content="checking exports\nExit code 7\nrefused", is_error=True),
+        ])
+
+    monkeypatch.setattr(claude_backend, "query", lambda *a, **kw: _q())
+    backend = ClaudeBackend(model="claude-sonnet-5")
+    events = [e async for e in backend.stream("go", cwd=tmp_path, max_turns=5)]
+    meta = {e.meta["tool_use_id"]: e.meta for e in events if e.kind == "tool_result"}
+    assert set(meta) == {"refused", "passed", "killed", "quoted",
+                         "printed_by_a_pass", "second_line"}, meta
+
+    assert meta["refused"]["exit_code"] == 1, (
+        "a refusal's exit status is the whole point — without it 103 invocations "
+        f"cannot be told from 103 refusals; got {meta['refused']!r}")
+    # Multi-digit, so a one-character parse cannot pass.
+    assert meta["killed"]["exit_code"] == 143, meta["killed"]
+    # No status was STATED for any of these; inventing one is a false measurement.
+    assert "exit_code" not in meta["passed"], meta["passed"]
+    assert "exit_code" not in meta["quoted"], (
+        "'Exit code 7' printed in the body is not this command's status; a body "
+        f"search inflates every refusal count taken from this field: {meta['quoted']!r}")
+    assert "exit_code" not in meta["printed_by_a_pass"], (
+        "this command SUCCEEDED — its stdout merely opens with the words. The "
+        "prefix alone cannot tell that from a failure; is_error is the other "
+        f"half of the mechanism: {meta['printed_by_a_pass']!r}")
+    assert "exit_code" not in meta["second_line"], (
+        "the status is stated on the FIRST line or not at all; a scan that walks "
+        f"line starts records a number the command never returned: {meta['second_line']!r}")
+
+    # The no-text rule is UNCHANGED: an int, and nothing that carried it.
+    assert not [e.text for e in events if e.kind == "tool_result" and e.text]
+    leaked = [v for m in meta.values() for v in m.values() if isinstance(v, str)]
+    assert not any("EXPORT_CLASSIFICATION" in v or "terminated" in v for v in leaked), (
+        f"tool_result meta must carry no output text; got {leaked!r}")
+
 
 @pytest.mark.real_backend  # exercises the REAL ClaudeBackend.stream
 async def test_stream_handles_PARALLEL_tool_results_and_measures_model_visible_text(
@@ -674,6 +771,39 @@ async def test_tool_use_emits_the_join_key_so_the_per_tool_slice_is_computable(
         "without the CALL-side id the size distribution cannot be sliced BY TOOL, "
         "which is the entire purpose of collecting it"
     )
+
+
+def test_exit_status_is_gated_on_is_error_and_never_raises():
+    """The same invariant `_result_size` carries, one helper over: telemetry
+    must never break the session. A raise here is not a lost measurement — the
+    handler at the bottom of `_run_once` catches it and the whole ATTEMPT fails.
+
+    Both malformed cases below are real. `"²"` and `"①"` satisfy `str.isdigit()`
+    and `int()` refuses them, so an isdigit-guarded parse still raises; and a
+    long enough run of ASCII digits trips CPython's `int_max_str_digits` (4300),
+    which `str.isdecimal()` does not cover either. Neither can be produced by
+    the CLI today — they are produced by whatever a COMMAND printed, which is
+    exactly the input this helper reads.
+    """
+    from no_human.agent.claude_backend import _exit_status
+
+    assert _exit_status("Exit code 1\nrefused", is_error=True) == {"exit_code": 1}
+    assert _exit_status("Exit code 143", is_error=True) == {"exit_code": 143}
+    # THE GATE: identical text, and this command did not fail.
+    assert _exit_status("Exit code 1\nrefused", is_error=False) == {}
+    # isdigit() is True for both of these; int() still refuses them.
+    assert _exit_status("Exit code ²", is_error=True) == {}
+    assert _exit_status("Exit code ①", is_error=True) == {}
+    # int_max_str_digits. The parse must decline it, not raise through.
+    assert _exit_status("Exit code " + "1" * 4301, is_error=True) == {}
+    # A single line longer than the window: the digits visible are only a
+    # PREFIX OF whatever number is there, so it is never guessed at. 100 digits
+    # is the case that MATTERS — it parses perfectly well, so nothing but the
+    # window stops a 100-digit "exit code" being recorded as a measurement.
+    assert _exit_status("Exit code " + "9" * 100, is_error=True) == {}
+    assert _exit_status("Exit code " + "9" * 100_000, is_error=True) == {}
+    assert _exit_status(None, is_error=True) == {}
+    assert _exit_status([{"type": "text", "text": "Exit code 1"}], is_error=True) == {}
 
 
 def test_result_size_flags_non_text_blocks_and_never_raises():

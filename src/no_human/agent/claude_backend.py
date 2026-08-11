@@ -267,6 +267,71 @@ def _result_size(content: Any) -> dict[str, Any]:
     }
 
 
+#: What a failed tool result OPENS with, and how far in we look for it. The
+#: window bounds the work (a multi-MB single-line result is not copied to be
+#: rejected) and bounds the digits, so `int()` cannot meet a 4,300-digit string.
+_EXIT_CODE_PREFIX = "Exit code "
+_EXIT_CODE_WINDOW = 64
+
+
+def _exit_status(content: Any, *, is_error: bool) -> dict[str, int]:
+    """``{"exit_code": N}`` when a FAILED result states a status, else ``{}``.
+
+    103 `export_guard` invocations across 8 tasks in one night, and the DB
+    cannot say whether any of that was a refusal LOOP: the size above cannot
+    tell a refusal from a pass. An int can, and an int is not output — the
+    no-text rule this file states at the emit site is unchanged.
+
+    🔴 TWO SIGNALS, AND NEITHER ALONE WILL DO — the first version of this
+    docstring claimed the SHAPE separated the populations, and that was wrong.
+    Measured over 3,733 real ToolResultBlocks: ``block.content`` is a plain
+    STRING for successes too (3,282 of them, against 127 errors and 324 block
+    lists), so the type says nothing about whether a command failed. The
+    ``{stdout, stderr, interrupted, isImage, noOutputExpected}`` dict is real
+    but it is the CLI's own ``toolUseResult`` record — the SDK does not deliver
+    it as block content. What the SDK gives is:
+
+    * ``is_error`` — which population this result is in; and
+    * the FIRST LINE of a failed result, which reads exactly ``Exit code N``
+      (84 of 84 such lines in that corpus, every one ``is_error=True``, and no
+      success opening with it).
+
+    On the prefix alone, a command that SUCCEEDS while printing a captured log
+    whose first line is ``Exit code 7`` — a replay, a fixture, this file's own
+    test data — is recorded as having exited 7. On ``is_error`` alone there is
+    no number at all, and the 43 non-command failures (a blocked tool, a schema
+    rejection) state none. So both, and the line is read as a PREFIX: a status
+    quoted mid-line, or on the second line, is not this command's status.
+
+    Anything unstated stays unstated — no key, because a fabricated status is a
+    measurement nobody made.
+    """
+    if not is_error or not isinstance(content, str):
+        return {}
+    window = content[:_EXIT_CODE_WINDOW]
+    first, newline, _ = window.partition("\n")
+    if not newline and len(content) > _EXIT_CODE_WINDOW:
+        # The first line runs past the window, so digits visible here may be a
+        # PREFIX OF the number rather than the number. Never guess at it.
+        return {}
+    first = first.strip()
+    if not first.startswith(_EXIT_CODE_PREFIX):
+        return {}
+    digits = first[len(_EXIT_CODE_PREFIX):].strip()
+    if not digits.isdigit():
+        return {}
+    try:
+        return {"exit_code": int(digits)}
+    except ValueError:
+        # `isdigit()` is TRUE for "²" and "①" and `int()` refuses them, so the
+        # guard above is not enough on its own (nor is `isdecimal()`: it does
+        # not cover a digit run long enough to trip `int_max_str_digits`).
+        # A raise here does not merely lose telemetry — the handler in
+        # `_run_once` turns it into a FAILED ATTEMPT. Same invariant as
+        # `_result_size`: telemetry must never break the session.
+        return {}
+
+
 def _fold_spend(prior: AgentResult, *, into: AgentResult) -> None:
     """Add a dead session's BILL — and only its bill — to the one that replaced it.
 
@@ -679,6 +744,10 @@ class ClaudeBackend:
                     if isinstance(blocks, list):
                         for block in blocks:
                             if isinstance(block, ToolResultBlock):
+                                # Bound once: it labels the population below AND
+                                # gates the exit code, which is meaningless on a
+                                # result that did not fail.
+                                is_error = bool(getattr(block, "is_error", False))
                                 yield AgentEvent(
                                     "tool_result",
                                     meta={
@@ -692,8 +761,14 @@ class ClaudeBackend:
                                         "parent_tool_use_id": message.parent_tool_use_id,
                                         # Error results are short and a different
                                         # population; they must be excludable.
-                                        "is_error": bool(getattr(block, "is_error", False)),
+                                        "is_error": is_error,
                                         **_result_size(block.content),
+                                        # The command's own status when a FAILED
+                                        # result states one — a refusal LOOP is
+                                        # only countable if a refusal is
+                                        # distinguishable from a pass.
+                                        **_exit_status(block.content,
+                                                       is_error=is_error),
                                     },
                                 )
                     continue
