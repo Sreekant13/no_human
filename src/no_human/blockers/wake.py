@@ -431,11 +431,33 @@ class WakeWatcher:
         if await self._is_terminal(task):
             return None
 
+        # Re-read the LIVE row before deciding anything else. `task` may be a
+        # snapshot taken by `tick()`'s `list_tasks(BLOCKED)` fetch — a
+        # concurrent `restore-approval` (or a shipped/DONE landing) can flip
+        # the real row's status *between* that fetch and this call. Deciding
+        # off the stale handle's `.status` is exactly the 2026-08-11 incident:
+        # a task moved to `awaiting_approval` with its old wake condition still
+        # armed still read as `blocked` here and fell into the wake-condition
+        # rung below, resuming a task whose review-PASSED work had just landed.
+        current = await self.store.get_task(task.id)
+        if current is None:
+            return None
+        if await self._disarm_stale_wake(task, current):
+            return None
+
         # An open PR: shepherd it. Merged → done; closed-unmerged → escalate;
         # new human comments → revise (B4); red CI on the PR head → bounded fix
         # loop (M1). It NEVER times out — a PR may wait for human approval
         # indefinitely.
-        if task.status == TaskStatus.AWAITING_APPROVAL:
+        #
+        # `current.status` (the fresh read above), not `task.status`: `task`
+        # can be the stale snapshot `tick()` listed under `BLOCKED` before a
+        # concurrent restore-approval flipped the live row to
+        # `awaiting_approval` — deciding off the stale status here would fall
+        # through to the wake-condition rung below using `task`'s own
+        # (possibly already-cleared-on-the-row-but-not-on-this-handle)
+        # blocker, the exact 2026-08-11 incident.
+        if current.status == TaskStatus.AWAITING_APPROVAL:
             return await self._check_open_pr(task)
 
         # A human chose "stop — keep the work parked as-is" (SCRUM-22's
@@ -499,6 +521,38 @@ class WakeWatcher:
             await self._escalate_timeout(task, blocker)
             return "escalated_timeout"
         return None
+
+    async def _disarm_stale_wake(self, task: Task, current: Task) -> bool:
+        """Belt-and-suspenders: a task whose LIVE status is already
+        ``awaiting_approval`` or ``done`` must never carry an armed wake
+        condition — whichever path put it there (a restore-approval race, a
+        record repaired some other way, a stale handle) — or the next tick's
+        wake-condition rung can still resume it. Clears the arm, persists it,
+        and emits ``wake_disarmed``. Returns True iff it disarmed something,
+        in which case the caller must stop the tick for this task (no rung
+        below may run against a row that just got rewritten out from under
+        it).
+        """
+        if current.status not in (TaskStatus.AWAITING_APPROVAL, TaskStatus.DONE):
+            return False
+        blocker = current.blocker or {}
+        condition = blocker.get("wake_condition")
+        armed = current.wake_check_at is not None or bool(condition)
+        if not armed:
+            return False
+        prior_wake_check_at = current.wake_check_at
+        current.wake_check_at = None
+        if condition:
+            blocker = dict(blocker)
+            del blocker["wake_condition"]
+            current.blocker = blocker or None
+        await self.store.update_task_columns(current)
+        await self._emit(
+            current, "wake_disarmed",
+            f"{current.id[:8]} is {current.status.value} — cleared stale "
+            f"wake_condition={condition!r} wake_check_at={prior_wake_check_at!r}",
+        )
+        return True
 
     async def _resume(self, task: Task) -> str:
         """Flip a parked task back to its prior working state (IMPLEMENTING).

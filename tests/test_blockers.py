@@ -681,6 +681,122 @@ async def test_awaiting_approval_never_times_out(store):
     assert r.status == TaskStatus.AWAITING_APPROVAL
 
 
+# --------------------------------------------------------------------------- #
+# restore-approval must clear the wake condition (live 2026-08-11 incident):  #
+# a wake must never resume an awaiting_approval task.                        #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_restored_awaiting_approval_is_disarmed_not_resumed(store):
+    """A task sitting in `awaiting_approval` with a stale, still-armed wake
+    condition (the shape `restore-approval` used to leave behind) must be
+    disarmed, not resumed — no `pr_watch` here, so `_check_open_pr` would
+    otherwise be the only thing standing between the wake-condition rung and
+    a spurious resume."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.AWAITING_APPROVAL,
+        blocker={"category": "DEPENDENCY_WAIT", "wake_condition": "after:2h",
+                 "raised_at": (now - timedelta(hours=3)).isoformat(),
+                 "confidence": 0.9},
+        wake_at=(now - timedelta(minutes=1)).isoformat(),
+    )
+    watcher = WakeWatcher(store, _cfg())
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") not in actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.AWAITING_APPROVAL
+    assert refreshed.wake_check_at is None
+    assert (refreshed.blocker or {}).get("wake_condition") is None
+    events = await store.list_events(t.id)
+    kinds = [e.get("kind") for e in events]
+    assert "wake_disarmed" in kinds
+    assert "resumed" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_stale_blocked_handle_restored_mid_tick_is_not_resumed(store):
+    """The actual live race: `tick()` lists the task while it is still
+    `blocked`; a concurrent `restore-approval` flips the DB row to
+    `awaiting_approval` before `_evaluate` runs on that stale handle. The
+    handle still reads `blocked` — deciding off it must not resume the task."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={"category": "DEPENDENCY_WAIT", "wake_condition": "after:2h",
+                 "raised_at": (now - timedelta(hours=3)).isoformat(),
+                 "confidence": 0.9},
+    )
+    live = await store.get_task(t.id)
+    await store.set_status(live, TaskStatus.AWAITING_APPROVAL, validate=False,
+                            human_override=True)
+    assert t.status == TaskStatus.BLOCKED  # confirms the handle stayed stale
+
+    watcher = WakeWatcher(store, _cfg())
+    action = await watcher._evaluate(t, now=now)
+    assert action is None
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.AWAITING_APPROVAL
+    events = await store.list_events(t.id)
+    assert any(e.get("kind") == "wake_disarmed" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_wake_disarm_is_emitted_once(store):
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.AWAITING_APPROVAL,
+        blocker={"category": "DEPENDENCY_WAIT", "wake_condition": "after:2h",
+                 "raised_at": (now - timedelta(hours=3)).isoformat(),
+                 "confidence": 0.9},
+        wake_at=(now - timedelta(minutes=1)).isoformat(),
+    )
+    watcher = WakeWatcher(store, _cfg())
+    await watcher.tick(now=now)
+    await watcher.tick(now=now)
+    events = await store.list_events(t.id)
+    disarm_events = [e for e in events if e.get("kind") == "wake_disarmed"]
+    assert len(disarm_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_genuinely_parked_task_still_resumes(store):
+    """Regression pin: the disarm must never touch a task that is genuinely
+    `blocked` — only a live `awaiting_approval`/`done` row is disarmed."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={"category": "DEPENDENCY_WAIT", "wake_condition": "after:2h",
+                 "raised_at": (now - timedelta(hours=3)).isoformat(),
+                 "confidence": 0.9},
+    )
+    watcher = WakeWatcher(store, _cfg())
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") in actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.IMPLEMENTING
+
+
+@pytest.mark.asyncio
+async def test_awaiting_approval_pr_comment_resume_survives_the_disarm(store):
+    """Regression pin: a genuinely `awaiting_approval` task with an open PR
+    and a fresh human comment must still resume via
+    `_check_approval_pr_comments` — the disarm belt must not swallow the
+    legitimate awaiting-approval resume path."""
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _approval_task(store, since="2026-06-22T11:00:00+00:00")
+
+    async def pr_comment(url):
+        return [PrComment(author="human", body="please rename it",
+                          created_at="2026-06-22T11:30:00+00:00")]
+
+    watcher = WakeWatcher(store, _cfg(), pr_comment=pr_comment)
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") in actions
+    r = await store.get_task(t.id)
+    assert r.status == TaskStatus.IMPLEMENTING
+
+
 @pytest.mark.asyncio
 async def test_awaiting_approval_revision_cap_escalates(store):
     now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)

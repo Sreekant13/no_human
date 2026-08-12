@@ -1549,6 +1549,15 @@ def task_restore_approval(task_id, reason):
                               "(concurrent change?) — nothing was recorded; "
                               "re-run after checking `nh task show`[/]")
                 sys.exit(1)
+            # Capture what the wake watcher would otherwise still act on
+            # BEFORE clearing it — an armed blocker + wake_check_at surviving
+            # this repair is the live 2026-08-11 incident (a stale escalation
+            # blocker resumed a just-landed task straight back into
+            # implementing). Naming what was disarmed in the event, not just
+            # dumping the raw (truncated) blocker, is what makes the repair
+            # auditable.
+            disarmed_condition = (t.blocker or {}).get("wake_condition")
+            disarmed_wake_check_at = t.wake_check_at
             t.blocker = None
             t.wake_check_at = None
             await store.update_task(t)
@@ -1556,7 +1565,9 @@ def task_restore_approval(task_id, reason):
             await store.save_events(t.id, [{
                 "source": "human", "kind": "state_repaired",
                 "text": f"{prior} → awaiting_approval: {reason}; "
-                        f"displaced blocker: {displaced}",
+                        f"displaced blocker: {displaced}; "
+                        f"disarmed wake_condition={disarmed_condition!r} "
+                        f"wake_check_at={disarmed_wake_check_at!r}",
                 "ts": _time.time(),
             }])
             console.print(f"[green]{t.id[:8]} → awaiting_approval[/] "

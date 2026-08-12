@@ -306,3 +306,65 @@ def test_restore_approval_refuses_a_cancelled_task(tmp_path):
     assert status is TaskStatus.FAILED, "status must not move"
     assert "state_repaired" not in kinds, (
         "no repair event may exist for a refused repair")
+
+
+# --- restore-approval must clear the blocker's wake condition (2026-08-11 --- #
+# --- incident: a stale escalation blocker resumed a just-landed task).    --- #
+
+def test_restore_approval_disarms_the_wake_condition(tmp_path):
+    """A task escalated with an armed wake condition (`after:2h` +
+    `wake_check_at`), then restore-approval'd back to `awaiting_approval`,
+    must not leave that condition armed — or the next watcher tick can still
+    resume it (the live 2026-08-11 incident). Sync test: the CLI command
+    owns its own asyncio.run."""
+    import asyncio as _asyncio
+    import unittest.mock as mock
+
+    from click.testing import CliRunner
+
+    from no_human.cli import commands as cmd_mod
+
+    db = tmp_path / "restore.db"
+
+    async def _setup():
+        async with Store(db) as store:
+            t = Task.new("escalated with an open PR", repo_path="/tmp/x")
+            t.context = {"pr_watch": "https://example.invalid/pr/1"}
+            t.blocker = {"category": "DEPENDENCY_WAIT",
+                         "wake_condition": "after:2h",
+                         "raised_at": "2026-08-11T20:00:00+00:00",
+                         "confidence": 0.9}
+            t.wake_check_at = "2026-08-11T22:00:00+00:00"
+            await store.create_task(t)
+            await store.save_events(t.id, [{
+                "source": "test", "kind": "pr_open", "text": "", "ts": 0.0}])
+            await store.set_status(t, TaskStatus.ESCALATED, validate=False,
+                                   human_override=True)
+            return t.id
+
+    tid = _asyncio.run(_setup())
+
+    class _Cfg:
+        db_path = db
+
+    with mock.patch.object(cmd_mod, "_bootstrap",
+                           lambda require_auth=False: (_Cfg(), None)):
+        result = CliRunner().invoke(
+            cmd_mod.task_restore_approval, [tid, "--reason", "probe"])
+
+    assert result.exit_code == 0, result.output
+
+    async def _check():
+        async with Store(db) as store:
+            fresh = await store.get_task(tid)
+            events = await store.list_events(tid)
+            return fresh, events
+
+    fresh, events = _asyncio.run(_check())
+    assert fresh.status is TaskStatus.AWAITING_APPROVAL
+    assert fresh.blocker is None
+    assert fresh.wake_check_at is None
+    repaired = [e for e in events if e.get("kind") == "state_repaired"]
+    assert len(repaired) == 1
+    assert "after:2h" in repaired[0]["text"]
+    assert "2026-08-11T22:00:00+00:00" in repaired[0]["text"]
