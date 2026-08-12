@@ -29,7 +29,7 @@ const answer = Array.from({ length: 9 }, (_, i) => ({
   id: `park${i}aaaabbbbccccdddd`,
   title: `Per-PR CI_GATE Integration Test Pipeline ${i}`,
   description_short:
-    "Fetch all code review comments on https://code.example.com/dev/metrics-core-query-service/pull/7004 and triage them",
+    "Fetch all code review comments on https://code.example.com/dev/query-service/pull/7004 and triage them",
   status: "awaiting_input",
   kind: "feature",
   blocker_question: "The PR was closed without merging. Abandon the task, or rework and reopen?",

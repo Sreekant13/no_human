@@ -410,7 +410,7 @@ async def test_upsert_updates_existing_github_comment_instead_of_posting_new(mon
         return "{}"  # PATCH/POST succeed
 
     monkeypatch.setattr(pw, "_run_cli", fake_run)
-    ok = await pw.upsert_agent_comment("code.example.com/dev/metrics-core-query-service#7004", "new status", key="ci_gate")
+    ok = await pw.upsert_agent_comment("code.example.com/dev/query-service#7004", "new status", key="ci_gate")
     assert ok is True
     # It PATCHed comment 99, and did NOT POST a new one.
     assert any("PATCH" in " ".join(c) and "/issues/comments/99" in " ".join(c) for c in calls)

@@ -92,7 +92,7 @@ def _clean_title(title: str) -> str:
 def _project_from_workspaces(workspaces: list[str]) -> str:
     """The repo path a conversation happened in, from its workspace URIs. The
     ingester stamps it as the memory's ``project`` so mined rules can be scoped
-    to the repo they came from — a conversation in the Metricsdb repo shouldn't
+    to the repo they came from — a conversation in the Metrics-core repo shouldn't
     surface its rules to a no_human task. Strips the ``file://`` scheme so the
     value matches ``task.repo_path`` (a filesystem path). Empty when unknown."""
     for w in workspaces or []:

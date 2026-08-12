@@ -92,17 +92,17 @@ def test_project_derived_from_workspace_uri():
 
 
 async def test_mined_rule_is_scoped_to_the_conversations_repo(store):
-    """A rule mined from a Metricsdb conversation must NOT surface as a global rule —
+    """A rule mined from a Metrics-core conversation must NOT surface as a global rule —
     it carries the repo it came from so a no_human task doesn't see it. This is
     the driver of the 197-item confirm-queue flood (all mined rules had empty
     project and were therefore unscoped)."""
-    metrics-core = Transcript(
-        cascade_id="c-metrics-core", title="Metricsdb Troubleshooting", created="2026-06-17",
+    metrics_core = Transcript(
+        cascade_id="c-metrics-core", title="Metrics-core Troubleshooting", created="2026-06-17",
         messages=[Message("user", "always verify the fix by running the tests", "STEP")],
         workspaces=["file:///Users/e/git/metrics-core"],
     )
     ing = TranscriptIngester(store)
-    res = await ing.ingest_transcripts([metrics-core])
+    res = await ing.ingest_transcripts([metrics_core])
     assert res.proposed >= 1
     pending = await LearningQueue(store).pending()
     assert pending[0]["project"] == "/Users/e/git/metrics-core"

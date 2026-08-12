@@ -148,7 +148,7 @@ async def test_confirm_rules_activates_proposal(client, store):
 
 @pytest.mark.asyncio
 async def test_complete_persists_and_status_reflects(client, tmp_path):
-    payload = {"team": "METRICSDB", "repos": ["/x/svc"], "docs": ["/docs/adr"]}
+    payload = {"team": "METRICS_CORE", "repos": ["/x/svc"], "docs": ["/docs/adr"]}
     r = await client.post("/api/onboarding/complete", json=payload)
     assert r.status_code == 200
     assert r.json()["ok"] is True
@@ -157,7 +157,7 @@ async def test_complete_persists_and_status_reflects(client, tmp_path):
     s = await client.get("/api/onboarding/status")
     body = s.json()
     assert body["completed"] is True
-    assert body["team"] == "METRICSDB"
+    assert body["team"] == "METRICS_CORE"
     assert (tmp_path / "config.yaml").exists()
 
 

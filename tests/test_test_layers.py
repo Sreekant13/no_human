@@ -290,7 +290,7 @@ def test_ci_from_layer_jenkins():
     """ci_from_layer builds a JenkinsCI from a layer ci dict."""
     ci = ci_from_layer({
         "backend": "jenkins",
-        "job": "job/metrics-core/job/metrics-core-query-service",
+        "job": "job/metrics-core/job/query-service",
         "mode": "human_gated",
     })
     assert isinstance(ci, JenkinsCI)

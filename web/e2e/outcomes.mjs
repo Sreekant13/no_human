@@ -42,11 +42,11 @@ const TASKS = [
   // short fixture titles ("Task done1…") could never reproduce that.
   mk("done1aaaabbbbccccdddd", "done", {
     pr_url: "https://example.com/repo/pull/13",
-    title: "done1 — Per-PR CI_GATE integration test pipeline for metrics-core-query-service PR #7004 triage",
+    title: "done1 — Per-PR CI_GATE integration test pipeline for query-service PR #7004 triage",
   }),
   mk("done2aaaabbbbccccdddd", "done", {
     pr_url: "local-pr://tasks/14",
-    title: "done2 — Per-PR CI_GATE integration test pipeline for metrics-core-query-service PR #7005 triage",
+    title: "done2 — Per-PR CI_GATE integration test pipeline for query-service PR #7005 triage",
   }),
   mk("fail1aaaabbbbccccdddd", "failed", { cancelled: false }),
   mk("canc1aaaabbbbccccdddd", "failed", { cancelled: true }),

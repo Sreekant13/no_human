@@ -883,8 +883,8 @@ def test_parse_pr_url_github():
     # EH2: the single canonical grammar carries the host so GHE PRs resolve.
     from no_human.vcs.pr_watcher import parse_pr_url
     assert parse_pr_url(
-        "https://code.example.com/dev/metrics-core-query-service/pull/7003"
-    ) == ("github", "code.example.com", "dev/metrics-core-query-service", 7003)
+        "https://code.example.com/dev/query-service/pull/7003"
+    ) == ("github", "code.example.com", "dev/query-service", 7003)
 
 
 def test_parse_pr_url_gitlab():
@@ -917,8 +917,8 @@ def test_fetch_pr_comments_forwards_ghe_host(monkeypatch):
     monkeypatch.setattr(prw, "fetch_github_pr_comments", _fake_gh)
     orch = object.__new__(Orchestrator)  # method uses no instance state
     asyncio.run(orch._fetch_pr_comments_text(
-        "https://code.example.com/dev/metrics-core-query-service/pull/7003"))
-    assert seen == {"repo": "dev/metrics-core-query-service", "num": 7003,
+        "https://code.example.com/dev/query-service/pull/7003"))
+    assert seen == {"repo": "dev/query-service", "num": 7003,
                     "host": "code.example.com"}
 
 
