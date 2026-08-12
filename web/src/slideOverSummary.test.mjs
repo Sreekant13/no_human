@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import {
   narrativeFor, chipsFor, milestonesFor, sectionSummary, defaultOpenSection,
   diffStats, colorForStatus, PARKED_STATUSES, STATUS_STAGE_LABEL, isTerminalStatus,
-  isHumanStopped,
+  isHumanStopped, questionState, lastReviewedAttempt,
   ADVISORY_SEVERITIES, isBlockingFinding, reviewVerdict, severityChip,
   checklistRowClass, approveButtonState, approvalFeedback, taskApprovedAt,
   testResultVerdict, fxCountsLabel,
@@ -305,6 +305,64 @@ test("review section: all-passed reads as a clean summary", () => {
   assert.equal(s.text, "All checks passed");
 });
 
+// ── attempt-scoping: SPEC/REVIEW state their scope, never a phantom link ──
+
+test("review summary names its attempt and the prior review", () => {
+  const task = {
+    attempts: [
+      { attempt_number: 1, review_checklist: { passed: false, items: [{ passed: false }] } },
+      { attempt_number: 2, review_checklist: { passed: false, items: [{ passed: false }] } },
+      { attempt_number: 3, review_checklist: { passed: false, items: [{ passed: false }] } },
+      { attempt_number: 4, review_passed: false, review_checklist: { passed: false, items: [{ passed: false }] } },
+      { attempt_number: 5 },
+    ],
+  };
+  const s = sectionSummary("review", { task });
+  assert.ok(s.text.includes("Attempt 5"), s.text);
+  assert.ok(s.text.includes("attempt 4"), s.text);
+  assert.ok(s.text.includes("FAIL"), s.text);
+});
+
+test("review summary with no prior review keeps the plain empty state", () => {
+  const task = { attempts: [{ attempt_number: 1 }] };
+  const s = sectionSummary("review", { task });
+  assert.equal(s.text, "Not reviewed yet");
+});
+
+test("spec summary is attempt-scoped and invents no link", () => {
+  const task = { status: "implementing", context: {}, attempts: [{ attempt_number: 1 }] };
+  const s = sectionSummary("spec", { task });
+  assert.equal(s.text, "No spec for this attempt yet");
+  assert.ok(!/attempt \d/.test(s.text), s.text);
+});
+
+test("a reviewed current attempt is unaffected by the attempt-scoping change", () => {
+  const passing = { attempts: [{ attempt_number: 1, review_checklist: { items: [{ passed: true }, { passed: true }] } }] };
+  assert.equal(sectionSummary("review", { task: passing }).text, "All checks passed");
+
+  const failing = {
+    attempts: [{ attempt_number: 1, review_checklist: { passed: false, items: [{ passed: true }, { passed: true }] } }],
+  };
+  assert.equal(sectionSummary("review", { task: failing }).text, "Reviewer failed");
+});
+
+test("lastReviewedAttempt skips the current attempt and returns the nearest prior reviewed one", () => {
+  const task = {
+    attempts: [
+      { attempt_number: 1, review_checklist: { passed: false, items: [{ passed: false }] } },
+      { attempt_number: 2 },
+    ],
+  };
+  const prior = lastReviewedAttempt(task);
+  assert.equal(prior.attempt_number, 1);
+  assert.equal(prior.passed, false);
+});
+
+test("lastReviewedAttempt is null when only the current attempt has ever existed", () => {
+  assert.equal(lastReviewedAttempt({ attempts: [{ attempt_number: 1 }] }), null);
+  assert.equal(lastReviewedAttempt({ attempts: [] }), null);
+});
+
 test("diff section: additions/deletions/file count, matching the +N -M across K files shape", () => {
   const diff = [
     "diff --git a/foo.js b/foo.js",
@@ -408,6 +466,62 @@ test("details micro keeps the live ask for a non-terminal (parked) blocker", () 
   const s = sectionSummary("details", { task: { status: "blocked", blocker: { question: "why?" } } });
   assert.equal(s.text, "Has a question for you");
   assert.equal(s.colorVar, colorForStatus("blocked"));
+});
+
+// ── SCRUM-108: an answered blocker clears the question badge ───────────────
+// reply_task (api/app.py) never clears task.blocker — it only appends to
+// context.human_replies and flips status to implementing — so a raw
+// `task.blocker?.question` check kept the badge lit long after the human
+// answered.
+
+function escalatedTask(overrides = {}) {
+  return {
+    status: "escalated",
+    blocker: { question: "which approach?", raised_at: "2026-08-12T08:00:00Z" },
+    context: {},
+    attempts: [],
+    ...overrides,
+  };
+}
+
+test("answered blocker clears the question badge", () => {
+  const task = escalatedTask();
+  assert.equal(sectionSummary("details", { task }).text, "Has a question for you");
+  assert.equal(questionState(task), "open");
+
+  // The exact shape reply_task produces: status flips to implementing,
+  // context.human_replies gains an entry, blocker is left untouched.
+  const replied = {
+    ...task,
+    status: "implementing",
+    context: {
+      human_replies: [{ at: "2026-08-12T08:05:00Z", question: "which approach?", answer: "do X" }],
+    },
+  };
+  assert.equal(questionState(replied), "answered");
+  const s = sectionSummary("details", { task: replied });
+  assert.notEqual(s.text, "Has a question for you");
+});
+
+test("a reply older than the blocker does not clear it", () => {
+  const task = escalatedTask({
+    context: {
+      human_replies: [{ at: "2026-08-12T07:00:00Z", question: "which approach?", answer: "do X" }],
+    },
+  });
+  assert.equal(questionState(task), "open");
+  assert.equal(sectionSummary("details", { task }).text, "Has a question for you");
+});
+
+test("a terminal task still says it asked, even carrying an old reply (regression guard)", () => {
+  const task = escalatedTask({
+    status: "done",
+    context: {
+      human_replies: [{ at: "2026-08-12T08:05:00Z", question: "which approach?", answer: "do X" }],
+    },
+  });
+  assert.equal(questionState(task), "terminal");
+  assert.equal(sectionSummary("details", { task }).text, "Asked before it ended");
 });
 
 // ── gate-aware default section ──────────────────────────────────────────────

@@ -11,13 +11,17 @@
 // max_pr_conflict_rounds isn't on the payload, and a hardcoded "/3" renders
 // the impossible "round 4/3" when the operator configures 5. If the backend
 // ever surfaces the bound (task.max_pr_conflict_rounds), show it.
+// 2026-08-12: wake.py legitimately stores rounds = max+1 on the escalating
+// tick (it increments before checking the cap) and that value can survive a
+// human resume back into an active status — so the numerator is clamped to
+// the cap for display only; the stored/escalation value is untouched.
 export function conflictRoundLabel(task) {
   const rounds = task?.pr_conflict_rounds;
   if (!rounds) return null;
   const max = task?.max_pr_conflict_rounds;
-  return max
-    ? `resolving merge conflict — round ${rounds}/${max}`
-    : `resolving merge conflict — round ${rounds}`;
+  if (!max) return `resolving merge conflict — round ${rounds}`;
+  const shown = Math.min(rounds, max);
+  return `resolving merge conflict — round ${shown}/${max}`;
 }
 
 // The badge shows only while the task is actually back IN the pipeline for the

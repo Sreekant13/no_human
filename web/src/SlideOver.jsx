@@ -17,7 +17,7 @@ import { clampAgentState, currentFunctionality, groupFunctionalities, laneAgentR
 import { agentSummary, taskSummary } from "./summaries.js";
 import {
   PARKED_STATUSES, narrativeFor, chipsFor, milestonesFor, sectionSummary,
-  defaultOpenSection, isTerminalStatus,
+  defaultOpenSection, isTerminalStatus, lastReviewedAttempt,
   reviewVerdict, severityChip, checklistRowClass, isBlockingFinding,
   approveButtonState, approvalFeedback, taskApprovedAt, testResultVerdict,
   fxCountsLabel,
@@ -427,6 +427,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
                     {isOpen && sectionBody(s.key, {
                       taskId, task, diff, isActive,
                       onSpecRefresh: () => fetchTask(taskId).then(setTask),
+                      onOpenSection: (key) => setOpenSection(key),
                     })}
                   </AccordionSection>
                 );
@@ -769,14 +770,14 @@ const SECTION_LIST = [
 // Resolves a section key to its (unchanged) tab component. Only called while
 // the section is open — this IS the lazy-render boundary the old tab switch
 // had; a closed section mounts nothing and fetches nothing.
-function sectionBody(key, { taskId, task, diff, isActive, onSpecRefresh }) {
+function sectionBody(key, { taskId, task, diff, isActive, onSpecRefresh, onOpenSection }) {
   switch (key) {
     case "system":   return <SystemTab taskId={taskId} task={task} isActive={isActive} />;
     case "activity": return <ActivityTab taskId={taskId} task={task} isActive={isActive} />;
     case "subtasks": return <SubtasksTab taskId={taskId} />;
     case "details":  return <DetailsTab task={task} />;
     case "spec":     return <SpecTab task={task} onRefresh={onSpecRefresh} />;
-    case "review":   return <ReviewTab task={task} diff={diff} />;
+    case "review":   return <ReviewTab task={task} diff={diff} onOpenSection={onOpenSection} />;
     case "diff":     return <DiffTab diff={diff} />;
     case "attempts": return <AttemptsTab task={task} />;
     default: return null;
@@ -1931,13 +1932,21 @@ function SpecTab({ task, onRefresh }) {
   const hasSpec = !!(spec && (spec.approach || spec.files_to_change?.length ||
     spec.test_plan || spec.out_of_scope?.length || spec.verification));
   if (!hasSpec) {
+    const isEarlyStatus = ["pending", "context", "planning"].includes(task.status);
     return (
       <div className="so-diff-empty" data-testid="spec-empty">
         {["code_review", "investigation", "design_doc", "ci_fix"].includes(task.kind)
           ? `Spec generation doesn't apply to ${task.kind} tasks.`
-          : ["pending", "context", "planning"].includes(task.status)
+          : isEarlyStatus
           ? "Spec not generated yet."
-          : "No spec available for this task."}
+          : "No spec recorded for this attempt."}
+        {/* orchestrator._persist_plan overwrites context.spec on every attempt —
+            there is no per-attempt spec artifact, so this states scope but never
+            invents a "view attempt N's spec" link. */}
+        {!isEarlyStatus && !["code_review", "investigation", "design_doc", "ci_fix"].includes(task.kind) && (
+          // Inherits .so-diff-empty's muted color/size — no new CSS class needed.
+          <div>Specs are kept for the latest plan only — earlier attempts&rsquo; specs are not retained.</div>
+        )}
       </div>
     );
   }
@@ -2163,7 +2172,7 @@ function CommentHunk({ diff, file, line }) {
   );
 }
 
-function ReviewTab({ task, diff }) {
+function ReviewTab({ task, diff, onOpenSection }) {
   const [rawOpen, setRawOpen] = useState(false);
   const [posted, setPosted] = useState({});  // index → "ok" | "error" | "busy"
   const [postingAll, setPostingAll] = useState(false);
@@ -2184,11 +2193,32 @@ function ReviewTab({ task, diff }) {
   const checklist = lastAttempt?.review_checklist;
 
   if (!checklist?.items?.length) {
+    // The stage strip aggregates attempt HISTORY ("Reviewing DONE" once any
+    // attempt was reviewed) while this section is scoped to the CURRENT
+    // attempt only — so both can be true at once and this must say which
+    // attempt it means, and point at the prior one instead of reading as
+    // data loss.
+    const attempts = task.attempts || [];
+    const n = attempts.length || 1;
+    const prior = lastReviewedAttempt(task);
+    const isFreshStart = n <= 1 && !prior
+      && (task.status === "pending" || task.status === "context" || task.status === "implementing");
     return (
-      <div className="so-diff-empty">
-        {task.status === "pending" || task.status === "context" || task.status === "implementing"
-          ? "Review not started yet."
-          : "No review checklist available."}
+      <div className="so-diff-empty" data-testid="review-empty">
+        {isFreshStart ? "Review not started yet." : `Attempt ${n} not reviewed yet.`}
+        {prior && (
+          <div>
+            {`Attempt ${prior.attempt_number}'s review: ${prior.passed ? "PASS" : "FAIL"} — `}
+            <button
+              type="button"
+              className="raw-toggle"
+              data-testid="view-prior-review"
+              onClick={() => onOpenSection && onOpenSection("attempts")}
+            >
+              view
+            </button>
+          </div>
+        )}
       </div>
     );
   }

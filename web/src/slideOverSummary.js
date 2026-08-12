@@ -31,6 +31,54 @@ export function isHumanStopped(task) {
     && (task.blocker?.human_stopped || task.blocker_human_stopped));
 }
 
+// Does this task's open blocker (if any) still need a human answer? `null`
+// when there's no question at all. reply_task (api/app.py) never clears
+// `task.blocker` on reply — it only appends to `context.human_replies` and
+// flips status to implementing — so a naive `task.blocker?.question` check
+// keeps reading "Has a question for you" long after the human answered it.
+// Order matters: terminal first (its own "asked before it ended" wording,
+// unaffected by replies), then a reply that's actually newer than the
+// question, then "still parked" reads as open, and everything else (a
+// running task carrying a stale blocker — a machine wake resume, or a reply
+// whose timestamp didn't parse) is treated as answered: a task the pipeline
+// is actively running is by construction not waiting on the human, so "open"
+// is the one verdict that cannot be true there.
+export function questionState(task) {
+  if (!task?.blocker?.question) return null;
+  if (isTerminalStatus(task.status)) return "terminal";
+  const raisedAt = Date.parse(task.blocker.raised_at);
+  const replies = task.context?.human_replies || [];
+  const answered = replies.some((r) => {
+    if (!String(r?.answer || "").trim()) return false;
+    const at = Date.parse(r?.at);
+    return !Number.isNaN(at) && !Number.isNaN(raisedAt) && at > raisedAt;
+  });
+  if (answered) return "answered";
+  if (PARKED_STATUSES.has(task.status) || task.status === "paused_quota") return "open";
+  return "answered";
+}
+
+// The most recent PRIOR attempt (never the current/last one) that actually
+// carries a review, or null. `orchestrator._persist_plan` overwrites
+// `context.spec` on every attempt (no per-attempt spec is kept), but reviews
+// live per-attempt on `attempts[].review_checklist` — so only the review side
+// has a real prior artifact to point the drawer at.
+export function lastReviewedAttempt(task) {
+  const attempts = task?.attempts || [];
+  for (let i = attempts.length - 2; i >= 0; i--) {
+    const checklist = attempts[i]?.review_checklist;
+    if (checklist?.items?.length) {
+      return {
+        attempt_number: attempts[i].attempt_number,
+        passed: attempts[i].review_passed ?? checklist.passed,
+        failed: checklist.items.filter((it) => !it.passed).length,
+        total: checklist.items.length,
+      };
+    }
+  }
+  return null;
+}
+
 // The "N agents · M events" line under a functionality-group header (FxLane).
 // Used to read "M ev" — an abbreviation nobody outside this codebase could
 // parse (2026-08-12 operator feedback). Spelled out and pluralized the same
@@ -534,7 +582,23 @@ function reviewMicro(task) {
   const last = attempts[attempts.length - 1];
   const checklist = last?.review_checklist;
   if (!checklist?.items?.length) {
-    return { text: "Not reviewed yet", colorVar: "var(--text-muted)" };
+    // Fewer than 2 attempts: there's nothing to be "unreviewed relative to"
+    // yet, so the plain empty state stands. From 2 attempts on, name which
+    // attempt this is and, if an earlier one carries a review, point at it —
+    // the stage strip can simultaneously say "Reviewing DONE" (attempt
+    // history) while THIS attempt hasn't been reviewed yet.
+    if (attempts.length <= 1) {
+      return { text: "Not reviewed yet", colorVar: "var(--text-muted)" };
+    }
+    const n = attempts.length;
+    const prior = lastReviewedAttempt(task);
+    if (prior) {
+      return {
+        text: `Attempt ${n} not reviewed yet · attempt ${prior.attempt_number}: ${prior.passed ? "PASS" : "FAIL"}`,
+        colorVar: "var(--text-muted)",
+      };
+    }
+    return { text: `Attempt ${n} not reviewed yet`, colorVar: "var(--text-muted)" };
   }
   const total = checklist.items.length;
   const failed = checklist.items.filter((it) => !it.passed).length;
@@ -594,11 +658,15 @@ export function sectionSummary(key, { task, diff } = {}) {
     case "details": {
       // An open question is the more actionable fact — it wins over the
       // criteria count when both are present (the criteria are still one
-      // click away inside the section either way).
-      if (task.blocker?.question) {
-        if (isTerminalStatus(task.status)) {
-          return { text: "Asked before it ended", colorVar: "var(--text-muted)" };
-        }
+      // click away inside the section either way). An "answered" blocker
+      // falls through to the criteria summary below: reply_task never
+      // clears task.blocker, so a raw `task.blocker?.question` check would
+      // keep showing the badge after the human already replied.
+      const qState = questionState(task);
+      if (qState === "terminal") {
+        return { text: "Asked before it ended", colorVar: "var(--text-muted)" };
+      }
+      if (qState === "open") {
         return { text: "Has a question for you", colorVar: colorForStatus(task.status) };
       }
       const total = task.acceptance_criteria?.length || 0;
@@ -617,9 +685,12 @@ export function sectionSummary(key, { task, diff } = {}) {
       return { text: "Description & criteria", colorVar: "var(--text-muted)" };
     }
     case "spec": {
+      // The spec isn't per-attempt (`orchestrator._persist_plan` overwrites
+      // `context.spec` on every attempt) — there's no prior-attempt spec
+      // artifact to link to, so this states scope but invents no link.
       const spec = task.context?.spec;
       const n = spec?.files_to_change?.length;
-      return { text: n ? `${n} file${n === 1 ? "" : "s"} planned` : "Not generated yet", colorVar: "var(--text-muted)" };
+      return { text: n ? `${n} file${n === 1 ? "" : "s"} planned` : "No spec for this attempt yet", colorVar: "var(--text-muted)" };
     }
     case "review":
       return reviewMicro(task);
