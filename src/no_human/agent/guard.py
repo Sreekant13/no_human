@@ -42,6 +42,9 @@ import re
 import shlex
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+from typing import Mapping
+
+from . import venv_install_guard
 
 # Read the platform through a constant, never an inline `os.name` test, so the
 # Windows branch below is reachable from a test on any host.
@@ -705,6 +708,7 @@ def evaluate(
     never_push_to: list[str],
     readonly: bool = False,
     cwd: str | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> GuardDecision:
     """Return allow/deny for a single proposed tool call.
 
@@ -712,6 +716,11 @@ def evaluate(
     the command — so file-existence questions (is `git checkout notes` a
     branch switch or a wipe?) are answered about the right directory. Without
     it the guard answers those questions conservatively (deny).
+
+    ``env`` is the environment the command would run in (``PATH``,
+    ``VIRTUAL_ENV``, ...); it defaults to ``os.environ`` so both backends
+    keep working unchanged, and exists as a parameter so tests can inject one
+    without leaking into the process's real environment.
     """
     # 0. Interactive prompts — denied in every role, readonly or not.
     if tool_name in INTERACTIVE_TOOLS:
@@ -830,5 +839,15 @@ def evaluate(
         push_reason = _push_denial_reason(cmd, never_push_to)
         if push_reason:
             return GuardDecision(False, push_reason)
+        # Structural (resolved-executable) venv-install guard — task
+        # 16a798c1's three review verdicts each defeated a lexical/regex
+        # rule here via shell segmentation, not a missing pattern; this is
+        # additive and resolves canonical paths instead. Runs last among the
+        # Bash checks so a command that is ALSO a merge/push/destructive-git
+        # violation keeps reporting that more specific reason. See
+        # `venv_install_guard`'s module docstring for the full spec.
+        venv_reason = venv_install_guard.denial_reason(cmd, cwd=cwd, env=env)
+        if venv_reason:
+            return GuardDecision(False, venv_reason)
 
     return GuardDecision(True)
