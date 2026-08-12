@@ -453,31 +453,41 @@ async def test_a_custom_merge_driver_cannot_manufacture_a_landing(tmp_path):
     assert _driver_ran(tmp_path), "vacuous: the driver was never consulted"
 
 
-async def test_a_genuine_landing_under_a_position_driver_reads_absent_once_base_moves(tmp_path):
-    """🔴 THIS TEST PINS A COST, NOT A GUARANTEE. It asserts False for content
-    that DID land -- i.e. it documents a live spurious escalation.
+async def test_a_genuine_landing_under_a_position_driver_is_shipped_via_history_anchor(tmp_path):
+    """🔴 FORMERLY A PINNED COST (pre-2026-08-12): this used to assert False
+    for content that DID land, documenting a spurious escalation the
+    both-directions rule could not avoid — a position-resolving driver on a
+    generated/lockfile-shaped path, genuinely landed, with a LATER task
+    editing the same path afterwards. Both sides then carry an edit, the
+    driver fires, and the TIP-anchored check is direction-asymmetric (True
+    forward, False reverse) — see ``_contained_at`` at the tip, still exactly
+    this shape.
 
-    It is the price of the both-directions rule, and the direct counter-example
-    to the claim this docstring's predecessor made ("a genuine landing is
-    unaffected"). A position-resolving driver on a generated or lockfile-shaped
-    path is exactly where such drivers live, so the shape is ordinary: the PR
-    edits the path, genuinely lands, and a LATER task edits the same path. Both
-    sides now carry an edit, so the driver fires; the forward pass keeps the
-    tip's blob (True) and the reverse pass keeps the BRANCH's blob (False).
-
-    The failure is fail-CLOSED -- a human reads the escalation -- which is why
-    the trade stands. It is also not curable without a merge engine that
-    ignores merge drivers, which `merge-tree` does not offer.
+    ``branch_landed_commit``'s history scan closes this specific instance
+    without touching the merge-driver limitation at all: at the LANDING
+    commit — before the later edit ever happened — the branch's blob and the
+    landing commit's blob are byte-IDENTICAL, so git resolves trivially and
+    never invokes the driver there. The driver only ever fires at the tip
+    (proven below by the sentinel), where the check still fails exactly as
+    documented; the scan then walks back and finds the commit where the
+    question can be answered without the driver in the loop. This is the same
+    "ask at the landing commit, not the tip" fix as the ordinary same-file
+    case — the driver was never the deciding factor, only what made the
+    tip-level symptom visible enough to pin a test on.
 
     Its predecessor asserted True here and was VACUOUS: both sides made the
-    IDENTICAL edit, so git resolved trivially and never ran the driver, which
-    is how this went unnoticed. Hence the sentinel.
+    IDENTICAL edit, so git resolved trivially and never ran the driver at
+    ALL, which is how that version went unnoticed. Hence the sentinel: the
+    driver DOES run (at the tip) in this fixture, and the answer is still
+    correct.
     """
     repo = _merge_driver_repo(tmp_path, land=True, extend=True)
     assert "feature content" in (repo / "f.py").read_text(), \
         "fixture: base really DID receive the branch's content"
-    assert await default_branch_shipped(str(repo), "feature", "main") is False
-    assert _driver_ran(tmp_path), "vacuous: the driver was never consulted"
+    assert await default_branch_shipped(str(repo), "feature", "main") is True
+    assert _driver_ran(tmp_path), \
+        "vacuous: the driver was never consulted (the tip-level attempt must " \
+        "still run it before the scan falls back to the landing commit)"
 
 
 async def test_the_same_landing_without_a_driver_is_still_shipped(tmp_path):
@@ -736,6 +746,171 @@ async def test_squash_merge_shape_is_shipped_despite_no_ancestry(tmp_path):
 async def test_genuinely_absent_branch_is_not_shipped(tmp_path):
     repo = _unshipped_repo(tmp_path)
     assert await default_branch_shipped(str(repo), "feature", "main") is False
+
+
+# --------------------------------------------------------------------------- #
+# Landed-commit anchoring (2026-08-12 incident): containment used to be asked
+# ONLY at the current base tip, so a LATER commit touching the same file as an
+# already-landed branch made the probe read "not shipped" again — the sibling
+# of the re-derived-ledger blindness, for ordinary source files. train15 (a
+# squash landing orchestrator.py) + train16 (a second, later edit to the same
+# file) is the exact live shape: train15's task re-escalated "closed without
+# merging" the moment train16 landed.
+# --------------------------------------------------------------------------- #
+
+
+def _stacked_trains_repo(tmp_path, *, filler_commits=0):
+    """train15 lands a branch's edit to shared.py as a fresh squash commit;
+    train16 (also from its own branch) later lands a SECOND edit to the same
+    file. Returns (repo, train15_branch, train16_branch, train15_landed_sha).
+
+    ``filler_commits`` inserts unrelated commits (touching a DIFFERENT file)
+    between the two trains, so a scan that is not path-filtered would have to
+    wade through them — the bound the depth/path-filter test pins.
+    """
+    repo = _make_repo(tmp_path)
+    (repo / "shared.py").write_text("line one\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "add shared.py")
+
+    _git(repo, "checkout", "-b", "train15")
+    (repo / "shared.py").write_text("line one\ntrain15 edit\n")
+    _git(repo, "commit", "-am", "train15: edit shared.py")
+    _git(repo, "checkout", "main")
+    (repo / "shared.py").write_text("line one\ntrain15 edit\n")
+    _git(repo, "commit", "-am", "squash-land train15")
+    train15_sha = _git_out(repo, "rev-parse", "HEAD").strip()
+
+    for i in range(filler_commits):
+        (repo / "unrelated.py").write_text(f"filler {i}\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", f"unrelated filler commit {i}")
+
+    _git(repo, "checkout", "-b", "train16", "main")
+    (repo / "shared.py").write_text("line one\ntrain15 edit\ntrain16 edit\n")
+    _git(repo, "commit", "-am", "train16: edit shared.py again")
+    _git(repo, "checkout", "main")
+    (repo / "shared.py").write_text("line one\ntrain15 edit\ntrain16 edit\n")
+    _git(repo, "commit", "-am", "squash-land train16 (rewrites the same file)")
+
+    return repo, "train15", "train16", train15_sha
+
+
+async def test_a_landed_pr_is_shipped_after_a_later_commit_rewrites_the_same_file(tmp_path):
+    """The `b53b9e13`/`6d525dd5` shape: train15 lands cleanly, train16 later
+    rewrites the same file — train15 must still read shipped, anchored at
+    the commit where IT landed, not at the (now-diverged) tip."""
+    repo, train15, _train16, train15_sha = _stacked_trains_repo(tmp_path)
+    rc = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--quiet", train15, "main", "--",
+         "shared.py"]
+    ).returncode
+    assert rc != 0, "fixture: the tip must no longer equal train15's own tree"
+    assert await default_branch_shipped(str(repo), train15, "main") is True
+    assert await pr_watcher.branch_landed_commit(
+        str(repo), train15, "main") == train15_sha
+
+
+async def test_two_stacked_squash_trains_sharing_a_file_both_read_shipped(tmp_path):
+    """Both halves of the stack ship: train16 (the current tip's own content)
+    via the ordinary tip check, train15 (superseded at the tip) via the
+    history anchor — the honest '+2' when both flip to done."""
+    repo, train15, train16, _sha = _stacked_trains_repo(tmp_path)
+    assert await default_branch_shipped(str(repo), train15, "main") is True
+    assert await default_branch_shipped(str(repo), train16, "main") is True
+
+
+async def test_genuinely_unlanded_work_is_still_not_shipped_after_the_history_scan(tmp_path):
+    """Control: a branch whose content never reached main at any historical
+    commit must not become shipped just because the scan now looks further
+    back — the scan finds nothing because there is nothing to find."""
+    repo = _make_repo(tmp_path)
+    (repo / "shared.py").write_text("line one\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "add shared.py")
+    _git(repo, "checkout", "-b", "feature")
+    (repo / "shared.py").write_text("line one\nfeature edit, never landed\n")
+    _git(repo, "commit", "-am", "feature: edit shared.py")
+    _git(repo, "checkout", "main")
+    for i in range(5):
+        (repo / "unrelated.py").write_text(f"filler {i}\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", f"unrelated filler commit {i}")
+
+    assert await default_branch_shipped(str(repo), "feature", "main") is False
+    assert await pr_watcher.branch_landed_commit(str(repo), "feature", "main") is None
+
+
+async def test_the_history_scan_is_bounded_and_path_filtered(tmp_path, monkeypatch):
+    """60 unrelated commits sit between train16's landing (which re-touches
+    the shared file, forcing the scan) and train15's own landing. Without
+    path-filtering, a depth-50 scan would examine up to 60 candidates; with
+    it, only commits that touched `shared.py` are even considered — pinned
+    by counting calls to `_contained_at` rather than trusting the result
+    alone."""
+    repo, train15, _train16, train15_sha = _stacked_trains_repo(
+        tmp_path, filler_commits=60)
+
+    calls = []
+    real = pr_watcher._contained_at
+
+    async def counting(repo_path, commit, branch):
+        calls.append(commit)
+        return await real(repo_path, commit, branch)
+
+    monkeypatch.setattr(pr_watcher, "_contained_at", counting)
+
+    # ONE call — `default_branch_shipped` is a thin `bool()` wrapper over the
+    # same function, so calling both here would double the count for no
+    # extra coverage.
+    result = await pr_watcher.branch_landed_commit(str(repo), train15, "main")
+    assert result == train15_sha
+    assert len(calls) <= 5, (
+        f"expected a small, path-filtered candidate set, got {len(calls)} "
+        f"calls — the 60 unrelated filler commits must never be examined"
+    )
+
+
+async def test_a_recorded_landed_sha_short_circuits_the_probe(tmp_path, monkeypatch):
+    """A previously recorded `landed_sha` that is still an ancestor of the
+    base tip must short-circuit straight to `commit_is_ancestor` — no
+    merge-tree at all, so a broken/raising `_unsettled_paths` must not even
+    be reached on this path."""
+    repo, train15, _train16, train15_sha = _stacked_trains_repo(tmp_path)
+
+    async def boom(*a, **kw):
+        raise AssertionError("_unsettled_paths must not run on the fast path")
+
+    monkeypatch.setattr(pr_watcher, "_unsettled_paths", boom)
+
+    result = await pr_watcher.branch_landed_commit(
+        str(repo), train15, "main", landed_sha=train15_sha)
+    assert result == train15_sha
+
+
+async def test_closed_pr_whose_landing_predates_a_same_file_commit_completes_the_task(
+        tmp_path, store):
+    """End to end through `WakeWatcher._check_open_pr`: train15's task, with
+    its PR closed unmerged (the operator's local-squash workflow never uses
+    GitHub's merge button) and train16 having since rewritten the same file,
+    must still complete — DONE, a `shipped` event, and `landed_sha` recorded
+    in context so a restart never has to re-run the scan."""
+    repo, train15, _train16, train15_sha = _stacked_trains_repo(tmp_path)
+    t = await _approval_task(store, repo)
+    t.context = await store.merge_context(t.id, {"pr_branch": train15})
+
+    async def pr_state(url):
+        return "CLOSED"
+
+    w = WakeWatcher(store, {}, pr_state=pr_state,
+                    pr_shipped=pr_watcher.branch_landed_commit)
+    out = await w._check_open_pr(t)
+    assert out == "shipped_pr_closed"
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    assert fresh.context.get("landed_sha") == train15_sha
+    events = await store.list_events(t.id)
+    assert any(e.get("kind") == "shipped" for e in events)
 
 
 # --------------------------------------------------------------------------- #

@@ -1032,6 +1032,144 @@ async def _unsettled_paths(repo_path: str, want_tree: str, ours: str,
     return conflicted | {n for n in names.split("\0") if n}
 
 
+async def _contained_at(repo_path: str, commit: str, branch: str) -> bool:
+    """The per-candidate containment question: is ``branch`` fully contained
+    in ``commit`` (both directions, generated ledgers excluded)?
+
+    Extracted from ``default_branch_shipped`` so the question can be asked at
+    an arbitrary point in history — the BASE TIP, or an earlier commit a
+    later same-file edit has since made the tip diverge from — rather than
+    only at the tip. Every rule documented on ``default_branch_shipped``
+    (both-directions, ``_GENERATED_LEDGERS``, fail-closed on any git
+    failure) applies unchanged; this is that body with ``commit`` in place
+    of the base tip.
+    """
+    rc, tree = await _git_rc(repo_path, "rev-parse", f"{commit}^{{tree}}")
+    if rc != 0 or not tree:
+        return False
+    # Short-circuited on purpose: the second direction is a whole extra
+    # merge-tree, and the first one failing already settles the answer.
+    for ours, theirs in ((commit, branch), (branch, commit)):
+        unsettled = await _unsettled_paths(repo_path, tree, ours, theirs)
+        if unsettled is None or (unsettled - _GENERATED_LEDGERS):
+            return False
+    return True
+
+
+async def _branch_paths(repo_path: str, base_tip: str, branch: str) -> list[str] | None:
+    """Paths ``branch`` has touched since it diverged from ``base_tip`` —
+    the path filter that keeps the history scan in ``branch_landed_commit``
+    cheap: only commits that touched one of these paths can possibly be the
+    commit where this branch's content landed.
+
+    ``None`` on any git failure ("cannot tell"), which the caller must treat
+    as "do not scan" rather than "nothing to filter on" — widening to the
+    whole history on a git failure would defeat the cost bound the path
+    filter exists for.
+    """
+    rc, mb = await _git_rc(repo_path, "merge-base", base_tip, branch)
+    if rc != 0 or not mb:
+        return None
+    rc, out = await _git_rc(repo_path, "diff", "--name-only", "--no-renames",
+                            "-z", mb, branch, "--")
+    if rc != 0:
+        return None
+    return [n for n in out.split("\0") if n]
+
+
+#: How far back ``branch_landed_commit`` scans a base tip's first-parent
+#: history, once the tip itself no longer contains the branch, looking for
+#: the commit where it WAS landed. A module constant, not a config key: a
+#: user's `blockers:` section in config.yaml REPLACES the defaults map
+#: wholesale (the deep-merge shadowing trap), so a config key here could
+#: silently resolve to an unset/zero depth and disable the fix it exists for.
+_LANDING_SCAN_DEPTH = 50
+
+
+async def commit_is_ancestor(repo_path: str, sha: str, base: str = "main") -> bool:
+    """Whether ``sha`` is an ancestor of ``base`` (or its upstream) — the
+    cheap re-check for a previously recorded ``landed_sha``: no merge-tree at
+    all, just ``git merge-base --is-ancestor``. False on any failure or if
+    ``sha`` is no longer reachable (fail-closed, same contract as every
+    other probe in this module — a caller falls back to the full scan)."""
+    if not repo_path or not sha or not base:
+        return False
+    for tip in await _base_tips(repo_path, base):
+        rc, _ = await _git_rc(repo_path, "merge-base", "--is-ancestor", sha, tip)
+        if rc == 0:
+            return True
+    return False
+
+
+async def branch_landed_commit(
+    repo_path: str, branch: str, base: str = "main", *,
+    landed_sha: str | None = None, depth: int = _LANDING_SCAN_DEPTH,
+) -> str | None:
+    """Where ``branch``'s content actually landed, or ``None`` if it did not
+    (or the question could not be asked). ``default_branch_shipped`` is now a
+    thin ``bool()`` wrapper over this.
+
+    THE DEFECT THIS FIXES. ``default_branch_shipped`` used to ask containment
+    only at the base tip. A landing routinely predates OTHER commits that
+    later touch the same file (a follow-up task, an unrelated edit) — once
+    one does, the tip's tree no longer equals what merging the branch in
+    would produce, even though the branch's own content landed cleanly
+    earlier and was never disturbed. Live incident 2026-08-12: two squash
+    trains landed back-to-back, both touching ``orchestrator.py``; the
+    EARLIER one's task re-escalated "closed without merging" the moment the
+    LATER one landed, because the probe kept asking the question at a tip
+    that had moved on. The honest question is "did this land, ever", not
+    "is it still exactly what the tip would produce today".
+
+    ORDER OF ATTEMPTS, cheapest and most certain first:
+
+    1. ``landed_sha``, if given and still an ancestor of a base tip
+       (``commit_is_ancestor``) — the steady-state path once a landing has
+       been recorded once: no merge-tree at all.
+    2. Each tip from ``_base_tips`` (unchanged: base plus its configured
+       upstream) — ``_contained_at(tip, branch)``. This is the ORIGINAL
+       check, asked at the tip, and covers every branch that has not been
+       disturbed by a later same-file edit.
+    3. Failing that, a bounded, PATH-FILTERED walk of the tip's first-parent
+       history: ``_branch_paths`` names what ``branch`` touched, and only
+       commits that touched one of those paths are even candidates
+       (``git rev-list --first-parent -n depth <tip> -- <paths>``) — so the
+       cost is bounded by how many of the branch's own files anyone else
+       ever re-touches, not by how much history exists. Each candidate is
+       asked the same ``_contained_at`` question a later commit's edits to
+       an UNRELATED file can never make it fail. ``_branch_paths`` returning
+       ``None`` (git failure) skips the scan for that tip entirely — it
+       never widens to the whole history.
+
+    Returns ``None`` (never a manufactured SHA) the moment every tip and
+    every candidate has been asked and failed, or on the same preconditions
+    ``default_branch_shipped`` refuses on (missing repo/branch/base).
+    """
+    if not repo_path or not branch or not base:
+        return None
+    if landed_sha and await commit_is_ancestor(repo_path, landed_sha, base):
+        return landed_sha
+    for tip in await _base_tips(repo_path, base):
+        rc, tip_sha = await _git_rc(repo_path, "rev-parse", tip)
+        if rc != 0 or not tip_sha:
+            continue
+        if await _contained_at(repo_path, tip_sha, branch):
+            return tip_sha
+        paths = await _branch_paths(repo_path, tip_sha, branch)
+        if not paths:
+            continue  # cannot tell (None), or branch has nothing to filter on
+        rc, out = await _git_rc(
+            repo_path, "rev-list", "--first-parent", "-n", str(depth),
+            tip_sha, "--", *paths)
+        if rc != 0 or not out:
+            continue
+        for candidate in out.splitlines():
+            candidate = candidate.strip()
+            if candidate and await _contained_at(repo_path, candidate, branch):
+                return candidate
+    return None
+
+
 async def default_branch_shipped(repo_path: str, branch: str, base: str = "main") -> bool:
     """Whether ``branch``'s changes are actually present in ``base``, checked
     by tree CONTENT rather than commit ancestry.
@@ -1185,19 +1323,18 @@ async def default_branch_shipped(repo_path: str, branch: str, base: str = "main"
     missing/deleted branch, unrelated histories, a conflicting merge, or a git
     older than 2.38 (no ``--write-tree``) -- callers must treat False as
     "can't tell", same as GitHub's PR state going unknown.
+
+    TIP-ANCHORED, WHICH WAS ITSELF A DEFECT (fixed 2026-08-12): this used to
+    ask the containment question ONLY at the base tip, so a later commit that
+    touched the same file as the branch -- a follow-up task, an unrelated
+    edit, nothing to do with this branch's own work -- made a genuinely
+    landed PR read as absent again. This is now a thin ``bool()`` wrapper
+    over ``branch_landed_commit``, which asks the same question at the tip
+    FIRST (unchanged cost for the common case) and, only if that fails, at
+    each candidate in a bounded, path-filtered walk of the tip's history —
+    see that function's docstring for the walk and its cost bound. Every rule
+    documented above (both-directions, ``_GENERATED_LEDGERS``, the merge-
+    driver limits, fail-closed on any git failure) is unchanged; it now
+    applies at whichever commit is being asked about, not only the tip.
     """
-    if not repo_path or not branch or not base:
-        return False
-    for tip in await _base_tips(repo_path, base):
-        rc, tip_tree = await _git_rc(repo_path, "rev-parse", f"{tip}^{{tree}}")
-        if rc != 0 or not tip_tree:
-            continue
-        # Short-circuited on purpose: the second direction is a whole extra
-        # merge-tree, and the first one failing already settles the answer.
-        for ours, theirs in ((tip, branch), (branch, tip)):
-            unsettled = await _unsettled_paths(repo_path, tip_tree, ours, theirs)
-            if unsettled is None or (unsettled - _GENERATED_LEDGERS):
-                break
-        else:
-            return True
-    return False
+    return bool(await branch_landed_commit(repo_path, branch, base))

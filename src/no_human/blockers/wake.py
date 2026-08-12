@@ -27,6 +27,7 @@ from typing import Any, Awaitable, Callable
 from ..core.db import Store
 from ..core.task import Task, TaskStatus
 from ..vcs.pr_outcome import observe_pr
+from ..vcs.pr_watcher import commit_is_ancestor
 from ..vcs.task_pr import resolve_task_pr
 from .taxonomy import Blocker, resume_checkpoint, resume_provenance
 
@@ -39,10 +40,14 @@ CiGreenChecker = Callable[[str], Awaitable[bool]]
 CiTerminalChecker = Callable[[str], Awaitable[tuple[bool, bool]]]
 # Returns list of new PrComment objects for a PR ref.
 PrCommentChecker = Callable[[str], Awaitable[list[Any]]]
-# (repo_path, branch, base) -> whether branch's content already landed on base
-# (a local, content-based check — see default_branch_shipped for why a
-# squash merge makes ancestry the wrong test).
-PrShippedChecker = Callable[[str, str, str], Awaitable[bool]]
+# (repo_path, branch, base) -> whether branch's content already landed on
+# base (a local, content-based check — see default_branch_shipped for why a
+# squash merge makes ancestry the wrong test). Since 2026-08-12 the return is
+# `str | bool | None`: a landed-commit SHA when the wired checker is
+# `branch_landed_commit` (the anchor `_complete_if_content_landed` records),
+# a bare bool from older/injected fakes. `bool(result)` is always the
+# shipped/not-shipped answer; the str form is read only when present.
+PrShippedChecker = Callable[[str, str, str], Awaitable[str | bool | None]]
 
 #: Sentinel returned by ``_complete_if_content_landed`` when the task went
 #: TERMINAL while the (subprocess-heavy) content probe was running. It is not
@@ -891,6 +896,25 @@ class WakeWatcher:
         ``pr_branch``, is the whole precondition set of the CLOSED rung this
         was extracted from, and it is preserved exactly. Pinned by the test
         that a BLOCKED task with landed content is still never completed.
+
+        LANDED-COMMIT ANCHORING (2026-08-12). ``pr_shipped`` may now return a
+        commit SHA instead of a bare ``True`` — ``branch_landed_commit``'s
+        contract, wired in by every host (``api/app.py``, ``cli/commands.py``)
+        — recording exactly where the content landed rather than merely that
+        it did. Two things follow, both required by the incident this fixes
+        (two stacked squash trains sharing a file; the earlier one's task
+        re-escalated the moment the later one landed, because the old
+        tip-only check re-asked the question at a tip that had moved on):
+
+        - A previously recorded ``ctx["landed_sha"]`` is checked FIRST, via
+          ``commit_is_ancestor`` — no merge-tree at all — before the probe
+          ever runs. Once a landing is known, re-confirming it costs one
+          cheap ancestry check forever, not a full content scan every tick.
+        - A fresh string result is written to ``ctx["landed_sha"]`` before
+          the DONE status is written, so the anchor survives a restart and
+          the next tick (or the next incident) does not have to re-derive it.
+        ``bool(result)`` keeps every existing caller that injects a plain
+        ``True``/``False`` fake working unchanged.
         """
         if self._pr_shipped is None:
             return None
@@ -920,11 +944,20 @@ class WakeWatcher:
             log.warning("no base_branch recorded for %s — skipping the "
                         "content check rather than guessing", task.id[:8])
             return None
-        try:
-            shipped = await self._pr_shipped(task.repo_path, branch, base)
-        except Exception as exc:  # noqa: BLE001 — a checker error must not crash the watcher
-            log.warning("pr_shipped check failed for %s: %s", task.id[:8], exc)
-            shipped = False
+        recorded_sha = ctx.get("landed_sha")
+        fresh_sha: str | None = None
+        if recorded_sha and await commit_is_ancestor(
+                task.repo_path, recorded_sha, base):
+            shipped = True
+        else:
+            try:
+                result = await self._pr_shipped(task.repo_path, branch, base)
+            except Exception as exc:  # noqa: BLE001 — a checker error must not crash the watcher
+                log.warning("pr_shipped check failed for %s: %s", task.id[:8], exc)
+                result = False
+            shipped = bool(result)
+            if isinstance(result, str):
+                fresh_sha = result
         # The shipped check just ran several local git subprocesses (rev-parse,
         # and up to two merge-trees per candidate base tip) — easily a few
         # seconds on a large repo — so re-verify terminal-ness before ANY
@@ -947,11 +980,18 @@ class WakeWatcher:
             return _TICK_ABORTED
         if not shipped:
             return None
+        landed_sha = recorded_sha if fresh_sha is None else fresh_sha
+        if fresh_sha is not None:
+            # Written BEFORE the DONE status so the anchor survives a restart
+            # even if the process dies between the two writes.
+            task.context = await self.store.merge_context(
+                task.id, {"landed_sha": fresh_sha})
         await observe_pr(self.store, task.id, url, forge_state=forge_state,
                          shipped=True)
+        sha_note = f" (landed as {landed_sha[:8]})" if landed_sha else " (squash-merged)"
         shipped_text = (
             f"{task.id[:8]} {situation} but its content is already on "
-            f"{base} (squash-merged): {url}"
+            f"{base}{sha_note}: {url}"
         )
         # `set_status`'s own event insert is the persistence now (atomic with
         # the status write) — `_emit` would double-persist, so call the host
@@ -1076,14 +1116,102 @@ class WakeWatcher:
         )
         return "no_resume_comment_after_landing"
 
+    #: Event kinds that answer the `pr_closed` rung's question on their own —
+    #: a human explicitly repaired the escalation, or approved/merged the PR
+    #: by hand. `merged`/`shipped*` are not included: those are the WATCHER's
+    #: own completion writes, already handled by `_complete_if_content_landed`
+    #: falling through with a `landed` action before this guard ever runs.
+    _PR_CLOSED_ANSWER_KINDS = frozenset({"state_repaired", "human_merged"})
+
+    async def _pr_closed_answered(self, task: Task, url: str) -> str | None:
+        """Whether a human has already answered the `pr_closed` rung's
+        question — "closed without merging: abandon, or rework?" — for this
+        exact PR URL, so the rung must hold rather than re-escalate.
+
+        THE LOOP THIS CLOSES (live 2026-08-12): `restore-approval` moves a
+        spuriously-escalated task back to `awaiting_approval`, but
+        `ESCALATED` was never in `_is_terminal`'s set, so the very next tick
+        re-polls the same still-CLOSED PR, falls through the same content
+        check, and re-escalates — the repair the human just made is
+        overwritten within one poll interval, forever. A recorded repair or
+        approval answers the rung's own question directly; re-asking it after
+        that answer is the defect, not a stricter check.
+
+        TWO WAYS TO BE ANSWERED, checked cheapest first:
+
+        1. ``ctx["pr_closed_repaired_url"] == url`` — the fast path
+           `restore-approval` stamps (`cli/commands.py`) so the guard never
+           depends on scanning the event log or on log text alone.
+        2. Failing that, the event log: the LATEST `pr_closed` event whose
+           text names this URL is the question being asked; the LATEST of
+           `_PR_CLOSED_ANSWER_KINDS` or a parsed `ctx["approved_at"]` is a
+           candidate answer. Answered only when the answer is AT LEAST AS
+           RECENT as the question (`repair_ts >= closed_ts`) — a repair that
+           predates the very escalation it supposedly answers is not an
+           answer to it, and a `pr_closed` event that was never asked
+           (`closed_ts is None`) has nothing here to answer, so this returns
+           unanswered and the caller's normal escalate-once path decides.
+           Pinned by test: a repair recorded BEFORE the escalation must not
+           suppress it — the guard is ORDERED, not blanket.
+
+        Returns ``"pr_closed_repair_honored"`` once (throttled by
+        `ctx["pr_closed_repair_honored"]`, the same cache-the-confirmation
+        pattern `_comment_after_landing` uses) — never a fresh event per
+        tick — or ``None`` when unanswered, in which case the caller's own
+        escalate-once guard decides.
+        """
+        ctx = task.context or {}
+        answered = ctx.get("pr_closed_repaired_url") == url
+        if not answered:
+            events = await self.store.list_events(task.id)
+            closed_ts: float | None = None
+            repair_ts: float | None = None
+            for e in events:
+                ts = e.get("ts")
+                if ts is None:
+                    continue
+                kind = e.get("kind")
+                if kind == "pr_closed" and url in (e.get("text") or ""):
+                    if closed_ts is None or ts > closed_ts:
+                        closed_ts = ts
+                elif kind in self._PR_CLOSED_ANSWER_KINDS:
+                    if repair_ts is None or ts > repair_ts:
+                        repair_ts = ts
+            approved_at = _parse_iso(ctx.get("approved_at"))
+            if approved_at is not None:
+                approved_ts = approved_at.timestamp()
+                if repair_ts is None or approved_ts > repair_ts:
+                    repair_ts = approved_ts
+            answered = (
+                closed_ts is not None and repair_ts is not None
+                and repair_ts >= closed_ts
+            )
+        if not answered:
+            return None
+        if ctx.get("pr_closed_repair_honored") == url:
+            return "pr_closed_repair_honored"
+        await observe_pr(self.store, task.id, url, forge_state="CLOSED",
+                         shipped=None)
+        task.context = await self.store.merge_context(
+            task.id, {"pr_closed_repair_honored": url})
+        await self._emit(
+            task, "pr_closed_repair_honored",
+            f"{task.id[:8]} pr_closed rung held: a repair/approval is on "
+            f"record for {url} — not re-escalating",
+        )
+        return "pr_closed_repair_honored"
+
     async def _check_open_pr(self, task: Task) -> str | None:
         """The awaiting-approval priority ladder, one rung per tick.
 
         1. **Merged** → DONE. The agent only ever *observes* merged-ness —
            the never-merge constraint is untouched. (Before this ladder, a
            merged PR left its task parked as awaiting_approval forever.)
-        2. **Closed unmerged** → ESCALATED with a question (previously polled
-           until the end of time).
+        2. **Closed unmerged** → ESCALATED with a question, but escalates at
+           most ONCE per PR URL, and never again once a repair or approval is
+           on record for it (`_pr_closed_answered`) — `ESCALATED` is not a
+           terminal status here, so without both guards a still-CLOSED PR
+           re-fires this rung every tick, defeating a human's own repair.
         3. **Textual conflict with main** (SCRUM-41) → bounded rebase loop:
            CI stays green through a conflict (it only runs the PR's own
            branch), so this is the one rung that polls `mergeable` directly.
@@ -1184,6 +1312,32 @@ class WakeWatcher:
             # is evidence of absence, so the RECORD gets `None` and stays
             # `unknown` (unsettled, re-polled) while the ESCALATION below —
             # deliberately unchanged — proceeds and puts a human on it.
+            #
+            # REPAIR-IS-TERMINAL (2026-08-12). A human who restored this task
+            # to AWAITING_APPROVAL has already answered the question this rung
+            # asks ("closed without merging: abandon, or rework?"); `ESCALATED`
+            # is not in `_is_terminal`'s set, so with no memory of that answer
+            # the very next tick re-polls the same still-CLOSED PR and
+            # re-escalates — the repair-defeating loop the 2026-08-12 incident
+            # was. `_pr_closed_answered` is that memory and must run before
+            # any write below.
+            answered = await self._pr_closed_answered(task, url)
+            if answered:
+                return answered
+            ctx = task.context or {}
+            if ctx.get("pr_closed_escalated_url") == url:
+                # ESCALATE-ONCE. Same non-terminal-ESCALATED gap as above, the
+                # other side of it: an unrepaired escalation must not grow a
+                # fresh `pr_closed` event and outcome write on every later
+                # tick just because the task is still parked there. The
+                # context flag alone could theoretically survive a row this
+                # task never actually escalated on (hand-edited context); the
+                # event-log check keeps the guard honest rather than trusting
+                # a single signal.
+                events = await self.store.list_events(task.id)
+                if any(e.get("kind") == "pr_closed" and url in (e.get("text") or "")
+                       for e in events):
+                    return None
             await observe_pr(self.store, task.id, url, forge_state=state,
                              shipped=None)
             data = task.blocker or {}
@@ -1196,6 +1350,8 @@ class WakeWatcher:
             task.blocker = data
             await self.store.update_task_columns(task)
             await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
+            task.context = await self.store.merge_context(
+                task.id, {"pr_closed_escalated_url": url})
             await self._emit(task, "pr_closed", f"{task.id[:8]} PR closed unmerged: {url}")
             return "escalated_pr_closed"
 

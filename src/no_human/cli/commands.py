@@ -1605,6 +1605,17 @@ def task_restore_approval(task_id, reason):
             t.blocker = None
             t.wake_check_at = None
             await store.update_task(t)
+            # Stamp the PR URL as repaired so `WakeWatcher._pr_closed_answered`
+            # holds the `pr_closed` rung terminal for it on the very next tick
+            # — the fast, context-only path, so the guard does not depend on
+            # the wake watcher successfully re-deriving the same answer from
+            # this event's text and timestamp (2026-08-12 repair-defeating
+            # loop: ESCALATED is not terminal, so an unguarded rung re-fired
+            # within one poll interval of this exact repair).
+            pr_url = (t.context or {}).get("pr_watch")
+            if pr_url:
+                t.context = await store.merge_context(
+                    t.id, {"pr_closed_repaired_url": pr_url})
             import time as _time
             await store.save_events(t.id, [{
                 "source": "human", "kind": "state_repaired",
@@ -2905,7 +2916,7 @@ def wake(loop):
     config, _ = _bootstrap(require_auth=False)
     from ..blockers import WakeWatcher, parse_duration
     from ..vcs.pr_watcher import (
-        check_pr_comments, default_branch_shipped, default_ci_annotations,
+        branch_landed_commit, check_pr_comments, default_ci_annotations,
         default_ci_log_excerpt, default_pr_checks, default_pr_merged,
         default_pr_mergeable, default_pr_state,
     )
@@ -2918,7 +2929,7 @@ def wake(loop):
             pr_mergeable=default_pr_mergeable,
             ci_log=default_ci_log_excerpt,
             ci_annotations=default_ci_annotations,
-            pr_shipped=default_branch_shipped,
+            pr_shipped=branch_landed_commit,
             on_event=lambda kind, text: console.print(f"[blue]● {kind}[/] {text}"),
         )
         actions = await watcher.tick()
@@ -3062,7 +3073,7 @@ def serve(max_workers, until_empty):
     async def _go() -> int:
         async with Store(config.db_path) as store:
             from ..vcs.pr_watcher import (
-        check_pr_comments, default_branch_shipped, default_ci_annotations,
+        branch_landed_commit, check_pr_comments, default_ci_annotations,
         default_ci_log_excerpt, default_pr_checks, default_pr_merged,
         default_pr_mergeable, default_pr_state,
     )
@@ -3073,7 +3084,7 @@ def serve(max_workers, until_empty):
             pr_mergeable=default_pr_mergeable,
             ci_log=default_ci_log_excerpt,
             ci_annotations=default_ci_annotations,
-            pr_shipped=default_branch_shipped,
+            pr_shipped=branch_landed_commit,
                 on_event=lambda k, t: console.print(f"[blue]● {k}[/] {t}"))
             # PR-E: periodic re-analysis job (EVOLUTION_PLAN Phase 9).
             reanalysis = None

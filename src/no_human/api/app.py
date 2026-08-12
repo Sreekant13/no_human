@@ -181,7 +181,7 @@ async def lifespan(app: FastAPI):
     try:
         from ..blockers import WakeWatcher
         from ..vcs.pr_watcher import (
-            check_pr_comments, default_branch_shipped, default_ci_annotations,
+            branch_landed_commit, check_pr_comments, default_ci_annotations,
             default_ci_log_excerpt, default_pr_checks, default_pr_merged,
             default_pr_mergeable, default_pr_state,
         )
@@ -192,7 +192,7 @@ async def lifespan(app: FastAPI):
             pr_mergeable=default_pr_mergeable,
             ci_log=default_ci_log_excerpt,
             ci_annotations=default_ci_annotations,
-            pr_shipped=default_branch_shipped,
+            pr_shipped=branch_landed_commit,
         )
     except Exception as exc:  # noqa: BLE001
         # B2 #13: this used to swallow silently — parked tasks are
