@@ -107,6 +107,7 @@ from .pricing import (
 from .pricing import weighted_tokens as _weighted_tokens
 from .pr_evidence import PrEvidence, collapse_appendix
 from .task import Task, TaskSpec, TaskStatus
+from .worktree import _LIVE_WORKTREES, teardown_worktree
 
 log = logging.getLogger("no_human.orchestrator")
 
@@ -115,16 +116,11 @@ log = logging.getLogger("no_human.orchestrator")
 # .claude/** is _EPHEMERAL).
 _COPIED_SKILL_MARKER = ".nh-copied"
 
-# Worktree paths THIS PROCESS is currently running a task in. Only the reaper
-# reads it, and only to answer one question: "is this directory, which carries
-# my own pid, one I am using right now, or one my own earlier crashed run left
-# behind?" — a question `os.kill(pid, 0)` cannot answer for our own pid.
-#
-# It is NOT a lock. Nothing waits on it, nothing is excluded by it, and two
-# attempts of one task still start freely and run side by side; it only ever
-# decides what is safe to DELETE. Serialising attempts would be the wrong fix:
-# overlap is legitimate, the shared path was the defect.
-_LIVE_WORKTREES: set[str] = set()
+# `_LIVE_WORKTREES` lives in `core/worktree.py` now (the centralized teardown
+# + startup janitor both need it) and is re-imported here under the same name
+# so every existing reader in this file (`_reap_dead_worktrees`,
+# `_acquire_worktree`) is unchanged textually. See that module's docstring for
+# what the set is for and why it is not a lock.
 
 
 def _new_worktree_token() -> str:
@@ -1574,27 +1570,14 @@ class Orchestrator:
         try:
             return await self._drive_watched(task, repo)
         finally:
-            # Kill any test subprocess still running in this worktree BEFORE
-            # removing it — a cancellation (pause/stuck-reset) unwinds the
-            # awaiting coroutine while asyncio.to_thread's pytest subprocess
-            # keeps running, and rmtree'ing its .venv out from under it is the
-            # xdist INTERNALERROR. No-op on a clean finish (already deregistered).
-            try:
-                killed = runner.terminate_running(wt_path)
-                if killed:
-                    log.warning("killed %d orphaned test proc(s) in %s before teardown",
-                                killed, task.id[:8])
-            except Exception:  # noqa: BLE001 — teardown must never crash
-                pass
-            try:
-                # Only ever OUR OWN directory. `wt_path` is unique to this run,
-                # so no concurrent attempt of the same task can be inside it —
-                # that is exactly the property the per-run name buys.
-                main_repo.remove_worktree(wt_path)
-            except Exception as exc:  # noqa: BLE001 — cleanup must never mask outcome
-                log.warning("worktree cleanup failed for %s: %s", task.id[:8], exc)
-            finally:
-                _LIVE_WORKTREES.discard(str(wt_path))
+            # Only ever OUR OWN directory. `wt_path` is unique to this run, so
+            # no concurrent attempt of the same task can be inside it — that
+            # is exactly the property the per-run name buys. `teardown_worktree`
+            # kills any leftover test subprocess first, tries the git removal,
+            # then verifies the directory is actually gone (rmtree fallback +
+            # a loud ERROR if it still survives) — never raises, so a teardown
+            # failure can never mask this run's outcome.
+            teardown_worktree(main_repo, wt_path, task_id=task.id)
 
     # ------------------------ cooperative cancellation --------------------- #
 
@@ -8697,17 +8680,9 @@ class Orchestrator:
                         continue      # a concurrent attempt in THIS process
                 elif pid_alive(owner_pid):
                     continue          # someone else is working in there
-                try:
-                    runner.terminate_running(entry)
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    main_repo.remove_worktree(entry)
-                except Exception:  # noqa: BLE001 — best-effort prune
-                    pass
-                shutil.rmtree(entry, ignore_errors=True)
-                log.info("reclaimed superseded worktree %s (task %s)",
-                         entry.name, task.id[:8])
+                if teardown_worktree(main_repo, entry, task_id=task.id):
+                    log.info("reclaimed superseded worktree %s (task %s)",
+                             entry.name, task.id[:8])
         except Exception as exc:  # noqa: BLE001 — reclaim never fails a task
             log.warning("worktree reclaim failed for %s: %s", task.id[:8], exc)
 

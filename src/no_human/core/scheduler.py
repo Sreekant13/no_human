@@ -33,6 +33,7 @@ from .db import Store
 from . import plan_gate
 from .events import EventPersister
 from .task import TaskStatus
+from .worktree import sweep_stale_worktrees
 
 log = logging.getLogger("no_human.scheduler")
 
@@ -404,6 +405,25 @@ class Scheduler:
             # indistinguishable from a bug that closed rows it should not have.
             log.info("startup: retired %d attempt row(s) left open on tasks "
                      "that had already finished", n)
+
+    async def _sweep_stale_worktrees(self) -> None:
+        """Startup-only: reclaim worktree directories left by tasks that
+        already reached a terminal status and will never run again.
+
+        Mirrors `_reconcile_terminal_task_attempts` above — same
+        "must never block boot" wrapping, same reason it runs once at startup
+        and not on a per-tick cadence. See `core/worktree.sweep_stale_worktrees`
+        for the reclaim rules (never age/mtime — only a provably dead owner or
+        a provably vanished git admin dir)."""
+        try:
+            removed, skipped = await sweep_stale_worktrees(self.store, self._config)
+        except Exception:  # noqa: BLE001 — the sweep must never block boot
+            log.exception("startup: sweeping stale worktrees failed")
+            return
+        if removed or skipped:
+            log.info(
+                "startup: reclaimed %d stale worktree(s), skipped %d",
+                removed, skipped)
 
     async def _recover_orphans(self, *, startup: bool = True) -> None:
         """Crash/strand recovery. At STARTUP (review 2026-07-25): nothing is
@@ -1081,6 +1101,7 @@ class Scheduler:
         # recover a checkpoint, and a row left open on a task that already
         # FINISHED is not a checkpoint to resume from — it is debris.
         await self._reconcile_terminal_task_attempts()
+        await self._sweep_stale_worktrees()
         await self._recover_orphans()
         while not stop.is_set():
             await self.tick()
