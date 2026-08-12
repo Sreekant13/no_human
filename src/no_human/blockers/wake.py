@@ -16,6 +16,7 @@ The condition grammar is deliberately tiny and machine-checkable:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import time
@@ -52,6 +53,13 @@ _TICK_ABORTED = "__tick_aborted__"
 
 _DURATION = re.compile(r"(\d+)\s*([smhd])", re.IGNORECASE)
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+# Bound on the default `ci_green` checker's `backend.trigger()` re-entry
+# (A7). `trigger()` polls an already-running pipeline to TERMINAL — right for
+# the orchestrator's own one-shot CI wait, wrong for a watcher tick that must
+# re-evaluate every parked task and come back periodically. A timeout here
+# reads as "not yet satisfied, ask again next tick", never as green.
+_CI_GREEN_POLL_TIMEOUT_SECONDS = 25
 
 # Platform-layer CI failures: the job never ran the code, so a red check
 # carrying this signature is INFRA, not a coder fix round (live incident
@@ -186,9 +194,20 @@ class WakeWatcher:
             str(a).lower()
             for a in blockers_cfg.get("ignore_comment_authors", [])
         }
+        self.config = config or {}
         self._pr_merged = pr_merged
-        self._ci_green = ci_green
-        self._ci_terminal = ci_terminal
+        # Default to the real checkers when the caller doesn't inject one
+        # (mirrors `ci_gate_gate` just below). Every WakeWatcher construction
+        # site used to pass neither, so `ci_green_on:<branch>` / `ci_terminal_on:`
+        # could NEVER fire — orchestrator.py parks human-gated CI promising "the
+        # task resumes when it is green" and nothing made that true (audit A7,
+        # 2026-08-11). These need `self.store`/`self.config`, unlike the
+        # stateless `default_pr_merged`-style helpers, so they are bound
+        # methods rather than free functions passed in from the call sites —
+        # every WakeWatcher gets a working checker by construction, including
+        # future construction sites that forget to ask for one.
+        self._ci_green = ci_green or self._default_ci_green
+        self._ci_terminal = ci_terminal or self._default_ci_terminal
         self._pr_comment = pr_comment
         self._pr_state = pr_state
         self._pr_checks = pr_checks
@@ -235,6 +254,98 @@ class WakeWatcher:
         except Exception:  # noqa: BLE001
             log.warning("CI_GATE gate wiring failed — rung disabled", exc_info=True)
             return None
+
+    # ------------------------- default CI checkers -------------------------- #
+    #
+    # `condition_satisfied` calls `self._ci_green(branch)` /
+    # `self._ci_terminal(pipeline_ref)` with only the string parsed out of the
+    # condition (the same contract every injected test double in
+    # tests/test_blockers.py uses) — neither carries the task or its repo. The
+    # defaults below recover that context by looking up the BLOCKED task that
+    # owns the exact condition string, then rebuild the CI backend from it:
+    # preferably the literal conf `_park_human_gated_ci` captured at park time
+    # (`task.context["human_gated_ci"]["ci_conf"]`, set from
+    # `Orchestrator.ci_runner_conf` — the EXACT source that gated this run),
+    # falling back to re-resolving profile-then-global for the task's repo via
+    # `resolve_ci_backend_for_repo` (the same precedence
+    # `Orchestrator._resolve_ci_runner` uses). Either way this fixes A7: the
+    # prior (removed) wiring read only the global `ci:` block via
+    # `ci_from_config(config)`, so a profile-only CI config — the common,
+    # human-confirmed `nh onboard` path — could never resolve a backend here,
+    # and `ci_green_on:<branch>` stayed permanently unreachable.
+    #
+    # Never resolving a backend, or any error along the way, reads as "not
+    # satisfied yet" — never as green. A task this can't answer is freed by
+    # the max-park-duration timeout escalation, not by a guess here.
+
+    async def _find_parked_task_for_condition(self, condition: str) -> Task | None:
+        """The BLOCKED task whose ``blocker.wake_condition`` is exactly
+        *condition*. Branches/pipeline refs this product generates are unique
+        enough in practice that one task owns a given condition; the first
+        match is used."""
+        for t in await self.store.list_tasks(TaskStatus.BLOCKED):
+            if ((t.blocker or {}).get("wake_condition") or "") == condition:
+                return t
+        return None
+
+    def _resolve_ci_backend_for_task(self, task: Task, stored_conf: dict | None):
+        from ..ci import ci_from_config, resolve_ci_backend_for_repo
+
+        if stored_conf:
+            try:
+                built = ci_from_config({"ci": {**stored_conf, "enabled": True}})
+            except Exception:  # noqa: BLE001 — fall back to re-resolving below
+                built = None
+            if built is not None:
+                return built
+        return resolve_ci_backend_for_repo(self.config, task.repo_path)
+
+    async def _default_ci_green(self, branch: str) -> bool:
+        """Real ``ci_green_on:<branch>`` checker (A7)."""
+        task = await self._find_parked_task_for_condition(f"ci_green_on:{branch}")
+        if task is None:
+            return False
+        hg = (task.context or {}).get("human_gated_ci") or {}
+        backend = self._resolve_ci_backend_for_task(task, hg.get("ci_conf"))
+        if backend is None:
+            return False
+        from ..ci.base import HumanGatedCI
+
+        try:
+            # Bounded: on a backend whose pipeline is already running,
+            # `trigger()` polls it to TERMINAL (up to `ci.timeout_minutes`,
+            # default an hour) — correct for the orchestrator's own one-shot
+            # CI wait, wrong here: a watcher tick re-evaluates every parked
+            # task and must not stall on one of them.
+            result = await asyncio.wait_for(
+                backend.trigger(branch), timeout=_CI_GREEN_POLL_TIMEOUT_SECONDS)
+        except HumanGatedCI:
+            return False  # still nobody started it
+        except asyncio.TimeoutError:
+            return False  # still running, or slow to answer — retry next tick
+        except Exception as exc:  # noqa: BLE001 — checker must never crash watcher
+            log.warning("default ci_green checker failed for %r: %s", branch, exc)
+            return False
+        return bool(result.passed)
+
+    async def _default_ci_terminal(self, pipeline_ref: str) -> tuple[bool, bool]:
+        """Real ``ci_terminal_on:<pipeline_ref>`` checker (A7). A single
+        non-blocking poll — always safe to call every tick."""
+        task = await self._find_parked_task_for_condition(
+            f"ci_terminal_on:{pipeline_ref}")
+        if task is None:
+            return (False, False)
+        hg = (task.context or {}).get("human_gated_ci") or {}
+        backend = self._resolve_ci_backend_for_task(task, hg.get("ci_conf"))
+        if backend is None:
+            return (False, False)
+        try:
+            result = await backend.check_status(pipeline_ref)
+        except Exception as exc:  # noqa: BLE001 — checker must never crash watcher
+            log.warning("default ci_terminal checker failed for %r: %s",
+                        pipeline_ref, exc)
+            return (False, False)
+        return (result.status.is_terminal, result.passed)
 
     # ----------------------------- condition ------------------------------- #
 

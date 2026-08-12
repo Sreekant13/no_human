@@ -435,6 +435,85 @@ async def test_ci_green_checker_resumes(store):
     assert (t.id, "resumed") in actions
 
 
+class _FakeCIForDefaultChecker:
+    """A minimal CIBackend double for exercising WakeWatcher's REAL default
+    ci_green checker (not a test-injected one) — the `ci_from_config` call
+    that checker makes is patched to return this instead of a real GitLabCI."""
+    name = "fake"
+
+    def __init__(self, result):
+        self._result = result
+        self.calls: list[str] = []
+
+    async def trigger(self, branch, extra_variables=None):
+        self.calls.append(branch)
+        return self._result
+
+
+@pytest.mark.asyncio
+async def test_default_ci_green_checker_stays_parked_while_red(store, monkeypatch):
+    """A7 red-first control: with NO ci_green injected (every WakeWatcher
+    construction site used to pass none), the REAL default checker must
+    rebuild the backend `_park_human_gated_ci` captured in
+    `context["human_gated_ci"]["ci_conf"]` and, while it reports red, leave
+    the task parked."""
+    from no_human.ci.base import CIResult, PipelineStatus
+
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={"category": "DEPENDENCY_WAIT",
+                 "wake_condition": "ci_green_on:no-human/gated-task",
+                 "raised_at": now.isoformat(), "confidence": 0.9},
+    )
+    t.context = {"human_gated_ci": {
+        "branch": "no-human/gated-task", "base": "main", "hint": "",
+        "ci_conf": {"backend": "gitlab", "project": "grp/repo"},
+    }}
+    await store.update_task(t)
+
+    red = _FakeCIForDefaultChecker(CIResult("1", "u", PipelineStatus.FAILED))
+    monkeypatch.setattr("no_human.ci.ci_from_config", lambda cfg: red)
+
+    watcher = WakeWatcher(store, _cfg())  # nothing injected — the real default runs
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") not in actions
+    refreshed = await store.get_task(t.id)
+    assert refreshed.status == TaskStatus.BLOCKED
+    assert red.calls == ["no-human/gated-task"], "the real checker must have run"
+
+
+@pytest.mark.asyncio
+async def test_default_ci_green_checker_resumes_once_green(store, monkeypatch):
+    """A7: the same setup as the red control, but the backend now reports
+    green — the real default checker (still nothing injected) must resume
+    the task. This is the false promise the audit named: before this fix,
+    `ci_green_on:<branch>` could never fire for a profile-configured backend
+    because the (dead) wiring only ever read the global `ci:` block."""
+    from no_human.ci.base import CIResult, PipelineStatus
+
+    now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
+    t = await _park(
+        store, status=TaskStatus.BLOCKED,
+        blocker={"category": "DEPENDENCY_WAIT",
+                 "wake_condition": "ci_green_on:no-human/gated-task",
+                 "raised_at": now.isoformat(), "confidence": 0.9},
+    )
+    t.context = {"human_gated_ci": {
+        "branch": "no-human/gated-task", "base": "main", "hint": "",
+        "ci_conf": {"backend": "gitlab", "project": "grp/repo"},
+    }}
+    await store.update_task(t)
+
+    green = _FakeCIForDefaultChecker(CIResult("1", "u", PipelineStatus.SUCCESS))
+    monkeypatch.setattr("no_human.ci.ci_from_config", lambda cfg: green)
+
+    watcher = WakeWatcher(store, _cfg())  # nothing injected — the real default runs
+    actions = await watcher.tick(now=now)
+    assert (t.id, "resumed") in actions
+    assert green.calls == ["no-human/gated-task"]
+
+
 @pytest.mark.asyncio
 async def test_pr_merged_checker_resumes(store):
     now = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)

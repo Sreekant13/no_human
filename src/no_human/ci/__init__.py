@@ -37,6 +37,72 @@ from .jenkins import JenkinsCI
 from .parser import parse_results
 
 
+# Keys that name WHICH pipeline to drive. A ci block carrying none of them is
+# a detection hint, not a request for a gate (see `ci_sources` docstring).
+_CI_TARGET_KEYS: tuple[str, ...] = ("project", "repo", "job")
+
+
+def ci_sources(config: dict[str, Any], prof: Any | None) -> list[tuple[str, dict[str, Any]]]:
+    """List ``(origin, conf)`` CI sources naming a pipeline target, in
+    precedence order: the project profile's ``ci`` block first (one repo,
+    human-confirmed via ``nh onboard``), then the global ``ci:`` block (the
+    install-wide fallback).
+
+    Shared by ``Orchestrator._resolve_ci_runner`` (which owns emitting
+    advisories + picking ``self.ci_runner``) and
+    ``resolve_ci_backend_for_repo`` (used by the wake watcher's default
+    ``ci_green``/``ci_terminal`` checkers) so both resolve a repo's CI to the
+    SAME backend. A profile-only config must not read differently at wake
+    time than it did when the orchestrator gated the run on it (audit finding
+    A7, 2026-08-11): the prior wake-side implementation read only the global
+    block, so a task human-gated on a profile-configured backend could never
+    self-wake — ``ci_green`` was permanently unreachable for the common case.
+
+    A profile ``ci`` block with none of ``_CI_TARGET_KEYS`` set is a detection
+    hint (``nh onboard`` writes a bare ``{"backend": "gitlab"}`` on seeing a
+    ``.gitlab-ci.yml``), not a claim, and is not returned as a source.
+    """
+    sources: list[tuple[str, dict[str, Any]]] = []
+    prof_ci = dict(getattr(prof, "ci", None) or {})
+    if any(str(prof_ci.get(k) or "").strip() for k in _CI_TARGET_KEYS):
+        sources.append(("project profile", prof_ci))
+    global_ci = dict((config or {}).get("ci") or {})
+    if global_ci.get("enabled"):
+        sources.append(("global config", global_ci))
+    return sources
+
+
+def resolve_ci_backend_for_repo(
+    config: dict[str, Any], repo_path: str | None,
+) -> CIBackend | None:
+    """Rebuild the CI backend a repo's human-gated park was raised from —
+    used at WAKE time, when only ``repo_path`` (not a live ``Orchestrator``)
+    is available. Loads the on-disk ``ProjectProfile`` for *repo_path* (if
+    any) and applies the exact same precedence as
+    ``Orchestrator._resolve_ci_runner`` via ``ci_sources``, so a task parked
+    on a profile-configured backend resolves the SAME backend here.
+
+    Returns ``None`` when no source is configured or buildable for this
+    repo — the caller (a wake checker) must then read the wake condition as
+    NOT satisfied, never crash and never guess a backend.
+    """
+    prof = None
+    if repo_path:
+        try:
+            from ..profile import ProjectProfile
+            prof = ProjectProfile.load(repo_path)
+        except Exception:  # noqa: BLE001 — a bad/missing profile is not a source
+            prof = None
+    for _origin, conf in ci_sources(config, prof):
+        try:
+            built = ci_from_config({"ci": {**conf, "enabled": True}})
+        except Exception:  # noqa: BLE001 — unusable source, try the next one
+            built = None
+        if built is not None:
+            return built
+    return None
+
+
 def ci_from_layer(layer_ci: dict[str, Any]) -> CIBackend | None:
     """Build a CI backend from a TestLayer's ``ci`` dict.
 
@@ -161,5 +227,6 @@ __all__ = [
     "GitLabCI", "GitHubActionsCI", "JenkinsCI", "GHECheckRunsCI", "CircleCICI",
     "CIMisconfigured",
     "ci_from_config", "ci_from_layer",
+    "ci_sources", "resolve_ci_backend_for_repo",
     "parse_results",
 ]

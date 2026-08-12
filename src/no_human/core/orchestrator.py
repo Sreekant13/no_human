@@ -938,6 +938,13 @@ class Orchestrator:
         if self.reviewer is not None:
             self.reviewer._on_event = self._reviewer_sink
         self.ci_runner = ci_runner
+        # The winning ``ci:`` conf dict that built `self.ci_runner`, when it
+        # was built via `_resolve_ci_runner` (profile/global config) rather
+        # than injected explicitly (embedders, tests). `_park_human_gated_ci`
+        # reads this to decide whether the wake watcher can rebuild the SAME
+        # backend at wake time (A7) — an explicit injection has no config to
+        # rebuild from, so it stays None and the park must be honest about it.
+        self.ci_runner_conf: dict[str, Any] | None = None
         self.learning_queue = learning_queue
 
     # ----------------------------- events ---------------------------------- #
@@ -1079,12 +1086,6 @@ class Orchestrator:
         log.warning("advisory: %s", text)
         self.emit("advisory", text)
 
-    # Keys that name WHICH pipeline to drive. A ci block carrying none of them
-    # is a detection hint, not a request for a gate: `nh onboard` writes a bare
-    # {"backend": "gitlab"} the moment it sees a .gitlab-ci.yml, and treating
-    # that as a claim would fire an advisory on every run of every GitLab repo.
-    _CI_TARGET_KEYS: tuple[str, ...] = ("project", "repo", "job")
-
     def _resolve_ci_runner(self, prof: Any | None) -> str | None:
         """Pick this run's CI backend. Precedence, most specific first:
 
@@ -1128,17 +1129,12 @@ class Orchestrator:
         if self.ci_runner is not None:
             return None                  # explicit injection always wins
 
-        sources: list[tuple[str, dict[str, Any]]] = []
-        prof_ci = dict(getattr(prof, "ci", None) or {})
-        if any(str(prof_ci.get(k) or "").strip() for k in self._CI_TARGET_KEYS):
-            sources.append(("project profile", prof_ci))
-        global_ci = dict(self.config.get("ci") or {})
-        if global_ci.get("enabled"):
-            sources.append(("global config", global_ci))
+        from ..ci import CIMisconfigured, ci_from_config, ci_sources
+
+        sources = ci_sources(self.config, prof)
         if not sources:
             return None                  # no CI configured anywhere — unchanged
 
-        from ..ci import CIMisconfigured, ci_from_config
         unusable: list[str] = []
         for origin, conf in sources:
             try:
@@ -1158,6 +1154,9 @@ class Orchestrator:
                 built, why = None, f"{type(exc).__name__}: {exc}"
             if built is not None:
                 self.ci_runner = built
+                # Keep the winning conf too: `_park_human_gated_ci` needs it to
+                # tell the wake watcher what it can (and cannot) rebuild later.
+                self.ci_runner_conf = dict(conf)
                 self.emit("ci_backend", f"CI from {origin}: {built.name}",
                           origin=origin, backend=built.name)
                 return None
@@ -5927,7 +5926,16 @@ class Orchestrator:
         CI), review/tamper/local tests already passed, so resuming opens the PR.
         """
         ctx = task.context or {}
-        ctx["human_gated_ci"] = {"branch": branch, "base": base, "hint": gated.wake_hint}
+        # `ci_conf` is the exact winning conf `self.ci_runner` was built from
+        # (None when it was injected rather than resolved — the test/embedder
+        # seam). The wake watcher's default `ci_green` checker prefers this
+        # over re-deriving from the profile/global config at wake time, so it
+        # rebuilds the literal SAME backend this run gated on rather than one
+        # that merely matches the same precedence rules (A7).
+        ctx["human_gated_ci"] = {
+            "branch": branch, "base": base, "hint": gated.wake_hint,
+            "ci_conf": self.ci_runner_conf,
+        }
         task.context = ctx
         blocker = Blocker(
             category=BlockerCategory.DEPENDENCY_WAIT,
