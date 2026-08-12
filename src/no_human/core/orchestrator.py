@@ -59,6 +59,7 @@ from ..history.skills import discover_skills
 from ..intake.split_proposal import generate_split_proposal
 from ..intake.surface_advisory import surface_advisory
 from ..learning import CONFIRMED_BY_AUTO, ORIGIN_REVIEW
+from ..learning.ranking import rank_and_select
 from ..learning.triggers import filter_triggered
 from ..notify.slack import SlackNotifier
 from ..review import selfcheck, tamper_adjudication
@@ -11244,6 +11245,12 @@ class Orchestrator:
     _RULES_CRITICAL_CAP = 8000   # chars for high-importance rules (full content)
     _RULES_RELEVANT_CAP = 4000   # chars for med-importance rules (compact)
 
+    # Memory lifecycle B (scored selection, learning/ranking.py): a hard count
+    # ceiling on top of the char budgets above, and a floor that always keeps
+    # the top-`_MEMORY_FLOOR_RANK` most-used importance:high rules eligible.
+    _MEMORY_CEILING = 25
+    _MEMORY_FLOOR_RANK = 5
+
     @staticmethod
     def _trigger_haystack(task: Task) -> str:
         """The task text a memory's or a playbook's trigger is matched against.
@@ -11278,6 +11285,14 @@ class Orchestrator:
         while being silently withheld from every task. The property is the only
         thing that knows what survived.
 
+        RANKING happens after the term screen and before installation:
+        `learning.ranking.rank_and_select` scores the matched, screened set by
+        importance x recency x frequency and clips it to `_MEMORY_CEILING`,
+        keeping the top `_MEMORY_FLOOR_RANK` most-used importance:high rules
+        eligible regardless of score. `_active_memories` — and therefore the
+        stamp below — only ever holds what ranking selected, so a rule bumped
+        off by the ceiling is correctly never recorded as used.
+
         Emits NOTHING. The implement path's `knowledge_accessed` audit line
         stays at its call site because only that path has ever had one, and
         moving it here would start emitting it on the review path too.
@@ -11297,7 +11312,16 @@ class Orchestrator:
             scope=await self._project_scope(task.repo_path),
         )
         triggered = filter_triggered(all_scoped, self._trigger_haystack(task))
-        self._active_memories = triggered
+        kept, _held = self._screen_memories_for_terms(triggered)
+        selected = rank_and_select(
+            kept, ceiling=self._MEMORY_CEILING, floor_rank=self._MEMORY_FLOOR_RANK,
+        )
+        if len(kept) > self._MEMORY_CEILING:
+            log.debug(
+                "memory ranking clipped %d matched rules to the %d ceiling",
+                len(kept), self._MEMORY_CEILING,
+            )
+        self._active_memories = selected
         injected_ids = [m["id"] for m in self._active_memories if m.get("id")]
         if injected_ids:
             # Batched, and never allowed to take the run down with it: this is

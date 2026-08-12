@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 from ..blockers import Blocker
+from ..learning.ranking import importance_tier
 from ..testing.repro_gate import MANIFEST as REPRO_MANIFEST
 from .task import Task
 
@@ -523,10 +524,10 @@ def build_memories_block(
     relevant: list[dict] = []
     long_tail: list[dict] = []
     for m in memories:
-        tags = m.get("tags") or []
-        if "importance:high" in tags:
+        tier = importance_tier(m)
+        if tier == "high":
             critical.append(m)
-        elif "importance:low" in tags:
+        elif tier == "low":
             long_tail.append(m)
         else:
             relevant.append(m)
