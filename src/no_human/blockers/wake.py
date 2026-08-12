@@ -492,12 +492,25 @@ class WakeWatcher:
                 # "the injection delivered nothing", and only that falls through.
                 rounds: int | None = 0
                 if condition and condition.strip().lower().startswith("pr_comment_on:"):
-                    rounds = await self._inject_pr_feedback(task, condition)
-                    # Bound the comment→revise loop: after max_revision_rounds
-                    # autonomous rounds, escalate to the human rather than resume.
-                    if rounds is not None and rounds > self.max_revision_rounds:
-                        await self._escalate_revisions(task, rounds)
-                        return "escalated_revisions"
+                    pr_ref = condition.split(":", 1)[1].strip()
+                    # A comment on a PR whose content already shipped is a
+                    # post-mortem note, not a work order (2026-08-12
+                    # incident) — check state+shipped before ever injecting
+                    # it as revision feedback.
+                    landed = await self._comment_after_landing(
+                        task, pr_ref, may_complete=False)
+                    if landed is not None:
+                        # Do not resume — but do not return either: treat it
+                        # exactly like the "injection delivered nothing" case
+                        # below and fall through to the max_park check.
+                        rounds = None
+                    else:
+                        rounds = await self._inject_pr_feedback(task, condition)
+                        # Bound the comment→revise loop: after max_revision_rounds
+                        # autonomous rounds, escalate to the human rather than resume.
+                        if rounds is not None and rounds > self.max_revision_rounds:
+                            await self._escalate_revisions(task, rounds)
+                            return "escalated_revisions"
                 if rounds is not None:
                     return await self._resume(task)
                 # The rung and the injection each fetch, so they can see
@@ -830,6 +843,118 @@ class WakeWatcher:
             f"{base} (squash-merged): {url}",
         )
         return action
+
+    async def _comment_after_landing(
+        self, task: Task, pr_ref: str, *, may_complete: bool,
+    ) -> str | None:
+        """Guard the two comment rungs against resuming a PR whose content
+        already shipped (2026-08-12 incident: the operator closed a landed
+        PR with an explanatory comment and the comment rung read it as
+        revision feedback, resuming a coder onto already-merged work).
+
+        Returns an action string when the caller must NOT resume; ``None``
+        when the caller keeps its existing behaviour unchanged.
+
+        - ``self._pr_state is None`` -> ``None`` (rung not wired).
+        - The state read is best-effort: on an exception, or on anything
+          other than a definite ``"CLOSED"`` (``""``/``"OPEN"``/``"MERGED"``),
+          returns ``None``. This deliberately keeps ``default_pr_state``'s
+          documented contract ("callers must treat unknown as no action,
+          never as closed") — failing the OTHER way here (treating an
+          unreadable state as closed) would permanently swallow a genuine
+          operator revision request behind a forge blip.
+        - Only on a definite ``CLOSED``:
+
+          ``may_complete=True`` (the AWAITING_APPROVAL rung,
+          ``_check_approval_pr_comments``): delegate to the existing
+          ``_complete_if_content_landed``, which owns the
+          ``default_branch_shipped`` probe (ledger-exclusions included), the
+          post-await terminal recheck, ``observe_pr``, and the DONE write —
+          nothing here re-implements any of it.
+            * ``_TICK_ABORTED`` (the task was already terminal): still
+              record the note, return ``None`` so the caller abandons the
+              tick exactly like every other caller does.
+            * a truthy action: record the note, return that action.
+            * ``None`` (not shipped, or the probe could not run — that
+              ``False`` is documented as overloaded): return ``None`` — a
+              closed but UNSHIPPED PR comment still resumes. Regression pin.
+
+          ``may_complete=False`` (the ``_evaluate`` / BLOCKED rung): never
+          writes DONE — a BLOCKED task with landed content is still never
+          auto-completed. Runs the shipped probe read-only
+          (``self._pr_shipped``), guarded exactly like
+          ``_complete_if_content_landed`` (no ``base_branch`` -> ``None``,
+          never default to "main"; a probe exception -> not shipped). Once
+          confirmed shipped for *pr_ref*, the confirmation is cached on the
+          task (``comment_after_landing_confirmed``): a still-parked task
+          does not re-probe the forge (``pr_state`` + ``pr_shipped``) or
+          re-emit the event on every subsequent tick while the same
+          operator comment sits there — this is the throttle the incident's
+          original fix was missing: without it, ``condition_satisfied``
+          re-satisfies on the SAME unresolved comment every tick forever
+          (the ladder never transitions the task off BLOCKED here), so the
+          confirmation must be cached rather than re-derived each time.
+        """
+        if not may_complete:
+            ctx = task.context or {}
+            if ctx.get("comment_after_landing_confirmed") == pr_ref:
+                return "no_resume_comment_after_landing"
+        if self._pr_state is None:
+            return None
+        try:
+            state = (await self._pr_state(pr_ref)) or ""
+        except Exception as exc:  # noqa: BLE001 — a poll error must not crash the watcher
+            log.warning("pr_state checker failed for %s: %s", pr_ref, exc)
+            return None
+        if state != "CLOSED":
+            return None
+
+        if may_complete:
+            landed = await self._complete_if_content_landed(
+                task, pr_ref, forge_state="CLOSED",
+                action="shipped_comment_after_landing",
+                situation="PR closed with a new comment",
+            )
+            if landed == _TICK_ABORTED:
+                await self._emit(
+                    task, "comment_after_landing",
+                    f"{task.id[:8]} got a comment on closed PR {pr_ref} "
+                    "after the task had already finished",
+                )
+                return None
+            if landed:
+                await self._emit(
+                    task, "comment_after_landing",
+                    f"{task.id[:8]} got a comment on closed PR {pr_ref} "
+                    "but its content already shipped — not resuming",
+                )
+                return landed
+            return None
+
+        # may_complete=False: never write DONE from here, even when the
+        # content has landed — only record the fact and decline to resume.
+        if self._pr_shipped is None:
+            return None
+        ctx = task.context or {}
+        branch = ctx.get("pr_branch")
+        base = ctx.get("base_branch")
+        if not task.repo_path or not branch or not base:
+            return None
+        try:
+            shipped = await self._pr_shipped(task.repo_path, branch, base)
+        except Exception as exc:  # noqa: BLE001 — a probe error must not crash the watcher
+            log.warning("pr_shipped check failed for %s: %s", task.id[:8], exc)
+            return None
+        if not shipped:
+            return None
+        task.context = await self.store.merge_context(
+            task.id, {"comment_after_landing_confirmed": pr_ref})
+        await self._emit(
+            task, "comment_after_landing",
+            f"{task.id[:8]} got a comment on closed PR {pr_ref} but its "
+            "content already shipped — not resuming",
+        )
+        return "no_resume_comment_after_landing"
 
     async def _check_open_pr(self, task: Task) -> str | None:
         """The awaiting-approval priority ladder, one rung per tick.
@@ -1370,12 +1495,6 @@ class WakeWatcher:
         except Exception as exc:  # noqa: BLE001 — a poll error must not crash the watcher
             log.warning("failed to poll PR comments for %s: %s", task.id[:8], exc)
             return None
-        # The poll above just awaited a network call; re-verify terminal-ness
-        # before writing anything (pr_feedback rung — the exact live incident,
-        # SCRUM-68: a done task's PR got a post-merge comment and this rung
-        # counted it as new human feedback and resumed the task).
-        if await self._is_terminal(task):
-            return None
 
         since = ctx.get("pr_comment_since")
         fresh = [c for c in comments
@@ -1386,6 +1505,31 @@ class WakeWatcher:
         # Advance the cursor past everything we've now seen (newest wins).
         newest = max((getattr(c, "created_at", "") or "") for c in comments)
         human = [c for c in fresh if not self._is_self_or_bot(c)]
+
+        # Closed+shipped guard runs BEFORE the terminal early-bail below: a
+        # genuine operator comment on a PR whose content already landed is a
+        # post-mortem note worth recording even when the task raced to DONE
+        # (or was already DONE) before/during this poll — the guard's own
+        # completion path (_complete_if_content_landed) re-checks
+        # terminal-ness after its own probe and never double-writes, so
+        # running it ahead of the check below is safe (SCRUM-68 invariant,
+        # preserved one level deeper).
+        if human:
+            landed = await self._comment_after_landing(task, url, may_complete=True)
+            if landed is not None:
+                if newest:
+                    task.context = await self.store.merge_context(
+                        task.id, {"pr_comment_since": newest})
+                return landed
+
+        # The poll above (and the guard's own probes) just awaited network
+        # calls; re-verify terminal-ness before writing anything further
+        # (pr_feedback rung — the exact live incident, SCRUM-68: a done
+        # task's PR got a post-merge comment and this rung counted it as new
+        # human feedback and resumed the task).
+        if await self._is_terminal(task):
+            return None
+
         if not human:
             # Bot chatter only (CI result tables etc.): move the cursor so the
             # same comments are never reconsidered, but do not burn an attempt.

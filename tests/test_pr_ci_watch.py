@@ -31,7 +31,7 @@ async def _approval_task(store, url="https://code.example.com/dev/x/pull/7004"):
 
 
 def _watcher(store, *, state="OPEN", checks=None, log="", events=None, comments=None,
-             ignore_authors=None):
+             ignore_authors=None, shipped=None):
     async def pr_state(url): return state
     async def pr_checks(url): return checks or []
     async def ci_log(link): return log
@@ -44,6 +44,11 @@ def _watcher(store, *, state="OPEN", checks=None, log="", events=None, comments=
     return WakeWatcher(
         store, cfg, pr_state=pr_state, pr_checks=pr_checks, ci_log=ci_log,
         pr_comment=pr_comment,
+        # `shipped` is itself the pr_shipped(repo_path, branch, base) async
+        # callable, or None to leave the checker unwired — matching every
+        # other checker on this fixture and letting a test simulate a
+        # raising probe by passing its own callable.
+        pr_shipped=shipped,
         on_event=(lambda k, t: events.append((k, t))) if events is not None else None,
     )
 
@@ -148,6 +153,240 @@ async def test_self_comment_advances_the_cursor(store):
     await _watcher(store, comments=[own])._check_approval_pr_comments(t)
     fresh = await store.get_task(t.id)
     assert (fresh.context or {}).get("pr_comment_since") == "2026-07-10T19:05:41Z"
+
+
+# ---- comment-after-landing guard (2026-08-12 incident) ---------------------- #
+# The operator closed a landed PR with an explanatory comment; the comment
+# rung read author+marker only (never PR state) and resumed a coder onto
+# already-merged work. Both comment rungs — the AWAITING_APPROVAL poll
+# (_check_approval_pr_comments, called directly here, the incident's own
+# shape) and the BLOCKED wake condition (_evaluate's pr_comment_on branch,
+# driven via _evaluate itself below) — must check state+shipped before ever
+# treating a comment as revision feedback.
+
+async def test_operator_comment_on_a_closed_shipped_pr_never_resumes(store):
+    from no_human.vcs.pr_watcher import PrComment
+    t = await _approval_task(store)
+    t.context["base_branch"] = "main"
+    await store.update_task(t)
+    dev = PrComment(author="dev", body="closing this — it landed as a local squash",
+                    created_at="2026-08-12T03:04:00Z")
+    events = []
+
+    async def shipped(repo_path, branch, base): return True
+
+    out = await _watcher(store, state="CLOSED", shipped=shipped, comments=[dev],
+                         events=events)._check_approval_pr_comments(t)
+    assert out != "resumed"
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    assert any(k == "comment_after_landing" for k, _ in events)
+    assert not any(k == "resumed" for k, _ in events)
+    assert not any(k == "pr_feedback" for k, _ in events)
+    assert "send_back_feedback" not in (fresh.context or {})
+
+
+async def test_a_landed_task_no_ops_and_still_records_the_note(store):
+    from no_human.vcs.pr_watcher import PrComment
+    t = await _approval_task(store)
+    t.context["base_branch"] = "main"
+    await store.update_task(t)
+    await store.set_status(t, TaskStatus.DONE, validate=False)
+    dev = PrComment(author="dev", body="closing this — it landed as a local squash",
+                    created_at="2026-08-12T03:04:00Z")
+    events = []
+
+    async def shipped(repo_path, branch, base): return True
+
+    out = await _watcher(store, state="CLOSED", shipped=shipped, comments=[dev],
+                         events=events)._check_approval_pr_comments(t)
+    assert out is None
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.DONE
+    assert any(k == "comment_after_landing" for k, _ in events)
+    assert not any(k == "shipped" for k, _ in events)
+
+
+async def test_operator_comment_on_a_closed_unshipped_pr_still_resumes(store):
+    from no_human.vcs.pr_watcher import PrComment
+    t = await _approval_task(store)
+    t.context["base_branch"] = "main"
+    await store.update_task(t)
+    dev = PrComment(author="dev", body="please rework this before reopening",
+                    created_at="2026-08-12T03:04:00Z")
+
+    async def shipped(repo_path, branch, base): return False
+
+    out = await _watcher(store, state="CLOSED", shipped=shipped,
+                         comments=[dev])._check_approval_pr_comments(t)
+    assert out == "resumed"
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.IMPLEMENTING
+    assert ("please rework this before reopening"
+            in fresh.context["send_back_feedback"][-1]["message"])
+
+
+async def test_unknown_pr_state_still_resumes(store):
+    """The state read failed (gh missing / network down) — the guard must
+    not silence a genuine reviewer comment behind that ambiguity."""
+    from no_human.vcs.pr_watcher import PrComment
+    t = await _approval_task(store)
+    t.context["base_branch"] = "main"
+    await store.update_task(t)
+    dev = PrComment(author="dev", body="please rename the helper",
+                    created_at="2026-08-12T03:04:00Z")
+
+    async def shipped(repo_path, branch, base): return True
+
+    out = await _watcher(store, state="", shipped=shipped,
+                         comments=[dev])._check_approval_pr_comments(t)
+    assert out == "resumed"
+
+
+async def test_a_raising_shipped_probe_still_resumes(store):
+    from no_human.vcs.pr_watcher import PrComment
+    t = await _approval_task(store)
+    t.context["base_branch"] = "main"
+    await store.update_task(t)
+    dev = PrComment(author="dev", body="please rename the helper",
+                    created_at="2026-08-12T03:04:00Z")
+
+    async def shipped(repo_path, branch, base): raise RuntimeError("git probe failed")
+
+    out = await _watcher(store, state="CLOSED", shipped=shipped,
+                         comments=[dev])._check_approval_pr_comments(t)
+    assert out == "resumed"
+
+
+async def test_the_cursor_advances_past_a_post_landing_comment(store):
+    """Run the rung twice with the SAME comment: comment_after_landing must
+    appear once, and the shipped probe must not re-run (the cursor already
+    advanced past this comment on the first pass)."""
+    from no_human.vcs.pr_watcher import PrComment
+    t = await _approval_task(store)
+    t.context["base_branch"] = "main"
+    await store.update_task(t)
+    dev = PrComment(author="dev", body="closing this — it landed as a local squash",
+                    created_at="2026-08-12T03:04:00Z")
+    events, calls = [], []
+
+    async def shipped(repo_path, branch, base):
+        calls.append((repo_path, branch, base))
+        return True
+
+    w = _watcher(store, state="CLOSED", shipped=shipped, comments=[dev], events=events)
+    assert await w._check_approval_pr_comments(t) != "resumed"
+    t2 = await store.get_task(t.id)
+    assert await w._check_approval_pr_comments(t2) is None
+    assert sum(1 for k, _ in events if k == "comment_after_landing") == 1
+    assert len(calls) == 1
+    assert t2.context.get("pr_comment_since") == "2026-08-12T03:04:00Z"
+
+
+async def _blocked_task(store, *, now, ref="org/repo#42"):
+    """A BLOCKED task parked on a pr_comment_on wake condition — the shape
+    _evaluate's pr_comment_on branch (not _check_approval_pr_comments)
+    actually reaches: the incident's own rung."""
+    t = Task.new("ci_gate", repo_path="/tmp/x")
+    t.context = {"pr_branch": "scratch/x", "base_branch": "main"}
+    await store.create_task(t)
+    t.blocker = {
+        "category": "DEPENDENCY_WAIT",
+        "wake_condition": f"pr_comment_on:{ref}",
+        "raised_at": now.isoformat(), "confidence": 0.9,
+    }
+    await store.update_task(t)
+    await store.set_status(t, TaskStatus.BLOCKED, validate=False)
+    return t
+
+
+async def test_the_evaluate_rung_never_resumes_a_closed_shipped_pr_comment(store):
+    """The incident's actual shape: _evaluate's pr_comment_on branch, not
+    just the AWAITING_APPROVAL poll rung."""
+    from no_human.vcs.pr_watcher import PrComment
+    now = datetime(2026, 8, 12, 3, 4, tzinfo=timezone.utc)
+    t = await _blocked_task(store, now=now)
+    comment = PrComment(author="dev", body="closing this — it landed as a local squash",
+                        created_at=now.isoformat())
+    events = []
+
+    async def pr_state(ref): return "CLOSED"
+    async def pr_shipped(repo_path, branch, base): return True
+    async def pr_comment(ref): return [comment]
+
+    w = WakeWatcher(store, {}, pr_state=pr_state, pr_shipped=pr_shipped,
+                    pr_comment=pr_comment,
+                    on_event=lambda k, txt: events.append((k, txt)))
+    out = await w._evaluate(t, now=now)
+    assert out is None
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.BLOCKED
+    assert any(k == "comment_after_landing" for k, _ in events)
+    assert not any(k == "resumed" for k, _ in events)
+    assert not any(k == "pr_feedback" for k, _ in events)
+
+
+async def test_the_evaluate_rung_still_resumes_on_a_closed_unshipped_pr_comment(store):
+    """Regression pin: a genuine reopen-and-rework comment must still wake
+    the task even though the PR itself is closed."""
+    from no_human.vcs.pr_watcher import PrComment
+    now = datetime(2026, 8, 12, 3, 4, tzinfo=timezone.utc)
+    t = await _blocked_task(store, now=now)
+    comment = PrComment(author="dev", body="please rework this before reopening",
+                        created_at=now.isoformat())
+
+    async def pr_state(ref): return "CLOSED"
+    async def pr_shipped(repo_path, branch, base): return False
+    async def pr_comment(ref): return [comment]
+
+    w = WakeWatcher(store, {}, pr_state=pr_state, pr_shipped=pr_shipped,
+                    pr_comment=pr_comment)
+    out = await w._evaluate(t, now=now)
+    assert out == "resumed"
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.IMPLEMENTING
+    assert ("please rework this before reopening"
+            in fresh.context["send_back_feedback"][-1]["message"])
+
+
+async def test_the_evaluate_rung_does_not_reprobe_after_confirming_shipped(store):
+    """Review finding 2026-08-12: without a throttle, a parked BLOCKED task
+    with landed content re-ran pr_state + pr_shipped and re-emitted
+    comment_after_landing on every tick while the operator's comment sat
+    there — the exact re-fire the incident showed, since condition_satisfied
+    re-satisfies on the same unresolved comment every tick."""
+    from no_human.vcs.pr_watcher import PrComment
+    now = datetime(2026, 8, 12, 3, 4, tzinfo=timezone.utc)
+    t = await _blocked_task(store, now=now)
+    comment = PrComment(author="dev", body="closing this — it landed as a local squash",
+                        created_at=now.isoformat())
+    state_calls, shipped_calls, events = [], [], []
+
+    async def pr_state(ref):
+        state_calls.append(ref)
+        return "CLOSED"
+
+    async def pr_shipped(repo_path, branch, base):
+        shipped_calls.append((repo_path, branch, base))
+        return True
+
+    async def pr_comment(ref): return [comment]
+
+    w = WakeWatcher(store, {}, pr_state=pr_state, pr_shipped=pr_shipped,
+                    pr_comment=pr_comment,
+                    on_event=lambda k, txt: events.append(k))
+    assert await w._evaluate(t, now=now) is None
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.BLOCKED
+    assert events.count("comment_after_landing") == 1
+    assert len(state_calls) == 1
+    assert len(shipped_calls) == 1
+
+    assert await w._evaluate(fresh, now=now) is None
+    assert (await store.get_task(t.id)).status is TaskStatus.BLOCKED
+    assert events.count("comment_after_landing") == 1
+    assert len(state_calls) == 1
+    assert len(shipped_calls) == 1
 
 
 # ---- the stuck-active watchdog --------------------------------------------- #
