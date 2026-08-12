@@ -559,12 +559,16 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
     "vcs/manifest_repair.py": {
         "exec:<dynamic>": Allowed(
             "the TARGET REPO's own `scripts/export_guard.py` (repo-controlled "
-            "content) run as `[sys.executable, <repo>/scripts/export_guard.py,"
-            " 'approve', <refused paths>]` — the manifest gate's documented "
-            "FIX, inside the task worktree, 120s timeout; the committed guard "
-            "rewrites RELEASE_MANIFEST.txt pins and dials nothing",
-            _ON + "the pipeline commit path, on exactly the manifest gate's "
-            "changed-pinned-files refusal (commit_with_manifest_repair)"),
+            "content), run in two shapes: PROACTIVELY as `[sys.executable, "
+            "<repo>/scripts/export_guard.py, 'approve', '--all', '--prune']` "
+            "before every commit attempt (300s timeout), and REACTIVELY as "
+            "`[sys.executable, <repo>/scripts/export_guard.py, 'approve', "
+            "<refused paths>]` — the manifest gate's documented FIX, inside "
+            "the task worktree (120s timeout); the committed guard rewrites "
+            "RELEASE_MANIFEST.txt pins and dials nothing",
+            _ON + "the pipeline commit path — proactively on every commit, "
+            "reactively on exactly the manifest gate's changed-pinned-files "
+            "refusal (commit_with_manifest_repair, approve_pending_pins)"),
     },
     "vcs/github.py": {
         "exec:gh": Allowed("your GitHub host — PR create/read",

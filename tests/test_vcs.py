@@ -1,5 +1,7 @@
 """Git ops + local PR-open path against a real bare repo. Never merges."""
 
+import hashlib
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -838,13 +840,23 @@ def test_parse_manifest_refusal_rejects_other_hook_failures():
 
 def _repo_with_manifest_gate(repo_with_bare_remote):
     """Wire the fixture repo with a refusing pre-commit hook + a stub
-    export_guard whose `approve` writes the manifest, satisfying the hook."""
+    export_guard whose `approve` writes the manifest, satisfying the hook.
+
+    The proactive `approve --all --prune` call (`approve_pending_pins`, run
+    before every commit attempt) also lands on this stub now. It is a total
+    no-op here — no ship-classification is configured in this fixture, so
+    it finds nothing to pin and leaves both RELEASE_MANIFEST.txt and
+    approve_called.txt untouched — which is exactly what keeps the four
+    tests below asserting the REACTIVE path's behaviour unmodified."""
     work = repo_with_bare_remote
     (work / "scripts").mkdir()
     (work / "scripts" / "export_guard.py").write_text(
         "import pathlib, sys\n"
         "assert sys.argv[1] == 'approve'\n"
         "root = pathlib.Path(__file__).resolve().parent.parent\n"
+        "(root / 'guard_calls.txt').open('a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if '--all' in sys.argv[2:]:\n"
+        "    sys.exit(0)\n"
         "(root / 'RELEASE_MANIFEST.txt').write_text('\\n'.join(sys.argv[2:]) + '\\n')\n"
         "(root / 'approve_called.txt').write_text(' '.join(sys.argv[2:]))\n"
     )
@@ -933,3 +945,359 @@ def test_a_second_refusal_after_repair_propagates(repo_with_bare_remote):
     (work / "w.py").write_text("w = 4\n")
     with pytest.raises(GitError, match="REFUSED"):
         commit_with_manifest_repair(repo, ["w.py"], "feat: w")
+
+
+# ---- proactive pin maintenance (task: export self-scan tests fail every -- #
+# in-progress worktree; the real incident, task 27e7352b: a brand-new
+# ship-classified file shipped with NO approval pin — the pre-commit gate
+# above never sees it (it only guards already-pinned files), so nothing
+# short of a proactive `approve --all --prune` before every commit attempt
+# catches it in time to land in the SAME commit.
+
+# scripts/export_guard.py's own real wording, reused verbatim so the stub's
+# refusal text is not a paraphrase a real caller would never actually see.
+_UNCLASSIFIED_REFUSAL = (
+    "approve: REFUSED — not ship-classified (classify each in "
+    "EXPORT_CLASSIFICATION.txt first):\n  {name}\n"
+)
+
+# Mirrors _cmd_approve's own three print lines exactly (scripts/export_guard.py):
+#   print(f"approved  {digest[:12]}  {rel} ({state})")
+#   print(f"pruned    {rel} (no longer ships)")
+#   print(f"REFUSED   {rel} — {n} scan hit(s); review, then re-run ...")
+_STUB_GUARD_ALL_SRC = """\
+import hashlib, json, pathlib, subprocess, sys
+
+root = pathlib.Path(__file__).resolve().parent.parent
+argv = sys.argv[1:]
+(root / "guard_calls.txt").open("a").write(" ".join(argv) + "\\n")
+assert argv and argv[0] == "approve"
+rest = argv[1:]
+
+if "--all" not in rest:
+    explicit = [a for a in rest if not a.startswith("--")]
+    (root / "RELEASE_MANIFEST.txt").write_text("\\n".join(explicit) + "\\n")
+    (root / "approve_called.txt").write_text(" ".join(explicit))
+    sys.exit(0)
+
+scenario_path = root / "_stub_scenario.json"
+scenario = json.loads(scenario_path.read_text()) if scenario_path.exists() else {}
+
+if scenario.get("unclassified"):
+    sys.stderr.write(
+        "approve: REFUSED \\u2014 not ship-classified (classify each in "
+        "EXPORT_CLASSIFICATION.txt first):\\n  " + scenario["unclassified"] + "\\n")
+    sys.exit(2)
+
+# Ship-set membership comes ONLY from `git ls-files` (tracked), exactly like
+# the real guard (scripts/export_guard.py:_tracked) — an untracked file is
+# invisible here too, which is what proves the caller staged it first.
+tracked = set(subprocess.run(
+    ["git", "ls-files"], cwd=root, capture_output=True, text=True
+).stdout.split())
+ship = [p for p in scenario.get("ship", []) if p in tracked]
+
+manifest_path = root / "RELEASE_MANIFEST.txt"
+pins = {}
+if manifest_path.exists():
+    for line in manifest_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            pins[parts[1]] = parts[0]
+
+refuse = set(scenario.get("refuse_scan", []))
+approved = []
+for rel in sorted(ship):
+    digest = hashlib.sha256((root / rel).read_bytes()).hexdigest()
+    if pins.get(rel) == digest:
+        continue
+    if rel in refuse:
+        print(f"REFUSED   {rel} \\u2014 1 scan hit(s); review, then re-run "
+              "with --acknowledge if every hit is a false positive:")
+        continue
+    pins[rel] = digest
+    approved.append(rel)
+    print(f"approved  {digest[:12]}  {rel} (new)")
+
+pruned = []
+if "--prune" in rest:
+    for stale in [p for p in list(pins) if p not in ship]:
+        del pins[stale]
+        pruned.append(stale)
+        print(f"pruned    {stale} (no longer ships)")
+
+if approved or pruned:
+    rows = "".join(f"{d}  {p}\\n" for p, d in sorted(pins.items()))
+    manifest_path.write_text(rows)
+
+if refuse & set(ship):
+    sys.exit(1)
+sys.exit(0)
+"""
+
+# A pre-commit hook that mirrors scripts/precommit_manifest_gate.py's own
+# narrow check (staged pinned file vs staged pin), not the crude
+# grep-for-"stale" hook above — this fixture needs the REAL distinction
+# between "a pin genuinely matches" and "it doesn't", which the crude hook
+# can't make (it would refuse or pass regardless of what actually changed).
+_HOOK_CHECK_SRC = """\
+import hashlib, subprocess, sys
+
+def staged_blob(rel):
+    r = subprocess.run(["git", "cat-file", "blob", ":" + rel], capture_output=True)
+    return r.stdout if r.returncode == 0 else None
+
+blob = staged_blob("RELEASE_MANIFEST.txt")
+pins = {}
+if blob:
+    for line in blob.decode().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            pins[parts[1]] = parts[0]
+
+staged = subprocess.run(
+    ["git", "diff", "--cached", "--name-only", "--diff-filter=AM"],
+    capture_output=True, text=True,
+).stdout.split()
+
+offenders = []
+for rel in staged:
+    if rel in pins:
+        b = staged_blob(rel)
+        if b is None:
+            continue
+        actual = hashlib.sha256(b).hexdigest()
+        if actual != pins[rel]:
+            offenders.append((rel, pins[rel], actual))
+
+if offenders:
+    sys.stderr.write("no_human pre-commit gate: REFUSED.\\n\\n")
+    sys.stderr.write(
+        "These staged file(s) are pinned in RELEASE_MANIFEST.txt, but their staged content does\\n"
+        "not match their pin \\u2014 the file changed and its manifest row did not,\\n"
+        "so this commit would ship a file the export ledger has not approved:\\n")
+    for rel, pinned, actual in offenders:
+        sys.stderr.write(f"  {rel}\\n")
+        sys.stderr.write(f"      pinned {pinned[:12]}\\u2026  staged {actual[:12]}\\u2026\\n")
+    sys.exit(1)
+sys.exit(0)
+"""
+
+
+def _repo_with_realistic_manifest_gate(
+    repo_with_bare_remote, *, ship=None, refuse_scan=None, unclassified=None,
+):
+    """A stub `export_guard.py` that supports BOTH invocation shapes
+    (`approve <paths>` reactive, `approve --all --prune` proactive) plus a
+    pre-commit hook that only refuses a genuine staged-pin mismatch."""
+    work = repo_with_bare_remote
+    (work / "scripts").mkdir()
+    (work / "scripts" / "export_guard.py").write_text(_STUB_GUARD_ALL_SRC)
+    (work / "RELEASE_MANIFEST.txt").write_text("")
+    scenario = {}
+    if ship is not None:
+        scenario["ship"] = list(ship)
+    if refuse_scan is not None:
+        scenario["refuse_scan"] = list(refuse_scan)
+    if unclassified is not None:
+        scenario["unclassified"] = unclassified
+    (work / "_stub_scenario.json").write_text(json.dumps(scenario))
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "gate fixture")
+    hook_py = work / ".git" / "hooks" / "_check_manifest.py"
+    hook_py.write_text(_HOOK_CHECK_SRC)
+    hook = work / ".git" / "hooks" / "pre-commit"
+    hook.write_text('#!/bin/sh\nexec python3 "$(dirname "$0")/_check_manifest.py"\n')
+    hook.chmod(0o755)
+    return work
+
+
+def test_a_changed_pinned_file_is_re_pinned_in_the_commit_itself(
+        repo_with_bare_remote):
+    """The real incident's sibling shape: an already-pinned file the coder
+    edits must be re-pinned IN the coder's own commit — proactively, never
+    by falling back to the reactive repair (which would mean the pre-commit
+    gate had to refuse first)."""
+    from no_human.vcs import commit_with_manifest_repair
+    work = _repo_with_realistic_manifest_gate(
+        repo_with_bare_remote, ship=["src/pkg/mod.py"])
+    (work / "src" / "pkg").mkdir(parents=True)
+    (work / "src" / "pkg" / "mod.py").write_text("y = 1\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "add mod")
+    old_digest = hashlib.sha256(b"y = 1\n").hexdigest()
+    (work / "RELEASE_MANIFEST.txt").write_text(f"{old_digest}  src/pkg/mod.py\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "pin mod")
+
+    repo = GitRepo(work, identity_name="agent", identity_email="a@x.y",
+                   never_push_to=[])
+    repo.create_branch("no-human/rt1", base="main")
+    (work / "src" / "pkg" / "mod.py").write_text("y = 2\n")
+    repairs = []
+    result = commit_with_manifest_repair(
+        repo, ["src/pkg/mod.py"], "feat: change",
+        on_repair=lambda p, note: repairs.append(p))
+
+    assert result.sha
+    assert repairs == [["src/pkg/mod.py"]]
+    committed = subprocess.run(
+        ["git", "show", "--name-only", "--format=", "HEAD"],
+        cwd=work, capture_output=True, text=True, check=True).stdout
+    assert "RELEASE_MANIFEST.txt" in committed
+    manifest_at_head = subprocess.run(
+        ["git", "show", "HEAD:RELEASE_MANIFEST.txt"],
+        cwd=work, capture_output=True, text=True, check=True).stdout
+    new_digest = hashlib.sha256(b"y = 2\n").hexdigest()
+    assert f"{new_digest}  src/pkg/mod.py" in manifest_at_head
+    # The reactive path never ran — the proactive pass already satisfied the
+    # pre-commit gate before `git commit` was even attempted.
+    assert not (work / "approve_called.txt").exists()
+
+
+def test_a_new_ship_classified_file_is_pinned_before_the_commit(
+        repo_with_bare_remote):
+    """The exact tests/test_pr_body_layout.py incident (task 27e7352b): a
+    brand-new ship-classified file must ship WITH a pin, in the same commit,
+    with no pre-commit refusal ever involved (a new file is not this gate's
+    job — check scripts/precommit_manifest_gate.py's own docstring)."""
+    from no_human.vcs import commit_with_manifest_repair
+    work = _repo_with_realistic_manifest_gate(
+        repo_with_bare_remote, ship=["src/new_thing.py"])
+    repo = GitRepo(work, identity_name="agent", identity_email="a@x.y",
+                   never_push_to=[])
+    repo.create_branch("no-human/rt2", base="main")
+    (work / "src").mkdir()
+    (work / "src" / "new_thing.py").write_text("NEW = True\n")
+
+    result = commit_with_manifest_repair(repo, ["src/new_thing.py"], "feat: new thing")
+
+    assert result.sha
+    manifest_at_head = subprocess.run(
+        ["git", "show", "HEAD:RELEASE_MANIFEST.txt"],
+        cwd=work, capture_output=True, text=True, check=True).stdout
+    digest = hashlib.sha256(b"NEW = True\n").hexdigest()
+    assert f"{digest}  src/new_thing.py" in manifest_at_head
+
+
+def test_a_partial_approval_on_refusal_still_reaches_on_repair(
+        repo_with_bare_remote):
+    """A single `--all` run can approve some files and refuse others in the
+    SAME invocation (the real guard writes the manifest for whatever
+    approved cleanly, then returns 1 for whatever it refused). That write
+    must never be silent: on_repair must fire for the file(s) that were
+    actually pinned, even though the run overall exits non-zero."""
+    from no_human.vcs import commit_with_manifest_repair
+    work = _repo_with_realistic_manifest_gate(
+        repo_with_bare_remote, ship=["clean.py", "leaky.py"],
+        refuse_scan=["leaky.py"])
+    repo = GitRepo(work, identity_name="agent", identity_email="a@x.y",
+                   never_push_to=[])
+    repo.create_branch("no-human/rt8", base="main")
+    (work / "clean.py").write_text("CLEAN = 1\n")
+    (work / "leaky.py").write_text("SECRET = 1\n")
+    repairs = []
+
+    result = commit_with_manifest_repair(
+        repo, ["clean.py", "leaky.py"], "feat: mixed",
+        on_repair=lambda p, note: repairs.append(p))
+
+    assert result.sha
+    manifest_at_head = subprocess.run(
+        ["git", "show", "HEAD:RELEASE_MANIFEST.txt"],
+        cwd=work, capture_output=True, text=True, check=True).stdout
+    clean_digest = hashlib.sha256(b"CLEAN = 1\n").hexdigest()
+    assert f"{clean_digest}  clean.py" in manifest_at_head
+    assert "leaky.py" not in manifest_at_head
+    # The partial write is reported, never silent (review finding: a prior
+    # version wrote the manifest on a non-zero exit without ever calling
+    # on_repair for what it actually approved).
+    assert repairs == [["clean.py"]]
+
+
+def test_a_scan_refusal_never_becomes_an_approval(repo_with_bare_remote, caplog):
+    """A planted leak/mismatch must still be refused — the proactive pass
+    approving OTHER files in the same run must never launder this one in."""
+    from no_human.vcs import commit_with_manifest_repair
+    work = _repo_with_realistic_manifest_gate(
+        repo_with_bare_remote, ship=["x.py"], refuse_scan=["x.py"])
+    repo = GitRepo(work, identity_name="agent", identity_email="a@x.y",
+                   never_push_to=[])
+    repo.create_branch("no-human/rt3", base="main")
+    (work / "x.py").write_text("SECRET = 1\n")
+    repairs = []
+
+    with caplog.at_level("WARNING"):
+        result = commit_with_manifest_repair(
+            repo, ["x.py"], "feat: x",
+            on_repair=lambda p, note: repairs.append((p, note)))
+
+    assert result.sha
+    manifest_at_head = subprocess.run(
+        ["git", "show", "HEAD:RELEASE_MANIFEST.txt"],
+        cwd=work, capture_output=True, text=True, check=True).stdout
+    assert "x.py" not in manifest_at_head
+    assert repairs == []  # nothing was actually approved -> no ledger entry
+    assert any("scan hit" in r.message for r in caplog.records)
+
+
+def test_an_unclassified_file_refusal_is_reported_and_never_repaired(
+        repo_with_bare_remote, caplog):
+    """An unclassified refusal must never be silently patched over — the
+    manifest stays exactly as it was, and the FIX text reaches the log."""
+    from no_human.vcs import commit_with_manifest_repair
+    work = _repo_with_realistic_manifest_gate(
+        repo_with_bare_remote, unclassified="bogus.py")
+    repo = GitRepo(work, identity_name="agent", identity_email="a@x.y",
+                   never_push_to=[])
+    repo.create_branch("no-human/rt4", base="main")
+    (work / "bogus.py").write_text("z = 1\n")
+    manifest_before = (work / "RELEASE_MANIFEST.txt").read_text()
+    repairs = []
+
+    with caplog.at_level("WARNING"):
+        result = commit_with_manifest_repair(
+            repo, ["bogus.py"], "feat: bogus",
+            on_repair=lambda p, note: repairs.append((p, note)))
+
+    assert result.sha
+    manifest_at_head = subprocess.run(
+        ["git", "show", "HEAD:RELEASE_MANIFEST.txt"],
+        cwd=work, capture_output=True, text=True, check=True).stdout
+    assert manifest_at_head == manifest_before
+    assert repairs == []
+    assert any("not ship-classified" in r.message for r in caplog.records)
+
+
+def test_approve_is_never_invoked_with_acknowledge(repo_with_bare_remote):
+    from no_human.vcs import commit_with_manifest_repair
+    work = _repo_with_realistic_manifest_gate(repo_with_bare_remote, ship=["a.py"])
+    repo = GitRepo(work, identity_name="agent", identity_email="a@x.y",
+                   never_push_to=[])
+    repo.create_branch("no-human/rt5", base="main")
+    (work / "a.py").write_text("a = 1\n")
+
+    commit_with_manifest_repair(repo, ["a.py"], "feat: a")
+
+    calls = (work / "guard_calls.txt").read_text()
+    assert "--acknowledge" not in calls
+
+
+def test_a_repo_without_the_export_guard_spawns_nothing(repo_with_bare_remote):
+    from no_human.vcs import commit_with_manifest_repair
+    work = repo_with_bare_remote
+    repo = GitRepo(work, identity_name="agent", identity_email="a@x.y",
+                   never_push_to=[])
+    repo.create_branch("no-human/rt6", base="main")
+    (work / "q.py").write_text("q = 1\n")
+
+    result = commit_with_manifest_repair(repo, ["q.py"], "feat: q")
+
+    assert result.sha
+    assert not (work / "guard_calls.txt").exists()
