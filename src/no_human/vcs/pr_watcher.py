@@ -708,6 +708,78 @@ async def default_ci_log_excerpt(link: str) -> str:
     return "\n".join(lines[-15:])[:2000]
 
 
+async def default_ci_annotations(ref: str, check_name: str = "") -> str:
+    """Check-run ANNOTATION text for the PR head's failing GitHub check(s), or "".
+
+    A job GitHub blocks at START (billing wall — "recent account payments
+    have failed" / "spending limit needs to be increased") never runs, so the
+    job-LOG API (`default_ci_log_excerpt`'s Jenkins consoleText fetch) returns
+    NOTHING for it: the failure text lives only in the check-run annotation
+    (verified live via `gh api repos/<owner>/<repo>/check-runs/<id>/annotations`
+    on PRs #171/#183, 2026-08-11/12 outage). GitHub/GHE only, mirroring
+    `_gh_repo_and_number`: GitLab and Jenkins-reported commit statuses (no
+    check-run id) return "".
+
+    `_gh_repo_and_number` returns a HOST-PREFIXED repo arg
+    (``host/owner/repo``, what every real ``pr_watch`` URL resolves to) meant
+    for `gh`'s own `--repo` flag, which accepts that form. `gh api` does NOT:
+    it takes a bare REST path (`repos/owner/repo/...`) and the host separately
+    via `--hostname` — so the prefix is split off here the same way
+    `upsert_agent_comment`'s GitHub branch already does.
+
+    Best-effort by design, same contract as `default_ci_log_excerpt`: gh
+    missing, unparseable ref, or any API/permission failure returns "".
+    """
+    if not shutil.which("gh"):
+        return ""
+    target = _gh_repo_and_number(ref)
+    if not target:
+        return ""
+    repo_arg, _num_str = target
+    host, _, slug = repo_arg.partition("/")
+    hostarg = ["--hostname", host] if host else []
+    sha = await default_pr_head(ref)
+    if not sha:
+        return ""
+    out = await _run_cli([
+        "gh", "api", *hostarg, f"repos/{slug}/commits/{sha}/check-runs",
+    ])
+    if not out:
+        return ""
+    try:
+        runs = json.loads(out).get("check_runs") or []
+    except json.JSONDecodeError:
+        return ""
+    texts: list[str] = []
+    for run in runs:
+        conclusion = str(run.get("conclusion") or "").lower()
+        if conclusion not in ("failure", "timed_out", "cancelled", "action_required"):
+            continue
+        if check_name and run.get("name") != check_name:
+            continue
+        run_id = run.get("id")
+        if not run_id:
+            continue
+        # Read-only, additive, idempotent — repeated calls change nothing.
+        # Paginated (default 30/page) but left unpaginated: the billing
+        # annotation is the only one on a never-started job, so one page
+        # always covers it.
+        ann_out = await _run_cli([
+            "gh", "api", *hostarg,
+            f"repos/{slug}/check-runs/{run_id}/annotations",
+        ])
+        if not ann_out:
+            continue
+        try:
+            for a in json.loads(ann_out):
+                text = f"{a.get('title', '')}\n{a.get('message', '')}".strip()
+                if text:
+                    texts.append(text)
+        except json.JSONDecodeError:
+            continue
+    return "\n".join(texts)[:2000]
+
+
 # `start_new_session` is POSIX-only and Windows rejects it outright, so it is
 # read through a constant rather than passed inline (same shape as
 # `testing.runner._NEW_GROUP_KWARGS`, kept local so `vcs` does not import

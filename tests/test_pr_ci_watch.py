@@ -30,11 +30,12 @@ async def _approval_task(store, url="https://code.example.com/dev/x/pull/7004"):
     return t
 
 
-def _watcher(store, *, state="OPEN", checks=None, log="", events=None, comments=None,
-             ignore_authors=None, shipped=None):
+def _watcher(store, *, state="OPEN", checks=None, log="", annotations="",
+             events=None, comments=None, ignore_authors=None, shipped=None):
     async def pr_state(url): return state
     async def pr_checks(url): return checks or []
     async def ci_log(link): return log
+    async def ci_annotations(url, name=""): return annotations
     async def pr_comment(url): return comments or []
     # The ignore list is CONFIGURED here rather than inherited from a default.
     # It used to ship naming a real CI service account, which meant a test
@@ -43,6 +44,7 @@ def _watcher(store, *, state="OPEN", checks=None, log="", events=None, comments=
     cfg = {"blockers": {"ignore_comment_authors": ignore_authors}} if ignore_authors else {}
     return WakeWatcher(
         store, cfg, pr_state=pr_state, pr_checks=pr_checks, ci_log=ci_log,
+        ci_annotations=ci_annotations,
         pr_comment=pr_comment,
         # `shipped` is itself the pr_shipped(repo_path, branch, base) async
         # callable, or None to leave the checker unwired — matching every
@@ -557,6 +559,53 @@ async def test_the_infra_signature_is_one_full_sentence_not_a_prefix(store):
     assert not _CI_INFRA_RE.search(
         "FAILED tests/test_billing.py::test_dunning - recent account payments have failed"
     )
+
+
+async def test_empty_log_with_billing_annotation_is_infra_not_a_round(store):
+    """A job GitHub blocks at START never produces a log at all — the billing
+    text lives only in the check-run ANNOTATION (verified via `gh api
+    .../check-runs/<id>/annotations` on PRs #171/#183). The empty-log-only
+    classifier can never fire for exactly the failure class it exists for;
+    the annotation channel must be tried and must classify it INFRA."""
+    t = await _approval_task(store)
+    events = []
+    w = _watcher(store, checks=[FAIL_CHECK], log="", annotations=_BILLING_LOG,
+                 events=events)
+    assert await w._check_open_pr(t) is None
+    fresh = await store.get_task(t.id)
+    assert fresh.status is TaskStatus.AWAITING_APPROVAL
+    assert not (fresh.context or {}).get("pr_ci_rounds")
+    assert "pr_ci_last_sig" not in (fresh.context or {})
+    assert "send_back_feedback" not in (fresh.context or {})
+    assert any(k == "pr_ci_infra" for k, _ in events)
+    assert not any(k in ("escalated_ci", "pr_ci_red") for k, _ in events)
+
+
+async def test_no_annotation_and_no_log_is_still_a_real_round(store):
+    """Fail-closed regression pin: an empty log AND an empty annotation must
+    still be treated as a real failure — infra is never assumed."""
+    t = await _approval_task(store)
+    events = []
+    w = _watcher(store, checks=[FAIL_CHECK], log="", annotations="", events=events)
+    assert await w._check_open_pr(t) == "resumed"
+    fresh = await store.get_task(t.id)
+    assert fresh.context["pr_ci_rounds"] == 1
+    assert fresh.context["send_back_feedback"][-1]["source"] == "pr_ci"
+    assert any(k == "pr_ci_red" for k, _ in events)
+
+
+async def test_empty_log_with_non_infra_annotation_is_a_real_round(store):
+    """Narrowness pin (intake decision): a non-matching annotation must NOT be
+    treated as infra — only the specific billing/payment wording counts."""
+    t = await _approval_task(store)
+    events = []
+    w = _watcher(store, checks=[FAIL_CHECK], log="", annotations="ERROR: test_foo failed",
+                 events=events)
+    assert await w._check_open_pr(t) == "resumed"
+    fresh = await store.get_task(t.id)
+    assert fresh.context["pr_ci_rounds"] == 1
+    assert fresh.context["send_back_feedback"][-1]["source"] == "pr_ci"
+    assert any(k == "pr_ci_red" for k, _ in events)
 
 
 async def test_advisory_policy_records_the_red_but_never_acts(store):

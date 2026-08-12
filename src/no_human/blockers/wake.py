@@ -61,13 +61,13 @@ _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 # because…") also appear in unrelated failures and in pytest echoes of this
 # very corpus, and a match here SUPPRESSES reporting — overmatching is the
 # dangerous direction. An unrecognized failure is always treated as real.
-# REACH (review finding, 2026-08-12): this classifier reads the ci_log
-# excerpt, and the only production ci_log is the Jenkins consoleText
-# fetcher — GitHub Actions exposes this text ONLY via the check-run
-# annotation, which nothing fetches yet. So today this fires for
-# log-yielding forges only; ticket 8c8b36b5 wires the annotation channel.
-# Until it lands, blockers.pr_ci_policy=advisory is the operational cover
-# for GitHub-hosted checks.
+# A job GitHub blocks at START (billing wall) never runs, so the job-LOG API
+# (the Jenkins consoleText fetcher) returns NOTHING for it — the failure text
+# lives only in the check-run ANNOTATION (verified via `gh api
+# .../check-runs/<id>/annotations` on PRs #171/#183, 2026-08-11/12 outage).
+# `_check_pr_ci` below matches this regex over BOTH channels (ticket
+# 8c8b36b5). blockers.pr_ci_policy=advisory remains the operator's cover for
+# GitHub-hosted checks this doesn't (yet) positively classify.
 _CI_INFRA_RE = re.compile(
     r"(?i)recent account payments have failed or your "
     r"spending limit needs to be increased"
@@ -113,6 +113,7 @@ class WakeWatcher:
         pr_checks: Callable[[str], Awaitable[list[dict]]] | None = None,
         pr_mergeable: Callable[[str], Awaitable[dict]] | None = None,
         ci_log: Callable[[str], Awaitable[str]] | None = None,
+        ci_annotations: Callable[[str, str], Awaitable[str]] | None = None,
         pr_shipped: PrShippedChecker | None = None,
         on_event: Callable[[str, str], None] | None = None,
         ci_gate_gate: Any = None,
@@ -193,6 +194,7 @@ class WakeWatcher:
         self._pr_checks = pr_checks
         self._pr_mergeable = pr_mergeable
         self._ci_log = ci_log
+        self._ci_annotations = ci_annotations
         self._pr_shipped = pr_shipped
         self._on_event = on_event or (lambda kind, text: None)
         # The post-PR CI_GATE integration gate (M6). Injectable for tests;
@@ -1301,19 +1303,31 @@ class WakeWatcher:
                 excerpt = await self._ci_log(failing[0]["link"])
             except Exception:  # noqa: BLE001 — the log is a bonus, not a dependency
                 excerpt = ""
-        # The log fetch above is a network await — re-verify terminal-ness
+        annotation = ""
+        if not excerpt and self._ci_annotations is not None:
+            # A job blocked at START never produces a log at all (see
+            # `_CI_INFRA_RE` above), so the annotation channel is only worth
+            # trying when the log came back empty — a log that DID come back
+            # already carries whatever text there is to classify.
+            try:
+                annotation = await self._ci_annotations(
+                    url, failing[0].get("name", ""))
+            except Exception:  # noqa: BLE001 — evidence is a bonus, not a dependency
+                annotation = ""
+        # Both fetches above are network awaits — re-verify terminal-ness
         # before ANY write in this rung (SCRUM-68; the round counter, the
         # escalation, and the resume below all mutate the task).
         if await self._is_terminal(task):
             return None
-        if excerpt and _CI_INFRA_RE.search(excerpt):
+        if _CI_INFRA_RE.search(excerpt) or _CI_INFRA_RE.search(annotation):
             # The run failed at the platform layer (billing / runner
             # provisioning), so it says nothing about the code: no fix round,
             # no send-back, no escalation. pr_ci_last_sig stays unset so a
             # later healthy build is evaluated fresh; pr_ci_infra_sig (its own
-            # key, checked above) makes re-polling this build free. An EMPTY
-            # or unreadable excerpt falls through to the real-failure path —
-            # infra must be positively identified, never assumed (fail closed).
+            # key, checked above) makes re-polling this build free. An empty
+            # log AND a missing/non-matching annotation falls through to the
+            # real-failure path — infra must be positively identified on
+            # EITHER channel, never assumed (fail closed).
             task.context = await self.store.merge_context(
                 task.id, {"pr_ci_infra_sig": signature})
             await self._emit(
@@ -1335,7 +1349,7 @@ class WakeWatcher:
                 f"round(s). Failing: {names}. Advise, or take over?"
             )
             data["root_cause_hypothesis"] = f"PR CI failing: {names}"
-            data["evidence"] = (excerpt or failing[0].get("link", ""))[:1500]
+            data["evidence"] = (excerpt or annotation or failing[0].get("link", ""))[:1500]
             task.blocker = data
             await self.store.update_task_columns(task)
             await self.store.set_status(task, TaskStatus.ESCALATED, validate=False)
@@ -1348,7 +1362,8 @@ class WakeWatcher:
         message = (
             f"The PR's CI is failing. Check(s): {names}.\n"
             f"Link: {failing[0].get('link', '')}\n"
-            + (f"Log excerpt:\n```\n{excerpt}\n```\n" if excerpt else "")
+            + (f"Log excerpt:\n```\n{excerpt}\n```\n" if excerpt
+               else f"Annotation:\n```\n{annotation}\n```\n" if annotation else "")
             + "Fix the cause on the same branch; the push updates the PR and "
               "re-runs the checks."
         )

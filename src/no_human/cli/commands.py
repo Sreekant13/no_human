@@ -2923,9 +2923,9 @@ def wake(loop):
     config, _ = _bootstrap(require_auth=False)
     from ..blockers import WakeWatcher, parse_duration
     from ..vcs.pr_watcher import (
-        check_pr_comments, default_branch_shipped, default_ci_log_excerpt,
-        default_pr_checks, default_pr_merged, default_pr_mergeable,
-        default_pr_state,
+        check_pr_comments, default_branch_shipped, default_ci_annotations,
+        default_ci_log_excerpt, default_pr_checks, default_pr_merged,
+        default_pr_mergeable, default_pr_state,
     )
 
     async def _tick_once(store):
@@ -2935,6 +2935,7 @@ def wake(loop):
             pr_state=default_pr_state, pr_checks=default_pr_checks,
             pr_mergeable=default_pr_mergeable,
             ci_log=default_ci_log_excerpt,
+            ci_annotations=default_ci_annotations,
             pr_shipped=default_branch_shipped,
             on_event=lambda kind, text: console.print(f"[blue]● {kind}[/] {text}"),
         )
@@ -3079,9 +3080,9 @@ def serve(max_workers, until_empty):
     async def _go() -> int:
         async with Store(config.db_path) as store:
             from ..vcs.pr_watcher import (
-        check_pr_comments, default_branch_shipped, default_ci_log_excerpt,
-        default_pr_checks, default_pr_merged, default_pr_mergeable,
-        default_pr_state,
+        check_pr_comments, default_branch_shipped, default_ci_annotations,
+        default_ci_log_excerpt, default_pr_checks, default_pr_merged,
+        default_pr_mergeable, default_pr_state,
     )
             watcher = WakeWatcher(
                 store, config.data,
@@ -3089,6 +3090,7 @@ def serve(max_workers, until_empty):
             pr_state=default_pr_state, pr_checks=default_pr_checks,
             pr_mergeable=default_pr_mergeable,
             ci_log=default_ci_log_excerpt,
+            ci_annotations=default_ci_annotations,
             pr_shipped=default_branch_shipped,
                 on_event=lambda k, t: console.print(f"[blue]● {k}[/] {t}"))
             # PR-E: periodic re-analysis job (EVOLUTION_PLAN Phase 9).

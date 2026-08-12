@@ -971,3 +971,55 @@ async def test_a_divergence_inside_max_park_still_stays_parked(store):
     actions = await watcher.tick(now=now)
     assert actions == [] or all(a[1] == "wake_tick" for a in actions), actions
     assert (await store.get_task(t.id)).status == TaskStatus.BLOCKED
+
+
+async def test_default_ci_annotations_hits_the_check_runs_rest_path_with_hostname(monkeypatch):
+    """BLOCKING review finding (2026-08-12): `_gh_repo_and_number` returns a
+    HOST-PREFIXED repo arg meant for `gh`'s `--repo` flag; `gh api`, unlike
+    `gh pr view --repo`, does NOT accept that prefix in the REST path —
+    interpolating it straight in 404s on every real PR. The host must be
+    split off and passed via `--hostname` instead (the same split
+    `upsert_agent_comment`'s GitHub branch already uses)."""
+    from no_human.vcs import pr_watcher as pw
+
+    calls: list[list[str]] = []
+
+    async def fake_run_cli(cmd):
+        calls.append(cmd)
+        if cmd[1:3] == ["pr", "view"]:
+            return json.dumps({"headRefOid": "deadbeef"})
+        if cmd[1] == "api":
+            path = cmd[-1]
+            if path.endswith("/annotations"):
+                return json.dumps([{
+                    "title": "build",
+                    "message": (
+                        "The job was not started because recent account "
+                        "payments have failed or your spending limit needs "
+                        "to be increased."
+                    ),
+                }])
+            if path.endswith("/check-runs"):
+                return json.dumps({"check_runs": [
+                    {"id": 999, "conclusion": "action_required", "name": "build"},
+                ]})
+        return None
+
+    monkeypatch.setattr(pw, "_run_cli", fake_run_cli)
+    monkeypatch.setattr(pw.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    result = await pw.default_ci_annotations(
+        "https://code.example.com/dev/x/pull/7004", "build")
+    assert "spending limit needs to be increased" in result
+
+    api_calls = [c for c in calls if c[1] == "api"]
+    assert len(api_calls) == 2, calls
+    for c in api_calls:
+        assert "--hostname" in c, c
+        assert c[c.index("--hostname") + 1] == "code.example.com"
+        # No host segment leaked into the REST path itself (the exact 404).
+        assert not c[-1].startswith("code.example.com/")
+    check_runs_call = next(c for c in api_calls if c[-1].endswith("/check-runs"))
+    assert check_runs_call[-1] == "repos/dev/x/commits/deadbeef/check-runs"
+    annotations_call = next(c for c in api_calls if c[-1].endswith("/annotations"))
+    assert annotations_call[-1] == "repos/dev/x/check-runs/999/annotations"
