@@ -1559,6 +1559,26 @@ class Store:
         )
         return dict(row) if row else None
 
+    async def latest_attempt_pr_url(self, task_id: str) -> str:
+        """The newest non-empty ``attempts.pr_url`` for *task_id*, or ``""``.
+
+        Ordered ``started_at DESC, rowid DESC`` — NOT ``attempt_number`` — for
+        the exact reason `latest_open_attempt` above documents: the live DB
+        holds rows where a lower attempt_number was inserted AFTER a higher
+        one, and rows tied at one number whose order SQLite does not define.
+        ``attempt_number`` answers "which attempt is this", not "which
+        happened most recently"; recency is what "inherit the PR from the run
+        that actually opened one" needs. ``NULL`` and ``''`` are both treated
+        as absent (``COALESCE(TRIM(pr_url), '')  <> ''``).
+        """
+        row = await self._fetchone(
+            "SELECT pr_url FROM attempts WHERE task_id = ? "
+            "AND COALESCE(TRIM(pr_url), '') <> '' "
+            "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            (task_id,),
+        )
+        return str(row[0]).strip() if row else ""
+
     @serialized_write
     async def close_open_attempts(self, task_id: str) -> None:
         """Retire every ``in_progress`` row of *task_id* — the caller has just

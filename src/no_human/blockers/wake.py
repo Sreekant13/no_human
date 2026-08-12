@@ -26,6 +26,7 @@ from typing import Any, Awaitable, Callable
 from ..core.db import Store
 from ..core.task import Task, TaskStatus
 from ..vcs.pr_outcome import observe_pr
+from ..vcs.task_pr import resolve_task_pr
 from .taxonomy import Blocker, resume_checkpoint, resume_provenance
 
 log = logging.getLogger("no_human.wake")
@@ -722,7 +723,7 @@ class WakeWatcher:
 
     async def _complete_if_content_landed(
         self, task: Task, url: str, *, forge_state: str, action: str,
-        situation: str,
+        situation: str, branch: str | None = None,
     ) -> str | None:
         """THE completion path for "this branch's content is already on base".
 
@@ -768,7 +769,12 @@ class WakeWatcher:
         if self._pr_shipped is None:
             return None
         ctx = task.context or {}
-        branch = ctx.get("pr_branch")
+        # `branch` is the resolver's answer (task_pr.resolve_task_pr) when the
+        # caller has one — it may be an inherited attempt's or a draft's
+        # branch, not `ctx["pr_branch"]`. Falling back to `ctx["pr_branch"]`
+        # keeps every caller that predates the resolver working unchanged.
+        if branch is None:
+            branch = ctx.get("pr_branch")
         base = ctx.get("base_branch")
         if not task.repo_path or not branch:
             return None
@@ -851,10 +857,13 @@ class WakeWatcher:
            the CI pipeline definition failed to compile on the server while
            every local check passed, and nothing was watching.
         """
-        ctx = task.context or {}
-        url = ctx.get("pr_watch")
+        pr = await resolve_task_pr(self.store, task)
+        url = pr.url
         if not url:
             return None
+        if pr.source != "pr_watch":
+            log.info("task %s: PR resolved from %s: %s",
+                     task.id[:8], pr.source, url)
 
         state = ""
         if self._pr_state is not None:
@@ -912,7 +921,7 @@ class WakeWatcher:
             # asserted that was not observed.
             landed = await self._complete_if_content_landed(
                 task, url, forge_state=state, action="shipped_pr_closed",
-                situation="PR closed")
+                situation="PR closed", branch=pr.branch)
             if landed == _TICK_ABORTED:
                 return None
             if landed:
@@ -948,10 +957,10 @@ class WakeWatcher:
         # previous refresh measured stays.
         await observe_pr(self.store, task.id, url, forge_state=state)
 
-        acted = await self._check_pr_conflict(task, url, state)
+        acted = await self._check_pr_conflict(task, url, state, branch=pr.branch)
         if acted:
             return acted
-        acted = await self._check_approval_pr_comments(task)
+        acted = await self._check_approval_pr_comments(task, pr=pr)
         if acted:
             return acted
         acted = await self._check_pr_ci(task, url)
@@ -963,7 +972,8 @@ class WakeWatcher:
         return await self._check_ci_gate_integration(task, url)
 
     async def _check_pr_conflict(self, task: Task, url: str,
-                                 forge_state: str = "") -> str | None:
+                                 forge_state: str = "", *,
+                                 branch: str | None = None) -> str | None:
         """Rung 3 (SCRUM-41): a textual conflict with main is invisible to CI
         (branch checks only run the PR's own branch) — this rung is the only
         one that polls `gh pr view --json mergeable,mergeStateStatus` directly.
@@ -1035,7 +1045,7 @@ class WakeWatcher:
         # re-run until the coder is done.
         landed = await self._complete_if_content_landed(
             task, url, forge_state=forge_state, action="shipped_pr_conflict",
-            situation="PR CONFLICTING (no rebase round needed)")
+            situation="PR CONFLICTING (no rebase round needed)", branch=branch)
         if landed == _TICK_ABORTED:
             return None
         if landed:
@@ -1332,16 +1342,27 @@ class WakeWatcher:
         )
         return outcome, await self._resume(task)
 
-    async def _check_approval_pr_comments(self, task: Task) -> str | None:
+    async def _check_approval_pr_comments(
+        self, task: Task, *, pr: Any = None,
+    ) -> str | None:
         """Poll an awaiting-approval PR for NEW human comments (B4).
 
         Uses a per-task ``pr_comment_since`` cursor so the same comment never
         triggers a second revision. On new comments: inject them, advance the
         cursor, and either resume the task to revise or — past the revision cap —
         escalate to the human. Never times out.
+
+        ``pr``, when given, is the caller's already-resolved
+        ``task_pr.resolve_task_pr`` result (``_check_open_pr`` computes one
+        per tick and passes it down so every rung agrees on one URL). When
+        omitted — direct calls, including existing tests — this resolves its
+        own, which degrades to the old ``ctx["pr_watch"]``-only behaviour for
+        any task that has one.
         """
         ctx = task.context or {}
-        url = ctx.get("pr_watch")
+        if pr is None:
+            pr = await resolve_task_pr(self.store, task)
+        url = pr.url
         if not url or self._pr_comment is None:
             return None
         try:

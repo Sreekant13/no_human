@@ -94,6 +94,7 @@ from ..vcs import (
 )
 from ..vcs import pr_watcher
 from ..vcs.receipts import verify_pr_receipt
+from ..vcs.task_pr import resolve_task_pr
 from . import plan_gate
 from .bounds import Bounds, QuotaExhausted, StuckDetector
 from .complexity import is_trivial as _is_trivial
@@ -5606,6 +5607,18 @@ class Orchestrator:
             attempt_id, review_checklist=decision.as_dict(), review_passed=1,
             status="succeeded",
         )
+        # This attempt opened no PR of its own (it is a zero-diff claim), but
+        # the task may already have one from an earlier attempt or a draft —
+        # backfill it onto this row for the audit trail, so a resumed task
+        # never strands the watcher on an attempt whose pr_url reads empty
+        # while an earlier one carries the real URL. Best-effort: an audit
+        # backfill must never fail an attempt that otherwise succeeded.
+        try:
+            pr = await resolve_task_pr(self.store, task)
+            if pr.url:
+                await self.store.update_attempt(attempt_id, pr_url=pr.url)
+        except Exception as exc:  # noqa: BLE001 — never fail the attempt on a backfill error
+            log.warning("task %s: PR backfill failed: %s", task.id[:8], exc)
         task.context = await self.store.merge_context(
             task.id, {"already_satisfied_report": claim})
         await self.store.set_status(task, TaskStatus.AWAITING_APPROVAL, validate=False)
