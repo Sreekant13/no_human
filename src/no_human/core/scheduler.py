@@ -28,7 +28,9 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from ..agent.worker_context import WorkerContext, set_worker_context
+from ..blockers.shipped import _TICK_ABORTED, complete_if_content_landed
 from ..config import parallelism_enabled, worktree_isolation_enabled
+from ..vcs.task_pr import resolve_task_pr
 from .db import Store
 from . import plan_gate
 from .events import EventPersister
@@ -391,6 +393,66 @@ class Scheduler:
     # costs little, while a live out-of-process run's longest silent stretch
     # (a full-suite pytest inside review) must fit under it.
     _STRANDED_GRACE_S = 900.0
+
+    async def _is_terminal_row(self, task) -> bool:
+        """Re-read the live row; terminal = DONE, or FAILED with a cancel
+        reason (there is no separate 'cancelled' status). Mirrors
+        `blockers.wake.WakeWatcher._is_terminal` — the shared shipped-check
+        below requires a callable, and the scheduler must not import the
+        watcher class just to reuse its terminal check."""
+        current = await self.store.get_task(task.id)
+        if current is None:
+            return False
+        if current.status == TaskStatus.DONE:
+            return True
+        return current.status == TaskStatus.FAILED and bool(
+            (current.context or {}).get("cancel_reason"))
+
+    async def _shipped_before_dispatch(self, task) -> bool:
+        """True when the task's work is already on its base — completed here
+        instead of burning a fresh attempt. False on EVERY ambiguity: no probe
+        wired, no recorded base/PR, probe error, or content genuinely absent.
+        Fail open to dispatching a fresh attempt, never to silent completion.
+
+        This is the fix for the live incident: a restart's resume/orphan
+        machinery used to decide from task STATUS alone, so a task whose PR
+        had already closed-landed still got a fresh `attempt 1/3` ~20 minutes
+        later. The check here is the SAME shared function
+        (`blockers.shipped.complete_if_content_landed`) the `pr_closed` rung
+        uses — one check, both callers, not a copy.
+        """
+        probe = getattr(self.wake, "pr_shipped", None)
+        if probe is None:
+            return False
+        ctx = task.context or {}
+        if not ctx.get("base_branch") or not task.repo_path:
+            # Cheap pre-filter: never spawn git for a task with no PR history.
+            return False
+        try:
+            pr = await resolve_task_pr(self.store, task)
+            if not pr.url:
+                return False
+            res = await complete_if_content_landed(
+                self.store, task, pr.url,
+                pr_shipped=probe, is_terminal=self._is_terminal_row,
+                on_event=self._on_event, forge_state="",
+                action="shipped_before_resume",
+                situation="a resumed attempt was about to start",
+                branch=pr.branch or None,
+            )
+        except Exception as exc:  # noqa: BLE001 — the gate must never block dispatch
+            log.warning("shipped-before-dispatch check failed for %s: %s",
+                        task.id[:8], exc)
+            return False
+        if res is _TICK_ABORTED:
+            log.info("task %s went terminal while the shipped check ran — "
+                      "skipping dispatch without rewriting it", task.id[:8])
+            return True
+        if res is None:
+            return False
+        log.info("task %s: content already on %s — completed instead of "
+                  "dispatching attempt 1", task.id[:8], ctx.get("base_branch"))
+        return True
 
     async def _reconcile_terminal_task_attempts(self) -> None:
         """Startup-only: retire attempt rows left open on tasks that finished.
@@ -877,6 +939,8 @@ class Scheduler:
         claimable = await self._claimable()
         self._last_claimable_count = len(claimable)
         for task in claimable[:slots]:
+            if await self._shipped_before_dispatch(task):
+                continue                          # completed; no attempt starts
             self._inflight.add(task.id)          # reserve BEFORE scheduling
             asyncio.ensure_future(self._run(task))
             started.append(task.id)

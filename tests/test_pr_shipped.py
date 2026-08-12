@@ -1252,3 +1252,33 @@ async def test_an_unparseable_conflict_section_is_cannot_tell(tmp_path, monkeypa
 
     monkeypatch.setattr(pr_watcher, "_git_rc", fake_git)
     assert await default_branch_shipped(str(repo), "feature", "main") is False
+
+
+async def test_wake_delegates_to_shared_shipped_helper(tmp_path, store, monkeypatch):
+    """One check, both callers (the resume/restart dispatch gate in
+    `core/scheduler.py` is the other). `_complete_if_content_landed` must be a
+    thin delegate to `blockers.shipped.complete_if_content_landed` — never a
+    re-implementation the scheduler's copy can drift from — so driving the
+    existing CLOSED rung here must call through the SAME module-level
+    function `wake.py` binds as `_complete_landed`."""
+    from no_human.blockers import wake as wake_module
+
+    repo = _squash_merge_repo(tmp_path)
+    t = await _approval_task(store, repo)
+    calls = []
+    real = wake_module._complete_landed
+
+    async def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(wake_module, "_complete_landed", spy)
+
+    async def pr_state(url):
+        return "CLOSED"
+
+    w = WakeWatcher(store, {}, pr_state=pr_state, pr_shipped=default_branch_shipped)
+    out = await w._check_open_pr(t)
+
+    assert out == "shipped_pr_closed"
+    assert len(calls) == 1, "the CLOSED rung must call the shared helper, not a copy"

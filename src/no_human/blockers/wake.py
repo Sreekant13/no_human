@@ -27,8 +27,8 @@ from typing import Any, Awaitable, Callable
 from ..core.db import Store
 from ..core.task import Task, TaskStatus
 from ..vcs.pr_outcome import observe_pr
-from ..vcs.pr_watcher import commit_is_ancestor
 from ..vcs.task_pr import resolve_task_pr
+from .shipped import _TICK_ABORTED, complete_if_content_landed as _complete_landed
 from .taxonomy import Blocker, resume_checkpoint, resume_provenance
 
 log = logging.getLogger("no_human.wake")
@@ -48,13 +48,6 @@ PrCommentChecker = Callable[[str], Awaitable[list[Any]]]
 # a bare bool from older/injected fakes. `bool(result)` is always the
 # shipped/not-shipped answer; the str form is read only when present.
 PrShippedChecker = Callable[[str, str, str], Awaitable[str | bool | None]]
-
-#: Sentinel returned by ``_complete_if_content_landed`` when the task went
-#: TERMINAL while the (subprocess-heavy) content probe was running. It is not
-#: an action: the caller must abandon its tick entirely rather than fall
-#: through to its own escalate/send-back path, which is the SCRUM-68 guard the
-#: probe's own callers had inline before the path was shared.
-_TICK_ABORTED = "__tick_aborted__"
 
 _DURATION = re.compile(r"(\d+)\s*([smhd])", re.IGNORECASE)
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -227,6 +220,14 @@ class WakeWatcher:
         if ci_gate_gate is None and (config or {}).get("ci_gate", {}).get("enabled"):
             ci_gate_gate = self._default_ci_gate_gate(config)
         self._ci_gate_gate = ci_gate_gate
+
+    @property
+    def pr_shipped(self):
+        """Read-only access to the wired content-shipped probe (or ``None`` if
+        this host never wired one). Lets a second caller — the scheduler's
+        resume-dispatch gate — reuse the exact same probe this watcher's own
+        rungs use, without reaching into a private attribute."""
+        return self._pr_shipped
 
     @staticmethod
     def _default_ci_gate_gate(config: dict):
@@ -858,15 +859,17 @@ class WakeWatcher:
     ) -> str | None:
         """THE completion path for "this branch's content is already on base".
 
-        ONE path, two callers — the CLOSED rung (which has always had it,
-        inline) and the CONFLICTING rung (which used to start a rebase round
-        without ever asking). Returns *action* once it has recorded the
-        outcome and written DONE; ``_TICK_ABORTED`` if the task went terminal
-        while the probe ran — on ANY answer the probe gave, see the guard
-        below, and both callers must abandon the tick on it; ``None`` for
-        every "no" — hook not wired, no branch or no base recorded, probe
-        error, or content genuinely absent — all of which mean the caller
-        keeps its existing behaviour unchanged.
+        ONE path, two callers here — the CLOSED rung (which has always had
+        it, inline) and the CONFLICTING rung (which used to start a rebase
+        round without ever asking) — plus a third caller in the scheduler
+        (the resume/restart dispatch gate). Returns *action* once it has
+        recorded the outcome and written DONE; ``_TICK_ABORTED`` if the task
+        went terminal while the probe ran — on ANY answer the probe gave, see
+        the guard in ``shipped.complete_if_content_landed``, and every caller
+        must abandon the tick on it; ``None`` for every "no" — hook not
+        wired, no branch or no base recorded, probe error, or content
+        genuinely absent — all of which mean the caller keeps its existing
+        behaviour unchanged.
 
         The question is CONTENT, not ancestry, and that is not a preference:
         this repo lands every PR as an identity-normalized LOCAL squash, so the
@@ -885,13 +888,14 @@ class WakeWatcher:
         A ``False`` is deliberately overloaded ("absent" and "could not run"
         collapse into it, per that function's contract), which is why it is
         only ever read as "keep going": the caller's existing path — escalate
-        to a human, or run the rebase round — is the safe side of the
-        ambiguity in both callers.
+        to a human, run the rebase round, or dispatch a fresh attempt — is
+        the safe side of the ambiguity in every caller.
 
-        REVIEW PRECONDITION. Neither caller may complete a task whose review
-        never passed, and neither needs its own check for that: both are
-        reached only through ``_check_open_pr``, which ``_evaluate`` calls only
-        for ``AWAITING_APPROVAL`` — the status a task reaches only after its
+        REVIEW PRECONDITION (this class's callers only). Neither of this
+        class's callers may complete a task whose review never passed, and
+        neither needs its own check for that: both are reached only through
+        ``_check_open_pr``, which ``_evaluate`` calls only for
+        ``AWAITING_APPROVAL`` — the status a task reaches only after its
         review passed and its PR was opened. That, plus a recorded
         ``pr_branch``, is the whole precondition set of the CLOSED rung this
         was extracted from, and it is preserved exactly. Pinned by the test
@@ -915,94 +919,18 @@ class WakeWatcher:
           the next tick (or the next incident) does not have to re-derive it.
         ``bool(result)`` keeps every existing caller that injects a plain
         ``True``/``False`` fake working unchanged.
+
+        The actual body (including the anchoring above) now lives in
+        ``blockers.shipped.complete_if_content_landed`` — this method is a
+        thin delegate so the scheduler's resume-dispatch gate shares the
+        exact same check instead of a copy.
         """
-        if self._pr_shipped is None:
-            return None
-        ctx = task.context or {}
-        # `branch` is the resolver's answer (task_pr.resolve_task_pr) when the
-        # caller has one — it may be an inherited attempt's or a draft's
-        # branch, not `ctx["pr_branch"]`. Falling back to `ctx["pr_branch"]`
-        # keeps every caller that predates the resolver working unchanged.
-        if branch is None:
-            branch = ctx.get("pr_branch")
-        base = ctx.get("base_branch")
-        if not task.repo_path or not branch:
-            return None
-        if not base:
-            # NEVER default to "main". The orchestrator persists the resolved
-            # base before any attempt runs (`orchestrator.py`: `if not
-            # ctx.get("base_branch")` → `_implicit_base_branch`, then
-            # `update_task`), so every task that can reach AWAITING_APPROVAL
-            # has one and this is unreachable for them. If it is ever reached —
-            # a legacy row, a hand-built context — the honest answer is "I do
-            # not know what this PR targets", not a guess: a backport opened
-            # against `release/2.3` would be asked about `main`, where the
-            # content usually IS present, and would complete a task whose work
-            # never reached its actual base. Falling back costs a spurious
-            # escalation or one wasted rebase round, with a human on the other
-            # end of both.
-            log.warning("no base_branch recorded for %s — skipping the "
-                        "content check rather than guessing", task.id[:8])
-            return None
-        recorded_sha = ctx.get("landed_sha")
-        fresh_sha: str | None = None
-        if recorded_sha and await commit_is_ancestor(
-                task.repo_path, recorded_sha, base):
-            shipped = True
-        else:
-            try:
-                result = await self._pr_shipped(task.repo_path, branch, base)
-            except Exception as exc:  # noqa: BLE001 — a checker error must not crash the watcher
-                log.warning("pr_shipped check failed for %s: %s", task.id[:8], exc)
-                result = False
-            shipped = bool(result)
-            if isinstance(result, str):
-                fresh_sha = result
-        # The shipped check just ran several local git subprocesses (rev-parse,
-        # and up to two merge-trees per candidate base tip) — easily a few
-        # seconds on a large repo — so re-verify terminal-ness before ANY
-        # caller acts, same SCRUM-68 guard as every other rung.
-        #
-        # 🔴 THIS SITS ABOVE THE `not shipped` EARLY-OUT AND MUST STAY THERE.
-        # The guard is about the AWAIT, not about the answer: a `POST /shipped`
-        # or `/cancel` landing while the probe ran leaves the caller's own
-        # recheck stale on EVERY path out of here. Review 2026-08-11 caught it
-        # narrowed to the positive path alone, and reproduced the cost — a
-        # phantom "abandon or rework?" blocker, a `pr_closed` event and an
-        # outcome row on a task that was already DONE, plus a round counter and
-        # a send-back on the conflict rung. The store's CAS refuses only the
-        # STATUS flip; nothing else here is CAS-guarded, so a "harmless"
-        # refused transition still leaves a record of a state change that never
-        # happened — the shape `cli/commands.py`'s restore-approval path
-        # already documents as ruled wrong. The probe raising is treated as
-        # `shipped=False` (not as an early return) for exactly this reason.
-        if await self._is_terminal(task):
-            return _TICK_ABORTED
-        if not shipped:
-            return None
-        landed_sha = recorded_sha if fresh_sha is None else fresh_sha
-        if fresh_sha is not None:
-            # Written BEFORE the DONE status so the anchor survives a restart
-            # even if the process dies between the two writes.
-            task.context = await self.store.merge_context(
-                task.id, {"landed_sha": fresh_sha})
-        await observe_pr(self.store, task.id, url, forge_state=forge_state,
-                         shipped=True)
-        sha_note = f" (landed as {landed_sha[:8]})" if landed_sha else " (squash-merged)"
-        shipped_text = (
-            f"{task.id[:8]} {situation} but its content is already on "
-            f"{base}{sha_note}: {url}"
+        return await _complete_landed(
+            self.store, task, url, pr_shipped=self._pr_shipped,
+            is_terminal=self._is_terminal, on_event=self._on_event,
+            forge_state=forge_state, action=action, situation=situation,
+            branch=branch,
         )
-        # `set_status`'s own event insert is the persistence now (atomic with
-        # the status write) — `_emit` would double-persist, so call the host
-        # mirror directly instead of going through it.
-        await self.store.set_status(
-            task, TaskStatus.DONE, validate=False,
-            event={"source": "watcher", "kind": "shipped", "text": shipped_text,
-                   "ts": time.time()},
-        )
-        self._on_event("shipped", shipped_text)
-        return action
 
     async def _comment_after_landing(
         self, task: Task, pr_ref: str, *, may_complete: bool,
