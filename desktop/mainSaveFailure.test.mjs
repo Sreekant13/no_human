@@ -31,7 +31,34 @@ process.env.NH_ORIGIN = `http://127.0.0.1:${19800 + (process.pid % 120)}`;  // n
 const stub = await import("./testing/electronStub.mjs");
 await import("./main.mjs");
 stub.fireReady();
-await new Promise((r) => setTimeout(r, 600));
+// whenReady -> createWindow -> _loadBoardOrError must SETTLE before the
+// handler below runs: saveAction() on a boot still in flight sees
+// lifecycle.state === null and answers "needs-restart"/"restart", masking
+// the real failure this test exists to pin.
+//
+// This fresh $HOME has NO credential yet (the token is written by the
+// handler under test, not before it), so the initial nav takes the
+// !hasCredential() branch and shows token.html WITHOUT ever touching
+// lifecycle.state (main.mjs:500-503) -- ensureServer only runs later,
+// inside the handler itself. So serverLabel() stays "server: probing…"
+// forever here; it is NOT the settled signal for this boot path. The
+// observable settle point is the setup screen's loadFile: win.loaded
+// records "file:token.html" once that nav lands, and BrowserWindow.last is
+// main.mjs's actual `win` (main.mjs:784, testing/electronStub.mjs:87-103).
+let settled = false;
+{
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    const w = stub.BrowserWindow.last;
+    if (w && w.loaded.some((x) => x.startsWith("file:token.html"))) {
+      settled = true;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+assert.ok(settled, `boot never reached the setup screen; window loaded=` +
+  `${JSON.stringify(stub.BrowserWindow.last?.loaded ?? [])}`);
 
 test.after(() => fs.rmSync(home, { recursive: true, force: true }));
 
