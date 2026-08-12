@@ -128,12 +128,6 @@ named here.
   `agent/guard.py`, alongside the `gh pr merge` / `glab mr merge` denial; §2).
   Until 2026-08-08 this sentence overstated: the guard denied the direct
   spellings but not this wrapper.
-- **`nh approve` lands the PR** — a local squash commit made as the operator
-  identity, then `git push` of that commit to your default branch and a
-  `gh pr close` / `glab mr close` of the PR (`vcs/approve_merge.py`). This is
-  **your** command (CLI `nh approve`, or the board's "Approve and merge"
-  button); an agent session's Bash is denied `gh pr merge` / `glab mr merge`
-  in every mode (§2) and this path never calls them.
 - **One `GET https://pypi.org/pypi/no-human/json` per day**, to notice a newer
   release (`updates.py:39`). No identifier, no repo name, no telemetry — the
   same request `pip install` makes. On by default (`updates.enabled: true`,

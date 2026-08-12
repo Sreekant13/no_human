@@ -201,21 +201,3 @@ def test_microsoft_graph_is_stated_as_opt_in() -> None:
         "Microsoft Graph" in section, \
         "the Microsoft Graph entry must stay conditional on context.m365.token"
     assert "fails closed and sends nothing" in section
-
-
-def test_approve_merge_module_is_disclosed() -> None:
-    """Direct repro for the 70881915 salvage. `test_every_outbound_module_is_
-    disclosed` above is driven by `detected_modules()`, which walks real files
-    on disk — on a tree where `vcs/approve_merge.py` does not exist yet, that
-    walk finds nothing to flag and the gate passes *vacuously*, not because
-    anything is disclosed. This test reads the module directly and fails
-    outright if it is absent, so it is red before the module + its §7 bullet
-    exist and green only once both do."""
-    module_path = PKG / "vcs" / "approve_merge.py"
-    assert module_path.exists(), (
-        "vcs/approve_merge.py must exist for `nh approve` to land PRs")
-    calls = outbound_calls(module_path.read_text(), str(module_path))
-    assert calls, "expected vcs/approve_merge.py to make outbound calls (gh/glab)"
-    assert "vcs/approve_merge.py" in disclosed_modules(), (
-        "vcs/approve_merge.py makes outbound calls but is not named in "
-        f"{EGRESS_SECTION!r}")

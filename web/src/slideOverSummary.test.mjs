@@ -983,7 +983,7 @@ test("the micro-summary still leads with the failure when the review FAILED", ()
 
 test("the Approve button changes state the moment it is clicked and once it lands", () => {
   const idle = approveButtonState({});
-  assert.equal(idle.label, "Approve and merge");
+  assert.equal(idle.label, "Approve");
   assert.equal(idle.disabled, false);
 
   const busy = approveButtonState({ busy: true });
@@ -1064,7 +1064,7 @@ test("reopening the drawer on an approved task shows the approved state, not a b
   // an approved task looks like.
   assert.deepEqual(approveButtonState({ outcome: "ok" }), reopened);
   // A task with no approval is untouched.
-  assert.equal(approveButtonState({ approvedAt: null }).label, "Approve and merge");
+  assert.equal(approveButtonState({ approvedAt: null }).label, "Approve");
   // An in-flight click still wins over the stale payload it is about to update.
   assert.match(approveButtonState({ busy: true, approvedAt: null }).label, /ing/i);
 });
@@ -1141,36 +1141,6 @@ test("a recorded approval says so and says who merges - never the agent", () => 
   assert.match(f.text, /merge/i);
   assert.match(f.text, /agent never merges/i, "constraint #2 must be visible on the confirmation");
   assert.doesNotMatch(f.text, /—/, "hyphens, not em-dashes, in user-facing strings");
-});
-
-// ── operator directive 2026-08-12: approve now MERGES the PR ───────────────
-
-test("test_idle_label_is_approve_and_merge", () => {
-  const idle = approveButtonState({});
-  assert.equal(idle.label, "Approve and merge");
-  assert.equal(idle.disabled, false);
-  assert.equal(idle.tone, "idle");
-});
-
-test("test_error_label_is_retry_approve_and_merge", () => {
-  const retry = approveButtonState({ outcome: "error", approvedAt: null });
-  assert.equal(retry.label, "Retry approve and merge");
-  assert.equal(retry.disabled, false);
-  assert.equal(retry.tone, "error");
-});
-
-test("test_success_feedback_mentions_merge", () => {
-  const f = approvalFeedback({ ok: true });
-  assert.match(f.text, /merge/i);
-  assert.match(f.text, /agent never merges/i);
-});
-
-test("SlideOver.jsx's approve control tells the operator it merges the PR", () => {
-  const src = readFileSync(join(SRC, "SlideOver.jsx"), "utf8");
-  const btn = src.match(/btn btn-approve[\s\S]{0,400}?<\/button>/);
-  assert.ok(btn, "approve button markup not found");
-  assert.match(btn[0], /merge/i,
-    "the confirmation/aria copy around the approve button must say it merges the PR");
 });
 
 test("the server's own message stays authoritative, with the queue remainder appended", () => {

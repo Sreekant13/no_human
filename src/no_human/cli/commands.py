@@ -3826,39 +3826,10 @@ def unblock(task_id, fail):
 # Human-action verbs (PLAN.md Part 6)                                         #
 # --------------------------------------------------------------------------- #
 
-def _review_pass_evidence(context: dict, head_sha: str, repo) -> tuple[bool, str]:
-    """(passed, evidence-line) for the branch's HEAD sha — the precondition
-    `land_task` itself does not (and must not) check: it would need
-    `Orchestrator._rounds_for_head`, and `vcs/` sits below `core/`
-    (`core.orchestrator` already imports `vcs` at module scope, so the
-    reverse import here would be circular). Local import keeps that
-    one-way."""
-    from ..core.orchestrator import Orchestrator
-
-    history = (context or {}).get("review_history") or []
-    if isinstance(history, str):
-        import ast
-        try:
-            history = ast.literal_eval(history)
-        except (ValueError, SyntaxError):
-            history = []
-    if not isinstance(history, list):
-        history = []
-    rounds = Orchestrator._rounds_for_head(history, head_sha=head_sha, repo=repo)
-    if not rounds:
-        return False, "no review round is stamped with a commit reachable from the branch head"
-    last = rounds[-1] if isinstance(rounds[-1], dict) else {}
-    passed = bool(last.get("passed"))
-    verdict = "PASS" if passed else "not passed"
-    evidence = f"review {verdict} on {head_sha[:12]} after {len(rounds)} round(s)"
-    return passed, evidence
-
-
 @cli.command("approve")
 @click.argument("task_id")
 def approve(task_id):
-    """Approve and merge — squash-lands the PR under the operator identity
-    (the agent still never merges on its own)."""
+    """Record your approval — YOU merge the PR (agent never merges)."""
     config, _ = _bootstrap(require_auth=False)
 
     async def _go():
@@ -3897,96 +3868,11 @@ def approve(task_id):
                     "claim confirmed; no code change was needed. Task done."
                 )
                 return
-
-            if not pr_url:
-                console.print(f"[bold green]approved[/] {t.id[:8]} — merge the PR in your git host.")
+            console.print(f"[bold green]approved[/] {t.id[:8]} — merge the PR in your git host.")
+            if pr_url:
+                console.print(f"  PR: {pr_url}")
+            else:
                 console.print("  [dim](no PR URL recorded)[/]")
-                return
-
-            from ..vcs.approve_merge import land_task
-            from ..vcs.git import GitError, GitRepo
-            from ..vcs.task_pr import resolve_task_pr
-
-            resolved = await resolve_task_pr(store, t)
-            branch = resolved.branch
-            if not branch or not t.repo_path:
-                console.print(
-                    f"[bold green]approved[/] {t.id[:8]} — merge the PR in your "
-                    "git host (no branch/repo recorded to merge automatically)."
-                )
-                console.print(f"  PR: {pr_url}")
-                return
-
-            git_cfg = config.get("git") or {}
-            try:
-                repo = GitRepo(
-                    Path(t.repo_path),
-                    identity_name=git_cfg.get("agent_identity_name", "no_human"),
-                    identity_email=git_cfg.get("agent_identity_email", "no-human@acme.com"),
-                    never_push_to=git_cfg.get("never_push_to")
-                    or ["main", "master", "release/*"],
-                )
-                repo.fetch()
-                ref = repo.resolve_commitish(branch)
-                head_sha = repo._run("rev-parse", ref) if ref else ""
-            except (GitError, OSError):
-                head_sha = ""
-
-            if not head_sha:
-                # Can't even resolve the branch locally — there is nothing to
-                # decide a merge from, so this is the same "auto-merge isn't
-                # possible, merge it yourself" outcome as no branch/repo
-                # recorded at all (above), not a hard failure: exit 0, the
-                # approval stands, the task stays awaiting_approval.
-                console.print(
-                    f"[bold green]approved[/] {t.id[:8]} — the branch {branch!r} "
-                    "could not be resolved in the local repo; merge the PR in "
-                    "your git host."
-                )
-                console.print(f"  PR: {pr_url}")
-                return
-
-            passed, evidence = _review_pass_evidence(t.context or {}, head_sha, repo)
-            if not passed:
-                console.print(
-                    f"[bold red]cannot merge:[/] preconditions — {evidence}. "
-                    "Approval recorded; task remains awaiting_approval."
-                )
-                sys.exit(1)
-
-            result = land_task(
-                repo_path=t.repo_path, branch=branch, pr_url=pr_url,
-                task_id=t.id, task_title=t.title, review_evidence=evidence,
-                config=config.data,
-            )
-
-            if result.skipped:
-                console.print(
-                    f"[bold green]approved[/] {t.id[:8]} — "
-                    f"{result.message or 'merge the PR in your git host.'}"
-                )
-                console.print(f"  PR: {pr_url}")
-                return
-
-            if not result.ok:
-                console.print(
-                    f"[bold red]merge FAILED[/] at step {result.step!r}:\n{result.stderr}"
-                )
-                console.print(
-                    "Approval recorded; task remains awaiting_approval. Fix the "
-                    "issue and re-run `nh approve`."
-                )
-                sys.exit(1)
-
-            await store.set_status(
-                t, TaskStatus.DONE, validate=False,
-                event={"source": "human", "kind": "human_merged",
-                       "sha": result.landed_sha, "text": result.message},
-            )
-            console.print(
-                f"[bold green]merged[/] {t.id[:8]} — landed "
-                f"{result.landed_sha[:12]} onto the default branch. Task done."
-            )
 
     asyncio.run(_go())
 

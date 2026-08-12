@@ -1152,17 +1152,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "auto_merge_on_approval": False,  # there is no auto-merge
         "approval_timeout": "24h",
     },
-    # `nh approve` merges the PR itself (operator directive 2026-08-12): a
-    # local squash under git.approve_identity, the manifest merge-result
-    # ledger rule, then a push to the default branch. This is the ONE human
-    # merge action (constraint #2's `approve IS the human merge action`) — the
-    # agent never merges on its own, still and always. `enabled: False`
-    # reverts to the pre-2026-08-12 record-only behaviour (approval is
-    # recorded, the human merges the PR in their git host by hand).
-    "approve_merge": {
-        "enabled": True,
-        "test_timeout_seconds": 1800,
-    },
     "git": {
         "branch_prefix": "no-human/",
         "commit_prefix": "",
@@ -1177,16 +1166,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pr_labels": [],
         "agent_identity_name": "no_human",
         "agent_identity_email": "no-human@acme.com",
-        # The OPERATOR's identity — used ONLY for the one commit `nh approve`
-        # makes when it squash-lands a PR (vcs/approve_merge.py). Distinct from
-        # agent_identity_* above on purpose: that commit is a human merge
-        # action (constraint #2), never the agent's, so it must never carry the
-        # agent's name/email. Defaults to this deployment's configured operator
-        # (operator directive 2026-08-12); override per install as needed.
-        "approve_identity": {
-            "name": "eyalgolan",
-            "email": "5146175+eyalgolan@users.noreply.github.com",
-        },
     },
     "safety": {
         # No size cap by default. A line/file count is a proxy for "scope

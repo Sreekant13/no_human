@@ -46,7 +46,7 @@ from pydantic import BaseModel
 from ..config import _atomic_write_text, load_config
 from ..core.db import Store
 from ..core.lanes import lane_for
-from ..core.orchestrator import Orchestrator, is_agent_session, is_narration
+from ..core.orchestrator import is_agent_session, is_narration
 from ..core.task import Task, TaskStatus
 from ..vcs.task_pr import task_has_pr_evidence
 from .models import (
@@ -842,37 +842,9 @@ async def get_diff(task_id: str, request: Request) -> str:
     return ""
 
 
-def _review_pass_evidence(context: dict, head_sha: str, repo) -> tuple[bool, str]:
-    """(passed, evidence-line) for the branch's HEAD sha — mirrors the CLI's
-    helper of the same name (`cli/commands.py`). Kept local rather than
-    shared: `vcs/approve_merge.py` sits below `core/` (`core.orchestrator`
-    already imports `vcs` at module scope) so it cannot import Orchestrator
-    itself, and this endpoint already imports Orchestrator anyway."""
-    history = (context or {}).get("review_history") or []
-    if isinstance(history, str):
-        import ast
-        try:
-            history = ast.literal_eval(history)
-        except (ValueError, SyntaxError):
-            history = []
-    if not isinstance(history, list):
-        history = []
-    rounds = Orchestrator._rounds_for_head(history, head_sha=head_sha, repo=repo)
-    if not rounds:
-        return False, "no review round is stamped with a commit reachable from the branch head"
-    last = rounds[-1] if isinstance(rounds[-1], dict) else {}
-    passed = bool(last.get("passed"))
-    verdict = "PASS" if passed else "not passed"
-    evidence = f"review {verdict} on {head_sha[:12]} after {len(rounds)} round(s)"
-    return passed, evidence
-
-
 @app.post("/api/tasks/{task_id}/approve")
 async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
-    """Approve and merge — squash-lands the PR under the operator identity.
-    The agent itself still never merges anything on its own (constraint #2);
-    this endpoint IS the human merge action `nh approve`/the GUI button
-    trigger."""
+    """Record human approval. NOTE: the agent never merges — human merges the PR."""
     store = _store(request)
     task = await _require_task(store, task_id)
     if task.status != TaskStatus.AWAITING_APPROVAL:
@@ -888,7 +860,6 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
     # LATER attempt may ship a real PR — that approval must stay a merge
     # instruction, never a false DONE (PR #101 round-2 review).
     message = "Approval recorded. Merge the PR in your git host — the agent never merges."
-    landed_sha = ""
     if (task.context or {}).get("already_satisfied_report"):
         # Guarded on `task_has_pr_evidence`, not `attempts.pr_url` alone (live
         # incident, task 8c8b36b5): a draft PR opened pre-review is recorded
@@ -904,106 +875,16 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
             )
             message = ("Already satisfied claim confirmed — no code change was "
                        "needed. Task done (there is no PR; the agent never merges).")
-        else:
-            landed_sha, error_detail = await _merge_task_pr(request, store, task, pr_url)
-            if error_detail:
-                raise HTTPException(status_code=500, detail=error_detail)
-            message = _merge_outcome_message(landed_sha)
-    else:
-        pr_url = await task_has_pr_evidence(store, task)
-        if pr_url:
-            landed_sha, error_detail = await _merge_task_pr(request, store, task, pr_url)
-            if error_detail:
-                raise HTTPException(status_code=500, detail=error_detail)
-            message = _merge_outcome_message(landed_sha)
     tasks = await _board_tasks(store, scheduler=_sched(request))
     await _mgr.broadcast({
         "type": "task_approved",
         "task_id": task.id,
         "tasks": [t.model_dump() for t in tasks],
     })
-    if landed_sha:
-        await _mgr.broadcast({
-            "type": "task_updated", "task_id": task.id,
-            "status": TaskStatus.DONE.value,
-            "tasks": [t.model_dump() for t in tasks],
-        })
     return {
         "ok": True,
         "message": message,
-        "landed_sha": landed_sha,
     }
-
-
-def _merge_outcome_message(landed_sha: str) -> str:
-    if landed_sha:
-        return f"Approved and merged — landed {landed_sha[:12]} onto the default branch."
-    return "Approval recorded. Merge the PR in your git host — the agent never merges."
-
-
-async def _merge_task_pr(
-    request: Request, store, task, pr_url: str,
-) -> tuple[str, dict[str, str] | None]:
-    """Land the PR (vcs/approve_merge.land_task) off the event loop.
-
-    Returns ``(landed_sha, error_detail)``. ``landed_sha`` is "" on any
-    skip/refusal/failure. ``error_detail`` is ``None`` on a clean skip (no
-    repo/branch to merge, `land_task` itself decided `approve_merge.enabled`
-    is false, etc — approval stays recorded, today's record-only message
-    stands) and is ``{"step": ..., "stderr": ...}`` on a genuine land
-    failure or a failed review-PASS precondition — the caller turns that
-    into an `HTTPException(500, ...)` so the failure is surfaced to the
-    human rather than silently read as success (plan §3/4). The task is
-    marked DONE by the caller only when a sha comes back."""
-    config = request.app.state.config
-    if not task.repo_path:
-        return "", None
-    from ..vcs.approve_merge import land_task
-    from ..vcs.git import GitError, GitRepo
-    from ..vcs.task_pr import resolve_task_pr
-
-    resolved = await resolve_task_pr(store, task)
-    branch = resolved.branch
-    if not branch:
-        return "", None
-
-    def _resolve_head() -> tuple[str, GitRepo | None]:
-        try:
-            repo = GitRepo(
-                Path(task.repo_path),
-                identity_name=config["git"]["agent_identity_name"],
-                identity_email=config["git"]["agent_identity_email"],
-                never_push_to=config["git"]["never_push_to"],
-            )
-            repo.fetch()
-            ref = repo.resolve_commitish(branch)
-            return (repo._run("rev-parse", ref) if ref else ""), repo
-        except (GitError, OSError):
-            return "", None
-
-    head_sha, repo = await asyncio.to_thread(_resolve_head)
-    if not head_sha or repo is None:
-        return "", None
-    passed, evidence = _review_pass_evidence(task.context or {}, head_sha, repo)
-    if not passed:
-        return "", {"step": "preconditions", "stderr": evidence}
-
-    result = await asyncio.to_thread(
-        land_task,
-        repo_path=task.repo_path, branch=branch, pr_url=pr_url,
-        task_id=task.id, task_title=task.title, review_evidence=evidence,
-        config=config.data,
-    )
-    if result.skipped:
-        return "", None
-    if not result.ok:
-        return "", {"step": result.step, "stderr": result.stderr}
-    await store.set_status(
-        task, TaskStatus.DONE, validate=False,
-        event={"source": "human", "kind": "human_merged",
-               "sha": result.landed_sha, "text": result.message},
-    )
-    return result.landed_sha, None
 
 
 @app.post("/api/tasks/{task_id}/finish-review")
