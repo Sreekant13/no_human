@@ -3424,10 +3424,28 @@ class Orchestrator:
                             task, repo, attempt_id, exc, result=result,
                             branch=branch)
                 if claim is not None:
-                    return await self._gate_already_satisfied(
-                        task, repo, attempt_id, claim, branch=branch,
-                        attempt_n=attempt_n,
-                    )
+                    eligible, why = self._already_satisfied_eligible(
+                        task, repo, base)
+                    if not eligible:
+                        # The branch carries a diff no completed verdict
+                        # covers. The claim is not a substitute for the review
+                        # that never finished — send the real diff through the
+                        # full gate. Never a silent downgrade: the board must
+                        # show why a claim path became a review path.
+                        self._emit_review(
+                            "already_satisfied_ineligible",
+                            "resumed attempt claims ALREADY-SATISFIED but its "
+                            f"branch head carries an unreviewed diff ({why}) "
+                            "— routing to a full independent review of the "
+                            "branch diff",
+                        )
+                        resumed_commit = repo.head_commit(base)
+                    else:
+                        return await self._gate_already_satisfied(
+                            task, repo, attempt_id, claim, branch=branch,
+                            attempt_n=attempt_n,
+                        )
+            if resumed_commit is None:
                 detail = _NO_CHANGES_DETAIL
                 # Keep what the agent SAID. Task d9d458b5 explained three times
                 # that the work was already committed and that it would not
@@ -6088,6 +6106,76 @@ class Orchestrator:
             for ans in replies[-3:]:
                 lines.append(f"  - {ans[:400]}")
         return "\n".join(lines)
+
+    def _already_satisfied_eligible(
+        self, task: Task, repo, base: str | None,
+    ) -> tuple[bool, str]:
+        """Is the zero-diff ALREADY-SATISFIED terminal available to THIS attempt?
+
+        Live incident 2026-08-11 (task 8c8b36b5, PR #253 +191/-19): the independent
+        review was killed mid-run by a server restart. `_recover_orphans` resumed
+        the task, the coder correctly added nothing to a branch that already
+        carried the whole diff, and the claim path took it to awaiting_approval —
+        the pipeline ran only the citation check. Constraint #3 was bypassed by
+        the crash seam.
+
+        Scoped to THAT seam, not to every resume. `_recover_orphans` is the only
+        writer of `resume_from.by == "orphan_recovery"` (`scheduler.py`'s
+        `_ORPHANABLE` is CONTEXT/PLANNING/REVIEWING/TESTING — IMPLEMENTING is not
+        in it), so this stamp exists only when one of THOSE phases was killed and
+        requeued: a genuinely interrupted review (or context/planning/testing) —
+        exactly this incident's shape. A `wake` resume (CI-fix, quota, timer) or a
+        human-gated `nh reply` never had a review in flight to interrupt, and its
+        already-reviewed escape (D15, `test_the_already_satisfied_escape_fires_
+        for_that_same_wake_resume`) must not be re-litigated by this gate.
+
+        Rule, keyed on the COMMIT SHA and not on whether a review ever started:
+          * not an orphan-recovery resume -> eligible (nothing here to interrupt);
+          * orphan-recovery resume, no diff vs base -> eligible (the ordinary
+            already-satisfied case: there is nothing to review, the claim IS the
+            deliverable);
+          * orphan-recovery resume, diff vs base, AND a review_history round
+            stamped with THIS exact head sha and passed=True -> eligible (the
+            diff has already been judged);
+          * orphan-recovery resume, diff vs base, no such round -> INELIGIBLE. A
+            `review_start` with no verdict is not a verdict.
+        Fails CLOSED: an unreadable base/head, an absent or unparsable history,
+        an unstamped round -> ineligible, i.e. a full review runs.
+        """
+        resume_by = ((task.context or {}).get("resume_from") or {}).get("by")
+        if resume_by != "orphan_recovery":
+            return True, ""
+        try:
+            head = repo.head_sha()
+        except Exception:  # noqa: BLE001 — unreadable head ⇒ fail closed
+            return False, "head sha unreadable"
+        try:
+            has_diff = bool(base) and repo.commits_ahead(base) > 0
+        except Exception:  # noqa: BLE001 — unresolvable ⇒ assume a diff exists
+            has_diff = True
+        if not has_diff:
+            return True, ""
+        history = (task.context or {}).get("review_history")
+        if isinstance(history, str):
+            try:
+                import ast
+                history = ast.literal_eval(history)
+            except (ValueError, SyntaxError):
+                history = None
+        if not isinstance(history, list):
+            history = []
+        # Exact sha equality, not `is_ancestor`: an ancestor match would let a
+        # PASS on an earlier commit of the same branch cover code added after
+        # it, which is the same laundering defect one level up.
+        matched = any(
+            isinstance(rec, dict)
+            and str(rec.get("sha") or "").strip() == head
+            and rec.get("passed") is True
+            for rec in history
+        )
+        if matched:
+            return True, ""
+        return False, "no completed review verdict recorded for this commit"
 
     async def _append_review_history(
         self, task: Task, decision, *, commit_sha: str = "",
