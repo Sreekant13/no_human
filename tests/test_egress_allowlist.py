@@ -322,6 +322,13 @@ GIT_SUBCOMMANDS: dict[str, tuple[str, str]] = {
                           "--write-tree it writes the result to the local "
                           "object store and prints its OID — no remote, no "
                           "worktree, no ref moved"),
+    # LOCAL because the only call sites in this tree are `merge --squash
+    # <local branch>` and `merge --abort` (vcs/approve_merge.py:361/:363) —
+    # both operate on a ref already in the local object store, no remote
+    # named. `git pull` (fetch + merge) stays EXTERNAL below; if `merge`
+    # ever gains a remote-naming call site here, this row is wrong.
+    "merge": (LOCAL, "merges a local ref into the worktree; contacts a "
+                     "remote only via `pull`, which stays EXTERNAL"),
     "grep": (LOCAL, "searches local tracked files / a local ref's tree; "
                     "reads the object store, never a remote"),
     "add": (LOCAL, "writes the index"),
@@ -604,6 +611,48 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
             "passes its argv straight through",
             _ON + "the injected runner is a test seam; the default path is the "
                   "`gh pr view` above"),
+    },
+    # `nh approve` merges the PR: a local squash commit as the operator
+    # identity, then a push and PR close. Entered ONLY from `nh approve` / the
+    # board's "Approve and merge" button (`land_task`) — never from an agent
+    # session (constraint #2, docs/security.md §2). This is NOT `gh pr merge`
+    # / `glab mr merge`: the merge itself is a local `git merge --squash`
+    # (see the GIT_SUBCOMMANDS["merge"] row below), and gh/glab here only
+    # read PR state and close the already-landed PR.
+    "vcs/approve_merge.py": {
+        "exec:git push": Allowed(
+            "your git remote — the squashed merge commit, pushed to the "
+            "default branch (`land_task`, :495)",
+            "user-invoked: only from `nh approve` / the board's "
+            "Approve-and-merge button"),
+        "exec:git ls-remote": Allowed(
+            "your git remote — refs only; reads back that the pushed ref "
+            "landed (`land_task`, :504)",
+            "user-invoked: only from `nh approve` / the board's "
+            "Approve-and-merge button"),
+        "exec:gh": Allowed(
+            "your GitHub host — `pr view --json state` then `pr close` "
+            "(`_close_pr`, :223/:236); closes the PR the squash landed. "
+            "This is not `gh pr merge`",
+            "user-invoked: only from `nh approve` / the board's "
+            "Approve-and-merge button"),
+        "exec:glab": Allowed(
+            "your GitLab host — `mr view` then `mr close` (`_close_pr`, "
+            ":201/:209); closes the MR the squash landed. This is not "
+            "`glab mr merge`",
+            "user-invoked: only from `nh approve` / the board's "
+            "Approve-and-merge button"),
+        # Per vcs/manifest_repair.py's precedent, the `<dynamic>` bucket is
+        # per-file on purpose — parking it elsewhere would blind this gate to
+        # a future dynamic exec added here.
+        "exec:<dynamic>": Allowed(
+            "`sys.executable` running the TARGET REPO's own "
+            "`scripts/export_guard.py` (`approve`/`verify`, :389/:436) and "
+            "`python -m pytest` over change-scoped tests (:459) — the "
+            "repo's own test suite can dial anywhere; this process does not "
+            "bound it",
+            "user-invoked: only from `nh approve` / the board's "
+            "Approve-and-merge button"),
     },
     "core/orchestrator.py": {
         "exec:gh": Allowed("your GitHub host — `gh api repos/…/pulls/<n>` for "
@@ -1703,6 +1752,46 @@ def test_known_negatives_are_not_external() -> None:
                   "git credential"):
         assert reach_of(f"exec:{local}")[0] == LOCAL, local
     assert reach_of("exec:ruff")[0] == LOCAL
+
+
+def test_git_merge_is_local_and_pull_stays_external() -> None:
+    """`git merge` (used here as `--squash <local branch>` / `--abort`) never
+    contacts a remote and must classify LOCAL; `git pull` is fetch+merge and
+    must stay EXTERNAL. The pair is the point — a LOCAL row for `merge` must
+    not bleed into `pull`."""
+    assert reach_of("exec:git merge")[0] == LOCAL
+    assert reach_of("exec:git pull")[0] == EXTERNAL
+
+
+def test_approve_merge_channel_set_is_pinned() -> None:
+    """Pin the exact channel set for vcs/approve_merge.py so a future channel
+    added to the merge-and-land path goes red rather than being silently
+    absorbed into an already-reviewed entry."""
+    assert set(ALLOWLIST["vcs/approve_merge.py"]) == {
+        "exec:gh", "exec:glab", "exec:git push", "exec:git ls-remote",
+        "exec:<dynamic>",
+    }
+
+
+def test_approve_merge_source_channels_are_all_declared() -> None:
+    """Direct repro for the 70881915 salvage. `test_no_undeclared_external_
+    egress` below is driven by `scan_tree(PKG)`, which walks real files on
+    disk — on a tree where `vcs/approve_merge.py` does not exist yet, that
+    walk finds nothing to flag and the gate passes *vacuously*, not because
+    anything is declared (this is exactly how the first salvage attempt's
+    repro tests were found to already pass on unfixed code). This test reads
+    the module directly and fails outright if it is absent, so it is red
+    before the module + its ALLOWLIST entry exist and green only once both
+    do."""
+    module_path = PKG / "vcs" / "approve_merge.py"
+    assert module_path.exists(), (
+        "vcs/approve_merge.py must exist for `nh approve` to land PRs")
+    found = channels_of(module_path.read_text(), str(module_path))
+    external = {channel for channel in found if reach_of(channel)[0] == EXTERNAL}
+    declared = set(ALLOWLIST.get("vcs/approve_merge.py", {}))
+    missing = external - declared
+    assert not missing, (
+        f"undeclared external channels in vcs/approve_merge.py: {missing}")
 
 
 # ---------------------------------------------------------------------------

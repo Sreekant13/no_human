@@ -556,8 +556,11 @@ export function approveButtonState({ busy = false, outcome = null, approvedAt = 
     return { label: "Approved — merge pending", disabled: true, tone: "ok" };
   }
   if (busy) return { label: "Approving…", disabled: true, tone: "busy" };
-  if (outcome === "error") return { label: "Retry approve", disabled: false, tone: "error" };
-  return { label: "Approve", disabled: false, tone: "idle" };
+  // Operator directive 2026-08-12: approve now MERGES the PR (a local squash
+  // under the operator identity, then push) rather than only recording
+  // approval for a human to merge by hand elsewhere — the label says so.
+  if (outcome === "error") return { label: "Retry approve and merge", disabled: false, tone: "error" };
+  return { label: "Approve and merge", disabled: false, tone: "idle" };
 }
 
 // The banner text plus the ARIA role it lands in. The server's own message
@@ -569,11 +572,13 @@ export function approvalFeedback({ ok = true, message = "", remaining = 0, error
     return {
       role: "alert",
       tone: "error",
-      text: `Approval NOT recorded${why ? ` - ${why}` : ""}. Nothing changed; click Retry approve.`,
+      text: `Approval NOT recorded${why ? ` - ${why}` : ""}. Nothing changed; click Retry approve and merge.`,
     };
   }
   const base = String(message || "").trim()
-    || "Approval recorded. You merge the PR in your git host - the agent never merges.";
+    // The server's own message (a landed sha, a skip reason) leads whenever it
+    // sends one — this fallback only covers a response with no `message`.
+    || "Approval recorded. The PR will be merged automatically - the agent never merges on its own.";
   const more = remaining > 0 ? ` ${remaining} more waiting - use Next review.` : "";
   return { role: "status", tone: "ok", text: base + more };
 }

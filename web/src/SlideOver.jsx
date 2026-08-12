@@ -461,6 +461,8 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
                 className={`btn btn-approve btn-approve-${approveBtn.tone}`}
                 onClick={handleApprove}
                 disabled={approveBtn.disabled || busy}
+                title="Squash-merges the PR onto the default branch and closes it - the agent never merges on its own."
+                aria-label={approveBtn.label}
               >
                 {approveBtn.label}
               </button>

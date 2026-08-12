@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import github, gitlab
+from .approve_merge import LandResult, land_task
 from .git import CommitResult, GitError, GitRepo, ProtectedBranch
 from .manifest_repair import commit_with_manifest_repair, parse_manifest_refusal
 
@@ -18,6 +19,8 @@ __all__ = [
     "open_pr",
     "commit_with_manifest_repair",
     "parse_manifest_refusal",
+    "land_task",
+    "LandResult",
 ]
 
 
