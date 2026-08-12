@@ -922,7 +922,7 @@ async def post_review_comments(
 
     # Route each finding to the change set that owns its file, and post via that
     # forge's API — a cross-repo review spans GitHub Enterprise AND GitLab, so a
-    # metrics-core MR finding must land on the metrics-core MR (glab), not the acme-test PR (gh).
+    # a finding on a GitLab-hosted file must land on that MR (glab), not the GHE PR (gh).
     from ..vcs.comment_poster import pick_pr_for_file, post_to_pr
 
     results = []

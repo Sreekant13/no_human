@@ -942,8 +942,8 @@ class Orchestrator:
         The agent may push its own branch and open a PR; it may never merge one.
         Pushing straight to the base branch *is* merging, without review — and
         `git.never_push_to` only lists the branches an install knows about up
-        front (main/master/release/*). metrics-core's integration branch is `dev`, so a
-        `git push origin HEAD:dev` sailed through the guard. The base is only
+        front (main/master/release/*). A repo whose integration branch is something
+        else — `dev`, say — lets `git push origin HEAD:dev` sail through it. The base is only
         known per task, so it is added here, per attempt.
 
         Rebuilt from config every attempt rather than appended, because the
@@ -1300,8 +1300,8 @@ class Orchestrator:
             }
             # Merge: disk skills not already in DB. User-level skills are
             # relevance-filtered by DEFAULT (C1 seed-context diet): each skill
-            # delivered costs context on every turn, and 10 metrics-core skills were
-            # loading into every unrelated dogfood session.
+            # delivered costs context on every turn, and a project's whole skill
+            # roster was loading into every unrelated session.
             from ..history.skills import relevant_skill_names
             # Repo BASENAME only — a full absolute path tokenizes into
             # generic components (git/master/users/...) that spuriously match.
@@ -4111,7 +4111,7 @@ class Orchestrator:
             if d.get("posted"):
                 continue
             # Route to the change set that owns this file, on its own forge —
-            # a metrics-core MR finding lands on the metrics-core MR (glab), not the GHE PR (gh).
+            # a finding on a GitLab-hosted file lands on that MR (glab), not the GHE PR (gh).
             target = pick_pr_for_file(d.get("file") or "", pr_files, pr_url)
             if not target:
                 continue
@@ -4138,7 +4138,7 @@ class Orchestrator:
         EH2: parses through the single canonical ``vcs.pr_watcher.parse_pr_url``
         (one grammar, not four) and — critically — forwards its ``host`` to the
         GitHub fetcher, so PR comments on a GitHub Enterprise instance (e.g.
-        ``code.example.com``, the metrics-core/CI_GATE case) are actually retrieved
+        ``code.example.com``, the self-hosted-forge case) are actually retrieved
         instead of silently querying github.com and coming back empty.
         """
         from ..vcs.pr_watcher import (

@@ -416,7 +416,13 @@ def test_prepared_case_repo_matches_the_pinned_base_content():
     # carried the employer name as a plain denylist literal — live source
     # deleted that whole test (8b564af1); the fixture takes a substitution
     # instead, because a scrub rule cannot delete a test.
-    assert scrubbed == 32, scrubbed
+    # 32 -> 33 on 2026-08-13 (P1 part 2): profile.py:6
+    # (logic-default-clobbers-explicit-cap) newly carries a scrub — a bare
+    # repo-name mention this pass found and BASE_FIXTURE_SCRUB had no rule
+    # for before. 12 other files also changed this pass (core/orchestrator.py
+    # x5, api/app.py x6, test_profile.py) but were already marked `scrubbed`
+    # for unrelated reasons, so they do not move this count.
+    assert scrubbed == 33, scrubbed
 
 
 def test_manifest_declares_the_scrub_without_indexing_the_original():
@@ -649,8 +655,10 @@ def test_scrubbed_fixtures_are_their_origin_blob_put_through_scrub():
     # construction. Here they also prove the loop did not silently check
     # nothing. 77 = the byte-pin test's 83 minus the 6 external-base parcelo
     # files whose provenance lives in the scenario-definition test instead.
+    # 32 -> 33 on 2026-08-13 (P1 part 2) — see the sibling byte-pin test above
+    # for which file newly moved.
     assert checked == 77, checked
-    assert scrubbed == 32, scrubbed
+    assert scrubbed == 33, scrubbed
 
 
 def test_materialiser_refuses_to_run_with_no_de_identification_rules(
