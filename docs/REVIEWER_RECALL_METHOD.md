@@ -199,9 +199,16 @@ ran on `claude-opus-4-8`; the shipping reviewer has been `claude-opus-4-8` again
 2026-08-11 (the 2026-07-26 tier move was reverted by the operator on measured evidence:
 the same-day A/B scored the newer tier lower, and it showed 3x round duration and ~7x
 session cost in production). The historical figure predates the control-set growth from
-4 to 10 cases, so a confirmation run at the current size is scheduled before any number
-returns to a user-facing surface. When one is published, publish it with denominator,
-date and model id — never a bare percentage.
+4 to 10 cases, so it is retired from every surface.
+
+**The confirmation run at the current corpus size has now run.** 2026-08-11, model
+`claude-opus-4-8`, 19 seeded cases + 10 controls: recall **15/19 (79%)** — by class:
+logic 4/4, spec-miss 4/4, security 3/4, test-tamper 3/4, wiring 1/3 — and specificity
+**7/10** (3 clean diffs drew a false FAIL). Wiring is the weakest class and is the
+standing taxonomy target for the next reviewer-prompt iteration — which, per the
+instrument discipline below, must be validated on newly planted cases, never by tuning
+against these. Both numbers travel together, with denominator, date and model id —
+never a bare percentage.
 
 ## Instrument discipline (non-negotiable)
 
