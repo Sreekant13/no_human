@@ -55,10 +55,10 @@ const failedReal = [
   { id: "cancelnewaaaabbbbcc", title: "Per-PR CI_GATE Pipeline", status: "failed", cancelled: true,
     kind: "bugfix", created_at: now, updated_at: now },
 ];
-// Open-PR affordance (operator demo finding): a card whose payload carries a
+// View-PR affordance (operator demo finding): a card whose payload carries a
 // pr_url must link straight to the PR. The demo DB's local-pr:// URLs must
 // degrade to a text badge, never a dead link. (DONE tasks left the board in 5D;
-// their Open PR link lives in the Outcomes table - covered by e2e/outcomes.mjs.)
+// their View PR link lives in the Outcomes table - covered by e2e/outcomes.mjs.)
 // Titles are REAL-length (~90 chars; production mean is ~80): a short fixture
 // title let a clipped-invisible badge pass the presence checks (review D1).
 const prTasks = [
@@ -168,16 +168,16 @@ for (const theme of ["dark", "light"]) {
     await page.waitForTimeout(300);
   }
 
-  // Open-PR — the card links straight to the PR, without opening the drawer.
+  // View-PR — the card links straight to the PR, without opening the drawer.
   const prCard = page.locator(".task-card", { hasText: "Awaiting task with PR" }).first();
   const prLink = prCard.locator("a.card-pr-badge");
-  check(`[${theme}] the card carries the Open PR anchor with the right href/target`,
+  check(`[${theme}] the card carries the View PR anchor with the right href/target`,
     await prLink.count() === 1
       && (await prLink.getAttribute("href")) === "https://example.com/repo/pull/12"
       && (await prLink.getAttribute("target")) === "_blank",
     `count=${await prLink.count()}`);
-  check(`[${theme}] the anchor is labelled (Open PR), not a cryptic pill`,
-    /Open PR/.test((await prLink.textContent().catch(() => "")) || ""));
+  check(`[${theme}] the anchor is labelled (View PR), not a cryptic pill`,
+    /View PR/.test((await prLink.textContent().catch(() => "")) || ""));
   check(`[${theme}] the anchor is keyboard-reachable (tabbable)`,
     await prLink.evaluate((el) => el.tabIndex >= 0).catch(() => false));
   // D1 — presence is not enough: with a REAL-length title the anchor must have
@@ -211,7 +211,7 @@ for (const theme of ["dark", "light"]) {
   await prLink.click();
   await page.waitForTimeout(400);
   const drawerAfterPr = await page.locator(".slideover").isVisible().catch(() => false);
-  check(`[${theme}] clicking Open PR does NOT open the drawer`, !drawerAfterPr);
+  check(`[${theme}] clicking View PR does NOT open the drawer`, !drawerAfterPr);
 
   if (theme === "dark") await page.screenshot({ path: `${OUT}/board-fixed-dark.png` });
   if (theme === "light") await page.screenshot({ path: `${OUT}/board-fixed-light.png` });

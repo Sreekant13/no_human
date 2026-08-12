@@ -13,14 +13,17 @@ import { fileURLToPath } from "node:url";
 const here = fileURLToPath(new URL(".", import.meta.url));
 const read = (f) => readFileSync(here + f, "utf8");
 
-test("Board card renders a labelled Open PR anchor for http(s) pr_urls", () => {
+test("Board card renders a labelled View PR anchor for http(s) pr_urls", () => {
   const src = read("Board.jsx");
   // A real anchor, new tab, no opener/referrer leak.
   assert.match(src, /<a\s[^>]*className="card-pr-badge"[\s\S]{0,200}target="_blank"/);
   assert.match(src, /className="card-pr-badge"[\s\S]{0,300}rel="noreferrer noopener"/);
-  // The label says what it does - "Open PR" with the external-link mark - so
-  // the affordance is discoverable, not a cryptic pill.
-  assert.match(src, /className="card-pr-badge"[\s\S]{0,400}Open PR ↗/);
+  // The label says what it does - "View PR" with the external-link mark - so
+  // the affordance is discoverable, not a cryptic pill. "Open" reads as the
+  // PR's OWN state (open vs closed/merged), which is wrong on a done task
+  // whose PR was closed by the squash-merge - the label must never say that.
+  assert.match(src, /className="card-pr-badge"[\s\S]{0,400}View PR ↗/);
+  assert.doesNotMatch(src, /Open PR/);
 });
 
 test("clicking the card's PR anchor must not also open the drawer", () => {
@@ -45,11 +48,12 @@ test("the card's keydown guard leaves the PR anchor's own Enter activation alone
 
 // 5D moved DONE tasks off the board into the Outcomes TaskTable - the
 // operator's "no button to get to the PR when the ticket is done" lives THERE.
-test("TaskTable rows carry the same Open PR anchor for http(s) pr_urls", () => {
+test("TaskTable rows carry the same View PR anchor for http(s) pr_urls", () => {
   const src = read("TaskTable.jsx");
   assert.match(src, /<a\s[^>]*className="card-pr-badge[^"]*"[\s\S]{0,200}target="_blank"/);
   assert.match(src, /className="card-pr-badge[^"]*"[\s\S]{0,300}rel="noreferrer noopener"/);
-  assert.match(src, /className="card-pr-badge[^"]*"[\s\S]{0,400}Open PR ↗/);
+  assert.match(src, /className="card-pr-badge[^"]*"[\s\S]{0,400}View PR ↗/);
+  assert.doesNotMatch(src, /Open PR/);
   // Clicking the link must not also open the row's drawer.
   assert.match(src, /card-pr-badge[^"]*"[\s\S]{0,400}onClick=\{\(e\) => e\.stopPropagation\(\)\}/);
   // Non-http (demo local-pr://) degrades to text-only, same rule as the card.

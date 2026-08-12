@@ -38,7 +38,8 @@ async def client(store, tmp_path):
 async def test_version_is_the_running_package_version(client):
     r = await client.get("/api/version")
     assert r.status_code == 200
-    assert r.json() == {"version": no_human.__version__}
+    body = r.json()
+    assert body["version"] == no_human.__version__
 
 
 @pytest.mark.asyncio
@@ -52,12 +53,22 @@ async def test_version_is_a_real_version_string_not_a_placeholder(client):
 
 
 @pytest.mark.asyncio
-async def test_version_carries_nothing_but_the_version(client):
+async def test_version_carries_only_version_and_channel_fields(client):
     """It is deliberately NOT part of /api/config: that payload is already
     broader than it should be, and a version is not configuration. This pins the
     shape so nothing else gets attached to it later."""
     body = (await client.get("/api/version")).json()
-    assert set(body) == {"version"}
+    assert set(body) == {"version", "dist_name", "published"}
+
+
+@pytest.mark.asyncio
+async def test_version_carries_the_real_distribution_channel(client):
+    """The browser Updates panel derives its upgrade instruction from these
+    fields rather than a hardcoded package name — pin the values it depends
+    on."""
+    body = (await client.get("/api/version")).json()
+    assert body["dist_name"] == "no-human"
+    assert isinstance(body["published"], bool)
 
 
 @pytest.mark.asyncio

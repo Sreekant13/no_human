@@ -292,14 +292,20 @@ export async function fetchConfig() {
   return r.json();
 }
 
-// The running `nh` version, for the browser path where there is no desktop
-// bridge to read it from. Never throws a version out of thin air: the caller
-// treats a failure as "unknown", which is what it was before this existed.
+// The running `nh` version and distribution channel, for the browser path
+// where there is no desktop bridge to read it from. Never throws a version
+// out of thin air: the caller treats a failure as "unknown", which is what it
+// was before this existed. `published` fails closed — an older server that
+// only ever returned `{version}` (or a malformed body) reads as unpublished,
+// never as a command that might not resolve.
 export async function fetchVersion() {
   const r = await fetch(`${BASE}/api/version`);
   if (!r.ok) throw new Error(`GET /api/version → ${r.status}`);
   const d = await r.json();
-  return typeof d?.version === "string" && d.version ? d.version : null;
+  const version = typeof d?.version === "string" && d.version ? d.version : null;
+  const distName = typeof d?.dist_name === "string" && d.dist_name ? d.dist_name : null;
+  const published = d?.published === true;
+  return { version, distName, published };
 }
 
 export async function fetchProfiles() {

@@ -2856,8 +2856,9 @@ async def show_config(request: Request) -> dict[str, Any]:
 
 
 @app.get("/api/version")
-async def show_version() -> dict[str, str]:
-    """The running `nh` version.
+async def show_version() -> dict[str, Any]:
+    """The running `nh` version, and whether the browser Updates panel may
+    print a pip command for it.
 
     The board runs in two places. Inside the desktop shell the version arrives
     over the preload bridge as ``window.nhDesktop.version``; in a plain browser
@@ -2869,10 +2870,21 @@ async def show_version() -> dict[str, str]:
     ``no_human.__version__`` is the same string ``nh --version`` prints and the
     same one the update check compares against, so all three agree by
     construction.
-    """
-    from .. import __version__
 
-    return {"version": __version__}
+    ``dist_name``/``published`` let the browser panel derive its upgrade
+    instruction from the real distribution channel instead of hardcoding a
+    package name that may not exist there yet: ``published`` is fail-closed
+    (``updates.is_published()`` never raises and defaults to False), so an
+    absent or unreadable cache reads as "not provably published", never as a
+    false "yes".
+    """
+    from .. import __version__, updates
+
+    return {
+        "version": __version__,
+        "dist_name": updates.DIST_NAME,
+        "published": updates.is_published(),
+    }
 
 
 @app.get("/api/integrations")

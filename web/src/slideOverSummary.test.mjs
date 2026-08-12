@@ -244,6 +244,27 @@ test("a non-http pr_url (demo local-pr://) yields a text chip with NO href", () 
   assert.equal(pr.sub, "pull request");
 });
 
+// Operator finding (E2E walk part A): "open pull request" reads as the PR's
+// OWN state, which is wrong once the PR is closed by a squash-merge on a done
+// task. Neither branch (http href or local-pr:// text) may use the verb.
+test("the PR chip caption never uses the verb 'open'", () => {
+  const httpTask = {
+    status: "done",
+    attempts: [{ branch_name: "nh/task-9", pr_url: "https://example.com/pr/9" }],
+  };
+  const httpPr = chipsFor(httpTask).find((c) => c.key === "pr");
+  assert.equal(httpPr.sub, "pull request");
+  assert.doesNotMatch(httpPr.sub, /open/i);
+
+  const localTask = {
+    status: "done",
+    attempts: [{ branch_name: "nh/task-10", pr_url: "local-pr://tasks/10" }],
+  };
+  const localPr = chipsFor(localTask).find((c) => c.key === "pr");
+  assert.equal(localPr.sub, "pull request");
+  assert.doesNotMatch(localPr.sub, /open/i);
+});
+
 // ── milestones ──────────────────────────────────────────────────────────────
 
 test("milestones mark created→planned→attempt→review→pr→done in order", () => {
@@ -393,9 +414,9 @@ test("no section micro-summary ever contains a raw status enum", () => {
   }
 });
 
-// ── details micro: never a phantom "0/N criteria done" ─────────────────────
+// ── details micro: never a phantom "0/N criteria done" or a bare "Not tracked" ──
 
-test("details micro: passed-review task with untracked criteria shows Not tracked, never 0/N", () => {
+test("details micro: passed-review task with untracked criteria names the count, never Not tracked or 0/N", () => {
   const task = {
     status: "awaiting_approval",
     acceptance_criteria: ["a", "b"],
@@ -404,14 +425,17 @@ test("details micro: passed-review task with untracked criteria shows Not tracke
     attempts: [{ review_passed: 1 }],
   };
   const s = sectionSummary("details", { task });
-  assert.equal(s.text, "Not tracked");
+  assert.match(s.text, /^\d+ acceptance criteri/);
+  assert.doesNotMatch(s.text, /Not tracked|0\/\d/);
+  assert.equal(s.text, "2 acceptance criteria");
 });
 
-test("details micro: done task with untracked criteria shows Not tracked, never 0/N", () => {
+test("details micro: done task with untracked criteria names the count, never Not tracked or 0/N", () => {
   const task = { status: "done", acceptance_criteria: ["a", "b", "c"] };
   const s = sectionSummary("details", { task });
-  assert.equal(s.text, "Not tracked");
-  assert.ok(!s.text.includes("0/"), `must never show a phantom 0/N, got "${s.text}"`);
+  assert.match(s.text, /^\d+ acceptance criteri/);
+  assert.doesNotMatch(s.text, /Not tracked|0\/\d/);
+  assert.equal(s.text, "3 acceptance criteria");
 });
 
 test("details micro: passed/done task with tracked criteria shows the real count", () => {
@@ -424,10 +448,18 @@ test("details micro: passed/done task with tracked criteria shows the real count
   assert.equal(s.text, "2/2 criteria done");
 });
 
-test("details micro: mid-flight task with untracked criteria shows Not tracked, never a phantom 0/N", () => {
+test("details micro: mid-flight task with untracked criteria names the count, never Not tracked or a phantom 0/N", () => {
   const task = { status: "coding", acceptance_criteria: ["a", "b"] };
   const s = sectionSummary("details", { task });
-  assert.equal(s.text, "Not tracked");
+  assert.match(s.text, /^\d+ acceptance criteri/);
+  assert.doesNotMatch(s.text, /Not tracked|0\/\d/);
+  assert.equal(s.text, "2 acceptance criteria");
+});
+
+test("details micro: exactly one untracked criterion is singular, never '1 criteria'", () => {
+  const task = { status: "done", acceptance_criteria: ["a"] };
+  const s = sectionSummary("details", { task });
+  assert.equal(s.text, "1 acceptance criterion");
 });
 
 test("details micro: mid-flight task with partially tracked criteria shows the real count", () => {

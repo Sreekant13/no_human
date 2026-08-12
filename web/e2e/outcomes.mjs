@@ -152,16 +152,16 @@ for (const theme of ["dark", "light"]) {
   await page.waitForTimeout(400);
   check(`[${theme}] R3 Done opens its own table`, (await page.locator(".stats-table tbody tr").count()) === 2);
 
-  // Open-PR — a DONE row links straight to its PR without opening the drawer.
+  // View-PR — a DONE row links straight to its PR without opening the drawer.
   const doneRow = page.locator(".stats-table tbody tr", { hasText: "done1" });
   const prLink = doneRow.locator("a.card-pr-badge");
-  check(`[${theme}] a DONE row carries the Open PR anchor with the right href/target`,
+  check(`[${theme}] a DONE row carries the View PR anchor with the right href/target`,
     (await prLink.count()) === 1
       && (await prLink.getAttribute("href")) === "https://example.com/repo/pull/13"
       && (await prLink.getAttribute("target")) === "_blank",
     `count=${await prLink.count()}`);
-  check(`[${theme}] the anchor is labelled (Open PR), not a cryptic pill`,
-    /Open PR/.test((await prLink.textContent().catch(() => "")) || ""));
+  check(`[${theme}] the anchor is labelled (View PR), not a cryptic pill`,
+    /View PR/.test((await prLink.textContent().catch(() => "")) || ""));
   // D1 — presence is not enough: the seeded title is REAL-length (~90 chars),
   // and the anchor must have an on-screen box INSIDE its cell and WIN the
   // hit-test at its own center. Under the old 260px ellipsis cell the badge
@@ -202,7 +202,7 @@ for (const theme of ["dark", "light"]) {
   });
   await prLink.click();
   await page.waitForTimeout(400);
-  check(`[${theme}] clicking Open PR does NOT open the row's drawer`,
+  check(`[${theme}] clicking View PR does NOT open the row's drawer`,
     !(await page.locator(".slideover").isVisible().catch(() => false)));
   if (theme === "dark") await page.screenshot({ path: `${OUT}/outcomes-done-dark.png` });
 

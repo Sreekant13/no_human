@@ -1641,6 +1641,18 @@ a.card-pr-badge:hover, a.card-pr-badge:focus-visible { text-decoration: underlin
     var(--bg-panel);
 }
 
+/* The zero-events state has one short line of text, not a diagram - forcing
+   it to the full-height panel above left a screenful of void under the
+   "Pipeline complete" micro-summary. Let the body size to its content. */
+.sys-view-empty {
+  height: auto;
+  min-height: 0;
+  padding: var(--sp-4) 0;
+}
+.sys-view-empty .so-diff-empty {
+  padding: 0;
+}
+
 /* ── Tree layout container ── */
 .sys-tree {
   display: flex;
@@ -4293,7 +4305,7 @@ a.so-chip-value:hover { color: var(--accent-300); }
   max-width: 130px;
 }
 /* Review D1: when the CELL was the ellipsis container, a real-length title
-   (~80 chars mean) pushed the Open PR badge past the 260px clip — focusable
+   (~80 chars mean) pushed the View PR badge past the 260px clip — focusable
    but invisible (WCAG 2.4.7/2.4.11). The name cell is now a flex ROW: only
    the TITLE span truncates (min-width:0 lets it shrink below its min-content)
    and the badge/"+N older" chips are fixed-size siblings that always stay in

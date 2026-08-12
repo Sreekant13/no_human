@@ -1463,7 +1463,7 @@ function SystemTab({ taskId, task, isActive }) {
 
   if (events.length === 0) {
     return (
-      <div className="sys-view">
+      <div className="sys-view sys-view-empty">
         <div className="so-diff-empty">
           {isActive ? "Waiting for events…" : "No events recorded for this task."}
         </div>

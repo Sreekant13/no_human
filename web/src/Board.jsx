@@ -404,7 +404,7 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClic
               rel="noreferrer noopener"
               title="open the pull request in a new tab"
               onClick={(e) => e.stopPropagation()}
-            >Open PR ↗</a>
+            >View PR ↗</a>
           ) : (
             <span className="card-pr-badge">PR</span>
           )

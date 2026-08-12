@@ -46,8 +46,10 @@ function UpdatesPanel() {
   const [busy, setBusy] = useState(false);
   // In a plain browser there is no preload bridge, so `desktop.version` is
   // undefined and the panel said "You are running no_human unknown in a
-  // browser". The server IS the installed package, so it can be asked.
-  const [servedVersion, setServedVersion] = useState(null);
+  // browser". The server IS the installed package, so it can be asked - and
+  // it also knows whether that package is actually published on the channel
+  // the panel would tell the operator to `pip install` from.
+  const [versionInfo, setVersionInfo] = useState(null);
   const desktop = typeof window !== "undefined" ? window.nhDesktop : undefined;
   const inShell = Boolean(desktop?.shell);
 
@@ -58,14 +60,15 @@ function UpdatesPanel() {
     let live = true;
     // Best-effort, exactly like the composer's greeting: a failed lookup leaves
     // the version unknown, which is what it always was. Never fabricated.
-    fetchVersion().then((v) => { if (live) setServedVersion(v); }).catch(() => {});
+    fetchVersion().then((v) => { if (live) setVersionInfo(v); }).catch(() => {});
     return () => { live = false; };
   }, [inShell]);
 
   const view = updateNotice({
     inShell,
-    current: desktop?.version ?? servedVersion,
+    current: desktop?.version ?? versionInfo?.version,
     update,
+    channel: versionInfo,
   });
 
   const run = useCallback(async (fn) => {

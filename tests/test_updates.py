@@ -57,8 +57,9 @@ def test_notice_names_both_versions_and_the_upgrade_command():
     assert notice is not None
     assert "0.2.0" in notice and "0.1.0" in notice
     # The distribution name, not the import name — `pip install no_human`
-    # would send the operator to a package that does not exist.
-    assert "pip install --upgrade no-human" in notice
+    # would send the operator to a package that does not exist. Sourced from
+    # the one constant so the literal here cannot drift from pyproject.toml.
+    assert f"pip install --upgrade {updates.DIST_NAME}" in notice
 
 
 def test_no_notice_when_current_or_cache_is_empty():
@@ -111,6 +112,36 @@ def test_the_cache_write_is_atomic_and_leaves_no_temp_files(tmp_path):
     leftovers = [p.name for p in tmp_path.iterdir() if p.name != updates.CACHE_NAME]
     assert leftovers == [], f"temp files left behind: {leftovers}"
     assert json.loads((tmp_path / updates.CACHE_NAME).read_text())["latest"] == "0.3.0"
+
+
+# --------------------------------------------------------------------------- #
+# is_published — evidence the distribution actually exists on the channel
+# --------------------------------------------------------------------------- #
+
+def test_is_published_false_without_cache(tmp_path):
+    assert updates.is_published(tmp_path) is False
+
+
+def test_is_published_false_on_unparsable_latest(tmp_path):
+    updates.write_cache({"latest": "<html>"}, tmp_path)
+    assert updates.is_published(tmp_path) is False
+
+
+def test_is_published_true_on_real_version(tmp_path):
+    updates.write_cache({"latest": "0.2.0"}, tmp_path)
+    assert updates.is_published(tmp_path) is True
+
+
+def test_is_published_never_raises(tmp_path):
+    """An unreadable cache directory must read as "not proven published",
+    never as a traceback."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(stat.S_IWUSR | stat.S_IXUSR)  # write+exec, no read
+    try:
+        assert updates.is_published(locked) is False
+    finally:
+        locked.chmod(stat.S_IRWXU)
 
 
 # --------------------------------------------------------------------------- #

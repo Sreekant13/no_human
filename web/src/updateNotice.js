@@ -25,9 +25,11 @@ export const TONES = ["ok", "info", "warn", "error"];
  * @param {boolean} s.inShell     running inside the desktop shell
  * @param {string}  s.current     the running version, or null/undefined
  * @param {object}  s.update      the last payload from the shell, if any
+ * @param {object}  s.channel     the browser-path distribution channel, from
+ *                                GET /api/version: {distName, published}
  * @returns {{title,detail,tone,actions:string[],version:string}}
  */
-export function updateNotice({ inShell = false, current = null, update = null } = {}) {
+export function updateNotice({ inShell = false, current = null, update = null, channel = null } = {}) {
   const version = current || "unknown";
 
   if (!inShell) {
@@ -37,10 +39,19 @@ export function updateNotice({ inShell = false, current = null, update = null } 
     // from GET /api/version (the server IS the installed package); on the rare
     // path where that lookup fails, say less rather than saying "unknown".
     const running = current ? `no_human ${current}` : "no_human";
+    // A pip command is only ever printed when the channel PROVES the package
+    // is published there (channel.published === true, from is_published() on
+    // the server, which fails closed). Anything short of that - no channel
+    // payload, an older server, a malformed response - gets the honest,
+    // confident fallback below rather than a command that may 404.
+    const detail = channel?.published === true
+      ? `You are running ${running} in a browser. Upgrade the command line`
+        + ` with: pip install --upgrade ${channel.distName}`
+      : `You are running ${running} in a browser. New versions ship on the`
+        + " releases page — the board updates when you update nh.";
     return {
       title: "Updates",
-      detail: `You are running ${running} in a browser. Upgrade the`
-        + " command line with: pip install --upgrade no-human",
+      detail,
       tone: "info",
       actions: [],
       version,

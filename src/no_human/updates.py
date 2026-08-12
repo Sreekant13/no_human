@@ -33,10 +33,15 @@ import threading
 from pathlib import Path
 from typing import Any, Callable
 
-#: PyPI's public JSON API. The project name is the DISTRIBUTION name
-#: (`no-human`), not the import name (`no_human`) — they differ, and using the
-#: import name returns 404 forever, which reads exactly like "no update".
-PYPI_JSON_URL = "https://pypi.org/pypi/no-human/json"
+#: The DISTRIBUTION name (`pyproject.toml` `[project] name`), not the import
+#: name (`no_human`) — they differ, and using the import name returns 404
+#: forever, which reads exactly like "no update". Every place that names the
+#: package for a human (the CLI notice, the browser Updates panel) must
+#: interpolate this constant rather than hardcode a second copy that can drift.
+DIST_NAME = "no-human"
+
+#: PyPI's public JSON API for the distribution above.
+PYPI_JSON_URL = f"https://pypi.org/pypi/{DIST_NAME}/json"
 
 #: Once a day. Matches the desktop shell's throttle so the two halves behave
 #: the same way.
@@ -107,6 +112,22 @@ def read_cache(directory: Path | None = None) -> dict[str, Any]:
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def is_published(directory: Path | None = None) -> bool:
+    """Whether the cache holds evidence the distribution actually exists on
+    the channel — a real, parsable version PyPI returned for it.
+
+    Pure and cache-only: no network call. Fails closed in every case — no
+    cache file, an unreadable one, or a `latest` that does not parse as a
+    version (an HTML error page, an empty string) all read as "not proven
+    published", never as a crash or a false "yes".
+    """
+    try:
+        latest = read_cache(directory).get("latest")
+        return parse_version(latest) is not None
+    except Exception:  # noqa: BLE001 - this must never be the thing that raises
+        return False
 
 
 def write_cache(data: dict[str, Any], directory: Path | None = None) -> bool:
@@ -227,7 +248,7 @@ def update_notice(current: str, cache: dict[str, Any]) -> str | None:
     if not is_newer(latest, current):
         return None
     return (f"A new version of no_human is available: {latest} "
-            f"(you have {current}). Upgrade with:  pip install --upgrade no-human")
+            f"(you have {current}). Upgrade with:  pip install --upgrade {DIST_NAME}")
 
 
 def check_for_update(current: str, *, config: Any = None,

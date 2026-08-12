@@ -93,7 +93,7 @@ export default function TaskTable({ tasks, onSelect = null, emptyHint = null }) 
               <td className="stats-td stats-td-name" title={t.title}>
                 {/* The title lives in its OWN ellipsis span inside a flex row:
                     when the cell was the ellipsis container, a real-length
-                    title (~80 chars mean) pushed the Open PR anchor past the
+                    title (~80 chars mean) pushed the View PR anchor past the
                     260px clip — focusable but invisible at every viewport
                     (review D1). The badge is a flex:0 0 auto sibling that can
                     never be clipped away. The flex row is an inner div, not
@@ -123,7 +123,7 @@ export default function TaskTable({ tasks, onSelect = null, emptyHint = null }) 
                       rel="noreferrer noopener"
                       title="open the pull request in a new tab"
                       onClick={(e) => e.stopPropagation()}
-                    >Open PR ↗</a>
+                    >View PR ↗</a>
                   ) : (
                     <span className="card-pr-badge stats-pr-link">PR</span>
                   )

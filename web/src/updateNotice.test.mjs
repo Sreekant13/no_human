@@ -34,16 +34,27 @@ test("Settings actually sources the version for the browser path", () => {
   // correct and the panel still says nothing useful.
   const src = readFileSync(fileURLToPath(new URL("./Settings.jsx", import.meta.url)), "utf8");
   assert.match(src, /fetchVersion/, "Settings must import and call fetchVersion");
-  assert.match(src, /current:\s*desktop\?\.version\s*\?\?\s*servedVersion/,
+  assert.match(src, /current:\s*desktop\?\.version\s*\?\?\s*versionInfo\?\.version/,
     "the shell's own version must still win; the server is the fallback");
   const api = readFileSync(fileURLToPath(new URL("./api.js", import.meta.url)), "utf8");
   assert.match(api, /\/api\/version/, "fetchVersion must call the endpoint that serves it");
 });
 
-test("a browser is never offered an in-app download", () => {
-  const n = updateNotice({ inShell: false, current: "0.1.0" });
+test("an unpublished channel never prints an install command", () => {
+  // No channel payload at all (older server, or the lookup failed) — the
+  // softened copy, never a command that might 404.
+  const n = updateNotice({ inShell: false, current: "0.4.2" });
+  assert.doesNotMatch(n.detail, /pip install/);
   assert.deepEqual(n.actions, [],
-    "there is no shell to install into — the only route is pip");
+    "there is no shell to install into — the only route is pip, and it isn't proven here");
+  assert.equal(n.tone, "info");
+});
+
+test("a published channel names the real distribution", () => {
+  const n = updateNotice({
+    inShell: false, current: "0.4.2",
+    channel: { distName: "no-human", published: true },
+  });
   assert.match(n.detail, /pip install --upgrade no-human/);
 });
 

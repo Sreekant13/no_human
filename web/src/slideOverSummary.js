@@ -9,6 +9,7 @@
 import { fmtCost, fmtTokens, taskBurn, taskCost } from "./cost.js";
 import { formatDuration } from "./formatDuration.js";
 import { httpPrUrl } from "./prUrl.js";
+import { pluralize } from "./pluralize.js";
 
 // The statuses whose gate the operator clears IN the drawer (Reply / Resume / the
 // blocker's options). Single definition — SlideOver's `isParked` and the
@@ -281,7 +282,7 @@ export function chipsFor(task) {
     // dead link, so it degrades to a text chip (same rule as the board card,
     // via the ONE shared guard in prUrl.js).
     if (httpPrUrl(pr)) {
-      chips.push({ key: "pr", label: branchFor(task) || "PR", sub: "open pull request", href: pr });
+      chips.push({ key: "pr", label: branchFor(task) || "PR", sub: "pull request", href: pr });
     } else {
       chips.push({ key: "pr", label: branchFor(task) || "PR", sub: "pull request" });
     }
@@ -675,9 +676,14 @@ export function sectionSummary(key, { task, diff } = {}) {
         const tracked = progress.length > 0;
         // No backend writer populates context.progress.acceptance_criteria
         // today (grep confirms there is none) — every task is "untracked" in
-        // production. This branch stays correct for if/when a writer lands.
+        // production. "Not tracked" read as an unexplained permanent defect;
+        // the count IS known and meaningful, so state that instead. This
+        // branch stays correct for if/when a per-criterion writer lands.
         if (!tracked) {
-          return { text: "Not tracked", colorVar: "var(--text-muted)" };
+          return {
+            text: `${total} acceptance ${pluralize(total, "criterion", "criteria")}`,
+            colorVar: "var(--text-muted)",
+          };
         }
         const done = progress.filter((p) => p?.status === "done").length;
         return { text: `${done}/${total} criteria done`, colorVar: "var(--text-muted)" };
