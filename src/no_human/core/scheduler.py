@@ -42,6 +42,13 @@ log = logging.getLogger("no_human.scheduler")
 # WIP-first: resumed work carries sunk cost and a waiting operator, and
 # pending-first starved three budget-raised resumes behind every newly
 # imported ticket on a one-worker pool (live, 2026-07-24).
+#
+# Within a status, OLDEST first (`list_claimable_tasks`): the claim path
+# used to consume `list_tasks`, which is `created_at DESC` for the board, so
+# the NEWEST pending ticket dispatched first and four day-old tickets never
+# dispatched at all (live, 2026-08-12) — including the repro-gate fix that
+# was blocking an escalated task. WIP-first (across statuses) and FIFO
+# (within a status) are independent and both hold.
 _CLAIMABLE = (TaskStatus.IMPLEMENTING, TaskStatus.PENDING)
 
 
@@ -354,7 +361,7 @@ class Scheduler:
     async def _claimable(self) -> list:
         out = []
         for status in _CLAIMABLE:
-            for t in await self.store.list_tasks(status):
+            for t in await self.store.list_claimable_tasks(status):
                 if t.id not in self._inflight:
                     out.append(t)
         # A plan-approval correction resumes into PLANNING, not IMPLEMENTING —
@@ -365,7 +372,7 @@ class Scheduler:
         # never on the correction text: a blank answer used to write the state
         # with empty text, which this claim missed and the orphan sweep below
         # then turned into a gate bypass).
-        for t in await self.store.list_tasks(TaskStatus.PLANNING):
+        for t in await self.store.list_claimable_tasks(TaskStatus.PLANNING):
             if t.id not in self._inflight and plan_gate.correcting(t):
                 out.append(t)
         return out

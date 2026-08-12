@@ -920,6 +920,85 @@ async def test_resumed_work_claims_before_fresh_pending(store):
 
 
 @pytest.mark.asyncio
+async def test_wip_first_beats_an_older_pending(store):
+    """WIP-first must hold even when the resumed task is the NEWER row —
+    the naive fix (one merged `ORDER BY created_at ASC` across statuses)
+    would hand the slot to the older PENDING task instead. The existing
+    `test_resumed_work_claims_before_fresh_pending` can't catch that: there
+    the resumed task already happens to be older, so a global ASC sort would
+    pass it by accident too."""
+    fake = FakeOrch(store, hold=asyncio.Event())
+    sched = Scheduler(store, lambda task=None: fake, max_workers=1)
+
+    older_pending = Task.new("older pending", repo_path="/tmp/x")
+    older_pending.created_at = "2026-08-01T08:00:00+00:00"
+    await store.create_task(older_pending)
+
+    resumed = Task.new("resumed WIP, newer", repo_path="/tmp/x")
+    resumed.created_at = "2026-08-11T08:00:00+00:00"
+    await store.create_task(resumed)
+    await store.set_status(resumed, TaskStatus.IMPLEMENTING, validate=False)
+
+    started = await sched.tick()
+    assert started == [resumed.id], (
+        f"expected WIP-first to beat the older pending task, got {started}")
+
+
+@pytest.mark.asyncio
+async def test_oldest_pending_claims_before_newer_pending(store):
+    """Bug (2026-08-12): the claim path consumed `list_tasks`, which is
+    `created_at DESC` for the board, so the NEWEST pending ticket dispatched
+    first and day-old tickets starved behind every fresh filing. Queue order
+    within a status must be FIFO (oldest first).
+
+    `older` is created SECOND (higher rowid) so neither insertion order nor
+    rowid can accidentally produce the pass — only `created_at ASC` can."""
+    fake = FakeOrch(store, hold=asyncio.Event())
+    sched = Scheduler(store, lambda task=None: fake, max_workers=1)
+
+    newer = Task.new("filed overnight", repo_path="/tmp/x")
+    newer.created_at = "2026-08-12T08:00:00+00:00"
+    await store.create_task(newer)
+
+    older = Task.new("filed a day ago", repo_path="/tmp/x")
+    older.created_at = "2026-08-11T08:00:00+00:00"
+    await store.create_task(older)
+
+    started = await sched.tick()
+    assert started == [older.id], (
+        f"expected the older pending task to claim the slot first, got {started}")
+
+
+@pytest.mark.asyncio
+async def test_claim_order_is_fifo_across_a_full_slice(store):
+    """Guards against a fix that only sorts the head of the claim list: five
+    PENDING tasks created in shuffled `created_at` order must be claimed in
+    ascending `created_at` order across the whole slice, not just the first
+    pick."""
+    fake = FakeOrch(store, hold=asyncio.Event())
+    sched = Scheduler(store, lambda task=None: fake, max_workers=3)
+
+    stamps = [
+        "2026-08-05T08:00:00+00:00",
+        "2026-08-09T08:00:00+00:00",
+        "2026-08-03T08:00:00+00:00",
+        "2026-08-11T08:00:00+00:00",
+        "2026-08-07T08:00:00+00:00",
+    ]
+    tasks = []
+    for i, stamp in enumerate(stamps):
+        t = Task.new(f"shuffled {i}", repo_path="/tmp/x")
+        t.created_at = stamp
+        await store.create_task(t)
+        tasks.append(t)
+
+    expected = [t.id for t in sorted(tasks, key=lambda t: t.created_at)[:3]]
+    started = await sched.tick()
+    assert started == expected, (
+        f"expected the three oldest ids in ascending order, got {started}")
+
+
+@pytest.mark.asyncio
 async def test_startup_recovers_orphaned_midrun_tasks(tmp_path):
     """Review 2026-07-25: scoping the stuck sweep to claimed tasks left a
     task orphaned in a mid-run status (process killed during review/testing)

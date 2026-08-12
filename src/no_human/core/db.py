@@ -1179,6 +1179,28 @@ class Store:
             )
         return [Task.from_row(dict(r)) for r in rows]
 
+    async def list_claimable_tasks(self, status: TaskStatus) -> list[Task]:
+        """Tasks in `status`, OLDEST FIRST — the scheduler's claim order.
+
+        Deliberately NOT `list_tasks`. That one is DESC because the board
+        legitimately shows newest first, and the scheduler consuming it made
+        dispatch LIFO: on 2026-08-12 four tickets filed a day earlier had never
+        dispatched while overnight filings went out within minutes, because
+        every fresh filing landed at the head of the PENDING list. Queue order
+        is FIFO; display order is not; they are two different questions and now
+        two different queries.
+
+        `rowid ASC` is the tie-break, not decoration: `created_at` is an
+        ISO-8601 string, so two rows created inside the same microsecond (or
+        imported with a coarser stamp by an intake poller) would otherwise
+        order arbitrarily and the FIFO guarantee would be luck.
+        """
+        rows = await self._fetchall(
+            "SELECT * FROM tasks WHERE status = ? ORDER BY created_at ASC, rowid ASC",
+            (status.value,),
+        )
+        return [Task.from_row(dict(r)) for r in rows]
+
     async def get_task_by_source_external_id(
         self, source: str, external_id: str
     ) -> Task | None:

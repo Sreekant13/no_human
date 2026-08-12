@@ -100,6 +100,30 @@ async def test_list_tasks_status_values(client, store):
 
 
 @pytest.mark.asyncio
+async def test_board_tasks_are_newest_first(client, store):
+    """Pins `_board_tasks` (app.py) — the board surface the acceptance
+    criterion names — to newest-first, independent of the scheduler's
+    (oldest-first) claim order fixed in the same change."""
+    oldest = Task.new("oldest", repo_path="/tmp/repo")
+    oldest.acceptance_criteria = ["Should work"]
+    oldest.created_at = "2026-08-01T08:00:00+00:00"
+    await store.create_task(oldest)
+    middle = Task.new("middle", repo_path="/tmp/repo")
+    middle.acceptance_criteria = ["Should work"]
+    middle.created_at = "2026-08-05T08:00:00+00:00"
+    await store.create_task(middle)
+    newest = Task.new("newest", repo_path="/tmp/repo")
+    newest.acceptance_criteria = ["Should work"]
+    newest.created_at = "2026-08-10T08:00:00+00:00"
+    await store.create_task(newest)
+
+    r = await client.get("/api/tasks")
+    assert r.status_code == 200
+    ids = [t["id"] for t in r.json()]
+    assert ids == [newest.id, middle.id, oldest.id]
+
+
+@pytest.mark.asyncio
 async def test_list_tasks_survives_naive_updated_at(client, store):
     """SCRUM-57: a single row with a naive updated_at (the 2026-07-26 incident
     shape) must not 500 the whole board — it renders with wall_seconds

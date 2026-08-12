@@ -205,6 +205,56 @@ async def test_list_by_status(store):
     assert {t.id for t in pend} == {a.id}
 
 
+async def test_list_tasks_is_newest_first(store):
+    """Board order stays DESC — pinned separately from the scheduler's claim
+    order (`list_claimable_tasks`), which is the opposite."""
+    oldest = Task.new("oldest", repo_path="/r")
+    oldest.created_at = "2026-08-01T08:00:00+00:00"
+    await store.create_task(oldest)
+    middle = Task.new("middle", repo_path="/r")
+    middle.created_at = "2026-08-05T08:00:00+00:00"
+    await store.create_task(middle)
+    newest = Task.new("newest", repo_path="/r")
+    newest.created_at = "2026-08-10T08:00:00+00:00"
+    await store.create_task(newest)
+
+    all_ids = [t.id for t in await store.list_tasks()]
+    assert all_ids == [newest.id, middle.id, oldest.id]
+
+    pend_ids = [t.id for t in await store.list_tasks(TaskStatus.PENDING)]
+    assert pend_ids == [newest.id, middle.id, oldest.id]
+
+
+async def test_list_claimable_tasks_is_oldest_first(store):
+    """The scheduler's claim query is the exact reverse of the board's, and
+    ties (identical `created_at`) break on ascending rowid — insertion
+    order — so the FIFO guarantee is deterministic, not luck."""
+    oldest = Task.new("oldest", repo_path="/r")
+    oldest.created_at = "2026-08-01T08:00:00+00:00"
+    await store.create_task(oldest)
+    middle = Task.new("middle", repo_path="/r")
+    middle.created_at = "2026-08-05T08:00:00+00:00"
+    await store.create_task(middle)
+    newest = Task.new("newest", repo_path="/r")
+    newest.created_at = "2026-08-10T08:00:00+00:00"
+    await store.create_task(newest)
+
+    claim_ids = [t.id for t in await store.list_claimable_tasks(TaskStatus.PENDING)]
+    assert claim_ids == [oldest.id, middle.id, newest.id]
+
+    # Tie-break: two rows with an identical created_at stamp order by
+    # ascending rowid (insertion order), not arbitrarily.
+    tie_first = Task.new("tie first", repo_path="/r")
+    tie_first.created_at = "2026-09-01T08:00:00+00:00"
+    await store.create_task(tie_first)
+    tie_second = Task.new("tie second", repo_path="/r")
+    tie_second.created_at = "2026-09-01T08:00:00+00:00"
+    await store.create_task(tie_second)
+
+    claim_ids = [t.id for t in await store.list_claimable_tasks(TaskStatus.PENDING)]
+    assert claim_ids[-2:] == [tie_first.id, tie_second.id]
+
+
 async def test_list_imported_tasks_filters_source_and_external_id(store):
     """SCRUM-54: the picker projection returns only (external_id, id, status,
     created_at) for jira-sourced tasks with a linked external_id — never
