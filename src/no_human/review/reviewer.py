@@ -52,6 +52,23 @@ _REVIEW_JSON = re.compile(r"REVIEW_JSON_START\s*(.*?)\s*REVIEW_JSON_END", re.DOT
 # verdict is UNCHANGED — this only stops throwing away the evidence.
 _UNPARSED_TAIL_CHARS = 300
 
+# An evidence collector that raises must never look like a collector that ran
+# clean — both produced "" before this, so a broken lint/wiring collector
+# silently weakened constraint #3's evidence basis (audit top-8 #8). The
+# marker is injected in place of "" so it still flows through the existing
+# `lint_evidence`/`wiring_evidence` params and renders in its section, but
+# `_reading_scope` (below) must never count it as "the lint/wiring findings".
+_EVIDENCE_FAILED_PREFIX = "[evidence collection FAILED:"
+
+
+def _evidence_failure_marker(kind: str, exc: BaseException) -> str:
+    return (
+        f"{_EVIDENCE_FAILED_PREFIX} {kind}: {type(exc).__name__}] — this "
+        "collector did NOT run; its silence is not evidence of a clean "
+        "result. Do not read the absence of findings here as a pass; if a "
+        "finding depends on it, run the check yourself."
+    )
+
 # 10 was set when the reviewer could not read files. D16 gave it read-only tools,
 # and it now spends most turns fetching the code it cites — the grounding that
 # kills false positives. On task 84251cb2 it exhausted 10 turns exploring a
@@ -715,9 +732,9 @@ def _reading_scope(
         have.append("the test run's output")
     if held_out_output:
         have.append("the held-out test output")
-    if lint_evidence:
+    if lint_evidence and not lint_evidence.startswith(_EVIDENCE_FAILED_PREFIX):
         have.append("the lint findings")
-    if wiring_evidence:
+    if wiring_evidence and not wiring_evidence.startswith(_EVIDENCE_FAILED_PREFIX):
         have.append("the wiring findings")
     listed = have[0] if len(have) == 1 else f"{', '.join(have[:-1])} and {have[-1]}"
     omitted_note = (
@@ -1923,16 +1940,16 @@ class AdversarialReviewer:
                         before_ref=before_ref, after_ref=after_ref,
                     )
                 )
-            except Exception:  # noqa: BLE001 — advisory, never blocks review
-                lint_evidence = ""
+            except Exception as exc:  # noqa: BLE001 — advisory, never blocks review
+                lint_evidence = _evidence_failure_marker("lint", exc)
             # Same advisory contract for wiring evidence: it feeds the
             # GOAL REACHABILITY judgment and never blocks by itself.
             try:
                 wiring_evidence = format_wiring_evidence(
                     collect_wiring_evidence(repo_path, before_ref, after_ref)
                 )
-            except Exception:  # noqa: BLE001 — advisory, never blocks review
-                wiring_evidence = ""
+            except Exception as exc:  # noqa: BLE001 — advisory, never blocks review
+                wiring_evidence = _evidence_failure_marker("wiring", exc)
         prompt = _build_review_prompt(
             task,
             diff,

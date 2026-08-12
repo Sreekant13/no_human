@@ -74,6 +74,27 @@ class GitLabAccessError(RuntimeError):
     parks a MISSING_ACCESS blocker naming ``GITLAB_TOKEN``."""
 
 
+#: Substrings of a failed `glab` invocation that mean "transient infra blip",
+#: not "the coder's code is broken". Checked AFTER `_AUTH_SIGNALS` so an auth
+#: wall always stays non-retryable even if it happens to also contain one of
+#: these words. Unmatched failures still fall through to `""`, so every
+#: scripted `_run_cmd` test that never intended to exercise this keeps its
+#: exact prior behaviour.
+_INFRA_SIGNALS: tuple[str, ...] = (
+    "(http 502)", "(http 503)", "(http 504)", "(http 429)",
+    "502 bad gateway", "503 service unavailable", "504 gateway timeout",
+    "429 too many requests",
+    "connection refused", "no such host", "i/o timeout",
+    "connection reset", "eof", "tls handshake timeout",
+)
+
+
+class GitLabInfraError(RuntimeError):
+    """`glab` hit a transient infra wall (5xx/network), not a code failure.
+    Unlike :class:`GitLabAccessError`, this IS retryable — it becomes
+    ``infra_failure`` and flows into the existing `max_infra_retries` loop."""
+
+
 #: A URL span in glab's output. Go's HTTP client echoes the whole request URL
 #: on a transport failure — `Get "https://host/api/v4/projects/g%2Fp/pipeline":
 #: dial tcp: lookup host: no such host` — and both the hostname and the project
@@ -162,6 +183,22 @@ def _access_reason(text: str, echoed: Sequence[str] = ()) -> str:
     return lines[0] if lines else "glab reported an authentication failure"
 
 
+def _is_infra_error(text: str, echoed: Sequence[str] = ()) -> bool:
+    view = _signal_view(text, echoed)
+    return any(sig in view for sig in _INFRA_SIGNALS)
+
+
+def _infra_reason(text: str, echoed: Sequence[str] = ()) -> str:
+    """Same idiom as `_access_reason`: quote the line that actually matched,
+    not just the first (boxed-error) line."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for line in lines:
+        view = _signal_view(line, echoed)
+        if any(sig in view for sig in _INFRA_SIGNALS):
+            return line
+    return lines[0] if lines else "glab reported an infrastructure failure"
+
+
 def _parse_trigger_output(text: str) -> tuple[str, str]:
     """Extract (pipeline_id, pipeline_url) from the trigger response.
 
@@ -248,6 +285,19 @@ class GitLabCI(CIBackend):
             ),
         )
 
+    def _infra_result(self, pipeline_id: str, pipeline_url: str,
+                      exc: GitLabInfraError) -> CIResult:
+        """A transient 5xx/network wall as a CIResult: UNKNOWN status,
+        ``infra_failure`` so the existing `max_infra_retries` loop in
+        `trigger()` retries it, surfaced honestly — never the coder's red."""
+        return CIResult(
+            pipeline_id=pipeline_id,
+            pipeline_url=pipeline_url,
+            status=PipelineStatus.UNKNOWN,
+            infra_failure=True,
+            parsed_output=f"GitLab infrastructure error ({exc}) — not a code failure",
+        )
+
     def _check_pipeline(self, pipeline_id: str) -> CIResult:
         """Blocking single poll of a pipeline."""
         encoded = urllib.parse.quote(self.project, safe="")
@@ -255,6 +305,8 @@ class GitLabCI(CIBackend):
             return self._check_pipeline_inner(pipeline_id, encoded)
         except GitLabAccessError as exc:
             return self._access_result(pipeline_id, "", exc)
+        except GitLabInfraError as exc:
+            return self._infra_result(pipeline_id, "", exc)
 
     def _check_pipeline_inner(self, pipeline_id: str, encoded: str) -> CIResult:
         raw_status = self._get_pipeline_status(pipeline_id, encoded)
@@ -272,11 +324,28 @@ class GitLabCI(CIBackend):
             status = PipelineStatus.UNKNOWN
 
         if status.is_terminal:
+            pipeline_url = f"https://{self.hostname}/{self.project}/-/pipelines/{pipeline_id}"
             jobs = self._get_jobs(pipeline_id, encoded)
+            if jobs is None:
+                if status == PipelineStatus.FAILED:
+                    return CIResult(
+                        pipeline_id=pipeline_id,
+                        pipeline_url=pipeline_url,
+                        status=status,
+                        infra_failure=True,
+                        parsed_output="pipeline jobs API call failed",
+                    )
+                # jobs are only load-bearing for FAILED (they drive the
+                # infra-vs-coder classification below); a jobs-poll blip on a
+                # SUCCESS/other terminal status must not mark infra_failure on
+                # an otherwise-passing result — that would trip the retry loop
+                # into re-triggering a NEW, non-idempotent pipeline for a run
+                # that already succeeded.
+                jobs = []
             infra = status == PipelineStatus.FAILED and _is_infra_failure(jobs)
             return CIResult(
                 pipeline_id=pipeline_id,
-                pipeline_url=f"https://{self.hostname}/{self.project}/-/pipelines/{pipeline_id}",
+                pipeline_url=pipeline_url,
                 status=status,
                 jobs=jobs,
                 infra_failure=infra,
@@ -294,11 +363,14 @@ class GitLabCI(CIBackend):
 
         The auth wall is caught here rather than deeper so it covers BOTH the
         trigger POST and every status/jobs poll underneath it with one path.
+        The infra wall is caught the same way, for the same reason.
         """
         try:
             return self._trigger_and_wait_inner(branch, variables)
         except GitLabAccessError as exc:
             return self._access_result("", "", exc)
+        except GitLabInfraError as exc:
+            return self._infra_result("", "", exc)
 
     def _trigger_and_wait_inner(
         self, branch: str, variables: dict[str, str]
@@ -365,6 +437,19 @@ class GitLabCI(CIBackend):
 
             if status.is_terminal:
                 jobs = self._get_jobs(pipeline_id, encoded)
+                if jobs is None:
+                    if status == PipelineStatus.FAILED:
+                        return CIResult(
+                            pipeline_id=pipeline_id,
+                            pipeline_url=pipeline_url,
+                            status=status,
+                            infra_failure=True,
+                            parsed_output="pipeline jobs API call failed",
+                        )
+                    # See _check_pipeline_inner: jobs only matter for FAILED
+                    # classification; don't mark infra_failure on a SUCCESS/
+                    # other terminal status just because the jobs poll blipped.
+                    jobs = []
                 infra = status == PipelineStatus.FAILED and _is_infra_failure(jobs)
                 return CIResult(
                     pipeline_id=pipeline_id,
@@ -405,12 +490,15 @@ class GitLabCI(CIBackend):
 
     def _get_jobs(
         self, pipeline_id: str, encoded_project: str
-    ) -> list[JobResult]:
+    ) -> list[JobResult] | None:
+        """``None`` means the call itself failed (no output / unparseable) —
+        distinct from a genuinely empty jobs list, so a broken jobs poll on a
+        terminal ``failed`` pipeline is never read as "no failed jobs found"."""
         data = self._glab_api(
             f"projects/{encoded_project}/pipelines/{pipeline_id}/jobs"
         )
         if not isinstance(data, list):
-            return []
+            return None
         return [
             JobResult(
                 name=j.get("name", ""),
@@ -458,11 +546,13 @@ def _load_gitlab_token() -> None:
 
 
 def _subprocess_run(cmd: list[str]) -> str:
-    """Run `glab`; "" on a plain failure, ``GitLabAccessError`` on an auth wall.
+    """Run `glab`; "" on a plain failure, ``GitLabAccessError`` on an auth
+    wall, ``GitLabInfraError`` on a transient 5xx/network wall.
 
-    Returning "" for BOTH is what conflated a 401 with a network blip. The
-    empty-string path is kept exactly as it was so every scripted test runner
-    (and every non-auth failure) behaves identically.
+    Returning "" for all three is what conflated a 401 (and a 502) with an
+    unclassified failure. The empty-string path is kept exactly as it was so
+    every scripted test runner (and every genuinely unclassified failure)
+    behaves identically.
     """
     _load_gitlab_token()
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -472,4 +562,6 @@ def _subprocess_run(cmd: list[str]) -> str:
     echoed = _operator_echoes(cmd)
     if _is_access_error(detail, echoed):
         raise GitLabAccessError(_access_reason(detail, echoed))
+    if _is_infra_error(detail, echoed):
+        raise GitLabInfraError(_infra_reason(detail, echoed))
     return ""

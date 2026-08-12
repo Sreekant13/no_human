@@ -322,6 +322,136 @@ async def test_gitlab_ci_infra_exhausted_returns_infra_result():
 
 
 # --------------------------------------------------------------------------- #
+# Infra outage on the jobs poll must retry, never bill the coder (audit       #
+# top-8 #8): a 502/network wall on `_get_jobs` used to disappear into `[]`,   #
+# which `_is_infra_failure` reads as "no failed jobs" — so an outage on a     #
+# terminal `failed` pipeline landed on the coder with zero retries.           #
+# --------------------------------------------------------------------------- #
+
+async def test_gitlab_502_on_jobs_poll_is_retried_then_classified_infra():
+    """A 502 on the jobs endpoint must retry within max_infra_retries and only
+    then surface honestly as infra — never a silent pass to the coder."""
+    from no_human.ci.gitlab import GitLabInfraError
+
+    calls = []
+
+    def fake(cmd):
+        calls.append(cmd)
+        if "--method" in cmd:  # trigger POST
+            return "https://x/pipelines/1\n"
+        if cmd and cmd[-1].endswith("/jobs"):
+            raise GitLabInfraError("502 Bad Gateway (HTTP 502)")
+        return json.dumps({"status": "failed"})
+
+    ci = GitLabCI("g/p", hostname="gitlab.acme.net", poll_interval=0,
+                  max_infra_retries=1, _run_cmd=fake)
+
+    import unittest.mock
+    with unittest.mock.patch("asyncio.sleep", return_value=None):
+        result = await ci.trigger("branch", {})
+
+    assert result.infra_failure is True
+    assert result.passed is False
+    trigger_calls = [c for c in calls if "--method" in c]
+    assert len(trigger_calls) == 2, (
+        f"max_infra_retries=1 should retry once (2 attempts total), got {trigger_calls}")
+
+
+async def test_gitlab_real_pipeline_failure_is_still_the_coders_red():
+    """A genuine script_failure must NOT be swallowed into a retry — the fix
+    must not turn a real red build into an infra blip."""
+    calls = []
+
+    def fake(cmd):
+        calls.append(cmd)
+        if "--method" in cmd:  # trigger POST
+            return "https://x/pipelines/1\n"
+        if cmd and cmd[-1].endswith("/jobs"):
+            return json.dumps([{"name": "t", "status": "failed",
+                                 "failure_reason": "script_failure", "web_url": ""}])
+        return json.dumps({"status": "failed"})
+
+    ci = GitLabCI("g/p", hostname="gitlab.acme.net", poll_interval=0,
+                  max_infra_retries=2, _run_cmd=fake)
+
+    import unittest.mock
+    with unittest.mock.patch("asyncio.sleep", return_value=None):
+        result = await ci.trigger("branch", {})
+
+    assert result.infra_failure is False
+    assert result.failed
+    trigger_calls = [c for c in calls if "--method" in c]
+    assert len(trigger_calls) == 1, f"a real failure must not retry, got {trigger_calls}"
+
+
+def test_gitlab_jobs_api_returning_nothing_is_infra_not_a_pass_to_the_coder():
+    """The silent-`[]` half of the hole: the jobs call returns "" (not an
+    exception) — `_get_jobs` must distinguish that from a genuinely empty jobs
+    list, so a terminal `failed` pipeline with an unreadable jobs response is
+    never read as "no failed jobs found"."""
+    fake = FakeRunner([
+        "https://x/pipelines/1\n",
+        json.dumps({"status": "failed"}),
+        "",  # jobs call returns nothing
+    ])
+    ci = GitLabCI("g/p", hostname="gitlab.acme.net", poll_interval=0, _run_cmd=fake)
+    result = ci._trigger_and_wait("branch", {})
+    assert result.infra_failure is True
+
+
+def test_gitlab_jobs_poll_blip_on_a_success_pipeline_is_not_infra():
+    """The jobs-is-None infra branch must be scoped to a FAILED pipeline: jobs
+    are only load-bearing for the infra-vs-coder classification when the
+    pipeline itself failed. A jobs-poll blip on an already-SUCCESS pipeline
+    must not flip infra_failure=True — that would trip the retry loop into
+    re-triggering a brand-new, non-idempotent pipeline for a run that already
+    passed."""
+    fake = FakeRunner([
+        "https://x/pipelines/1\n",
+        json.dumps({"status": "success"}),
+        "",  # jobs call returns nothing on an already-successful pipeline
+    ])
+    ci = GitLabCI("g/p", hostname="gitlab.acme.net", poll_interval=0, _run_cmd=fake)
+    result = ci._trigger_and_wait("branch", {})
+    assert result.passed is True
+    assert result.infra_failure is False
+
+
+def test_subprocess_run_separates_502_from_401_from_a_plain_failure():
+    """Unit-level classification: a 502 reads as infra (never access), a 401
+    reads as access (never infra), and operator-chosen argv text echoed back
+    into an otherwise unclassified failure manufactures neither verdict — the
+    same `_signal_view` redaction `_is_access_error` already relies on."""
+    from no_human.ci.gitlab import _is_access_error, _is_infra_error, _operator_echoes
+
+    body_502 = "glab: 502 Bad Gateway (HTTP 502)\n"
+    assert _is_infra_error(body_502)
+    assert not _is_access_error(body_502)
+
+    body_401 = "glab: 401 Unauthorized (HTTP 401)\n"
+    assert _is_access_error(body_401)
+    assert not _is_infra_error(body_401)
+
+    # A project literally named "eof-canary" would, unredacted, make ANY
+    # failure that echoes it back bare (outside a URL) read as infra — "eof"
+    # is one of the bare, no-space `_INFRA_SIGNALS`.
+    argv = _glab_argv("grp%2Feof-canary")
+    echoes = _operator_echoes(argv)
+    plain_failure = (
+        '  Get "https://gitlab.acme.net/api/v4/projects/grp%2Feof-canary'
+        '/pipeline": some transient glitch\n'
+        '  request to projects/grp/eof-canary/pipeline failed, please retry\n'
+    )
+    # Non-vacuity: without the echo redaction this really would trip the
+    # infra signal purely off the operator's own project name.
+    assert _is_infra_error(plain_failure, echoed=()), (
+        "test is vacuous: the unredacted text does not contain the signal")
+    assert not _is_infra_error(plain_failure, echoes), (
+        "the operator's own project name must not manufacture an infra verdict")
+    assert not _is_access_error(plain_failure, echoes)
+
+
+# --------------------------------------------------------------------------- #
 # ci_from_config                                                               #
 # --------------------------------------------------------------------------- #
 

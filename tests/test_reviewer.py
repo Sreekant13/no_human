@@ -801,6 +801,81 @@ async def test_gate_mode_still_truncates(simple_repo):
 
 
 # --------------------------------------------------------------------------- #
+# Evidence collector failure visibility (audit top-8 #8)                       #
+# --------------------------------------------------------------------------- #
+
+async def _run_gate_capturing_prompt(simple_repo) -> list[str]:
+    """Drive the real `review()` gate path (no diff_override, so the lint/wiring
+    collectors actually run) and return the captured prompts."""
+    calls: list[str] = []
+
+    class CapturingBackend:
+        async def run(self, prompt, *, cwd, max_turns, effort=None,
+                      resume=None, on_event=None, supervisor_hook=None):
+            calls.append(prompt)
+            out = _block(True, [{"label": "ok", "passed": True,
+                                 "evidence": "calc.py:1", "severity": "low"}])
+            return AgentResult(final_text=out, num_turns=1, is_error=False,
+                               tokens_used=10, session_id="f",
+                               stop_reason="end_turn")
+
+    reviewer = AdversarialReviewer(backend=CapturingBackend())
+    t = Task.new("add mul()")
+    t.acceptance_criteria = ["mul(a,b) returns product"]
+    await reviewer.review(t, repo_path=simple_repo)
+    return calls
+
+
+async def test_erroring_lint_collector_puts_a_failure_marker_in_the_reviewer_prompt(
+    simple_repo, monkeypatch,
+):
+    """A broken lint collector must never look like a clean one — before this
+    fix both produced "" and the prompt was byte-identical to "nothing found",
+    silently weakening constraint #3's evidence basis."""
+    def raiser(*a, **k):
+        raise TimeoutError("lint collector timed out")
+
+    monkeypatch.setattr("no_human.review.reviewer.collect_lint_evidence", raiser)
+    calls = await _run_gate_capturing_prompt(simple_repo)
+    assert "[evidence collection FAILED: lint: TimeoutError]" in calls[0]
+
+
+async def test_erroring_wiring_collector_puts_a_failure_marker_in_the_reviewer_prompt(
+    simple_repo, monkeypatch,
+):
+    def raiser(*a, **k):
+        raise TimeoutError("wiring collector timed out")
+
+    monkeypatch.setattr("no_human.review.reviewer.collect_wiring_evidence", raiser)
+    calls = await _run_gate_capturing_prompt(simple_repo)
+    assert "[evidence collection FAILED: wiring: TimeoutError]" in calls[0]
+
+
+async def test_a_failed_collector_is_never_claimed_as_evidence_in_reading_scope(
+    simple_repo, monkeypatch,
+):
+    """Mirror-image guard: a failed collector's marker must reach the prompt,
+    but READING SCOPE must never claim it as "the lint findings" — that would
+    assert evidence that does not exist."""
+    def raiser(*a, **k):
+        raise TimeoutError("lint collector timed out")
+
+    monkeypatch.setattr("no_human.review.reviewer.collect_lint_evidence", raiser)
+    calls = await _run_gate_capturing_prompt(simple_repo)
+    prompt = calls[0]
+    assert "[evidence collection FAILED: lint: TimeoutError]" in prompt
+    assert "the lint findings" not in prompt
+
+
+async def test_clean_collector_prompt_is_unchanged(simple_repo):
+    """Non-vacuity control: a collector that raises nothing must yield a prompt
+    with no failure marker at all — guards against the marker leaking into the
+    normal path."""
+    calls = await _run_gate_capturing_prompt(simple_repo)
+    assert "[evidence collection FAILED" not in calls[0]
+
+
+# --------------------------------------------------------------------------- #
 # PR URL parsing                                                               #
 # --------------------------------------------------------------------------- #
 
