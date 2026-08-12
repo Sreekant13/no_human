@@ -35,6 +35,7 @@ from ..context import ContextGatherer, build_default_sources
 from ..core.db import USAGE_ROLES, Store
 from ..core.events import EventPersister
 from ..core.orchestrator import CODER_ROLE, Orchestrator, is_agent_session
+from ..core.runtime import build_orchestrator
 from ..core.task import Task, TaskStatus
 from ..intake import classify_kind, ingest_from_url, parse_source
 from ..notify import build_notifier
@@ -263,29 +264,10 @@ def _warn_if_editable_install_dangles() -> None:
 
 
 def _build_orchestrator(config, store: Store, *, event_sink=None, task=None) -> Orchestrator:
-    # THE ONE SWITCH. `make_backend` returns exactly the ClaudeBackend this
-    # line used to construct — same class, same arguments — unless
-    # `worker.backend` says otherwise. The orchestrator below is handed a
-    # `CodingBackend` and cannot tell which it got.
-    backend = make_backend(
-        model=config.primary_model,
-        config=config.data,
-        role="coder",
-        forbidden_paths=config["safety"]["forbidden_paths"],
-        never_push_to=config["git"]["never_push_to"],
-    )
-    review_backend = None  # reviewer defaults to ClaudeBackend(readonly=True)
-    # Fan-out over every configured notify-OUT channel (Slack + Teams). One
-    # source of truth for which channels are live: notify.build_notifier.
-    notifier = build_notifier(config.data)
-    gatherer = ContextGatherer(build_default_sources(store, config.data))
-    from ..learning import LearningQueue
-    from ..review.reviewer import AdversarialReviewer
-    reviewer = AdversarialReviewer.from_config(config.data, backend=review_backend)
-    return Orchestrator(store, config.data, backend, notifier,
-                        event_sink=event_sink, context_gatherer=gatherer,
-                        learning_queue=LearningQueue(store),
-                        reviewer=reviewer)
+    """Back-compat alias for the shared factory (core/runtime.build_orchestrator).
+    Kept as a module-level name because five call sites in this module and
+    cli/tui.py resolve it at call time, and tests monkeypatch it here."""
+    return build_orchestrator(config, store, event_sink=event_sink, task=task)
 
 
 async def _run_cli_grill(config, task: Task, store=None) -> Task:

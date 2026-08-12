@@ -141,33 +141,15 @@ async def lifespan(app: FastAPI):
 
     # Always start the embedded worker — board up = worker up.
     # CLI may override max_workers/poll_interval via app.state._worker_opts.
-    from ..agent.claude_backend import ClaudeBackend
-    from ..context import ContextGatherer, build_default_sources
-    from ..core.orchestrator import Orchestrator
+    from ..core.runtime import build_orchestrator
     from ..core.scheduler import Scheduler, resolve_max_workers
-    from ..learning import LearningQueue
-    from ..notify import build_notifier
-    from ..review.reviewer import AdversarialReviewer
 
     def _orch_factory(task=None):
-        # Single in-process Claude Agent SDK backend (lean-stack; no alternate
-        # backend abstraction).
-        backend = ClaudeBackend(
-            model=config.primary_model,
-            forbidden_paths=config["safety"]["forbidden_paths"],
-            never_push_to=config["git"]["never_push_to"],
-        )
-        review_backend = None  # reviewer defaults to ClaudeBackend(readonly=True)
-        # Fan-out over every configured notify-OUT channel (Slack + Teams).
-        notifier = build_notifier(config.data)
-        gatherer = ContextGatherer(build_default_sources(store, config.data))
-        reviewer = AdversarialReviewer.from_config(config.data, backend=review_backend)
-        return Orchestrator(
-            store, config.data, backend, notifier,
-            context_gatherer=gatherer,
-            learning_queue=LearningQueue(store),
-            reviewer=reviewer,
-        )
+        # ONE construction site for CLI and server alike (core/runtime).
+        # The server used to hardcode ClaudeBackend here, so a task run
+        # through the GUI ignored `worker.backend` while the same task via
+        # `nh` honoured it (audit A8/X2, 2026-08-11).
+        return build_orchestrator(config, store, task=task)
 
     overrides = getattr(app.state, "_worker_opts", None) or {}
     conc = config.data.get("concurrency", {})
