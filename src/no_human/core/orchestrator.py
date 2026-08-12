@@ -3334,7 +3334,10 @@ class Orchestrator:
                 detail = (f"{'design doc' if task.kind == 'design_doc' else 'investigation'}"
                       " complete (report-only, no code changes)")
                 self.emit("investigation_report", detail)
-                await self.store.set_status(task, TaskStatus.DONE, validate=False)
+                await self.store.set_status(
+                    task, TaskStatus.DONE, validate=False,
+                    event={"source": "orchestrator", "kind": "investigation_report",
+                           "text": detail})
                 self.emit("state", "done", status="done")
                 # The findings ARE the deliverable — they must ride on
                 # outcome.report or every consumer that judges the deliverable
@@ -7738,7 +7741,10 @@ class Orchestrator:
                 for d in drafts) if drafts else "(no issues found)"))
 
         if not drafts:
-            await self.store.set_status(task, TaskStatus.DONE, validate=False)
+            await self.store.set_status(
+                task, TaskStatus.DONE, validate=False,
+                event={"source": "orchestrator", "kind": "review_finished",
+                       "text": "done — no issues to comment"})
             self.emit("state", "done — no issues to comment", status="done")
             return TaskOutcome(task, status=TaskStatus.DONE, detail=detail,
                                report=review_report)
@@ -7798,7 +7804,10 @@ class Orchestrator:
         await self.store.update_task(task)
         remaining = sum(1 for d in drafts if not d.get("posted"))
         if remaining == 0:
-            await self.store.set_status(task, TaskStatus.DONE, validate=False)
+            await self.store.set_status(
+                task, TaskStatus.DONE, validate=False,
+                event={"source": "orchestrator", "kind": "review_finished",
+                       "text": "done — all approved comments posted"})
             self.emit("state", "done — all approved comments posted", status="done")
         return posted, remaining
 

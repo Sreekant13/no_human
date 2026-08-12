@@ -529,7 +529,8 @@ async def test_live_status_populated_via_sink(store):
             })
             hold.set()
             await asyncio.sleep(0.01)
-            await store.set_status(task, TaskStatus.DONE, validate=False)
+            await store.set_status(task, TaskStatus.DONE, validate=False,
+                                   event={"source": "test", "kind": "test_seed"})
             return SimpleNamespace(status=TaskStatus.DONE, task=task)
 
     orch = FakeOrchWithSink()
@@ -557,7 +558,8 @@ async def test_events_persisted_to_store_on_task_finish(store):
             self._sink({"kind": "tool_use", "tool_name": "Read",
                         "tool_input": {"file_path": "/a/b/test.py"}, "text": "Read test.py"})
             self._sink({"kind": "result", "text": "done"})
-            await store.set_status(task, TaskStatus.DONE, validate=False)
+            await store.set_status(task, TaskStatus.DONE, validate=False,
+                                   event={"source": "test", "kind": "test_seed"})
             hold.set()
             return SimpleNamespace(status=TaskStatus.DONE, task=task)
 
@@ -571,7 +573,9 @@ async def test_events_persisted_to_store_on_task_finish(store):
     await asyncio.sleep(0.05)  # let the finally block's save_events land
 
     persisted = await store.list_events(t.id)
-    assert len(persisted) == 2
+    # 3, not 2: `set_status(..., DONE, event=...)` now persists its own
+    # completion event atomically with the status write (no silent done).
+    assert len(persisted) == 3
     assert persisted[0]["kind"] == "tool_use"
     assert persisted[1]["kind"] == "result"
 
@@ -596,7 +600,8 @@ async def test_sink_preserves_subagent_task_id(store):
             # no_human task's id backfilled (existing, still-needed behavior).
             self._sink({"kind": "tool_use", "tool_name": "Read"})
             hold.set()
-            await store.set_status(task, TaskStatus.DONE, validate=False)
+            await store.set_status(task, TaskStatus.DONE, validate=False,
+                                   event={"source": "test", "kind": "test_seed"})
             return SimpleNamespace(status=TaskStatus.DONE, task=task)
 
     orch = FakeOrchWithSubagentEvents()
@@ -634,7 +639,8 @@ async def test_events_are_persisted_mid_run(store):
             # Give the flusher a chance to run while we are still "in" the task.
             await asyncio.sleep(0.05)
             mid_run_rows.append(len(await store.list_events(task.id)))
-            await store.set_status(task, TaskStatus.DONE, validate=False)
+            await store.set_status(task, TaskStatus.DONE, validate=False,
+                                   event={"source": "test", "kind": "test_seed"})
             return SimpleNamespace(status=TaskStatus.DONE, task=task)
 
     orch = FakeOrchObservingItsOwnPersistence()
@@ -648,8 +654,10 @@ async def test_events_are_persisted_mid_run(store):
         await asyncio.sleep(0.01)
 
     assert mid_run_rows == [5], "events must reach SQLite before the run ends"
-    # And the final flush must not re-insert what was already written.
-    assert len(await store.list_events(t.id)) == 5
+    # 6, not 5: the final flush must not re-insert what was already written,
+    # plus the one completion event `set_status(..., DONE, event=...)` now
+    # persists atomically with the status write.
+    assert len(await store.list_events(t.id)) == 6
 
 
 async def test_flushed_events_are_not_duplicated_by_the_final_flush(store):
@@ -662,7 +670,8 @@ async def test_flushed_events_are_not_duplicated_by_the_final_flush(store):
             for i in range(3):
                 self._sink({"kind": "tool_use", "tool_name": f"Read{i}"})
                 await asyncio.sleep(0.03)   # several flush intervals elapse
-            await store.set_status(task, TaskStatus.DONE, validate=False)
+            await store.set_status(task, TaskStatus.DONE, validate=False,
+                                   event={"source": "test", "kind": "test_seed"})
             return SimpleNamespace(status=TaskStatus.DONE, task=task)
 
     sched = Scheduler(store, lambda task=None: SlowFakeOrch(), max_workers=1)
@@ -675,8 +684,11 @@ async def test_flushed_events_are_not_duplicated_by_the_final_flush(store):
         await asyncio.sleep(0.01)
 
     persisted = await store.list_events(t.id)
-    assert len(persisted) == 3
-    assert [e["tool_name"] for e in persisted] == ["Read0", "Read1", "Read2"]
+    # 4, not 3: `set_status(..., DONE, event=...)` persists its own
+    # completion event atomically with the status write.
+    assert len(persisted) == 4
+    tool_use = [e for e in persisted if e.get("kind") == "tool_use"]
+    assert [e["tool_name"] for e in tool_use] == ["Read0", "Read1", "Read2"]
 
 
 # --------------------------------------------------------------------------- #

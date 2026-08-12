@@ -46,7 +46,11 @@ async def _seed_task(store: Store, *, status=TaskStatus.PENDING, title="Fix thin
     t.acceptance_criteria = ["Should work"]
     await store.create_task(t)
     if status != TaskStatus.PENDING:
-        await store.set_status(t, status, validate=False)
+        if status is TaskStatus.DONE:
+            await store.set_status(t, status, validate=False,
+                                   event={"source": "test", "kind": "test_seed"})
+        else:
+            await store.set_status(t, status, validate=False)
     return t
 
 
@@ -1730,6 +1734,8 @@ async def test_approve_completes_an_already_satisfied_task(client, store):
     refreshed = await store.find_task(t.id)
     assert refreshed.status is TaskStatus.DONE
     assert refreshed.context.get("approved_at") is not None
+    events = await store.list_events(t.id)
+    assert any(e.get("kind") == "approved_already_satisfied" for e in events)
 
 
 @pytest.mark.asyncio

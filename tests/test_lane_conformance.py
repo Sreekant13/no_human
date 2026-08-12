@@ -341,7 +341,8 @@ async def test_board_endpoint_ships_the_lane(client, store, status, expected):
     t = Task.new(f"lane {status.value}", repo_path="/tmp/repo")
     await store.create_task(t)
     if status != TaskStatus.PENDING:
-        await store.set_status(t, status, validate=False)
+        event = {"source": "test", "kind": "test_seed"} if status is TaskStatus.DONE else None
+        await store.set_status(t, status, validate=False, event=event)
 
     r = await client.get("/api/tasks")
     assert r.status_code == 200
@@ -376,7 +377,8 @@ async def test_board_lane_agrees_with_lane_for_on_every_row(client, store):
         t = Task.new(f"row {status.value}", repo_path="/tmp/repo")
         await store.create_task(t)
         if status != TaskStatus.PENDING:
-            await store.set_status(t, status, validate=False)
+            event = {"source": "test", "kind": "test_seed"} if status is TaskStatus.DONE else None
+            await store.set_status(t, status, validate=False, event=event)
 
     rows = (await client.get("/api/tasks")).json()
     assert len(rows) == len(list(TaskStatus))

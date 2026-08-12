@@ -137,7 +137,8 @@ async def test_ci_gate_triggered_but_never_passed_on_a_done_task_contradicts(sto
         _ev("pr_open"), _ev("review"), _ev("tests"),
         _ev("ci_gate_trigger"),
     ])
-    await store.set_status(t, TaskStatus.DONE, validate=False)
+    await store.set_status(t, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
     d = await diagnose(store)
     assert any("CI_GATE UNPROVEN" in c for c in d.contradictions)
     # The pass event clears it.
@@ -249,14 +250,16 @@ async def test_done_code_review_needs_no_pr_open(store):
     cr = Task.new("review PR 123", repo_path="/tmp/x")
     cr.kind = "code_review"
     await store.create_task(cr)
-    await store.set_status(cr, TaskStatus.DONE, validate=False)
+    await store.set_status(cr, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
     d = await diagnose(store)
     assert not any(cr.id[:8] in g and "pr_open" in g for g in d.evidence_gaps)
 
     feat = Task.new("add feature", repo_path="/tmp/x")
     feat.kind = "feature"
     await store.create_task(feat)
-    await store.set_status(feat, TaskStatus.DONE, validate=False)
+    await store.set_status(feat, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
     d = await diagnose(store)
     assert any(feat.id[:8] in g and "pr_open" in g for g in d.evidence_gaps)
 

@@ -6,6 +6,7 @@ import asyncio
 import functools
 import json
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -20,6 +21,21 @@ import aiosqlite
 from .task import Task, TaskStatus, assert_transition
 
 log = logging.getLogger("no_human.db")
+
+
+class SilentCompletion(Exception):
+    """Raised by `Store.set_status` when a caller tries to write DONE without
+    a completion `event`.
+
+    Live incident (task 8c8b36b5): three DONE writers called `set_status`
+    with no event obligation at all, so the false-done write left no trace —
+    the task's `task_events` simply stopped, with nothing recording who
+    completed it or why. This is the fail-loud guard that makes a silent
+    DONE impossible to write again: deliberately the opposite of
+    `EventPersister`'s best-effort contract (`core/events.py`) — a DONE
+    transition's event is not advisory, it is the ONLY record the
+    transition happened at all.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -1245,6 +1261,7 @@ class Store:
         *,
         validate: bool = True,
         human_override: bool = False,
+        event: dict[str, Any] | None = None,
     ) -> Task | None:
         """Transition a task, enforcing the legal-transition map by default.
 
@@ -1265,10 +1282,40 @@ class Store:
         (retry, cancel, shipped). Every other call site (watcher,
         orchestrator, scheduler, pipeline) must leave it at the default so a
         stale in-process handle can never clobber a human's terminal write.
+
+        `event` is REQUIRED whenever `new_status` is DONE (`SilentCompletion`
+        otherwise) — must be a dict with a truthy `kind` and `source`. It is
+        INSERTed into `task_events` in the same commit as the status write,
+        and only when the CAS actually moved the row (`cur.rowcount`): a
+        refused transition records nothing, same as every other field on a
+        no-op write. The insert is deliberately NOT wrapped in try/except —
+        an emitter failure must fail the completion loudly, the opposite of
+        `EventPersister`'s best-effort contract. Non-DONE transitions are
+        unaffected: `event` is optional and ignored when absent.
         """
         if validate:
             assert_transition(task.status, new_status)
+        # Checked AFTER `assert_transition` on purpose: an illegally-shaped
+        # transition (e.g. CONTEXT -> DONE) must still raise `IllegalTransition`
+        # — that is a different, pre-existing invariant, and this guard must
+        # not shadow it. Only once a DONE transition is otherwise legal does
+        # "did you bring an event" apply.
+        if new_status is TaskStatus.DONE and not (
+            event and event.get("kind") and event.get("source")
+        ):
+            raise SilentCompletion(
+                f"set_status({task.id[:8]}, DONE) requires event={{'kind':.., "
+                "'source':..}} — a DONE transition must never write silently"
+            )
         now = _now()
+        # Captured BEFORE the UPDATE: the idempotent-rewrite branch below
+        # (`status = ?` in the CAS WHERE) matches — and reports rowcount=1 —
+        # even when the row is ALREADY at `new_status`, e.g. a second
+        # `set_status(DONE, event=...)` call on a row already DONE. That is
+        # a real SQL match but NOT a real transition, so `rowcount` alone
+        # cannot gate the event insert below: a second completion event
+        # would be recorded for a status that never actually changed.
+        already_there = task.status is new_status
         if human_override:
             cur = await self.db.execute(
                 "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
@@ -1289,6 +1336,13 @@ class Store:
                     new_status.value,
                     TaskStatus.DONE.value, TaskStatus.FAILED.value,
                 ),
+            )
+        if cur.rowcount and event and not already_there:
+            ev = dict(event)
+            ev.setdefault("ts", time.time())
+            await self.db.execute(
+                "INSERT INTO task_events (task_id, ts, data) VALUES (?, ?, ?)",
+                (task.id, ev["ts"], json.dumps(ev)),
             )
         await self.db.commit()
         if cur.rowcount == 0:

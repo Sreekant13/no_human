@@ -788,7 +788,8 @@ async def test_write_back_uses_the_uuid_not_the_human_identifier(store):
     poller = LinearPoller(adapter, store, config=_cfg(write_back=True))
     await poller.poll_once()
     (task,) = await store.list_tasks()
-    await store.set_status(task, TaskStatus.DONE, validate=False)
+    await store.set_status(task, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
     await poller.sync_statuses()
     assert adapter.transitions == [("uuid-eng-1", "completed")]
     assert adapter.comments[0][0] == "uuid-eng-1"
@@ -990,6 +991,7 @@ async def test_tick_runs_write_back_even_though_it_is_a_separate_half(store):
     poller = LinearPoller(adapter, store, config=_cfg(write_back=True))
     await poller.tick()
     (task,) = await store.list_tasks()
-    await store.set_status(task, TaskStatus.DONE, validate=False)
+    await store.set_status(task, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
     await poller.tick()
     assert adapter.transitions == [("uuid-eng-1", "completed")]

@@ -38,6 +38,7 @@ from ..core.orchestrator import CODER_ROLE, Orchestrator, is_agent_session
 from ..core.task import Task, TaskStatus
 from ..intake import classify_kind, ingest_from_url, parse_source
 from ..notify import build_notifier
+from ..vcs.task_pr import task_has_pr_evidence
 
 console = Console()
 
@@ -1484,12 +1485,25 @@ def task_resume(task_id):
     asyncio.run(_go())
 
 
+# The exact false-done signature `restore-approval` repairs on a DONE row:
+# a completion event of one of these kinds means the DONE was NOT silent —
+# something legitimately completed the task, and the verb must refuse rather
+# than second-guess a real completion (task 8c8b36b5's false DONE has none
+# of these; its events stop at a `wake_tick`).
+_COMPLETION_EVENT_KINDS = frozenset({
+    "merged", "shipped", "shipped_pr_closed", "shipped_comment_after_landing",
+    "human_merged", "approved_already_satisfied", "review_finished",
+})
+
+
 @task.command("restore-approval")
 @click.argument("task_id")
 @click.option("--reason", default="spurious escalation reversed",
               help="Recorded in the repair event.")
 def task_restore_approval(task_id, reason):
-    """Return a spuriously-escalated task to awaiting_approval.
+    """Return a spuriously-escalated task to awaiting_approval — or repair a
+    task false-flipped to DONE with its PR still open and no completion
+    event on record.
 
     Hard-scoped repair, not a generic override: only a task STOPPED on a
     blocker that already opened a PR (pr_open event + pr_watch in context)
@@ -1504,6 +1518,14 @@ def task_restore_approval(task_id, reason):
     now produce. The narrow guards are unchanged and are what make it safe: an
     open PR and a pr_open event, neither of which a task that never got there
     can fake.
+
+    Also accepts DONE (2026-08-12, task 8c8b36b5's incident class): a row is
+    a false-done repair candidate only when EVERY one of these holds — no
+    `cancel_reason` (a human's explicit DONE-adjacent call is never touched),
+    no completion event on record (`_COMPLETION_EVENT_KINDS` — a real
+    completion is never second-guessed), and `task_has_pr_evidence` resolves
+    to a real PR (there is genuine outstanding work to restore to). Passing
+    all three is exactly the false-done shape; failing any one refuses.
     """
     config, _ = _bootstrap(require_auth=False)
 
@@ -1513,9 +1535,9 @@ def task_restore_approval(task_id, reason):
             if not t:
                 print_no_task_matching(task_id)
                 sys.exit(1)
-            if t.status not in (TaskStatus.ESCALATED, TaskStatus.FAILED):
+            if t.status not in (TaskStatus.ESCALATED, TaskStatus.FAILED, TaskStatus.DONE):
                 console.print(f"[yellow]task is {t.status.value!r}, not "
-                              "escalated or failed — nothing to restore[/]")
+                              "escalated, failed, or done — nothing to restore[/]")
                 sys.exit(1)
             if (t.context or {}).get("cancel_reason"):
                 # A CANCELLED task is FAILED by a human's explicit decision —
@@ -1528,6 +1550,46 @@ def task_restore_approval(task_id, reason):
                 console.print("[yellow]task was cancelled by a human "
                               "(cancel_reason set) — refusing to restore[/]")
                 sys.exit(1)
+            if t.status is TaskStatus.DONE:
+                events = await store.list_events(t.id)
+                if any(e.get("kind") in _COMPLETION_EVENT_KINDS for e in events):
+                    console.print("[yellow]task has a completion event on "
+                                  "record — this DONE was not silent; "
+                                  "refusing[/]")
+                    sys.exit(1)
+                pr_url = await task_has_pr_evidence(store, t)
+                if not pr_url:
+                    console.print("[yellow]no PR evidence for this task — "
+                                  "nothing outstanding to restore[/]")
+                    sys.exit(1)
+                prior = t.status.value
+                moved = await store.set_status(
+                    t, TaskStatus.AWAITING_APPROVAL, validate=False,
+                    human_override=True)
+                if moved is None:
+                    console.print("[red]the transition was refused by the "
+                                  "store (concurrent change?) — nothing was "
+                                  "recorded; re-run after checking "
+                                  "`nh task show`[/]")
+                    sys.exit(1)
+                cleared = [k for k in ("approved_at", "already_satisfied_report")
+                           if k in (t.context or {})]
+                t.context = await store.merge_context(
+                    t.id, {"approved_at": None, "already_satisfied_report": None})
+                t.blocker = None
+                t.wake_check_at = None
+                await store.update_task(t)
+                await store.save_events(t.id, [{
+                    "source": "human", "kind": "state_repaired",
+                    "text": f"{prior} → awaiting_approval: {reason}; "
+                            f"false-done repair (no completion event on "
+                            f"record); PR: {pr_url}; cleared context keys: "
+                            f"{cleared}",
+                    "ts": time.time(),
+                }])
+                console.print(f"[green]{t.id[:8]} → awaiting_approval[/] "
+                              f"(false-done repair recorded)")
+                return
             if not (t.context or {}).get("pr_watch"):
                 console.print("[yellow]task has no open PR (pr_watch) — "
                               "restore-approval only repairs parked-PR tasks[/]")
@@ -3788,19 +3850,24 @@ def approve(task_id):
                 sys.exit(1)
             t.context = await store.merge_context(
                 t.id, {"approved_at": _now_iso()})
-            attempts = await store.list_attempts(t.id)
-            pr_url = next(
-                (a["pr_url"] for a in reversed(attempts) if a.get("pr_url")), None
-            )
             # An already-satisfied claim has no PR to merge — approval IS the
             # human confirmation its terminal promised, so it completes here
             # (the agent still never merges anything; there is nothing to).
-            # Guarded on pr_url: the report key persists in context, and after
-            # a send-back a LATER attempt may ship a real PR — that approval
+            # Guarded on `task_has_pr_evidence`, not `attempts.pr_url` alone
+            # (live incident, task 8c8b36b5): a draft PR opened pre-review is
+            # recorded only in `context["pr_draft_created"]` or a `pr_draft`
+            # event, never on an attempt row — reading attempts alone missed
+            # it and completed the task while its PR sat open. After a
+            # send-back a LATER attempt may ship a real PR — that approval
             # must stay a merge instruction, never a false DONE (PR #101
             # round-2 review).
+            pr_url = await task_has_pr_evidence(store, t)
             if (t.context or {}).get("already_satisfied_report") and not pr_url:
-                await store.set_status(t, TaskStatus.DONE, validate=False)
+                await store.set_status(
+                    t, TaskStatus.DONE, validate=False,
+                    event={"source": "human", "kind": "approved_already_satisfied",
+                           "text": "already-satisfied claim confirmed by approve"},
+                )
                 console.print(
                     f"[bold green]approved[/] {t.id[:8]} — already satisfied "
                     "claim confirmed; no code change was needed. Task done."

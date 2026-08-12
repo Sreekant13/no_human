@@ -954,7 +954,8 @@ async def test_the_idempotency_marker_survives_a_reload_from_the_store(store):
     cfg = _cfg(write_back=True)
     await MondayPoller(adapter, store, config=cfg).poll_once()
     (task,) = await store.list_tasks()
-    await store.set_status(task, TaskStatus.DONE, validate=False)
+    await store.set_status(task, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
     await MondayPoller(adapter, store, config=cfg).sync_statuses()
     assert len(adapter.comments) == 1
 
@@ -1149,7 +1150,8 @@ async def test_tick_runs_write_back_even_though_it_is_a_separate_half(store):
     poller = MondayPoller(adapter, store, config=_cfg(write_back=True))
     await poller.tick()
     (task,) = await store.list_tasks()
-    await store.set_status(task, TaskStatus.DONE, validate=False)
+    await store.set_status(task, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
     await poller.tick()
     assert adapter.transitions == [("2000000001", "done")]
 

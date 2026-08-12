@@ -46,7 +46,11 @@ def _seed_task(db_path: Path, status: TaskStatus, *, title="Test task",
             if task_id is not None:
                 t.id = task_id
             await s.create_task(t)
-            await s.set_status(t, status, validate=False)
+            if status is TaskStatus.DONE:
+                await s.set_status(t, status, validate=False,
+                                   event={"source": "test", "kind": "test_seed"})
+            else:
+                await s.set_status(t, status, validate=False)
             return t.id
     return asyncio.run(_go())
 
@@ -65,6 +69,13 @@ def _get_task(db_path: Path, task_id: str) -> Task:
     async def _go():
         async with Store(db_path) as s:
             return await s.find_task(task_id)
+    return asyncio.run(_go())
+
+
+def _list_events(db_path: Path, task_id: str) -> list[dict]:
+    async def _go():
+        async with Store(db_path) as s:
+            return await s.list_events(task_id)
     return asyncio.run(_go())
 
 
@@ -157,6 +168,8 @@ def test_approve_completes_an_already_satisfied_task(tmp_path, monkeypatch):
     refreshed = _get_task(db, task_id)
     assert refreshed.status is TaskStatus.DONE
     assert refreshed.context.get("approved_at") is not None
+    events = _list_events(db, task_id)
+    assert any(e.get("kind") == "approved_already_satisfied" for e in events)
 
 
 def test_approve_wrong_status(tmp_path, monkeypatch):

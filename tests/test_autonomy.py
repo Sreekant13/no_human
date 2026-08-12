@@ -18,7 +18,8 @@ async def _mk(store, title, status, *, blocker=None):
     t = Task.new(title, repo_path="/r")
     await store.create_task(t)
     if status is not TaskStatus.PENDING:
-        await store.set_status(t, status, validate=False)
+        event = {"source": "test", "kind": "test_seed"} if status is TaskStatus.DONE else None
+        await store.set_status(t, status, validate=False, event=event)
     if blocker is not None:
         t.blocker = blocker
         t.status = status
@@ -73,6 +74,7 @@ async def test_days_window_filters(store):
     t = Task.new("old", repo_path="/r")
     t.created_at = "2000-01-01T00:00:00+00:00"
     await store.create_task(t)
-    await store.set_status(t, TaskStatus.DONE, validate=False)
+    await store.set_status(t, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
     rep = await compute_autonomy_metrics(store, days=1)
     assert rep.total_tasks == 0

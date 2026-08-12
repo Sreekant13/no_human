@@ -28,7 +28,8 @@ def _seed_task(db_path: Path, status: TaskStatus, *, title="Test task") -> str:
         async with Store(db_path) as s:
             t = Task.new(title, repo_path="/tmp/repo")
             await s.create_task(t)
-            await s.set_status(t, status, validate=False)
+            event = {"source": "test", "kind": "test_seed"} if status is TaskStatus.DONE else None
+            await s.set_status(t, status, validate=False, event=event)
             return t.id
     return asyncio.run(_go())
 

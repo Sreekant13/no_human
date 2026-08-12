@@ -563,7 +563,8 @@ async def test_unblock_ready_clears_a_checkpoint_it_never_chose(store):
     dep = Task.new("dep", repo_path="/tmp/repo")
     dep.parent_id = parent.id
     await store.create_task(dep)
-    await store.set_status(dep, TaskStatus.DONE, validate=False)
+    await store.set_status(dep, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
 
     blocked = Task.new("blocked on dep", repo_path="/tmp/repo")
     blocked.parent_id = parent.id

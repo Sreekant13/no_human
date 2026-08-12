@@ -464,7 +464,8 @@ def _shipped_then_terminal(store, task, answer):
     concurrent-completion race, made deterministic."""
     async def pr_shipped(repo_path, branch, base):
         fresh = await store.get_task(task.id)
-        await store.set_status(fresh, TaskStatus.DONE, validate=False)
+        await store.set_status(fresh, TaskStatus.DONE, validate=False,
+                               event={"source": "test", "kind": "test_seed"})
         if isinstance(answer, BaseException):
             raise answer
         return answer

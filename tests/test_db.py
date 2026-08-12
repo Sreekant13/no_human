@@ -48,7 +48,8 @@ async def test_set_status_cas_guard_blocks_stale_write_over_done_row(store):
     await store.set_status(t, TaskStatus.IMPLEMENTING)
     # A human `shipped` verb elsewhere writes DONE directly to the DB row.
     await store.set_status(
-        t, TaskStatus.DONE, validate=False, human_override=True)
+        t, TaskStatus.DONE, validate=False, human_override=True,
+        event={"source": "test", "kind": "test_seed"})
 
     stale = Task.new("x", repo_path="/tmp/r")
     stale.id = t.id
@@ -88,7 +89,8 @@ async def test_set_status_cas_guard_applies_to_validate_false(store):
     t = Task.new("x", repo_path="/tmp/r")
     await store.create_task(t)
     await store.set_status(
-        t, TaskStatus.DONE, validate=False, human_override=True)
+        t, TaskStatus.DONE, validate=False, human_override=True,
+        event={"source": "test", "kind": "test_seed"})
 
     result = await store.set_status(t, TaskStatus.PENDING, validate=False)
 
@@ -134,7 +136,8 @@ async def test_update_task_cas_guard_blocks_stale_status_over_done_row(store):
     context markers on an already-DONE row long after completion)."""
     t = Task.new("x", repo_path="/tmp/r")
     await store.create_task(t)
-    await store.set_status(t, TaskStatus.DONE, validate=False)
+    await store.set_status(t, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
 
     stale = await store.get_task(t.id)
     stale.status = TaskStatus.IMPLEMENTING  # stale caller resurrecting it
@@ -483,7 +486,8 @@ async def _task_with_open_attempt(store, status: TaskStatus):
     t = Task.new(f"t-{status.value}", repo_path="/tmp/r")
     await store.create_task(t)
     await store.create_attempt(t.id, 1)
-    await store.set_status(t, status, validate=False)
+    event = {"source": "test", "kind": "test_seed"} if status is TaskStatus.DONE else None
+    await store.set_status(t, status, validate=False, event=event)
     return t
 
 

@@ -992,11 +992,10 @@ async def test_done_task_with_human_merged_event_ignores_new_pr_comment(store):
     t.context = {"pr_watch": "https://code.example.com/o/r/pull/9"}
     await store.create_task(t)
     await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
-    await store.set_status(t, TaskStatus.DONE, validate=False)
-    await store.save_events(t.id, [{
+    await store.set_status(t, TaskStatus.DONE, validate=False, event={
         "source": "human", "kind": "human_merged",
         "sha": "deadbeef", "note": "merged by hand", "ts": 0,
-    }])
+    })
     before = len(await store.list_events(t.id))
 
     async def pr_comment(url):
@@ -1052,10 +1051,9 @@ async def test_evaluate_rechecks_current_db_status_not_the_stale_arg(store):
     # AWAITING_APPROVAL in memory — only the DB row is flipped to done, via a
     # second Task handle, exactly as a concurrent request would.
     t2 = await store.get_task(t.id)
-    await store.set_status(t2, TaskStatus.DONE, validate=False)
-    await store.save_events(t.id, [{
+    await store.set_status(t2, TaskStatus.DONE, validate=False, event={
         "source": "human", "kind": "human_merged", "sha": "abc", "ts": 0,
-    }])
+    })
     assert t.status is TaskStatus.AWAITING_APPROVAL  # confirms the staleness
 
     w = WakeWatcher(store, _cfg())
@@ -1080,10 +1078,9 @@ async def test_pr_feedback_rung_rechecks_terminal_after_the_network_poll(store):
         # Simulate a concurrent POST /shipped landing while this network call
         # is in flight.
         current = await store.get_task(t.id)
-        await store.set_status(current, TaskStatus.DONE, validate=False)
-        await store.save_events(t.id, [{
+        await store.set_status(current, TaskStatus.DONE, validate=False, event={
             "source": "human", "kind": "human_merged", "sha": "abc", "ts": 0,
-        }])
+        })
         return [PrComment(author="human", body="great, thanks!",
                           created_at="2026-07-26T12:00:00+00:00")]
 
@@ -1139,7 +1136,8 @@ async def test_resume_refuses_a_terminal_task(store):
     await store.create_task(t)
     await store.set_status(t, TaskStatus.BLOCKED, validate=False)
     stale = await store.get_task(t.id)
-    await store.set_status(t, TaskStatus.DONE, validate=False)
+    await store.set_status(t, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
     events = []
     w = WakeWatcher(store, _cfg(), on_event=lambda k, task: events.append(k))
     out = await w._resume(stale)
@@ -1155,7 +1153,8 @@ async def test_escalate_revisions_refuses_a_terminal_task(store):
     await store.create_task(t)
     await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
     stale = await store.get_task(t.id)
-    await store.set_status(t, TaskStatus.DONE, validate=False)
+    await store.set_status(t, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
     events = []
     w = WakeWatcher(store, _cfg(), on_event=lambda k, task: events.append(k))
     await w._escalate_revisions(stale, rounds=99)
@@ -1194,7 +1193,8 @@ async def test_stall_watchdog_refuses_a_terminal_task(store):
         "ts": _time.time() - 7200,
     }])
     stale = await store.get_task(t.id)
-    await store.set_status(t, TaskStatus.DONE, validate=False)
+    await store.set_status(t, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
     events = []
     w = WakeWatcher(store, _cfg(stuck_active_minutes=30),
                     on_event=lambda k, task: events.append(k))
@@ -1217,7 +1217,8 @@ async def test_ci_rung_rechecks_terminal_after_the_log_fetch(store):
         return [{"name": "unit", "status": "fail", "link": "http://ci/1"}]
 
     async def ci_log(link):
-        await store.set_status(t, TaskStatus.DONE, validate=False)
+        await store.set_status(t, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
         return "boom log"
 
     events = []
@@ -1240,7 +1241,8 @@ async def test_inject_pr_feedback_refuses_a_terminal_task(store):
     await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
 
     async def pr_comment(ref):
-        await store.set_status(t, TaskStatus.DONE, validate=False)
+        await store.set_status(t, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
         return [{"author": "human", "body": "merged this by hand, thanks"}]
 
     events = []

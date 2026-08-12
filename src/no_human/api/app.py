@@ -48,6 +48,7 @@ from ..core.db import Store
 from ..core.lanes import lane_for
 from ..core.orchestrator import is_agent_session, is_narration
 from ..core.task import Task, TaskStatus
+from ..vcs.task_pr import task_has_pr_evidence
 from .models import (
     AttemptOut, BoardPayload, CreateProjectRequest, CreateTaskRequest,
     GrillQuestionOut, GrillResultOut, GrillStepRequest, IntegrationSetupRequest,
@@ -877,10 +878,18 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
     # instruction, never a false DONE (PR #101 round-2 review).
     message = "Approval recorded. Merge the PR in your git host — the agent never merges."
     if (task.context or {}).get("already_satisfied_report"):
-        attempts = await store.list_attempts(task.id)
-        has_pr = any(a.get("pr_url") for a in attempts)
-        if not has_pr:
-            await store.set_status(task, TaskStatus.DONE, validate=False)
+        # Guarded on `task_has_pr_evidence`, not `attempts.pr_url` alone (live
+        # incident, task 8c8b36b5): a draft PR opened pre-review is recorded
+        # only in `context["pr_draft_created"]` or a `pr_draft` event, never
+        # on an attempt row — reading attempts alone missed it and completed
+        # the task while its PR sat open.
+        pr_url = await task_has_pr_evidence(store, task)
+        if not pr_url:
+            await store.set_status(
+                task, TaskStatus.DONE, validate=False,
+                event={"source": "human", "kind": "approved_already_satisfied",
+                       "text": "already-satisfied claim confirmed by approve"},
+            )
             message = ("Already satisfied claim confirmed — no code change was "
                        "needed. Task done (there is no PR; the agent never merges).")
     tasks = await _board_tasks(store, scheduler=_sched(request))
@@ -910,7 +919,11 @@ async def finish_review(task_id: str, request: Request) -> dict[str, Any]:
         )
     drafts = (task.context or {}).get("draft_review_comments") or []
     posted = sum(1 for d in drafts if d.get("posted"))
-    await store.set_status(task, TaskStatus.DONE, validate=False)
+    await store.set_status(
+        task, TaskStatus.DONE, validate=False,
+        event={"source": "human", "kind": "review_finished",
+               "text": f"review finished — {posted}/{len(drafts)} comment(s) posted"},
+    )
     tasks = await _board_tasks(store, scheduler=_sched(request))
     await _mgr.broadcast({
         "type": "task_updated",
@@ -1267,11 +1280,10 @@ async def mark_shipped(
     task.wake_check_at = None
     await store.update_task_columns(task)
     await store.set_status(
-        task, TaskStatus.DONE, validate=False, human_override=True)
-    await store.save_events(task.id, [{
-        "source": "human", "kind": "human_merged",
-        "sha": sha, "note": body.note, "ts": time.time(),
-    }])
+        task, TaskStatus.DONE, validate=False, human_override=True,
+        event={"source": "human", "kind": "human_merged",
+               "sha": sha, "note": body.note, "ts": time.time()},
+    )
     attempts = await store.list_attempts(task.id)
     tasks = await _board_tasks(store, scheduler=_sched(request))
     await _mgr.broadcast({

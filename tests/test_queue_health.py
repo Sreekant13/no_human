@@ -22,7 +22,8 @@ async def store():
 async def _task(store, status: TaskStatus, *, updated_min_ago: int = 0):
     t = Task.new(f"t-{status.value}-{updated_min_ago}", repo_path="/r")
     await store.create_task(t)
-    await store.set_status(t, status, validate=False)
+    event = {"source": "test", "kind": "test_seed"} if status is TaskStatus.DONE else None
+    await store.set_status(t, status, validate=False, event=event)
     if updated_min_ago:
         ts = (datetime.now(timezone.utc)
               - timedelta(minutes=updated_min_ago)).isoformat()

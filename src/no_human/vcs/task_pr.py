@@ -78,3 +78,40 @@ async def resolve_task_pr(store: Any, task: Any) -> ResolvedPR:
             return ResolvedPR(draft_url, _clean(ctx.get("pr_draft_branch")), "draft")
 
     return ResolvedPR("", "", "none")
+
+
+_PR_EVENT_KINDS = {"pr_open", "pr_draft"}
+
+
+async def task_has_pr_evidence(store: Any, task: Any) -> str:
+    """The PR this task is known to have, or ``""`` — the ONE question "is
+    there something for the human to merge?" fails CLOSED on.
+
+    Live incident (8c8b36b5): a draft PR opened pre-review is recorded only
+    as ``context["pr_draft_created"]``, never on an attempt row. The two
+    "is there a PR to merge" call sites that read ``attempts.pr_url`` alone
+    missed it and completed the task while its PR (#253) sat open. This is
+    the ONE place both must call instead.
+
+    First tries `resolve_task_pr` (covers `pr_watch` -> `attempts.pr_url` ->
+    `pr_draft_created`, minus `abandoned_pr_urls`). If that comes up empty,
+    scans persisted `task_events` for any event whose `kind` is in
+    ``{"pr_open", "pr_draft"}`` and reads its URL from `pr_url` (the
+    `pr_draft` shape — ``orchestrator.emit("pr_draft", ..., pr_url=url)``)
+    falling back to `text` (the `pr_open` shape — the URL IS the emitted
+    text there). Not abandoned, not counted. This is the belt-and-braces
+    rung for a PR recorded only in the event log and nowhere else.
+    """
+    resolved = await resolve_task_pr(store, task)
+    if resolved.url:
+        return resolved.url
+
+    ctx = task.context or {}
+    abandoned = {_clean(u) for u in (ctx.get("abandoned_pr_urls") or [])}
+    for e in await store.list_events(task.id):
+        if e.get("kind") not in _PR_EVENT_KINDS:
+            continue
+        url = _clean(e.get("pr_url")) or _clean(e.get("text"))
+        if url and url not in abandoned:
+            return url
+    return ""

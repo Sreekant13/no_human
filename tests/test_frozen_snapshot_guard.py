@@ -440,7 +440,8 @@ async def test_tick_detects_and_recovers_a_frozen_view(store, peer, caplog):
     # Everything created before the pin is PENDING and therefore claimable; take
     # them out of the way so the assertion below is about the HIDDEN task only.
     for t in await store.list_tasks(TaskStatus.PENDING):
-        await peer.set_status(t, TaskStatus.DONE, validate=False)
+        await peer.set_status(t, TaskStatus.DONE, validate=False,
+                              event={"source": "test", "kind": "test_seed"})
     hidden = await _mk(peer, "invisible to the pinned pool")
 
     sched = _sched(store)

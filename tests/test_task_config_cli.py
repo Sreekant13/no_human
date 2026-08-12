@@ -29,7 +29,8 @@ def _seed_task(db_path: Path, *, config: dict | None = None,
             if config is not None:
                 t.config = config
             await s.create_task(t)
-            await s.set_status(t, TaskStatus.DONE, validate=False)
+            await s.set_status(t, TaskStatus.DONE, validate=False,
+                               event={"source": "test", "kind": "test_seed"})
             return t.id
     return asyncio.run(_go())
 

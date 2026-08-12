@@ -319,7 +319,8 @@ async def test_a_refused_status_write_leaves_no_checkpoint_behind(store):
 
     async def _list_tasks(status):              # the human wins the race
         if status is TaskStatus.REVIEWING:
-            await store.set_status(stale, TaskStatus.DONE, validate=False)
+            await store.set_status(stale, TaskStatus.DONE, validate=False,
+                                   event={"source": "test", "kind": "test_seed"})
             return [stale]
         return await real_list(status)
 

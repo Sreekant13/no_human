@@ -191,7 +191,8 @@ async def test_a_landed_task_no_ops_and_still_records_the_note(store):
     t = await _approval_task(store)
     t.context["base_branch"] = "main"
     await store.update_task(t)
-    await store.set_status(t, TaskStatus.DONE, validate=False)
+    await store.set_status(t, TaskStatus.DONE, validate=False,
+                           event={"source": "test", "kind": "test_seed"})
     dev = PrComment(author="dev", body="closing this — it landed as a local squash",
                     created_at="2026-08-12T03:04:00Z")
     events = []

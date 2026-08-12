@@ -23,7 +23,8 @@ async def _task_with_playbook(store, name: str, status: TaskStatus, tokens: int)
                                    "text": f"applying playbook: {name}"}])
     aid = await store.create_attempt(t.id, 1)
     await store.update_attempt(aid, tokens_used=tokens, cache_read_tokens=0)
-    await store.set_status(t, status, validate=False)
+    event = {"source": "test", "kind": "test_seed"} if status is TaskStatus.DONE else None
+    await store.set_status(t, status, validate=False, event=event)
     return t
 
 

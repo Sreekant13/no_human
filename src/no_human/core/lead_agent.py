@@ -205,12 +205,12 @@ class LeadAgent:
                 if gate_result is not None:
                     return True  # quality gate set parent to ESCALATED
 
-            self._emit(
-                "compound_done",
-                f"all {len(subtasks)} sub-tasks completed",
-            )
+            compound_done_text = f"all {len(subtasks)} sub-tasks completed"
+            self._emit("compound_done", compound_done_text)
             await self.store.set_status(
                 parent, TaskStatus.DONE, validate=False,
+                event={"source": "lead_agent", "kind": "compound_done",
+                       "text": compound_done_text},
             )
             return True
 

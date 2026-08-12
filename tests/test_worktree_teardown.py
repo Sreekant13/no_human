@@ -210,7 +210,8 @@ async def test_the_startup_janitor_removes_terminal_leftovers_and_keeps_live_one
             ctx["cancel_reason"] = cancel_reason
             task.context = ctx
             await store.update_task(task)
-        await store.set_status(task, status, validate=False)
+        event = {"source": "test", "kind": "test_seed"} if status is TaskStatus.DONE else None
+        await store.set_status(task, status, validate=False, event=event)
         return task
 
     t_done = await _mk(TaskStatus.DONE)

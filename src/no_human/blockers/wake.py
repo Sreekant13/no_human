@@ -836,12 +836,19 @@ class WakeWatcher:
             return None
         await observe_pr(self.store, task.id, url, forge_state=forge_state,
                          shipped=True)
-        await self.store.set_status(task, TaskStatus.DONE, validate=False)
-        await self._emit(
-            task, "shipped",
+        shipped_text = (
             f"{task.id[:8]} {situation} but its content is already on "
-            f"{base} (squash-merged): {url}",
+            f"{base} (squash-merged): {url}"
         )
+        # `set_status`'s own event insert is the persistence now (atomic with
+        # the status write) — `_emit` would double-persist, so call the host
+        # mirror directly instead of going through it.
+        await self.store.set_status(
+            task, TaskStatus.DONE, validate=False,
+            event={"source": "watcher", "kind": "shipped", "text": shipped_text,
+                   "ts": time.time()},
+        )
+        self._on_event("shipped", shipped_text)
         return action
 
     async def _comment_after_landing(
@@ -1003,8 +1010,13 @@ class WakeWatcher:
             return None
         if state == "MERGED":
             await observe_pr(self.store, task.id, url, forge_state=state)
-            await self.store.set_status(task, TaskStatus.DONE, validate=False)
-            await self._emit(task, "merged", f"{task.id[:8]} PR merged by a human: {url}")
+            merged_text = f"{task.id[:8]} PR merged by a human: {url}"
+            await self.store.set_status(
+                task, TaskStatus.DONE, validate=False,
+                event={"source": "watcher", "kind": "merged", "text": merged_text,
+                       "ts": time.time()},
+            )
+            self._on_event("merged", merged_text)
             return "merged"
         if state == "CLOSED":
             # GitHub's merged flag is never true for our PRs: the operator's
