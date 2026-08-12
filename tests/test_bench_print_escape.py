@@ -76,6 +76,11 @@ _PROVABLY_SAFE = {
     # aggregate metrics: floats/ints out of card.as_dict()["aggregate"]
     "agg['success_rate']", "agg['median_cost_ratio']",
     "agg['total_nh_tokens']", "agg['corrections_avoided']",
+    # closed-set string label out of card.as_dict()["aggregate"] — always one
+    # of northstar.BASIS_TIER_WEIGHTED/BASIS_CACHE_WEIGHTED/BASIS_MIXED or
+    # the literal "n/a" (cost_ratio_basis()/NorthStarCard.
+    # median_cost_ratio_basis), never model- or file-authored text
+    "agg['median_cost_ratio_basis']",
     # a status enum's own value, from a closed set defined in this repo
     "score.outcome_status",
     # ✅/❌ glyph and a formatted ratio, both built literally a few lines above

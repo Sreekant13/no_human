@@ -21,7 +21,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from .northstar import BenchScore
+from .northstar import BASIS_MIXED, BenchScore
 
 RESULTS_DIR = Path(__file__).resolve().parents[3] / "eval" / "results" / "northstar"
 REPORT_MD = Path(__file__).resolve().parents[3] / "docs" / "NORTH_STAR_BENCH.md"
@@ -194,6 +194,30 @@ def score_did_priced_work(score: BenchScore) -> bool:
     waiting to drift.
     """
     return bool(score.nh_priced_tokens)
+
+
+def cost_ratio_basis(scores: list[BenchScore]) -> str:
+    """The single basis label for a POPULATION of scores' cost ratios —
+    what every rendering surface (report card headline, per-project table,
+    CLI, web JSON) prints so a reader can never mistake which price table a
+    published median was actually computed against.
+
+    ``BenchScore.cost_ratio_basis`` answers the question for one row; this
+    is the ONE place that collapses a population of rows down to one label,
+    so the report and the web panel cannot each invent their own rule for
+    "what do we call it when the rows disagree". Empty input has no ratio to
+    label at all ("n/a" — never a bare pass-through of an empty string).
+    Uniform input reports that basis. A population straddling the part-1
+    change (an old score loaded from a pre-tier-weighting ``latest.json``
+    alongside a freshly-run one) is ``BASIS_MIXED`` — never silently
+    reported as either pure basis.
+    """
+    bases = {s.cost_ratio_basis for s in scores}
+    if not bases:
+        return "n/a"
+    if len(bases) > 1:
+        return BASIS_MIXED
+    return next(iter(bases))
 
 
 def published_file() -> Path:
@@ -463,6 +487,14 @@ class NorthStarCard:
         return median(vals) if vals else None
 
     @property
+    def median_cost_ratio_basis(self) -> str:
+        """The basis label for `median_cost_ratio`, over the SAME population
+        (`priced_scores`) the median itself is taken over — never a
+        different predicate, or the label could describe rows the number was
+        not computed from."""
+        return cost_ratio_basis(self.priced_scores)
+
+    @property
     def dead_specs(self) -> int:
         """Specs that ran but burned zero tokens — the SDK died before any model
         call. A skip is a decision and is excluded; this counts deaths only.
@@ -598,6 +630,11 @@ class NorthStarCard:
                 "median_cost_ratio": (round(self.median_cost_ratio, 4)
                                       if self.median_cost_ratio is not None
                                       else None),
+                # Travels WITH the ratio on every wire payload (the web
+                # panel's `_bench_payload` spreads this dict straight onto
+                # the JSON response) so no renderer can print the number
+                # without also having its basis at hand.
+                "median_cost_ratio_basis": self.median_cost_ratio_basis,
                 # Specs that RAN but burned zero tokens: the SDK died before any
                 # model call. Published runs are under the refusal threshold by
                 # construction, so this is the number that makes a *sub*-
@@ -1104,6 +1141,23 @@ def northstar_gate(current: NorthStarCard,
             reasons.append(
                 f"median {label} ratio regressed {prev_r:.2f} → {cur_r:.2f} "
                 f"(> +{max_ratio_regression})")
+    # A basis change (e.g. the part-1 rollout of tier-weighting) makes the
+    # cost-ratio comparison above unsound even when neither figure is
+    # missing: the two medians were priced against DIFFERENT tables, so a
+    # "regressed"/"improved" reading compares numbers that were never on the
+    # same basis to begin with. Flagged here rather than left implicit,
+    # per the rule that a surface must never let old and new ratios be
+    # silently conflated. "n/a" (no priced scores on one side) is not a
+    # basis change — there is nothing to compare.
+    prev_basis, cur_basis = (previous.median_cost_ratio_basis,
+                             current.median_cost_ratio_basis)
+    if "n/a" not in (prev_basis, cur_basis) and prev_basis != cur_basis:
+        reasons.append(
+            f"cost ratio basis changed: '{prev_basis}' -> '{cur_basis}' — "
+            "the baseline and this run priced no_human's spend on different "
+            "tables, so the cost-ratio comparison above is not like-for-"
+            "like. Republish a new baseline on the current basis (basis: "
+            f"{cur_basis}) before trusting future comparisons.")
     if reasons:
         return NorthStarGate(False, reasons)
     return NorthStarGate(True, ["no regression vs previous run"])
@@ -1239,7 +1293,8 @@ def render_northstar_md(card: NorthStarCard,
         "one. For what actually landed, and what that does and does not "
         "establish, run `nh pr-outcomes show` (real runs only).",
         f"  - {_trials_note}",
-        f"- **Median COST ratio (price-weighted, cache-aware): "
+        f"- **Median COST ratio (price-weighted, cache-aware; "
+        f"basis: {agg['median_cost_ratio_basis']}): "
         f"{agg['median_cost_ratio'] if agg['median_cost_ratio'] is not None else 'n/a'}**"
         f" — over the {_priced} of {agg['total'] - agg['skipped']} ran spec(s) "
         f"with a recorded original cost AND non-zero no_human spend; <1.0 means no_human was cheaper than "
@@ -1289,7 +1344,7 @@ def render_northstar_md(card: NorthStarCard,
         "",
         "## Per-task",
         "",
-        "| task | outcome | satisfied | nh tokens | orig tokens | cost ratio | "
+        "| task | outcome | satisfied | nh tokens | orig tokens | cost ratio (basis) | "
         "orig follow-ups (proxy) | attempts | tokens @ escalation | "
         + ("pass^k | " if card.trials > 1 else "")
         + "notes |",
@@ -1304,7 +1359,11 @@ def render_northstar_md(card: NorthStarCard,
     hidden = len(card.scores) - len(core_scores)
     per_spec = card.per_spec_passes if card.trials > 1 else {}
     for s in core_scores:
-        ratio_s = (f"{s.cost_ratio:.2f}" if s.cost_ratio else "—")
+        # The basis rides in the SAME cell as the number — a separate column
+        # would let a reader eyeball the ratio column alone and re-introduce
+        # the exact conflation this field exists to prevent.
+        ratio_s = (f"{s.cost_ratio:.2f} ({s.cost_ratio_basis})"
+                   if s.cost_ratio else "—")
         sat = {True: "✅", False: "❌", None: "—"}[s.goal_satisfied]
         # One row per TRIAL under --trials, so the trial has to be in the cell
         # or the table reads as N duplicate rows of the same spec disagreeing
@@ -1359,7 +1418,8 @@ def render_northstar_md(card: NorthStarCard,
     # cost/quality by project). Aggregate-only (repo name + counts + median
     # cost), so it's privacy-safe over ALL scores, not just core.
     from collections import defaultdict
-    proj: dict = defaultdict(lambda: {"n": 0, "ok": 0, "esc": 0, "ratios": []})
+    proj: dict = defaultdict(
+        lambda: {"n": 0, "ok": 0, "esc": 0, "ratios": [], "priced": []})
     for s in card.scores:
         p = s.project or "?"
         proj[p]["n"] += 1
@@ -1372,13 +1432,16 @@ def render_northstar_md(card: NorthStarCard,
     # headline). Do not reintroduce a local `if s.cost_ratio ...` test.
     for s in card.priced_scores:
         proj[s.project or "?"]["ratios"].append(s.cost_ratio)
+        proj[s.project or "?"]["priced"].append(s)
     if len(proj) > 1:
         lines += ["", "## Per-project", "",
-                  "| project | tasks | satisfied | honest-escalations | median cost (priced n) |",
+                  "| project | tasks | satisfied | honest-escalations | "
+                  "median cost (priced n, basis) |",
                   "|---|---|---|---|---|"]
         for p in sorted(proj):
             a = proj[p]
-            med = (f"{median(a['ratios']):.3f} ({len(a['ratios'])})"
+            med = (f"{median(a['ratios']):.3f} ({len(a['ratios'])}, "
+                   f"{cost_ratio_basis(a['priced'])})"
                    if a["ratios"] else "—")
             # Redact the DISPLAYED label; the grouping key `p` stays the real
             # name so counts and medians are unchanged. (v13's project labels

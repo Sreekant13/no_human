@@ -66,6 +66,17 @@ ROLE_ALIASES: dict[str, str] = {"implementer": "coder"}
 #: for no_human), never deflate it.
 ANCHOR_MODEL = "claude-sonnet-5"
 
+#: The two bases `BenchScore.cost_ratio` can land on, and the ONLY spellings
+#: any rendering surface (CLI, the report card, the web JSON payload) may
+#: print — never a literal "tier-weighted"/"cache-weighted" typed inline
+#: elsewhere, so the two cannot drift into slightly different wording on
+#: different surfaces. `MIXED` is for an aggregate spanning both (a card that
+#: straddles the part-1 change: an old score loaded from a pre-tier-weighting
+#: `latest.json` alongside a freshly-run one).
+BASIS_TIER_WEIGHTED = "tier-weighted"
+BASIS_CACHE_WEIGHTED = "cache-weighted"
+BASIS_MIXED = "mixed"
+
 
 def _canonical_role(role: str) -> str:
     return ROLE_ALIASES.get((role or "").strip().lower(),
@@ -322,6 +333,21 @@ class BenchScore:
         return total
 
     @property
+    def cost_ratio_basis(self) -> str:
+        """Which price table `cost_ratio`'s numerator (`nh_priced_tokens`)
+        actually landed on — the single fact every rendering surface must
+        show alongside the ratio itself, so a tier-weighted number and one
+        computed on the older, role-blind cache-only basis are never
+        silently conflated as the same figure (this repo's top defect class:
+        text asserting what code does not compute).
+
+        Branches on the exact same emptiness check `nh_priced_tokens`
+        branches on — never a second, independently-maintained test — so
+        this label can never disagree with the number it is labeling.
+        """
+        return BASIS_TIER_WEIGHTED if self.nh_role_tokens else BASIS_CACHE_WEIGHTED
+
+    @property
     def cost_ratio(self) -> float | None:
         """Price-weighted ratio using Anthropic's cache multipliers
         (fresh=1.0, cache_read=0.1, cache_creation=1.25) applied SYMMETRICALLY
@@ -376,6 +402,11 @@ class BenchScore:
                             if self.token_ratio is not None else None),
             "cost_ratio": (round(self.cost_ratio, 3)
                            if self.cost_ratio is not None else None),
+            # The basis label travels WITH the number on every wire payload —
+            # see `cost_ratio_basis`'s docstring. Emitted unconditionally
+            # (never gated on `cost_ratio is not None`) so a reader can tell
+            # "no baseline" apart from "baseline, but on the older basis".
+            "cost_ratio_basis": self.cost_ratio_basis,
             "notes": self.notes,
             "events": self.events,
             "nh_role_tokens": self.nh_role_tokens,

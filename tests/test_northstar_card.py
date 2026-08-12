@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import pytest
+
 from no_human.eval.northstar import BenchScore
 from no_human.eval.northstar_card import (
     NorthStarCard,
+    cost_ratio_basis,
     corpus_shortfall,
     northstar_gate,
     render_northstar_md,
@@ -112,6 +115,50 @@ def test_median_cost_ratio_is_none_when_every_spec_did_zero_work():
                    nh_cache_creation_tokens=0, orig=2000)
     card = NorthStarCard(scores=[dead1, dead2])
     assert card.median_cost_ratio is None
+
+
+# --------------------- bench cost ratio part 2: basis label ------------------ #
+
+def test_median_cost_ratio_basis_is_uniform_when_every_score_agrees():
+    all_cache_weighted = NorthStarCard(scores=[
+        _score(task_id="a", nh=500, orig=1000),
+        _score(task_id="b", nh=300, orig=1000),
+    ])
+    assert all_cache_weighted.median_cost_ratio_basis == "cache-weighted"
+
+    tiered = _score(task_id="c", nh=500, orig=1000)
+    tiered.nh_role_tokens = {
+        "reviewer": {"tokens_used": 500, "cache_read_tokens": 100,
+                    "cache_creation_tokens": 20}}
+    all_tier_weighted = NorthStarCard(scores=[tiered])
+    assert all_tier_weighted.median_cost_ratio_basis == "tier-weighted"
+
+
+def test_median_cost_ratio_basis_is_mixed_never_silently_one_or_the_other():
+    """A card straddling the part-1 rollout — one score loaded from a
+    pre-tier-weighting `latest.json`, one freshly run with a per-role
+    breakdown — must report 'mixed', not silently pick either pure basis."""
+    legacy = _score(task_id="legacy", nh=500, orig=1000)
+    fresh = _score(task_id="fresh", nh=500, orig=1000)
+    fresh.nh_role_tokens = {
+        "coder": {"tokens_used": 500, "cache_read_tokens": 0,
+                 "cache_creation_tokens": 0}}
+    card = NorthStarCard(scores=[legacy, fresh])
+    assert card.median_cost_ratio_basis == "mixed"
+
+
+def test_median_cost_ratio_basis_is_n_a_with_no_priced_population():
+    card = NorthStarCard(scores=[])
+    assert card.median_cost_ratio_basis == "n/a"
+
+
+def test_cost_ratio_basis_helper_matches_the_card_property():
+    """`NorthStarCard.median_cost_ratio_basis` and the per-project rows in
+    `render_northstar_md` both route through this ONE function — pinned
+    directly so the two can never compute the label two different ways."""
+    scores = [_score(task_id="a", nh=500, orig=1000)]
+    card = NorthStarCard(scores=scores)
+    assert cost_ratio_basis(card.priced_scores) == card.median_cost_ratio_basis
 
 
 def test_a_cache_only_spec_is_not_dead():
@@ -303,6 +350,27 @@ def test_headline_denominator_wording_names_the_priced_predicate():
         "AND non-zero no_human spend" in md, md
 
 
+def test_report_headline_states_the_cost_ratio_basis_explicitly():
+    """bench cost ratio part 2 acceptance: the report card must say what
+    price table the published median was computed against, right beside the
+    number — a reader must never have to infer it."""
+    tiered = _score(task_id="a")
+    tiered.nh_role_tokens = {
+        "coder": {"tokens_used": tiered.nh_tokens,
+                 "cache_read_tokens": tiered.nh_cache_tokens,
+                 "cache_creation_tokens": tiered.nh_cache_creation_tokens}}
+    card = NorthStarCard(label="x", created_at="2026-08-12", scores=[tiered])
+    card.scores[0].subset = "core"
+    md = render_northstar_md(card)
+    assert "basis: tier-weighted" in md, md
+
+    legacy_card = NorthStarCard(label="y", created_at="2026-08-12",
+                                scores=[_score(task_id="b")])
+    legacy_card.scores[0].subset = "core"
+    md2 = render_northstar_md(legacy_card)
+    assert "basis: cache-weighted" in md2, md2
+
+
 def test_zero_spend_spec_renders_dash_not_zero_in_per_task_ratio_column():
     """A spec with cost_ratio == 0.0 (no_human crashed/skipped/escalated
     before any model call) must render the SAME unavailable marker the
@@ -400,6 +468,34 @@ def test_gate_fails_closed_when_current_ratio_vanishes():
     g = northstar_gate(no_ratio, prev)
     assert not g.passed
     assert any("cannot verify cost" in r for r in g.reasons)
+
+
+def test_gate_flags_a_cost_ratio_basis_change_across_the_part_1_rollout():
+    """A baseline computed on the old (cache-only) basis and a run computed
+    with a per-role breakdown are not a like-for-like comparison, even
+    though neither ratio is missing — the gate must say so rather than let
+    the two numbers be silently diffed as if they were on the same basis."""
+    prev = NorthStarCard(scores=[_score(nh=500, orig=1000)])   # cache-weighted
+    cur_score = _score(nh=500, orig=1000)
+    cur_score.nh_role_tokens = {
+        "coder": {"tokens_used": 500, "cache_read_tokens": 100,
+                 "cache_creation_tokens": 20}}
+    cur = NorthStarCard(scores=[cur_score])                    # tier-weighted
+    assert prev.median_cost_ratio_basis == "cache-weighted"
+    assert cur.median_cost_ratio_basis == "tier-weighted"
+
+    g = northstar_gate(cur, prev)
+    assert not g.passed
+    assert any("cost ratio basis changed" in r for r in g.reasons), g.reasons
+
+
+def test_gate_does_not_flag_a_basis_change_when_both_sides_agree():
+    """Negative control: same basis on both sides must never spuriously
+    trip the basis-change reason."""
+    prev = NorthStarCard(scores=[_score(nh=500, orig=1000)])
+    cur = NorthStarCard(scores=[_score(nh=500, orig=1000)])
+    g = northstar_gate(cur, prev)
+    assert not any("cost ratio basis changed" in r for r in g.reasons), g.reasons
 
 
 def test_gate_blocks_a_broken_corpus_even_with_NO_baseline():
@@ -927,7 +1023,9 @@ def test_per_project_count_beside_the_median_is_the_priced_population():
     md = render_northstar_md(card)
     row = _project_row(md, "p")
 
-    assert "(2)" in row, row
+    # bench cost ratio part 2: the median cell also carries its basis label
+    # now, so the priced-population count is "(2, <basis>)", not a bare "(2)".
+    assert "(2, cache-weighted)" in row, row
     assert "| 3 |" in row, row  # `tasks` column: still the full population
 
 
@@ -942,12 +1040,39 @@ def test_the_per_spec_cost_cell_refuses_to_call_zero_spend_a_win():
     below it was honest.
     """
     from no_human.cli.commands import _bench_cost_cell
-    assert _bench_cost_cell(0.0) == "cost n/a", "zero spend is not a cost win"
-    assert _bench_cost_cell(None) == "cost n/a", "no baseline is not a cost win"
+    assert _bench_cost_cell(0.0, "tier-weighted") == "cost n/a", \
+        "zero spend is not a cost win"
+    assert _bench_cost_cell(None, "tier-weighted") == "cost n/a", \
+        "no baseline is not a cost win"
     # Control: a real ratio still renders, so the guard is not swallowing
     # everything — including one below 0.005, which rounds to 0.00 but is real.
-    assert _bench_cost_cell(0.09) == "cost×0.09"
-    assert _bench_cost_cell(0.001) == "cost×0.00"
+    assert _bench_cost_cell(0.09, "tier-weighted") == "cost×0.09 (tier-weighted)"
+    assert _bench_cost_cell(0.001, "cache-weighted") == "cost×0.00 (cache-weighted)"
+
+
+def test_the_per_spec_cost_cell_cannot_render_a_ratio_without_its_basis():
+    """Structural pin (bench cost ratio part 2): `basis` has no default, so
+    a call site that only has the number literally cannot compile a
+    rendering call without also supplying it — unlike a runtime check, this
+    cannot be forgotten by a NEW call site added later.
+
+    This is the mechanism, not just a convention: no code path anywhere in
+    this tree CAN render an unlabeled cost ratio through this function,
+    because the interpreter itself refuses the call.
+    """
+    import inspect
+
+    from no_human.cli.commands import _bench_cost_cell
+
+    sig = inspect.signature(_bench_cost_cell)
+    params = list(sig.parameters.values())
+    assert params[1].name == "basis"
+    assert params[1].default is inspect.Parameter.empty, (
+        "basis must be REQUIRED — a default would let a call site render "
+        "a bare, unlabeled ratio")
+
+    with pytest.raises(TypeError):
+        _bench_cost_cell(0.09)  # type: ignore[call-arg]
 
 
 def test_the_published_report_carries_the_generators_judge_calibration_pointer():

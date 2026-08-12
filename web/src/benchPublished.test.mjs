@@ -24,6 +24,10 @@ test("published baseline yields the trusted figures", () => {
     escalation_specs: 15,
     honest_escalation_rate: 0.77,
     median_cost_ratio: 0.107,
+    // northstar bench cost ratio part 2: `undefined` on this fixture, which
+    // predates the basis label — carried through when the backend sends it
+    // (see the dedicated test below).
+    median_cost_ratio_basis: undefined,
     // bench-v2 V1 fields. `undefined` here because this fixture is a
     // pre-trials card — the point of the deepEqual is that the projection is
     // an exhaustive whitelist, so a new field the backend publishes and this
@@ -43,6 +47,17 @@ test("published baseline yields the trusted figures", () => {
     dead_spec_count: undefined,
   });
   assert.equal(publishedEscalationPct(row), "87% (13/15)");
+});
+
+// northstar bench cost ratio part 2: the basis label must travel WITH the
+// ratio through the whitelist, or a reader of "Last published run" cannot
+// tell a tier-weighted figure apart from one computed on the older,
+// role-blind cache-only basis.
+test("the basis label travels with the cost ratio through the whitelist", () => {
+  const tierWeighted = { ...publishedBaseline, median_cost_ratio_basis: "tier-weighted" };
+  const row = selectPublishedRun(tierWeighted);
+  assert.equal(row.median_cost_ratio, 0.107);
+  assert.equal(row.median_cost_ratio_basis, "tier-weighted");
 });
 
 test("no published run → null", () => {

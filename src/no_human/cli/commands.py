@@ -5417,7 +5417,7 @@ def bench_build(days, roots, out_dir):
                   "into eval/northstar_tasks/ and setting subset: core[/]")
 
 
-def _bench_cost_cell(cost_ratio: float | None) -> str:
+def _bench_cost_cell(cost_ratio: float | None, basis: str) -> str:
     """The per-spec cost cell in `nh bench run`'s live output.
 
     Named so the rule is testable: it lives inside a long async run loop and
@@ -5434,8 +5434,13 @@ def _bench_cost_cell(cost_ratio: float | None) -> str:
     there, and `tests/test_northstar_card.py` pins that. The judgement about
     what a 0.0 MEANS belongs to each consumer, and this was the consumer that
     was not making it.
+
+    `basis` is REQUIRED, not optional: a cost ratio can only be rendered
+    alongside the price table it was computed against (`BenchScore.
+    cost_ratio_basis`) — see northstar bench cost ratio part 2. There is no
+    default that would let a call site print the number without it.
     """
-    return f"cost×{cost_ratio:.2f}" if cost_ratio else "cost n/a"
+    return f"cost×{cost_ratio:.2f} ({basis})" if cost_ratio else "cost n/a"
 
 
 @bench.command("run")
@@ -5777,7 +5782,7 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
                                   f"({escape(crash_note[:80])})")
                 else:
                     mark = {True: "✅", False: "❌", None: "⏭"}[score.goal_satisfied]
-                    ratio = _bench_cost_cell(score.cost_ratio)
+                    ratio = _bench_cost_cell(score.cost_ratio, score.cost_ratio_basis)
                     console.print(
                         f"  {mark} {escape(spec.id)} {score.outcome_status} ({ratio})")
                 # Stamped HERE, not inside the runner: `run_one`'s signature is
@@ -5832,7 +5837,7 @@ def bench_run(full, limit, gate, prev_path, label, specs_dir, resume, parallel,
             # README, and this run's own card is the only place that knows the
             # interval — so the console must not be the surface that drops it.
             f"[bold]success {escape(success_headline(card))}[/] · "
-            f"median cost ratio {agg['median_cost_ratio']} · "
+            f"median cost ratio {agg['median_cost_ratio']} (basis: {agg['median_cost_ratio_basis']}) · "
             f"corrections avoided {agg['corrections_avoided']} → "
             f"{out.relative_to(Path.cwd()) if out.is_relative_to(Path.cwd()) else out}")
         refusals = publish_refusals(card, previous)
@@ -6077,7 +6082,7 @@ def bench_publish(results_file: str, force: bool):
         # crash is strictly worse than the pre-write one this branch set out to fix.
         f"[green]published[/] {escape(card.label or path.name)} — "
         f"success {escape(success_headline(card))} · "
-        f"median cost ratio {agg['median_cost_ratio']} · "
+        f"median cost ratio {agg['median_cost_ratio']} (basis: {agg['median_cost_ratio_basis']}) · "
         f"{agg['total_nh_tokens']:,} tokens → docs/NORTH_STAR_BENCH.md")
 
 

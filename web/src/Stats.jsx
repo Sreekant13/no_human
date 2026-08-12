@@ -646,7 +646,15 @@ function BenchTrust({ bench }) {
           <dd className={undercorpus ? "bench-bad" : ""}>{corpus > 0 ? `${total} of ${corpus} loaded` : "unknown (older card)"}</dd>
         </div>
         {Number.isFinite(card.median_cost_ratio) && (
-          <div><dt>Median cost</dt><dd>{card.median_cost_ratio}×</dd></div>
+          <div>
+            <dt>Median cost</dt>
+            <dd>
+              {card.median_cost_ratio}×{" "}
+              <span className="bench-cost-basis">
+                (basis: {card.median_cost_ratio_basis || "n/a"})
+              </span>
+            </dd>
+          </div>
         )}
       </dl>
 
@@ -696,7 +704,10 @@ function BenchPublishedRow({ bench }) {
       </span>
       {Number.isFinite(row.median_cost_ratio) && (
         <span className="bench-published-item">
-          <span className="bench-published-dt">Cost</span> {row.median_cost_ratio}×
+          <span className="bench-published-dt">Cost</span> {row.median_cost_ratio}×{" "}
+          <span className="bench-cost-basis">
+            (basis: {row.median_cost_ratio_basis || "n/a"})
+          </span>
         </span>
       )}
     </section>

@@ -41,6 +41,10 @@ export function selectPublishedRun(bench) {
     escalation_specs: bench.escalation_specs,
     honest_escalation_rate: bench.honest_escalation_rate,
     median_cost_ratio: bench.median_cost_ratio,
+    // Travels WITH the ratio (northstar bench cost ratio part 2) — a bare
+    // number here would let this row silently conflate a tier-weighted
+    // figure with one computed on the older, role-blind cache-only basis.
+    median_cost_ratio_basis: bench.median_cost_ratio_basis,
   };
 }
 

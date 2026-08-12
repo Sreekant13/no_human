@@ -16,6 +16,8 @@ import pytest
 from no_human.eval.bench_task import BenchTask
 from no_human.eval.northstar import (
     ANCHOR_MODEL,
+    BASIS_CACHE_WEIGHTED,
+    BASIS_TIER_WEIGHTED,
     PRICED_ROLES,
     BenchScore,
     NorthStarRunner,
@@ -1362,3 +1364,52 @@ def test_role_breakdown_survives_card_reload(tmp_path):
     assert legacy_score.nh_role_tokens == {}
     assert legacy_score.cost_ratio == pytest.approx(
         (600 + 0.1 * 1000 + 1.25 * 40) / 1000)
+
+
+# ------------------- bench cost ratio part 2: basis label -------------------- #
+
+def _score(**kw) -> BenchScore:
+    base = dict(
+        task_id="x", title="t", outcome_status="done", goal_satisfied=True,
+        escalated_honestly=False, mergeable=True,
+        nh_tokens=600, nh_cache_tokens=1000, nh_cache_creation_tokens=40,
+        nh_turns=1, nh_wall_clock_s=1.0,
+        orig_tokens=1000, orig_cache_tokens=0, orig_cache_creation_tokens=0,
+        orig_wall_clock_s=1.0, orig_corrections=0,
+    )
+    base.update(kw)
+    return BenchScore(**base)
+
+
+def test_cost_ratio_basis_is_tier_weighted_iff_a_breakdown_was_recorded():
+    """The label must branch on the EXACT same emptiness check
+    `nh_priced_tokens` branches on — never a second, independently
+    maintained test that could disagree with the number it labels."""
+    with_breakdown = _score(nh_role_tokens={
+        "reviewer": {"tokens_used": 100, "cache_read_tokens": 1000,
+                    "cache_creation_tokens": 40},
+    })
+    assert with_breakdown.cost_ratio_basis == BASIS_TIER_WEIGHTED
+    assert with_breakdown.cost_ratio_basis == "tier-weighted"
+
+    without_breakdown = _score()
+    assert without_breakdown.nh_role_tokens == {}
+    assert without_breakdown.cost_ratio_basis == BASIS_CACHE_WEIGHTED
+    assert without_breakdown.cost_ratio_basis == "cache-weighted"
+
+
+def test_cost_ratio_basis_travels_with_the_ratio_in_as_dict():
+    """The wire shape carries the basis unconditionally — even a score with
+    no baseline (`cost_ratio is None`) still says what basis it WOULD use,
+    so a reader is never left to assume."""
+    scored = _score(nh_role_tokens={
+        "utility": {"tokens_used": 500, "cache_read_tokens": 0,
+                   "cache_creation_tokens": 0}})
+    d = scored.as_dict()
+    assert d["cost_ratio_basis"] == "tier-weighted"
+    assert d["cost_ratio"] is not None
+
+    no_baseline = _score(orig_tokens=0, orig_cache_tokens=0)
+    d2 = no_baseline.as_dict()
+    assert d2["cost_ratio"] is None
+    assert d2["cost_ratio_basis"] == "cache-weighted"
