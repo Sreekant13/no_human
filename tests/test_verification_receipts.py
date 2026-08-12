@@ -61,6 +61,7 @@ from no_human.agent.verification_receipts import (
 from no_human.config import load_config
 from no_human.core.db import Store
 from no_human.core.orchestrator import Orchestrator
+from no_human.core.pr_evidence import collapse_appendix
 from no_human.core.task import Task
 from no_human.notify.slack import SlackNotifier
 from no_human.vcs import comment_poster
@@ -1633,6 +1634,14 @@ def _pin_not_the_diff(s: str, entry: str) -> None:
     a free-form dict a caller fills, so a changed-file list could arrive inside
     it and be read with names the renderer already uses.
 
+    `evidence` JOINED THE ALLOWED SET when the part-2 evidence pipeline landed
+    (`core/pr_evidence.py`). It is a `PrEvidence` instance whose fields are
+    `repro`/`tamper`/`tests`/`review_verdict`/`ci_state` — none of them a
+    changed-file list, and `_verification_section` only ever reads
+    `evidence.repro` (to seed `receipts`/`observable`, the same two names
+    already allowed). Widening this set to admit it is deliberate, not drift;
+    admitting a NAME that could carry a diff comparison would not be.
+
     WHAT IS STILL NOT PROVEN, stated rather than implied. Half four is about
     what the RENDERER reads, and two things sit outside it. A comparison made by
     the renderer's CALLER, which then hands over only already-filtered receipts,
@@ -1643,7 +1652,7 @@ def _pin_not_the_diff(s: str, entry: str) -> None:
     assert "no receipt is compared against the files this PR changes" in entry
     params = set(inspect.signature(
         Orchestrator._verification_section).parameters)
-    assert params == {"receipts", "test_evidence", "observable"}, params
+    assert params == {"receipts", "test_evidence", "observable", "evidence"}, params
     fields = {f.name for f in dataclasses.fields(VerificationReceipt)}
     assert fields == {"kind", "command", "output_excerpt", "output_bytes",
                       "truncated", "seq"}, fields
@@ -1665,6 +1674,12 @@ def _pin_not_the_diff(s: str, entry: str) -> None:
         # builtins, and methods called on its own locals
         "any", "append", "dict", "extend", "get", "id", "isinstance", "join",
         "len", "list", "set", "str", "strip",
+        # `evidence.repro` — an ATTRIBUTE of the function's own `evidence`
+        # parameter, read only to seed `receipts`/`observable` (both already
+        # allowed above). Exactly as safe as reading `receipts` or
+        # `observable` directly: it is the caller's own argument, not hidden
+        # module/class state, so it cannot smuggle in a diff comparison.
+        "repro",
     }
     render = Orchestrator._verification_section
     extra = sorted(_referenced_names(render.__code__) - allowed)
@@ -3285,9 +3300,21 @@ async def test_nothing_downstream_edits_the_section_it_ships(
         rows, test_evidence={"ran": True}, observable=True)
     body = orch._pr_body(Task.new("t", repo_path="/r"), _Commit(), _Result(),
                          test_evidence={"ran": True}, receipts=rows)
-    assert section in body, (
-        "the PR body does not embed the section verbatim; something between "
-        "the render and the forge edits it, and the prose guard cannot see it")
+    # PART 2 (evidence pipeline): `_pr_body` now folds this section behind a
+    # `<details>` disclosure via the ONE documented transform,
+    # `collapse_appendix` — the operator's short-PR-body directive. That is
+    # the only edit sanctioned between render and the forge: every word of
+    # `section` still reaches the body verbatim, just relocated behind the
+    # fold, which is what the two assertions below hold apart.
+    collapsed = collapse_appendix(
+        section, heading="How I verified this",
+        summary="expand the full command log and its stated limits")
+    assert collapsed in body, (
+        "the PR body does not embed the section behind the documented "
+        "collapse_appendix() transform; something else is editing it, and "
+        "the prose guard cannot see it")
+    assert section.removeprefix("## How I verified this\n").strip() in body, (
+        "collapsing must not drop or edit a single word of the section")
 
     forge: list[str] = []
     monkeypatch.setattr(comment_poster, "marker_present_on_pr",

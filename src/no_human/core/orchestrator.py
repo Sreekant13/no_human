@@ -105,6 +105,7 @@ from .pricing import (
     raw_cap_as_weighted,
 )
 from .pricing import weighted_tokens as _weighted_tokens
+from .pr_evidence import PrEvidence, collapse_appendix
 from .task import Task, TaskSpec, TaskStatus
 
 log = logging.getLogger("no_human.orchestrator")
@@ -13395,17 +13396,41 @@ SIX of them read a checkpoint and TWO do not — but do
             f"- {self._inline_cell(c, None)}" for c in task.acceptance_criteria
         ) or "- (none stated)"
         head_sha = (getattr(commit, "sha", "") or "").strip()
+        observable = self._backend_is_observable()
+        # PART 2 OF c7da49d4's DECOMPOSITION: every gate output this body can
+        # cite (repro, tamper, tests, review verdict, CI/annotation state) is
+        # gathered ONCE, here, into `evidence`. Every section below renders
+        # from that one object — none of them re-reads `task.context`,
+        # `receipts` or `test_evidence` independently — so two sections can
+        # never print two different answers to "how many rounds passed" or
+        # "how many commands ran". See `core/pr_evidence.py`.
+        evidence = self._gather_evidence(
+            task, test_evidence=test_evidence, receipts=receipts,
+            head_sha=head_sha, repo=repo, observable=observable,
+        )
         # ONE evidence area, decisive-first (the independent reviewer's verdict,
         # then the orchestrator's own test run) — see `_evidence_section`. The
         # raw command receipts stay their own `## How I verified this` appendix
         # after it: that section is a mechanical, deliberately exhaustive audit
         # log with its own truthfulness contract, not part of the short
-        # "does it work" summary a reviewer reads first.
+        # "does it work" summary a reviewer reads first. It is folded behind a
+        # `<details>` disclosure (`collapse_appendix`) — every word still
+        # reaches the body, just behind the fold instead of in front of it,
+        # which is what keeps the SCANNABLE part of the body short per the
+        # operator's directive without dropping a single truth pin.
         #
         # The `## Stats` line (files/diffstat/turns) was REMOVED: the forge shows
         # the diffstat itself, and the turn count is internal noise. `repo`/`base`
         # remain live — `base` scopes the merge-boundary footer and `repo` proves
         # the review rounds judged THIS head (C4).
+        verification = self._verification_section(
+            receipts, test_evidence=test_evidence, observable=observable,
+            evidence=evidence,
+        )
+        verification = collapse_appendix(
+            verification, heading="How I verified this",
+            summary="expand the full command log and its stated limits",
+        )
         return (
             f"{self._ticket_line(task)}"
             f"## Task\n{self._inline_cell(task.title, None)}\n\n"
@@ -13413,14 +13438,37 @@ SIX of them read a checkpoint and TWO do not — but do
             f"{self._assumptions_section(task)}"
             f"{self._superseded_section(task)}"
             f"## Implementation summary\n{self._summary_section(result)}\n\n"
-            f"{self._evidence_section(task, test_evidence=test_evidence, head_sha=head_sha, repo=repo)}"
-            f"{self._verification_section(receipts, test_evidence=test_evidence, observable=self._backend_is_observable())}"
+            f"{self._evidence_section(task, head_sha=head_sha, repo=repo, evidence=evidence)}"
+            f"{verification}"
             f"{self._merge_boundary_footer(task, branch=branch, base=base, attempt_n=attempt_n)}"
+        )
+
+    def _gather_evidence(
+        self, task: Task, *, test_evidence: dict | None = None,
+        receipts: list[dict] | None = None, head_sha: str = "",
+        repo=None, observable: bool = True,
+    ) -> PrEvidence:
+        """Gather this attempt's gate outputs ONCE into a single `PrEvidence`.
+
+        Every field is the RAW structured output of one gate — nothing here
+        formats a sentence a human reads; that stays with the section
+        renderer that owns the prose. What this buys: a section renderer
+        takes `evidence` instead of re-deriving its own answer from
+        `task.context`/`receipts`/`test_evidence`, so there is exactly one
+        place per gate where its output is read out of the attempt.
+        """
+        return PrEvidence(
+            repro={"receipts": list(receipts or []), "observable": observable},
+            tamper=self._tamper_data(task),
+            tests=test_evidence,
+            review_verdict=self._review_verdict_data(task, head_sha=head_sha, repo=repo),
+            ci_state=(task.context or {}).get("ci_status"),
         )
 
     def _evidence_section(
         self, task: Task, *, test_evidence: dict | None = None,
         head_sha: str = "", repo=None,
+        evidence: PrEvidence | None = None,
     ) -> str:
         """The operator's "ONE area of evidence": what confirms this change works,
         decisive-first, in rich text.
@@ -13436,15 +13484,26 @@ SIX of them read a checkpoint and TWO do not — but do
         Returns "" when neither channel has anything, so a body with no review
         and no test run gains no empty heading. Reorganises existing truthful
         content only — no new claim is made here.
+
+        ``evidence`` is the object every sub-section renders from — pass it
+        through rather than letting `_review_evidence_section` /
+        `_tamper_adjudication_section` / `_test_evidence_section` each
+        re-gather their own (they still can, standalone, for their own unit
+        tests — see their docstrings — but the production `_pr_body` path
+        gathers exactly once, in `_gather_evidence`).
         """
-        review = self._review_evidence_section(task, head_sha=head_sha, repo=repo)
+        if evidence is None:
+            evidence = self._gather_evidence(
+                task, test_evidence=test_evidence, head_sha=head_sha, repo=repo)
+        review = self._review_evidence_section(
+            task, head_sha=head_sha, repo=repo, evidence=evidence)
         # A waived tamper-guard fire is evidence the human MUST see. It rides in
         # this section, not a footnote: `_handle_tamper_fire` passes the gate on
         # a LEGITIMATE verdict, and the only thing that keeps that from being a
         # silent weakening is the human reading the justification here, at the
         # moment they decide to merge.
-        tamper = self._tamper_adjudication_section(task)
-        tests = self._test_evidence_section(test_evidence)
+        tamper = self._tamper_adjudication_section(task, evidence=evidence)
+        tests = self._test_evidence_section(evidence.tests)
         if not review and not tamper and not tests:
             return ""
         lead = (
@@ -13458,19 +13517,19 @@ SIX of them read a checkpoint and TWO do not — but do
     # ------------------------- PR body: the pieces ------------------------- #
 
     @staticmethod
-    def _tamper_adjudication_section(task: Task) -> str:
-        """The LEGITIMATE waivers this task's tamper fires produced, in the PR
-        body. "" when the guard never fired or nothing was waived.
+    def _tamper_data(task: Task) -> list[dict] | None:
+        """The LEGITIMATE tamper waivers this task's fires produced, as the
+        already-`_inline_cell`-safe records `tamper_adjudication.pr_body_section`
+        renders — or `None` when the guard never fired or nothing was waived.
 
-        Only LEGITIMATE entries render: TAMPERING and CANNOT_DECIDE never reach
-        a PR (they bounce the attempt or park the task), so printing them would
-        describe a state this artifact cannot be in.
+        The ONE place `task.context["tamper_adjudications"]` is read for the PR
+        body: `_tamper_adjudication_section` renders from this, not from a
+        second read of `task.context`, so gathering it (via `_gather_evidence`)
+        and rendering it can never disagree about which entries are legitimate.
 
-        Every cell goes through `_inline_cell`. `justification` is the
-        adjudicator model's own prose, and a model-authored cell in a PR body is
-        a heading-injection channel — a single newline in it renders a live
-        `<h1>` outside any section, which is precisely the fabrication the
-        review-evidence section was hardened against.
+        Only LEGITIMATE entries survive: TAMPERING and CANNOT_DECIDE never
+        reach a PR (they bounce the attempt or park the task), so printing them
+        would describe a state this artifact cannot be in.
         """
         entries = [
             e for e in ((task.context or {}).get("tamper_adjudications") or [])
@@ -13478,8 +13537,8 @@ SIX of them read a checkpoint and TWO do not — but do
             and e.get("verdict") == tamper_adjudication.LEGITIMATE
         ]
         if not entries:
-            return ""
-        safe = [
+            return None
+        return [
             {
                 "verdict": tamper_adjudication.LEGITIMATE,
                 "where": Orchestrator._inline_cell(str(e.get("where") or ""), None),
@@ -13490,6 +13549,27 @@ SIX of them read a checkpoint and TWO do not — but do
             }
             for e in entries
         ]
+
+    @staticmethod
+    def _tamper_adjudication_section(
+        task: Task, *, evidence: PrEvidence | None = None,
+    ) -> str:
+        """The LEGITIMATE waivers this task's tamper fires produced, in the PR
+        body. "" when the guard never fired or nothing was waived.
+
+        Every cell goes through `_inline_cell`. `justification` is the
+        adjudicator model's own prose, and a model-authored cell in a PR body is
+        a heading-injection channel — a single newline in it renders a live
+        `<h1>` outside any section, which is precisely the fabrication the
+        review-evidence section was hardened against.
+
+        Renders EXCLUSIVELY from ``evidence.tamper`` (gathered once by
+        `_gather_evidence` on the production `_pr_body` path; gathered here,
+        standalone, when called without one — e.g. this file's own unit tests).
+        """
+        safe = evidence.tamper if evidence is not None else Orchestrator._tamper_data(task)
+        if not safe:
+            return ""
         return tamper_adjudication.pr_body_section(safe)
 
     def _ticket_line(self, task: Task) -> str:
@@ -13608,26 +13688,28 @@ SIX of them read a checkpoint and TWO do not — but do
         return kept
 
     @staticmethod
-    def _review_evidence_section(
+    def _review_verdict_data(
         task: Task, *, head_sha: str = "", repo=None,
-    ) -> str:
-        """W1.6: the reviewer's verdict trail on the PR itself — the tokens
-        that buy the human a 5-minute review instead of a transcript dig.
-        Renders the review_history rounds (independent fresh-context reviewer,
-        evidence-based pass/fail) and, when present, the resolved blocking
-        findings of the final round. Returns "" when no review ran.
+    ) -> dict | None:
+        """W1.6: the reviewer's verdict trail, as RAW structured facts — the
+        ONE place `task.context["review_history"]` is read for the PR body.
+        `_review_evidence_section` renders from this, never from a second
+        read of `task.context`.
 
-        C4: `review_history` is TASK-lifetime, so a later attempt's PR used to
-        render an earlier attempt's verdict against a diff the human cannot
-        see. Rounds stamped with a commit that is NOT an ancestor of this PR's
-        head are dropped, and if that leaves nothing the section says so out
-        loud rather than vanishing — "no review evidence" and "no section" look
-        identical to a reader, and only one of them is a warning.
+        Returns `None` when no review has ever run for this task. Returns
+        `{"unmatched": True}` when review rounds exist but none is stamped
+        with a commit that is an ancestor of `head_sha` (C4) — a fact the
+        section must still SAY out loud rather than silently vanish, since
+        "no review evidence" and "no section" look identical to a reader.
+        Otherwise returns `{"rounds": int, "verdict": "PASSED"|"not passed",
+        "addressed": [str, ...]}` — `addressed` already `_inline_cell`-safe
+        and capped at 8, matching what the section has always shown.
 
-        Data flows review -> body here, and only here. Nothing in this method
-        may ever flow the other way: the body carries coder-authored text, and
-        feeding it to the gate that decides merges is a prompt-injection
-        channel (see the reverted `fix/pr-body-head-before-review` step 2).
+        Data flows review -> evidence -> body here, and only here. Nothing in
+        this method may ever flow the other way: the body carries
+        coder-authored text, and feeding it to the gate that decides merges
+        is a prompt-injection channel (see the reverted
+        `fix/pr-body-head-before-review` step 2).
         """
         history = (task.context or {}).get("review_history")
         if isinstance(history, str):
@@ -13637,17 +13719,13 @@ SIX of them read a checkpoint and TWO do not — but do
             except (ValueError, SyntaxError):
                 history = None
         if not isinstance(history, list) or not history:
-            return ""
+            return None
         history = Orchestrator._rounds_for_head(history, head_sha=head_sha, repo=repo)
         if not history:
-            return ("### Independent review\n- (no review has run against this "
-                    "commit yet — the rounds on record judged a different "
-                    "commit of this task)\n\n")
+            return {"unmatched": True}
         rounds = len(history)
         last = history[-1] if isinstance(history[-1], dict) else {}
         verdict = "PASSED" if last.get("passed") else "not passed"
-        lines = [f"- independent review rounds: {rounds}; final verdict: "
-                 f"**{verdict}**"]
         # The blocking findings each earlier round raised (and the coder then
         # addressed) — the human sees what was caught without reading logs.
         addressed: list[str] = []
@@ -13666,9 +13744,33 @@ SIX of them read a checkpoint and TWO do not — but do
                 # rendered INSIDE the section headed `## Review evidence`, which
                 # is the exact fabrication this branch exists to stop.
                 addressed.append(Orchestrator._inline_cell(b))
+        return {"rounds": rounds, "verdict": verdict, "addressed": addressed[:8]}
+
+    @staticmethod
+    def _review_evidence_section(
+        task: Task, *, head_sha: str = "", repo=None,
+        evidence: PrEvidence | None = None,
+    ) -> str:
+        """The reviewer's verdict trail on the PR itself — the tokens that buy
+        the human a 5-minute review instead of a transcript dig. Renders
+        EXCLUSIVELY from ``evidence.review_verdict`` (gathered once by
+        `_gather_evidence` on the production `_pr_body` path; gathered here,
+        standalone, when called without one). Returns "" when no review ran.
+        """
+        rv = (evidence.review_verdict if evidence is not None
+              else Orchestrator._review_verdict_data(task, head_sha=head_sha, repo=repo))
+        if not rv:
+            return ""
+        if rv.get("unmatched"):
+            return ("### Independent review\n- (no review has run against this "
+                    "commit yet — the rounds on record judged a different "
+                    "commit of this task)\n\n")
+        lines = [f"- independent review rounds: {rv['rounds']}; final verdict: "
+                 f"**{rv['verdict']}**"]
+        addressed = rv.get("addressed") or []
         if addressed:
             lines.append("- findings raised and addressed across rounds:")
-            lines += [f"  - {a}" for a in addressed[:8]]
+            lines += [f"  - {a}" for a in addressed]
         return "### Independent review\n" + "\n".join(lines) + "\n\n"
 
     #: How many recorded commands are shown WITH their captured output, and how
@@ -13776,7 +13878,7 @@ SIX of them read a checkpoint and TWO do not — but do
     @staticmethod
     def _verification_section(
         receipts: list[dict] | None, *, test_evidence: dict | None = None,
-        observable: bool = True,
+        observable: bool = True, evidence: PrEvidence | None = None,
     ) -> str:
         """"How I verified this" - rendered MECHANICALLY from captured receipts.
 
@@ -13822,9 +13924,18 @@ SIX of them read a checkpoint and TWO do not — but do
 
         ``observable=False`` says the backend cannot be watched at all (no
         PostToolUse hooks), which is a third fact again - not "nothing ran".
+
+        ``evidence.repro``, when given, is the single source for *receipts*
+        and *observable* (`_gather_evidence` already carries them) — the
+        explicit params stay for this file's own standalone unit tests, which
+        call this method directly with neither.
         """
         from ..agent.verification_receipts import (
             RECEIPT_CAP, kinds_in, md_fence, md_inline_code)
+
+        if evidence is not None and evidence.repro is not None:
+            receipts = evidence.repro.get("receipts")
+            observable = evidence.repro.get("observable", observable)
 
         rows = [r for r in (receipts or []) if isinstance(r, dict)]
         header = "## How I verified this\n"

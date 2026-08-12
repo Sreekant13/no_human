@@ -1,0 +1,142 @@
+"""The PR body's evidence PIPELINE (part 2 of the c7da49d4 decomposition).
+
+Part 1 (27e7352b) is the TEMPLATE: a short, scannable body with the verbose
+evidence folded into `<details>` blocks. THIS module is the other half — the
+attempt's gate outputs (repro, tamper, tests, review verdict, CI/annotation
+state) are gathered ONCE into `PrEvidence`, a single structured object, and
+every renderer that prints a measured fact ("truth pin") reads it from there.
+No renderer may re-derive a gate's output independently: that is what let two
+sections print two different answers to the same question.
+
+`PrEvidence` is deliberately a thin, frozen carrier — it stores what each gate
+ACTUALLY produced (dicts/lists already in that gate's own shape), not a
+re-interpretation of it. The re-interpretation (formatting a sentence a human
+reads) stays with the renderer that owns that section's prose; what this
+module guarantees is that the renderer has nowhere else to get the fact from.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(frozen=True)
+class PrEvidence:
+    """The attempt's gate outputs, gathered once per `_pr_body` render.
+
+    Fields hold the RAW structured output of each gate — `None` when that
+    gate produced nothing for this attempt. A field being `None` is itself a
+    fact ("this gate has nothing to say"), so renderers distinguish "no data"
+    from "data says nothing happened" the same way they always have.
+
+    * ``repro`` — the verification-receipts gate: ``{"receipts": [...],
+      "observable": bool}``.
+    * ``tamper`` — the tamper-adjudication gate: the list of LEGITIMATE
+      waiver entries, or ``None``.
+    * ``tests`` — the orchestrator's own layered test run (`test_evidence`),
+      in the shape `testing/runner.py` produces it.
+    * ``review_verdict`` — the independent reviewer's verdict trail:
+      ``{"rounds": int, "verdict": str, "addressed": [...], "unmatched":
+      bool}``, or ``None`` when no round has judged this head.
+    * ``ci_state`` — CI/annotation state for this attempt, or ``None`` before
+      CI has reported anything.
+    """
+
+    repro: dict[str, Any] | None = None
+    tamper: list[dict[str, Any]] | None = None
+    tests: dict[str, Any] | None = None
+    review_verdict: dict[str, Any] | None = None
+    ci_state: Any = None
+
+    def has(self, field: str) -> bool:
+        return getattr(self, field, None) is not None
+
+    # ----------------------- truth pins ----------------------- #
+    # A "truth pin" is a concrete, measured-fact sentence the body renders
+    # (a count, a verdict, a pass/fail line) — as opposed to prose. Every pin
+    # method below returns `None` when its backing field has nothing to say,
+    # so "the field is empty" and "the pin was never asked for" are the same
+    # code path: a renderer cannot accidentally print a pin its evidence
+    # object does not back.
+
+    def review_verdict_pin(self) -> str | None:
+        rv = self.review_verdict
+        if not rv or not rv.get("rounds"):
+            return None
+        return (f"independent review rounds: {rv['rounds']}; "
+                f"final verdict: **{rv['verdict']}**")
+
+    def repro_count_pin(self) -> str | None:
+        if self.repro is None:
+            return None
+        n = len(self.repro.get("receipts") or [])
+        return f"{n} verification command(s) were recorded during this attempt."
+
+    def tests_summary_pin(self) -> str | None:
+        t = self.tests
+        if not isinstance(t, dict) or not t.get("ran"):
+            return None
+        verb = "PASS" if t.get("ok") else "FAIL"
+        return (f"tests: {verb} — {t.get('passed', 0)} passed, "
+                f"{t.get('failed', 0)} failed, {t.get('errors', 0)} errors")
+
+    def ci_state_pin(self) -> str | None:
+        if not self.ci_state:
+            return None
+        return f"CI state: {self.ci_state}"
+
+    def truth_pins(self) -> dict[str, str]:
+        """``{backing field name: exact fact sentence}`` for every truth pin
+        this object can justify. A PR body must never render a measured-fact
+        sentence that is not a value here — `tests/test_pr_evidence.py`'s
+        `test_every_rendered_truth_pin_has_backing_evidence` asserts exactly
+        that against a real `_pr_body()` render.
+        """
+        pins: dict[str, str] = {}
+        for field, pin in (
+            ("review_verdict", self.review_verdict_pin()),
+            ("repro", self.repro_count_pin()),
+            ("tests", self.tests_summary_pin()),
+            ("ci_state", self.ci_state_pin()),
+        ):
+            if pin:
+                pins[field] = pin
+        return pins
+
+
+_DETAILS_RE = re.compile(r"<details>.*?</details>", re.S)
+
+
+def visible_chars(body: str) -> int:
+    """Characters of *body* outside every `<details>...</details>` block —
+    what a reader sees without expanding anything, since GitHub renders
+    `<details>` closed by default. This is the "scannable" length the
+    operator's short-PR-body directive targets, as opposed to the raw total
+    length (which collapsing does not shrink — it only relocates text behind
+    a fold).
+    """
+    return len(_DETAILS_RE.sub("", body))
+
+
+def collapse_appendix(section_text: str, *, heading: str, summary: str) -> str:
+    """Fold everything under a rendered ``## {heading}`` section behind a
+    `<details>` disclosure, leaving the heading itself live and scannable.
+
+    *section_text* must start with ``## {heading}\\n`` (every section builder
+    in `orchestrator.py` emits its own heading); if it does not — the shape
+    changed, or the section is empty — *section_text* is returned unchanged
+    rather than risk mangling something this function does not recognise.
+    Nothing is removed: every word of *section_text* still reaches the body,
+    just behind the fold instead of in front of it.
+    """
+    prefix = f"## {heading}\n"
+    if not section_text.startswith(prefix):
+        return section_text
+    rest = section_text[len(prefix):].strip("\n")
+    if not rest:
+        return section_text
+    return (
+        f"{prefix}\n<details><summary>{summary}</summary>\n\n"
+        f"{rest}\n\n</details>\n\n"
+    )
