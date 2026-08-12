@@ -2045,9 +2045,7 @@ class Orchestrator:
             # still open multiple PRs). Only the explicit decomposition.enabled
             # switch re-enables the legacy child-task path.
             decomposition = (task.context or {}).get("decomposition")
-            decompose_children = self.config.get(
-                "decomposition", {}
-            ).get("enabled", False)
+            decompose_children = self._decompose_children_enabled()
             if decompose_children and decomposition and decomposition.get("decompose"):
                 from .lead_agent import LeadAgent
                 lead = LeadAgent(
@@ -10170,20 +10168,29 @@ class Orchestrator:
         )
         return True
 
-    @staticmethod
-    def _plan_is_unusable(plan: str) -> bool:
+    def _decompose_children_enabled(self) -> bool:
+        """The ONLY switch that re-enables the legacy LeadAgent child-task path.
+        Read by _drive (dispatch), _generate_plan (prompt + marker handling) and
+        _plan_is_unusable (exemption) so the three cannot disagree."""
+        return bool((self.config.get("decomposition") or {}).get("enabled", False))
+
+    def _plan_is_unusable(self, plan: str) -> bool:
         """Belt to the ``is_error`` gate: does this plan carry no plan at all?
 
         Not every degenerate planner output is flagged as an error. Prose with
         no ``##`` sections parses to an empty ``TaskSpec`` — no files, no
         approach, no test plan — which empties exactly the same downstream
         surfaces while still being inlined as an authoritative implementation
-        contract. A decomposition verdict is not a plan and is exempt: it is
-        consumed from ``task.context``, never parsed into sections.
+        contract. A decomposition verdict is not a plan and is exempt — but
+        only when the decomposition gate is on: it is consumed from
+        ``task.context`` by the LeadAgent hand-off, and with the gate off
+        nothing ever reads that key, so a bare DECOMPOSE_PLAN JSON block must
+        be judged as a plan like anything else (no ``##`` sections → unusable
+        → the honest "planner's output was unusable" outcome).
         """
         if not plan:
             return True
-        if _parse_decomposition(plan) is not None:
+        if self._decompose_children_enabled() and _parse_decomposition(plan) is not None:
             return False
         spec = TaskSpec.from_plan(plan)
         return not (spec.files_to_change or spec.approach.strip()
@@ -10310,9 +10317,7 @@ class Orchestrator:
         # A task never spawns child tasks unless the legacy path is explicitly
         # re-enabled. By default, complexity is handled IN-SESSION: the worker
         # delegates focused sub-tasks to sub-agents and may open multiple PRs.
-        decompose_children = self.config.get(
-            "decomposition", {}
-        ).get("enabled", False)
+        decompose_children = self._decompose_children_enabled()
         if decompose_children:
             compound_section = (
                 "## COMPOUND TASK ASSESSMENT\n"
@@ -10620,7 +10625,15 @@ class Orchestrator:
         """Shared tail for both planning paths: if `plan` carries a
         decomposition marker, persist it to task.context so `_drive` picks it
         up. Returns the parsed decomposition dict, or None if plan is a
-        normal (non-compound) plan."""
+        normal (non-compound) plan.
+
+        Gated: with decomposition.enabled off, this is a no-op regardless of
+        what the plan text contains — no context write, no store write —
+        because `_drive` never reads the key with the gate off, and leaving
+        a stale one would be picked up if the gate were flipped on mid-flight.
+        """
+        if not self._decompose_children_enabled():
+            return None
         decomp = _parse_decomposition(plan)
         if decomp is not None:
             ctx = task.context or {}
@@ -10722,7 +10735,7 @@ class Orchestrator:
             # signal, not something to blend — synthesizing "half a decompose"
             # makes no sense.
             for name, text in drafts:
-                if _parse_decomposition(text) is not None:
+                if self._decompose_children_enabled() and _parse_decomposition(text) is not None:
                     decomp = await self._apply_decomposition(task, text)
                     self.emit(
                         "planning_moa",
