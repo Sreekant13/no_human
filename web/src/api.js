@@ -720,10 +720,11 @@ export function connectTaskSSE(taskId, onEvent, onDone) {
 
 // ── WebSocket ───────────────────────────────────────────────────────────────
 
-export function connectWS(onMessage) {
+export function connectWS(onMessage, { onOpen, onClose, makeSocket } = {}) {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const host = import.meta.env.DEV ? "127.0.0.1:8420" : location.host;
-  const ws = new WebSocket(`${proto}://${host}/ws`);
+  const url = `${proto}://${host}/ws`;
+  const ws = (makeSocket || ((u) => new WebSocket(u)))(url);
   ws.onmessage = (e) => {
     try {
       onMessage(JSON.parse(e.data));
@@ -731,6 +732,11 @@ export function connectWS(onMessage) {
       /* ignore malformed frame */
     }
   };
-  ws.onerror = () => {};
+  ws.onopen = () => { if (onOpen) onOpen(); };
+  // Both routed to the same handler: a paired error+close from the same
+  // socket is ONE disconnect, deduped by the reconnector (wsReconnect.js),
+  // not here.
+  ws.onclose = () => { if (onClose) onClose(); };
+  ws.onerror = () => { if (onClose) onClose(); };
   return ws;
 }

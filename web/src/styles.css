@@ -276,6 +276,37 @@ html, body, #root {
 
 /* ── Command-center layout: persistent left sidebar + main content ────────── */
 .nh-shell-cc { flex-direction: row; }
+
+/* Incident 2026-08-12: a dead websocket over a stale board is invisible
+   unless something says so. Fixed (not sticky) so it stays a full-width top
+   bar regardless of the sidebar+main row layout above; `role="status"`,
+   never a modal. */
+.nh-stale-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 60;
+  padding: 6px 12px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  background: color-mix(in oklab, var(--amber) 20%, var(--bg-raised));
+  border-bottom: 1px solid var(--amber);
+}
+.nh-stale-banner-sync {
+  background: color-mix(in oklab, var(--blue) 20%, var(--bg-raised));
+  border-bottom-color: var(--blue);
+}
+.nh-stale-banner-error {
+  background: color-mix(in oklab, var(--red) 20%, var(--bg-raised));
+  border-bottom-color: var(--red);
+  color: var(--red);
+}
+@media (prefers-reduced-motion: reduce) {
+  .nh-stale-banner { transition: none; }
+}
 .nh-sidebar {
   width: 232px;
   flex-shrink: 0;

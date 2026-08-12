@@ -21,6 +21,8 @@ import { ledgerSummary, LEDGER_WINDOW_MS } from "./nightLedger.js";
 import { fmtCost, taskBurn } from "./cost.js";
 import { deriveSpendDisplay, perShippedCost } from "./ledgerSpend.js";
 import { tasksReducer } from "./tasksReducer.js";
+import { createReconnector } from "./wsReconnect.js";
+import { connectionBanner } from "./connectionBanner.js";
 import { drainChip } from "./drainChip.js";
 import { initialDrainReadout, nextDrainReadout, readoutPayload } from "./drainReadout.js";
 import { useEscapeKey } from "./useEscapeKey.js";
@@ -651,6 +653,11 @@ function BacklogSeedOverlay({ issueKey, tracker, notice, queueLeft, onSkip, onSt
 export default function App() {
   const [tasks, dispatch] = useReducer(tasksReducer, []);
   const [wsLive, setWsLive] = useState(false);
+  // Drives the stale-data banner (incident 2026-08-12): "connecting" until
+  // the first open, "resyncing" once open but before the snapshot lands,
+  // "live" only after a fresh snapshot is delivered — a socket that is open
+  // over stale data is exactly the incident, not a healthy state.
+  const [wsPhase, setWsPhase] = useState("connecting");
   const prevTasksRef = useRef([]);
   const [fetchError, setFetchError] = useState(null);
   const [showNewTask, setShowNewTask] = useState(false);
@@ -762,7 +769,6 @@ export default function App() {
   // needs a browser reload to take effect. A poll would buy nothing: the only
   // writer is a deliberate human action that already has a reload attached.
   const [onboarded, setOnboarded] = useState(null);
-  const wsRef = useRef(null);
 
   // onboarding gate
   useEffect(() => {
@@ -905,33 +911,26 @@ export default function App() {
     // belongs to.
   }, [backlogHeadKey]);
 
-  // WebSocket
+  // WebSocket — exponential backoff + snapshot re-fetch on reconnect
+  // (wsReconnect.js; incident 2026-08-12). The old effect here closed over a
+  // fixed three-second retry timer and never re-fetched the snapshot, so a
+  // socket that reconnected after a server restart sat open over stale state
+  // with nothing visibly wrong.
   useEffect(() => {
-    let disposed = false;
-    let retry = null;
-    function connect() {
-      if (disposed) return;
-      const ws = connectWS((msg) => {
+    const reconnector = createReconnector({
+      connect: (handlers) => connectWS((msg) => {
         if (msg.tasks) dispatch({ type: "sync", tasks: msg.tasks });
         // inflight rides the WS frame; `running` stays the REST poll's
         // authority (a WS frame from a worker-less server said running:true).
         if (msg.worker) setWorkerStatus(prev => ({ ...prev, ...msg.worker }));
-      });
-      ws.onopen = () => setWsLive(true);
-      ws.onclose = () => {
-        setWsLive(false);
-        if (!disposed) retry = setTimeout(connect, 3000);
-      };
-      wsRef.current = ws;
-    }
-    connect();
+      }, handlers),
+      fetchSnapshot: fetchTasks,
+      onSnapshot: (ts) => { setFetchError(null); dispatch({ type: "set", tasks: ts }); },
+      onStatus: (phase) => { setWsPhase(phase); setWsLive(phase === "live"); },
+    });
+    reconnector.start();
     return () => {
-      // The retry id was never captured, so the cleanup could not cancel it: close() fires
-      // onclose, which 3s later built ANOTHER socket that overwrote wsRef and orphaned the
-      // previous one — two live sockets both dispatching into the reducer.
-      disposed = true;
-      if (retry) clearTimeout(retry);
-      wsRef.current?.close();
+      reconnector.stop();
     };
   }, []);
 
@@ -997,8 +996,12 @@ export default function App() {
   // SCRUM-15: same derivation as OverviewStrip/lane headers so the sidebar
   // "Working (N)" figure agrees with the board instead of its own count.
   const sidebarCounts = deriveCounts(tasks);
+  const banner = connectionBanner(wsPhase);
   return (
     <div className="nh-shell nh-shell-cc">
+      {banner && (
+        <div className={banner.className} role={banner.role}>{banner.text}</div>
+      )}
       <aside className="nh-sidebar">
         <div className="nh-sidebar-brand"><Brand onHome={() => setPage("board")} /></div>
         {/* 1.5: grouped nav, Claude-app style — muted uppercase group headers over
