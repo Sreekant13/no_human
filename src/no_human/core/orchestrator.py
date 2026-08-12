@@ -3461,45 +3461,57 @@ class Orchestrator:
             edited = getattr(self, "_agent_edited_files", None)
             repaired: list[tuple[list[str], str]] = []
             try:
-                # Handles the manifest gate's changed-pinned-files refusal by
-                # performing the gate's own documented approve+retry flow;
-                # anything else raises. In a thread: the approve re-scans each
-                # refused file (~0.24s/file measured) and must not stall the
-                # loop. The on_repair box is drained AFTER the thread returns
-                # so the emit stays on the loop thread.
-                commit = await asyncio.to_thread(
-                    commit_with_manifest_repair,
-                    repo, list(edited) if edited else None, commit_msg,
-                    on_repair=lambda p, note: repaired.append((p, note)),
-                )
-            except ProtectedBranch:
-                # A pipeline commit aimed at main/master is a wiring bug, not
-                # an attempt outcome — surface it loudly, never retry it.
-                raise
-            except GitError as exc:
-                # 2026-08-11: three finished tasks died as task_crashed when a
-                # pre-commit refusal propagated raw from this call. A commit
-                # failure after the work is done is an ATTEMPT failure with the
-                # refusal as evidence — never an uncategorized crash.
-                detail = ("commit failed: " + str(exc).strip())[:2000]
-                self.emit("commit_refused", detail[:500])
-                await self.store.update_attempt(
-                    attempt_id, status="failed", failure_reason=detail,
-                )
-                return TaskOutcome(
-                    task, status=TaskStatus.FAILED, detail=detail)
-            if repaired:
-                # The pipeline changed the release-approval ledger — that
-                # must be on the task's record, warnings included (approve
-                # prints e.g. "N stale pin(s)" to stderr).
-                rep_paths, rep_note = repaired[0]
-                self.emit(
-                    "manifest_repaired",
-                    f"re-approved {len(rep_paths)} pinned file(s): "
-                    + ", ".join(rep_paths)[:300]
-                    + (f" — {rep_note[:200]}" if rep_note else ""),
-                    paths=rep_paths[:20],
-                )
+                try:
+                    # Handles the manifest gate's changed-pinned-files refusal
+                    # by performing the gate's own documented approve+retry
+                    # flow; anything else raises. In a thread: the approve
+                    # re-scans each refused file (~0.24s/file measured) and
+                    # must not stall the loop. The on_repair box is drained
+                    # AFTER the thread returns so the emit stays on the loop
+                    # thread.
+                    commit = await asyncio.to_thread(
+                        commit_with_manifest_repair,
+                        repo, list(edited) if edited else None, commit_msg,
+                        on_repair=lambda p, note: repaired.append((p, note)),
+                    )
+                except ProtectedBranch:
+                    # A pipeline commit aimed at main/master is a wiring bug,
+                    # not an attempt outcome — surface it loudly, never retry
+                    # it.
+                    raise
+                except GitError as exc:
+                    # 2026-08-11: three finished tasks died as task_crashed
+                    # when a pre-commit refusal propagated raw from this
+                    # call. A commit failure after the work is done is an
+                    # ATTEMPT failure with the refusal as evidence — never an
+                    # uncategorized crash.
+                    detail = ("commit failed: " + str(exc).strip())[:2000]
+                    self.emit("commit_refused", detail[:500])
+                    await self.store.update_attempt(
+                        attempt_id, status="failed", failure_reason=detail,
+                    )
+                    return TaskOutcome(
+                        task, status=TaskStatus.FAILED, detail=detail)
+            finally:
+                # A ledger mutation is NEVER absent from the record.
+                # export_guard's approve rewrites RELEASE_MANIFEST.txt in the
+                # working tree BEFORE the retry commit; if that retry refuses
+                # (or ProtectedBranch propagates) the mutation already
+                # happened, so the drain must run on every exit path — R2,
+                # 2026-08-12. (`if repaired:` previously sat after the
+                # except-return and could not be reached.)
+                if repaired:
+                    # The pipeline changed the release-approval ledger — that
+                    # must be on the task's record, warnings included
+                    # (approve prints e.g. "N stale pin(s)" to stderr).
+                    rep_paths, rep_note = repaired[0]
+                    self.emit(
+                        "manifest_repaired",
+                        f"re-approved {len(rep_paths)} pinned file(s): "
+                        + ", ".join(rep_paths)[:300]
+                        + (f" — {rep_note[:200]}" if rep_note else ""),
+                        paths=rep_paths[:20],
+                    )
         await self.store.update_attempt(attempt_id, commit_sha=commit.sha)
         # Size is reported, not enforced: the human approving the PR is the gate,
         # and they should see how big the change is (config.py:safety explains why

@@ -6542,3 +6542,106 @@ async def test_a_verdict_clears_the_consecutive_infra_park_streak(
     done = await store.get_task(t.id)
     assert _REVIEW_INFRA_PARKS_KEY not in (done.context or {}), (
         "a working review gate left the infra-park streak standing")
+
+
+_MANIFEST_REFUSAL = (
+    "no_human pre-commit gate: REFUSED\n"
+    "  src/pkg/mod.py\n"
+    "    pinned abc123"
+)
+
+
+async def test_a_refusing_commit_fails_the_attempt_honestly_not_as_a_crash(
+        bare_repo, tmp_path, store, monkeypatch):
+    """R2/F4: the try/except around `commit_with_manifest_repair` (the seam
+    itself) must turn a `GitError` into an honest attempt failure — never an
+    uncategorized `task_crashed` (`scheduler.py` only emits that when
+    `run_task` raises)."""
+    from no_human.core import orchestrator as orch_mod
+    from no_human.vcs import GitError
+
+    def fake_commit_with_manifest_repair(repo, edited, commit_msg, on_repair=None):
+        raise GitError(_MANIFEST_REFUSAL)
+
+    monkeypatch.setattr(orch_mod, "commit_with_manifest_repair",
+                        fake_commit_with_manifest_repair)
+
+    cfg = _config(tmp_path)
+    cfg.data["bounds"] = {"max_attempts": 1}
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(_mutate_add_mul),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)  # must not raise
+
+    kinds = [e["kind"] for e in events]
+    assert "task_crashed" not in kinds, kinds
+    assert "commit_refused" in kinds, kinds
+    assert "commit" not in kinds, "no commit ever succeeded — none should be recorded"
+    assert "manifest_repaired" not in kinds, (
+        "no repair happened on this path — a spurious event was emitted")
+    assert outcome.status is not TaskStatus.PENDING
+    assert outcome.status != TaskStatus.AWAITING_APPROVAL
+
+    attempts = await store.list_attempts(t.id)
+    assert attempts, "no attempt was recorded"
+    for a in attempts:
+        assert a["status"] == "failed", a
+        assert a["failure_reason"].startswith("commit failed:"), a["failure_reason"]
+        assert "REFUSED" in a["failure_reason"], a["failure_reason"]
+
+
+async def test_a_repair_before_a_second_refusal_is_still_on_the_record(
+        bare_repo, tmp_path, store, monkeypatch):
+    """R2: when `export_guard approve` SUCCEEDS (the release ledger is
+    rewritten in the working tree — `on_repair` fires) and the retry commit
+    then refuses AGAIN, the ledger mutation must never be silently absent
+    from the task record: `manifest_repaired` must still be emitted even
+    though the attempt ultimately fails with `commit_refused`."""
+    from no_human.core import orchestrator as orch_mod
+    from no_human.vcs import GitError
+
+    approved_paths = ["src/pkg/mod.py", "tests/test_mod.py"]
+
+    def fake_commit_with_manifest_repair(repo, edited, commit_msg, on_repair=None):
+        if on_repair is not None:
+            on_repair(approved_paths, "1 stale pin(s)")
+        raise GitError(_MANIFEST_REFUSAL)
+
+    monkeypatch.setattr(orch_mod, "commit_with_manifest_repair",
+                        fake_commit_with_manifest_repair)
+
+    cfg = _config(tmp_path)
+    cfg.data["bounds"] = {"max_attempts": 1}
+    events = []
+    orch = Orchestrator(store, cfg.data, FakeBackend(_mutate_add_mul),
+                        SlackNotifier(None), event_sink=events.append)
+    t = Task.new("add mul()", repo_path=str(bare_repo))
+    t.acceptance_criteria = ["mul(a,b) returns a*b"]
+    await store.create_task(t)
+
+    await orch.run_task(t)  # must not raise
+
+    kinds = [e["kind"] for e in events]
+    # Regression guard on the exact bug: `if repaired:` used to sit
+    # unreachable after the except-return, so the event count was 0 on this
+    # path. It must be exactly 1 — never dropped, never duplicated by the
+    # finally on a success path that never happens here.
+    assert kinds.count("manifest_repaired") == 1, kinds
+    repaired_events = [e for e in events if e["kind"] == "manifest_repaired"]
+    repaired_event = repaired_events[0]
+    assert repaired_event["paths"] == approved_paths
+    assert "src/pkg/mod.py" in repaired_event["text"]
+    assert "tests/test_mod.py" in repaired_event["text"]
+    assert "1 stale pin(s)" in repaired_event["text"]
+
+    assert "commit_refused" in kinds, kinds
+
+    attempts = await store.list_attempts(t.id)
+    assert attempts, "no attempt was recorded"
+    for a in attempts:
+        assert a["status"] == "failed", a
+        assert "REFUSED" in a["failure_reason"], a["failure_reason"]
