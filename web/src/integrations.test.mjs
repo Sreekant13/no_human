@@ -22,7 +22,16 @@ test("the Configure form is generated from the integration's fields spec", () =>
 
 test("secret fields render as password inputs with the required placeholder", () => {
   assert.match(src, /type=\{f\.secret \? "password" : "text"\}/);
-  assert.match(src, /f\.secret \? \(f\.set \? "●●● set" : "Not set"\) : ""/);
+  assert.match(src, /placeholder=\{f\.secret \? fieldSecretLabel\(f\) : ""\}/);
+  assert.match(src, /from "\.\/integrationSecret\.js"/);
+});
+
+test("the Secret summary line and the form badge derive from the same source, not it.configured", () => {
+  // The reported defect: the card's Secret line used to render `it.configured`
+  // (an integration-wide predicate that never looks at the secret itself) —
+  // see integrationSecret.test.mjs for the behavioural coverage of the fix.
+  assert.doesNotMatch(src, /it\.configured \? "●●● set"/);
+  assert.doesNotMatch(src, /integration-secret\$\{it\.configured/);
 });
 
 test("no field is ever prefilled from server data — every field starts blank", () => {

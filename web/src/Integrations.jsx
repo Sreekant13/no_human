@@ -6,6 +6,7 @@ import {
 import { testResultView } from "./integrationTestResult.js";
 import { IntegrationIcon } from "./integrationIcons.jsx";
 import { useEscapeKey } from "./useEscapeKey.js";
+import { secretState, fieldSecretLabel } from "./integrationSecret.js";
 
 // Settings → Integrations. One card per integration: brand mark, kind, live
 // status chip, a Configure form generated from the integration's `fields`
@@ -192,6 +193,7 @@ export default function IntegrationsPanel() {
       <div className="integrations-list">
         {items.map((it) => {
           const chip = statusChip(it);
+          const secret = secretState(it);
           const isOpen = expanded === it.name;
           const isConfiguring = configuring === it.name;
           return (
@@ -209,12 +211,12 @@ export default function IntegrationsPanel() {
               {isOpen && (
                 <div className="integration-body">
                   <div className="integration-detail">{it.detail || "—"}</div>
-                  {SECRET_ENV_KEY[it.name] && (
+                  {SECRET_ENV_KEY[it.name] && secret && (
                     <div className="integration-field">
                       <span className="ntm-label" style={{ marginBottom: 0 }}>Secret</span>
                       <code>{SECRET_ENV_KEY[it.name]}</code>
-                      <span className={`integration-secret${it.configured ? " set" : ""}`}>
-                        {it.configured ? "●●● set" : "not set"}
+                      <span className={`integration-secret${secret.set ? " set" : ""}`}>
+                        {secret.label}
                       </span>
                     </div>
                   )}
@@ -310,7 +312,11 @@ function IntegrationConfigForm({
           <div className="ntm-field" key={f.name}>
             <label className="ntm-label" htmlFor={inputId}>
               {f.label}
-              {f.set && <span className="integration-field-set">Set</span>}
+              {f.secret && (
+                <span className={`integration-field-set${f.set ? "" : " unset"}`}>
+                  {fieldSecretLabel(f)}
+                </span>
+              )}
             </label>
             <input
               id={inputId}
@@ -318,7 +324,7 @@ function IntegrationConfigForm({
               className="new-task-input"
               type={f.secret ? "password" : "text"}
               autoComplete={f.secret ? "new-password" : "off"}
-              placeholder={f.secret ? (f.set ? "●●● set" : "Not set") : ""}
+              placeholder={f.secret ? fieldSecretLabel(f) : ""}
               value={values[f.name] ?? ""}
               onChange={(e) => onChange(f.name, e.target.value)}
               onBlur={(e) => onBlur(f.name, e.target.value, f.secret)}
