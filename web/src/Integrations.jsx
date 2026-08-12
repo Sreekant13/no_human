@@ -3,6 +3,7 @@ import { fetchIntegrations, testIntegration, saveIntegrationConfig } from "./api
 import {
   statusChip, KIND_LABEL, NAME_LABEL, CONFIG_HINT, SECRET_ENV_KEY,
 } from "./integrationChip.js";
+import { testResultView } from "./integrationTestResult.js";
 import { IntegrationIcon } from "./integrationIcons.jsx";
 import { useEscapeKey } from "./useEscapeKey.js";
 
@@ -36,6 +37,11 @@ export default function IntegrationsPanel() {
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState(null);
   const [testing, setTesting] = useState(null);
+  // Per-integration Test-connection result (name → { tone, icon, text }),
+  // computed via testResultView so every click renders exactly one outcome —
+  // never nothing (see integrationTestResult.js for the response-shape map,
+  // including the ambient-CLI-auth case that used to render silently).
+  const [testResults, setTestResults] = useState({});
 
   // Configure form state — one integration's form open at a time, mirroring
   // `expanded`/`testing` above.
@@ -70,12 +76,15 @@ export default function IntegrationsPanel() {
 
   async function runTest(name) {
     setTesting(name);
+    setTestResults((r) => ({ ...r, [name]: null }));
     try {
       const status = await testIntegration(name);
       setItems((prev) => prev.map((it) => (it.name === name ? { ...it, ...status } : it)));
+      setTestResults((r) => ({ ...r, [name]: testResultView(status) }));
     } catch (e) {
       setItems((prev) => prev.map((it) =>
         it.name === name ? { ...it, healthy: false, detail: e.message } : it));
+      setTestResults((r) => ({ ...r, [name]: testResultView(null, e) }));
     } finally {
       setTesting(null);
     }
@@ -217,11 +226,11 @@ export default function IntegrationsPanel() {
                         ? <><span className="grill-spinner" /> Testing…</>
                         : "Test connection"}
                     </button>
-                    {testing !== it.name && it.healthy === true && (
-                      <span className="integration-result ok">✓ {it.detail}</span>
-                    )}
-                    {testing !== it.name && it.healthy === false && (
-                      <span className="integration-result err">✕ {it.detail}</span>
+                    {testing !== it.name && testResults[it.name] && (
+                      <span className={`integration-result ${testResults[it.name].tone}`}
+                            role="status" aria-live="polite">
+                        {testResults[it.name].icon} {testResults[it.name].text}
+                      </span>
                     )}
                     {(it.fields || []).length > 0 && (
                       <button type="button" className="btn btn-sendback btn-sm"

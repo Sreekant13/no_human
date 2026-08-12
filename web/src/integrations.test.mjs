@@ -182,3 +182,30 @@ test("Escape closes the expanded card AND, if a Configure form is open, closes i
     "escape must close the configure form (setConfiguring(null)) and wipe typed values (setFormValues({}))");
   assert.match(src, /useEscapeKey\(closeOnEscape,\s*expanded !== null\)/);
 });
+
+// Walk bug (2026-08-12): the result region used to gate on it.healthy ===
+// true/false, which silently rendered nothing for the ambient-auth payload
+// (healthy: null). It must route through testResultView / testResults state
+// instead, and every runTest exit path (success and failure) must record a
+// result so a click can never end in silence.
+test("the test-connection result is never gated on healthy === true/false", () => {
+  assert.doesNotMatch(src, /it\.healthy === true/,
+    "the result region must not gate rendering on it.healthy === true");
+  assert.doesNotMatch(src, /it\.healthy === false/,
+    "the result region must not gate rendering on it.healthy === false");
+  assert.match(src, /testResultView\(/, "must route the result through testResultView");
+  assert.match(src, /testResults\[it\.name\]/, "must render from per-integration testResults state");
+  // Both the try and catch arms of runTest must write a result, or an
+  // exception path could still end in silence.
+  const runTestMatch = src.match(/async function runTest\(name\) \{[\s\S]*?\n  \}\n/);
+  assert.ok(runTestMatch, "could not find runTest");
+  const runTestBody = runTestMatch[0];
+  const tryIdx = runTestBody.indexOf("try {");
+  const catchIdx = runTestBody.indexOf("} catch");
+  const finallyIdx = runTestBody.indexOf("} finally");
+  assert.ok(tryIdx >= 0 && catchIdx > tryIdx && finallyIdx > catchIdx, "runTest must have try/catch/finally");
+  const tryBody = runTestBody.slice(tryIdx, catchIdx);
+  const catchBody = runTestBody.slice(catchIdx, finallyIdx);
+  assert.match(tryBody, /setTestResults\(/, "the try arm must call setTestResults");
+  assert.match(catchBody, /setTestResults\(/, "the catch arm must call setTestResults");
+});
