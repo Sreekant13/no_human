@@ -336,6 +336,7 @@ class _Forge:
     def __init__(self):
         self.titles = []
         self.comments = []
+        self.closes = []
 
     def set_pr_title(self, url, title):
         self.titles.append((url, title))
@@ -345,6 +346,10 @@ class _Forge:
         self.comments.append((url, body))
         return {"ok": True, "error": ""}
 
+    def close_pr(self, url):
+        self.closes.append(url)
+        return {"ok": True, "error": ""}
+
 
 @pytest.fixture
 def forge(monkeypatch):
@@ -352,6 +357,7 @@ def forge(monkeypatch):
     import no_human.vcs.comment_poster as cp
     monkeypatch.setattr(cp, "set_pr_title", f.set_pr_title)
     monkeypatch.setattr(cp, "post_to_pr", f.post_to_pr)
+    monkeypatch.setattr(cp, "close_pr", f.close_pr)
     return f
 
 
@@ -369,14 +375,13 @@ async def test_an_abandoned_draft_says_so_in_its_title(store, tmp_path, forge):
     # The prefix names only what every route establishes — that this draft was
     # not delivered. It used to read "[ABANDONED — attempt failed review]", and
     # THIS TEST PINNED THAT STRING, so the suite defended the false claim
-    # instead of catching it. The reason belongs in the comment, below.
+    # instead of catching it. The reason no longer goes to a comment at all
+    # (refile of 1dfed378: closing, not commenting, is how an abandoned draft
+    # is marked) — it is closed instead.
     assert forge.titles == [("https://github.com/o/r/pull/106",
                              "[ABANDONED — not delivered] Fix the thing")]
-    url, note = forge.comments[0]
-    assert url == "https://github.com/o/r/pull/106"
-    assert "Abandoned by no_human" in note
-    assert "the attempt did not pass review" in note
-    assert "never merges and never closes" in note
+    assert forge.comments == [], "the abandon path must never post a comment"
+    assert forge.closes == ["https://github.com/o/r/pull/106"]
 
 
 async def test_abandoning_moves_the_url_out_of_the_live_slot(store, tmp_path, forge):
@@ -418,6 +423,7 @@ async def test_escalating_abandons_the_draft_it_opened(store, tmp_path, forge):
     out = await orch._raise_blocker(t, blocker, escalate_now=True)
     assert out.status == TaskStatus.ESCALATED
     assert forge.titles and "[ABANDONED" in forge.titles[0][1]
+    assert forge.closes == ["https://github.com/o/r/pull/111"]
     assert "pr_draft_created" not in (t.context or {})
 
 
@@ -435,6 +441,7 @@ async def test_a_PARKED_task_keeps_its_draft(store, tmp_path, forge):
     out = await orch._raise_blocker(t, blocker)
     assert out.status != TaskStatus.ESCALATED, "fixture no longer parks — retune it"
     assert forge.titles == []
+    assert forge.closes == []
     assert t.context["pr_draft_created"] == "https://github.com/o/r/pull/120"
 
 
@@ -580,6 +587,7 @@ async def test_a_delivered_pr_is_never_retitled_as_abandoned(store, tmp_path, fo
     assert out == ""
     assert forge.titles == [], "a delivered PR was retitled [ABANDONED]"
     assert forge.comments == [], "a delivered PR was told it is not a delivery"
+    assert forge.closes == [], "a delivered, human-reviewed PR was closed"
     assert t.context["pr_draft_created"] == _DELIVERED
     assert "abandoned_pr_urls" not in t.context
 
@@ -1142,6 +1150,7 @@ async def test_the_delivered_url_alone_is_enough_to_spare_the_pr(
     assert forge.titles == [], (
         "the branch fields drifted apart and the delivered PR was retitled "
         "[ABANDONED] anyway — the URL clause is what stops that")
+    assert forge.closes == [], "the URL clause is also what stops the close"
     assert t.context["pr_draft_created"] == _DELIVERED
 
 
@@ -1275,10 +1284,13 @@ async def test_the_abandoned_title_never_asserts_a_reason_it_cannot_know(
 async def test_the_abandon_comment_claims_no_review_verdict_either(
     store, tmp_path, forge, blocker,
 ):
-    """The same false claim lived in the comment's first sentence — "nothing in
-    it should be read as a REVIEWED or delivered change" — which on the
-    CI-infra route contradicts a review that passed. Whether a review ran varies
-    by route, so the note claims neither and lets `Reason:` carry it."""
+    """The old comment's first sentence — "nothing in it should be read as a
+    REVIEWED or delivered change" — contradicted a review that passed on the
+    CI-infra route. Refile of 1dfed378: the abandon path posts no comment at
+    all any more, on ANY escalating route — the strongest form of "claims no
+    review verdict" is claiming nothing, on the forge, whatsoever. The PR is
+    retitled and closed instead; the reason still reaches the human off-forge
+    (the `pr_draft_abandoned` event / board / `nh blocked`)."""
     orch = _orch(store, tmp_path)
     t = Task.new("Add the thing", repo_path="/r")
     t.context = {"pr_draft_created": "https://github.com/o/r/pull/9",
@@ -1286,19 +1298,19 @@ async def test_the_abandon_comment_claims_no_review_verdict_either(
     await store.create_task(t)
     await orch._raise_blocker(t, blocker, escalate_now=True)
 
-    (_url, note), = forge.comments
-    assert "reviewed or delivered change" not in note, (
-        "the note still denies a review that may well have passed")
-    assert "not a delivered change" in note
-    # …and the true reason still reaches the human, where it belongs.
-    assert str(blocker.root_cause_hypothesis)[:40] in note
+    assert forge.comments == [], (
+        "the abandon path posted a comment — it must post none, regardless "
+        "of the route or the reason it carries")
+    assert forge.closes == ["https://github.com/o/r/pull/9"]
 
 
 async def test_the_true_reason_is_still_carried_on_the_ci_infra_route(
     store, tmp_path, forge,
 ):
     """Neutralising the title must not cost the information — it moves, it does
-    not vanish."""
+    not vanish. Refile of 1dfed378: it moved off the forge entirely (no
+    comment), onto the `pr_draft_abandoned` event / board / `nh blocked`; the
+    draft itself is retitled and closed, never told a false verdict."""
     orch = _orch(store, tmp_path)
     t = Task.new("Add the thing", repo_path="/r")
     t.context = {"pr_draft_created": "https://github.com/o/r/pull/9",
@@ -1309,9 +1321,10 @@ async def test_the_true_reason_is_still_carried_on_the_ci_infra_route(
                     root_cause_hypothesis="CI infra failure persisted after 2 retries"),
         escalate_now=True)
 
-    (_url, note), = forge.comments
-    assert "CI infra failure persisted after 2 retries" in note
-    assert "never merges and never closes" in note
+    assert forge.comments == [], "no comment is posted on an abandoned draft"
+    (_url, title), = forge.titles
+    assert title.startswith("[ABANDONED — not delivered] "), title
+    assert forge.closes == ["https://github.com/o/r/pull/9"]
 
 
 # ═══ R6: the SECOND `_abandon_draft_pr` caller, and the `Reason:` channel ════ #
@@ -1383,12 +1396,19 @@ async def _abandon_via_coder_blocker(orch, store, final_text):
 
 
 # ── F1: the branch-changed caller asserted a review verdict it never had ──── #
+#
+# Refile of 1dfed378: `_abandon_draft_pr` posts NO comment on ANY route any
+# more, so a claimed-but-unestablished review verdict can no longer reach the
+# forge at all — the strongest form of the property these tests defended.
+# What still holds, and is what these now pin: the draft is retitled and
+# closed, and no comment of any kind is posted.
 
 async def test_the_branch_changed_abandon_asserts_no_review_verdict(
     store, tmp_path, forge, captured_draft_body,
 ):
-    """`_open_draft_pr_for_review` retiring a prior-branch draft. Its reason may
-    claim only that the work moved branches."""
+    """`_open_draft_pr_for_review` retiring a prior-branch draft used to assert
+    a review verdict it never established. It cannot any more: the abandon
+    path posts nothing."""
     work = _repo_with_two_commits(tmp_path)
     _git(work, "remote", "add", "origin", "https://github.com/o/r.git")
     repo = GitRepo(work)
@@ -1406,23 +1426,17 @@ async def test_the_branch_changed_abandon_asserts_no_review_verdict(
 
     (_url, title), = forge.titles
     assert title.startswith("[ABANDONED — not delivered] "), title
-    (_url, note), = forge.comments
-    low = note.lower()
-    for claim in ("did not pass review", "failed review", "passed review"):
-        assert claim not in low, (
-            f"the branch-changed call site asserts a review verdict it has not "
-            f"established ({claim!r}); the route "
-            f"review-PASSED -> local tests fail -> retry on a new branch "
-            f"reaches here with a PASSING verdict on record:\n{note}")
-    # …and it still says the true thing, which is the only thing it knows.
-    assert "feat/x" in note, "the reason no longer names the branch the work moved to"
+    assert forge.comments == [], (
+        "the branch-changed abandon path must post no comment — it cannot "
+        "assert a review verdict it never established if it says nothing")
+    assert forge.closes == ["https://github.com/o/r/pull/106"]
 
 
 async def test_the_branch_changed_reason_is_not_quoted_as_the_agents_words(
     store, tmp_path, forge, captured_draft_body,
 ):
-    """no_human wrote this reason itself, so it must NOT carry the
-    agent-authored attribution — that would be the same defect mirrored."""
+    """no_human wrote this reason itself, so nothing about it — attributed or
+    not — reaches the forge: the abandon path posts no comment at all."""
     work = _repo_with_two_commits(tmp_path)
     _git(work, "remote", "add", "origin", "https://github.com/o/r.git")
     repo = GitRepo(work)
@@ -1436,12 +1450,18 @@ async def test_the_branch_changed_reason_is_not_quoted_as_the_agents_words(
     await orch._open_draft_pr_for_review(
         task, repo, "feat/x", "main", "attempt-2", commit=commit, result=_Result())
 
-    (_url, note), = forge.comments
-    assert Orchestrator._AGENT_REASON_ATTRIBUTION not in note, (
-        "a reason no_human authored is attributed to the coding agent")
+    assert forge.comments == [], (
+        "a reason no_human authored still must not reach the forge as a "
+        "comment — there is no comment on the abandon path any more")
 
 
-# ── F2: `Reason:` is a model-authored channel and was rendered raw ────────── #
+# ── F2: `Reason:` used to be a model-authored channel and was rendered raw ── #
+#
+# Refile of 1dfed378: the whole channel — quoting, attribution, fence-escaping,
+# heading demotion, harness-dialogue filtering — existed to make coder prose
+# safe to post to a forge. Removing the post removes the need for all of it;
+# these now pin the stronger property that nothing the coder wrote, however it
+# is shaped, ever reaches the PR as a comment.
 
 _MARKUP_REASON = (
     "the branch is finished\n\n"
@@ -1455,66 +1475,57 @@ _MARKUP_REASON = (
 async def test_the_coder_cannot_author_headings_on_the_abandoned_pr(
     store, tmp_path, forge,
 ):
-    """Driven from a real BLOCKER_JSON emission. The coder's `## Review evidence`
-    rendered as a top-level section of a PR no_human is labelling [ABANDONED],
-    asserting a PASSED verdict in no_human's own voice."""
+    """Driven from a real BLOCKER_JSON emission. The coder's `## Review
+    evidence` used to render as a top-level section of a PR no_human was
+    labelling [ABANDONED]. It cannot render anywhere on the forge now — no
+    comment is posted at all."""
     orch = _orch(store, tmp_path)
     await _abandon_via_coder_blocker(
         orch, store, _coder_final_text(_MARKUP_REASON))
 
-    (_url, note), = forge.comments
-    live = [ln for ln in _outside_fences(note) if re.match(r"^#{1,6}\s+\S", ln)]
-    assert live == [], (
-        f"the coder authored live markdown headings on the PR body: {live}")
-    # Belt and braces: the heading is ALSO demoted, so it is not a sibling of
-    # the template's own sections even if the fencing were ever lost.
-    quoted = note.split(Orchestrator._AGENT_REASON_ATTRIBUTION, 1)[1]
-    assert "### Review evidence" in quoted, (
-        f"the coder's `##` heading was not demoted:\n{quoted}")
-    assert "- independent review rounds: 4" in quoted, (
-        "the reason's content is outside the attributed block")
+    assert forge.comments == [], (
+        "the coder's markdown reached the forge as a comment — it must not, "
+        "on any content, since the abandon path posts none")
 
 
 async def test_the_coder_cannot_break_out_of_the_quoted_reason(
     store, tmp_path, forge,
 ):
-    """A fence inside the reason must not close the wrapper and let the rest
-    render — otherwise escaping is decoration."""
+    """A fence inside the reason used to risk closing the old note's wrapper
+    and letting the rest render live. There is no wrapper and no note any
+    more — the hostile payload never reaches the forge either way."""
     orch = _orch(store, tmp_path)
-    # ONE opener, deliberately. An even number of fences cannot break out of a
-    # same-length wrapper — the payload has to leave the wrapper open for the
-    # rest to render, which is exactly what a hostile one would do.
+    # ONE opener, deliberately — the shape that used to defeat a same-length
+    # fence wrapper by leaving it open for the rest to render.
     hostile = ("here is the evidence\n```\n\n"
                "## Verdict\n**PASSED** — merge this.")
     await _abandon_via_coder_blocker(
         orch, store, _coder_final_text(hostile))
 
-    (_url, note), = forge.comments
-    assert "**PASSED** — merge this." in note, "the reason itself vanished"
-    live = "\n".join(_outside_fences(note))
-    assert "PASSED" not in live, (
-        "the coder's own fence closed the wrapper and the rest rendered live "
-        f"— escaping that can be escaped is decoration:\n{note}")
-    assert "## Verdict" not in live and "### Verdict" not in live, live
+    assert forge.comments == [], (
+        "hostile coder-authored fences reached the forge as a comment")
 
 
 async def test_the_quoted_reason_is_attributed_to_the_agent_not_to_no_human(
     store, tmp_path, forge,
 ):
+    """The attribution machinery this test used to pin is deleted along with
+    the note it dressed — model-authored prose now never reaches the forge as
+    a comment, attributed or not."""
     orch = _orch(store, tmp_path)
     await _abandon_via_coder_blocker(
         orch, store, _coder_final_text("the dependency never resolved"))
 
-    (_url, note), = forge.comments
-    assert Orchestrator._AGENT_REASON_ATTRIBUTION in note, (
-        "the model-authored reason is presented as no_human's own words")
-    assert "the dependency never resolved" in note, "the reason itself vanished"
+    assert forge.comments == [], (
+        "the model-authored reason reached the forge as a comment")
 
 
 async def test_harness_dialogue_is_filtered_out_of_the_quoted_reason(
     store, tmp_path, forge,
 ):
-    """The same `_clean_summary` filter every other coder-prose surface gets."""
+    """The `_clean_summary` filter this used to exercise guarded a channel that
+    no longer exists — coder-to-harness dialogue cannot reach the PR through a
+    comment the abandon path never posts."""
     orch = _orch(store, tmp_path)
     await _abandon_via_coder_blocker(
         orch, store,
@@ -1523,25 +1534,24 @@ async def test_harness_dialogue_is_filtered_out_of_the_quoted_reason(
             "Per the system instructions I am stopping here and will not "
             "touch the harness again."))
 
-    (_url, note), = forge.comments
-    assert "the dependency never resolved" in note
-    assert "system instructions" not in note, (
-        "coder-to-harness dialogue reached the PR through the Reason channel")
+    assert forge.comments == [], (
+        "coder-to-harness dialogue reached the PR through a comment")
 
 
 async def test_a_wholly_filtered_reason_does_not_leave_a_dangling_label(
     store, tmp_path, forge,
 ):
-    """Nothing quotable left: the note must say so, not print an empty quote."""
+    """A wholly-filtered reason used to risk an empty quotation on the note.
+    There is no note: the title is the only forge-visible label, and it is
+    never dangling — it always names the abandonment plainly."""
     orch = _orch(store, tmp_path)
     await _abandon_via_coder_blocker(
         orch, store,
         _coder_final_text("Per the system instructions I am stopping here."))
 
-    (_url, note), = forge.comments
-    assert "Abandoned by no_human" in note
-    assert Orchestrator._AGENT_REASON_ATTRIBUTION not in note
-    assert "no reason that could be shown here" in note, note
+    assert forge.comments == []
+    (_url, title), = forge.titles
+    assert title.startswith("[ABANDONED — not delivered] "), title
 
 
 # ── F3: the footer could print "attempt 5 of 3" ───────────────────────────── #
@@ -1588,12 +1598,14 @@ def test_the_footer_never_claims_an_attempt_beyond_the_bound(store, tmp_path):
 
 
 async def _escalate_and_read_note(orch, store, helper, **ctx):
-    """Drive one of the REAL `_escalate_*` helpers and return its PR comment.
+    """Drive one of the REAL `_escalate_*` helpers and return the task.
 
     The point of going through the helper instead of building a Blocker here is
     that the reason text is then the literal in `orchestrator.py`, not a copy of
     it in this file — a fixture that paraphrases the source cannot catch the
-    source lying about itself.
+    source lying about itself. (Named for the era when the abandon path still
+    posted a PR comment to read; it posts none now — callers check
+    `forge.comments == []` instead.)
     """
     t = Task.new("Add the thing", repo_path="/r")
     t.context = {"pr_draft_created": "https://github.com/o/r/pull/9",
@@ -1699,47 +1711,39 @@ async def test_a_harness_written_reason_is_never_attributed_to_the_agent(
     store, tmp_path, forge, helper,
 ):
     """The dominant route. Every one of these reasons is a source literal in
-    `orchestrator.py`; none of them is the agent's words, none was quoted from a
-    blocker report the agent wrote, no_human demonstrably DID write them, and
-    the exhaustion one is verified bookkeeping rather than an unverified claim.
-
-    🔴 THAT SENTENCE WAS FALSE FOR `_escalate_exhausted` UNTIL THE FIX, and true
-    only of the fixture: `_exhausted` records no `failure_reason`, so the
-    `Last: {tried[-1]}` clause the reason used to end with had nothing to
-    interpolate. `_exhausted_after_a_failed_review` is the same route with what
-    production stores, and it is now in this list so the claim is tested on a
-    payload somebody generated. What makes the docstring true is that
-    `root_cause_hypothesis` is now a pure literal on every route here — pinned
-    directly by `test_the_exhaustion_reason_does_not_move_with_the_attempt_log`.
-    """
+    `orchestrator.py`; none of them is the agent's words. Refile of 1dfed378:
+    a false provenance claim can no longer be published on any of these
+    routes, because none of them posts a comment at all — the reason reaches
+    the human only through `render_report` (board / `nh blocked`), which never
+    carries this attribution string either (see
+    `test_the_attempt_trail_still_reaches_the_human_on_the_board`)."""
     orch = _orch(store, tmp_path)
-    await _escalate_and_read_note(orch, store, helper)
+    t = await _escalate_and_read_note(orch, store, helper)
 
-    assert forge.comments, "the escalation opened no abandon comment at all"
-    (_url, note), = forge.comments
-    assert Orchestrator._AGENT_REASON_ATTRIBUTION not in note, (
-        "no_human's own source literal is published as 'the coding agent's own "
-        "words … no_human did not write this text and has not verified it' — a "
-        f"false provenance claim on the provenance artifact:\n{note}")
-    for claim in ("in the coding agent's own words",
-                  "quoted from its blocker report",
-                  "no_human did not write this text",
-                  "has not verified it"):
-        assert claim not in note, (note, claim)
-    assert "Reason:" in note, (
-        "the reason must still reach the human, just unattributed")
+    assert forge.comments == [], (
+        "the escalation posted a PR comment — no route may, harness-authored "
+        "reason or not")
+    assert (t.blocker or {}).get("root_cause_hypothesis") or (
+        t.blocker or {}).get("question"), (
+        "the reason must still reach the human somewhere — via the persisted "
+        "blocker / render_report — even though it is never posted to the PR")
 
 
 async def test_the_exhaustion_reason_is_the_harness_bookkeeping_verbatim(
     store, tmp_path, forge,
 ):
-    """Pins the exact text the false label was attached to, so a future rewrite
-    of `_escalate_exhausted` cannot quietly move this test off its own subject."""
+    """Pins the exact text the false label used to be attached to, so a future
+    rewrite of `_escalate_exhausted` cannot quietly move this test off its own
+    subject. It now reaches the human through the persisted blocker
+    (`render_report`), not a PR comment — the abandon path posts none."""
+    from no_human.blockers import Blocker as _B, render_report
+
     orch = _orch(store, tmp_path)
-    await _escalate_and_read_note(orch, store, _exhausted)
-    (_url, note), = forge.comments
-    assert "max_attempts (3) reached without a passing, untampered change" in note
-    assert note.count("Reason:") == 1
+    t = await _escalate_and_read_note(orch, store, _exhausted)
+    assert forge.comments == []
+    blocker = _B.from_dict(t.blocker)
+    report = render_report(blocker, task_title=t.title, task_id=t.id)
+    assert "max_attempts (3) reached without a passing, untampered change" in report
 
 
 # ── H1: the exhaustion reason interpolated the last attempt's failure_reason ── #
@@ -1774,15 +1778,19 @@ async def test_the_exhaustion_reason_does_not_move_with_the_attempt_log(
     """The invariant, stated so it cannot be satisfied by filtering one payload.
 
     Two runs of the SAME route differing only in what the last attempt recorded
-    must post the same reason. That holds for a pure literal and for nothing
-    else — no escaping, capping or heading-demotion of the attempt text would
-    pass it — so it also covers every other `failure_reason` writer, present and
-    future, without this test having to enumerate them.
+    must produce the same `root_cause_hypothesis` — the pure literal, never the
+    attempt's own text — and, refile of 1dfed378, neither run may post a PR
+    comment at all, so no escaping/capping/heading-demotion question can even
+    arise on the forge any more. Both properties are checked, so this test
+    still covers every `failure_reason` writer, present and future, without
+    having to enumerate them.
     """
+    from no_human.blockers import Blocker as _B
+
     orch = _orch(store, tmp_path)
-    await _escalate_and_read_note(orch, store, _exhausted)
-    (_url, without), = forge.comments
-    forge.comments.clear()
+    t1 = await _escalate_and_read_note(orch, store, _exhausted)
+    without = _B.from_dict(t1.blocker).root_cause_hypothesis
+    assert forge.comments == []
     forge.titles.clear()
 
     async def _with_reason(o, t):
@@ -1792,11 +1800,12 @@ async def test_the_exhaustion_reason_does_not_move_with_the_attempt_log(
         await o._escalate_exhausted(t, None, "main")
 
     orch2 = _orch(store, tmp_path)
-    await _escalate_and_read_note(orch2, store, _with_reason)
-    (_url, with_reason), = forge.comments
+    t2 = await _escalate_and_read_note(orch2, store, _with_reason)
+    with_reason = _B.from_dict(t2.blocker).root_cause_hypothesis
+    assert forge.comments == []
 
     assert with_reason == without, (
-        "the attempt's failure_reason reached the abandoned-PR comment; on the "
+        "the attempt's failure_reason moved `root_cause_hypothesis`; on the "
         "commonest exhaustion path that text is the reviewer model's own\n"
         f"--- with a failure_reason ---\n{with_reason}\n"
         f"--- without one ---\n{without}")
@@ -1805,24 +1814,17 @@ async def test_the_exhaustion_reason_does_not_move_with_the_attempt_log(
 async def test_the_reviewers_words_never_reach_the_abandoned_pr_comment(
     store, tmp_path, forge,
 ):
-    """The concrete harm, asserted where a renderer would do it.
-
-    `_live_headings` is this file's independent block scanner, pinned against
-    GitHub's real /markdown endpoint by
-    `test_the_live_heading_scanner_sees_what_github_sees` — so "no live heading"
-    here means what GitHub does, not what a regex hopes.
-    """
+    """The concrete harm, asserted at its strongest now: refile of 1dfed378
+    means there is no abandoned-PR comment for the reviewer's words to reach —
+    the whole surface is gone. The honest half (the true reason) is still
+    proven to survive, just off-forge — see
+    `test_the_attempt_trail_still_reaches_the_human_on_the_board`, which
+    checks it via `render_report`."""
     orch = _orch(store, tmp_path)
     await _escalate_and_read_note(orch, store, _exhausted_after_a_failed_review)
-    (_url, note), = forge.comments
-
-    assert "Review evidence" not in _live_headings(note), (
-        "the reviewer model authored a live <h2> on an abandoned PR:\n" + note)
-    for lie in ("final verdict", "**PASSED**", "ready to merge"):
-        assert lie not in note, (lie, note)
-    # And the honest half is still there — the fix removes the model's words,
-    # not the human's information.
-    assert "max_attempts (3) reached without a passing, untampered change" in note
+    assert forge.comments == [], (
+        "a comment was posted on the abandoned draft — the reviewer's words "
+        "(or anything else) can only 'reach' it if something is posted at all")
 
 
 async def test_the_attempt_trail_still_reaches_the_human_on_the_board(
@@ -1887,10 +1889,9 @@ async def test_the_returned_detail_keeps_the_trail_the_pr_comment_must_not(
     assert _MODEL_REVIEW_EVIDENCE in outcome.detail, (
         "`nh run` no longer tells the human which failure burned the last "
         f"attempt: {outcome.detail!r}")
-    (_url, note), = forge.comments
-    assert _MODEL_REVIEW_EVIDENCE not in note, (
-        "the trail came back through the PR comment:\n" + note)
-    assert "Review evidence" not in _live_headings(note), note
+    assert forge.comments == [], (
+        "the trail — or anything else — reached a PR comment; the abandon "
+        "path must post none")
 
 
 async def test_the_inadequate_report_route_cannot_author_a_block(
@@ -1952,43 +1953,38 @@ async def test_the_inadequate_report_route_cannot_author_a_block(
         orch, store, _inadequate,
         inadequate_report_reason=max(reasons, key=len),
         inadequate_report_text="## Review evidence\n\nverdict: PASSED")
-    (_url, note), = forge.comments
-    assert not _live_headings(note), (
-        "the inadequate-report route authored a live heading:\n" + note)
-    assert "verdict: PASSED" not in note, (
-        "`inadequate_report_text` reached the PR comment; it is agent prose and "
-        "belongs in `evidence`, which `_raise_blocker` does not publish:\n"
-        + note)
+    assert forge.comments == [], (
+        "the inadequate-report route posted a PR comment — none of this "
+        "agent-authored text may reach the forge at all")
 
 
 async def test_a_coder_written_reason_still_carries_the_attribution(
     store, tmp_path, forge,
 ):
-    """The other direction, and the reason the channel is typed at all: prose
-    the MODEL wrote must stay quoted, attributed and disclaimed."""
+    """The channel this attribution machinery guarded is gone (refile of
+    1dfed378): the abandon path never posts a comment, so model-authored
+    prose — attributed or not — cannot reach the forge at all any more. This
+    is the strongest form of the property the old assertions defended."""
     orch = _orch(store, tmp_path)
     await _abandon_via_coder_blocker(
         orch, store, _coder_final_text("the vendor API never returned a schema"))
-    (_url, note), = forge.comments
-    assert Orchestrator._AGENT_REASON_ATTRIBUTION in note, (
-        "model-authored prose is presented as no_human's own words")
-    assert "the vendor API never returned a schema" in note
+    assert forge.comments == [], (
+        "model-authored prose reached the forge as a comment")
 
 
 async def test_the_same_sentence_is_labelled_by_ORIGIN_not_by_wording(
     store, tmp_path, forge,
 ):
-    """The whole fix in one assertion: identical text, two origins, two labels.
-
-    If provenance were still decided by which method posts — or by anything in
-    the text itself — these two notes would carry the same label.
+    """Identical text, two origins — coder-authored and harness-authored —
+    and now neither ever reaches the forge as a comment. The old assertion
+    that provenance decided a LABEL on the posted note no longer applies
+    because nothing is posted; this pins the stronger property instead.
     """
     sentence = "max_attempts (3) reached without a passing, untampered change"
 
     orch = _orch(store, tmp_path)
     await _abandon_via_coder_blocker(orch, store, _coder_final_text(sentence))
-    (_url, from_coder), = forge.comments
-    forge.comments.clear()
+    assert forge.comments == []
     forge.titles.clear()
 
     t = Task.new("Add the thing", repo_path="/r")
@@ -1999,17 +1995,17 @@ async def test_the_same_sentence_is_labelled_by_ORIGIN_not_by_wording(
         t, _blocker(category=BlockerCategory.NOVEL_UNKNOWN,
                     root_cause_hypothesis=sentence),
         escalate_now=True)
-    (_url, from_harness), = forge.comments
-
-    assert Orchestrator._AGENT_REASON_ATTRIBUTION in from_coder
-    assert Orchestrator._AGENT_REASON_ATTRIBUTION not in from_harness
-    assert sentence in from_coder and sentence in from_harness
+    assert forge.comments == [], (
+        "harness-authored reason reached the forge as a comment")
 
 
 async def test_the_agent_cannot_clear_its_own_provenance_flag(store, tmp_path, forge):
     """`parse_blocker` sanitises `options` and `category` as trust boundaries;
     the provenance flag is the third. An agent that emits the key set to false
-    in its own BLOCKER_JSON must not get its prose published as no_human's."""
+    in its own BLOCKER_JSON must not get its prose published as no_human's —
+    and now that the abandon path posts no comment at all, that holds
+    trivially for the forge; the flag itself must still not be attacker-
+    clearable, since it still gates the `pr_draft_abandoned` event's reason."""
     import json as _json
     from no_human.blockers import parse_blocker
 
@@ -2030,16 +2026,17 @@ async def test_the_agent_cannot_clear_its_own_provenance_flag(store, tmp_path, f
                  "pr_draft_branch": "nh/a1"}
     await store.create_task(t)
     await orch._raise_blocker(t, emitted, escalate_now=True)
-    (_url, note), = forge.comments
-    assert Orchestrator._AGENT_REASON_ATTRIBUTION in note
+    assert forge.comments == [], (
+        "agent-authored prose reached the forge as a comment")
 
 
 async def test_the_harness_fallback_sentence_is_not_attributed_away(
     store, tmp_path, forge,
 ):
-    """A coder blocker whose prose fields are both empty: what gets posted is
-    then `_raise_blocker`'s OWN literal, so it must lose the attribution even
-    though the blocker it came from is agent-authored."""
+    """A coder blocker whose prose fields are both empty: what used to be
+    posted was `_raise_blocker`'s OWN literal. The abandon path posts no
+    comment at all now, so the fallback sentence — like every other reason —
+    never reaches the forge; this pins that instead of a label on a note."""
     from no_human.blockers import Blocker as _B
 
     orch = _orch(store, tmp_path)
@@ -2052,10 +2049,8 @@ async def test_the_harness_fallback_sentence_is_not_attributed_away(
     empty.reason_is_agent_authored = True          # as parse_blocker would set it
     await orch._raise_blocker(t, empty, escalate_now=True)
 
-    (_url, note), = forge.comments
-    assert "the attempt escalated to a human before finishing" in note
-    assert Orchestrator._AGENT_REASON_ATTRIBUTION not in note, (
-        "no_human's own fallback sentence is quoted as the agent's words")
+    assert forge.comments == [], (
+        "no_human's own fallback sentence reached the forge as a comment")
 
 
 def test_a_blocker_built_by_a_constructor_is_harness_authored_by_default():
@@ -2102,8 +2097,8 @@ async def test_the_escalating_route_fixtures_are_not_attributed_either(
                  "pr_draft_branch": "nh/a1"}
     await store.create_task(t)
     await orch._raise_blocker(t, blocker, escalate_now=True)
-    (_url, note), = forge.comments
-    assert Orchestrator._AGENT_REASON_ATTRIBUTION not in note, note
+    assert forge.comments == [], (
+        "the escalating route posted a PR comment — none does any more")
 
 
 # ══════ R7-B: the summary channel let the coder author a top-level section ═══ #
@@ -3895,15 +3890,16 @@ def test_the_summary_reformatter_has_exactly_the_callers_its_docstring_names():
     safe only because each caller runs it once. That safety argument is about
     the CALL GRAPH, so it must be checked against the call graph.
 
-    It was not, and it drifted: the docstring said "the only call graph there
-    is — `_summary_section` calls this once" while `_quote_agent_reason`, four
+    It once drifted: the docstring said "the only call graph there is —
+    `_summary_section` calls this once" while `_quote_agent_reason`, four
     hundred lines above it, had already become a second caller on the very
     branch whose subject is claims the code does not establish.
-
-    Discovered from the AST rather than grepped for a hand-written list, so a
-    third caller — or a caller that runs it twice — reddens this instead of
-    silently making the docstring false again. Redefining the property is the
-    fix when that happens, not deleting the test.
+    `_quote_agent_reason` was deleted with the abandon-path comment it served
+    (refile of 1dfed378), so `_summary_section` is the only caller again —
+    but discovered from the AST, not asserted from memory, so a caller
+    reappearing (or one running it twice) reddens this instead of silently
+    making the docstring false again. Redefining the property is the fix when
+    that happens, not deleting the test.
     """
     import ast
     import inspect
@@ -3923,7 +3919,7 @@ def test_the_summary_reformatter_has_exactly_the_callers_its_docstring_names():
         if n:
             calls[node.name] = n
 
-    assert calls == {"_quote_agent_reason": 1, "_summary_section": 1}, (
+    assert calls == {"_summary_section": 1}, (
         "the call graph moved out from under `_reformat_summary_markdown`'s "
         "non-idempotence note — every caller must apply it exactly ONCE, and "
         "the docstring must name the callers that exist: " + repr(calls))

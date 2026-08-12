@@ -4,10 +4,14 @@ injected into a task's prompt only when it is RELEVANT, so context spend
 
 A memory's ``tags`` are its trigger condition: it is injected only when one
 of its tags appears in the task's text (title + description + acceptance
-criteria + changed files). A memory with NO tags is unconditional — always
-injected, exactly as before (backward compatible). Pure functions so the
-behaviour is unit-pinned; the orchestrator just filters and emits an audit
-event naming what was injected vs suppressed.
+criteria + changed files). The task text — the "haystack" every function
+below matches against — has exactly one producer,
+``Orchestrator._trigger_haystack`` (``core/orchestrator.py``); "changed
+files" there means the plan's ``FILES TO CHANGE/CREATE`` paths, or the
+ticket-named paths before a plan exists. A memory with NO tags is
+unconditional — always injected, exactly as before (backward compatible).
+Pure functions so the behaviour is unit-pinned; the orchestrator just
+filters and emits an audit event naming what was injected vs suppressed.
 """
 
 from __future__ import annotations
@@ -44,7 +48,9 @@ def memory_is_triggered(memory: dict[str, Any], haystack: str) -> bool:
     fire for a task that says "venv". A PROVENANCE tag contributes no trigger
     terms at all, so a memory tagged only with provenance never auto-injects.
     A tag from outside the vocabulary (pre-B3 rows, outcome-path enum tags)
-    matches on its literal value exactly as before."""
+    matches on its literal value exactly as before — including a tag that is
+    itself a path or filename (e.g. ``triggers.py``), which matches literally
+    against the file signal in *haystack* and nowhere else."""
     from .vocab import trigger_terms
     tags = [t for t in _tags_of(memory) if t.strip()]
     if not tags:

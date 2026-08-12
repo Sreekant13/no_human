@@ -162,6 +162,31 @@ def set_pr_title(url: str, title: str) -> dict:
     return {"ok": ok, "error": err}
 
 
+def close_pr(url: str) -> dict:
+    """Close the PR/MR at *url*. No comment is posted — see the b1fd13ca hazard.
+
+    Returns ``{"ok": bool, "error": str}``. Deliberately not ``gh pr close``:
+    that needs a repo cwd and can post a `--comment`; the raw API call matches
+    `set_pr_title`'s existing shape and cannot emit a comment.
+
+    Closing an already-closed PR is a no-op (200) — idempotent, safe on
+    retry/resume. Never raises: failure is reported in the return value, same
+    contract as `set_pr_title`.
+    """
+    parsed = parse_pr_url(url)
+    if not parsed:
+        return {"ok": False, "error": f"unparseable PR URL: {url}"}
+    forge, host, slug, number = parsed
+    if forge == "gitlab":
+        ok, err = _run(["glab", "api", "--hostname", host, "-X", "PUT",
+                        f"projects/{slug}/merge_requests/{number}",
+                        "-f", "state_event=close"])
+        return {"ok": ok, "error": err}
+    ok, err = _run(["gh", "api", "--hostname", host, "-X", "PATCH",
+                    f"repos/{slug}/pulls/{number}", "-f", "state=closed"])
+    return {"ok": ok, "error": err}
+
+
 def marker_present_on_pr(url: str, marker: str) -> tuple[bool, bool]:
     """``(could_read, marker_found)`` for the comments already on *url*.
 

@@ -157,6 +157,68 @@ def test_the_location_prefix_still_leads_the_visible_text(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# close_pr — the abandon-path close primitive (refile of 1dfed378)
+# ---------------------------------------------------------------------------
+# An abandoned draft used to be retitled and left OPEN with a note attached.
+# The note channel is gone (R18/b1fd13ca comment-resume hazard); this is the
+# primitive that actually closes the PR — a state transition on one field,
+# never a comment.
+
+
+def test_close_pr_github_patches_state_closed(monkeypatch):
+    calls = []
+
+    def fake_run(argv, timeout=15):
+        calls.append(argv)
+        return True, ""
+
+    monkeypatch.setattr(comment_poster, "_run", fake_run)
+    res = comment_poster.close_pr("https://github.com/o/r/pull/106")
+    assert calls == [["gh", "api", "--hostname", "github.com", "-X", "PATCH",
+                       "repos/o/r/pulls/106", "-f", "state=closed"]], calls
+    assert res == {"ok": True, "error": ""}
+
+
+def test_close_pr_gitlab_uses_state_event_close(monkeypatch):
+    calls = []
+
+    def fake_run(argv, timeout=15):
+        calls.append(argv)
+        return True, ""
+
+    monkeypatch.setattr(comment_poster, "_run", fake_run)
+    res = comment_poster.close_pr(MR7006)
+    assert calls == [["glab", "api", "--hostname", "gitlab.acme.net", "-X", "PUT",
+                       "projects/ci_gate%2Fsubgroup%2Fmetrics-core/merge_requests/7006",
+                       "-f", "state_event=close"]], calls
+    assert res == {"ok": True, "error": ""}
+
+
+def test_close_pr_never_posts_a_comment(monkeypatch):
+    calls = []
+
+    def fake_run(argv, timeout=15):
+        calls.append(argv)
+        return True, ""
+
+    monkeypatch.setattr(comment_poster, "_run", fake_run)
+    comment_poster.close_pr(GHE)
+    comment_poster.close_pr(MR7006)
+    joined = [" ".join(a) for a in calls]
+    assert calls, "close_pr never shelled out"
+    assert not any("comments" in j or "notes" in j for j in joined), calls
+
+
+def test_close_pr_on_unparseable_url_fails_closed(monkeypatch):
+    def fake_run(argv, timeout=15):
+        raise AssertionError("close_pr shelled out for an unparseable URL")
+
+    monkeypatch.setattr(comment_poster, "_run", fake_run)
+    res = comment_poster.close_pr("not-a-url")
+    assert res == {"ok": False, "error": "unparseable PR URL: not-a-url"}
+
+
+# ---------------------------------------------------------------------------
 # The guard over the guard: RECOMPUTED, never hand-listed
 # ---------------------------------------------------------------------------
 # A first version of this section excluded the two stampers by BASENAME and

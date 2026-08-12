@@ -4642,6 +4642,11 @@ class Orchestrator:
         ctx = task.context or {}
         ctx["pr_watch"] = pr.url
         ctx["pr_branch"] = branch
+        # Explicit delivered-for-review discriminator, written exactly where
+        # delivery is established — not derived from title text or from the
+        # pr_watch/pr_branch OR-guard below, which stays as belt-and-braces
+        # for context predating this field. See `_abandon_draft_pr`.
+        ctx["pr_delivered_url"] = pr.url
         ctx.setdefault("pr_comment_since", _now())
         if linked_pr_urls:
             ctx["linked_pr_urls"] = linked_pr_urls
@@ -4999,21 +5004,22 @@ class Orchestrator:
 
         Because this blocker is built with `Blocker(...)`,
         `reason_is_agent_authored` is False, so `_raise_blocker` hands
-        `_abandon_draft_pr` `reason_from_agent=False`, so the note takes the
-        PLAIN branch — `f"Reason: {reason[:400]}"` — with no `_clean_summary`,
-        no `_reformat_summary_markdown` and no fence. A driven run posted a live
-        `<h2>Review evidence</h2>` / "final verdict: **PASSED** — ready to
+        `_abandon_draft_pr` `reason_from_agent=False`. HISTORICAL: back when
+        `_abandon_draft_pr` still posted a note, that took the PLAIN branch —
+        `f"Reason: {reason[:400]}"` — with no `_clean_summary`,
+        no `_reformat_summary_markdown` and no fence, and a driven run posted a
+        live `<h2>Review evidence</h2>` / "final verdict: **PASSED** — ready to
         merge" (confirmed through GitHub's /markdown endpoint) onto a PR this
-        same call was titling "[ABANDONED — not delivered]", and without even
-        the agent disclaimer, since `from_agent=False`. That is verbatim the
-        incident `_AGENT_REASON_ATTRIBUTION` cites as why the channel had to be
-        typed by provenance in the first place.
+        same call was titling "[ABANDONED — not delivered]", without even the
+        agent disclaimer, since `from_agent=False`. That incident is why the
+        abandon path posts no comment at all any more (refile of 1dfed378) —
+        removing the channel, not filtering it harder.
 
         The remedy is the one `_escalate_zero_diff` already uses two methods
         down: model prose goes in `evidence`/`tried`, which `_raise_blocker`
         never posts and which `render_report` shows the human on the board and
         in `nh blocked` under "2. What happened" / "4. What I tried". Nothing is
-        lost; it just stops being published in no_human's own voice.
+        lost; it just is never published in no_human's own voice on the forge.
 
         NOT FIXED by flipping `reason_is_agent_authored` to True: this sentence
         is MIXED provenance, and attributing `max_attempts (N) reached…` — the
@@ -7056,9 +7062,11 @@ class Orchestrator:
     # are dead in their TITLE (the only field a repo's PR list shows), and the
     # live one links them.
     #
-    # Retitling and commenting are the only forge writes here. Neither merges,
-    # approves, un-drafts, or closes anything: constraint #2 is untouched, and
-    # only a PR this task itself opened is ever touched.
+    # Retitling and closing are the only forge writes here, and only on a
+    # draft this task itself opened and then abandoned — never on a delivered
+    # or human-reviewed PR (see the explicit `pr_delivered_url` guard below).
+    # Neither merges, approves, nor un-drafts anything: constraint #2 binds
+    # MERGE, not close, and remains untouched.
     # 🔴 REASON-NEUTRAL, AND IT MUST STAY THAT WAY. This read "[ABANDONED —
     # attempt failed review]", which `_raise_blocker` then stamped on EVERY
     # escalated route regardless of why. On the CI-infra route the review has
@@ -7078,78 +7086,36 @@ class Orchestrator:
     # with room to be precise.
     _ABANDONED_TITLE_PREFIX = "[ABANDONED — not delivered] "
 
-    # 🔴 `Reason:` WAS A RAW, UNFILTERED, MODEL-AUTHORED CHANNEL ONTO A PR.
-    # On the escalated route `_raise_blocker` passes
-    # `blocker.root_cause_hypothesis or blocker.question` — fields the CODER
-    # writes: `blockers/report.py` puts them in the prompt schema and
-    # `parse_blocker` lifts them verbatim out of the coder's `final_text`. That
-    # parser sanitises `options` (no agent-attached actions) and `category` (no
-    # agent-claimed BUDGET_EXHAUSTED); it never touches the prose. Interpolated
-    # straight into this note the coder could author markdown in no_human's own
-    # voice — a driven run produced a rendered "## Review evidence / final
-    # verdict: **PASSED** … ready to merge" block on a PR no_human was
-    # simultaneously labelling [ABANDONED]. Everywhere else coder prose is
-    # confined under `## Implementation summary`, run through `_clean_summary`
-    # and heading-demoted; this one surface had none of it.
-    #
-    # So the channel is now typed by PROVENANCE, not trusted by default:
-    #   * agent-authored text is cleaned, demoted, wrapped in a fence long
-    #     enough that no fence inside it can close the wrapper, and labelled as
-    #     the agent's words that no_human did not write or verify;
-    #   * text no_human wrote itself is rendered plainly and must NOT carry the
-    #     attribution, which would be the same lie mirrored.
-    # `reason_from_agent` HAS NO DEFAULT, and that is the fix for the defect a
-    # default caused. It used to default to True on the reasoning that a caller
-    # who does not think about provenance should get the "safe" treatment, and
-    # that the worst case — quoting no_human's own sentence as if the agent said
-    # it — was harmless. Both halves were wrong. The dominant caller
-    # (`_raise_blocker`, reached by every harness-authored escalation) took that
-    # default, so the "worst case" was the NORMAL case; and it is not harmless,
-    # because the attribution does not merely misfile a sentence, it instructs
-    # the reader to distrust it ("no_human … has not verified it") on text that
-    # is the harness's own verified bookkeeping. A parameter with no default
-    # cannot be inherited by accident: every call site states the provenance it
-    # has established, and a new one will not compile until it does.
-    _AGENT_REASON_ATTRIBUTION = (
-        "Reason, in the coding agent's own words — quoted from its blocker "
-        "report. no_human did not write this text and has not verified it:")
-    _NO_AGENT_REASON = (
-        "The attempt's blocker report carried no reason that could be shown "
-        "here.")
-    _REASON_MAX_CHARS = 400
-
-    @staticmethod
-    def _quote_agent_reason(reason: str) -> str:
-        """Model-authored prose, rendered so it cannot pose as no_human's.
-
-        Returns "" when nothing survives the filter — the caller then says so
-        rather than printing an empty quotation.
-        """
-        text = str(reason or "")[:Orchestrator._REASON_MAX_CHARS]
-        cleaned = Orchestrator._clean_summary(text)
-        if (not cleaned.strip()
-                or cleaned == Orchestrator._SUMMARY_FILTERED_PLACEHOLDER):
-            return ""
-        body = Orchestrator._reformat_summary_markdown(cleaned)
-        # The wrapper must be LONGER than the longest backtick run inside it
-        # (CommonMark): a coder that writes ``` mid-reason otherwise closes the
-        # wrapper and everything after it renders live again — escaping that
-        # can be escaped is decoration.
-        longest = max((len(m) for m in re.findall(r"`+", body)), default=0)
-        fence = "`" * max(3, longest + 1)
-        return f"{fence}text\n{body}\n{fence}"
+    # 🔴 THE ABANDON PATH NO LONGER POSTS A COMMENT AT ALL (refile of
+    # 1dfed378): it retitles, then CLOSES. `Reason:` used to be a raw,
+    # unfiltered, model-authored channel onto a PR — `blocker.
+    # root_cause_hypothesis`/`question` are fields the coding agent writes
+    # (`blockers/report.py` / `parse_blocker`), interpolated straight into a
+    # note with no `_clean_summary` demotion, and a driven run once rendered a
+    # coder-authored "## Review evidence … PASSED … ready to merge" block on a
+    # PR no_human was simultaneously labelling [ABANDONED]. Removing the
+    # comment removes that channel entirely rather than continuing to filter
+    # it — the b1fd13ca / ed2266eff comment-resume hazard (an unmarked comment
+    # on a watched PR reads as human feedback and re-wakes the task) is
+    # discharged the same way. `reason`/`reason_from_agent` stay in the
+    # signature: the reason still reaches the timeline/board/`nh blocked` via
+    # the `pr_draft_abandoned` event below, which is internal bookkeeping, not
+    # a forge write, so the provenance concern that drove the old attribution
+    # machinery does not apply there.
 
     async def _abandon_draft_pr(
         self, task: Task, reason: str, *, reason_from_agent: bool,
     ) -> str:
-        """Mark this task's outstanding draft PR as abandoned. Best-effort.
+        """Mark this task's outstanding draft PR as abandoned: retitle, then
+        CLOSE it. Best-effort — closing is cleanup, never a gate.
 
-        ``reason_from_agent`` is REQUIRED: it says whether ``reason`` is prose
-        the coding agent wrote (quote it, attribute it, disclaim it) or prose
-        no_human wrote (render it plainly, and never attribute it away). See
-        `_AGENT_REASON_ATTRIBUTION` for why it has no default.
+        ``reason`` and ``reason_from_agent`` are kept for the call sites and
+        for the `pr_draft_abandoned` event emitted below, which carries the
+        reason onto the timeline/board/`nh blocked`; neither reaches the forge
+        any more (see the comment above `_ABANDONED_TITLE_PREFIX` — the note
+        that used to render them there is gone).
 
-        Bookkeeping happens even when the forge write fails — the URL must
+        Bookkeeping happens even when the forge writes fail — the URL must
         leave `pr_draft_created` either way, or the next attempt would treat a
         stale draft as its own and rewrite a body it did not author.
         """
@@ -7175,6 +7141,15 @@ class Orchestrator:
         # branch survives a forge that spells the same MR's URL two ways. The
         # asymmetry decides the OR — a guard that over-fires costs a dead draft
         # its label, one that under-fires corrupts a live human-reviewed PR.
+        # Explicit discriminator first (criterion 3): written by `_finalize`
+        # at the one place delivery-for-review is established, so it cannot
+        # be derived from a title or inferred from any other slot.
+        delivered_explicit = str(ctx.get("pr_delivered_url") or "").strip()
+        if url and url == delivered_explicit:
+            self._advisory(
+                f"not abandoning {url}: it is the PR this task delivered for "
+                f"review, not a draft an attempt walked away from")
+            return ""
         delivered_url = str(ctx.get("pr_watch") or "").strip()
         delivered_branch = str(ctx.get("pr_branch") or "").strip()
         draft_branch = str(ctx.get("pr_draft_branch") or "").strip()
@@ -7186,38 +7161,16 @@ class Orchestrator:
             return ""
         if url.startswith("http"):
             title = self._ABANDONED_TITLE_PREFIX + self._commit_message(task)
-            if reason_from_agent:
-                quoted = self._quote_agent_reason(reason)
-                reason_block = (
-                    f"{self._AGENT_REASON_ATTRIBUTION}\n\n{quoted}"
-                    if quoted else self._NO_AGENT_REASON)
-            else:
-                reason_block = f"Reason: {str(reason)[:self._REASON_MAX_CHARS]}"
-            note = (
-                # Says only what holds on every route. The previous wording —
-                # "nothing in it should be read as a REVIEWED or delivered
-                # change" — carried the same false claim as the old title: on
-                # the CI-infra route the change HAS been reviewed and passed,
-                # and telling a human otherwise devalues a real signal. Whether
-                # a review ran varies by route, so this claims neither; the
-                # reason below carries it.
-                "**Abandoned by no_human.** This draft's attempt stopped before "
-                "delivering it, so it is not a delivered change and was never "
-                "put up for approval.\n\n"
-                f"{reason_block}\n\n"
-                "no_human never merges and never closes PRs — deleting or "
-                "closing this one is a human decision."
-            )
             try:
-                from ..vcs.comment_poster import post_to_pr, set_pr_title
+                from ..vcs.comment_poster import close_pr, set_pr_title
                 res = await asyncio.to_thread(set_pr_title, url, title)
                 if not res.get("ok"):
                     self._advisory(
                         f"could not retitle abandoned draft {url}: {res.get('error')}")
-                res = await asyncio.to_thread(post_to_pr, url, note)
+                res = await asyncio.to_thread(close_pr, url)
                 if not res.get("ok"):
                     self._advisory(
-                        f"could not comment on abandoned draft {url}: {res.get('error')}")
+                        f"could not close abandoned draft {url}: {res.get('error')}")
             except Exception as exc:  # noqa: BLE001 — never fail an off-ramp on this
                 self._advisory(f"abandoning draft {url} failed: {exc}")
         prior = [u for u in (ctx.get("abandoned_pr_urls") or []) if u]
@@ -11259,9 +11212,21 @@ class Orchestrator:
         must not start matching on different text from a rule — "this task is
         about kafka" has to mean the same thing to both or the audit line and
         the injected procedure disagree about the same task.
+
+        title + description + acceptance criteria + the FILE SIGNAL: the
+        changed/target paths from `complexity.named_paths` — the plan's
+        `FILES TO CHANGE/CREATE` when a plan exists (authoritative), else the
+        ticket-named path tokens (a subset of the text already above, so the
+        fallback cannot widen anything). A memory tagged by file or module
+        (e.g. ``triggers.py``) can only ever match through this signal — it
+        never appears in title/description/criteria prose. These are PLANNED
+        paths, not a git diff, so a "delete X" line still contributes an inert
+        path token and a plan naming a file to CREATE still matches.
         """
+        from .complexity import named_paths
         return (f"{task.title} {task.description or ''} "
-                f"{' '.join(task.acceptance_criteria or [])}")
+                f"{' '.join(task.acceptance_criteria or [])} "
+                f"{' '.join(named_paths(task))}")
 
     async def _load_active_memories(
         self, task: Task, *, attempt_id: str | None = None,
@@ -13312,15 +13277,15 @@ SIX of them read a checkpoint and TWO do not — but do
         of the one already there. `'…\\n<UserCard />\\n\\nand it renders fine.'`
         becomes `'…\\n<UserCard />\\n\\n\\nand it renders fine.'`, for all five
         shapes driven. It changes nothing that renders (two blank lines end the
-        same blocks one does) and it is harmless in BOTH call graphs there are —
-        `_summary_section` and `_quote_agent_reason` each call it exactly once,
-        on `_clean_summary`'s output — but it is recorded here so a future
-        caller does not discover it by shipping it. ("the only call graph there
-        is" is what this said while the second caller was already in the tree,
-        four hundred lines up: a docstring asserting a whole-file property that
-        nothing in the file establishes. `grep -n _reformat_summary_markdown
-        src/no_human/core/orchestrator.py` is the check, and it is why the
-        sentence now names the callers instead of counting them.)
+        same blocks one does) and it is harmless in the one call graph there is
+        — `_summary_section` calls it exactly once, on `_clean_summary`'s
+        output — but it is recorded here so a future caller does not discover
+        it by shipping it. (`_abandon_draft_pr`'s `_quote_agent_reason` was a
+        second caller until the abandon path stopped posting a comment at all
+        — refile of 1dfed378 — and was deleted with it. `grep -n
+        _reformat_summary_markdown src/no_human/core/orchestrator.py` is the
+        check, and it is why the sentence names the caller instead of counting
+        callers.)
 
         WHAT THE EVIDENCE ACTUALLY IS, because three rounds were lost to a
         docstring claiming more than had been driven: the two bullets of "WHAT

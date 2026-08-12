@@ -100,6 +100,7 @@ def test_generic_aliases_do_not_trigger():
 # --------------------------------------------------------------------------- #
 
 import ast
+import inspect
 import textwrap
 from pathlib import Path
 
@@ -346,3 +347,86 @@ async def test_touch_is_one_statement_per_chunk_not_one_per_id(tmp_path):
             f"{len(updates)} statements for 25 ids — the batch collapsed into "
             f"a per-id loop on a hot path")
         assert await store.touch_memories_used([]) == 0
+
+
+# --------------------------------------------------------------------------- #
+# File signal: the haystack was missing the changed/target files its own       #
+# docstring promised, so a memory tagged by file/module could never match.     #
+# --------------------------------------------------------------------------- #
+
+async def test_a_file_tagged_rule_fires_only_because_of_the_planned_file_set(tmp_path):
+    async with Store(tmp_path / "nh.db") as store:
+        file_tagged = await store.add_memory(
+            mem_type="rule", title="triggers.py file rule", content="x",
+            tags=["src/no_human/learning/triggers.py"], confirmed=True)
+        control = await store.add_memory(
+            mem_type="rule", title="kafka rule", content="x",
+            tags=["kafka"], confirmed=True)
+
+        task = Task.new("Fix the injection rate", repo_path="")
+        task.context = {
+            "spec": {
+                "files_to_change": [
+                    "src/no_human/learning/triggers.py — add the file signal",
+                ],
+            },
+        }
+        all_scoped, triggered = await _bare_orchestrator(store)._load_active_memories(task)
+
+        assert {m["id"] for m in all_scoped} == {file_tagged, control}, (
+            "control: both rules must be FETCHED, or the filter — not the "
+            "fetch — is what's under test here")
+        assert [m["id"] for m in triggered] == [file_tagged], (
+            "the file-tagged rule must fire from the planned file set alone, "
+            "and the unrelated kafka rule must stay held")
+
+
+async def test_the_file_signal_is_the_only_thing_that_could_have_matched(tmp_path):
+    """Pins that the match above comes from `files_to_change`, not from
+    incidental text — same memory and task, no spec this time."""
+    async with Store(tmp_path / "nh.db") as store:
+        await store.add_memory(
+            mem_type="rule", title="triggers.py file rule", content="x",
+            tags=["src/no_human/learning/triggers.py"], confirmed=True)
+
+        task = Task.new("Fix the injection rate", repo_path="")
+        task.context = {}
+        _, triggered = await _bare_orchestrator(store)._load_active_memories(task)
+
+        assert triggered == [], (
+            "with no plan and no path token anywhere in title/description/"
+            "criteria, the file-tagged rule must be held — if it still fires "
+            "the previous test's match wasn't actually coming from the file "
+            "signal")
+
+
+def test_the_haystack_names_the_planned_files_and_says_so():
+    task = Task.new("Refactor the board renderer", repo_path="")
+    task.context = {
+        "spec": {
+            "files_to_change": [
+                "web/src/board.tsx",
+                "src/no_human/core/db.py",
+            ],
+        },
+    }
+    haystack = Orchestrator._trigger_haystack(task)
+    assert "web/src/board.tsx" in haystack
+    assert "src/no_human/core/db.py" in haystack
+    # no regression on the existing signal
+    assert "Refactor the board renderer" in haystack
+
+    doc = Orchestrator._trigger_haystack.__doc__ or ""
+    import no_human.learning.triggers as triggers_mod
+    triggers_doc = triggers_mod.__doc__ or ""
+    assert "file" in doc.lower(), (
+        "_trigger_haystack's docstring must state that it includes the "
+        "file signal")
+    assert "file" in triggers_doc.lower(), (
+        "triggers.py's module docstring must state that the haystack "
+        "includes the file signal")
+
+    src = inspect.getsource(Orchestrator._trigger_haystack)
+    assert "named_paths" in src, (
+        "the docstring claims a file signal but the function body never "
+        "calls named_paths() — a docstring-only claim must fail this test")
