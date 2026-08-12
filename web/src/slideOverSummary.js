@@ -31,6 +31,14 @@ export function isHumanStopped(task) {
     && (task.blocker?.human_stopped || task.blocker_human_stopped));
 }
 
+// The "N agents · M events" line under a functionality-group header (FxLane).
+// Used to read "M ev" — an abbreviation nobody outside this codebase could
+// parse (2026-08-12 operator feedback). Spelled out and pluralized the same
+// way agentCount already is on the same line.
+export function fxCountsLabel(agentCount, eventCount) {
+  return `${agentCount} agent${agentCount === 1 ? "" : "s"} · ${eventCount} event${eventCount === 1 ? "" : "s"}`;
+}
+
 const ACTIVE_STATUSES = new Set([
   "pending", "context", "planning", "implementing", "reviewing", "testing",
 ]);

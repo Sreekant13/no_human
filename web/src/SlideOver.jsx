@@ -20,6 +20,7 @@ import {
   defaultOpenSection, isTerminalStatus,
   reviewVerdict, severityChip, checklistRowClass, isBlockingFinding,
   approveButtonState, approvalFeedback, taskApprovedAt, testResultVerdict,
+  fxCountsLabel,
 } from "./slideOverSummary.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
@@ -1340,8 +1341,8 @@ function FxLane({ g, isCurrent, flowOut, agentStates, node, expandedId, onToggle
         <div className="fx-head-meta">
           <span className={`fx-status s-${g.status}`}>{g.status}</span>
           {g.present && (
-            <span className="fx-counts">
-              {g.agentCount} agent{g.agentCount === 1 ? "" : "s"} · {g.eventCount} ev
+            <span className="fx-counts" title={fxCountsLabel(g.agentCount, g.eventCount)}>
+              {fxCountsLabel(g.agentCount, g.eventCount)}
             </span>
           )}
         </div>

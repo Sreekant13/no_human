@@ -9,7 +9,7 @@ import {
   isHumanStopped,
   ADVISORY_SEVERITIES, isBlockingFinding, reviewVerdict, severityChip,
   checklistRowClass, approveButtonState, approvalFeedback, taskApprovedAt,
-  testResultVerdict,
+  testResultVerdict, fxCountsLabel,
 } from "./slideOverSummary.js";
 
 const SRC = dirname(fileURLToPath(import.meta.url));
@@ -1041,4 +1041,31 @@ test("the flash banner is a live region so the confirmation is announced, not ju
   assert.ok(banner, "FlashBanner not found");
   assert.match(banner[0], /aria-live/);
   assert.match(banner[0], /role=/);
+});
+
+// ── fxCountsLabel: the group-header "N agents · N events" line ─────────────
+// 2026-08-12 operator feedback: "under each agent in the ui it says <some
+//_number> ev. what is this? it's very unclear." — the count was a cryptic
+// "N ev" abbreviation; it must read "N events" (singular "event" for 1),
+// matching how "agent"/"agents" already pluralizes on the same line.
+
+test("fxCountsLabel spells out events in full, singular and plural", () => {
+  assert.equal(fxCountsLabel(3, 1), "3 agents · 1 event");
+  assert.equal(fxCountsLabel(3, 42), "3 agents · 42 events");
+  assert.equal(fxCountsLabel(1, 0), "1 agent · 0 events");
+});
+
+test("fxCountsLabel never emits the old cryptic 'ev' abbreviation", () => {
+  for (const [agents, events] of [[1, 1], [2, 2], [5, 1234]]) {
+    const text = fxCountsLabel(agents, events);
+    assert.doesNotMatch(text, /\bev\b/, `"${text}" still abbreviates events as "ev"`);
+  }
+});
+
+test("SlideOver.jsx renders the group header count from fxCountsLabel, not the raw 'ev' abbreviation", () => {
+  const src = readFileSync(join(SRC, "SlideOver.jsx"), "utf8");
+  assert.match(src, /fxCountsLabel\(g\.agentCount, g\.eventCount\)/,
+    "the fx-counts span must be built from fxCountsLabel");
+  assert.doesNotMatch(src, /\{g\.eventCount\} ev\b/,
+    "the old inline 'N ev' template must be gone");
 });
