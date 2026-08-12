@@ -31,7 +31,6 @@ from typing import Any, Awaitable, Callable
 CASES_DIR = Path(__file__).resolve().parent / "cases"
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
 METHOD_DOC = "docs/REVIEWER_RECALL_METHOD.md"
-DEFAULT_MODEL = "claude-opus-5"
 # Per-case directory holding the base content the case's diff applies to.
 BASE_DIR_NAME = "base"
 
@@ -48,6 +47,19 @@ class HeadlineRefusedError(RuntimeError):
     """Raised when the recall headline would be computed with an unmeasured
     (ERROR) case in the denominator — the runner refuses rather than print a
     misleading number."""
+
+
+class TranscriptOverwriteRefused(RuntimeError):
+    """``runs/<date>/`` already holds transcripts and ``overwrite=`` was not
+    given.
+
+    Writes to the audit trail are destructive per-case-file
+    (``Path.write_text`` replaces) and not idempotent across differing runs:
+    a stub or partial run silently replaces a real measurement's transcripts
+    for the same UTC day. Reproduced 2026-08-12 as a bogus 0/19 headline
+    after a test suite run overwrote a real day's transcripts. Fail closed:
+    pass ``overwrite=True`` only when that replacement is intended.
+    """
 
 
 @dataclass
@@ -408,10 +420,13 @@ async def run_all(
     *,
     cases_dir: Path = CASES_DIR,
     reviewer_fn: ReviewerFn | None = None,
-    model: str = DEFAULT_MODEL,
+    model: str,
     run_date: str | None = None,
     runs_dir: Path = RUNS_DIR,
+    overwrite: bool = False,
 ) -> RecallReport:
+    run_date = run_date or _today()
+    _assert_runs_dir_writable(runs_dir, run_date, overwrite)
     fn = reviewer_fn or _default_reviewer_fn(model)
     cases = load_cases(cases_dir)
     results: list[CaseResult] = []
@@ -419,13 +434,40 @@ async def run_all(
         workdir = Path(tmp)
         for case in cases:
             results.append(await run_case(repo_root, case, fn, workdir))
-    report = RecallReport(results=results, model=model,
-                          run_date=run_date or _today())
-    write_transcripts(report, runs_dir)
+    report = RecallReport(results=results, model=model, run_date=run_date)
+    write_transcripts(report, runs_dir, overwrite=overwrite)
     return report
 
 
-def write_transcripts(report: RecallReport, runs_dir: Path = RUNS_DIR) -> Path:
+def _assert_runs_dir_writable(runs_dir: Path, run_date: str, overwrite: bool) -> None:
+    """Refuse to touch ``runs_dir/run_date/`` if it already holds transcripts,
+    unless ``overwrite`` is True. Fail closed: an unreadable directory raises
+    :class:`TranscriptOverwriteRefused` too — never treated as "empty" and
+    silently skipped past. A missing or genuinely empty directory is fine.
+    """
+    if overwrite:
+        return
+    out_dir = runs_dir / run_date
+    try:
+        existing = list(out_dir.glob("*.json")) if out_dir.exists() else []
+    except OSError as exc:
+        raise TranscriptOverwriteRefused(
+            f"{out_dir} could not be inspected before writing ({exc}) — "
+            "refusing to write into it. Pass overwrite=True once you have "
+            "confirmed it is safe to replace, or move the directory aside."
+        ) from exc
+    if existing:
+        raise TranscriptOverwriteRefused(
+            f"{out_dir} already holds {len(existing)} transcript(s) — "
+            "refusing to overwrite a same-day audit trail (it may be a real "
+            "measurement). Pass overwrite=True to replace it deliberately, "
+            "or move the directory aside first."
+        )
+
+
+def write_transcripts(
+    report: RecallReport, runs_dir: Path = RUNS_DIR, *, overwrite: bool = False,
+) -> Path:
     """Persist one ``<case_id>.json`` audit transcript per case under
     ``runs_dir/<run_date>/`` — called on every :func:`run_all` invocation, per
     docs/REVIEWER_RECALL_METHOD.md ("Borderline transcripts are kept").
@@ -440,7 +482,13 @@ def write_transcripts(report: RecallReport, runs_dir: Path = RUNS_DIR) -> Path:
     nothing wrong with this clean diff" and "the reviewer flagged something and
     the citation rule threw it away because the cited file is not in the
     scratch repo" — which, with 4 controls, is worth 25 specificity points.
+
+    This is the enforcement point for :func:`_assert_runs_dir_writable`: it is
+    called here too (not only in :func:`run_all`'s preflight) so no caller —
+    present or future — can route around the audit-trail guard by calling
+    this function directly.
     """
+    _assert_runs_dir_writable(runs_dir, report.run_date, overwrite)
     out_dir = runs_dir / report.run_date
     out_dir.mkdir(parents=True, exist_ok=True)
     for r in report.results:
@@ -542,7 +590,8 @@ def run_and_report(
     repo_root: Path | str | None = None,
     *,
     reviewer_fn: ReviewerFn | None = None,
-    model: str = DEFAULT_MODEL,
+    model: str,
+    overwrite: bool = False,
 ) -> str:
     """CLI entry point: `nh bench report --reviewer-recall` calls this.
 
@@ -550,5 +599,6 @@ def run_and_report(
     rendered report text (never a bare percentage).
     """
     root = Path(repo_root) if repo_root else Path(__file__).resolve().parents[2]
-    report = asyncio.run(run_all(root, reviewer_fn=reviewer_fn, model=model))
+    report = asyncio.run(run_all(root, reviewer_fn=reviewer_fn, model=model,
+                                 overwrite=overwrite))
     return render_report(report)

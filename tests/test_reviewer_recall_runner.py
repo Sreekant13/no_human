@@ -746,7 +746,7 @@ async def test_run_case_invokes_injected_reviewer_with_checked_out_repo(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_run_all_iterates_every_case_with_injected_reviewer():
+async def test_run_all_iterates_every_case_with_injected_reviewer(tmp_path):
     call_count = {"n": 0}
 
     async def stub_reviewer(repo_path, diff_text, case_spec):
@@ -755,11 +755,125 @@ async def test_run_all_iterates_every_case_with_injected_reviewer():
             return rr.ReviewOutcome(status="PASS", findings=[])
         return rr.ReviewOutcome(status="PASS", findings=[])  # every seeded case missed
 
-    report = await rr.run_all(REPO_ROOT, reviewer_fn=stub_reviewer, model="stub-model")
+    report = await rr.run_all(REPO_ROOT, reviewer_fn=stub_reviewer,
+                              model="stub-model", runs_dir=tmp_path)
     all_cases = rr.load_cases()
     assert call_count["n"] == len(all_cases)
     assert len(report.results) == len(all_cases)
     assert report.model == "stub-model"
+
+
+def test_no_test_calls_run_all_without_runs_dir():
+    """Regression guard for the stub-transcript overwrite hazard: every call
+    site in THIS test file of the function under test (module attribute
+    "run_all", accessed off the ``rr`` alias) must pass ``runs_dir=`` — a run
+    that omits it writes into the real ``eval/reviewer_recall/runs/<today>/``
+    and can clobber a same-day real measurement's audit trail.
+
+    Built from parts so this guard's own source never contains the literal
+    call-site pattern it searches for (which would make it match itself).
+    """
+    needle = "rr" + "." + "run_all" + "("
+    source = Path(__file__).read_text()
+    call_starts = [m.start() for m in re.finditer(re.escape(needle), source)]
+    assert call_starts, "expected at least one call site of the function under test"
+    for start in call_starts:
+        # Grab a generous window after the call open-paren — every call in
+        # this file fits well within it — and check runs_dir= appears before
+        # the matching close. Cheap and sufficient: no call here nests
+        # another such call inside its own arguments.
+        window = source[start:start + 400]
+        depth = 0
+        end = None
+        for i, ch in enumerate(window):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        assert end is not None, f"unterminated call at offset {start}"
+        call_text = window[:end]
+        assert "runs_dir=" in call_text, (
+            f"call site at offset {start} is missing runs_dir=: {call_text!r}"
+        )
+
+
+# --- SCRUM-XX: no default model id — an unattributed run must be impossible -
+
+def test_runner_defines_no_default_model():
+    assert not hasattr(rr, "DEFAULT_MODEL")
+    assert "claude-opus-5" not in RUNNER_PATH.read_text()
+
+
+def test_run_and_report_requires_an_explicit_model():
+    with pytest.raises(TypeError) as excinfo:
+        rr.run_and_report(REPO_ROOT)
+    assert "model" in str(excinfo.value)
+
+
+def test_run_all_requires_an_explicit_model(tmp_path):
+    async def stub_reviewer(repo_path, diff_text, case_spec):
+        raise AssertionError("reviewer must not be invoked: model is missing")
+
+    with pytest.raises(TypeError) as excinfo:
+        rr.run_all(REPO_ROOT, reviewer_fn=stub_reviewer, runs_dir=tmp_path)
+    assert "model" in str(excinfo.value)
+
+
+# --- SCRUM-XX: the audit trail fails closed on a non-empty runs/<date>/ ----
+
+@pytest.mark.asyncio
+async def test_run_all_refuses_to_overwrite_an_existing_run(tmp_path):
+    existing = tmp_path / "2026-07-25"
+    existing.mkdir()
+    sentinel = existing / "x.json"
+    sentinel.write_text('{"case_name": "x"}')
+    before = sentinel.read_bytes()
+
+    call_count = {"n": 0}
+
+    async def stub_reviewer(repo_path, diff_text, case_spec):
+        call_count["n"] += 1
+        return rr.ReviewOutcome(status="PASS", findings=[])
+
+    with pytest.raises(rr.TranscriptOverwriteRefused):
+        await rr.run_all(REPO_ROOT, reviewer_fn=stub_reviewer, model="stub-model",
+                         run_date="2026-07-25", runs_dir=tmp_path)
+
+    assert call_count["n"] == 0
+    assert sentinel.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_run_all_overwrites_only_when_explicitly_asked(tmp_path):
+    existing = tmp_path / "2026-07-25"
+    existing.mkdir()
+    (existing / "x.json").write_text('{"case_name": "x"}')
+
+    async def stub_reviewer(repo_path, diff_text, case_spec):
+        return rr.ReviewOutcome(status="PASS", findings=[])
+
+    report = await rr.run_all(REPO_ROOT, reviewer_fn=stub_reviewer, model="stub-model",
+                              run_date="2026-07-25", runs_dir=tmp_path, overwrite=True)
+    all_cases = rr.load_cases()
+    assert len(report.results) == len(all_cases)
+    for case in all_cases:
+        assert (existing / f"{case.case_id}.json").exists()
+
+
+def test_write_transcripts_refuses_without_overwrite(tmp_path):
+    report = rr.RecallReport(
+        results=[rr.CaseResult(case_id="x", cls="logic", is_control=False,
+                               outcome=rr.ReviewOutcome(status="PASS", findings=[]),
+                               caught=False, status="OK")],
+        model="stub-model", run_date="2026-07-25",
+    )
+    rr.write_transcripts(report, tmp_path)
+    with pytest.raises(rr.TranscriptOverwriteRefused):
+        rr.write_transcripts(report, tmp_path)
+    rr.write_transcripts(report, tmp_path, overwrite=True)
 
 
 # --- load_cases must never quietly shrink the denominator -------------------

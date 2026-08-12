@@ -179,6 +179,14 @@ not `null` — an unmeasured case has no caught/missed verdict to report) and
 reviewer emitted none), so a wiring catch — or a goal false alarm on a
 control — is auditable without a re-run.
 
+**The audit trail fails closed.** `run_all` refuses to write into a
+`runs/<date>/` directory that already holds transcripts, raising
+`TranscriptOverwriteRefused`, unless `overwrite=True` is passed explicitly.
+This refusal is checked before any reviewer invocation, so a refused run
+costs zero measurements and leaves the existing transcripts byte-for-byte
+untouched — a same-UTC-day stub or partial run can no longer silently
+replace a real measurement's audit trail.
+
 ## Reporting
 
 `nh bench report --reviewer-recall` prints:

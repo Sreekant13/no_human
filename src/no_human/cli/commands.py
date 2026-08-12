@@ -6293,6 +6293,9 @@ def bench_report(reviewer_recall: bool):
             # surface it as a clean refusal, not a traceback.
             console.print(f"[red]recall headline refused:[/] {escape(str(exc))}")
             sys.exit(1)
+        except module.TranscriptOverwriteRefused as exc:
+            console.print(f"[red]recall run refused:[/] {escape(str(exc))}")
+            sys.exit(1)
         console.print(text, markup=False)
         return
 
