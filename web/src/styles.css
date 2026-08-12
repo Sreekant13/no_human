@@ -4777,6 +4777,23 @@ a.so-chip-value:hover { color: var(--accent-300); }
   margin-bottom: 6px;
 }
 
+/* Memory lifecycle A: use_count / last_used_at / outcome histogram, shared by
+   the Rules, Skills and Learnings cards (MemoryUsageRow, Settings.jsx). */
+.memory-usage-row {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+
+.memory-usage-empty {
+  font-style: italic;
+}
+
+.memory-usage-label {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
 .learning-select {
   display: inline-flex;
   align-items: center;

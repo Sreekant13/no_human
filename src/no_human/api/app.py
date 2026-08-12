@@ -2702,13 +2702,30 @@ class _MemoryBody(BaseModel):
     project: str | None = None
 
 
+async def _with_usage_counts(
+    store: Store, items: list[Any],
+) -> list[dict[str, Any]]:
+    """Attach the memory-lifecycle-A outcome split (success/failure/
+    cancelled/timeout counts) to each memory row, for the Rules/Skills/
+    Learnings panels. `use_count`/`last_used_at` are already columns on
+    `memories` and travel with `dict(r)`; only the split needs a join.
+    Correlational, not causal — the web cards must label it so."""
+    rows = [dict(r) for r in items]
+    counts = await store.memory_outcome_counts([r["id"] for r in rows if r.get("id")])
+    zero = {"success_count": 0, "failure_count": 0,
+            "cancelled_count": 0, "timeout_count": 0}
+    for r in rows:
+        r.update(counts.get(r.get("id"), zero))
+    return rows
+
+
 @app.get("/api/rules")
 async def list_rules(request: Request) -> list[dict[str, Any]]:
     store = _store(request)
     from ..learning import TYPE_RULE, TYPE_ANTI_PATTERN
     items = await store.list_memories(confirmed=True, mem_type=TYPE_RULE)
     items += await store.list_memories(confirmed=True, mem_type=TYPE_ANTI_PATTERN)
-    return [dict(r) for r in items]
+    return await _with_usage_counts(store, items)
 
 
 @app.post("/api/rules", status_code=201)
@@ -2741,7 +2758,7 @@ async def list_skills(request: Request) -> list[dict[str, Any]]:
     from ..learning import TYPE_SKILL, TYPE_FACT
     items = await store.list_memories(confirmed=True, mem_type=TYPE_SKILL)
     items += await store.list_memories(confirmed=True, mem_type=TYPE_FACT)
-    return [dict(r) for r in items]
+    return await _with_usage_counts(store, items)
 
 
 @app.post("/api/skills", status_code=201)
@@ -2776,7 +2793,7 @@ async def list_learnings(
     from ..learning import LearningQueue
     q = LearningQueue(store)
     rows = await (q.active() if active else q.pending())
-    return [dict(r) for r in rows]
+    return await _with_usage_counts(store, rows)
 
 
 @app.post("/api/learnings/{mem_id}/confirm")

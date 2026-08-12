@@ -18,6 +18,7 @@ import {
   learningEvidence,
   learningOrigin,
   learningScope,
+  memoryUsageSummary,
 } from "./learningCard.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 import { pluralize } from "./pluralize.js";
@@ -489,6 +490,31 @@ function MemoryList({ kind, fetchFn, addFn, removeFn }) {
   );
 }
 
+// Memory lifecycle A: use_count / last_used_at / outcome histogram, shared by
+// the Rules, Skills and Learnings cards — one row, one place, so the three
+// panels can't drift on how the same ledger is read.
+function MemoryUsageRow({ item }) {
+  const u = memoryUsageSummary(item);
+  if (u.useCount === 0) {
+    return <div className="memory-usage-row memory-usage-empty">not yet injected into a prompt</div>;
+  }
+  const last = u.lastUsedAt ? String(u.lastUsedAt).slice(0, 19) : "unknown";
+  return (
+    <div className="memory-usage-row">
+      <span className="memory-usage-count">used {u.useCount}x</span>
+      <span className="memory-usage-last"> · last {last}</span>
+      {u.total > 0 && (
+        <span className="memory-usage-outcomes">
+          {" "}· {u.successPct}% success / {u.failurePct}% failure
+          {u.cancelledPct > 0 ? ` / ${u.cancelledPct}% cancelled` : ""}
+          {u.timeoutPct > 0 ? ` / ${u.timeoutPct}% timeout` : ""}
+        </span>
+      )}
+      <div className="memory-usage-label">{u.label}</div>
+    </div>
+  );
+}
+
 function MemoryCard({ item, onRemove }) {
   const tags = (() => {
     try {
@@ -511,6 +537,7 @@ function MemoryCard({ item, onRemove }) {
           {tags.map((t, i) => <span key={i} className="memory-tag">{t}</span>)}
         </div>
       )}
+      <MemoryUsageRow item={item} />
     </div>
   );
 }
@@ -820,6 +847,7 @@ function LearningCard({ item, isPending, onAction, selected, onToggleSelect }) {
       </div>
       {evidence && <div className="learning-evidence">evidence: {evidence}</div>}
       {item.content && <div className="memory-card-content">{item.content}</div>}
+      <MemoryUsageRow item={item} />
       {isPending && (
         <div className="learning-actions">
           <button

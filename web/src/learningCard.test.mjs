@@ -3,10 +3,12 @@ import assert from "node:assert/strict";
 import {
   BULK_CONFIRM_CAP,
   bulkConfirmIds,
+  CORRELATIONAL_LABEL,
   filterLearnings,
   learningEvidence,
   learningOrigin,
   learningScope,
+  memoryUsageSummary,
 } from "./learningCard.js";
 
 // ── blast radius ─────────────────────────────────────────────────────────── //
@@ -259,4 +261,61 @@ test("the timeline chip uses a button, never <summary>", () => {
   assert.doesNotMatch(fn, /<summary|<details/);
   assert.match(fn, /<button/);
   assert.match(fn, /aria-expanded/);
+});
+
+// ── memory lifecycle A: usage ledger ─────────────────────────────────────── //
+
+test("a memory with no recorded use reports zero, not garbage from missing fields", () => {
+  const u = memoryUsageSummary({});
+  assert.equal(u.useCount, 0);
+  assert.equal(u.lastUsedAt, null);
+  assert.equal(u.total, 0);
+  assert.equal(u.successPct, 0);
+  assert.equal(u.failurePct, 0);
+  assert.equal(u.label, CORRELATIONAL_LABEL);
+  assert.equal(memoryUsageSummary(null).useCount, 0, "must not throw on null");
+});
+
+test("the outcome split is percentages of the LEDGERED total, not use_count", () => {
+  // use_count can outrun the ledger total (a task still in flight has an
+  // injection row with task_outcome still NULL) — the split must be read off
+  // what actually resolved, not off the raw injection count.
+  const u = memoryUsageSummary({
+    use_count: 10, last_used_at: "2026-08-01T12:00:00",
+    success_count: 3, failure_count: 1, cancelled_count: 0, timeout_count: 0,
+  });
+  assert.equal(u.useCount, 10);
+  assert.equal(u.lastUsedAt, "2026-08-01T12:00:00");
+  assert.equal(u.total, 4);
+  assert.equal(u.successPct, 75);
+  assert.equal(u.failurePct, 25);
+  assert.equal(u.cancelledPct, 0);
+  assert.equal(u.timeoutPct, 0);
+});
+
+test("the correlational label is exported, not hand-typed at each call site", () => {
+  assert.equal(CORRELATIONAL_LABEL, "Correlational metrics — not causal");
+  assert.equal(memoryUsageSummary({}).label, CORRELATIONAL_LABEL);
+});
+
+test("both the Rules/Skills card and the Learnings card render the usage row", () => {
+  assert.match(settingsJsx, /from "\.\/learningCard\.js"/);
+  assert.match(settingsJsx, /memoryUsageSummary\(/, "imported but never called");
+  assert.match(settingsJsx, /function MemoryUsageRow/);
+  // MemoryCard (rules/skills) AND LearningCard both mount it — a usage row on
+  // only one of the two would leave the other panel exactly as blind as
+  // before this change.
+  const memoryCard = settingsJsx.slice(
+    settingsJsx.indexOf("function MemoryCard"),
+    settingsJsx.indexOf("function AddMemoryModal"));
+  assert.match(memoryCard, /<MemoryUsageRow item={item} \/>/);
+  const learningCard = settingsJsx.slice(settingsJsx.indexOf("function LearningCard"));
+  assert.match(learningCard, /<MemoryUsageRow item={item} \/>/);
+});
+
+test("the usage row and its correlational label carry their own CSS", () => {
+  for (const cls of ["memory-usage-row", "memory-usage-empty", "memory-usage-label"]) {
+    assert.ok(settingsJsx.includes(cls), `${cls} is styled but never rendered`);
+    assert.match(stylesCss, new RegExp(`\\.${cls}[\\s,{:.]`), `.${cls} has no CSS rule`);
+  }
 });

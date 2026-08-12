@@ -1098,6 +1098,14 @@ class Store:
         if "confirmed_by" not in mem_existing:
             await self.db.execute(
                 "ALTER TABLE memories ADD COLUMN confirmed_by TEXT")
+        # Memory lifecycle A: how many times this memory has ever reached a
+        # prompt, incremented alongside `last_used_at` at the same chokepoint
+        # (`record_memory_uses`). DEFAULT 0, unlike its siblings above — this
+        # is a count, not a fact a legacy row cannot honestly report; zero is
+        # the true value for a row with no recorded injection.
+        if "use_count" not in mem_existing:
+            await self.db.execute(
+                "ALTER TABLE memories ADD COLUMN use_count INTEGER DEFAULT 0")
 
         # Phase 6a: test_layers column on projects (JSON-encoded TestPlan layers).
         proj_existing = {row["name"]
@@ -2603,6 +2611,129 @@ class Store:
             total += cur.rowcount
         await self.db.commit()
         return total
+
+    @serialized_write
+    async def record_memory_uses(
+        self, mem_ids: list[str], *, task_id: str, attempt_id: str | None = None,
+    ) -> int:
+        """Memory lifecycle A: increment `use_count` and append one
+        `memory_uses` ledger row per injected memory. Called immediately
+        after `touch_memories_used`, from the same chokepoint
+        (`Orchestrator._load_active_memories`) — that call stamps WHEN a
+        memory was last used; this one stamps WHICH TASK used it, so a later
+        terminal handler can join injection to outcome.
+
+        `task_outcome` starts NULL on every row: it is filled by
+        `fill_memory_use_outcomes`, from `run_task`'s finalizer, once the
+        task actually reaches a terminal state. Never populated here — the
+        outcome of a task that has just started is not knowable yet.
+
+        Chunked at 400 like `touch_memories_used`, for the same reason
+        (SQLite's `IN (?, …)` bind-parameter ceiling).
+        """
+        ids = [i for i in (mem_ids or []) if i]
+        if not ids:
+            return 0
+        now = _now()
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            marks = ", ".join("?" for _ in chunk)
+            await self.db.execute(
+                f"UPDATE memories SET use_count = COALESCE(use_count, 0) + 1 "
+                f"WHERE id IN ({marks})", chunk,
+            )
+        for mem_id in ids:
+            await self.db.execute(
+                "INSERT INTO memory_uses (id, memory_id, task_id, attempt_id, "
+                "injected_at, task_outcome, created_at) "
+                "VALUES (?, ?, ?, ?, ?, NULL, ?)",
+                (uuid.uuid4().hex, mem_id, task_id, attempt_id, now, now),
+            )
+        await self.db.commit()
+        return len(ids)
+
+    @serialized_write
+    async def fill_memory_use_outcomes(self, task_id: str, outcome: str) -> int:
+        """Stamp `task_outcome` on every still-open (`task_outcome IS NULL`)
+        `memory_uses` row for *task_id*.
+
+        Called once, from `Orchestrator.run_task`'s terminal-state finalizer,
+        with a coarse label — 'success' | 'failure' | 'cancelled' | 'timeout'
+        — resolved from that run's `TaskOutcome`. Every OTHER status
+        (`awaiting_approval`, `escalated`, `paused_quota`, `blocked` without
+        an operator cancel, …) is a resumable off-ramp, not a verdict, and is
+        never passed here — those rows stay NULL until a later `run_task`
+        call on the same task actually resolves one of the four.
+
+        `WHERE task_outcome IS NULL` rather than an unconditional UPDATE: a
+        task can be resumed after DONE/FAILED (e.g. a follow-up `nh reply`
+        that reopens it), and a resume's fresh injections must get THEIR OWN
+        outcome, not have an earlier terminal label overwritten onto rows
+        that have not happened yet — while rows already resolved by an
+        earlier terminal call stay exactly as they were recorded.
+        """
+        cur = await self.db.execute(
+            "UPDATE memory_uses SET task_outcome = ? "
+            "WHERE task_id = ? AND task_outcome IS NULL",
+            (outcome, task_id),
+        )
+        await self.db.commit()
+        return cur.rowcount
+
+    async def memory_usage_report(self) -> list[dict[str, Any]]:
+        """Per-memory usage stats for `nh learnings --usage` and the
+        Learnings/Rules UI rows: use_count, last_used_at, and the outcome
+        split of every ledgered injection.
+
+        Read-only, and CORRELATIONAL, not causal — every caller that renders
+        this must carry that label; nothing here proves a rule's presence
+        changed a task's outcome, only that the two coincided.
+        """
+        rows = await self._fetchall(
+            "SELECT m.id AS memory_id, m.type AS type, m.title AS title, "
+            "m.last_used_at AS last_used_at, "
+            "COALESCE(m.use_count, 0) AS use_count, "
+            "SUM(CASE WHEN u.task_outcome = 'success' THEN 1 ELSE 0 END) "
+            "  AS success_count, "
+            "SUM(CASE WHEN u.task_outcome = 'failure' THEN 1 ELSE 0 END) "
+            "  AS failure_count, "
+            "SUM(CASE WHEN u.task_outcome = 'cancelled' THEN 1 ELSE 0 END) "
+            "  AS cancelled_count, "
+            "SUM(CASE WHEN u.task_outcome = 'timeout' THEN 1 ELSE 0 END) "
+            "  AS timeout_count "
+            "FROM memories m LEFT JOIN memory_uses u ON u.memory_id = m.id "
+            "WHERE COALESCE(m.use_count, 0) > 0 "
+            "GROUP BY m.id ORDER BY use_count DESC"
+        )
+        return [dict(r) for r in rows]
+
+    async def memory_outcome_counts(
+        self, mem_ids: list[str],
+    ) -> dict[str, dict[str, int]]:
+        """The same outcome split as `memory_usage_report`, keyed by memory
+        id, for enriching the Rules/Skills/Learnings API responses without a
+        full report scan. Ids with no ledger rows are simply absent —
+        callers default to zero."""
+        ids = [i for i in (mem_ids or []) if i]
+        if not ids:
+            return {}
+        marks = ", ".join("?" for _ in ids)
+        rows = await self._fetchall(
+            f"SELECT memory_id, task_outcome, COUNT(*) AS n FROM memory_uses "
+            f"WHERE memory_id IN ({marks}) GROUP BY memory_id, task_outcome",
+            ids,
+        )
+        out: dict[str, dict[str, int]] = {}
+        for r in rows:
+            d = out.setdefault(
+                r["memory_id"],
+                {"success_count": 0, "failure_count": 0,
+                 "cancelled_count": 0, "timeout_count": 0},
+            )
+            key = f"{r['task_outcome']}_count"
+            if key in d:
+                d[key] = r["n"]
+        return out
 
     async def stale_memories(
         self, *, days: int, project: str | None = None,

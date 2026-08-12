@@ -4370,8 +4370,12 @@ def _learning_evidence_line(raw) -> str | None:
                    "Read-only — it never archives or deletes.")
 @click.option("--days", default=30, show_default=True,
               help="How many days without a use makes a rule stale (--stale).")
+@click.option("--usage", is_flag=True,
+              help="Memory lifecycle A: per-memory use_count, last_used_at "
+                   "and the outcome split (success/failure/cancelled/timeout) "
+                   "of every ledgered injection. Read-only.")
 def learnings(confirm_id, reject_id, active, harvest, harvest_project,
-              stale, days):
+              stale, days, usage):
     """Review the human-confirmed learning queue; confirm or reject proposals.
 
     Nothing enters the active rule set without your one-click confirm.
@@ -4396,6 +4400,14 @@ def learnings(confirm_id, reject_id, active, harvest, harvest_project,
     already queued is skipped by its dedupe key, and so is one you REJECTED —
     rejecting a supervisor proposal archives it rather than deleting it, so
     your "no" survives the next harvest.
+
+    ``--usage`` answers a different question than ``--stale``: not just
+    whether a rule has EVER been injected, but how often, and what happened
+    to the tasks it rode along with — joined from the `memory_uses` ledger
+    (`Orchestrator._load_active_memories` writes it at injection,
+    `run_task`'s finalizer fills the outcome once a task ends). The counts
+    are CORRELATIONAL, not causal: a rule injected into a task that failed
+    did not necessarily cause the failure.
     """
     config, _ = _bootstrap(require_auth=False)
     from ..learning import LearningQueue
@@ -4436,6 +4448,30 @@ def learnings(confirm_id, reject_id, active, harvest, harvest_project,
                     if written else
                     "[green]no new supervisor-correction proposals[/] — either "
                     "no correction recurred, or they are already queued")
+            if usage:
+                rows = await store.memory_usage_report()
+                if not rows:
+                    console.print(
+                        "[green]no memory has been injected into a prompt "
+                        "yet[/] — nothing to report")
+                    return
+                console.rule(f"[bold]{len(rows)} memor{'y' if len(rows) == 1 else 'ies'} "
+                             f"with recorded use")
+                console.print(
+                    "[yellow]Correlational metrics — not causal[/]: a rule "
+                    "injected into a task that failed did not necessarily "
+                    "cause the failure.\n", emoji=False)
+                for m in rows:
+                    used = (m.get("last_used_at") or "")[:19] or "never"
+                    console.print(
+                        f"[bold]{m['memory_id'][:8]}[/] [magenta]{m['type']}[/] "
+                        f"{escape(m['title'])} — used {m['use_count']}x, "
+                        f"last {used}, outcomes: "
+                        f"{m['success_count']} success / "
+                        f"{m['failure_count']} failure / "
+                        f"{m['cancelled_count']} cancelled / "
+                        f"{m['timeout_count']} timeout", emoji=False)
+                return
             if stale:
                 rows = await q.stale(days=days)
                 total = len(await q.active())

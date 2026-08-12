@@ -1502,6 +1502,92 @@ class Orchestrator:
         return fallback
 
     async def run_task(self, task: Task) -> TaskOutcome:
+        """Drive a task to a terminal/parked outcome, then close out this
+        run's memory-injection ledger rows with a resolved outcome label
+        where one exists.
+
+        Memory lifecycle A: the single top-level entry point every caller
+        goes through (the scheduler, every CLI command, the eval harnesses,
+        every orchestrator test) — the write-side mirror of
+        `_load_active_memories` being the single injection chokepoint. Wraps
+        the actual drive (`_run_task_body`, this method's former self)
+        rather than threading a "task just ended" hook through its many
+        internal `TaskOutcome` return points, which is exactly the kind of
+        second, drifting copy `_load_active_memories`'s own docstring warns
+        against.
+        """
+        outcome = await self._run_task_body(task)
+        await self._finalize_memory_use_outcome(task, outcome)
+        return outcome
+
+    #: Coarse outcome labels a `memory_uses` row's `task_outcome` may hold.
+    #: Exactly the four the design calls "primary terminal states" — every
+    #: other `TaskStatus` (`awaiting_approval`, `escalated`, `paused_quota`,
+    #: `blocked` without an operator cancel, …) is a resumable off-ramp, not
+    #: a verdict, and `_memory_use_outcome_label` returns `None` for all of
+    #: them rather than inventing a fifth label.
+    _MEMORY_OUTCOME_SUCCESS = "success"
+    _MEMORY_OUTCOME_FAILURE = "failure"
+    _MEMORY_OUTCOME_CANCELLED = "cancelled"
+    _MEMORY_OUTCOME_TIMEOUT = "timeout"
+
+    @classmethod
+    def _memory_use_outcome_label(cls, outcome: TaskOutcome) -> str | None:
+        """Resolve *outcome* to one of the four terminal labels, or `None` if
+        it is an off-ramp still pending a real verdict.
+
+        Order matters: an attempt-level timeout is checked by its `detail`
+        PREFIX first, before the coarser status check, because a timed-out
+        run still surfaces as plain `FAILED` — checking status first would
+        misfile it as an ordinary failure instead of the infra condition it
+        actually is. `_honor_cancel` is the only path that returns `BLOCKED`
+        with a `"cancelled by operator: "`-prefixed detail; every other
+        `BLOCKED` (e.g. a parked blocker awaiting a human) is left `None`.
+
+        `AWAITING_APPROVAL` counts as SUCCESS, not a pending off-ramp: it is
+        this codebase's own definition of a successful run — every one of its
+        three call sites (`_open_pr`, the already-satisfied claim, the
+        code-review draft path) reaches it only after marking the attempt
+        `status="succeeded"` (`update_attempt(..., status="succeeded", …)`,
+        `review_passed=1`), the same signal `test_full_pipeline_opens_local_pr`
+        asserts on. `DONE` is reached far less often through `run_task` itself
+        (most of it happens later — a human's `/approve`, a merge the PR
+        watcher detects — outside this call chain entirely), so treating only
+        `DONE` as success would leave the ledger blind to the common case: a
+        task that shipped a PR and is simply waiting on the human.
+        """
+        detail = outcome.detail or ""
+        if detail.startswith(_ATTEMPT_TIMEOUT_DETAIL):
+            return cls._MEMORY_OUTCOME_TIMEOUT
+        if outcome.status in (TaskStatus.DONE, TaskStatus.AWAITING_APPROVAL):
+            return cls._MEMORY_OUTCOME_SUCCESS
+        if outcome.status == TaskStatus.FAILED:
+            return cls._MEMORY_OUTCOME_FAILURE
+        if (outcome.status == TaskStatus.BLOCKED
+                and detail.startswith("cancelled by operator")):
+            return cls._MEMORY_OUTCOME_CANCELLED
+        return None
+
+    async def _finalize_memory_use_outcome(
+        self, task: Task, outcome: TaskOutcome,
+    ) -> None:
+        """Fill `task_outcome` on every still-open `memory_uses` row for
+        *task* once this run resolves to one of the four terminal labels.
+
+        Bookkeeping, never load-bearing: a locked database or a store opened
+        read-only must not turn a resolved task outcome into a failed run,
+        the same reasoning `_load_active_memories` already applies to the
+        injection side of this ledger.
+        """
+        label = self._memory_use_outcome_label(outcome)
+        if label is None:
+            return
+        try:
+            await self.store.fill_memory_use_outcomes(task.id, label)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not fill memory use outcomes: %s", exc)
+
+    async def _run_task_body(self, task: Task) -> TaskOutcome:
         """Drive a task to a terminal/parked outcome.
 
         By default the task runs in its OWN git worktree (``isolation.enabled``)
@@ -7628,8 +7714,10 @@ class Orchestrator:
         # site alone would have reported every rule the REVIEWER used, and only
         # the reviewer, as never used. Nothing is emitted here: the review path
         # has never carried a `knowledge_accessed` line and adding one is not
-        # this change's business.
-        await self._load_active_memories(task)
+        # this change's business. `attempt_id` is already created above (the
+        # review attempt), unlike the implement path's call, so its ledger
+        # rows carry it from the start.
+        await self._load_active_memories(task, attempt_id=attempt_id)
 
         profile_ctx = ""
         if prof:
@@ -11169,7 +11257,7 @@ class Orchestrator:
                 f"{' '.join(task.acceptance_criteria or [])}")
 
     async def _load_active_memories(
-        self, task: Task,
+        self, task: Task, *, attempt_id: str | None = None,
     ) -> tuple[list[dict], list[dict]]:
         """Fetch this task's confirmed rules, trigger-filter them, install them
         as `_active_memories`, and stamp `last_used_at` on the ones that
@@ -11193,6 +11281,16 @@ class Orchestrator:
         Emits NOTHING. The implement path's `knowledge_accessed` audit line
         stays at its call site because only that path has ever had one, and
         moving it here would start emitting it on the review path too.
+
+        Memory lifecycle A: also the ONE place a task's injections are
+        appended to the `memory_uses` ledger (`Store.record_memory_uses`),
+        right beside the `last_used_at` stamp it has always written — same
+        reasoning, same failure mode a second, uncentralised call site would
+        reproduce. `attempt_id` is the caller's if it already has one (the
+        review path creates its attempt before calling in); the implement
+        path calls in BEFORE its attempt loop creates attempt 1, so it has
+        none yet and the ledger rows are written with `attempt_id=NULL` —
+        still joinable to their outcome by `task_id` alone.
         """
         all_scoped = await self.store.list_memories(
             confirmed=True, project=task.repo_path,
@@ -11210,6 +11308,11 @@ class Orchestrator:
                 await self.store.touch_memories_used(injected_ids)
             except Exception as exc:  # noqa: BLE001
                 log.warning("could not stamp memory use: %s", exc)
+            try:
+                await self.store.record_memory_uses(
+                    injected_ids, task_id=task.id, attempt_id=attempt_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not record memory use ledger: %s", exc)
         return all_scoped, triggered
 
     # `_active_memories` is a PROPERTY, not a plain attribute, and the screen

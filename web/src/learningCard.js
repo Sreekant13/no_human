@@ -117,6 +117,42 @@ export function filterLearnings(items, query) {
   });
 }
 
+// ── memory lifecycle A: usage ledger ────────────────────────────────────── //
+//
+// `GET /api/rules|/api/skills|/api/learnings` now join each row against the
+// `memory_uses` ledger server-side (`_with_usage_counts`, api/app.py) and
+// return `use_count`/`last_used_at` (plain `memories` columns) plus
+// `success_count`/`failure_count`/`cancelled_count`/`timeout_count` (summed
+// from the ledger). This turns that into the shape a card renders, exactly
+// once, the way `learningScope`/`learningEvidence` already do for the other
+// two facts on the same card.
+//
+// CORRELATIONAL, NOT CAUSAL. `nh learnings --usage` prints this exact string
+// beside the same numbers on the CLI side — a rule injected into a task that
+// failed did not necessarily cause the failure, it was merely present.
+export const CORRELATIONAL_LABEL = "Correlational metrics — not causal";
+
+export function memoryUsageSummary(item) {
+  const useCount = Number((item && item.use_count) || 0);
+  const lastUsedAt = (item && item.last_used_at) || null;
+  const success = Number((item && item.success_count) || 0);
+  const failure = Number((item && item.failure_count) || 0);
+  const cancelled = Number((item && item.cancelled_count) || 0);
+  const timeout = Number((item && item.timeout_count) || 0);
+  const total = success + failure + cancelled + timeout;
+  const pct = (n) => (total ? Math.round((n / total) * 100) : 0);
+  return {
+    useCount,
+    lastUsedAt,
+    total,
+    successPct: pct(success),
+    failurePct: pct(failure),
+    cancelledPct: pct(cancelled),
+    timeoutPct: pct(timeout),
+    label: CORRELATIONAL_LABEL,
+  };
+}
+
 // The most learnings one "Confirm selected" may send.
 //
 // Each confirm is its own request and the store serialises writes, so a
