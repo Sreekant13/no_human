@@ -27,7 +27,24 @@ def _task():
 
 
 @pytest.mark.asyncio
-async def test_success_proposes_skill(queue, store):
+async def test_success_proposes_nothing_by_default(queue):
+    """Memory lifecycle C: the per-success templated skill proposal (the flood
+    source — ~394 of the NULL-origin pending rows measured against a copy of
+    the operator's database) is gated behind `propose_on_success`, default
+    off. Every existing `LearningQueue(store)` call site — the `queue`
+    fixture included — gets the safe direction without being touched."""
+    mem_id = await queue.propose_from_outcome(
+        _task(), status=TaskStatus.AWAITING_APPROVAL, summary="added mul()")
+    assert mem_id is None
+    assert await queue.pending() == []
+
+
+@pytest.mark.asyncio
+async def test_success_proposes_skill_when_flag_enabled(store):
+    """The gate is reversible, not a deletion: an operator who opts back in
+    (`propose_on_success=True`) gets exactly the old behaviour — this
+    reproduces what `test_success_proposes_skill` asserted before the gate."""
+    queue = LearningQueue(store, propose_on_success=True)
     mem_id = await queue.propose_from_outcome(
         _task(), status=TaskStatus.AWAITING_APPROVAL, summary="added mul()")
     assert mem_id is not None
@@ -56,8 +73,13 @@ async def test_failure_proposes_anti_pattern(queue):
 
 @pytest.mark.asyncio
 async def test_proposal_not_in_active_set_until_confirmed(queue):
+    # Blocker-derived, not success-derived: the per-success proposal is now
+    # gated off by default (test_success_proposes_nothing_by_default), and
+    # this test's actual claim — active() excludes an unconfirmed proposal —
+    # has nothing to do with which producer wrote the row.
     await queue.propose_from_outcome(
-        _task(), status=TaskStatus.AWAITING_APPROVAL, summary="x")
+        _task(), status=TaskStatus.ESCALATED,
+        blocker={"category": "NOVEL_UNKNOWN", "root_cause_hypothesis": "x"})
     # The active set (what later tasks consult) must NOT include the proposal.
     assert await queue.active() == []
     assert len(await queue.pending()) == 1
@@ -66,7 +88,8 @@ async def test_proposal_not_in_active_set_until_confirmed(queue):
 @pytest.mark.asyncio
 async def test_confirm_promotes_to_active(queue):
     mem_id = await queue.propose_from_outcome(
-        _task(), status=TaskStatus.AWAITING_APPROVAL, summary="x")
+        _task(), status=TaskStatus.ESCALATED,
+        blocker={"category": "NOVEL_UNKNOWN", "root_cause_hypothesis": "x"})
     assert await queue.confirm(mem_id) is True
     active = await queue.active()
     assert len(active) == 1
@@ -266,3 +289,46 @@ async def test_reject_uses_the_right_verb_for_each_origin(queue, store, origin, 
             "when the event genuinely recurs"
         )
         assert not await store.memory_dedupe_key_exists(f"key:{origin}")
+
+
+# ── memory lifecycle C: the flood-source predicate ────────────────────────── #
+
+@pytest.mark.asyncio
+async def test_is_templated_success_proposal_predicate(store):
+    """`learning.retire.is_templated_success_proposal` names the flood source
+    for the one-time triage — it must match the exact shape `_build`'s
+    AWAITING_APPROVAL/DONE branch writes and nothing else."""
+    from no_human.learning.retire import is_templated_success_proposal
+
+    queue = LearningQueue(store, propose_on_success=True)
+    template_id = await queue.propose_from_outcome(
+        _task(), status=TaskStatus.AWAITING_APPROVAL, summary="added mul()")
+    template_row = await store.find_memory(template_id)
+    assert is_templated_success_proposal(template_row) is True
+
+    # A review-origin proposal must never match, even if it happened to share
+    # the type — `origin` being set is disqualifying on its own.
+    review_id = await store.add_memory(
+        mem_type=TYPE_SKILL, title="Approach that worked: something",
+        content="Consider capturing the successful approach as a reusable "
+                "skill.",
+        source="proposed", confirmed=False, origin="review",
+        dedupe_key="predicate:review")
+    review_row = await store.find_memory(review_id)
+    assert is_templated_success_proposal(review_row) is False
+
+    # An anti-pattern (the failure-path proposal) must never match.
+    anti_id = await queue.propose_from_outcome(
+        _task(), status=TaskStatus.ESCALATED,
+        blocker={"category": "NOVEL_UNKNOWN", "root_cause_hypothesis": "x"})
+    anti_row = await store.find_memory(anti_id)
+    assert is_templated_success_proposal(anti_row) is False
+
+    # A confirmed row must never match — the predicate is triage-target-only.
+    confirmed_id = await store.add_memory(
+        mem_type=TYPE_SKILL, title="Approach that worked: something else",
+        content="Consider capturing the successful approach as a reusable "
+                "skill.",
+        source="proposed", confirmed=True)
+    confirmed_row = await store.find_memory(confirmed_id)
+    assert is_templated_success_proposal(confirmed_row) is False

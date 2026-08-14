@@ -553,10 +553,18 @@ def test_mine_reply_refuses_personal_data():
 
 
 async def test_task_outcome_proposals_are_gated_too(store):
-    """learning/queue.py is the other door into the queue."""
+    """learning/queue.py is the other door into the queue.
+
+    Memory lifecycle C gates the per-success templated proposal behind
+    `propose_on_success` (default off), which would make a DONE-status
+    proposal return None regardless of PII — masking the gate this test
+    exists to prove. Opt back in so the assertion below still exercises the
+    PII check on the outcome-proposal path, not the unrelated flood-control
+    default.
+    """
     from no_human.core.task import Task, TaskStatus
 
-    q = LearningQueue(store)
+    q = LearningQueue(store, propose_on_success=True)
     task = Task.new("Ship the order to Flat 1, 12 Herzl Street, Tel Aviv",
                     repo_path="/tmp/repo")
     assert await q.propose_from_outcome(task, status=TaskStatus.DONE) is None

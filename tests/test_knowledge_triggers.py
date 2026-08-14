@@ -170,6 +170,15 @@ async def test_a_rule_held_by_the_term_screen_is_not_recorded_as_used(tmp_path):
         clean = await store.add_memory(
             mem_type="rule", title="Deployment runner conventions",
             content="Drain the queue before deploying.", confirmed=True)
+        # P1 brain hygiene's WRITE-time quarantine gate (`core/db.py`'s
+        # `add_memory`) uses this same banned-terms matcher, so `held` was
+        # also quarantined on insert — a separate, additive control (see
+        # `learning/provenance.py`'s module docstring). That would hide it
+        # from `list_memories(confirmed=True, …)` entirely, before it ever
+        # reaches the READ-side screen this test targets. Un-quarantine it so
+        # the row reaches `all_scoped` exactly as it did before that gate
+        # existed, isolating the property under test.
+        await store.set_quarantine(held, False, None)
 
         task = Task.new("fix the deployment runner", repo_path="")
         orch = _bare_orchestrator(store)

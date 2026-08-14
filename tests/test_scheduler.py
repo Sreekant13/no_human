@@ -442,6 +442,124 @@ async def test_scheduler_tick_triggers_reanalysis(store):
 
 
 # --------------------------------------------------------------------------- #
+# Memory lifecycle C: RetirementSweepJob                                      #
+# --------------------------------------------------------------------------- #
+
+from no_human.core.scheduler import RetirementSweepJob
+
+
+@pytest.mark.asyncio
+async def test_retirement_sweep_due_immediately_then_not(store):
+    """due() is False immediately after maybe_run() — the same shape as
+    ReanalysisJob's due-after-interval test."""
+    job = RetirementSweepJob(store, interval_seconds=60)
+    assert job.due()  # _last_run == 0.0 at construction
+    result = await job.maybe_run()
+    assert result is not None
+    assert not job.due()
+
+
+@pytest.mark.asyncio
+async def test_retirement_sweep_maybe_run_skips_when_not_due(store):
+    job = RetirementSweepJob(store, interval_seconds=9999)
+    job._last_run = time.time()  # just ran
+    assert await job.maybe_run() is None
+
+
+@pytest.mark.asyncio
+async def test_retirement_sweep_archives_old_unconfirmed_proposals(store):
+    from no_human.learning import TYPE_SKILL
+
+    old_id = await store.add_memory(
+        mem_type=TYPE_SKILL, title="old", content="x", confirmed=False)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=60)).strftime(
+        "%Y-%m-%d %H:%M:%S")
+    await store.db.execute(
+        "UPDATE memories SET created_at = ? WHERE id = ?", (cutoff, old_id))
+    await store.db.commit()
+
+    job = RetirementSweepJob(store, interval_seconds=60, archive_after_days=45)
+    result = await job.maybe_run()
+    assert result == {"archived": 1}
+
+    row = await store._fetchone(
+        "SELECT archived FROM memories WHERE id = ?", (old_id,))
+    assert row["archived"] == 1
+
+
+@pytest.mark.asyncio
+async def test_retirement_sweep_last_run_advances_even_if_run_raises(store, monkeypatch):
+    """A raising `_run` must still advance `_last_run`, or a persistently
+    failing sweep would retry every single tick instead of backing off."""
+    job = RetirementSweepJob(store, interval_seconds=60)
+
+    async def _boom():
+        raise RuntimeError("sweep exploded")
+
+    monkeypatch.setattr(job, "_run", _boom)
+    assert job.due()
+    with pytest.raises(RuntimeError):
+        await job.maybe_run()
+    assert not job.due(), "_last_run must advance even though _run raised"
+    assert not job._running
+
+
+@pytest.mark.asyncio
+async def test_scheduler_disabled_retirement_job_never_writes(store):
+    """`enabled=False` (the job simply never being constructed/passed) means
+    the scheduler's tick never touches the memories table."""
+    from no_human.learning import TYPE_SKILL
+
+    old_id = await store.add_memory(
+        mem_type=TYPE_SKILL, title="old", content="x", confirmed=False)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=60)).strftime(
+        "%Y-%m-%d %H:%M:%S")
+    await store.db.execute(
+        "UPDATE memories SET created_at = ? WHERE id = ?", (cutoff, old_id))
+    await store.db.commit()
+
+    fake = FakeOrch(store, hold=asyncio.Event())
+    sched = Scheduler(
+        store, lambda task=None: fake, max_workers=1,
+        on_event=lambda k, t: None,
+        retirement_job=None,  # disabled
+    )
+    await sched.tick()
+
+    row = await store._fetchone(
+        "SELECT archived FROM memories WHERE id = ?", (old_id,))
+    assert row["archived"] == 0
+
+
+@pytest.mark.asyncio
+async def test_scheduler_tick_triggers_retirement_sweep(store):
+    from no_human.learning import TYPE_SKILL
+
+    old_id = await store.add_memory(
+        mem_type=TYPE_SKILL, title="old", content="x", confirmed=False)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=60)).strftime(
+        "%Y-%m-%d %H:%M:%S")
+    await store.db.execute(
+        "UPDATE memories SET created_at = ? WHERE id = ?", (cutoff, old_id))
+    await store.db.commit()
+
+    events = []
+    job = RetirementSweepJob(store, interval_seconds=0, archive_after_days=45)
+    fake = FakeOrch(store, hold=asyncio.Event())
+    sched = Scheduler(
+        store, lambda task=None: fake, max_workers=1,
+        on_event=lambda k, t: events.append((k, t)),
+        retirement_job=job,
+    )
+    await sched.tick()
+
+    row = await store._fetchone(
+        "SELECT archived FROM memories WHERE id = ?", (old_id,))
+    assert row["archived"] == 1
+    assert any(k == "memory_sweep" for k, _ in events)
+
+
+# --------------------------------------------------------------------------- #
 # WikiRefreshJob                                                               #
 # --------------------------------------------------------------------------- #
 

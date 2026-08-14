@@ -294,6 +294,7 @@ class Scheduler:
         on_event: Callable[[str, str], None] | None = None,
         reanalysis_job: ReanalysisJob | None = None,
         wiki_refresh_job: "WikiRefreshJob | None" = None,
+        retirement_job: "RetirementSweepJob | None" = None,
         config: dict | None = None,
     ):
         self.store = store
@@ -314,6 +315,7 @@ class Scheduler:
         self._infra_cooldown_active: bool = False
         self.reanalysis = reanalysis_job
         self.wiki_refresh = wiki_refresh_job
+        self.retirement = retirement_job
         self._config = config or {}
         # Per-task event log: task_id -> deque of {ts, source, kind, text, ...}
         self._event_log: dict[str, deque] = {}
@@ -998,6 +1000,20 @@ class Scheduler:
                     )
             except Exception as exc:  # noqa: BLE001 — never kill the pool
                 log.warning("wiki refresh failed: %s", exc)
+        # Memory lifecycle C: periodic unconfirmed-proposal sweep
+        # (best-effort, never blocks task dispatch — same shape as
+        # reanalysis/wiki_refresh above).
+        if self.retirement is not None:
+            try:
+                sweep_result = await self.retirement.maybe_run()
+                if sweep_result and sweep_result.get("archived", 0) > 0:
+                    self._on_event(
+                        "memory_sweep",
+                        f"archived {sweep_result['archived']} unconfirmed "
+                        f"proposal(s)",
+                    )
+            except Exception as exc:  # noqa: BLE001 — never kill the pool
+                log.warning("memory retirement sweep failed: %s", exc)
         return started
 
     def task_events(self, task_id: str) -> list[dict]:
@@ -1324,6 +1340,75 @@ class ReanalysisJob:
             "proposed": result.proposed,
             "duplicates": result.duplicates,
         }
+
+
+# --------------------------------------------------------------------------- #
+# Memory lifecycle C: retirement sweep                                        #
+# --------------------------------------------------------------------------- #
+
+
+class RetirementSweepJob:
+    """The daily 45-day auto-archive sweep for unconfirmed proposals (AC1).
+
+    Same ``due()``/``maybe_run()`` shape as ``ReanalysisJob``. ``enabled=False``
+    is honoured by the CALLER passing ``None`` instead of constructing this
+    (see ``api/app.py``'s lifespan) — same pattern as ``reanalysis``/
+    ``wiki_refresh`` being ``None``-able on ``Scheduler``.
+
+    Never touches a confirmed row (`Store.archive_unconfirmed_older_than`'s
+    ``confirmed = 0`` clause is a literal equality, not this job's job to
+    enforce) and never raises out of `maybe_run` — a failing sweep must not
+    take the dispatch loop down with it.
+    """
+
+    def __init__(
+        self,
+        store: Store,
+        *,
+        interval_seconds: float = 86400,  # default: once per day
+        archive_after_days: int = 45,
+        max_per_run: int = 500,
+    ):
+        self.store = store
+        self.interval = max(60, interval_seconds)
+        self.archive_after_days = archive_after_days
+        self.max_per_run = max_per_run
+        # 0.0 means "never run" — the first `due()` check after boot is
+        # therefore always True, so the first tick after startup IS the
+        # startup sweep. There is no separate startup-only code path to test.
+        self._last_run: float = 0.0
+        self._running = False
+
+    def due(self, now: float | None = None) -> bool:
+        return (now or time.time()) - self._last_run >= self.interval
+
+    async def maybe_run(self) -> dict | None:
+        """Run the sweep if due and not already running. Returns a result
+        dict or None if skipped.
+
+        ``_last_run`` is stamped in ``finally`` — a raising `_run` must still
+        advance it, or a persistently failing sweep would retry every single
+        tick instead of backing off to the next interval.
+        """
+        if not self.due() or self._running:
+            return None
+        self._running = True
+        try:
+            return await self._run()
+        finally:
+            self._running = False
+            self._last_run = time.time()
+
+    async def _run(self) -> dict:
+        from ..learning.retire import sweep_unconfirmed
+
+        report = await sweep_unconfirmed(
+            self.store, days=self.archive_after_days,
+            limit=self.max_per_run)
+        log.info("memory retirement sweep: archived %d unconfirmed "
+                 "proposal(s) older than %d day(s)",
+                 len(report.archived_ids), self.archive_after_days)
+        return {"archived": len(report.archived_ids)}
 
 
 # --------------------------------------------------------------------------- #

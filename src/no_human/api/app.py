@@ -215,12 +215,35 @@ async def lifespan(app: FastAPI):
             max_proposals_per_run=int(ra_cfg.get("max_proposals", 20)),
         )
 
+    # Memory lifecycle C: the daily unconfirmed-proposal sweep (AC1).
+    # `enabled: False` is honoured by passing None instead of constructing
+    # the job — same shape as `reanalysis` above. Numeric coercions are
+    # wrapped: a malformed config.yaml value here (`float("abc")`) must not
+    # take the whole lifespan/board down with it.
+    retirement_job = None
+    learning_cfg = config.data.get("learning", {})
+    if learning_cfg.get("sweep_enabled", True):
+        try:
+            from ..core.scheduler import RetirementSweepJob
+            retirement_job = RetirementSweepJob(
+                store,
+                interval_seconds=float(
+                    learning_cfg.get("sweep_interval_seconds", 86400)),
+                archive_after_days=int(
+                    learning_cfg.get("archive_unconfirmed_days", 45)),
+            )
+        except (TypeError, ValueError) as exc:
+            log.error("bad learning.* sweep config — retirement sweep "
+                      "disabled this run: %s", exc)
+            retirement_job = None
+
     sched = Scheduler(
         store, _orch_factory,
         max_workers=max_workers,
         wake_watcher=watcher,
         on_event=lambda k, t: log.info("worker: %s — %s", k, t),
         reanalysis_job=reanalysis,
+        retirement_job=retirement_job,
         config=config.data,
     )
     stop_event = asyncio.Event()
@@ -2800,6 +2823,22 @@ async def list_learnings(
     return await _with_usage_counts(store, rows)
 
 
+# Registered BEFORE any `/api/learnings/{mem_id}` route (constraint noted in
+# PLAN.md — belt-and-suspenders even though the method/suffix already
+# disambiguate it from the POST .../{mem_id}/retire below) so a literal path
+# segment is never captured by a path parameter.
+@app.get("/api/learnings/retire-candidates")
+async def learnings_retire_candidates(
+    request: Request, days: int = 90,
+) -> list[dict[str, Any]]:
+    """Memory lifecycle C, AC2: stale ACTIVE (confirmed) rules — SUGGEST
+    only. Read-only; nothing here archives anything."""
+    store = _store(request)
+    from ..learning.retire import retirement_candidates
+    rows = await retirement_candidates(store, days=days)
+    return [dict(r) for r in rows]
+
+
 @app.post("/api/learnings/{mem_id}/confirm")
 async def confirm_learning(mem_id: str, request: Request) -> dict[str, Any]:
     store = _store(request)
@@ -2820,6 +2859,56 @@ async def reject_learning(mem_id: str, request: Request) -> dict[str, Any]:
     from ..learning import LearningQueue
     await LearningQueue(store).reject(m["id"])
     return {"ok": True, "id": m["id"]}
+
+
+@app.post("/api/learnings/{mem_id}/retire")
+async def retire_learning(mem_id: str, request: Request) -> dict[str, Any]:
+    """Memory lifecycle C, AC2: the human's explicit yes to a `retire?`
+    suggestion. 404 unknown id; 409 if the row is not confirmed (retirement
+    is for ACTIVE rules — an unconfirmed proposal has `reject` for that job).
+    Idempotent: retiring an already-archived row returns
+    ``{"ok": True, "already_archived": True}`` rather than an error, since a
+    dismissed-then-retried client action should never surface as a failure."""
+    store = _store(request)
+    m = await store.find_memory(mem_id)
+    if not m:
+        raise HTTPException(status_code=404, detail=f"learning {mem_id!r} not found")
+    if m.get("archived"):
+        return {"ok": True, "id": m["id"], "already_archived": True}
+    if not m.get("confirmed"):
+        raise HTTPException(
+            status_code=409,
+            detail="only a confirmed (active) rule can be retired — "
+                   "reject the pending proposal instead")
+    from ..learning import LearningQueue
+    await LearningQueue(store).retire(m["id"])
+    return {"ok": True, "id": m["id"]}
+
+
+@app.get("/api/memories/quarantine")
+async def quarantine_counts(request: Request) -> dict[str, int]:
+    """Per-panel quarantined row counts (P1 brain hygiene) — an honest
+    footer, not a changed list shape. `/api/rules` and `/api/skills` keep
+    returning a bare list; this is a NEW endpoint so their response shape
+    stays untouched.
+
+    ``total`` is deliberately the ALL-TYPES quarantined count, not
+    ``rules + skills`` — the memories table has more types than the four the
+    Rules/Skills panels cover (e.g. proposals), and a row of one of those can
+    be quarantined without ever surfacing in either panel. So
+    ``total >= rules + skills`` is expected, not a double-count bug (round-3
+    review advisory 2): the Learnings footer is deliberately the grand total
+    across every type, while ``rules``/``skills`` are the two panel subsets.
+    """
+    store = _store(request)
+    from ..learning import TYPE_ANTI_PATTERN, TYPE_FACT, TYPE_RULE, TYPE_SKILL
+    rules = (await store.count_quarantined(mem_type=TYPE_RULE)
+             + await store.count_quarantined(mem_type=TYPE_ANTI_PATTERN))
+    skills = (await store.count_quarantined(mem_type=TYPE_SKILL)
+              + await store.count_quarantined(mem_type=TYPE_FACT))
+    all_types_total = await store.count_quarantined()
+    return {"rules": rules, "skills": skills, "learnings": all_types_total,
+            "total": all_types_total}
 
 
 _SECRET_KEY_RE = re.compile(r"(token|secret|password|webhook|key)", re.IGNORECASE)

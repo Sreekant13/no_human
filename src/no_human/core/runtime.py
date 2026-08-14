@@ -39,7 +39,14 @@ def build_orchestrator(config, store: Store, *, event_sink: Any = None,
     from ..learning import LearningQueue
     from ..review.reviewer import AdversarialReviewer
     reviewer = AdversarialReviewer.from_config(config.data, backend=review_backend)
+    # Memory lifecycle C: the per-success templated skill proposal is gated
+    # behind this flag (default off — config.data merges unknown keys, so an
+    # older config.yaml without it reads the DEFAULT_CONFIG default via
+    # dict.get, never a KeyError).
+    propose_on_success = bool(
+        config.data.get("learning", {}).get("propose_on_success", False))
     return Orchestrator(store, config.data, backend, notifier,
                         event_sink=event_sink, context_gatherer=gatherer,
-                        learning_queue=LearningQueue(store),
+                        learning_queue=LearningQueue(
+                            store, propose_on_success=propose_on_success),
                         reviewer=reviewer)

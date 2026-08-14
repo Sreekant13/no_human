@@ -88,7 +88,13 @@ class SessionsSource:
                 params.append(task.repo_path)
         rows = await self.store.query(
             f"SELECT type, title, content FROM memories WHERE confirmed = 1 AND "
-            f"(archived IS NULL OR archived = 0) AND ({clauses}) AND "
+            f"(archived IS NULL OR archived = 0) AND "
+            # P1 brain hygiene (`learning/provenance.py`): this is the
+            # documented second raw-SQL route into a prompt (see this
+            # module's docstring above), so it needs its own quarantine
+            # clause exactly like `archived`'s, mirroring
+            # `Store.list_memories`'s default filter.
+            f"(quarantined IS NULL OR quarantined = 0) AND ({clauses}) AND "
             f"{scope_clause} LIMIT ?",
             (*params, self.limit),
         )

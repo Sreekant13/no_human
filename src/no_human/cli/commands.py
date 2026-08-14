@@ -1999,6 +1999,90 @@ def rules_remove(rule_id):
 
 
 # --------------------------------------------------------------------------- #
+# P1 brain hygiene — the memories-table inventory + one-time backfill         #
+# --------------------------------------------------------------------------- #
+
+@cli.group("memories")
+def memories_group():
+    """P1 brain hygiene: inventory and quarantine of employer-context rows in
+    the memories table (`learning/provenance.py`)."""
+
+
+@memories_group.command("scan")
+@click.option("--apply", "apply_", is_flag=True,
+              help="Flag the union set quarantined=1 (idempotent; never clears).")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def memories_scan(apply_, as_json):
+    """Report the needle-class inventory; optionally backfill the quarantine
+    flag onto the matched rows.
+
+    Reports CLASS LABELS and counts only — never a matched term, never a row
+    title or content excerpt. A scan that reads zero rows while the UI lists
+    confirmed rules/skills is a FAILURE (`InventoryError`, non-zero exit), not
+    a clean run — see `learning.provenance.scan_memories` for why.
+
+    Counts are also reported BY CLASS INDEX (``class-1``, ``class-2``, ...;
+    ``needle-1``, ``needle-2``, ...) — the only form of this inventory safe to
+    quote on a forge-visible surface (PR body, commit message). Class labels
+    stay local to this console/JSON output and never leave the machine."""
+    config, _ = _bootstrap(require_auth=False)
+
+    async def _go():
+        from ..learning.provenance import (
+            InventoryError, project_allowlist, quarantine_reason, scan_memories,
+        )
+        allowlist = project_allowlist(config)
+        async with Store(config.db_path) as store:
+            try:
+                inv = await scan_memories(store, allowlist=allowlist)
+            except InventoryError as exc:
+                if as_json:
+                    click.echo(json.dumps({"error": str(exc)}))
+                else:
+                    console.print(f"[bold red]scan failed:[/] {exc}")
+                sys.exit(1)
+            newly_flagged = 0
+            if apply_:
+                for mem_id in inv.union_ids:
+                    row = await store.find_memory(mem_id)
+                    if row is None or int(row.get("quarantined") or 0):
+                        continue
+                    reason = quarantine_reason(
+                        title=row.get("title"), content=row.get("content"),
+                        project=row.get("project"), allowlist=allowlist,
+                    )
+                    if await store.set_quarantine(mem_id, True, reason):
+                        newly_flagged += 1
+            result = {
+                "total_rows": inv.total_rows,
+                "per_class": inv.per_class,
+                "per_class_index": inv.per_class_index,
+                "per_needle_index": inv.per_needle_index,
+                "union_total": inv.union_total,
+                "applied": apply_,
+                "newly_flagged": newly_flagged,
+            }
+            if as_json:
+                click.echo(json.dumps(result))
+                return
+            console.print(f"scanned [bold]{inv.total_rows}[/] row(s)")
+            for i in sorted(inv.per_class_index):
+                console.print(f"  class-{i}: {inv.per_class_index[i]}")
+            for i in sorted(inv.per_needle_index):
+                console.print(f"  class-2/needle-{i}: {inv.per_needle_index[i]}")
+            for cls, n in inv.per_class.items():
+                console.print(f"  {cls}: {n}")
+            console.print(f"union total: [bold]{inv.union_total}[/]")
+            if apply_:
+                console.print(f"newly flagged quarantined: {newly_flagged}")
+            else:
+                console.print("[dim]report only — pass --apply to flag the "
+                               "union set quarantined=1[/]")
+
+    asyncio.run(_go())
+
+
+# --------------------------------------------------------------------------- #
 # Playbooks (1.4) — reusable procedures injected when a task matches           #
 # --------------------------------------------------------------------------- #
 
@@ -4370,16 +4454,31 @@ def _learning_evidence_line(raw) -> str | None:
 @click.option("--harvest-project", default=None,
               help="Limit --harvest to one repo path (default: every project).")
 @click.option("--stale", is_flag=True,
-              help="Report confirmed rules not injected into a prompt lately. "
-                   "Read-only — it never archives or deletes.")
+              help="Show the retire? section: confirmed rules not injected "
+                   "into a prompt lately. Suggestion only — nothing is ever "
+                   "auto-archived; confirm with --retire <id>.")
 @click.option("--days", default=30, show_default=True,
               help="How many days without a use makes a rule stale (--stale).")
 @click.option("--usage", is_flag=True,
               help="Memory lifecycle A: per-memory use_count, last_used_at "
                    "and the outcome split (success/failure/cancelled/timeout) "
                    "of every ledgered injection. Read-only.")
+@click.option("--retire", "retire_id", default=None,
+              help="Archive a CONFIRMED (active) rule you no longer want "
+                   "injected — the retire? suggestion's explicit yes. "
+                   "Reversible; refuses an unconfirmed id.")
+@click.option("--triage-templated", "triage_templated", is_flag=True,
+              help="One-time flood-source triage: find pending proposals "
+                   "the per-success templated skill producer wrote (no "
+                   "evidence). Dry run by default.")
+@click.option("--apply", "triage_apply", is_flag=True,
+              help="With --triage-templated, actually archive the matched "
+                   "rows (reversible) instead of only reporting them.")
+@click.option("--limit", "triage_limit", default=500, show_default=True,
+              help="Cap on rows --triage-templated archives in one run.")
 def learnings(confirm_id, reject_id, active, harvest, harvest_project,
-              stale, days, usage):
+              stale, days, usage, retire_id, triage_templated, triage_apply,
+              triage_limit):
     """Review the human-confirmed learning queue; confirm or reject proposals.
 
     Nothing enters the active rule set without your one-click confirm.
@@ -4412,6 +4511,15 @@ def learnings(confirm_id, reject_id, active, harvest, harvest_project,
     `run_task`'s finalizer fills the outcome once a task ends). The counts
     are CORRELATIONAL, not causal: a rule injected into a task that failed
     did not necessarily cause the failure.
+
+    ``--retire <id>`` is the retire? section's explicit yes: archives a
+    CONFIRMED rule (reversible), refusing anything not confirmed.
+
+    ``--triage-templated`` is the one-time flood-source cleanup: finds
+    pending proposals the per-success templated skill producer wrote (no
+    evidence beyond "a task finished") and reports them. Dry run by default
+    — pass ``--apply`` to actually archive them (reversible) and write a
+    JSON receipt.
     """
     config, _ = _bootstrap(require_auth=False)
     from ..learning import LearningQueue
@@ -4477,15 +4585,15 @@ def learnings(confirm_id, reject_id, active, harvest, harvest_project,
                         f"{m['timeout_count']} timeout", emoji=False)
                 return
             if stale:
-                rows = await q.stale(days=days)
+                rows = await q.retire_candidates(days=days)
                 total = len(await q.active())
                 if not rows:
                     console.print(
                         f"[green]every one of the {total} active rule(s) has "
                         f"been used in the last {days} day(s)[/]")
                     return
-                console.rule(f"[bold]{len(rows)} of {total} active rule(s) "
-                             f"unused for {days}+ day(s)")
+                console.rule(f"[bold]retire? — {len(rows)} of {total} active "
+                             f"rule(s) unused for {days}+ day(s)")
                 for m in rows:
                     used = (m.get("last_used_at") or "")[:19]
                     # "never" here means NO RECORD, which is two different
@@ -4497,11 +4605,95 @@ def learnings(confirm_id, reject_id, active, harvest, harvest_project,
                     console.print(
                         f"[bold]{m['id'][:8]}[/] [magenta]{m['type']}[/] "
                         f"{escape(m['title'])} — {when}", emoji=False)
+                    console.print(
+                        f"  suggestion only: nh learnings --retire {m['id'][:8]}",
+                        emoji=False)
                 console.print(
                     "\n[dim]Nothing was changed. These are your confirmed "
                     "rules; a rule can be unused simply because you have not "
                     "worked in its project. Remove one with: "
                     "nh learnings --reject <id>[/]", emoji=False)
+                return
+            if retire_id:
+                mem = await store.find_memory(retire_id)
+                if not mem:
+                    console.print(f"[red]no rule matching[/] {retire_id}")
+                    return
+                if not mem.get("confirmed"):
+                    console.print(
+                        f"[red]{mem['id'][:8]} is not a confirmed (active) "
+                        f"rule[/] — reject it instead: "
+                        f"nh learnings --reject {mem['id'][:8]}")
+                    return
+                if await q.retire(mem["id"]):
+                    console.print(
+                        f"[yellow]retired[/] {mem['id'][:8]} — reversible: "
+                        f"UPDATE memories SET archived = 0 WHERE id = "
+                        f"'{mem['id']}'")
+                else:
+                    console.print(
+                        f"[dim]{mem['id'][:8]} was already archived[/]")
+                return
+            if triage_templated:
+                from ..learning.retire import is_templated_success_proposal
+                pending_rows = await q.pending()
+                targets = [m for m in pending_rows
+                          if is_templated_success_proposal(m)]
+                before_pending = len(pending_rows)
+                if not targets:
+                    console.print(
+                        "[green]no templated per-success proposals found[/] "
+                        f"({before_pending} pending total)")
+                    return
+                by_project: dict[str, int] = {}
+                for m in targets:
+                    by_project[m.get("project") or "(unscoped)"] = (
+                        by_project.get(m.get("project") or "(unscoped)", 0) + 1)
+                console.rule(
+                    f"[bold]{'archiving' if triage_apply else 'would archive'} "
+                    f"{len(targets)} templated per-success proposal(s)[/] "
+                    f"of {before_pending} pending")
+                for proj, n in sorted(by_project.items(),
+                                      key=lambda kv: -kv[1]):
+                    console.print(f"  [dim]{escape(proj)}: {n}[/]", emoji=False)
+                for m in targets[:15]:
+                    console.print(f"  {m['id'][:8]}  {escape(m['title'])}",
+                                 emoji=False)
+                if len(targets) > 15:
+                    console.print(f"  [dim]... and {len(targets) - 15} more[/]",
+                                 emoji=False)
+                if not triage_apply:
+                    id_list = ", ".join(f"'{m['id']}'" for m in targets)
+                    console.print(
+                        "\n[dim]Dry run — nothing was changed. Re-run with "
+                        "--apply to archive these (reversible). Reversal "
+                        f"SQL: UPDATE memories SET archived = 0 WHERE id IN "
+                        f"({id_list})[/]", emoji=False)
+                    return
+                reason = ("one-time triage 2026-08-12: templated per-success "
+                          "proposal (flood source), no evidence — reversible")
+                archived_ids = []
+                for m in targets[:triage_limit]:
+                    if await store.archive_memory(m["id"], reason):
+                        archived_ids.append(m["id"])
+                after_pending = len(await q.pending())
+                console.print(
+                    f"\n[green]archived {len(archived_ids)}[/] — pending "
+                    f"{before_pending} -> {after_pending}")
+                import json as _json
+                import time as _time
+                from ..config import NO_HUMAN_HOME
+                receipts_dir = NO_HUMAN_HOME / "receipts"
+                receipts_dir.mkdir(parents=True, exist_ok=True)
+                receipt_path = receipts_dir / (
+                    f"learning-triage-{int(_time.time())}.json")
+                receipt_path.write_text(_json.dumps({
+                    "reason": reason,
+                    "archived_ids": archived_ids,
+                    "before_pending": before_pending,
+                    "after_pending": after_pending,
+                }, indent=2))
+                console.print(f"[dim]receipt: {receipt_path}[/]", emoji=False)
                 return
             if confirm_id:
                 mem = await store.find_memory(confirm_id)

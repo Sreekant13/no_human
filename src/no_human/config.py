@@ -1708,6 +1708,29 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # HUMAN approval (a MERGED PR outcome, migration 0010). A miss is always
         # the safe direction: it withholds a lesson, it never lets one through.
         "auto_confirm_recurring": False,
+        # Memory lifecycle C (2026-08-12 research report). The per-success
+        # templated skill proposal (`learning.queue._build`'s
+        # AWAITING_APPROVAL/DONE branch) is the flood source — no evidence
+        # beyond "a task finished", ~394 of the pending backlog measured
+        # against a copy of the operator's database. Default OFF; the safe
+        # direction, same as `auto_confirm_recurring` above.
+        "propose_on_success": False,
+        # AC1: unconfirmed proposals older than this many days are
+        # auto-archived (reversible — never deleted) by the daily sweep.
+        "archive_unconfirmed_days": 45,
+        # AC2: confirmed rules unused for this many days surface in the
+        # `retire?` SUGGEST-only section — never auto-archived.
+        "retire_suggest_days": 90,
+        # How often the retirement sweep job ticks. `_last_run = 0.0` at
+        # construction means the first tick after boot runs immediately —
+        # that IS the startup sweep, with no separate path to test.
+        "sweep_interval_seconds": 86400,
+        # Kill switch for the sweep job (`api/app.py`'s lifespan passes None
+        # to `Scheduler` instead of constructing `RetirementSweepJob`). The
+        # `sweep_unconfirmed`/`archive_unconfirmed_older_than` FUNCTIONS stay
+        # reachable regardless (CLI `--triage-templated`, tests) — this only
+        # turns off the unattended daily tick.
+        "sweep_enabled": True,
     },
 }
 

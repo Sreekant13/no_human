@@ -7,7 +7,10 @@ import {
   fetchProjects, createProject, updateProject, deleteProject,
   fetchProfiles, detectRepos, onboardRepo,
   fetchAuthStatus, setAuthToken, fetchVersion,
+  fetchRetireCandidates, retireLearning,
+  fetchQuarantineCounts,
 } from "./api.js";
+import { quarantineFooterLabel } from "./quarantineFooter.js";
 import { capName, PROFILE_CAP, TOKENVAR_CAP } from "./capName.js";
 import { authPanelView } from "./authPanelView.js";
 import { groupLearningsByProject } from "./learningGroups.js";
@@ -20,6 +23,7 @@ import {
   learningScope,
   memoryUsageSummary,
 } from "./learningCard.js";
+import { retireCandidates } from "./learningRetire.js";
 import { useEscapeKey } from "./useEscapeKey.js";
 import { pluralize } from "./pluralize.js";
 import { updateNotice } from "./updateNotice.js";
@@ -431,6 +435,7 @@ function MemoryList({ kind, fetchFn, addFn, removeFn }) {
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
   const [error, setError] = useState(null);
+  const [quarantined, setQuarantined] = useState(0);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -438,7 +443,12 @@ function MemoryList({ kind, fetchFn, addFn, removeFn }) {
       .then((data) => { setItems(data); setError(null); })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [fetchFn]);
+    // Best-effort: a footer count that fails to load says nothing, rather
+    // than surfacing a second error banner over the list that DID load.
+    fetchQuarantineCounts()
+      .then((c) => setQuarantined(c[kind] || 0))
+      .catch(() => {});
+  }, [fetchFn, kind]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -480,6 +490,9 @@ function MemoryList({ kind, fetchFn, addFn, removeFn }) {
             <MemoryCard key={item.id} item={item} onRemove={handleRemove} />
           ))}
         </div>
+      )}
+      {!loading && quarantineFooterLabel(quarantined) && (
+        <div className="settings-empty">{quarantineFooterLabel(quarantined)}</div>
       )}
       {showAdd && (
         <AddMemoryModal
@@ -631,19 +644,56 @@ function LearningsPanel() {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(() => new Set());
   const [bulk, setBulk] = useState(null);   // {done, total} while confirming
+  const [quarantined, setQuarantined] = useState(0);
+
+  // Memory lifecycle C: the retire? section — stale ACTIVE rules, suggest
+  // only. `dismissed` is purely client-side (a page reload forgets it — the
+  // server never learns of a "not now", per the suggest-only contract) and
+  // `retiring` tracks the one id an in-flight POST /retire is for, so a
+  // double-click cannot fire it twice.
+  const [retireCands, setRetireCands] = useState([]);
+  const [dismissed, setDismissed] = useState(() => new Set());
+  const [retiring, setRetiring] = useState(null);
 
   const load = useCallback(() => {
     setLoading(true);
     Promise.all([
       fetchLearnings({ active: false }),
       fetchLearnings({ active: true }),
+      fetchRetireCandidates({ days: 90 }),
     ])
-      .then(([p, a]) => { setPending(p); setActive(a); setError(null); })
+      .then(([p, a, r]) => {
+        setPending(p); setActive(a); setRetireCands(r); setError(null);
+      })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
+    // Best-effort, same as MemoryList: a failed footer count is silent, not
+    // a second error banner over a queue that loaded fine.
+    fetchQuarantineCounts()
+      .then((c) => setQuarantined(c.learnings || 0))
+      .catch(() => {});
   }, []);
 
   useEffect(() => { load(); }, [load]);
+
+  async function handleRetire(id) {
+    if (retiring) return;
+    setRetiring(id);
+    try {
+      await retireLearning(id);
+      load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setRetiring(null);
+    }
+  }
+
+  function dismissRetireCandidate(id) {
+    setDismissed((s) => new Set(s).add(id));
+  }
+
+  const retireVisible = retireCandidates(retireCands, [...dismissed], { days: 90 });
 
   async function handleAction(id, action) {
     try {
@@ -805,6 +855,46 @@ function LearningsPanel() {
             </details>
           ))}
         </div>
+      )}
+      {/* Memory lifecycle C: suggest-only. Nothing here ever auto-archives —
+          each row is the human's own explicit yes (Retire) or a client-side
+          "not now" (Dismiss) that writes nothing server-side. */}
+      {view === "active" && !loading && retireVisible.length > 0 && (
+        <div className="retire-candidates">
+          <h4 className="retire-candidates-title">
+            retire? — {retireVisible.length} confirmed rule
+            {retireVisible.length === 1 ? "" : "s"} unused for 90+ days
+          </h4>
+          <div className="memory-list">
+            {retireVisible.map((item) => (
+              <div key={item.id} className="memory-card retire-candidate-card">
+                <div className="memory-card-header">
+                  <span className="memory-type-badge">{item.type}</span>
+                  <span className="memory-title">{item.title}</span>
+                </div>
+                <div className="retire-candidate-label">{item.label}</div>
+                <div className="memory-card-actions">
+                  <button
+                    className="btn btn-sm"
+                    disabled={retiring === item.id}
+                    onClick={() => handleRetire(item.id)}
+                  >
+                    {retiring === item.id ? "Retiring…" : "Retire"}
+                  </button>
+                  <button
+                    className="btn btn-sm btn-ghost"
+                    onClick={() => dismissRetireCandidate(item.id)}
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {!loading && quarantineFooterLabel(quarantined) && (
+        <div className="settings-empty">{quarantineFooterLabel(quarantined)}</div>
       )}
     </div>
   );

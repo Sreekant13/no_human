@@ -145,7 +145,10 @@ async def test_correction_proposal_evidence_cites_the_correction_events(store):
 
 @pytest.mark.asyncio
 async def test_outcome_proposal_carries_structured_evidence(store):
-    q = LearningQueue(store)
+    # Memory lifecycle C gates the per-success templated proposal behind
+    # `propose_on_success` (default off) — opt back in here since this test's
+    # claim is about the evidence shape, not about the flood-control default.
+    q = LearningQueue(store, propose_on_success=True)
     t = await _task(store, title="Ship the exporter")
     await q.propose_from_outcome(t, status=TaskStatus.AWAITING_APPROVAL)
 

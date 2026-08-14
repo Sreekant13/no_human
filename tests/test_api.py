@@ -2745,3 +2745,70 @@ async def test_the_live_stream_carries_the_verdict_meta_too(store):
                 if l.startswith("data: ") and '"review"' in l]
     assert frame["passed"] is True, f"the live stream lost the verdict: {frame}"
     assert set(_VERDICT_META) <= set(frame)
+
+
+# --------------------------------------------------------------------------- #
+# Memory lifecycle C: retire-candidates / retire endpoints                    #
+# --------------------------------------------------------------------------- #
+
+async def test_retire_candidates_returns_a_stale_confirmed_row(client, store):
+    from no_human.learning import TYPE_RULE
+
+    mem_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="stale rule", content="x", confirmed=True)
+    from datetime import datetime, timedelta, timezone
+    stale_ts = (datetime.now(timezone.utc) - timedelta(days=120)).isoformat()
+    await store.db.execute(
+        "UPDATE memories SET last_used_at = ? WHERE id = ?", (stale_ts, mem_id))
+    await store.db.commit()
+
+    r = await client.get("/api/learnings/retire-candidates?days=90")
+    assert r.status_code == 200
+    ids = {row["id"] for row in r.json()}
+    assert mem_id in ids
+
+
+async def test_retire_archives_and_drops_from_active(client, store):
+    from no_human.learning import TYPE_RULE
+
+    mem_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="unused rule", content="x", confirmed=True)
+
+    active_before = await client.get("/api/learnings?active=true")
+    assert mem_id in {row["id"] for row in active_before.json()}
+
+    r = await client.post(f"/api/learnings/{mem_id}/retire")
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+    active_after = await client.get("/api/learnings?active=true")
+    assert mem_id not in {row["id"] for row in active_after.json()}
+
+
+async def test_retire_second_call_is_idempotent(client, store):
+    from no_human.learning import TYPE_RULE
+
+    mem_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="unused rule", content="x", confirmed=True)
+    r1 = await client.post(f"/api/learnings/{mem_id}/retire")
+    assert r1.status_code == 200
+    assert r1.json().get("already_archived") is not True
+
+    r2 = await client.post(f"/api/learnings/{mem_id}/retire")
+    assert r2.status_code == 200
+    assert r2.json()["already_archived"] is True
+
+
+async def test_retire_unconfirmed_row_is_409(client, store):
+    from no_human.learning import TYPE_RULE
+
+    mem_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="pending proposal", content="x",
+        confirmed=False)
+    r = await client.post(f"/api/learnings/{mem_id}/retire")
+    assert r.status_code == 409
+
+
+async def test_retire_unknown_id_is_404(client):
+    r = await client.post("/api/learnings/does-not-exist/retire")
+    assert r.status_code == 404

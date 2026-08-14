@@ -309,11 +309,25 @@ async def _project_scope_of(path: str | None) -> str | None:
         return None
 
 
+# Memory lifecycle C: the per-success templated skill proposal (the
+# AWAITING_APPROVAL/DONE branch of `_build`) is the flood source — it
+# produced ~394 of the NULL-origin pending rows measured against a copy of
+# the operator's database (487-488 pending vs 53 active), and it carries no
+# evidence beyond "a task finished to a reviewable PR". GATED, not deleted
+# (reversibility is the point of the whole lifecycle design): the code stays,
+# a keyword-only flag with a default that keeps it off, so every existing
+# call site (`LearningQueue(store)`, no flag) gets the safe direction without
+# being touched.
+PROPOSE_ON_SUCCESS_DEFAULT = False
+
+
 class LearningQueue:
     """Proposes learnings from task outcomes and manages confirmation."""
 
-    def __init__(self, store: Store):
+    def __init__(self, store: Store, *,
+                 propose_on_success: bool = PROPOSE_ON_SUCCESS_DEFAULT):
         self.store = store
+        self.propose_on_success = propose_on_success
 
     # ----------------------------- propose --------------------------------- #
 
@@ -357,6 +371,15 @@ class LearningQueue:
         summary: str,
     ) -> Proposal | None:
         if status in (TaskStatus.AWAITING_APPROVAL, TaskStatus.DONE):
+            # Memory lifecycle C flood control: this branch produced ~394 of
+            # the NULL-origin pending rows measured against a copy of the
+            # operator's live database, and carries no evidence beyond "a
+            # task finished" — no reviewer finding, no correction, no
+            # operator input. Gated behind `propose_on_success` (default
+            # off) rather than deleted, for reversibility. See
+            # `PROPOSE_ON_SUCCESS_DEFAULT` above.
+            if not self.propose_on_success:
+                return None
             title = f"Approach that worked: {task.title}"[:120]
             content = (
                 f"Task '{task.title}' completed to a reviewable PR.\n"
@@ -937,7 +960,61 @@ class LearningQueue:
         return await self.store.stale_memories(days=days)
 
     async def confirm(self, mem_id: str) -> bool:
-        return await self.store.confirm_memory(mem_id)
+        """Promote a proposal into the active set, then supersede its oldest
+        near-duplicate ACTIVE row, if any exist (AC3). Return value is
+        UNCHANGED from before this feature (True/False on the confirm itself)
+        so every API/CLI caller's contract holds — supersede is a side
+        effect, never surfaced through this return.
+
+        Wrapped so a supersede failure can never undo the confirm: the human
+        asked for THIS row to become active, and that must land even if the
+        bookkeeping for what it replaces does not.
+        """
+        confirmed = await self.store.confirm_memory(mem_id)
+        if not confirmed:
+            return confirmed
+        try:
+            from .retire import find_superseded
+            row = await self.store.find_memory(mem_id)
+            if row is not None:
+                dupes = await find_superseded(self.store, row)
+                if dupes:
+                    # Oldest match only — bounded, one supersede per confirm,
+                    # not a cascade across every near-duplicate found.
+                    dupes.sort(key=lambda r: r.get("created_at") or "")
+                    oldest = dupes[0]
+                    await self.store.supersede_memory(
+                        oldest["id"], mem_id,
+                        reason="superseded by a newly confirmed near-duplicate",
+                    )
+        except Exception:  # noqa: BLE001 — never undo a real confirm
+            log.warning("supersede-on-confirm failed for %s", mem_id,
+                       exc_info=True)
+        return confirmed
+
+    async def retire_candidates(
+        self, *, days: int = 90,
+    ) -> list[dict[str, Any]]:
+        """SUGGEST-only report of stale active rules — the `retire?` surface.
+        Never archives; see `learning/retire.py:retirement_candidates`."""
+        from .retire import retirement_candidates
+        return await retirement_candidates(self.store, days=days)
+
+    async def retire(self, mem_id: str) -> bool:
+        """The human's explicit yes to a retirement suggestion (AC2's only
+        door). Verifies the row is confirmed (retirement is for ACTIVE
+        rules — pending has `reject` for that job), then archives it exactly
+        like any other archive: reversible, no `superseded_by` (this is not a
+        duplicate collapsing onto a survivor, it is one rule going quiet).
+
+        NEVER called by any scheduled job — see `RetirementSweepJob`, which
+        only ever calls `sweep_unconfirmed`. Dismissal of a suggestion writes
+        nothing here or anywhere; it is purely a client-side "not now"."""
+        row = await self.store.find_memory(mem_id)
+        if row is None or not row.get("confirmed"):
+            return False
+        return await self.store.archive_memory(
+            mem_id, "retired at the human gate (unused >90d)")
 
     async def reject(self, mem_id: str) -> bool:
         """A human's "no".

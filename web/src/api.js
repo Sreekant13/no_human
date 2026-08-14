@@ -274,6 +274,12 @@ export async function fetchLearnings({ active = false } = {}) {
   return r.json();
 }
 
+export async function fetchQuarantineCounts() {
+  const r = await fetch(`${BASE}/api/memories/quarantine`);
+  if (!r.ok) throw new Error(`GET /api/memories/quarantine → ${r.status}`);
+  return r.json();
+}
+
 export async function confirmLearning(id) {
   const r = await fetch(`${BASE}/api/learnings/${id}/confirm`, { method: "POST" });
   if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST confirm → ${r.status}`)); }
@@ -283,6 +289,23 @@ export async function confirmLearning(id) {
 export async function rejectLearning(id) {
   const r = await fetch(`${BASE}/api/learnings/${id}/reject`, { method: "POST" });
   if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST reject → ${r.status}`)); }
+  return r.json();
+}
+
+// Memory lifecycle C: the retire? section — stale ACTIVE (confirmed) rules,
+// suggest-only. Read-only; nothing here archives anything.
+export async function fetchRetireCandidates({ days = 90 } = {}) {
+  const r = await fetch(`${BASE}/api/learnings/retire-candidates?days=${days}`);
+  if (!r.ok) throw new Error(`GET retire-candidates → ${r.status}`);
+  return r.json();
+}
+
+// The human's explicit yes to a retire? suggestion. Reversible server-side
+// (archive, never delete); idempotent (a second call reports
+// `already_archived` rather than erroring).
+export async function retireLearning(id) {
+  const r = await fetch(`${BASE}/api/learnings/${id}/retire`, { method: "POST" });
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST retire → ${r.status}`)); }
   return r.json();
 }
 

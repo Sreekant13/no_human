@@ -1118,6 +1118,46 @@ class Store:
         if "use_count" not in mem_existing:
             await self.db.execute(
                 "ALTER TABLE memories ADD COLUMN use_count INTEGER DEFAULT 0")
+        # P1 brain hygiene: a recoverable QUARANTINE flag, separate from
+        # `archived` (a different flag, a different meaning — curator
+        # dedupe/rejection, not provenance). `quarantined` gates a row out of
+        # every read path `list_memories` feeds (the UI, rule injection,
+        # export/manifest) without deleting it; see `learning/provenance.py`
+        # for what sets it. `NOT NULL DEFAULT 0` is legal for SQLite
+        # `ADD COLUMN` and backfills every existing row to "not quarantined",
+        # which is correct: nothing here retroactively flags a pre-existing
+        # row — that is `nh memories scan --apply`'s job, run once, explicitly.
+        if "quarantined" not in mem_existing:
+            await self.db.execute(
+                "ALTER TABLE memories ADD COLUMN quarantined "
+                "INTEGER NOT NULL DEFAULT 0")
+        # PROVENANCE, as a JSON field — project/context/timestamp/reason —
+        # stamped by `add_memory` at write time. NO DEFAULT, same reasoning as
+        # `origin`/`evidence`/`last_used_at` above: a legacy row genuinely has
+        # no recorded provenance, and NULL says so honestly.
+        if "provenance" not in mem_existing:
+            await self.db.execute(
+                "ALTER TABLE memories ADD COLUMN provenance TEXT")
+
+        # Memory lifecycle C: WHICH row this one replaced — set only by
+        # `supersede_memory` when a freshly-confirmed row turns out to be a
+        # near-duplicate of an existing active one. Points from the OLD
+        # (archived) row to the NEW (surviving) row's id, so "why is this
+        # archived?" answers with "superseded by <id>" instead of a bare
+        # archive reason string that would have to be parsed to find it.
+        #
+        # NO DEFAULT, same reasoning as `origin`/`evidence`/`last_used_at`/
+        # `confirmed_by`: NULL means "not superseded", which is honestly true
+        # of every row that predates this column, not a guess.
+        #
+        # There is no alembic in this repo (`migrations/0001_init.sql` is
+        # `CREATE TABLE IF NOT EXISTS` and replays on every connect — a bare
+        # `ALTER` there would fail on the second connect, and SQLite has no
+        # `ADD COLUMN IF NOT EXISTS`), so this follows the exact PRAGMA-guarded
+        # idiom as every other `memories` column added since the base schema.
+        if "superseded_by" not in mem_existing:
+            await self.db.execute(
+                "ALTER TABLE memories ADD COLUMN superseded_by TEXT")
 
         # Phase 6a: test_layers column on projects (JSON-encoded TestPlan layers).
         proj_existing = {row["name"]
@@ -2125,6 +2165,7 @@ class Store:
         dedupe_key: str | None = None, origin: str | None = None,
         evidence: dict[str, Any] | None = None,
         project_scope: str | None = None,
+        project_allowlist: list[str] | None = None,
     ) -> str | None:
         """Insert a memory. If ``dedupe_key`` matches an existing memory's
         signature (stored in file_path), skip and return None.
@@ -2137,6 +2178,23 @@ class Store:
         task, citing the correction/review event) — stored as JSON, NULL where
         unrecorded. ``project_scope`` is the B4 project identity
         (``learning/scope.py``); NULL keeps the row on legacy path matching.
+
+        P1 BRAIN HYGIENE — WRITE-TIME PROVENANCE GATE. Every insert is passed
+        through ``learning.provenance.quarantine_reason`` before the row is
+        written. A hit sets ``quarantined = 1``; either way, ``provenance``
+        records ``{project, project_scope, context, ingested_at,
+        quarantine_reason}`` as JSON — a legacy row predating this column has
+        none of that and stays NULL, same reasoning as ``origin``/``evidence``.
+        ``project_allowlist``, when given, OVERRIDES the configured allowlist
+        (an explicit ``[]`` therefore forces the project class inert for this
+        one call). When left at the default (``None``, meaning "the caller
+        did not pass one" — no caller in this repo does), it is resolved via
+        ``learning.provenance.project_allowlist()``, which reads the
+        ``NO_HUMAN_LEARNING_PROJECT_ALLOWLIST`` env var and is INERT when that
+        is unset. This is what actually wires the project-allowlist needle
+        class into every write, not just into ``nh memories scan``. This is
+        the single write chokepoint (every caller in this repo goes through
+        it), so nothing else needs to duplicate the gate.
 
         RAISES ``ValueError`` for an unconfirmed memory whose ``source`` is not
         ``SOURCE_PROPOSED`` — see that constant for the three call sites that
@@ -2226,15 +2284,31 @@ class Store:
             ):
                 return None
         mem_id = uuid.uuid4().hex
+        from ..learning.provenance import project_allowlist as _resolve_allowlist
+        from ..learning.provenance import quarantine_reason
+        resolved_allowlist = (
+            project_allowlist if project_allowlist is not None
+            else _resolve_allowlist()
+        )
+        reason = quarantine_reason(
+            title=title, content=content, project=project, tags=tags,
+            allowlist=resolved_allowlist,
+        )
+        row_provenance = json.dumps({
+            "project": project, "project_scope": project_scope,
+            "context": origin or source, "ingested_at": _now(),
+            "quarantine_reason": reason,
+        })
         await self.db.execute(
             """INSERT INTO memories
                  (id, type, title, content, file_path, tags, project, source,
-                  confirmed, origin, evidence, project_scope)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  confirmed, origin, evidence, project_scope, quarantined,
+                  provenance)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (mem_id, mem_type, title, content, dedupe_key,
              json.dumps(tags or []), project, source, 1 if confirmed else 0,
              origin, json.dumps(evidence) if evidence is not None else None,
-             project_scope),
+             project_scope, 1 if reason else 0, row_provenance),
         )
         await self.db.commit()
         return mem_id
@@ -2321,6 +2395,7 @@ class Store:
         mem_type: str | None = None, project: str | None = None,
         scope: str | None = None,
         include_global: bool = True, include_archived: bool = False,
+        include_quarantined: bool = False,
     ) -> list[dict[str, Any]]:
         """List memories, optionally scoped to a project.
 
@@ -2336,11 +2411,22 @@ class Store:
         with neither key (``project IS NULL AND project_scope IS NULL``) —
         exactly the pre-B4 rows the old ``project IS NULL`` clause matched,
         since no row had a scope before the column existed.
+
+        ``include_quarantined`` defaults OFF, mirroring ``include_archived``
+        exactly — the P1 brain-hygiene flag (``learning/provenance.py``). This
+        is what makes every caller of ``list_memories`` (the Rules/Skills/
+        Learnings UI, ``nh rules``/``nh skills``, rule injection via
+        ``Orchestrator._load_active_memories``, the learning queue, the
+        curator) honour quarantine without any of them touching this method's
+        callers individually.
         """
         clauses, params = [], []
         if not include_archived:
             # archived is NULL on rows that predate the column — treat as live
             clauses.append("(archived IS NULL OR archived = 0)")
+        if not include_quarantined:
+            # quarantined is NULL on rows that predate the column — treat as live
+            clauses.append("(quarantined IS NULL OR quarantined = 0)")
         if confirmed is not None:
             clauses.append("confirmed = ?")
             params.append(1 if confirmed else 0)
@@ -2599,6 +2685,172 @@ class Store:
         cur = await self.db.execute(
             "UPDATE memories SET archived = 1, content = content || ? "
             "WHERE id = ? AND archived = 0", (suffix, mem_id))
+        await self.db.commit()
+        return cur.rowcount > 0
+
+    async def count_quarantined(self, *, mem_type: str | None = None) -> int:
+        """How many rows carry ``quarantined = 1`` — the honest count the
+        Rules/Skills/Learnings UI footers report (`learning/provenance.py`)."""
+        sql = "SELECT COUNT(*) AS n FROM memories WHERE quarantined = 1"
+        params: tuple[Any, ...] = ()
+        if mem_type is not None:
+            sql += " AND type = ?"
+            params = (mem_type,)
+        row = await self._fetchone(sql, params)
+        return int(row["n"]) if row else 0
+
+    @serialized_write
+    async def set_quarantine(
+        self, mem_id: str, on: bool, reason: str | None = None,
+    ) -> bool:
+        """Flip the P1 brain-hygiene quarantine flag. Never deletes — the same
+        recoverable-row invariant `archive_memory` states above applies here:
+        the row and its dedupe key stay in the database either way.
+
+        Stamps ``provenance.quarantine_reason`` (JSON-merged onto whatever the
+        row already carries) so a manually-quarantined row records why, the
+        same as a write-time quarantine does."""
+        row = await self._fetchone(
+            "SELECT provenance FROM memories WHERE id = ?", (mem_id,))
+        if row is None:
+            return False
+        try:
+            prov = json.loads(row["provenance"]) if row["provenance"] else {}
+        except (ValueError, TypeError):
+            prov = {}
+        if not isinstance(prov, dict):
+            prov = {}
+        prov["quarantine_reason"] = reason if on else None
+        prov["quarantined_at"] = _now() if on else prov.get("quarantined_at")
+        cur = await self.db.execute(
+            "UPDATE memories SET quarantined = ?, provenance = ? WHERE id = ?",
+            (1 if on else 0, json.dumps(prov), mem_id),
+        )
+        await self.db.commit()
+        return cur.rowcount > 0
+
+    @serialized_write
+    async def archive_unconfirmed_older_than(
+        self, *, days: int, source: str = SOURCE_PROPOSED, limit: int = 500,
+        reason: str = "", dry_run: bool = False,
+    ) -> list[str]:
+        """Memory lifecycle C: the 45-day auto-archive sweep for unconfirmed
+        proposals. Reversible — this sets ``archived = 1``, it never deletes,
+        and the same `file_path` dedupe key survives (that is what makes an
+        archive "stick": a re-proposed duplicate still hits it).
+
+        This does NOT call `archive_memory` — that method's ``AND archived =
+        0`` guard silently no-ops on legacy rows where `archived` is NULL
+        (every row written before the column existed), which is exactly the
+        shape the sweep must reach. The WHERE clause below is deliberately
+        wider: ``archived IS NULL OR archived = 0``.
+
+        Mandatory clauses, each closing a specific hole:
+        - ``confirmed = 0`` (literal, not ``IS NULL OR = 0``): an ambiguous
+          row is never swept. This is the AC2 wall — a confirmed row can
+          never match this method's WHERE clause, full stop.
+        - ``source = ?``: never touches board/user-added unconfirmed rows,
+          only the queue-visibility contract's own rows.
+        - ``created_at IS NOT NULL AND created_at != '' AND
+          datetime(created_at) IS NOT NULL AND datetime(created_at) <=
+          datetime('now', ?)``: the comparison runs IN SQL, not in Python.
+          `created_at` has two live formats — the column DEFAULT
+          (``datetime('now')`` → ``"2026-08-12 10:00:00"``) and `_now()`'s ISO
+          (``"2026-08-12T10:00:00+00:00"``) — and ``' ' < 'T'`` lexically, so a
+          Python-side ISO-string cutoff would mark every default-format row as
+          expired regardless of its real age. SQLite's `datetime()` parses
+          both wire formats and returns NULL on anything it cannot parse, so
+          an unparseable `created_at` is skipped rather than archived — fail
+          closed, an absent/garbage input is a refusal, not a sweep target.
+
+        Select-then-update so callers get the ids back (for the sweep's log
+        line and for reversal), then one chunked ``UPDATE ... WHERE id IN
+        (...)`` at 400 binds (same chunking as `touch_memories_used`) rather
+        than N awaited writes behind `serialized_write`'s single connection
+        lock.
+
+        ``limit`` truncates the SELECT (``ORDER BY created_at ASC`` — oldest
+        first) and does not, itself, sweep everything eligible; callers that
+        care must log when ``len(result) == limit`` since a truncated sweep
+        looks identical to a complete one otherwise.
+
+        ``dry_run=True`` returns the ids that WOULD be archived and writes
+        nothing.
+
+        Raises ``ValueError`` if ``days < 1`` — a zero or negative window
+        would archive rows written this very second.
+        """
+        if days < 1:
+            raise ValueError(f"days must be >= 1, got {days}")
+        rows = await self._fetchall(
+            "SELECT id FROM memories WHERE confirmed = 0 AND source = ? "
+            "AND (archived IS NULL OR archived = 0) "
+            "AND created_at IS NOT NULL AND created_at != '' "
+            "AND datetime(created_at) IS NOT NULL "
+            "AND datetime(created_at) <= datetime('now', ?) "
+            "ORDER BY created_at ASC LIMIT ?",
+            (source, f"-{days} days", limit),
+        )
+        ids = [r["id"] for r in rows]
+        if not ids or dry_run:
+            return ids
+        suffix = f"\n\n[archived: {reason}]" if reason else ""
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            marks = ", ".join("?" for _ in chunk)
+            await self.db.execute(
+                f"UPDATE memories SET archived = 1, content = content || ? "
+                f"WHERE id IN ({marks})",
+                (suffix, *chunk),
+            )
+        await self.db.commit()
+        return ids
+
+    @serialized_write
+    async def supersede_memory(
+        self, old_id: str, new_id: str, reason: str = "",
+    ) -> bool:
+        """Archive *old_id* with a `superseded_by` pointer to *new_id* — the
+        AC3 mechanism: confirming a near-duplicate archives the old row rather
+        than leaving two active copies of the same rule.
+
+        Refuses (returns False, writes nothing) when:
+        - ``old_id == new_id`` — a row cannot supersede itself.
+        - either id does not exist.
+        - ``old_id`` is already archived (nothing to supersede — it is
+          already inert).
+        - ``new_id`` is itself archived, or itself already superseded — no
+          chains and no cycles: a pointer always resolves to exactly one live
+          row in one hop.
+
+        This method does NOT forbid archiving a ``confirmed = 1`` row — that
+        IS the supersede case (an old confirmed rule superseded by a new one)
+        — so the "never auto-archive a confirmed row" guarantee lives in the
+        CALLER (`LearningQueue.confirm`, which only ever calls this on the
+        row it just confirmed superseding an EXISTING near-duplicate that the
+        human's own confirm click just judged redundant — never unattended).
+        """
+        if old_id == new_id:
+            return False
+        old_row = await self._fetchone(
+            "SELECT id, archived FROM memories WHERE id = ?", (old_id,))
+        new_row = await self._fetchone(
+            "SELECT id, archived, superseded_by FROM memories WHERE id = ?",
+            (new_id,))
+        if old_row is None or new_row is None:
+            return False
+        if old_row["archived"]:
+            return False
+        if new_row["archived"] or new_row["superseded_by"]:
+            return False
+        suffix = f"\n\n[archived: {reason}]" if reason else ""
+        cur = await self.db.execute(
+            "UPDATE memories SET archived = 1, superseded_by = ?, "
+            "content = content || ? "
+            "WHERE id = ? AND (archived IS NULL OR archived = 0) "
+            "AND superseded_by IS NULL",
+            (new_id, suffix, old_id),
+        )
         await self.db.commit()
         return cur.rowcount > 0
 
