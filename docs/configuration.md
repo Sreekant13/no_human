@@ -19,6 +19,23 @@ changes in code and not here fails the suite.
 | `server.port` | `8420` | Web board bind port |
 | `concurrency.enabled` | `false` | Parallel task workers, each in its own worktree |
 | `ci.enabled` | `false` | Trigger and poll GitLab CI, GitHub Actions, Jenkins or CircleCI |
+| `pipeline.review_routing.enabled` | `true` | Review depth scales with diff size — see below |
+| `pipeline.review_routing.max_diff_lines` | `200` | The single-turn-gate threshold, in added+deleted lines |
+
+Review depth scales with diff size: a gate review of a diff at or under
+`max_diff_lines` changed lines runs SINGLE-TURN, no tools — the diff, the full
+text of every changed file, lint and wiring evidence are already in the
+prompt, so the exploration turns buy nothing. Any diff containing a
+risk-flagged pattern ALWAYS gets the full multi-round review regardless of
+size: a guard/scrub function touched (detected by path AND by diff content,
+so a guard function in an otherwise generic file — e.g. `install_pre_push_guard`
+in `vcs/push_hook.py` — is still caught), a test file deleted or renamed away,
+or a security-sensitive path (`auth`, `crypt`, `secret`, `credential`, `token`,
+`key`, `.env`, `config.yaml`, `config.py`, `.github/workflows/**`,
+`.githooks/**`) — as does a diff too big to measure (binary) or a re-review
+after a prior round already failed. `enabled: false` restores the
+pre-2026-08-14 behaviour (every gate review is full). See
+`src/no_human/core/review_routing.py`.
 
 Concurrency ships off, and `concurrency.max_workers` defaults to 2 when you turn
 it on. In the default `subscription` mode a present `ANTHROPIC_API_KEY` aborts

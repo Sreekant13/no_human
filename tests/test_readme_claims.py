@@ -121,6 +121,7 @@ def _resolve(path: str):
 REQUIRED_ROWS = {
     "server.port", "llm.primary_model", "llm.review_model",
     "bounds.max_attempts", "bounds.max_turns_per_attempt",
+    "pipeline.review_routing.enabled", "pipeline.review_routing.max_diff_lines",
 }
 
 

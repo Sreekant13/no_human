@@ -12068,6 +12068,10 @@ class Orchestrator:
             raise TypeError(
                 "confirmed_rules is computed by _run_reviewer (the "
                 "gate-independence channel), never passed by the caller")
+        if "single_turn" in kwargs:
+            raise TypeError(
+                "single_turn is computed by _run_reviewer from "
+                "review_routing.route, never passed by the caller")
         # Escalation checkpoint 2 of 2, and the last one that can still matter:
         # what the coder ACTUALLY changed. The tier was granted on a prediction;
         # the diff is the fact. Anything outside ≤2 prose files gets the full
@@ -12118,6 +12122,40 @@ class Orchestrator:
                     task,
                     "the diff edits agent instructions or gate control data "
                     f"({', '.join(changed)}) — the review is not bounded")
+        # Review depth scales with diff size (2026-08-14): a small, risk-free
+        # diff gets a single-turn gate instead of the full multi-round review.
+        # A pure pre-processing filter over what git says changed — never a
+        # judgment the model makes about itself — so it runs BEFORE
+        # `reviewer.review` is ever reached, same as the trivial-tier
+        # checkpoint above it. Only for a real gate review of the actual
+        # working diff: `code_review`/`already_satisfied`/`tamper_adjudication`
+        # set `mode`, and a caller-supplied `diff_override` has no refs to
+        # read a fresh diff from — both already have their own depth rules.
+        # A diff that already failed a review round earns the full depth
+        # back: `prior_rounds` (the caller-computed review-continuity block,
+        # see `_review_continuity`) is non-empty from round 2 on.
+        if (kwargs.get("mode", "gate") == "gate"
+                and "diff_override" not in kwargs
+                and not kwargs.get("prior_rounds")):
+            from . import review_routing
+            rt_repo_path = kwargs["repo_path"]
+            rt_before = kwargs.get("before_ref") or "HEAD~1"
+            rt_after = kwargs.get("after_ref") or "HEAD"
+            try:
+                rt_enabled, rt_max_lines = review_routing.routing_config(self.config)
+                rt_entries = review_routing.changed_entries(rt_repo_path, rt_before, rt_after)
+                rt_lines = review_routing.diff_line_count(rt_repo_path, rt_before, rt_after)
+                rt_route, rt_why = review_routing.route(
+                    entries=rt_entries, line_count=rt_lines,
+                    enabled=rt_enabled, max_lines=rt_max_lines,
+                    repo_path=rt_repo_path, before=rt_before, after=rt_after,
+                )
+            except Exception as exc:  # noqa: BLE001 — any failure routes FULL
+                rt_route = review_routing.Route.FULL_REVIEW
+                rt_why = f"routing check failed ({type(exc).__name__})"
+            self.emit("review_routing", rt_why, route=rt_route.value)
+            if rt_route is review_routing.Route.SINGLE_TURN:
+                kwargs["single_turn"] = True
         return await self.reviewer.review(
             task,
             confirmed_rules=self._format_reviewer_memories() or "",

@@ -1835,6 +1835,7 @@ class AdversarialReviewer:
         draft_pr_absent: str = "",
         linked_repos: list[tuple[Path, str]] | None = None,
         tamper_findings: str = "",
+        single_turn: bool = False,
     ) -> ReviewDecision:
         # Tamper-adjudication mode: the tamper guard fired and something has to
         # decide whether the TICKET required those test changes (see
@@ -1950,6 +1951,22 @@ class AdversarialReviewer:
                 )
             except Exception as exc:  # noqa: BLE001 — advisory, never blocks review
                 wiring_evidence = _evidence_failure_marker("wiring", exc)
+        # Review depth scales with diff size: a small, risk-free diff (routed
+        # by `core/review_routing.route`, called before this method) gets the
+        # same single-turn, no-tools treatment as `diff_override` — the diff,
+        # the full text of every changed file, lint and wiring evidence are
+        # already assembled above with zero tool calls, so the exploration
+        # turns buy nothing. Guarded by completeness, independent of what the
+        # router decided: `_full_file_context` includes a changed file WHOLE
+        # OR NOT AT ALL, so an omission (a small-by-line-count edit to a large
+        # file — orchestrator.py, reviewer.py, exactly the files this repo
+        # edits) or a diff cut by `_DIFF_CAP` means the `allow_tools=False`
+        # prompt would be missing something it also cannot go read — that
+        # always takes the multi-turn path regardless of the route.
+        route_single_turn = (
+            single_turn and not diff_override
+            and not omitted_files and diff_total_len == len(diff)
+        )
         prompt = _build_review_prompt(
             task,
             diff,
@@ -1964,14 +1981,15 @@ class AdversarialReviewer:
             linked_section=linked_section,
             lint_evidence=lint_evidence,
             wiring_evidence=wiring_evidence,
-            allow_tools=not diff_override,
+            allow_tools=not diff_override and not route_single_turn,
             draft_pr=draft_pr,
             draft_pr_absent=draft_pr_absent,
         )
 
-        # When the diff is already provided, use a single-turn call (no tools).
-        # The model has everything it needs in the prompt — no repo exploration.
-        if diff_override:
+        # When the diff is already provided (or routed single-turn), use a
+        # single-turn call (no tools). The model has everything it needs in
+        # the prompt — no repo exploration.
+        if diff_override or route_single_turn:
             decision = await self._fast_review(prompt, repo_path, before_ref=before_ref)
             # R17: `_fast_review` has no no-verdict interception of its own, so
             # this exit used to hand the fail-closed sentinel to the verdict

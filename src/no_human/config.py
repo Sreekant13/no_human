@@ -1220,6 +1220,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # What this never touches: the review gate itself, the tamper guard,
         # the export gate, and the human merge.
         "trivial_tier": {"enabled": True},
+        # Review depth scales with diff size (2026-08-14). A gate review of a
+        # diff at or under `max_diff_lines` changed (added+deleted) lines
+        # runs SINGLE-TURN, no tools: the diff, the full text of every changed
+        # file, lint and wiring evidence are already in the prompt, so the
+        # exploration turns buy nothing. A diff containing a risk-flagged
+        # pattern — a guard/scrub function touched (by path OR by content), a
+        # deleted/renamed-away test file, or a security-sensitive path —
+        # ALWAYS gets the full multi-round review regardless of size; so does
+        # a diff too big to measure (binary) or a re-review after a prior
+        # round failed. See `core/review_routing.py`. `enabled: false`
+        # restores the pre-2026-08-14 behaviour (every gate review is full).
+        "review_routing": {"enabled": True, "max_diff_lines": 200},
     },
     "planning": {
         # Plan-first worker (Phase 1): generate a detailed implementation plan
