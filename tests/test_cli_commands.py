@@ -184,6 +184,156 @@ def test_approve_wrong_status(tmp_path, monkeypatch):
     assert "not awaiting_approval" in output or "cannot approve" in output
 
 
+def _git(repo, *args, check=True):
+    import subprocess
+    return subprocess.run(["git", "-C", str(repo), *args], check=check,
+                          capture_output=True, text=True)
+
+
+def _git_out(repo, *args) -> str:
+    return _git(repo, *args).stdout.strip()
+
+
+def _make_landed_repo(tmp_path) -> Path:
+    repo = tmp_path / "landed_repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("orig\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "initial")
+    return repo
+
+
+def _seed_landed_task(db_path: Path, repo_path: Path, *,
+                      status=TaskStatus.AWAITING_APPROVAL) -> str:
+    async def _go():
+        async with Store(db_path) as s:
+            t = Task.new("landed-check", repo_path=str(repo_path))
+            t.context = {"base_branch": "main", "pr_branch": ""}
+            await s.create_task(t)
+            if status is not TaskStatus.PENDING:
+                await s.set_status(t, status, validate=False)
+            return t.id
+    return asyncio.run(_go())
+
+
+def test_approve_landed_override_completes(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    repo = _make_landed_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    tid = _seed_landed_task(db, repo)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, [
+        "approve", tid[:8], "--landed", sha,
+        "--because", "supervisor squash train 15",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert "override" in result.output.lower()
+
+    refreshed = _get_task(db, tid)
+    assert refreshed.status is TaskStatus.DONE
+    events = _list_events(db, tid)
+    assert any(e.get("kind") == "approved_landed_override" for e in events)
+    ev = [e for e in events if e.get("kind") == "approved_landed_override"][0]
+    assert ev["sha"] == sha
+    assert ev["justification"] == "supervisor squash train 15"
+    assert "residue" in ev
+
+
+def test_approve_landed_requires_justification(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    repo = _make_landed_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    tid = _seed_landed_task(db, repo)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["approve", tid[:8], "--landed", sha])
+
+    assert result.exit_code != 0
+    refreshed = _get_task(db, tid)
+    assert refreshed.status is TaskStatus.AWAITING_APPROVAL
+    assert _list_events(db, tid) == []
+
+
+def test_approve_landed_refuses_blank_justification(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    repo = _make_landed_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    tid = _seed_landed_task(db, repo)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, [
+        "approve", tid[:8], "--landed", sha, "--because", "   ",
+    ])
+
+    assert result.exit_code != 0
+    refreshed = _get_task(db, tid)
+    assert refreshed.status is TaskStatus.AWAITING_APPROVAL
+    assert _list_events(db, tid) == []
+
+
+def test_approve_landed_refuses_unknown_sha(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    repo = _make_landed_repo(tmp_path)
+    _git(repo, "checkout", "-b", "side")
+    (repo / "a.txt").write_text("side\n")
+    _git(repo, "commit", "-am", "side: never merged")
+    side_sha = _git_out(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "main")
+    tid = _seed_landed_task(db, repo)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, [
+        "approve", tid[:8], "--landed", side_sha,
+        "--because", "asserting anyway",
+    ])
+
+    assert result.exit_code != 0
+    assert "not an ancestor" in result.output.lower()
+    refreshed = _get_task(db, tid)
+    assert refreshed.status is TaskStatus.AWAITING_APPROVAL
+    assert _list_events(db, tid) == []
+
+
+def test_approve_landed_refuses_wrong_task_status(tmp_path, monkeypatch):
+    db = tmp_path / "test.db"
+    repo = _make_landed_repo(tmp_path)
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    tid = _seed_landed_task(db, repo, status=TaskStatus.IMPLEMENTING)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, [
+        "approve", tid[:8], "--landed", sha, "--because", "asserting anyway",
+    ])
+
+    assert result.exit_code != 0
+    output = result.output.lower()
+    assert "not awaiting_approval" in output
+    refreshed = _get_task(db, tid)
+    assert refreshed.status is TaskStatus.IMPLEMENTING
+
+
+def test_approve_without_landed_is_unchanged(tmp_path, monkeypatch):
+    """Regression guard: adding --landed/--because must not disturb the plain
+    `nh approve <id>` path — same assertions as test_approve_awaiting_task."""
+    db = tmp_path / "test.db"
+    task_id = _seed_task(db, TaskStatus.AWAITING_APPROVAL)
+    _seed_attempt(db, task_id, pr_url="https://example.com/pr/1")
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, ["approve", task_id[:8]])
+
+    assert result.exit_code == 0, result.output
+    assert "approved" in result.output.lower()
+    assert "https://example.com/pr/1" in result.output
+    refreshed = _get_task(db, task_id)
+    assert refreshed.context.get("approved_at") is not None
+
+
 def test_approve_unknown_id(tmp_path, monkeypatch):
     db = tmp_path / "test.db"
     _seed_task(db, TaskStatus.PENDING)  # ensure DB exists

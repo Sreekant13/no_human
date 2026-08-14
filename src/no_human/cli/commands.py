@@ -3959,10 +3959,43 @@ def _review_pass_evidence(context: dict, head_sha: str, repo) -> tuple[bool, str
 
 @cli.command("approve")
 @click.argument("task_id")
-def approve(task_id):
+@click.option("--landed", "landed_sha", default=None,
+              help="Human landed-override: assert this task's content landed "
+                   "at this commit (an ancestor of its base branch), when "
+                   "automated containment refuses on a supervisor-adapted "
+                   "squash train. Requires --because.")
+@click.option("--because", "justification", default=None,
+              help="Required with --landed: why a human is asserting this "
+                   "landed rather than letting containment decide.")
+def approve(task_id, landed_sha, justification):
     """Approve and merge — squash-lands the PR under the operator identity
     (the agent still never merges on its own)."""
     config, _ = _bootstrap(require_auth=False)
+
+    if landed_sha is not None:
+        async def _go_landed():
+            from ..blockers.landed_override import OverrideRefused, approve_landed_override
+            async with Store(config.db_path) as store:
+                t = await store.find_task(task_id)
+                if not t:
+                    print_no_task_matching(task_id)
+                    sys.exit(1)
+                try:
+                    result = await approve_landed_override(
+                        store, t, landed_sha, justification or "")
+                except OverrideRefused as exc:
+                    console.print(f"[bold red]refused:[/] {exc.reason}")
+                    sys.exit(1)
+                residue = result["residue"]
+                residue_text = ", ".join(residue) if residue else "none"
+                console.print(
+                    f"[bold green]override recorded[/] — {t.id[:8]} completed on "
+                    f"human assertion that content landed at {landed_sha[:12]}. "
+                    f"residue: {residue_text}"
+                )
+
+        asyncio.run(_go_landed())
+        return
 
     async def _go():
         async with Store(config.db_path) as store:

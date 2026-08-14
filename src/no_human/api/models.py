@@ -592,6 +592,15 @@ class ShippedRequest(BaseModel):
     note: str | None = None
 
 
+class LandedOverrideRequest(BaseModel):
+    # Unlike ShippedRequest, `sha` here IS verified — commit_is_ancestor
+    # against the task's recorded base_branch — and `justification` is
+    # required (non-empty, enforced server-side): see
+    # blockers/landed_override.py's approve_landed_override.
+    sha: str
+    justification: str
+
+
 class SaveIntegrationConfigRequest(BaseModel):
     fields: dict[str, str] = {}
 

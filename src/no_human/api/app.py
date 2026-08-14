@@ -52,9 +52,9 @@ from ..vcs.task_pr import task_has_pr_evidence
 from .models import (
     AttemptOut, BoardPayload, CreateProjectRequest, CreateTaskRequest,
     GrillQuestionOut, GrillResultOut, GrillStepRequest, IntegrationSetupRequest,
-    ImportedInfo, ProjectOut, ReplyRequest, SaveIntegrationConfigRequest,
-    SendBackRequest, ShippedRequest, TaskOut, TaskSummaryOut, TrackerIssueOut,
-    UpdateProjectRequest,
+    ImportedInfo, LandedOverrideRequest, ProjectOut, ReplyRequest,
+    SaveIntegrationConfigRequest, SendBackRequest, ShippedRequest, TaskOut,
+    TaskSummaryOut, TrackerIssueOut, UpdateProjectRequest,
 )
 
 import logging
@@ -964,6 +964,56 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
         "ok": True,
         "message": message,
         "landed_sha": landed_sha,
+    }
+
+
+@app.post("/api/tasks/{task_id}/approve-landed")
+async def approve_landed(
+    task_id: str, body: LandedOverrideRequest, request: Request,
+) -> dict[str, Any]:
+    """The HUMAN landed-override affirmation: a human asserts (with required
+    justification) that an ``awaiting_approval`` task's content landed at
+    ``sha`` — for the narrow class where automated containment honestly
+    refuses (a supervising session's squash train adapted the content: a
+    later train car's classification-decision edits, or a real union-resolved
+    source conflict, so no candidate commit's tree matches the branch
+    verbatim). See ``blockers/landed_override.py`` for the full contract.
+
+    This is deliberately additive and non-idempotent: a second call on the
+    same task 409s (the task is DONE), so a replay cannot append a duplicate
+    override event. It never merges, pushes, or touches git state — the
+    override is a recorded human assertion, not a merge action (constraint
+    #2: the agent never merges; there is nothing to merge here)."""
+    from ..blockers.landed_override import OverrideRefused, approve_landed_override
+
+    store = _store(request)
+    task = await _require_task(store, task_id)
+    if task.status != TaskStatus.AWAITING_APPROVAL:
+        raise HTTPException(
+            status_code=409,
+            detail=f"task is {task.status.value!r}, not awaiting_approval",
+        )
+    try:
+        result = await approve_landed_override(store, task, body.sha, body.justification)
+    except OverrideRefused as exc:
+        raise HTTPException(status_code=400, detail=exc.reason)
+
+    tasks = await _board_tasks(store, scheduler=_sched(request))
+    await _mgr.broadcast({
+        "type": "task_approved",
+        "task_id": task.id,
+        "tasks": [t.model_dump() for t in tasks],
+    })
+    await _mgr.broadcast({
+        "type": "task_updated", "task_id": task.id,
+        "status": TaskStatus.DONE.value,
+        "tasks": [t.model_dump() for t in tasks],
+    })
+    return {
+        "ok": True,
+        "message": result["text"],
+        "sha": result["sha"],
+        "residue": result["residue"],
     }
 
 

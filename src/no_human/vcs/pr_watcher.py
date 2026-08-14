@@ -1169,6 +1169,42 @@ async def _contained_at(repo_path: str, commit: str, branch: str) -> bool:
     return True
 
 
+async def containment_residue(repo_path: str, commit: str, branch: str) -> list[str] | None:
+    """Paths that keep ``branch`` from being contained at ``commit`` — the
+    honest reason automated containment refused, exposed for the audit
+    trail a human override records. ``None`` means the question could not be
+    asked at all (a git failure); ``[]`` means ``branch`` IS contained.
+
+    Mirrors ``_contained_at``'s body (both directions, ``_GENERATED_LEDGERS``,
+    classification-settled forgiveness) but *returns* the residue rather than
+    reducing it to a bool. Deliberately NOT a refactor of ``_contained_at`` to
+    call this and check emptiness: ``_contained_at`` short-circuits on the
+    FIRST direction that fails, because for a plain yes/no that is the
+    cheaper answer (one `merge-tree` instead of two on the common failing
+    case); this function needs to see BOTH directions before it can report
+    the full, honest residue, so it always evaluates both and unions them.
+    Do not fold this back into a shared body without keeping that split.
+    """
+    rc, tree = await _git_rc(repo_path, "rev-parse", f"{commit}^{{tree}}")
+    if rc != 0 or not tree:
+        return None
+    settled_classification: bool | None = None
+    union: set[str] = set()
+    for ours, theirs in ((commit, branch), (branch, commit)):
+        unsettled = await _unsettled_paths(repo_path, tree, ours, theirs)
+        if unsettled is None:
+            return None
+        residue = unsettled - _GENERATED_LEDGERS
+        if residue == {_CLASSIFICATION_LEDGER}:
+            if settled_classification is None:
+                settled_classification = await _classification_settled(
+                    repo_path, commit, branch)
+            if settled_classification:
+                residue = set()
+        union |= residue
+    return sorted(union)
+
+
 async def _branch_paths(repo_path: str, base_tip: str, branch: str) -> list[str] | None:
     """Paths ``branch`` has touched since it diverged from ``base_tip`` —
     the path filter that keeps the history scan in ``branch_landed_commit``
