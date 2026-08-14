@@ -171,6 +171,12 @@ EventSink = Callable[[dict], None]
 # planners. The UI folds `planner:<lens>` and `aggregator` back onto one Planner
 # node; the raw value is kept on the event so the lens is never lost.
 CODER_ROLE = "agent"
+# Cadence for the coder-in-attempt cache telemetry (`cache_burn` events,
+# below): every Nth "usage" message on the coder's OWN session, so a live
+# attempt is visible in `nh logs` / the board before it exits rather than
+# only at the end (the "nh logs hides cache burn" class — tokens=731 for a
+# 4M-token attempt).
+_CACHE_BURN_EVERY = 10
 PLANNER_ROLE = "planner"
 AGGREGATOR_ROLE = "aggregator"
 # The review gate. Unlike every other role this source is OVERLOADED: it is
@@ -1017,6 +1023,15 @@ class Orchestrator:
     def emit(self, kind: str, text: str = "", **meta: Any) -> None:
         self._sink({"source": "orchestrator", "kind": kind, "text": text, **meta})
 
+    def _on_coder_compact(self, trigger: str) -> None:
+        """The coder session's PreCompact hook (`_make_compact_hook`). Bumps
+        the per-attempt counter `cache_burn` events report (AC2 — the
+        observable that proves the AC1 config fix actually fires) and keeps
+        emitting the human-readable timeline event this replaced."""
+        self._attempt_compactions = getattr(self, "_attempt_compactions", 0) + 1
+        self.emit("compaction", f"context compaction fired ({trigger})",
+                   compactions=self._attempt_compactions)
+
     async def _repro_base_ref(
         self, repo_path: Path, base: str, *, resume_shape: bool = False,
     ) -> str:
@@ -1516,6 +1531,29 @@ class Orchestrator:
                     usage["output_tokens"] = int(
                         usage["output_tokens"] or 0) + int(
                         event.meta["output_tokens"])
+                # Per-attempt cache telemetry (AC2): the attempt row only
+                # fills `cache_read_tokens`/`cache_creation_tokens` in at
+                # attempt EXIT (see the abort handlers above and the success
+                # path), so a live multi-million-token attempt reads as zero
+                # until then. Emitting a running total here, at a cadence
+                # rather than every message, makes it visible mid-flight in
+                # `nh logs` and the board without spamming the event log.
+                if usage["assistant_messages"] % _CACHE_BURN_EVERY == 0:
+                    self.emit(
+                        "cache_burn",
+                        f"cache burn: {usage['cache_read_tokens']:,} read + "
+                        f"{usage['cache_creation_tokens']:,} creation "
+                        f"({usage['assistant_messages']} msgs)",
+                        cache_read=usage["cache_read_tokens"],
+                        cache_creation=usage["cache_creation_tokens"],
+                        tokens_used=usage["tokens_used"],
+                        total=(usage["cache_read_tokens"]
+                               + usage["cache_creation_tokens"]
+                               + usage["tokens_used"]),
+                        attempt_number=getattr(
+                            self, "_active_attempt_number", None),
+                        compactions=getattr(self, "_attempt_compactions", 0),
+                    )
                 # COST-WEIGHTED, matching the ceiling's unit (core.pricing).
                 # The counters above stay RAW because they are what gets
                 # persisted to the attempt row; only the comparison is priced.
@@ -2974,6 +3012,9 @@ class Orchestrator:
         self._active_repo_root: str = str(repo.path)
         # Scopes the cancellation signal to the task whose session is running.
         self._active_task_id = task.id
+        # `_agent_sink` stamps this on every `cache_burn` event so a reader
+        # can tell which attempt a live (not-yet-persisted) figure belongs to.
+        self._active_attempt_number = attempt_seq
         # B3: (repo, commit, command) -> TestRunResult, for this attempt only.
         # Never spans attempts: attempt N+1 has a different commit anyway, and a
         # stale entry feeding the review gate would be a false pass. The key also
@@ -3489,8 +3530,7 @@ class Orchestrator:
                         effort="high",
                         on_event=self._agent_sink,
                         supervisor_hook=supervisor,
-                        on_compact=lambda trigger: self.emit(
-                            "compaction", f"context compaction fired ({trigger})"),
+                        on_compact=self._on_coder_compact,
                         **extra,
                     ),
                     timeout=attempt_timeout_s,
@@ -9448,6 +9488,11 @@ class Orchestrator:
             # attempt whose context is simply too big (a handful).
             "assistant_messages": 0,
         }
+        # Per-attempt compaction counter (AC2's proof that the AC1 config fix
+        # actually fires): reset here alongside `_attempt_usage`, incremented
+        # by the coder's `on_compact` hook, and reported on every
+        # `cache_burn` event so a reader can see whether compaction ever ran.
+        self._attempt_compactions = 0
         ceiling, label = remaining_tokens, "the task's remaining lifetime budget"
         if attempt_cap is not None and attempt_cap < remaining_tokens:
             ceiling, label = attempt_cap, "the per-attempt cap"

@@ -54,6 +54,13 @@ PreCompact events ever fired    0
    a compaction knob, and do not rebuild SDK-owned compaction (per the project's lean-stack
    constraint: the product keeps a single Claude backend via the Agent SDK and never
    re-implements capabilities the SDK already owns).
+   **CORRECTION (coder-in-attempt cache-burn ticket, landed — see Lever 2 below):** "nothing to
+   engage" was the wrong read of the same fact. Auto-compaction never fired because its window
+   defaults to the ~200k-token full model context, and the coder's own context plateaus around
+   170k — under the threshold, not past a ceiling that doesn't exist. The fix is still not a
+   rebuild: it sets `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, an env var the bundled CLI already reads,
+   to 140k for the coder role only. Configuring the SDK's own compaction is the opposite of
+   re-implementing it.
 2. **The seed is not the whale.** It was already dieted in C1 (−43%) and is now ~6.4k tokens —
    **10%** of the 65.5k re-read each turn. Halving it again would cut ~5% of the burn. Worth
    little.
@@ -67,6 +74,43 @@ task, and each is rejected if the review pass-rate moves:
 - prune/summarise stale tool output (a file read 20 turns ago is re-read 20 times);
 - isolate exploration in a sub-agent so its transcript never enters the main context;
 - cut turns (33 median): every turn removed saves a full 65.5k re-read.
+
+## Lever 2 — the coder's compaction window (landed)
+
+The coder-in-attempt cache-burn ticket (refile of 83b51a6e). `agent/backend.py::make_backend`
+now resolves `bounds.coder_compact_window_tokens` (default
+`DEFAULT_CODER_COMPACT_WINDOW_TOKENS = 140_000`, fail-closed on a bad value) and passes it to
+`ClaudeBackend(compact_window_tokens=...)`, which sets
+`ClaudeAgentOptions.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]` — scoped to the coder role only,
+never reviewer/planner/utility/supervisor/distill. `orchestrator.py` adds `cache_burn` telemetry
+(a running-total event every 10th coder message) and a per-attempt compaction counter
+(`_on_coder_compact`), both surfaced live in `nh logs` — the observable proof the config actually
+fires, since real compaction had 0 historical occurrences before this change.
+
+**Measured before/after**, `scripts/measure_cache_burn.py --db ~/.no_human/no_human.db --role
+coder` (652 real coder attempts, replaying each attempt's real recorded `cache_creation_tokens`
+growth through a counterfactual: as-recorded — no compaction, matching the 0-events history above
+— versus windowed at 140k):
+
+```
+652 real coder attempts, window=140,000 tokens, post-compact floor=30% of window
+(estimate — no historical compaction event exists to measure this from):
+  median modelled burn: 8,171,012 -> 5,952,536 (30.9% reduction)
+  P95 modelled burn:    56,951,074 -> 19,370,621
+  simulated compactions across all attempts: 789
+```
+
+**Honest limits, stated rather than buried:** this is an offline replay, not a live benchmark
+re-run — no benchmark infrastructure was available in this session to launch real before/after
+coder attempts, and the vendor CLI's actual compaction behaviour is opaque and cannot be
+re-simulated exactly. The post-compaction floor (what compaction resets the running context DOWN
+to) is an estimate (30% of the window) because zero historical compaction events exist to measure
+it from; the growth *inputs* driving the replay are real, per-turn `cache_creation_tokens` figures
+already recorded by the product, not synthetic. Both the as-recorded and windowed series are built
+from the identical growth input, so the windowed total can only ever be lower — a structural
+guarantee pinned by a regression test in `tests/test_measure_cache_burn.py`, which also caught and
+fixed a real bug (an earlier version of the script diffed the noisier `cache_read_tokens` column
+directly and produced attempts where "after" came out higher than "before").
 
 ## What the cost surfaces now say (and what they still cannot see)
 

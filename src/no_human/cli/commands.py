@@ -4415,6 +4415,22 @@ def logs(task_id):
             if not attempts:
                 console.print("[dim]no attempts yet[/]")
                 return
+            # Per-attempt cache telemetry (coder-in-attempt cache-burn ticket).
+            # A running (or aborted-before-exit) attempt has NOT yet had its
+            # `cache_read_tokens`/`cache_creation_tokens` columns filled — those
+            # write only at attempt exit — so it would otherwise print as free.
+            # `cache_burn` task_events carry the running total mid-flight; the
+            # newest one per attempt_number is the live figure, and its
+            # `compactions` count is the observable proof the AC1 config fix
+            # actually fired.
+            _cache_events = {}
+            for _e in await store.list_events(t.id):
+                if _e.get("kind") != "cache_burn":
+                    continue
+                _an = _e.get("attempt_number")
+                _prev = _cache_events.get(_an)
+                if _prev is None or (_e.get("ts") or 0) >= (_prev.get("ts") or 0):
+                    _cache_events[_an] = _e
             for a in attempts:
                 import json as _json
                 tr_raw = a.get("test_results")
@@ -4437,6 +4453,12 @@ def logs(task_id):
                 _spend, _burn = _attempt_tokens(a)
                 _fmt = lambda v: f"{v:,}" if v is not None else "?"
                 _plain = a.get("tokens_used")
+                # The newest `cache_burn` event for THIS attempt, if any —
+                # the live figure for a running (or aborted-before-exit)
+                # attempt whose persisted cache columns are still 0/NULL, and
+                # the source of the compaction count either way (AC2).
+                _live = _cache_events.get(a.get("attempt_number"))
+                _compactions = (_live or {}).get("compactions") or 0
                 console.print(
                     f"\n  [bold]attempt #{a['attempt_number']}[/] "
                     f"[{status_color}]{a.get('status', '?')}[/]  "
@@ -4454,8 +4476,26 @@ def logs(task_id):
                     # even before the re-pricing — the sink and the lifetime
                     # ledger have summed cache creation since the twelve-column
                     # fix. It is now counted at 1.25x, the dearest of the three.
-                    f"{a.get('cache_creation_tokens') or 0:,}[/]"
+                    f"{a.get('cache_creation_tokens') or 0:,}"
+                    + (f" · compactions {_compactions:,}" if _compactions else "")
+                    + "[/]"
                 )
+                # A running/aborted-before-exit attempt has 0/NULL in the
+                # persisted cache columns above — the row only fills in at
+                # attempt EXIT — which used to read as "cheap" for exactly the
+                # attempts that most need attention (the "nh logs hides cache
+                # burn" class: tokens=731 for a 4M-token attempt). Never print
+                # a bare 0 here: fail loud with either the live figure or an
+                # explicit "not yet reported".
+                if not (a.get("cache_read_tokens") or a.get("cache_creation_tokens")):
+                    if _live is not None:
+                        console.print(
+                            f"    [yellow]cache (live): read "
+                            f"{_live.get('cache_read', 0):,} · creation "
+                            f"{_live.get('cache_creation', 0):,}[/]"
+                        )
+                    else:
+                        console.print("    [dim]cache: not yet reported[/]")
                 # WHERE the burn went, by named role. The line above breaks
                 # out the coder alone, which answers "how much" and never
                 # "which role" — and the roles are the only handle anyone has

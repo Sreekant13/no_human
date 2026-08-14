@@ -517,8 +517,19 @@ class ClaudeBackend:
         tool_result_caps: dict[str, int] | None = None,
         tools: list[str] | None = None,
         system_prompt: str | None = None,
+        compact_window_tokens: int | None = None,
     ):
         self.model = model
+        # The auto-compaction window override (coder cache-burn ticket). `None`
+        # (the default for every existing construction site — reviewer,
+        # planner, utility, supervisor, distiller) means "leave the CLI's own
+        # default alone"; only `make_backend`'s coder path ever sets this.
+        # `_options()` turns it into `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, the env
+        # var the bundled CLI reads — auto-compaction is on by default but its
+        # window defaults to the full model context (~200k), while the coder's
+        # measured context plateaus around ~170k, so it rarely fires without
+        # this override.
+        self.compact_window_tokens = compact_window_tokens
         self.forbidden_paths = forbidden_paths or [".env", "secrets/", "*.key", "*.pem"]
         self.never_push_to = never_push_to or ["main", "master", "release/*"]
         # bypassPermissions: unattended autonomy. The PreToolUse guard is the
@@ -628,6 +639,14 @@ class ClaudeBackend:
             )
         if agents:
             kwargs["agents"] = agents
+        if self.compact_window_tokens:
+            # Additive: ClaudeAgentOptions.env merges into the subprocess
+            # environment rather than replacing it, and this is a fresh
+            # options object per call, so nothing here can leak across a
+            # reused backend instance or another role's session.
+            kwargs["env"] = {
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(int(self.compact_window_tokens))
+            }
         # ALWAYS set explicitly. Never leave this to the SDK default.
         #
         # This block used to set the field only for writing or skilled sessions

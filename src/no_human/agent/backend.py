@@ -48,9 +48,12 @@ the exactly-one-billing-path scrub live.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Protocol, runtime_checkable
+
+log = logging.getLogger("no_human.agent.backend")
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .supervisor import SupervisorHook
@@ -257,6 +260,43 @@ def resolve_backend_name(config: dict[str, Any] | None, *, role: str = "coder") 
     return str(((config or {}).get("worker") or {}).get("backend") or "claude")
 
 
+#: The coder's `CLAUDE_CODE_AUTO_COMPACT_WINDOW` override when
+#: `bounds.coder_compact_window_tokens` is absent from config. Below the
+#: ~170k-token context plateau measured on real coder attempts (the CLI's own
+#: default window is the full model context, ~200k, which is why compaction
+#: was effectively never observed for coder sessions) and above the largest
+#: single prompt the coder receives.
+DEFAULT_CODER_COMPACT_WINDOW_TOKENS = 140_000
+
+
+def _resolve_coder_compact_window_tokens(bounds_cfg: dict[str, Any] | None) -> int:
+    """The coder's compaction-window override, failing CLOSED on a bad value.
+
+    An absent key resolves to :data:`DEFAULT_CODER_COMPACT_WINDOW_TOKENS`. A
+    present but non-positive/non-numeric value is never forwarded to the CLI
+    (which would either silently ignore a garbage env var or reject the
+    subprocess) — it is logged and replaced with the same default.
+    """
+    raw = (bounds_cfg or {}).get("coder_compact_window_tokens")
+    if raw is None:
+        return DEFAULT_CODER_COMPACT_WINDOW_TOKENS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        log.warning(
+            "bounds.coder_compact_window_tokens=%r is not an integer; "
+            "using the default %d", raw, DEFAULT_CODER_COMPACT_WINDOW_TOKENS,
+        )
+        return DEFAULT_CODER_COMPACT_WINDOW_TOKENS
+    if value <= 0:
+        log.warning(
+            "bounds.coder_compact_window_tokens=%d is not positive; "
+            "using the default %d", value, DEFAULT_CODER_COMPACT_WINDOW_TOKENS,
+        )
+        return DEFAULT_CODER_COMPACT_WINDOW_TOKENS
+    return value
+
+
 def make_backend(
     *,
     model: str,
@@ -291,6 +331,15 @@ def make_backend(
     if name in ("claude", "", "claude-agent-sdk"):
         from .claude_backend import ClaudeBackend
 
+        # Scope guard (this ticket is the CODER's in-attempt cache burn only):
+        # a readonly session (reviewer/planner/utility/supervisor/distill all
+        # construct with readonly=True) never gets the window, regardless of
+        # the role string passed in, and only role="coder" does.
+        compact_window_tokens = None
+        if role == "coder" and not readonly:
+            compact_window_tokens = _resolve_coder_compact_window_tokens(
+                (config or {}).get("bounds"))
+
         return ClaudeBackend(
             model=model,
             forbidden_paths=forbidden_paths,
@@ -300,6 +349,7 @@ def make_backend(
             supervisor_hook=supervisor_hook,
             lint_hook=lint_hook,
             tool_result_caps=tool_result_caps,
+            compact_window_tokens=compact_window_tokens,
         )
 
     if name == "codex":
@@ -347,6 +397,7 @@ __all__ = [
     "CodingBackend",
     "CLAUDE_PINNED_ROLES",
     "DEFAULT_CODEX_MODEL",
+    "DEFAULT_CODER_COMPACT_WINDOW_TOKENS",
     "make_backend",
     "resolve_backend_name",
 ]
