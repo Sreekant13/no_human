@@ -48,7 +48,7 @@ async def test_hypothesis_stored_and_emitted_after_two_failures(tmp_path):
     fake = _HypoBackend("HYPOTHESIS: the worker polls a queue that the test "
                         "never seeds.\nTRY INSTEAD: seed the queue fixture "
                         "before starting the worker.")
-    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
+    with _patch("no_human.core.orchestrator.advisory_backend", return_value=fake):
         await orch._generate_stuck_hypothesis(t)
 
     assert "HYPOTHESIS" in t.context["stuck_hypothesis"]
@@ -62,7 +62,7 @@ async def test_hypothesis_skipped_below_two_failures(tmp_path):
     t = Task.new("x", repo_path=str(tmp_path))
     t.context = {"attempt_log": ["attempt 1: failed"]}
     fake = _HypoBackend("HYPOTHESIS: x\nTRY INSTEAD: y")
-    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
+    with _patch("no_human.core.orchestrator.advisory_backend", return_value=fake):
         await orch._generate_stuck_hypothesis(t)
     assert "stuck_hypothesis" not in (t.context or {})
     assert fake.prompts == []
@@ -73,7 +73,7 @@ async def test_malformed_reply_is_dropped_not_stored(tmp_path):
     t = Task.new("x", repo_path=str(tmp_path))
     t.context = {"attempt_log": ["attempt 1: f", "attempt 2: f"]}
     fake = _HypoBackend("I could not determine anything useful.")
-    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
+    with _patch("no_human.core.orchestrator.advisory_backend", return_value=fake):
         await orch._generate_stuck_hypothesis(t)
     assert "stuck_hypothesis" not in (t.context or {})
 
@@ -87,7 +87,7 @@ async def test_backend_error_never_blocks(tmp_path):
         async def run(self, *a, **k):
             raise RuntimeError("utility model unavailable")
 
-    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=_Boom()):
+    with _patch("no_human.core.orchestrator.advisory_backend", return_value=_Boom()):
         await orch._generate_stuck_hypothesis(t)  # must not raise
     assert "stuck_hypothesis" not in (t.context or {})
 
@@ -117,7 +117,7 @@ async def test_missing_repo_path_skips_the_call(tmp_path):
     t = Task.new("x", repo_path="")
     t.context = {"attempt_log": ["attempt 1: f", "attempt 2: f"]}
     fake = _HypoBackend("HYPOTHESIS: x\nTRY INSTEAD: y")
-    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
+    with _patch("no_human.core.orchestrator.advisory_backend", return_value=fake):
         await orch._generate_stuck_hypothesis(t)
     assert fake.prompts == []
 
@@ -131,6 +131,6 @@ async def test_operator_reply_reaches_the_diagnosis(tmp_path):
         "human_replies": ["ignore the queue — the real issue is the API contract"],
     }
     fake = _HypoBackend("HYPOTHESIS: x\nTRY INSTEAD: y")
-    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
+    with _patch("no_human.core.orchestrator.advisory_backend", return_value=fake):
         await orch._generate_stuck_hypothesis(t)
     assert "API contract" in fake.prompts[0]

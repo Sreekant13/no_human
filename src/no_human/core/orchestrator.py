@@ -30,6 +30,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Literal
 
+from ..agent.advisory import advisory_backend
 from ..agent.backend import AgentEvent, CodingBackend
 from ..agent.claude_backend import ClaudeBackend
 from ..agent.claude_backend import (
@@ -1927,7 +1928,7 @@ class Orchestrator:
                 "HYPOTHESIS: <the single most likely root cause of the repeated failures>\n"
                 "TRY INSTEAD: <one concretely DIFFERENT approach for the next attempt>"
             )
-            backend = ClaudeBackend(model=self._utility_model(), readonly=True)
+            backend = advisory_backend(self._utility_model(), role="distill")
             result = await backend.run(
                 prompt, cwd=Path(task.repo_path), max_turns=1,
                 effort="low",
@@ -2035,7 +2036,7 @@ class Orchestrator:
         try:
             diff_compressed = False
             if len(diff_text) > self._ATTEMPT_DIFF_DISTILL_THRESHOLD:
-                backend = ClaudeBackend(model=self._utility_model(), readonly=True)
+                backend = advisory_backend(self._utility_model(), role="distill")
                 prompt = (
                     "Summarise this diff as a per-file changelog of what has "
                     "already been implemented in this working tree. Keep file "
@@ -6921,7 +6922,7 @@ class Orchestrator:
         """One bounded utility-tier turn: findings → a repo-level lesson.
         Same shape as `_generate_stuck_hypothesis` — readonly, max_turns=1,
         low effort, usage booked to the attempt's utility columns."""
-        backend = ClaudeBackend(model=self._utility_model(), readonly=True)
+        backend = advisory_backend(self._utility_model(), role="distill")
         result = await backend.run(
             prompt, cwd=Path(task.repo_path or "."), max_turns=1, effort="low",
         )
@@ -8425,7 +8426,7 @@ class Orchestrator:
         for idx, chunk in large:
             before = len(chunk.content)
             try:
-                backend = ClaudeBackend(model=distill_model, readonly=True)
+                backend = advisory_backend(distill_model, role="distill")
                 prompt = (
                     f"Summarize this context for a developer working on: {task.title}\n"
                     f"Source: {chunk.source} — {chunk.title}\n\n"
@@ -9781,7 +9782,7 @@ class Orchestrator:
             "supervisor_model", "claude-sonnet-5",
         )
         async def sv_llm_call(prompt: str) -> str:
-            sv_backend = ClaudeBackend(model=sv_model, readonly=True)
+            sv_backend = advisory_backend(sv_model, role="supervisor")
             result = await sv_backend.run(
                 prompt, cwd=Path(work_dir or task.repo_path or "."),
                 max_turns=1, effort="low",

@@ -237,7 +237,7 @@ async def test_distillation_failure_is_loud_and_falls_back(tmp_path, caplog, mon
 
     boom = _DiffBackend(raise_exc=RuntimeError("utility backend unavailable"))
     with caplog.at_level(logging.ERROR, logger="no_human.orchestrator"):
-        with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=boom):
+        with _patch("no_human.core.orchestrator.advisory_backend", return_value=boom):
             # must not raise — the caller (_run_attempt) is unaffected.
             await orch._distill_attempt_state(t, repo, 2, "main")
 
@@ -265,7 +265,7 @@ async def test_empty_distillation_result_is_treated_as_failure(tmp_path, caplog)
 
     empty = _DiffBackend(text="")
     with caplog.at_level(logging.ERROR, logger="no_human.orchestrator"):
-        with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=empty):
+        with _patch("no_human.core.orchestrator.advisory_backend", return_value=empty):
             await orch._distill_attempt_state(t, repo, 2, "main")
 
     failed = [e for e in events if e.get("kind") == "attempt_distill_failed"]
@@ -315,12 +315,12 @@ async def test_utility_tier_is_used_for_diff_compression(tmp_path):
     t.context = {"attempt_log": ["attempt 1: failed"]}
 
     fake = _DiffBackend(text="feature.py: added feature() returning a constant")
-    with _patch("no_human.core.orchestrator.ClaudeBackend",
-                return_value=fake) as mocked_cls:
+    with _patch("no_human.core.orchestrator.advisory_backend",
+                return_value=fake) as mocked_seam:
         await orch._distill_attempt_state(t, repo, 2, "main")
 
-    assert mocked_cls.call_args.kwargs["model"] == orch._utility_model()
-    assert mocked_cls.call_args.kwargs.get("readonly") is True
+    assert mocked_seam.call_args.args[0] == orch._utility_model()
+    assert mocked_seam.call_args.kwargs.get("role") == "distill"
     # spend landed in distill_*, not utility_*/plan_/supervisor_.
     assert getattr(orch, "_distill_usage", None) is not None
     assert orch._distill_usage["tokens_used"] == 42

@@ -334,9 +334,9 @@ async def evaluate_spec(
     try:
         import tempfile
         from pathlib import Path
-        from ..agent.claude_backend import ClaudeBackend
-        be = backend or ClaudeBackend(
-            model=model or _default_utility_model(), readonly=True,
+        from ..agent.advisory import advisory_backend
+        be = backend or advisory_backend(
+            model or _default_utility_model(), role="intake",
         )
         criteria_text = "\n".join(f"  - {c}" for c in acceptance_criteria) or "  (none)"
         prompt = _render(
@@ -409,9 +409,9 @@ async def resolve_assumptions(
     try:
         import tempfile
         from pathlib import Path
-        from ..agent.claude_backend import ClaudeBackend
-        be = backend or ClaudeBackend(
-            model=model or _default_utility_model(), readonly=True,
+        from ..agent.advisory import advisory_backend
+        be = backend or advisory_backend(
+            model or _default_utility_model(), role="intake",
         )
         criteria_text = "\n".join(f"  - {c}" for c in acceptance_criteria) or "  (none)"
         prompt = _render(
@@ -516,9 +516,9 @@ async def generate_grill_questions(
     try:
         import tempfile
         from pathlib import Path
-        from ..agent.claude_backend import ClaudeBackend
-        be = backend or ClaudeBackend(
-            model=model or _default_utility_model(), readonly=True,
+        from ..agent.advisory import advisory_backend
+        be = backend or advisory_backend(
+            model or _default_utility_model(), role="intake",
         )
         criteria_text = "\n".join(f"  - {c}" for c in acceptance_criteria) or "  (none)"
         prompt = _render(

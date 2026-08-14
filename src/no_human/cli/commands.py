@@ -4499,8 +4499,8 @@ def learnings_curate(apply_llm):
     from ..learning.curator import curate
 
     async def _llm(prompt: str) -> str:
-        from ..agent.claude_backend import ClaudeBackend
-        backend = ClaudeBackend(model=config.utility_model, readonly=True)
+        from ..agent.advisory import advisory_backend
+        backend = advisory_backend(config.utility_model, role="distill")
         result = await backend.run(prompt, cwd=Path("."), max_turns=1,
                                    effort="low")
         return result.final_text or ""
@@ -4645,9 +4645,9 @@ def learnings(confirm_id, reject_id, active, harvest, harvest_project,
         swallowed HERE rather than allowed to abandon the rest of the harvest.
         `nh learnings` runs with `require_auth=False`, so "no credential
         configured" is an ordinary way to reach this."""
-        from ..agent.claude_backend import ClaudeBackend
+        from ..agent.advisory import advisory_backend
         try:
-            backend = ClaudeBackend(model=config.utility_model, readonly=True)
+            backend = advisory_backend(config.utility_model, role="distill")
             result = await backend.run(prompt, cwd=Path("."), max_turns=1,
                                        effort="low")
             return (result.final_text or "")[:600]

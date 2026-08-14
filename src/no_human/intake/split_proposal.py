@@ -102,10 +102,10 @@ async def generate_split_proposal(
     try:
         import tempfile
         from pathlib import Path
-        from ..agent.claude_backend import ClaudeBackend
+        from ..agent.advisory import advisory_backend
 
-        be = backend or ClaudeBackend(
-            model=model or _default_utility_model(), readonly=True,
+        be = backend or advisory_backend(
+            model or _default_utility_model(), role="intake",
         )
         criteria = getattr(task, "acceptance_criteria", None) or []
         criteria_text = "\n".join(f"  - {c}" for c in criteria) or "  (none)"

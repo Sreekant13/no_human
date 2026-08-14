@@ -4772,13 +4772,17 @@ async def test_distillation_runs_on_the_utility_model_not_the_reviewer(
                                is_error=False, tokens_used=0, session_id="s",
                                stop_reason="end_turn")
 
+    def _fake_advisory_backend(model, *, role):
+        return _Backend(model=model)
+
     cfg = _config(tmp_path)
     orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
                         SlackNotifier(None))
     chunk = _Chunk("x" * (orch._CHUNK_DISTILL_THRESHOLD + 1))
     t = Task.new("t", repo_path=str(tmp_path))
 
-    with _patch("no_human.core.orchestrator.ClaudeBackend", _Backend):
+    with _patch("no_human.core.orchestrator.advisory_backend",
+                _fake_advisory_backend):
         await orch._distill_large_chunks([chunk], t)
 
     assert seen == [cfg.data["llm"]["utility_model"]]

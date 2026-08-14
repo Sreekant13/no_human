@@ -106,7 +106,7 @@ async def test_supervisor_burn_lands_in_the_supervisor_column(
     """Driven through the REAL `_build_supervisor` wiring — the closure the
     orchestrator hands to `SupervisorHook`, not a re-implementation of it."""
     be = _TokenBackend(SUP, text="CONTINUE\nlooks fine")
-    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", be)
+    monkeypatch.setattr("no_human.core.orchestrator.advisory_backend", be)
     orch = _orch(store, tmp_path)
     t = await _task(store)
 
@@ -132,7 +132,7 @@ async def test_supervisor_burn_with_no_attempt_row_reaches_the_ledger(
     it under a site that names the ROLE, so the residual keeps the same
     resolution the attempt row has."""
     be = _TokenBackend(SUP, text="CONTINUE\nfine")
-    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", be)
+    monkeypatch.setattr("no_human.core.orchestrator.advisory_backend", be)
     orch = _orch(store, tmp_path)
     t = await _task(store)
 
@@ -157,7 +157,7 @@ async def test_distillation_burn_lands_in_the_distill_column(
     store, tmp_path, monkeypatch,
 ):
     be = _TokenBackend(DIS, text="a short summary")
-    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", be)
+    monkeypatch.setattr("no_human.core.orchestrator.advisory_backend", be)
     orch = _orch(store, tmp_path)
     t = await _task(store, repo=str(tmp_path))
     chunk = _Chunk("x" * (orch._CHUNK_DISTILL_THRESHOLD + 1))
@@ -180,7 +180,7 @@ async def test_a_distilled_chunk_that_produced_nothing_is_still_billed(
     tokens were spent anyway. A cost column that only records USEFUL spend
     understates exactly the case worth optimising away."""
     be = _TokenBackend(DIS, text="y" * 9_000)   # longer than the chunk
-    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", be)
+    monkeypatch.setattr("no_human.core.orchestrator.advisory_backend", be)
     orch = _orch(store, tmp_path)
     t = await _task(store, repo=str(tmp_path))
     chunk = _Chunk("x" * (orch._CHUNK_DISTILL_THRESHOLD + 1))
@@ -203,12 +203,12 @@ async def test_the_two_roles_do_not_share_a_bucket(
     t = await _task(store, repo=str(tmp_path))
 
     be_d = _TokenBackend(DIS, text="a short summary")
-    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", be_d)
+    monkeypatch.setattr("no_human.core.orchestrator.advisory_backend", be_d)
     await orch._distill_large_chunks(
         [_Chunk("x" * (orch._CHUNK_DISTILL_THRESHOLD + 1))], t)
 
     be_s = _TokenBackend(SUP, text="CONTINUE\nfine")
-    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", be_s)
+    monkeypatch.setattr("no_human.core.orchestrator.advisory_backend", be_s)
     await orch._build_supervisor(t, work_dir=str(tmp_path)).preflight("plan")
 
     row = await _drain_to_attempt(orch, store, t)
@@ -234,7 +234,7 @@ async def test_a_skipped_distillation_is_recorded_so_a_zero_is_falsifiable(
     the decision are unchanged here; only the record of it is added."""
     events = []
     be = _TokenBackend(DIS, text="must never be produced")
-    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", be)
+    monkeypatch.setattr("no_human.core.orchestrator.advisory_backend", be)
     orch = _orch(store, tmp_path, sink=events.append)
     t = await _task(store, repo=str(tmp_path))
     small = _Chunk("x" * (orch._CHUNK_DISTILL_THRESHOLD - 1))
@@ -268,7 +268,7 @@ async def test_a_distillation_records_the_bytes_it_removed(
     did happen. This is that side."""
     events = []
     be = _TokenBackend(DIS, text="a short summary")
-    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", be)
+    monkeypatch.setattr("no_human.core.orchestrator.advisory_backend", be)
     orch = _orch(store, tmp_path, sink=events.append)
     t = await _task(store, repo=str(tmp_path))
     chunk = _Chunk("x" * (orch._CHUNK_DISTILL_THRESHOLD + 1))
@@ -302,7 +302,7 @@ async def test_a_distillation_that_grows_the_chunk_is_recorded_as_a_growth(
     orch_threshold = Orchestrator._CHUNK_DISTILL_THRESHOLD
     before = orch_threshold + 100
     be = _TokenBackend(DIS, text="y" * (before - 1))   # one char under
-    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", be)
+    monkeypatch.setattr("no_human.core.orchestrator.advisory_backend", be)
     orch = _orch(store, tmp_path, sink=events.append)
     t = await _task(store, repo=str(tmp_path))
     chunk = _Chunk("x" * before)
@@ -335,7 +335,7 @@ async def test_a_distillation_that_raises_is_recorded_not_silent(
         def __call__(self, *a, **kw):
             raise RuntimeError("Credit balance too low")
 
-    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", _Boom())
+    monkeypatch.setattr("no_human.core.orchestrator.advisory_backend", _Boom())
     orch = _orch(store, tmp_path, sink=events.append)
     t = await _task(store, repo=str(tmp_path))
     chunk = _Chunk("x" * (orch._CHUNK_DISTILL_THRESHOLD + 1))
@@ -364,7 +364,7 @@ async def test_a_distillation_that_buys_nothing_is_recorded_too(
     are zero — spend with no trace of what it bought."""
     events = []
     be = _TokenBackend(DIS, text="z" * 9_000)         # longer than the chunk
-    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", be)
+    monkeypatch.setattr("no_human.core.orchestrator.advisory_backend", be)
     orch = _orch(store, tmp_path, sink=events.append)
     t = await _task(store, repo=str(tmp_path))
     chunk = _Chunk("x" * (orch._CHUNK_DISTILL_THRESHOLD + 1))
@@ -656,7 +656,7 @@ async def test_mutation_supervisor_sink_reverted_to_utility(
     are separate tests and not folded into it.
     """
     be = _TokenBackend(SUP, text="CONTINUE\nfine")
-    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", be)
+    monkeypatch.setattr("no_human.core.orchestrator.advisory_backend", be)
     orch = _orch(store, tmp_path)
     monkeypatch.setattr(
         Orchestrator, "_note_supervisor_usage",
@@ -685,7 +685,7 @@ async def test_mutation_distill_sink_dropped_entirely(
     total, so `lifetime_usage` drops by the whole distill bill.
     """
     be = _TokenBackend(DIS, text="a short summary")
-    monkeypatch.setattr("no_human.core.orchestrator.ClaudeBackend", be)
+    monkeypatch.setattr("no_human.core.orchestrator.advisory_backend", be)
     orch = _orch(store, tmp_path)
     monkeypatch.setattr(
         Orchestrator, "_note_distill_usage", lambda self, result: None)

@@ -512,3 +512,14 @@ def test_the_quota_regex_does_not_fire_on_ordinary_english():
               "FAILED tests/test_hit_your_retry_limit.py",
               "TypeError: 'bool' object is not subscriptable"):
         assert _quota_signal(t) is False, t
+
+
+def test_coder_options_unchanged_by_the_advisory_seam(tmp_path):
+    """The advisory seam (`agent/advisory.py`) adds `tools`/`system_prompt`
+    params to `ClaudeBackend`, both defaulting to `None`. The default (coder)
+    construction must keep serializing exactly as before: no `tools`, no
+    `system_prompt` override, `project` settings."""
+    opts = ClaudeBackend(model="claude-sonnet-5")._options(tmp_path, 40)
+    assert opts.tools is None
+    assert opts.system_prompt is None
+    assert opts.setting_sources == ["project"]

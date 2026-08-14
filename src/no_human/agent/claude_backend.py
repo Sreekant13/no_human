@@ -515,6 +515,8 @@ class ClaudeBackend:
         supervisor_hook: SupervisorHook | None = None,
         lint_hook: Any | None = None,
         tool_result_caps: dict[str, int] | None = None,
+        tools: list[str] | None = None,
+        system_prompt: str | None = None,
     ):
         self.model = model
         self.forbidden_paths = forbidden_paths or [".env", "secrets/", "*.key", "*.pem"]
@@ -525,6 +527,15 @@ class ClaudeBackend:
         self.readonly = readonly
         self.supervisor_hook = supervisor_hook
         self.lint_hook = lint_hook
+        # Both None by default: the coder/reviewer/planner path is byte-for-
+        # byte unchanged. The advisory seam (`agent/advisory.py`) is the only
+        # caller that passes these — `tools=[]` drops the full built-in tool
+        # schema from a single-turn call that never uses a tool (38.5M
+        # tok/week measured across the utility+supervisor tiers), and a
+        # `system_prompt` string replaces the coding harness's prompt with
+        # the role's own.
+        self.tools = tools
+        self.system_prompt = system_prompt
         # None means "use the measured defaults"; {} means explicitly OFF.
         #
         # 🔴 READONLY BACKENDS ARE EXEMPT BY DEFAULT, AND THAT IS THE POINT OF THE
@@ -648,6 +659,10 @@ class ClaudeBackend:
         # `core/prompt_blocks.py::build_repo_hints_block`, where it is ours,
         # logged and bounded.
         kwargs["setting_sources"] = [] if (self.readonly and not skills) else ["project"]
+        if self.tools is not None:
+            kwargs["tools"] = self.tools
+        if self.system_prompt is not None:
+            kwargs["system_prompt"] = self.system_prompt
         return ClaudeAgentOptions(
             model=self.model,
             cwd=str(cwd),
