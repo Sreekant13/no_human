@@ -1,7 +1,11 @@
 """PreToolUse safety guard policy (PLAN.md Part 10)."""
 
 import os
+import sys
 import tempfile
+from pathlib import Path
+
+import pytest
 
 from no_human.agent import guard
 
@@ -756,3 +760,430 @@ def test_gits_own_global_options_do_not_break_legitimate_commands():
     for cmd in ("git -C /repo stash", "git -c user.name=x stash pop",
                 "git --git-dir=/r/.git restore ."):
         assert not _ev("Bash", {"command": cmd}).allow, cmd
+
+
+# --------------------------------------------------------------------------- #
+# Installing into the shared developer venv (defence in depth under the
+# env-level containment seeded by `ClaudeBackend._options`). Fake checkouts
+# only — never the real repo venv.
+# --------------------------------------------------------------------------- #
+
+def _fake_primary_checkout(tmp_path):
+    primary = tmp_path / "primary"
+    (primary / "src" / "no_human").mkdir(parents=True)
+    (primary / "src" / "no_human" / "__init__.py").write_text("")
+    (primary / ".venv" / "bin").mkdir(parents=True)
+    (primary / ".venv" / "bin" / "python").write_text("")
+    (primary / ".venv" / "bin" / "pip").write_text("")
+    return primary
+
+
+def _fake_worktree(tmp_path):
+    worktree = tmp_path / "worktree"
+    (worktree / ".venv" / "bin").mkdir(parents=True)
+    (worktree / ".venv" / "bin" / "python").write_text("")
+    (worktree / ".venv" / "bin" / "pip").write_text("")
+    return worktree
+
+
+def test_installing_into_the_primary_venv_is_refused(tmp_path, monkeypatch):
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    bypasses = [
+        f"{primary}/.venv/bin/pip install foo",
+        f"VIRTUAL_ENV={primary}/.venv pip install -e .",
+        f"source {primary}/.venv/bin/activate && uv pip install -e .",
+        f"uv pip install --python {primary}/.venv/bin/python -e .",
+        f"cd {primary} && uv sync",
+        # A separator INSIDE a quoted nested-shell payload used to shred the
+        # segment before anything looked at it (attempt 2's failure).
+        f'sh -c "{primary}/.venv/bin/pip install foo && echo ok"',
+        f'bash -lc "cd {primary} && uv sync"',
+        # A wrapper flag `_strip_wrappers` cannot parse used to strand the
+        # recovery scan, which only knew `git`/shell-runners (attempt 2's
+        # second failure).
+        f"env -i {primary}/.venv/bin/pip install foo",
+        f"sudo -H {primary}/.venv/bin/pip install foo",
+        # A leading duration/flag on `timeout`/`nice` used to make argv[0] of
+        # `rest` the duration, not the install verb (attempt 2's third
+        # failure).
+        f"timeout 300 {primary}/.venv/bin/pip install foo",
+        f"nice -n 10 {primary}/.venv/bin/pip install foo",
+        # uv's own project selectors, which do exactly what `cd <p> && uv
+        # sync` does (attempt 2's fourth failure).
+        f"uv sync --project {primary}",
+        f"uv sync --directory {primary}",
+    ]
+    for cmd in bypasses:
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, cwd=str(worktree))
+        assert d.allow is False, f"must be refused: {cmd}"
+
+    # `python -m pip install -e <primary>` run FROM the primary checkout: no
+    # explicit venv is named, so the target is resolved from cwd.
+    d = guard.evaluate("Bash", {"command": f"python -m pip install -e {primary}"},
+                       forbidden_paths=FORBIDDEN, never_push_to=PROTECTED,
+                       cwd=str(primary))
+    assert d.allow is False
+
+
+def test_the_refusal_names_the_worktree_venv_alternative(tmp_path, monkeypatch):
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    d = guard.evaluate("Bash", {"command": f"{primary}/.venv/bin/pip install foo"},
+                       forbidden_paths=FORBIDDEN, never_push_to=PROTECTED,
+                       cwd=str(worktree))
+    assert d.allow is False
+    assert str(worktree) in d.reason
+    assert ".venv" in d.reason
+    assert "--python" in d.reason or "run the command from" in d.reason
+    assert str(primary / ".venv") in d.reason
+
+
+def test_installs_into_the_worktree_own_venv_are_allowed(tmp_path, monkeypatch):
+    """Negative control: the guard is not a blanket install ban."""
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    allowed = [
+        "uv pip install -e .",
+        "pip install -r requirements.txt",
+        "uv sync",
+        f"{worktree}/.venv/bin/pip install foo",
+        f"uv pip install --python {worktree}/.venv/bin/python foo",
+    ]
+    for cmd in allowed:
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, cwd=str(worktree))
+        assert d.allow is True, f"must stay allowed: {cmd} — {d.reason}"
+
+
+def test_read_only_and_informational_package_commands_stay_allowed(tmp_path, monkeypatch):
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    allowed = [
+        "pip list",
+        "pip show x",
+        "uv lock",
+        "uv venv .venv",
+        "uv run pytest",
+        'echo "then run pip install -e ."',
+    ]
+    for cmd in allowed:
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, cwd=str(worktree))
+        assert d.allow is True, f"must stay allowed: {cmd} — {d.reason}"
+
+
+def test_unknown_cwd_and_unresolvable_targets_are_refused(tmp_path, monkeypatch):
+    primary = _fake_primary_checkout(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    # No cwd at all: an install can't be shown to land anywhere safe.
+    d = guard.evaluate("Bash", {"command": "pip install -e ."},
+                       forbidden_paths=FORBIDDEN, never_push_to=PROTECTED, cwd=None)
+    assert d.allow is False
+
+    # The target is shell expansion — cannot be established either way.
+    d = guard.evaluate("Bash", {"command": "VIRTUAL_ENV=$TARGET pip install -e ."},
+                       forbidden_paths=FORBIDDEN, never_push_to=PROTECTED, cwd=None)
+    assert d.allow is False
+
+    # A packaged/non-editable install: nothing to protect, never a false
+    # denial. `sys.prefix` is also neutralised here so this test is not at
+    # the mercy of whatever venv happens to be running pytest.
+    other = tmp_path / "not-a-venv"
+    other.mkdir()
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: None)
+    monkeypatch.setattr(sys, "prefix", str(other))
+    d = guard.evaluate("Bash", {"command": "pip install -e ."},
+                       forbidden_paths=FORBIDDEN, never_push_to=PROTECTED,
+                       cwd=str(other))
+    assert d.allow is True
+
+
+def test_the_venv_refusal_applies_in_readonly_too(tmp_path, monkeypatch):
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    d = guard.evaluate("Bash", {"command": f"{primary}/.venv/bin/pip install foo"},
+                       forbidden_paths=FORBIDDEN, never_push_to=PROTECTED,
+                       cwd=str(worktree), readonly=True)
+    assert d.allow is False
+    assert str(primary / ".venv") in d.reason
+
+
+def test_protected_venvs_excludes_anything_under_the_session_cwd(tmp_path, monkeypatch):
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    protected = guard._protected_venvs(str(worktree))
+    assert (primary / ".venv").resolve() in protected
+    assert (worktree / ".venv").resolve() not in protected
+
+
+# --------------------------------------------------------------------------- #
+# Punctuation-run separators. `shlex` in `punctuation_chars` mode emits a
+# maximal RUN of punctuation as a SINGLE token ('\n\n', ';\n', '&\n', '||\n'),
+# not the individual operators `_INSTALL_SEP_TOKENS` used to check for by
+# exact string membership. That let a blank line or a punctuation run glue an
+# unrelated prefix command and the real install into one segment whose
+# argv[0] was the prefix — `_pkg_install_match` never saw the install.
+# --------------------------------------------------------------------------- #
+
+#: This module must be the one under test, in THIS worktree — not a stale
+#: editable install resolving elsewhere (`worktree pytest tests the WRONG
+#: tree`, a proven failure mode for this repo).
+_GUARD_FILE = Path(guard.__file__).resolve()
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_the_guard_under_test_is_this_worktrees_copy():
+    assert _GUARD_FILE == (_REPO_ROOT / "src" / "no_human" / "agent" / "guard.py").resolve()
+
+
+def test_reviewer_proven_separator_run_bypasses_are_refused(tmp_path, monkeypatch):
+    """Each of these four commands allowed the install through on the
+    pre-fix guard (reviewer-proven, review FAIL 2026-08-11)."""
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    bypasses = [
+        f"cd {primary}\n\nuv sync",
+        f"cd {primary};\nuv sync",
+        f"true &\n{primary}/.venv/bin/pip install foo",
+        f"echo start\n\n{primary}/.venv/bin/pip install -e {primary}",
+    ]
+    for cmd in bypasses:
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, cwd=str(worktree))
+        assert d.allow is False, f"must be refused: {cmd!r}"
+
+
+def test_installs_into_the_worktrees_own_venv_stay_allowed_across_separators(tmp_path, monkeypatch):
+    """Negative control: the punctuation-run fix must not turn into a
+    blanket refusal — an install that lands in the task worktree's own
+    .venv is still allowed, even across a punctuation-run separator."""
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    allowed = [
+        f"cd {worktree}\n\nuv sync",
+        f"true &\n{worktree}/.venv/bin/pip install foo",
+        "echo start\n\nuv sync",
+    ]
+    for cmd in allowed:
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, cwd=str(worktree))
+        assert d.allow is True, f"must stay allowed: {cmd!r} — {d.reason}"
+
+
+@pytest.mark.parametrize("sep", [";\n", "&\n", "\n\n", "||\n"])
+def test_separator_runs_between_a_benign_prefix_and_an_install_are_refused(tmp_path, monkeypatch, sep):
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    cmd = f"echo hello{sep}{primary}/.venv/bin/pip install foo"
+    d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                       never_push_to=PROTECTED, cwd=str(worktree))
+    assert d.allow is False, f"must be refused: {cmd!r}"
+
+
+def test_a_trailing_comment_does_not_swallow_the_newline_separator(tmp_path, monkeypatch):
+    """Review FAIL 2026-08-11: shlex's default `#` commenter reads through
+    end-of-line via its own `readline()`, consuming the `\\n` that should end
+    the segment — so a trailing comment glued the benign first line to the
+    install on the next line into one segment and the install slipped
+    through. Both reviewer-proven repros must be refused."""
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    bypasses = [
+        f"echo x #\n{primary}/.venv/bin/pip install foo",
+        f"true #comment\ncd {primary} && uv sync",
+    ]
+    for cmd in bypasses:
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, cwd=str(worktree))
+        assert d.allow is False, f"must be refused: {cmd!r}"
+
+
+# --------------------------------------------------------------------------- #
+# Grouping punctuation (`(){}`) as a segment boundary. Round 4 (review FAIL
+# 2026-08-11) proved `_INSTALL_PUNCTUATION` split `(`/`)` into their own
+# tokens but the (then) boundary set only recognised `;&|\n`, so a `(`/`)`
+# token glued onto the next command's argv[0] instead of ending a segment —
+# `(cd <primary> && uv sync)` tokenised as `[['(', 'cd', '<primary>'],
+# ['uv', 'sync', ')']]`, swallowing the `cd`. Fix: a token is a boundary
+# when it consists ENTIRELY of `_INSTALL_PUNCTUATION` characters, not a
+# hand-picked subset — so `(`, `)`, `{`, `}`, and any run mixing them with
+# redirects/separators (`;>`, `)&`, `;(`) all end a segment.
+# --------------------------------------------------------------------------- #
+
+def test_reviewer_proven_grouping_punctuation_bypasses_are_refused(tmp_path, monkeypatch):
+    """Each of these four commands allowed the install through on the
+    pre-fix guard (reviewer-proven, review FAIL 2026-08-11, round 4)."""
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    bypasses = [
+        f"(cd {primary} && uv sync)",
+        f"(cd {primary}; uv sync)",
+        f"{{ cd {primary}; uv sync; }}",
+        f"( {primary}/.venv/bin/pip install foo )",
+    ]
+    for cmd in bypasses:
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, cwd=str(worktree))
+        assert d.allow is False, f"must be refused: {cmd!r}"
+
+
+def test_installs_into_the_worktrees_own_venv_stay_allowed_inside_groups(tmp_path, monkeypatch):
+    """Negative control: the grouping-punctuation fix must not turn into a
+    blanket refusal — an install that lands in the task worktree's own
+    .venv is still allowed, even wrapped in a subshell/group."""
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    allowed = [
+        "uv pip install -e .",
+        f"{worktree}/.venv/bin/pip install foo",
+        f"(cd {worktree} && uv sync)",
+        f"( {worktree}/.venv/bin/pip install foo )",
+        f"{{ cd {worktree}; uv sync; }}",
+    ]
+    for cmd in allowed:
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, cwd=str(worktree))
+        assert d.allow is True, f"must stay allowed: {cmd!r} — {d.reason}"
+
+
+def test_parens_inside_a_quoted_argument_do_not_over_block(tmp_path, monkeypatch):
+    """Over-block check: classifying an all-punctuation TOKEN as a boundary
+    must not reach into a quoted payload. A quoted argument that merely
+    CONTAINS parens (mixed with letters/digits/spaces) is never itself an
+    all-punctuation token, so it must survive as one argv entry and the
+    command must be judged on its own merits — an install into the
+    worktree's own venv with a parenthetical version string stays allowed,
+    and an unrelated echo with a parenthetical stays allowed too."""
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    allowed = [
+        'echo "(hello world)" && uv sync',
+        f'{worktree}/.venv/bin/pip install "pkg==1.0 (stable)"',
+    ]
+    for cmd in allowed:
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, cwd=str(worktree))
+        assert d.allow is True, f"must stay allowed: {cmd!r} — {d.reason}"
+
+
+# --------------------------------------------------------------------------- #
+# Shell reserved-word heads (`then`/`do`/`else`/`elif`/…). `_segment_tokens`
+# splits a compound command's condition from its BODY on `;`/`\n`, so
+# `if true; then <install>; fi` and `while false; do <install>; done` each
+# produce a segment whose argv[0] is a bash keyword, not the install verb —
+# `then <install...>` / `do <install...>`. Neither `then` nor `do` is a
+# package manager or a `_WRAPPERS` entry, so the pre-fix guard never looked
+# past them and the install inside the compound-command body slipped through
+# (review rounds 2026-08-11 and this ticket; reviewer-proven repros: `if
+# true; then P/.venv/bin/pip install foo; fi` and `while false; do
+# P/.venv/bin/pip install foo; done`, both `allow=True` pre-fix).
+# --------------------------------------------------------------------------- #
+
+def test_reviewer_proven_shell_keyword_bypasses_are_refused(tmp_path, monkeypatch):
+    """The exact two repros the reviewer ran against this branch's fixtures
+    (cwd=worktree, `_primary_checkout` monkeypatched to a fake primary),
+    both `allow=True` pre-fix."""
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    bypasses = [
+        f"if true; then {primary}/.venv/bin/pip install foo; fi",
+        f"while false; do {primary}/.venv/bin/pip install foo; done",
+    ]
+    for cmd in bypasses:
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, cwd=str(worktree))
+        assert d.allow is False, f"must be refused: {cmd!r}"
+
+
+def test_further_keyword_headed_bodies_are_refused(tmp_path, monkeypatch):
+    """Same class, other reserved-word heads the shell grammar allows in
+    command position: `else`, `elif`+`then`, `until`/`do`, `for`/`do`, and a
+    `case` pattern body. The keyword set is closed by the shell grammar, not
+    enumerated by example, so each of these must be caught by the same
+    mechanism as the two reviewer repros above."""
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    bypasses = [
+        f"if false; then echo x; else {primary}/.venv/bin/pip install foo; fi",
+        f"if false; then echo x; elif true; then {primary}/.venv/bin/pip install foo; fi",
+        f"until false; do {primary}/.venv/bin/pip install foo; done",
+        f"for x in 1; do {primary}/.venv/bin/pip install foo; done",
+        f"case $x in a) {primary}/.venv/bin/pip install foo;; esac",
+    ]
+    for cmd in bypasses:
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, cwd=str(worktree))
+        assert d.allow is False, f"must be refused: {cmd!r}"
+
+
+def test_keyword_headed_installs_into_the_worktrees_own_venv_stay_allowed(tmp_path, monkeypatch):
+    """Negative control: keyword-stripping must not turn into a blanket
+    refusal — an install that lands in the task worktree's own `.venv`
+    stays allowed even when it sits in a compound-command body."""
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    allowed = [
+        f"if true; then {worktree}/.venv/bin/pip install foo; fi",
+        f"while false; do {worktree}/.venv/bin/pip install foo; done",
+        "if true; then uv sync; fi",
+        "while false; do uv sync; done",
+    ]
+    for cmd in allowed:
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, cwd=str(worktree))
+        assert d.allow is True, f"must stay allowed: {cmd!r} — {d.reason}"
+
+
+def test_a_literal_argument_named_then_does_not_trigger_keyword_stripping(tmp_path, monkeypatch):
+    """Both-direction control: `_strip_shell_keywords` only ever removes
+    from the HEAD of a segment. A reserved word appearing later in a
+    segment — an ordinary argument, e.g. `echo then pip` — must not be
+    stripped or mistaken for a compound-command head."""
+    primary = _fake_primary_checkout(tmp_path)
+    worktree = _fake_worktree(tmp_path)
+    monkeypatch.setattr(guard, "_primary_checkout", lambda: primary)
+
+    allowed = [
+        "echo then pip",
+        "echo do install foo",
+        "echo we do not run pip install here",
+    ]
+    for cmd in allowed:
+        d = guard.evaluate("Bash", {"command": cmd}, forbidden_paths=FORBIDDEN,
+                           never_push_to=PROTECTED, cwd=str(worktree))
+        assert d.allow is True, f"must stay allowed: {cmd!r} — {d.reason}"

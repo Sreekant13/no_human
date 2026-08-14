@@ -40,8 +40,9 @@ import fnmatch
 import os
 import re
 import shlex
+import sys
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Mapping
 
 from . import venv_install_guard
@@ -157,6 +158,503 @@ _LIVE_SERVER = re.compile(
     r"(?:^|[|;&]\s*|`|\$\(|^\s*|/|\bsudo\s+|\benv\s+[^|;&]*?\s)"
     r"nh\s+(?:serve|start|watch|bench\s+run)\b"
 )
+
+# --------------------------------------------------------------------------- #
+# Installing into the shared developer venv — defence in depth. A coder
+# session's own worktree is disposable, but a Bash command that names the
+# PRIMARY checkout's venv explicitly (`/primary/.venv/bin/pip …`,
+# `VIRTUAL_ENV=… pip install`, `source /primary/.venv/bin/activate && pip
+# install`, `uv pip install --python /primary/.venv/…`, `cd /primary && uv
+# sync`, all of those spelled through `sh -c`/`bash -lc`/`xargs`/`timeout`/
+# `uv run`) rewrites that venv's editable-install record
+# (`_editable_impl_no_human.pth`) to point at the coder's worktree — silently
+# breaking the checkout that is running the operator, the same failure
+# `doctor.editable_install_problem` only reports AFTER the fact. Installs into
+# the session's OWN worktree venv stay allowed — only the venv
+# `no_human.__file__` resolves to under the PRIMARY checkout is protected.
+# --------------------------------------------------------------------------- #
+
+#: Same venv directory names `testing/runner.py::_venv_bin` probes.
+_VENV_DIR_NAMES = (".venv", "venv")
+
+
+def _primary_checkout() -> "Path | None":
+    """The checkout `no_human.__file__` resolves to: this file is
+    <checkout>/src/no_human/agent/guard.py, so parents[3] is the checkout
+    root. `None` for a non-editable/site-packages/frozen install — the same
+    false-positive guard `doctor.editable_install_problem` uses — in which
+    case there is nothing to protect."""
+    root = Path(__file__).resolve().parents[3]
+    if (root / "src" / "no_human" / "__init__.py").is_file():
+        return root
+    return None
+
+
+def _protected_venvs(cwd: "str | None") -> list:
+    """Venv roots a coder-session install must never write into.
+
+    Always includes the primary checkout's own `.venv`/`venv` (unconditional
+    — that is the one this guard exists to protect, whatever the session's
+    cwd is). Also includes `sys.prefix` when it is itself a venv, covering a
+    venv living outside the checkout that the running process actually uses —
+    BUT that candidate is dropped when it is at or under the session's own
+    `cwd`, since that is exactly the case where it IS the session's own
+    worktree venv, which must stay installable.
+    """
+    protected = []
+    primary = _primary_checkout()
+    if primary is not None:
+        for name in _VENV_DIR_NAMES:
+            d = primary / name
+            if d.is_dir():
+                protected.append(d.resolve())
+    try:
+        prefix_cfg = Path(sys.prefix) / "pyvenv.cfg"
+        if prefix_cfg.is_file():
+            prefix_venv = Path(sys.prefix).resolve()
+            if cwd is None:
+                protected.append(prefix_venv)
+            else:
+                cwd_p = Path(cwd).resolve()
+                if not (prefix_venv == cwd_p or cwd_p in prefix_venv.parents):
+                    protected.append(prefix_venv)
+    except OSError:  # pragma: no cover - defensive
+        pass
+    return protected
+
+
+#: Verbs that mutate a pip-family environment.
+_PIP_VERBS = ("install", "uninstall", "sync")
+_PY_EXE_RE = re.compile(r"^python[0-9.]*$")
+
+#: argv[0] names this guard treats as package-manager invocations — passed to
+#: `_strip_wrappers` so `env -i pip install …` / `sudo -H <primary>/.venv/`
+#: `bin/pip install …` still recover the real command despite a wrapper flag
+#: (`-i`, `-H`) that helper does not parse (pip is neither `git` nor a shell
+#: runner, the two families it already knows how to re-find).
+_PKG_MANAGER_NAMES = frozenset({"pip", "pip3", "uv", "poetry", "pipenv", "conda", "mamba"})
+
+
+def _is_pkg_manager_name(name: str) -> bool:
+    return name in _PKG_MANAGER_NAMES or bool(_PY_EXE_RE.match(name))
+
+
+def _pkg_install_match(argv: list):
+    """The install-command's trailing args, or ``None`` if ``argv`` (argv[0]
+    possibly a path) is not a package-install invocation. Deliberately NOT
+    matched: `pip list/show/freeze/download`, `uv lock`, `uv run` (handled by
+    its own recursion below), `uv venv` — read-only, environment-creation, or
+    unrelated to the developer venv's package set."""
+    if not argv:
+        return None
+    name = PurePosixPath(argv[0]).name
+    rest = argv[1:]
+    if name in ("pip", "pip3"):
+        if rest and rest[0] in _PIP_VERBS:
+            return rest[1:]
+        return None
+    if _PY_EXE_RE.match(name):
+        if len(rest) >= 3 and rest[0] == "-m" and rest[1] == "pip" and rest[2] in _PIP_VERBS:
+            return rest[3:]
+        return None
+    if name == "uv":
+        if rest and rest[0] == "pip":
+            if len(rest) >= 2 and rest[1] in _PIP_VERBS:
+                return rest[2:]
+            return None
+        if rest and rest[0] in ("sync", "add", "remove"):
+            return rest[1:]
+        return None
+    if name == "poetry":
+        if rest and rest[0] in ("install", "add", "remove", "update"):
+            return rest[1:]
+        return None
+    if name == "pipenv":
+        if rest and rest[0] in _PIP_VERBS:
+            return rest[1:]
+        return None
+    if name in ("conda", "mamba"):
+        if rest and rest[0] in ("install", "remove", "update"):
+            return rest[1:]
+        return None
+    return None
+
+
+def _venv_root_from_exe(p: "Path") -> "Path":
+    """Venv root given a path that may point at `bin`/`Scripts` or an
+    executable inside it; the path unchanged otherwise."""
+    if p.name in ("bin", "Scripts"):
+        return p.parent
+    if p.parent.name in ("bin", "Scripts"):
+        return p.parent.parent
+    return p
+
+
+def _resolve_install_path(raw: str, cwd: "str | None") -> "Path":
+    p = Path(raw).expanduser()
+    if not p.is_absolute() and cwd:
+        p = Path(cwd) / p
+    try:
+        return p.resolve()
+    except OSError:  # pragma: no cover - defensive
+        return p
+
+
+def _flag_value(args: list, names: tuple) -> "str | None":
+    for i, a in enumerate(args):
+        for n in names:
+            if a == n and i + 1 < len(args):
+                return args[i + 1]
+            if a.startswith(n + "="):
+                return a.split("=", 1)[1]
+    return None
+
+
+#: Sentinel: the target could not be resolved (shell expansion in a decisive
+#: position) — distinct from `None`, which means "nothing named a target and
+#: there is no cwd either".
+_UNRESOLVED_TARGET = object()
+
+
+def _install_target(argv0: str, install_args: list, env_map: dict,
+                     activated: "str | None", running_cwd: "str | None"):
+    """Where this install would land, resolved in priority order (first match
+    wins): the invoked executable's own path, an explicit
+    `--python`/`--prefix`/`--target`/`--root` flag, uv's own project selector
+    (`--project`/`--directory`), a `VIRTUAL_ENV`/`UV_PROJECT_ENVIRONMENT`
+    assignment on the command, an earlier `source .../activate` in the same
+    command, else the session's current cwd (already folded in any earlier
+    `cd` on the same command line). Returns `(path, via_cwd)`, where `via_cwd`
+    is True for the project-selector and cwd-fallback cases — the ones where
+    uv/pip's own project-root discovery means ANY path at-or-under the primary
+    checkout, not just its `.venv`, resolves to the checkout's venv
+    (`_target_hits_protected` uses this to tell `cd <primary>/src && uv sync`
+    / `uv sync --project <primary>/src` from an unrelated `--target
+    <primary>/somewhere`). Returns `(_UNRESOLVED_TARGET, False)` if a decisive
+    piece is shell expansion (`$`/backtick), or `(None, True)` if nothing
+    resolves it and there is no cwd to fall back on."""
+    if "/" in argv0 or "\\" in argv0:
+        if _UNRESOLVABLE.search(argv0):
+            return _UNRESOLVED_TARGET, False
+        return _venv_root_from_exe(_resolve_install_path(argv0, running_cwd)), False
+    for names in (("--python", "-p"), ("--prefix",), ("--target",), ("--root",)):
+        v = _flag_value(install_args, names)
+        if v is not None:
+            if _UNRESOLVABLE.search(v):
+                return _UNRESOLVED_TARGET, False
+            return _venv_root_from_exe(_resolve_install_path(v, running_cwd)), False
+    proj = _flag_value(install_args, ("--project", "--directory"))
+    if proj is not None:
+        if _UNRESOLVABLE.search(proj):
+            return _UNRESOLVED_TARGET, False
+        return _resolve_install_path(proj, running_cwd), True
+    for key in ("VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"):
+        v = env_map.get(key)
+        if v is not None:
+            if _UNRESOLVABLE.search(v):
+                return _UNRESOLVED_TARGET, False
+            return _resolve_install_path(v, running_cwd), False
+    if activated is not None:
+        if _UNRESOLVABLE.search(activated):
+            return _UNRESOLVED_TARGET, False
+        return _resolve_install_path(activated, running_cwd), False
+    if running_cwd is None:
+        return None, True
+    return _resolve_install_path(running_cwd, None), True
+
+
+def _target_hits_protected(target: "Path", protected: list, primary: "Path | None"):
+    """The protected venv ``target`` lands in/on, or `None`. Covers: target IS
+    a protected venv, target is INSIDE one, and target is a directory that
+    CONTAINS one (target dir == primary checkout → its `.venv` is what an
+    install lands in). ``primary`` is only passed for a via_cwd target (see
+    `_install_target`): any path at-or-under the primary checkout root also
+    hits its venv, because that is what uv/pip's own upward project-root
+    discovery does from an arbitrary cwd or `--project`/`--directory` value —
+    not because that subdirectory IS the venv."""
+    for p in protected:
+        if target == p or p in target.parents or target in p.parents:
+            return p
+    if primary is not None and (target == primary or primary in target.parents):
+        for p in protected:
+            if p.parent == primary:
+                return p
+        return primary
+    return None
+
+
+def _venv_install_denial_message(venv: "Path", cwd: "str | None") -> str:
+    if cwd is not None:
+        alternative = (
+            f"Install into THIS session's own venv instead: run the command "
+            f"from {cwd} (its `.venv` is already first on PATH, so "
+            f"`uv pip install -e .` / `pip install …` land there), or target "
+            f"it explicitly with `uv pip install --python {cwd}/.venv/bin/python …`."
+        )
+    else:
+        alternative = (
+            "Re-run with the session worktree as cwd; installs into the "
+            "worktree's own `.venv` are allowed."
+        )
+    return (
+        f"installing into the shared developer venv at {venv} is blocked: it "
+        "is the venv `import no_human` resolves to for the operator's primary "
+        "checkout, and an install there rewrites its editable-install record "
+        "(`_editable_impl_no_human.pth`) to point at your worktree — silently "
+        f"breaking the checkout that is running you. {alternative}"
+    )
+
+
+def _check_install_argv(argv: list, env_map: dict, activated: "str | None",
+                         running_cwd: "str | None", protected: list,
+                         primary: "Path | None", cwd: "str | None") -> "str | None":
+    """Denial reason for a single already-tokenised argv, or `None`."""
+    install_args = _pkg_install_match(argv)
+    if install_args is None:
+        return None
+    # `--system` targets the system interpreter, not the developer venv — out
+    # of this guard's remit. `--dry-run` changes nothing.
+    if "--system" in install_args or "--dry-run" in install_args:
+        return None
+    target, via_cwd = _install_target(argv[0], install_args, env_map, activated, running_cwd)
+    if target is _UNRESOLVED_TARGET or target is None:
+        return _venv_install_denial_message(protected[0], cwd)
+    hit = _target_hits_protected(target, protected, primary if via_cwd else None)
+    if hit is not None:
+        return _venv_install_denial_message(hit, cwd)
+    return None
+
+
+#: Punctuation shlex splits into its own tokens (even without surrounding
+#: whitespace) OUTSIDE quotes — the shell operator set (`;&|`), redirects
+#: (`<>`), grouping (`(){}`), and a literal newline, added here (and removed
+#: from `whitespace` below) so a bare newline still ends a segment, exactly
+#: like `_CMD_SEP`, instead of silently gluing the next line's command onto
+#: this one's argv. `(){}` MUST be here too: without them in the punctuation
+#: set, a brace/paren with no surrounding space (`{cd`) glues onto the next
+#: word instead of tokenising separately (review round 4, 2026-08-11).
+_INSTALL_PUNCTUATION = "(){};<>|&\n"
+
+#: Boundary CHARACTERS (not a literal-token set), derived from the same
+#: punctuation set `_segment_tokens` splits on — NOT a narrower hand-picked
+#: subset. shlex's `punctuation_chars` mode groups a maximal RUN of
+#: punctuation into a single token, so a blank line, `;\n`, `&\n`, `||\n`,
+#: a redirect glued to a separator (`;>`), or a grouping char glued to
+#: another (`;(`, `)&`) each arrive as ONE token. Checking that token against
+#: a literal set of known operators (`{"&&", "||", ";", ...}`), or against a
+#: boundary-char set that omits some of `_INSTALL_PUNCTUATION` (redirects,
+#: parens, braces), both fall through to `current.append(tok)` for the
+#: tokens they don't recognise — gluing two commands into one segment whose
+#: argv[0] is the first command, so `_pkg_install_match` never sees the
+#: install hiding in `(...)`/`{...}`/behind a redirect (review rounds
+#: 2026-08-11 and this ticket). The fix: a token is a boundary when it
+#: consists ENTIRELY of characters from `_INSTALL_PUNCTUATION` — the exact
+#: set `_segment_tokens` already uses to decide what counts as punctuation —
+#: regardless of run length or which characters repeat. A token that mixes
+#: punctuation with any non-punctuation character (letters, digits, a space
+#: from a quoted payload) is never a boundary, so quoted arguments — even
+#: ones containing parens — stay intact as real argv.
+_INSTALL_BOUNDARY_CHARS = frozenset(_INSTALL_PUNCTUATION)
+
+
+def _segment_tokens(text: str) -> list:
+    """Tokenise ``text`` into shell command segments (each a list of already
+    unquoted tokens), splitting on any run made ENTIRELY of characters from
+    `_INSTALL_PUNCTUATION` (`;&|` operators, `<>` redirects, `(){}` grouping,
+    newline) — but ONLY when those characters sit OUTSIDE a quoted string.
+    `_CMD_SEP.split(text)`
+    (used elsewhere in this module) splits the RAW text first, so a separator
+    inside a quoted payload — `sh -c "cd /p && uv sync"` — shreds that payload
+    into two half-tokens before anything has looked at it. Using shlex's
+    `punctuation_chars` mode tokenises the WHOLE string in one pass: a quoted
+    substring stays one token regardless of what punctuation it contains,
+    while the same punctuation outside quotes still splits it, spaced or not
+    (`cmd1&&cmd2` splits exactly like `cmd1 && cmd2`). Falls back to the
+    legacy raw-split-then-per-segment approach only for text a real shell
+    would itself reject (unbalanced quoting) — malformed input, not a bypass.
+
+    `commenters` is disabled: shlex's default `#` commenter reads through
+    end-of-line via its own `readline()`, which SWALLOWS the trailing `\n` —
+    so `echo x #\n<venv>/bin/pip install foo` never sees a separator between
+    the two commands and they glue into one segment. `shlex.split` disables
+    commenters by default for the same reason; this hand-built lexer must too.
+    """
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=_INSTALL_PUNCTUATION)
+        lex.whitespace = lex.whitespace.replace("\n", "")
+        lex.whitespace_split = True
+        lex.commenters = ""
+        tokens = list(lex)
+    except ValueError:
+        segments = []
+        for raw_seg in _CMD_SEP.split(text):
+            raw_seg = raw_seg.strip()
+            if not raw_seg:
+                continue
+            try:
+                segments.append(shlex.split(raw_seg))
+            except ValueError:
+                segments.append(raw_seg.split())
+        return segments
+    segments = []
+    current = []
+    for tok in tokens:
+        if tok and set(tok) <= _INSTALL_BOUNDARY_CHARS:
+            if current:
+                segments.append(current)
+            current = []
+        else:
+            current.append(tok)
+    if current:
+        segments.append(current)
+    return segments
+
+
+#: Bash reserved words that can sit in argv[0] position of a segment after
+#: `_segment_tokens` splits on `;`/`\n`/`&`/`|` — `if true; then <install>;
+#: fi` and `while false; do <install>; done` split into segments
+#: `['then', <install...>]` / `['do', <install...>]`, so an install hiding in
+#: a compound-command BODY reads as argv[0]='then'/'do', which is neither a
+#: package manager nor a `_WRAPPERS` entry, so `_pkg_install_match` never
+#: evaluates it (review rounds 2026-08-11, this ticket — repro'd with both
+#: `if/then/fi` and `while/do/done`). These are bash's OWN reserved words
+#: used in command position — a finite set fixed by the shell grammar, not
+#: an enumeration of examples the next repro can dodge — so stripping ALL of
+#: them (not just `then`/`do`) closes the class. `{`/`}`/`(`/`)` need no
+#: entry here: they consist entirely of `_INSTALL_PUNCTUATION` characters, so
+#: `_segment_tokens` already treats them as segment BOUNDARIES and they never
+#: reach a segment as a token.
+_SHELL_KEYWORDS = frozenset({
+    "if", "then", "elif", "else", "fi",
+    "do", "done", "while", "until", "for", "in",
+    "case", "esac", "select", "function", "time", "!",
+})
+
+
+def _strip_shell_keywords(tokens: list[str]) -> list[str]:
+    """Drop leading shell reserved words, repeatedly, so what remains is the
+    compound-command BODY's own argv[0] — `['then', 'do', pip, install, foo]`
+    reduces to `[pip, install, foo]`, the thing analysis actually needs to
+    see. Only ever strips from the HEAD: a reserved word appearing later in
+    the segment (`echo then pip`) is an ordinary argument, not a keyword, and
+    is left untouched — `_strip_wrappers`, called on the result, mirrors the
+    same head-only discipline for `env`/`sudo`/etc.
+    """
+    i = 0
+    while i < len(tokens) and tokens[i] in _SHELL_KEYWORDS:
+        i += 1
+    return tokens[i:]
+
+
+def _looks_quoted(tok: str) -> bool:
+    # A multi-word token can only come from something that WAS quoted —
+    # shlex/whitespace-splitting never produces a bare space inside a token
+    # otherwise. This is the signal that recursion should re-tokenise it as
+    # its own command line (`sh -c "..."`, `bash -lc '...'`, `eval "..."`).
+    return any(c.isspace() for c in tok)
+
+
+def _scan_for_install_denial(text: str, cwd: "str | None", running_cwd: "str | None",
+                              activated: "str | None", protected: list,
+                              primary: "Path | None", depth: int):
+    """Scan ``text`` for a package-install invocation that lands in a
+    protected venv. Threads `cd`/`source .../activate` state between segments
+    on the SAME command line, the way a real shell would. Recurses up to two
+    levels into nested shell runners (`sh -c "..."`, `xargs pip install ...`,
+    `timeout 300 pip install ...`) — mirrors `_git_push_invocations`'s
+    recursion into quoted/continuation argv, so those wrappers cannot launder
+    an install past this guard. Returns `(reason_or_None, running_cwd,
+    activated)` — the trailing two are this scan's updated state; a nested
+    recursion's own updates do not leak back into the caller, matching how a
+    subshell's `cd` never affects its parent."""
+    for tokens in _segment_tokens(text):
+        if not tokens:
+            continue
+
+        tokens = _strip_shell_keywords(tokens)
+        if not tokens:
+            continue
+
+        # Env assignments visible on THIS segment (`VAR=val cmd`, `env VAR=val
+        # cmd`) — captured before wrapper-stripping discards them.
+        env_map = {}
+        i = 0
+        while i < len(tokens):
+            if tokens[i] == "env":
+                i += 1
+                continue
+            m = re.fullmatch(r"([A-Za-z_]\w*)=(.*)", tokens[i])
+            if not m:
+                break
+            env_map[m.group(1)] = m.group(2)
+            i += 1
+
+        argv = _strip_wrappers(tokens, _is_pkg_manager_name)
+        if not argv:
+            continue
+
+        if argv[0] == "cd" and len(argv) >= 2:
+            if _UNRESOLVABLE.search(argv[1]):
+                running_cwd = None
+            else:
+                running_cwd = str(_resolve_install_path(argv[1], running_cwd))
+            continue
+        if argv[0] in ("source", ".") and len(argv) >= 2:
+            m2 = re.match(r"(.+)/(?:bin|Scripts)/activate(?:\.\w+)?$", argv[1])
+            if m2:
+                activated = m2.group(1)
+            continue
+
+        reason = _check_install_argv(argv, env_map, activated, running_cwd, protected,
+                                      primary, cwd)
+        if reason:
+            return reason, running_cwd, activated
+
+        if depth >= 2:
+            continue
+        name = PurePosixPath(argv[0]).name
+        rest = argv[1:]
+        if name == "uv" and rest and rest[0] == "run" and len(rest) >= 2:
+            reason = _check_install_argv(rest[1:], {}, activated, running_cwd,
+                                          protected, primary, cwd)
+            if reason:
+                return reason, running_cwd, activated
+            continue
+        if name in _SHELL_RUNNERS:
+            # `xargs <venv>/bin/pip install`, `nice -n 10 pip install …`,
+            # `timeout 300 pip install …` — the command is the rest of THIS
+            # argv, already tokenised, but a leading duration/PID/flag means
+            # the install verb is not `rest[0]`. Rather than parse each
+            # wrapper's own option grammar, try every suffix — a handful of
+            # tokens at most.
+            for k in range(len(rest)):
+                reason = _check_install_argv(rest[k:], {}, activated, running_cwd,
+                                              protected, primary, cwd)
+                if reason:
+                    return reason, running_cwd, activated
+            # `sh -c "pip install …"`, `bash -lc '…'` — the real command is
+            # one quoted token; re-tokenise it as its own command line.
+            for tok in rest:
+                if _looks_quoted(tok):
+                    sub_reason, _, _ = _scan_for_install_denial(
+                        tok, cwd, running_cwd, activated, protected, primary, depth + 1
+                    )
+                    if sub_reason:
+                        return sub_reason, running_cwd, activated
+    return None, running_cwd, activated
+
+
+def _venv_install_denial(cmd: str, cwd: "str | None") -> "str | None":
+    """Why this command's package install must be denied, or `None` to allow
+    it. `[]` from `_protected_venvs` (a packaged/non-editable install,
+    nothing to protect) makes this a no-op — never a false denial."""
+    protected = _protected_venvs(cwd)
+    if not protected:
+        return None
+    primary = _primary_checkout()
+    reason, _, _ = _scan_for_install_denial(cmd, cwd, cwd, None, protected, primary, 0)
+    return reason
+
 
 # Merging the PR — the one action that is always a human's (§3.2). `git merge`
 # is NOT this: a PR is merged through the forge, and that is what must be denied.
@@ -282,15 +780,22 @@ def _looks_like_git_push(text: str) -> bool:
     return bool(re.search(r"\bgit\b.*\bpush\b", text, re.DOTALL))
 
 
-def _strip_wrappers(tokens: list[str]) -> list[str]:
+def _strip_wrappers(tokens: list[str], is_extra_target=None) -> list[str]:
     """argv with leading `VAR=value` assignments and `_WRAPPERS` words removed.
 
     A wrapper may carry its own flags and flag VALUES (`env -i`, `sudo -u me`),
     and their option grammars differ per tool, so no attempt is made to parse
     them: when what follows a wrapper still starts with a flag, the argv is
     taken from the first token that names `git` or a shell runner — the only
-    argv[0] values any caller of this function acts on. Skipping the unparsed
-    middle can only widen what is analysed, never allow more.
+    argv[0] values any caller of this function acted on until ``is_extra_target``
+    was added. Skipping the unparsed middle can only widen what is analysed,
+    never allow more.
+
+    ``is_extra_target`` is an optional ``str -> bool`` predicate widening the
+    recovery scan beyond `git`/shell-runners for a caller with its own set of
+    interesting argv[0] names (the package-install guard uses it for
+    `pip`/`uv`/`poetry`/... — otherwise `env -i pip install …` recovers to
+    nothing, since pip is neither git nor a shell runner).
     """
     i = 0
     saw_wrapper = False
@@ -304,7 +809,8 @@ def _strip_wrappers(tokens: list[str]) -> list[str]:
     if saw_wrapper and argv and argv[0].startswith("-"):
         for j, tok in enumerate(argv):
             name = PurePosixPath(tok).name
-            if name == "git" or name in _SHELL_RUNNERS:
+            if (name == "git" or name in _SHELL_RUNNERS
+                    or (is_extra_target is not None and is_extra_target(name))):
                 return argv[j:]
     return argv
 
@@ -824,6 +1330,11 @@ def evaluate(
                 "credentials regardless of checkout. Test CLI behavior through "
                 "the test suite (CliRunner), never a live process.",
             )
+        # Applies to EVERY session mode, like `_LIVE_SERVER` above — this is
+        # about the operator's real primary checkout, not the repo's content.
+        venv_reason = _venv_install_denial(cmd, cwd)
+        if venv_reason:
+            return GuardDecision(False, venv_reason)
         # Kept as-is: catches `git push` spelled in ways argv analysis does not
         # reach (inside a heredoc, an alias, a quoted fragment of a larger
         # script). The argv analysis below is additive, never a replacement.
