@@ -52,7 +52,7 @@ import secrets
 from pathlib import Path
 from typing import Any
 
-from ..blockers import Blocker
+from ..blockers import Blocker, question_hash
 from ..learning.ranking import importance_tier
 from ..testing.repro_gate import MANIFEST as REPRO_MANIFEST
 from .task import Task
@@ -246,6 +246,35 @@ def build_resume_digest(task: Task) -> str:
             f"  A: {latest.get('answer', '')}\n"
             "Use this answer; do NOT re-ask. Do not lower the bar."
         )
+        # Blocker answers survive attempt death: every stored answer on the
+        # task, not just the latest, so a resumed run never re-asks a question
+        # a human already settled in an EARLIER attempt (the latest-reply
+        # paragraph above only ever shows the last one). Bounded to the last 5
+        # distinct questions, skipping blank answers — same capacity-budget
+        # discipline as `build_intake_qa_block`. Tolerates bare-string entries
+        # (pre-existing rows written before this field existed).
+        seen_hashes: set[str] = set()
+        answered: list[str] = []
+        for entry in reversed(replies):
+            if not isinstance(entry, dict):
+                continue
+            answer = entry.get("answer")
+            if not answer:
+                continue
+            h = entry.get("question_hash") or question_hash(entry.get("question"))
+            if not h or h in seen_hashes:
+                continue
+            seen_hashes.add(h)
+            q = " ".join(str(entry.get("question", "")).split())[:200]
+            a = " ".join(str(answer).split())[:400]
+            answered.append(f"  Q: {q}\n  A: {a}")
+            if len(answered) >= 5:
+                break
+        if answered:
+            parts.append(
+                "ANSWERED QUESTIONS — the operator has already settled these. "
+                "Use the answer; do NOT re-ask:\n" + "\n".join(reversed(answered))
+            )
     feedback = ctx.get("send_back_feedback") or []
     if feedback:
         parts.append(

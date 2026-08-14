@@ -268,6 +268,12 @@ class Blocker:
     # None when unmeasured (e.g. `store.lifetime_usage` failed — telemetry is
     # fail-open, routing is not). Never invent zeros for a missing object.
     escalation_latency: dict[str, int] | None = None
+    # Which DB attempt raised this blocker (`store.create_attempt`'s id), so a
+    # stored `human_replies` answer can record `source_attempt_id` and the
+    # answer-reuse idempotency guard can key "already reused for THIS attempt"
+    # (blockers/answers.py, orchestrator._raise_blocker). "" when unknown (a
+    # blocker built outside an attempt, e.g. the plan-approval gate).
+    attempt_id: str = ""
 
     def __post_init__(self) -> None:
         # `options` is list[BlockerOption] unconditionally, whoever built it:
@@ -298,6 +304,7 @@ class Blocker:
             "escalation_latency": (
                 dict(self.escalation_latency) if self.escalation_latency else None
             ),
+            "attempt_id": self.attempt_id,
         }
 
     @classmethod
@@ -333,6 +340,7 @@ class Blocker:
                 }
                 if data.get("escalation_latency") else None
             ),
+            attempt_id=str(data.get("attempt_id", "") or ""),
         )
 
 

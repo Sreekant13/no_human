@@ -2582,6 +2582,7 @@ async def reply_task(
     from ..blockers import (
         ActionError,
         Blocker,
+        answer_record,
         apply_action,
         is_plan_approval_action,
         is_terminal_action,
@@ -2627,10 +2628,13 @@ async def reply_task(
         except ActionError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    await store.append_context_list(task.id, "human_replies", {
-        "at": _now(), "question": question, "answer": answer,
-        "applied": applied,
-    })
+    record = answer_record(
+        question=question, answer=answer,
+        attempt_id=(task.blocker or {}).get("attempt_id") or "",
+        source="operator:api",
+    )
+    record["applied"] = applied
+    await store.append_context_list(task.id, "human_replies", record)
     # Terminal option (SCRUM-22): the human chose "stop — keep parked". Record
     # the answer and leave the parked status untouched; resuming here is what
     # silently inverted the stop.

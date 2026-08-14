@@ -47,10 +47,13 @@ from ..blockers import (
     BlockerOption,
     blocker_prompt_suffix,
     fallback_blocker,
+    find_stored_answer,
     missing_access,
     notification_line,
     parse_blocker,
+    question_hash,
     render_report,
+    reuse_record,
     triage,
 )
 from ..ci.base import CIResult, HumanGatedCI
@@ -3544,7 +3547,8 @@ class Orchestrator:
                 attempt_id, status="failed",
                 failure_reason=f"agent blocker: {emitted.category.value}",
             )
-            return await self._raise_blocker(task, emitted, repo=repo, branch=branch)
+            return await self._raise_blocker(
+                task, emitted, repo=repo, branch=branch, attempt_id=attempt_id)
 
         # --- commit (deterministic) ---
         resumed_commit = None
@@ -5913,10 +5917,69 @@ class Orchestrator:
         return TaskOutcome(task, status=TaskStatus.AWAITING_APPROVAL,
                            detail=detail, report=claim)
 
+    def _blocker_reuse_eligible(
+        self, blocker: Blocker, attempt_id: str | None,
+    ) -> bool:
+        """Scope guard for answer reuse (blocker answers survive attempt
+        death): only a blocker that (1) carries a question, (2) was raised by
+        the CODER — never a harness-literal blocker like plan approval or
+        budget exhaustion, which stay human-only regardless of any stored
+        answer with matching text, (3) is attributable to a real attempt, and
+        (4) would otherwise cost a human a round-trip (a route that neither
+        parks silently nor already forgoes notification) is eligible to have
+        a prior operator answer replayed instead of asked again."""
+        if not (blocker.question or "").strip():
+            return False
+        if not blocker.reason_is_agent_authored:
+            return False
+        if not attempt_id:
+            return False
+        route = triage(
+            blocker,
+            escalate_below_confidence=self._escalate_below_conf(),
+            budget_exhaustion_terminal=self._budget_exhaustion_terminal(),
+        )
+        return (not route.parked) and route.notify_now
+
+    async def _reuse_stored_answer(
+        self, task: Task, blocker: Blocker, stored: dict[str, Any], attempt_id: str,
+    ) -> TaskOutcome:
+        """The answer-reuse path: append the replay to ``human_replies``,
+        announce it under its own event kind, and hand back a retryable
+        (never off-ramp) outcome so the bounded attempt loop moves straight to
+        the next attempt — carrying the answer via `build_resume_digest` —
+        instead of parking on the operator a second time for a question they
+        already answered."""
+        record = reuse_record(stored, reused_in_attempt_id=attempt_id)
+        await self.store.append_context_list(task.id, "human_replies", record)
+        # Refresh THIS run's in-memory context (not just the DB row) so the
+        # very next attempt's prompt sees the answer without a re-fetch.
+        ctx = dict(task.context or {})
+        replies = list(ctx.get("human_replies") or [])
+        replies.append(record)
+        ctx["human_replies"] = replies
+        task.context = ctx
+        original_attempt_id = stored.get("source_attempt_id") or ""
+        original_answer = stored.get("answer") or ""
+        self.emit(
+            "answer_reused",
+            f"reusing the operator's earlier answer to: "
+            f"{(blocker.question or '')[:200]}",
+            original_question_hash=record["question_hash"],
+            reused_in_attempt_id=attempt_id,
+            original_attempt_id=original_attempt_id,
+            original_answer=original_answer,
+            reused_at=record["answered_at"],
+        )
+        return TaskOutcome(
+            task, status=TaskStatus.FAILED,
+            detail=f"answer reused: {original_answer[:200]}", off_ramp=False,
+        )
+
     async def _raise_blocker(
         self, task: Task, blocker: Blocker, *, repo: GitRepo | None = None,
         branch: str | None = None, escalate_now: bool = False,
-        notify_override: bool | None = None,
+        notify_override: bool | None = None, attempt_id: str | None = None,
     ) -> TaskOutcome:
         """Checkpoint WIP, route by taxonomy (22.2), persist, and notify by
         severity (22.6). The single funnel for every off-ramp.
@@ -5929,7 +5992,35 @@ class Orchestrator:
         route's default — used to give the human a heads-up on a *parked* task
         they must still act on (e.g. a human-gated CI build), which otherwise
         parks silently.
+
+        ``attempt_id`` identifies the attempt raising *blocker* (only the
+        coder-blocker call site passes it). It is stamped onto the blocker so
+        a stored answer can record which attempt a human actually answered,
+        and — before anything else — it gates answer reuse: if this task
+        already has a human answer to the SAME normalized question (and it
+        was not already reused for this exact attempt), that answer is
+        replayed instead of parking on the operator again (see
+        `_blocker_reuse_eligible` / `_reuse_stored_answer`).
         """
+        blocker.attempt_id = attempt_id or blocker.attempt_id or ""
+
+        # 0. Answer reuse — before any checkpoint/routing/persistence, so a
+        # reused answer never parks the task at all.
+        if self._blocker_reuse_eligible(blocker, attempt_id):
+            replies = list((task.context or {}).get("human_replies") or [])
+            target_hash = question_hash(blocker.question)
+            already_reused_here = any(
+                isinstance(r, dict) and r.get("source") == "reuse"
+                and r.get("question_hash") == target_hash
+                and r.get("reused_in_attempt_id") == attempt_id
+                for r in replies
+            )
+            if not already_reused_here:
+                stored = find_stored_answer(replies, blocker.question)
+                if stored is not None:
+                    return await self._reuse_stored_answer(
+                        task, blocker, stored, attempt_id)
+
         # 1. Checkpoint: never lose work (22.5). Commit WIP as [WIP-BLOCKED].
         if repo is not None:
             sha = self._checkpoint_wip(repo, task)

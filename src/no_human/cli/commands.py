@@ -2755,6 +2755,7 @@ def reply(task_id, answer, choose, run):
     from ..blockers import (
         ActionError,
         Blocker,
+        answer_record,
         apply_action,
         is_plan_approval_action,
         is_terminal_action,
@@ -2805,10 +2806,13 @@ def reply(task_id, answer, choose, run):
                 if applied:
                     console.print(f"[green]applied[/] {applied}")
 
-            await store.append_context_list(t.id, "human_replies", {
-                "at": _now_iso(), "question": question, "answer": answer,
-                "applied": applied,
-            })
+            record = answer_record(
+                question=question, answer=answer,
+                attempt_id=(t.blocker or {}).get("attempt_id") or "",
+                source="operator:cli",
+            )
+            record["applied"] = applied
+            await store.append_context_list(t.id, "human_replies", record)
 
             # 2.3 (CodeRabbit learnings): if the reply states a reusable
             # preference/rule, propose it to the HUMAN-CONFIRMED learning queue

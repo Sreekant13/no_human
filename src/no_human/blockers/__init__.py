@@ -1,6 +1,13 @@
 """Blocker handling (PLAN.md Part 22): taxonomy, structured escalation, and the
 wake-condition watcher."""
 
+from .answers import (
+    answer_record,
+    find_stored_answer,
+    normalize_question,
+    question_hash,
+    reuse_record,
+)
 from .report import (
     blocker_prompt_suffix,
     ci_misconfigured,
@@ -33,6 +40,11 @@ __all__ = [
     "apply_action",
     "is_plan_approval_action",
     "is_terminal_action",
+    "answer_record",
+    "find_stored_answer",
+    "normalize_question",
+    "question_hash",
+    "reuse_record",
     "Blocker",
     "BlockerCategory",
     "BlockerOption",
