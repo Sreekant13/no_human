@@ -548,6 +548,9 @@ def test_publish_allows_english_that_merely_contains_a_term(bench_env):
     the only escape would be editing a real measured note to satisfy it."""
     results, report = bench_env
     src = results / "v13.json"
+    # A short banned term contained inside a longer ordinary-English word is
+    # the containment under test — the note MUST keep such a word or this
+    # test is vacuous (the word below carries one; see the boundary rule).
     _note_card("pattern recognition in the report generator script").save(src)
 
     res = CliRunner().invoke(cli, ["bench", "publish", str(src)])

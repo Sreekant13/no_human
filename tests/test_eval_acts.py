@@ -106,7 +106,7 @@ async def test_missing_context_resolves_assumptions_even_on_accept(
     the headline verdict."""
     async def _fake_resolve(title, description, criteria, *, backend=None, model=None,
                             usage_sink=None):
-        return ["assume the export endpoint means /api/data/export"]
+        return ["assume the report endpoint means /api/reports/fetch"]
     monkeypatch.setattr(ev, "resolve_assumptions", _fake_resolve)
 
     t = Task.new("underspecified but clear task", repo_path="/r")
@@ -120,7 +120,7 @@ async def test_missing_context_resolves_assumptions_even_on_accept(
 
     got = await store.get_task(t.id)
     assert got.context["assumptions"] == [
-        "assume the export endpoint means /api/data/export"]
+        "assume the report endpoint means /api/reports/fetch"]
 
 
 async def test_missing_dimensions_default_to_no_assumptions(store, tmp_path):

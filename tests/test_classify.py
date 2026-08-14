@@ -307,7 +307,7 @@ def test_review_plus_implement_stays_out_of_code_review():
 def test_question_form_asks_route_to_investigation():
     from no_human.intake.classify import classify_kind, TaskKind
     for title in [
-        "what are the allowed columns in the data/export endpoint",
+        "what are the allowed columns in the report endpoint",
         "why is the export endpoint slow on large ranges",
         'read the code and tell me when the uploader returns: "Import completed"',
         "figure out why alerting issues are not coming through",
