@@ -1042,15 +1042,18 @@ async def test_going_terminal_during_the_probe_aborts_the_closed_rung(
 
 
 def _ledger_repo(tmp_path, *, extra_branch_file=None, extra_ledger=None,
-                 diverge_classification=False):
+                 diverge_classification=False,
+                 classification_branch=None, classification_main=None):
     """The 5ef97879 shape: the code landed, the manifest was RE-DERIVED.
 
     Base, branch and main each carry a different manifest row for the same
     path, so the two sides changed the same line differently — a genuine
     merge CONFLICT confined to the ledger, which is exactly what the live
     refs produced. `EXPORT_CLASSIFICATION.txt` stays IDENTICAL across the two
-    sides unless `diverge_classification`, matching the incident (it merged
-    cleanly there) and keeping it out of the excluded set.
+    sides unless `diverge_classification` (a ship<->drop flip) or the more
+    precise `classification_branch`/`classification_main` pair, which each
+    write the EXACT text their side needs — used by the count-only-divergence
+    cases, where the two sides must differ in a rule's count integer alone.
     """
     repo = _make_repo(tmp_path)
     (repo / "RELEASE_MANIFEST.txt").write_text("AAA  a.txt\n")
@@ -1063,6 +1066,8 @@ def _ledger_repo(tmp_path, *, extra_branch_file=None, extra_ledger=None,
     (repo / "RELEASE_MANIFEST.txt").write_text("BBB  a.txt\n")
     if diverge_classification:
         (repo / "EXPORT_CLASSIFICATION.txt").write_text("drop     1  a.txt\n")
+    if classification_branch is not None:
+        (repo / "EXPORT_CLASSIFICATION.txt").write_text(classification_branch)
     if extra_branch_file:
         (repo / extra_branch_file).write_text("only on the branch\n")
     if extra_ledger:
@@ -1076,12 +1081,20 @@ def _ledger_repo(tmp_path, *, extra_branch_file=None, extra_ledger=None,
     _git(repo, "checkout", "main")
     (repo / "a.txt").write_text("changed\n")
     (repo / "RELEASE_MANIFEST.txt").write_text("DDD  a.txt\n")
+    if classification_main is not None:
+        (repo / "EXPORT_CLASSIFICATION.txt").write_text(classification_main)
     if extra_ledger:
         (repo / extra_ledger).parent.mkdir(parents=True, exist_ok=True)
         (repo / extra_ledger).write_text("DDD  a.txt\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", "squash: land a.txt, re-derive the manifest")
     return repo
+
+
+#: The base text for the count-only-divergence cases below: two rules, so a
+#: pattern change, an added/removed rule, and a header edit are all separately
+#: expressible against it.
+_CLASSIFICATION_BASE_TEXT = "# header\nship     2  a.txt\ndrop     1  secrets/\n"
 
 
 async def test_a_branch_diverging_only_in_the_generated_manifest_is_shipped(tmp_path):
@@ -1103,6 +1116,113 @@ async def test_a_classification_only_divergence_is_not_shipped(tmp_path):
     repo = _ledger_repo(tmp_path, diverge_classification=True)
     assert (repo / "EXPORT_CLASSIFICATION.txt").read_text() == "ship     1  a.txt\n", \
         "fixture: base still carries the OLD decision"
+    assert await default_branch_shipped(str(repo), "feature", "main") is False
+
+
+async def test_a_classification_count_only_divergence_is_shipped(tmp_path):
+    """THE FIX (live class, 2026-08-14). A supervising-session squash train
+    UNION-edits every rule's win-count across the branches it folds in, so a
+    non-first car's classification differs from its own landing candidate in
+    the count integer alone — forever, since the count is a re-derived tally,
+    never taken from the branch. Here the branch carries `ship 2 a.txt`; the
+    landing re-derived it to `ship 3 a.txt`. Everything else (the header, the
+    `drop` rule, the code) is identical, apart from the manifest re-pin every
+    landing does anyway. This must read as shipped, and `branch_landed_commit`
+    must resolve to a real SHA, not just a bool."""
+    repo = _ledger_repo(
+        tmp_path,
+        classification_branch=_CLASSIFICATION_BASE_TEXT,
+        classification_main="# header\nship     3  a.txt\ndrop     1  secrets/\n",
+    )
+    assert (repo / "a.txt").read_text() == "changed\n", "fixture: code landed"
+    assert await default_branch_shipped(str(repo), "feature", "main") is True
+    landed = await pr_watcher.branch_landed_commit(str(repo), "feature", "main")
+    assert landed is not None
+
+
+async def test_a_classification_pattern_change_is_still_not_shipped(tmp_path):
+    """CONTROL. The `drop` rule's PATTERN changes (`secrets/` ->
+    `secrets/keys/`), not just a count — the exact shape that once hid an
+    unlanded drop. Still not shipped."""
+    repo = _ledger_repo(
+        tmp_path,
+        classification_branch=_CLASSIFICATION_BASE_TEXT,
+        classification_main="# header\nship     2  a.txt\ndrop     1  secrets/keys/\n",
+    )
+    assert await default_branch_shipped(str(repo), "feature", "main") is False
+
+
+async def test_a_classification_added_or_removed_rule_is_still_not_shipped(tmp_path):
+    """CONTROL. The branch adds a THIRD rule the landing never took — a real
+    decision, not a count re-derivation. Still not shipped."""
+    repo = _ledger_repo(
+        tmp_path,
+        classification_branch=_CLASSIFICATION_BASE_TEXT + "ship     5  extra/\n",
+        classification_main=_CLASSIFICATION_BASE_TEXT,
+    )
+    assert await default_branch_shipped(str(repo), "feature", "main") is False
+
+
+async def test_a_classification_comment_change_is_still_not_shipped(tmp_path):
+    """CONTROL, fail-closed: only the `#` header differs (no rule line
+    changes at all). Only count lines are ever forgiven — a comment edit is
+    not."""
+    repo = _ledger_repo(
+        tmp_path,
+        classification_branch=_CLASSIFICATION_BASE_TEXT,
+        classification_main="# updated header\nship     2  a.txt\ndrop     1  secrets/\n",
+    )
+    assert await default_branch_shipped(str(repo), "feature", "main") is False
+
+
+async def test_a_classification_lookalike_path_is_not_forgiven(tmp_path):
+    """CONTROL. `docs/EXPORT_CLASSIFICATION.txt` — a lookalike BASENAME, not
+    the exact repo-root path — diverges between the two sides. The exact-path
+    doctrine means this is never eligible for the count-only forgiveness, so
+    it must still block, same as the real ledger's own lookalike-path test."""
+    repo = _ledger_repo(tmp_path, extra_ledger="docs/EXPORT_CLASSIFICATION.txt")
+    assert await default_branch_shipped(str(repo), "feature", "main") is False
+
+
+async def test_count_only_classification_never_excuses_a_real_unlanded_path(tmp_path):
+    """CONTROL. The same count-only classification divergence as the red-first
+    case, PLUS one real file (`b.txt`) that never landed. The classification
+    forgiveness only ever fires when it is the SOLE residue; a real unlanded
+    path must still block regardless."""
+    repo = _ledger_repo(
+        tmp_path,
+        classification_branch=_CLASSIFICATION_BASE_TEXT,
+        classification_main="# header\nship     3  a.txt\ndrop     1  secrets/\n",
+        extra_branch_file="b.txt",
+    )
+    assert not (repo / "b.txt").exists(), "fixture: b.txt must not be on base"
+    assert await default_branch_shipped(str(repo), "feature", "main") is False
+
+
+async def test_a_branch_that_deletes_the_classification_is_not_shipped(tmp_path):
+    """CONTROL. The branch removes `EXPORT_CLASSIFICATION.txt` outright — a
+    real decision (stop classifying at all), not a count re-derivation.
+    `git show <branch>:EXPORT_CLASSIFICATION.txt` fails on that side, so
+    `_classification_decisions` returns ``None`` and the divergence is never
+    settled."""
+    repo = _make_repo(tmp_path)
+    (repo / "RELEASE_MANIFEST.txt").write_text("AAA  a.txt\n")
+    (repo / "EXPORT_CLASSIFICATION.txt").write_text(_CLASSIFICATION_BASE_TEXT)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "add the generated ledgers")
+
+    _git(repo, "checkout", "-b", "feature")
+    (repo / "a.txt").write_text("changed\n")
+    (repo / "RELEASE_MANIFEST.txt").write_text("BBB  a.txt\n")
+    _git(repo, "rm", "-q", "EXPORT_CLASSIFICATION.txt")
+    _git(repo, "commit", "-m", "feature: change a.txt, drop the classification")
+
+    _git(repo, "checkout", "main")
+    (repo / "a.txt").write_text("changed\n")
+    (repo / "RELEASE_MANIFEST.txt").write_text("DDD  a.txt\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "squash: land a.txt, re-derive the manifest")
+
     assert await default_branch_shipped(str(repo), "feature", "main") is False
 
 

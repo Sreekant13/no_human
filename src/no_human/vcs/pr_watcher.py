@@ -944,10 +944,96 @@ async def _base_tips(repo_path: str, base: str) -> list[str]:
 #: an unlanded `drop` — a file somebody decided to stop publishing that keeps
 #: publishing — inside this repo's primary privacy mechanism. It was also never
 #: required: in the measured incident (PR #183) the manifest was the sole
-#: residue in both directions and the classification merged cleanly. A
-#: classification-only divergence now falls through to a rebase round or a
-#: human, which is the safe side of the trade.
+#: residue in both directions and the classification merged cleanly.
+#:
+#: NARROWED FURTHER (live class, 2026-08-14): a classification-only divergence
+#: used to fall through to a rebase round or a human unconditionally, which was
+#: the safe side of the trade until it collided with how the supervising
+#: session actually lands multiple branches — a squash train UNION-edits every
+#: landed rule's win-COUNT (`ship N pattern`) across all the branches it folds
+#: in, so every branch after the first in a train diverges from the landing
+#: candidate in that integer alone, forever: the count is a re-derived tally of
+#: matched files, not a decision, and re-deriving it the way `RELEASE_MANIFEST
+#: .txt` is re-derived is exactly what left those tasks stuck. So the ledger is
+#: now compared at LINE granularity (`_classification_settled`, below) instead
+#: of being all-or-nothing excluded: if EVERY differing line between the two
+#: sides is the same rule's count integer — same `ship`/`drop`, same pattern,
+#: only the count differs — the divergence is forgiven; ANY other difference
+#: (a flipped decision, a changed or added/removed pattern, a reordered or
+#: malformed line, a comment/header edit) still blocks, exactly as before. This
+#: is not a subset relaxation of the name-exclusion above: the ledger's own
+#: PATH is never dropped from comparison, only a specific SHAPE of content
+#: divergence in it is. `test_a_classification_only_divergence_is_not_shipped`
+#: still pins the ship→drop flip as unforgiven; the new count-only behaviour is
+#: pinned by `test_a_classification_count_only_divergence_is_shipped`.
 _GENERATED_LEDGERS = frozenset({"RELEASE_MANIFEST.txt"})
+
+#: The one classification ledger eligible for the narrower, line-granularity
+#: forgiveness above. An exact repo-root path, same doctrine as
+#: `_GENERATED_LEDGERS`: never a basename or glob match, so
+#: `docs/EXPORT_CLASSIFICATION.txt` does not qualify. Deliberately NOT folded
+#: into `_GENERATED_LEDGERS` itself — that frozenset means "excluded outright",
+#: and this path is never excluded outright, only forgiven when every
+#: differing line is a count integer.
+_CLASSIFICATION_LEDGER = "EXPORT_CLASSIFICATION.txt"
+
+
+async def _classification_decisions(repo_path: str, ref: str) -> list[str] | None:
+    """The ``ref``'s ``EXPORT_CLASSIFICATION.txt``, canonicalised line-by-line
+    with each rule line's win-count integer elided — the comparison basis for
+    ``_classification_settled``.
+
+    Mirrors the grammar in ``scripts/build_public_export.py:parse_classification``
+    (not imported: ``scripts/`` is outside the package) without importing it:
+    a line whose ``.split()`` is exactly three fields with the first field
+    ``ship``/``drop`` and the second an integer is a rule line, canonicalised
+    to ``f"{decision} {pattern}"`` — the count dropped on purpose, since it is
+    a derived tally, not a decision. Every other line (comments, blanks,
+    malformed rule lines) is kept verbatim (``.strip()``ped), so any change to
+    them still counts as a real divergence.
+
+    Order is preserved: the file is last-matching-rule-wins, so a reordering
+    changes which rule wins and is a decision change, not a count edit.
+
+    ``None`` — "cannot tell" — on any git failure or an empty read: the file
+    absent on this side (deleted, or predates the ledger), or a `git show`
+    that failed outright. The caller treats ``None`` as unsettled, never as
+    "no rules to compare".
+    """
+    rc, text = await _git_rc(repo_path, "show", f"{ref}:{_CLASSIFICATION_LEDGER}")
+    if rc != 0 or not text:
+        return None
+    decisions: list[str] = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[0] in ("ship", "drop") and parts[1].isdigit():
+            decisions.append(f"{parts[0]} {parts[2]}")
+        else:
+            decisions.append(line.strip())
+    return decisions
+
+
+async def _classification_settled(repo_path: str, commit: str, branch: str) -> bool:
+    """Whether ``commit`` and ``branch`` carry the SAME classification
+    decisions, ignoring only each rule's win-count integer.
+
+    Both sides read via ``_classification_decisions``; ``None`` on either
+    side (file absent, or any git failure) settles nothing — ``False``. This
+    is direction-independent (a set of decisions is or is not the same
+    regardless of which side is asked first), so ``_contained_at`` computes it
+    at most once per call and reuses it for both merge directions.
+
+    Sequence equality gives the required semantics for free: a pure count
+    edit (the union-edit train case) canonicalises to identical sequences and
+    settles ✅; a ship↔drop flip, a pattern change, an added/removed/reordered
+    rule, or a comment/header edit all change the sequence and stay unsettled
+    ❌ — the same outcome as before this function existed.
+    """
+    ours = await _classification_decisions(repo_path, commit)
+    theirs = await _classification_decisions(repo_path, branch)
+    if ours is None or theirs is None:
+        return False
+    return ours == theirs
 
 
 async def _unsettled_paths(repo_path: str, want_tree: str, ours: str,
@@ -1057,11 +1143,28 @@ async def _contained_at(repo_path: str, commit: str, branch: str) -> bool:
     rc, tree = await _git_rc(repo_path, "rev-parse", f"{commit}^{{tree}}")
     if rc != 0 or not tree:
         return False
+    # Computed at most once, lazily, and reused for both directions: the
+    # line-granularity classification comparison is direction-independent, so
+    # asking it twice would be a wasted `git show` pair on the common case
+    # where the classification never shows up as residue at all.
+    settled_classification: bool | None = None
     # Short-circuited on purpose: the second direction is a whole extra
     # merge-tree, and the first one failing already settles the answer.
     for ours, theirs in ((commit, branch), (branch, commit)):
         unsettled = await _unsettled_paths(repo_path, tree, ours, theirs)
-        if unsettled is None or (unsettled - _GENERATED_LEDGERS):
+        if unsettled is None:
+            return False
+        residue = unsettled - _GENERATED_LEDGERS
+        # Equality, not subset-with-discard: the classification is forgiven
+        # only when it is the SOLE remaining residue, so any real unlanded
+        # path still fails without the extra `git show` pair ever running.
+        if residue == {_CLASSIFICATION_LEDGER}:
+            if settled_classification is None:
+                settled_classification = await _classification_settled(
+                    repo_path, commit, branch)
+            if settled_classification:
+                residue = set()
+        if residue:
             return False
     return True
 
@@ -1233,13 +1336,25 @@ async def default_branch_shipped(repo_path: str, branch: str, base: str = "main"
     an unlanded `drop` — a file somebody decided to stop publishing that goes
     on publishing — inside this repo's primary privacy mechanism. The obvious
     sharper guard (require the branch's decision LINES to be present on base)
-    does not work, because the win-count is IN-BAND and every landing rewrites
-    the text of rows it decided nothing about. So the name is simply out: a
-    classification-only divergence now reads as NOT shipped and falls through
-    to a rebase round or a human, which is the safe side.
-    `test_a_classification_only_divergence_is_not_shipped` pins that, and
-    `test_the_exclusion_is_one_exact_path_not_a_name_pattern` pins the
-    boundary, so neither can widen quietly.
+    does not work as a byte comparison, because the win-count is IN-BAND and
+    every landing rewrites the text of rows it decided nothing about.
+    `test_a_classification_only_divergence_is_not_shipped` still pins the
+    ship→drop flip as unforgiven, and
+    `test_the_exclusion_is_one_exact_path_not_a_name_pattern` still pins the
+    exact-path boundary.
+
+    NARROWED FURTHER (live class, 2026-08-14): the byte comparison above is too
+    blunt for how this repo actually lands multiple branches — a supervising
+    squash train UNION-edits every rule's win-count across all the branches it
+    folds in, so every branch after the first in a train diverges from its own
+    landing candidate in that integer alone, forever, and `branch_landed_commit`
+    never returns for it. `_classification_settled` now compares the ledger at
+    LINE granularity instead of all-or-nothing: each rule line's count is
+    elided before comparing (`_classification_decisions`), so a pure count
+    edit settles and a changed pattern, a flipped decision, an added/removed/
+    reordered rule, or a comment edit does not — see `_GENERATED_LEDGERS` for
+    the full accounting and `test_a_classification_count_only_divergence_is_
+    shipped` for the pin.
 
     That replaced a per-file blob comparison over the branch's touched paths,
     which demanded BYTE EQUALITY on every one of them and so could never
