@@ -115,7 +115,12 @@ def _allowed_transitions() -> dict[TaskStatus, frozenset[TaskStatus]]:
         table[state].add(TaskStatus.PENDING)  # a parked task can resume to pending
 
     # Compound parent: implementing → compound_parent (park),
-    # compound_parent → done / failed / escalated (scheduler callback).
+    # compound_parent → done / failed / escalated. Nothing creates these
+    # rows any more — the LeadAgent decomposition subsystem that wrote them
+    # was deleted 2026-08-12 (operator decision A1). These transitions are
+    # retained only so historical rows written before the deletion still
+    # validate/round-trip; see
+    # tests/test_db.py::test_historical_compound_parent_and_subtask_rows_still_load.
     table[TaskStatus.IMPLEMENTING].add(TaskStatus.COMPOUND_PARENT)
     table[TaskStatus.COMPOUND_PARENT] |= {
         TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.ESCALATED,
