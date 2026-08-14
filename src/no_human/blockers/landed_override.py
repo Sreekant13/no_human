@@ -14,7 +14,11 @@ event, so the two surfaces cannot drift.
 never constructs ``vcs.git.GitRepo``, never calls ``vcs.approve_merge.land_task``,
 never merges or pushes. The override is a human ASSERTION recorded on the
 task, not a merge action — constraint #2 (the agent never merges) is
-untouched because there is no merge here to begin with.
+untouched because there is no merge here to begin with. Closing the task's
+PR(s) after the DONE write (``pr_closeout.close_task_prs_on_completion``) is
+not a merge or a push either — it changes no code and no state the forge
+gates on, the same justification ``approve_merge._close_pr`` and the
+abandon path already stand on.
 
 This is a HUMAN override of automated containment, not a containment pass:
 the audit event's text says so explicitly, and the event's ``kind`` —
@@ -31,6 +35,7 @@ from typing import Any, Awaitable, Callable
 
 from ..core.task import Task, TaskStatus
 from ..vcs.pr_watcher import commit_is_ancestor, containment_residue
+from .pr_closeout import close_task_prs_on_completion
 
 LANDED_OVERRIDE_KIND = "approved_landed_override"
 
@@ -150,5 +155,7 @@ async def approve_landed_override(
         event["residue_note"] = residue_note
 
     await store.set_status(task, TaskStatus.DONE, validate=False, event=event)
+    await close_task_prs_on_completion(
+        store, task, completion_path=LANDED_OVERRIDE_KIND)
 
     return {"sha": sha, "residue": residue, "text": text}

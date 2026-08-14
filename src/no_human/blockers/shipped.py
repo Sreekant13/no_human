@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable
 from ..core.task import Task, TaskStatus
 from ..vcs.pr_outcome import observe_pr
 from ..vcs.pr_watcher import commit_is_ancestor
+from .pr_closeout import close_task_prs_on_completion
 
 log = logging.getLogger("no_human.wake")
 
@@ -184,6 +185,7 @@ async def complete_if_content_landed(
         event={"source": "watcher", "kind": "shipped", "text": shipped_text,
                "ts": time.time()},
     )
+    await close_task_prs_on_completion(store, task, completion_path=action)
     on_event("shipped", shipped_text)
     return action
 

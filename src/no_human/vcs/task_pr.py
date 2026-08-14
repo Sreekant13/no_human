@@ -115,3 +115,46 @@ async def task_has_pr_evidence(store: Any, task: Any) -> str:
         if url and url not in abandoned:
             return url
     return ""
+
+
+async def task_pr_urls(store: Any, task: Any) -> list[str]:
+    """Every PR URL this task is known to have, deduped, minus
+    ``abandoned_pr_urls`` — read-only, no network.
+
+    ``resolve_task_pr``/``task_has_pr_evidence`` each answer "the ONE PR to
+    look at", first non-empty rung wins. A completion closeout needs the
+    OPPOSITE question — "every PR this task might still have open" — because
+    a task can accumulate more than one live URL (e.g. ``pr_watch`` plus a
+    separately recorded ``pr_draft`` event for an earlier attempt's PR that
+    was never explicitly abandoned). This scans every source those two
+    functions read, unions them, and returns all surviving URLs instead of
+    stopping at the first.
+    """
+    ctx = task.context or {}
+    abandoned = {_clean(u) for u in (ctx.get("abandoned_pr_urls") or [])}
+
+    urls: list[str] = []
+    for candidate in (
+        _clean(ctx.get("pr_watch")),
+        _clean(ctx.get("pr_delivered_url")),
+        _clean(ctx.get("pr_draft_created")),
+        _clean(await store.latest_attempt_pr_url(task.id)),
+    ):
+        if candidate:
+            urls.append(candidate)
+
+    for e in await store.list_events(task.id):
+        if e.get("kind") not in _PR_EVENT_KINDS:
+            continue
+        url = _clean(e.get("pr_url")) or _clean(e.get("text"))
+        if url:
+            urls.append(url)
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for url in urls:
+        if not url.startswith("http") or url in abandoned or url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+    return out
