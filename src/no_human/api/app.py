@@ -26,7 +26,7 @@ from dataclasses import asdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:  # import-cycle-free: the eval package is loaded lazily below
@@ -405,6 +405,22 @@ async def _require_task(store: Store, task_id: str) -> Task:
     if task is None:
         raise HTTPException(status_code=404, detail=f"task {task_id!r} not found")
     return task
+
+
+async def _emit_task_event(
+    store: Store, task_id: str, kind: str, text: str, *, persist: bool = True,
+) -> None:
+    """Broadcast a merge-progress frame over the existing WebSocket, so the
+    SlideOver's live-progress panel sees `merge_started`/`merge_step_*`
+    within one server round-trip of the step actually happening.
+
+    ``persist=False`` is for `human_merged`, which `set_status` already
+    writes to `task_events` — broadcasting it again here (for a second
+    observer/tab watching mid-merge) must not double-insert it."""
+    ev = {"source": "human", "kind": kind, "text": text, "ts": time.time()}
+    if persist:
+        await store.save_events(task_id, [ev])
+    await _mgr.broadcast({"type": "task_event", "task_id": task_id, "event": ev})
 
 
 def _latest_pr_url(attempts: list[dict]) -> str | None:
@@ -903,68 +919,95 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
             status_code=409,
             detail=f"task is {task.status.value!r}, not awaiting_approval",
         )
-    task.context = await store.merge_context(task.id, {"approved_at": _now()})
-    # An already-satisfied claim has no PR to merge — approval IS the human
-    # confirmation its terminal promised, so it completes the task (the agent
-    # still never merges anything; there is nothing to merge). Guarded on
-    # pr_url: the report key persists in context, and after a send-back a
-    # LATER attempt may ship a real PR — that approval must stay a merge
-    # instruction, never a false DONE (PR #101 round-2 review).
-    message = "Approval recorded. Merge the PR in your git host — the agent never merges."
-    landed_sha = ""
-    completed_landed = False
-    if (task.context or {}).get("already_satisfied_report"):
-        # Guarded on `task_has_pr_evidence`, not `attempts.pr_url` alone (live
-        # incident, task 8c8b36b5): a draft PR opened pre-review is recorded
-        # only in `context["pr_draft_created"]` or a `pr_draft` event, never
-        # on an attempt row — reading attempts alone missed it and completed
-        # the task while its PR sat open.
-        pr_url = await task_has_pr_evidence(store, task)
-        if not pr_url:
-            await store.set_status(
-                task, TaskStatus.DONE, validate=False,
-                event={"source": "human", "kind": "approved_already_satisfied",
-                       "text": "already-satisfied claim confirmed by approve"},
+    # Idempotency guard (409, not the button's disabled state alone): a
+    # second approve for the same task — a raced double-click that beat the
+    # frontend's own disable, or a second browser tab — must never reach a
+    # second `land_task` (a second squash/push race). Database-backed CAS on
+    # `context.merge_in_progress` so this holds across server instances, not
+    # just in-process.
+    if not await store.claim_merge(task.id):
+        raise HTTPException(status_code=409, detail="Merge already in progress")
+    try:
+        task.context = await store.merge_context(task.id, {"approved_at": _now()})
+        # An already-satisfied claim has no PR to merge — approval IS the human
+        # confirmation its terminal promised, so it completes the task (the agent
+        # still never merges anything; there is nothing to merge). Guarded on
+        # pr_url: the report key persists in context, and after a send-back a
+        # LATER attempt may ship a real PR — that approval must stay a merge
+        # instruction, never a false DONE (PR #101 round-2 review).
+        message = "Approval recorded. Merge the PR in your git host — the agent never merges."
+        landed_sha = ""
+        completed_landed = False
+
+        loop = asyncio.get_running_loop()
+
+        def on_step(step: str) -> None:
+            # Called from the `land_task` worker thread (asyncio.to_thread) —
+            # bridge back onto the event loop so the broadcast can await the
+            # websocket sends. `_emit_task_event` never raises.
+            asyncio.run_coroutine_threadsafe(
+                _emit_task_event(store, task.id, f"merge_step_{step}", f"merge: {step}"),
+                loop,
             )
-            message = ("Already satisfied claim confirmed — no code change was "
-                       "needed. Task done (there is no PR; the agent never merges).")
+
+        async def _merge(pr_url: str) -> tuple[str, dict[str, str] | None]:
+            await _emit_task_event(store, task.id, "merge_started", "merge started")
+            return await _merge_task_pr(request, store, task, pr_url, on_step=on_step)
+
+        if (task.context or {}).get("already_satisfied_report"):
+            # Guarded on `task_has_pr_evidence`, not `attempts.pr_url` alone (live
+            # incident, task 8c8b36b5): a draft PR opened pre-review is recorded
+            # only in `context["pr_draft_created"]` or a `pr_draft` event, never
+            # on an attempt row — reading attempts alone missed it and completed
+            # the task while its PR sat open.
+            pr_url = await task_has_pr_evidence(store, task)
+            if not pr_url:
+                await store.set_status(
+                    task, TaskStatus.DONE, validate=False,
+                    event={"source": "human", "kind": "approved_already_satisfied",
+                           "text": "already-satisfied claim confirmed by approve"},
+                )
+                message = ("Already satisfied claim confirmed — no code change was "
+                           "needed. Task done (there is no PR; the agent never merges).")
+            else:
+                landed_sha, error_detail = await _merge(pr_url)
+                if error_detail:
+                    raise HTTPException(status_code=500, detail=error_detail)
+                if landed_sha:
+                    message = _merge_outcome_message(landed_sha)
+                else:
+                    completed_landed, message = await _landed_completion_outcome(
+                        store, task, landed_sha)
         else:
-            landed_sha, error_detail = await _merge_task_pr(request, store, task, pr_url)
-            if error_detail:
-                raise HTTPException(status_code=500, detail=error_detail)
-            if landed_sha:
-                message = _merge_outcome_message(landed_sha)
-            else:
-                completed_landed, message = await _landed_completion_outcome(
-                    store, task, landed_sha)
-    else:
-        pr_url = await task_has_pr_evidence(store, task)
-        if pr_url:
-            landed_sha, error_detail = await _merge_task_pr(request, store, task, pr_url)
-            if error_detail:
-                raise HTTPException(status_code=500, detail=error_detail)
-            if landed_sha:
-                message = _merge_outcome_message(landed_sha)
-            else:
-                completed_landed, message = await _landed_completion_outcome(
-                    store, task, landed_sha)
-    tasks = await _board_tasks(store, scheduler=_sched(request))
-    await _mgr.broadcast({
-        "type": "task_approved",
-        "task_id": task.id,
-        "tasks": [t.model_dump() for t in tasks],
-    })
-    if landed_sha or completed_landed:
+            pr_url = await task_has_pr_evidence(store, task)
+            if pr_url:
+                landed_sha, error_detail = await _merge(pr_url)
+                if error_detail:
+                    raise HTTPException(status_code=500, detail=error_detail)
+                if landed_sha:
+                    message = _merge_outcome_message(landed_sha)
+                else:
+                    completed_landed, message = await _landed_completion_outcome(
+                        store, task, landed_sha)
+        tasks = await _board_tasks(store, scheduler=_sched(request))
         await _mgr.broadcast({
-            "type": "task_updated", "task_id": task.id,
-            "status": TaskStatus.DONE.value,
+            "type": "task_approved",
+            "task_id": task.id,
             "tasks": [t.model_dump() for t in tasks],
         })
-    return {
-        "ok": True,
-        "message": message,
-        "landed_sha": landed_sha,
-    }
+        if landed_sha or completed_landed:
+            await _mgr.broadcast({
+                "type": "task_updated", "task_id": task.id,
+                "status": TaskStatus.DONE.value,
+                "tasks": [t.model_dump() for t in tasks],
+            })
+        return {
+            "ok": True,
+            "message": message,
+            "landed_sha": landed_sha,
+        }
+    finally:
+        await store.release_merge(task.id)
 
 
 @app.post("/api/tasks/{task_id}/approve-landed")
@@ -1042,6 +1085,7 @@ def _merge_outcome_message(landed_sha: str) -> str:
 
 async def _merge_task_pr(
     request: Request, store, task, pr_url: str,
+    on_step: Callable[[str], None] | None = None,
 ) -> tuple[str, dict[str, str] | None]:
     """Land the PR (vcs/approve_merge.land_task) off the event loop.
 
@@ -1102,16 +1146,23 @@ async def _merge_task_pr(
         land_task,
         repo_path=task.repo_path, branch=branch, pr_url=pr_url,
         task_id=task.id, task_title=task.title, review_evidence=evidence,
-        config=config.data,
+        config=config.data, on_step=on_step,
     )
     if result.skipped:
         return "", None
     if not result.ok:
+        await _emit_task_event(
+            store, task.id, "merge_failed",
+            f"merge failed at {result.step}: {result.stderr[:200]}",
+        )
         return "", {"step": result.step, "stderr": result.stderr}
     await store.set_status(
         task, TaskStatus.DONE, validate=False,
         event={"source": "human", "kind": "human_merged",
                "sha": result.landed_sha, "text": result.message},
+    )
+    await _emit_task_event(
+        store, task.id, "human_merged", result.message, persist=False,
     )
     return result.landed_sha, None
 

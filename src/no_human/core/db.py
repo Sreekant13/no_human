@@ -1542,6 +1542,39 @@ class Store:
             "SELECT context FROM tasks WHERE id = ?", (task_id,))
         return json.loads(row[0]) if row and row[0] else {}
 
+    _MERGE_CLAIM_STALE_S = 1800  # a crashed server must not wedge the button forever
+
+    @serialized_write
+    async def claim_merge(self, task_id: str) -> bool:
+        """Atomically claim the merge lock for *task_id*.
+
+        One UPDATE, guarded by a WHERE clause that only matches when no
+        claim is held (or the held claim is older than
+        ``_MERGE_CLAIM_STALE_S``) — SQLite's write serialization (see
+        `merge_context`) makes this a real CAS across coroutines *and*
+        processes, which is what makes a second concurrent `approve` see a
+        409 instead of a second land. Returns whether the claim was taken.
+        """
+        now = time.time()
+        cur = await self.db.execute(
+            """UPDATE tasks SET
+                 context = json_set(COALESCE(context, '{}'),
+                                    '$.merge_in_progress', ?),
+                 updated_at = ?
+               WHERE id = ?
+                 AND COALESCE(json_extract(context, '$.merge_in_progress'), 0)
+                     < ?""",
+            (now, _now(), task_id, now - self._MERGE_CLAIM_STALE_S),
+        )
+        await self.db.commit()
+        return bool(cur.rowcount)
+
+    async def release_merge(self, task_id: str) -> None:
+        """Release the merge lock claimed by `claim_merge` — deletes the
+        `merge_in_progress` key (RFC 7396 `None`-deletes), via the same
+        atomic merge path as every other context writer."""
+        await self.merge_context(task_id, {"merge_in_progress": None})
+
     @serialized_write
     async def append_context_list(self, task_id: str, key: str, item: dict) -> None:
         """Atomically append *item* to the context list at *key* (created if

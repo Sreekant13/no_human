@@ -26,6 +26,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const SUITES = [
   ["board", "board.mjs"],
   ["drawer", "drawer.mjs"],
+  ["merge progress", "merge-progress.mjs"],
   ["composer", "composer.mjs"],
   ["backlog queue", "backlog-queue.mjs"],
   ["form order", "form-order.mjs"],

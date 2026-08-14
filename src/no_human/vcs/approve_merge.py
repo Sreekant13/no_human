@@ -116,6 +116,19 @@ def _sh(args: list[str], *, cwd: Path | str, timeout: float | None = None,
     )
 
 
+def _step(on_step: Callable[[str], None] | None, name: str) -> None:
+    """Invoke *on_step* for a step boundary — never lets a progress callback
+    (a WS broadcast, in production) turn a land failure into a callback
+    failure. Best-effort only; the land procedure's own return value is the
+    single source of truth for what happened."""
+    if on_step is None:
+        return
+    try:
+        on_step(name)
+    except Exception:  # noqa: BLE001 — progress reporting must never fail a land
+        pass
+
+
 def _load_export_builder(root: Path):
     """Load `scripts/build_public_export.py` by path, same as `export_guard.py`
     does — best-effort: returns None on any error, since this is only used to
@@ -265,6 +278,7 @@ def land_task(
     changed_test_paths: list[str] | None = None,
     remote: str = "origin",
     _before_push: Callable[[], None] | None = None,
+    on_step: Callable[[str], None] | None = None,
 ) -> LandResult:
     """Run the whole land procedure. Never raises — every failure path
     returns a :class:`LandResult` with ``ok=False`` and the failing step.
@@ -278,7 +292,13 @@ def land_task(
     before the push-time tip re-check, so a test can simulate a concurrent
     push landing on the remote's default branch mid-run — otherwise
     unreachable from a synchronous, single-threaded call.
+
+    ``on_step`` is an optional progress callback, invoked with one of
+    :data:`STEPS` at each step boundary (so a caller can stream "merge is at
+    step X" to a human watching a slow land run) — never raises out of this
+    function (see :func:`_step`).
     """
+    _step(on_step, "preconditions")
     approve_cfg = config.get("approve_merge") or {}
     if not approve_cfg.get("enabled", True):
         return LandResult(ok=True, step="preconditions", skipped=True, branch=branch,
@@ -316,6 +336,7 @@ def land_task(
     test_timeout = approve_cfg.get("test_timeout_seconds", _DEFAULT_TEST_TIMEOUT_S)
 
     # -- step 2: fetch + resolve the CURRENT default-branch tip ------------ #
+    _step(on_step, "fetch")
     repo.fetch(remote)
     resolved_branch = repo.resolve_commitish(branch) or resolved_branch
     default = repo.default_branch()
@@ -339,6 +360,7 @@ def land_task(
     tip_sha = tip_proc.stdout.strip()
 
     # -- worktree, at the tip, detached -------------------------------------#
+    _step(on_step, "worktree")
     tmp_dir = Path(tempfile.mkdtemp(prefix="nh-land-"))
     shutil.rmtree(tmp_dir, ignore_errors=True)  # free the name for `worktree add`
     try:
@@ -362,7 +384,7 @@ def land_task(
             task_id=task_id, task_title=task_title, review_evidence=review_evidence,
             op_name=op_name, op_email=op_email, test_timeout=test_timeout,
             pr_url=pr_url, changed_test_paths=changed_test_paths,
-            _before_push=_before_push,
+            _before_push=_before_push, on_step=on_step,
         )
     finally:
         _cleanup_worktree(repo, tmp_dir)
@@ -388,8 +410,10 @@ def _land_in_worktree(
     task_title: str, review_evidence: str, op_name: str, op_email: str,
     test_timeout: float, pr_url: str, changed_test_paths: list[str] | None,
     _before_push: Callable[[], None] | None,
+    on_step: Callable[[str], None] | None = None,
 ) -> LandResult:
     # -- step 3: squash --------------------------------------------------- #
+    _step(on_step, "squash")
     merge_proc = _sh(["git", "merge", "--squash", resolved_branch], cwd=worktree_path)
     if merge_proc.returncode != 0:
         _sh(["git", "merge", "--abort"], cwd=worktree_path)
@@ -397,6 +421,7 @@ def _land_in_worktree(
                            stderr=_cap(merge_proc.stdout + "\n" + merge_proc.stderr))
 
     # -- step 4: manifest merge-result ledger rule ------------------------ #
+    _step(on_step, "manifest")
     guard = worktree_path / "scripts" / "export_guard.py"
     manifest = worktree_path / "RELEASE_MANIFEST.txt"
     if guard.exists() and manifest.exists():
@@ -455,6 +480,7 @@ def _land_in_worktree(
     # anything free-text reaches a tracked, published artifact. Imported
     # lazily — `eval` transitively imports `core.orchestrator`, which imports
     # this package, so a module-level import here is circular.
+    _step(on_step, "commit")
     from ..eval.vendor_terms import redact_for_publish
     message = (f"{redact_for_publish(task_title)}\n\n{task_id}\n"
                f"{redact_for_publish(review_evidence)}")
@@ -473,6 +499,7 @@ def _land_in_worktree(
     landed_sha = _sh(["git", "rev-parse", "HEAD"], cwd=worktree_path).stdout.strip()
 
     # -- step 6a: export_guard verify -------------------------------------- #
+    _step(on_step, "verify")
     if guard.exists():
         try:
             verify_proc = _sh([sys.executable, "scripts/export_guard.py", "verify"],
@@ -488,6 +515,7 @@ def _land_in_worktree(
                                stderr=_cap(verify_proc.stdout + "\n" + verify_proc.stderr))
 
     # -- step 6b: change-scoped tests --------------------------------------#
+    _step(on_step, "tests")
     test_paths = changed_test_paths
     if test_paths is None:
         squash_diff = _sh(["git", "diff", "--name-only", f"{tip_sha}..HEAD"],
@@ -511,6 +539,7 @@ def _land_in_worktree(
                                stderr=_cap(test_proc.stdout + "\n" + test_proc.stderr))
 
     # -- step 7: ff-merge + push, remote-ref verified ---------------------- #
+    _step(on_step, "push")
     if _before_push is not None:
         _before_push()
     repo.fetch(remote)
@@ -552,6 +581,7 @@ def _land_in_worktree(
                    f"(saw {remote_sha or '(none)'})")
 
     # -- step 8: close the PR, without a comment ---------------------------#
+    _step(on_step, "close_pr")
     close_cwd = repo.path if repo.path.exists() else Path(tempfile.gettempdir())
     close_note = _close_pr(pr_url, close_cwd)
     msg = f"landed {landed_sha[:12]} onto {default}"

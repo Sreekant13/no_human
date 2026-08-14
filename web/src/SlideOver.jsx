@@ -3,7 +3,7 @@ import {
   approveLandedTask, approveTask, cancelTask, chooseBlockerOption, fetchDiff, fetchSubtasks,
   fetchTask, fetchTaskEvents, finishReview,
   pauseTask, postReviewComments, replyTask, resumeTask, retryTask, sendBack,
-  connectTaskSSE,
+  connectTaskSSE, connectTaskProgress,
 } from "./api.js";
 import Markdown from "./Markdown.jsx";
 import { keepFocusInDialog } from "./keepFocusInDialog.js";
@@ -20,7 +20,7 @@ import {
   defaultOpenSection, isTerminalStatus, lastReviewedAttempt,
   reviewVerdict, severityChip, checklistRowClass, isBlockingFinding,
   approveButtonState, approvalFeedback, taskApprovedAt, testResultVerdict,
-  fxCountsLabel,
+  fxCountsLabel, mergeStepLabel, landFailureFeedback,
 } from "./slideOverSummary.js";
 
 // ── Inline SVG icons — consistent, scalable, theme-aware ──────────────────
@@ -78,8 +78,36 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   // "error" if it did not. Drives the button's label + disabled state so the
   // click is confirmed on the control itself, not only in the banner.
   const [approveOutcome, setApproveOutcome] = useState(null);
+  // The land is a synchronous 2-4 minute server call with zero feedback
+  // otherwise (operator finding: it read as "doesn't work"). `merging` flips
+  // true SYNCHRONOUSLY on click, before the `approveTask` await, so the
+  // button's disabled "Merging…" state lands in the same commit as the click.
+  const [merging, setMerging] = useState(false);
+  const [mergeStartedAt, setMergeStartedAt] = useState(null);
+  const [mergeElapsedMs, setMergeElapsedMs] = useState(0);
+  const [mergeStep, setMergeStep] = useState(null);
   const dialogRef = useRef(null);
   const closeRef = useRef(null);
+
+  // Elapsed-time ticker for the "Merging… m:ss" label.
+  useEffect(() => {
+    if (!merging || !mergeStartedAt) return undefined;
+    setMergeElapsedMs(Date.now() - mergeStartedAt);
+    const id = setInterval(() => setMergeElapsedMs(Date.now() - mergeStartedAt), 1000);
+    return () => clearInterval(id);
+  }, [merging, mergeStartedAt]);
+
+  // Live merge-step subscription — rides the existing WS broadcast
+  // (task_event frames: merge_started/merge_step_*/human_merged/merge_failed),
+  // the same wiring the SlideOver already has for other WS-driven updates.
+  useEffect(() => {
+    if (!merging) return undefined;
+    const ws = connectTaskProgress(taskId, (ev) => {
+      const step = mergeStepLabel(ev?.kind);
+      if (step) setMergeStep(step);
+    });
+    return () => { try { ws.close(); } catch { /* already closed */ } };
+  }, [merging, taskId]);
 
   // A NEW task resets the review-first latch; a refreshKey bump must not —
   // it would yank the user back to the review tab on every WS update.
@@ -242,10 +270,20 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   // state at the render site and the guard separately is what let an enabled
   // "Retry approve" sit on top of a handler that returns immediately; sharing
   // the object makes that class of divergence unrepresentable.
-  const approveBtn = approveButtonState({ busy, outcome: approveOutcome, approvedAt });
+  const approveBtn = approveButtonState({
+    busy, outcome: approveOutcome, approvedAt,
+    merging, elapsedMs: mergeElapsedMs, step: mergeStep,
+  });
 
   async function handleApprove() {
-    if (!isAwaiting || approveBtn.disabled) return;
+    if (!isAwaiting || approveBtn.disabled || merging) return;
+    // Synchronous — before the first `await` — so this state change and the
+    // click land in the same React commit (the <50ms latency criterion).
+    setMerging(true);
+    setMergeStartedAt(Date.now());
+    setMergeElapsedMs(0);
+    setMergeStep(null);
+    setFlash(null);
     setBusy(true);
     setApproveOutcome(null);
     let posted = false;
@@ -260,9 +298,16 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
       setFlash(approvalFeedback({ ok: true, message: res?.message, remaining }));
     } catch (e) {
       setApproveOutcome("error");
-      setFlash(approvalFeedback({ ok: false, error: e.message }));
+      // A genuine land failure carries {step, stderr} as `detail` (see
+      // api.js's approveTask) — the persistent inline alert names the step
+      // and the first 200 chars of stderr. Anything else (a plain 409/500
+      // string detail) falls back to the existing banner text.
+      const detail = e && typeof e.detail === "object" && e.detail && e.detail.step
+        ? e.detail : null;
+      setFlash(detail ? landFailureFeedback(detail) : approvalFeedback({ ok: false, error: e.message }));
     } finally {
       setBusy(false);
+      setMerging(false);
     }
     // The refresh is OUTSIDE the approval's try on purpose. It used to sit
     // inside it, so a transient GET failure AFTER the POST had already landed
@@ -481,18 +526,24 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
               // silently re-stamp approved_at.
               // `approveBtn` is the SAME object handleApprove guards on, so an
               // enabled label can never outlive the handler that backs it.
-              <button
-                className={`btn btn-approve btn-approve-${approveBtn.tone}`}
-                onClick={handleApprove}
-                disabled={approveBtn.disabled || busy}
-                title="Squash-merges the PR onto the default branch and closes it - the agent never merges on its own."
-                aria-label={approveBtn.label}
-              >
-                {approveBtn.label}
-              </button>
+              <>
+                <button
+                  className={`btn btn-approve btn-approve-${approveBtn.tone}`}
+                  onClick={handleApprove}
+                  disabled={approveBtn.disabled || busy}
+                  title="Squash-merges the PR onto the default branch and closes it - the agent never merges on its own."
+                  aria-label={approveBtn.label}
+                >
+                  {approveBtn.label}
+                </button>
+                {/* The live step name streamed from the server (merge_step_*
+                    WS frames) — what actually makes the multi-minute window
+                    read as progress rather than a frozen button. */}
+                {approveBtn.step && <span className="approve-merge-step">{approveBtn.step}</span>}
+              </>
             )}
             {isAwaiting && (
-              <button className="btn btn-sendback" onClick={() => setSbOpen(true)} disabled={busy}>
+              <button className="btn btn-sendback" onClick={() => setSbOpen(true)} disabled={busy || merging}>
                 Send back
               </button>
             )}
@@ -504,7 +555,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
               // matches the branch verbatim) — a HUMAN override, not a
               // containment pass; the modal below requires both fields and
               // shows the task being confirmed before it submits.
-              <button className="btn btn-sendback" onClick={() => setLandedOpen(true)} disabled={busy}
+              <button className="btn btn-sendback" onClick={() => setLandedOpen(true)} disabled={busy || merging}
                       title="Assert this task's content landed elsewhere, with a required justification">
                 Content landed elsewhere?
               </button>

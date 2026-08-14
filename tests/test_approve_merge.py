@@ -23,6 +23,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -34,7 +36,7 @@ from no_human.api.app import app
 from no_human.cli.commands import cli
 from no_human.core.db import Store
 from no_human.core.task import Task, TaskStatus
-from no_human.vcs.approve_merge import land_task
+from no_human.vcs.approve_merge import LandResult, land_task
 from no_human.vcs.git import GitError, GitRepo, ProtectedBranch
 from no_human.vcs.pr_watcher import default_branch_shipped
 
@@ -1201,12 +1203,14 @@ async def test_api_approve_completes_when_content_already_landed(land_env, api_s
 
 
 @pytest.mark.asyncio
-async def test_api_approve_surfaces_land_failure(land_env, api_store_client):
+async def test_api_approve_surfaces_land_failure(land_env, api_store_client, monkeypatch):
     """A genuine `land_task` failure (export_guard verify fails here) must
     come back as an HTTPException the caller can see — not a silent 200
     wearing the record-only "merge it yourself" message, which would read
     a real failure as success. The task stays awaiting_approval either way
     (plan §8's clean-abort contract, mirrored by the CLI's own exit(1))."""
+    from no_human.api.app import _mgr
+
     client, store = api_store_client
     branch, head_sha = land_env.cut_branch(
         "no-human/t-apiverifyfail", extra_files={"FORCE_VERIFY_FAIL": "x"})
@@ -1221,6 +1225,15 @@ async def test_api_approve_surfaces_land_failure(land_env, api_store_client):
     })
     await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
 
+    broadcasts = []
+    orig_broadcast = _mgr.broadcast
+
+    async def spy_broadcast(payload):
+        broadcasts.append(payload)
+        return await orig_broadcast(payload)
+
+    monkeypatch.setattr(_mgr, "broadcast", spy_broadcast)
+
     r = await client.post(f"/api/tasks/{t.id}/approve")
     assert r.status_code == 500, r.text
     detail = r.json()["detail"]
@@ -1232,3 +1245,201 @@ async def test_api_approve_surfaces_land_failure(land_env, api_store_client):
     events = await store.list_events(t.id)
     assert not [e for e in events if e.get("kind") == "human_merged"]
     assert land_env.remote_main_sha() == before
+
+    # A land failure must still surface a `merge_failed` progress frame — a
+    # second observer/tab watching the WS sees the failure, not just the
+    # caller of this one POST.
+    task_events = [b for b in broadcasts if b.get("type") == "task_event"]
+    failed = [b for b in task_events if b["event"].get("kind") == "merge_failed"]
+    assert len(failed) == 1, broadcasts
+    assert "verify" in failed[0]["event"]["text"]
+
+    # The merge lock must be released even on a genuine land failure — a
+    # retried approve for the same task must not itself 409.
+    assert not (refreshed.context or {}).get("merge_in_progress")
+
+
+# --------------------------------------------------------------------------- #
+# Live merge progress: idempotency guard + streamed task_events               #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_second_approve_during_merge_returns_409(land_env, api_store_client, monkeypatch):
+    """The idempotency guard (operator finding: a 2-4 minute synchronous land
+    with zero feedback read as a dead button, and a raced double-click must
+    never reach a second `land_task`). `land_task` is patched with a stub that
+    blocks on a real thread barrier, so the second request deterministically
+    observes "still landing" rather than depending on timing."""
+    client, store = api_store_client
+    branch, head_sha = land_env.cut_branch("no-human/t-409")
+
+    t = Task.new("Fix the thing", repo_path=str(land_env.clone))
+    t.acceptance_criteria = ["Should work"]
+    await store.create_task(t)
+    await store.merge_context(t.id, {
+        "pr_watch": land_env.pr_url, "pr_branch": branch,
+        "review_history": [{"sha": head_sha, "passed": True}],
+    })
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_land_task(*, repo_path, branch, pr_url, task_id, task_title,
+                        review_evidence, config, on_step=None, **kwargs):
+        entered.set()
+        assert release.wait(timeout=5), "test barrier never released"
+        return LandResult(ok=True, step="close_pr", landed_sha="a" * 40,
+                           pr_url=pr_url, branch=branch, message="landed")
+
+    monkeypatch.setattr("no_human.vcs.approve_merge.land_task", slow_land_task)
+
+    first = asyncio.create_task(client.post(f"/api/tasks/{t.id}/approve"))
+    # Block the TEST coroutine on a real OS thread wait (not an asyncio
+    # primitive) — `slow_land_task` runs inside `asyncio.to_thread`, a real
+    # worker thread, and only `entered.set()` proves the first request has
+    # actually claimed the merge lock and started landing.
+    await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5)
+
+    r2 = await client.post(f"/api/tasks/{t.id}/approve")
+    release.set()
+    r1 = await first
+
+    assert r1.status_code == 200, r1.text
+    assert r2.status_code == 409, r2.text
+    assert r2.json()["detail"] == "Merge already in progress"
+
+
+@pytest.mark.asyncio
+async def test_approve_emits_merge_progress_events_in_order(land_env, api_store_client, monkeypatch):
+    """The server streams merge_started -> merge_step_<step> (one per real
+    land step) -> human_merged over the SAME WS broadcast the SlideOver
+    already renders other frames from — this is what turns the previously
+    dead multi-minute window into visible progress."""
+    from no_human.api.app import _mgr
+
+    client, store = api_store_client
+    branch, head_sha = land_env.cut_branch("no-human/t-progress")
+
+    t = Task.new("Fix the thing", repo_path=str(land_env.clone))
+    t.acceptance_criteria = ["Should work"]
+    await store.create_task(t)
+    await store.merge_context(t.id, {
+        "pr_watch": land_env.pr_url, "pr_branch": branch,
+        "review_history": [{"sha": head_sha, "passed": True}],
+    })
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+
+    broadcasts = []
+    orig_broadcast = _mgr.broadcast
+
+    async def spy_broadcast(payload):
+        broadcasts.append(payload)
+        return await orig_broadcast(payload)
+
+    monkeypatch.setattr(_mgr, "broadcast", spy_broadcast)
+
+    r = await client.post(f"/api/tasks/{t.id}/approve")
+    assert r.status_code == 200, r.text
+
+    task_events = [b for b in broadcasts if b.get("type") == "task_event"]
+    kinds = [b["event"]["kind"] for b in task_events]
+    assert kinds and kinds[0] == "merge_started", kinds
+    assert "merge_step_fetch" in kinds, kinds
+    assert "merge_step_push" in kinds, kinds
+    assert kinds[-1] == "human_merged", kinds
+
+    ts_values = [b["event"]["ts"] for b in task_events]
+    assert ts_values == sorted(ts_values), ts_values
+
+
+@pytest.mark.asyncio
+async def test_merge_lock_released_after_success_and_after_failure(
+    land_env, api_store_client, monkeypatch,
+):
+    """`claim_merge`/`release_merge` must not wedge the button forever —
+    the lock is released in `approve_task`'s `finally`, on both the happy
+    path and a genuine land failure, so a retried approve is never stuck
+    behind its own predecessor's lock."""
+    client, store = api_store_client
+
+    # -- success path -------------------------------------------------------
+    branch, head_sha = land_env.cut_branch("no-human/t-lock-ok")
+    t_ok = Task.new("Fix the thing", repo_path=str(land_env.clone))
+    t_ok.acceptance_criteria = ["Should work"]
+    await store.create_task(t_ok)
+    await store.merge_context(t_ok.id, {
+        "pr_watch": land_env.pr_url, "pr_branch": branch,
+        "review_history": [{"sha": head_sha, "passed": True}],
+    })
+    await store.set_status(t_ok, TaskStatus.AWAITING_APPROVAL, validate=False)
+
+    r_ok = await client.post(f"/api/tasks/{t_ok.id}/approve")
+    assert r_ok.status_code == 200, r_ok.text
+    refreshed_ok = await store.find_task(t_ok.id)
+    assert not (refreshed_ok.context or {}).get("merge_in_progress")
+    # The lock is genuinely reclaimable, not just falsy-looking.
+    assert await store.claim_merge(t_ok.id) is True
+    await store.release_merge(t_ok.id)
+
+    # -- failure path -------------------------------------------------------
+    branch2, head_sha2 = land_env.cut_branch(
+        "no-human/t-lock-fail", extra_files={"FORCE_VERIFY_FAIL": "x"})
+    t_fail = Task.new("Fix the other thing", repo_path=str(land_env.clone))
+    t_fail.acceptance_criteria = ["Should work"]
+    await store.create_task(t_fail)
+    await store.merge_context(t_fail.id, {
+        "pr_watch": land_env.pr_url, "pr_branch": branch2,
+        "review_history": [{"sha": head_sha2, "passed": True}],
+    })
+    await store.set_status(t_fail, TaskStatus.AWAITING_APPROVAL, validate=False)
+
+    r_fail = await client.post(f"/api/tasks/{t_fail.id}/approve")
+    assert r_fail.status_code == 500, r_fail.text
+    refreshed_fail = await store.find_task(t_fail.id)
+    assert not (refreshed_fail.context or {}).get("merge_in_progress")
+
+    # A retry after a failure must not be blocked by a stuck lock.
+    def ok_land_task(*, repo_path, branch, pr_url, task_id, task_title,
+                      review_evidence, config, on_step=None, **kwargs):
+        return LandResult(ok=True, step="close_pr", landed_sha="b" * 40,
+                           pr_url=pr_url, branch=branch, message="landed")
+
+    monkeypatch.setattr("no_human.vcs.approve_merge.land_task", ok_land_task)
+    r_retry = await client.post(f"/api/tasks/{t_fail.id}/approve")
+    assert r_retry.status_code == 200, r_retry.text
+
+
+@pytest.mark.asyncio
+async def test_stale_merge_claim_is_reclaimable(tmp_path):
+    """A crashed server must not wedge the button forever — a claim older
+    than `Store._MERGE_CLAIM_STALE_S` is reclaimable by a fresh `approve`."""
+    store = await Store(tmp_path / "stale.db").connect()
+    try:
+        t = Task.new("Fix the thing", repo_path="/tmp/does-not-matter")
+        await store.create_task(t)
+        stale_ts = time.time() - Store._MERGE_CLAIM_STALE_S - 60
+        await store.merge_context(t.id, {"merge_in_progress": stale_ts})
+
+        assert await store.claim_merge(t.id) is True, \
+            "a claim older than the TTL must be reclaimable"
+        refreshed = await store.find_task(t.id)
+        claimed_ts = (refreshed.context or {}).get("merge_in_progress")
+        assert claimed_ts and claimed_ts != stale_ts
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_merge_claim_blocks_a_second_claim(tmp_path):
+    """The mirror of the staleness test — a LIVE claim must refuse a second
+    one, which is the whole point of the CAS."""
+    store = await Store(tmp_path / "fresh.db").connect()
+    try:
+        t = Task.new("Fix the thing", repo_path="/tmp/does-not-matter")
+        await store.create_task(t)
+        assert await store.claim_merge(t.id) is True
+        assert await store.claim_merge(t.id) is False, \
+            "a live (non-stale) claim must refuse a second claim"
+    finally:
+        await store.close()

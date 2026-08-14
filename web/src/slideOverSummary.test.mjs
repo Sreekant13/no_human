@@ -9,7 +9,7 @@ import {
   isHumanStopped, questionState, lastReviewedAttempt,
   ADVISORY_SEVERITIES, isBlockingFinding, reviewVerdict, severityChip,
   checklistRowClass, approveButtonState, approvalFeedback, taskApprovedAt,
-  testResultVerdict, fxCountsLabel,
+  testResultVerdict, fxCountsLabel, mergeStepLabel, landFailureFeedback,
 } from "./slideOverSummary.js";
 
 const SRC = dirname(fileURLToPath(import.meta.url));
@@ -1244,4 +1244,67 @@ test("SlideOver.jsx renders the group header count from fxCountsLabel, not the r
     "the fx-counts span must be built from fxCountsLabel");
   assert.doesNotMatch(src, /\{g\.eventCount\} ev\b/,
     "the old inline 'N ev' template must be gone");
+});
+
+// ── Live merge progress: the button must reflect the running merge ─────────
+// Operator finding: a 2-4 minute synchronous land with zero feedback read as
+// "doesn't work". `merging`/`elapsedMs`/`step` give approveButtonState a
+// state for the whole window, not just click-and-eventual-result.
+
+test("approveButtonState({merging}) shows an elapsed mm:ss timer and is disabled", () => {
+  const merging = approveButtonState({ merging: true, elapsedMs: 42000 });
+  assert.match(merging.label, /Merging… 0:42/);
+  assert.equal(merging.disabled, true);
+});
+
+test("approveButtonState merging elapsed timer formats minutes correctly", () => {
+  const merging = approveButtonState({ merging: true, elapsedMs: 125000 });
+  assert.match(merging.label, /Merging… 2:05/);
+});
+
+test("approveButtonState merging never overrides an already-approved outcome", () => {
+  const ok = approveButtonState({ merging: true, outcome: "ok" });
+  assert.equal(ok.label, "Approved — merge pending");
+  assert.equal(ok.disabled, true);
+
+  const reopened = approveButtonState({
+    merging: true, approvedAt: "2026-07-30T10:00:00+00:00",
+  });
+  assert.equal(reopened.label, "Approved — merge pending");
+});
+
+test("approveButtonState merging carries the current step through, when known", () => {
+  const withStep = approveButtonState({ merging: true, elapsedMs: 1000, step: "push" });
+  assert.equal(withStep.step, "push");
+  const noStep = approveButtonState({ merging: true, elapsedMs: 1000 });
+  assert.equal(noStep.step, null);
+});
+
+test("mergeStepLabel extracts the bare step name from a merge_step_<step> event kind", () => {
+  assert.equal(mergeStepLabel("merge_step_push"), "push");
+  assert.equal(mergeStepLabel("merge_step_verify"), "verify");
+  assert.equal(mergeStepLabel("merge_step_close_pr"), "close_pr");
+});
+
+test("mergeStepLabel ignores unrelated frame kinds", () => {
+  assert.equal(mergeStepLabel("merge_started"), null);
+  assert.equal(mergeStepLabel("human_merged"), null);
+  assert.equal(mergeStepLabel("task_updated"), null);
+  assert.equal(mergeStepLabel(""), null);
+  assert.equal(mergeStepLabel(undefined), null);
+});
+
+test("landFailureFeedback names the failed step and includes the stderr text", () => {
+  const fb = landFailureFeedback({ step: "push", stderr: "remote rejected: non-fast-forward" });
+  assert.equal(fb.role, "alert");
+  assert.match(fb.text, /Failed: push/);
+  assert.match(fb.text, /remote rejected: non-fast-forward/);
+  assert.equal(fb.dismissible, true);
+});
+
+test("landFailureFeedback truncates stderr to the first 200 characters", () => {
+  const long = "x".repeat(500);
+  const fb = landFailureFeedback({ step: "verify", stderr: long });
+  const shown = fb.text.split(" — ")[1];
+  assert.equal(shown.length, 200);
 });

@@ -535,7 +535,16 @@ export function taskApprovedAt(task) {
 // Re-approval is BLOCKED, not merely labelled: a second POST cannot produce a
 // merge (only the human's git host can) and its only effect is to overwrite the
 // timestamp of when the human actually approved.
-export function approveButtonState({ busy = false, outcome = null, approvedAt = null } = {}) {
+function mmss(ms) {
+  const total = Math.max(0, Math.floor((ms || 0) / 1000));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+export function approveButtonState({
+  busy = false, outcome = null, approvedAt = null, merging = false, elapsedMs = 0, step = null,
+} = {}) {
   // Wording matched to Board.jsx's action hint for the same state, so the card
   // and the drawer never describe one task two ways.
   //
@@ -554,6 +563,14 @@ export function approveButtonState({ busy = false, outcome = null, approvedAt = 
   // by a later send-back, so this cannot latch on a stale stamp.
   if (outcome === "ok" || approvedAt) {
     return { label: "Approved — merge pending", disabled: true, tone: "ok" };
+  }
+  // The land is a synchronous 2-4 minute server call — this branch is what
+  // keeps the button reflecting it instead of looking dead. Checked before
+  // `busy` (the click-to-request-resolves state) since a merge in progress
+  // subsumes it: the elapsed timer is the point, not just "disabled".
+  if (merging) {
+    const label = `Merging… ${mmss(elapsedMs)}`;
+    return { label, disabled: true, tone: "busy", step: step || null };
   }
   if (busy) return { label: "Approving…", disabled: true, tone: "busy" };
   // Operator directive 2026-08-12: approve now MERGES the PR (a local squash
@@ -581,6 +598,31 @@ export function approvalFeedback({ ok = true, message = "", remaining = 0, error
     || "Approval recorded. The PR will be merged automatically - the agent never merges on its own.";
   const more = remaining > 0 ? ` ${remaining} more waiting - use Next review.` : "";
   return { role: "status", tone: "ok", text: base + more };
+}
+
+// `merge_step_<step>` -> the bare step name the button shows next to the
+// elapsed timer. Anything else (merge_started, human_merged, merge_failed,
+// an unrelated frame kind) is not a step label.
+export function mergeStepLabel(kind) {
+  const k = String(kind || "");
+  if (!k.startsWith("merge_step_")) return null;
+  const step = k.slice("merge_step_".length);
+  return step || null;
+}
+
+// The persistent inline alert for a land failure — intake-resolved shape:
+// a heading naming the failed step, the first 200 chars of stderr, and a
+// dismissible close button (the dismiss affordance itself lives in the
+// component that renders this; this just marks it dismissible via `role`).
+export function landFailureFeedback({ step, stderr } = {}) {
+  const stepName = String(step || "unknown").trim();
+  const capped = String(stderr || "").slice(0, 200);
+  return {
+    role: "alert",
+    tone: "error",
+    dismissible: true,
+    text: `Failed: ${stepName}${capped ? ` — ${capped}` : ""}`,
+  };
 }
 
 function reviewMicro(task) {

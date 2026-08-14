@@ -68,11 +68,17 @@ export async function uploadAttachment(taskId, file) {
 export async function approveTask(id) {
   const r = await fetch(`${BASE}/api/tasks/${id}/approve`, { method: "POST" });
   if (!r.ok) {
-    // The server explains WHY (409: the task is no longer awaiting approval).
-    // A bare status code left the operator with no way to tell a rejected
-    // approval from a network blip.
+    // The server explains WHY (409: the task is no longer awaiting approval,
+    // or a merge is already in progress; 500: a land failure with a
+    // {step, stderr} detail). A bare status code left the operator with no
+    // way to tell a rejected approval from a network blip — and the inline
+    // failure panel needs the raw `detail` object (step/stderr), not just
+    // the flattened message text, so both are attached to the thrown Error.
     const detail = await r.json().catch(() => ({}));
-    throw new Error(detailMessage(detail, `POST approve → ${r.status}`));
+    const err = new Error(detailMessage(detail, `POST approve → ${r.status}`));
+    err.status = r.status;
+    err.detail = detail?.detail;
+    throw err;
   }
   return r.json();
 }
@@ -793,4 +799,18 @@ export function connectWS(onMessage, { onOpen, onClose, makeSocket } = {}) {
   ws.onclose = () => { if (onClose) onClose(); };
   ws.onerror = () => { if (onClose) onClose(); };
   return ws;
+}
+
+// A `connectWS` subscription filtered to the additive `task_event` frame
+// kind (merge_started/merge_step_*/human_merged/merge_failed) for one task —
+// rides the existing broadcast socket rather than opening a second
+// connection. Matches on the full id first (the drawer holds the full task
+// id); the prefix fallback covers a caller that only has the short id.
+export function connectTaskProgress(taskId, onEvent) {
+  return connectWS((msg) => {
+    if (msg?.type !== "task_event") return;
+    const msgId = msg.task_id || "";
+    if (msgId !== taskId && !msgId.startsWith(String(taskId).slice(0, 8))) return;
+    if (onEvent) onEvent(msg.event);
+  });
 }
