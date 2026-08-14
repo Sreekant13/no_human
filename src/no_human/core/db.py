@@ -1028,6 +1028,20 @@ class Store:
             # gates (`_check_lifetime_budget`, `_at_lifetime_ceiling`) read,
             # so they cannot disagree about whether a dead dispatch counted.
             "infra_failure": "INTEGER",
+            # 1 = this attempt was a post-PASS MECHANICAL round — a pr_conflict
+            # rebase, or a re-verification tick after the change had already
+            # passed independent review (`orchestrator._mechanical_round`).
+            # The row is never skipped — it is the durable record — only
+            # `lifetime_usage_by_class`'s attempt COUNT excludes it, the same
+            # chokepoint `infra_failure` uses, so both budget gates
+            # (`_check_lifetime_budget`, `_at_lifetime_ceiling`) cannot
+            # disagree. NULL/0 on every pre-existing row; nothing backfills it.
+            # INCIDENT 2026-08-13: tasks 79183501 and 1a4b7bf7 PASSED review,
+            # then each supervising-train landing under their open PRs spawned
+            # a pr_conflict rebase round that burned a lifetime attempt, until
+            # attempts hit cap and killed work that was already reviewed and
+            # about to land.
+            "mechanical_round": "INTEGER",
         }
         for col, decl in att_wanted.items():
             if col not in att_existing:
@@ -1597,7 +1611,8 @@ class Store:
     # ---------------------------- attempts --------------------------------- #
 
     @serialized_write
-    async def create_attempt(self, task_id: str, attempt_number: int) -> str:
+    async def create_attempt(self, task_id: str, attempt_number: int, *,
+                              mechanical: bool = False) -> str:
         # Read BEFORE the UPDATE below opens a write transaction. `connect()`
         # has already warmed this, so it is a cached attribute read — but
         # ordering it here means even a cold cache cannot shell out to git
@@ -1625,8 +1640,9 @@ class Store:
         # `code_version` was resolved above, outside the write transaction.
         await self.db.execute(
             "INSERT INTO attempts (id, task_id, attempt_number, "
-            "loaded_code_version) VALUES (?, ?, ?, ?)",
-            (attempt_id, task_id, attempt_number, code_version),
+            "loaded_code_version, mechanical_round) VALUES (?, ?, ?, ?, ?)",
+            (attempt_id, task_id, attempt_number, code_version,
+             1 if mechanical else 0),
         )
         await self.db.commit()
         return attempt_id
@@ -1694,6 +1710,24 @@ class Store:
             (task_id,),
         )
         return dict(row) if row else None
+
+    async def latest_review_verdict(self, task_id: str) -> int | None:
+        """The NEWEST recorded review verdict for the task (1 = PASS, 0 =
+        FAIL), or None if no attempt ever recorded one.
+
+        Newest by ``(started_at, rowid)`` — NOT ``attempt_number``: the live
+        DB holds duplicate and out-of-order numbers (see
+        `latest_open_attempt`), so ordering by number can hand back a verdict
+        from an earlier round. A later review FAIL must re-arm the lifetime
+        budget cap after an earlier PASS, so "latest", not "any PASS ever",
+        is what `orchestrator._mechanical_round` and `_check_lifetime_budget`
+        need here.
+        """
+        row = await self._fetchone(
+            "SELECT review_passed FROM attempts WHERE task_id = ? "
+            "AND review_passed IS NOT NULL "
+            "ORDER BY started_at DESC, rowid DESC LIMIT 1", (task_id,))
+        return None if row is None else int(row["review_passed"])
 
     async def latest_attempt_pr_url(self, task_id: str) -> str:
         """The newest non-empty ``attempts.pr_url`` for *task_id*, or ``""``.
@@ -1976,10 +2010,16 @@ class Store:
         # (`orchestrator._infra_sdk_failure`) — a dead SDK dispatch (auth
         # wall, zero tokens streamed) did no work, so it must not consume a
         # lifetime attempt (INCIDENT 2026-08-13: 4 tasks burned all 9 on
-        # exactly this). The token SUMs above are UNCHANGED: an infra attempt
-        # spends nothing, and if it somehow did, the money is still counted.
+        # exactly this) — OR `mechanical_round = 1` (`orchestrator.
+        # _mechanical_round`) — a post-PASS pr_conflict rebase or
+        # re-verification tick that changes no code (INCIDENT 2026-08-13:
+        # tasks 79183501 and 1a4b7bf7 PASSED review, then rebase rounds under
+        # supervising-train landings burned the rest of their lifetime
+        # attempts). The token SUMs above are UNCHANGED: both kinds of
+        # attempt still have their real spend counted if any was recorded.
         row = await self._fetchone(
             "SELECT COALESCE(SUM(CASE WHEN COALESCE(infra_failure, 0) = 0 "
+            "AND COALESCE(mechanical_round, 0) = 0 "
             f"THEN 1 ELSE 0 END), 0) AS n, {selects} FROM attempts "
             "WHERE task_id = ?",
             (task_id,),

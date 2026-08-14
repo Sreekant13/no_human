@@ -762,6 +762,15 @@ def _infra_sdk_failure(result) -> str | None:
     return None
 
 
+# Round sources that change NO code: the supervisor lands a PASSed head with
+# its own squash procedure, so a rebase round under an already-reviewed PR is
+# pure waste. INCIDENT 2026-08-13: tasks 79183501 and 1a4b7bf7 PASSED review,
+# then each supervising train landing under their open PRs spawned a
+# pr_conflict rebase round, each burning a lifetime attempt, until 9/9 killed
+# work that was already reviewed and about to land.
+_MECHANICAL_FEEDBACK_SOURCES = frozenset({"pr_conflict"})
+
+
 def _classify_error(stop_reason: str | None, text: str,
                     api_error_status: object = None) -> str:
     """Classify a terminal agent error for observability + routing (Phase 0.3).
@@ -2761,6 +2770,69 @@ class Orchestrator:
         # (never fake done). 22.3: ≤2 distinct alternatives, then escalate.
         return await self._escalate_exhausted(task, repo, base_branch)
 
+    async def _mechanical_round(self, task: Task) -> bool:
+        """Is the round about to start a post-PASS MECHANICAL one — no code
+        change to make, so it must not consume a lifetime attempt?
+
+        Requires BOTH, and the conjunction is what makes it safe in each
+        direction:
+          * the latest recorded review verdict is a PASS (so a review FAIL,
+            and any operator reject that records one, re-arms the counter),
+            and
+          * the newest ``send_back_feedback`` entry names a mechanical
+            source (`_MECHANICAL_FEEDBACK_SOURCES`) — a stale pr_conflict
+            entry cannot make a corrective round free, because the verdict
+            half fails once a newer round records a FAIL.
+        """
+        feedback = (task.context or {}).get("send_back_feedback") or []
+        if not feedback or not isinstance(feedback[-1], dict):
+            return False
+        if feedback[-1].get("source") not in _MECHANICAL_FEEDBACK_SOURCES:
+            return False
+        return await self.store.latest_review_verdict(task.id) == 1
+
+    async def _budget_frozen_by_pass(self, task: Task) -> bool:
+        """Is lifetime-budget enforcement frozen for the round about to run?
+
+        A bare ``latest_review_verdict(task.id) == 1`` is NOT this predicate
+        — a review caught that exact shortcut as unsound (orchestrator.py
+        9520/7088, review round 1): a non-mechanical send-back
+        (`_check_approval_pr_comments`'s operator reject, `_check_pr_ci`,
+        `_check_ci_gate_integration`) appends to ``send_back_feedback`` and
+        calls `wake._resume`, which flips the task straight to IMPLEMENTING
+        — but none of those rungs themselves write a NEW `review_passed`
+        row. The stale PASS from the round that already landed would still
+        read as "latest", so a bare verdict check freezes the gate for
+        genuine attempt-consuming rework too, letting it run unbounded.
+
+        Two DISTINCT shapes are actually safe to freeze, and this is their
+        union — not a single looser check:
+
+        1. The task is PARKED in `AWAITING_APPROVAL` with a PASS on record.
+           No round is running; there is nothing to cap yet, and the human
+           who will land or reject the PR must not find it flipped to
+           `failed(BUDGET_EXHAUSTED)` out from under them while it sits
+           there (criterion 2, INCIDENT 2026-08-13 tasks 79183501/1a4b7bf7).
+        2. `_mechanical_round(task)` — the round in progress is a stamped
+           mechanical one: the NEWEST `send_back_feedback` entry names a
+           mechanical source (`_MECHANICAL_FEEDBACK_SOURCES`, currently just
+           `pr_conflict`) AND the latest verdict is still the PASS that
+           authorised it. This is what actually covers a pr_conflict
+           rebase in the live flow: `wake._resume` sets status to
+           IMPLEMENTING BEFORE the loop head calls this gate, so by the time
+           it runs, status is no longer `AWAITING_APPROVAL` — only the
+           mechanical-round check still recognises the round as free.
+
+        A pr_comment / pr_ci / ci_gate send-back matches NEITHER shape: by
+        the time its resumed round reaches this gate, status is IMPLEMENTING
+        (not AWAITING_APPROVAL) and its newest feedback source is not
+        mechanical, so `_mechanical_round` is False too — the cap applies to
+        it exactly as it would to any other round (the control case).
+        """
+        if task.status == TaskStatus.AWAITING_APPROVAL:
+            return await self.store.latest_review_verdict(task.id) == 1
+        return await self._mechanical_round(task)
+
     async def _run_attempt(
         self, task: Task, repo: GitRepo, attempt_n: int, base: str | None = None
     ) -> TaskOutcome:
@@ -2783,7 +2855,8 @@ class Orchestrator:
         # `git checkout -B` then resets — destroying the [WIP-BLOCKED] checkpoint
         # it was meant to continue from. attempt_n still bounds the loop.
         attempt_seq = len(await self.store.list_attempts(task.id)) + 1
-        attempt_id = await self.store.create_attempt(task.id, attempt_seq)
+        attempt_id = await self.store.create_attempt(
+            task.id, attempt_seq, mechanical=await self._mechanical_round(task))
         stuck = StuckDetector()
         self._stuck: StuckDetector | None = stuck  # visible to _agent_sink
         self._agent_edited_files: set[str] = set()  # reset per attempt
@@ -6383,7 +6456,13 @@ class Orchestrator:
         # is legal (verification is not re-run — nothing changed).
         await self.store.set_status(task, TaskStatus.TESTING, validate=False)
         attempt_n = len(await self.store.list_attempts(task.id)) + 1
-        attempt_id = await self.store.create_attempt(task.id, attempt_n)
+        # Re-verification tick: the docstring above already states the change
+        # was reviewed + tested before parking and verification is NOT
+        # re-run here — provably no code changes, so a round resuming a
+        # PASSed task must not burn a lifetime attempt.
+        attempt_id = await self.store.create_attempt(
+            task.id, attempt_n,
+            mechanical=await self.store.latest_review_verdict(task.id) == 1)
         await self.store.update_attempt(attempt_id, branch_name=branch,
                                         commit_sha=repo.head_sha())
         commit = SimpleNamespace(files_changed=0, insertions=0, deletions=0,
@@ -6991,7 +7070,14 @@ class Orchestrator:
         `_check_lifetime_budget` gates on (cost-weighted tokens OR attempts) —
         literally the same function, `_over_lifetime_caps` — with no blocker
         built and no event emitted, for advisory callers that only need to know
-        whether spending more is allowed."""
+        whether spending more is allowed.
+
+        Frozen exactly when `_budget_frozen_by_pass` says so — see
+        `_check_lifetime_budget`'s matching short-circuit. This advisory guard
+        must not disagree with the gate it advises; that drift is exactly what
+        `_over_lifetime_caps`'s docstring was written to prevent."""
+        if await self._budget_frozen_by_pass(task):
+            return False
         used_attempts, by_class = await self.store.lifetime_usage_by_class(task.id)
         cap_attempts, cap_tokens = self._lifetime_limits(task)
         return self._over_lifetime_caps(
@@ -7969,7 +8055,8 @@ class Orchestrator:
         # out-of-order numbers are what made "the attempt that died"
         # unanswerable by number (see `Store.latest_open_attempt`).
         attempt_id = await self.store.create_attempt(
-            task.id, len(await self.store.list_attempts(task.id)) + 1)
+            task.id, len(await self.store.list_attempts(task.id)) + 1,
+            mechanical=await self._mechanical_round(task))
 
         # Build profile + rules context for the staff-level reviewer.
         prof = await self._usable_profile(repo.path)
@@ -9407,7 +9494,28 @@ class Orchestrator:
         in price. The raw total is still computed and still reported — it is
         the number every other surface shows — but it is not what the gate
         compares, and the blocker prints both so the two cannot be confused.
+
+        Frozen by `_budget_frozen_by_pass` — a PASSED task parked in
+        AWAITING_APPROVAL, or a round stamped mechanical (a pr_conflict
+        rebase / re-verification tick, which `create_attempt(mechanical=...)`
+        already excludes from the attempt count above). Freezing the gate
+        itself is the second half — it also stops the COST-WEIGHTED TOKEN
+        axis from tripping on a PASSed task (INCIDENT 2026-08-13: tasks
+        79183501, 1a4b7bf7). It is deliberately NOT a bare "latest verdict is
+        a PASS" check: a non-mechanical send-back (operator pr_comment
+        reject, pr_ci, ci_gate) resumes the task to IMPLEMENTING for real,
+        attempt-consuming rework without itself recording a new verdict, so a
+        bare verdict check would freeze the gate for that too — see
+        `_budget_frozen_by_pass`'s docstring. The per-attempt `attempt_tokens`
+        cap (`BudgetAbort`) is untouched, so a single runaway round still ends.
         """
+        if await self._budget_frozen_by_pass(task):
+            self.emit(
+                "lifetime_budget",
+                "budget frozen — independent review PASSED",
+                frozen_by_review_pass=True,
+            )
+            return None
         used_attempts, by_class = await self.store.lifetime_usage_by_class(task.id)
         used_tokens = _weighted_tokens(**by_class)
         # The three ADDEND classes only. `by_class` also carries
