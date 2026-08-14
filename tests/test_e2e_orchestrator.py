@@ -5852,6 +5852,40 @@ async def test_design_doc_report_only_completes_as_done(bare_repo, tmp_path, sto
     assert attempts[-1]["status"] == "succeeded"
 
 
+async def test_design_doc_with_test_bearing_criteria_escalates_instead_of_completing(
+    bare_repo, tmp_path, store
+):
+    """Defect 204f2177 (red-first repro): a design_doc-classified task whose
+    acceptance criteria demand a CLI flag with red-first tests must never
+    silently complete via the report-only path — it escalates to a human
+    instead of being marked DONE on a report that never ships the demanded
+    artifact."""
+    cfg = _config(tmp_path)
+    events = []
+    orch = Orchestrator(store, cfg.data, _DesignDocBackend(), SlackNotifier(None),
+                        event_sink=events.append)
+    t = Task.new("Add nh approve --landed", repo_path=str(bare_repo), kind="design_doc")
+    t.acceptance_criteria = [
+        "nh approve --landed marks the PR landed",
+        "a red-first test proves the flag's behaviour before the fix",
+        "a control test proves the flag is a no-op without --landed",
+    ]
+    await store.create_task(t)
+
+    outcome = await orch.run_task(t)
+
+    assert outcome.status is not TaskStatus.DONE, (
+        f"a report-only completion must never silently satisfy test-bearing "
+        f"criteria — got {outcome.status}")
+    assert outcome.status is TaskStatus.AWAITING_INPUT
+    refreshed = await store.find_task(t.id)
+    assert refreshed.status is TaskStatus.AWAITING_INPUT
+    assert refreshed.blocker is not None
+    assert refreshed.blocker.get("category") == "AMBIGUITY"
+    kinds = [e["kind"] for e in events]
+    assert "kind_criteria_mismatch" in kinds
+
+
 class _CleanReviewer:
     """Reviewer stub: passes the review with zero findings."""
 

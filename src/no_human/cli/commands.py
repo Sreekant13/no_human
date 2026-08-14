@@ -37,7 +37,7 @@ from ..core.events import EventPersister
 from ..core.orchestrator import CODER_ROLE, Orchestrator, is_agent_session
 from ..core.runtime import build_orchestrator
 from ..core.task import Task, TaskStatus
-from ..intake import classify_kind, ingest_from_url, parse_source
+from ..intake import classify_kind, ingest_from_url, kind_criteria_mismatch, parse_source
 from ..notify import build_notifier
 from ..vcs.task_pr import task_has_pr_evidence
 
@@ -919,6 +919,21 @@ def task_add(source, title, repo, description, criteria, external_id, kind, link
             # WS-A: tag the task with its type so the right pipeline drives it.
             verdict = classify_kind(t, override=kind)
             t.kind = verdict.kind.value
+            # Defect 204f2177: a report-only kind (design_doc/investigation)
+            # paired with test-bearing criteria (a CLI flag, red-first tests,
+            # a shipped artifact) can never be satisfied by that kind's
+            # report-only completion — refuse at intake rather than silently
+            # applying the mismatched kind. Never auto-accept; the human must
+            # pick an implement-shaped --kind or drop the test-bearing ask.
+            mismatch = kind_criteria_mismatch(t.kind, t.acceptance_criteria)
+            if mismatch:
+                console.print(f"[red]intake refused:[/] {mismatch}")
+                console.print(
+                    "[dim]pass an explicit --kind (e.g. feature/bugfix) that "
+                    "ships the demanded artifact, or drop the test-bearing "
+                    "criteria if this really is a report-only deliverable.[/]"
+                )
+                sys.exit(1)
             if backend:
                 t.config["backend"] = backend
             if approve_plan:

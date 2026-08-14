@@ -6,7 +6,13 @@ from typing import Any
 
 from ..core.task import Task
 from .base import SourceRef, parse_source
-from .classify import KindVerdict, TaskKind, classify, classify_kind
+from .classify import (
+    KindVerdict,
+    TaskKind,
+    classify,
+    classify_kind,
+    kind_criteria_mismatch,
+)
 from .grill import GrillQuestion, GrillResult, grill_step
 from .github_issues import GitHubAdapter
 from .gitlab_issues import GitLabAdapter
@@ -14,6 +20,7 @@ from .gitlab_issues import GitLabAdapter
 __all__ = [
     "SourceRef", "parse_source", "get_adapter", "ingest_from_url",
     "TaskKind", "KindVerdict", "classify", "classify_kind",
+    "kind_criteria_mismatch",
     "GrillQuestion", "GrillResult", "grill_step",
 ]
 

@@ -60,6 +60,7 @@ from ..blockers import (
 from ..ci.base import CIResult, HumanGatedCI
 from ..config import active_auth_profile
 from ..history.skills import discover_skills
+from ..intake.classify import kind_criteria_mismatch
 from ..intake.split_proposal import generate_split_proposal
 from ..intake.surface_advisory import surface_advisory
 from ..learning import CONFIRMED_BY_AUTO, ORIGIN_REVIEW
@@ -3683,6 +3684,40 @@ class Orchestrator:
             if (task.kind in _REPORT_KINDS
                     and (result.final_text or "").strip()):
                 findings = (result.final_text or "").strip()
+                # Defect 204f2177: assert kind/criteria consistency BEFORE
+                # applying report-only completion. A report-only kind
+                # (design_doc/investigation) produces a report and never
+                # code — so criteria demanding a tested/shipped artifact (a
+                # CLI flag, red-first tests, an endpoint) can never be
+                # satisfied by it. That live ticket was classified
+                # design_doc, then marked DONE on "design doc complete
+                # (report-only, no code changes)" with the demanded CLI flag
+                # never shipped and nothing flagged the mismatch. Refuse
+                # instead of silently completing, and escalate to a human —
+                # never lower the bar by completing anyway.
+                mismatch = kind_criteria_mismatch(task.kind, task.acceptance_criteria)
+                if mismatch is not None:
+                    await self.store.update_attempt(
+                        attempt_id, status="failed",
+                        failure_reason=f"kind/criteria mismatch: {mismatch}")
+                    self.emit("kind_criteria_mismatch", mismatch)
+                    mismatch_blocker = Blocker(
+                        category=BlockerCategory.AMBIGUITY,
+                        transient=False, confidence=1.0, goal=task.title,
+                        root_cause_hypothesis=mismatch,
+                        evidence=mismatch,
+                        question=(
+                            "This task's kind is report-only (design_doc/"
+                            "investigation) but its acceptance criteria "
+                            "demand a tested/shipped artifact a report can "
+                            "never deliver. Confirm the right kind (e.g. "
+                            "feature/bugfix) or drop the test-bearing "
+                            "criteria if this really is report-only."
+                        ),
+                    )
+                    return await self._raise_blocker(
+                        task, mismatch_blocker, repo=repo, branch=branch,
+                        attempt_id=attempt_id)
                 # C3: a report-kind task bypasses the code reviewer, so its only
                 # completion bar is that the report is non-empty. Reject an
                 # unambiguously-inadequate deliverable (a bare "Done.", a

@@ -7,7 +7,9 @@ from no_human.intake.classify import (
     TaskKind,
     classify,
     classify_kind,
+    kind_criteria_mismatch,
     parse_agent_verdict,
+    find_test_bearing_signal,
 )
 
 
@@ -550,3 +552,75 @@ def test_verb_as_noun_after_punctuation_stays_a_question():
         "what should I do, remove or keep the legacy adapter?",
     ]:
         assert classify_kind(_t(title)).kind is TaskKind.INVESTIGATION, title
+
+
+# ── kind/criteria consistency guard (defect 204f2177) ─────────────────────── #
+# A report-only kind (design_doc/investigation) completes without ever
+# shipping code — so criteria demanding a test/CLI/endpoint/shipped artifact
+# can never be satisfied by it. `kind_criteria_mismatch` names that clash so
+# intake can refuse it and completion can refuse to silently finish it.
+
+def test_design_doc_with_a_cli_flag_criterion_is_flagged_red_first():
+    """Red-first repro of the live defect shape: design_doc kind + a criterion
+    naming a CLI flag and tests must be caught, not silently accepted."""
+    reason = kind_criteria_mismatch(
+        "design_doc",
+        [
+            "nh approve --landed marks the PR landed",
+            "a red-first test proves the flag's behaviour before the fix",
+            "a control test proves the flag is a no-op without --landed",
+        ],
+    )
+    assert reason is not None
+    assert "design_doc" in reason
+
+
+def test_design_doc_with_only_prose_criteria_completes_report_only():
+    """Control: a genuine design_doc ticket with prose-only criteria (no
+    test-bearing signal) is NOT flagged — it must still complete report-only."""
+    reason = kind_criteria_mismatch(
+        "design_doc",
+        ["document covers options and a recommendation"],
+    )
+    assert reason is None
+
+
+def test_investigation_with_a_test_criterion_is_flagged():
+    reason = kind_criteria_mismatch(
+        "investigation",
+        ["add a test that reproduces the root cause"],
+    )
+    assert reason is not None
+    assert "investigation" in reason
+
+
+def test_feature_kind_is_never_flagged_regardless_of_criteria():
+    """The guard is scoped to report-only kinds — a feature/bugfix task
+    demanding tests is completely normal and must not be flagged."""
+    reason = kind_criteria_mismatch(
+        "feature",
+        ["add a red-first test", "ship a new CLI endpoint"],
+    )
+    assert reason is None
+
+
+def test_kind_criteria_mismatch_accepts_taskkind_enum_too():
+    assert kind_criteria_mismatch(
+        TaskKind.DESIGN_DOC, ["shipped as a CLI flag"]) is not None
+    assert kind_criteria_mismatch(
+        TaskKind.DESIGN_DOC, ["prose only, no signal words"]) is None
+
+
+@pytest.mark.parametrize("word", [
+    "test", "red-first", "test-bearing", "lands", "CLI", "endpoint",
+    "shipped", "artifact",
+])
+def test_each_documented_keyword_is_detected(word):
+    assert find_test_bearing_signal([f"the change {word} correctly"]) is not None
+
+
+def test_no_false_positive_on_substrings():
+    """`\\btest\\b` must not fire on 'testable', 'contest', etc. — a keyword
+    embedded in a larger word is not the signal word itself."""
+    assert find_test_bearing_signal(["the criteria are testable and clear"]) is None
+    assert find_test_bearing_signal(["do not contest the outcome"]) is None

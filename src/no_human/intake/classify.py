@@ -72,6 +72,70 @@ class KindVerdict:
         return {"kind": self.kind.value, "reason": self.reason, "source": self.source}
 
 
+# --------------------------------------------------------------------------- #
+# Kind/criteria consistency guard (defect 204f2177)                           #
+# --------------------------------------------------------------------------- #
+#
+# A report-only kind (design_doc/investigation) completes without ever
+# producing code, a test, or a shipped artifact — that IS its success shape
+# (see core/orchestrator.py's report-only DONE path). So when acceptance
+# criteria demand exactly those things — a test, red-first proof, a CLI flag,
+# an endpoint, something that "lands" or "ships" — a report-only kind can
+# never satisfy them: it silently completes "report-only" while the demanded
+# artifact never ships. Live case: task 204f2177 asked for `nh approve
+# --landed` with red-first + control tests, was classified design_doc, and
+# was marked DONE on a report with no code change — nothing flagged the
+# mismatch. This guard names that mismatch so both intake (never accept it)
+# and completion (never silently finish it) can refuse instead.
+REPORT_ONLY_KINDS: frozenset[str] = frozenset(
+    {TaskKind.DESIGN_DOC.value, TaskKind.INVESTIGATION.value})
+
+# Deliberately the literal signal words the spec calls out, not a broader
+# semantic guess — a false negative here is a silent miss (bad), but a false
+# positive just makes intake ask a human to confirm the kind (cheap).
+_TEST_BEARING_WORDS: tuple[str, ...] = (
+    "test", "red-first", "test-bearing", "lands", "cli", "endpoint",
+    "shipped", "artifact",
+)
+_TEST_BEARING_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in _TEST_BEARING_WORDS) + r")\b", re.I)
+
+
+def find_test_bearing_signal(acceptance_criteria: list[str] | None) -> str | None:
+    """Return the first test-bearing/shipped-artifact keyword found in
+    ``acceptance_criteria`` (e.g. ``"test"``, ``"CLI"``, ``"lands"``), or
+    ``None`` if none of the signal words appear."""
+    text = " ".join(acceptance_criteria or [])
+    m = _TEST_BEARING_PATTERN.search(text)
+    return m.group(0) if m else None
+
+
+def kind_criteria_mismatch(
+    kind: "TaskKind | str | None", acceptance_criteria: list[str] | None,
+) -> str | None:
+    """Return a reason string if ``kind`` is report-only (design_doc /
+    investigation) but ``acceptance_criteria`` demand a tested/shipped
+    artifact — the defect-204f2177 shape. ``None`` when the pairing is
+    consistent (report-only kind with prose-only criteria, or any other
+    kind).
+
+    Callers use this at TWO points, per the bug: at intake (before a task is
+    even created — refuse rather than silently apply the mismatched kind) and
+    at completion (before a report-only completion is applied — refuse rather
+    than silently mark DONE)."""
+    kind_value = kind.value if isinstance(kind, TaskKind) else str(kind or "")
+    if kind_value not in REPORT_ONLY_KINDS:
+        return None
+    hit = find_test_bearing_signal(acceptance_criteria)
+    if hit is None:
+        return None
+    return (
+        f"kind={kind_value!r} is report-only (produces a report, never code) "
+        f"but acceptance criteria contain the test-bearing signal {hit!r} — "
+        "a report-only completion would never ship the demanded artifact"
+    )
+
+
 # Ordered most-specific-first. The first pattern that matches wins, so a task
 # that says "fix the failing CI build" routes to ci_fix, not bugfix. Each entry
 # is (kind, compiled pattern, human label for the evidence string).

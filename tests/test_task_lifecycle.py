@@ -297,6 +297,66 @@ def test_task_add_rejects_a_linked_repo_that_is_not_a_checkout(tmp_path, monkeyp
 
 
 # --------------------------------------------------------------------------- #
+# nh task add — kind/criteria consistency guard (defect 204f2177)             #
+# --------------------------------------------------------------------------- #
+
+
+def test_task_add_refuses_design_doc_kind_with_test_bearing_criteria(tmp_path, monkeypatch):
+    """Red-first repro of the live defect: `--kind design_doc` paired with
+    criteria demanding a CLI flag + tests must be refused at intake, not
+    silently accepted and later marked DONE on a report-only path that never
+    ships the demanded artifact."""
+    db = tmp_path / "test.db"
+    runner = _make_runner(db, monkeypatch)
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+
+    result = runner.invoke(cli, [
+        "task", "add", "--title", "Add nh approve --landed",
+        "--repo", str(repo), "--kind", "design_doc",
+        "--criteria", "a red-first test proves the flag's behaviour",
+        "--criteria", "the CLI flag lands the PR",
+        "--no-grill", "--no-run",
+    ], catch_exceptions=False)
+
+    assert result.exit_code == 1
+    assert "intake refused" in result.output
+    assert "design_doc" in result.output
+
+    async def _go():
+        async with Store(db) as s:
+            return await s.list_tasks()
+    tasks = asyncio.run(_go())
+    assert tasks == [], "no task should have been created when intake refuses"
+
+
+def test_task_add_accepts_design_doc_kind_with_prose_only_criteria(tmp_path, monkeypatch):
+    """Control: a genuine design_doc ticket with prose-only criteria (no
+    test-bearing signal) is accepted at intake exactly as before."""
+    db = tmp_path / "test.db"
+    runner = _make_runner(db, monkeypatch)
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+
+    result = runner.invoke(cli, [
+        "task", "add", "--title", "Write a design doc for the retention pipeline",
+        "--repo", str(repo), "--kind", "design_doc",
+        "--criteria", "document covers options and a recommendation",
+        "--no-grill", "--no-run",
+    ], catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    task_id = _created_task_id(result.output)
+
+    async def _go():
+        async with Store(db) as s:
+            return await s.find_task(task_id)
+    t = asyncio.run(_go())
+    assert t is not None
+    assert t.kind == "design_doc"
+
+
+# --------------------------------------------------------------------------- #
 # nh task add — repo default budgets (SCRUM-48)                                #
 # --------------------------------------------------------------------------- #
 
