@@ -483,6 +483,16 @@ class Store:
             # when the calls do.
             from .build_info import loaded_code
             await asyncio.to_thread(loaded_code)
+            # Best-effort retention groom, same "every entrypoint passes
+            # through connect()" reasoning as the warm-up above. A wedged
+            # connect is worse than an ungroomed ledger, so this is
+            # deliberately fail-open — the totals invariant that must never
+            # lie lives in compact_unattributed_usage/unattributed_usage_totals
+            # themselves, not here.
+            try:
+                await self.compact_unattributed_usage()
+            except Exception:  # noqa: BLE001 — retention must never fail a connect
+                log.debug("unattributed_usage compaction failed", exc_info=True)
         except BaseException:
             db, self._db = self._db, None
             try:
@@ -1222,13 +1232,26 @@ class Store:
                 task_id TEXT,
                 tokens_used INTEGER DEFAULT 0,
                 cache_read_tokens INTEGER DEFAULT 0,
-                cache_creation_tokens INTEGER DEFAULT 0
+                cache_creation_tokens INTEGER DEFAULT 0,
+                rolled_up INTEGER DEFAULT 0
             )
         """)
         await self.db.execute(
             "CREATE INDEX IF NOT EXISTS idx_unattributed_usage_task "
             "ON unattributed_usage(task_id)"
         )
+        # `rolled_up` (compact_unattributed_usage's retention roll-up marker,
+        # below) postdates the table above for installs that already have it —
+        # CREATE TABLE IF NOT EXISTS is a no-op there, same idiom as
+        # `confirmed_by`/`test_layers` above.
+        uu_existing = {row["name"]
+                       for row in await self._fetchall(
+                           "PRAGMA table_info(unattributed_usage)")}
+        if "rolled_up" not in uu_existing:
+            await self.db.execute(
+                "ALTER TABLE unattributed_usage ADD COLUMN "
+                "rolled_up INTEGER DEFAULT 0"
+            )
 
     # ----------------------------- tasks ---------------------------------- #
 
@@ -2175,8 +2198,18 @@ class Store:
 
         ``task_id=None`` totals the WHOLE ledger (the default question — "how
         much intake spend does no task own"); pass an id to scope it.
+
+        ``calls`` is not a plain ``COUNT(*)``: retention compaction
+        (``compact_unattributed_usage``) collapses aged rows into one
+        roll-up row per ``(site, model)``, tagged ``rolled_up`` with the
+        number of original rows it stands for. A roll-up row must still
+        count as the calls it replaced, or "how many LLM calls landed here"
+        would silently shrink the moment a row ages past the retention
+        window — so this sums ``rolled_up`` where set, and 1 per ordinary
+        (non-rolled-up) row.
         """
-        sql = ("SELECT COUNT(*) AS calls, "
+        sql = ("SELECT COALESCE(SUM(CASE WHEN rolled_up > 0 THEN rolled_up "
+               "ELSE 1 END), 0) AS calls, "
                "COALESCE(SUM(tokens_used), 0) AS tokens_used, "
                "COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, "
                "COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens "
@@ -2191,6 +2224,109 @@ class Store:
         out["total"] = (out["tokens_used"] + out["cache_read_tokens"]
                         + out["cache_creation_tokens"])
         return out
+
+    @serialized_write
+    async def compact_unattributed_usage(
+        self, *, retention_days: int | None = None
+    ) -> int:
+        """Roll up ``unattributed_usage`` rows older than the retention
+        window into one row per ``(site, model)`` group. Returns the number
+        of original rows collapsed (0 if nothing aged out, or the knob is
+        disabled).
+
+        DELETE, not roll-up, would let the residual total
+        (``unattributed_usage_totals``) silently shrink — that number is
+        documented as the whole-cost figure to trust, and this table exists
+        precisely so spend is never quietly dropped. So aged rows are
+        summed and replaced by one row per group instead: ``site``/``model``
+        survive (the residual stays diagnosable), ``task_id`` does not (a
+        group can span many tasks), and ``rolled_up`` carries how many
+        source rows the group stands for so ``calls`` in
+        ``unattributed_usage_totals`` stays exact — see that method's
+        docstring for why ``COUNT(*)`` alone would drift.
+
+        Totals invariant: the three token columns are summed per group and
+        re-inserted unchanged, so ``SUM(tokens_used)`` etc. over the whole
+        table is exactly what it was before compaction — only the row count
+        and per-row ``ts``/``task_id`` detail are lost for rows older than
+        the window.
+
+        Idempotent: the roll-up row is written with ``ts = cutoff``, which
+        is never ``< cutoff`` on the same call's own cutoff, so running this
+        twice back to back is a no-op the second time (the guard SELECT
+        below finds nothing new to compact). On a later day, a roll-up row
+        can itself age past a NEW cutoff and get folded into a fresh
+        roll-up — arithmetically stable because its ``rolled_up`` count
+        (not a bare 1) carries forward.
+
+        ``retention_days=None`` reads ``usage_ledger.retention_days`` from
+        config (default 90 if config load fails — see ``config.py``);
+        ``retention_days<=0`` disables compaction (returns 0, no rows
+        touched).
+        """
+        if retention_days is None:
+            try:
+                from ..config import load_config
+                # create_if_missing=False: a plain connect() must never have
+                # the side effect of materializing ~/.no_human/config.yaml —
+                # read the knob if a config is already there, else fall
+                # through to the documented default below.
+                retention_days = int(
+                    load_config(create_if_missing=False)
+                    .get("usage_ledger", {}).get("retention_days", 90))
+            except Exception:  # noqa: BLE001 — a bad/unreadable config must
+                # not block compaction; 90 is the documented default.
+                retention_days = 90
+        if retention_days <= 0:
+            return 0
+        # Truncated to the day: two calls on the SAME UTC calendar day compute
+        # the IDENTICAL cutoff, which is what makes this idempotent (the
+        # roll-up row below is written with ts = cutoff, and a value cannot be
+        # `< ` a cutoff it exactly equals). Full microsecond precision would
+        # make every call's cutoff strictly greater than the last, sweeping the
+        # previous roll-up row back up on the very next call.
+        cutoff_dt = (datetime.now(timezone.utc)
+                     - timedelta(days=retention_days)).replace(
+                         hour=0, minute=0, second=0, microsecond=0)
+        cutoff = cutoff_dt.isoformat()
+        guard = await self._fetchone(
+            "SELECT COUNT(*) AS c FROM unattributed_usage WHERE ts < ?",
+            (cutoff,),
+        )
+        total = int(guard["c"] if guard else 0)
+        if not total:
+            return 0
+        groups = await self._fetchall(
+            "SELECT site, model, "
+            "SUM(tokens_used) AS tokens_used, "
+            "SUM(cache_read_tokens) AS cache_read_tokens, "
+            "SUM(cache_creation_tokens) AS cache_creation_tokens, "
+            # A group can already contain a PRIOR roll-up row (from an
+            # earlier compaction) alongside ordinary rows. `COUNT(*)` would
+            # count that roll-up row as 1, discarding however many original
+            # calls it stood for. Sum `rolled_up` where set, 1 per ordinary
+            # row instead — the same accumulator `unattributed_usage_totals`
+            # uses (see that method's docstring) — so re-compaction on a
+            # later day carries the count forward exactly instead of
+            # resetting it to the row count.
+            "SUM(CASE WHEN rolled_up > 0 THEN rolled_up ELSE 1 END) AS n "
+            "FROM unattributed_usage WHERE ts < ? GROUP BY site, model",
+            (cutoff,),
+        )
+        await self.db.execute(
+            "DELETE FROM unattributed_usage WHERE ts < ?", (cutoff,))
+        for g in groups:
+            await self.db.execute(
+                "INSERT INTO unattributed_usage (id, ts, site, model, "
+                "task_id, tokens_used, cache_read_tokens, "
+                "cache_creation_tokens, rolled_up) "
+                "VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+                (uuid.uuid4().hex, cutoff, g["site"], g["model"],
+                 int(g["tokens_used"] or 0), int(g["cache_read_tokens"] or 0),
+                 int(g["cache_creation_tokens"] or 0), int(g["n"])),
+            )
+        await self.db.commit()
+        return total
 
     # --------------------------- memories ---------------------------------- #
     # The human-confirmed learning queue (PLAN.md 4.5): proposals land here

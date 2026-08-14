@@ -55,7 +55,6 @@ answer is ``unknown``, never ``closed_unmerged``.
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable, Sequence
@@ -502,20 +501,3 @@ async def refresh_outcomes(
                                    checks=checks, shipped=shipped)
         tally[outcome] += 1
     return tally
-
-
-def parse_attributes(raw: Any) -> dict[str, Any]:
-    """The ``attributes`` JSON blob as a dict; ``{}`` for anything unreadable.
-
-    The forward slot for later MEASURED facts (a priced cost, a revert SHA, the
-    id of a reviewer verdict). Never a score: an evidence-based pass/fail gate
-    is this project's review mechanism and a numeric self-rating is forbidden,
-    so nothing that lands in here may be a judgement no instrument produced.
-    """
-    if isinstance(raw, dict):
-        return dict(raw)
-    try:
-        val = json.loads(raw or "{}")
-    except (TypeError, ValueError):
-        return {}
-    return val if isinstance(val, dict) else {}

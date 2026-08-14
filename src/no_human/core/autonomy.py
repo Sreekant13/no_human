@@ -287,6 +287,21 @@ def _within_window(task: Task, cutoff: datetime | None) -> bool:
 
 
 def _is_empty_diff(diff: Any) -> bool:
+    """True when a POPULATED ``attempts.diff`` value is blank.
+
+    As of this commit, no production path writes ``attempts.diff`` — grep
+    ``src/no_human`` for a writer and there is none; only tests set it. The
+    column is kept rather than dropped because `list_attempts` is
+    ``SELECT *``, so every attempt-row consumer would need to be re-audited
+    for a column it drops. The real "did this attempt produce nothing"
+    signal for production data is ``attempts.commit_sha`` being unset on a
+    turn-exhaustion attempt (see ``compute_autonomy_metrics``) — the
+    orchestrator only stamps ``commit_sha`` when it checkpoints a
+    WIP-PARTIAL commit (``orchestrator.py:3763``, gated on
+    ``repo.has_changes()``), so no commit means no diff. This function stays
+    as the reader for the day a writer lands, or for a caller that already
+    has a diff string.
+    """
     return not diff or not str(diff).strip()
 
 
@@ -322,7 +337,27 @@ async def compute_autonomy_metrics(
             continue
         for a in attempts:
             reason = a.get("failure_reason") or ""
-            if _TURN_EXHAUSTION_RE.search(reason) and _is_empty_diff(a.get("diff")):
+            if not _TURN_EXHAUSTION_RE.search(reason):
+                continue
+            # An earlier version matched `orchestrator._NO_CHANGES_DETAIL`
+            # against `reason` here — it never fires: the zero-diff and
+            # turn-exhaustion outcomes are mutually exclusive branches in the
+            # orchestrator (orchestrator.py:2702 vs. :3963), so no
+            # turn-exhaustion `failure_reason` ever carries that text.
+            # `diff` itself is never written in production either (see
+            # `_is_empty_diff`). The signal production actually records is
+            # `commit_sha`: the orchestrator only stamps it on a
+            # turn-exhaustion attempt when it checkpointed a WIP-PARTIAL
+            # commit (orchestrator.py:3763, gated on `repo.has_changes()`) —
+            # an unset `commit_sha` means the attempt left the tree
+            # byte-identical. A POPULATED `diff` (tests, a future writer) is
+            # judged by its own content instead.
+            diff = a.get("diff")
+            if diff is not None:
+                empty = _is_empty_diff(diff)
+            else:
+                empty = not a.get("commit_sha")
+            if empty:
                 report.turn_exhaustion_empty += 1
 
     report.by_status = dict(status_counter)

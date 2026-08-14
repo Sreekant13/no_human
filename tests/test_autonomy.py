@@ -55,15 +55,56 @@ async def test_touchpoint_and_pr_reached_rates(store):
     assert rep.blocker_categories == {"STAGNATION": 1, "MISSING_ACCESS": 1}
 
 
-async def test_turn_exhaustion_empty_diff_counted(store):
+async def test_turn_exhaustion_counted_from_absent_commit(store):
+    # Production-shaped: neither `diff` nor `commit_sha` is passed here — this
+    # mirrors the orchestrator's own max_turns/error path (orchestrator.py
+    # :3724-3763) when `repo.has_changes()` was False: no WIP-PARTIAL commit
+    # gets checkpointed, so `commit_sha` stays the column's NULL default. That
+    # absence is the metric's real "empty" signal (see autonomy.py
+    # `_is_empty_diff`'s docstring) — `diff` itself is never written in
+    # production, and the orchestrator NEVER puts turn-exhaustion wording and
+    # the zero-diff detail in the same `failure_reason` (they are mutually
+    # exclusive branches — orchestrator.py:2702 vs. :3963), so a check for
+    # that combined text is always false and would undercount every real
+    # case; hence it is not used here.
     t = await _mk(store, "big", TaskStatus.FAILED)
     aid1 = await store.create_attempt(t.id, 1)
     await store.update_attempt(
-        aid1, failure_reason="Agent run did not complete (max_turns)", diff=None)
+        aid1, failure_reason="agent run did not complete (max_turns)")
     aid2 = await store.create_attempt(t.id, 2)
-    # A real failure with a diff is NOT counted as turn-exhaustion-empty.
+    await store.update_attempt(aid2, failure_reason="review failed")
+
+    rep = await compute_autonomy_metrics(store)
+    assert rep.turn_exhaustion_empty == 1
+
+
+async def test_turn_exhaustion_with_changes_is_not_counted(store):
+    # A turn-exhaustion attempt that DID checkpoint a WIP-PARTIAL commit
+    # (`commit_sha` set — mirrors orchestrator.py:3763 when
+    # `repo.has_changes()` was True) is not "empty": it left real changes in
+    # the tree even though the run itself failed. This is the case a
+    # naive "any turn-exhaustion attempt counts" implementation would get
+    # wrong.
+    t = await _mk(store, "big", TaskStatus.FAILED)
+    aid = await store.create_attempt(t.id, 1)
     await store.update_attempt(
-        aid2, failure_reason="review failed", diff="diff --git a b")
+        aid, failure_reason="agent run did not complete (max_turns)",
+        commit_sha="deadbeef")
+
+    rep = await compute_autonomy_metrics(store)
+    assert rep.turn_exhaustion_empty == 0
+
+
+async def test_populated_diff_column_still_counts(store):
+    # No production writer sets `diff` today, but the reader must still honor
+    # it when a row DOES carry one (tests, a future writer): an explicitly
+    # empty diff counts even when `commit_sha` IS set — a populated `diff`'s
+    # own content takes precedence over the `commit_sha` fallback.
+    t = await _mk(store, "big", TaskStatus.FAILED)
+    aid = await store.create_attempt(t.id, 1)
+    await store.update_attempt(
+        aid, failure_reason="agent run did not complete (max_turns)",
+        commit_sha="deadbeef", diff="")
 
     rep = await compute_autonomy_metrics(store)
     assert rep.turn_exhaustion_empty == 1

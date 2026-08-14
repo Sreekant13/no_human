@@ -1205,7 +1205,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_files_changed": None,
         "max_lines_changed": None,
         "forbidden_paths": [".env", "secrets/", "*.key", "*.pem"],
-        "block_test_weakening": True,
     },
     "pipeline": {
         # Proportionality (2026-08-09). Measured: a one-line edit to a markdown
@@ -1390,10 +1389,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "filter_user_skills": True,
     "blockers": {
         # Part 22 blocker handling.
-        "max_alternatives_before_escalate": 2,
         "max_park_duration": "48h",
         "wake_poll_interval": "10m",
-        "transient_infra_retries": 2,
         "escalate_on_low_confidence_below": 0.6,
         # PR comments from these authors never trigger a revision ("[bot]"
         # logins are always ignored on top). A CI service account that posts a
@@ -1770,6 +1767,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # reachable regardless (CLI `--triage-templated`, tests) — this only
         # turns off the unattended daily tick.
         "sweep_enabled": True,
+    },
+    # The `unattributed_usage` ledger (core/db.py) is append-only and never
+    # DELETEd wholesale: it is the whole-cost residual `nh status` reads as
+    # the true total, and a plain DELETE would make that number silently
+    # shrink. Past this many days, `Store.compact_unattributed_usage` rolls
+    # aged rows up into one row per (site, model) instead — token totals
+    # survive exactly; per-row ts/task_id detail does not. `0` disables
+    # compaction (unbounded growth, the pre-existing behavior).
+    "usage_ledger": {
+        "retention_days": 90,
     },
 }
 

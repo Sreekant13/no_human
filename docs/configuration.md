@@ -21,6 +21,7 @@ changes in code and not here fails the suite.
 | `ci.enabled` | `false` | Trigger and poll GitLab CI, GitHub Actions, Jenkins or CircleCI |
 | `pipeline.review_routing.enabled` | `true` | Review depth scales with diff size — see below |
 | `pipeline.review_routing.max_diff_lines` | `200` | The single-turn-gate threshold, in added+deleted lines |
+| `usage_ledger.retention_days` | `90` | Age past which `unattributed_usage` rows are rolled up (not deleted — totals stay exact, per-row `ts`/`task_id` detail is lost); `0` disables compaction |
 
 Review depth scales with diff size: a gate review of a diff at or under
 `max_diff_lines` changed lines runs SINGLE-TURN, no tools — the diff, the full
@@ -194,7 +195,6 @@ safety:
   max_files_changed: null         # no size cap by default; set an int to escalate
   max_lines_changed: null         # SCOPE_EXPLOSION past it. The human is the gate.
   forbidden_paths: [".env", "secrets/", "*.key", "*.pem"]
-  block_test_weakening: true
 
 bounds:
   max_attempts: 3
@@ -220,11 +220,14 @@ hooks:
                                   # unless the repo has a confirmed lint command.
 
 blockers:                         # Part 22
-  max_alternatives_before_escalate: 2
   max_park_duration: "48h"        # parked past this => escalate (never abandon)
   wake_poll_interval: "10m"
-  transient_infra_retries: 2
   escalate_on_low_confidence_below: 0.6   # unsure what's wrong => ask, don't thrash
+
+usage_ledger:
+  retention_days: 90              # unattributed_usage rows older than this are rolled
+                                   # up (not deleted) into one row per (site, model);
+                                   # 0 disables compaction
 
 ci:                               # opt-in; the install-wide fallback (see below)
   enabled: false
