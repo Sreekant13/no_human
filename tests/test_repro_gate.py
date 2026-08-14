@@ -601,3 +601,90 @@ def test_is_python_profile_routing():
         ProjectProfile(repo_path=".", ecosystem="node")) is False
     assert repro_gate._is_python_profile(
         ProjectProfile(repo_path=".", ecosystem="maven")) is False
+
+
+# --------------------------------------------------------------------------- #
+# resume-shape: a resumed attempt's `base_ref` is the task's TRUE pre-work    #
+# base (the caller — Orchestrator._repro_base_ref — is responsible for that), #
+# but the checkpoint it branched from already contains a prior attempt's fix. #
+# The gate must still require BOTH directions (red-on-base, green-on-tip) —   #
+# only the WORDING of the fail reasons and the recorded `resume_shape` flag   #
+# change. Criteria 3/4 from the ticket.                                      #
+# --------------------------------------------------------------------------- #
+
+
+def test_resume_shape_fail_on_base_pass_on_tip_passes(repo):
+    """Criterion 3: red-on-base + green-on-tip still passes when resumed."""
+    r = run_repro_gate(repo, "HEAD", resume_shape=True)
+    assert r.verdict == "pass", r.reasons
+    assert r.resume_shape is True
+    assert r.to_json()["resume_shape"] is True
+
+
+def test_resume_shape_passing_on_both_fails_with_no_proof_reason(repo):
+    """Criterion 4: a repro that passes on BOTH trees proves nothing — even
+    (especially) for a resumed attempt, where a green base is the checkpoint's
+    prior fix, not health. The reason must say so in resume terms."""
+    (repo / "test_repro.py").write_text(
+        "def test_add_fixed():\n    assert True\n"
+    )
+    r = run_repro_gate(repo, "HEAD", resume_shape=True)
+    assert r.verdict == "fail"
+    assert "resume-shape" in r.reasons[0]
+    assert "no proof of change" in r.reasons[0]
+
+
+def test_resume_shape_failing_on_tip_is_a_fail_not_a_pass(repo):
+    """A tip-red repro is never accepted, resume-shape or not."""
+    (repo / "calc.py").write_text("def add(a, b):\n    return a - b  # still buggy\n")
+    r = run_repro_gate(repo, "HEAD", resume_shape=True)
+    assert r.verdict == "fail"
+    assert r.verdict != "pass"
+    assert "resume-shape" in r.reasons[0]
+    assert "pass-on-tip" in r.reasons[0]
+
+
+def test_resume_shape_unresolvable_base_is_error_never_fail(repo):
+    """Mirrors test_a_bad_base_ref_is_an_error_never_a_fail: an unresolvable
+    base is 'cannot verify', never a guessed fail/pass — resume-shape or not."""
+    r = run_repro_gate(repo, "no-such-ref", resume_shape=True)
+    assert r.verdict == "error"
+
+
+def test_normal_gate_is_byte_identical_to_resume_off(repo):
+    """Criterion 5: the non-resume path is untouched by this feature — same
+    verdict, same three reason strings, verbatim, plus the (default-False)
+    resume_shape key `to_json()` now always carries."""
+    r = run_repro_gate(repo, "HEAD")
+    assert r.to_json() == {
+        "verdict": "pass",
+        "tests": ["test_repro.py::test_add_fixed"],
+        "reasons": [],
+        "resume_shape": False,
+    }
+
+    (repo / "test_repro.py").write_text("def test_add_fixed():\n    assert True\n")
+    r_fails_before = run_repro_gate(repo, "HEAD")
+    assert r_fails_before.reasons[0] == (
+        "fails-before failed — the declared repro tests already pass "
+        "on the base code, so they do not demonstrate this change"
+    )
+
+    (repo / "test_repro.py").write_text(
+        "from calc import add\n\ndef test_add_fixed():\n    assert add(1, 2) == 3\n"
+    )
+    (repo / "calc.py").write_text("def add(a, b):\n    return a - b  # still buggy\n")
+    r_passes_after = run_repro_gate(repo, "HEAD")
+    assert r_passes_after.reasons[0].startswith(
+        "passes-after failed — the declared repro tests do not pass on "
+        "the attempt's own tree:\n"
+    )
+
+    (repo / "test_repro.py").unlink()
+    r_deleted = run_repro_gate(repo, "HEAD")
+    assert r_deleted.reasons[0].startswith(
+        "declared test file(s) missing from the attempt tree:"
+    )
+    assert r_deleted.reasons[0].endswith(
+        "— a listed repro test may not be deleted"
+    )

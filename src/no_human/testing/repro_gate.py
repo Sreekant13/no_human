@@ -56,10 +56,11 @@ class ReproResult:
     verdict: str                    # "pass" | "fail" | "waived" | "error"
     tests: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
+    resume_shape: bool = False
 
     def to_json(self) -> dict:
         return {"verdict": self.verdict, "tests": self.tests,
-                "reasons": self.reasons}
+                "reasons": self.reasons, "resume_shape": self.resume_shape}
 
 
 def read_manifest(repo_path: Path) -> list[str]:
@@ -296,6 +297,7 @@ def _run_test_cmd(
 
 def run_repro_gate(
     repo_path: Path, base_ref: str, profile: "ProjectProfile | None" = None,
+    *, resume_shape: bool = False,
 ) -> ReproResult:
     """Prove fails-before / passes-after for the declared repro tests.
 
@@ -310,6 +312,21 @@ def run_repro_gate(
     tests with pytest, unchanged. Any other declared ecosystem routes the same
     fails-before/passes-after proof through the profile's own ``test_cmd``
     instead (SCRUM-65), so the guarantee is not pytest-only.
+
+    ``resume_shape`` (keyword-only, default ``False``) covers a RESUMED
+    attempt: one that branches from a ``[WIP-BLOCKED]``/``[WIP-PARTIAL]``
+    checkpoint rather than from the task's true base. The caller is
+    responsible for handing this function a ``base_ref`` that resolves to
+    that TRUE pre-work base (never the checkpoint itself — see
+    ``Orchestrator._repro_base_ref``); this flag only changes the WORDING of
+    the fail reasons and stamps ``resume_shape`` on the result, so a resumed
+    task's send-back message reads as "this resumed attempt proved nothing"
+    rather than the misleading "the base code already does this". The
+    red-first contract is NOT relaxed: both directions (fail-on-base AND
+    pass-on-tip) are still required for ``pass``, exactly as the default
+    path requires. When ``resume_shape`` is ``False`` (the default) this
+    function's behaviour, reasons and return values are byte-identical to
+    before this parameter existed.
     """
     tests = read_manifest(repo_path)
     if not tests:
@@ -367,6 +384,11 @@ def run_repro_gate(
         return ReproResult("error", tests=tests, reasons=[
             f"repro tests could not be executed:\n{out_after}"])
     if not ok_after:
+        if resume_shape:
+            return ReproResult("fail", tests=tests, resume_shape=True, reasons=[
+                "resume-shape: pass-on-tip failed — the declared repro "
+                "tests do not pass on the attempt's own tree:\n"
+                f"{out_after}"])
         return ReproResult("fail", tests=tests, reasons=[
             "passes-after failed — the declared repro tests do not pass on "
             f"the attempt's own tree:\n{out_after}"])
@@ -409,10 +431,15 @@ def run_repro_gate(
             return ReproResult("error", tests=tests, reasons=[
                 f"base-tree repro run could not execute:\n{out_before}"])
         if ok_before:
+            if resume_shape:
+                return ReproResult("fail", tests=tests, resume_shape=True, reasons=[
+                    "resume-shape: fails-before failed — the declared repro "
+                    "tests already pass on the resumed base, so this attempt "
+                    "has no proof of change"])
             return ReproResult("fail", tests=tests, reasons=[
                 "fails-before failed — the declared repro tests already pass "
                 "on the base code, so they do not demonstrate this change"])
-        return ReproResult("pass", tests=tests)
+        return ReproResult("pass", tests=tests, resume_shape=resume_shape)
     finally:
         subprocess.run(["git", "worktree", "remove", "--force", str(worktree)],
                        cwd=repo_path, capture_output=True)

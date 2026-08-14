@@ -1017,11 +1017,37 @@ class Orchestrator:
     def emit(self, kind: str, text: str = "", **meta: Any) -> None:
         self._sink({"source": "orchestrator", "kind": kind, "text": text, **meta})
 
-    async def _repro_base_ref(self, repo_path: Path, base: str) -> str:
+    async def _repro_base_ref(
+        self, repo_path: Path, base: str, *, resume_shape: bool = False,
+    ) -> str:
         """The commit the task's changes grew from: merge-base of HEAD and the
         target branch (origin/<base> preferred, local <base> as fallback).
-        Falls back to HEAD~1 when neither resolves — the gate then reports its
-        own error rather than us guessing silently."""
+
+        Non-resume (default): falls back to HEAD~1 when neither resolves —
+        the gate then reports its own error rather than us guessing silently.
+        This path is unchanged from before ``resume_shape`` existed.
+
+        Resume-shape (``resume_shape=True``): a resumed attempt's HEAD sits on
+        top of a ``[WIP-BLOCKED]``/``[WIP-PARTIAL]`` checkpoint, often in a
+        detached worktree where neither ``origin/<base>`` nor ``<base>``
+        resolves at all — so ``HEAD~1`` would silently be the checkpoint
+        itself (or, if the checkpoint sits several ordinary commits above the
+        true base, some commit still WITHIN the resumed attempt's own work).
+        Either way that "base" already contains the fix, so the gate reads a
+        genuine change as "the base code already does this". Falling back to
+        ``HEAD~1`` therefore assumes the checkpoint is exactly one commit
+        above the true base, which does not hold once an attempt makes
+        several ordinary commits before being checkpointed. Instead, walk
+        HEAD's ancestry past every commit stamped with the agent's own git
+        identity (``_agent_git_identity`` — EVERY commit an attempt makes,
+        ordinary work or checkpoint, carries that one identity) and use the
+        first ancestor authored by anyone else — the true pre-task base,
+        regardless of how many attempt commits sit between it and HEAD. When
+        that walk itself finds nothing (e.g. the whole reachable history is
+        attempt-authored), return a ref that cannot resolve, so the gate's own
+        ``git worktree add`` fails and reports ``error`` — "cannot verify" is
+        the correct verdict for an unresolvable base, never a guessed "fail".
+        """
         for candidate in (f"origin/{base}", base):
             proc = await asyncio.create_subprocess_exec(
                 "git", "merge-base", "HEAD", candidate,
@@ -1031,7 +1057,89 @@ class Orchestrator:
             out, _ = await proc.communicate()
             if proc.returncode == 0 and out.strip():
                 return out.decode().strip()
-        return "HEAD~1"
+        if not resume_shape:
+            return "HEAD~1"
+        walked = await self._resume_pre_work_base(repo_path)
+        return walked or "nh-resume-base-unresolved"
+
+    async def _resume_pre_work_base(self, repo_path: Path) -> str | None:
+        """Walk HEAD's ancestry to the first commit that is NEITHER authored
+        under an agent identity NOR a ``[WIP-BLOCKED]``/``[WIP-PARTIAL]``
+        checkpoint — the true pre-task base for a resumed attempt, however
+        many attempt commits (ordinary work commits plus checkpoints) sit
+        above it.
+
+        Two independent signals gate a commit as "attempt, keep walking":
+
+          1. A WIP-prefixed subject — always skipped, regardless of author.
+          2. The author email matches EITHER the configured agent identity
+             (``_agent_git_identity``) OR HEAD's own author email. The
+             second is the hardening: a resumed attempt's config may set
+             ``git.agent_identity_email`` to something that does not match
+             the identity actually stamped on the repo's history (e.g. a
+             different install, a changed config default). HEAD is, by
+             construction of the resume-shape path, always an attempt
+             commit — so its own author is a self-calibrating signal for
+             "this identity is the attempt's", independent of what config
+             claims. Without it, a config/history identity mismatch would
+             make every ordinary attempt commit (fix, checkpoint-adjacent
+             work — anything not WIP-prefixed) look "not agent-authored" to
+             the config-only check, and the walk would stop on the first
+             one it saw: an attempt commit still carrying the very change
+             under test, reinstating the bug this walk exists to kill.
+
+        Returns ``None`` when the walk fails (bad repo, detached with no
+        history) or every reachable commit is agent-authored (under either
+        identity) or a WIP checkpoint — the caller must not guess a base in
+        either case."""
+        agent_email = self._agent_git_identity()["GIT_AUTHOR_EMAIL"]
+        proc = await asyncio.create_subprocess_exec(
+            "git", "log", "--format=%H%x00%ae%x00%s", "HEAD",
+            cwd=repo_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return None
+        lines = out.decode(errors="replace").splitlines()
+        head_email: str | None = None
+        for line in lines:
+            sha, sep, rest = line.partition("\x00")
+            if not sep:
+                continue
+            email, sep2, subject = rest.partition("\x00")
+            if not sep2:
+                continue
+            email = email.strip()
+            if head_email is None:
+                head_email = email  # HEAD's own author — the self-calibrated identity
+            if subject.startswith("[WIP-BLOCKED]") or subject.startswith("[WIP-PARTIAL]"):
+                continue
+            if email != agent_email and email != head_email:
+                return sha
+        return None
+
+    def _is_resume_shape(self, task: Task) -> bool:
+        """Is this attempt branching from a WIP checkpoint rather than the
+        task's true base — the shape that broke the repro gate's fails-before
+        check (a checkpoint already contains the prior attempt's fix, so it
+        reads as "the base code already does this")?
+
+        Explicit override first: a ``resume_shape`` flag on the task's
+        context, the task-config knob a human or caller can set directly.
+        Otherwise derived: a non-empty ``resume_from.sha`` in context means
+        this run continues from a ``[WIP-BLOCKED]``/``[WIP-PARTIAL]`` /
+        crash checkpoint (see ``_resume_branch_point``,
+        ``_checkpoint_wip``). Never raises — a missing or oddly-typed
+        context reads as ``False`` (non-resume, the existing behaviour)."""
+        try:
+            ctx = task.context or {}
+            if bool(ctx.get("resume_shape")):
+                return True
+            resume_from = ctx.get("resume_from") or {}
+            return bool(resume_from.get("sha"))
+        except (AttributeError, TypeError):
+            return False
 
     async def _apply_surface_advisory(
         self, ctx: dict, spec: TaskSpec, task: Task | None = None,
@@ -4117,18 +4225,23 @@ class Orchestrator:
             )
             enforced = repro_mode == "required" or (
                 task.kind == "bugfix" and repro_mode != "off" and changed_py)
-            base_ref = await self._repro_base_ref(repo.path, base)
+            resume_shape = self._is_resume_shape(task)
+            base_ref = await self._repro_base_ref(
+                repo.path, base, resume_shape=resume_shape)
             prof = getattr(self, "_active_profile", None)
             try:
                 repro = await asyncio.to_thread(
-                    run_repro_gate, repo.path, base_ref, prof)
+                    run_repro_gate, repo.path, base_ref, prof,
+                    resume_shape=resume_shape)
                 self.emit(
                     "repro_gate",
                     f"{repro.verdict}"
                     + (f" ({len(repro.tests)} test(s))" if repro.tests else "")
                     + (f" — {repro.reasons[0][:200]}" if repro.reasons else "")
-                    + (" [required]" if enforced else " [advisory]"),
+                    + (" [required]" if enforced else " [advisory]")
+                    + (" [resume-shape]" if resume_shape else ""),
                     verdict=repro.verdict,
+                    resume_shape=resume_shape,
                 )
             except Exception as exc:  # noqa: BLE001 — a crashed gate is not a verdict
                 self._advisory(f"repro gate crashed: {exc}")
