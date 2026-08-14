@@ -127,6 +127,31 @@ def test_load_config_rejects_api_key(tmp_path):
         load_config(cfg_path)
 
 
+def test_load_config_rejects_decomposition_enabled(tmp_path):
+    """The LeadAgent child-task path was removed 2026-08-12 (operator
+    decision A1); re-enabling its gate must fail loudly at startup, not
+    silently do nothing."""
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("decomposition:\n  enabled: true\n")
+    with pytest.raises(config.ConfigError, match="decomposition was removed"):
+        load_config(cfg_path)
+
+
+def test_load_config_allows_decomposition_default(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("decomposition:\n  enabled: false\n")
+    cfg = load_config(cfg_path)
+    assert cfg.data["decomposition"]["enabled"] is False
+
+
+def test_load_config_default_has_no_decomposition_enabled(tmp_path):
+    """Nobody touches the key — the load-bearing default-off path."""
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("llm:\n  auth_mode: subscription\n")
+    cfg = load_config(cfg_path)
+    assert cfg.data["decomposition"]["enabled"] is False
+
+
 def test_atomic_write_text_uses_os_replace(tmp_path, monkeypatch):
     """Guard: _atomic_write_text must go through os.replace, not direct write."""
     target = tmp_path / "config.yaml"

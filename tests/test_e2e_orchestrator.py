@@ -1944,21 +1944,6 @@ async def test_planner_prompt_unchanged_for_single_repo(bare_repo, tmp_path, sto
     assert all("LINKED REPOSITORIES" not in p for p in backend.prompts)
 
 
-async def test_planner_prompt_decompose_when_enabled(bare_repo, tmp_path, store):
-    """The legacy child-task path is only offered when decomposition.enabled."""
-    cfg = _planning_config(tmp_path)
-    cfg.data["decomposition"] = {"enabled": True}
-    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
-                        SlackNotifier(None))
-    t = Task.new("multi-concern task", repo_path=str(bare_repo))
-    backend = PromptCapturingPlannerBackend(_SAMPLE_PLAN)
-
-    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=backend):
-        await orch._generate_plan(t, GitRepo(bare_repo))
-
-    assert any("DECOMPOSE_PLAN_START" in p for p in backend.prompts)
-
-
 async def test_planning_skips_for_code_review(bare_repo, tmp_path, store):
     """Planning is gated: code_review kind skips it entirely (no Claude call)."""
     cfg = _planning_config(tmp_path)
@@ -2945,39 +2930,6 @@ async def test_moa_planning_falls_back_on_insufficient_proposers(bare_repo, tmp_
     assert any("falling back" in e.get("text", "") for e in moa_events)
     planning_events = [e for e in events if e.get("kind") == "planning"]
     assert any("plan generated" in e.get("text", "") for e in planning_events)
-
-
-async def test_moa_planning_uses_decompose_proposal_directly(bare_repo, tmp_path, store):
-    """A confident compound-task signal from ONE proposer is used directly —
-    never blended/averaged with the other proposals."""
-    decompose_text = (
-        "DECOMPOSE_PLAN_START\n```json\n"
-        '{"decompose": true, "justification": "multi-concern", "subtasks": '
-        '[{"title": "A", "kind": "feature", "description": "d", '
-        '"acceptance_criteria": ["x"], "depends_on": [], "repo_path": "."}]}\n'
-        "```\nDECOMPOSE_PLAN_END\n"
-    )
-    cfg = _moa_config(tmp_path)
-    cfg.data["decomposition"] = {"enabled": True}
-    events = []
-    orch = Orchestrator(store, cfg.data, FakeBackend(lambda cwd: None),
-                        SlackNotifier(None), event_sink=events.append)
-    t = Task.new("compound task", repo_path=str(bare_repo))
-    await store.create_task(t)
-
-    fake = MoAFakeBackend(proposals={
-        "minimal-first": _SAMPLE_PLAN,
-        "risk-first": decompose_text,
-        "test-first": _SAMPLE_PLAN,
-    })
-    with _patch("no_human.core.orchestrator.ClaudeBackend", return_value=fake):
-        result = await orch._generate_plan(t, GitRepo(bare_repo))
-
-    assert result == decompose_text.strip()
-    assert t.context["decomposition"]["decompose"] is True
-    assert len(fake.prompts) == 3  # only the 3 proposers — no aggregator call
-    planning_events = [e for e in events if e.get("kind") == "planning"]
-    assert any("compound task detected" in e.get("text", "") for e in planning_events)
 
 
 async def test_moa_planning_can_be_disabled(bare_repo, tmp_path, store):

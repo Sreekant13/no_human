@@ -335,34 +335,6 @@ def _summarize_tool_sig(tool: str, inp: dict) -> str:
     return str(first)[:80]
 
 
-_DECOMPOSE_RE = re.compile(
-    r"DECOMPOSE_PLAN_START\s*```(?:json)?\s*(\{.*?\})\s*```\s*DECOMPOSE_PLAN_END",
-    re.DOTALL,
-)
-
-
-def _parse_decomposition(plan_text: str) -> dict | None:
-    """Extract a decomposition plan from DECOMPOSE_PLAN markers.
-
-    Returns the parsed dict if found and valid, None otherwise (fail-safe:
-    a parse failure falls through to the normal single-agent path).
-    """
-    m = _DECOMPOSE_RE.search(plan_text)
-    if not m:
-        return None
-    try:
-        data = json.loads(m.group(1))
-    except (json.JSONDecodeError, ValueError) as exc:
-        log.warning("decomposition JSON parse failed: %s", exc)
-        return None
-    if not isinstance(data, dict) or not data.get("decompose"):
-        return None
-    if not isinstance(data.get("subtasks"), list) or not data["subtasks"]:
-        log.warning("decomposition plan has no subtasks")
-        return None
-    return data
-
-
 # How often the watcher re-reads `tasks.cancel_requested` while a task runs.
 # The agent session is the only thing being interrupted, and it emits events far
 # faster than this, so the operator's `nh task pause` lands within a few seconds.
@@ -1548,11 +1520,9 @@ class Orchestrator:
 
         EXPLICIT bases are unaffected, and are resolved by the callers before
         this is reached — it is only ever the `or` arm of
-        `ctx.get("base_branch") or ...`. Two real flows pin one:
-        the API's `base_branch` (PR-001, `api/app.py`), and the lead agent's
-        stacked-PR chaining, which propagates a dependency's PR branch as the
-        dependent sub-task's base (`lead_agent._unblock_ready`). Only the
-        IMPLICIT inheritance of the checkout's branch dies here.
+        `ctx.get("base_branch") or ...`. The one real flow that pins it is
+        the API's `base_branch` (PR-001, `api/app.py`). Only the IMPLICIT
+        inheritance of the checkout's branch dies here.
 
         Order: the confirmed profile's declared default, then the remote's
         actual default (origin/HEAD), then — only when NEITHER can be read —
@@ -2340,36 +2310,14 @@ class Orchestrator:
             plan_text = await self._generate_plan(task, repo)
             await self._persist_plan(task, plan_text)
 
-            # GAP 1: the optional human plan-approval gate, checked here so it
-            # also precedes DECOMPOSITION — spawning child tasks off an
-            # unapproved plan is spend too. The load-bearing check is the
+            # GAP 1: the optional human plan-approval gate, checked here so an
+            # unapproved plan never proceeds. The load-bearing check is the
             # unconditional one at the head of the attempt loop below; this one
             # only pulls it earlier on the PENDING walk. Both read live state
             # (the flag on the task, the approval on its context), so neither
             # can be left stale by a route that forgets to clear something.
             if plan_gate.required(task) and not plan_gate.approved(task):
                 return await self._park_for_plan_approval(task, plan_text)
-
-            # Compound task decomposition: if the planner detected complexity
-            # and emitted a DECOMPOSE_PLAN, hand off to the LeadAgent.
-            # Gated OFF by default: a task must not spawn child tasks. Complex
-            # work is delegated IN-SESSION to sub-agents instead (one task may
-            # still open multiple PRs). Only the explicit decomposition.enabled
-            # switch re-enables the legacy child-task path.
-            decomposition = (task.context or {}).get("decomposition")
-            decompose_children = self._decompose_children_enabled()
-            if decompose_children and decomposition and decomposition.get("decompose"):
-                from .lead_agent import LeadAgent
-                lead = LeadAgent(
-                    self.store, config=self.config, emit=self.emit,
-                )
-                subtasks = await lead.decompose(task, decomposition)
-                self.emit(
-                    "state", "compound",
-                    status="compound_parent",
-                    subtask_count=len(subtasks),
-                )
-                return await lead.park_parent(task)
 
         # Capture the base branch once and PERSIST it on the task. Deriving it
         # from current_branch() is wrong on three axes: (1) within a run, after
@@ -8592,9 +8540,9 @@ class Orchestrator:
 
         - DECOMPOSE (SCRUM-36): attach a non-binding split proposal (same
           guarded/deduped seam as the SCOPE_EXPLOSION and surface-advisory
-          triggers) so the human has a concrete starting point. Child-task
-          decomposition itself is still left to the planner's existing
-          DECOMPOSE_PLAN path — this only drafts the advisory.
+          triggers) so the human has a concrete starting point. This only
+          drafts the advisory — there is no automated child-task path;
+          delegation for a complex task happens IN-SESSION via sub-agents.
 
         All best-effort — any failure logs and returns; never blocks the
         pipeline."""
@@ -10679,12 +10627,6 @@ class Orchestrator:
         )
         return True
 
-    def _decompose_children_enabled(self) -> bool:
-        """The ONLY switch that re-enables the legacy LeadAgent child-task path.
-        Read by _drive (dispatch), _generate_plan (prompt + marker handling) and
-        _plan_is_unusable (exemption) so the three cannot disagree."""
-        return bool((self.config.get("decomposition") or {}).get("enabled", False))
-
     def _plan_is_unusable(self, plan: str) -> bool:
         """Belt to the ``is_error`` gate: does this plan carry no plan at all?
 
@@ -10692,17 +10634,12 @@ class Orchestrator:
         no ``##`` sections parses to an empty ``TaskSpec`` — no files, no
         approach, no test plan — which empties exactly the same downstream
         surfaces while still being inlined as an authoritative implementation
-        contract. A decomposition verdict is not a plan and is exempt — but
-        only when the decomposition gate is on: it is consumed from
-        ``task.context`` by the LeadAgent hand-off, and with the gate off
-        nothing ever reads that key, so a bare DECOMPOSE_PLAN JSON block must
-        be judged as a plan like anything else (no ``##`` sections → unusable
-        → the honest "planner's output was unusable" outcome).
+        contract, so it is judged unusable like anything else (no ``##``
+        sections → unusable → the honest "planner's output was unusable"
+        outcome).
         """
         if not plan:
             return True
-        if self._decompose_children_enabled() and _parse_decomposition(plan) is not None:
-            return False
         spec = TaskSpec.from_plan(plan)
         return not (spec.files_to_change or spec.approach.strip()
                     or spec.test_plan.strip())
@@ -10825,61 +10762,21 @@ class Orchestrator:
                 parts.append(f"Lint command: {prof.lint_cmd}")
             profile_hint = "\nRepo profile:\n" + "\n".join(f"  {p}" for p in parts if p) + "\n"
 
-        # A task never spawns child tasks unless the legacy path is explicitly
-        # re-enabled. By default, complexity is handled IN-SESSION: the worker
-        # delegates focused sub-tasks to sub-agents and may open multiple PRs.
-        decompose_children = self._decompose_children_enabled()
-        if decompose_children:
-            compound_section = (
-                "## COMPOUND TASK ASSESSMENT\n"
-                "If this task is too complex for a single agent session — e.g. many "
-                "distinct areas of code, investigation needed before implementation, "
-                "multiple repos, broad test coverage, or exploratory debugging across "
-                "many files — emit a decomposition plan.\n\n"
-                "Example: a change touching only 1-2 files but bundling 3+ unrelated "
-                "external-system concerns (build API, CI pipeline polling, PR/comment "
-                "pagination, error-classification logic) is compound by CONCERN count, "
-                "not file count. Each concern becomes its own sub-task; when the "
-                "concerns are genuinely independent, leave `depends_on` empty so they "
-                "run in PARALLEL (independent sub-tasks are dispatched concurrently). "
-                "Only chain a sub-task (single `depends_on`) when it truly must build "
-                "on another's result.\n\n"
-                "Wrap the decomposition in DECOMPOSE_PLAN_START / DECOMPOSE_PLAN_END "
-                "markers with a JSON block inside a fenced code block:\n"
-                "DECOMPOSE_PLAN_START\n"
-                "```json\n"
-                '{"decompose": true, "justification": "...", "subtasks": '
-                '[{"title": "...", "kind": "investigation|feature|bugfix|test_gap", '
-                '"description": "...", "acceptance_criteria": ["..."], '
-                '"depends_on": [], "repo_path": "..."}]}\n'
-                "```\n"
-                "DECOMPOSE_PLAN_END\n\n"
-                "Rules for decomposition:\n"
-                "- Each sub-task must be independently testable and reviewable.\n"
-                "- Each sub-task must have a clear justification. No duplicates.\n"
-                "- Maximum 50 sub-tasks. Prefer fewer, larger sub-tasks.\n"
-                "- Each sub-task may depend on at most ONE other sub-task "
-                "(no diamond/multi-parent dependencies).\n"
-                "- PREFER independent sub-tasks (empty `depends_on`) when they touch "
-                "separate concerns/files — independents run concurrently (parallel "
-                "developers). Use a single `depends_on` ONLY for a real ordering "
-                "dependency (e.g. a later task extends an earlier task's branch).\n"
-                "- Only decompose if a single agent session truly cannot handle it.\n"
-                "- If you decompose, do NOT also produce a normal plan above.\n"
-            )
-        else:
-            compound_section = (
-                "## COMPLEX TASK — IN-SESSION DELEGATION (no child tasks)\n"
-                "Do NOT split this into separate tasks. All work stays in THIS "
-                "task. If the task spans several independent concerns (e.g. build "
-                "API, CI polling, PR/comment pagination, error classification), "
-                "structure the plan by concern and delegate focused, read-only "
-                "investigation of each concern to the `no_human_researcher` "
-                "sub-agent to keep the implementer's context budget free. The "
-                "implementer then applies the changes for every concern within "
-                "this session. It is acceptable for one task to produce multiple "
-                "commits/PRs, but it must never create new tasks.\n\n"
-            )
+        # A task never spawns child tasks. Complexity is handled IN-SESSION:
+        # the worker delegates focused sub-tasks to sub-agents and may open
+        # multiple PRs.
+        compound_section = (
+            "## COMPLEX TASK — IN-SESSION DELEGATION (no child tasks)\n"
+            "Do NOT split this into separate tasks. All work stays in THIS "
+            "task. If the task spans several independent concerns (e.g. build "
+            "API, CI polling, PR/comment pagination, error classification), "
+            "structure the plan by concern and delegate focused, read-only "
+            "investigation of each concern to the `no_human_researcher` "
+            "sub-agent to keep the implementer's context budget free. The "
+            "implementer then applies the changes for every concern within "
+            "this session. It is acceptable for one task to produce multiple "
+            "commits/PRs, but it must never create new tasks.\n\n"
+        )
 
         # D19: the planner explores with cwd=primary repo. Without this map it
         # never learns the linked repos exist and plans around them. `base_prompt`
@@ -11104,15 +11001,6 @@ class Orchestrator:
             if "SKIP_PLAN" in plan[:200]:
                 self.emit("planning", "skipped (trivial — planner assessed as one-line diff)")
                 return ""
-            # Check for compound task decomposition markers.
-            decomp = await self._apply_decomposition(task, plan)
-            if decomp is not None:
-                self.emit(
-                    "planning",
-                    f"compound task detected: {len(decomp.get('subtasks', []))} "
-                    f"sub-tasks ({result.num_turns} turns, {result.tokens_used} tokens)",
-                )
-                return plan
             if self._plan_is_unusable(plan):
                 return await self._plan_unavailable(
                     task, "the planner's output was unusable (no plan sections)",
@@ -11131,27 +11019,6 @@ class Orchestrator:
             # exception's repr can be arbitrarily long.
             return await self._plan_unavailable(
                 task, f"planning failed: {str(exc)[:200]}")
-
-    async def _apply_decomposition(self, task: Task, plan: str) -> dict | None:
-        """Shared tail for both planning paths: if `plan` carries a
-        decomposition marker, persist it to task.context so `_drive` picks it
-        up. Returns the parsed decomposition dict, or None if plan is a
-        normal (non-compound) plan.
-
-        Gated: with decomposition.enabled off, this is a no-op regardless of
-        what the plan text contains — no context write, no store write —
-        because `_drive` never reads the key with the gate off, and leaving
-        a stale one would be picked up if the gate were flipped on mid-flight.
-        """
-        if not self._decompose_children_enabled():
-            return None
-        decomp = _parse_decomposition(plan)
-        if decomp is not None:
-            ctx = task.context or {}
-            ctx["decomposition"] = decomp
-            task.context = ctx
-            await self.store.update_task(task)
-        return decomp
 
     # MoA (Mixture-of-Agents) planning proposers: all three run on
     # planner_model (the fixed planner role) — planning always runs on the
@@ -11183,8 +11050,7 @@ class Orchestrator:
         Returns None on any failure (too few proposers succeeded, or an
         exception) so the caller falls back to the single-proposer path.
         Otherwise returns the SAME shape `_generate_plan` itself returns:
-        "" for a trivial/skip verdict, else the final plan text (with any
-        decomposition already persisted to task.context)."""
+        "" for a trivial/skip verdict, else the final plan text."""
         n = max(1, min(int(moa_cfg.get("proposers", 3)), len(self._MOA_LENSES)))
         lenses = self._MOA_LENSES[:n]
         try:
@@ -11242,22 +11108,8 @@ class Orchestrator:
                           f"only {len(drafts)}/{n} proposers succeeded — falling back")
                 return None
 
-            # Structural verdicts (compound / trivial) are a single confident
-            # signal, not something to blend — synthesizing "half a decompose"
-            # makes no sense.
-            for name, text in drafts:
-                if self._decompose_children_enabled() and _parse_decomposition(text) is not None:
-                    decomp = await self._apply_decomposition(task, text)
-                    self.emit(
-                        "planning_moa",
-                        f"'{name}' proposer detected a compound task "
-                        f"({len(decomp.get('subtasks', []))} sub-tasks) — using it directly",
-                    )
-                    self.emit(
-                        "planning",
-                        f"compound task detected: {len(decomp.get('subtasks', []))} sub-tasks",
-                    )
-                    return text
+            # A trivial verdict is a single confident signal, not something to
+            # blend.
             if all("SKIP_PLAN" in text[:200] for _, text in drafts):
                 self.emit("planning_moa", "all proposers assessed the task as trivial")
                 self.emit("planning", "skipped (trivial — all proposers assessed as one-line diff)")
@@ -11299,7 +11151,6 @@ class Orchestrator:
                     f"({agg_result.num_turns} turns, {agg_result.tokens_used} tokens)",
                     model=planner_model,
                 )
-            await self._apply_decomposition(task, merged)
             self.emit("planning", f"plan generated ({len(merged)} chars, "
                        f"{len(drafts)} MoA proposals synthesized)")
             return merged

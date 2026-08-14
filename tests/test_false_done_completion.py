@@ -33,7 +33,6 @@ from no_human.api.app import app
 from no_human.blockers.wake import WakeWatcher
 from no_human.cli.commands import cli, task_restore_approval
 from no_human.core.db import SilentCompletion, Store
-from no_human.core.lead_agent import LeadAgent
 from no_human.core.task import Task, TaskStatus
 from no_human.vcs.task_pr import task_has_pr_evidence
 
@@ -266,10 +265,17 @@ async def test_a_refused_terminal_transition_writes_no_event(store):
 # with no `event=`, so on unfixed code they now fail loudly with
 # `SilentCompletion` instead of silently completing; they are the coverage
 # for those four sites.
+#
+# A sixth scenario, "lead_agent_compound_done" (LeadAgent.check_completion's
+# `compound_done` DONE write), was removed 2026-08-12 when the LeadAgent
+# subsystem itself was deleted (task 14c0f71b, operator decision A1) — that
+# DONE writer no longer exists, so there is nothing left for the scenario to
+# exercise. Same pattern as tests/test_lead_agent.py's tombstone and
+# tests/test_db.py's test_historical_compound_parent_and_subtask_rows_still_load.
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scenario", [
     "api_approve_prless", "api_finish_review", "api_shipped",
-    "wake_merged", "wake_shipped", "lead_agent_compound_done",
+    "wake_merged", "wake_shipped",
 ])
 async def test_every_done_writer_leaves_a_task_event(store, client, scenario):
     if scenario == "api_approve_prless":
@@ -328,20 +334,6 @@ async def test_every_done_writer_leaves_a_task_event(store, client, scenario):
         out = await w._check_open_pr(t)
         assert out == "shipped_pr_closed"
         completion_kinds = {"shipped"}
-
-    elif scenario == "lead_agent_compound_done":
-        parent = Task.new("compound", repo_path="/tmp/r")
-        await store.create_task(parent)
-        await store.set_status(parent, TaskStatus.COMPOUND_PARENT, validate=False)
-        sub = Task.new("sub", repo_path="/tmp/r", parent_id=parent.id)
-        sub.status = TaskStatus.DONE  # bootstrapped on INSERT, not via set_status
-        await store.create_task(sub)
-        t = parent
-        before = len(await store.list_events(t.id))
-        la = LeadAgent(store, config={})
-        finished = await la.check_completion(parent)
-        assert finished is True
-        completion_kinds = {"compound_done"}
 
     else:
         raise AssertionError(scenario)

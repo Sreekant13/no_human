@@ -57,8 +57,6 @@ REGISTRY: dict[tuple[str, str], str] = {
     # --- fresh runs: clear, so nothing is inherited ---
     ("api/app.py", "retry_task"): CLEARS,
     ("cli/commands.py", "task_retry._go"): CLEARS,
-    ("core/lead_agent.py", "LeadAgent.check_completion"): CLEARS,
-    ("core/lead_agent.py", "LeadAgent._unblock_ready"): CLEARS,
     # --- deliberate inheritance, argued in the code ---
     # Requeues an attempt that was already in flight when the process died.
     # Stamping over a HUMAN's gated sha would fail their resume as fabrication,
@@ -224,8 +222,11 @@ def test_every_path_that_drops_the_checkpoint_also_retires_the_attempt_rows():
     behind `POST /retry`, `nh reject` behind Send back).
     """
     drops, closes = _drop_sites_and_closers()
-    # Positive control — a broken walk must not pass vacuously.
-    assert len(drops) >= 6, (
+    # Positive control — a broken walk must not pass vacuously. Was 6 before
+    # the LeadAgent sub-task-retry and _unblock_ready writers were removed
+    # 2026-08-12 (operator decision A1); 4 remain: `POST /tasks/{id}/retry`,
+    # `nh task retry`, and both "send back" twins.
+    assert len(drops) >= 4, (
         f"the AST walk found only {len(drops)} checkpoint-dropping writers "
         f"({sorted(drops)}) — the instrument is broken")
 

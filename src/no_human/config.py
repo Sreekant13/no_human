@@ -156,6 +156,10 @@ def _non_owner_grantees(grantees: set[str], principal: str) -> set[str]:
     }
 
 
+class ConfigError(RuntimeError):
+    """Raised when config.yaml asks for something the product cannot do."""
+
+
 class AuthError(RuntimeError):
     """Raised when the process is not provably in subscription-billing mode."""
 
@@ -1466,12 +1470,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "worktree_root": None,    # pre-split alias for isolation.worktree_root
     },
     "decomposition": {
-        # A single task NEVER spawns child tasks by default. All delegation for a
-        # complex task happens IN-SESSION via sub-agents (the SDK Agent tool /
-        # no_human_researcher), and one task may still open multiple PRs. This
-        # gate (default off) is the ONLY switch that re-enables the legacy
-        # LeadAgent child-task decomposition path; leave it off to keep all work
-        # for a task inside that task.
+        # TOMBSTONE (2026-08-12, operator decision A1): the LeadAgent
+        # child-task decomposition subsystem this gate re-enabled has been
+        # DELETED — `no_human.core.lead_agent` no longer exists. Intake-level
+        # decomposition (the split-proposal advisory) and in-session
+        # delegation via SDK sub-agents replace it; a task never spawns
+        # child tasks. The key stays only so `enabled: true` in an old
+        # config.yaml fails loudly instead of silently doing nothing — see
+        # `_reject_decomposition_enabled`, called from `load_config`.
         "enabled": False,
     },
     "ci": {
@@ -1953,6 +1959,7 @@ def load_config(
         )
     merged = _deep_merge(DEFAULT_CONFIG, user_data)
     merged.pop("tracker", None)  # ignore any stale block from an old config
+    _reject_decomposition_enabled(merged)
     return Config(data=merged, path=config_path)
 
 
@@ -2033,3 +2040,21 @@ def _reject_api_key_in_config(data: dict[str, Any]) -> None:
                 walk(item)
 
     walk(data)
+
+
+def _reject_decomposition_enabled(data: dict[str, Any]) -> None:
+    """Fail loudly if a config asks for the removed LeadAgent child-task path.
+
+    ``decomposition.enabled`` re-enabled the legacy ``LeadAgent`` sub-task
+    orchestrator (``no_human.core.lead_agent``), deleted 2026-08-12 (operator
+    decision A1: intake-level decomposition composes with every gate we have;
+    runtime child-spawning fought them). The key stays in DEFAULT_CONFIG so an
+    old config.yaml that turns it on gets a clear startup error instead of the
+    key silently doing nothing.
+    """
+    if bool((data.get("decomposition") or {}).get("enabled", False)):
+        raise ConfigError(
+            "decomposition was removed 2026-08-12 — delegation happens "
+            "in-session via SDK subagents; intake-level splitting replaces "
+            "child tasks"
+        )

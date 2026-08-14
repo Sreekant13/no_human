@@ -629,53 +629,6 @@ def test_summarize_event_irrelevant():
     assert _summarize_event(ev) is None
 
 
-# --------------------------------------------------------------------------- #
-# _check_compound_parent via Scheduler                                         #
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_check_compound_parent_marks_done(store):
-    """When all sub-tasks are DONE, the parent transitions to DONE."""
-    parent = Task.new("compound", repo_path="/tmp/r")
-    await store.create_task(parent)
-    await store.set_status(parent, TaskStatus.IMPLEMENTING, validate=False)
-    await store.set_status(parent, TaskStatus.COMPOUND_PARENT, validate=False)
-
-    sub = Task.new("sub", repo_path="/tmp/r", parent_id=parent.id)
-    sub.status = TaskStatus.DONE
-    await store.create_task(sub)
-
-    events = []
-    sched = Scheduler(
-        store, lambda task=None: None, max_workers=1,
-        on_event=lambda k, t: events.append((k, t)),
-    )
-
-    await sched._check_compound_parent(sub)
-
-    refreshed = await store.get_task(parent.id)
-    assert refreshed.status == TaskStatus.DONE
-    assert any(k == "compound_resolved" for k, _ in events)
-
-
-@pytest.mark.asyncio
-async def test_check_compound_parent_ignores_non_compound(store):
-    """If parent is not COMPOUND_PARENT, _check_compound_parent is a no-op."""
-    parent = Task.new("normal", repo_path="/tmp/r")
-    await store.create_task(parent)
-
-    sub = Task.new("sub", repo_path="/tmp/r", parent_id=parent.id)
-    sub.status = TaskStatus.DONE
-    await store.create_task(sub)
-
-    sched = Scheduler(store, lambda task=None: None, max_workers=1)
-    await sched._check_compound_parent(sub)
-
-    refreshed = await store.get_task(parent.id)
-    assert refreshed.status == TaskStatus.PENDING  # unchanged
-
-
 @pytest.mark.asyncio
 async def test_live_status_populated_via_sink(store):
     """_sink callback populates _live_status on the scheduler."""
@@ -1342,10 +1295,10 @@ async def test_orphan_recovery_does_not_resurrect_a_deliberately_cleared_checkpo
         store):
     """A CLEARS path removed the checkpoint; the sweep must not put it back.
 
-    `POST /api/tasks/{id}/retry`, `LeadAgent`'s sub-task retry and
-    `_unblock_ready` all write `resume_from: None` — "retry means from base; a
-    fresh run must not silently branch from a checkpoint some EARLIER actor
-    chose". The candidate sha must therefore come from the attempt that
+    `POST /api/tasks/{id}/retry` and its siblings write `resume_from: None` —
+    "retry means from base; a fresh run must not silently branch from a
+    checkpoint some EARLIER actor chose". The candidate sha must therefore
+    come from the attempt that
     actually DIED (the one still `in_progress`, db.py `create_attempt` closes
     every older one), never from "the newest attempt this task ever had": the
     latter reaches straight back past the clear, into a run that already

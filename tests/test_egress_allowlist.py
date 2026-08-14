@@ -685,15 +685,6 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
             _ON + "updates.enabled defaults to TRUE; off with "
                   "updates.enabled:false or NH_NO_UPDATE_CHECK=1"),
     },
-    # The target repo's own test command. What those tests reach is the target
-    # repo's business, but it leaves this machine through our subprocess, so it
-    # is named here rather than left implicit.
-    "core/lead_agent.py": {
-        "exec:<dynamic>": Allowed(
-            "whatever the repo's confirmed test command runs (shell=True)",
-            _ON + "the quality gate runs it; skipped when no test command is "
-                  "confirmed"),
-    },
     "testing/runner.py": {
         "exec:<dynamic>": Allowed(
             "whatever the repo's test command runs",

@@ -326,9 +326,6 @@ class Scheduler:
         self._EVENT_FLUSH_INTERVAL = 2.0
         # Phase 4a: SSE — per-task notify so streaming clients wake on new events.
         self._event_notify: dict[str, asyncio.Event] = {}
-        # Compound-parent completion: per-parent lock prevents race conditions
-        # when multiple sub-tasks complete concurrently.
-        self._compound_locks: dict[str, asyncio.Lock] = {}
         # Live status: short human-readable summary of what the agent is doing.
         self._live_status: dict[str, str] = {}
         # --- liveness (2026-08-01 incident) ------------------------------- #
@@ -619,10 +616,10 @@ class Scheduler:
         `Store.latest_open_attempt`, the most recently STARTED row still
         ``in_progress``, and only that row. "The newest attempt this task ever
         had" reaches back PAST a deliberate clear: `POST /tasks/{id}/retry`,
-        `nh task retry`, `LeadAgent`'s sub-task retry, `_unblock_ready` and
-        both "send back" twins all drop the checkpoint because a fresh run must
-        not branch from one an earlier actor chose, and the first sweep after
-        any of them put it straight back, from a run that had already failed.
+        `nh task retry` and both "send back" twins all drop the checkpoint
+        because a fresh run must not branch from one an earlier actor chose,
+        and the first sweep after any of them put it straight back, from a
+        run that had already failed.
         Those paths now call `Store.close_open_attempts` FIRST, so after a
         clear there is no open row to reach back to; the reason that fix is
         there and not here is written out on that method — the context a clear
@@ -1151,46 +1148,6 @@ class Scheduler:
 
             # Stop the periodic flusher, then write whatever it hasn't taken.
             await persister.aclose()
-
-            # Compound-parent completion: if this task is a sub-task, check
-            # whether the parent compound task should transition.
-            await self._check_compound_parent(task)
-
-    async def _check_compound_parent(self, task) -> None:
-        """After a sub-task finishes, check if the parent should complete."""
-        parent_id = getattr(task, "parent_id", None)
-        if not parent_id:
-            return
-        try:
-            parent = await self.store.get_task(parent_id)
-        except Exception:  # noqa: BLE001
-            return
-        if parent is None or parent.status != TaskStatus.COMPOUND_PARENT:
-            return
-
-        # Per-parent lock: prevents two concurrent sub-task completions from
-        # racing on the same parent's check_completion.
-        lock = self._compound_locks.setdefault(parent_id, asyncio.Lock())
-        async with lock:
-            try:
-                from .lead_agent import LeadAgent
-                lead = LeadAgent(
-                    self.store,
-                    config=self._config,
-                    emit=lambda kind, text, **kw: self._on_event(kind, text),
-                )
-                finished = await lead.check_completion(parent)
-                if finished:
-                    self._compound_locks.pop(parent_id, None)
-                    self._on_event(
-                        "compound_resolved",
-                        f"parent {parent_id[:8]} → {parent.status.value}",
-                    )
-            except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "compound completion check failed for %s: %s",
-                    parent_id[:8], exc,
-                )
 
     async def run_forever(
         self, *, stop: asyncio.Event, poll_interval: float = 10.0,

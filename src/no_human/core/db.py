@@ -1721,11 +1721,11 @@ class Store:
         declared the run that owned them over.
 
         Called by the CHECKPOINT-CLEARING paths (`POST /tasks/{id}/retry`,
-        `nh task retry`, `LeadAgent`'s sub-task retry and `_unblock_ready`,
-        and both "send back" twins), all of which promise "a fresh run branches
-        from base". The criterion that picks those six is INTENT TO DISCARD, not
-        sha-lessness: a sha-less ``resume_from`` describes twelve sites, and the
-        other six pass a VARIABLE checkpoint and are CONTINUE re-entries, where
+        `nh task retry`, and both "send back" twins), all of which promise "a
+        fresh run branches from base". The criterion that picks those four is
+        INTENT TO DISCARD, not sha-lessness: a sha-less ``resume_from``
+        describes ten sites, and the other six pass a VARIABLE checkpoint
+        and are CONTINUE re-entries, where
         the sweep re-deriving a sha is the designed rescue under
         ``by: "orphan_recovery"`` with the zero-diff gate armed — so retiring
         their rows would break them, not protect them.

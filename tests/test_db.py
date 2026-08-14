@@ -541,3 +541,28 @@ async def test_an_existing_failure_reason_is_preserved(store):
 
     rows = await store.list_attempts(t.id)
     assert rows[0]["failure_reason"] == "the real reason"
+
+
+async def test_historical_compound_parent_and_subtask_rows_still_load(store):
+    """The LeadAgent subsystem that WROTE `parent_id` and `COMPOUND_PARENT`
+    was removed 2026-08-12 (operator decision A1), but rows it left behind
+    before removal must still round-trip: the `parent_id` column and the
+    `COMPOUND_PARENT` status stay in the schema/enum for exactly this reason,
+    even though nothing creates new rows shaped this way any more."""
+    parent = Task.new("compound", repo_path="/tmp/r")
+    await store.create_task(parent)
+    await store.set_status(parent, TaskStatus.IMPLEMENTING, validate=False)
+    await store.set_status(parent, TaskStatus.COMPOUND_PARENT, validate=False)
+
+    sub = Task.new("sub", repo_path="/tmp/r", parent_id=parent.id)
+    await store.create_task(sub)
+
+    reloaded_parent = await store.get_task(parent.id)
+    assert reloaded_parent.status == TaskStatus.COMPOUND_PARENT
+
+    reloaded_sub = await store.get_task(sub.id)
+    assert reloaded_sub.parent_id == parent.id
+
+    subtasks = await store.list_subtasks(parent.id)
+    assert [s.id for s in subtasks] == [sub.id]
+    assert await store.count_subtasks(parent.id) == 1

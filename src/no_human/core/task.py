@@ -112,7 +112,7 @@ def _allowed_transitions() -> dict[TaskStatus, frozenset[TaskStatus]]:
     for state in resumable:
         table[state] |= _ACTIVE
         table[state].add(TaskStatus.FAILED)
-        table[state].add(TaskStatus.PENDING)  # LeadAgent unblocks dep-gated sub-tasks
+        table[state].add(TaskStatus.PENDING)  # a parked task can resume to pending
 
     # Compound parent: implementing → compound_parent (park),
     # compound_parent → done / failed / escalated (scheduler callback).
