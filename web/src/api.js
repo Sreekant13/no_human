@@ -224,8 +224,8 @@ export async function retryTask(id) {
 
 // ── Knowledge management ────────────────────────────────────────────────────
 
-export async function fetchRules() {
-  const r = await fetch(`${BASE}/api/rules`);
+export async function fetchRules({ includeArchived = false } = {}) {
+  const r = await fetch(`${BASE}/api/rules${includeArchived ? "?include_archived=1" : ""}`);
   if (!r.ok) throw new Error(`GET /api/rules → ${r.status}`);
   return r.json();
 }
@@ -246,8 +246,8 @@ export async function removeRule(id) {
   return r.json();
 }
 
-export async function fetchSkills() {
-  const r = await fetch(`${BASE}/api/skills`);
+export async function fetchSkills({ includeArchived = false } = {}) {
+  const r = await fetch(`${BASE}/api/skills${includeArchived ? "?include_archived=1" : ""}`);
   if (!r.ok) throw new Error(`GET /api/skills → ${r.status}`);
   return r.json();
 }
@@ -306,6 +306,15 @@ export async function fetchRetireCandidates({ days = 90 } = {}) {
 export async function retireLearning(id) {
   const r = await fetch(`${BASE}/api/learnings/${id}/retire`, { method: "POST" });
   if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST retire → ${r.status}`)); }
+  return r.json();
+}
+
+// Rules/Skills UI triage action (Memory lifecycle C part B): undo an
+// archive/retire/supersede/sweep. Idempotent on the server (already_active),
+// same convention as retireLearning above.
+export async function restoreLearning(id) {
+  const r = await fetch(`${BASE}/api/learnings/${id}/restore`, { method: "POST" });
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST restore → ${r.status}`)); }
   return r.json();
 }
 

@@ -2866,11 +2866,15 @@ async def _with_usage_counts(
 
 
 @app.get("/api/rules")
-async def list_rules(request: Request) -> list[dict[str, Any]]:
+async def list_rules(
+    request: Request, include_archived: bool = False,
+) -> list[dict[str, Any]]:
     store = _store(request)
     from ..learning import TYPE_RULE, TYPE_ANTI_PATTERN
-    items = await store.list_memories(confirmed=True, mem_type=TYPE_RULE)
-    items += await store.list_memories(confirmed=True, mem_type=TYPE_ANTI_PATTERN)
+    items = await store.list_memories(
+        confirmed=True, mem_type=TYPE_RULE, include_archived=include_archived)
+    items += await store.list_memories(
+        confirmed=True, mem_type=TYPE_ANTI_PATTERN, include_archived=include_archived)
     return await _with_usage_counts(store, items)
 
 
@@ -2899,11 +2903,15 @@ async def remove_rule(rule_id: str, request: Request) -> dict[str, Any]:
 
 
 @app.get("/api/skills")
-async def list_skills(request: Request) -> list[dict[str, Any]]:
+async def list_skills(
+    request: Request, include_archived: bool = False,
+) -> list[dict[str, Any]]:
     store = _store(request)
     from ..learning import TYPE_SKILL, TYPE_FACT
-    items = await store.list_memories(confirmed=True, mem_type=TYPE_SKILL)
-    items += await store.list_memories(confirmed=True, mem_type=TYPE_FACT)
+    items = await store.list_memories(
+        confirmed=True, mem_type=TYPE_SKILL, include_archived=include_archived)
+    items += await store.list_memories(
+        confirmed=True, mem_type=TYPE_FACT, include_archived=include_archived)
     return await _with_usage_counts(store, items)
 
 
@@ -3001,6 +3009,24 @@ async def retire_learning(mem_id: str, request: Request) -> dict[str, Any]:
                    "reject the pending proposal instead")
     from ..learning import LearningQueue
     await LearningQueue(store).retire(m["id"])
+    return {"ok": True, "id": m["id"]}
+
+
+@app.post("/api/learnings/{mem_id}/restore")
+async def restore_learning(mem_id: str, request: Request) -> dict[str, Any]:
+    """Memory lifecycle C part B: the Rules/Skills UI's triage action — a
+    human's explicit undo of an archive, whatever produced it (the 45-day
+    sweep, a supersede-on-confirm, or a manual retire). 404 unknown id;
+    idempotent on a row that is already live (``already_active: True``, 200
+    — the same double-click contract `retire_learning` chose, so a stale
+    button never surfaces as a failure)."""
+    store = _store(request)
+    m = await store.find_memory(mem_id)
+    if not m:
+        raise HTTPException(status_code=404, detail=f"learning {mem_id!r} not found")
+    if not m.get("archived"):
+        return {"ok": True, "id": m["id"], "already_active": True}
+    await store.unarchive_memory(m["id"])
     return {"ok": True, "id": m["id"]}
 
 

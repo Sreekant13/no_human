@@ -2812,3 +2812,83 @@ async def test_retire_unconfirmed_row_is_409(client, store):
 async def test_retire_unknown_id_is_404(client):
     r = await client.post("/api/learnings/does-not-exist/retire")
     assert r.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Memory lifecycle C part B: include_archived on /api/rules|/api/skills, and  #
+# the /restore triage endpoint (Rules/Skills UI)                              #
+# --------------------------------------------------------------------------- #
+
+async def test_rules_exclude_archived_by_default_and_include_on_request(client, store):
+    from no_human.learning import TYPE_RULE
+
+    mem_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="soon archived", content="x", confirmed=True)
+    await store.archive_memory(mem_id, reason="test")
+
+    default = await client.get("/api/rules")
+    assert mem_id not in {row["id"] for row in default.json()}
+
+    included = await client.get("/api/rules?include_archived=1")
+    rows = {row["id"]: row for row in included.json()}
+    assert mem_id in rows
+    assert rows[mem_id]["archived"] == 1
+
+
+async def test_skills_include_archived_flag(client, store):
+    from no_human.learning import TYPE_SKILL, TYPE_FACT
+
+    skill_id = await store.add_memory(
+        mem_type=TYPE_SKILL, title="soon archived skill", content="x", confirmed=True)
+    fact_id = await store.add_memory(
+        mem_type=TYPE_FACT, title="soon archived fact", content="x", confirmed=True)
+    await store.archive_memory(skill_id, reason="test")
+    await store.archive_memory(fact_id, reason="test")
+
+    default = await client.get("/api/skills")
+    default_ids = {row["id"] for row in default.json()}
+    assert skill_id not in default_ids and fact_id not in default_ids
+
+    included = await client.get("/api/skills?include_archived=1")
+    rows = {row["id"]: row for row in included.json()}
+    assert rows[skill_id]["archived"] == 1
+    assert rows[fact_id]["archived"] == 1
+
+
+async def test_restore_unarchives_and_clears_superseded(client, store):
+    from no_human.learning import TYPE_RULE
+
+    old_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="old rule", content="x", confirmed=True)
+    new_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="new rule", content="y", confirmed=True)
+    assert await store.supersede_memory(old_id, new_id, reason="dup")
+
+    r = await client.post(f"/api/learnings/{old_id}/restore")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body.get("already_active") is not True
+
+    m = await store.find_memory(old_id)
+    assert m["archived"] == 0
+    assert m["superseded_by"] is None
+
+    included = await client.get("/api/rules?include_archived=1")
+    row = next(row for row in included.json() if row["id"] == old_id)
+    assert row["archived"] == 0
+
+
+async def test_restore_is_idempotent_on_a_live_row(client, store):
+    from no_human.learning import TYPE_RULE
+
+    mem_id = await store.add_memory(
+        mem_type=TYPE_RULE, title="live rule", content="x", confirmed=True)
+    r = await client.post(f"/api/learnings/{mem_id}/restore")
+    assert r.status_code == 200
+    assert r.json()["already_active"] is True
+
+
+async def test_restore_unknown_id_is_404(client):
+    r = await client.post("/api/learnings/does-not-exist/restore")
+    assert r.status_code == 404

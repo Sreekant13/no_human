@@ -2688,6 +2688,27 @@ class Store:
         await self.db.commit()
         return cur.rowcount > 0
 
+    @serialized_write
+    async def unarchive_memory(self, mem_id: str) -> bool:
+        """Reverse of `archive_memory` — the Rules/Skills UI's Restore action
+        (Memory lifecycle C part B), and equally the undo for a sweep or a
+        supersede, since all three only ever set ``archived = 1``.
+
+        ``superseded_by`` is cleared: a restored row is live again, and
+        leaving the pointer would make lineage that reads it (a live row
+        with a `superseded_by` set) look like it is still retired. Content —
+        including the ``[archived: reason]`` suffix `archive_memory` and
+        friends appended — is left alone, as the audit trail.
+
+        Guard is ``archived = 1`` (not the wider ``IS NULL OR = 0`` some
+        sibling methods use for "is live" — here we want the strict
+        opposite, "was archived", which NULL/0 never satisfy)."""
+        cur = await self.db.execute(
+            "UPDATE memories SET archived = 0, superseded_by = NULL "
+            "WHERE id = ? AND archived = 1", (mem_id,))
+        await self.db.commit()
+        return cur.rowcount > 0
+
     async def count_quarantined(self, *, mem_type: str | None = None) -> int:
         """How many rows carry ``quarantined = 1`` — the honest count the
         Rules/Skills/Learnings UI footers report (`learning/provenance.py`)."""

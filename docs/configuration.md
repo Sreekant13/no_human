@@ -306,6 +306,42 @@ exception, for friends/commercial installs that pay Anthropic directly with
 4. No OAuth token is exported into the process env in this mode.
 5. The run is attributed to the `api_key` profile for cost/audit tracking.
 
+## `learning:` — memory lifecycle
+
+Memory lifecycle C (`docs/design/memory-lifecycle-triage.md`) — retirement and
+flood control for rules/skills. Defaults, pinned to `config.DEFAULT_CONFIG` the
+same way the table above is:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `learning.archive_unconfirmed_days` | `45` | Unconfirmed (`confirmed = 0`), `source="proposed"` rows older than this are auto-archived by the daily `RetirementSweepJob` — reversible, never deleted |
+| `learning.retire_suggest_days` | `90` | Confirmed rules unused this long surface in the `retire?` SUGGEST-only section — never auto-archived |
+| `learning.sweep_interval_seconds` | `86400` | How often the retirement sweep ticks; the first tick runs immediately at boot |
+| `learning.sweep_enabled` | `true` | Kill switch for the unattended daily sweep (the CLI triage path stays reachable either way) |
+| `learning.propose_on_success` | `false` | The flood-kill: the per-success templated skill proposal only fires when this is explicitly turned on |
+
+Three mechanisms, concretely:
+
+1. **45-day auto-archive.** `Store.archive_unconfirmed_older_than` sweeps
+   unconfirmed, `source="proposed"` rows past `archive_unconfirmed_days`
+   (default 45) once a day and once at boot. Reversible — it sets
+   `archived = 1`, never `DELETE`s.
+2. **Flood-kill.** The per-success templated proposal (`learning/queue.py`'s
+   `_build`) is gated behind `propose_on_success`, **off** by default — the
+   flood source that historically produced ~394 near-duplicate pending rows
+   is simply not invoked unless an operator opts in. `nh learnings
+   --triage-templated [--apply]` cleans up any pre-existing backlog from
+   before this gate existed.
+3. **Supersede-on-confirm.** `Store.supersede_memory`, called from
+   `LearningQueue.confirm`, archives the oldest matching *active* row with
+   `superseded_by` pointing at the newly confirmed survivor when a confirmed
+   near-duplicate exists — never more than one hop, never a chain.
+
+The Rules/Skills panel surfaces all three: an **Archived**/**Superseded**
+badge, a "Show archived" filter, and **Restore**/**Dismiss** triage actions —
+see `docs/design/memory-lifecycle-triage.md`'s "Rules/Skills UI" section for
+the exact contract.
+
 ## Tests command
 
 `tests.command` (optional) overrides test detection for the local suite the

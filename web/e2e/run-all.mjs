@@ -34,6 +34,7 @@ const SUITES = [
   ["onboarding a11y", "onboarding-a11y.mjs"],
   ["settings a11y", "settings-a11y.mjs"],
   ["settings account", "settings-account.mjs"],
+  ["rules archive", "rules-archive.mjs"],
   ["bench trust", "bench-trust.mjs"],
   ["failure reason", "failure-reason.mjs"],
   ["grill a11y", "grill-a11y.mjs"],

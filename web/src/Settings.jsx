@@ -7,9 +7,10 @@ import {
   fetchProjects, createProject, updateProject, deleteProject,
   fetchProfiles, detectRepos, onboardRepo,
   fetchAuthStatus, setAuthToken, fetchVersion,
-  fetchRetireCandidates, retireLearning,
+  fetchRetireCandidates, retireLearning, restoreLearning,
   fetchQuarantineCounts,
 } from "./api.js";
+import { archiveBadge, archivedCount, visibleMemories } from "./memoryArchive.js";
 import { quarantineFooterLabel } from "./quarantineFooter.js";
 import { capName, PROFILE_CAP, TOKENVAR_CAP } from "./capName.js";
 import { authPanelView } from "./authPanelView.js";
@@ -436,11 +437,15 @@ function MemoryList({ kind, fetchFn, addFn, removeFn }) {
   const [showAdd, setShowAdd] = useState(false);
   const [error, setError] = useState(null);
   const [quarantined, setQuarantined] = useState(0);
+  const [showArchived, setShowArchived] = useState(false);
+  const [dismissed, setDismissed] = useState(() => new Set());
 
   const load = useCallback(() => {
     setLoading(true);
-    fetchFn()
-      .then((data) => { setItems(data); setError(null); })
+    // Fetches BOTH live and archived once — toggling "Show archived" is then
+    // a pure client-side filter (visibleMemories), no extra roundtrip.
+    fetchFn({ includeArchived: true })
+      .then((data) => { setItems(data); setDismissed(new Set()); setError(null); })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
     // Best-effort: a footer count that fails to load says nothing, rather
@@ -462,6 +467,24 @@ function MemoryList({ kind, fetchFn, addFn, removeFn }) {
     }
   }
 
+  async function handleRestore(id) {
+    try {
+      await restoreLearning(id);
+      load();
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
+  // Client-side only — writes nothing server-side, the same "not now"
+  // contract as the retire? section's dismissal (learningRetire.js).
+  function handleDismiss(id) {
+    setDismissed((prev) => new Set(prev).add(id));
+  }
+
+  const archivedTotal = archivedCount(items);
+  const visible = visibleMemories(items, { showArchived, dismissedIds: [...dismissed] });
+
   return (
     <div className="memory-panel">
       <div className="memory-header">
@@ -471,8 +494,18 @@ function MemoryList({ kind, fetchFn, addFn, removeFn }) {
             while staying intact for any non-overlay reuse of this panel. */}
         <h3 className="memory-title">
           <span className="panel-title-text">{kind === "rules" ? "Confirmed Rules" : "Confirmed Skills"}</span>
-          {!loading && <span className="memory-count">{items.length}</span>}
+          {!loading && <span className="memory-count">{visible.length}</span>}
         </h3>
+        {!loading && archivedTotal > 0 && (
+          <label className="memory-archive-toggle">
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={(e) => setShowArchived(e.target.checked)}
+            />
+            {" "}Show archived ({archivedTotal})
+          </label>
+        )}
         <button className="btn btn-new-task" onClick={() => setShowAdd(true)}>
           + Add {kind.slice(0, -1)}
         </button>
@@ -480,14 +513,20 @@ function MemoryList({ kind, fetchFn, addFn, removeFn }) {
       {error && <div className="settings-error">{error}</div>}
       {loading ? (
         <div className="settings-empty">Loading…</div>
-      ) : items.length === 0 ? (
+      ) : visible.length === 0 ? (
         <div className="settings-empty">
           No confirmed {kind} yet. Add one to inject it into every agent prompt.
         </div>
       ) : (
         <div className="memory-list">
-          {items.map((item) => (
-            <MemoryCard key={item.id} item={item} onRemove={handleRemove} />
+          {visible.map((item) => (
+            <MemoryCard
+              key={item.id}
+              item={item}
+              onRemove={handleRemove}
+              onRestore={handleRestore}
+              onDismiss={handleDismiss}
+            />
           ))}
         </div>
       )}
@@ -531,19 +570,23 @@ function MemoryUsageRow({ item }) {
   );
 }
 
-function MemoryCard({ item, onRemove }) {
+function MemoryCard({ item, onRemove, onRestore, onDismiss }) {
   const tags = (() => {
     try {
       const t = typeof item.tags === "string" ? JSON.parse(item.tags) : item.tags;
       return Array.isArray(t) ? t : [];
     } catch { return []; }
   })();
+  const badge = archiveBadge(item);
 
   return (
     <div className="memory-card">
       <div className="memory-card-header">
         <span className="memory-card-id">{(item.id || "").slice(0, 8)}</span>
         <span className="memory-card-type">{item.type}</span>
+        {badge && (
+          <span className="memory-card-badge" title={badge.title}>{badge.label}</span>
+        )}
         <button className="memory-card-remove" onClick={() => onRemove(item.id)} title="Remove">✕</button>
       </div>
       <div className="memory-card-title">{item.title}</div>
@@ -554,6 +597,12 @@ function MemoryCard({ item, onRemove }) {
         </div>
       )}
       <MemoryUsageRow item={item} />
+      {badge && (
+        <div className="memory-card-actions">
+          <button className="btn btn-sm" onClick={() => onRestore(item.id)}>Restore</button>
+          <button className="btn btn-sm btn-ghost" onClick={() => onDismiss(item.id)}>Dismiss</button>
+        </div>
+      )}
     </div>
   );
 }

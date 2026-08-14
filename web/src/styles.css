@@ -4682,6 +4682,29 @@ a.so-chip-value:hover { color: var(--accent-300); }
   font-weight: 500;
 }
 
+/* Memory lifecycle C part B: archived/superseded state on a Rules/Skills
+   card, and the "Show archived" toggle above the list. */
+.memory-card-badge {
+  font-size: 10px;
+  color: var(--amber);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.2);
+  border-radius: 10px;
+  padding: 2px 8px;
+  font-weight: 500;
+}
+
+.memory-archive-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
 /* ── LEARNINGS ──────────────────────────────────────────────────────────── */
 
 .learnings-toggle {

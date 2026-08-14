@@ -80,10 +80,35 @@ cp ~/.no_human/no_human.db /tmp/triage.db
 # commands above against it before ever touching the live file.
 ```
 
+## Rules/Skills UI (part B)
+
+The Rules and Skills panels (`web/src/Settings.jsx`'s `MemoryList`/
+`MemoryCard`) surface this feature's state instead of leaving it visible only
+via `nh rules`/`nh skills` or raw SQL:
+
+- Each panel fetches once with `include_archived=1` (`GET /api/rules` and
+  `GET /api/skills` both now accept that query param, default `false` — every
+  existing caller is byte-identical) and filters client-side
+  (`web/src/memoryArchive.js`), so toggling the checkbox costs no roundtrip.
+- A card whose row is archived carries a badge: **Archived**, or
+  **Superseded** (naming the surviving row's id) when `superseded_by` is set
+  — superseded implies archived, so superseded always wins the badge.
+- A "Show archived (N)" checkbox above the list reveals archived/superseded
+  cards; it is hidden entirely when there are none. Archived cards are
+  hidden by default, exactly like `list_memories`'s own default.
+- Every archived/superseded card gets two triage actions: **Restore**
+  (`POST /api/learnings/{id}/restore` — a plain `UPDATE ... SET archived = 0,
+  superseded_by = NULL`, idempotent on a row that is already live) and
+  **Dismiss**, which is purely client-side (a "not now" that hides the card
+  until the panel next reloads) and writes nothing server-side — the same
+  dismissal contract the retire? section's Dismiss already uses.
+
 ## Reversing any of this
 
 Every archive this feature performs is a plain `UPDATE`, reversible with the
-matching `UPDATE ... SET archived = 0`:
+matching `UPDATE ... SET archived = 0` — or, for a human at the keyboard, the
+Rules/Skills panel's own Restore button above, which is that same statement
+behind an idempotent, audited endpoint:
 
 ```sql
 -- Undo a sweep or triage archive for one id:
