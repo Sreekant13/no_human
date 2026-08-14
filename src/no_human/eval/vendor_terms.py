@@ -317,7 +317,7 @@ def _home_path_pattern() -> re.Pattern | None:
         re.escape(home.rstrip("/")) + r"(?=[/\s|)\]]|$)" + _PATH_RUN)
 
 
-def _redact_split_forms(text: str) -> str:
+def _redact_split_forms(text: str, placeholder: str = "<redacted>") -> str:
     """Remove terms that only the NORMALISED pass of `find_banned_terms` sees.
 
     The paired half of the split-form detection. Detection alone would have made
@@ -353,8 +353,37 @@ def _redact_split_forms(text: str) -> str:
             merged.append([s, e])
     out = text
     for s, e in reversed(merged):
-        out = out[:s] + "<redacted>" + out[e:]
+        out = out[:s] + placeholder + out[e:]
     return out
+
+
+def redact_terms(text: str, placeholder: str = "[REDACTED]") -> tuple[str, list[str]]:
+    """*text* with every banned term replaced by *placeholder*, plus the terms hit.
+
+    Term-only redaction: unlike `redact_for_publish`, this does NOT touch home
+    paths — an outbound PR title/body/commit message legitimately contains
+    paths, and home-path redaction is the publish path's concern, not this
+    one. Reuses the same detector rules (`_RAW_RULES`, `_redact_split_forms`)
+    so a term this function misses is a term `find_banned_terms` also misses —
+    there is exactly one definition of "banned", never two drifting copies.
+
+    Same fixed-point loop as `redact_for_publish`, for the identical reason:
+    redacting one glued term can expose another whose pass already ran.
+    """
+    if not text:
+        return text, []
+    found = find_banned_terms(text)
+    if not found:
+        return text, []
+    out = text
+    for _ in range(len(BANNED_TERMS) + 1):
+        before = out
+        for _, rx in _RAW_RULES:
+            out = rx.sub(placeholder, out)
+        out = _redact_split_forms(out, placeholder)
+        if out == before:
+            break
+    return out, found
 
 
 def redact_for_publish(text: str) -> str:

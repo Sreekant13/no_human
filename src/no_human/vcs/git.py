@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+from .outbound_scrub import scrub_outbound
 from .push_hook import install_pre_push_guard
 
 
@@ -28,7 +29,7 @@ _AI_ATTRIBUTION = re.compile(
 
 def _sanitize_commit_message(msg: str) -> str:
     """Strip AI attribution trailers from a commit message."""
-    return _AI_ATTRIBUTION.sub("", msg).rstrip()
+    return scrub_outbound(_AI_ATTRIBUTION.sub("", msg).rstrip(), "commit_message")
 
 
 class GitError(RuntimeError):

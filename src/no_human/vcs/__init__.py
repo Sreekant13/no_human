@@ -8,6 +8,7 @@ from pathlib import Path
 from . import github, gitlab
 from .git import CommitResult, GitError, GitRepo, ProtectedBranch
 from .manifest_repair import commit_with_manifest_repair, parse_manifest_refusal
+from .outbound_scrub import scrub_outbound
 
 __all__ = [
     "GitRepo",
@@ -64,6 +65,11 @@ def open_pr(
     we push the branch and return a ``local`` marker — the push itself proves the
     branch/commit/PR-open code path without touching a real forge.
     """
+    # Scrub before anything else: no title/body reaches classification, push,
+    # or a forge adapter unscrubbed.
+    title = scrub_outbound(title, "pr_title")
+    body = scrub_outbound(body, "pr_body")
+
     # Classify the remote BEFORE pushing. The old order pushed first and gave
     # any unrecognized https host a fake `local-pr://` marker afterwards — the
     # branch landed on a forge we couldn't even name, and the task reported

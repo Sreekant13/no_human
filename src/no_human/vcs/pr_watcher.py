@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Awaitable
 
+from .outbound_scrub import ScrubDrainedError, scrub_outbound
+
 log = logging.getLogger("no_human.pr_watcher")
 
 
@@ -372,6 +374,10 @@ async def post_reply_comment(pr_ref: str, message: str) -> bool:
     recognize the product's own comments (see marker docstring).
     Returns True on success.
     """
+    try:
+        message = scrub_outbound(message, "pr_reply_comment")
+    except ScrubDrainedError:
+        return False
     message = f"{AGENT_COMMENT_MARKER}\n{message}"
     if "!" in pr_ref:
         project_id, _, iid_str = pr_ref.partition("!")
@@ -418,6 +424,10 @@ async def upsert_agent_comment(pr_ref: str, message: str, key: str = "") -> bool
     create if listing/patching isn't possible. Never mentions "no_human" in the
     visible body — the marker is an invisible HTML comment.
     """
+    try:
+        message = scrub_outbound(message, "pr_agent_comment")
+    except ScrubDrainedError:
+        return False
     submarker = f"<!-- nh:{key} -->" if key else ""
     body = f"{AGENT_COMMENT_MARKER}{submarker}\n{message}"
     find = submarker or AGENT_COMMENT_MARKER

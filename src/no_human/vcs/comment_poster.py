@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 import subprocess
 
+from .outbound_scrub import ScrubDrainedError, scrub_outbound
 from .pr_watcher import AGENT_COMMENT_MARKER, is_agent_comment, parse_pr_url
 
 _DIFF_FILE = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)
@@ -90,6 +91,10 @@ def post_to_pr(url: str, body: str, file: str | None = None, line: int | None = 
     Returns ``{"ok": bool, "mode": "inline"|"issue_comment"|"mr_note", "error": str}``.
     Every body is stamped with a self-marker — see `_stamped`.
     """
+    try:
+        body = scrub_outbound(body, "pr_comment")
+    except ScrubDrainedError as e:
+        return {"ok": False, "mode": "refused", "error": str(e)}
     parsed = parse_pr_url(url)
     if not parsed:
         return {"ok": False, "mode": None, "error": f"unparseable PR URL: {url}"}
@@ -148,6 +153,10 @@ def set_pr_title(url: str, title: str) -> dict:
     Retitling is not merging and not approving: it changes no code, no state
     the forge gates on, and touches only a PR no_human itself opened.
     """
+    try:
+        title = scrub_outbound(title, "pr_title_retitle")
+    except ScrubDrainedError as e:
+        return {"ok": False, "error": str(e)}
     parsed = parse_pr_url(url)
     if not parsed:
         return {"ok": False, "error": f"unparseable PR URL: {url}"}
