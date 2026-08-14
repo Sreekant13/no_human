@@ -35,7 +35,7 @@ test("the attempt row actually carries the loaded sha", () => {
     `${COLUMN} must be a real attempts column (db.py att_wanted)`,
   );
   assert.ok(
-    db.includes(`loaded_code_version) VALUES`),
+    /loaded_code_version[^)]*\) VALUES/.test(db),
     "create_attempt must write it — a declared column nothing writes is null forever",
   );
 });
