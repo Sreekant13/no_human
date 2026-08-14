@@ -1,5 +1,5 @@
-// The no_human brand mark: the `nh` monogram — two arches sharing a stroke,
-// picking up the lane colours at the feet.
+// The no_human brand mark: the circuit-face shield — a face traced in
+// circuit lines inside a hexagonal shield (operator-supplied, 2026-08-15).
 //
 // This serves the SAME image file the marketing site serves, rather than a
 // hand-authored SVG copy of it. A copy would be a restatement, and

@@ -41,7 +41,7 @@ function Brand({ onHome }) {
   if (!onHome) {
     return (
       <div className="legion-brand">
-        <LegionLogo size={32} />
+        <LegionLogo size={44} />
         <div className="legion-wordmark">
           <span className="legion-name">no_human</span>
           <span className="legion-tag">get the max out of Claude</span>
@@ -52,7 +52,7 @@ function Brand({ onHome }) {
   return (
     <button type="button" className="legion-brand legion-brand-home" onClick={onHome}
             title="Back to work in progress" aria-label="no_human — back to work in progress">
-      <LegionLogo size={32} />
+      <LegionLogo size={44} />
       <span className="legion-wordmark">
         <span className="legion-name">no_human</span>
         <span className="legion-tag">get the max out of Claude</span>
