@@ -23,6 +23,10 @@ secrets/
 *.db
 *.db-wal
 *.db-shm
+# ...except the memory-triage runbook's committed test fixture: a tracked
+# INPUT (synthetic, neutral content -- see EXPORT_CLASSIFICATION.txt), same
+# carve-out shape as desktop/build/icon.icns above.
+!testdata/memory_triage_fixture.db
 
 # Test scratch
 /tmp_e2e/
