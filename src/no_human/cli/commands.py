@@ -4005,6 +4005,16 @@ def approve(task_id):
                 console.print(f"  PR: {pr_url}")
                 return
 
+            from ..blockers.shipped import complete_if_approved_and_landed
+            if await complete_if_approved_and_landed(
+                    store, t, pr_url, branch=branch) is not None:
+                console.print(
+                    f"[bold green]approved[/] {t.id[:8]} — content is already "
+                    "on the default branch; task done (no merge attempted)."
+                )
+                console.print(f"  PR: {pr_url}")
+                return
+
             git_cfg = config.get("git") or {}
             try:
                 repo = GitRepo(

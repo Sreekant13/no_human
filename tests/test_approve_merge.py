@@ -22,6 +22,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -34,7 +35,7 @@ from no_human.cli.commands import cli
 from no_human.core.db import Store
 from no_human.core.task import Task, TaskStatus
 from no_human.vcs.approve_merge import land_task
-from no_human.vcs.git import GitRepo, ProtectedBranch
+from no_human.vcs.git import GitError, GitRepo, ProtectedBranch
 from no_human.vcs.pr_watcher import default_branch_shipped
 
 pytestmark = pytest.mark.usefixtures("isolated_env_file")
@@ -362,6 +363,20 @@ class LandEnv:
         _git(race, "commit", "-qm", f"race: {note}")
         _git(race, "push", "-q", "origin", "HEAD:main")
         return _git(race, "rev-parse", "HEAD").stdout.strip()
+
+
+def _push_conflicting_change(land_env, path: str, content: str) -> str:
+    """Push a change to *path* on origin/main from a THIRD clone, off the
+    SAME tip a branch was cut from — a real conflicting edit (not just a
+    ledger-file difference) so `git merge --squash` hits an actual conflict
+    on *path* rather than a clean/empty merge."""
+    race = land_env.tmp_path / f"conflict-{len(list(land_env.tmp_path.glob('conflict-*')))}"
+    _git(land_env.tmp_path, "clone", "-q", str(land_env.origin), str(race))
+    (race / path).write_text(content)
+    _git(race, "add", path)
+    _git(race, "commit", "-qm", f"conflict: {path}")
+    _git(race, "push", "-q", "origin", "HEAD:main")
+    return _git(race, "rev-parse", "HEAD").stdout.strip()
 
 
 @pytest.fixture
@@ -756,6 +771,88 @@ def test_failure_removes_temp_worktree_and_keeps_awaiting_approval(land_env):
     assert len(after_worktrees) == 1
 
 
+def test_squash_conflict_leaves_no_worktree(land_env, monkeypatch):
+    """A REAL `git merge --squash` conflict (not the manifest-step failure
+    the test above covers) — the branch and a concurrent push both edit
+    README.md, so the squash step itself fails and aborts. Pins that this
+    failure path (like every other) leaves neither a registered worktree
+    nor its temp dir behind."""
+    branch, head_sha = land_env.cut_branch(
+        "no-human/t-squashconflict",
+        extra_files={"README.md": "branch changed this line\n"})
+    _push_conflicting_change(land_env, "README.md", "main changed this line too\n")
+
+    created_dirs: list[str] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def _track_mkdtemp(*a, **kw):
+        p = real_mkdtemp(*a, **kw)
+        created_dirs.append(p)
+        return p
+
+    monkeypatch.setattr(tempfile, "mkdtemp", _track_mkdtemp)
+
+    repo = GitRepo(land_env.clone, never_push_to=["main", "master", "release/*"])
+    before_worktrees = repo.list_worktrees()
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config,
+    )
+    assert not result.ok
+    assert result.step == "squash"
+    assert result.stderr
+
+    after_worktrees = repo.list_worktrees()
+    assert after_worktrees == before_worktrees
+    assert len(after_worktrees) == 1
+    assert created_dirs, "expected land_task to have created exactly one temp worktree dir"
+    assert not Path(created_dirs[-1]).exists()
+
+
+def test_worktree_add_failure_leaves_no_worktree(land_env, monkeypatch):
+    """`add_worktree` succeeding at the git level (a REAL worktree gets
+    registered) and then the wrapper raising afterward is the one failure
+    shape `land_task`'s old `except (GitError, ProtectedBranch)` handler at
+    the `worktree` step did NOT clean up — every other step's failure goes
+    through the `finally` below it, but this one returned straight away.
+    Without the fix, `after_worktrees` would show the leaked entry."""
+    branch, head_sha = land_env.cut_branch("no-human/t-worktreefail")
+    real_add_worktree = GitRepo.add_worktree
+
+    def _add_then_fail(self, *a, **kw):
+        real_add_worktree(self, *a, **kw)  # really create it, git-level
+        raise GitError("simulated failure after worktree creation")
+
+    monkeypatch.setattr(GitRepo, "add_worktree", _add_then_fail)
+
+    created_dirs: list[str] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def _track_mkdtemp(*a, **kw):
+        p = real_mkdtemp(*a, **kw)
+        created_dirs.append(p)
+        return p
+
+    monkeypatch.setattr(tempfile, "mkdtemp", _track_mkdtemp)
+
+    repo = GitRepo(land_env.clone, never_push_to=["main", "master", "release/*"])
+    before_worktrees = repo.list_worktrees()
+    result = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="deadbeef", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config,
+    )
+    assert not result.ok
+    assert result.step == "worktree"
+
+    after_worktrees = repo.list_worktrees()
+    assert after_worktrees == before_worktrees
+    assert len(after_worktrees) == 1
+    assert created_dirs, "expected land_task to have created exactly one temp worktree dir"
+    assert not Path(created_dirs[-1]).exists()
+
+
 def test_disabled_config_records_approval_only(land_env):
     branch, head_sha = land_env.cut_branch("no-human/t-disabled")
     before = land_env.remote_main_sha()
@@ -839,7 +936,7 @@ def _make_cli_runner(db_path, config_data, monkeypatch) -> CliRunner:
 
 def _seed_land_task(db_path, status, *, repo_path, branch=None, pr_url=None,
                     review_history=None, title="Fix the thing",
-                    task_id=None) -> str:
+                    task_id=None, base_branch=None) -> str:
     async def _go():
         async with Store(db_path) as s:
             t = Task.new(title, repo_path=repo_path)
@@ -854,6 +951,8 @@ def _seed_land_task(db_path, status, *, repo_path, branch=None, pr_url=None,
                 ctx["pr_branch"] = branch
             if review_history is not None:
                 ctx["review_history"] = review_history
+            if base_branch:
+                ctx["base_branch"] = base_branch
             if ctx:
                 await s.merge_context(t.id, ctx)
             if status is not TaskStatus.PENDING:
@@ -924,6 +1023,80 @@ def test_cli_approve_marks_done_with_landed_sha(land_env, tmp_path, monkeypatch)
     assert sha[:12] in result.output
 
 
+def test_cli_approve_completes_when_content_already_landed(land_env, tmp_path, monkeypatch):
+    """The live-repro shape (task e58a81d6): a supervising-session squash
+    train already landed this branch's content — via a FIRST task's
+    `land_task` here, standing in for that train — and this SECOND task's
+    (closed) PR still points at the same branch. Approving it must complete
+    via content-equivalence, never attempt a conflicting re-merge. Red-first
+    on the code before this change: the old `nh approve` re-squashed the
+    same branch onto the now-different tip and hit a real conflict on
+    RELEASE_MANIFEST.txt (the branch wipes it; the first land regenerates
+    it), leaving the task awaiting_approval — see
+    `test_squash_conflict_leaves_no_worktree` for that failure shape."""
+    branch, head_sha = land_env.cut_branch("no-human/t-clilanded")
+    first = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="firsttask", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config,
+    )
+    assert first.ok, first.stderr
+    # Belt-and-braces: `land_task`'s own push already opportunistically
+    # updates `origin/main` locally, but an explicit fetch removes any doubt
+    # the second approve's containment probe reads a stale tracking ref.
+    _git(land_env.clone, "fetch", "-q", "origin", "main")
+
+    db = tmp_path / "t.db"
+    task_id = _seed_land_task(
+        db, TaskStatus.AWAITING_APPROVAL, repo_path=str(land_env.clone),
+        branch=branch, pr_url=land_env.pr_url,
+        review_history=[{"sha": head_sha, "passed": True}],
+        base_branch="main",
+    )
+    repo = GitRepo(land_env.clone, never_push_to=["main", "master", "release/*"])
+    before_worktrees = repo.list_worktrees()
+    before_main = land_env.remote_main_sha()
+
+    runner = _make_cli_runner(db, land_env.config, monkeypatch)
+    result = runner.invoke(cli, ["approve", task_id[:8]])
+    assert result.exit_code == 0, result.output
+
+    t, events = _fetch_task_and_events(db, task_id)
+    assert t.status is TaskStatus.DONE
+    approved_landed = [e for e in events if e.get("kind") == "approved_landed"]
+    assert len(approved_landed) == 1
+    assert not [e for e in events if e.get("kind") == "human_merged"]
+    assert land_env.remote_main_sha() == before_main
+    assert repo.list_worktrees() == before_worktrees
+
+
+def test_approve_unlanded_pr_still_merges_and_probe_says_no(land_env, tmp_path, monkeypatch):
+    """Control for the landed-completion path above: an ordinary, still-open
+    PR's content is NOT on the default branch yet, so the new content check
+    must say "no" and `nh approve` must still land it via `land_task` exactly
+    as before this change."""
+    branch, head_sha = land_env.cut_branch("no-human/t-unlanded")
+    before = land_env.remote_main_sha()
+    db = tmp_path / "t.db"
+    task_id = _seed_land_task(
+        db, TaskStatus.AWAITING_APPROVAL, repo_path=str(land_env.clone),
+        branch=branch, pr_url=land_env.pr_url,
+        review_history=[{"sha": head_sha, "passed": True}],
+        base_branch="main",
+    )
+    runner = _make_cli_runner(db, land_env.config, monkeypatch)
+    result = runner.invoke(cli, ["approve", task_id[:8]])
+    assert result.exit_code == 0, result.output
+
+    t, events = _fetch_task_and_events(db, task_id)
+    assert t.status is TaskStatus.DONE
+    merged = [e for e in events if e.get("kind") == "human_merged"]
+    assert len(merged) == 1
+    assert merged[0]["sha"]
+    assert not [e for e in events if e.get("kind") == "approved_landed"]
+    assert land_env.remote_main_sha() != before
+
+
 # --------------------------------------------------------------------------- #
 # API: POST /api/tasks/{id}/approve                                           #
 # --------------------------------------------------------------------------- #
@@ -985,6 +1158,46 @@ async def test_api_approve_marks_done_with_landed_sha(land_env, api_store_client
     merged = [e for e in events if e.get("kind") == "human_merged"]
     assert len(merged) == 1
     assert merged[0]["sha"] == data["landed_sha"]
+
+
+@pytest.mark.asyncio
+async def test_api_approve_completes_when_content_already_landed(land_env, api_store_client):
+    """API counterpart of `test_cli_approve_completes_when_content_already_landed`
+    — same closed-PR-but-landed shape, via `POST /api/tasks/{id}/approve`."""
+    client, store = api_store_client
+    branch, head_sha = land_env.cut_branch("no-human/t-apilanded")
+    first = land_task(
+        repo_path=str(land_env.clone), branch=branch, pr_url=land_env.pr_url,
+        task_id="firsttask", task_title="Add feature", review_evidence="review PASS",
+        config=land_env.config,
+    )
+    assert first.ok, first.stderr
+    _git(land_env.clone, "fetch", "-q", "origin", "main")
+
+    t = Task.new("Fix the thing", repo_path=str(land_env.clone))
+    t.acceptance_criteria = ["Should work"]
+    await store.create_task(t)
+    await store.merge_context(t.id, {
+        "pr_watch": land_env.pr_url, "pr_branch": branch,
+        "review_history": [{"sha": head_sha, "passed": True}],
+        "base_branch": "main",
+    })
+    await store.set_status(t, TaskStatus.AWAITING_APPROVAL, validate=False)
+
+    before_main = land_env.remote_main_sha()
+    r = await client.post(f"/api/tasks/{t.id}/approve")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["ok"] is True
+    assert data["landed_sha"] == ""
+
+    refreshed = await store.find_task(t.id)
+    assert refreshed.status is TaskStatus.DONE
+    events = await store.list_events(t.id)
+    approved_landed = [e for e in events if e.get("kind") == "approved_landed"]
+    assert len(approved_landed) == 1
+    assert not [e for e in events if e.get("kind") == "human_merged"]
+    assert land_env.remote_main_sha() == before_main
 
 
 @pytest.mark.asyncio

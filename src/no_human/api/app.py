@@ -912,6 +912,7 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
     # instruction, never a false DONE (PR #101 round-2 review).
     message = "Approval recorded. Merge the PR in your git host — the agent never merges."
     landed_sha = ""
+    completed_landed = False
     if (task.context or {}).get("already_satisfied_report"):
         # Guarded on `task_has_pr_evidence`, not `attempts.pr_url` alone (live
         # incident, task 8c8b36b5): a draft PR opened pre-review is recorded
@@ -931,21 +932,29 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
             landed_sha, error_detail = await _merge_task_pr(request, store, task, pr_url)
             if error_detail:
                 raise HTTPException(status_code=500, detail=error_detail)
-            message = _merge_outcome_message(landed_sha)
+            if landed_sha:
+                message = _merge_outcome_message(landed_sha)
+            else:
+                completed_landed, message = await _landed_completion_outcome(
+                    store, task, landed_sha)
     else:
         pr_url = await task_has_pr_evidence(store, task)
         if pr_url:
             landed_sha, error_detail = await _merge_task_pr(request, store, task, pr_url)
             if error_detail:
                 raise HTTPException(status_code=500, detail=error_detail)
-            message = _merge_outcome_message(landed_sha)
+            if landed_sha:
+                message = _merge_outcome_message(landed_sha)
+            else:
+                completed_landed, message = await _landed_completion_outcome(
+                    store, task, landed_sha)
     tasks = await _board_tasks(store, scheduler=_sched(request))
     await _mgr.broadcast({
         "type": "task_approved",
         "task_id": task.id,
         "tasks": [t.model_dump() for t in tasks],
     })
-    if landed_sha:
+    if landed_sha or completed_landed:
         await _mgr.broadcast({
             "type": "task_updated", "task_id": task.id,
             "status": TaskStatus.DONE.value,
@@ -956,6 +965,23 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
         "message": message,
         "landed_sha": landed_sha,
     }
+
+
+async def _landed_completion_outcome(store, task, landed_sha: str) -> tuple[bool, str]:
+    """After a no-op `_merge_task_pr` (``landed_sha == ""``), tell whether
+    that no-op was the landed-completion path (`complete_if_approved_and_landed`
+    already wrote DONE) rather than one of the existing skip/refusal paths
+    (task still AWAITING_APPROVAL — no branch/repo recorded, an unresolvable
+    branch, or `land_task` deciding it is disabled/has nothing to merge).
+    Re-reads the row rather than threading a third return value through
+    `_merge_task_pr`, since every existing "" -> no-op path there leaves the
+    task AWAITING_APPROVAL and only this new path writes DONE."""
+    assert not landed_sha
+    refreshed = await store.get_task(task.id)
+    if refreshed is not None and refreshed.status == TaskStatus.DONE:
+        return True, ("Content is already on the default branch — approval "
+                       "recorded and task completed; no merge was attempted.")
+    return False, _merge_outcome_message(landed_sha)
 
 
 def _merge_outcome_message(landed_sha: str) -> str:
@@ -988,6 +1014,17 @@ async def _merge_task_pr(
     resolved = await resolve_task_pr(store, task)
     branch = resolved.branch
     if not branch:
+        return "", None
+
+    from ..blockers.shipped import complete_if_approved_and_landed
+    landed = await complete_if_approved_and_landed(store, task, pr_url, branch=branch)
+    if landed is not None:
+        # Content is already on the default branch (a closed-PR squash train,
+        # most often) — the task is DONE (or was already terminal) and no
+        # merge was ever attempted. `approve_task` re-reads the row to build
+        # its message/broadcast rather than this function returning a third
+        # value, since the existing "" == "no merge happened" callers all
+        # stay correct either way.
         return "", None
 
     def _resolve_head() -> tuple[str, GitRepo | None]:

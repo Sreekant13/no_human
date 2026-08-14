@@ -344,6 +344,14 @@ def land_task(
     try:
         repo.add_worktree(tmp_dir, base=tip_sha, detach=True)
     except (GitError, ProtectedBranch) as exc:
+        # `git worktree add` can register the worktree (and create its admin
+        # dir / the directory itself) before failing partway through — e.g. a
+        # `ProtectedBranch` refusal raised by this wrapper AFTER the `git`
+        # call already ran, or a git-side failure after the admin files were
+        # written. Best-effort cleanup here closes the one failure path that
+        # used to strand a worktree (every OTHER step's failure already goes
+        # through the `finally` below).
+        _cleanup_worktree(repo, tmp_dir)
         return LandResult(ok=False, step="worktree", branch=branch, pr_url=pr_url,
                            stderr=_cap(str(exc)))
 
@@ -357,8 +365,21 @@ def land_task(
             _before_push=_before_push,
         )
     finally:
-        repo.remove_worktree(tmp_dir, force=True)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        _cleanup_worktree(repo, tmp_dir)
+
+
+def _cleanup_worktree(repo: "GitRepo", path: Path) -> None:
+    """Best-effort worktree teardown, shared by every failure path (the
+    `add_worktree` failure above and the `finally` around every in-worktree
+    step) so no `land_task` outcome can strand a temp worktree or its admin
+    dir. Swallows the same errors `GitRepo.remove_worktree`'s own `check=
+    False` already tolerates plus a missing directory — cleanup must never
+    replace the real failure being reported."""
+    try:
+        repo.remove_worktree(path, force=True)
+    except (GitError, OSError):
+        pass
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _land_in_worktree(

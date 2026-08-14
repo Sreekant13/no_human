@@ -186,3 +186,90 @@ async def complete_if_content_landed(
     )
     on_event("shipped", shipped_text)
     return action
+
+
+async def complete_if_approved_and_landed(
+    store: Any, task: Task, pr_url: str, *,
+    branch: str | None = None,
+    probe: Callable[[str, str, str], Awaitable[bool | str]] | None = None,
+    is_terminal: Callable[[Task], Awaitable[bool]] | None = None,
+    on_event: Callable[[str, str], None] | None = None,
+) -> str | None:
+    """The human-approve path's landed-completion check (`api/app.py`'s
+    ``_merge_task_pr`` and ``cli/commands.py``'s ``approve`` command) — a
+    thin wrapper over :func:`complete_if_content_landed`, the SAME shared
+    check the wake/scheduler rungs use (see the module docstring), so
+    "is this branch's content on the default branch?" is answered once, not
+    reimplemented per caller. Fixes the live incident where a closed PR
+    whose content had already landed via a squash train was re-merged by
+    `nh approve`, hit conflicts, and left the task stuck awaiting_approval.
+
+    Defaults ``probe`` to ``vcs.pr_watcher.branch_landed_commit`` (lazy
+    import — keeps `blockers` -> `vcs` at call time only, mirroring every
+    other caller of this module), and ``is_terminal``/``on_event`` to the
+    scheduler's re-read-the-row check (`Scheduler._is_terminal_row`) and a
+    no-op respectively — the CLI/API callers have no watcher instance to
+    reuse the way `wake.py`'s rungs do, so both are constructed here instead
+    of imported from a class.
+
+    Returns ``None`` on every ambiguity (no probe, no branch/base recorded,
+    probe error, content genuinely absent) — the caller keeps today's merge
+    behaviour exactly. Returns ``_TICK_ABORTED`` if the task went terminal
+    while the probe ran — treated the same as "nothing to do" by both
+    callers, since either way there is no merge left to attempt. Returns
+    ``"approved_landed"`` once the task has been completed, after which an
+    extra ``approved_landed`` audit event is appended (`save_events` is
+    append-only — `complete_if_content_landed`'s own `set_status` call
+    already wrote the `shipped` event and the DONE status; this does not
+    re-write status).
+
+    No review-PASS precondition is checked here — this path performs NO
+    merge and NO push, and both callers already refuse unless
+    ``task.status is AWAITING_APPROVAL``, the same precondition
+    `complete_if_content_landed`'s "REVIEW PRECONDITION" paragraph documents
+    for wake.py's CLOSED rung.
+
+    Never raises: any exception is logged and swallowed to ``None`` so a
+    probe error falls through to the existing merge attempt rather than
+    turning an approve into a 500 — fail-open here means "merge like today",
+    not a silent completion.
+    """
+    try:
+        if probe is None:
+            from ..vcs.pr_watcher import branch_landed_commit
+            probe = branch_landed_commit
+        if is_terminal is None:
+            async def _default_is_terminal(t: Task) -> bool:
+                current = await store.get_task(t.id)
+                if current is None:
+                    return False
+                if current.status == TaskStatus.DONE:
+                    return True
+                return current.status == TaskStatus.FAILED and bool(
+                    (current.context or {}).get("cancel_reason"))
+            is_terminal = _default_is_terminal
+        if on_event is None:
+            on_event = lambda kind, text: None  # noqa: E731 — default is a no-op printer/logger
+
+        result = await complete_if_content_landed(
+            store, task, pr_url, pr_shipped=probe, is_terminal=is_terminal,
+            on_event=on_event, forge_state=None, action="approved_landed",
+            situation="approval was requested", branch=branch,
+        )
+    except Exception as exc:  # noqa: BLE001 — the gate must never turn an approve into a 500
+        log.warning("approve landed-completion check failed for %s: %s",
+                    task.id[:8], exc)
+        return None
+    if result != "approved_landed":
+        return result  # None (keep merging) or _TICK_ABORTED (abandon the tick)
+
+    ctx = task.context or {}
+    base = ctx.get("base_branch") or "the default branch"
+    landed = ctx.get("landed_sha") or ""
+    sha_note = f" ({landed[:8]})" if landed else ""
+    await store.save_events(task.id, [{
+        "source": "human", "kind": "approved_landed", "ts": time.time(),
+        "text": f"approve: content already on {base}{sha_note} — "
+                "completed without a merge",
+    }])
+    return result
