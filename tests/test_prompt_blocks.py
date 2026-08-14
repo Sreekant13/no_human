@@ -490,3 +490,24 @@ def test_question_text_cannot_forge_section_structure():
                   if l.startswith("INTAKE Q&A") and "answer them yourself):" in l
                   and "could not" not in l]
         assert not forged
+
+
+def test_resume_digest_never_reads_distilled_state():
+    """Round-2 review (task 8b28140d): the distilled-retry doc
+    (``task.context['distilled_state']``) is consumed ONLY by the
+    orchestrator's ``_build_implement_prompt`` seam, which applies a lineage
+    guard before rendering it. ``build_resume_digest`` has no parameter for
+    it and must stay ignorant of that key — pinning this means a future
+    caller cannot re-introduce a bare ``ctx['distilled_state']`` read here
+    and bypass the lineage guard."""
+    from no_human.core.prompt_blocks import build_resume_digest
+    from no_human.core.task import Task, TaskStatus
+    t = Task(id="a", source="test", title="x", status=TaskStatus.IMPLEMENTING,
+             acceptance_criteria=["c"],
+             context={"distilled_state": "STALE-DOC-MARKER",
+                       "distilled_state_attempt": 3})
+    d = build_resume_digest(t)
+    assert "STALE-DOC-MARKER" not in d
+    assert d == build_resume_digest(
+        Task(id="a", source="test", title="x", status=TaskStatus.IMPLEMENTING,
+             acceptance_criteria=["c"]))

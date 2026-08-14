@@ -1338,6 +1338,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # to cut exploration turns. Cached per (repo, HEAD). Off = fall back to
         # pure agentic exploration.
         "repo_map_enabled": True,
+        # Retry-cost class: attempt N>1 gets a distilled state doc (what was
+        # tried, what failed, the diff so far, review findings, remaining
+        # criteria) INSTEAD of re-accumulating the repo map and gathered-
+        # context digest every attempt. False restores the pre-change prompt
+        # byte-for-byte — every attempt re-accumulates, as before this switch
+        # existed.
+        "attempt_state_distill_enabled": True,
     },
     # C1 seed-context diet: user-level (~/.claude/skills) skills are delivered
     # to the coder only when relevant to the task (token overlap on title/

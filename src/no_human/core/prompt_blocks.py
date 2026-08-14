@@ -20,12 +20,19 @@ Terminology (established from the repo, not invented here):
   collected into ``ReviewDecision.blocking_items`` at reviewer.py:364).
   Low/nit failures are *advisory* (reviewer.py:371) — they never gate an
   attempt and are not subject to the budget below.
-* **Distilled attempt-state doc**: ``build_resume_digest`` (this module) — the
-  seed a resumed task's fresh session reads instead of stale full context.
-  Called via ``Orchestrator._resume_digest`` and injected into the next
-  attempt's implement prompt. Its sections are read from ``task.context``:
-  ``review_feedback``, ``review_suggested_next``, ``attempt_log``,
-  ``send_back_feedback``, ``handoff``, ``ci_failure``.
+* **Resume digest**: ``build_resume_digest`` (this module) — the seed a
+  *resumed* task's (``nh reply``) fresh session reads instead of stale full
+  context. Called via ``Orchestrator._resume_digest`` and injected into the
+  next attempt's implement prompt. Its sections are read from
+  ``task.context``: ``review_feedback``, ``review_suggested_next``,
+  ``attempt_log``, ``send_back_feedback``, ``handoff``, ``ci_failure``.
+* **Distilled attempt-state doc**: ``build_distilled_state`` (this module) —
+  the attempt N>1 replacement for re-accumulated context (repo map + gathered-
+  context digest). Produced by ``Orchestrator._distill_attempt_state`` and
+  consumed at the ``_build_implement_prompt`` seam. Unlike the resume digest
+  it is NOT a substitute for it — both can appear in the same prompt; this one
+  replaces bulk re-reads, the resume digest replaces stale human/reviewer
+  context.
 * **Capacity budget** (``RESUME_FINDING_BUDGET`` below): every blocking
   finding is rendered, never sliced off the list — the historical `[:6]`
   item-count cap in ``Orchestrator._record_review_feedback`` silently dropped
@@ -62,6 +69,48 @@ EXPORT_CLASSIFICATION_FILE = "EXPORT_CLASSIFICATION.txt"
 # comment (so most findings never truncate) while bounding a pathological
 # multi-paragraph comment to a fixed, predictable cost per finding.
 RESUME_FINDING_BUDGET = 400
+
+# Attempt N>1 distilled state doc (retry-cost class): caps the WHOLE doc, in
+# chars — matching the module/orchestrator idiom (_RULES_CRITICAL_CAP = 8000,
+# _CHUNK_DISTILL_THRESHOLD = 2000) at ~4 chars/token, so 8000 chars is
+# ~estimate_tokens(8000) == 2000 tokens. Not asserted in prose beyond that:
+# test_capacity_budget_arithmetic_is_computed_not_asserted's sibling for this
+# doc measures the actual rendered size, the same discipline RESUME_FINDING_
+# BUDGET's comment above already documents.
+DISTILLED_STATE_CAP = 8000
+
+# The review-findings section's own ceiling, chars. A per-finding budget
+# (RESUME_FINDING_BUDGET) bounds one finding's length but not how many of
+# them there are — with no section-level cap, N findings could alone exceed
+# DISTILLED_STATE_CAP before the diff section (the one section explicitly
+# designed to absorb overflow, see build_distilled_state) ever gets a turn,
+# which is exactly the failure a prior attempt shipped: a whole-doc tail-cut
+# silently dropped the criteria section because the four non-diff sections
+# together already exceeded the cap. Capping findings here keeps that from
+# happening again while still rendering every finding it can afford, in full,
+# with an honest "... and N more" line for whatever does not fit — never a
+# silent drop.
+_DISTILL_FINDINGS_CAP = 3000
+
+
+def estimate_tokens(text: str) -> int:
+    """~4 chars/token estimate, ceiling-rounded. ONE definition — shared by
+    ``DISTILLED_STATE_CAP``'s doc-comment arithmetic above and by the
+    orchestrator's ``attempt_context_size`` instrument, so a fixture's token
+    claim and the runtime cap cannot silently drift apart."""
+    return (len(text) + 3) // 4
+
+
+class DistillationError(RuntimeError):
+    """Raised by the orchestrator's utility-tier attempt-state distillation
+    wrapper (``Orchestrator._distill_attempt_state``) on any outcome that is
+    not usable text: an empty/blank result from the utility backend, or a
+    failure building the doc itself. The orchestrator catches this (and any
+    other exception from the same call) as the single loud-failure path —
+    log at ERROR, emit ``attempt_distill_failed``, fall back to full context
+    re-read. Never raised from here — this module is pure and never calls the
+    backend; it exists beside the cap it protects so the failure mode and the
+    budget it guards are defined in one place."""
 
 
 def fit_finding_text(text: str, budget: int) -> str:
@@ -313,6 +362,166 @@ def build_resume_digest(task: Task) -> str:
                 "OUT OF SCOPE — do NOT do any of these (the spec forbids "
                 "them; touching them fails review):\n" + forbidden)
     return "\n\n".join(parts)
+
+
+def _distill_tried_section(task: Task) -> str:
+    ctx = task.context or {}
+    lines = [f"  - {entry}" for entry in (ctx.get("attempt_log") or [])]
+    if task.blocker:
+        b = Blocker.from_dict(task.blocker)
+        if b.tried:
+            lines.append(f"  - prior blocker attempts: {'; '.join(b.tried)}")
+    body = "\n".join(lines) if lines else "  (none recorded)"
+    return "## What was tried\n" + body
+
+
+def _distill_failed_section(task: Task, last_detail: str) -> str:
+    ctx = task.context or {}
+    lines = []
+    if last_detail and last_detail.strip():
+        lines.append(f"  - {last_detail.strip()}")
+    stuck = (ctx.get("stuck_hypothesis") or "").strip()
+    if stuck:
+        lines.append(f"  - diagnosis: {stuck}")
+    handoff = ctx.get("handoff") or {}
+    stopped = handoff.get("stopped_because") if isinstance(handoff, dict) else None
+    if stopped:
+        lines.append(f"  - stopped because: {stopped}")
+    ci_failure = ctx.get("ci_failure") or {}
+    if ci_failure:
+        summary = ci_failure.get("summary") or ""
+        failing = ci_failure.get("failing_tests") or []
+        detail = summary
+        if failing:
+            detail += (" " if detail else "") + f"(failing: {', '.join(failing)})"
+        if detail:
+            lines.append(f"  - CI failure: {detail}")
+    body = "\n".join(lines) if lines else "  (none recorded)"
+    return "## What failed and why\n" + body
+
+
+def _distill_findings_section(review_feedback: list[dict], omitted: int) -> str:
+    """Every finding rendered VERBATIM (only per-finding length is bounded,
+    visibly, same as ``build_resume_digest``) until the section's own
+    ``_DISTILL_FINDINGS_CAP`` is reached — see that constant's comment for why
+    a section-level cap exists at all. Whatever does not fit is COUNTED, never
+    silently dropped."""
+    lines: list[str] = []
+    rendered_chars = 0
+    shown = 0
+    for f in review_feedback:
+        loc = f"{f.get('file', '')}:{f.get('line', 0)}" if f.get("file") else ""
+        detail = f.get("comment") or f.get("evidence") or ""
+        detail = fit_finding_text(detail, RESUME_FINDING_BUDGET)
+        line = f"  - {f.get('label', '')}{f' ({loc})' if loc else ''}: {detail}"
+        if lines and rendered_chars + len(line) + 1 > _DISTILL_FINDINGS_CAP:
+            omitted += len(review_feedback) - shown
+            break
+        lines.append(line)
+        rendered_chars += len(line) + 1
+        shown += 1
+    if omitted:
+        lines.append(
+            f"  - … and {omitted} more blocking finding(s) were recorded "
+            "— see `nh logs`"
+        )
+    body = "\n".join(lines) if lines else "  (none recorded)"
+    return "## Review findings (verbatim)\n" + body
+
+
+def _distill_criteria_section(task: Task, review_feedback: list[dict]) -> str:
+    """Never claims a criterion is MET — that verdict belongs to the reviewer,
+    not this doc. ``[NOT MET]`` only when a blocking finding names it;
+    otherwise ``[status unknown]``."""
+    blocking_text = " ".join(
+        f"{f.get('label', '')} {f.get('comment', '')} {f.get('evidence', '')}"
+        for f in review_feedback
+    ).lower()
+    lines = []
+    for c in task.acceptance_criteria or []:
+        status = "[NOT MET]" if c.lower() in blocking_text else "[status unknown]"
+        lines.append(f"  - {c} — {status}")
+    body = "\n".join(lines) if lines else "  (none stated)"
+    return "## Remaining acceptance criteria\n" + body
+
+
+def _distill_diff_section(diff_text: str, changed_files: list[str], budget: int) -> str:
+    files_block = "\n".join(f"  - {f}" for f in changed_files) or "  (no changed files recorded)"
+    header = f"## Diff so far\nChanged files:\n{files_block}\n\n```diff\n"
+    footer = "\n```"
+    body_budget = max(0, budget - len(header) - len(footer))
+    if len(diff_text) <= body_budget:
+        body = diff_text
+    else:
+        removed = len(diff_text) - body_budget
+        marker = (
+            f"\n[{removed} more chars truncated — run `git diff` in your "
+            "worktree for the full text]"
+        )
+        keep = max(0, body_budget - len(marker))
+        body = diff_text[:keep] + marker
+    return header + body + footer
+
+
+def build_distilled_state(
+    task: Task, *, diff_text: str, changed_files: list[str], last_detail: str,
+) -> str:
+    """The attempt N>1 replacement for re-accumulated context (repo map +
+    gathered-context digest, see ``Orchestrator._distill_attempt_state``).
+    Pure: arguments only, same contract as ``build_resume_digest``. The doc
+    this returns is scoped to the attempt that produced it (tagged via
+    ``task.context['distilled_state_attempt']``) and is dropped, never
+    consumed, on a resumed attempt 1 — see ``_distill_attempt_state`` and the
+    ``_build_implement_prompt`` seam's ``attempt_n`` gating. Renders
+    exactly five Markdown headings:
+
+      1. What was tried        — ``ctx['attempt_log']`` + prior blocker.tried
+      2. What failed and why   — ``last_detail``, ``stuck_hypothesis``,
+                                  ``handoff.stopped_because``, ``ci_failure``
+      3. Review findings        — every ``ctx['review_feedback']`` entry,
+         (verbatim)               verbatim, capped by section (never by count)
+      4. Remaining acceptance   — every ``task.acceptance_criteria`` entry,
+         criteria                 never claims MET
+      5. Diff so far            — ``changed_files`` + fenced ``diff_text``
+
+    BUDGET ALLOCATION, and why the diff is rendered LAST: sections 1/2/3/4 are
+    small and independently bounded (3 by ``_DISTILL_FINDINGS_CAP``; 1/2/4 are
+    structurally small — attempt-log entries and CI details are pre-capped
+    upstream, acceptance criteria are normally a handful of sentences), so
+    they are rendered first and their combined length is treated as fixed.
+    The diff section receives whatever remains of ``DISTILLED_STATE_CAP`` and
+    is placed LAST specifically so it is the section any overflow lands on —
+    truncated with a visible ``[N more chars truncated]`` marker, never a
+    silent cut. A prior version joined the sections as
+    [tried, failed, diff, findings, criteria] and safety-net-truncated the
+    WHOLE doc from the tail when the four non-diff sections alone exceeded
+    the cap (a 20-finding review round did exactly this) — silently dropping
+    the criteria section the contract requires. Reordering so diff absorbs
+    the overflow, plus the findings section's own cap, is the fix; the
+    trailing whole-doc safety net below is now a last-resort guard that
+    should rarely fire, and when it does, it can only cut into the diff
+    section (the last one rendered), never criteria or findings.
+    """
+    ctx = task.context or {}
+    review_fb = ctx.get("review_feedback") or []
+    omitted = ctx.get("review_feedback_omitted") or 0
+
+    tried = _distill_tried_section(task)
+    failed = _distill_failed_section(task, last_detail)
+    findings = _distill_findings_section(review_fb, omitted)
+    criteria = _distill_criteria_section(task, review_fb)
+
+    fixed = "\n\n".join([tried, failed, findings, criteria])
+    diff_budget = max(0, DISTILLED_STATE_CAP - len(fixed) - 2)  # "\n\n" before diff
+    diff = _distill_diff_section(diff_text, changed_files, diff_budget)
+
+    doc = "\n\n".join([tried, failed, findings, criteria, diff])
+    if len(doc) > DISTILLED_STATE_CAP:
+        # Last resort — see docstring above. Only ever trims the diff, which
+        # is last, because the sections before it are already bounded.
+        marker = "\n[truncated to fit the distilled-state cap]"
+        doc = doc[: DISTILLED_STATE_CAP - len(marker)] + marker
+    return doc
 
 
 # Per-process supervisor channel tag (#126 r1 finding-2 nonce follow-up).

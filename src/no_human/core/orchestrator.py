@@ -75,7 +75,9 @@ from ..testing.repro_gate import MANIFEST as REPRO_MANIFEST
 from ..testing.repro_gate import run_repro_gate
 from .prompt_blocks import (
     EXPORT_CLASSIFICATION_FILE,
+    DistillationError,
     _export_gate_rule,
+    build_distilled_state,
     build_intake_qa_block,
     build_memories_block,
     build_playbook_block,
@@ -83,6 +85,7 @@ from .prompt_blocks import (
     build_repo_hints_block,
     build_resume_digest,
     build_rules_block,
+    estimate_tokens,
 )
 from ..project_config import apply_repo_config, load_repo_config
 from .report_quality import report_inadequacy
@@ -1892,6 +1895,166 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001 — advisory, never blocks the retry
             self._advisory(f"stuck hypothesis skipped: {exc}")
 
+    # Retry-cost class (refile of 4413c7c5): attempt N>1 diff over this many
+    # chars is compressed through the utility tier before being handed to
+    # build_distilled_state, so a large multi-file change doesn't eat the
+    # doc's whole cap on its own.
+    _ATTEMPT_DIFF_DISTILL_THRESHOLD = 6000  # chars
+
+    async def _distill_attempt_state(
+        self, task: Task, repo: GitRepo, attempt_n: int, base: str | None,
+    ) -> None:
+        """Build the attempt N>1 distilled-state doc and store it on
+        ``task.context['distilled_state']`` for the ``_build_implement_prompt``
+        seam to consume INSTEAD of re-accumulating the repo map and gathered-
+        context digest — the retry-cost class this exists to fix (80% of spend
+        delivered 37% of the work; retries re-read the whole repo+history every
+        attempt).
+
+        attempt 1 is byte-identical to before this change: nothing here runs
+        except clearing a stale doc (see below).
+        Best-effort in the same shape as ``_distill_large_chunks``/
+        ``_generate_stuck_hypothesis`` — a failed distillation must never break
+        an attempt — but UNLIKE those two the failure must be LOUD, not merely
+        advisory, because a silently degraded distillation here would silently
+        starve the coder of context it needs (a hint degrading is fine; the
+        WHOLE prior-attempt state vanishing is not). So: ERROR log, an
+        ``attempt_distill_failed`` event with the exception type, an
+        ``advisory`` event for the board, and ``distilled_state`` popped from
+        context so the seam falls back to full re-accumulation — today's
+        behaviour, byte for byte.
+
+        INVARIANT: ``distilled_state`` present in ``task.context`` ⇒ written
+        by the currently-running attempt. This method runs unconditionally at
+        the top of every attempt (including attempt 1 — see the call site)
+        and is the only writer *and* the only clearer of that key. A resumed
+        attempt 1 (``nh reply``/requeue re-enters the loop at ``attempt_n==1``
+        — attempts are renumbered per run) must never inherit a doc a PRIOR
+        run left behind, so both early-return paths below pop it first.
+
+        THREE-OUTCOME EVENT INVARIANT (the rule ``_distill_large_chunks``'s
+        docstring establishes — every outcome leaves a record, so a zero has
+        exactly one meaning):
+          ``attempt_distill``          doc built and stored
+          ``attempt_distill_skipped``  nothing to distill (reason=disabled, or
+                                        reason=stale_cleared when a resumed
+                                        attempt 1 dropped a prior run's doc;
+                                        attempt 1 with nothing to clear emits
+                                        NOTHING, not even this — see below)
+          ``attempt_distill_failed``   the loud path (see above)
+        """
+        if attempt_n <= 1:
+            ctx = task.context or {}
+            had_state = ctx.pop("distilled_state", None) is not None
+            had_attempt = ctx.pop("distilled_state_attempt", None) is not None
+            if had_state or had_attempt:
+                task.context = ctx
+                await self.store.update_task(task)
+                self.emit(
+                    "attempt_distill_skipped",
+                    "resumed attempt 1 cleared a prior run's distilled state",
+                    reason="stale_cleared",
+                    attempt=attempt_n,
+                )
+            return
+        if not (self.config.get("context") or {}).get(
+            "attempt_state_distill_enabled", True
+        ):
+            ctx = task.context or {}
+            had_state = ctx.pop("distilled_state", None) is not None
+            had_attempt = ctx.pop("distilled_state_attempt", None) is not None
+            if had_state or had_attempt:
+                # Second door: the config kill switch must not leave a stale
+                # doc from a run where the feature was on behind for the seam
+                # to pick up — same defect class as the attempt_n<=1 case.
+                task.context = ctx
+                await self.store.update_task(task)
+            self.emit(
+                "attempt_distill_skipped",
+                "attempt-state distillation disabled by config",
+                reason="disabled",
+            )
+            return
+
+        try:
+            diff_text = repo.diff(base or "HEAD~1")
+        except Exception as exc:  # noqa: BLE001 — a diff read must never block
+            log.warning("attempt-state diff read failed: %s", exc)
+            diff_text = ""
+        changed_files = self._safe_changed_files(repo, base)
+        ctx = task.context or {}
+
+        try:
+            diff_compressed = False
+            if len(diff_text) > self._ATTEMPT_DIFF_DISTILL_THRESHOLD:
+                backend = ClaudeBackend(model=self._utility_model(), readonly=True)
+                prompt = (
+                    "Summarise this diff as a per-file changelog of what has "
+                    "already been implemented in this working tree. Keep file "
+                    "paths and function names so the reader can verify against "
+                    f"the tree. Max {self._ATTEMPT_DIFF_DISTILL_THRESHOLD} "
+                    "chars.\n\n"
+                    f"{diff_text[:60_000]}"
+                )
+                result = await backend.run(
+                    prompt, cwd=Path(task.repo_path or str(repo.path)),
+                    max_turns=1, effort="low",
+                )
+                self._note_distill_usage(result)
+                summary = (result.final_text or "").strip()
+                if not summary:
+                    raise DistillationError(
+                        "utility backend returned no text for the diff summary"
+                    )
+                # A summary that isn't actually smaller is kept as a compressed
+                # doc anyway (diff_compressed=False, raw diff survives —
+                # build_distilled_state still truncates it visibly if it must)
+                # rather than sold as a saving that didn't happen (the off-by-
+                # 12 lesson at _distill_large_chunks, deliberately not repeated
+                # here).
+                if len(summary) < len(diff_text):
+                    diff_text = summary
+                    diff_compressed = True
+
+            attempt_log = ctx.get("attempt_log") or []
+            last_detail = attempt_log[-1] if attempt_log else ""
+            doc = build_distilled_state(
+                task, diff_text=diff_text, changed_files=changed_files,
+                last_detail=last_detail,
+            )
+            ctx["distilled_state"] = doc
+            ctx["distilled_state_attempt"] = attempt_n
+            task.context = ctx
+            await self.store.update_task(task)
+            self.emit(
+                "attempt_distill",
+                f"distilled attempt state for attempt {attempt_n} "
+                f"({len(doc)} chars)",
+                chars=len(doc), tokens=estimate_tokens(doc),
+                diff_compressed=diff_compressed,
+            )
+        except Exception as exc:  # noqa: BLE001 — swallowed by design, LOUD by
+            # requirement: the silence, not the swallow, is the bug this
+            # guards (see docstring). Never let the sink itself take the
+            # attempt down.
+            log.error(
+                "attempt-state distillation failed: %s; falling back to full "
+                "context re-read", exc,
+            )
+            with contextlib.suppress(Exception):
+                self.emit(
+                    "attempt_distill_failed",
+                    f"attempt-state distillation failed: {type(exc).__name__}: {exc}",
+                    error=type(exc).__name__,
+                )
+            with contextlib.suppress(Exception):
+                self._advisory(f"attempt-state distillation failed: {exc}")
+            ctx.pop("distilled_state", None)
+            ctx.pop("distilled_state_attempt", None)
+            task.context = ctx
+            with contextlib.suppress(Exception):
+                await self.store.update_task(task)
+
     def _active_models(self) -> dict[str, str]:
         """The model bound to each role, read from the live objects.
 
@@ -2887,7 +3050,14 @@ class Orchestrator:
         # --- implement (the SDK session) ---
         await self.store.set_status(task, TaskStatus.IMPLEMENTING)
         self.emit("state", "implementing", status="implementing")
-        prompt = self._build_implement_prompt(task, str(repo.path))
+        # Retry-cost class: attempt N>1 gets a distilled state doc instead of
+        # re-accumulating the repo map + gathered-context digest. Byte-
+        # identical to before this line existed on attempt 1 (see the method's
+        # early return).
+        await self._distill_attempt_state(task, repo, attempt_n, base)
+        prompt = self._build_implement_prompt(
+            task, str(repo.path), attempt_n=attempt_n
+        )
 
         # Supervisor hook: a PostToolUse evaluator that course-corrects the
         # working agent in real time (replaces the human-in-the-loop).
@@ -10984,7 +11154,10 @@ class Orchestrator:
             log.warning("pre-flight plan check failed: %s", exc)
         return prompt
 
-    def _build_implement_prompt(self, task: Task, work_dir: str | None = None) -> str:
+    def _build_implement_prompt(
+        self, task: Task, work_dir: str | None = None, *,
+        attempt_n: int | None = None,
+    ) -> str:
         criteria = "\n".join(f"  - {c}" for c in task.acceptance_criteria) or "  (none stated)"
         kind_directive = self._kind_directive(task)
         # Resolve the profile early — the rules block and profile block both need it.
@@ -11014,6 +11187,28 @@ class Orchestrator:
         brain_block = self._team_brain_block()
         digest = self._context_digest(task)
         resume = self._resume_digest(task)
+        # Retry-cost class: attempt N>1's distilled state doc REPLACES the
+        # repo map and gathered-context digest below — those are exactly the
+        # bytes re-accumulated every attempt that the doc exists to cut. "" on
+        # attempt 1 (nothing in task.context to distill yet), so attempt 1 is
+        # unaffected by this branch.
+        #
+        # Fail-closed consumption: only trust a doc that is (a) present, (b)
+        # for an attempt_n we were actually told is >= 2, and (c) tagged with
+        # THIS attempt's number. An unknown attempt number, a missing lineage
+        # tag, or a mismatch all mean re-accumulate — never trust a doc we
+        # cannot attribute to the currently-running attempt (round-2 review:
+        # a stale doc from a prior run must not reach a resumed attempt 1).
+        ctx_distilled = (task.context or {}).get("distilled_state") or ""
+        doc_attempt = (task.context or {}).get("distilled_state_attempt")
+        distilled = (
+            ctx_distilled
+            if (ctx_distilled and attempt_n is not None and attempt_n >= 2
+                and doc_attempt == attempt_n)
+            else ""
+        )
+        if distilled:
+            digest = ""
         # Multi-repo context (Phase D / WS-E).
         from .multi_repo import cross_repo_context
         multi_ctx = cross_repo_context(task, task.repo_path or "")
@@ -11097,7 +11292,8 @@ class Orchestrator:
         # under-resourcing complex tasks costs more than the map does.
         full_plan_inlined = bool(plan) and len(plan) <= self._PLAN_INLINE_MAX
         map_block = ""
-        if not full_plan_inlined and self.config.get("context", {}).get("repo_map_enabled", True):
+        if (not full_plan_inlined and not distilled
+                and self.config.get("context", {}).get("repo_map_enabled", True)):
             try:
                 from ..context.repo_map import repo_map
                 map_text = repo_map(Path(work_dir or task.repo_path))
@@ -11156,6 +11352,47 @@ class Orchestrator:
                 )
             )
 
+        distilled_block = ""
+        if distilled:
+            distilled_block = (
+                "DISTILLED STATE FROM YOUR PREVIOUS ATTEMPT(S) — this "
+                "replaces the repo map and gathered-context digest. Trust "
+                "the diff section: that work is already in your working "
+                "tree.\n"
+                f"{distilled}\n\n"
+            )
+
+        # Retry-cost class instrument: measurable per attempt, not assumed —
+        # same discipline as the `prompt_size` event (C1 diet). `reaccumulated_
+        # *` sums exactly the bytes THIS seam re-reads every turn from these
+        # three sources; on attempt 1 that's map+digest (distilled is unset),
+        # on a distilled attempt N>1 it's just distilled (map+digest are
+        # suppressed above) — so the ratio between an attempt-1 and an
+        # attempt-2 breakdown IS the measured saving.
+        breakdown = {
+            "map_chars": len(map_block),
+            "digest_chars": len(digest),
+            "distilled_chars": len(distilled),
+        }
+        breakdown["reaccumulated_chars"] = (
+            breakdown["map_chars"] + breakdown["digest_chars"]
+            + breakdown["distilled_chars"]
+        )
+        breakdown["reaccumulated_tokens"] = estimate_tokens(
+            map_block + digest + distilled
+        )
+        self._last_context_breakdown = breakdown
+        # Guarded: `_build_implement_prompt` is exercised via the
+        # `object.__new__(Orchestrator)` unit-test idiom throughout this
+        # suite (tests/test_context_diet.py, tests/test_stuck_hypothesis.py)
+        # with no `_sink` attribute set — construction must never crash for
+        # want of an event sink.
+        if hasattr(self, "_sink"):
+            self.emit(
+                "attempt_context_size",
+                "attempt context re-accumulation breakdown", **breakdown,
+            )
+
         # Prompt ordering: STABLE prefix first (cacheable across retries within
         # the same repo) → VOLATILE task-specific content last (Phase 2a).
         return (
@@ -11187,6 +11424,7 @@ class Orchestrator:
             f"{plan_block}"
             f"{map_block}"
             f"{(digest + chr(10) + chr(10)) if digest else ''}"
+            f"{distilled_block}"
             f"{(resume + chr(10) + chr(10)) if resume else ''}"
             + selfcheck.build_prompt(task.title, task.acceptance_criteria)
         )

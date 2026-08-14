@@ -73,6 +73,30 @@ MECHANISMS: list[tuple[str, tuple[str, ...], str]] = [
      "scrubbed, backend unavailable); the failures are swallowed by design so "
      "a gather never breaks, which makes this count the only evidence they "
      "happened — `distill_*` stays 0 because the call never billed"),
+    # Retry-cost class (attempt N>1 distilled state doc, replacing repo-map +
+    # context-digest re-accumulation). Read these three together exactly like
+    # the context_distill_* trio above, for the same reason: attempt 1 emits
+    # NONE of them (the early return in `_distill_attempt_state`), so a task
+    # that never reached a second attempt reads identically to a dead lever —
+    # check `attempt_start`/`attempt_failed` counts alongside these before
+    # reading a zero as broken.
+    ("attempt_distill", ("attempt_distill",),
+     "zero = no attempt has been distilled yet — expected if no task has "
+     "reached attempt 2, or the config kill switch is off (see "
+     "attempt_distill_skipped's reason)"),
+    ("attempt_distill_skipped", ("attempt_distill_skipped",),
+     "reason=disabled means context.attempt_state_distill_enabled is false; "
+     "reason=stale_cleared means a resumed attempt 1 (nh reply/requeue) "
+     "dropped a prior run's distilled_state doc — expected and healthy, not "
+     "a defect. Attempt 1 with no stale doc to clear emits nothing at all. "
+     "Zero here WITH attempt_distill also at zero, alongside attempts that "
+     "did reach a retry, means the seam is never being called at all"),
+    ("attempt_distill_failed", ("attempt_distill_failed",),
+     "zero is good — no distillation attempt has ever raised. Non-zero means "
+     "the utility-tier call is failing (quota exhausted, credentials "
+     "scrubbed, backend unavailable) and every one of those attempts fell "
+     "back to full re-accumulation — check the ERROR-level log line "
+     "alongside this event for the exception"),
     ("lifetime_budget", ("lifetime_budget",),
      "zero = no task ever hit its lifetime caps (good), or the gate is dead"),
     ("stuck_detection", ("stuck",), "zero = no attempt ever looped (or detector dead)"),
