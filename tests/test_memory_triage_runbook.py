@@ -38,11 +38,18 @@ from tests._memory_triage_fixture import (
     DEFAULT_FIXTURE_PATH as FIXTURE_PATH,
     FRESH_COUNT,
     STALE_COUNT,
+    T_CONFIRMED_COUNT,
+    T_ORGANIC_COUNT,
+    T_TEMPLATED_COUNT,
     TITLE_FRESH_PREFIX,
     TITLE_NON_PROPOSED_SOURCE,
     TITLE_STALE_PREFIX,
     TITLE_SUPERSEDED_OLD,
+    TITLE_T_CONFIRMED_PREFIX,
+    TITLE_T_ORGANIC_PREFIX,
+    TITLE_T_TEMPLATED_PREFIX,
     TITLE_UNPARSEABLE,
+    build_templated_only_fixture,
     default_ages,
     stamp_ages,
 )
@@ -85,6 +92,14 @@ def work_db(tmp_path, monkeypatch):
     dest = tmp_path / "work.db"
     shutil.copy(FIXTURE_PATH, dest)
     stamp_ages(dest, default_ages())
+    monkeypatch.chdir(tmp_path)
+    return dest
+
+
+@pytest.fixture
+def templated_db(tmp_path, monkeypatch):
+    dest = tmp_path / "templated.db"
+    asyncio.run(build_templated_only_fixture(dest))
     monkeypatch.chdir(tmp_path)
     return dest
 
@@ -472,3 +487,168 @@ def test_execute_twice_is_a_noop_second_time(work_db):
     event2 = _read_event(Path.cwd())
     assert event2["archived_ids"] == []
     assert event2["before_counts"] == event2["after_counts"]
+
+
+# --------------------------------------------------------------------------- #
+# --templated-only                                                             #
+# --------------------------------------------------------------------------- #
+
+
+def test_templated_only_execute_archives_exactly_the_class(templated_db):
+    templated_ids = set(_title_ids(
+        templated_db,
+        [f"{TITLE_T_TEMPLATED_PREFIX}{i}"
+         for i in range(1, T_TEMPLATED_COUNT + 1)]))
+
+    rc = triage.main(["--templated-only", "--execute", str(templated_db)])
+    assert rc == 0
+
+    con = sqlite3.connect(templated_db)
+    try:
+        archived_count = con.execute(
+            "SELECT COUNT(*) FROM memories WHERE archived = 1"
+        ).fetchone()[0]
+        archived_ids_direct = {
+            r[0] for r in con.execute(
+                "SELECT id FROM memories WHERE archived = 1")}
+    finally:
+        con.close()
+    assert archived_count == T_TEMPLATED_COUNT
+    assert archived_ids_direct == templated_ids
+
+    event = _read_event(Path.cwd())
+    assert set(event["archived_ids"]) == templated_ids
+    assert event["refused_ids"] == []
+
+
+def test_templated_only_leaves_organic_proposals_untouched(templated_db):
+    organic_ids = set(_title_ids(
+        templated_db,
+        [f"{TITLE_T_ORGANIC_PREFIX}{i}" for i in range(1, T_ORGANIC_COUNT + 1)]))
+    before = {row[0]: row for row in _snapshot(templated_db)
+              if row[0] in organic_ids}
+    assert len(before) == T_ORGANIC_COUNT
+
+    rc = triage.main(["--templated-only", "--execute", str(templated_db)])
+    assert rc == 0
+
+    after = {row[0]: row for row in _snapshot(templated_db)
+              if row[0] in organic_ids}
+    assert after == before
+
+
+def test_templated_only_leaves_confirmed_rules_untouched(templated_db):
+    confirmed_ids = set(_title_ids(
+        templated_db,
+        [f"{TITLE_T_CONFIRMED_PREFIX}{i}"
+         for i in range(1, T_CONFIRMED_COUNT + 1)]))
+    before = {row[0]: row for row in _snapshot(templated_db)
+              if row[0] in confirmed_ids}
+    assert len(before) == T_CONFIRMED_COUNT
+
+    rc = triage.main(["--templated-only", "--execute", str(templated_db)])
+    assert rc == 0
+
+    after = {row[0]: row for row in _snapshot(templated_db)
+              if row[0] in confirmed_ids}
+    assert after == before
+
+    event = _read_event(Path.cwd())
+    assert (event["after_counts"]["confirmed_active"]
+            == event["before_counts"]["confirmed_active"]
+            == T_CONFIRMED_COUNT)
+
+
+def test_templated_only_reversal_sql_restores_state(templated_db):
+    before = _snapshot(templated_db)
+
+    rc = triage.main(["--templated-only", "--execute", str(templated_db)])
+    assert rc == 0
+
+    event = _read_event(Path.cwd())
+    assert event["archived_ids"]
+
+    con = sqlite3.connect(templated_db)
+    try:
+        con.executescript(event["reversal_sql"])
+        con.commit()
+    finally:
+        con.close()
+
+    after = _snapshot(templated_db)
+    assert len(after) == len(before)
+    assert after == before
+
+
+def test_templated_only_dry_run_reports_count(templated_db, capsys):
+    rc = triage.main(["--templated-only", "--dry-run", str(templated_db)])
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert (f"Identified {T_TEMPLATED_COUNT} templated success proposals "
+            "ready for archival" in out)
+
+
+def test_templated_only_dry_run_writes_nothing(templated_db):
+    before_hash = hashlib.sha256(templated_db.read_bytes()).hexdigest()
+    before_stat = templated_db.stat()
+    before_snapshot = _snapshot(templated_db)
+
+    rc = triage.main(["--templated-only", "--dry-run", str(templated_db)])
+
+    assert rc == 0
+    after_stat = templated_db.stat()
+    assert hashlib.sha256(templated_db.read_bytes()).hexdigest() == before_hash
+    assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+    assert after_stat.st_size == before_stat.st_size
+    assert _snapshot(templated_db) == before_snapshot
+
+    sidecars = [
+        p for p in templated_db.parent.iterdir()
+        if p.name != templated_db.name
+        and (p.name.endswith("-wal") or p.name.endswith("-shm")
+             or p.name.endswith(".tmp"))
+    ]
+    assert sidecars == []
+    assert not (Path.cwd() / "repair_event.json").exists()
+
+
+def test_templated_only_respects_limit(templated_db, capsys):
+    rc = triage.main(
+        ["--templated-only", "--execute", str(templated_db),
+         "--limit", "4"])
+    assert rc == 0
+
+    con = sqlite3.connect(templated_db)
+    try:
+        archived_count = con.execute(
+            "SELECT COUNT(*) FROM memories WHERE archived = 1"
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert archived_count == 4
+
+    event = _read_event(Path.cwd())
+    assert len(event["archived_ids"]) == 4
+    assert event["truncated"] is True
+
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "--limit=4" in out
+
+
+def test_templated_only_refuses_live_no_human_home(tmp_path, monkeypatch):
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    monkeypatch.setenv("NO_HUMAN_HOME", str(fake_home))
+    live_db = fake_home / "no_human.db"
+    asyncio.run(build_templated_only_fixture(live_db))
+    before_hash = hashlib.sha256(live_db.read_bytes()).hexdigest()
+
+    rc_dry = triage.main(["--templated-only", "--dry-run", str(live_db)])
+    assert rc_dry != 0
+    assert hashlib.sha256(live_db.read_bytes()).hexdigest() == before_hash
+
+    rc_exec = triage.main(["--templated-only", "--execute", str(live_db)])
+    assert rc_exec != 0
+    assert hashlib.sha256(live_db.read_bytes()).hexdigest() == before_hash

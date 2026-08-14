@@ -33,18 +33,38 @@ usage error):
                           REPLACING, not appending -- copy the artifact off
                           before re-running, or pass --event-path.
 
+--templated-only          Composable with EITHER --dry-run or --execute
+                          (not a third mode). Ignores age and --days
+                          entirely -- archives (or, under --dry-run,
+                          reports) exactly the rows passing
+                          `is_templated_success_proposal` among unconfirmed
+                          proposals, at ANY age. Policy label
+                          `TRIAGE-templated-success-proposal-any-age`.
+                          Same reversal shape as the windowed sweep (sets
+                          `archived = 1`, never deletes) plus, since this
+                          mode's rows may be much older than one run, the
+                          emitted `repair_event.json` carries the exact
+                          restoring `reversal_sql` for this run's ids
+                          rather than relying on a caller to hand-write it.
+                          Still governed by the same `--limit` cap and the
+                          same live-database guard below.
+
 USAGE:
 
     python scripts/memory_triage_runbook.py --dry-run /path/to/a/copy.db
     python scripts/memory_triage_runbook.py --execute /path/to/a/copy.db \\
         [--days 45] [--limit 500] [--event-path /tmp/repair_event.json]
+    python scripts/memory_triage_runbook.py --templated-only --execute \\
+        /path/to/a/copy.db [--limit 500] [--event-path /tmp/repair_event.json]
 
 POLICY REFERENCE: LANDED-lifecycle-C-45day --
 `src/no_human/learning/retire.py:sweep_unconfirmed` /
 `src/no_human/core/db.py:Store.archive_unconfirmed_older_than`. `--days`
 defaults to `no_human.learning.retire.DEFAULT_ARCHIVE_UNCONFIRMED_DAYS`
 (imported here, never a literal 45) so a product-side policy change moves
-this script with it.
+this script with it. `--templated-only` uses a separate policy label,
+`TRIAGE-templated-success-proposal-any-age`, and does not read `--days` as
+a selector -- see above.
 
 REVERSAL. Every archive here only ever sets `archived = 1` -- nothing is
 ever deleted, and `superseded_by` lineage on unrelated rows is left alone.
@@ -86,6 +106,11 @@ from no_human.learning.retire import (
 )
 
 POLICY_LABEL = "LANDED-lifecycle-C-45day"
+TEMPLATED_POLICY_LABEL = "TRIAGE-templated-success-proposal-any-age"
+TEMPLATED_ARCHIVE_REASON = (
+    "templated per-success proposal (flood source), no evidence -- "
+    "reversible"
+)
 
 # Stable print/iteration order for the seven documented classes.
 CLASS_ORDER = (
@@ -226,6 +251,44 @@ async def class_counts(store: Store, *, days: int) -> dict:
     }
 
 
+async def templated_targets(store: Store, *, limit: int) -> list[dict]:
+    """The exact set `--templated-only` archives: unconfirmed rows passing
+    `is_templated_success_proposal`, at ANY age. Reuses the identical
+    `list_memories(confirmed=False, include_archived=False)` call
+    `class_counts` uses for its `templated_success_proposal` count, so the
+    reported count and the actual archive target set can never diverge.
+
+    Deterministic sort (oldest `created_at` first, id tiebreak) so
+    `--limit` truncation is reproducible run to run."""
+    rows = await store.list_memories(confirmed=False, include_archived=False)
+    matched = [row for row in rows if is_templated_success_proposal(row)]
+    matched.sort(key=lambda row: (str(row.get("created_at") or ""), row["id"]))
+    return matched[:limit]
+
+
+def _sql_quote(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def _reversal_sql(ids: list[str], reason: str) -> str:
+    """Single executable statement undoing `archive_memory`'s writes for
+    *ids* -- both the `archived` flag and the `\\n\\n[archived: reason]`
+    content suffix it appended (`core/db.py:2721`). `Store.unarchive_memory`
+    resets the flag/`superseded_by` and deliberately leaves the suffix as an
+    audit trail; this reversal goes further because full-state restoration
+    is the point of a repair event. `-- nothing to reverse` (a comment,
+    still executable) when *ids* is empty."""
+    if not ids:
+        return "-- nothing to reverse"
+    suffix = f"\n\n[archived: {reason}]"
+    id_list = ", ".join(f"'{_sql_quote(mem_id)}'" for mem_id in ids)
+    return (
+        "UPDATE memories SET archived = 0, superseded_by = NULL, "
+        f"content = replace(content, '{_sql_quote(suffix)}', '') "
+        f"WHERE id IN ({id_list});"
+    )
+
+
 def _backup_to_temp_copy(source: Path, dest: Path) -> None:
     """Copy *source* into *dest* via SQLite's backup API rather than
     `shutil.copy` -- captures a WAL-mode source consistently, and creates no
@@ -256,19 +319,31 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-async def _dry_run_async(path: Path, *, days: int, limit: int) -> int:
+async def _dry_run_async(
+    path: Path, *, days: int, limit: int, templated_only: bool = False,
+) -> int:
     with tempfile.TemporaryDirectory(prefix="nh-triage-dryrun-") as tmp_dir:
         copy_path = Path(tmp_dir) / "dry_run_copy.db"
         _backup_to_temp_copy(path, copy_path)
         store = await Store(copy_path).connect()
         try:
             counts = await class_counts(store, days=days)
-            report = await sweep_unconfirmed(
-                store, days=days, limit=limit, dry_run=True)
+            if templated_only:
+                targets = await templated_targets(store, limit=limit)
+                archived_ids = [row["id"] for row in targets]
+            else:
+                report = await sweep_unconfirmed(
+                    store, days=days, limit=limit, dry_run=True)
+                archived_ids = report.archived_ids
         finally:
             await store.close()
-    _print_dry_run(path, days=days, limit=limit, counts=counts,
-                    archived_ids=report.archived_ids)
+    if templated_only:
+        _print_templated_dry_run(
+            path, days=days, limit=limit, counts=counts,
+            archived_ids=archived_ids)
+    else:
+        _print_dry_run(path, days=days, limit=limit, counts=counts,
+                        archived_ids=archived_ids)
     return 0
 
 
@@ -305,6 +380,35 @@ def _print_dry_run(
     print("DRY RUN -- nothing was written")
 
 
+def _print_templated_dry_run(
+    path: Path, *, days: int, limit: int, counts: dict,
+    archived_ids: list,
+) -> None:
+    print(f"DRY RUN (--templated-only) -- database: {path}")
+    print("(opened read-only via a throwaway temp copy; nothing written "
+          "to the source path or its directory)")
+    print(f"policy: {TEMPLATED_POLICY_LABEL} (limit={limit})")
+    print(f"days={days} (reporting only; not a selector in "
+          "--templated-only)")
+    print()
+    _print_class_counts(counts)
+    print()
+    print(f"Identified {len(archived_ids)} templated success proposals "
+          "ready for archival")
+    for mem_id in archived_ids[:_TRUNCATE_PRINT_N]:
+        print(f"  {mem_id[:8]}")
+    if len(archived_ids) > _TRUNCATE_PRINT_N:
+        print(f"  ... and {len(archived_ids) - _TRUNCATE_PRINT_N} more")
+    if len(archived_ids) >= limit:
+        print(f"WARNING: hit --limit={limit} -- more may still be "
+              f"eligible; re-run (or raise --limit) to continue")
+    print()
+    print("reversal SQL for this run's ids: "
+          + _reversal_sql(archived_ids, TEMPLATED_ARCHIVE_REASON))
+    print()
+    print("DRY RUN -- nothing was written")
+
+
 def _write_event_atomic(event_path: Path, event: dict) -> None:
     tmp_path = event_path.with_name(event_path.name + ".tmp")
     tmp_path.write_text(json.dumps(event, indent=2, sort_keys=True))
@@ -330,15 +434,55 @@ def _print_execute_summary(
     print(f"repair event written: {event_path}")
 
 
+def _print_templated_execute_summary(
+    path: Path, *, before: dict, after: dict, archived_ids: list,
+    refused_ids: list, limit: int, event_path: Path,
+) -> None:
+    print(f"EXECUTE (--templated-only) -- database: {path}")
+    print(f"policy: {TEMPLATED_POLICY_LABEL}")
+    print()
+    print("before:")
+    _print_class_counts(before)
+    print("after:")
+    _print_class_counts(after)
+    print()
+    if archived_ids:
+        print(f"archived {len(archived_ids)} row(s)")
+    else:
+        print("archived 0 rows -- already clean")
+    if refused_ids:
+        print(f"WARNING: {len(refused_ids)} target(s) refused by "
+              f"archive_memory (legacy NULL archived) -- ids: "
+              f"{', '.join(refused_ids)}")
+    if len(archived_ids) >= limit:
+        print(f"WARNING: hit --limit={limit} -- more may still be "
+              f"eligible; re-run (or raise --limit) to continue")
+    print(f"repair event written: {event_path}")
+
+
 async def _execute_async(
     path: Path, *, days: int, limit: int, event_path: Path,
+    templated_only: bool = False,
 ) -> int:
     start = _now_iso()
     store = await Store(path).connect()
     try:
         before = await class_counts(store, days=days)
-        report = await sweep_unconfirmed(
-            store, days=days, limit=limit, dry_run=False)
+        if templated_only:
+            targets = await templated_targets(store, limit=limit)
+            reason = TEMPLATED_ARCHIVE_REASON
+            archived_ids: list[str] = []
+            refused_ids: list[str] = []
+            for row in targets:
+                ok = await store.archive_memory(row["id"], reason)
+                (archived_ids if ok else refused_ids).append(row["id"])
+            truncated = len(targets) >= limit
+        else:
+            report = await sweep_unconfirmed(
+                store, days=days, limit=limit, dry_run=False)
+            archived_ids, refused_ids = report.archived_ids, []
+            reason = report.reason
+            truncated = len(archived_ids) >= limit
         after = await class_counts(store, days=days)
     finally:
         await store.close()
@@ -347,30 +491,46 @@ async def _execute_async(
         "before_counts": before,
         "after_counts": after,
         "timestamps": {"start": start, "end": end},
-        "policy": POLICY_LABEL,
-        "archived_ids": report.archived_ids,
-        "reason": report.reason,
+        "policy": TEMPLATED_POLICY_LABEL if templated_only else POLICY_LABEL,
+        "archived_ids": archived_ids,
+        "reason": reason,
         "days": days,
         "limit": limit,
         "db_path": str(path),
-        "truncated": len(report.archived_ids) >= limit,
+        "truncated": truncated,
     }
+    if templated_only:
+        event["mode"] = "templated-only"
+        event["refused_ids"] = refused_ids
+        event["reversal_sql"] = _reversal_sql(archived_ids, reason)
     _write_event_atomic(event_path, event)
-    _print_execute_summary(
-        path, before=before, after=after, archived_ids=report.archived_ids,
-        event_path=event_path)
+    if templated_only:
+        _print_templated_execute_summary(
+            path, before=before, after=after, archived_ids=archived_ids,
+            refused_ids=refused_ids, limit=limit, event_path=event_path)
+    else:
+        _print_execute_summary(
+            path, before=before, after=after, archived_ids=archived_ids,
+            event_path=event_path)
+    if templated_only and refused_ids:
+        return 1
     return 0
 
 
-def run_dry_run(path: Path, *, days: int, limit: int) -> int:
-    return asyncio.run(_dry_run_async(path, days=days, limit=limit))
+def run_dry_run(
+    path: Path, *, days: int, limit: int, templated_only: bool = False,
+) -> int:
+    return asyncio.run(_dry_run_async(
+        path, days=days, limit=limit, templated_only=templated_only))
 
 
 def run_execute(
     path: Path, *, days: int, limit: int, event_path: Path,
+    templated_only: bool = False,
 ) -> int:
-    return asyncio.run(
-        _execute_async(path, days=days, limit=limit, event_path=event_path))
+    return asyncio.run(_execute_async(
+        path, days=days, limit=limit, event_path=event_path,
+        templated_only=templated_only))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -402,6 +562,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the repair-event JSON path (default: "
              "./repair_event.json in the working directory). --execute "
              "only.")
+    parser.add_argument(
+        "--templated-only", dest="templated_only", action="store_true",
+        help="Archive exactly the rows passing is_templated_success_"
+             "proposal among unconfirmed proposals, at ANY age (the "
+             "45-day window and --days do not apply). Composable with "
+             "--dry-run/--execute; --limit still caps one run.")
     return parser
 
 
@@ -419,12 +585,14 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 1
     if args.dry_run is not None:
-        return run_dry_run(path, days=args.days, limit=args.limit)
+        return run_dry_run(path, days=args.days, limit=args.limit,
+                            templated_only=args.templated_only)
     event_path = (
         args.event_path if args.event_path is not None
         else Path.cwd() / "repair_event.json")
     return run_execute(
-        path, days=args.days, limit=args.limit, event_path=event_path)
+        path, days=args.days, limit=args.limit, event_path=event_path,
+        templated_only=args.templated_only)
 
 
 if __name__ == "__main__":

@@ -232,6 +232,86 @@ async def build_fixture(path: Path) -> None:
             sidecar.unlink()
 
 
+TITLE_T_TEMPLATED_PREFIX = "Approach that worked: triage templated "
+TITLE_T_ORGANIC_PREFIX = "organic unconfirmed proposal "
+TITLE_T_CONFIRMED_PREFIX = "confirmed active rule "
+
+T_TEMPLATED_COUNT = 10
+T_ORGANIC_COUNT = 5
+T_CONFIRMED_COUNT = 3
+
+# The templated rows are FRESH (well inside the 45-day window) -- this is
+# what proves "--templated-only archives regardless of age". The organic
+# rows are STALE (well past the window) -- the strong control: eligible for
+# the windowed sweep, but --templated-only must leave them alone regardless.
+T_TEMPLATED_AGE_DAYS = 5
+T_ORGANIC_AGE_DAYS = 60
+
+
+def templated_only_ages() -> dict[str, int]:
+    """The `stamp_ages()` argument for `build_templated_only_fixture`'s
+    age-sensitive rows -- mirrors `default_ages()` for the other fixture."""
+    ages = {}
+    for i in range(1, T_TEMPLATED_COUNT + 1):
+        ages[f"{TITLE_T_TEMPLATED_PREFIX}{i}"] = T_TEMPLATED_AGE_DAYS
+    for i in range(1, T_ORGANIC_COUNT + 1):
+        ages[f"{TITLE_T_ORGANIC_PREFIX}{i}"] = T_ORGANIC_AGE_DAYS
+    return ages
+
+
+async def build_templated_only_fixture(path: Path) -> None:
+    """Purpose-built fixture for `--templated-only` (distinct from
+    `build_fixture`/the committed `.db` -- written fresh to *path* by every
+    test, never committed as a binary):
+
+      - `T_TEMPLATED_COUNT` templated per-success proposals matching
+        `is_templated_success_proposal`, aged FRESH -- the class
+        `--templated-only` must archive regardless of age.
+      - `T_ORGANIC_COUNT` organic unconfirmed proposals the predicate
+        rejects, aged STALE -- the control that also proves the windowed
+        sweep never ran (they are window-eligible but must be untouched).
+      - `T_CONFIRMED_COUNT` confirmed, unarchived active rules -- the
+        control proving no confirmed row is ever touched.
+    """
+    if path.exists():
+        path.unlink()
+    store = await Store(path).connect()
+    try:
+        for i in range(1, T_TEMPLATED_COUNT + 1):
+            await store.add_memory(
+                mem_type=TYPE_SKILL, title=f"{TITLE_T_TEMPLATED_PREFIX}{i}",
+                content=_TEMPLATE_CONTENT_MARKER, confirmed=False)
+
+        for i in range(1, T_ORGANIC_COUNT + 1):
+            await store.add_memory(
+                mem_type=TYPE_SKILL, title=f"{TITLE_T_ORGANIC_PREFIX}{i}",
+                content=f"Organic unconfirmed proposal body {i}.",
+                confirmed=False)
+
+        for i in range(1, T_CONFIRMED_COUNT + 1):
+            await store.add_memory(
+                mem_type=TYPE_RULE, title=f"{TITLE_T_CONFIRMED_PREFIX}{i}",
+                content=f"Confirmed active rule body {i}.", confirmed=True)
+
+        # Consolidate WAL into the main file before anything reads this
+        # file read-only -- same reasoning as `build_fixture` above.
+        await store.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        await store.close()
+
+    stamp_ages(path, templated_only_ages())
+    con = sqlite3.connect(path)
+    try:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.commit()
+    finally:
+        con.close()
+    for suffix in ("-wal", "-shm"):
+        sidecar = path.with_name(path.name + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+
+
 if __name__ == "__main__":
     target = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_FIXTURE_PATH
     asyncio.run(build_fixture(target))
