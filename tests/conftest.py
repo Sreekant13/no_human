@@ -9,6 +9,36 @@ WANTS to observe a delay can set it back explicitly.
 
 import pytest
 
+# Fail-CLOSED, not detect-after. `no_human.testing.pytest_isolated_home` is
+# meant to redirect HOME before `no_human.config` can bind DB_PATH/CONFIG_PATH
+# to the operator's real one, but its usual registration path (the pytest11
+# entry point in pyproject.toml) is skipped under
+# `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` or by a stale editable-install dist-info
+# (needs `uv sync` after this repo's pyproject.toml changes) — and in either
+# case nothing aborts the run; `test_plugin_is_registered` only *detects* the
+# gap, and only once its turn comes up, by which point earlier test modules
+# may already have imported `no_human.config` against the real HOME. This
+# conftest is collected before ANY test module, so importing the plugin here
+# — and refusing to proceed if it did not activate — is the earliest and most
+# reliable point to stop the suite before that can happen. The import itself
+# is also a second, independent activation path: if the entry point never
+# fired, this import is the plugin's first import and its module-level
+# `_activate()` runs right here, before any test module's `import
+# no_human.config`.
+import no_human.testing.pytest_isolated_home as _isolated_home
+
+if _isolated_home.ISOLATED_HOME is None:
+    raise RuntimeError(
+        "no_human.testing.pytest_isolated_home did not activate for this "
+        "suite: HOME was not redirected before no_human.config could bind "
+        "DB_PATH/CONFIG_PATH to it, so running further risks writing into "
+        "the operator's real ~/.no_human. Likely causes: this checkout is "
+        "not discoverable from the current working directory "
+        "(no_human.testing.pytest_isolated_home._repo_root_or_none() "
+        "returned None), or NH_TEST_HOME_ISOLATION=0 was set on purpose. "
+        "Fix the cause or run from the repo root; do not bypass this check."
+    )
+
 
 @pytest.fixture(autouse=True)
 def _no_real_backoffs(monkeypatch):
@@ -113,18 +143,27 @@ def isolated_env_file(tmp_path, monkeypatch):
     fixture returns `env_path` precisely so a test that wants the conflict can
     write to it. None does yet.
 
-    AND THE GAP THIS FIXTURE IS NOT BIG ENOUGH TO CLOSE, named here so nobody
-    reads the isolation as broader than it is. `config.ENV_PATH` can be
-    redirected at all only because `load_env_var` resolves it at CALL time.
-    `DB_PATH` and `CONFIG_PATH` are bound at IMPORT time from `NO_HUMAN_HOME =
-    Path.home() / ".no_human"` (config.py), so the suite still writes `cache/`,
-    `worktrees/` and `config.yaml` into whatever HOME it is given, and a branch
-    carrying a migration replays that migration into the operator's live
-    database — which has actually happened, not a hypothetical. Closing it
-    needs a session-scoped plugin that redirects HOME BEFORE `no_human.config`
-    is imported: a different mechanism, not an extension of this fixture, and
-    deliberately out of scope here. Until it exists, the suite is run under a
-    temp HOME, and that is a procedure rather than a guard.
+    THE GAP THIS FIXTURE WAS NOT BIG ENOUGH TO CLOSE, AND WHAT CLOSED IT.
+    `config.ENV_PATH` can be redirected at all only because `load_env_var`
+    resolves it at CALL time. `DB_PATH` and `CONFIG_PATH` are bound at IMPORT
+    time from `NO_HUMAN_HOME = Path.home() / ".no_human"` (config.py) — no
+    per-test fixture can un-bind an import-time value, because a fixture body
+    only runs after collection has already imported every test module (and
+    transitively `no_human.config`). That gap is what let a branch carrying a
+    migration replay it into the operator's live database on 2026-08-10 — not
+    a hypothetical.
+
+    It is now closed by `no_human.testing.pytest_isolated_home`, a
+    session-scoped pytest plugin registered via the `pytest11` entry point
+    (`pyproject.toml`, `[project.entry-points.pytest11]` — requires `uv sync`
+    to refresh the editable install's dist-info after this file changed). It
+    sets `HOME` to a fresh temp directory before `no_human.config` is
+    importable at all — the earliest hook pytest offers, and earlier than any
+    fixture can run — so `DB_PATH`/`CONFIG_PATH` bind under the temp HOME
+    from the first import, never under the operator's real one. This is a
+    guard, not a procedure: `tests/test_home_isolation.py` proves it,
+    including a subprocess control showing the same assertion FAILS when the
+    plugin is blocked.
     """
     import no_human.config as nh_config
 

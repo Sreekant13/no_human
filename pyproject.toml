@@ -31,6 +31,14 @@ dependencies = [
 [project.scripts]
 nh = "no_human.cli.commands:main"
 
+# Redirects HOME to a temp dir before no_human.config can bind DB_PATH /
+# CONFIG_PATH to the operator's real ~/.no_human — see
+# src/no_human/testing/pytest_isolated_home.py for why this must be a
+# pytest11 entry point (loads before test collection) and not a fixture.
+# Self-guarded: a no-op outside this repo's own suite.
+[project.entry-points.pytest11]
+no_human_isolated_home = "no_human.testing.pytest_isolated_home"
+
 [dependency-groups]
 dev = [
     "pyinstaller>=6.21.0",

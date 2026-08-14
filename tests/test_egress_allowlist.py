@@ -195,7 +195,12 @@ NET_IMPORTS: dict[str, str] = {
 #: so a new `import imaplib` cannot arrive silently.
 INERT_IMPORTS: frozenset[str] = frozenset({
     # stdlib: pure computation, filesystem, process, or text
-    "__future__", "abc", "argparse", "ast", "base64", "bisect", "collections",
+    "__future__", "abc", "argparse", "ast",
+    # registers callables to run at interpreter shutdown; opens and accepts
+    # nothing, and the callable it registers here (shutil.rmtree) is itself
+    # classified.
+    "atexit",
+    "base64", "bisect", "collections",
     "concurrent", "contextlib", "contextvars", "copy", "csv", "dataclasses",
     "datetime", "decimal", "difflib", "enum", "errno", "fcntl", "fnmatch",
     "functools", "getpass", "glob", "gzip", "hashlib", "heapq", "hmac", "html",
