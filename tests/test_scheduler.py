@@ -122,6 +122,51 @@ async def test_quota_pause_gates_the_whole_pool(store):
     assert len(after) == 1                         # resumes once quota is back
 
 
+@pytest.fixture
+def _infra_breaker():
+    """The breaker is a process-wide singleton (`core/infra_breaker.py`) —
+    reset it around the test so it cannot leak into (or be polluted by)
+    any other test in the same worker process."""
+    from no_human.core.infra_breaker import infra_breaker as _get
+
+    _get().reset()
+    yield _get()
+    _get().reset()
+
+
+async def test_infra_breaker_pauses_the_whole_pool_and_lapsing_resumes_it(
+        store, _infra_breaker):
+    """INCIDENT 2026-08-13: 3 consecutive zero-token/auth SDK failures across
+    distinct tasks means the account or transport itself is down — the WHOLE
+    pool must stop dispatching, via the same cooldown gate a single-task
+    quota park already uses, and resume once it lapses (the existing quota
+    watcher's job; this test proves the scheduler side only)."""
+    _infra_breaker.record_infra_failure("task-a")
+    _infra_breaker.record_infra_failure("task-b")
+    _infra_breaker.record_infra_failure("task-c")
+    assert _infra_breaker.tripped() is not None
+
+    events = []
+    fake = FakeOrch(store)
+    sched = Scheduler(store, lambda task=None: fake, max_workers=2,
+                      on_event=lambda kind, text: events.append((kind, text)))
+    await _mk_tasks(store, 1)
+    now = datetime(2026, 8, 13, 17, 14, tzinfo=timezone.utc)
+
+    during = await sched.tick(now=now)
+    assert during == [], "the fleet breaker must gate dispatch pool-wide"
+    assert sched._quota_cooldown_until is not None
+    assert any(kind == "quota_pause" for kind, _ in events)
+
+    # Lapse the cooldown (the existing quota-watcher's job in production) and
+    # tick again: dispatch resumes and the breaker's streak is cleared, or a
+    # single stale incident would pause the fleet forever.
+    sched._quota_cooldown_until = now - timedelta(seconds=1)
+    after = await sched.tick(now=now + timedelta(seconds=5))
+    assert len(after) == 1
+    assert _infra_breaker.tripped() is None
+
+
 def _git(cwd, *args):
     import subprocess
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)

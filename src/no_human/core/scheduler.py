@@ -24,16 +24,18 @@ import logging
 import os
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
 from ..agent.worker_context import WorkerContext, set_worker_context
 from ..blockers.shipped import _TICK_ABORTED, complete_if_content_landed
 from ..config import parallelism_enabled, worktree_isolation_enabled
 from ..vcs.task_pr import resolve_task_pr
+from .bounds import QuotaExhausted
 from .db import Store
 from . import plan_gate
 from .events import EventPersister
+from .infra_breaker import infra_breaker
 from .task import TaskStatus
 from .worktree import sweep_stale_worktrees
 
@@ -305,6 +307,11 @@ class Scheduler:
         self._dispatched: set[str] = set()
         self._on_event = on_event or (lambda kind, text: None)
         self._quota_cooldown_until: datetime | None = None
+        # True only while the CURRENT cooldown was armed by the fleet infra
+        # breaker (not by an ordinary single-task quota park) — so `tick()`
+        # knows to clear the breaker's streak when THIS cooldown lapses,
+        # without also clearing it on every tick a park-driven cooldown ends.
+        self._infra_cooldown_active: bool = False
         self.reanalysis = reanalysis_job
         self.wiki_refresh = wiki_refresh_job
         self._config = config or {}
@@ -928,6 +935,25 @@ class Scheduler:
             await self._recover_orphans(startup=False)
         except Exception as exc:  # noqa: BLE001 — sweep must not kill the pool
             log.warning("stranded-task sweep failed: %s", exc)
+
+        # A cooldown THIS breaker armed has lapsed — start the next window's
+        # streak clean, or a single infra blip years apart from another would
+        # otherwise silently accumulate toward the threshold forever.
+        if self._infra_cooldown_active and not self._in_quota_cooldown(now):
+            infra_breaker().reset()
+            self._infra_cooldown_active = False
+
+        # 3 consecutive zero-token/auth SDK failures across distinct tasks
+        # (INCIDENT 2026-08-13) means the account or transport itself is
+        # down — pause the WHOLE pool via the same cooldown gate a per-task
+        # quota park uses, instead of feeding the next queued task straight
+        # into the same wall.
+        infra_reason = infra_breaker().tripped()
+        if infra_reason and not self._in_quota_cooldown(now):
+            self._quota_cooldown_until = now + timedelta(
+                seconds=QuotaExhausted.RETRY_AFTER_S)
+            self._infra_cooldown_active = True
+            self._on_event("quota_pause", f"fleet paused — {infra_reason}")
 
         if self._in_quota_cooldown(now):
             return []  # 7.4: pool-wide pause until the subscription resets

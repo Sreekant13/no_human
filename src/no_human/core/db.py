@@ -1016,6 +1016,18 @@ class Store:
             # success measurement. See core/build_info.py for the format and
             # for why this records rather than blocks.
             "loaded_code_version": "TEXT",
+            # 1 = this attempt died in the SDK/transport before doing any
+            # work (an auth/billing wall, or a session that streamed zero
+            # tokens) — see `orchestrator._infra_sdk_failure`. NULL/0
+            # everywhere else, including every pre-existing row: nothing
+            # backfills it, so old rows keep counting exactly as they always
+            # did, which is correct since nothing knows they were infra.
+            # The row itself is NEVER skipped — it is the only durable record
+            # of the incident — only `lifetime_usage_by_class`'s attempt
+            # COUNT excludes it, which is the single chokepoint both budget
+            # gates (`_check_lifetime_budget`, `_at_lifetime_ceiling`) read,
+            # so they cannot disagree about whether a dead dispatch counted.
+            "infra_failure": "INTEGER",
         }
         for col, decl in att_wanted.items():
             if col not in att_existing:
@@ -1805,6 +1817,14 @@ class Store:
         return grouped
 
     async def count_attempts(self, task_id: str) -> int:
+        """Raw row count — how many attempt rows exist for this task,
+        INCLUDING infra-classified ones (`infra_failure = 1`).
+
+        NOT the budget counter: a dead SDK dispatch still gets a row (the row
+        is the only durable record of it), but it must not consume a lifetime
+        attempt — see `lifetime_usage_by_class`, which is what
+        `_check_lifetime_budget` / `_at_lifetime_ceiling` actually read.
+        """
         row = await self._fetchone(
             "SELECT COUNT(*) AS n FROM attempts WHERE task_id = ?", (task_id,)
         )
@@ -1912,8 +1932,16 @@ class Store:
                 " + ".join(f"COALESCE({c}, 0)" for c in cols), name)
             for name, cols in wanted.items()
         )
+        # The ATTEMPT count excludes rows classified `infra_failure = 1`
+        # (`orchestrator._infra_sdk_failure`) — a dead SDK dispatch (auth
+        # wall, zero tokens streamed) did no work, so it must not consume a
+        # lifetime attempt (INCIDENT 2026-08-13: 4 tasks burned all 9 on
+        # exactly this). The token SUMs above are UNCHANGED: an infra attempt
+        # spends nothing, and if it somehow did, the money is still counted.
         row = await self._fetchone(
-            f"SELECT COUNT(*) AS n, {selects} FROM attempts WHERE task_id = ?",
+            "SELECT COALESCE(SUM(CASE WHEN COALESCE(infra_failure, 0) = 0 "
+            f"THEN 1 ELSE 0 END), 0) AS n, {selects} FROM attempts "
+            "WHERE task_id = ?",
             (task_id,),
         )
         if not row:

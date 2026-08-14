@@ -106,6 +106,7 @@ from . import plan_gate
 from .bounds import Bounds, QuotaExhausted, StuckDetector
 from .complexity import is_trivial as _is_trivial
 from .db import AUX_USAGE_TIERS, Store
+from .infra_breaker import infra_breaker
 from .pricing import class_breakdown as _class_breakdown
 from .pricing import (
     RAW_TO_WEIGHTED_RATIO, config_is_weighted, override_inverted,
@@ -712,6 +713,80 @@ def _quota_signal(text: str) -> bool:
     rate limit handling" no longer reaches here at all."""
     t = text.lower()
     return bool(_QUOTA_RE.search(t)) or any(s in t for s in _QUOTA_TERMS)
+
+
+# INCIDENT (2026-08-13 17:14-18:15): the operator's subscription hit its
+# weekly limit and the server kept dispatching. 7 tasks failed
+# BUDGET_EXHAUSTED at attempts 9/9 — four of them (79183501, 2893fa27,
+# e58a81d6, edeff716) with ZERO tokens across ALL 9 attempts. Every dispatch
+# died in the SDK with the bare `Exception: Claude Code returned an error
+# result: success` (the SDK's own subtype label — "success" — has nothing to
+# do with the real cause, the account's weekly-limit banner, which never
+# reached `final_text` at all). `_quota_signal` above owns the CLI's OWN
+# prose ("hit your weekly limit"); it correctly did NOT match this shape,
+# because there was no prose to match — so `paused_quota` never engaged and
+# every dead dispatch burned a lifetime attempt on an account wall none of
+# them could ever get past.
+#
+# Every text term below has a space or is a full API error TYPE (the same
+# precedent as `_QUOTA_TERMS`'s own `"rate_limit_error"`), never a bare word:
+# `final_text` carries a traceback, and a bare substring like "billing" would
+# match a file path the way the old bare "quota" once matched `quota_park.py`
+# in a stack trace.
+_AUTH_LIMIT_TERMS = (
+    "invalid token", "authentication failed", "authentication_error",
+    "invalid api key", "oauth token expired", "token has expired",
+    "payment required", "subscription expired", "account suspended",
+    "credit balance is too low", "weekly limit", "monthly limit",
+    "billing error", "permission_error",
+)
+_AUTH_LIMIT_STATUSES = ("401", "402", "403", "429", "529")
+
+
+def _infra_sdk_failure(result) -> str | None:
+    """Reason iff this errored result is INFRA (the account/transport), not
+    work — an auth/billing wall, or a session that died before producing a
+    single token (the incident shape above).
+
+    Sits BESIDE `_quota_signal`, never inside it: that function is scoped to
+    the CLI's own explanatory prose, and widening it to catch prose-less
+    failures would blur what each function is proven against. This is the
+    second half — the shapes that carry no prose at all, either because the
+    SDK/transport died before the CLI ever got to explain itself (the
+    structural check) or because the error names an auth/billing failure in
+    vocabulary the CLI's quota banner never uses (401/403/429, "invalid
+    token", ...).
+
+    The structural check requires ALL of: `is_error`, `num_turns <= 1`, zero
+    `tokens_used` AND zero of both cache classes, and `stop_reason` is not
+    `"max_turns"` (a turn-starved session that DID stream tokens is a real,
+    chargeable failure — `_run_attempt`'s existing max_turns path, untouched).
+    A session that streamed zero tokens did no work whatever the cause, so
+    charging a lifetime attempt for it is accounting a purchase that never
+    happened.
+    """
+    if not getattr(result, "is_error", False):
+        return None
+    status = str(getattr(result, "api_error_status", None) or "")
+    if status in _AUTH_LIMIT_STATUSES:
+        return f"SDK reported HTTP {status} — infrastructure/auth, not work"
+    text = _dewrap((getattr(result, "final_text", "") or "").lower())
+    for term in _AUTH_LIMIT_TERMS:
+        if term in text:
+            return (f"SDK error names an infra/billing wall ({term!r}) — "
+                     "infrastructure, not work")
+    stop = (getattr(result, "stop_reason", "") or "").lower()
+    tokens_used = getattr(result, "tokens_used", 0) or 0
+    cache_read = getattr(result, "cache_read_tokens", 0) or 0
+    cache_creation = getattr(result, "cache_creation_tokens", 0) or 0
+    if (
+        (getattr(result, "num_turns", 0) or 0) <= 1
+        and not tokens_used and not cache_read and not cache_creation
+        and stop != "max_turns"
+    ):
+        return ("SDK died before the session produced any tokens (turn 1, 0 "
+                "tokens) — infrastructure, not work")
+    return None
 
 
 def _classify_error(stop_reason: str | None, text: str,
@@ -3461,8 +3536,35 @@ class Orchestrator:
             cache_creation_tokens=result.cache_creation_tokens,
             **self._pop_aux_usage(),
         )
+        # A result that streamed real tokens proves the account/transport
+        # works, whatever else it does — clear any infra streak the fleet
+        # breaker was building BEFORE the error-routing below, so a genuine
+        # in-work failure (max_turns, a real traceback) never counts toward
+        # a fleet-wide pause meant for dead dispatches.
+        if (result.tokens_used or result.cache_read_tokens
+                or result.cache_creation_tokens):
+            infra_breaker().record_healthy()
         if result.is_error and _quota_signal(result.final_text or ""):
             raise QuotaExhausted(_quota_reason(result.final_text or ""))
+
+        # INCIDENT (2026-08-13): the SDK/transport shapes `_quota_signal`
+        # cannot see — no CLI prose to match, sometimes zero tokens streamed
+        # at all. Classified and routed BEFORE the generic `if result.is_error`
+        # block below, into the SAME park path `_quota_signal` uses just
+        # above, so a dead dispatch pauses the task instead of burning a
+        # lifetime attempt on a wall it never got past.
+        infra_reason = _infra_sdk_failure(result)
+        if result.is_error and infra_reason:
+            await self.store.update_attempt(
+                attempt_id, status="failed",
+                failure_reason=f"infra: {infra_reason}", infra_failure=1)
+            self.emit("agent_error", infra_reason, error_class="infra")
+            if infra_breaker().record_infra_failure(task.id):
+                self.emit(
+                    "quota_pause",
+                    "fleet paused — 3 consecutive zero-token/auth SDK "
+                    "failures across distinct tasks")
+            raise QuotaExhausted(infra_reason)
 
         # Refusal → fail-fast (Broker). A model refusal is a COMPLETED turn the
         # agent declined (stop_reason="refusal", is_error False, no diff) — so it
