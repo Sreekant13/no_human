@@ -50,7 +50,7 @@ from ..core.orchestrator import Orchestrator, is_agent_session, is_narration
 from ..core.task import Task, TaskStatus
 from ..vcs.task_pr import task_has_pr_evidence
 from .models import (
-    AttemptOut, BoardPayload, CreateProjectRequest, CreateTaskRequest,
+    AttemptOut, BoardPayload, CancelRequest, CreateProjectRequest, CreateTaskRequest,
     GrillQuestionOut, GrillResultOut, GrillStepRequest, IntegrationSetupRequest,
     ImportedInfo, LandedOverrideRequest, ProjectOut, ReplyRequest,
     SaveIntegrationConfigRequest, SendBackRequest, ShippedRequest, TaskOut,
@@ -1375,9 +1375,12 @@ async def resume_task(
 
 @app.post("/api/tasks/{task_id}/cancel")
 async def cancel_task(
-    task_id: str, request: Request,
+    task_id: str, request: Request, body: CancelRequest | None = None,
 ) -> dict[str, Any]:
-    """Cancel a task (sets to FAILED)."""
+    """Cancel a task (sets to FAILED). `body` is optional so the CLI's and
+    the board's pre-existing no-reason POST keep working unchanged; when the
+    board's cancel modal supplies a typed reason it is trimmed and truncated
+    to 500 chars before being recorded, matching the client-side clamp."""
     store = _store(request)
     task = await _require_task(store, task_id)
     if task.status in {TaskStatus.DONE, TaskStatus.FAILED}:
@@ -1385,8 +1388,10 @@ async def cancel_task(
             status_code=409,
             detail=f"task is already {task.status.value!r}",
         )
+    reason = (body.reason if body else None) or ""
+    reason = reason.strip()[:500] or "Cancelled from board"
     task.context = await store.merge_context(
-        task.id, {"cancel_reason": "Cancelled from board"})
+        task.id, {"cancel_reason": reason})
     await store.set_status(
         task, TaskStatus.FAILED, validate=False, human_override=True)
     # Cancel must STOP the work, not just flip the status. A running task's SDK

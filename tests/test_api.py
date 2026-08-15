@@ -950,6 +950,36 @@ async def test_cancel_sets_reason_and_fails(client, store):
 
 
 @pytest.mark.asyncio
+async def test_cancel_records_the_operator_reason(client, store):
+    """The board's Cancel-task modal posts a typed reason; it must be
+    recorded verbatim, the task must land FAILED (never DONE — a cancel is
+    never a false "done"), and the board payload's derived `cancelled` flag
+    must be True so Stats keeps it out of the success-rate denominator."""
+    t = await _seed_task(store, status=TaskStatus.IMPLEMENTING)
+    r = await client.post(f"/api/tasks/{t.id}/cancel", json={"reason": "duplicate of X"})
+    assert r.status_code == 200
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.FAILED
+    assert fresh.status != TaskStatus.DONE
+    assert fresh.context["cancel_reason"] == "duplicate of X"
+    from no_human.api.models import TaskSummaryOut
+    assert TaskSummaryOut.from_task(fresh).cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_cancel_without_a_body_keeps_the_default_reason(client, store):
+    """Regression guard: the board's own no-reason POST (and any pre-existing
+    caller) must keep 200ing with the unchanged default reason now that the
+    body is optional."""
+    t = await _seed_task(store, status=TaskStatus.IMPLEMENTING)
+    r = await client.post(f"/api/tasks/{t.id}/cancel")
+    assert r.status_code == 200
+    fresh = await store.find_task(t.id)
+    assert fresh.status == TaskStatus.FAILED
+    assert fresh.context.get("cancel_reason") == "Cancelled from board"
+
+
+@pytest.mark.asyncio
 async def test_resume_clears_blocker_and_implements(client, store):
     t = await _seed_task(store, status=TaskStatus.BLOCKED)
     t.blocker = {"category": "AMBIGUITY", "question": "?"}

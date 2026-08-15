@@ -5862,6 +5862,18 @@ a.so-chip-value:hover { color: var(--accent-300); }
 .btn-cancel-quiet:hover:not(:disabled) { opacity: 1; }
 .btn-cancel-quiet:disabled { opacity: 0.35; cursor: default; }
 
+/* Cancel-task confirm modal's destructive submit — same shape as
+   .btn-approve (the modal's other button), colored for a destructive action
+   rather than the accent gradient. */
+.btn-cancel-danger {
+  background: var(--danger, #ff6b6b);
+  border-color: var(--danger, #ff6b6b);
+  color: var(--bg);
+  border-radius: var(--r-md);
+}
+.btn-cancel-danger:hover:not(:disabled) { filter: brightness(1.1); }
+.btn-cancel-danger:disabled { opacity: 0.4; cursor: not-allowed; }
+
 /* U4: collapsed failed-run groups */
 .failed-group-count {
   font-size: 11px; color: var(--fg-dim, #8b93a7);

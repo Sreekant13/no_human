@@ -83,22 +83,6 @@ export async function approveTask(id) {
   return r.json();
 }
 
-export async function approveLandedTask(id, sha, justification) {
-  const r = await fetch(`${BASE}/api/tasks/${id}/approve-landed`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sha, justification }),
-  });
-  if (!r.ok) {
-    // Same convention as approveTask: 400 (bad sha/empty justification) and
-    // 409 (task no longer awaiting_approval) both carry a server-explained
-    // reason — surface it verbatim rather than a bare status code.
-    const detail = await r.json().catch(() => ({}));
-    throw new Error(detailMessage(detail, `POST approve-landed → ${r.status}`));
-  }
-  return r.json();
-}
-
 export async function finishReview(id) {
   const r = await fetch(`${BASE}/api/tasks/${id}/finish-review`, { method: "POST" });
   if (!r.ok) {
@@ -232,8 +216,14 @@ export async function resumeTask(id) {
   return r.json();
 }
 
-export async function cancelTask(id) {
-  const r = await fetch(`${BASE}/api/tasks/${id}/cancel`, { method: "POST" });
+export async function cancelTask(id, reason) {
+  // No reason → the exact same no-body POST as before (server default:
+  // "Cancelled from board"). A reason is posted as JSON so the operator's
+  // typed explanation lands in the task's audit trail.
+  const opts = reason
+    ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }
+    : { method: "POST" };
+  const r = await fetch(`${BASE}/api/tasks/${id}/cancel`, opts);
   if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(detailMessage(d, `POST cancel → ${r.status}`)); }
   return r.json();
 }

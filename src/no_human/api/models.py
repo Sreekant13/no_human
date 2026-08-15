@@ -592,6 +592,13 @@ class ShippedRequest(BaseModel):
     note: str | None = None
 
 
+class CancelRequest(BaseModel):
+    # Optional: the board's cancel button always posts this (reason may be
+    # None when the operator left it blank); `nh` CLI callers and any other
+    # no-body POST still work — see cancel_task's default in api/app.py.
+    reason: str | None = None
+
+
 class LandedOverrideRequest(BaseModel):
     # Unlike ShippedRequest, `sha` here IS verified — commit_is_ancestor
     # against the task's recorded base_branch — and `justification` is

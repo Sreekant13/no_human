@@ -1,12 +1,16 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import {
-  approveLandedTask, approveTask, cancelTask, chooseBlockerOption, fetchDiff, fetchSubtasks,
+  approveTask, cancelTask, chooseBlockerOption, fetchDiff, fetchSubtasks,
   fetchTask, fetchTaskEvents, finishReview,
   pauseTask, postReviewComments, replyTask, resumeTask, retryTask, sendBack,
   connectTaskSSE, connectTaskProgress,
 } from "./api.js";
 import Markdown from "./Markdown.jsx";
 import { keepFocusInDialog } from "./keepFocusInDialog.js";
+import {
+  CANCEL_TITLE, CANCEL_BODY, CANCEL_CONFIRM_LABEL, CANCEL_KEEP_LABEL,
+  CANCEL_REASON_PLACEHOLDER, REASON_MAX, submitCancel,
+} from "./cancelFlow.js";
 import { ROLE_LABEL, discoverSubagents, eventSource, modelsByNode } from "./eventRoles.js";
 import { deriveAgentStatus } from "./pipelineStatus.js";
 import { taskProgress } from "./taskProgress.js";
@@ -64,15 +68,14 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
   const [sbMsg, setSbMsg] = useState("");
   const [replyOpen, setReplyOpen] = useState(false);
   const [replyMsg, setReplyMsg] = useState("");
-  const [landedOpen, setLandedOpen] = useState(false);
-  const [landedSha, setLandedSha] = useState("");
-  const [landedJustification, setLandedJustification] = useState("");
+  const [cancelOpen, setCancelOpen] = useState(false);
+  const [cancelReason, setCancelReason] = useState("");
   const closeSb = useCallback(() => setSbOpen(false), []);
   const closeReply = useCallback(() => setReplyOpen(false), []);
-  const closeLanded = useCallback(() => setLandedOpen(false), []);
+  const closeCancel = useCallback(() => setCancelOpen(false), []);
   const sbRef = useNestedModalKeys(sbOpen, closeSb);
   const replyRef = useNestedModalKeys(replyOpen, closeReply);
-  const landedRef = useNestedModalKeys(landedOpen, closeLanded);
+  const cancelRef = useNestedModalKeys(cancelOpen, closeCancel);
   const [flash, setFlash] = useState(null);
   // null before the operator clicks Approve, "ok" once the server recorded it,
   // "error" if it did not. Drives the button's label + disabled state so the
@@ -325,20 +328,20 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
     }
   }
 
-  async function handleLandedOverride() {
-    if (!landedSha.trim() || !landedJustification.trim() || busy) return;
+  async function handleCancel() {
+    if (busy) return;
     setBusy(true);
     try {
-      const res = await approveLandedTask(taskId, landedSha.trim(), landedJustification.trim());
-      setLandedOpen(false);
-      setLandedSha("");
-      setLandedJustification("");
-      setApproveOutcome("ok");
-      setFlash(res?.message || "Human override recorded — task completed on the asserted landed sha.");
-      const updated = await fetchTask(taskId);
-      setTask(updated);
-    } catch (e) {
-      setFlash(`Error: ${e.message}`);
+      const res = await submitCancel({ taskId, reason: cancelReason, api: cancelTask });
+      if (res.ok) {
+        setCancelOpen(false);
+        setCancelReason("");
+        setFlash(res.message);
+        const updated = await fetchTask(taskId);
+        setTask(updated);
+      } else {
+        setFlash(`Error: ${res.error}`);
+      }
     } finally {
       setBusy(false);
     }
@@ -380,10 +383,11 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
 
   async function handleLifecycle(action) {
     if (busy) return;
-    const actions = { pause: pauseTask, resume: resumeTask, cancel: cancelTask, retry: retryTask };
+    // "cancel" is not here: it opens the confirm modal (openCancelModal)
+    // instead of firing straight through this handler.
+    const actions = { pause: pauseTask, resume: resumeTask, retry: retryTask };
     const fn = actions[action];
     if (!fn) return;
-    if (action === "cancel" && !window.confirm("Cancel this task? It will be marked as failed.")) return;
     setBusy(true);
     try {
       const res = await fn(taskId);
@@ -469,7 +473,8 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
             busy={busy}
             onAction={(id) => {
               if (id === "reply") setReplyOpen(true);
-              else handleLifecycle(id); // "resume" | "cancel"
+              else if (id === "cancel") setCancelOpen(true);
+              else handleLifecycle(id); // "resume"
             }}
           />
         )}
@@ -547,19 +552,6 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
                 Send back
               </button>
             )}
-            {isAwaiting && (
-              // The narrow escape hatch for the class automated containment
-              // honestly refuses (a supervising session's squash train that a
-              // later train car's classification edits, or a union-resolved
-              // source conflict, leaves with no candidate commit whose tree
-              // matches the branch verbatim) — a HUMAN override, not a
-              // containment pass; the modal below requires both fields and
-              // shows the task being confirmed before it submits.
-              <button className="btn btn-sendback" onClick={() => setLandedOpen(true)} disabled={busy || merging}
-                      title="Assert this task's content landed elsewhere, with a required justification">
-                Content landed elsewhere?
-              </button>
-            )}
             {isAwaiting && nextInQueue && onJump && (
               // Review-queue navigation belongs to the review flow only. It used
               // to show on ANY drawer with a pending review in the queue — so a
@@ -595,12 +587,12 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
               // Destructive action: spatially separated from the primary CTA
               // (it used to sit as an equal sibling next to Approve — the
               // classic danger-adjacency mistake) and demoted to a quiet
-              // text button. Still one click, still confirmable by the
-              // lifecycle handler. Suppressed when the DecisionPanel is
-              // present — it carries its own "Stop this task".
+              // text button. Opens the confirm modal rather than acting
+              // immediately — cancelling is irreversible. Suppressed when the
+              // DecisionPanel is present — it carries its own "Stop this task".
               <button
                 className="btn-cancel-quiet"
-                onClick={() => handleLifecycle("cancel")}
+                onClick={() => setCancelOpen(true)}
                 disabled={busy}
                 title="Cancel this task (destructive)"
               >
@@ -687,48 +679,36 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
         </div>
       )}
 
-      {/* human landed-override modal — a HUMAN asserts the task's content
-          landed at a sha automated containment could not verify. Never
-          phrased as "already shipped": the copy and the recorded event both
-          say override, not containment pass. */}
-      {landedOpen && (
+      {/* cancel-task confirm modal — irreversible, so it always requires an
+          explicit confirm click; the reason is optional and never blocks
+          submit. The sha + justification "landed elsewhere" override this
+          replaced stays CLI-only (`nh approve --landed`), unreachable here. */}
+      {cancelOpen && (
         <div
           className="sendback-overlay" data-nested-modal
           onMouseDown={keepFocusInDialog}>
-          <div className="sendback-modal" ref={landedRef} role="dialog" aria-modal="true"
-               aria-label="Human override: content landed elsewhere">
-            <div className="sendback-label">Human override — content landed elsewhere</div>
-            <p className="reply-context">
-              Confirming for <strong>{task?.title ?? "this task"}</strong> ({taskId?.slice(0, 8)}):
-              automated containment could not verify this task's content landed
-              (e.g. a supervising session's squash train adapted it). Asserting
-              this is a human override, not a containment pass — it is recorded
-              on the audit trail with your justification.
-            </p>
-            <input
-              className="sendback-textarea"
-              style={{ minHeight: "auto" }}
-              placeholder="Commit sha (an ancestor of the base branch)"
-              value={landedSha}
-              onChange={(e) => setLandedSha(e.target.value)}
-              autoFocus
-            />
+          <div className="sendback-modal" ref={cancelRef} role="dialog" aria-modal="true"
+               aria-label={CANCEL_TITLE}>
+            <div className="sendback-label">{CANCEL_TITLE}</div>
+            <p className="reply-context">{CANCEL_BODY}</p>
             <textarea
               className="sendback-textarea"
-              placeholder="Justification (required) — why you're asserting this landed"
-              value={landedJustification}
-              onChange={(e) => setLandedJustification(e.target.value)}
+              placeholder={CANCEL_REASON_PLACEHOLDER}
+              value={cancelReason}
+              onChange={(e) => setCancelReason(e.target.value)}
+              maxLength={REASON_MAX}
+              autoFocus
             />
             <div className="sendback-actions">
-              <button className="btn btn-sendback" onClick={() => setLandedOpen(false)}>
-                Cancel
+              <button className="btn btn-sendback" onClick={() => setCancelOpen(false)} disabled={busy}>
+                {CANCEL_KEEP_LABEL}
               </button>
               <button
-                className="btn btn-approve"
-                onClick={handleLandedOverride}
-                disabled={!landedSha.trim() || !landedJustification.trim() || busy}
+                className="btn btn-cancel-danger"
+                onClick={handleCancel}
+                disabled={busy}
               >
-                {busy ? "…" : "Record override"}
+                {busy ? "…" : CANCEL_CONFIRM_LABEL}
               </button>
             </div>
           </div>
