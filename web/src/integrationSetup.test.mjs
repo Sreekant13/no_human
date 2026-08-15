@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   draftFrom, changedValues, toList, listToText, readiness, setupSummary, secretHint,
-  humanizeField, switchLabel,
+  humanizeField, switchLabel, effectiveEnabled,
 } from "./integrationSetup.js";
 
 // Shaped exactly like GET /api/integrations/setup returns (see
@@ -10,7 +10,7 @@ import {
 // because the server refuses to describe a credential field at all.
 const LINEAR = {
   name: "linear", kind: "issue_tracker", enable_field: "enabled",
-  enabled: false, configured: false, detail: "not configured",
+  enabled: false, enable_default: false, configured: false, detail: "not configured",
   fields: [
     { name: "enabled", label: "Enabled", kind: "bool", value: false },
     { name: "team_key", label: "Team key", kind: "text", value: "" },
@@ -21,14 +21,40 @@ const LINEAR = {
   secret_note: "",
 };
 
+// teams.enabled ships True (a mute switch, see effectiveEnabled) — the one
+// spec in this file whose raw `enabled` and `enable_default` are both true.
 const TEAMS = {
   name: "teams", kind: "notifications", enable_field: "enabled",
-  enabled: true, configured: false, detail: "not configured",
+  enabled: true, enable_default: true, configured: false, detail: "not configured",
   fields: [{ name: "enabled", label: "Enabled", kind: "bool", value: true }],
   secrets: [],
   secret_note: "The Power Automate webhook URL carries its own credential in " +
     "the query string. Onboarding will not take it — paste it in " +
     "Settings → Integrations → Microsoft Teams.",
+};
+
+const JIRA = {
+  name: "jira", kind: "issue_tracker", enable_field: "enabled",
+  enabled: false, enable_default: false, configured: false, detail: "not configured",
+  fields: [{ name: "enabled", label: "Enabled", kind: "bool", value: false }],
+  secrets: [{ env_var: "JIRA_API_TOKEN", set: false }],
+  secret_note: "",
+};
+
+const MONDAY = {
+  name: "monday", kind: "issue_tracker", enable_field: "enabled",
+  enabled: false, enable_default: false, configured: false, detail: "not configured",
+  fields: [{ name: "enabled", label: "Enabled", kind: "bool", value: false }],
+  secrets: [{ env_var: "MONDAY_API_TOKEN", set: false }],
+  secret_note: "",
+};
+
+const SLACK = {
+  name: "slack", kind: "chat", enable_field: "intake",
+  enabled: false, enable_default: false, configured: false, detail: "not configured",
+  fields: [{ name: "intake", label: "Intake", kind: "bool", value: false }],
+  secrets: [{ env_var: "SLACK_BOT_TOKEN", set: false }],
+  secret_note: "",
 };
 
 test("draftFrom seeds one editable value per advertised field", () => {
@@ -127,4 +153,31 @@ test("the switch label names what it actually switches", () => {
 test("secretHint is honest when nothing is needed", () => {
   assert.equal(secretHint({ name: "x", secrets: [], secret_note: "" }),
                "No credential needed.");
+});
+
+test("a mute switch that ships on reads Off until the channel is configured", () => {
+  const r = readiness(TEAMS);
+  assert.equal(r.label, "Off");
+  assert.equal(r.tone, "neutral");
+  assert.equal(effectiveEnabled(TEAMS, { enabled: true }), false);
+});
+
+test("a fresh-config wizard shows every integration off", () => {
+  const fresh = [JIRA, LINEAR, MONDAY, SLACK, TEAMS];
+  for (const spec of fresh) {
+    assert.equal(readiness(spec).state, "off", `${spec.name} should read off`);
+    assert.equal(effectiveEnabled(spec), false, `${spec.name} should be effectively off`);
+  }
+  assert.equal(setupSummary(fresh).on, 0);
+});
+
+test("an opt-in switch the user turned on still reads On — needs settings", () => {
+  const on = { ...JIRA, enabled: true, enable_default: false,
+    secrets: [{ env_var: "JIRA_API_TOKEN", set: true }] };
+  assert.equal(readiness(on).label, "On — needs settings");
+});
+
+test("a configured mute switch stays on", () => {
+  const configured = { ...TEAMS, configured: true };
+  assert.notEqual(readiness(configured).state, "off");
 });

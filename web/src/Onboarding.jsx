@@ -11,7 +11,7 @@ import { KIND_LABEL, NAME_LABEL } from "./integrationChip.js";
 import { IntegrationIcon } from "./integrationIcons.jsx";
 import {
   draftFrom, changedValues, listToText, readiness, setupSummary, secretHint,
-  switchLabel,
+  switchLabel, effectiveEnabled,
 } from "./integrationSetup.js";
 import { backDisabled, backDisabledReason, forwardDisabled } from "./onboardingNav.js";
 import { scanSummary } from "./onboardingHistory.js";
@@ -1138,7 +1138,12 @@ function IntegrationSetupCard({ spec, draft, saving, saved, error, onField, onSa
   const values = draft[spec.name] || {};
   const ready = readiness(spec);
   const enableField = spec.enable_field;
-  const isOn = enableField ? values[enableField] !== false : true;
+  // A mute switch that ships ON (e.g. teams) reads as effectively off until
+  // the integration is configured — see effectiveEnabled(). Unchecking this
+  // box on a fresh install writes nothing (changedValues sees no diff from
+  // the stored default), so a later-pasted webhook still fires; this is
+  // presentation only.
+  const isOn = effectiveEnabled(spec, values);
   const dirty = Object.keys(changedValues(spec, draft)).length > 0;
   const settings = (spec.fields || []).filter((f) => f.name !== enableField);
   const label = NAME_LABEL[spec.name] || spec.name;
@@ -1154,7 +1159,7 @@ function IntegrationSetupCard({ spec, draft, saving, saved, error, onField, onSa
           <label className="ob-integration-switch">
             <input
               type="checkbox"
-              checked={values[enableField] !== false}
+              checked={isOn}
               onChange={(e) => onField(spec.name, enableField, e.target.checked)}
             />
             <span>{switchLabel(spec, label)}</span>

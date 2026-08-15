@@ -1610,6 +1610,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
             # OFF: no worker starts and no import-time side effects occur.
             # SLACK_BOT_TOKEN / SLACK_APP_TOKEN live in ~/.no_human/.env only —
             # never in this world-readable file.
+            #
+            # This block's switch is `intake`, not `enabled` — there is no
+            # `integrations.slack.enabled` key, deliberately: `enable_field()`
+            # falls back to a block's single bool key when it has no `enabled`
+            # key of its own, and `intake` is that key. Adding an `enabled`
+            # key here would rebind the switch away from `intake` and break
+            # the Socket-Mode worker toggle. The `enabled: None` tri-state
+            # elsewhere in this registry belongs only to the `ci.*` views
+            # (github/gitlab/jenkins/circleci), which have no switch of their
+            # own — it does not apply to slack, whose switch (`intake`) is a
+            # concrete bool, defaulting False.
             "intake": False,
         },
         "teams": {

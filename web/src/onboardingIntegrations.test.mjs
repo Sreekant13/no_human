@@ -54,9 +54,11 @@ test("no integration is named in the UI — a new one renders with no edit here"
 
 test("the on/off switch is whatever the spec's enable_field names", () => {
   assert.match(CARD, /const enableField = spec\.enable_field;/);
-  assert.match(CARD, /checked=\{values\[enableField\] !== false\}/);
-  // ...and an integration with no switch is not rendered as switched off.
-  assert.match(CARD, /enableField \? values\[enableField\] !== false : true/);
+  // The checkbox reflects EFFECTIVE state, not the raw stored value: a mute
+  // switch that ships on (e.g. teams) must not render as checked on a fresh,
+  // unconfigured install — see effectiveEnabled() in integrationSetup.js.
+  assert.match(CARD, /checked=\{isOn\}/);
+  assert.match(CARD, /effectiveEnabled\(spec, values\)/);
 });
 
 test("every other control comes from the spec's fields, typed by `kind`", () => {

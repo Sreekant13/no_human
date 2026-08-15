@@ -84,11 +84,34 @@ export function switchLabel(spec, name) {
     : `Enable ${name} ${humanizeField(spec.enable_field)}`;
 }
 
+// Whether an integration's switch is effectively ON, as opposed to what its
+// raw config value says. A switch that SHIPS ON (`enable_default: true`, e.g.
+// teams) is a mute switch — it exists so an upgrade never silently mutes an
+// already-pasted webhook, not a claim that the channel is live. With no
+// webhook the notifier no-ops regardless. On a fresh install, presenting that
+// raw `true` next to every other integration's `false` reads as "this one is
+// somehow already on". So: a mute switch counts as on only once the
+// integration is actually `configured`; a switch that ships OFF is a plain
+// opt-in, and if it is on, the user turned it on themselves.
+//
+// `values`, when given, is the wizard's draft for this integration
+// ({fieldName: value}, see draftFrom); omitted, this falls back to the raw
+// spec's own `enabled`. Presentation only — nothing here changes what is
+// stored or what notify.build_notifier reads, so upgrade behaviour (an
+// existing install with a pasted webhook) is untouched.
+export function effectiveEnabled(spec, values) {
+  const field = spec.enable_field;
+  if (!field) return true; // no switch at all (ci.* views) — never "off"
+  const raw = (values || {})[field] ?? spec.enabled;
+  if (raw === false) return false;
+  return !(spec.enable_default === true && !spec.configured);
+}
+
 // The honest state line for one integration — the whole point of the step is
 // that this cannot say "Configured" while nothing runs.
 //
 // Four states, in the order they are decided:
-//   off        — its own switch is off, so nothing runs whatever else is set
+//   off        — its own switch is effectively off (see effectiveEnabled)
 //   needs-key  — switched on, but a credential it needs is not in .env yet
 //   incomplete — switched on and credentialled, but its settings are blank
 //   ready      — on, credentialled and configured
@@ -104,7 +127,7 @@ export function switchLabel(spec, name) {
 // claiming an integration is live while nothing runs.
 export function readiness(spec) {
   const missing = (spec.secrets || []).filter((s) => !s.set).map((s) => s.env_var);
-  if (spec.enable_field && spec.enabled === false) {
+  if (spec.enable_field && !effectiveEnabled(spec)) {
     return { state: "off", label: "Off", tone: "neutral", missing };
   }
   if (missing.length > 0) {

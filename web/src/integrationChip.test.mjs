@@ -41,6 +41,16 @@ test("statusChip does not call a switched-off integration Configured", () => {
                "Configured, off");
 });
 
+// A mute switch that ships on (teams: enabled defaults true) must not read
+// as "on" on a fresh, unconfigured install — `!configured` is checked before
+// `enabled` is ever looked at, so this can never render an "on" tone.
+test("statusChip shows an unconfigured mute switch as Unconfigured, not on", () => {
+  assert.deepEqual(
+    statusChip({ configured: false, enabled: true, healthy: null }),
+    { label: "Unconfigured", tone: "neutral" },
+  );
+});
+
 test("statusChip is unchanged for integrations that have no switch", () => {
   // github/gitlab/jenkins are views over ci.*; the API sends enabled: null.
   assert.deepEqual(statusChip({ configured: true, healthy: null, enabled: null }),

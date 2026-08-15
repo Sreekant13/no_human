@@ -416,6 +416,63 @@ def test_enable_field_is_discovered_not_named():
     assert reg.enable_field("github") is None
 
 
+def test_setup_specs_report_whether_the_switch_ships_on():
+    """`enable_default` lets the UI tell a ships-ON mute switch (teams) from an
+    opt-in one (everything else): the wizard must not present a mute switch's
+    raw `True` as "already on" before the channel is configured."""
+    specs = {s["name"]: s for s in reg.setup_specs({})}
+    for name in ("jira", "linear", "monday", "slack"):
+        assert specs[name]["enable_default"] is False, name
+    assert specs["teams"]["enable_default"] is True
+
+
+def test_slack_switch_is_intake_and_ships_off():
+    """slack.enabled does not exist; its switch is `intake`, and it defaults
+    False like every other opt-in switch. The `enabled: None` tri-state
+    belongs only to the ci.* views (github/gitlab/jenkins/circleci), which
+    have no switch of their own — never to slack."""
+    assert reg.enable_field("slack") == "intake"
+    assert reg.enable_default("slack") is False
+    assert reg.enable_state({}, "slack") is False
+    st = {s.name: s for s in reg.list_integrations({})}
+    none_named = {name for name, s in st.items() if s.enabled is None}
+    assert none_named == {"github", "gitlab", "jenkins", "circleci"}
+    assert st["slack"].enabled is False
+
+
+def test_upgrade_with_webhook_and_enabled_true_still_notifies():
+    """Control: an existing install with a pasted webhook and the mute switch
+    left on (or explicitly True) keeps notifying — the upgrade contract this
+    task must not touch."""
+    cfg = {
+        "notifications": {
+            "teams_webhook_url":
+                "https://prod-27.westus.logic.azure.com:443/workflows/abc/"
+                "triggers/manual/paths/invoke?sig=SECRETSIG",
+        },
+        "integrations": {"teams": {"enabled": True}},
+    }
+    teams = dict(build_notifier(cfg).channels)["teams"]
+    assert teams.webhook_url == cfg["notifications"]["teams_webhook_url"]
+    assert teams.enabled is True
+
+
+def test_upgrade_with_webhook_and_enabled_false_is_muted():
+    """Control: the same upgrade scenario with the mute switch flipped off
+    suppresses delivery — the webhook is kept, not deleted, but nothing sends."""
+    cfg = {
+        "notifications": {
+            "teams_webhook_url":
+                "https://prod-27.westus.logic.azure.com:443/workflows/abc/"
+                "triggers/manual/paths/invoke?sig=SECRETSIG",
+        },
+        "integrations": {"teams": {"enabled": False}},
+    }
+    teams = dict(build_notifier(cfg).channels)["teams"]
+    assert teams.webhook_url is None
+    assert teams.enabled is False
+
+
 # --------------------------------------------------------------------------- #
 # API surface                                                                  #
 # --------------------------------------------------------------------------- #

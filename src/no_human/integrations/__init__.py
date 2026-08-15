@@ -997,10 +997,11 @@ def setup_specs(config: dict) -> list[dict[str, Any]]:
     ``DEFAULT_CONFIG["integrations"]``.
 
     Per integration: its current values (non-secret only), which key is its
-    on/off switch, whether it is on, the .env variable names its credential
-    needs and whether each is already set. Never a secret VALUE — the
-    credential fields report ``set: bool`` exactly like
-    :func:`integration_fields` does."""
+    on/off switch, whether it is on, whether that switch *ships* on (a mute
+    switch, e.g. teams, vs. an opt-in the user must flip themselves), the
+    .env variable names its credential needs and whether each is already
+    set. Never a secret VALUE — the credential fields report ``set: bool``
+    exactly like :func:`integration_fields` does."""
     from .. import config as _config_mod
     from ..config import DEFAULT_CONFIG
 
@@ -1018,6 +1019,7 @@ def setup_specs(config: dict) -> list[dict[str, Any]]:
             "kind": KIND_BY_NAME.get(name, ""),
             "enable_field": enable_field(name),
             "enabled": enable_state(config, name),
+            "enable_default": enable_default(name),
             "configured": status.configured,
             "detail": status.detail,
             "fields": _setup_fields(name, defaults, current),
