@@ -233,7 +233,8 @@ async def test_read_file_marker_cannot_write_to_the_database(store, monkeypatch)
         def close(self):
             self._conn.close()
 
-    monkeypatch.setattr(sqlite3, "connect",
+    from no_human.core import db as db_mod
+    monkeypatch.setattr(db_mod, "_sqlite_connect",
                         lambda *a, **k: _Intercept(real_connect(*a, **k)))
     marker = read_file_marker(store.path)
 
@@ -242,6 +243,9 @@ async def test_read_file_marker_cannot_write_to_the_database(store, monkeypatch)
         f"read_file_marker's connection accepted a WRITE ({outcome[0]}) — the "
         "probe can modify the database it audits")
     assert marker.count >= 0, "and the function still returned its marker"
+    assert sqlite3.connect is real_connect, (
+        "the test patched the GLOBAL sqlite3.connect — that corrupts coverage.py's "
+        "own connection and cascades into every later test")
 
     # Known negative: with the pragma absent the same interception DOES write,
     # so the assertion above is measuring the pragma and not something else.

@@ -201,6 +201,21 @@ def _now() -> str:
 SOURCE_PROPOSED = "proposed"
 
 
+def _sqlite_connect(path: str, *, timeout: float = 5.0):
+    """The ONE point of use for stdlib `sqlite3.connect` in this module, and a
+    deliberate test seam.
+
+    Tests that need to intercept the probe's connection must patch THIS name
+    (`no_human.core.db._sqlite_connect`), never `sqlite3.connect`. Patching the
+    stdlib attribute is process-global: coverage.py opens its own SQLite
+    connections during the run and at teardown, receives the test's wrapper
+    object instead of a real Connection, and dies — taking the whole coverage
+    report and every test after it with it.
+    """
+    import sqlite3
+    return sqlite3.connect(path, timeout=timeout)
+
+
 def read_file_marker(path: Path) -> "SnapshotMarker":
     """Read the database file's true head through a brand-new connection.
 
@@ -217,9 +232,12 @@ def read_file_marker(path: Path) -> "SnapshotMarker":
     promise, which matters because this runs against the operator's live file.
 
     Blocking on purpose — callers hand it to `asyncio.to_thread`.
+
+    Opens its connection through `_sqlite_connect`, the module's test seam —
+    see that function's docstring for why patching it, not `sqlite3.connect`,
+    is required.
     """
-    import sqlite3
-    conn = sqlite3.connect(str(path), timeout=5.0)
+    conn = _sqlite_connect(str(path), timeout=5.0)
     try:
         conn.execute("PRAGMA query_only = ON")
         row = conn.execute(
