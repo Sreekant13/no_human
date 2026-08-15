@@ -207,12 +207,24 @@ def _make_landed_repo(tmp_path) -> Path:
 
 
 def _seed_landed_task(db_path: Path, repo_path: Path, *,
-                      status=TaskStatus.AWAITING_APPROVAL) -> str:
+                      status=TaskStatus.AWAITING_APPROVAL,
+                      attempt_branch: str | None = None,
+                      attempt_commit_sha: str = "") -> str:
+    """`attempt_branch` seeds an attempt row (branch_name/commit_sha) so a
+    `status=TaskStatus.FAILED` task's content is locatable the same way a
+    budget-exhausted pre-PR task's is — via `Store.latest_attempt_branch`,
+    not `context["pr_branch"]` (left blank here on purpose)."""
     async def _go():
         async with Store(db_path) as s:
             t = Task.new("landed-check", repo_path=str(repo_path))
             t.context = {"base_branch": "main", "pr_branch": ""}
             await s.create_task(t)
+            if attempt_branch is not None:
+                attempt_id = await s.create_attempt(t.id, 1)
+                await s.update_attempt(
+                    attempt_id, branch_name=attempt_branch,
+                    commit_sha=attempt_commit_sha, status="failed",
+                    failure_reason="BUDGET_EXHAUSTED")
             if status is not TaskStatus.PENDING:
                 await s.set_status(t, status, validate=False)
             return t.id
@@ -315,6 +327,47 @@ def test_approve_landed_refuses_wrong_task_status(tmp_path, monkeypatch):
     assert "not awaiting_approval" in output
     refreshed = _get_task(db, tid)
     assert refreshed.status is TaskStatus.IMPLEMENTING
+
+
+def test_approve_landed_completes_failed_no_pr(tmp_path, monkeypatch):
+    """The 5b2246c1 shape: a task that died pre-PR (budget exhaustion) whose
+    branch content a human later hand-lands must be completable via the same
+    `--landed`/`--because` override — not stuck FAILED forever because
+    neither `nh approve --landed` (needs awaiting_approval) nor
+    `nh task restore-approval` (needs PR evidence) admits it."""
+    db = tmp_path / "test.db"
+    repo = _make_landed_repo(tmp_path)
+    _git(repo, "checkout", "-b", "feature")
+    (repo / "b.txt").write_text("new\n")
+    _git(repo, "add", "b.txt")
+    _git(repo, "commit", "-m", "feature: add b.txt")
+    feature_sha = _git_out(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "main")
+    (repo / "b.txt").write_text("new\n")
+    _git(repo, "add", "b.txt")
+    _git(repo, "commit", "-m", "hand-landed: add b.txt")
+    landed_sha = _git_out(repo, "rev-parse", "main")
+
+    tid = _seed_landed_task(
+        db, repo, status=TaskStatus.FAILED,
+        attempt_branch="feature", attempt_commit_sha=feature_sha)
+    runner = _make_runner(db, monkeypatch)
+
+    result = runner.invoke(cli, [
+        "approve", tid[:8], "--landed", landed_sha,
+        "--because", "hand-landed by operator",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert "failed" in result.output.lower()
+
+    refreshed = _get_task(db, tid)
+    assert refreshed.status is TaskStatus.DONE
+    events = _list_events(db, tid)
+    ev = [e for e in events if e.get("kind") == "approved_landed_override"][0]
+    assert ev["sha"] == landed_sha
+    assert ev["shape"] == "failed_pre_pr"
+    assert ev["prior_status"] == "failed"
 
 
 def test_approve_without_landed_is_unchanged(tmp_path, monkeypatch):

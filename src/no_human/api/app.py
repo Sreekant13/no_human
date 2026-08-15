@@ -1015,12 +1015,23 @@ async def approve_landed(
     task_id: str, body: LandedOverrideRequest, request: Request,
 ) -> dict[str, Any]:
     """The HUMAN landed-override affirmation: a human asserts (with required
-    justification) that an ``awaiting_approval`` task's content landed at
-    ``sha`` — for the narrow class where automated containment honestly
-    refuses (a supervising session's squash train adapted the content: a
-    later train car's classification-decision edits, or a real union-resolved
-    source conflict, so no candidate commit's tree matches the branch
-    verbatim). See ``blockers/landed_override.py`` for the full contract.
+    justification) that a task's content landed at ``sha``, for either of two
+    narrow shapes ``blockers/landed_override.py`` resolves and gates:
+
+    - an ``awaiting_approval`` task where automated containment honestly
+      refuses (a supervising session's squash train adapted the content: a
+      later train car's classification-decision edits, or a real
+      union-resolved source conflict, so no candidate commit's tree matches
+      the branch verbatim), or
+    - a ``failed`` task that died before ever opening a PR (budget
+      exhaustion, a pre-review test failure, a compile error) whose content
+      a human later hand-landed — refused if the task was human-cancelled or
+      already has PR evidence (that pair goes through
+      ``nh task restore-approval`` instead).
+
+    See ``blockers/landed_override.py`` for the full contract; this endpoint
+    only cheap-guards obviously-ineligible statuses and otherwise delegates
+    every eligibility decision to that module.
 
     This is deliberately additive and non-idempotent: a second call on the
     same task 409s (the task is DONE), so a replay cannot append a duplicate
@@ -1031,10 +1042,13 @@ async def approve_landed(
 
     store = _store(request)
     task = await _require_task(store, task_id)
-    if task.status != TaskStatus.AWAITING_APPROVAL:
+    if task.status not in (TaskStatus.AWAITING_APPROVAL, TaskStatus.FAILED):
         raise HTTPException(
             status_code=409,
-            detail=f"task is {task.status.value!r}, not awaiting_approval",
+            detail=(
+                f"task is {task.status.value!r}, not awaiting_approval or "
+                "a pre-PR failed task"
+            ),
         )
     try:
         result = await approve_landed_override(store, task, body.sha, body.justification)

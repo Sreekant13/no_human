@@ -3963,7 +3963,9 @@ def _review_pass_evidence(context: dict, head_sha: str, repo) -> tuple[bool, str
               help="Human landed-override: assert this task's content landed "
                    "at this commit (an ancestor of its base branch), when "
                    "automated containment refuses on a supervisor-adapted "
-                   "squash train. Requires --because.")
+                   "squash train — or a task that failed before ever opening "
+                   "a PR (e.g. budget exhaustion) whose content a human "
+                   "later landed. Requires --because.")
 @click.option("--because", "justification", default=None,
               help="Required with --landed: why a human is asserting this "
                    "landed rather than letting containment decide.")
@@ -3988,10 +3990,14 @@ def approve(task_id, landed_sha, justification):
                     sys.exit(1)
                 residue = result["residue"]
                 residue_text = ", ".join(residue) if residue else "none"
+                prior_note = (
+                    " (was failed, no PR)"
+                    if result.get("prior_status") == "failed" else ""
+                )
                 console.print(
-                    f"[bold green]override recorded[/] — {t.id[:8]} completed on "
-                    f"human assertion that content landed at {landed_sha[:12]}. "
-                    f"residue: {residue_text}"
+                    f"[bold green]override recorded[/] — {t.id[:8]} completed"
+                    f"{prior_note} on human assertion that content landed at "
+                    f"{landed_sha[:12]}. residue: {residue_text}"
                 )
 
         asyncio.run(_go_landed())

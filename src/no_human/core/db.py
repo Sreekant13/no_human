@@ -1823,6 +1823,30 @@ class Store:
         )
         return str(row[0]).strip() if row else ""
 
+    async def latest_attempt_branch(self, task_id: str) -> dict[str, str]:
+        """The newest recorded ``branch_name``/``commit_sha`` pair for
+        *task_id*, or ``{"branch": "", "commit_sha": ""}`` if no attempt ever
+        recorded a branch — mirrors `latest_attempt_pr_url` so a task's
+        content stays locatable even when ``pr_branch`` was never written
+        (the pre-PR failed shape `blockers/landed_override.py` resolves).
+
+        Ordered ``started_at DESC, rowid DESC`` — NOT ``attempt_number`` —
+        for the exact reason `latest_open_attempt` documents. ``NULL`` and
+        ``''`` both collapse to absent.
+        """
+        row = await self._fetchone(
+            "SELECT branch_name, commit_sha FROM attempts WHERE task_id = ? "
+            "AND COALESCE(TRIM(branch_name), '') <> '' "
+            "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            (task_id,),
+        )
+        if row is None:
+            return {"branch": "", "commit_sha": ""}
+        return {
+            "branch": str(row[0] or "").strip(),
+            "commit_sha": str(row[1] or "").strip(),
+        }
+
     @serialized_write
     async def close_open_attempts(self, task_id: str) -> None:
         """Retire every ``in_progress`` row of *task_id* — the caller has just
