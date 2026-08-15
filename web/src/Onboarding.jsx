@@ -15,6 +15,7 @@ import {
 } from "./integrationSetup.js";
 import { backDisabled, backDisabledReason, forwardDisabled } from "./onboardingNav.js";
 import { scanSummary } from "./onboardingHistory.js";
+import { summaryRepoCounts } from "./onboardingSummary.js";
 import {
   newProjectDef, toggleProjectRepo as bindProjectRepo, setPrimaryRepo,
   dropRepoEverywhere, unboundProjects, unboundProjectsMessage, projectPayload,
@@ -930,32 +931,46 @@ export default function Onboarding({ onComplete }) {
                   : readiness.usable > 0 ? "Ready."
                   : "Almost ready."}
               </h2>
-              <ul className="ob-summary">
-                <li>
-                  <span>Projects</span>
-                  <b>{projectDefs.length}{unbound.length ? ` · ${unbound.length} with no repos` : ""}</b>
-                </li>
-                <li><span>Repos</span><b>{selectedRepos.size}</b></li>
-                <li><span>Docs</span><b>{docs.filter((d) => d.trim()).length}</b></li>
-                <li><span>Rules confirmed</span><b>{chosenRules.size}</b></li>
-                <li>
-                  <span>Repos with a proven test command</span>
-                  <b>{readiness === null ? "…" : `${readiness.usable} of ${readiness.total}`}</b>
-                </li>
-                {/* Counted from the SERVER's refreshed specs, so this line
-                    agrees with what is actually in config.yaml — "on" is the
-                    switch, "ready" additionally has its credential and its
-                    settings. Never claims more than the config supports. */}
-                <li>
-                  <span>Integrations on</span>
-                  <b>{integrations === null
-                    ? "—"
-                    : `${setupSummary(integrations).on} of ${setupSummary(integrations).total}` +
-                      (setupSummary(integrations).ready < setupSummary(integrations).on
-                        ? ` · ${setupSummary(integrations).ready} ready`
-                        : "")}</b>
-                </li>
-              </ul>
+              {/* Both repo rows below come from summaryRepoCounts(readiness) —
+                  the server's registered-repo store — not from selectedRepos
+                  (this mount's checkboxes). They used to disagree: "Repos: 0"
+                  beside "0 of 1" for the same registered repo whenever the
+                  ticks didn't match what was actually persisted (reload,
+                  re-run, reset). The launch payload below still POSTs
+                  [...selectedRepos] — that is a separate, intentional
+                  question ("what did THIS run of the wizard tick") and is out
+                  of scope here; don't "fix" it back to selectedRepos.size. */}
+              {(() => {
+                const counts = summaryRepoCounts(readiness);
+                return (
+                  <ul className="ob-summary">
+                    <li>
+                      <span>Projects</span>
+                      <b>{projectDefs.length}{unbound.length ? ` · ${unbound.length} with no repos` : ""}</b>
+                    </li>
+                    <li><span>Repos</span><b>{counts.repos}</b></li>
+                    <li><span>Docs</span><b>{docs.filter((d) => d.trim()).length}</b></li>
+                    <li><span>Rules confirmed</span><b>{chosenRules.size}</b></li>
+                    <li>
+                      <span>Repos with a proven test command</span>
+                      <b>{counts.proven}</b>
+                    </li>
+                    {/* Counted from the SERVER's refreshed specs, so this line
+                        agrees with what is actually in config.yaml — "on" is the
+                        switch, "ready" additionally has its credential and its
+                        settings. Never claims more than the config supports. */}
+                    <li>
+                      <span>Integrations on</span>
+                      <b>{integrations === null
+                        ? "—"
+                        : `${setupSummary(integrations).on} of ${setupSummary(integrations).total}` +
+                          (setupSummary(integrations).ready < setupSummary(integrations).on
+                            ? ` · ${setupSummary(integrations).ready} ready`
+                            : "")}</b>
+                    </li>
+                  </ul>
+                );
+              })()}
               {readiness && !readiness.error && readiness.usable === 0 && (
                 <p className="ob-prove-verdict bad">
                   No repo has a proven test command yet. Your tasks will still run — but
