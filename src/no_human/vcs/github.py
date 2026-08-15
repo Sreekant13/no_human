@@ -6,8 +6,6 @@ import logging
 import subprocess
 from pathlib import Path
 
-from ._labels import is_label_error, label_args
-
 log = logging.getLogger("no_human.vcs")
 
 
@@ -25,48 +23,29 @@ def is_github_remote(url: str, extra_hosts: tuple[str, ...] | list[str] = ()) ->
 
 def open_pr(
     repo_path: Path, branch: str, title: str, body: str, *, base: str = "main",
-    labels: list[str] | None = None, update_existing_body: bool = False,
+    update_existing_body: bool = False,
 ) -> str:
     """Create a draft PR and return its URL. Requires `gh` auth.
 
     Idempotent: if a PR already exists for ``branch`` (e.g. when revising after a
     human PR comment, which pushes onto the same branch), return the existing PR's
     URL instead of failing — the push has already updated it. Never merges.
-
-    ``labels`` are applied at creation time, not after, so a CI job that validates
-    labels on PR-open never observes an unlabelled PR. A label that doesn't exist
-    on THIS repo (a label another repo requires, applied to a repo that never
-    defined it) must not block the PR: `gh` fails the whole
-    create, so we retry once without labels and open the PR unlabelled
-    (logged). A retry that still fails is a real error and is surfaced.
     """
-    def _create(with_labels: bool) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            [
-                "gh", "pr", "create",
-                "--head", branch,
-                "--base", base,
-                "--title", title,
-                "--body", body,
-                "--draft",
-                *(label_args(labels) if with_labels else []),
-            ],
-            cwd=repo_path, capture_output=True, text=True,
-        )
-
-    proc = _create(with_labels=True)
+    proc = subprocess.run(
+        [
+            "gh", "pr", "create",
+            "--head", branch,
+            "--base", base,
+            "--title", title,
+            "--body", body,
+            "--draft",
+        ],
+        cwd=repo_path, capture_output=True, text=True,
+    )
     if proc.returncode == 0:
         return proc.stdout.strip()
 
     stderr = proc.stderr.strip()
-    # A nonexistent label shouldn't strand the task — open the PR without it.
-    if labels and is_label_error(stderr):
-        log.warning("gh rejected label(s) %s for %s (%s); opening PR without them",
-                    labels, repo_path, stderr)
-        proc = _create(with_labels=False)
-        if proc.returncode == 0:
-            return proc.stdout.strip()
-        stderr = proc.stderr.strip()
     if "already exists" in stderr.lower():
         existing = _existing_pr_url(repo_path, branch)
         if existing:

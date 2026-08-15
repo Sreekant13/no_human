@@ -5009,11 +5009,6 @@ class Orchestrator:
                              receipts=receipts,
                              repo=repo, base=base, branch=branch,
                              attempt_n=attempt_n)
-        # Labels are a per-repo concern, so a task may override the global
-        # default — including with an explicit [] to opt out of it entirely.
-        task_labels = (task.config or {}).get("pr_labels")
-        pr_labels = (task_labels if task_labels is not None
-                     else self.config.get("git", {}).get("pr_labels", []))
         # Refresh the body only if THIS TASK opened the draft that is sitting on THIS
         # branch. Durable (task.context), so it survives a park/resume and a process
         # restart; branch-scoped, so a revision onto a different branch cannot inherit it.
@@ -5023,7 +5018,6 @@ class Orchestrator:
         try:
             pr = open_pr(repo, branch, title, body, base=base,
                          github_hosts=self.config.get("git", {}).get("github_hosts"),
-                         labels=pr_labels,
                          # Refresh the body: this run opened the pre-gate draft with the
                          # pre-review body, and the evidence sections only exist now.
                          update_existing_body=may_refresh_body)
@@ -5067,7 +5061,6 @@ class Orchestrator:
                 # call read [None, True, None].
                 pr = open_pr(repo, branch, title, body, base=base,
                              github_hosts=self.config.get("git", {}).get("github_hosts"),
-                             labels=pr_labels,
                              update_existing_body=may_refresh_body,
                              force_with_lease=forced)
             except Exception as exc2:  # noqa: BLE001
@@ -5129,8 +5122,6 @@ class Orchestrator:
         for lr_path, lr_repo, lr_base in (linked_commits or []):
             try:
                 lr_body = f"Linked PR for {task.title}\n\nPrimary PR: {pr.url}"
-                # No labels: a linked repo has its own label set, and the primary
-                # repo's labels may not exist there.
                 lr_pr = open_pr(lr_repo, branch, title, lr_body, base=lr_base,
                                 github_hosts=gh_hosts)
                 linked_pr_urls.append(lr_pr.url)
@@ -7897,14 +7888,10 @@ class Orchestrator:
             # `gh pr list` is one call per attempt on GitHub only, and it is the only way
             # to tell "created" from "reused" — open_pr returns a url either way.
             pre_existing = bool(_gh._existing_pr_url(repo.path, branch))
-            task_labels = (task.config or {}).get("pr_labels")
-            pr_labels = (task_labels if task_labels is not None
-                         else self.config.get("git", {}).get("pr_labels", []))
             pr = await asyncio.to_thread(
                 open_pr, repo, branch, title, body,
                 base=base or "main",
                 github_hosts=self.config.get("git", {}).get("github_hosts"),
-                labels=pr_labels,
             )
         except ProtectedBranch as exc:
             # 🔴 CAUGHT, NOT RE-RAISED. `raise` here escaped `run_task` entirely — the
@@ -9874,7 +9861,7 @@ class Orchestrator:
         split the task, or "raise the limit for this task". Only the first was
         ever implemented — the limit was read from global config alone, so a
         human who answered "raise the limit" got the identical blocker on the
-        next attempt. A per-task override (same shape as `pr_labels`) makes the
+        next attempt. A per-task override makes the
         offer real. The global default is untouched, and the agent cannot set
         this itself: `task.config` is written by `nh`, not by the agent
         (see blockers/actions.py).

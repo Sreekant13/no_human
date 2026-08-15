@@ -361,7 +361,7 @@ async def test_the_draft_helper_actually_RETURNS_the_url_it_opened_0a(tmp_path,
     orch = Orchestrator.__new__(Orchestrator)
     orch._sink = lambda e: None
     orch._active_attempt_id = None
-    orch.config = {"git": {"github_hosts": [], "pr_labels": []}}
+    orch.config = {"git": {"github_hosts": []}}
     # The helper now stakes a DURABLE claim ("this run created the draft, so this run
     # may rewrite its body") in task.context, because an in-process attribute could not
     # survive a park/resume — a review drove that defect. A store is therefore a real
@@ -412,7 +412,7 @@ async def test_a_non_github_remote_gets_no_pre_gate_pr_0a(tmp_path, monkeypatch)
     orch = Orchestrator.__new__(Orchestrator)
     orch._sink = lambda e: None
     orch._active_attempt_id = None
-    orch.config = {"git": {"github_hosts": [], "pr_labels": []}}
+    orch.config = {"git": {"github_hosts": []}}
     # The helper now stakes a DURABLE claim ("this run created the draft, so this run
     # may rewrite its body") in task.context, because an in-process attribute could not
     # survive a park/resume — a review drove that defect. A store is therefore a real

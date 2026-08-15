@@ -1174,11 +1174,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Extra GitHub Enterprise hosts treated as GitHub (github.com is always
         # recognized). Add your GHE host (e.g. "code.example.com") to open real PRs.
         "github_hosts": ["github.com", "code.example.com"],
-        # Labels applied when the agent opens a PR/MR. Some repos gate CI on a
-        # label (some repos require a V* version label on PRs into their integration
-        # branch). Usually
-        # a per-repo concern — a task can override via its own `pr_labels`.
-        "pr_labels": [],
         "agent_identity_name": "no_human",
         "agent_identity_email": "no-human@acme.com",
         # The OPERATOR's identity — used ONLY for the one commit `nh approve`

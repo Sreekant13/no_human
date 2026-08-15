@@ -34,7 +34,7 @@ class PlanNotApproved(RuntimeError):
 
 # The per-task option key. It lives on ``task.config`` because that is where
 # every other per-task, human-only override already lives (`nh task config`,
-# `pr_labels`, `backend`, the budget caps) — a run reads it, the agent never
+# `backend`, the budget caps) — a run reads it, the agent never
 # writes it.
 CONFIG_KEY = "plan_approval"
 

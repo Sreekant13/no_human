@@ -46,7 +46,6 @@ def open_pr(
     *,
     base: str = "main",
     github_hosts: list[str] | None = None,
-    labels: list[str] | None = None,
     update_existing_body: bool = False,
     force_with_lease: bool = False,
 ) -> PrResult:
@@ -59,10 +58,6 @@ def open_pr(
 
     ``github_hosts`` lists extra GitHub Enterprise hosts (from ``git.github_hosts``)
     so a GHE remote like code.example.com is recognized as GitHub.
-
-    ``labels`` are attached when the PR/MR is created. Some CI jobs validate
-    labels on PR-open (a repo can require a label of its own), so applying
-    them after the fact would race the first CI run.
 
     For a local bare-repo remote (Phase 0 testing target) there is no PR API, so
     we push the branch and return a ``local`` marker — the push itself proves the
@@ -90,12 +85,10 @@ def open_pr(
     pushed_sha = repo.push(branch, force_with_lease=force_with_lease)
     if is_github:
         return PrResult(github.open_pr(repo.path, branch, title, body, base=base,
-                                       labels=labels,
                                        update_existing_body=update_existing_body),
                         "github", branch, pushed_sha=pushed_sha)
     if is_gitlab:
-        return PrResult(gitlab.open_mr(repo.path, branch, title, body, base=base,
-                                       labels=labels),
+        return PrResult(gitlab.open_mr(repo.path, branch, title, body, base=base),
                         "gitlab", branch, pushed_sha=pushed_sha)
 
     # Local (file-path) remote — the Phase 0 testing target: no PR API, the

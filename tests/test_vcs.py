@@ -276,35 +276,21 @@ def test_is_github_remote_detects_github_and_ghe():
 
 
 # --------------------------------------------------------------------------- #
-# PR labels: a repo can gate CI on a label of its own at PR-open, so          #
-# they must be applied when the PR is created, not after.                     #
+# PR labels: the pr_labels feature (attach labels when opening a PR/MR) was   #
+# removed — operator directive 2026-08-15. Opening a PR/MR must never send    #
+# a --label flag, and the labels= kwarg must no longer exist anywhere.        #
 # --------------------------------------------------------------------------- #
 
 
-def test_label_args_normalizes():
-    from no_human.vcs._labels import label_args
-    assert label_args(None) == []
-    assert label_args([]) == []
-    assert label_args(["needs-review"]) == ["--label", "needs-review"]
-    # order preserved, blanks dropped, duplicates collapsed
-    assert label_args(["needs-review", "  ", "", "triage", "needs-review"]) == [
-        "--label", "needs-review", "--label", "triage",
-    ]
-    # a label with spaces stays one argv element
-    assert label_args(["DO NOT MERGE"]) == ["--label", "DO NOT MERGE"]
-    # surrounding whitespace is stripped, so config typos can't emit --label ''
-    assert label_args([" needs-review "]) == ["--label", "needs-review"]
-
-
 def _capture_argv(monkeypatch, module, returncode=0, stdout="https://pr/1"):
-    """Record the argv the forge CLI would be invoked with."""
-    seen = {}
+    """Record every argv the forge CLI would be invoked with."""
+    calls = []
 
     class _Proc:
         pass
 
     def fake_run(argv, **kwargs):
-        seen["argv"] = argv
+        calls.append(argv)
         proc = _Proc()
         proc.returncode = returncode
         proc.stdout = stdout
@@ -312,98 +298,45 @@ def _capture_argv(monkeypatch, module, returncode=0, stdout="https://pr/1"):
         return proc
 
     monkeypatch.setattr(module.subprocess, "run", fake_run)
-    return seen
-
-
-def test_github_open_pr_passes_labels_at_creation(monkeypatch, tmp_path):
-    from no_human.vcs import github
-    seen = _capture_argv(monkeypatch, github)
-    url = github.open_pr(tmp_path, "br", "PROJ-1: t", "body", base="dev",
-                         labels=["needs-review"])
-    assert url == "https://pr/1"
-    argv = seen["argv"]
-    assert argv[:3] == ["gh", "pr", "create"]
-    # label rides on the create call itself — never a follow-up `gh pr edit`
-    assert "--label" in argv and argv[argv.index("--label") + 1] == "needs-review"
-    assert "--draft" in argv  # never merges
-
-
-def test_github_open_pr_without_labels_omits_flag(monkeypatch, tmp_path):
-    from no_human.vcs import github
-    seen = _capture_argv(monkeypatch, github)
-    github.open_pr(tmp_path, "br", "t", "body", base="dev")
-    assert "--label" not in seen["argv"]
-
-
-def test_gitlab_open_mr_passes_labels(monkeypatch, tmp_path):
-    from no_human.vcs import gitlab
-    seen = _capture_argv(monkeypatch, gitlab)
-    gitlab.open_mr(tmp_path, "br", "t", "body", base="dev", labels=["needs-review", "triage"])
-    argv = seen["argv"]
-    assert argv[:3] == ["glab", "mr", "create"]
-    assert [argv[i + 1] for i, a in enumerate(argv) if a == "--label"] == ["needs-review", "triage"]
-    assert "--no-merge" in argv  # never merges
-
-
-def _sequence_run(monkeypatch, module, results):
-    """Queue (returncode, stdout, stderr) tuples; record every argv seen."""
-    calls = []
-    queue = list(results)
-
-    class _Proc:
-        pass
-
-    def fake_run(argv, **kwargs):
-        calls.append(argv)
-        rc, out, err = queue.pop(0)
-        proc = _Proc()
-        proc.returncode, proc.stdout, proc.stderr = rc, out, err
-        return proc
-
-    monkeypatch.setattr(module.subprocess, "run", fake_run)
     return calls
 
 
-def test_is_label_error_is_narrow():
-    from no_human.vcs._labels import is_label_error
-    assert is_label_error("could not add label: 'needs-review' not found")
-    assert is_label_error("label 'needs-review' does not exist")
-    assert not is_label_error("authentication required")  # unrelated failure
-    assert not is_label_error("a merge conflict on the branch")  # 'label' absent
-
-
-def test_github_open_pr_retries_without_labels_when_label_missing(monkeypatch, tmp_path):
-    """A label applied to a repo that never defined it must not
-    strand the task — the PR opens unlabelled on retry (the ca23ce68 E2E blocker)."""
+def test_github_open_pr_never_sends_a_label_flag(monkeypatch, tmp_path):
     from no_human.vcs import github
-    calls = _sequence_run(monkeypatch, github, [
-        (1, "", "could not add label: 'needs-review' not found"),   # 1st: with labels
-        (0, "https://pr/9", ""),                            # 2nd: without labels
-    ])
-    url = github.open_pr(tmp_path, "br", "t", "body", base="dev", labels=["needs-review"])
-    assert url == "https://pr/9"
-    assert "--label" in calls[0]           # first attempt carried the label
-    assert "--label" not in calls[1]       # retry dropped it
-    assert len(calls) == 2
+    calls = _capture_argv(monkeypatch, github)
+    url = github.open_pr(tmp_path, "br", "PROJ-1: t", "body", base="dev")
+    assert url == "https://pr/1"
+    assert len(calls) == 1  # no retry-without-labels loop left to trigger
+    argv = calls[0]
+    assert argv[:3] == ["gh", "pr", "create"]
+    assert "--label" not in argv
+    assert "--draft" in argv  # never merges
+    with pytest.raises(TypeError):
+        github.open_pr(tmp_path, "br", "t", "b", base="dev", labels=["x"])
 
 
-def test_github_open_pr_non_label_failure_is_not_masked(monkeypatch, tmp_path):
-    from no_human.vcs import github
-    _sequence_run(monkeypatch, github, [(1, "", "authentication required")])
-    with pytest.raises(RuntimeError, match="authentication required"):
-        github.open_pr(tmp_path, "br", "t", "body", base="dev", labels=["needs-review"])
-
-
-def test_gitlab_open_mr_retries_without_labels_when_label_missing(monkeypatch, tmp_path):
+def test_gitlab_open_mr_never_sends_a_label_flag(monkeypatch, tmp_path):
     from no_human.vcs import gitlab
-    calls = _sequence_run(monkeypatch, gitlab, [
-        (1, "", "label 'needs-review' does not exist"),
-        (0, "https://mr/3", ""),
-    ])
-    url = gitlab.open_mr(tmp_path, "br", "t", "body", base="dev", labels=["needs-review"])
-    assert url == "https://mr/3"
-    assert "--label" not in calls[1]
-    assert len(calls) == 2
+    calls = _capture_argv(monkeypatch, gitlab)
+    url = gitlab.open_mr(tmp_path, "br", "t", "body", base="dev")
+    assert url == "https://pr/1"
+    assert len(calls) == 1
+    argv = calls[0]
+    assert argv[:3] == ["glab", "mr", "create"]
+    assert "--label" not in argv
+    assert "--no-merge" in argv  # never merges
+    with pytest.raises(TypeError):
+        gitlab.open_mr(tmp_path, "br", "t", "b", base="dev", labels=["x"])
+
+
+def test_open_pr_facade_rejects_labels_kwarg():
+    with pytest.raises(TypeError):
+        vcs.open_pr(None, "br", "t", "b", labels=["x"])
+
+
+def test_pr_labels_config_key_removed():
+    import no_human.config as config
+    assert "pr_labels" not in config.DEFAULT_CONFIG["git"]
 
 
 def test_open_pr_local_path(repo_with_bare_remote):

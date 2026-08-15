@@ -431,7 +431,7 @@ async def test_task_create_ignores_plan_approval_for_jira_source(client, store, 
 @pytest.mark.asyncio
 async def test_flag_rides_on_task_config_and_survives_a_round_trip(store):
     """It lives on `task.config` — the same carrier as every other per-task,
-    human-only override (`nh task config`, pr_labels, the budget caps)."""
+    human-only override (`nh task config`, the budget caps)."""
     t = Task.new("x", repo_path="/tmp/repo")
     assert plan_gate.required(t) is False       # default OFF
     t.config["plan_approval"] = True

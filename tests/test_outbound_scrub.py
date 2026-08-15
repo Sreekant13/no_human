@@ -463,11 +463,12 @@ _FREE_TEXT_FIELD_PREFIXES = ("body=", "title=", "description=")
 # (file, function) -> (file, function) it delegates its scrubbing to. Every
 # entry here is a DELIBERATE, reviewed exception — not a way to silence the
 # test — and the delegate side is itself verified to call scrub_outbound.
+# The `_create` entries (removed 2026-08-15 with the pr_labels feature) named
+# a nested helper that only existed to retry `gh`/`glab` create once without
+# labels; github.py/gitlab.py now build the argv directly in open_pr/open_mr.
 _DELEGATED_TO = {
     ("github.py", "open_pr"): ("__init__.py", "open_pr"),
-    ("github.py", "_create"): ("__init__.py", "open_pr"),
     ("gitlab.py", "open_mr"): ("__init__.py", "open_pr"),
-    ("gitlab.py", "_create"): ("__init__.py", "open_pr"),
 }
 
 
@@ -544,7 +545,12 @@ def test_every_forge_free_text_write_routes_through_scrub_outbound():
                 )
     # Not vacuous: this must actually have found the known writers, or the
     # AST walk itself is broken and the assertion below is trivially true.
-    assert total_sinks >= 7, (
+    # Was >= 7 until the pr_labels removal (2026-08-15) inlined github.py's
+    # nested `_create` helper into `open_pr`: the create-call and the
+    # existing-PR body-edit call are now both sinks named "open_pr", so the
+    # set of distinct sink NAMES lost one entry even though both call sites
+    # (and their scrub_outbound coverage) are still scanned and accounted for.
+    assert total_sinks >= 6, (
         f"expected to discover the known gh/glab free-text writers, found "
         f"only {total_sinks} — the discovery scan itself may be broken"
     )

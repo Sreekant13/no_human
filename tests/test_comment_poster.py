@@ -311,11 +311,14 @@ _BODY_FORWARDERS = {"_post_gitlab_inline"}
 #: over a real positive: a set of names excused every matching call in the
 #: function forever, and an unmarked `gh api .../issues/1/comments` planted
 #: inside open_pr left the guard green. The function named is the INNERMOST one:
-#: `open_pr` builds its argv in a nested `_create`, and naming the outer
+#: `open_pr` builds its `gh pr create` argv directly (the nested `_create`
+#: helper it used to retry once without labels was removed with pr_labels,
+#: 2026-08-15) and also its own `gh pr edit` body-refresh call, so both of
+#: open_pr's non-comment writes now count under the one name. Naming the outer
 #: function was one of the ways a planted call got laundered. An entry here can
 #: only ever excuse a call matched by its BODY argument — a call that names a
 #: comment ENDPOINT is never excusable, whatever function it sits in.
-_SAFE_NON_COMMENT_WRITES = {"vcs/github.py:_create": 1, "vcs/github.py:open_pr": 1}
+_SAFE_NON_COMMENT_WRITES = {"vcs/github.py:open_pr": 2}
 
 
 def _forge_calls(path: pathlib.Path):
