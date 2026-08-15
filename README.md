@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/nh-mark.png" alt="" width="96" height="96">
+<img src="docs/assets/nh-mark.png" alt="" width="160" height="160">
 
 # no_human
 

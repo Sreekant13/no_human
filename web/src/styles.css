@@ -617,7 +617,7 @@ html, body, #root {
 .legion-brand {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
 }
 /* The brand is a <button> when it navigates home. Tailwind preflight is OFF in
    this app, so a button keeps the UA's background, border, font and centring
@@ -652,10 +652,12 @@ html, body, #root {
 }
 .legion-name {
   transition: color var(--dur-fast) ease;
+  /* Same face and weight as the app's headings (DM Sans 600, normal
+     tracking) — at 800/-0.02em the wordmark read as a different font. */
   font-family: var(--font-ui);
   font-size: 26px;
-  font-weight: 800;
-  letter-spacing: -0.02em;
+  font-weight: 600;
+  letter-spacing: normal;
   color: var(--text-hi);
 }
 .legion-tag {
