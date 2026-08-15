@@ -94,6 +94,29 @@ Every task carries an enforced spend cap. `nh logs <id>` shows real spend
 against it, per task.
 
 
+## Integrations
+
+Point no_human at the tracker you already use and it pulls the tickets to your
+board — a tracker's filter lives in your config, never in a task's own text,
+and a transport error logs and retries on the next tick instead of crashing
+the pool.
+
+| Tracker | How tickets arrive | Filter you configure |
+|---|---|---|
+| **Jira Cloud** | Polled via REST `search/jql` (HTTP Basic `email:token`) | `integrations.jira.jql` |
+| **Linear** | Polled via the GraphQL API | `integrations.linear.team_key` + `state_types` + `label` |
+| **monday.com** | Polled via GraphQL v2 | `integrations.monday.board_id` + `status_column` + `todo_labels` |
+
+Jira ticket state round-trips: when a task ships, the ticket moves — the
+label-based round-trip is pinned by its own test. Setup for each tracker:
+[docs/adapters.md](docs/adapters.md).
+
+**Watch the Jira flow end to end** — tickets synced from a Jira board, scoped,
+implemented, and delivered as a review-passed pull request:
+
+[![Jira flow demo](https://getnohuman.com/assets/demo-jira-poster.jpg)](https://getnohuman.com/assets/demo-jira.mp4)
+
+
 ## Docs
 
 | | |
