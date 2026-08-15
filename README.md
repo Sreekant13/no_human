@@ -112,9 +112,10 @@ label-based round-trip is pinned by its own test. Setup for each tracker:
 [docs/adapters.md](docs/adapters.md).
 
 **Watch the Jira flow end to end** — tickets synced from a Jira board, scoped,
-implemented, and delivered as a review-passed pull request:
+implemented, and delivered as a review-passed pull request (click for the full
+video with every step):
 
-[![Jira flow demo](https://getnohuman.com/assets/demo-jira-poster.jpg)](https://getnohuman.com/assets/demo-jira.mp4)
+[![Jira flow demo](https://getnohuman.com/assets/demo-jira.gif)](https://getnohuman.com/assets/demo-jira.mp4)
 
 
 ## Docs
