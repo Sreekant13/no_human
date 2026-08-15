@@ -117,7 +117,7 @@ from .pricing import (
 from .pricing import weighted_tokens as _weighted_tokens
 from .pr_evidence import PrEvidence, collapse_appendix
 from .task import Task, TaskSpec, TaskStatus
-from .worktree import _LIVE_WORKTREES, teardown_worktree
+from .worktree import _LIVE_WORKTREES, reset_agent_workspace, teardown_worktree
 
 log = logging.getLogger("no_human.orchestrator")
 
@@ -3063,6 +3063,23 @@ class Orchestrator:
         # was failed as fabrication — two burnt attempts and a human paged, which
         # is the very failure this change exists to remove.
         branched_from_own_partial = False
+
+        # A reused worktree carries whatever the PREVIOUS attempt left
+        # uncommitted (a stuck coder session, a crash before the commit) —
+        # both `repo.checkout(branch)` below and `repo.create_branch` /
+        # `git checkout -B` refuse to run over that with "Your local changes
+        # would be overwritten by checkout". Reset immediately before the
+        # branch decision so both routes start clean; guarded to agent-owned
+        # worktrees only (never a human's primary checkout).
+        discarded = reset_agent_workspace(repo, self.config, task_id=task.id)
+        if discarded:
+            self.emit(
+                "workspace_reset",
+                f"discarded {len(discarded)} uncommitted leftover(s) from a "
+                f"previous attempt before branching: {', '.join(discarded[:5])}",
+                ok=True,
+            )
+
         revision_branch = ctx.get("pr_branch")
         if revision_branch:
             branch = revision_branch

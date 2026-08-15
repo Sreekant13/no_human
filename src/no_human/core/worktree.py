@@ -55,6 +55,84 @@ log = logging.getLogger("no_human.worktree")
 _LIVE_WORKTREES: set[str] = set()
 
 
+def is_agent_worktree(
+    path, config, *, live: set[str] | None = None,
+) -> bool:
+    """Fail-closed containment predicate: True only for a directory this
+    process's own worktree machinery could have produced — never a human's
+    primary checkout, and never anything outside the configured worktree
+    root. `reset_agent_workspace` is destructive (hard reset + clean), so
+    this is the guard that stands between it and an operator's live tree.
+
+    All of the following must hold, else False:
+      1. ``path``'s PARENT is exactly the configured ``worktree_root`` —
+         nothing outside the root is ever in scope, however it is shaped.
+      2. ``path``'s directory NAME parses under ``config.worktree_owner``
+         into the ``<task_id>.<owner_pid>.<token>`` shape this process
+         mints for a per-run worktree, OR ``path`` is registered in
+         ``live`` (this process is running a task in it right now — covers
+         legacy/bare-task-id directories that still predate the shaped
+         name).
+      3. ``path/.git`` is a FILE, not a directory — the marker of a linked
+         worktree. A primary checkout's ``.git`` is a directory; treating
+         one as agent-owned would let this reset a human's tree.
+
+    Any exception (unreadable path, a symlink that does not resolve, a
+    non-existent directory) reads as False — "cannot prove it is ours"
+    is not "safe to reset"."""
+    from ..config import worktree_owner, worktree_root
+
+    if live is None:
+        live = _LIVE_WORKTREES
+    try:
+        p = Path(path).resolve()
+        root = worktree_root(config).resolve()
+        if p.parent != root:
+            return False
+        _, owner_pid = worktree_owner(p.name)
+        shaped = len(p.name.split(".")) >= 3 and owner_pid is not None
+        if not (shaped or str(path) in live or str(p) in live):
+            return False
+        return (p / ".git").is_file()
+    except Exception:  # noqa: BLE001 — unreadable/unresolvable reads as "not ours"
+        return False
+
+
+def reset_agent_workspace(
+    repo, config, *, task_id: str, live: set[str] | None = None,
+) -> list[str] | None:
+    """Hard-reset + clean an agent-owned worktree immediately before a
+    branch decision (`checkout` / `checkout -B`), so a previous attempt's
+    uncommitted leftovers can never crash the next one's startup.
+
+    Returns the discarded paths (``[]`` on an already-clean tree), or
+    ``None`` when the guard declined — never raises, so a reset failure
+    (or a workspace this process does not own) can never fail a task; the
+    caller's own branch operation remains the loud symptom if something is
+    still wrong afterward."""
+    if not is_agent_worktree(repo.path, config, live=live):
+        log.info(
+            "workspace reset SKIPPED for task %s — %s is not an "
+            "agent-owned worktree", task_id[:8], repo.path,
+        )
+        return None
+    try:
+        discarded = repo.reset_workspace()
+    except Exception as exc:  # noqa: BLE001 — reset must never fail a task
+        log.error(
+            "workspace reset FAILED for task %s at %s: %s",
+            task_id[:8], repo.path, exc,
+        )
+        return None
+    if discarded:
+        log.warning(
+            "workspace reset discarded %d uncommitted leftover(s) for task "
+            "%s before branching (previous attempt's leftovers): %s",
+            len(discarded), task_id[:8], ", ".join(discarded[:5]),
+        )
+    return discarded
+
+
 def teardown_worktree(
     main_repo, wt_path: Path, *, task_id: str, live: set[str] | None = None,
 ) -> bool:

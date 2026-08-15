@@ -88,6 +88,32 @@ class GitRepo:
             )
         return proc.stdout.strip()
 
+    def _run_porcelain_lines(self, *args: str, check: bool = True) -> list[str]:
+        """Like `_run`, but for `status --porcelain` output specifically.
+
+        `_run`'s `proc.stdout.strip()` is a whole-output strip, not a
+        per-line one: on multi-line porcelain output (`" M calc.py\\n??
+        scratch.txt\\n"`) it eats only the leading space off the FIRST
+        line, silently shortening its 3-char `XY ` status prefix to 2 —
+        every prefix-sliced caller (`line[3:]`) then truncates that one
+        entry's path by a character (`"calc.py"` -> `"alc.py"`). Splitting
+        on `"\\n"` and dropping only the trailing newline (never a global
+        `.strip()`) keeps every line's prefix width intact."""
+        cmd = [
+            "git",
+            "-c", f"user.name={self.identity_name}",
+            "-c", f"user.email={self.identity_email}",
+            *args,
+        ]
+        proc = subprocess.run(
+            cmd, cwd=self.path, capture_output=True, text=True
+        )
+        if check and proc.returncode != 0:
+            raise GitError(
+                f"git {' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip()}"
+            )
+        return [line for line in proc.stdout.split("\n") if line]
+
     def current_branch(self) -> str:
         return self._run("rev-parse", "--abbrev-ref", "HEAD")
 
@@ -190,6 +216,39 @@ class GitRepo:
 
     def has_changes(self) -> bool:
         return bool(self._run("status", "--porcelain", "--", ".", *self._EPHEMERAL))
+
+    def reset_workspace(self) -> list[str]:
+        """Discard EVERYTHING uncommitted in this checkout — staged/unstaged
+        changes to tracked files AND untracked files/dirs — so a `checkout`/
+        `checkout -B` right after this call can never fail with "Your local
+        changes would be overwritten by checkout". Agent worktrees only:
+        callers must prove ownership first (`core/worktree.is_agent_worktree`)
+        before calling this — it is destructive and unconditional.
+
+        Deliberately `clean -fd`, never `-x`: ignored artifacts (`.venv`,
+        `node_modules`, `dist`, caches) are expensive to rebuild and never
+        block a checkout, so they are left alone. `-e .no_human` preserves
+        the agent's own scratch/plan sidecar.
+
+        Runs entirely with `check=False` — a locked index or unreadable tree
+        must not raise here; the `checkout`/`checkout -B` that follows is
+        left to surface that failure loudly, as it does today. Returns the
+        relative paths that were dirty before the reset (empty on an
+        already-clean tree — idempotent)."""
+        status_lines = self._run_porcelain_lines(
+            "status", "--porcelain", "--", ".", *self._EPHEMERAL, check=False)
+        discarded: list[str] = []
+        for line in status_lines:
+            rel = line[3:].strip() if len(line) > 3 else ""
+            if rel.startswith('"') and rel.endswith('"'):
+                rel = rel[1:-1]
+            if " -> " in rel:            # rename: "old -> new"
+                rel = rel.split(" -> ", 1)[1]
+            if rel:
+                discarded.append(rel)
+        self._run("reset", "--hard", check=False)
+        self._run("clean", "-fd", "-e", ".no_human", check=False)
+        return discarded
 
     def uncommitted_source_files(
         self, coder_touched: set[str] | None = None,
