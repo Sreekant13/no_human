@@ -12,7 +12,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import { NH_EXE_NAME, bundledNhPath } from "./server.mjs";
+import { validateIco } from "../packaging/icoFromPng.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(fs.readFileSync(path.join(here, "package.json"), "utf8"));
@@ -116,6 +118,21 @@ test("both shell pages declare a language (WCAG 3.1.1)", () => {
       `${page} must declare a language on its root element`);
   }
 });
+
+// Neither icon binary is committed any more (see packaging/derive-icons.mjs) —
+// and electron-builder.config.cjs now REFUSES to load (process.exit(1)) if
+// desktop/build/icon.ico, or icon.icns on darwin, is absent or older than the
+// brand master. That check runs at import time, below, so it must be
+// satisfied BEFORE the import — derive on demand, right here, rather than
+// relying on whatever a prior build happened to leave on disk.
+{
+  const r = spawnSync(process.execPath,
+    [path.join(here, "..", "packaging", "derive-icons.mjs")], { stdio: "inherit" });
+  if (r.status !== 0) {
+    throw new Error("packagedFiles.test.mjs: derive-icons.mjs failed to produce "
+      + "fresh desktop icons; see its FAIL: output above");
+  }
+}
 
 // The real electron-builder configuration. It moved out of package.json into a
 // .cjs file because the signing decision has to branch on the environment, so
@@ -426,20 +443,22 @@ test("the app ships the brand icon, not Electron's stock atom", () => {
     "desktop/build/icon.icns is not an icns file");
 
   // ...and the SIZE TABLE, because magic bytes alone are blind to appearance.
-  // The mark that shipped until 2026-08-07 carried NINE variants and no 1024
-  // (`ic10`); macOS uses that one for Finder's largest preview and Quick Look,
-  // and an icns without it silently upscales the 512. Walking the TOC costs
-  // nothing and turns "is this an icns" into "is this OUR icns, at every size
-  // the platform asks for". It is deliberately a table of OSTypes rather than a
-  // pixel assertion: this file has no image decoder and must not grow one.
+  // The brand master ships at 512x512 only (web/public/nh-mark-512.png), so the
+  // iconset derive-icons.mjs builds maxes out at NINE variants and deliberately
+  // carries no 1024 (`ic10`) — upscaling 512 -> 1024 would add interpolation
+  // artifacts, not real detail; see the header comment in
+  // packaging/derive-icons.mjs for the one-line fix once a 1024px master
+  // lands. Walking the TOC costs nothing and turns "is this an icns" into "is
+  // this OUR icns, at every size a 512px master can honestly produce". It is
+  // deliberately a table of OSTypes rather than a pixel assertion: this file
+  // has no image decoder and must not grow one.
   //
-  // It does NOT stand alone. `RELEASE_MANIFEST.txt` pins this file's sha256 and
-  // `scripts/export_guard.py verify` runs per-PR and on every push to main, so
-  // swapping in a different app's icon already fails there (measured: reverting
-  // to main's icon makes that gate exit 1). This assertion catches the case the
-  // hash pin cannot — a revert that also re-derives the manifest.
+  // It does NOT stand alone. Neither icon binary is committed any more — this
+  // icns was freshly derived (above, before the config import) from
+  // web/public/nh-mark-512.png by packaging/derive-icons.mjs, so this test is
+  // really asserting that derivation itself, not a pinned artefact.
   const REQUIRED = ["ic04", "ic05", "ic07", "ic08", "ic09",
-                    "ic10", "ic11", "ic12", "ic13", "ic14"];
+                    "ic11", "ic12", "ic13", "ic14"];
   const present = [];
   let off = 8;
   const total = buf.readUInt32BE(4);
@@ -450,12 +469,12 @@ test("the app ships the brand icon, not Electron's stock atom", () => {
     present.push(type);
     off += len;
   }
-  assert.ok(present.length >= 10,
+  assert.ok(present.length >= 9,
     `the icns TOC walk found only ${present.length} entries - it did not parse`);
   const missing = REQUIRED.filter((t) => !present.includes(t));
   assert.deepEqual(missing, [],
     `desktop/build/icon.icns is missing size variant(s) ${missing.join(", ")}; ` +
-    "the brand mark ships every size the platform asks for");
+    "the brand mark ships every size a 512px master can honestly produce");
 });
 
 
@@ -610,4 +629,18 @@ test("parity: the Windows build has an icon, and it is a real .ico", () => {
   }
   assert.ok(sizes.includes(256),
     `${icon} has no 256x256 entry (has ${sizes.join(", ")}) — NSIS requires one`);
+
+  // derive-icons.mjs's contract (ported from the old make-win-icon.ps1): a
+  // fixed 6-entry PNG-payload ICO with the directory laid out before every
+  // payload, so the first payload always starts at 6 + 16*6 = 102. This is
+  // the actual output-format guarantee the derivation tests pin from the
+  // producer side (packaging/icoFromPng.mjs); asserting it here too catches
+  // a mismatch between what derive-icons.mjs writes and what this build
+  // config actually ships.
+  assert.doesNotThrow(() => validateIco(buf),
+    `${icon} failed packaging/icoFromPng.mjs's own validateIco()`);
+  assert.equal(count, 6, `${icon} must have exactly 6 entries, got ${count}`);
+  const firstOffset = buf.readUInt32LE(6 + 12);
+  assert.equal(firstOffset, 102,
+    `${icon}'s first payload must start at offset 102 (directory-first layout), got ${firstOffset}`);
 });

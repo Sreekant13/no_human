@@ -2,11 +2,12 @@
 __pycache__/
 *.py[oc]
 build/
-# ...except the app icon: desktop/build is electron-builder's buildResources
-# and the brand icns is a tracked INPUT that lives there, not an output.
+# desktop/build is electron-builder's buildResources. Neither icon.icns nor
+# icon.ico is tracked: both are build OUTPUTS, derived at package time from
+# web/public/nh-mark-512.png by packaging/derive-icons.mjs — see that file's
+# header comment for why the binaries stopped being committed.
 !desktop/build/
 desktop/build/*
-!desktop/build/icon.icns
 dist/
 wheels/
 *.egg-info
@@ -24,8 +25,7 @@ secrets/
 *.db-wal
 *.db-shm
 # ...except the memory-triage runbook's committed test fixture: a tracked
-# INPUT (synthetic, neutral content -- see EXPORT_CLASSIFICATION.txt), same
-# carve-out shape as desktop/build/icon.icns above.
+# INPUT (synthetic, neutral content -- see EXPORT_CLASSIFICATION.txt).
 !testdata/memory_triage_fixture.db
 
 # Test scratch

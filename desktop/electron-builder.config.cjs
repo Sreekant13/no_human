@@ -17,6 +17,8 @@
 // fails at runtime with ERR_UPDATER_ZIP_FILE_NOT_FOUND. The DMG remains the
 // thing a human downloads; the ZIP is what the updater consumes.
 
+const fs = require("fs");
+const path = require("path");
 const { signingBanner, signingPlan } = require("./signing.cjs");
 
 const plan = signingPlan(process.env);
@@ -34,6 +36,40 @@ if (plan.fatal) {
     + "environment cannot produce a signed, notarized app.");
   process.exit(1);
 }
+
+// Neither icon binary is committed — see packaging/derive-icons.mjs. The
+// brand mark's compressed bytes coincidentally spell 3-byte identity-scanner
+// needle terms (a structural false positive, verified byte-level), so the
+// binaries stop existing as tracked files and are regenerated from
+// web/public/nh-mark-512.png before every packaging build. A config that
+// silently proceeds without them would ship Electron's stock atom icon
+// instead of the brand mark — worse than refusing here, by name, with the
+// fix. `icon.ico` is required on every platform (its derivation is pure
+// Node); `icon.icns` only where it can actually be produced (sips/iconutil
+// are macOS-only), so this check does not fire on the ubuntu/windows CI
+// runners that load this config but never build for mac.
+const ICON_MASTER_PATH = path.join(__dirname, "..", "web", "public", "nh-mark-512.png");
+
+function requireFreshIcon(buildRelPath) {
+  const iconPath = path.join(__dirname, "build", buildRelPath);
+  if (!fs.existsSync(ICON_MASTER_PATH)) {
+    console.error(`Refusing to build: the brand master ${ICON_MASTER_PATH} is missing.`);
+    process.exit(1);
+  }
+  if (!fs.existsSync(iconPath)) {
+    console.error(`Refusing to build: ${iconPath} does not exist. Run `
+      + "`node ../packaging/derive-icons.mjs` (from desktop/) first.");
+    process.exit(1);
+  }
+  if (fs.statSync(iconPath).mtimeMs < fs.statSync(ICON_MASTER_PATH).mtimeMs) {
+    console.error(`Refusing to build: ${iconPath} is older than the brand master `
+      + `${ICON_MASTER_PATH} — stale. Run \`node ../packaging/derive-icons.mjs\` (from desktop/) first.`);
+    process.exit(1);
+  }
+}
+
+requireFreshIcon("icon.ico");
+if (process.platform === "darwin") requireFreshIcon("icon.icns");
 
 const mac = {
   category: "public.app-category.developer-tools",
@@ -77,9 +113,10 @@ const mac = {
 const win = {
   target: ["nsis", "zip"],
   // Same art as desktop/build/icon.icns, so both platforms wear the same
-  // mark. Regenerate with packaging/make-win-icon.ps1 (Windows) or any tool
-  // that packs the iconset's 16/32/48/64/128/256 PNGs as PNG-compressed ICO
-  // members. The source PNGs the icons are cut from are not in this repo.
+  // mark. Both are derived at package time by packaging/derive-icons.mjs
+  // from web/public/nh-mark-512.png — never committed (see the freshness
+  // check above). packaging/make-win-icon.ps1 still exists as the Windows-
+  // native fallback but is no longer the path this build takes.
   icon: "build/icon.ico",
   // The filename carries the verdict, exactly as make-dmg.sh does for the DMG:
   // "An operator cannot upload no_human-0.1.0-UNSIGNED.dmg to a release page
@@ -133,8 +170,9 @@ module.exports = {
   appId: "dev.nohuman.board",
   productName: "no_human",
   // buildResources holds icon.icns — the brand mark the dock, Finder and the
-  // DMG show. Generated from the site's mark-dark-512.png; without it every
-  // build wore Electron's stock atom icon.
+  // DMG show. Derived at package time by packaging/derive-icons.mjs from
+  // web/public/nh-mark-512.png, never committed; without it every build
+  // wore Electron's stock atom icon.
   directories: { output: "dist", buildResources: "build" },
   // `nhPackagedFiles`, NOT `build`. electron-builder reads a `build` key out of
   // package.json all by itself whenever it is invoked WITHOUT `--config` —

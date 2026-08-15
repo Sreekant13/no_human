@@ -41,6 +41,19 @@ VERSION="$(node -p "require('${ROOT}/desktop/package.json').version")"
 # "no_human-0.1.0-UNSIGNED.dmg" to a release page believing it is shippable.
 DMG="${OUT}/no_human-${VERSION}${ARTIFACT_TAG}.dmg"
 
+# Neither icon binary is committed (see packaging/derive-icons.mjs) — both
+# are derived from web/public/nh-mark-512.png at package time. electron-
+# builder.config.cjs already refused to run without a fresh icon.ico/.icns,
+# so by the time the .app below exists it was built with a real icon. This
+# is the GATE anyway (--verify is the load-bearing half): it catches the
+# case where the .app was produced by a hand-run electron-builder that
+# skipped the config's check, or where the icons went stale in between.
+echo "==> deriving desktop icons from web/public/nh-mark-512.png"
+node "${ROOT}/packaging/derive-icons.mjs" --require-icns \
+  || { echo "FAIL: icon derivation failed — the DMG would ship Electron's stock atom icon" >&2; exit 1; }
+node "${ROOT}/packaging/derive-icons.mjs" --verify --require-icns \
+  || { echo "FAIL: derived icons did not validate" >&2; exit 1; }
+
 test -d "${APP}" || { echo "FAIL: no .app at ${APP} — build it first" >&2; exit 1; }
 mkdir -p "${OUT}"
 rm -f "${RW}" "${DMG}"

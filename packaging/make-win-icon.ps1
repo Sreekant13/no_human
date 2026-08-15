@@ -1,3 +1,11 @@
+# SUPERSEDED as the build path by packaging/derive-icons.mjs, which now runs
+# on every `npm run dist*` (see desktop/package.json) and derives icon.ico
+# directly from web/public/nh-mark-512.png with a dependency-free Node
+# pipeline — no committed icon.icns or icon.ico any more, on either platform.
+# This script is kept as a Windows-native fallback for a box with no Node, and
+# its logic is UNCHANGED: it still reads desktop\build\icon.icns (now itself
+# freshly derived, not committed) rather than the PNG master directly.
+#
 # Generate desktop\build\icon.ico from the SAME artwork the macOS build uses.
 #
 # WHY THIS EXISTS. The Windows icon must be the same mark as the Mac one, and
@@ -8,10 +16,6 @@
 # this repository is desktop\build\icon.icns, so the .ico is derived from it.
 # That keeps a single source of truth rather than introducing a second, and it
 # means the two platforms cannot drift to different artwork.
-#
-# The .ico is COMMITTED, not generated at build time: a build that shells out to
-# an image toolchain is a build that breaks on a machine without one, and the
-# icon changes roughly never. Re-run this script only when the mark changes.
 #
 # Output entries are PNG-compressed, which every supported Windows understands
 # (Vista+). 256x256 is required by electron-builder's NSIS target.
