@@ -1,5 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { connectWS, createTask, uploadAttachment, fetchTasks, fetchWorkerStatus, fetchQueueHealth, fetchOnboardingStatus, fetchAuthStatus, fetchTrackerIssue, grillStep, grillStepSSE } from "./api.js";
+import { connectWS, createTask, uploadAttachment, fetchTasks, fetchWorkerStatus, fetchQueueHealth, fetchOnboardingStatus, fetchAuthStatus, fetchTrackerIssue, fetchConfig, grillStep, grillStepSSE } from "./api.js";
+import { initTelemetry, captureScreen } from "./telemetry.js";
 import Board from "./Board.jsx";
 import Backlog from "./Backlog.jsx";
 import SettingsOverlay from "./Settings.jsx";
@@ -444,7 +445,9 @@ function NewTaskModal({
         <div className="new-task-modal" role="dialog" aria-modal="true" aria-label="Refined spec" tabIndex={-1} ref={grillRef}>
           <QueueNotice notice={notice} remaining={queueLeft} onStopAll={onStopQueue} />
           <div className="sendback-label">Refined Spec</div>
-          <div className="grill-spec">
+          {/* ph-no-capture: the refined spec (title, description, acceptance
+              criteria, eval rationale) is operator content. */}
+          <div className="grill-spec ph-no-capture">
             <div className="grill-spec-title">{grillResult.title}</div>
             {evalVerdict && (
               <div className="eval-verdict-card">
@@ -476,7 +479,7 @@ function NewTaskModal({
               ))}
             </ul>
           </div>
-          {error && <div className="new-task-error">{error}</div>}
+          {error && <div className="new-task-error ph-no-capture">{error}</div>}
           <div className="sendback-actions">
             <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
             <button className="btn btn-approve" disabled={busy} onClick={handleSubmit}>{busy ? "\u2026" : "Create Task"}</button>
@@ -498,7 +501,7 @@ function NewTaskModal({
             <Spinner />
             <div className="grill-loading-text">Reading your code so the questions are worth asking...</div>
             {grillEvents.length > 0 && (
-              <div className="grill-explore-log">
+              <div className="grill-explore-log ph-no-capture">
                 {grillEvents.map((ev, i) => (
                   <div key={i} className="grill-explore-entry" style={{ opacity: i === grillEvents.length - 1 ? 1 : 0.5 }}>
                     {ev.kind === 'tool_use' ? `\u2699 ${ev.text}` : ev.text}
@@ -538,7 +541,7 @@ function NewTaskModal({
               <div className="grill-loading-text">Thinking about that...</div>
               <div className="grill-loading-hint">Refining the next question based on your input</div>
             </div>
-            {error && <div className="new-task-error">{error}</div>}
+            {error && <div className="new-task-error ph-no-capture">{error}</div>}
             <div className="sendback-actions">
               <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
             </div>
@@ -560,7 +563,7 @@ function NewTaskModal({
             <div className="grill-progress-fill" style={{ width: `${progressPct}%` }} />
           </div>
           {grillQA.length > 0 && (
-            <div className="grill-qa-history">
+            <div className="grill-qa-history ph-no-capture">
               {grillQA.map((qa, i) => (
                 <div key={i} className="grill-qa-item">
                   <div><strong>Q{i+1}:</strong> {qa.question}</div>
@@ -571,13 +574,14 @@ function NewTaskModal({
           )}
           <div className="ntm-field">
             <div className="ntm-label">Question</div>
-            <div style={{ fontWeight: 500, fontSize: '14px', lineHeight: 1.5, margin: '4px 0 12px' }}>{grillQuestion.question}</div>
+            {/* ph-no-capture: the question paraphrases the operator's spec. */}
+            <div className="ph-no-capture" style={{ fontWeight: 500, fontSize: '14px', lineHeight: 1.5, margin: '4px 0 12px' }}>{grillQuestion.question}</div>
           </div>
           {grillQuestion.suggestions.map((s, i) => (
-            <button key={i} type="button" className="grill-suggestion" onClick={() => setGrillAnswer(s.replace(/^[A-D]:\s*/, ''))}>{s}</button>
+            <button key={i} type="button" className="grill-suggestion ph-no-capture" onClick={() => setGrillAnswer(s.replace(/^[A-D]:\s*/, ''))}>{s}</button>
           ))}
           <textarea className="sendback-textarea" placeholder="Your answer (or click a suggestion above)" value={grillAnswer} onChange={(e) => setGrillAnswer(e.target.value)} rows={2} style={{ marginTop: '8px' }} />
-          {error && <div className="new-task-error">{error}</div>}
+          {error && <div className="new-task-error ph-no-capture">{error}</div>}
           <div className="sendback-actions">
             <button type="button" className="btn btn-sendback" onClick={onClose}>Cancel</button>
             <button type="button" className="btn btn-sendback btn-sm"
@@ -629,8 +633,10 @@ function BacklogSeedOverlay({ issueKey, tracker, notice, queueLeft, onSkip, onSt
   useEffect(() => { ref.current?.focus(); }, []);
   return (
     <div className="sendback-overlay" onMouseDown={keepFocusInDialog}>
+      {/* ph-no-capture: the tracker issue key names the operator's
+          project, in the aria-label attribute and the body text both. */}
       <div
-        className="new-task-modal"
+        className="new-task-modal ph-no-capture"
         role="dialog"
         aria-modal="true"
         aria-label={`Reading ${issueKey}`}
@@ -744,6 +750,14 @@ export default function App() {
     // can only mean a broken bridge, and an empty catch would bury it.
     window.nhDesktop?.setTheme?.(theme);
   }, [theme]);
+  // Opt-in usage telemetry + masked replay (telemetry.js): the config fetch
+  // decides consent; without it posthog-js is never even imported. Screen
+  // views report the lane NAME only (board/backlog/done/failed/stats/about).
+  useEffect(() => {
+    fetchConfig().then((cfg) => initTelemetry(cfg)).catch(() => {});
+  }, []);
+  useEffect(() => { captureScreen(page); }, [page]);
+  useEffect(() => { if (settingsOpen) captureScreen("settings"); }, [settingsOpen]);
   // Desktop shell (Electron) marks itself via the preload bridge; the class
   // gates the inset-title-bar accommodations (drag region + traffic-light
   // clearance) so the browser experience is untouched.

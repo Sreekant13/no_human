@@ -210,7 +210,7 @@ export default function IntegrationsPanel() {
               </button>
               {isOpen && (
                 <div className="integration-body">
-                  <div className="integration-detail">{it.detail || "—"}</div>
+                  <div className="integration-detail ph-no-capture">{it.detail || "—"}</div>
                   {SECRET_ENV_KEY[it.name] && secret && (
                     <div className="integration-field">
                       <span className="ntm-label" style={{ marginBottom: 0 }}>Secret</span>

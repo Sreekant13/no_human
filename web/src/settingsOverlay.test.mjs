@@ -24,12 +24,13 @@ test("the Config section is gone: no ConfigPanel, no config entry in the section
   assert.doesNotMatch(settingsJsx, /label:\s*["']Config["']/);
 });
 
-test("the section list covers Projects, Rules, Skills, Learnings, Integrations, Account, Updates", () => {
+test("the section list covers Projects, Rules, Skills, Learnings, Integrations, Account, Usage insights, Updates", () => {
   // The name used to claim "exactly" while only checking presence, so adding a
   // section quietly made the title a lie. Both directions are asserted now:
   // every expected label is there, and the list holds nothing else.
+  // "Usage insights" is the opt-in telemetry consent panel (telemetry.js).
   const expected = ["Projects", "Rules", "Skills", "Learnings", "Integrations",
-                    "Account", "Updates"];
+                    "Account", "Usage insights", "Updates"];
   for (const label of expected) {
     assert.match(settingsJsx, new RegExp(`label:\\s*["']${label}["']`), `missing section: ${label}`);
   }

@@ -8,7 +8,7 @@ import {
   fetchProfiles, detectRepos, onboardRepo,
   fetchAuthStatus, setAuthToken, fetchVersion,
   fetchRetireCandidates, retireLearning, restoreLearning,
-  fetchQuarantineCounts,
+  fetchQuarantineCounts, fetchTelemetryConsent, saveTelemetryConsent,
 } from "./api.js";
 import { archiveBadge, archivedCount, visibleMemories } from "./memoryArchive.js";
 import { quarantineFooterLabel } from "./quarantineFooter.js";
@@ -37,6 +37,7 @@ const SECTIONS = [
   { key: "learnings", label: "Learnings" },
   { key: "integrations", label: "Integrations" },
   { key: "account",   label: "Account" },
+  { key: "insights",  label: "Usage insights" },
   { key: "updates",   label: "Updates" },
 ];
 
@@ -130,6 +131,74 @@ function UpdatesPanel() {
             </button>
           ))}
         </div>
+      )}
+    </div>
+  );
+}
+
+// Usage insights: the telemetry CONSENT toggle. Off by default; the server
+// owns the write (and mints the anonymous instance id on first enable). The
+// two-line description matches the published privacy policy exactly — do not
+// soften or embellish it here.
+function UsageInsightsPanel() {
+  const [enabled, setEnabled] = useState(null); // null = still loading
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    let live = true;
+    fetchTelemetryConsent()
+      .then((c) => { if (live) setEnabled(Boolean(c?.enabled)); })
+      .catch((err) => { if (live) setError(String(err?.message ?? err)); });
+    return () => { live = false; };
+  }, []);
+
+  async function toggle() {
+    if (busy || enabled === null) return;
+    setBusy(true);
+    setError(null);
+    setSaved(false);
+    try {
+      const out = await saveTelemetryConsent(!enabled);
+      setEnabled(Boolean(out?.telemetry?.enabled));
+      setSaved(true);
+    } catch (err) {
+      setError(String(err?.message ?? err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="memory-panel">
+      <div className="memory-header">
+        <h3 className="memory-title"><span className="panel-title-text">Usage insights</span></h3>
+      </div>
+      <p className="font-ui text-sm text-text-muted">
+        Off by default. When on: anonymous usage events and masked recordings
+        of the app&apos;s own interface. Never your code.
+      </p>
+      <div className="mt-4 flex items-center gap-3">
+        <button
+          type="button"
+          role="switch"
+          aria-checked={enabled === true}
+          aria-label="Share usage insights"
+          disabled={busy || enabled === null}
+          className={enabled ? "btn btn-approve" : "btn"}
+          onClick={toggle}
+        >
+          {enabled === null ? "Loading…" : enabled ? "On" : "Off"}
+        </button>
+        {saved && (
+          <span className="font-ui text-xs text-text-muted" role="status">
+            Saved — takes effect after the board reloads.
+          </span>
+        )}
+      </div>
+      {error && (
+        <div className="nh-alarm mt-3" role="alert">{error}</div>
       )}
     </div>
   );
@@ -421,6 +490,7 @@ export default function SettingsOverlay({ onClose }) {
             {section === "learnings" && <LearningsPanel />}
             {section === "integrations" && <IntegrationsPanel />}
             {section === "account"     && <AuthPanel />}
+            {section === "insights"    && <UsageInsightsPanel />}
             {section === "updates"     && <UpdatesPanel />}
           </div>
         </div>
@@ -580,7 +650,7 @@ function MemoryCard({ item, onRemove, onRestore, onDismiss }) {
   const badge = archiveBadge(item);
 
   return (
-    <div className="memory-card">
+    <div className="memory-card ph-no-capture">
       <div className="memory-card-header">
         <span className="memory-card-id">{(item.id || "").slice(0, 8)}</span>
         <span className="memory-card-type">{item.type}</span>
@@ -916,7 +986,7 @@ function LearningsPanel() {
           </h4>
           <div className="memory-list">
             {retireVisible.map((item) => (
-              <div key={item.id} className="memory-card retire-candidate-card">
+              <div key={item.id} className="memory-card retire-candidate-card ph-no-capture">
                 <div className="memory-card-header">
                   <span className="memory-type-badge">{item.type}</span>
                   <span className="memory-title">{item.title}</span>
@@ -961,7 +1031,7 @@ function LearningCard({ item, isPending, onAction, selected, onToggleSelect }) {
   const origin = learningOrigin(item);
   const evidence = learningEvidence(item.evidence);
   return (
-    <div className={`memory-card learning-card${selected ? " selected" : ""}`}>
+    <div className={`memory-card learning-card ph-no-capture${selected ? " selected" : ""}`}>
       <div className="memory-card-header">
         {isPending && (
           // NEVER pre-ticked. The server sends `selected: false` on every
@@ -1132,7 +1202,7 @@ function ProjectCard({ project, onDelete, onUpdated }) {
   }
 
   return (
-    <div className={`memory-card project-card${expanded ? " expanded" : ""}`}>
+    <div className={`memory-card project-card ph-no-capture${expanded ? " expanded" : ""}`}>
       {/* A <div> with an onClick was keyboard-inert, and expanding a project is the ONLY route
           to its repo list and test-plan editor — the whole panel was mouse-only. */}
       <div
@@ -1164,7 +1234,7 @@ function ProjectCard({ project, onDelete, onUpdated }) {
               {project.repo_paths.map((rp) => (
                 <div key={rp} className="project-repo-row">
                   <span className="project-repo-name">{rp.split('/').pop()}</span>
-                  <span className="project-repo-path">{rp}</span>
+                  <span className="project-repo-path ph-no-capture">{rp}</span>
                   {rp === project.primary_repo ? (
                     <span className="project-repo-primary">primary</span>
                   ) : (
@@ -1277,18 +1347,18 @@ function TestPlanEditor({ project, onUpdated }) {
         <div key={idx} className="project-repo-row">
           <span className="project-repo-name">{l.name}</span>
           {l.runner === "ci" ? (
-            <code className="project-repo-path" style={{ color: 'var(--accent)' }}
+            <code className="project-repo-path ph-no-capture" style={{ color: 'var(--accent)' }}
               title={l.ci ? JSON.stringify(l.ci, null, 2) : ""}>
               ci:{l.ci?.backend || "?"} {"\u2192"} {l.ci?.project || l.ci?.job || "?"}
             </code>
           ) : (
-            <code className="project-repo-path">{l.command}</code>
+            <code className="project-repo-path ph-no-capture">{l.command}</code>
           )}
           <span className={`memory-tag${l.gating !== "blocking" ? " advisory" : ""}`}>
             {l.gating}
           </span>
           {l.repo && (
-            <span className="project-repo-path" style={{ flex: 'none' }} title={l.repo}>
+            <span className="project-repo-path ph-no-capture" style={{ flex: 'none' }} title={l.repo}>
               {"\u2197"} {l.repo.split("/").pop()}
             </span>
           )}
@@ -1434,7 +1504,7 @@ function AddProjectModal({ onClose, onSaved }) {
             </div>
           </div>
           {detected.length > 0 && (
-            <div className="ob-repolist" style={{ maxHeight: '180px', margin: '8px 0' }}>
+            <div className="ob-repolist ph-no-capture" style={{ maxHeight: '180px', margin: '8px 0' }}>
               {detected.map((r) => (
                 <label key={r.path} className={`ob-repo${selectedRepos.has(r.path) ? " sel" : ""}`} style={{ padding: '4px 8px' }}>
                   <input type="checkbox" checked={selectedRepos.has(r.path)} onChange={() => toggleRepo(r.path)} />

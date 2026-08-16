@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import re
+import time
 import unicodedata
 import shutil
 import subprocess
@@ -1022,6 +1023,53 @@ class Orchestrator:
 
     def emit(self, kind: str, text: str = "", **meta: Any) -> None:
         self._sink({"source": "orchestrator", "kind": kind, "text": text, **meta})
+        self._telemetry_hook(kind, meta)
+
+    def _telemetry_hook(self, kind: str, meta: dict[str, Any]) -> None:
+        """The ONE server-side telemetry hook: map a small set of emitted
+        kinds to the closed telemetry allowlist (opt-in, default OFF — see
+        telemetry.py). Never any task id/title/repo/path/prompt: only the
+        task KIND, terminal status, a duration bucket and an attempt count.
+        Fail-open by construction — telemetry can never break a run."""
+        try:
+            from .. import telemetry
+            if kind == "kind":
+                # First per-run event (`run()` on a PENDING task) — carries
+                # task_kind only, never a title. Task.kind is an unvalidated
+                # str at the API layer, so the value is normalized to the
+                # known vocabulary here: anything else leaves the machine as
+                # the literal "other", keeping `source` a closed set even if
+                # a client invents kinds (privacy posture: closed sets only).
+                self._tel_started_at = time.time()
+                self._tel_attempts = 0
+                self._tel_terminal_sent = False
+                raw_kind = str(meta.get("task_kind") or "unknown")
+                telemetry.record(
+                    "task_created", config=self.config,
+                    source=raw_kind if raw_kind in (
+                        "feature", "bugfix", "ci_fix", "traceability",
+                        "test_gap", "unknown") else "other")
+            elif kind == "attempt_start":
+                self._tel_attempts = getattr(self, "_tel_attempts", 0) + 1
+            elif (kind == "state"
+                  and meta.get("status") in ("done", "awaiting_approval")
+                  and not getattr(self, "_tel_terminal_sent", False)):
+                self._tel_terminal_sent = True
+                started = getattr(self, "_tel_started_at", None)
+                bucket = (telemetry.duration_bucket((time.time() - started) / 60)
+                          if started else "unknown")
+                telemetry.record(
+                    "task_completed", config=self.config,
+                    status=str(meta.get("status")), duration_bucket=bucket,
+                    attempts=getattr(self, "_tel_attempts", 0))
+            elif kind == "failed" and not getattr(self, "_tel_terminal_sent", False):
+                # Terminal `_fail` off-ramp. The free-text detail must NOT
+                # ship; the category is the signal name itself.
+                self._tel_terminal_sent = True
+                telemetry.record("task_failed", config=self.config,
+                                 category="failed")
+        except Exception:
+            pass
 
     def _on_coder_compact(self, trigger: str) -> None:
         """The coder session's PreCompact hook (`_make_compact_hook`). Bumps

@@ -54,7 +54,7 @@ from .models import (
     GrillQuestionOut, GrillResultOut, GrillStepRequest, IntegrationSetupRequest,
     ImportedInfo, LandedOverrideRequest, ProjectOut, ReplyRequest,
     SaveIntegrationConfigRequest, SendBackRequest, ShippedRequest, TaskOut,
-    TaskSummaryOut, TrackerIssueOut, UpdateProjectRequest,
+    TaskSummaryOut, TelemetryConsentRequest, TrackerIssueOut, UpdateProjectRequest,
 )
 
 import logging
@@ -138,6 +138,15 @@ async def lifespan(app: FastAPI):
     store = external_store or await Store(config.db_path).connect()
     app.state.store = store
     app.state.config = config
+    # CSP is computed once per app start from the loaded config: strict by
+    # default, widened by exactly the PostHog hosts when the operator opted in.
+    app.state.csp = _build_csp(config.data)
+    # Opt-in telemetry (default OFF — record() no-ops without consent).
+    try:
+        from .. import telemetry as _telemetry
+        _telemetry.record("app_started", config=config.data)
+    except Exception:
+        pass
 
     # Always start the embedded worker — board up = worker up.
     # CLI may override max_workers/poll_interval via app.state._worker_opts.
@@ -333,11 +342,33 @@ _CSP = (
     "base-uri 'self'; frame-ancestors 'none'"
 )
 
+# The two PostHog hosts the browser needs when (and ONLY when) the operator
+# has opted in to Usage insights: the recorder/client bundle is fetched from
+# us-assets, events + replay payloads POST to both. Exact hosts, nothing wider.
+_POSTHOG_SCRIPT_HOST = "https://us-assets.i.posthog.com"
+_POSTHOG_CONNECT_HOSTS = "https://us.i.posthog.com https://us-assets.i.posthog.com"
+
+
+def _build_csp(config_data: dict) -> str:
+    """The CSP header value for this app start. With telemetry off (the
+    default) this returns `_CSP` UNCHANGED — byte-identical, a test pins it.
+    With telemetry configured+enabled, script-src/connect-src gain exactly
+    the PostHog hosts above."""
+    tel = (config_data or {}).get("telemetry") or {}
+    if not (tel.get("enabled") and str(tel.get("posthog_publishable") or "").strip()):
+        return _CSP
+    return (_CSP
+            .replace("script-src 'self'", f"script-src 'self' {_POSTHOG_SCRIPT_HOST}")
+            .replace("connect-src 'self' ws: wss:",
+                     f"connect-src 'self' ws: wss: {_POSTHOG_CONNECT_HOSTS}"))
+
 
 @app.middleware("http")
 async def _csp_header(request, call_next):
     response = await call_next(request)
-    response.headers.setdefault("Content-Security-Policy", _CSP)
+    # Computed per app start (lifespan). Fallback: the strict no-telemetry value.
+    csp = getattr(request.app.state, "csp", None) or _CSP
+    response.headers.setdefault("Content-Security-Policy", csp)
     return response
 
 
@@ -927,6 +958,14 @@ async def approve_task(task_id: str, request: Request) -> dict[str, Any]:
     # just in-process.
     if not await store.claim_merge(task.id):
         raise HTTPException(status_code=409, detail="Merge already in progress")
+    # Opt-in telemetry: the click itself, nothing about WHAT was approved.
+    try:
+        from .. import telemetry as _telemetry
+        cfg = getattr(request.app.state, "config", None)
+        _telemetry.record("approve_clicked",
+                          config=cfg.data if cfg is not None else {})
+    except Exception:
+        pass
     try:
         task.context = await store.merge_context(task.id, {"approved_at": _now()})
         # An already-satisfied claim has no PR to merge — approval IS the human
@@ -3416,6 +3455,40 @@ async def save_integration_config_endpoint(
     out = asdict(status)
     out["fields"] = integration_fields(name, refreshed.data)
     return out
+
+
+@app.put("/api/telemetry/consent")
+async def save_telemetry_consent(
+    body: TelemetryConsentRequest, request: Request
+) -> dict[str, Any]:
+    """Settings > Usage insights: persist `telemetry.enabled` to config.yaml.
+
+    On FIRST enable, mints the anonymous `telemetry.instance_id` (uuid4)
+    HERE, server-side, in the same write — the id never comes from the
+    browser. Off by default; turning it off writes `enabled: false` and
+    leaves the id in place (so re-enabling keeps one stable anonymous id
+    rather than manufacturing a fresh "new install" every toggle)."""
+    import uuid
+
+    from ..integrations import _write_config_values
+
+    _require_local_origin(request, writing=True)
+    from ..config import CONFIG_PATH, load_config
+
+    updates: dict[str, Any] = {"telemetry.enabled": bool(body.enabled)}
+    current = load_config(CONFIG_PATH).data.get("telemetry") or {}
+    if body.enabled and not str(current.get("instance_id") or "").strip():
+        updates["telemetry.instance_id"] = str(uuid.uuid4())
+    await asyncio.to_thread(_write_config_values, CONFIG_PATH, updates)
+
+    refreshed = load_config(CONFIG_PATH)
+    request.app.state.config.data = refreshed.data
+    # Recompute the CSP now (same builder the lifespan uses at app start), so
+    # the widened/strict header tracks consent without waiting for a restart.
+    request.app.state.csp = _build_csp(refreshed.data)
+    tel = copy.deepcopy(refreshed.data.get("telemetry") or {})
+    # Replay/init runs at page bootstrap, so the browser reloads to apply.
+    return {"telemetry": _scrub_secrets(tel), "reload_required": True}
 
 
 async def _attach_imported(

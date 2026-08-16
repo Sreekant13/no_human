@@ -409,8 +409,12 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
           change-request with no confirm, the same loss that motivated
           removing backdrop-close from the other five overlays. */}
       <div className="slideover-backdrop" onMouseDown={keepFocusInDialog} />
+      {/* ph-no-capture on the WHOLE drawer: every tab renders operator
+          content (spec, diffs — in Review and Diff tabs both — blockers,
+          activity, agent logs). Three review rounds proved per-tab masking
+          misses surfaces; the drawer records as one blocked box. */}
       <div
-        className="slideover"
+        className="slideover ph-no-capture"
         role="dialog"
         aria-modal="true"
         aria-labelledby="so-dialog-title"
@@ -425,7 +429,9 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
         <div className="so-header">
           <div className="so-header-text">
             <div className="so-id">{task?.id ?? taskId}</div>
-            <div className="so-title" id="so-dialog-title">{task?.title ?? "Loading…"}</div>
+            {/* ph-no-capture: task titles are operator content — excluded from
+                session replay (PostHog block-level suppression class). */}
+            <div className="so-title ph-no-capture" id="so-dialog-title">{task?.title ?? "Loading…"}</div>
           </div>
           <button className="so-close" onClick={onClose} ref={closeRef} aria-label="Close"><IconX size={16} /></button>
         </div>
@@ -452,7 +458,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
         {task?.failure_reason && (
           <div className="so-failure" role="alert">
             <div className="so-failure-label">Why it failed</div>
-            <div className="so-failure-reason">{task.failure_reason}</div>
+            <div className="so-failure-reason ph-no-capture">{task.failure_reason}</div>
           </div>
         )}
 
@@ -654,7 +660,7 @@ export default function SlideOver({ taskId, onClose, refreshKey = 0,
             {decision && (decision.question || decision.ask) && (
               // Context so the box isn't blank: what the human is actually
               // answering, quoted from the blocker.
-              <p className="reply-context">{decision.question || decision.ask}</p>
+              <p className="reply-context ph-no-capture">{decision.question || decision.ask}</p>
             )}
             <textarea
               className="sendback-textarea"
@@ -1769,7 +1775,7 @@ function ActivityTab({ taskId, task, isActive }) {
 
   if (events.length === 0) {
     return (
-      <div className="activity-feed">
+      <div className="activity-feed ph-no-capture">
         <div className="so-diff-empty">
           {isActive ? "Waiting for events…" : "No events recorded for this task."}
         </div>
@@ -1797,7 +1803,7 @@ function ActivityTab({ taskId, task, isActive }) {
   const turnPct = maxTurns ? Math.min(100, (turnCount / maxTurns) * 100) : null;
 
   return (
-    <div className="activity-feed">
+    <div className="activity-feed ph-no-capture">
       <div className="activity-legend">
         <span className="al-role role-worker"><i />Orchestrator — drives pipeline</span>
         <span className="al-role role-agent"><i />Worker — reads &amp; edits code</span>
@@ -1998,13 +2004,14 @@ function DetailsTab({ task }) {
       {task.description && (
         <section>
           <div className="so-section-label">Description</div>
-          <div className="so-description">{task.description}</div>
+          {/* ph-no-capture: the spec/description is operator content. */}
+          <div className="so-description ph-no-capture">{task.description}</div>
         </section>
       )}
       {task.acceptance_criteria?.length > 0 && (
         <section>
           <div className="so-section-label">Acceptance criteria</div>
-          <ul className="so-criteria" data-testid="criteria-list">
+          <ul className="so-criteria ph-no-capture" data-testid="criteria-list">
             {task.acceptance_criteria.map((c, i) => {
               const progress = task.context?.progress?.acceptance_criteria?.[i];
               const status = progress?.status;
@@ -2691,7 +2698,8 @@ function DiffTab({ diff }) {
   }
   const lines = diff.split("\n");
   return (
-    <div className="so-diff-wrap" data-testid="diff-view">
+    // ph-no-capture: the diff renders the operator's code — never recorded.
+    <div className="so-diff-wrap ph-no-capture" data-testid="diff-view">
       <pre className="diff-pre">
         {lines.map((line, i) => (
           <div key={i} className={`diff-line ${diffLineClass(line)}`}>

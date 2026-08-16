@@ -518,7 +518,8 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
           )}
 
           {needsPrUrl(kind) && (
-            <div className="mt-3">
+            /* ph-no-capture: the PR URL names the operator's repo. */
+            <div className="mt-3 ph-no-capture">
               <input
                 className={TEXT_FIELD}
                 placeholder="https://github.com/owner/repo/pull/123"
@@ -542,7 +543,8 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
 
           {/* Where the work happens. */}
           <p className="mt-3 px-1 font-ui text-xs uppercase tracking-wide text-text-dim" id="repo-eyebrow">Repository</p>
-          <div className="mt-1.5 flex flex-wrap items-center gap-2">
+          {/* ph-no-capture: repo names/paths are operator content. */}
+          <div className="mt-1.5 flex flex-wrap items-center gap-2 ph-no-capture">
             {!freeTextRepo ? (
               <SelectPill
                 grow
@@ -782,8 +784,10 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
             </p>
           )}
 
-          {/* One large input surface: the prompt and the controls that qualify it. */}
-          <div className="mt-4 rounded-2xl border border-solid border-line bg-panel p-4 transition-colors focus-within:border-accent sm:p-5">
+          {/* One large input surface: the prompt and the controls that qualify it.
+              ph-no-capture: the whole composer surface (prompt textarea +
+              attachments) is operator content — excluded from session replay. */}
+          <div className="mt-4 rounded-2xl border border-solid border-line bg-panel p-4 transition-colors focus-within:border-accent sm:p-5 ph-no-capture">
             <textarea
               className="min-h-[180px] w-full resize-none border-0 bg-transparent px-2 py-1 font-ui text-lg leading-relaxed text-text outline-none placeholder:text-text-muted sm:min-h-[200px]"
               autoFocus
@@ -856,14 +860,14 @@ export default function TaskComposer({ busy, error, initial, notice, queueRemain
           </div>
 
           {files.length > 0 && (
-            <div className="mt-3 px-5 font-ui text-sm text-text-muted">
+            <div className="mt-3 px-5 font-ui text-sm text-text-muted ph-no-capture">
               {files.map((f) => `${f.name} (${formatBytes(f.size)})`).join(", ")}
             </div>
           )}
 
           {error && (
             <div
-              className="mt-4 rounded-2xl px-5 py-4 font-ui text-sm"
+              className="mt-4 rounded-2xl px-5 py-4 font-ui text-sm ph-no-capture"
               style={{ color: "var(--red)", background: "var(--red-dim)" }}
             >
               {error}

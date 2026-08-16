@@ -14,7 +14,7 @@
 export default function QueueNotice({ notice, remaining = 0, onStopAll = null }) {
   if (!notice) return null;
   return (
-    <div className="queue-notice">
+    <div className="queue-notice ph-no-capture">
       <span className="queue-notice-text">{notice}</span>
       {onStopAll && remaining > 0 && (
         <button

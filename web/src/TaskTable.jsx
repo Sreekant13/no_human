@@ -63,7 +63,9 @@ export default function TaskTable({ tasks, onSelect = null, emptyHint = null }) 
             <th className="stats-th stats-th-right">Est. Cost</th>
           </tr>
         </thead>
-        <tbody>
+        {/* ph-no-capture: every row renders operator content (task titles,
+            PR URLs, repo names) — the whole body is masked from replay. */}
+        <tbody className="ph-no-capture">
           {rows.map((t) => (
             <tr
               key={t.id}

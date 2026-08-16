@@ -283,7 +283,10 @@ function TaskCard({ task, accent, isAwaiting, showSubStatus, staleAnswer, onClic
   const isQueuedNow = activity.mode === "queued";
   const waiting = isWaiting(task);
 
-  let cardCls = "task-card";
+  // ph-no-capture: the ENTIRE card is operator content (title, live status,
+  // description, blocker question, repo name, PR URL) — masked wholesale
+  // from session replay rather than per-field.
+  let cardCls = "task-card ph-no-capture";
   if (isAwaiting) cardCls += " awaiting";
   if (isStale) cardCls += " stale";
   if (isRunningNow) cardCls += " active-working";

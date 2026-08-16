@@ -15,7 +15,7 @@ const read = (f) => readFileSync(here + f, "utf8");
 test("PathInput.jsx fetches suggestions and pairs the input with its datalist", () => {
   const src = read("PathInput.jsx");
   assert.match(src, /suggestPaths/);
-  assert.match(src, /<datalist id=\{listId\}>/);
+  assert.match(src, /<datalist id=\{listId\} className="ph-no-capture">/);  // masked: options echo operator filesystem paths
   assert.match(src, /list=\{listId\}/);
 });
 

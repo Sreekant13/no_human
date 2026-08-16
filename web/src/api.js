@@ -336,6 +336,21 @@ export async function fetchConfig() {
   return r.json();
 }
 
+// Settings > Usage insights (opt-in telemetry) consent toggle. The server
+// persists `telemetry.enabled` and mints the anonymous instance id on first
+// enable — the browser only ever sends the boolean.
+export const saveTelemetryConsent = (enabled) =>
+  _put("/api/telemetry/consent", { enabled });
+
+// The current consent state, and ONLY that — Settings deliberately has no
+// whole-config reader any more (the Config panel was removed; its absence is
+// pinned by settingsOverlay.test.mjs), so the Usage insights panel gets a
+// projection that cannot grow back into one.
+export async function fetchTelemetryConsent() {
+  const cfg = await fetchConfig();
+  return { enabled: Boolean(cfg?.telemetry?.enabled) };
+}
+
 // The running `nh` version and distribution channel, for the browser path
 // where there is no desktop bridge to read it from. Never throws a version
 // out of thin air: the caller treats a failure as "unknown", which is what it

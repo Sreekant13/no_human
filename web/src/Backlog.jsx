@@ -233,7 +233,7 @@ export default function Backlog({ onStart, refreshNonce = 0 }) {
             {/* An upstream failure is NOT an empty backlog. The server's detail
                 says which (expired token vs. site/project config); it is shown
                 verbatim under a heading that never claims "no tickets". */}
-            <span>
+            <span className="ph-no-capture">
               <b>Couldn&apos;t reach {e.label}.</b> {e.message} Your backlog is not empty — it
               could not be read.
             </span>
@@ -278,7 +278,7 @@ export default function Backlog({ onStart, refreshNonce = 0 }) {
                 (checked ? "border-accent" : "border-line")
               }
             >
-              <label className={"flex min-w-0 flex-1 items-center gap-3 " + (disabled ? "cursor-default" : "cursor-pointer")}>
+              <label className={"flex min-w-0 flex-1 items-center gap-3 ph-no-capture " + (disabled ? "cursor-default" : "cursor-pointer")}>
                 <input
                   type="checkbox"
                   className="h-4 w-4 shrink-0"
@@ -289,7 +289,9 @@ export default function Backlog({ onStart, refreshNonce = 0 }) {
                   aria-label={`Select ${issue.key}: ${issue.summary}`}
                   title={disabled ? "Already started as a task — use Start again to create a second one" : undefined}
                 />
-                <span className="flex min-w-0 flex-col gap-1">
+                {/* ph-no-capture: ticket key/title + assignee are the
+                    operator's tracker content — excluded from replay. */}
+                <span className="flex min-w-0 flex-col gap-1 ph-no-capture">
                   <span className="truncate font-ui text-sm font-medium text-text">
                     {issue.key}: {issue.summary}
                   </span>
@@ -330,7 +332,7 @@ export default function Backlog({ onStart, refreshNonce = 0 }) {
                 {imp && (
                   <button
                     type="button"
-                    className={`${GHOST_BTN} h-8 px-3 text-xs`}
+                    className={`${GHOST_BTN} h-8 px-3 text-xs ph-no-capture`}
                     onClick={() => start([issue])}
                     title={`${issue.key} already has a task (${issue.imported.status}). Starting it again creates a SECOND task for the same ticket.`}
                   >

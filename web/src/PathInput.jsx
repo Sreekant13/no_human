@@ -28,7 +28,7 @@ export default function PathInput({
         style={style}
         {...rest}
       />
-      <datalist id={listId}>
+      <datalist id={listId} className="ph-no-capture">
         {opts.map((o) => (
           <option key={o.path} value={o.path}>{o.is_repo ? "git repo" : "folder"}</option>
         ))}

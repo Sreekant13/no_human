@@ -88,7 +88,7 @@ function PathInput({ value, onChange, placeholder, autoFocus }) {
         autoFocus={autoFocus} spellCheck={false}
         onChange={(e) => onChange(e.target.value)}
       />
-      <datalist id={listId}>
+      <datalist id={listId} className="ph-no-capture">
         {opts.map((o) => (
           <option key={o.path} value={o.path}>
             {o.is_repo ? "git repo" : "folder"}
@@ -634,13 +634,13 @@ export default function Onboarding({ onComplete }) {
                   </button>
                 </div>
               )}
-              <div className="ob-repolist">
+              <div className="ob-repolist ph-no-capture">
                 {detected.length === 0 && <div className="ob-empty">{busy ? <><span className="grill-spinner" style={{ width: 16, height: 16, verticalAlign: 'middle', marginRight: 8 }} />Looking for your repositories…</> : "No repositories found. Search another folder above."}</div>}
                 {detected.map((r) => {
                   const st = onboarded[r.path];
                   const pv = proveState[r.path];
                   return (
-                    <div key={r.path} className="ob-repo-row">
+                    <div key={r.path} className="ob-repo-row ph-no-capture">
                     <label className={`ob-repo${selectedRepos.has(r.path) ? " sel" : ""}`}>
                       <input type="checkbox" checked={selectedRepos.has(r.path)} onChange={() => toggleRepo(r.path)} />
                       <span className="ob-repo-name">{r.name}</span>
@@ -714,13 +714,13 @@ export default function Onboarding({ onComplete }) {
                   those (unboundProjectsMessage). So the copy is what was wrong. */}
               {projectDefs.length === 0 && <div className="ob-empty">No projects yet — this step is optional. You can add them here or later in Settings.</div>}
               {projectDefs.map((pd, pi) => (
-                <div key={pd.name} className="ob-project-card">
+                <div key={pd.name} className="ob-project-card ph-no-capture">
                   <div className="ob-project-head">
-                    <strong>{pd.name}</strong>
+                    <strong className="ph-no-capture">{pd.name}</strong>
                     <span className="ob-faint">{pd.repos.size} repo{pd.repos.size !== 1 ? "s" : ""}</span>
                     <button className="ob-btn-ghost" style={{ marginLeft: 'auto', fontSize: '0.75rem' }} aria-label={`Remove project ${pd.name}`} onClick={() => removeProject(pi)}>✕</button>
                   </div>
-                  <div className="ob-repolist" style={{ maxHeight: '140px' }}>
+                  <div className="ob-repolist ph-no-capture" style={{ maxHeight: '140px' }}>
                     {[...selectedRepos].map((rp) => (
                       <label key={rp} className={`ob-repo${pd.repos.has(rp) ? " sel" : ""}`} style={{ padding: '0.25rem 0.5rem' }}>
                         <input type="checkbox" checked={pd.repos.has(rp)} onChange={() => toggleProjectRepo(pi, rp)} />
@@ -1133,7 +1133,7 @@ export function ProvePanel({ repoPath, profile, prove, editedCmd, onEditCmd,
       )}
 
       {status === "error" && (
-        <p className="ob-prove-verdict bad">Could not run the proof: {prove.error}</p>
+        <p className="ob-prove-verdict bad ph-no-capture">Could not run the proof: {prove.error}</p>
       )}
     </div>
   );

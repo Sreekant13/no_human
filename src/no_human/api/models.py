@@ -612,6 +612,13 @@ class SaveIntegrationConfigRequest(BaseModel):
     fields: dict[str, str] = {}
 
 
+class TelemetryConsentRequest(BaseModel):
+    """Settings > Usage insights toggle. `enabled` is the ONLY field: the
+    anonymous instance id is minted server-side on first enable — never
+    accepted from the browser."""
+    enabled: bool
+
+
 class IntegrationSetupRequest(BaseModel):
     """The onboarding "Connect your tools" step's payload for ONE integration:
     its non-secret settings only (bools, text, string lists).

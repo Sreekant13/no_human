@@ -293,7 +293,7 @@ function CostByProject({ tasks }) {
   const max = Math.max(...rows.map((r) => r.cost), 0);
 
   return (
-    <div className="stats-section" data-testid="cost-by-project">
+    <div className="stats-section ph-no-capture" data-testid="cost-by-project">
       <h3 className="stats-section-title">Cost by Project</h3>
       <div className="stats-section-sub">
         {fmtCost(total)} across {rows.length} {pluralize(rows.length, "project")}
@@ -398,7 +398,7 @@ function RepoUnderstanding() {
   if (repos.length === 0) return null;   // nothing onboarded yet — no empty widget
 
   return (
-    <div className="stats-section" data-testid="repo-understanding">
+    <div className="stats-section ph-no-capture" data-testid="repo-understanding">
       <h3 className="stats-section-title">Repository Understanding</h3>
       <div className="stats-section-sub">
         What no_human knows about a repo — profile, structure map, and playbooks
@@ -486,7 +486,7 @@ function SessionSearch() {
   const groups = groupByTask(results);
 
   return (
-    <div className="stats-section" data-testid="session-search">
+    <div className="stats-section ph-no-capture" data-testid="session-search">
       <h3 className="stats-section-title">Search history</h3>
       <div className="stats-section-sub">
         Full-text search across every task's failures, reviews, and blockers
